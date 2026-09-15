@@ -35,22 +35,28 @@ impl Anthropic {
     ///   `strict` (those are the OpenAI spelling).
     /// - Never send `budget_tokens`.
     /// - Never prefill an assistant turn — the only message is the user turn.
+    /// - `effort` is omitted for models that reject it (see
+    ///   [`supports_effort`]), because sending it there is a hard 400.
     fn build_body(&self, shot: &Shot, prompt: &str) -> Value {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&shot.png);
+
+        let mut output_config = json!({
+            "format": {
+                    "type": "json_schema",
+                "schema": {"type": "object",
+                    "properties": {"detail": {"type": "string"}, "headline": {"type": "string"}},
+                    "required": ["detail", "headline"], "additionalProperties": false}
+            }
+        });
+        if supports_effort(&self.model) && !self.effort.is_empty() {
+            output_config["effort"] = Value::String(self.effort.clone());
+        }
 
         json!({
             "model": self.model,
             "max_tokens": 4000,
             "system": prompt,
-            "output_config": {
-                "effort": self.effort,
-                "format": {
-                    "type": "json_schema",
-                    "schema": {"type": "object",
-                        "properties": {"detail": {"type": "string"}, "headline": {"type": "string"}},
-                        "required": ["detail", "headline"], "additionalProperties": false}
-                }
-            },
+            "output_config": output_config,
             "messages": [{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
                 {"type": "text", "text": "Check my working."}
@@ -123,6 +129,19 @@ impl Provider for Anthropic {
 
         Self::parse_response(&body_text)
     }
+}
+
+
+/// Whether a model accepts `output_config.effort`.
+///
+/// Effort is rejected outright on the 4.5-generation Sonnet and Haiku models —
+/// sending it returns a 400 rather than being ignored — so those must be
+/// filtered out rather than passed through hopefully. Everything current
+/// (Opus 5 / 4.8 / 4.7 / 4.6, Sonnet 5, the Fable line) accepts it, so the
+/// default is to send it and carve out the known exceptions.
+fn supports_effort(model: &str) -> bool {
+    const NO_EFFORT: [&str; 2] = ["claude-haiku-4-5", "claude-sonnet-4-5"];
+    !NO_EFFORT.iter().any(|m| model.starts_with(m))
 }
 
 #[cfg(test)]
@@ -211,5 +230,34 @@ mod tests {
     fn parse_response_rejects_invalid_json() {
         let err = Anthropic::parse_response("not json").unwrap_err();
         assert!(err.to_string().contains("not valid JSON"));
+    }
+
+    #[test]
+    fn effort_is_sent_for_models_that_accept_it() {
+        let p = Anthropic::new("k", "claude-opus-5", "low");
+        let body = p.build_body(&sample_shot(), "sys");
+        assert_eq!(body["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn effort_is_omitted_for_models_that_reject_it() {
+        // Sending effort to these is a 400, not a no-op.
+        for model in ["claude-haiku-4-5", "claude-sonnet-4-5"] {
+            let p = Anthropic::new("k", model, "low");
+            let body = p.build_body(&sample_shot(), "sys");
+            assert!(
+                body["output_config"].get("effort").is_none(),
+                "{model} must not carry effort"
+            );
+            // The schema must still be there — only effort is dropped.
+            assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        }
+    }
+
+    #[test]
+    fn empty_effort_is_never_sent() {
+        let p = Anthropic::new("k", "claude-opus-5", "");
+        let body = p.build_body(&sample_shot(), "sys");
+        assert!(body["output_config"].get("effort").is_none());
     }
 }

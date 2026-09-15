@@ -27,12 +27,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::capture;
 use crate::config::Config;
+use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::hotkey::{
     chord_to_string, Chord, HotkeyHook, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
 };
 use crate::provider::{Answer, Chain, Shot};
 use crate::ui::card::Card;
-use crate::ui::tray::{cmd, Tray, WM_APP_TRAY};
+use crate::ui::tray::{cmd, decode, MenuChoice, Tray, WM_APP_TRAY};
 
 /// Posted by the worker when a request finishes. `lparam` is
 /// `Box::into_raw(Box::new(Result<Answer, String>))`; the handler takes
@@ -52,6 +53,9 @@ struct App {
     card: Card,
     tray: Tray,
     hook: Option<HotkeyHook>,
+    /// Global click watcher. Armed only while an answer is on screen, so a
+    /// click during the request cannot dismiss the pending spinner.
+    watcher: Option<ClickWatcher>,
     /// A request is in flight; further triggers are ignored until it lands.
     busy: bool,
     last: Option<Answer>,
@@ -70,7 +74,8 @@ pub fn run() -> Result<()> {
 
     let hwnd = create_owner_window(instance)?;
 
-    let card = Card::new(instance).context("creating the notification card")?;
+    let mut card = Card::new(instance).context("creating the notification card")?;
+    card.set_text_scale(config.ui.text_scale);
     let tray = Tray::new(hwnd, instance).context("creating the tray icon")?;
 
     let mut app = Box::new(App {
@@ -79,6 +84,7 @@ pub fn run() -> Result<()> {
         card,
         tray,
         hook: None,
+        watcher: None,
         busy: false,
         last: None,
     });
@@ -96,6 +102,9 @@ pub fn run() -> Result<()> {
             &format!("{e:#}\n\nUse Ask now from the tray menu instead."),
         ),
     }
+
+    // Non-fatal: without it the card still auto-dismisses on its timer.
+    app.watcher = ClickWatcher::install(hwnd).ok();
 
     // Hand the App to the window proc. It stays alive until WM_DESTROY.
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize) };
@@ -185,6 +194,9 @@ impl App {
         }
 
         self.busy = true;
+        // Disarmed for the whole in-flight window: a click while the spinner
+        // is up must not touch the card.
+        self.set_watch(false);
         self.card.show_pending();
 
         let chain = Arc::clone(&self.chain);
@@ -215,6 +227,7 @@ impl App {
                     self.config.ui.card_seconds,
                 );
                 self.last = Some(answer);
+                self.set_watch(true);
             }
             Err(e) => {
                 let headline = first_line(&e, 88);
@@ -223,6 +236,7 @@ impl App {
                     headline,
                     detail: e,
                 });
+                self.set_watch(true);
             }
         }
     }
@@ -289,6 +303,7 @@ impl App {
             Ok(config) => {
                 self.config = config;
                 self.chain = Arc::new(self.config.build_chain());
+                self.card.set_text_scale(self.config.ui.text_scale);
                 if let Some(hook) = &self.hook {
                     hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
                 }
@@ -328,10 +343,58 @@ impl App {
         }
     }
 
+    /// Apply a model chosen from a tray submenu. The index addresses the
+    /// tray's own list, which is not necessarily the config's — it appends a
+    /// hand-edited current model that is missing from `models` — so the name
+    /// is resolved from the tray rather than re-indexed here.
+    fn pick_model(&mut self, openai: bool, index: usize) {
+        let picked = if openai {
+            self.tray.openai_model_at(index)
+        } else {
+            self.tray.anthropic_model_at(index)
+        }
+        .map(str::to_owned);
+
+        let Some(model) = picked else { return };
+
+        let slot = if openai {
+            &mut self.config.providers.openai.model
+        } else {
+            &mut self.config.providers.anthropic.model
+        };
+        if *slot == model {
+            return;
+        }
+        *slot = model.clone();
+
+        self.chain = Arc::new(self.config.build_chain());
+        let saved = self.config.save();
+        self.refresh_tray_labels();
+
+        match saved {
+            Ok(()) => self.card.show_answer(&model, "", 3),
+            Err(e) => self.card.show_error(
+                &format!("Using {model} — but not saved"),
+                &format!("It will revert when you quit.
+
+{e:#}"),
+            ),
+        }
+        self.set_watch(true);
+    }
+
     fn refresh_tray_labels(&mut self) {
         let primary = chord_to_string(&self.config.hotkeys.primary);
         let secondary = chord_to_string(&self.config.hotkeys.secondary);
         self.tray.set_key_bindings(&primary, &secondary);
+
+        let p = &self.config.providers;
+        self.tray.set_models(
+            &p.openai.models,
+            &p.openai.model,
+            &p.anthropic.models,
+            &p.anthropic.model,
+        );
 
         let ready = self.chain.ready_provider_names();
         let tip = if ready.is_empty() {
@@ -340,6 +403,40 @@ impl App {
             format!("copilot-ask — {} · {primary}", ready.join(", "))
         };
         self.tray.set_tooltip(&tip);
+    }
+
+    fn set_watch(&self, on: bool) {
+        if let Some(w) = &self.watcher {
+            if on {
+                w.arm();
+            } else {
+                w.disarm();
+            }
+        }
+    }
+
+    /// A click reported by the global watcher. Clicks that land on the card
+    /// itself belong to the card (they expand it); everything else closes it.
+    fn on_global_click(&mut self, x: i32, y: i32) {
+        use crate::ui::card::CardState;
+        if matches!(self.card.state(), CardState::Hidden) {
+            self.set_watch(false);
+            return;
+        }
+        if self.point_in_card(x, y) {
+            return;
+        }
+        self.card.hide();
+        self.set_watch(false);
+    }
+
+    fn point_in_card(&self, x: i32, y: i32) -> bool {
+        let mut rc = windows::Win32::Foundation::RECT::default();
+        let ok = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(self.card.hwnd(), &mut rc)
+        }
+        .is_ok();
+        ok && x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom
     }
 
     fn hwnd_isize(&self) -> isize {
@@ -382,15 +479,29 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 
     match msg {
         WM_APP_TRAY => {
-            if let Some(command) = app.tray.on_tray_message(lparam) {
-                match command {
-                    cmd::ASK_NOW => app.ask(),
-                    cmd::COPY_LAST => app.copy_last(),
-                    cmd::SET_PRIMARY => app.start_learning(HK_PRIMARY),
-                    cmd::SET_SECONDARY => app.start_learning(HK_SECONDARY),
-                    cmd::EDIT_SETTINGS => app.edit_settings(),
-                    cmd::RELOAD => app.reload(),
-                    cmd::QUIT => unsafe {
+            if let Some(id) = app.tray.on_tray_message(lparam) {
+                // Choosing anything other than a rebind disarms a learn mode
+                // left armed by an earlier "Set ... key" click; otherwise it
+                // would silently swallow the next key pressed anywhere.
+                if !matches!(
+                    decode(id),
+                    MenuChoice::Command(cmd::SET_PRIMARY)
+                        | MenuChoice::Command(cmd::SET_SECONDARY)
+                ) {
+                    if let Some(h) = &app.hook {
+                        h.cancel_learning();
+                    }
+                }
+                match decode(id) {
+                    MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
+                    MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
+                    MenuChoice::Command(cmd::ASK_NOW) => app.ask(),
+                    MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
+                    MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
+                    MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
+                    MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
+                    MenuChoice::Command(cmd::RELOAD) => app.reload(),
+                    MenuChoice::Command(cmd::QUIT) => unsafe {
                         let _ = DestroyWindow(hwnd);
                     },
                     _ => {}
@@ -409,6 +520,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>)
             };
             app.on_result(result);
+            LRESULT(0)
+        }
+        WM_APP_DISMISS => {
+            let (x, y) = unpack_point(lparam.0 as u32);
+            app.on_global_click(x, y);
             LRESULT(0)
         }
         WM_APP_LEARNED => {

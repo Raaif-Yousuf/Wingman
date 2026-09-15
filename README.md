@@ -8,12 +8,14 @@ Built for one job: verifying a hand-worked physics or statistics problem before
 you commit the numbers.
 
 ```
-┌──────────────────────────────────┐
-│ ✗ 1.35 m/s² up the slope —       │
-│   you used cos 30°, not sin 30°  │
-│                click for working │
-└──────────────────────────────────┘
+      ╭───╮                  ╭──────────────────────────────────────────╮
+      │ ◜ │   ── then ──▶    │ 53.3 rad/s^2; your 26.7 uses hoop inertia │
+      ╰───╯                  ╰──────────────────────────────────────────╯
+     spinner                       click it for the full working
 ```
+
+Click anywhere else and it goes away. Clicks while the spinner is up are ignored,
+so you can keep working while it thinks.
 
 ## Build
 
@@ -41,6 +43,10 @@ Configure one provider or both. With both set, Anthropic is the automatic
 fallback when OpenAI fails — a provider with an empty key is skipped, not treated
 as an error.
 
+Switch models from the tray at any time; the choice is written straight back to
+the config. To offer a model that isn't listed, add it to `models` under the
+relevant provider — no rebuild needed.
+
 ## Hotkeys
 
 Two bindings, both live at once:
@@ -58,6 +64,7 @@ Same for the secondary binding.
 
 - **Ask now** — trigger without the hotkey (left-click does this too)
 - **Copy last answer** — headline and working to the clipboard
+- **ChatGPT model ▸** / **Claude model ▸** — switch models, saved immediately
 - **Set Copilot key…** / **Set secondary key…** — rebind by pressing the key
 - **Edit settings** — opens `config.toml`
 - **Reload settings** — re-read the file without restarting
@@ -72,6 +79,8 @@ Same for the secondary binding.
 | `providers.order` | `["openai", "anthropic"]` | fallback order |
 | `providers.*.effort` | `"low"` | reasoning depth; raise for harder problems |
 | `ui.card_seconds` | `12` | auto-dismiss for the collapsed card; `0` = never |
+| `ui.text_scale` | `1.0` | multiplies the card's font size; lower is smaller |
+| `providers.*.models` | see file | what the tray's model submenu offers |
 | `ui.prompt` | see file | the system prompt — edit it to change what it checks |
 
 Roughly 1-2 cents and 3-8 seconds per check at the defaults.

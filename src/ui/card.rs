@@ -16,6 +16,7 @@
 //!     pub fn show_answer(&mut self, headline: &str, detail: &str, auto_dismiss_secs: u32);
 //!     pub fn show_error(&mut self, headline: &str, detail: &str);
 //!     pub fn hide(&mut self);
+//!     pub fn set_text_scale(&mut self, scale: f32);
 //!     pub fn state(&self) -> CardState;
 //!     pub fn handle_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT>;
 //! }
@@ -61,16 +62,17 @@ use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect,
-    GetDC, GetMonitorInfoW, GetStockObject, GetTextMetricsW, IntersectClipRect, MonitorFromPoint,
-    MonitorFromWindow, ReleaseDC, SelectObject, SetBkMode, SetTextColor, DEFAULT_GUI_FONT,
-    DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP,
-    DT_VCENTER,
-    DT_WORDBREAK, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    Arc, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
+    CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint,
+    ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject, GetTextMetricsW,
+    IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_RIGHT, DT_SINGLELINE, DT_TOP,
+    DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID,
     SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
@@ -127,6 +129,7 @@ impl Card {
             dpi: 96,
             theme,
             fonts: Fonts::null(),
+            text_scale: 1.0,
             anim_frame: 0,
             scroll_offset: 0,
             scroll_max: 0,
@@ -213,10 +216,20 @@ impl Card {
         self.inner.hide();
     }
 
+    /// Multiplies every font size in the card. 1.0 is the built-in default.
+    /// Clamped to a sane range so a bad config value cannot make the card
+    /// unreadable or enormous.
+    pub fn set_text_scale(&mut self, scale: f32) {
+        self.inner.set_text_scale(scale);
+    }
+
     pub fn state(&self) -> CardState {
         self.inner.state
     }
 
+    /// The card's own window proc dispatches internally; this is the seam
+    /// tests use to feed synthetic messages.
+    #[allow(dead_code)]
     pub fn handle_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         self.inner.handle_message(msg, wparam, lparam)
     }
@@ -437,36 +450,76 @@ impl Fonts {
     }
 }
 
-/// Builds the headline/body fonts for `dpi`, deriving from the shell's
-/// message font (`SPI_GETNONCLIENTMETRICS`) so the card matches the system.
-/// Infallible: any Win32 failure degrades to a stock GUI font rather than
-/// panicking or propagating an error.
-fn build_fonts(dpi: u32) -> Fonts {
+/// Headline size relative to the system message font. Deliberately below
+/// 1.0: a stock Windows notification uses roughly the message-font size,
+/// and the user wants the card's headline clearly smaller than that (see
+/// `HEADLINE_MAX_LINES` for the character-budget arithmetic this feeds).
+const HEADLINE_FONT_SCALE: f32 = 0.85;
+/// Sits just under the headline so the two remain distinguishable by size
+/// as a secondary cue, even though colour (`Palette::headline` vs.
+/// `Palette::detail`) is now the primary way to tell them apart -- neither
+/// font is bold any more.
+const DETAIL_FONT_SCALE: f32 = 0.8;
+
+/// Builds the headline/body fonts for `dpi` and `text_scale`, deriving from
+/// the shell's message font (`SPI_GETNONCLIENTMETRICS`) so the card matches
+/// the system. Infallible: any Win32 failure degrades to a stock GUI font
+/// rather than panicking or propagating an error.
+fn build_fonts(dpi: u32, text_scale: f32) -> Fonts {
     unsafe {
         let mut ncm = NONCLIENTMETRICSW {
             cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
             ..Default::default()
         };
-        let got = SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS,
+
+        // `SystemParametersInfoForDpi` returns metrics ALREADY scaled for the
+        // DPI you ask for. `SystemParametersInfoW` also returns pre-scaled
+        // metrics -- for the system DPI, not this monitor's. Either way the
+        // font that comes back is in real pixels, so multiplying it by
+        // dpi/96 a second time double-scales it: at 250% the card rendered
+        // ~2.5x too large, which is exactly what it looked like on screen.
+        //
+        // So: ask for this monitor's DPI, then apply only the design ratios
+        // and the user's text_scale -- never the DPI factor again.
+        let got = SystemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS.0,
             ncm.cbSize,
             Some(&mut ncm as *mut _ as *mut c_void),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            0,
+            dpi,
         )
-        .is_ok();
+        .is_ok()
+            || SystemParametersInfoW(
+                SPI_GETNONCLIENTMETRICS,
+                ncm.cbSize,
+                Some(&mut ncm as *mut _ as *mut c_void),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .is_ok();
 
-        let base = if got { ncm.lfMessageFont } else { fallback_logfont() };
-        // `lfMessageFont` comes back at the system's baseline (96 DPI)
-        // scale; every actual pixel size used on screen must be scaled from
-        // that baseline by the *current monitor's* DPI, not hardcoded.
-        let scale = dpi as f32 / 96.0;
+        let base = if got {
+            ncm.lfMessageFont
+        } else {
+            // The fallback is expressed at 96 DPI, so this one does need the
+            // monitor scale applied.
+            let mut lf = fallback_logfont();
+            lf.lfHeight = scaled_height(lf.lfHeight, dpi as f32 / 96.0);
+            lf
+        };
+
+        let scale = text_scale;
 
         let mut headline_lf = base;
-        headline_lf.lfWeight = FW_SEMIBOLD.0 as i32;
-        headline_lf.lfHeight = scaled_height(base.lfHeight, scale * 1.16);
+        // Normal weight and sub-message size, per user feedback: the
+        // headline should read smaller than a regular Windows notification,
+        // not bolder/larger than one. Headline vs. detail is distinguished
+        // by colour now (see Palette), not by weight.
+        headline_lf.lfWeight = FW_NORMAL.0 as i32;
+        headline_lf.lfHeight = scaled_height(base.lfHeight, scale * HEADLINE_FONT_SCALE);
 
         let mut body_lf = base;
-        body_lf.lfHeight = scaled_height(base.lfHeight, scale);
+        body_lf.lfWeight = FW_NORMAL.0 as i32;
+        body_lf.lfHeight = scaled_height(base.lfHeight, scale * DETAIL_FONT_SCALE);
 
         Fonts {
             headline: font_or_stock(&headline_lf),
@@ -510,21 +563,44 @@ fn fallback_logfont() -> windows::Win32::Graphics::Gdi::LOGFONTW {
 // Layout constants (logical pixels at 96 DPI; scaled per-window via `scale`)
 // ---------------------------------------------------------------------------
 
-const MARGIN_DP: i32 = 20;
-const PADDING_DP: i32 = 18;
-const CARD_WIDTH_DP: i32 = 400;
-/// Collapsed headline cap. The prompt budgets 90 characters, and at a high
-/// DPI scale that needs four lines at this width -- three silently ellipsised
-/// real answers mid-sentence.
-const HEADLINE_MAX_LINES: i32 = 4;
-const PENDING_WIDTH_DP: i32 = 240;
-const GAP_DP: i32 = 8;
+const MARGIN_DP: i32 = 14;
+const PADDING_DP: i32 = 14;
+const CARD_WIDTH_DP: i32 = 280;
+/// Collapsed headline cap. The prompt budgets a 90-character headline.
+/// Content width is `CARD_WIDTH_DP - 2*PADDING_DP` = 280 - 28 = 252dp.
+/// Segoe UI's average character width is roughly half its em size; the
+/// headline font's `lfHeight` at 96 DPI/1.0 text scale is
+/// `round(-12 * HEADLINE_FONT_SCALE)` = `round(-12 * 0.85)` = -10, i.e. a
+/// ~10dp em, so average glyph width is ~5dp -- call it 4.5dp once
+/// `DT_WORDBREAK`'s end-of-line slack is priced in. That's 252 / 4.5 ~= 56
+/// characters per line, so two lines already covers a 90-character
+/// headline; three lines leaves real headroom for wider glyphs/short words
+/// that push wrapping earlier, so a full 90-character headline is never
+/// silently `DT_END_ELLIPSIS`'d.
+const HEADLINE_MAX_LINES: i32 = 3;
+/// Side length of the small square pending card (there is no text in it
+/// any more -- just the spinner -- so it does not need to be wide).
+const PENDING_SIZE_DP: i32 = 60;
+const GAP_DP: i32 = 6;
 const WHEEL_SCROLL_DP: i32 = 48;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_DISMISS: usize = 2;
-const ANIM_INTERVAL_MS: u32 = 450;
+/// A rotation needs ~16-33ms/frame to read as smooth; the old text-dot
+/// animation could get away with much slower ticks, but a spinner cannot.
+const ANIM_INTERVAL_MS: u32 = 20;
 const PENDING_SAFETY_TIMEOUT_SECS: u32 = 30;
+
+// -- Spinner (pending state) -------------------------------------------
+
+/// Pen width for both the dim ring and the bright sweep, in logical pixels.
+const SPINNER_STROKE_DP: i32 = 4;
+/// Degrees the sweep advances per `TIMER_ANIM` tick. At `ANIM_INTERVAL_MS`
+/// (20ms) this is 360 / 6 * 20ms = 1200ms per full revolution -- a typical
+/// indeterminate-spinner cadence.
+const SPINNER_DEGREES_PER_FRAME: f32 = 6.0;
+/// Arc length of the bright sweep segment.
+const SPINNER_SWEEP_DEG: f32 = 100.0;
 
 // ---------------------------------------------------------------------------
 // CardInner: the real state; addressed by raw pointer from GWLP_USERDATA
@@ -538,6 +614,9 @@ struct CardInner {
     dpi: u32,
     theme: Theme,
     fonts: Fonts,
+    /// User-tunable multiplier applied to every font size. Set via
+    /// [`Card::set_text_scale`]; defaults to 1.0.
+    text_scale: f32,
     anim_frame: u32,
     scroll_offset: i32,
     scroll_max: i32,
@@ -551,16 +630,29 @@ impl CardInner {
     }
 
     fn rebuild_fonts(&mut self) {
-        let fresh = build_fonts(self.dpi);
+        let fresh = build_fonts(self.dpi, self.text_scale);
         let old = std::mem::replace(&mut self.fonts, fresh);
         old.delete();
+    }
+
+    /// Clamps and applies a new text-scale multiplier, then rebuilds fonts
+    /// and re-runs the current state's layout so the change is visible
+    /// immediately, even if the card is already on screen.
+    fn set_text_scale(&mut self, scale: f32) {
+        // Clamped to roughly half to double the default so a bad config
+        // value cannot make the card unreadable (too small) or enormous
+        // (too large).
+        self.text_scale = scale.clamp(0.5, 2.0);
+        self.rebuild_fonts();
+        self.relayout_current_state();
     }
 
     // -- show/hide -----------------------------------------------------
 
     fn show_pending(&mut self) {
         self.reset_activation_and_timers();
-        self.headline = "Thinking".to_string();
+        // No text in the pending state any more -- it shows a spinner.
+        self.headline.clear();
         self.detail.clear();
         self.state = CardState::Pending;
         self.anim_frame = 0;
@@ -741,17 +833,13 @@ impl CardInner {
     }
 
     fn layout_pending(&mut self) {
-        let padding = self.scale(PADDING_DP);
-        let width = self.scale(PENDING_WIDTH_DP);
-        let line_h = self.line_height(self.fonts.headline).max(1);
-        let height = padding * 2 + line_h;
+        let size = self.scale(PENDING_SIZE_DP);
         let work = self.work_area_for_cursor();
-        self.place_bottom_right(work, width, height);
+        self.place_bottom_right(work, size, size);
     }
 
     fn layout_collapsed(&mut self) {
         let padding = self.scale(PADDING_DP);
-        let gap = self.scale(GAP_DP);
         let width = self.scale(CARD_WIDTH_DP);
         let content_width = (width - padding * 2).max(1);
 
@@ -760,11 +848,9 @@ impl CardInner {
         let measured = self.measure_wrapped(self.fonts.headline, &self.headline, content_width);
         let headline_h = measured.min(max_headline_h).max(headline_line_h);
 
-        let mut height = padding * 2 + headline_h;
-        if !self.detail.is_empty() {
-            let hint_h = self.line_height(self.fonts.body).max(1);
-            height += gap + hint_h;
-        }
+        // No affordance line: the card is just the headline. Clicking it
+        // still expands when there is detail to show.
+        let height = padding * 2 + headline_h;
 
         let work = self.work_area_for_cursor();
         self.place_bottom_right(work, width, height);
@@ -918,33 +1004,82 @@ impl CardInner {
             match self.state {
                 CardState::Hidden => {}
                 CardState::Pending => self.paint_pending(hdc, rc, padding, &palette),
-                CardState::Collapsed => self.paint_collapsed(hdc, rc, padding, gap, &palette),
+                CardState::Collapsed => self.paint_collapsed(hdc, rc, padding, &palette),
                 CardState::Expanded => self.paint_expanded(hdc, rc, padding, gap, &palette),
             }
         }
     }
 
+    /// Draws the indeterminate spinner: a dim full ring, then a brighter arc
+    /// segment swept on top of it, its position driven by `anim_frame`.
+    /// Replaces the old "Thinking..." text entirely.
     unsafe fn paint_pending(&self, hdc: HDC, rc: RECT, padding: i32, palette: &Palette) {
-        let dots = ".".repeat(1 + (self.anim_frame as usize % 3));
-        let text = format!("Thinking{dots}");
-        let mut buf = utf16(&text);
-        let mut rect = RECT {
-            left: rc.left + padding,
-            top: rc.top,
-            right: rc.right - padding,
-            bottom: rc.bottom,
-        };
-        SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
-        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-        DrawTextW(
-            hdc,
-            &mut buf,
-            &mut rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        let w = rc.right - rc.left;
+        let h = rc.bottom - rc.top;
+        let cx = rc.left + w / 2;
+        let cy = rc.top + h / 2;
+        let diameter = (w.min(h) - padding * 2).max(4);
+        let radius = (diameter / 2).max(1);
+        let left = cx - radius;
+        let top = cy - radius;
+        let right = cx + radius;
+        let bottom = cy + radius;
+        let stroke = self.scale(SPINNER_STROKE_DP).max(2);
+
+        // Arc() never fills, but Ellipse() does -- select NULL_BRUSH so the
+        // dim ring is an outline, not a filled disc.
+        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+
+        // Dim full ring underneath.
+        let ring_pen = CreatePen(
+            PS_SOLID,
+            stroke,
+            windows::Win32::Foundation::COLORREF(palette.border),
         );
+        if !ring_pen.0.is_null() {
+            let old_pen = SelectObject(hdc, HGDIOBJ(ring_pen.0));
+            let _ = Ellipse(hdc, left, top, right, bottom);
+            SelectObject(hdc, old_pen);
+        }
+        let _ = DeleteObject(HGDIOBJ(ring_pen.0));
+
+        // Bright sweeping arc on top. Prefer a geometric pen with round end
+        // caps for a clean look; fall back to a plain cosmetic pen if that
+        // ever fails (e.g. exotic display driver).
+        let brush = LOGBRUSH {
+            lbStyle: BS_SOLID,
+            lbColor: windows::Win32::Foundation::COLORREF(palette.headline),
+            lbHatch: 0,
+        };
+        let mut arc_pen = ExtCreatePen(
+            PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
+            stroke as u32,
+            &brush,
+            None,
+        );
+        if arc_pen.0.is_null() {
+            arc_pen = CreatePen(
+                PS_SOLID,
+                stroke,
+                windows::Win32::Foundation::COLORREF(palette.headline),
+            );
+        }
+        if !arc_pen.0.is_null() {
+            let start_deg = (self.anim_frame as f32 * SPINNER_DEGREES_PER_FRAME) % 360.0;
+            let end_deg = start_deg + SPINNER_SWEEP_DEG;
+            let (x1, y1) = ray_point(cx, cy, start_deg, radius);
+            let (x2, y2) = ray_point(cx, cy, end_deg, radius);
+
+            let old_pen = SelectObject(hdc, HGDIOBJ(arc_pen.0));
+            let _ = Arc(hdc, left, top, right, bottom, x1, y1, x2, y2);
+            SelectObject(hdc, old_pen);
+        }
+        let _ = DeleteObject(HGDIOBJ(arc_pen.0));
+
+        SelectObject(hdc, old_brush);
     }
 
-    unsafe fn paint_collapsed(&self, hdc: HDC, rc: RECT, padding: i32, gap: i32, palette: &Palette) {
+    unsafe fn paint_collapsed(&self, hdc: HDC, rc: RECT, padding: i32, palette: &Palette) {
         let content_w = (rc.right - rc.left - padding * 2).max(1);
         let headline_line_h = self.line_height(self.fonts.headline).max(1);
         let max_headline_h = headline_line_h * HEADLINE_MAX_LINES;
@@ -973,24 +1108,6 @@ impl CardInner {
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
 
-        if !self.detail.is_empty() {
-            let hint_top = rc.top + padding + headline_h + gap;
-            let mut hint_buf = utf16("click for working");
-            let mut hint_rect = RECT {
-                left: rc.left + padding,
-                top: hint_top,
-                right: rc.left + padding + content_w,
-                bottom: hint_top + self.line_height(self.fonts.body).max(1),
-            };
-            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-            DrawTextW(
-                hdc,
-                &mut hint_buf,
-                &mut hint_rect,
-                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-            );
-        }
     }
 
     unsafe fn paint_expanded(&self, hdc: HDC, rc: RECT, padding: i32, gap: i32, palette: &Palette) {
@@ -1147,6 +1264,17 @@ impl CardInner {
     }
 }
 
+/// A point at distance `len` from `(cx, cy)` along the ray at `angle_deg`
+/// (standard math convention: 0 deg is +x, increasing counterclockwise).
+/// Used to give `Arc` the two boundary points that define where the
+/// spinner's sweep begins and ends.
+fn ray_point(cx: i32, cy: i32, angle_deg: f32, len: i32) -> (i32, i32) {
+    let rad = angle_deg.to_radians();
+    let x = cx + (len as f32 * rad.cos()).round() as i32;
+    let y = cy - (len as f32 * rad.sin()).round() as i32;
+    (x, y)
+}
+
 fn work_area_for_monitor(hmon: windows::Win32::Graphics::Gdi::HMONITOR) -> RECT {
     unsafe {
         let mut mi = MONITORINFO {
@@ -1226,5 +1354,32 @@ mod tests {
         card.hide();
         assert_eq!(card.state(), CardState::Hidden);
         // Dropping must not panic (this exercises DestroyWindow + WM_NCDESTROY).
+    }
+
+    #[test]
+    fn set_text_scale_clamps_and_rebuilds() {
+        let mut card = Card::new(instance()).expect("Card::new");
+        assert!((card.inner.text_scale - 1.0).abs() < f32::EPSILON);
+
+        // Within range: applied as-is.
+        card.set_text_scale(1.5);
+        assert!((card.inner.text_scale - 1.5).abs() < f32::EPSILON);
+
+        // Below the floor: clamped up to 0.5.
+        card.set_text_scale(0.01);
+        assert!((card.inner.text_scale - 0.5).abs() < f32::EPSILON);
+
+        // Above the ceiling: clamped down to 2.0.
+        card.set_text_scale(50.0);
+        assert!((card.inner.text_scale - 2.0).abs() < f32::EPSILON);
+
+        // Fonts must survive the rebuild (never left null) and painting
+        // whatever state is active must still not panic afterwards.
+        assert!(!card.inner.fonts.headline.0.is_null());
+        assert!(!card.inner.fonts.body.0.is_null());
+
+        card.show_answer("headline text", "detail text", 0);
+        card.set_text_scale(0.75);
+        assert_eq!(card.state(), CardState::Collapsed);
     }
 }

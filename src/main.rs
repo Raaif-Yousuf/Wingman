@@ -3,6 +3,7 @@
 mod app;
 mod capture;
 mod config;
+mod dismiss;
 mod hotkey;
 mod provider;
 mod ui;

@@ -32,7 +32,11 @@ pub struct Answer {
 #[derive(Debug)]
 pub struct Shot {
     pub png: Vec<u8>,
+    // Carried alongside the bytes because a provider that wants to reason
+    // about resolution shouldn't have to re-decode the PNG to get it.
+    #[allow(dead_code)]
     pub width: u32,
+    #[allow(dead_code)]
     pub height: u32,
 }
 
@@ -87,6 +91,9 @@ impl Chain {
     /// Names of every provider in the chain, in order, regardless of
     /// readiness. Mainly useful for introspection/testing and for surfacing
     /// the active provider in UI (e.g. a tray tooltip).
+    /// Every configured provider, ready or not. `ready_provider_names` is
+    /// what the tooltip uses; this one exists for diagnostics.
+    #[allow(dead_code)]
     pub fn provider_names(&self) -> Vec<&'static str> {
         self.providers.iter().map(|p| p.name()).collect()
     }
