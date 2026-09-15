@@ -41,6 +41,12 @@ use crate::ui::tray::{cmd, decode, MenuChoice, Tray, WM_APP_TRAY};
 /// ownership and must reconstruct the `Box` to free it.
 pub const WM_APP_RESULT: u32 = WM_APP + 3;
 
+/// Posted by a second launch (the Copilot key with no argv to steer it) to
+/// tell the running instance to act as if the hotkey fired. `WM_APP + 6`:
+/// `+1` through `+5` are already claimed by the tray, hotkey and dismiss
+/// modules (see the crate-wide grep for `WM_APP +` before picking another).
+pub const WM_APP_ACTIVATE: u32 = WM_APP + 6;
+
 const WINDOW_CLASS: PCWSTR = w!("CopilotAsk.Owner.Window.4d1b62f0");
 
 /// How long to wait after hiding a visible card before capturing, so the
@@ -78,7 +84,12 @@ pub fn run() -> Result<()> {
     let _instance = match crate::single_instance::acquire() {
         crate::single_instance::Instance::First(lock) => lock,
         crate::single_instance::Instance::Already => {
-            crate::single_instance::poke_existing();
+            // The shell launches this app by AUMID with no way to pass
+            // arguments, so the Copilot key always arrives here bare; only a
+            // launch explicitly carrying `--settings` should open Settings
+            // instead of asking.
+            let activation = crate::single_instance::activation_from_args(std::env::args());
+            crate::single_instance::poke_existing(activation);
             return Ok(());
         }
     };
@@ -600,6 +611,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         }
         WM_APP_HOTKEY => {
             let _which = wparam.0; // both bindings do the same thing
+            app.ask();
+            LRESULT(0)
+        }
+        WM_APP_ACTIVATE => {
+            // `ask` already no-ops while `busy`, so a second Copilot-key press
+            // landing here while a request is in flight is harmless.
             app.ask();
             LRESULT(0)
         }

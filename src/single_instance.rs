@@ -72,13 +72,25 @@ fn acquire_named(name: windows::core::PCWSTR) -> Instance {
     }
 }
 
+/// What a duplicate launch should make the running instance do.
+///
+/// The Windows shell launches this app by AUMID with no command line at all
+/// when the Copilot key is pressed, so `Ask` is the default every hardware
+/// press produces; `Settings` exists only for a launch that deliberately
+/// asks for it.
+pub enum Activation {
+    /// Run the same request a hotkey press or "Ask now" would.
+    Ask,
+    /// Open the Settings window, as a left-click on the tray icon does.
+    Settings,
+}
+
 /// Hand focus to the instance that is already running.
 ///
 /// Called just before a duplicate exits. Silently vanishing would look like
-/// the app failed to start, so the running instance opens its settings window
-/// instead — the same thing a left-click on the tray icon does, which is the
-/// most likely reason someone launched it a second time.
-pub fn poke_existing() {
+/// the app failed to start, so the running instance is told what to do
+/// instead.
+pub fn poke_existing(activation: Activation) {
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_LBUTTONUP};
 
     unsafe {
@@ -88,12 +100,44 @@ pub fn poke_existing() {
         if hwnd.0.is_null() {
             return;
         }
-        let _ = PostMessageW(
-            Some(hwnd),
-            crate::ui::tray::WM_APP_TRAY,
-            windows::Win32::Foundation::WPARAM(0),
-            windows::Win32::Foundation::LPARAM(WM_LBUTTONUP as isize),
-        );
+        match activation {
+            // Reuses the tray's own left-click message rather than calling
+            // into app.rs directly, so this stays byte-for-byte what a real
+            // left-click already does -- no new code path to keep in sync.
+            Activation::Settings => {
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    crate::ui::tray::WM_APP_TRAY,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(WM_LBUTTONUP as isize),
+                );
+            }
+            // A dedicated message rather than a spoofed tray click: unlike
+            // Settings, "ask" is not standing in for some other UI gesture,
+            // it is the primary thing a Copilot-key press means now.
+            Activation::Ask => {
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    crate::app::WM_APP_ACTIVATE,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+        }
+    }
+}
+
+/// Decide what a duplicate launch means from its `argv`, without touching
+/// Win32 so it can be unit-tested without a window to post to.
+///
+/// argv[0] is the program path, not a flag, so it is always skipped -- a
+/// program installed at a path literally containing `--settings` must not be
+/// mistaken for the flag.
+pub fn activation_from_args<I: IntoIterator<Item = String>>(args: I) -> Activation {
+    if args.into_iter().skip(1).any(|a| a == "--settings") {
+        Activation::Settings
+    } else {
+        Activation::Ask
     }
 }
 
@@ -129,5 +173,49 @@ mod tests {
         // Guards against someone "simplifying" the test back onto MUTEX_NAME,
         // which would make the suite fail whenever the app is running.
         assert!(!std::ptr::eq(TEST_NAME.0, MUTEX_NAME.0));
+    }
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_args_means_ask() {
+        // The Copilot key gives the shell no way to pass a command line, so
+        // this is the case that has to happen every time the hardware key is
+        // pressed while the app is already running.
+        assert!(matches!(
+            activation_from_args(args(&["copilot-ask.exe"])),
+            Activation::Ask
+        ));
+    }
+
+    #[test]
+    fn the_settings_flag_means_settings() {
+        assert!(matches!(
+            activation_from_args(args(&["copilot-ask.exe", "--settings"])),
+            Activation::Settings
+        ));
+    }
+
+    #[test]
+    fn an_unrelated_arg_means_ask() {
+        // Anything other than the exact flag falls back to the Copilot-key
+        // behaviour, rather than silently opening Settings for a typo.
+        assert!(matches!(
+            activation_from_args(args(&["copilot-ask.exe", "--frobnicate"])),
+            Activation::Ask
+        ));
+    }
+
+    #[test]
+    fn argv0_named_like_the_flag_is_not_mistaken_for_it() {
+        // argv[0] is the program path, chosen by whoever launches the
+        // process, not an argument the user typed -- it must never be read
+        // as a flag.
+        assert!(matches!(
+            activation_from_args(args(&["--settings"])),
+            Activation::Ask
+        ));
     }
 }

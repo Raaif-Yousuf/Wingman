@@ -17,14 +17,38 @@ you commit the numbers.
 Click anywhere else and it goes away. Clicks while the spinner is up are ignored,
 so you can keep working while it thinks.
 
-## Build
+## Install
+
+```powershell
+.\install.ps1
+```
+
+Builds it, puts the `.exe` in `%LOCALAPPDATA%\Programs\copilot-ask`, registers it
+with Windows, and switches on start-with-Windows. Re-run it to upgrade in place.
+One UAC prompt the first time, to trust the certificate it signs with; none after
+that.
+
+Registering is what puts copilot-ask in **Start ▸ All apps**, in
+**Settings ▸ Apps ▸ Installed apps**, and in the Copilot key picker described
+below. Windows lists only packaged, signed apps in that picker, which is the
+whole reason the install does more than copy a file.
+
+`-SkipBuild` uses the existing `target\release\copilot-ask.exe` instead of
+running cargo; `-NoAutostart` installs without the login entry.
+
+Nothing in install, upgrade or uninstall reads, writes or deletes your
+`config.toml`, so your keys and prompt survive all three.
+
+### Or don't install it
 
 ```powershell
 cargo build --release
 # target\release\copilot-ask.exe
 ```
 
-No runtime dependency — the `.exe` is standalone.
+The `.exe` is standalone and runs from anywhere with no runtime dependency. You
+lose the app lists and the Copilot key picker, and start-with-Windows only if you
+tick it yourself in Settings.
 
 ## First run
 
@@ -79,6 +103,27 @@ If the Copilot key does nothing, use **Set Copilot key…** in the tray menu and
 press it once — whatever your firmware actually emits gets captured and saved.
 Same for the secondary binding.
 
+### Through Windows Settings instead
+
+Once installed, copilot-ask can also be made the Copilot key's target the
+official way:
+
+**Settings ▸ Bluetooth & devices ▸ Keyboard ▸ Customize Copilot key on keyboard
+▸ Custom ▸ copilot-ask**
+
+You have to click that yourself. Windows protects the setting so no app can make
+itself the target — which is the right call, and means an installer cannot do it
+for you however much it would like to.
+
+Both routes work at once and do the same thing. The difference is that this one
+is Windows launching the app, so it works regardless of what the keyboard hook
+sees; the hook is still what serves the secondary binding.
+
+One gap worth knowing: if copilot-ask is **not already running**, a key press
+starts it and stops there rather than asking. That is deliberate — the same bare
+launch is what runs at login, and asking on it would mean a billed API call every
+boot. With start-with-Windows on it is always running anyway.
+
 ## Tray menu
 
 - **Ask now** — trigger without the hotkey
@@ -109,7 +154,8 @@ Roughly 1-2 cents and 3-8 seconds per check at the defaults.
 
 ## Start with Windows
 
-Tick **Start with Windows** in Settings. It writes a per-user entry to
+`install.ps1` turns this on for you. Otherwise, tick **Start with Windows** in
+Settings — same entry, same effect. It writes a per-user entry to
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — no admin prompt, and
 it shows up in Task Manager's Startup tab like any other startup app. Untick to
 remove it.
@@ -130,26 +176,32 @@ as a ghost until you mouse over it — the process never got to remove it.
 
 ## Uninstall
 
-There is no installer, so there is nothing in Add/Remove Programs. Three things
-to remove:
+```powershell
+.\uninstall.ps1
+```
+
+Stops it, unregisters the package, clears the autostart entry, hands the Copilot
+key back to Search if it was pointed here, deletes
+`%LOCALAPPDATA%\Programs\copilot-ask`, and removes the signing certificate from
+both stores. One UAC prompt, for that last part; `-KeepCertificate` skips it,
+which is what you want if you are about to reinstall.
+
+Since it is a registered app you can also use **Settings ▸ Apps ▸ Installed apps
+▸ copilot-ask ▸ Uninstall**. That removes the package but leaves the autostart
+entry, the certificate and the installed folder behind, so the script is the
+tidier route.
+
+Either way your config is left alone, deliberately — it holds your API keys and
+your prompt, and throwing those away is your call:
 
 ```powershell
-# 1. stop it (or use Quit in the tray menu)
-Get-Process copilot-ask -ErrorAction SilentlyContinue | Stop-Process -Force
-
-# 2. remove the autostart entry, if you ticked Start with Windows
-Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
-  -Name "copilot-ask" -ErrorAction SilentlyContinue
-
-# 3. delete the config -- this holds your API keys
 Remove-Item "$env:APPDATA\copilot-ask" -Recurse -Force
 ```
 
-Then delete the project folder itself. Nothing else is written anywhere: no
-Program Files, no services, no scheduled tasks, no shell extensions.
+Rotate any API key that was in it; deleting the file does not invalidate it.
 
-Rotate any API key that was in the config, since deleting the file does not
-invalidate it.
+Then delete the project folder. Nothing else is written anywhere: no Program
+Files, no services, no scheduled tasks, no shell extensions.
 
 ## Design
 
