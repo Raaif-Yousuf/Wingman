@@ -45,8 +45,17 @@ pub enum Instance {
 /// as `First`: refusing to start because a lock could not be taken would be a
 /// worse failure than the duplicate it is guarding against.
 pub fn acquire() -> Instance {
+    acquire_named(MUTEX_NAME)
+}
+
+/// The mechanism, with the name injected.
+///
+/// Split out so the test can claim a name of its own. Testing against
+/// `MUTEX_NAME` would mean `cargo test` passes or fails depending on whether
+/// the real app happens to be running -- which is exactly what it did before.
+fn acquire_named(name: windows::core::PCWSTR) -> Instance {
     unsafe {
-        match CreateMutexW(None, true, MUTEX_NAME) {
+        match CreateMutexW(None, true, name) {
             Ok(handle) => {
                 // CreateMutexW succeeds and returns a handle to the EXISTING
                 // mutex when the name is taken, so the error code is the only
@@ -92,22 +101,33 @@ pub fn poke_existing() {
 mod tests {
     use super::*;
 
+    /// A name only this test uses, so the result does not depend on whether
+    /// the real app is running on the machine running the tests.
+    const TEST_NAME: windows::core::PCWSTR = w!("Local\\CopilotAsk.SingleInstance.test.9f2c");
+
     #[test]
     fn the_first_caller_wins_and_a_second_is_refused() {
-        let first = acquire();
+        let first = acquire_named(TEST_NAME);
         assert!(
             matches!(first, Instance::First(_)),
-            "nothing else should hold the name in a fresh test process"
+            "the test's own name should be free"
         );
 
         // A second attempt while the first lock is alive must be refused --
         // this is the whole point of the module.
-        assert!(matches!(acquire(), Instance::Already));
+        assert!(matches!(acquire_named(TEST_NAME), Instance::Already));
 
         drop(first);
 
         // Once released the name is claimable again, so quitting and
         // relaunching works rather than locking the user out until reboot.
-        assert!(matches!(acquire(), Instance::First(_)));
+        assert!(matches!(acquire_named(TEST_NAME), Instance::First(_)));
+    }
+
+    #[test]
+    fn the_production_name_is_not_what_the_test_locks() {
+        // Guards against someone "simplifying" the test back onto MUTEX_NAME,
+        // which would make the suite fail whenever the app is running.
+        assert!(!std::ptr::eq(TEST_NAME.0, MUTEX_NAME.0));
     }
 }
