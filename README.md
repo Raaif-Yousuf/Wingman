@@ -118,6 +118,29 @@ The checkbox reads the registry when Settings opens, so it always reflects
 reality rather than a mirrored setting that can drift. If you move or rebuild
 the exe somewhere else, the entry is repaired to the new path on next launch.
 
+## Uninstall
+
+There is no installer, so there is nothing in Add/Remove Programs. Three things
+to remove:
+
+```powershell
+# 1. stop it (or use Quit in the tray menu)
+Get-Process copilot-ask -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# 2. remove the autostart entry, if you ticked Start with Windows
+Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+  -Name "copilot-ask" -ErrorAction SilentlyContinue
+
+# 3. delete the config -- this holds your API keys
+Remove-Item "$env:APPDATA\copilot-ask" -Recurse -Force
+```
+
+Then delete the project folder itself. Nothing else is written anywhere: no
+Program Files, no services, no scheduled tasks, no shell extensions.
+
+Rotate any API key that was in the config, since deleting the file does not
+invalidate it.
+
 ## Design
 
 Architecture, request shapes, and the Win32 details are in

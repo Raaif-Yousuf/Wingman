@@ -501,6 +501,13 @@ const ES_PASSWORD: i32 = 0x0020;
 const ES_MULTILINE: i32 = 0x0004;
 const ES_WANTRETURN: i32 = 0x1000;
 const ES_AUTOVSCROLL: i32 = 0x0040;
+/// Single-line edits NEED this. Without it the control accepts only as much
+/// text as fits its visible width, so pasting a ~108-character API key
+/// silently drops everything past the right-hand edge. `ES_AUTOVSCROLL` is the
+/// multiline vertical equivalent and does nothing here.
+const ES_AUTOHSCROLL: i32 = 0x0080;
+#[cfg(test)]
+const WM_PASTE: u32 = 0x0302;
 const ES_NUMBER: i32 = 0x2000;
 const BS_GROUPBOX: i32 = 0x0007;
 const BS_AUTOCHECKBOX: i32 = 0x0003;
@@ -846,7 +853,7 @@ fn build_ui(
     ctx.create(
         WC_EDIT,
         &config.providers.openai.api_key,
-        (ES_PASSWORD | ES_AUTOVSCROLL) as u32,
+        (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
         WS_EX_BORDER,
         r.x + LABEL_W,
         r.y,
@@ -905,7 +912,7 @@ fn build_ui(
     ctx.create(
         WC_EDIT,
         &config.providers.anthropic.api_key,
-        (ES_PASSWORD | ES_AUTOVSCROLL) as u32,
+        (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
         WS_EX_BORDER,
         r.x + LABEL_W,
         r.y,
@@ -1127,7 +1134,7 @@ fn build_ui(
     ctx.create(
         WC_EDIT,
         &config.ui.card_seconds.to_string(),
-        (ES_NUMBER | ES_AUTOVSCROLL) as u32,
+        (ES_NUMBER | ES_AUTOHSCROLL) as u32,
         WS_EX_BORDER,
         r.x + 190,
         r.y,
@@ -1476,6 +1483,41 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Put `text` on the clipboard. Returns false if the clipboard is unavailable
+/// (another process holds it), so tests can skip rather than fail spuriously.
+#[cfg(test)]
+fn put_on_clipboard(owner: HWND, text: &str) -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        if OpenClipboard(Some(owner)).is_err() {
+            return false;
+        }
+        let _ = EmptyClipboard();
+        let bytes = wide.len() * 2;
+        let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
+            let _ = CloseClipboard();
+            return false;
+        };
+        let dst = GlobalLock(h) as *mut u16;
+        if dst.is_null() {
+            let _ = CloseClipboard();
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+        let _ = GlobalUnlock(h);
+        // CF_UNICODETEXT == 13
+        let ok = SetClipboardData(13, Some(HANDLE(h.0))).is_ok();
+        let _ = CloseClipboard();
+        ok
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1720,6 +1762,34 @@ mod tests {
 
         assert!(get_dlg_item(hwnd, ID_SAVE).is_some());
         assert!(get_dlg_item(hwnd, ID_CANCEL).is_some());
+
+        // Pasting a full-length API key must not be truncated.
+        //
+        // This has to go through the real input path (clipboard + WM_PASTE).
+        // `SetWindowTextW` bypasses the length enforcement that a single-line
+        // edit applies to user input, which is exactly how the missing
+        // ES_AUTOHSCROLL shipped: the programmatic round-trip below passed
+        // while real pasting silently dropped the tail of the key.
+        {
+            let key = format!("sk-ant-api03-{}", "A".repeat(95));
+            let field = get_dlg_item(hwnd, ID_ANTHROPIC_KEY).expect("anthropic key field");
+            set_text(field, "");
+            if put_on_clipboard(hwnd, &key) {
+                unsafe {
+                    SendMessageW(field, WM_PASTE, None, None);
+                }
+                let got = get_text(field);
+                assert_eq!(
+                    got.chars().count(),
+                    key.chars().count(),
+                    "pasted key was truncated: {} of {} chars survived",
+                    got.chars().count(),
+                    key.chars().count()
+                );
+                assert_eq!(got, key);
+            }
+            set_text(field, "");
+        }
 
         // Typing an API key into each field and saving must actually persist
         // both. This is the whole point of the window, and it is the one path
