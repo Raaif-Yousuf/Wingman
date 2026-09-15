@@ -71,6 +71,18 @@ pub fn run() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    // Claim the single-instance name before anything else is created. A
+    // duplicate must not register a tray icon or install a keyboard hook,
+    // because both would double every keypress -- and the second API call is
+    // billed just like the first.
+    let _instance = match crate::single_instance::acquire() {
+        crate::single_instance::Instance::First(lock) => lock,
+        crate::single_instance::Instance::Already => {
+            crate::single_instance::poke_existing();
+            return Ok(());
+        }
+    };
+
     // If autostart is on but aimed at an old path (the exe was moved or
     // rebuilt elsewhere), point it back here. Otherwise it fails silently
     // while Settings still reports it as enabled.

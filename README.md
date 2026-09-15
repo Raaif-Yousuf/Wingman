@@ -118,6 +118,16 @@ The checkbox reads the registry when Settings opens, so it always reflects
 reality rather than a mirrored setting that can drift. If you move or rebuild
 the exe somewhere else, the entry is repaired to the new path on next launch.
 
+## Only one instance
+
+Launching it again while it is already running does not start a second copy —
+the new process hands over to the running one, which opens its Settings window,
+then exits. Without that, two instances mean two tray icons, two keyboard hooks
+and **two billed API calls per keypress**, with nothing in the UI to hint at it.
+
+If you kill it with Task Manager rather than **Quit**, the tray icon can linger
+as a ghost until you mouse over it — the process never got to remove it.
+
 ## Uninstall
 
 There is no installer, so there is nothing in Add/Remove Programs. Three things

@@ -34,6 +34,8 @@ touches a `HWND` beyond posting to it.
 | `src/ui/tray.rs` | `Shell_NotifyIconW` icon + context menu | know about providers |
 | `src/ui/settings.rs` | the GUI settings window (modal) | persist anything itself |
 | `src/dismiss.rs` | `WH_MOUSE_LL` click-anywhere-to-close watcher | know about the card |
+| `src/single_instance.rs` | named-mutex guard; a duplicate exits | own any UI |
+| `src/autostart.rs` | the `Run` key entry behind "Start with Windows" | mirror state into `Config` |
 | `src/ui/card.rs` | notification card window (collapsed + expanded) | know about providers |
 | `src/app.rs` | window proc, state machine, wiring | contain business logic |
 | `src/main.rs` | entry point, `#![windows_subsystem = "windows"]` | — |

@@ -7,6 +7,7 @@ mod config;
 mod dismiss;
 mod hotkey;
 mod provider;
+mod single_instance;
 mod ui;
 
 fn main() {
