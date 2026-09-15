@@ -183,7 +183,13 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Config> {
         let mut config = if path.exists() {
             let contents = fs::read_to_string(path).unwrap_or_default();
-            Self::parse_or_default(&contents)
+            let (cfg, repaired) = Self::parse_reporting_repair(&contents);
+            if repaired {
+                // Best effort: the in-memory value is already correct, so a
+                // failed write here is not worth failing the load over.
+                let _ = cfg.save_to(path);
+            }
+            cfg
         } else {
             let defaults = Config::default();
             defaults.save_to(path)?;
@@ -197,10 +203,23 @@ impl Config {
     /// for missing keys/sections (via `#[serde(default)]` on every struct in
     /// this module), and to `Config::default()` wholesale if the text does
     /// not parse as TOML at all. Never errors — the app must always start.
+    /// Parse without caring whether anything needed repairing. `load_from`
+    /// uses [`Config::parse_reporting_repair`] so it can write the fix back;
+    /// this is the plain form the tests read against.
+    #[allow(dead_code)]
     pub fn parse_or_default(toml_str: &str) -> Config {
         let mut cfg: Config = toml::from_str(toml_str).unwrap_or_default();
         cfg.backfill();
         cfg
+    }
+
+    /// Like [`Config::parse_or_default`], but also reports whether the parse
+    /// had to repair anything -- the caller writes the file back so the
+    /// on-disk copy stops disagreeing with what is actually being sent.
+    fn parse_reporting_repair(toml_str: &str) -> (Config, bool) {
+        let mut cfg: Config = toml::from_str(toml_str).unwrap_or_default();
+        let repaired = cfg.backfill();
+        (cfg, repaired)
     }
 
     /// Fills in values a config written by an older build has no key for.
@@ -211,7 +230,7 @@ impl Config {
     /// empty model list and an empty tray submenu, so an absent list is
     /// backfilled here rather than left empty. A list the user has genuinely
     /// customized is never touched.
-    fn backfill(&mut self) {
+    fn backfill(&mut self) -> bool {
         let d = Providers::default();
         if self.providers.openai.models.is_empty() {
             self.providers.openai.models = d.openai.models;
@@ -222,6 +241,33 @@ impl Config {
         if self.ui.text_scale <= 0.0 {
             self.ui.text_scale = Ui::default().text_scale;
         }
+        self.repair_refusal_trigger()
+    }
+
+    /// Rewrites one sentence of a stored prompt that makes Claude refuse.
+    ///
+    /// An earlier default told the model the detail field was "your scratchpad
+    /// -- reason it out before committing to a verdict". Anthropic's safety
+    /// classifier reads that as an attempt to extract the model's internal
+    /// reasoning and declines outright: `stop_reason: "refusal"`, category
+    /// `reasoning_extraction`, reproducible every time. The rubric appended by
+    /// the difficulty toggle happened to mask it, so the failure only showed
+    /// up with that toggle OFF.
+    ///
+    /// The prompt is user-editable and lives in config.toml, so fixing the
+    /// constant does not fix configs already written. Only this one sentence
+    /// is replaced, and only where it appears verbatim -- any other edits the
+    /// user has made to their prompt are left alone.
+    fn repair_refusal_trigger(&mut self) -> bool {
+        const TRIGGER: &str =
+            "This is your scratchpad \u{2014} reason it out before committing to a verdict.";
+        const REPLACEMENT: &str = "Write this out in full before you write the headline, so that the headline states the conclusion this working actually reaches.";
+
+        if self.ui.prompt.contains(TRIGGER) {
+            self.ui.prompt = self.ui.prompt.replace(TRIGGER, REPLACEMENT);
+            return true;
+        }
+        false
     }
 
     /// `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, when set, override the
@@ -483,5 +529,34 @@ models = ["claude-sonnet-5"]
 text_scale = 0.0
 ");
         assert_eq!(cfg.ui.text_scale, 1.0);
+    }
+
+    #[test]
+    fn a_stored_prompt_that_makes_claude_refuse_is_repaired() {
+        // Configs written by an earlier build carry the sentence that trips
+        // Anthropic's reasoning_extraction classifier. Loading must fix it,
+        // or Claude refuses every request with the difficulty toggle off.
+        let toml = "[ui]\nprompt = \"before. This is your scratchpad \u{2014} reason it out before committing to a verdict. after\"\n";
+        let cfg = Config::parse_or_default(toml);
+        assert!(
+            !cfg.ui.prompt.contains("scratchpad"),
+            "the refusal trigger must be gone: {}",
+            cfg.ui.prompt
+        );
+        // Surrounding text the user may have written is preserved.
+        assert!(cfg.ui.prompt.starts_with("before. "));
+        assert!(cfg.ui.prompt.ends_with(" after"));
+    }
+
+    #[test]
+    fn an_unrelated_custom_prompt_is_left_alone() {
+        let toml = "[ui]\nprompt = \"Just check my algebra please.\"\n";
+        let cfg = Config::parse_or_default(toml);
+        assert_eq!(cfg.ui.prompt, "Just check my algebra please.");
+    }
+
+    #[test]
+    fn the_shipped_default_contains_no_refusal_trigger() {
+        assert!(!Config::default().ui.prompt.contains("scratchpad"));
     }
 }

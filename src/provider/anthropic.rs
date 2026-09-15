@@ -78,7 +78,7 @@ impl Anthropic {
         if want_difficulty {
             properties["difficulty"] = json!({
                 "type": "string",
-                "enum": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "U"]
+                "enum": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "U", "N"]
             });
             required.push("difficulty");
         }
@@ -285,7 +285,7 @@ mod tests {
         let schema = &body["output_config"]["format"]["schema"];
         assert_eq!(
             schema["properties"]["difficulty"],
-            json!({"type": "string", "enum": ["1","2","3","4","5","6","7","8","9","10","U"]})
+            json!({"type": "string", "enum": ["1","2","3","4","5","6","7","8","9","10","U","N"]})
         );
         assert_eq!(schema["required"], json!(["detail", "headline", "difficulty"]));
         // Anthropic's format object still takes no `name`/`strict`.

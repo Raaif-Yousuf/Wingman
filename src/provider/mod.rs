@@ -16,7 +16,7 @@ Work the problem out yourself from what is visible, then:
 Carry units through and give the final value to a sensible number of significant figures.
 
 Respond with exactly two fields, and write them in this order:
-- detail: FIRST. At most 700 characters, plain text. Work the problem through here step by step so the user can check it against their own. This is your scratchpad — reason it out before committing to a verdict.
+- detail: FIRST. At most 700 characters, plain text. Show the worked solution step by step, so the user can check it against their own. Write this out in full before you write the headline, so that the headline states the conclusion this working actually reaches.
 - headline: SECOND, and it must be the conclusion of the working you just wrote. At most 90 characters, plain text. Lead with the final value, or with the correction if a visible answer is wrong. Never state a verdict in the headline that your own detail contradicts; if the working changed your mind, the headline follows the working.
 
 Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline.";
@@ -48,7 +48,9 @@ Anchors:
 10 = a PhD student in the field would struggle. Open-ended derivations and proofs requiring a specialist technique, not just more algebra.
 U = Ultra: a professor would struggle. Research-level, or a known-hard proof.
 
-Use the WHOLE range. Most routine homework is 2-5. If the problem is recognisably graduate-level, it starts at 7, not 5. If it asks you to PROVE a general theorem rather than compute a value, it is almost never below 8.";
+Use the WHOLE range. Most routine homework is 2-5. If the problem is recognisably graduate-level, it starts at 7, not 5. If it asks you to PROVE a general theorem rather than compute a value, it is almost never below 8.
+
+If there is no problem to rate at all -- the screen shows no question, or you are asking for something to be made visible -- answer \"N\". Do NOT reach for \"U\" in that case: \"U\" means the problem is extraordinarily hard, not that you could not find one.";
 
 /// A 1-10 rating, or `Ultra` for "a professor would struggle". Pure data —
 /// the colour mapping lives in the card, not here.
@@ -64,6 +66,12 @@ impl Difficulty {
     /// (case-insensitive, surrounding whitespace tolerated). Returns `None`
     /// for anything else — a bad value must degrade to "no badge", never to
     /// a wrong badge.
+    /// `"N"` is the model's explicit "nothing to rate here" answer and maps
+    /// to `None`, like any other unrecognised value. It exists because the
+    /// schema makes `difficulty` required: without an escape hatch a screen
+    /// with no problem on it still gets a rating, and the model reached for
+    /// `"U"` -- a purple "a professor would struggle" badge on a screenshot
+    /// of a terminal.
     pub fn parse(s: &str) -> Option<Difficulty> {
         let t = s.trim();
         if t.eq_ignore_ascii_case("u") || t.eq_ignore_ascii_case("ultra") {
@@ -405,4 +413,14 @@ mod tests {
         }
         assert_eq!(Difficulty::Ultra.rank(), 11);
     }
+    #[test]
+    fn not_applicable_yields_no_badge() {
+        // The model answers "N" when there is nothing on screen to rate.
+        // It must render as no badge, never as a difficulty.
+        assert_eq!(Difficulty::parse("N"), None);
+        assert_eq!(Difficulty::parse("n"), None);
+        // And it must not be confused with Ultra.
+        assert_eq!(Difficulty::parse("U"), Some(Difficulty::Ultra));
+    }
+
 }
