@@ -1,0 +1,19 @@
+{
+  "id": "resp_def456",
+  "object": "response",
+  "created_at": 1757836800,
+  "status": "incomplete",
+  "model": "gpt-5.5",
+  "output": [
+    {
+      "id": "rs_1",
+      "type": "reasoning",
+      "summary": []
+    }
+  ],
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 10,
+    "total_tokens": 1210
+  }
+}
