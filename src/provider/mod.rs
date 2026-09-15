@@ -21,12 +21,104 @@ Respond with exactly two fields, and write them in this order:
 
 Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline.";
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+/// Appended programmatically to the system prompt when the difficulty toggle
+/// is on — never folded into `DEFAULT_PROMPT` itself, because the user edits
+/// that text in Settings and it must stay exactly theirs.
+///
+/// Worded to rate the PROBLEM shown on screen, not the model's own answer and
+/// not its confidence, and states the 1/3/5/7/9/10/Ultra anchors explicitly
+/// so the model uses the full range instead of clustering on a few values.
+pub const DIFFICULTY_RUBRIC: &str = "
+
+Also rate how difficult the PROBLEM ON SCREEN is for a HUMAN STUDENT. Add a third field:
+- difficulty: THIRD, after headline, once you have actually worked the problem through. Exactly one of \"1\" through \"10\", or \"U\".
+
+Calibration is the hard part, so read this carefully. You solve nearly all of these easily; that is NOT the scale. Do not rate your own confidence, your own effort, or how quickly you found the answer. Rate how hard the problem would be for a student at the level it is aimed at. Rating by your own effort compresses everything into 1-5 and makes the whole scale useless.
+
+Anchors:
+1 = an easy high-school question. One step, one formula. (speed = distance / time)
+2 = high-school, a couple of steps.
+3 = easy university intro-course level. (a block on an incline; moment of inertia of a disk)
+4 = intro university, several steps or a small subtlety.
+5 = medium university level. Mid-degree material: multi-step, and you must choose the method rather than being told it.
+6 = upper-undergraduate, harder than routine homework.
+7 = hard university level. Typically GRADUATE coursework: quantum perturbation theory, Lagrangian mechanics with constraints, a non-obvious statistical derivation.
+8 = graduate coursework that most of the class would get wrong.
+9 = very hard for an undergraduate. Qualifying-exam standard.
+10 = a PhD student in the field would struggle. Open-ended derivations and proofs requiring a specialist technique, not just more algebra.
+U = Ultra: a professor would struggle. Research-level, or a known-hard proof.
+
+Use the WHOLE range. Most routine homework is 2-5. If the problem is recognisably graduate-level, it starts at 7, not 5. If it asks you to PROVE a general theorem rather than compute a value, it is almost never below 8.";
+
+/// A 1-10 rating, or `Ultra` for "a professor would struggle". Pure data —
+/// the colour mapping lives in the card, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Difficulty {
+    /// Invariant: 1..=10.
+    Level(u8),
+    Ultra,
+}
+
+impl Difficulty {
+    /// Parses what the model returns: "1".."10" or "U"/"ultra"
+    /// (case-insensitive, surrounding whitespace tolerated). Returns `None`
+    /// for anything else — a bad value must degrade to "no badge", never to
+    /// a wrong badge.
+    pub fn parse(s: &str) -> Option<Difficulty> {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("u") || t.eq_ignore_ascii_case("ultra") {
+            return Some(Difficulty::Ultra);
+        }
+        // Parse as u32 first so a huge number (would overflow a u8) fails
+        // cleanly via the range check below rather than via a silent
+        // wrapping cast.
+        let n: u32 = t.parse().ok()?;
+        if (1..=10).contains(&n) {
+            Some(Difficulty::Level(n as u8))
+        } else {
+            None
+        }
+    }
+
+    /// Badge text: "1".."10", "U".
+    pub fn label(&self) -> &'static str {
+        match self {
+            Difficulty::Ultra => "U",
+            Difficulty::Level(n) => match n {
+                1 => "1",
+                2 => "2",
+                3 => "3",
+                4 => "4",
+                5 => "5",
+                6 => "6",
+                7 => "7",
+                8 => "8",
+                9 => "9",
+                10 => "10",
+                _ => unreachable!("Difficulty::Level invariant is 1..=10"),
+            },
+        }
+    }
+
+    /// 1..=11, where Ultra is 11. Lets the card position a colour on the
+    /// gradient without matching on the variant.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Difficulty::Level(n) => *n,
+            Difficulty::Ultra => 11,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Answer {
-    /// <= 90 chars. Leads with the final value or the correction.
-    pub headline: String,
     /// <= 700 chars of plain-text working. May be empty.
     pub detail: String,
+    /// <= 90 chars. Leads with the final value or the correction.
+    pub headline: String,
+    /// `None` when the rating was not requested, or when the model returned
+    /// something unparseable.
+    pub difficulty: Option<Difficulty>,
 }
 
 #[derive(Debug)]
@@ -42,7 +134,7 @@ pub struct Shot {
 
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
-    fn ask(&self, shot: &Shot, prompt: &str) -> anyhow::Result<Answer>;
+    fn ask(&self, shot: &Shot, prompt: &str, want_difficulty: bool) -> anyhow::Result<Answer>;
 
     /// Whether this provider is usable, e.g. has a non-empty API key.
     ///
@@ -68,14 +160,14 @@ impl Chain {
         Self { providers }
     }
 
-    pub fn ask(&self, shot: &Shot, prompt: &str) -> anyhow::Result<Answer> {
+    pub fn ask(&self, shot: &Shot, prompt: &str, want_difficulty: bool) -> anyhow::Result<Answer> {
         let mut first_err: Option<anyhow::Error> = None;
 
         for provider in &self.providers {
             if !provider.ready() {
                 continue;
             }
-            match provider.ask(shot, prompt) {
+            match provider.ask(shot, prompt, want_difficulty) {
                 Ok(answer) => return Ok(answer),
                 Err(e) => {
                     if first_err.is_none() {
@@ -130,7 +222,7 @@ mod tests {
             self.ready
         }
 
-        fn ask(&self, _shot: &Shot, _prompt: &str) -> anyhow::Result<Answer> {
+        fn ask(&self, _shot: &Shot, _prompt: &str, _want_difficulty: bool) -> anyhow::Result<Answer> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             (self.result)()
         }
@@ -138,8 +230,9 @@ mod tests {
 
     fn ok_answer() -> anyhow::Result<Answer> {
         Ok(Answer {
-            headline: "42".into(),
             detail: "because reasons".into(),
+            headline: "42".into(),
+            difficulty: None,
         })
     }
 
@@ -167,7 +260,7 @@ mod tests {
             result: ok_answer,
         };
         let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
-        let answer = chain.ask(&shot(), "prompt").unwrap();
+        let answer = chain.ask(&shot(), "prompt", false).unwrap();
         assert_eq!(answer.headline, "42");
     }
 
@@ -181,7 +274,7 @@ mod tests {
             fn ready(&self) -> bool {
                 false
             }
-            fn ask(&self, _shot: &Shot, _prompt: &str) -> anyhow::Result<Answer> {
+            fn ask(&self, _shot: &Shot, _prompt: &str, _want_difficulty: bool) -> anyhow::Result<Answer> {
                 panic!("unready provider must not be asked");
             }
         }
@@ -193,7 +286,7 @@ mod tests {
             result: ok_answer,
         };
         let chain = Chain::new(vec![Box::new(PanicsIfCalled), Box::new(good)]);
-        let answer = chain.ask(&shot(), "prompt").unwrap();
+        let answer = chain.ask(&shot(), "prompt", false).unwrap();
         assert_eq!(answer.headline, "42");
     }
 
@@ -207,13 +300,13 @@ mod tests {
             fn ready(&self) -> bool {
                 false
             }
-            fn ask(&self, _shot: &Shot, _prompt: &str) -> anyhow::Result<Answer> {
+            fn ask(&self, _shot: &Shot, _prompt: &str, _want_difficulty: bool) -> anyhow::Result<Answer> {
                 unreachable!("should never be called when not ready")
             }
         }
 
         let chain = Chain::new(vec![Box::new(NeverReady), Box::new(NeverReady)]);
-        let err = chain.ask(&shot(), "prompt").unwrap_err();
+        let err = chain.ask(&shot(), "prompt", false).unwrap_err();
         assert_eq!(err.to_string(), "no providers configured");
     }
 
@@ -232,7 +325,7 @@ mod tests {
             result: || Err(anyhow::anyhow!("second error")),
         };
         let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
-        let err = chain.ask(&shot(), "prompt").unwrap_err();
+        let err = chain.ask(&shot(), "prompt", false).unwrap_err();
         assert_eq!(err.to_string(), "first error");
     }
 
@@ -246,7 +339,7 @@ mod tests {
             fn ready(&self) -> bool {
                 false
             }
-            fn ask(&self, _shot: &Shot, _prompt: &str) -> anyhow::Result<Answer> {
+            fn ask(&self, _shot: &Shot, _prompt: &str, _want_difficulty: bool) -> anyhow::Result<Answer> {
                 unreachable!("should never be called when not ready")
             }
         }
@@ -257,7 +350,59 @@ mod tests {
             result: || Err(anyhow::anyhow!("real error")),
         };
         let chain = Chain::new(vec![Box::new(NeverReady), Box::new(a)]);
-        let err = chain.ask(&shot(), "prompt").unwrap_err();
+        let err = chain.ask(&shot(), "prompt", false).unwrap_err();
         assert_eq!(err.to_string(), "real error");
+    }
+
+    #[test]
+    fn difficulty_parses_every_valid_level() {
+        for n in 1..=10u8 {
+            assert_eq!(
+                Difficulty::parse(&n.to_string()),
+                Some(Difficulty::Level(n)),
+                "failed for {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn difficulty_parses_ultra_case_insensitively() {
+        for s in ["u", "U", "ultra", "Ultra", "ULTRA"] {
+            assert_eq!(Difficulty::parse(s), Some(Difficulty::Ultra), "failed for {s:?}");
+        }
+    }
+
+    #[test]
+    fn difficulty_tolerates_surrounding_whitespace() {
+        assert_eq!(Difficulty::parse("  7  "), Some(Difficulty::Level(7)));
+        assert_eq!(Difficulty::parse("  U  "), Some(Difficulty::Ultra));
+    }
+
+    #[test]
+    fn difficulty_rejects_out_of_range_and_garbage() {
+        for s in [
+            "0",
+            "11",
+            "-1",
+            "",
+            "seven",
+            "3.5",
+            "999999999999999999999999999999", // overflows a u32, let alone a u8
+        ] {
+            assert_eq!(Difficulty::parse(s), None, "expected None for {s:?}");
+        }
+    }
+
+    #[test]
+    fn difficulty_label_and_rank() {
+        assert_eq!(Difficulty::Level(1).label(), "1");
+        assert_eq!(Difficulty::Level(9).label(), "9");
+        assert_eq!(Difficulty::Level(10).label(), "10");
+        assert_eq!(Difficulty::Ultra.label(), "U");
+
+        for n in 1..=10u8 {
+            assert_eq!(Difficulty::Level(n).rank(), n);
+        }
+        assert_eq!(Difficulty::Ultra.rank(), 11);
     }
 }

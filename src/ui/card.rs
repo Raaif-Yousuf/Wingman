@@ -13,7 +13,7 @@
 //!     pub fn new(instance: HINSTANCE) -> anyhow::Result<Self>;
 //!     pub fn hwnd(&self) -> HWND;
 //!     pub fn show_pending(&mut self);
-//!     pub fn show_answer(&mut self, headline: &str, detail: &str, auto_dismiss_secs: u32);
+//!     pub fn show_answer(&mut self, headline: &str, detail: &str, auto_dismiss_secs: u32, difficulty: Option<Difficulty>);
 //!     pub fn show_error(&mut self, headline: &str, detail: &str);
 //!     pub fn hide(&mut self);
 //!     pub fn set_text_scale(&mut self, scale: f32);
@@ -45,6 +45,15 @@
 //!   the one state where staying on screen until the user notices it is more
 //!   valuable than tidiness. Call `hide()` explicitly if different behaviour
 //!   is wanted.
+//! - `show_error` also has no `difficulty` parameter: errors have no
+//!   difficulty rating, and `show_error` always clears any badge left over
+//!   from a previous `show_answer` call so it can never linger on an error
+//!   card.
+//! - `show_answer`'s `difficulty: Option<Difficulty>` draws a small badge in
+//!   the card's bottom-right corner (Collapsed and Expanded only, never
+//!   Pending). Pass `None` to render exactly as before this feature existed
+//!   (no badge, no reserved space, no layout shift) -- this is what the
+//!   integrator should pass when the user has the feature disabled.
 //! - `show_pending` likewise has no timeout parameter, but pending state still
 //!   carries an internal safety-net auto-dismiss (`PENDING_SAFETY_TIMEOUT_SECS`)
 //!   so a card is never stuck forever if the worker thread never reports back.
@@ -65,12 +74,12 @@ use windows::Win32::Graphics::Gdi::{
     Arc, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint,
     ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject, GetTextMetricsW,
-    IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, SelectObject, SetBkMode,
-    SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_TOP,
-    DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID,
-    SRCCOPY, TEXTMETRICW, TRANSPARENT,
+    IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect, SelectClipRgn,
+    SelectObject, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT, DT_CENTER,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP,
+    DT_VCENTER, DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND,
+    PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
@@ -86,6 +95,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCDESTROY, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
+
+use crate::provider::Difficulty;
 
 // ---------------------------------------------------------------------------
 // Public state
@@ -126,6 +137,7 @@ impl Card {
             state: CardState::Hidden,
             headline: String::new(),
             detail: String::new(),
+            difficulty: None,
             dpi: 96,
             theme,
             fonts: Fonts::null(),
@@ -201,15 +213,27 @@ impl Card {
         self.inner.show_pending();
     }
 
-    pub fn show_answer(&mut self, headline: &str, detail: &str, auto_dismiss_secs: u32) {
-        self.inner.show_collapsed(headline, detail, auto_dismiss_secs);
+    pub fn show_answer(
+        &mut self,
+        headline: &str,
+        detail: &str,
+        auto_dismiss_secs: u32,
+        difficulty: Option<Difficulty>,
+    ) {
+        self.inner
+            .show_collapsed(headline, detail, auto_dismiss_secs, difficulty);
     }
 
     pub fn show_error(&mut self, headline: &str, detail: &str) {
         // No timeout parameter is given for errors: they persist until the
         // user dismisses them (click to expand, then Esc / focus-loss), or
         // until a later show_* call replaces them. See module docs.
-        self.inner.show_collapsed(headline, detail, 0);
+        //
+        // difficulty is always None here: errors have no difficulty rating,
+        // and passing None explicitly (rather than leaving a stale value)
+        // ensures a previous answer's badge can never linger on an error
+        // card.
+        self.inner.show_collapsed(headline, detail, 0, None);
     }
 
     pub fn hide(&mut self) {
@@ -361,6 +385,64 @@ fn rgb(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
+// ---------------------------------------------------------------------------
+// Difficulty badge colour
+// ---------------------------------------------------------------------------
+
+/// Green -> amber -> red gradient stops for `Difficulty::Level`, at ranks 1,
+/// 5 and 10 respectively. Three stops (not a straight two-stop green->red
+/// lerp) so the midpoint reads as amber/yellow rather than a muddy brown.
+const GRADIENT_LOW: (u8, u8, u8) = (0x2e, 0xa0, 0x43); // green, rank 1
+const GRADIENT_MID: (u8, u8, u8) = (0xf2, 0xa9, 0x00); // amber, rank 5
+const GRADIENT_HIGH: (u8, u8, u8) = (0xd6, 0x2c, 0x2c); // red, rank 10
+/// Deliberately outside the 1-10 gradient: Ultra is its own thing, not
+/// "worse than 10".
+const ULTRA_COLOR: (u8, u8, u8) = (0x8e, 0x24, 0xaa); // purple
+
+/// Maps a difficulty to the badge's fill colour, via `Difficulty::rank()`
+/// (1..=11, Ultra == 11) rather than matching on the variant, per that
+/// method's own doc comment. Ranks outside 1..=10 are clamped rather than
+/// trusted for the gradient half, since this module must never panic
+/// regardless of what upstream hands it.
+fn difficulty_color(difficulty: Difficulty) -> u32 {
+    let rank = difficulty.rank();
+    if rank >= 11 {
+        return rgb(ULTRA_COLOR.0, ULTRA_COLOR.1, ULTRA_COLOR.2);
+    }
+    let level = rank.clamp(1, 10) as f32;
+    let (from, to, t) = if level <= 5.0 {
+        (GRADIENT_LOW, GRADIENT_MID, (level - 1.0) / 4.0)
+    } else {
+        (GRADIENT_MID, GRADIENT_HIGH, (level - 5.0) / 5.0)
+    };
+    rgb(
+        lerp_u8(from.0, to.0, t),
+        lerp_u8(from.1, to.1, t),
+        lerp_u8(from.2, to.2, t),
+    )
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let t = t.clamp(0.0, 1.0);
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+/// Picks a legible label colour (near-black ink or near-white) for text sat
+/// on top of `fill`, using perceived luminance (ITU-R BT.601 weights) so a
+/// light fill (amber) gets dark ink and a dark fill (green/red/purple) gets
+/// white, per spec ("a yellow fill with white text is not [fine]").
+fn badge_text_color(fill: u32) -> u32 {
+    let r = (fill & 0xFF) as f32;
+    let g = ((fill >> 8) & 0xFF) as f32;
+    let b = ((fill >> 16) & 0xFF) as f32;
+    let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+    if luminance > 140.0 {
+        rgb(0x20, 0x20, 0x20)
+    } else {
+        rgb(0xff, 0xff, 0xff)
+    }
+}
+
 /// Reads `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`.
 ///
 /// `windows` 0.62 is built in this project *without* the `Win32_System_Registry`
@@ -428,6 +510,8 @@ fn registry_apps_use_light_theme() -> bool {
 struct Fonts {
     headline: HFONT,
     body: HFONT,
+    /// Small font used only for the difficulty badge's label.
+    badge: HFONT,
 }
 
 impl Fonts {
@@ -435,6 +519,7 @@ impl Fonts {
         Fonts {
             headline: HFONT(std::ptr::null_mut()),
             body: HFONT(std::ptr::null_mut()),
+            badge: HFONT(std::ptr::null_mut()),
         }
     }
 
@@ -445,6 +530,9 @@ impl Fonts {
             }
             if !self.body.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(self.body.0));
+            }
+            if !self.badge.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.badge.0));
             }
         }
     }
@@ -460,6 +548,10 @@ const HEADLINE_FONT_SCALE: f32 = 0.85;
 /// `Palette::detail`) is now the primary way to tell them apart -- neither
 /// font is bold any more.
 const DETAIL_FONT_SCALE: f32 = 0.8;
+/// The difficulty badge's label is the smallest text on the card -- it is an
+/// at-a-glance annotation, not a headline, and the whole point is that it not
+/// compete with the (already small, non-bold) answer text for attention.
+const BADGE_FONT_SCALE: f32 = 0.7;
 
 /// Builds the headline/body fonts for `dpi` and `text_scale`, deriving from
 /// the shell's message font (`SPI_GETNONCLIENTMETRICS`) so the card matches
@@ -521,9 +613,14 @@ fn build_fonts(dpi: u32, text_scale: f32) -> Fonts {
         body_lf.lfWeight = FW_NORMAL.0 as i32;
         body_lf.lfHeight = scaled_height(base.lfHeight, scale * DETAIL_FONT_SCALE);
 
+        let mut badge_lf = base;
+        badge_lf.lfWeight = FW_NORMAL.0 as i32;
+        badge_lf.lfHeight = scaled_height(base.lfHeight, scale * BADGE_FONT_SCALE);
+
         Fonts {
             headline: font_or_stock(&headline_lf),
             body: font_or_stock(&body_lf),
+            badge: font_or_stock(&badge_lf),
         }
     }
 }
@@ -584,6 +681,25 @@ const PENDING_SIZE_DP: i32 = 60;
 const GAP_DP: i32 = 6;
 const WHEEL_SCROLL_DP: i32 = 48;
 
+// -- Difficulty badge (Collapsed / Expanded only) -----------------------
+
+/// Distance from the card's outer edge to the badge's outer edge. Smaller
+/// than `PADDING_DP` on purpose: the badge nestles into the corner, mostly
+/// inside the existing padding whitespace, rather than adding a second ring
+/// of margin around it.
+const BADGE_EDGE_MARGIN_DP: i32 = 8;
+/// Horizontal/vertical text inset inside the badge shape.
+const BADGE_PAD_X_DP: i32 = 5;
+const BADGE_PAD_Y_DP: i32 = 3;
+/// Floor on both badge dimensions so a single-digit label (e.g. "1") still
+/// reads as a deliberate shape rather than a sliver -- this also makes
+/// single-character badges come out as circles (width == height) while
+/// two-character ones ("10") and "U" come out as pills.
+const BADGE_MIN_DIAMETER_DP: i32 = 18;
+/// Minimum clearance kept between the badge and any headline text next to
+/// it, on top of the badge's own width.
+const BADGE_TEXT_GAP_DP: i32 = 6;
+
 const TIMER_ANIM: usize = 1;
 const TIMER_DISMISS: usize = 2;
 /// A rotation needs ~16-33ms/frame to read as smooth; the old text-dot
@@ -611,6 +727,11 @@ struct CardInner {
     state: CardState,
     headline: String,
     detail: String,
+    /// `None` renders exactly as before this feature existed: no badge, no
+    /// reserved layout space. Cleared by `show_error` and by `show_pending`
+    /// so a stale badge can never linger onto a state that shouldn't have
+    /// one.
+    difficulty: Option<Difficulty>,
     dpi: u32,
     theme: Theme,
     fonts: Fonts,
@@ -654,6 +775,7 @@ impl CardInner {
         // No text in the pending state any more -- it shows a spinner.
         self.headline.clear();
         self.detail.clear();
+        self.difficulty = None; // pending never shows a badge; keep state tidy
         self.state = CardState::Pending;
         self.anim_frame = 0;
         self.scroll_offset = 0;
@@ -673,10 +795,17 @@ impl CardInner {
         self.reveal();
     }
 
-    fn show_collapsed(&mut self, headline: &str, detail: &str, auto_dismiss_secs: u32) {
+    fn show_collapsed(
+        &mut self,
+        headline: &str,
+        detail: &str,
+        auto_dismiss_secs: u32,
+        difficulty: Option<Difficulty>,
+    ) {
         self.reset_activation_and_timers();
         self.headline = headline.to_string();
         self.detail = detail.to_string();
+        self.difficulty = difficulty;
         self.state = CardState::Collapsed;
         self.scroll_offset = 0;
         self.scroll_max = 0;
@@ -843,9 +972,10 @@ impl CardInner {
         let width = self.scale(CARD_WIDTH_DP);
         let content_width = (width - padding * 2).max(1);
 
+        let headline_width = self.headline_content_width(content_width);
         let headline_line_h = self.line_height(self.fonts.headline).max(1);
         let max_headline_h = headline_line_h * HEADLINE_MAX_LINES;
-        let measured = self.measure_wrapped(self.fonts.headline, &self.headline, content_width);
+        let measured = self.measure_wrapped(self.fonts.headline, &self.headline, headline_width);
         let headline_h = measured.min(max_headline_h).max(headline_line_h);
 
         // No affordance line: the card is just the headline. Clicking it
@@ -862,8 +992,9 @@ impl CardInner {
         let width = self.scale(CARD_WIDTH_DP);
         let content_width = (width - padding * 2).max(1);
 
+        let headline_width = self.headline_content_width(content_width);
         let headline_h = self
-            .measure_wrapped(self.fonts.headline, &self.headline, content_width)
+            .measure_wrapped(self.fonts.headline, &self.headline, headline_width)
             .max(self.line_height(self.fonts.headline));
         let detail_h = if self.detail.is_empty() {
             0
@@ -948,6 +1079,79 @@ impl CardInner {
             ReleaseDC(None, hdc);
             (rect.bottom - rect.top).max(0)
         }
+    }
+
+    /// Natural (unwrapped) size of a single-line label, e.g. a badge's text.
+    fn measure_label(&self, font: HFONT, text: &str) -> (i32, i32) {
+        if text.is_empty() {
+            let h = self.line_height(font);
+            return (h, h);
+        }
+        unsafe {
+            let hdc = GetDC(None);
+            if hdc.0.is_null() {
+                let h = self.line_height(font);
+                return (h, h);
+            }
+            let old = SelectObject(hdc, HGDIOBJ(font.0));
+            let mut buf = utf16(text);
+            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            DrawTextW(
+                hdc,
+                &mut buf,
+                &mut rect,
+                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(hdc, old);
+            ReleaseDC(None, hdc);
+            ((rect.right - rect.left).max(1), (rect.bottom - rect.top).max(1))
+        }
+    }
+
+    // -- difficulty badge --------------------------------------------------
+
+    /// Outer width/height of the badge shape for `difficulty`, scaled for
+    /// this card's DPI and text scale. A short label (e.g. "1") floors out at
+    /// a circle; a wider one ("10", "U") grows into a pill.
+    fn badge_size(&self, difficulty: Difficulty) -> (i32, i32) {
+        let (tw, th) = self.measure_label(self.fonts.badge, difficulty.label());
+        let pad_x = self.scale(BADGE_PAD_X_DP);
+        let pad_y = self.scale(BADGE_PAD_Y_DP);
+        let min_d = self.scale(BADGE_MIN_DIAMETER_DP);
+        let w = (tw + pad_x * 2).max(min_d);
+        let h = (th + pad_y * 2).max(min_d);
+        (w, h)
+    }
+
+    /// How much narrower the headline's (and, in Expanded, the scroll hint's)
+    /// available width must be so nothing is drawn underneath the badge.
+    /// Returns 0 whenever there is no badge to avoid (i.e. `difficulty` is
+    /// `None`), which is what keeps the `None` case pixel-identical to the
+    /// pre-badge layout.
+    fn badge_reserve(&self, difficulty: Option<Difficulty>) -> i32 {
+        match difficulty {
+            None => 0,
+            Some(d) => {
+                let (badge_w, _) = self.badge_size(d);
+                let edge_margin = self.scale(BADGE_EDGE_MARGIN_DP);
+                let gap = self.scale(BADGE_TEXT_GAP_DP);
+                let padding = self.scale(PADDING_DP);
+                // The content area's right edge already sits `padding` in
+                // from the card edge; the badge sits `edge_margin` in from
+                // the same edge. Only the amount by which the badge (plus a
+                // little breathing room) extends past that existing padding
+                // needs to be reserved on top of it.
+                (edge_margin + badge_w + gap - padding).max(0)
+            }
+        }
+    }
+
+    /// Content width to wrap the headline into, narrowed to clear the
+    /// difficulty badge when one is shown. Every headline layout/paint call
+    /// site must use this (not the raw content width) so the reserved space
+    /// stays in sync between measurement and drawing.
+    fn headline_content_width(&self, content_w: i32) -> i32 {
+        (content_w - self.badge_reserve(self.difficulty)).max(1)
     }
 
     // -- painting --------------------------------------------------------
@@ -1081,6 +1285,7 @@ impl CardInner {
 
     unsafe fn paint_collapsed(&self, hdc: HDC, rc: RECT, padding: i32, palette: &Palette) {
         let content_w = (rc.right - rc.left - padding * 2).max(1);
+        let headline_w = self.headline_content_width(content_w);
         let headline_line_h = self.line_height(self.fonts.headline).max(1);
         let max_headline_h = headline_line_h * HEADLINE_MAX_LINES;
         // Must match layout_collapsed's arithmetic exactly. Using the cap here
@@ -1088,7 +1293,7 @@ impl CardInner {
         // bottom edge whenever the headline wraps to fewer than the maximum
         // number of lines -- i.e. most of the time.
         let headline_h = self
-            .measure_wrapped(self.fonts.headline, &self.headline, content_w)
+            .measure_wrapped(self.fonts.headline, &self.headline, headline_w)
             .min(max_headline_h)
             .max(headline_line_h);
 
@@ -1096,7 +1301,7 @@ impl CardInner {
         let mut headline_rect = RECT {
             left: rc.left + padding,
             top: rc.top + padding,
-            right: rc.left + padding + content_w,
+            right: rc.left + padding + headline_w,
             bottom: rc.top + padding + headline_h,
         };
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
@@ -1108,6 +1313,7 @@ impl CardInner {
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
 
+        self.paint_difficulty_badge(hdc, rc);
     }
 
     unsafe fn paint_expanded(&self, hdc: HDC, rc: RECT, padding: i32, gap: i32, palette: &Palette) {
@@ -1120,8 +1326,9 @@ impl CardInner {
         // the border/padding.
         IntersectClipRect(hdc, content_left, content_top, rc.right - padding, content_bottom);
 
+        let headline_w = self.headline_content_width(content_w);
         let headline_h = self
-            .measure_wrapped(self.fonts.headline, &self.headline, content_w)
+            .measure_wrapped(self.fonts.headline, &self.headline, headline_w)
             .max(self.line_height(self.fonts.headline));
 
         let y0 = content_top - self.scroll_offset;
@@ -1129,7 +1336,7 @@ impl CardInner {
         let mut headline_rect = RECT {
             left: content_left,
             top: y0,
-            right: content_left + content_w,
+            right: content_left + headline_w,
             bottom: y0 + headline_h,
         };
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
@@ -1180,10 +1387,13 @@ impl CardInner {
             FillRect(hdc, &band, bg);
             let _ = DeleteObject(HGDIOBJ(bg.0));
             let mut hint = utf16("more below");
+            // Reuse the headline's badge reservation so the hint (which is
+            // also right-aligned, in the same bottom-right corner the badge
+            // occupies) does not draw underneath it either.
             let mut hint_rect = RECT {
                 left: content_left,
                 top: rc.bottom - padding - band_h + self.scale(2),
-                right: rc.right - padding,
+                right: content_left + headline_w,
                 bottom: rc.bottom - padding,
             };
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
@@ -1195,6 +1405,60 @@ impl CardInner {
                 DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
             );
         }
+
+        self.paint_difficulty_badge(hdc, rc);
+    }
+
+    /// Draws the difficulty badge in the card's bottom-right corner, if any
+    /// (`self.difficulty` is `None` for Pending, for errors, and whenever the
+    /// integrator disabled the feature -- in all of those cases this is a
+    /// no-op, which is what keeps that path pixel-identical to the code
+    /// before this feature existed).
+    ///
+    /// Called last, after the rest of `paint_collapsed`/`paint_expanded`, so
+    /// the badge always sits on top. `paint_expanded` narrows its clip region
+    /// to the padded content box for scrolling; the badge lives partly
+    /// outside that box (in the corner's padding whitespace), so the clip is
+    /// reset first -- otherwise it would be silently clipped away there.
+    unsafe fn paint_difficulty_badge(&self, hdc: HDC, rc: RECT) {
+        let Some(difficulty) = self.difficulty else {
+            return;
+        };
+
+        let _ = SelectClipRgn(hdc, None);
+
+        let (w, h) = self.badge_size(difficulty);
+        let edge_margin = self.scale(BADGE_EDGE_MARGIN_DP);
+        let right = rc.right - edge_margin;
+        let bottom = rc.bottom - edge_margin;
+        let left = (right - w).max(rc.left);
+        let top = (bottom - h).max(rc.top);
+
+        let fill = difficulty_color(difficulty);
+        let text_color = badge_text_color(fill);
+        // Equal-radius rounding on both axes: when w == h (short labels like
+        // "1") this comes out as a circle; when w > h ("10", "U") it comes
+        // out as a pill.
+        let round = h;
+
+        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(fill));
+        let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        let _ = RoundRect(hdc, left, top, right, bottom, round, round);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+
+        let mut label = utf16(difficulty.label());
+        let mut label_rect = RECT { left, top, right, bottom };
+        SelectObject(hdc, HGDIOBJ(self.fonts.badge.0));
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_color));
+        DrawTextW(
+            hdc,
+            &mut label,
+            &mut label_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
     }
 
     // -- message handling --------------------------------------------------
@@ -1336,7 +1600,12 @@ mod tests {
         card.show_pending();
         assert_eq!(card.state(), CardState::Pending);
 
-        card.show_answer("2 + 2 = 4", "You carried correctly.", 5);
+        card.show_answer(
+            "2 + 2 = 4",
+            "You carried correctly.",
+            5,
+            Some(Difficulty::Level(1)),
+        );
         assert_eq!(card.state(), CardState::Collapsed);
 
         // Simulate the click that expands a collapsed card with detail.
@@ -1350,6 +1619,9 @@ mod tests {
 
         card.show_error("Couldn't capture the screen", "detail text");
         assert_eq!(card.state(), CardState::Collapsed);
+        // show_error must clear any badge left over from the previous
+        // show_answer call above -- it must never linger on an error card.
+        assert_eq!(card.inner.difficulty, None);
 
         card.hide();
         assert_eq!(card.state(), CardState::Hidden);
@@ -1377,9 +1649,127 @@ mod tests {
         // whatever state is active must still not panic afterwards.
         assert!(!card.inner.fonts.headline.0.is_null());
         assert!(!card.inner.fonts.body.0.is_null());
+        assert!(!card.inner.fonts.badge.0.is_null());
 
-        card.show_answer("headline text", "detail text", 0);
+        card.show_answer("headline text", "detail text", 0, Some(Difficulty::Ultra));
         card.set_text_scale(0.75);
         assert_eq!(card.state(), CardState::Collapsed);
+    }
+
+    #[test]
+    fn difficulty_none_reserves_no_width() {
+        let card = Card::new(instance()).expect("Card::new");
+        assert_eq!(card.inner.badge_reserve(None), 0);
+        let content_w = card.inner.scale(CARD_WIDTH_DP) - 2 * card.inner.scale(PADDING_DP);
+        assert_eq!(card.inner.headline_content_width(content_w), content_w);
+
+        // A real difficulty always reserves *some* width.
+        assert!(card.inner.badge_reserve(Some(Difficulty::Level(1))) > 0);
+        assert!(card.inner.badge_reserve(Some(Difficulty::Level(10))) > 0);
+        assert!(card.inner.badge_reserve(Some(Difficulty::Ultra)) > 0);
+    }
+
+    #[test]
+    fn long_headline_wraps_clear_of_the_badge() {
+        let mut card = Card::new(instance()).expect("Card::new");
+        let content_w = card.inner.scale(CARD_WIDTH_DP) - 2 * card.inner.scale(PADDING_DP);
+        let long_headline = "supercalifragilisticexpialidocious ".repeat(6);
+
+        // Baseline: no badge, full content width.
+        card.show_answer(&long_headline, "detail", 0, None);
+        let no_badge_h =
+            card.inner
+                .measure_wrapped(card.inner.fonts.headline, &card.inner.headline, content_w);
+
+        // With a badge: the headline must be measured/drawn into a strictly
+        // narrower width (so it wraps clear of the badge), which can only
+        // ever push the wrapped height up, never down.
+        card.show_answer(&long_headline, "detail", 0, Some(Difficulty::Level(10)));
+        let narrowed_w = card.inner.headline_content_width(content_w);
+        assert!(narrowed_w < content_w);
+        let badge_h = card.inner.measure_wrapped(
+            card.inner.fonts.headline,
+            &card.inner.headline,
+            narrowed_w,
+        );
+        assert!(badge_h >= no_badge_h);
+
+        // The card must still lay out and paint without panicking for every
+        // difficulty value with this long headline (exercises paint_collapsed
+        // and paint_expanded's badge path end-to-end).
+        for difficulty in [
+            Difficulty::Level(1),
+            Difficulty::Level(5),
+            Difficulty::Level(10),
+            Difficulty::Ultra,
+        ] {
+            card.show_answer(&long_headline, "some detail text", 0, Some(difficulty));
+            let _ = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+            card.inner.try_expand();
+            let _ = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+            card.hide();
+        }
+    }
+
+    fn channels(c: u32) -> (u8, u8, u8) {
+        (
+            (c & 0xFF) as u8,
+            ((c >> 8) & 0xFF) as u8,
+            ((c >> 16) & 0xFF) as u8,
+        )
+    }
+
+    #[test]
+    fn difficulty_color_gradient_is_sane() {
+        // Rank 1: dominantly green.
+        let (r, g, b) = channels(difficulty_color(Difficulty::Level(1)));
+        assert!(g > r && g > b, "rank 1 should read as green (r={r} g={g} b={b})");
+
+        // Rank 10: dominantly red.
+        let (r, g, b) = channels(difficulty_color(Difficulty::Level(10)));
+        assert!(r > g && r > b, "rank 10 should read as red (r={r} g={g} b={b})");
+
+        // Rank 5 sits at the amber midpoint stop: not muddy brown, i.e. red
+        // and green channels should both be well above blue and reasonably
+        // close to each other.
+        let (r, g, b) = channels(difficulty_color(Difficulty::Level(5)));
+        assert!(r > b && g > b, "rank 5 should read as amber (r={r} g={g} b={b})");
+
+        // Ultra: purple, outside the gradient -- blue and red both clearly
+        // above green.
+        let (r, g, b) = channels(difficulty_color(Difficulty::Ultra));
+        assert!(b > g && r > g, "Ultra should read as purple (r={r} g={g} b={b})");
+
+        // All 11 ranks (Level(1..=10) plus Ultra) must be visually
+        // distinguishable from one another.
+        let mut colors: Vec<u32> = (1..=10u8)
+            .map(|n| difficulty_color(Difficulty::Level(n)))
+            .collect();
+        colors.push(difficulty_color(Difficulty::Ultra));
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(
+                    colors[i], colors[j],
+                    "ranks {i} and {j} produced the same colour"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn badge_text_color_contrasts_with_its_fill() {
+        // A light (amber) fill must get dark ink, not white-on-yellow.
+        let amber = difficulty_color(Difficulty::Level(5));
+        assert_eq!(badge_text_color(amber), rgb(0x20, 0x20, 0x20));
+
+        // Darker fills (green, red, purple) must get white ink.
+        for d in [Difficulty::Level(1), Difficulty::Level(10), Difficulty::Ultra] {
+            let fill = difficulty_color(d);
+            assert_eq!(
+                badge_text_color(fill),
+                rgb(0xff, 0xff, 0xff),
+                "{d:?} fill {fill:#08x} should contrast with white text"
+            );
+        }
     }
 }

@@ -33,6 +33,7 @@ use crate::hotkey::{
 };
 use crate::provider::{Answer, Chain, Shot};
 use crate::ui::card::Card;
+use crate::ui::settings;
 use crate::ui::tray::{cmd, decode, MenuChoice, Tray, WM_APP_TRAY};
 
 /// Posted by the worker when a request finishes. `lparam` is
@@ -48,6 +49,8 @@ const WINDOW_CLASS: PCWSTR = w!("CopilotAsk.Owner.Window.4d1b62f0");
 const CARD_SETTLE_MS: u64 = 60;
 
 struct App {
+    /// Kept so the settings window can be created on demand.
+    instance: HINSTANCE,
     config: Config,
     chain: Arc<Chain>,
     card: Card,
@@ -68,6 +71,11 @@ pub fn run() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    // If autostart is on but aimed at an old path (the exe was moved or
+    // rebuilt elsewhere), point it back here. Otherwise it fails silently
+    // while Settings still reports it as enabled.
+    crate::autostart::repair_if_stale();
+
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let config = Config::load().unwrap_or_default();
     let chain = Arc::new(config.build_chain());
@@ -79,6 +87,7 @@ pub fn run() -> Result<()> {
     let tray = Tray::new(hwnd, instance).context("creating the tray icon")?;
 
     let mut app = Box::new(App {
+        instance,
         config,
         chain,
         card,
@@ -201,10 +210,11 @@ impl App {
 
         let chain = Arc::clone(&self.chain);
         let prompt = self.config.ui.prompt.clone();
+        let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> =
-                worker(&chain, &shot, &prompt).map_err(|e| format!("{e:#}"));
+                worker(&chain, &shot, &prompt, want_difficulty).map_err(|e| format!("{e:#}"));
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -225,6 +235,7 @@ impl App {
                     &answer.headline,
                     &answer.detail,
                     self.config.ui.card_seconds,
+                    answer.difficulty,
                 );
                 self.last = Some(answer);
                 self.set_watch(true);
@@ -235,6 +246,8 @@ impl App {
                 self.last = Some(Answer {
                     headline,
                     detail: e,
+                    // An error has no difficulty to report.
+                    difficulty: None,
                 });
                 self.set_watch(true);
             }
@@ -243,7 +256,7 @@ impl App {
 
     fn copy_last(&mut self) {
         let Some(answer) = &self.last else {
-            self.card.show_answer("Nothing to copy yet", "", 4);
+            self.card.show_answer("Nothing to copy yet", "", 4, None);
             return;
         };
         let text = if answer.detail.is_empty() {
@@ -252,7 +265,7 @@ impl App {
             format!("{}\n\n{}", answer.headline, answer.detail)
         };
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-            Ok(()) => self.card.show_answer("Copied", "", 3),
+            Ok(()) => self.card.show_answer("Copied", "", 3, None),
             Err(e) => self.card.show_error("Couldn't copy", &format!("{e}")),
         }
     }
@@ -273,6 +286,7 @@ impl App {
             &format!("Press the {slot} now"),
             "Whatever you press next becomes the binding. Modifiers on their own are ignored. Times out in 10 seconds.",
             11,
+            None,
         );
     }
 
@@ -290,7 +304,7 @@ impl App {
 
         let name = chord_to_string(&chord);
         match saved {
-            Ok(()) => self.card.show_answer(&format!("Bound to {name}"), "", 4),
+            Ok(()) => self.card.show_answer(&format!("Bound to {name}"), "", 4, None),
             Err(e) => self.card.show_error(
                 &format!("Bound to {name} — but not saved"),
                 &format!("It will work until you quit.\n\n{e:#}"),
@@ -302,18 +316,47 @@ impl App {
         match Config::load() {
             Ok(config) => {
                 self.config = config;
-                self.chain = Arc::new(self.config.build_chain());
-                self.card.set_text_scale(self.config.ui.text_scale);
-                if let Some(hook) = &self.hook {
-                    hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
-                }
-                self.refresh_tray_labels();
-                self.card.show_answer("Settings reloaded", "", 3);
+                self.apply_config();
+                self.card.show_answer("Settings reloaded", "", 3, None);
             }
             Err(e) => self
                 .card
                 .show_error("Couldn't reload settings", &format!("{e:#}")),
         }
+    }
+
+    /// Open the GUI settings window. Modal: it runs its own message loop, so
+    /// the hotkey is inert until it closes. On Save the new config is applied
+    /// in full — the same path `reload` takes — so nothing gets half-applied.
+    fn open_settings(&mut self) {
+        // The card would sit on top of the settings window, and a click in
+        // that window would dismiss it anyway.
+        self.card.hide();
+        self.set_watch(false);
+
+        let Some(edited) = settings::show_modal(self.instance, &self.config) else {
+            return;
+        };
+
+        self.config = edited;
+        if let Err(e) = self.config.save() {
+            self.card
+                .show_error("Couldn't save settings", &format!("{e:#}"));
+            return;
+        }
+        self.apply_config();
+        self.card.show_answer("Settings saved", "", 3, None);
+        self.set_watch(true);
+    }
+
+    /// Push `self.config` into everything that caches a piece of it.
+    fn apply_config(&mut self) {
+        self.chain = Arc::new(self.config.build_chain());
+        self.card.set_text_scale(self.config.ui.text_scale);
+        if let Some(hook) = &self.hook {
+            hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
+        }
+        self.refresh_tray_labels();
     }
 
     fn edit_settings(&mut self) {
@@ -372,9 +415,38 @@ impl App {
         self.refresh_tray_labels();
 
         match saved {
-            Ok(()) => self.card.show_answer(&model, "", 3),
+            Ok(()) => self.card.show_answer(&model, "", 3, None),
             Err(e) => self.card.show_error(
                 &format!("Using {model} — but not saved"),
+                &format!("It will revert when you quit.
+
+{e:#}"),
+            ),
+        }
+        self.set_watch(true);
+    }
+
+    /// Move a provider to the front of `providers.order`, making it the one
+    /// that answers. The other stays in the list as the fallback rather than
+    /// being dropped, so switching never costs you the second provider.
+    fn set_provider(&mut self, openai: bool) {
+        let want = if openai { "openai" } else { "anthropic" };
+        let order = &mut self.config.providers.order;
+        if order.first().map(String::as_str) == Some(want) {
+            return;
+        }
+        order.retain(|p| p != want);
+        order.insert(0, want.to_string());
+
+        self.chain = Arc::new(self.config.build_chain());
+        let saved = self.config.save();
+        self.refresh_tray_labels();
+
+        let name = if openai { "ChatGPT" } else { "Claude" };
+        match saved {
+            Ok(()) => self.card.show_answer(name, "", 3, None),
+            Err(e) => self.card.show_error(
+                &format!("Using {name} — but not saved"),
                 &format!("It will revert when you quit.
 
 {e:#}"),
@@ -389,6 +461,8 @@ impl App {
         self.tray.set_key_bindings(&primary, &secondary);
 
         let p = &self.config.providers;
+        let openai_first = p.order.first().map(String::as_str) != Some("anthropic");
+        self.tray.set_active_provider(openai_first);
         self.tray.set_models(
             &p.openai.models,
             &p.openai.model,
@@ -444,8 +518,8 @@ impl App {
     }
 }
 
-fn worker(chain: &Chain, shot: &Shot, prompt: &str) -> Result<Answer> {
-    chain.ask(shot, prompt)
+fn worker(chain: &Chain, shot: &Shot, prompt: &str, want_difficulty: bool) -> Result<Answer> {
+    chain.ask(shot, prompt, want_difficulty)
 }
 
 /// First line of an error, truncated on a char boundary, for the headline.
@@ -501,6 +575,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
                     MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
+                    MenuChoice::Command(cmd::USE_OPENAI) => app.set_provider(true),
+                    MenuChoice::Command(cmd::USE_ANTHROPIC) => app.set_provider(false),
+                    MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
                     MenuChoice::Command(cmd::QUIT) => unsafe {
                         let _ = DestroyWindow(hwnd);
                     },

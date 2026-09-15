@@ -32,6 +32,8 @@ touches a `HWND` beyond posting to it.
 | `src/provider/anthropic.rs` | Anthropic Messages API impl | — |
 | `src/hotkey.rs` | `WH_KEYBOARD_LL` hook, chord matching, learn mode | know about providers |
 | `src/ui/tray.rs` | `Shell_NotifyIconW` icon + context menu | know about providers |
+| `src/ui/settings.rs` | the GUI settings window (modal) | persist anything itself |
+| `src/dismiss.rs` | `WH_MOUSE_LL` click-anywhere-to-close watcher | know about the card |
 | `src/ui/card.rs` | notification card window (collapsed + expanded) | know about providers |
 | `src/app.rs` | window proc, state machine, wiring | contain business logic |
 | `src/main.rs` | entry point, `#![windows_subsystem = "windows"]` | — |
@@ -60,9 +62,36 @@ pub struct Shot {
 
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
-    fn ask(&self, shot: &Shot, prompt: &str) -> anyhow::Result<Answer>;
+    fn ask(&self, shot: &Shot, prompt: &str, want_difficulty: bool) -> anyhow::Result<Answer>;
+}
+
+/// Shown as a badge in the card's bottom-right corner. Pure data — the
+/// green-to-red gradient lives in the card.
+pub enum Difficulty {
+    Level(u8), // 1..=10
+    Ultra,     // "a professor would struggle"
 }
 ```
+
+### Difficulty
+
+Off by config (`ui.show_difficulty`). When off the property is absent from the
+schema and the rubric is absent from the prompt, so it costs nothing — the
+toggle is not merely a rendering switch.
+
+| value | anchor |
+|---|---|
+| 1 | easy high-school |
+| 3 | easy university intro course |
+| 5 | medium university |
+| 7 | hard university |
+| 9 | very hard for an undergraduate |
+| 10 | a PhD student would struggle |
+| U | a professor would struggle |
+
+`difficulty` sits **after** `headline` in the schema, so the rating is formed
+once the problem has actually been worked through. An unparseable value
+degrades to no badge, never to a wrong badge.
 
 ```rust
 // src/hotkey.rs
@@ -230,7 +259,11 @@ Colors follow the system light/dark setting, read at startup from
 `Shell_NotifyIconW` with `NIM_ADD`. The icon loads from an embedded resource and
 falls back to `IDI_APPLICATION`. Right-click opens a `TrackPopupMenu`:
 
-- **Ask now** — trigger the flow without the hotkey
+- **Ask now** — trigger the flow without the hotkey (left-click on the icon
+  opens **Settings** instead: the icon is easy to hit by accident, and firing a
+  paid API call on a stray click is worse than opening a window)
+- **Provider ▸** — which service answers; reorders `providers.order` rather
+  than dropping the other, so the fallback survives a switch
 - **Copy last answer** — headline + detail to the clipboard via `arboard`
 - separator
 - **Set Copilot key…** — learn mode for the primary binding

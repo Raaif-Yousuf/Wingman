@@ -29,12 +29,13 @@ No runtime dependency — the `.exe` is standalone.
 ## First run
 
 Launch it. A tray icon appears and `%APPDATA%\copilot-ask\config.toml` is created.
-Open it from the tray (**Edit settings**) and paste your API key:
+Left-click the tray icon to open **Settings**, and paste your key into
+**OpenAI API key** or **Anthropic API key** — both are in the Providers group at
+the top. Everything else lives there too: model, effort, capture size, card
+timeout, text size, the difficulty toggle and the prompt.
 
-```toml
-[providers.openai]
-api_key = "sk-proj-..."
-```
+The config file is still there (`Open config.toml` in the tray menu) if you want
+to edit it by hand.
 
 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` in the environment override the file, so
 you can keep keys out of the config entirely if you prefer.
@@ -46,6 +47,24 @@ as an error.
 Switch models from the tray at any time; the choice is written straight back to
 the config. To offer a model that isn't listed, add it to `models` under the
 relevant provider — no rebuild needed.
+
+## Difficulty rating
+
+Each answer carries a 1-10 rating of the problem in the card's bottom-right
+corner, green through amber to red, with a purple **U** above 10.
+
+| | |
+|---|---|
+| 1 | easy high-school |
+| 3 | easy university intro course |
+| 5 | medium university |
+| 7 | hard university, typically graduate coursework |
+| 9 | very hard for an undergraduate |
+| 10 | a PhD student would struggle |
+| U | a professor would struggle |
+
+Turn it off with **Show difficulty rating** in Settings. Off means the rating is
+never requested, not merely hidden, so it costs nothing.
 
 ## Hotkeys
 
@@ -62,8 +81,10 @@ Same for the secondary binding.
 
 ## Tray menu
 
-- **Ask now** — trigger without the hotkey (left-click does this too)
+- **Ask now** — trigger without the hotkey
+- **Settings…** — the settings window (left-clicking the tray icon opens this too)
 - **Copy last answer** — headline and working to the clipboard
+- **Provider ▸** — which service answers (ChatGPT or Claude)
 - **ChatGPT model ▸** / **Claude model ▸** — switch models, saved immediately
 - **Set Copilot key…** / **Set secondary key…** — rebind by pressing the key
 - **Edit settings** — opens `config.toml`
@@ -80,6 +101,7 @@ Same for the secondary binding.
 | `providers.*.effort` | `"low"` | reasoning depth; raise for harder problems |
 | `ui.card_seconds` | `12` | auto-dismiss for the collapsed card; `0` = never |
 | `ui.text_scale` | `1.0` | multiplies the card's font size; lower is smaller |
+| `ui.show_difficulty` | `true` | the 1-10/U badge; when off it is not requested at all |
 | `providers.*.models` | see file | what the tray's model submenu offers |
 | `ui.prompt` | see file | the system prompt — edit it to change what it checks |
 
@@ -87,14 +109,14 @@ Roughly 1-2 cents and 3-8 seconds per check at the defaults.
 
 ## Start with Windows
 
-There is no installer. Drop a shortcut in the Startup folder:
+Tick **Start with Windows** in Settings. It writes a per-user entry to
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — no admin prompt, and
+it shows up in Task Manager's Startup tab like any other startup app. Untick to
+remove it.
 
-```powershell
-$s = (New-Object -ComObject WScript.Shell).CreateShortcut(
-  "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\copilot-ask.lnk")
-$s.TargetPath = "$PWD\target\release\copilot-ask.exe"
-$s.Save()
-```
+The checkbox reads the registry when Settings opens, so it always reflects
+reality rather than a mirrored setting that can drift. If you move or rebuild
+the exe somewhere else, the entry is repaired to the new path on next launch.
 
 ## Design
 

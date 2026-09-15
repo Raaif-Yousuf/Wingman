@@ -14,7 +14,12 @@ embed-resource = "3.0"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# preserve_order: Value::Object is a BTreeMap by default and serializes keys
+# alphabetically, so the schema property order the code writes is NOT what
+# gets sent. That order is load-bearing -- the model answers in it, and with
+# "headline" emitted before "detail" it commits to a verdict before doing the
+# arithmetic and contradicts itself. Do not remove this feature.
+serde_json = { version = "1.0", features = ["preserve_order"] }
 toml = "1.1"
 base64 = "0.23"
 anyhow = "1.0"
@@ -31,6 +36,7 @@ features = [
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Dwm",
   "Win32_System_LibraryLoader",
+  "Win32_System_Registry",
   "Win32_System_Threading",
   "Win32_UI_Controls",
   "Win32_UI_HiDpi",

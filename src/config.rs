@@ -142,6 +142,10 @@ pub struct Ui {
     /// Multiplies every font size in the card. 1.0 is the built-in default;
     /// lower is smaller. Clamped by the card to a readable range.
     pub text_scale: f32,
+    /// Show the 1-10/Ultra difficulty badge in the card's bottom-right
+    /// corner. When off, the rating is not requested from the model at all,
+    /// so the rubric costs nothing on every call.
+    pub show_difficulty: bool,
     /// System prompt, editable by the user in the TOML file.
     pub prompt: String,
 }
@@ -151,6 +155,7 @@ impl Default for Ui {
         Self {
             card_seconds: 12,
             text_scale: 1.0,
+            show_difficulty: true,
             prompt: DEFAULT_PROMPT.to_string(),
         }
     }

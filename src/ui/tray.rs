@@ -64,6 +64,15 @@ pub mod cmd {
     pub const EDIT_SETTINGS: u32 = 1005;
     pub const RELOAD: u32 = 1006;
     pub const QUIT: u32 = 1007;
+    /// Open the settings window. This is also what a left-click on the tray
+    /// icon does -- deliberately NOT `ASK_NOW`, because the icon is easy to
+    /// hit by accident and firing a paid API call on a stray click is worse
+    /// than opening a window.
+    pub const OPEN_SETTINGS: u32 = 1008;
+    /// Make ChatGPT the active provider (moves it to the front of the order).
+    pub const USE_OPENAI: u32 = 1009;
+    /// Make Claude the active provider.
+    pub const USE_ANTHROPIC: u32 = 1010;
 
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
@@ -120,6 +129,9 @@ pub struct Tray {
     /// Model lists and current-selection index for the two submenus. Set
     /// via [`Tray::set_models`]; empty until then, in which case the
     /// submenu shows a single greyed-out "none configured" entry.
+    /// Which provider is first in `providers.order`; radio-checked in the
+    /// Provider submenu.
+    active_provider_openai: bool,
     openai_models: Vec<String>,
     openai_current: Option<usize>,
     anthropic_models: Vec<String>,
@@ -160,6 +172,7 @@ impl Tray {
             hwnd,
             primary_label: String::new(),
             secondary_label: String::new(),
+            active_provider_openai: true,
             openai_models: Vec::new(),
             openai_current: None,
             anthropic_models: Vec::new(),
@@ -198,6 +211,11 @@ impl Tray {
     /// keeping room to append `*_current` if it would otherwise be
     /// dropped). Does not touch the shell icon; only affects the next menu
     /// built by [`Tray::on_tray_message`].
+    /// Marks which provider is active. `true` = ChatGPT, `false` = Claude.
+    pub fn set_active_provider(&mut self, openai: bool) {
+        self.active_provider_openai = openai;
+    }
+
     pub fn set_models(
         &mut self,
         openai: &[String],
@@ -214,7 +232,7 @@ impl Tray {
         self.anthropic_current = current;
     }
 
-    /// Handle the `WM_APP_TRAY` message. Returns `Some(cmd::ASK_NOW)` on
+    /// Handle the `WM_APP_TRAY` message. Returns `Some(cmd::OPEN_SETTINGS)` on
     /// left-click/Enter activation, or the chosen menu command id on
     /// right-click/context-menu activation (`None` if the menu was
     /// dismissed without a choice, or the event was something else this
@@ -238,7 +256,7 @@ impl Tray {
     pub fn on_tray_message(&mut self, lparam: LPARAM) -> Option<u32> {
         let event = (lparam.0 as u32) & 0xFFFF;
         match event {
-            e if e == WM_LBUTTONUP || e == NIN_SELECT => Some(cmd::ASK_NOW),
+            e if e == WM_LBUTTONUP || e == NIN_SELECT => Some(cmd::OPEN_SETTINGS),
             e if e == WM_CONTEXTMENU || e == WM_RBUTTONUP => self.show_menu(),
             _ => None,
         }
@@ -288,6 +306,7 @@ impl Tray {
         append_item(hmenu, cmd::ASK_NOW, "Ask now")?;
         append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
         append_separator(hmenu)?;
+        append_provider_submenu(hmenu, self.active_provider_openai)?;
         append_model_submenu(
             hmenu,
             "ChatGPT model",
@@ -309,7 +328,8 @@ impl Tray {
             cmd::SET_SECONDARY,
             &key_label("Set secondary key", &self.secondary_label),
         )?;
-        append_item(hmenu, cmd::EDIT_SETTINGS, "Edit settings")?;
+        append_item(hmenu, cmd::OPEN_SETTINGS, "Settings...")?;
+        append_item(hmenu, cmd::EDIT_SETTINGS, "Open config.toml")?;
         append_item(hmenu, cmd::RELOAD, "Reload settings")?;
         append_separator(hmenu)?;
         append_item(hmenu, cmd::QUIT, "Quit")?;
@@ -389,6 +409,33 @@ fn mark_radio_checked(hmenu: HMENU, id: u32) {
         ..Default::default()
     };
     let _ = unsafe { SetMenuItemInfoW(hmenu, id, false, &info) };
+}
+
+/// Build the "Provider" submenu: which service actually answers. This is the
+/// `providers.order` front-runner, distinct from the per-provider model
+/// submenus below -- picking Claude here does not change which ChatGPT model
+/// is configured, it changes who gets asked first.
+fn append_provider_submenu(parent: HMENU, openai_active: bool) -> Result<()> {
+    let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
+    let built = (|| -> Result<()> {
+        append_item(sub, cmd::USE_OPENAI, "ChatGPT")?;
+        append_item(sub, cmd::USE_ANTHROPIC, "Claude")?;
+        mark_radio_checked(
+            sub,
+            if openai_active {
+                cmd::USE_OPENAI
+            } else {
+                cmd::USE_ANTHROPIC
+            },
+        );
+        Ok(())
+    })();
+    if built.is_err() {
+        // Not yet attached to the parent, so nothing else will free it.
+        let _ = unsafe { DestroyMenu(sub) };
+        return built;
+    }
+    append_submenu(parent, sub, "Provider")
 }
 
 /// Build one model submenu (`CreatePopupMenu`, populate, attach to
