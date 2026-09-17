@@ -169,6 +169,7 @@ was checked directly on 2026-09-15 (Windows 11 build 26200):
 | autostart | `HKCU\…\Run` → `"%LOCALAPPDATA%\Programs\copilot-ask\copilot-ask.exe"`, other entries intact |
 | no-argument launch while running | one process throughout; spinner then a real card with a model answer |
 | `config.toml` | untouched by install |
+| `wingman.exe --settings` as the FIRST instance (nothing running yet) | Settings window opens once the tray icon and hook exist, before message pumping starts (issue #149). Owed: not yet checked by hand on this machine. `cargo test single_instance` covers only the pure argv decision (`first_launch_action`); a bare `wingman.exe` launch under the same conditions must NOT open Settings -- check both. |
 
 ## Setting the key is the user's, not the installer's
 

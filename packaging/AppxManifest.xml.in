@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Sparse package for copilot-ask.
+  Sparse package for Wingman.
 
-  Sparse, not full: AllowExternalContent keeps copilot-ask.exe at a real path
+  Sparse, not full: AllowExternalContent keeps wingman.exe at a real path
   under %LOCALAPPDATA%\Programs so the HKCU\...\Run autostart value stays valid
-  across upgrades, and so nothing virtualizes the %APPDATA%\copilot-ask writes
+  across upgrades, and so nothing virtualizes the %APPDATA%\Wingman writes
   that hold config.toml. See docs/superpowers/specs/2026-09-15-packaging-and-install-design.md.
 
   @VERSION@ and @PUBLISHER@ are substituted by install.ps1. Publisher must
@@ -22,13 +22,13 @@
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap uap3 uap10 rescap">
 
-  <Identity Name="RaaifYousuf.CopilotAsk"
+  <Identity Name="RaaifYousuf.Wingman"
             Publisher="@PUBLISHER@"
             Version="@VERSION@"
             ProcessorArchitecture="x64" />
 
   <Properties>
-    <DisplayName>copilot-ask</DisplayName>
+    <DisplayName>Wingman</DisplayName>
     <PublisherDisplayName>Raaif Yousuf</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
     <!-- The sparse-package opt-in. Without it, Add-AppxPackage -ExternalLocation
@@ -51,11 +51,11 @@
 
   <Applications>
     <!-- Executable is resolved against the external location, not the package. -->
-    <Application Id="CopilotAsk"
-                 Executable="copilot-ask.exe"
+    <Application Id="Wingman"
+                 Executable="wingman.exe"
                  EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="copilot-ask"
+        DisplayName="Wingman"
         Description="Check what's on screen with a vision model"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
@@ -67,8 +67,8 @@
              read through a broker, declared but empty. -->
         <uap3:Extension Category="windows.appExtension">
           <uap3:AppExtension Name="com.microsoft.windows.copilotkeyprovider"
-                             Id="CopilotAsk"
-                             DisplayName="copilot-ask"
+                             Id="Wingman"
+                             DisplayName="Wingman"
                              Description="Check what's on screen with a vision model"
                              PublicFolder="Public" />
         </uap3:Extension>
