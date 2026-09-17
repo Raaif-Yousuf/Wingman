@@ -9,6 +9,7 @@ mod capture;
 mod config;
 #[cfg(test)]
 mod config_example;
+mod connectors;
 mod diagnostics;
 mod dismiss;
 mod executors;

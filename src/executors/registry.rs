@@ -5,6 +5,7 @@
 //! give for free, and it keeps "is this name known" and "what to build for
 //! it" in the same place a reviewer reads top to bottom.
 
+use super::calendar_add::CalendarAddExecutor;
 use super::clipboard::ClipboardExecutor;
 use super::none::NoneExecutor;
 use super::Executor;
@@ -20,6 +21,7 @@ pub fn resolve(name: &str) -> anyhow::Result<Box<dyn Executor>> {
     match name {
         "none" => Ok(Box::new(NoneExecutor)),
         "clipboard" => Ok(Box::new(ClipboardExecutor::new())),
+        "calendar_add" => Ok(Box::new(CalendarAddExecutor::new())),
         _ => anyhow::bail!(
             "No executor named \"{name}\". Check the action's executor field in actions.toml."
         ),
@@ -40,6 +42,13 @@ mod tests {
     fn resolves_clipboard_by_name() {
         let executor = resolve("clipboard").expect("\"clipboard\" is a built-in executor");
         assert_eq!(executor.name(), "clipboard");
+    }
+
+    #[test]
+    fn resolves_calendar_add_by_name() {
+        let executor = resolve("calendar_add").expect("\"calendar_add\" is a built-in executor");
+        assert_eq!(executor.name(), "calendar_add");
+        assert_eq!(executor.effect(), super::super::Effect::Writes);
     }
 
     #[test]

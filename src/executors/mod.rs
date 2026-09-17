@@ -8,6 +8,7 @@
 //! always takes `Confirmed<serde_json::Value>`, the same JSON currency
 //! `actions::schema`'s proposal registry already speaks.
 
+mod calendar_add;
 mod clipboard;
 mod none;
 pub mod registry;
