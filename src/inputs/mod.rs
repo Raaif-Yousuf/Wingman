@@ -8,3 +8,14 @@
 
 pub mod selection;
 pub mod uia;
+
+/// Serializes every test in this module tree that drives real UIA over COM.
+/// MEASURED 2026-09-17 (#208): UIA integration tests in `uia` and
+/// `selection` fail intermittently with E_FAIL when run in parallel.
+#[cfg(test)]
+pub(crate) static UIA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_uia_test() -> std::sync::MutexGuard<'static, ()> {
+    UIA_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}

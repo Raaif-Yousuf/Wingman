@@ -1523,11 +1523,7 @@ mod tests {
         /// `uia.rs` is out of this task's scope) -- this lock only
         /// serializes the three tests below against each other, not against
         /// `uia.rs`'s test.
-        static UIA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-        fn lock_uia_test() -> std::sync::MutexGuard<'static, ()> {
-            UIA_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-        }
+        use crate::inputs::lock_uia_test;
 
         /// The task brief's required integration test: a real EDIT control
         /// with known text and a programmatic `EM_SETSEL` selection,

@@ -974,6 +974,7 @@ mod tests {
 
         #[test]
         fn snapshot_hwnd_resolves_labels_and_redacts_the_password_field() {
+            let _uia = crate::inputs::lock_uia_test();
             let hinstance = instance();
             assert!(
                 ensure_class_registered(hinstance),
