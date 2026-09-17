@@ -31,15 +31,33 @@ use serde_json::{json, Value};
 
 /// One HTTP response, transport-agnostic so retry logic can be unit tested
 /// without a real network call. `Err` from `Transport::post_json` means a
-/// transport-level failure (DNS, connect, timeout, a dropped connection
-/// while reading the body) -- never a non-2xx status, which is a normal
-/// `Ok(RawResponse)` with `status` set accordingly.
+/// transport-level failure -- see [`TransportError`] for the two kinds --
+/// never a non-2xx status, which is a normal `Ok(RawResponse)` with `status`
+/// set accordingly.
 pub(crate) struct RawResponse {
     pub status: u16,
     /// Header names as the server sent them; look up with
     /// [`find_header`] (case-insensitive) rather than indexing directly.
     pub headers: Vec<(String, String)>,
     pub body: String,
+}
+
+/// #187: a transport failure is only safe to retry when the vendor never
+/// received (or at least never acknowledged) the request. Once a status has
+/// come back, `send_json` succeeding means the request almost certainly
+/// reached the vendor -- and, for a billed completion API, was almost
+/// certainly already processed/charged -- so a failure reading the body
+/// after that point must never be treated the same as "never connected".
+pub(crate) enum TransportError {
+    /// DNS, connect, TLS, or send failed -- no response was ever received.
+    /// Safe to retry per [`RetryPolicy`].
+    NoResponse(String),
+    /// A status (and headers) were received, but reading the body then
+    /// failed (e.g. the connection dropped mid-body). The request almost
+    /// certainly already reached the vendor, so this is never retried as a
+    /// fresh attempt -- it surfaces immediately, naming the status that was
+    /// received, so the card is honest about what's known to have happened.
+    BodyReadFailed { status: u16, error: String },
 }
 
 pub(crate) trait Transport {
@@ -49,7 +67,7 @@ pub(crate) trait Transport {
         headers: &[(&str, &str)],
         body: &Value,
         timeout: Duration,
-    ) -> std::result::Result<RawResponse, String>;
+    ) -> std::result::Result<RawResponse, TransportError>;
 }
 
 /// The real transport: `ureq`, blocking, no streaming (see the crate-level
@@ -63,7 +81,7 @@ impl Transport for UreqTransport {
         headers: &[(&str, &str)],
         body: &Value,
         timeout: Duration,
-    ) -> std::result::Result<RawResponse, String> {
+    ) -> std::result::Result<RawResponse, TransportError> {
         let mut builder = ureq::post(url);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
@@ -79,18 +97,20 @@ impl Transport for UreqTransport {
             .timeout_global(Some(timeout))
             .build()
             .send_json(body)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| TransportError::NoResponse(e.to_string()))?;
 
+        // A status was received from here on -- any further failure is
+        // `BodyReadFailed`, never folded back into `NoResponse` (#187).
         let status = response.status().as_u16();
         let headers = response
             .headers()
             .iter()
             .map(|(name, value)| (name.as_str().to_string(), value.to_str().unwrap_or_default().to_string()))
             .collect();
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| format!("failed to read response body: {e}"))?;
+        let body = response.body_mut().read_to_string().map_err(|e| TransportError::BodyReadFailed {
+            status,
+            error: format!("failed to read response body: {e}"),
+        })?;
 
         Ok(RawResponse { status, headers, body })
     }
@@ -330,7 +350,12 @@ pub(crate) struct RetryEnv<'a> {
 ///
 /// - A transport error or a 5xx is retried up to `policy.max_retries`
 ///   times with jittered exponential backoff, capped at
-///   `policy.max_total_backoff` cumulative sleep.
+///   `policy.max_total_backoff` cumulative sleep. "A transport error" here
+///   means [`TransportError::NoResponse`] specifically -- no status was ever
+///   received, so nothing is known to have reached the vendor. A body-read
+///   failure *after* a status was received ([`TransportError::BodyReadFailed`])
+///   is never retried this way (#187): the request almost certainly already
+///   reached the vendor, so retrying it risks a second billed completion.
 /// - A 429 is retried exactly once, sleeping the server's stated
 ///   `retry-after` verbatim (never jittered -- that delay is the server's
 ///   instruction, not our backoff), but only when that delay is at most
@@ -375,7 +400,15 @@ pub(crate) fn post_json_with(
         let attempt_timeout = timeout.min(wall_clock_remaining());
 
         match env.transport.post_json(url, headers, body, attempt_timeout) {
-            Err(transport_err) => {
+            // #187: a status was already received -- the request almost
+            // certainly reached the vendor (and, for a billed completion
+            // API, was almost certainly already processed). Never retried
+            // as a fresh attempt; surfaces immediately, naming the status
+            // that was received so the card is honest about what's known.
+            Err(TransportError::BodyReadFailed { status, error }) => {
+                return Err(anyhow!("{tag}: HTTP {status} received, then failed reading the response body: {error}"));
+            }
+            Err(TransportError::NoResponse(transport_err)) => {
                 let backoff_remaining = policy.max_total_backoff.saturating_sub(backoff_spent);
                 if retries < policy.max_retries && !backoff_remaining.is_zero() && wall_clock_remaining() > policy.retry_floor {
                     let delay = jittered_backoff(retries, policy.base_delay, backoff_remaining);
@@ -641,12 +674,12 @@ mod tests {
     // -- test doubles ----------------------------------------------------
 
     struct ScriptedTransport {
-        responses: Mutex<Vec<std::result::Result<RawResponse, String>>>,
+        responses: Mutex<Vec<std::result::Result<RawResponse, TransportError>>>,
         calls: Mutex<u32>,
     }
 
     impl ScriptedTransport {
-        fn new(responses: Vec<std::result::Result<RawResponse, String>>) -> Self {
+        fn new(responses: Vec<std::result::Result<RawResponse, TransportError>>) -> Self {
             Self {
                 responses: Mutex::new(responses),
                 calls: Mutex::new(0),
@@ -665,7 +698,7 @@ mod tests {
             _headers: &[(&str, &str)],
             _body: &Value,
             _timeout: Duration,
-        ) -> std::result::Result<RawResponse, String> {
+        ) -> std::result::Result<RawResponse, TransportError> {
             *self.calls.lock().unwrap() += 1;
             let mut responses = self.responses.lock().unwrap();
             assert!(!responses.is_empty(), "transport called more times than scripted");
@@ -701,7 +734,12 @@ mod tests {
         }
     }
 
-    fn ok(body: &str) -> std::result::Result<RawResponse, String> {
+    /// A scripted pre-response failure -- no status was ever received.
+    fn no_response(msg: &str) -> std::result::Result<RawResponse, TransportError> {
+        Err(TransportError::NoResponse(msg.to_string()))
+    }
+
+    fn ok(body: &str) -> std::result::Result<RawResponse, TransportError> {
         Ok(RawResponse {
             status: 200,
             headers: vec![],
@@ -709,12 +747,18 @@ mod tests {
         })
     }
 
-    fn status(code: u16, headers: Vec<(&str, &str)>, body: &str) -> std::result::Result<RawResponse, String> {
+    fn status(code: u16, headers: Vec<(&str, &str)>, body: &str) -> std::result::Result<RawResponse, TransportError> {
         Ok(RawResponse {
             status: code,
             headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             body: body.to_string(),
         })
+    }
+
+    /// A scripted #187 failure: a status was received, then reading the
+    /// body failed.
+    fn body_read_failed(status: u16, msg: &str) -> std::result::Result<RawResponse, TransportError> {
+        Err(TransportError::BodyReadFailed { status, error: msg.to_string() })
     }
 
     fn run(
@@ -736,7 +780,7 @@ mod tests {
 
     #[test]
     fn transport_error_retries_then_succeeds_without_a_real_sleep() {
-        let transport = ScriptedTransport::new(vec![Err("connection refused".to_string()), ok("done")]);
+        let transport = ScriptedTransport::new(vec![no_response("connection refused"), ok("done")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
 
@@ -788,7 +832,7 @@ mod tests {
     #[test]
     fn transport_errors_stop_after_max_retries_within_the_backoff_budget() {
         let transport =
-            ScriptedTransport::new(vec![Err("e1".to_string()), Err("e2".to_string()), Err("e3".to_string())]);
+            ScriptedTransport::new(vec![no_response("e1"), no_response("e2"), no_response("e3")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
 
@@ -801,6 +845,58 @@ mod tests {
         let total: Duration = sleeps.iter().sum();
         assert!(total <= RetryPolicy::default().max_total_backoff);
         assert!(err.to_string().contains("transport error"));
+    }
+
+    // -- #187: a body-read failure after a status is never retried --------
+
+    #[test]
+    fn body_read_failure_after_200_is_not_retried_and_surfaces_immediately() {
+        let transport = ScriptedTransport::new(vec![body_read_failed(200, "connection reset")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+
+        let err = run(&transport, &sleeper, &clock).unwrap_err();
+
+        assert_eq!(
+            transport.call_count(),
+            1,
+            "#187: never retried -- the vendor almost certainly already received (and may have billed) the request"
+        );
+        assert!(sleeper.recorded().is_empty(), "no retry means no backoff sleep either");
+        let msg = err.to_string();
+        assert!(msg.contains("200"), "names the status that was received: {msg}");
+        assert!(msg.contains("connection reset"), "names the underlying error: {msg}");
+    }
+
+    #[test]
+    fn body_read_failure_after_5xx_is_not_retried_either() {
+        // The "do not retry a body-read failure" rule doesn't depend on
+        // which status came back -- any status at all means the request
+        // reached the vendor.
+        let transport = ScriptedTransport::new(vec![body_read_failed(500, "reset mid-body")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+
+        let err = run(&transport, &sleeper, &clock).unwrap_err();
+
+        assert_eq!(transport.call_count(), 1);
+        assert!(sleeper.recorded().is_empty());
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[test]
+    fn a_pre_response_transport_error_is_still_retried_normally() {
+        // Contrast case: `NoResponse` (never got a status at all) keeps the
+        // existing retry-then-succeed behaviour -- #187 only changes the
+        // BodyReadFailed path.
+        let transport = ScriptedTransport::new(vec![no_response("connection refused"), ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+
+        let result = run(&transport, &sleeper, &clock).unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(transport.call_count(), 2);
     }
 
     #[test]
@@ -957,10 +1053,10 @@ mod tests {
             _headers: &[(&str, &str)],
             _body: &Value,
             timeout: Duration,
-        ) -> std::result::Result<RawResponse, String> {
+        ) -> std::result::Result<RawResponse, TransportError> {
             self.timeouts_seen.lock().unwrap().push(timeout);
             self.clock.0.set(self.clock.0.get() + timeout.as_secs());
-            Err("simulated hang".to_string())
+            Err(TransportError::NoResponse("simulated hang".to_string()))
         }
     }
 
