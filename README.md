@@ -19,6 +19,20 @@ forth, ChatGPT and Ollama's own app already do that well.
 > and this file gets updated in the same commit. Everywhere else, the product
 > is called Wingman.
 
+## Why not Copilot or Recall?
+
+Sourced from [`docs/positioning.md`](docs/positioning.md); every claim below
+about Wingman is checked against the code in this repo, not aspirational.
+
+| | Wingman | Copilot on Windows |
+|---|---|---|
+| **Footprint** | A tray icon, about 2 MB, 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
+| **Verifiable** | Offline mode refuses any non-loopback network call in code, enforced before a socket ever opens (see [`docs/offline.md`](docs/offline.md)). Open source under MIT: read the code yourself | Copilot Vision sends the screen to Microsoft's servers. Windows Recall shipped plaintext screenshots and had to be pulled twice before relaunching opt-in |
+| **Extensible** (planned) | An action will be a small, readable definition: a prompt, an input list and an executor. The framework is the product, actions are the contribution surface | Closed |
+| **Never the final button** | Fills, drafts and proposes. Never presses Send, Submit, Buy or Pay: a permanent rule, not a version-1 limit to be relaxed later | Copilot Actions and other "agent" products sell autonomy |
+| **Not a chatbot** | One press, one action, one card, done. No conversation view, no follow-up question | Copilot is a chat pane first, everything else second |
+| **Bring your own model** | OpenAI, Anthropic, Gemini or a local Ollama model today; any OpenAI-compatible endpoint is planned. No account or subscription required for the app itself | Recall and Click to Do require a 40+ TOPS NPU; the strongest models sit behind Copilot Pro |
+
 ## What works today
 
 One action, built and running: **Check my work**. Press the key, Wingman
