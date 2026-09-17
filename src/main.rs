@@ -13,6 +13,7 @@ mod diagnostics;
 mod dismiss;
 mod executors;
 mod hotkey;
+mod inputs;
 mod known_folder;
 mod mode;
 mod pause;
