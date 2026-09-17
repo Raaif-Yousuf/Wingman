@@ -1,27 +1,14 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use base64::Engine;
 use serde_json::{json, Value};
 
-use super::{Answer, Difficulty, Provider, Shot};
+use super::common;
+use super::{Answer, Provider, Shot};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-
-/// The wire shape of the model's JSON payload. Kept separate from the public
-/// `Answer` because `difficulty` arrives as a bare string ("7", "U", ...)
-/// that is not a `Difficulty`'s natural `Deserialize` form — it is parsed
-/// explicitly in `parse_response`, and a bad/missing value must degrade to
-/// `None` rather than fail the whole parse.
-#[derive(serde::Deserialize)]
-struct RawAnswer {
-    detail: String,
-    headline: String,
-    #[serde(default)]
-    difficulty: Option<String>,
-}
 
 pub struct Anthropic {
     pub api_key: String,
@@ -55,40 +42,17 @@ impl Anthropic {
     /// pre-difficulty shape: no `difficulty` property, no rubric text in
     /// `system` (see `build_body_is_unchanged_when_difficulty_off`).
     fn build_body(&self, shot: &Shot, prompt: &str, want_difficulty: bool) -> Value {
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&shot.png);
+        let b64 = common::encode_images_base64(std::slice::from_ref(&shot.png))
+            .pop()
+            .expect("exactly one image was passed in");
 
-        // The rubric is appended here, never merged into DEFAULT_PROMPT, so
-        // the user's own edited prompt text in Settings is untouched.
-        let system_prompt = if want_difficulty {
-            format!("{prompt}{}", super::DIFFICULTY_RUBRIC)
-        } else {
-            prompt.to_string()
-        };
-
-        // `detail` is listed (and required) before `headline` deliberately:
-        // with `headline` first the model committed to a verdict before
-        // doing the arithmetic and then contradicted itself. `difficulty`
-        // goes last, after `headline`, so the model rates the problem only
-        // once it has actually worked through it rather than up front.
-        let mut properties = json!({
-            "detail": {"type": "string"},
-            "headline": {"type": "string"}
-        });
-        let mut required = vec!["detail", "headline"];
-        if want_difficulty {
-            properties["difficulty"] = json!({
-                "type": "string",
-                "enum": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "U", "N"]
-            });
-            required.push("difficulty");
-        }
+        let system_prompt = common::augmented_system_prompt(prompt, want_difficulty);
+        let schema = common::answer_schema(want_difficulty);
 
         let mut output_config = json!({
             "format": {
                     "type": "json_schema",
-                "schema": {"type": "object",
-                    "properties": properties,
-                    "required": required, "additionalProperties": false}
+                "schema": schema
             }
         });
         if supports_effort(&self.model) && !self.effort.is_empty() {
@@ -146,15 +110,7 @@ impl Anthropic {
             }
         };
 
-        let raw: RawAnswer =
-            serde_json::from_str(text).context("anthropic: text block is not a valid Answer")?;
-        Ok(Answer {
-            detail: raw.detail,
-            headline: raw.headline,
-            // A missing or unparseable difficulty must yield `None`, never
-            // an error — the answer itself is what matters.
-            difficulty: raw.difficulty.as_deref().and_then(Difficulty::parse),
-        })
+        common::parse_answer_text("anthropic", text)
     }
 }
 
@@ -170,30 +126,17 @@ impl Provider for Anthropic {
     fn ask(&self, shot: &Shot, prompt: &str, want_difficulty: bool) -> Result<Answer> {
         let body = self.build_body(shot, prompt, want_difficulty);
 
-        // `http_status_as_error(false)` so a non-2xx comes back as `Ok` with
-        // the real response (and its body) instead of an `Err` that has
-        // discarded the body we need to report.
-        let mut response = ureq::post(ENDPOINT)
-            .header("x-api-key", self.api_key.clone())
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .config()
-            .http_status_as_error(false)
-            .timeout_global(Some(REQUEST_TIMEOUT))
-            .build()
-            .send_json(&body)
-            .map_err(|e| anyhow!("anthropic: transport error: {e}"))?;
-
-        let status = response.status();
-        let body_text = response
-            .body_mut()
-            .read_to_string()
-            .context("anthropic: failed to read response body")?;
-
-        if !status.is_success() {
-            let truncated: String = body_text.chars().take(300).collect();
-            return Err(anyhow!("anthropic: HTTP {status}: {truncated}"));
-        }
+        let body_text = common::post_json(
+            ENDPOINT,
+            &[
+                ("x-api-key", self.api_key.as_str()),
+                ("anthropic-version", ANTHROPIC_VERSION),
+                ("content-type", "application/json"),
+            ],
+            &body,
+            REQUEST_TIMEOUT,
+            "anthropic",
+        )?;
 
         Self::parse_response(&body_text)
     }
@@ -215,6 +158,7 @@ fn supports_effort(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -316,6 +260,30 @@ mod tests {
         assert!(system.len() > "system prompt text".len());
     }
 
+    // #156: `assert_eq!(a_value, b_value)` on two `serde_json::Value`s does
+    // NOT check key order -- with `preserve_order`, `Value::Object` is
+    // backed by an `IndexMap`, and its `PartialEq` compares as a set. Only a
+    // *serialized string* comparison catches a property-order regression,
+    // and rule 3 says order is load-bearing. These two golden strings were
+    // captured from this exact function before the #156 dedup refactor
+    // (`cargo test zzz_print_golden_strings -- --nocapture`, then deleted)
+    // and must still match byte-for-byte after it.
+    #[test]
+    fn golden_request_body_no_difficulty_is_byte_identical() {
+        let provider = Anthropic::new("sk-ant-test", "claude-opus-5", "low");
+        let body = provider.build_body(&sample_shot(), "system prompt text", false);
+        let golden = r#"{"model":"claude-opus-5","max_tokens":4000,"system":"system prompt text","output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"}},"required":["detail","headline"],"additionalProperties":false}},"effort":"low"},"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw=="}},{"type":"text","text":"Check my working."}]}]}"#;
+        assert_eq!(serde_json::to_string(&body).unwrap(), golden);
+    }
+
+    #[test]
+    fn golden_request_body_with_difficulty_is_byte_identical() {
+        let provider = Anthropic::new("sk-ant-test", "claude-opus-5", "low");
+        let body = provider.build_body(&sample_shot(), "system prompt text", true);
+        let golden = r#"{"model":"claude-opus-5","max_tokens":4000,"system":"system prompt text\n\nAlso rate how difficult the PROBLEM ON SCREEN is for a HUMAN STUDENT. Add a third field:\n- difficulty: THIRD, after headline, once you have actually worked the problem through. Exactly one of \"1\" through \"10\", or \"U\".\n\nCalibration is the hard part, so read this carefully. You solve nearly all of these easily; that is NOT the scale. Do not rate your own confidence, your own effort, or how quickly you found the answer. Rate how hard the problem would be for a student at the level it is aimed at. Rating by your own effort compresses everything into 1-5 and makes the whole scale useless.\n\nAnchors:\n1 = an easy high-school question. One step, one formula. (speed = distance / time)\n2 = high-school, a couple of steps.\n3 = easy university intro-course level. (a block on an incline; moment of inertia of a disk)\n4 = intro university, several steps or a small subtlety.\n5 = medium university level. Mid-degree material: multi-step, and you must choose the method rather than being told it.\n6 = upper-undergraduate, harder than routine homework.\n7 = hard university level. Typically GRADUATE coursework: quantum perturbation theory, Lagrangian mechanics with constraints, a non-obvious statistical derivation.\n8 = graduate coursework that most of the class would get wrong.\n9 = very hard for an undergraduate. Qualifying-exam standard.\n10 = a PhD student in the field would struggle. Open-ended derivations and proofs requiring a specialist technique, not just more algebra.\nU = Ultra: a professor would struggle. Research-level, or a known-hard proof.\n\nUse the WHOLE range. Most routine homework is 2-5. If the problem is recognisably graduate-level, it starts at 7, not 5. If it asks you to PROVE a general theorem rather than compute a value, it is almost never below 8.\n\nIf there is no problem to rate at all -- the screen shows no question, or you are asking for something to be made visible -- answer \"N\". Do NOT reach for \"U\" in that case: \"U\" means the problem is extraordinarily hard, not that you could not find one.","output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"},"difficulty":{"type":"string","enum":["1","2","3","4","5","6","7","8","9","10","U","N"]}},"required":["detail","headline","difficulty"],"additionalProperties":false}},"effort":"low"},"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw=="}},{"type":"text","text":"Check my working."}]}]}"#;
+        assert_eq!(serde_json::to_string(&body).unwrap(), golden);
+    }
+
     #[test]
     fn ready_reflects_api_key_presence() {
         assert!(Anthropic::new("sk-ant-real", "claude-opus-5", "low").ready());
@@ -343,7 +311,7 @@ mod tests {
             {"type": "text", "text": "{\"detail\": \"d\", \"headline\": \"h\", \"difficulty\": \"U\"}"}
         ]}"#;
         let answer = Anthropic::parse_response(body).expect("should parse");
-        assert_eq!(answer.difficulty, Some(Difficulty::Ultra));
+        assert_eq!(answer.difficulty, Some(crate::provider::Difficulty::Ultra));
     }
 
     #[test]
