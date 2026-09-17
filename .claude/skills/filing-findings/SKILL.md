@@ -59,8 +59,14 @@ Unbounded parallel builds have frozen this machine by exhausting RAM.
 - **Never run bare `cargo test`** or `cargo test --release`. Run the tests
   you touched: `cargo test <module_or_test_name>`. The orchestrator runs
   the full suite.
-- Build with `CARGO_BUILD_JOBS=4` and the shared target dir so builds queue
-  behind a file lock instead of running in parallel:
-  `export CARGO_TARGET_DIR=C:/Users/raaif/copilot-ask/target CARGO_BUILD_JOBS=4`
+- In a worktree, use **your own** target dir plus the shared sccache, and cap
+  jobs:
+  `export CARGO_TARGET_DIR=C:/Users/raaif/copilot-ask/target/wt/$(basename "$PWD") RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2`
+  Do not share one target dir between worktrees. MEASURED 2026-09-16: cargo
+  hashes a workspace member's artifacts by its workspace-relative path, so two
+  worktrees of this crate write the same test binary, and a filtered run
+  silently executed a binary built from another worktree's source (new tests
+  missing from `--list` until a `touch`). sccache shares the dependency
+  compiles safely across target dirs.
 - "Blocking waiting for file lock" is expected. Wait; do not delete locks.
 - No `cargo build --release` unless the task is about the release binary.
