@@ -59,9 +59,10 @@
 //!    whatever is on the clipboard *right now*, byte-exact, for every
 //!    format this module knows how to restore -- see "What is and is not
 //!    preserved" below.
-//! 3. **Inject Ctrl+C**, `dwExtraInfo` tagged with [`INJECTED_MARKER`] (see
-//!    that constant's doc comment for why nothing in `hotkey.rs` currently
-//!    reads this tag).
+//! 3. **Inject Ctrl+C**, `dwExtraInfo` tagged with
+//!    [`crate::hotkey::INJECTED_MARKER`] (issue #209: `hotkey.rs`'s
+//!    `hook_proc` now reads this tag and ignores anything carrying it,
+//!    rather than treating the injected Ctrl+C as a real keypress).
 //! 4. **Wait, event-driven, bounded.** [`win32::wait_for_clipboard_update`]
 //!    registers `AddClipboardFormatListener` on a message-only window and
 //!    blocks on `MsgWaitForMultipleObjects` up to the caller's budget,
@@ -305,21 +306,6 @@ pub fn build_ctrl_c_plan(release: &[u32]) -> Vec<SyntheticKeyEvent> {
     });
     plan
 }
-
-/// `dwExtraInfo` tag applied to every synthetic input event this module
-/// injects (see [`win32::inject_events`]). `THEORY (unverified)`: the task
-/// brief assumes `hotkey.rs`'s low-level hook already filters on
-/// `LLKHF_INJECTED` and that this tag exists so it "ignores" these events --
-/// **it does not**. `hook_proc` (`src/hotkey.rs`) reads `kb.vkCode` and the
-/// live modifier state on every `WM_KEYDOWN`/`WM_SYSKEYDOWN` with no check
-/// of `kb.flags` or `kb.dwExtraInfo` at all, injected or not. In practice
-/// this is harmless today: Ctrl+C is not shaped like either configured
-/// hotkey chord (which both require Shift, per the design spec's examples),
-/// so the hook's `matches()` check never fires for it regardless. The tag is
-/// still applied, as a marker any future filtering logic can key off, and
-/// the gap is filed as a follow-up finding (see this session's report)
-/// rather than fixed here: `hotkey.rs` is out of this task's scope.
-const INJECTED_MARKER: usize = 0x57494E47; // ASCII "WING", arbitrary but recognizable
 
 // ---------------------------------------------------------------------------
 // Clipboard snapshot / restore, injectable
@@ -604,7 +590,8 @@ mod com {
 mod win32 {
     #![allow(dead_code)] // see the module doc comment's "not wired yet"
 
-    use super::{RawClipboard, SyntheticKeyEvent, INJECTED_MARKER};
+    use super::{RawClipboard, SyntheticKeyEvent};
+    use crate::hotkey::INJECTED_MARKER;
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
     use windows::core::w;
@@ -795,10 +782,10 @@ mod win32 {
     }
 
     /// `SendInput`s the given plan. Never called by this module's own
-    /// automated tests (see [`INJECTED_MARKER`]'s doc comment and the crate
-    /// task brief: it would type into whatever real window has focus when
-    /// the test runs). Covered by [`super::build_ctrl_c_plan`]'s pure tests
-    /// plus the manual check filed to #166.
+    /// automated tests (see [`crate::hotkey::INJECTED_MARKER`]'s doc comment
+    /// and the crate task brief: it would type into whatever real window has
+    /// focus when the test runs). Covered by [`super::build_ctrl_c_plan`]'s
+    /// pure tests plus the manual check filed to #166.
     pub(super) fn inject_events(events: &[SyntheticKeyEvent]) {
         let inputs: Vec<INPUT> = events.iter().map(to_input).collect();
         if inputs.is_empty() {
