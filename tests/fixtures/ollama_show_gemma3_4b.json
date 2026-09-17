@@ -1,0 +1,17 @@
+{
+  "capabilities": [
+    "completion",
+    "vision"
+  ],
+  "details": {
+    "parent_model": "",
+    "format": "gguf",
+    "family": "gemma3",
+    "families": [
+      "gemma3"
+    ],
+    "parameter_size": "4.3B",
+    "quantization_level": "Q4_K_M"
+  },
+  "modified_at": "2026-08-08T13:39:16.1790462-05:00"
+}

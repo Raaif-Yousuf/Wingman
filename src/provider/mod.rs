@@ -1,6 +1,7 @@
 mod common;
 pub mod anthropic;
 pub mod ollama;
+pub mod ollama_admin;
 pub mod openai;
 
 use anyhow::{Context, Result};
