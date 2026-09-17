@@ -256,6 +256,11 @@ Rotate any API key that was in it; deleting the file does not invalidate it.
 Then delete the project folder. Nothing else is written anywhere: no Program
 Files, no services, no scheduled tasks, no shell extensions.
 
+## Promises
+
+What Wingman commits to, and how each promise is enforced or verifiable
+today: [`PROMISES.md`](PROMISES.md).
+
 ## Privacy and security
 
 What leaves the machine, when, and how to wipe local state is in
