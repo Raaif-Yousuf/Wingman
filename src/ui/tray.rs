@@ -534,3 +534,60 @@ fn load_icon(instance: HINSTANCE) -> HICON {
     }
     unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or(HICON(std::ptr::null_mut()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- command ids -------------------------------------------------------
+    // Companion to settings.rs's `control_ids_are_pairwise_unique` (#144):
+    // this module's ids live in a completely separate WM_COMMAND namespace
+    // (the tray context menu, not the settings dialog's children), but the
+    // same failure shape -- two constants sharing a value so one handler
+    // silently steals the other's clicks -- applies here too.
+
+    /// Every fixed `cmd::*` command id, paired with its constant name. The
+    /// two model submenus use dynamic ranges instead (`base_id + index`) and
+    /// are checked separately below, since they aren't single ids.
+    const ALL_FIXED_CMD_IDS: &[(&str, u32)] = &[
+        ("ASK_NOW", cmd::ASK_NOW),
+        ("COPY_LAST", cmd::COPY_LAST),
+        ("SET_PRIMARY", cmd::SET_PRIMARY),
+        ("SET_SECONDARY", cmd::SET_SECONDARY),
+        ("EDIT_SETTINGS", cmd::EDIT_SETTINGS),
+        ("RELOAD", cmd::RELOAD),
+        ("QUIT", cmd::QUIT),
+        ("OPEN_SETTINGS", cmd::OPEN_SETTINGS),
+        ("USE_OPENAI", cmd::USE_OPENAI),
+        ("USE_ANTHROPIC", cmd::USE_ANTHROPIC),
+    ];
+
+    #[test]
+    fn fixed_cmd_ids_are_pairwise_unique() {
+        for (i, (name_a, id_a)) in ALL_FIXED_CMD_IDS.iter().enumerate() {
+            for (name_b, id_b) in ALL_FIXED_CMD_IDS.iter().skip(i + 1) {
+                assert_ne!(id_a, id_b, "{name_a} and {name_b} share command id {id_a}");
+            }
+        }
+    }
+
+    #[test]
+    fn model_submenu_ranges_do_not_overlap_each_other_or_the_fixed_ids() {
+        let openai_range = cmd::OPENAI_MODEL_BASE..cmd::OPENAI_MODEL_BASE + cmd::MODEL_RANGE;
+        let anthropic_range =
+            cmd::ANTHROPIC_MODEL_BASE..cmd::ANTHROPIC_MODEL_BASE + cmd::MODEL_RANGE;
+
+        assert!(
+            openai_range.end <= anthropic_range.start
+                || anthropic_range.end <= openai_range.start,
+            "OpenAI model range {openai_range:?} overlaps Anthropic model range {anthropic_range:?}"
+        );
+
+        for (name, id) in ALL_FIXED_CMD_IDS {
+            assert!(
+                !openai_range.contains(id) && !anthropic_range.contains(id),
+                "{name} ({id}) falls inside a model submenu's dynamic id range"
+            );
+        }
+    }
+}
