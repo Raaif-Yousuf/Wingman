@@ -15,6 +15,7 @@ mod executors;
 mod hotkey;
 mod known_folder;
 mod mode;
+mod ocr;
 mod pause;
 mod provider;
 mod secrets;

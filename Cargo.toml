@@ -47,12 +47,33 @@ features = [
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_System_Time",
+  # Issue #30 (OCR): RoInitialize/RoUninitialize, to give the calling
+  # worker thread a WinRT apartment before touching any Windows.Media.Ocr
+  # type -- without this, activating OcrEngine or DataWriter fails.
+  "Win32_System_WinRT",
   "Win32_UI_Controls",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
+  # Issue #30 (OCR): Windows.Media.Ocr over a captured Shot.
+  "Foundation",
+  "Globalization",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage_Streams",
 ]
+
+# Issue #30 (OCR): IAsyncOperation::Status/GetResults/Cancel and AsyncStatus
+# are generated as types from this separate crate, not re-exported under
+# windows::Foundation in 0.62 -- naming AsyncStatus (for a bounded poll loop
+# instead of the unbounded Async::join()) needs it as a direct dependency.
+# Already pinned by Cargo.lock at 0.3.2 via `windows` itself, so this adds
+# no new download.
+[dependencies.windows-future]
+version = "0.3"
+default-features = false
+features = ["std"]
 
 [profile.release]
 opt-level = "z"
