@@ -10,6 +10,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned rather than "whatever Install-Module resolves today": a runner
+  # image can update its preinstalled module set at any time, and a Pester
+  # major-version jump (5 -> 6) has changed output/parameter behavior before.
+  # scripts/verify-all.sh (the local gate) is the source of truth for what
+  # "green" means; these are the versions it was last verified against.
+  PESTER_VERSION: '5.9.1'
+  PSSCRIPTANALYZER_VERSION: '1.25.0'
 
 jobs:
   ci:
@@ -34,7 +41,18 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
+        # WINGMAN_FULL_SUITE=1 is scripts/hooks/block_unfiltered_cargo_test.py's
+        # override for the local "never run a bare cargo test" rule
+        # (.claude/skills/filing-findings/SKILL.md section 5). That hook is a
+        # Claude Code PreToolUse hook; it never runs in CI at all, so this run
+        # is not actually blocked without it. Set anyway so this step matches
+        # scripts/verify-all.sh's `env WINGMAN_FULL_SUITE=1 cargo test`
+        # invocation verbatim, rather than CI and the local gate quietly
+        # running two differently-flagged commands that happen to behave the
+        # same today.
         run: cargo test --all-targets
+        env:
+          WINGMAN_FULL_SUITE: '1'
 
       - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@v2
@@ -57,3 +75,75 @@ jobs:
           name: wingman-windows-exe
           path: target/release/*.exe
           if-no-files-found: error
+
+  hooks:
+    name: Python hook tests
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: python -m unittest discover -s scripts/hooks/tests -t .
+        run: python -m unittest discover -s scripts/hooks/tests -t .
+
+  pester:
+    name: Pester (packaging)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Every Wingman.Common.Tests.ps1 test either calls pure functions, mocks
+      # the cmdlets a phase touches (Mock -ModuleName Wingman.Common), or -- for
+      # the two tests that exercise Invoke-MakeAppxPack/Invoke-WingmanSignTool's
+      # exit-code handling -- runs a tiny .cmd stub under $TestDrive instead of
+      # the real tool. None of the 77 tests shell out to a real makeappx.exe or
+      # signtool.exe, so this job needs no Windows SDK install: what
+      # windows-latest ships with (or doesn't) is irrelevant here.
+      - name: Install Pester ${{ env.PESTER_VERSION }}
+        shell: pwsh
+        run: |
+          Install-Module -Name Pester -RequiredVersion $env:PESTER_VERSION `
+            -Force -SkipPublisherCheck -Scope CurrentUser
+
+      - name: Invoke-Pester -Path packaging
+        shell: pwsh
+        run: |
+          Import-Module Pester -RequiredVersion $env:PESTER_VERSION -Force
+          $r = Invoke-Pester -Path packaging -PassThru -Output Detailed
+          "Passed=$($r.PassedCount) Failed=$($r.FailedCount)"
+          if ($r.FailedCount -gt 0) {
+            $r.Failed | ForEach-Object { "failed: $($_.ExpandedName)" }
+            exit 1
+          }
+
+  pssa:
+    name: PSScriptAnalyzer (install.ps1, uninstall.ps1, packaging)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install PSScriptAnalyzer ${{ env.PSSCRIPTANALYZER_VERSION }}
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion $env:PSSCRIPTANALYZER_VERSION `
+            -Force -SkipPublisherCheck -Scope CurrentUser
+
+      - name: Invoke-ScriptAnalyzer (0 Warning/Error required)
+        shell: pwsh
+        run: |
+          Import-Module PSScriptAnalyzer -RequiredVersion $env:PSSCRIPTANALYZER_VERSION -Force
+          $findings = @()
+          foreach ($p in 'install.ps1', 'uninstall.ps1') {
+            $findings += Invoke-ScriptAnalyzer -Path $p -Severity Warning, Error
+          }
+          $findings += Invoke-ScriptAnalyzer -Path packaging -Recurse -Severity Warning, Error
+          $findings | ForEach-Object { "$($_.ScriptName):$($_.Line) $($_.RuleName) $($_.Message)" }
+          "findings=$($findings.Count)"
+          if ($findings.Count -gt 0) { exit 1 }
