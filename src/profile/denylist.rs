@@ -194,38 +194,19 @@ fn iban_mod97_valid(candidate: &str) -> bool {
 }
 
 // -- CVV / bank-account / routing labels ------------------------------------
-
-const CVV_LABELS: &[&str] = &[
-    "cvv2",
-    "cvc2",
-    "cvv",
-    "cvc",
-    "security code",
-    "card verification",
-];
-
-const BANK_LABELS: &[&str] = &[
-    "account number",
-    "acct number",
-    "acct no",
-    "account no",
-    "routing number",
-    "routing no",
-    "aba routing",
-    "sort code",
-    "bank account",
-    "swift code",
-    "bic code",
-];
+//
+// #215 (closed): these two term lists used to be maintained here
+// independently of `executors::fill_form::PAYMENT_LABEL_TERMS`'s own
+// wording for the same concepts. Both now read from the one shared table in
+// `crate::payment_denylist`, so a term added to cover a gap in one caller is
+// automatically covered in the other.
 
 fn contains_cvv_label(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    CVV_LABELS.iter().any(|needle| lower.contains(needle))
+    crate::payment_denylist::contains_any(text, crate::payment_denylist::CVV_TERMS)
 }
 
 fn contains_bank_label(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    BANK_LABELS.iter().any(|needle| lower.contains(needle))
+    crate::payment_denylist::contains_any(text, crate::payment_denylist::BANK_TERMS)
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 
 pub mod calendar;
 pub mod extract_text;
+pub mod fill_form;
 pub mod review_email;
 pub mod schema;
 
@@ -201,6 +202,10 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 ///   second Look/Propose/Confirm/Do action, and the first whose "Do" step
 ///   writes text into an arbitrary UIA-editable control (`replace_text`)
 ///   instead of opening a generated file.
+/// - `"fill-this-form"` (#40, `fill_form::builtin_action`): proposal
+///   `form_fill`, executor `fill_form` (#33, already shipped). See
+///   `actions::fill_form`'s own module doc comment for the two-stage
+///   (local-then-model) proposal it builds.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -233,6 +238,7 @@ pub fn builtin_actions() -> Vec<Action> {
         },
         calendar::builtin_action(),
         review_email::builtin_action(),
+        fill_form::builtin_action(),
     ]
 }
 
@@ -389,9 +395,9 @@ mod tests {
         let builtins = builtin_actions();
         assert_eq!(
             builtins.len(),
-            4,
+            5,
             "check-my-work, extract-text-to-clipboard (#41), add-to-calendar (#39), \
-             review-this-email (#38)"
+             review-this-email (#38), fill-this-form (#40)"
         );
         // Found by id, not by position, so this stays valid regardless of
         // what order the built-ins are in.

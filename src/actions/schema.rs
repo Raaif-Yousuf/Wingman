@@ -8,12 +8,12 @@
 //! model should commit to (`headline`, `difficulty`) after the field that
 //! justifies it (`detail`), never before.
 //!
-//! `"verdict"`, `"calendar_event"` (#26) and `"text_review"` (#38) are
-//! registered today. `text_answer` and `form_fill` (named in
+//! `"verdict"`, `"calendar_event"` (#26), `"text_review"` (#38) and
+//! `"form_fill"` (#40) are registered today. `text_answer` (named in
 //! CONTRIBUTING.md's "Add an action in 20 minutes" and the expansion plan's
-//! §6) get their own `match` arm here the same day their first action
-//! lands, not before -- an unimplemented arm would be untestable dead code
-//! (see the `wired-to-nothing` skill).
+//! §6) gets its own `match` arm here the same day its first action lands,
+//! not before -- an unimplemented arm would be untestable dead code (see
+//! the `wired-to-nothing` skill).
 //!
 //! A property can carry `"editable": true` -- a non-standard JSON Schema
 //! keyword a provider's completion never sees echoed back (it only reads
@@ -48,6 +48,7 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "verdict" => Some(crate::provider::common::answer_schema(rate_difficulty)),
         "calendar_event" => Some(calendar_event_schema()),
         "text_review" => Some(text_review_schema()),
+        "form_fill" => Some(form_fill_schema()),
         _ => None,
     }
 }
@@ -134,6 +135,62 @@ fn text_review_schema() -> Value {
     })
 }
 
+/// The `form_fill` proposal schema (#40 "Fill this form"). **This is the
+/// model-facing request schema, not the final `fill_form` executor proposal
+/// shape.** `actions::fill_form`'s two-stage design (see that module's doc
+/// comment) maps most fields locally via `profile::match_label`, with no
+/// model call at all; only the fields it cannot map (or maps ambiguously)
+/// are ever sent to the model, and this schema is what THAT completion must
+/// satisfy -- one entry per unmapped field, named by the `control_id` the
+/// prompt gave it (an index into that request's own field list, not a
+/// stable identifier across requests). `actions::fill_form` then merges the
+/// model's response with the locally-mapped fields and builds the actual
+/// `executors::fill_form`-consumable proposal (`{fields:
+/// [{target, label, value, sensitive, approved}]}`, keyed by UIA `target`
+/// identity, never `control_id`) -- that merge, not this schema, is what
+/// `executors::fill_form::parse_field_fill` reads.
+///
+/// Deliberately lean for the two-stage design's whole point (saving
+/// tokens): no `label` property, since the model never needs to echo back a
+/// label `actions::fill_form` already knows from the UIA snapshot it sent.
+///
+/// Property order is load-bearing (rule 3): `control_id` first (which field
+/// this entry is about), then `source` (a token that must be `"profile"`,
+/// `"model"` or `"skip"` -- committing to a strategy before naming specifics
+/// forces the model to decide *how* it knows a value before writing one
+/// down), then `profile_field` (which profile field name, when
+/// `source == "profile"`; empty otherwise -- `actions::fill_form` looks up
+/// the real value itself, never trusting a value the model might have
+/// echoed for a profile-sourced field), then `value` (the model's own
+/// literal text, read only when `source == "model"`), then `sensitive`
+/// last: the model's own opinion of whether ITS OWN invented value is
+/// sensitive, which only makes sense to ask once that value has already
+/// been produced.
+fn form_fill_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "fields": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "control_id": {"type": "string"},
+                        "source": {"type": "string"},
+                        "profile_field": {"type": "string"},
+                        "value": {"type": "string"},
+                        "sensitive": {"type": "boolean"}
+                    },
+                    "required": ["control_id", "source", "profile_field", "value", "sensitive"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["fields"],
+        "additionalProperties": false
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,7 +234,6 @@ mod tests {
     #[test]
     fn unknown_proposal_kind_is_none_not_a_panic() {
         assert_eq!(schema_for("text_answer", false), None);
-        assert_eq!(schema_for("form_fill", false), None);
         assert_eq!(schema_for("totally_made_up", true), None);
     }
 
@@ -318,6 +374,87 @@ mod tests {
         assert_eq!(
             schema_for("text_review", false),
             schema_for("text_review", true)
+        );
+    }
+
+    // -- form_fill (#40) -----------------------------------------------
+
+    #[test]
+    fn form_fill_is_registered() {
+        assert!(schema_for("form_fill", false).is_some());
+    }
+
+    #[test]
+    fn form_fill_wraps_a_fields_array_matching_the_executor_proposal_shape() {
+        // `executors::fill_form::parse_form_fill` reads a top-level
+        // "fields" array too -- same wrapper key, even though the item
+        // shape differs (this is the model-facing request schema, not the
+        // final merged proposal; see this function's own doc comment).
+        let schema = schema_for("form_fill", false).expect("form_fill is registered");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], serde_json::json!(["fields"]));
+        assert_eq!(schema["properties"]["fields"]["type"], "array");
+    }
+
+    #[test]
+    fn form_fill_item_declares_fields_in_load_bearing_order() {
+        let schema = schema_for("form_fill", false).expect("form_fill is registered");
+        let item_props = schema["properties"]["fields"]["items"]["properties"]
+            .as_object()
+            .expect("items.properties is an object");
+        let names: Vec<&str> = item_props.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            vec![
+                "control_id",
+                "source",
+                "profile_field",
+                "value",
+                "sensitive"
+            ]
+        );
+        let required = &schema["properties"]["fields"]["items"]["required"];
+        assert_eq!(
+            *required,
+            serde_json::json!([
+                "control_id",
+                "source",
+                "profile_field",
+                "value",
+                "sensitive"
+            ])
+        );
+    }
+
+    #[test]
+    fn form_fill_never_asks_the_model_to_echo_a_label() {
+        // The whole point of the two-stage design (`actions::fill_form`'s
+        // module doc comment) is token savings: the model is never asked
+        // to repeat a label `actions::fill_form` already knows from the
+        // UIA snapshot.
+        let schema = schema_for("form_fill", false).expect("form_fill is registered");
+        let item_props = schema["properties"]["fields"]["items"]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(!item_props.contains_key("label"));
+        assert!(!item_props.contains_key("target"));
+    }
+
+    #[test]
+    fn form_fill_rejects_additional_properties_at_every_level() {
+        let schema = schema_for("form_fill", false).expect("form_fill is registered");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["fields"]["items"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn form_fill_ignores_rate_difficulty() {
+        assert_eq!(
+            schema_for("form_fill", false),
+            schema_for("form_fill", true)
         );
     }
 }

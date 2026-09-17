@@ -22,6 +22,7 @@ mod known_folder;
 mod mode;
 mod ocr;
 mod pause;
+mod payment_denylist;
 mod profile;
 mod provider;
 mod secrets;

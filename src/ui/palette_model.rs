@@ -313,6 +313,7 @@ pub enum DispatchTarget {
     ExtractText,
     AddToCalendar,
     ReviewEmail,
+    FillForm,
     CalculateSelection,
     CopyRegion,
 }
@@ -333,6 +334,7 @@ pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
         crate::actions::EXTRACT_TEXT_ACTION_ID => Some(DispatchTarget::ExtractText),
         crate::actions::calendar::ACTION_ID => Some(DispatchTarget::AddToCalendar),
         crate::actions::review_email::ACTION_ID => Some(DispatchTarget::ReviewEmail),
+        crate::actions::fill_form::ACTION_ID => Some(DispatchTarget::FillForm),
         CALCULATE_SELECTION_ACTION_ID => Some(DispatchTarget::CalculateSelection),
         COPY_REGION_ACTION_ID => Some(DispatchTarget::CopyRegion),
         _ => None,

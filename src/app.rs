@@ -85,6 +85,20 @@ pub const WM_APP_CALENDAR_RESULT: u32 = WM_APP + 8;
 /// `WM_APP_*` constant to `tests::ALL_WM_APP_IDS` too (issue #163).
 pub const WM_APP_REVIEW_RESULT: u32 = WM_APP + 12;
 
+/// Posted by the "Fill this form" worker thread (#40, `fill_form_from_screen`)
+/// when local mapping (and, only if needed, the model) finish building a
+/// `form_fill` proposal: `lparam` is `Box::into_raw(Box::new(Result<serde_json::Value,
+/// String>))`, the fill_form-flow analogue of [`WM_APP_CALENDAR_RESULT`].
+/// Kept as its own message for the same reason that one is: a different
+/// boxed payload meaning than any other `WM_APP_*_RESULT`, even though the
+/// Rust type happens to be the same `Result<Value, String>` -- see
+/// `on_form_fill_result`'s own doc comment for the extra shapes this one
+/// value can carry (an empty-profile signal, a no-fillable-fields signal,
+/// or a real proposal). `WM_APP + 13`: `+9` through `+12` are already
+/// `WM_APP_PREVIEW_DECIDED`/`WM_APP_PALETTE_TOGGLE`/`WM_APP_PALETTE_RUN`/
+/// `WM_APP_REVIEW_RESULT`.
+pub const WM_APP_FORM_FILL_RESULT: u32 = WM_APP + 13;
+
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
 /// How long to wait after hiding a visible card before capturing, so the
@@ -142,6 +156,22 @@ struct App {
     /// including while a calendar preview is on screen, so the two flows'
     /// previews can never be confused with each other.
     pending_review: Option<actions::review_email::ReviewContext>,
+    /// #40: the merged, pre-approval `form_fill` proposal
+    /// `actions::fill_form::build_proposal` built, kept between
+    /// `on_form_fill_result` (which shows its translated preview) and
+    /// `on_preview_decided` (which rebuilds the real proposal from it once
+    /// "Do it" fires -- see `actions::fill_form::rebuild_after_confirm`).
+    /// `None` whenever no fill_form preview is currently on screen; always
+    /// taken (never merely read) at the top of `on_preview_decided`, so a
+    /// Cancel on this preview can never leak into an unrelated LATER
+    /// preview's decision.
+    pending_form_fill: Option<Value>,
+    /// #40: the `Undo` the most recent successful `fill_form` run returned,
+    /// so "Restore last form" (tray) can put its fields back. `FnOnce`
+    /// (`executors::Undo::undo` consumes it), so this is `take()`n on use --
+    /// a second "Restore" click after a successful restore reports "nothing
+    /// to restore" rather than attempting a stale undo twice.
+    last_form_undo: Option<executors::Undo>,
 }
 
 pub fn run() -> Result<()> {
@@ -237,6 +267,8 @@ pub fn run() -> Result<()> {
         pause: PauseState::Running,
         pending_conflict: None,
         pending_review: None,
+        pending_form_fill: None,
+        last_form_undo: None,
     });
     app.refresh_tray_labels();
     // Issue #19: reflect the loaded mode in the tray submenu/icon from the
@@ -628,6 +660,7 @@ impl App {
             Some(DispatchTarget::ExtractText) => self.extract_text(),
             Some(DispatchTarget::AddToCalendar) => self.add_event_from_screen(),
             Some(DispatchTarget::ReviewEmail) => self.review_this_email(),
+            Some(DispatchTarget::FillForm) => self.fill_form_from_screen(),
             Some(DispatchTarget::CalculateSelection) => self.calculate_selection(),
             Some(DispatchTarget::CopyRegion) => self.copy_region(),
             None => {}
@@ -943,26 +976,59 @@ impl App {
     /// "Do" never happens without an explicit confirm -- and `Some` for
     /// "Do it".
     ///
-    /// #38: `self.pending_review` is `Some` exactly when the preview
-    /// currently closing was "Review this email"'s, not "Add event from
-    /// screen"'s (only one preview is ever on screen at a time, so this is
-    /// an unambiguous branch, not a guess) -- taken and cleared
-    /// unconditionally here, on Cancel/Esc as much as on "Do it", so a
-    /// cancelled review preview never leaves a stale target behind for the
-    /// next one. When it is `None`, this is calendar's own flow: the
-    /// executor is resolved fresh by the fixed `"calendar_add"` name, the
-    /// same "fixed until a second confirm-required action exists" status
-    /// `CalendarAddExecutor::new`'s own fixed `"ics"` connector choice had
-    /// before #38 landed.
+    /// Three actions can leave a preview on screen (`add_event_from_screen`,
+    /// `review_this_email`, `fill_form_from_screen`) and only one preview is
+    /// ever on screen at a time, so exactly one of `self.pending_review` /
+    /// `self.pending_form_fill` is `Some` -- or neither, for calendar's own
+    /// flow. Both are `take()`n unconditionally, before `take_confirmed()`
+    /// is even consulted, on Cancel/Esc as much as on "Do it", so a
+    /// cancelled preview of either kind can never leave a stale slot behind
+    /// for the next, unrelated preview's decision to pick up by mistake
+    /// (#38, #40).
+    ///
+    /// #38: when `pending_review` is `Some`, this is "Review this email"'s
+    /// decision -- `run_review_executor` resolves the `replace_text`
+    /// executor against the stashed target.
+    ///
+    /// #40: when `pending_form_fill` is `Some`, this is "Fill this form"'s
+    /// decision. The flat value the card confirmed is only the PREVIEW's
+    /// translation (`actions::fill_form::build_preview_schema_and_value`),
+    /// so it is rebuilt against the real merged proposal
+    /// (`actions::fill_form::rebuild_after_confirm`) before running the
+    /// `fill_form` executor.
+    ///
+    /// Otherwise (`pending_review` and `pending_form_fill` both `None`),
+    /// this is calendar's own flow: the executor is resolved fresh by the
+    /// fixed `"calendar_add"` name, the same "fixed until a second
+    /// confirm-required action exists" status `CalendarAddExecutor::new`'s
+    /// own fixed `"ics"` connector choice had before #38/#40 landed.
     fn on_preview_decided(&mut self) {
         let pending_review = self.pending_review.take();
+        let pending_form_fill = self.pending_form_fill.take();
         let Some(confirmed) = self.card.take_confirmed() else {
             return;
         };
+
         if let Some(ctx) = pending_review {
             self.run_review_executor(ctx);
             return;
         }
+
+        if let Some(original) = pending_form_fill {
+            let rebuilt = actions::fill_form::rebuild_after_confirm(&original, confirmed.value());
+            let token = confirm::user_confirmed();
+            let final_confirmed = confirm::confirm(confirm::Proposal::new(rebuilt), token);
+            match executors::registry::resolve("fill_form") {
+                Ok(executor) => self.run_form_fill_executor(executor.as_ref(), final_confirmed),
+                Err(e) => {
+                    self.card
+                        .show_error("Couldn't fill the form", &format!("{e:#}"));
+                    self.set_watch(true);
+                }
+            }
+            return;
+        }
+
         match executors::registry::resolve("calendar_add") {
             Ok(executor) => self.run_calendar_executor(executor.as_ref(), confirmed),
             Err(e) => {
@@ -1176,6 +1242,208 @@ impl App {
             Err(e) => {
                 self.card
                     .show_error("Couldn't update the email", &format!("{e:#}"));
+            }
+        }
+        self.set_watch(true);
+    }
+
+    /// #40: "Fill this form", the tray's fourth one-shot Look/Propose/Confirm/Do
+    /// action, mirroring `add_event_from_screen`'s pause/busy/readiness/
+    /// capture steps (duplicated, not extracted -- same #214-filed reason
+    /// `add_event_from_screen`'s own doc comment gives for not touching
+    /// `ask()`'s code either). Unlike calendar, this needs no today/UTC
+    /// offset; it needs the foreground window's handle (for the worker's
+    /// own UIA walk, run off this thread so the message loop stays
+    /// responsive) and `config.forms.require_tick_for` (#40, expansion plan
+    /// §15's still-owed owner decision -- see `config::RequireTickFor`).
+    fn fill_form_from_screen(&mut self) {
+        if self.busy {
+            return;
+        }
+
+        if pause::is_paused_now() {
+            self.card
+                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
+            return;
+        }
+
+        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
+            self.card.hide();
+            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
+        }
+
+        let path = Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "config.toml".into());
+        if let Some((headline, detail)) =
+            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+        {
+            self.card.show_error(&headline, &detail);
+            return;
+        }
+
+        let optimistic_chain = self
+            .config
+            .providers
+            .build_chain_for_mode(self.config.mode, true);
+        let image_limits = optimistic_chain
+            .first_ready_caps()
+            .and_then(|caps| caps.image_limits);
+        let (max_long_edge, max_pixels) =
+            capture::resolve_limits(image_limits, self.config.capture.max_edge);
+        let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
+            Ok(r) => r,
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
+                return;
+            }
+        };
+        let foreground_hwnd_isize =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
+
+        self.busy = true;
+        self.set_watch(false);
+        self.card.show_pending();
+
+        let providers = self.config.providers.clone();
+        let mode = self.config.mode;
+        let require_tick_for = self.config.forms.require_tick_for;
+        let target = self.hwnd_isize();
+        std::thread::spawn(move || {
+            let result: std::result::Result<Value, String> = (|| -> Result<Value> {
+                let shot = capture::encode(&raw)?;
+                form_fill_worker(
+                    &providers,
+                    mode,
+                    &shot,
+                    &raw,
+                    foreground_hwnd_isize,
+                    require_tick_for,
+                )
+            })()
+            .map_err(|e| format!("{e:#}"));
+            let payload = Box::into_raw(Box::new(result));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_FORM_FILL_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                );
+            }
+        });
+    }
+
+    /// Handles the fill_form worker's result (#40). `value` carries one of
+    /// three shapes: an empty-profile signal
+    /// (`{"empty_profile": true, "toml_path": ..., "bin_path": ...}` --
+    /// `form_fill_worker` returns this instead of ever building a UIA
+    /// snapshot, per `actions::fill_form::load_or_import_profile`'s own
+    /// "point at where to add profile data" decision), a proposal with no
+    /// fillable fields at all (`actions::fill_form::has_fillable_fields`
+    /// false -- nothing found on the foreground window, or every candidate
+    /// was filtered out), or a real `form_fill` proposal, which is
+    /// translated to the card's existing preview machinery
+    /// (`actions::fill_form::build_preview_schema_and_value`) and shown --
+    /// `self.pending_form_fill` is set here and consumed by
+    /// `on_preview_decided`.
+    fn on_form_fill_result(&mut self, result: std::result::Result<Value, String>) {
+        self.busy = false;
+
+        let value = match result {
+            Ok(v) => v,
+            Err(e) => {
+                let headline = first_line(&e, 88);
+                self.card.show_error(&headline, &e);
+                self.set_watch(true);
+                return;
+            }
+        };
+
+        if value.get("empty_profile").and_then(Value::as_bool) == Some(true) {
+            let toml_path = value.get("toml_path").and_then(Value::as_str).unwrap_or("");
+            let bin_path = value.get("bin_path").and_then(Value::as_str).unwrap_or("");
+            self.card.show_answer(
+                actions::fill_form::EMPTY_PROFILE_HEADLINE,
+                &actions::fill_form::empty_profile_detail(toml_path, bin_path),
+                0,
+                None,
+            );
+            self.set_watch(true);
+            return;
+        }
+
+        if !actions::fill_form::has_fillable_fields(&value) {
+            self.card.show_answer(
+                "Nothing to fill",
+                "No fillable fields were found on the foreground window.",
+                5,
+                None,
+            );
+            self.set_watch(true);
+            return;
+        }
+
+        let (schema, preview_value) = actions::fill_form::build_preview_schema_and_value(&value);
+        self.pending_form_fill = Some(value);
+        self.card
+            .show_preview("Fill this form", &schema, &preview_value, false);
+    }
+
+    /// Runs the `fill_form` executor and shows the result card (rule 5:
+    /// what happened, not what was intended -- `Undo.summary`, built by
+    /// `executors::fill_form::format_outcomes`, already lists filled,
+    /// skipped and refused fields by name). On success, stashes the `Undo`
+    /// for "Restore last form" (tray, `restore_last_form`).
+    fn run_form_fill_executor(
+        &mut self,
+        executor: &dyn executors::Executor,
+        confirmed: confirm::Confirmed<Value>,
+    ) {
+        match executor.execute(confirmed) {
+            Ok(undo) => {
+                self.card.show_answer("Form filled", &undo.summary, 0, None);
+                self.last_form_undo = Some(undo);
+            }
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't fill the form", &format!("{e:#}"));
+            }
+        }
+        self.set_watch(true);
+    }
+
+    /// Tray "Restore last form" (#40's Undo requirement). Takes
+    /// `self.last_form_undo` (an `Undo::undo` is `FnOnce`, consumed on use)
+    /// so a second click after a successful restore reports "nothing to
+    /// restore" rather than attempting a stale undo twice. Always shown in
+    /// the tray (no dynamic enable/disable state) -- clicking it with
+    /// nothing to restore is a plain informational card, never a dialog
+    /// box (rule 7).
+    fn restore_last_form(&mut self) {
+        let Some(undo) = self.last_form_undo.take() else {
+            self.card.show_answer(
+                "Nothing to restore",
+                "No form has been filled since Wingman started, or it was already restored.",
+                5,
+                None,
+            );
+            self.set_watch(true);
+            return;
+        };
+        match undo.undo() {
+            Ok(()) => {
+                self.card.show_answer(
+                    "Form restored",
+                    "The fields this filled have been put back.",
+                    5,
+                    None,
+                );
+            }
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't fully restore the form", &format!("{e:#}"));
             }
         }
         self.set_watch(true);
@@ -2065,6 +2333,77 @@ fn review_worker(
     })
 }
 
+/// #40: the "Fill this form" worker. Loads (and, per
+/// `actions::fill_form::load_or_import_profile`, possibly one-shot-imports)
+/// the profile first -- an empty profile short-circuits to the
+/// `"empty_profile"` signal `on_form_fill_result` recognizes, before ever
+/// walking the UIA tree. `foreground_hwnd` was captured on the main thread
+/// by `App::fill_form_from_screen` (via `GetForegroundWindow()`, before this
+/// thread spawned); the actual UIA walk (`inputs::uia::snapshot_hwnd`, a
+/// live COM call that can block) runs HERE, off the main thread, same
+/// reasoning `inputs::uia`'s own module doc comment gives for never calling
+/// it from the hook thread. The model is only ever asked about fields stage
+/// 1 (`actions::fill_form::map_candidates_locally`) could not map -- if
+/// `unmapped` is empty, `chain.complete_parsed_with_fallback` is never
+/// called at all, which is exactly what this file's live `#[ignore]`d test
+/// in `actions::fill_form` (`fill_form_live_local_mapping_fills_a_whole_form_with_zero_model_calls`)
+/// asserts at the pure-logic layer this function is built from.
+fn form_fill_worker(
+    providers: &Providers,
+    mode: Mode,
+    shot: &Shot,
+    raw: &capture::RawShot,
+    foreground_hwnd: isize,
+    require_tick_for: crate::config::RequireTickFor,
+) -> Result<Value> {
+    let profile = actions::fill_form::load_or_import_profile()
+        .context("failed to load or import the profile")?;
+
+    if actions::fill_form::profile_is_empty(&profile) {
+        let bin_path = crate::profile::Profile::path()?;
+        let toml_path = bin_path.with_file_name("profile.toml");
+        return Ok(serde_json::json!({
+            "empty_profile": true,
+            "toml_path": toml_path.display().to_string(),
+            "bin_path": bin_path.display().to_string(),
+        }));
+    }
+
+    let hwnd = HWND(foreground_hwnd as *mut core::ffi::c_void);
+    let snapshot = crate::inputs::uia::snapshot_hwnd(
+        hwnd,
+        crate::inputs::uia::DEFAULT_MAX_ELEMENTS,
+        crate::inputs::uia::DEFAULT_BUDGET,
+    )
+    .context("failed to read the form's fields")?;
+    let candidates = actions::fill_form::fillable_candidates(&snapshot.fields);
+
+    let (mut mapped, unmapped) = actions::fill_form::map_candidates_locally(&candidates, &profile);
+
+    if !unmapped.is_empty() {
+        let ollama_ready = mode == Mode::Auto
+            && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+            && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
+        let chain = providers.build_chain_for_mode(mode, ollama_ready);
+
+        let req = actions::fill_form::form_fill_request(shot, &unmapped, &profile);
+        let responses = chain.complete_parsed_with_fallback(
+            &req,
+            || non_vision_inputs(raw, foreground_hwnd),
+            |c| actions::fill_form::parse_model_response(&c.text),
+        )?;
+        mapped.extend(actions::fill_form::merge_model_response(
+            &unmapped, &responses, &profile,
+        ));
+    }
+
+    Ok(actions::fill_form::build_proposal(
+        &candidates,
+        &mapped,
+        require_tick_for,
+    ))
+}
+
 /// #39: today's local date and current local UTC offset, for the "Add
 /// event from screen" prompt -- DST-correct the same way
 /// `deadline_until_tomorrow` already is for Pause, via the identical
@@ -2512,6 +2851,11 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_CALENDAR_RESULT
         | WM_APP_PREVIEW_DECIDED
         | WM_APP_REVIEW_RESULT
+        // #40: same reasoning as WM_APP_REVIEW_RESULT just above -- Settings
+        // being open while "Fill this form" is mid-flight is the same corner
+        // case, and WM_APP_FORM_FILL_RESULT's boxed `Result<Value, String>`
+        // payload is freed explicitly in the Ignore arm below.
+        | WM_APP_FORM_FILL_RESULT
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
@@ -2565,12 +2909,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
         match settings_reentrancy_policy(msg, taskbar_created_msg) {
             SettingsReentrancy::Ignore => {
-                // WM_APP_LEARNED, WM_APP_CALENDAR_RESULT and
-                // WM_APP_PALETTE_RUN are the only ignored messages carrying
-                // a boxed payload; free them so none leaks.
+                // WM_APP_LEARNED, WM_APP_CALENDAR_RESULT,
+                // WM_APP_FORM_FILL_RESULT and WM_APP_PALETTE_RUN are the
+                // only ignored messages carrying a boxed payload; free them
+                // so none leaks.
                 if msg == WM_APP_LEARNED {
                     drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
-                } else if msg == WM_APP_CALENDAR_RESULT {
+                } else if msg == WM_APP_CALENDAR_RESULT || msg == WM_APP_FORM_FILL_RESULT {
                     drop(unsafe {
                         Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
                     });
@@ -2635,6 +2980,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
                     MenuChoice::Command(cmd::QUICK_ASK) => app.toggle_palette(),
                     MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
+                    MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
+                    MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
                     MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
                     MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
                     MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
@@ -2696,6 +3043,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 )
             };
             app.on_review_result(result);
+            LRESULT(0)
+        }
+        WM_APP_FORM_FILL_RESULT => {
+            let result =
+                unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>) };
+            app.on_form_fill_result(result);
             LRESULT(0)
         }
         WM_APP_PREVIEW_DECIDED => {
@@ -2789,7 +3142,10 @@ mod tests {
     use super::App;
     use super::{final_settings_card, SettingsFinalCard};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
-    use super::{WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_RESULT, WM_APP_REVIEW_RESULT};
+    use super::{
+        WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT, WM_APP_RESULT,
+        WM_APP_REVIEW_RESULT,
+    };
     use crate::actions::{self, Origin};
     use crate::config::Providers;
     use crate::dismiss::WM_APP_DISMISS;
@@ -3204,6 +3560,7 @@ mod tests {
             WM_APP_PAUSE_TOGGLE,
             WM_APP_CALENDAR_RESULT,
             WM_APP_PREVIEW_DECIDED,
+            WM_APP_FORM_FILL_RESULT,
         ] {
             assert_eq!(
                 settings_reentrancy_policy(msg, FAKE_TASKBAR_CREATED_MSG),
@@ -3252,6 +3609,7 @@ mod tests {
         ("WM_APP_PALETTE_TOGGLE", WM_APP_PALETTE_TOGGLE),
         ("WM_APP_PALETTE_RUN", WM_APP_PALETTE_RUN),
         ("WM_APP_REVIEW_RESULT", WM_APP_REVIEW_RESULT),
+        ("WM_APP_FORM_FILL_RESULT", WM_APP_FORM_FILL_RESULT),
     ];
 
     #[test]

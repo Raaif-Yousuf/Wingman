@@ -64,6 +64,9 @@ pub struct Config {
     /// here, the same pattern `providers.order` already uses for the
     /// Provider submenu.
     pub mode: Mode,
+    /// #40 "Fill this form". See [`Forms`]'s own doc comment for the
+    /// still-owed owner decision this carries.
+    pub forms: Forms,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -450,6 +453,42 @@ impl Default for Ui {
             prompt: DEFAULT_PROMPT.to_string(),
         }
     }
+}
+
+/// Which fields "Fill this form" (#40) requires an explicit tick for in the
+/// preview card before "Do it" will write them (`executors::fill_form`'s own
+/// gate: `sensitive && !approved` is skipped). Expansion plan §15 decision
+/// #2, "whether Fill this form may use the profile's email and phone
+/// without a per-field tick", is an OWNER decision this crate does not make
+/// -- `OWNER_TODO.md` item 3 carries it, still awaiting a yes/adjust as of
+/// this writing. `Sensitive` (this type's default) is `OWNER_TODO.md` item
+/// 3's own RECOMMENDED value, not a decision made here: "name, email, phone
+/// and address fill without a per-field tick; date of birth and anything
+/// the model marks sensitive need a tick in the preview." **PROVISIONAL**:
+/// liable to change the moment the owner answers that row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequireTickFor {
+    /// Every field needs a tick, regardless of the profile's or the
+    /// model's own sensitivity marking.
+    All,
+    /// Only a field marked `sensitive` (by the profile, or by the model for
+    /// a field it filled itself) needs a tick. `OWNER_TODO.md` item 3's
+    /// recommended, still-provisional default.
+    #[default]
+    Sensitive,
+    /// No field ever needs a tick. The most permissive setting; not the
+    /// default, and never silently upgraded to it.
+    None,
+}
+
+/// #40 "Fill this form". Only one setting exists today -- see
+/// [`RequireTickFor`] for the decision it carries and why its default is
+/// marked provisional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Forms {
+    pub require_tick_for: RequireTickFor,
 }
 
 impl Config {
@@ -1109,6 +1148,45 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    // -- forms.require_tick_for (#40) ----------------------------------------
+
+    #[test]
+    fn default_require_tick_for_is_sensitive_the_provisional_owner_todo_recommendation() {
+        assert_eq!(
+            Config::default().forms.require_tick_for,
+            RequireTickFor::Sensitive
+        );
+    }
+
+    #[test]
+    fn require_tick_for_round_trips_through_toml_as_snake_case() {
+        for (variant, word) in [
+            (RequireTickFor::All, "all"),
+            (RequireTickFor::Sensitive, "sensitive"),
+            (RequireTickFor::None, "none"),
+        ] {
+            let mut config = Config::default();
+            config.forms.require_tick_for = variant;
+            let text = toml::to_string_pretty(&config).expect("serialize");
+            assert!(
+                text.contains(&format!("require_tick_for = \"{word}\"")),
+                "expected {word:?} in:\n{text}"
+            );
+            let parsed: Config = toml::from_str(&text).expect("deserialize");
+            assert_eq!(parsed.forms.require_tick_for, variant);
+        }
+    }
+
+    #[test]
+    fn an_unset_forms_table_in_a_hand_edited_file_still_parses_to_the_default() {
+        // `#[serde(default)]` on both `Config::forms` and `Forms` itself:
+        // an older config.toml with no `[forms]` section at all must not
+        // fail to parse (the same "an older file gets the default"
+        // contract every other Config section already gives).
+        let parsed: Config = toml::from_str("").expect("an empty document must still parse");
+        assert_eq!(parsed.forms.require_tick_for, RequireTickFor::Sensitive);
     }
 
     // -- hotkeys.pause (issue #181) ------------------------------------------
