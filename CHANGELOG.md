@@ -15,6 +15,11 @@ tagged release.
   Look/Propose/Confirm/Do loop, local models, executors).
 - `SECURITY.md`, `PRIVACY.md`, `CODE_OF_CONDUCT.md`.
 - `CHANGELOG.md` (this file), `THIRD_PARTY_NOTICES.md`.
+- `.github/workflows/release.yml`: on a `v*` tag, builds the release exe,
+  packages the sparse MSIX headlessly via the new `packaging/Build-Msix.ps1`,
+  signs both only if the `WINGMAN_MSIX_PFX_BASE64` / `WINGMAN_MSIX_PFX_PASSWORD`
+  secrets are set, computes `SHA256SUMS`, and creates or updates the GitHub
+  release with all three (issue #8).
 
 ### Changed
 

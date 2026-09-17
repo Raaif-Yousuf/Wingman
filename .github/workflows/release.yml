@@ -1,0 +1,114 @@
+name: Release
+
+# Signing needs two repository secrets, set up by the owner in GitHub repo
+# settings (see OWNER_TODO.md): WINGMAN_MSIX_PFX_BASE64 (the code-signing
+# certificate, PKCS#12, base64-encoded) and WINGMAN_MSIX_PFX_PASSWORD. With
+# neither secret set, this workflow still runs and still produces a release,
+# with an unsigned .exe and .msix and a note in the release body saying so.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build, package, sign if configured, release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Decode signing certificate, if configured
+        id: cert
+        env:
+          WINGMAN_MSIX_PFX_BASE64: ${{ secrets.WINGMAN_MSIX_PFX_BASE64 }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrEmpty($env:WINGMAN_MSIX_PFX_BASE64)) {
+            Write-Host "No WINGMAN_MSIX_PFX_BASE64 secret set; building unsigned artifacts."
+            "has_cert=false" >> $env:GITHUB_OUTPUT
+          } else {
+            $bytes = [Convert]::FromBase64String($env:WINGMAN_MSIX_PFX_BASE64)
+            $pfxPath = Join-Path $env:RUNNER_TEMP 'wingman-signing.pfx'
+            [IO.File]::WriteAllBytes($pfxPath, $bytes)
+            "has_cert=true" >> $env:GITHUB_OUTPUT
+            "pfx_path=$pfxPath" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Build the sparse MSIX (packaging\Build-Msix.ps1)
+        id: msix
+        env:
+          WINGMAN_MSIX_PFX_PASSWORD: ${{ secrets.WINGMAN_MSIX_PFX_PASSWORD }}
+        shell: pwsh
+        run: |
+          $buildArgs = @{ ExePath = 'target\release\wingman.exe' }
+          if ('${{ steps.cert.outputs.has_cert }}' -eq 'true') {
+            if ([string]::IsNullOrEmpty($env:WINGMAN_MSIX_PFX_PASSWORD)) {
+              throw "WINGMAN_MSIX_PFX_BASE64 is set but WINGMAN_MSIX_PFX_PASSWORD is not."
+            }
+            $buildArgs['PfxPath'] = '${{ steps.cert.outputs.pfx_path }}'
+            $buildArgs['PfxPassword'] = ConvertTo-SecureString -String $env:WINGMAN_MSIX_PFX_PASSWORD -AsPlainText -Force
+          }
+          $out = & .\packaging\Build-Msix.ps1 @buildArgs
+          $out | Write-Host
+          $exeLine  = $out | Where-Object { $_ -like 'built-exe=*' }
+          $msixLine = $out | Where-Object { $_ -like 'built-msix=*' }
+          if (-not $exeLine -or -not $msixLine) { throw "Build-Msix.ps1 did not report its output paths." }
+          "exe_path=$($exeLine -replace '^built-exe=', '')"   >> $env:GITHUB_OUTPUT
+          "msix_path=$($msixLine -replace '^built-msix=', '')" >> $env:GITHUB_OUTPUT
+
+      - name: Stage release assets and compute SHA256SUMS
+        id: assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item '${{ steps.msix.outputs.exe_path }}' dist\wingman.exe -Force
+          Copy-Item '${{ steps.msix.outputs.msix_path }}' dist\wingman.msix -Force
+          $hashes = Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          }
+          Set-Content -Path dist\SHA256SUMS -Value $hashes -Encoding ascii
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $signedNote = if ('${{ steps.cert.outputs.has_cert }}' -eq 'true') {
+            'Signed with the certificate in the WINGMAN_MSIX_PFX_BASE64 repository secret.'
+          } else {
+            'UNSIGNED: no WINGMAN_MSIX_PFX_BASE64 secret is configured for this repository, ' +
+            'so wingman.exe and wingman.msix are not signed. wingman.exe still runs standalone. ' +
+            'wingman.msix cannot be installed with Add-AppxPackage unless you trust the ' +
+            'certificate that eventually signs it; build from source and run install.ps1 for a ' +
+            'locally-signed, installable copy in the meantime.'
+          }
+          $sums = Get-Content dist\SHA256SUMS -Raw
+          $notes = "$signedNote`n`n``````text`n$sums``````"
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -Path $notesPath -Value $notes -Encoding utf8
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag dist\wingman.exe dist\wingman.msix dist\SHA256SUMS --clobber
+            gh release edit $tag --notes-file $notesPath
+          } else {
+            gh release create $tag dist\wingman.exe dist\wingman.msix dist\SHA256SUMS `
+              --title $tag --notes-file $notesPath
+          }

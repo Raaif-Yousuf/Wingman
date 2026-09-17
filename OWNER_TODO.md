@@ -34,3 +34,15 @@ once after the rename to Wingman. If already done, delete this row.
 
 Enable Discussions; add the MIT license file via the first push (the repo
 currently reports no license); pin the roadmap issue once filed.
+
+## 6. Release signing secrets (optional, needed for a signed release)
+
+`.github/workflows/release.yml` (issue #8) signs the exe and msix only if
+`WINGMAN_MSIX_PFX_BASE64` (a PKCS#12 code-signing certificate, base64-encoded)
+and `WINGMAN_MSIX_PFX_PASSWORD` are set as repository secrets under Settings ▸
+Secrets and variables ▸ Actions. Without them the workflow still runs and
+still produces a release; the exe and msix are just unsigned, with a note to
+that effect in the release body. No script can generate and upload a
+certificate a CI runner should hold on your behalf, so this is a manual step
+if you want signed release artifacts. Delete this row once decided (skip
+signing for now, or the secrets are set).
