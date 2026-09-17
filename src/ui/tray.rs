@@ -27,24 +27,46 @@
 //! This module owns [`WM_APP_TRAY`], the value passed to the shell as
 //! `uCallbackMessage`; the integrating agent should route `WM_APP_TRAY` in
 //! the main window proc to [`Tray::on_tray_message`].
+//!
+//! # `TaskbarCreated` (icon survives an Explorer restart)
+//!
+//! `NIM_ADD` only adds the icon to the taskbar's *current* notification
+//! area; if Explorer crashes or is restarted, that area is destroyed along
+//! with every process's icon in it, and nothing re-adds ours automatically.
+//! The documented recovery is the shell's `TaskbarCreated` message,
+//! broadcast to every top-level window once a new taskbar exists. The
+//! integrating agent must call [`register_taskbar_created`] once at
+//! startup and route the id it returns, in the main window proc, to
+//! [`Tray::readd`] -- see `app.rs`'s `wnd_proc` for the wiring. Unlike
+//! [`WM_APP_TRAY`] this id is not a compile-time constant (it comes from
+//! `RegisterWindowMessageW` at runtime), so it cannot be matched as an
+//! ordinary `match` arm; a guard (`id if id == app.taskbar_created_msg`)
+//! is required.
 
 use anyhow::{anyhow, Context, Result};
-use windows::core::PCWSTR;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, SetForegroundWindow,
-    SetMenuItemInfoW, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION, MENUITEMINFOW,
-    MFS_CHECKED, MFT_RADIOCHECK, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE,
-    MIIM_STATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, RegisterWindowMessageW,
+    SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION,
+    MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    MIIM_FTYPE, MIIM_STATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP,
     WM_RBUTTONUP,
 };
 
 /// Posted by the shell to this app's window proc on tray icon activity.
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
+
+/// Registers the shell's `TaskbarCreated` message and returns its (runtime,
+/// not compile-time) id. Call once at startup; see the module docs' section
+/// on `TaskbarCreated` for how to route the result.
+pub fn register_taskbar_created() -> u32 {
+    unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) }
+}
 
 /// Identifies our one tray icon in every `NOTIFYICONDATAW` call.
 const TRAY_ICON_ID: u32 = 1;
@@ -120,6 +142,9 @@ pub fn decode(id: u32) -> MenuChoice {
 
 pub struct Tray {
     hwnd: HWND,
+    /// Kept so [`Tray::readd`] can reload the icon exactly as [`Tray::new`]
+    /// did, without the caller having to thread it through again.
+    instance: HINSTANCE,
     /// Display strings for the current primary/secondary bindings (e.g.
     /// `"Win+Shift+F23"`), shown in the "Set ... key" menu labels. Set via
     /// [`Tray::set_key_bindings`]; empty until then, in which case the
@@ -145,31 +170,11 @@ impl Tray {
     /// first; `IDI_APPLICATION` is the real fallback (see
     /// [`EMBEDDED_ICON_ID`]).
     pub fn new(hwnd: HWND, instance: HINSTANCE) -> Result<Self> {
-        let icon = load_icon(instance);
-
-        let mut nid = NOTIFYICONDATAW {
-            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-            hWnd: hwnd,
-            uID: TRAY_ICON_ID,
-            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
-            uCallbackMessage: WM_APP_TRAY,
-            hIcon: icon,
-            ..Default::default()
-        };
-        set_sz_tip(&mut nid.szTip, "Wingman");
-
-        let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
-        if !added.as_bool() {
-            return Err(anyhow!("Shell_NotifyIconW(NIM_ADD) failed"));
-        }
-
-        // Best-effort: if the shell won't upgrade us to v4 we still work,
-        // just with legacy (non-semantic) mouse messages.
-        nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &nid) };
+        add_icon(hwnd, instance)?;
 
         Ok(Self {
             hwnd,
+            instance,
             primary_label: String::new(),
             secondary_label: String::new(),
             active_provider_openai: true,
@@ -178,6 +183,16 @@ impl Tray {
             anthropic_models: Vec::new(),
             anthropic_current: None,
         })
+    }
+
+    /// Re-add the icon after the shell's `TaskbarCreated` broadcast (see the
+    /// module docs). Runs the exact same `NIM_ADD` + `NIM_SETVERSION` calls
+    /// as [`Tray::new`]; the cached labels/models on `self` are untouched
+    /// (they were never shell-side state), but the tooltip was, so the
+    /// caller should re-issue [`Tray::set_tooltip`] afterwards (`app.rs`
+    /// does this by calling its existing `refresh_tray_labels`).
+    pub fn readd(&self) -> Result<()> {
+        add_icon(self.hwnd, self.instance)
     }
 
     /// Update the tooltip shown when hovering the icon (the spec: "shows the
@@ -411,31 +426,43 @@ fn mark_radio_checked(hmenu: HMENU, id: u32) {
     let _ = unsafe { SetMenuItemInfoW(hmenu, id, false, &info) };
 }
 
+/// Attach `submenu` to `parent` (see [`append_submenu`]). If the attach
+/// itself fails, `submenu` was never reachable from `parent`, so nothing
+/// else will ever free it -- destroy it here before propagating the error.
+fn attach_submenu_or_destroy(parent: HMENU, submenu: HMENU, text: &str) -> Result<()> {
+    if let Err(e) = append_submenu(parent, submenu, text) {
+        let _ = unsafe { DestroyMenu(submenu) };
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Build the "Provider" submenu: which service actually answers. This is the
 /// `providers.order` front-runner, distinct from the per-provider model
 /// submenus below -- picking Claude here does not change which ChatGPT model
 /// is configured, it changes who gets asked first.
+///
+/// Like [`append_model_submenu`], `sub` is attached to `parent` before it is
+/// populated (via [`attach_submenu_or_destroy`]), not after: once attached,
+/// a population failure is still cleaned up by the caller's eventual
+/// `DestroyMenu(parent)`, and a failed attach is cleaned up immediately by
+/// `attach_submenu_or_destroy` itself. Previously this populated first and
+/// attached last, so a failure in the final `append_submenu` call leaked
+/// `sub` -- see #147.
 fn append_provider_submenu(parent: HMENU, openai_active: bool) -> Result<()> {
     let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
-    let built = (|| -> Result<()> {
-        append_item(sub, cmd::USE_OPENAI, "ChatGPT")?;
-        append_item(sub, cmd::USE_ANTHROPIC, "Claude")?;
-        mark_radio_checked(
-            sub,
-            if openai_active {
-                cmd::USE_OPENAI
-            } else {
-                cmd::USE_ANTHROPIC
-            },
-        );
-        Ok(())
-    })();
-    if built.is_err() {
-        // Not yet attached to the parent, so nothing else will free it.
-        let _ = unsafe { DestroyMenu(sub) };
-        return built;
-    }
-    append_submenu(parent, sub, "Provider")
+    attach_submenu_or_destroy(parent, sub, "Provider")?;
+    append_item(sub, cmd::USE_OPENAI, "ChatGPT")?;
+    append_item(sub, cmd::USE_ANTHROPIC, "Claude")?;
+    mark_radio_checked(
+        sub,
+        if openai_active {
+            cmd::USE_OPENAI
+        } else {
+            cmd::USE_ANTHROPIC
+        },
+    );
+    Ok(())
 }
 
 /// Build one model submenu (`CreatePopupMenu`, populate, attach to
@@ -443,11 +470,13 @@ fn append_provider_submenu(parent: HMENU, openai_active: bool) -> Result<()> {
 /// single greyed-out "none configured" entry is shown instead of an empty
 /// submenu.
 ///
-/// The submenu is attached to `parent` (via [`append_submenu`]) before it is
-/// populated, not after, specifically so that if population fails partway
-/// through, the already-attached submenu is still reachable from `parent`
-/// and gets cleaned up by the caller's eventual `DestroyMenu(parent)` --
-/// avoiding a leaked, never-attached `HMENU` on the error path.
+/// The submenu is attached to `parent` (via [`attach_submenu_or_destroy`])
+/// before it is populated, not after, specifically so that if population
+/// fails partway through, the already-attached submenu is still reachable
+/// from `parent` and gets cleaned up by the caller's eventual
+/// `DestroyMenu(parent)` -- avoiding a leaked, never-attached `HMENU` on the
+/// error path. A failure in the attach itself is cleaned up immediately by
+/// `attach_submenu_or_destroy`.
 fn append_model_submenu(
     parent: HMENU,
     label: &str,
@@ -456,7 +485,7 @@ fn append_model_submenu(
     current: Option<usize>,
 ) -> Result<()> {
     let submenu = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
-    append_submenu(parent, submenu, label)?;
+    attach_submenu_or_destroy(parent, submenu, label)?;
 
     if models.is_empty() {
         let wide = to_wide("(none configured)");
@@ -523,6 +552,53 @@ fn set_sz_tip(dst: &mut [u16], text: &str) {
     }
 }
 
+/// `NIM_ADD` the icon and switch it to `NOTIFYICON_VERSION_4`
+/// (`NIM_SETVERSION`) -- see the module docs for why. Shared by
+/// [`Tray::new`] and [`Tray::readd`] so the two can never drift apart.
+/// `instance` is used to try loading an embedded icon resource first;
+/// `IDI_APPLICATION` is the real fallback (see [`EMBEDDED_ICON_ID`]).
+fn add_icon(hwnd: HWND, instance: HINSTANCE) -> Result<()> {
+    let icon = load_icon(instance);
+
+    // Best-effort: NIM_ADD fails outright if this (hWnd, uID) pair is
+    // already registered with the shell -- e.g. Tray::readd running while
+    // the previous registration is still live, which is exactly what
+    // happens in a test with no real Explorer restart in between. After a
+    // genuine Explorer crash this NIM_DELETE itself fails harmlessly (the
+    // shell's own icon table died with the old Explorer process), so it is
+    // safe to attempt unconditionally in both cases.
+    let del = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        ..Default::default()
+    };
+    let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &del) };
+
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
+        uCallbackMessage: WM_APP_TRAY,
+        hIcon: icon,
+        ..Default::default()
+    };
+    set_sz_tip(&mut nid.szTip, "Wingman");
+
+    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
+    if !added.as_bool() {
+        return Err(anyhow!("Shell_NotifyIconW(NIM_ADD) failed"));
+    }
+
+    // Best-effort: if the shell won't upgrade us to v4 we still work, just
+    // with legacy (non-semantic) mouse messages.
+    nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+    let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &nid) };
+
+    Ok(())
+}
+
 /// Try the embedded resource icon first (see [`EMBEDDED_ICON_ID`]); fall
 /// back to the system's generic application icon, which always exists.
 fn load_icon(instance: HINSTANCE) -> HICON {
@@ -533,4 +609,147 @@ fn load_icon(instance: HINSTANCE) -> HICON {
         }
     }
     unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or(HICON(std::ptr::null_mut()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- TaskbarCreated recovery (#145) -------------------------------------
+
+    #[test]
+    fn register_taskbar_created_returns_a_nonzero_id() {
+        // RegisterWindowMessageW returns 0 on failure; a real id is always
+        // in the 0xC000-0xFFFF range, but the only contract this module
+        // relies on is "nonzero and stable for the process".
+        assert_ne!(register_taskbar_created(), 0);
+    }
+
+    #[test]
+    fn tray_new_then_readd_both_succeed_against_a_real_window() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, CW_USEDEFAULT, WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+
+        // "STATIC" is a predefined system window class -- no RegisterClassExW
+        // needed, unlike settings.rs's own smoke test.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+        // The exact scenario #145 is about: re-adding after the icon was
+        // dropped (here simulated by just calling it again on the same,
+        // already-added icon id -- NIM_ADD is idempotent for that case).
+        tray.readd().expect("Tray::readd should re-add the icon");
+
+        drop(tray); // NIM_DELETE via Drop
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    // -- submenu attach ordering (#147) -------------------------------------
+
+    #[test]
+    fn attach_submenu_or_destroy_frees_the_submenu_when_attach_fails() {
+        use windows::Win32::UI::WindowsAndMessaging::IsMenu;
+
+        let sub = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        // A null HMENU never identifies a menu, so AppendMenuW's attach call
+        // inside `append_submenu` fails deterministically here -- no need to
+        // exhaust real USER objects to hit the same error path.
+        let invalid_parent = HMENU(std::ptr::null_mut());
+
+        let result = attach_submenu_or_destroy(invalid_parent, sub, "Provider");
+
+        assert!(result.is_err(), "attaching to a null HMENU should fail");
+        assert!(
+            !unsafe { IsMenu(sub) }.as_bool(),
+            "attach_submenu_or_destroy leaked `sub`: it is still a valid menu \
+             handle after the attach it was meant to guard failed"
+        );
+    }
+
+    #[test]
+    fn attach_submenu_or_destroy_attaches_on_success() {
+        use windows::Win32::UI::WindowsAndMessaging::GetMenuItemCount;
+
+        let parent = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        let sub = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+
+        let result = attach_submenu_or_destroy(parent, sub, "Provider");
+
+        assert!(result.is_ok());
+        assert_eq!(unsafe { GetMenuItemCount(Some(parent)) }, 1);
+        let _ = unsafe { DestroyMenu(parent) }; // also frees `sub`, now a child
+    }
+
+    // -- command ids -------------------------------------------------------
+    // Companion to settings.rs's `control_ids_are_pairwise_unique` (#144):
+    // this module's ids live in a completely separate WM_COMMAND namespace
+    // (the tray context menu, not the settings dialog's children), but the
+    // same failure shape -- two constants sharing a value so one handler
+    // silently steals the other's clicks -- applies here too.
+
+    /// Every fixed `cmd::*` command id, paired with its constant name. The
+    /// two model submenus use dynamic ranges instead (`base_id + index`) and
+    /// are checked separately below, since they aren't single ids.
+    const ALL_FIXED_CMD_IDS: &[(&str, u32)] = &[
+        ("ASK_NOW", cmd::ASK_NOW),
+        ("COPY_LAST", cmd::COPY_LAST),
+        ("SET_PRIMARY", cmd::SET_PRIMARY),
+        ("SET_SECONDARY", cmd::SET_SECONDARY),
+        ("EDIT_SETTINGS", cmd::EDIT_SETTINGS),
+        ("RELOAD", cmd::RELOAD),
+        ("QUIT", cmd::QUIT),
+        ("OPEN_SETTINGS", cmd::OPEN_SETTINGS),
+        ("USE_OPENAI", cmd::USE_OPENAI),
+        ("USE_ANTHROPIC", cmd::USE_ANTHROPIC),
+    ];
+
+    #[test]
+    fn fixed_cmd_ids_are_pairwise_unique() {
+        for (i, (name_a, id_a)) in ALL_FIXED_CMD_IDS.iter().enumerate() {
+            for (name_b, id_b) in ALL_FIXED_CMD_IDS.iter().skip(i + 1) {
+                assert_ne!(id_a, id_b, "{name_a} and {name_b} share command id {id_a}");
+            }
+        }
+    }
+
+    #[test]
+    fn model_submenu_ranges_do_not_overlap_each_other_or_the_fixed_ids() {
+        let openai_range = cmd::OPENAI_MODEL_BASE..cmd::OPENAI_MODEL_BASE + cmd::MODEL_RANGE;
+        let anthropic_range =
+            cmd::ANTHROPIC_MODEL_BASE..cmd::ANTHROPIC_MODEL_BASE + cmd::MODEL_RANGE;
+
+        assert!(
+            openai_range.end <= anthropic_range.start
+                || anthropic_range.end <= openai_range.start,
+            "OpenAI model range {openai_range:?} overlaps Anthropic model range {anthropic_range:?}"
+        );
+
+        for (name, id) in ALL_FIXED_CMD_IDS {
+            assert!(
+                !openai_range.contains(id) && !anthropic_range.contains(id),
+                "{name} ({id}) falls inside a model submenu's dynamic id range"
+            );
+        }
+    }
 }
