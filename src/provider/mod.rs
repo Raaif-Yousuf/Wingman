@@ -1,4 +1,9 @@
-mod common;
+// #19: `pub(crate)` (not private) so `mode::probe_ollama_ready` can reach
+// `common::get_text_with_timeout` -- the Offline guard's enforcement lives
+// in `common.rs` (the one file every provider's HTTP send already funnels
+// through), and the Ollama-readiness probe needs to funnel through the
+// exact same guarded path rather than opening its own socket.
+pub(crate) mod common;
 pub mod anthropic;
 pub mod ollama;
 pub mod ollama_admin;

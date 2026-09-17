@@ -112,6 +112,13 @@ pub mod cmd {
     /// Shown in place of the "Pause" submenu while paused.
     pub const RESUME: u32 = 1014;
 
+    /// Mode (issue #19): Cloud / Local / Auto / Offline, shown as a
+    /// radio-checked "Mode" submenu (see [`super::append_mode_submenu`]).
+    pub const MODE_CLOUD: u32 = 1015;
+    pub const MODE_LOCAL: u32 = 1016;
+    pub const MODE_AUTO: u32 = 1017;
+    pub const MODE_OFFLINE: u32 = 1018;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -190,6 +197,14 @@ pub struct Tray {
     /// Whether the tray is currently showing the paused icon/menu. Set via
     /// [`Tray::set_paused`].
     paused: bool,
+    /// Lazily derived from `base_icon` the first time Offline mode needs it
+    /// (see [`make_offline_icon`]). Same ownership rules as `greyed_icon`.
+    offline_icon: Option<HICON>,
+    /// Issue #19. Which "Mode" submenu item is radio-checked, and (via
+    /// [`Tray::resolve_icon`]) whether the icon should show the Offline
+    /// tint. Defaults to `Auto`, same as [`crate::mode::Mode::default`],
+    /// until [`Tray::set_mode`] is called with the loaded config's value.
+    mode: crate::mode::Mode,
 }
 
 impl Tray {
@@ -214,6 +229,8 @@ impl Tray {
             base_icon,
             greyed_icon: None,
             paused: false,
+            offline_icon: None,
+            mode: crate::mode::Mode::default(),
         })
     }
 
@@ -225,37 +242,64 @@ impl Tray {
     /// does this by calling its existing `refresh_tray_labels`).
     ///
     /// `NIM_ADD` always sets the freshly loaded *base* icon, so if the tray
-    /// was showing the greyed paused icon before Explorer restarted, this
-    /// re-applies it (dropping any stale cached `greyed_icon`, since
-    /// `base_icon` may now be a different handle).
+    /// was showing the greyed paused icon (or the Offline tint) before
+    /// Explorer restarted, this re-applies it (dropping any stale cached
+    /// `greyed_icon`/`offline_icon`, since `base_icon` may now be a
+    /// different handle).
     pub fn readd(&mut self) -> Result<()> {
         self.base_icon = add_icon(self.hwnd, self.instance)?;
         if let Some(icon) = self.greyed_icon.take() {
             let _ = unsafe { DestroyIcon(icon) };
         }
-        if self.paused {
-            self.set_paused(true);
+        if let Some(icon) = self.offline_icon.take() {
+            let _ = unsafe { DestroyIcon(icon) };
         }
+        apply_icon(self.hwnd, self.resolve_icon());
         Ok(())
     }
 
     /// Grey (or restore) the tray icon and switch the context menu between
-    /// the "Pause" submenu and the single "Resume" item (issue #20). The
-    /// greyed icon is derived once from `base_icon` and cached; if
-    /// derivation fails (best-effort, see [`make_greyed_icon`]), the icon
-    /// stays normal-colored -- the tooltip text ("Paused...") remains the
-    /// authoritative signal either way, this is cosmetic.
+    /// the "Pause" submenu and the single "Resume" item (issue #20).
+    /// Pausing takes precedence over the Offline tint when both apply --
+    /// see [`Tray::resolve_icon`]. The greyed icon is derived once from
+    /// `base_icon` and cached; if derivation fails (best-effort, see
+    /// [`make_greyed_icon`]), the icon stays normal-colored -- the tooltip
+    /// text ("Paused...") remains the authoritative signal either way,
+    /// this is cosmetic.
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
-        let icon = if paused {
+        apply_icon(self.hwnd, self.resolve_icon());
+    }
+
+    /// Issue #19: radio-check `mode` in the tray's "Mode" submenu and, for
+    /// `Offline` specifically, tint the icon so it is visually
+    /// distinguishable at a glance -- see [`Tray::resolve_icon`] for how
+    /// this composes with [`Tray::set_paused`] (Paused always wins).
+    pub fn set_mode(&mut self, mode: crate::mode::Mode) {
+        self.mode = mode;
+        apply_icon(self.hwnd, self.resolve_icon());
+    }
+
+    /// Which icon should be showing right now, deriving and caching
+    /// `greyed_icon`/`offline_icon` on first use. Paused is visually
+    /// dominant: a paused-AND-offline tray still shows the greyed icon,
+    /// never a blend of the two and never the Offline tint alone, so the
+    /// single most safety-relevant state (nothing runs, rule 5/7) is never
+    /// masked by a less urgent one.
+    fn resolve_icon(&mut self) -> HICON {
+        if self.paused {
             if self.greyed_icon.is_none() {
                 self.greyed_icon = make_greyed_icon(self.base_icon);
             }
-            self.greyed_icon.unwrap_or(self.base_icon)
-        } else {
-            self.base_icon
-        };
-        apply_icon(self.hwnd, icon);
+            return self.greyed_icon.unwrap_or(self.base_icon);
+        }
+        if self.mode == crate::mode::Mode::Offline {
+            if self.offline_icon.is_none() {
+                self.offline_icon = make_offline_icon(self.base_icon);
+            }
+            return self.offline_icon.unwrap_or(self.base_icon);
+        }
+        self.base_icon
     }
 
     /// Update the tooltip shown when hovering the icon (the spec: "shows the
@@ -390,6 +434,8 @@ impl Tray {
             append_pause_submenu(hmenu)?;
         }
         append_separator(hmenu)?;
+        append_mode_submenu(hmenu, self.mode)?;
+        append_separator(hmenu)?;
         append_provider_submenu(hmenu, self.active_provider_openai)?;
         append_model_submenu(
             hmenu,
@@ -432,9 +478,12 @@ impl Drop for Tray {
         let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
 
         // `base_icon` is a shared system handle (see its doc comment) and
-        // must not be destroyed; `greyed_icon`, if ever built, is owned by
-        // this struct and must be.
+        // must not be destroyed; `greyed_icon`/`offline_icon`, if ever
+        // built, are owned by this struct and must be.
         if let Some(icon) = self.greyed_icon.take() {
+            let _ = unsafe { DestroyIcon(icon) };
+        }
+        if let Some(icon) = self.offline_icon.take() {
             let _ = unsafe { DestroyIcon(icon) };
         }
     }
@@ -522,6 +571,30 @@ fn append_pause_submenu(parent: HMENU) -> Result<()> {
     append_item(sub, cmd::PAUSE_1H, "1 hour")?;
     append_item(sub, cmd::PAUSE_UNTIL_TOMORROW, "Until tomorrow")?;
     append_item(sub, cmd::PAUSE_UNTIL_RESUMED, "Until resumed")?;
+    Ok(())
+}
+
+/// Build the "Mode" submenu (issue #19): Cloud / Local / Auto / Offline,
+/// radio-checked to `current`. Order matches the expansion plan's Modes
+/// table.
+fn append_mode_submenu(parent: HMENU, current: crate::mode::Mode) -> Result<()> {
+    use crate::mode::Mode;
+
+    let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
+    attach_submenu_or_destroy(parent, sub, "Mode")?;
+
+    let items = [
+        (cmd::MODE_CLOUD, Mode::Cloud),
+        (cmd::MODE_LOCAL, Mode::Local),
+        (cmd::MODE_AUTO, Mode::Auto),
+        (cmd::MODE_OFFLINE, Mode::Offline),
+    ];
+    for (id, mode) in items {
+        append_item(sub, id, mode.label())?;
+    }
+    if let Some((id, _)) = items.iter().find(|(_, m)| *m == current) {
+        mark_radio_checked(sub, *id);
+    }
     Ok(())
 }
 
@@ -720,13 +793,21 @@ fn load_icon(instance: HINSTANCE) -> HICON {
 /// [`grey_pixel`].
 const GREY_FACTOR: f32 = 0.45;
 
+/// How strongly the Offline icon (issue #19) shifts toward blue: `0.0` = no
+/// tint (identical to the base icon), `1.0` = fully blue. Deliberately
+/// modest -- unlike Pause, Offline is not meant to look "disabled", just
+/// distinguishable at a glance; see [`offline_tint_pixel`] and
+/// `Tray::resolve_icon`'s doc comment for why Paused still wins when both
+/// apply.
+const OFFLINE_TINT_FACTOR: f32 = 0.35;
+
 /// Desaturate and dim a single 32bpp BGRA pixel toward the "greyed out"
 /// look, blending its color toward its own luma and scaling its alpha, both
 /// by `factor`. Pure and allocation-free so the transform itself is
-/// unit-tested without touching GDI -- [`make_greyed_icon`] is the only
-/// place that reads or writes real pixel memory, and is Win32-only (checked
-/// by hand per CLAUDE.md rule 8; the manual check itself is named on issue
-/// #20's closing comment and issue #166).
+/// unit-tested without touching GDI -- [`derive_icon_with_transform`] is
+/// the only place that reads or writes real pixel memory, and is Win32-only
+/// (checked by hand per CLAUDE.md rule 8; the manual check itself is named
+/// on issue #20's closing comment and issue #166).
 fn grey_pixel([b, g, r, a]: [u8; 4], factor: f32) -> [u8; 4] {
     let luma = 0.114 * b as f32 + 0.587 * g as f32 + 0.299 * r as f32;
     let mix = |c: u8| -> u8 { (luma + (c as f32 - luma) * factor).round().clamp(0.0, 255.0) as u8 };
@@ -734,16 +815,48 @@ fn grey_pixel([b, g, r, a]: [u8; 4], factor: f32) -> [u8; 4] {
     [mix(b), mix(g), mix(r), new_a]
 }
 
-/// Derive a greyed version of `icon` at runtime (issue #20) by reading its
-/// 32bpp color bitmap, desaturating and dimming every pixel with
-/// [`grey_pixel`], and building a new icon from the result plus the
-/// original (untouched) mask bitmap.
+/// Shift a single 32bpp BGRA pixel toward blue by `factor` (issue #19):
+/// unlike [`grey_pixel`], alpha is left untouched -- Offline is not meant
+/// to look dimmed or disabled, only cool-toned and distinguishable from the
+/// normal icon at a glance. Pure and allocation-free, same reasoning as
+/// `grey_pixel`'s doc comment.
+fn offline_tint_pixel([b, g, r, a]: [u8; 4], factor: f32) -> [u8; 4] {
+    let bluer = (b as f32 + (255.0 - b as f32) * factor).round().clamp(0.0, 255.0) as u8;
+    let shrink = |c: u8| -> u8 { (c as f32 * (1.0 - factor * 0.5)).round().clamp(0.0, 255.0) as u8 };
+    [bluer, shrink(g), shrink(r), a]
+}
+
+/// Derive a greyed version of `icon` at runtime (issue #20): reads its
+/// 32bpp color bitmap, desaturates and dims every pixel with
+/// [`grey_pixel`], and builds a new icon from the result plus the original
+/// (untouched) mask bitmap. Thin wrapper around
+/// [`derive_icon_with_transform`]; see that function's doc for the shared
+/// GDI plumbing and failure/cleanup behavior.
+fn make_greyed_icon(icon: HICON) -> Option<HICON> {
+    derive_icon_with_transform(icon, |px| grey_pixel(px, GREY_FACTOR))
+}
+
+/// Derive the Offline-tinted version of `icon` at runtime (issue #19), the
+/// same way [`make_greyed_icon`] derives the paused one, using
+/// [`offline_tint_pixel`] instead of [`grey_pixel`] as the per-pixel
+/// transform.
+fn make_offline_icon(icon: HICON) -> Option<HICON> {
+    derive_icon_with_transform(icon, |px| offline_tint_pixel(px, OFFLINE_TINT_FACTOR))
+}
+
+/// Shared GDI plumbing behind [`make_greyed_icon`] and [`make_offline_icon`]
+/// (issue #19 factored this out of what was originally `make_greyed_icon`
+/// alone, so the two icon variants can never let their DIB-handling drift
+/// apart from each other): reads `icon`'s 32bpp color bitmap, applies
+/// `transform` to every pixel, and builds a new icon from the result plus
+/// the original (untouched) mask bitmap.
 ///
 /// Returns `None` on any GDI failure; callers fall back to the normal icon
-/// -- pausing is still fully in effect either way, this is cosmetic. Cleans
-/// up every GDI object it creates or that `GetIconInfo` hands back on every
-/// path, including the early-return failure paths.
-fn make_greyed_icon(icon: HICON) -> Option<HICON> {
+/// -- the underlying state (Paused / Offline) is still fully in effect
+/// either way, this is cosmetic. Cleans up every GDI object it creates or
+/// that `GetIconInfo` hands back on every path, including the early-return
+/// failure paths.
+fn derive_icon_with_transform(icon: HICON, transform: impl Fn([u8; 4]) -> [u8; 4]) -> Option<HICON> {
     unsafe {
         let mut info = ICONINFO::default();
         GetIconInfo(icon, &mut info).ok()?;
@@ -809,7 +922,7 @@ fn make_greyed_icon(icon: HICON) -> Option<HICON> {
         let pixel_count = width as usize * height as usize;
         let pixels = std::slice::from_raw_parts_mut(bits_ptr as *mut [u8; 4], pixel_count);
         for px in pixels.iter_mut() {
-            *px = grey_pixel(*px, GREY_FACTOR);
+            *px = transform(*px);
         }
 
         let new_info = ICONINFO {
@@ -945,6 +1058,10 @@ mod tests {
         ("PAUSE_UNTIL_TOMORROW", cmd::PAUSE_UNTIL_TOMORROW),
         ("PAUSE_UNTIL_RESUMED", cmd::PAUSE_UNTIL_RESUMED),
         ("RESUME", cmd::RESUME),
+        ("MODE_CLOUD", cmd::MODE_CLOUD),
+        ("MODE_LOCAL", cmd::MODE_LOCAL),
+        ("MODE_AUTO", cmd::MODE_AUTO),
+        ("MODE_OFFLINE", cmd::MODE_OFFLINE),
     ];
 
     #[test]
@@ -1088,6 +1205,132 @@ mod tests {
         assert!(!tray.paused);
 
         drop(tray); // Drop must DestroyIcon(greyed_icon) without panicking.
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    // -- offline_tint_pixel (issue #19) --------------------------------------
+
+    #[test]
+    fn offline_tint_pixel_factor_zero_is_identity() {
+        let px = offline_tint_pixel([10, 20, 30, 255], 0.0);
+        assert_eq!(px, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn offline_tint_pixel_leaves_alpha_untouched() {
+        // Unlike grey_pixel, Offline is not meant to look dimmed.
+        for a in [0u8, 1, 128, 255] {
+            let px = offline_tint_pixel([10, 20, 30, a], OFFLINE_TINT_FACTOR);
+            assert_eq!(px[3], a);
+        }
+    }
+
+    #[test]
+    fn offline_tint_pixel_shifts_a_neutral_grey_toward_blue() {
+        let px = offline_tint_pixel([128, 128, 128, 255], OFFLINE_TINT_FACTOR);
+        assert!(px[0] > 128, "blue should rise, got {}", px[0]);
+        assert!(px[1] < 128, "green should fall, got {}", px[1]);
+        assert!(px[2] < 128, "red should fall, got {}", px[2]);
+    }
+
+    // -- make_offline_icon / Tray::set_mode, against real GDI (issue #19) --
+
+    #[test]
+    fn make_offline_icon_succeeds_against_a_real_icon() {
+        let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }.expect("LoadIconW(IDI_APPLICATION)");
+        let tinted = make_offline_icon(icon);
+        assert!(tinted.is_some(), "make_offline_icon should derive a tinted icon from a real system icon");
+        if let Some(t) = tinted {
+            let _ = unsafe { DestroyIcon(t) };
+        }
+    }
+
+    #[test]
+    fn tray_set_mode_offline_derives_and_caches_the_tinted_icon_against_a_real_window() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, CW_USEDEFAULT, WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray mode test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let mut tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+        assert_eq!(tray.mode, crate::mode::Mode::Auto);
+        assert!(tray.offline_icon.is_none());
+
+        tray.set_mode(crate::mode::Mode::Offline);
+        assert_eq!(tray.mode, crate::mode::Mode::Offline);
+        assert!(
+            tray.offline_icon.is_some(),
+            "set_mode(Offline) should have derived and cached the tinted icon"
+        );
+
+        tray.set_mode(crate::mode::Mode::Auto);
+        assert_eq!(tray.mode, crate::mode::Mode::Auto);
+
+        drop(tray); // Drop must DestroyIcon(offline_icon) without panicking.
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    #[test]
+    fn resolve_icon_prefers_paused_over_offline_when_both_apply() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, CW_USEDEFAULT, WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray precedence test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let mut tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+        tray.set_mode(crate::mode::Mode::Offline);
+        tray.set_paused(true);
+
+        // Both caches exist (both were derived at some point), but the
+        // Paused icon must be the one actually resolved/applied while both
+        // states are active -- see `resolve_icon`'s doc comment.
+        let resolved = tray.resolve_icon();
+        assert_eq!(
+            resolved, tray.greyed_icon.unwrap(),
+            "Paused must be visually dominant over the Offline tint"
+        );
+
+        drop(tray);
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 }

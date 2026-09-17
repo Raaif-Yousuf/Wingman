@@ -32,11 +32,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::capture;
-use crate::config::Config;
+use crate::config::{Config, Providers};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::hotkey::{
     chord_to_string, Chord, HotkeyHook, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
 };
+use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
 use crate::provider::{parse_answer, physics_request, Answer, Chain, Shot};
 use crate::ui::card::Card;
@@ -134,6 +135,12 @@ pub fn run() -> Result<()> {
 
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let config = Config::load().unwrap_or_default();
+    // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
+    // anything below can start a request (the hotkey hook isn't installed
+    // yet, but `--settings`'s `open_settings` path below can still save,
+    // and `provider::common`'s Offline guard must be correctly configured
+    // from the very first request, not just from the first tray click).
+    mode::set_current(config.mode);
     let chain = Arc::new(config.build_chain());
 
     let hwnd = create_owner_window(instance)?;
@@ -171,6 +178,10 @@ pub fn run() -> Result<()> {
         pause: PauseState::Running,
     });
     app.refresh_tray_labels();
+    // Issue #19: reflect the loaded mode in the tray submenu/icon from the
+    // start, same as `refresh_tray_labels` already does for the provider
+    // submenu and key bindings.
+    app.tray.set_mode(app.config.mode);
 
     // issue #149: install.ps1's post-install step launches the freshly
     // installed exe with `--settings`, expecting Settings to open so the
@@ -333,14 +344,23 @@ impl App {
         self.set_watch(false);
         self.card.show_pending();
 
-        let chain = Arc::clone(&self.chain);
+        // Issue #19: the mode-aware chain is built fresh on the WORKER
+        // thread (inside `worker`, below), not here on the main thread --
+        // Auto mode's Ollama reachability probe is a real network call,
+        // and capture is the last thing allowed to touch anything blocking
+        // on this thread (the "Instant" constraint). `self.chain` (built
+        // mode-agnostically, at config load/reload/switch time) stays the
+        // main-thread-only "is anything configured at all" gate above and
+        // the tooltip's source, unaffected by this.
+        let providers = self.config.providers.clone();
+        let mode = self.config.mode;
         let prompt = self.config.ui.prompt.clone();
         let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
                 let shot = capture::encode(&raw)?;
-                worker(&chain, &shot, &prompt, want_difficulty)
+                worker(&providers, mode, &shot, &prompt, want_difficulty)
             })()
             .map_err(|e| format!("{e:#}"));
             let payload = Box::into_raw(Box::new(result));
@@ -679,6 +699,33 @@ impl App {
         self.set_watch(true);
     }
 
+    /// Issue #19: switch `Mode`, publish it to the process-wide atomic the
+    /// Offline guard reads (`mode::set_current`), radio-check it in the
+    /// tray and update the icon (`Tray::set_mode`), and persist it --
+    /// mirrors `set_provider`'s shape exactly. Unlike Pause, Mode IS
+    /// persisted (`Config.mode`), so unlike `pause_for`/`resume` this
+    /// writes to disk, same as every other tray setting change.
+    fn set_mode(&mut self, mode: Mode) {
+        if self.config.mode == mode {
+            return;
+        }
+        self.config.mode = mode;
+        mode::set_current(mode);
+        self.tray.set_mode(mode);
+
+        let saved = self.config.save();
+        match saved {
+            Ok(()) => self.card.show_answer(mode.label(), "", 3, None),
+            Err(e) => self.card.show_error(
+                &format!("Using {}: not saved", mode.label()),
+                &format!("It will revert when you quit.
+
+{e:#}"),
+            ),
+        }
+        self.set_watch(true);
+    }
+
     fn refresh_tray_labels(&mut self) {
         let primary = chord_to_string(&self.config.hotkeys.primary);
         let secondary = chord_to_string(&self.config.hotkeys.secondary);
@@ -862,7 +909,20 @@ impl App {
     }
 }
 
-fn worker(chain: &Chain, shot: &Shot, prompt: &str, want_difficulty: bool) -> Result<Answer> {
+/// Issue #19: builds the mode-aware chain HERE, on the worker thread, from
+/// `providers` + `mode` -- not on the main thread before spawning -- because
+/// Auto mode's Ollama reachability probe (`mode::probe_ollama_ready`) is a
+/// real network call, and the main thread must stay off the network
+/// entirely (capture already runs there; nothing after it may block on I/O,
+/// the "Instant" constraint in the expansion plan). Cloud, Local and
+/// Offline need no probe at all and pay nothing extra --
+/// `mode::should_probe_ollama` gates it, and it only ever runs for Auto.
+fn worker(providers: &Providers, mode: Mode, shot: &Shot, prompt: &str, want_difficulty: bool) -> Result<Answer> {
+    let ollama_ready = mode == Mode::Auto
+        && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+        && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
+    let chain = providers.build_chain_for_mode(mode, ollama_ready);
+
     // #12: the trait moved from `Provider::ask(shot, prompt, want_difficulty)
     // -> Answer` to `Provider::complete(&Request) -> Completion`, so the
     // physics-check schema is now built here (via `physics_request`) instead
@@ -1193,6 +1253,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         app.pause_for(PauseChoice::UntilResumed)
                     }
                     MenuChoice::Command(cmd::RESUME) => app.resume(),
+                    MenuChoice::Command(cmd::MODE_CLOUD) => app.set_mode(Mode::Cloud),
+                    MenuChoice::Command(cmd::MODE_LOCAL) => app.set_mode(Mode::Local),
+                    MenuChoice::Command(cmd::MODE_AUTO) => app.set_mode(Mode::Auto),
+                    MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
                     MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
                     MenuChoice::Command(cmd::QUIT) => unsafe {
                         let _ = DestroyWindow(hwnd);

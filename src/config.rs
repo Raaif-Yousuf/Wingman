@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::hotkey::Chord;
+use crate::mode::Mode;
 use crate::provider::{Anthropic, Chain, Ollama, OpenAi, Provider, DEFAULT_PROMPT};
 use crate::secrets::{target_name, CredManagerStore, SecretStore};
 
@@ -36,6 +37,13 @@ pub struct Config {
     /// without config.toml ever carrying it forward.
     #[serde(skip)]
     pub unreadable_secrets: Vec<String>,
+    /// Issue #19: `Cloud | Local | Auto | Offline`. Defaults to `Auto` per
+    /// the expansion plan's Modes table. `App::run` publishes this to
+    /// `mode::set_current` at startup, and `App::set_mode` keeps the
+    /// process-wide mirror in sync with every tray change and re-saves it
+    /// here, the same pattern `providers.order` already uses for the
+    /// Provider submenu.
+    pub mode: Mode,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -103,8 +111,11 @@ impl Default for Providers {
             // so listing them by default costs nothing), a freshly
             // installed Ollama with a vision model pulled would start
             // answering silently for a user who never asked for a local
-            // provider at all. Opt-in only, until the Mode work (#19)
-            // decides what "Auto" should default to.
+            // provider at all. Opt-in only -- issue #19 settled this: being
+            // named here IS the opt-in signal `mode::should_probe_ollama`
+            // gates Auto mode's reachability probe on, which is what keeps
+            // Auto free of added latency for a user who never configured
+            // Ollama (see that function's doc comment).
             order: vec!["openai".to_string(), "anthropic".to_string()],
             openai: ProviderConfig {
                 model: "gpt-5.5".to_string(),
@@ -622,35 +633,85 @@ impl Config {
             .output();
     }
 
-    /// Builds the provider fallback chain per `providers.order`. Providers
-    /// not named in `order` are omitted entirely; unrecognized names are
-    /// ignored. Providers with an empty API key are still included in the
-    /// chain but report themselves not-`ready()`, so `Chain::ask` skips
-    /// them without failing.
+    /// Builds the provider fallback chain per `providers.order`, ignoring
+    /// `mode` entirely. Providers not named in `order` are omitted
+    /// entirely; unrecognized names are ignored. Providers with an empty
+    /// API key are still included in the chain but report themselves
+    /// not-`ready()`, so `Chain::ask` skips them without failing.
+    ///
+    /// Used for the cheap "is anything configured at all" gate
+    /// (`App::ask`'s "No API key" card) and by the tray tooltip -- neither
+    /// needs mode filtering, since an empty *unfiltered* chain means an
+    /// empty chain under every mode too. The actual per-press request goes
+    /// through [`Providers::build_chain_for_mode`] instead.
     pub fn build_chain(&self) -> Chain {
-        // #175: the unreadable-credential marker is a placeholder, not a key.
-        let key = |k: &str| if k == UNREADABLE_KEY_MARKER { String::new() } else { k.to_string() };
-        let mut providers: Vec<Box<dyn Provider>> = Vec::new();
-        for name in &self.providers.order {
-            match name.as_str() {
-                "openai" => providers.push(Box::new(OpenAi::new(
-                    key(&self.providers.openai.api_key),
-                    self.providers.openai.model.clone(),
-                    self.providers.openai.effort.clone(),
-                ))),
-                "anthropic" => providers.push(Box::new(Anthropic::new(
-                    key(&self.providers.anthropic.api_key),
-                    self.providers.anthropic.model.clone(),
-                    self.providers.anthropic.effort.clone(),
-                ))),
-                "ollama" => providers.push(Box::new(Ollama::new(
-                    self.providers.ollama.base_url.clone(),
-                    self.providers.ollama.model.clone(),
-                    self.providers.ollama.effort.clone(),
-                ))),
-                _ => {}
-            }
+        self.providers.build_chain()
+    }
+}
+
+/// #175: the unreadable-credential marker is a placeholder, not a key; a
+/// provider built from it must report not ready instead of sending it.
+fn unreadable_as_empty(key: &str) -> String {
+    if key == UNREADABLE_KEY_MARKER {
+        String::new()
+    } else {
+        key.to_string()
+    }
+}
+
+impl Providers {
+    /// Constructs the `Provider` for one `providers.order` name against
+    /// `self`'s per-provider config, or `None` for an unrecognized name.
+    /// The one name-to-provider mapping [`Providers::build_chain`] and
+    /// [`Providers::build_chain_for_mode`] (#19) both build from, so the
+    /// two can never drift apart from each other (see the
+    /// `wired-to-nothing` skill's "hard-coded list" row).
+    fn provider_for(&self, name: &str) -> Option<Box<dyn Provider>> {
+        match name {
+            "openai" => Some(Box::new(OpenAi::new(
+                unreadable_as_empty(&self.openai.api_key),
+                self.openai.model.clone(),
+                self.openai.effort.clone(),
+            ))),
+            "anthropic" => Some(Box::new(Anthropic::new(
+                unreadable_as_empty(&self.anthropic.api_key),
+                self.anthropic.model.clone(),
+                self.anthropic.effort.clone(),
+            ))),
+            "ollama" => Some(Box::new(Ollama::new(
+                self.ollama.base_url.clone(),
+                self.ollama.model.clone(),
+                self.ollama.effort.clone(),
+            ))),
+            _ => None,
         }
+    }
+
+    /// [`Config::build_chain`]'s implementation, kept here (rather than
+    /// needing a whole `Config`) so [`App::ask`]'s worker thread (`app.rs`,
+    /// issue #19) can build a chain from just the cloned `Providers` it
+    /// carries across the thread boundary, without also carrying
+    /// `hotkeys`/`capture`/`ui` along for no reason.
+    pub fn build_chain(&self) -> Chain {
+        let providers: Vec<Box<dyn Provider>> =
+            self.order.iter().filter_map(|name| self.provider_for(name)).collect();
+        Chain::new(providers)
+    }
+
+    /// Issue #19: like [`Providers::build_chain`], but `order` is first
+    /// filtered and reordered by `mode::select_providers` for `mode`.
+    /// `ollama_ready` is the caller's already-computed answer to "is Ollama
+    /// reachable with the model loaded, right now" (see
+    /// `mode::should_probe_ollama` / `mode::probe_ollama_ready`) -- this
+    /// function itself does no network I/O, so it is cheap enough to call
+    /// fresh on every press rather than caching a chain across presses
+    /// (which is exactly what Auto mode needs: Ollama's reachability can
+    /// change between two presses, and rule 5 rules out polling to keep a
+    /// cached answer warm).
+    pub fn build_chain_for_mode(&self, mode: Mode, ollama_ready: bool) -> Chain {
+        let selected = crate::mode::select_providers(mode, &self.order, ollama_ready);
+        let providers: Vec<Box<dyn Provider>> =
+            selected.iter().filter_map(|name| self.provider_for(name)).collect();
         Chain::new(providers)
     }
 }
@@ -856,6 +917,95 @@ api_key = "sk-x"
         let chain = config.build_chain();
         assert_eq!(chain.provider_names(), vec!["openai", "anthropic"]);
         assert_eq!(chain.ready_provider_names(), vec!["anthropic"]);
+    }
+
+    // -- #19: Mode -------------------------------------------------------
+
+    #[test]
+    fn default_mode_is_auto() {
+        assert_eq!(Config::default().mode, Mode::Auto);
+    }
+
+    #[test]
+    fn mode_persists_through_a_toml_round_trip() {
+        for mode in [Mode::Cloud, Mode::Local, Mode::Auto, Mode::Offline] {
+            let config = Config { mode, ..Config::default() };
+            let text = toml::to_string_pretty(&config).expect("serialize");
+            assert!(text.contains(&format!("mode = \"{}\"", mode_wire_name(mode))), "{text}");
+            let parsed: Config = toml::from_str(&text).expect("deserialize");
+            assert_eq!(parsed.mode, mode, "round trip failed for {mode:?}");
+        }
+    }
+
+    #[test]
+    fn an_older_config_missing_the_mode_key_backfills_to_auto() {
+        // A config.toml written before #19 has no `mode` key at all;
+        // #[serde(default)] on `Config` must still produce `Auto`, not a
+        // parse failure or a bogus default.
+        let old = r#"
+[providers.openai]
+model = "gpt-5.5"
+"#;
+        let cfg = Config::parse_or_default(old);
+        assert_eq!(cfg.mode, Mode::Auto);
+    }
+
+    fn mode_wire_name(m: Mode) -> &'static str {
+        match m {
+            Mode::Cloud => "cloud",
+            Mode::Local => "local",
+            Mode::Auto => "auto",
+            Mode::Offline => "offline",
+        }
+    }
+
+    #[test]
+    fn build_chain_for_mode_cloud_excludes_ollama() {
+        let mut config = Config::default();
+        config.providers.order = vec!["openai".to_string(), "anthropic".to_string(), "ollama".to_string()];
+        let chain = config.providers.build_chain_for_mode(Mode::Cloud, true);
+        assert_eq!(chain.provider_names(), vec!["openai", "anthropic"]);
+    }
+
+    #[test]
+    fn build_chain_for_mode_local_is_ollama_only() {
+        let mut config = Config::default();
+        config.providers.order = vec!["openai".to_string(), "anthropic".to_string(), "ollama".to_string()];
+        let chain = config.providers.build_chain_for_mode(Mode::Local, false);
+        assert_eq!(chain.provider_names(), vec!["ollama"]);
+    }
+
+    #[test]
+    fn build_chain_for_mode_offline_is_ollama_only() {
+        let mut config = Config::default();
+        config.providers.order = vec!["openai".to_string(), "anthropic".to_string(), "ollama".to_string()];
+        let chain = config.providers.build_chain_for_mode(Mode::Offline, false);
+        assert_eq!(chain.provider_names(), vec!["ollama"]);
+    }
+
+    #[test]
+    fn build_chain_for_mode_auto_puts_ollama_first_only_when_ready() {
+        let mut config = Config::default();
+        config.providers.order = vec!["openai".to_string(), "anthropic".to_string(), "ollama".to_string()];
+
+        let ready = config.providers.build_chain_for_mode(Mode::Auto, true);
+        assert_eq!(ready.provider_names(), vec!["ollama", "openai", "anthropic"]);
+
+        let not_ready = config.providers.build_chain_for_mode(Mode::Auto, false);
+        assert_eq!(not_ready.provider_names(), vec!["openai", "anthropic"]);
+    }
+
+    #[test]
+    fn build_chain_and_build_chain_for_mode_agree_when_every_provider_is_cloud() {
+        // With no local provider configured at all, mode filtering has
+        // nothing to remove -- both builders must produce the exact same
+        // chain for every mode, proving `provider_for` never drifted
+        // between the two call sites.
+        let config = Config::default(); // order: ["openai", "anthropic"], no ollama
+        let unfiltered = config.build_chain().provider_names();
+        for mode in [Mode::Cloud, Mode::Auto] {
+            assert_eq!(config.providers.build_chain_for_mode(mode, true).provider_names(), unfiltered, "mode {mode:?}");
+        }
     }
 
     #[test]
