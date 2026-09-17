@@ -96,6 +96,27 @@ pub(crate) fn user_confirmed() -> ConfirmationToken {
     ConfirmationToken(())
 }
 
+/// The preview card's actual "Do it" / Enter handler (#26): builds the
+/// `Confirmed<Value>` from a [`crate::ui::preview::PreviewModel`]'s
+/// *currently shown* values -- after any edits, never the original proposal
+/// the provider returned. `card.rs`'s `WM_COMMAND`/`WM_KEYDOWN` handler is
+/// the one real caller; both take a `ConfirmationToken`, so this is still
+/// only reachable via [`user_confirmed`].
+///
+/// This function is the literal implementation of #26's Done-when ("Enter
+/// yields a `Confirmed` equal to what was shown"): `model.to_value()` is
+/// read once, here, and becomes the `Confirmed`'s value with nothing else
+/// in between -- there is no second read of the model, no re-fetch of the
+/// original proposal, so what an executor later receives cannot diverge
+/// from what the card had on screen at the moment "Do it" was pressed.
+#[allow(dead_code)]
+pub(crate) fn confirm_preview(
+    model: &crate::ui::preview::PreviewModel,
+    token: ConfirmationToken,
+) -> Confirmed<serde_json::Value> {
+    confirm(Proposal::new(model.to_value()), token)
+}
+
 /// The one exception to "only a real user confirmation produces a
 /// `Confirmed<P>`": a read-only executor whose action has `confirm = false`
 /// never shows a preview (expansion plan §6: "Read-only actions show a
@@ -165,6 +186,56 @@ mod tests {
         let token = user_confirmed();
         let confirmed = confirm(proposal, token);
         assert_eq!(confirmed.into_value(), "hello");
+    }
+
+    // -- confirm_preview (#26): "Enter yields a Confirmed equal to what was
+    // shown" ------------------------------------------------------------
+
+    fn calendar_model_with(overrides: &[(&str, &str)]) -> crate::ui::preview::PreviewModel {
+        let schema = crate::actions::schema::schema_for("calendar_event", false)
+            .expect("calendar_event is registered");
+        let value = serde_json::json!({
+            "title": "Standup", "start": "09:00", "end": "09:15",
+            "location": "Room 2", "notes": "bring laptop"
+        });
+        let mut model = crate::ui::preview::PreviewModel::from_schema(&schema, &value);
+        for (name, v) in overrides {
+            model.set_value(name, v.to_string());
+        }
+        model
+    }
+
+    #[test]
+    fn confirm_preview_with_no_edits_matches_the_original_proposal() {
+        let model = calendar_model_with(&[]);
+        let shown = model.to_value();
+        let confirmed = confirm_preview(&model, user_confirmed());
+        assert_eq!(*confirmed.value(), shown);
+    }
+
+    #[test]
+    fn confirm_preview_after_an_edit_yields_a_confirmed_equal_to_what_was_shown() {
+        // #26's literal Done-when, proven through the real Confirmed<Value>
+        // type (see `ui::preview`'s own unit test of the same property at
+        // the PreviewModel layer).
+        let model = calendar_model_with(&[("start", "10:30")]);
+        let shown = model.to_value(); // exactly what the card would be showing
+        let confirmed = confirm_preview(&model, user_confirmed());
+        assert_eq!(
+            *confirmed.value(),
+            shown,
+            "the confirmed value must equal exactly what was on screen"
+        );
+        assert_eq!(confirmed.value()["start"], "10:30");
+    }
+
+    #[test]
+    fn confirm_preview_ignores_a_refused_edit_to_a_non_editable_field() {
+        let mut model = calendar_model_with(&[]);
+        let changed = model.set_value("location", "Room 9"); // not editable
+        assert!(!changed);
+        let confirmed = confirm_preview(&model, user_confirmed());
+        assert_eq!(confirmed.value()["location"], "Room 2");
     }
 
     // -- auto_confirm_read_only ------------------------------------------

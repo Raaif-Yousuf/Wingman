@@ -8,15 +8,24 @@
 //! model should commit to (`headline`, `difficulty`) after the field that
 //! justifies it (`detail`), never before.
 //!
-//! Only `"verdict"` is registered today, because it is the only proposal
-//! kind any built-in action uses. `text_answer`, `calendar_event`,
-//! `form_fill` and `text_review` (named in CONTRIBUTING.md's "Add an action
-//! in 20 minutes" and the expansion plan's §6) get their own `match` arm
-//! here the same day their first action lands, not before -- an
+//! `"verdict"` and `"calendar_event"` (#26) are registered today.
+//! `text_answer`, `form_fill` and `text_review` (named in CONTRIBUTING.md's
+//! "Add an action in 20 minutes" and the expansion plan's §6) get their own
+//! `match` arm here the same day their first action lands, not before -- an
 //! unimplemented arm would be untestable dead code (see the
 //! `wired-to-nothing` skill).
+//!
+//! A property can carry `"editable": true` -- a non-standard JSON Schema
+//! keyword a provider's completion never sees echoed back (it only reads
+//! `type`/`enum`/etc. from `properties`), read solely by
+//! `ui::preview::PreviewModel::from_schema` to decide which fields the
+//! confirm card renders as an EDIT control versus plain text. Keeping the
+//! flag on the same schema value the provider is sent, rather than a
+//! parallel per-proposal-kind table, is what keeps "which fields are
+//! editable" from drifting out of sync with "which fields exist": the two
+//! questions share one answer, in one place, in schema property order.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Looks up the JSON Schema for `proposal`. `rate_difficulty` only affects
 /// `"verdict"` (whether its `difficulty` property and rubric-driven enum are
@@ -37,8 +46,45 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         // proves this registry is a drop-in replacement for the direct
         // call it replaces.
         "verdict" => Some(crate::provider::common::answer_schema(rate_difficulty)),
+        "calendar_event" => Some(calendar_event_schema()),
         _ => None,
     }
+}
+
+/// The `calendar_event` proposal schema (#26): title, start, end, location,
+/// notes.
+///
+/// Property order is load-bearing (rule 3), same as `answer_schema`'s
+/// `detail`-before-`headline`: `title` comes first so the model commits to
+/// *which* event this is before it has to work out *when* -- extracting a
+/// start/end time only makes sense once the model has already anchored on
+/// one specific event on screen, not some other one nearby. `start` before
+/// `end` mirrors how a time range is naturally read and lets `end` be
+/// filled in relative to an already-committed `start` (an end time earlier
+/// than its own start is a self-contradiction the model can only avoid by
+/// having already picked a start). `location` and `notes` trail last: both
+/// are supplementary context that never changes whether the event or its
+/// times are correct, so nothing upstream needs to be committed before they
+/// are filled in.
+///
+/// Only `title` and `start` are `"editable"` (#26's Done-when: "a
+/// `calendar_event` proposal renders with editable start and title"); `end`,
+/// `location` and `notes` render as plain text in the preview card. All
+/// five are `required`: a calendar event with a blank title or start is not
+/// a usable proposal to show "Do it" for.
+fn calendar_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "editable": true},
+            "start": {"type": "string", "editable": true},
+            "end": {"type": "string"},
+            "location": {"type": "string"},
+            "notes": {"type": "string"}
+        },
+        "required": ["title", "start", "end", "location", "notes"],
+        "additionalProperties": false
+    })
 }
 
 #[cfg(test)]
@@ -84,7 +130,66 @@ mod tests {
     #[test]
     fn unknown_proposal_kind_is_none_not_a_panic() {
         assert_eq!(schema_for("text_answer", false), None);
-        assert_eq!(schema_for("calendar_event", false), None);
+        assert_eq!(schema_for("form_fill", false), None);
         assert_eq!(schema_for("totally_made_up", true), None);
+    }
+
+    // -- calendar_event (#26) -------------------------------------------
+
+    #[test]
+    fn calendar_event_is_registered() {
+        assert!(schema_for("calendar_event", false).is_some());
+    }
+
+    #[test]
+    fn calendar_event_declares_fields_in_load_bearing_order() {
+        let schema = schema_for("calendar_event", false).expect("calendar_event is registered");
+        let names: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("properties is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(names, vec!["title", "start", "end", "location", "notes"]);
+        // `required` is a JSON array, so this checks order too, not just
+        // membership (same guard `verdict`'s test above uses).
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["title", "start", "end", "location", "notes"])
+        );
+    }
+
+    #[test]
+    fn calendar_event_marks_only_title_and_start_editable() {
+        let schema = schema_for("calendar_event", false).expect("calendar_event is registered");
+        let props = schema["properties"].as_object().unwrap();
+        for (name, def) in props {
+            let editable = def
+                .get("editable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let expected = matches!(name.as_str(), "title" | "start");
+            assert_eq!(
+                editable, expected,
+                "property {name:?} editable={editable} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn calendar_event_rejects_additional_properties() {
+        let schema = schema_for("calendar_event", false).expect("calendar_event is registered");
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn calendar_event_ignores_rate_difficulty() {
+        // rate_difficulty only affects "verdict" -- calendar_event's shape
+        // must be identical regardless of the flag, the same contract
+        // schema_for's own doc comment states.
+        assert_eq!(
+            schema_for("calendar_event", false),
+            schema_for("calendar_event", true)
+        );
     }
 }
