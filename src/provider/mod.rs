@@ -322,15 +322,45 @@ impl Chain {
 
     /// Tries each ready provider in order, returning the first success. See
     /// the type-level doc for the exact fallback semantics.
+    ///
+    /// Issue #176: production code now always goes through
+    /// [`complete_parsed`](Self::complete_parsed) instead (worker's caller
+    /// needs `parse_answer` to run inside the fallback loop, not after it),
+    /// so this plain form is unused outside tests -- same
+    /// unused-until-a-caller-needs-it status as `provider_names` below.
+    /// Kept as the simple entry point for a future caller that has no
+    /// content to validate.
+    #[allow(dead_code)]
     pub fn complete(&self, req: &Request) -> anyhow::Result<Completion> {
+        self.complete_parsed(req, |c| Ok(c.clone()))
+    }
+
+    /// Like [`complete`](Self::complete), but a provider's success is not
+    /// just "returned HTTP 200" -- it also has to satisfy `parse`. A 200
+    /// response whose text fails `parse` (a schema-invalid answer, say) is
+    /// treated exactly like a transport error or a non-2xx: this provider is
+    /// skipped and the chain falls through to the next ready one, and the
+    /// *first* such failure (transport or parse) is what a full-chain
+    /// failure surfaces. `Chain` stays action-agnostic -- it never knows
+    /// what `parse` checks -- so the physics-check schema lives entirely in
+    /// [`parse_answer`], not here (issue #176: before the #12 trait refactor
+    /// this fallback-on-invalid-schema behaviour lived inside each
+    /// provider's own `ask`; `complete_parsed` restores it without teaching
+    /// `Chain` about any one action's schema again).
+    pub fn complete_parsed<T>(
+        &self,
+        req: &Request,
+        mut parse: impl FnMut(&Completion) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         let mut first_err: Option<anyhow::Error> = None;
 
         for provider in &self.providers {
             if !provider.ready() {
                 continue;
             }
-            match provider.complete(req) {
-                Ok(completion) => return Ok(completion),
+            let outcome = provider.complete(req).and_then(|completion| parse(&completion));
+            match outcome {
+                Ok(value) => return Ok(value),
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -443,6 +473,17 @@ mod tests {
     fn ok_completion() -> anyhow::Result<Completion> {
         Ok(Completion {
             text: r#"{"detail":"because reasons","headline":"42"}"#.to_string(),
+            usage: None,
+            stop: StopReason::Complete,
+        })
+    }
+
+    /// A 200 response whose body doesn't match the physics-check schema --
+    /// the case #176 is about: a schema-invalid 200 must be treated as this
+    /// provider failing, not as the whole request failing.
+    fn unparseable_completion() -> anyhow::Result<Completion> {
+        Ok(Completion {
+            text: r#"{"not":"an answer"}"#.to_string(),
             usage: None,
             stop: StopReason::Complete,
         })
@@ -670,6 +711,110 @@ mod tests {
         assert_eq!(Effort::Low.as_str(), Some("low"));
         assert_eq!(Effort::Medium.as_str(), Some("medium"));
         assert_eq!(Effort::High.as_str(), Some("high"));
+    }
+
+    // -- Chain::complete_parsed (issue #176) -----------------------------
+
+    #[test]
+    fn complete_parsed_falls_through_when_first_providers_answer_fails_validation() {
+        // Provider 1 returns a 200 that doesn't parse as an Answer; the
+        // chain must move on to provider 2 rather than surfacing the parse
+        // failure as the whole request's outcome.
+        let a = MockProvider {
+            id: "a",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: unparseable_completion,
+        };
+        let b = MockProvider {
+            id: "b",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: ok_completion,
+        };
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        let answer = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap();
+        assert_eq!(answer.headline, "42");
+    }
+
+    #[test]
+    fn complete_parsed_surfaces_first_parse_error_when_all_fail_validation() {
+        let a = MockProvider {
+            id: "a",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: unparseable_completion,
+        };
+        let b = MockProvider {
+            id: "b",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: unparseable_completion,
+        };
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        let err = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid Answer"),
+            "expected the first provider's parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn complete_parsed_still_skips_unready_providers() {
+        struct NeverReady;
+        impl Provider for NeverReady {
+            fn id(&self) -> &'static str {
+                "never"
+            }
+            fn ready(&self) -> bool {
+                false
+            }
+            fn capabilities(&self, _model: &str) -> Caps {
+                Caps::default()
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+                unreachable!("should never be called when not ready")
+            }
+        }
+        let good = MockProvider {
+            id: "good",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: ok_completion,
+        };
+        let chain = Chain::new(vec![Box::new(NeverReady), Box::new(good)]);
+        let answer = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap();
+        assert_eq!(answer.headline, "42");
+    }
+
+    #[test]
+    fn complete_parsed_falls_through_on_transport_error_too() {
+        // A plain transport/HTTP failure must still fall through exactly as
+        // `complete` does -- complete_parsed generalizes complete, it
+        // doesn't change its existing behaviour.
+        let a = MockProvider {
+            id: "a",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: || Err(anyhow::anyhow!("a failed")),
+        };
+        let b = MockProvider {
+            id: "b",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: ok_completion,
+        };
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        let answer = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap();
+        assert_eq!(answer.headline, "42");
     }
 
     // -- physics_request / parse_answer ---------------------------------

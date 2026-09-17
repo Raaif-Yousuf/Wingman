@@ -310,10 +310,16 @@ impl App {
             return;
         }
 
-        // Capture runs here, on the main thread, and must happen before the
-        // pending card is shown — otherwise the card is in its own screenshot.
-        let shot = match capture::grab(&self.config.capture.monitor, self.config.capture.max_edge) {
-            Ok(s) => s,
+        // Capture (grab the pixels and downscale) runs here, on the main
+        // thread, and must happen before the pending card is shown --
+        // otherwise the card is in its own screenshot. Encoding those pixels
+        // to PNG does NOT happen here: issue #177 measured
+        // `CompressionType::Best` PNG encoding at up to ~1s in a release
+        // build on a 1402x876 image, which froze the message loop for that
+        // whole time with nothing on screen after the key press. `encode`
+        // now runs on the worker thread below, after `show_pending`.
+        let raw = match capture::grab_raw(&self.config.capture.monitor, self.config.capture.max_edge) {
+            Ok(r) => r,
             Err(e) => {
                 self.card
                     .show_error("Couldn't capture the screen", &format!("{e:#}"));
@@ -332,8 +338,11 @@ impl App {
         let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
-            let result: std::result::Result<Answer, String> =
-                worker(&chain, &shot, &prompt, want_difficulty).map_err(|e| format!("{e:#}"));
+            let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
+                let shot = capture::encode(&raw)?;
+                worker(&chain, &shot, &prompt, want_difficulty)
+            })()
+            .map_err(|e| format!("{e:#}"));
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -857,12 +866,14 @@ fn worker(chain: &Chain, shot: &Shot, prompt: &str, want_difficulty: bool) -> Re
     // #12: the trait moved from `Provider::ask(shot, prompt, want_difficulty)
     // -> Answer` to `Provider::complete(&Request) -> Completion`, so the
     // physics-check schema is now built here (via `physics_request`) instead
-    // of inside each provider, and the raw completion text is parsed back
-    // into an `Answer` here too (via `parse_answer`) instead of inside each
-    // provider's response parsing.
+    // of inside each provider.
+    //
+    // #176: `parse_answer` has to run *inside* the chain's fallback loop
+    // (via `complete_parsed`), not after `complete` returns, so a
+    // schema-invalid 200 from one provider falls through to the next ready
+    // provider instead of failing the whole request.
     let req = physics_request(shot, prompt, want_difficulty);
-    let completion = chain.complete(&req)?;
-    parse_answer(&completion.text)
+    chain.complete_parsed(&req, |c| parse_answer(&c.text))
 }
 
 /// FILETIME's epoch (1601-01-01 UTC) precedes the Unix epoch (1970-01-01
