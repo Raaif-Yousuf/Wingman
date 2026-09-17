@@ -411,31 +411,43 @@ fn mark_radio_checked(hmenu: HMENU, id: u32) {
     let _ = unsafe { SetMenuItemInfoW(hmenu, id, false, &info) };
 }
 
+/// Attach `submenu` to `parent` (see [`append_submenu`]). If the attach
+/// itself fails, `submenu` was never reachable from `parent`, so nothing
+/// else will ever free it -- destroy it here before propagating the error.
+fn attach_submenu_or_destroy(parent: HMENU, submenu: HMENU, text: &str) -> Result<()> {
+    if let Err(e) = append_submenu(parent, submenu, text) {
+        let _ = unsafe { DestroyMenu(submenu) };
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Build the "Provider" submenu: which service actually answers. This is the
 /// `providers.order` front-runner, distinct from the per-provider model
 /// submenus below -- picking Claude here does not change which ChatGPT model
 /// is configured, it changes who gets asked first.
+///
+/// Like [`append_model_submenu`], `sub` is attached to `parent` before it is
+/// populated (via [`attach_submenu_or_destroy`]), not after: once attached,
+/// a population failure is still cleaned up by the caller's eventual
+/// `DestroyMenu(parent)`, and a failed attach is cleaned up immediately by
+/// `attach_submenu_or_destroy` itself. Previously this populated first and
+/// attached last, so a failure in the final `append_submenu` call leaked
+/// `sub` -- see #147.
 fn append_provider_submenu(parent: HMENU, openai_active: bool) -> Result<()> {
     let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
-    let built = (|| -> Result<()> {
-        append_item(sub, cmd::USE_OPENAI, "ChatGPT")?;
-        append_item(sub, cmd::USE_ANTHROPIC, "Claude")?;
-        mark_radio_checked(
-            sub,
-            if openai_active {
-                cmd::USE_OPENAI
-            } else {
-                cmd::USE_ANTHROPIC
-            },
-        );
-        Ok(())
-    })();
-    if built.is_err() {
-        // Not yet attached to the parent, so nothing else will free it.
-        let _ = unsafe { DestroyMenu(sub) };
-        return built;
-    }
-    append_submenu(parent, sub, "Provider")
+    attach_submenu_or_destroy(parent, sub, "Provider")?;
+    append_item(sub, cmd::USE_OPENAI, "ChatGPT")?;
+    append_item(sub, cmd::USE_ANTHROPIC, "Claude")?;
+    mark_radio_checked(
+        sub,
+        if openai_active {
+            cmd::USE_OPENAI
+        } else {
+            cmd::USE_ANTHROPIC
+        },
+    );
+    Ok(())
 }
 
 /// Build one model submenu (`CreatePopupMenu`, populate, attach to
@@ -443,11 +455,13 @@ fn append_provider_submenu(parent: HMENU, openai_active: bool) -> Result<()> {
 /// single greyed-out "none configured" entry is shown instead of an empty
 /// submenu.
 ///
-/// The submenu is attached to `parent` (via [`append_submenu`]) before it is
-/// populated, not after, specifically so that if population fails partway
-/// through, the already-attached submenu is still reachable from `parent`
-/// and gets cleaned up by the caller's eventual `DestroyMenu(parent)` --
-/// avoiding a leaked, never-attached `HMENU` on the error path.
+/// The submenu is attached to `parent` (via [`attach_submenu_or_destroy`])
+/// before it is populated, not after, specifically so that if population
+/// fails partway through, the already-attached submenu is still reachable
+/// from `parent` and gets cleaned up by the caller's eventual
+/// `DestroyMenu(parent)` -- avoiding a leaked, never-attached `HMENU` on the
+/// error path. A failure in the attach itself is cleaned up immediately by
+/// `attach_submenu_or_destroy`.
 fn append_model_submenu(
     parent: HMENU,
     label: &str,
@@ -456,7 +470,7 @@ fn append_model_submenu(
     current: Option<usize>,
 ) -> Result<()> {
     let submenu = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
-    append_submenu(parent, submenu, label)?;
+    attach_submenu_or_destroy(parent, submenu, label)?;
 
     if models.is_empty() {
         let wide = to_wide("(none configured)");
@@ -538,6 +552,42 @@ fn load_icon(instance: HINSTANCE) -> HICON {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- submenu attach ordering (#147) -------------------------------------
+
+    #[test]
+    fn attach_submenu_or_destroy_frees_the_submenu_when_attach_fails() {
+        use windows::Win32::UI::WindowsAndMessaging::IsMenu;
+
+        let sub = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        // A null HMENU never identifies a menu, so AppendMenuW's attach call
+        // inside `append_submenu` fails deterministically here -- no need to
+        // exhaust real USER objects to hit the same error path.
+        let invalid_parent = HMENU(std::ptr::null_mut());
+
+        let result = attach_submenu_or_destroy(invalid_parent, sub, "Provider");
+
+        assert!(result.is_err(), "attaching to a null HMENU should fail");
+        assert!(
+            !unsafe { IsMenu(sub) }.as_bool(),
+            "attach_submenu_or_destroy leaked `sub`: it is still a valid menu \
+             handle after the attach it was meant to guard failed"
+        );
+    }
+
+    #[test]
+    fn attach_submenu_or_destroy_attaches_on_success() {
+        use windows::Win32::UI::WindowsAndMessaging::GetMenuItemCount;
+
+        let parent = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        let sub = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+
+        let result = attach_submenu_or_destroy(parent, sub, "Provider");
+
+        assert!(result.is_ok());
+        assert_eq!(unsafe { GetMenuItemCount(Some(parent)) }, 1);
+        let _ = unsafe { DestroyMenu(parent) }; // also frees `sub`, now a child
+    }
 
     // -- command ids -------------------------------------------------------
     // Companion to settings.rs's `control_ids_are_pairwise_unique` (#144):
