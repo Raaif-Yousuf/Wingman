@@ -15,11 +15,20 @@
   %APPDATA%\Wingman\config.toml or the pre-rename
   %APPDATA%\copilot-ask\config.toml, so API keys and settings survive.
 
-  Before doing anything else it removes a pre-rename `copilot-ask` install if
-  one is found (old package, old process, old install dir, old Run value),
-  the same way uninstall.ps1 -KeepCertificate would: the certificate store is
-  never touched here (issue #10). A pre-rename config.toml is left alone --
-  src/config.rs migrates it forward on first run of the new exe.
+  Runs in three phases so a failure never leaves the machine with neither app
+  (issue #165): (1) build, stage, sign and pack the new package -- no system
+  side effects, nothing here can leave the machine worse off; (2) stop the
+  old process and any running copy of the new one, register the new package,
+  write the new Run value, and verify the registration actually took; only
+  once that is verified (3) remove a pre-rename `copilot-ask` install if one
+  is found (old package, old process, old install dir, old Run value), the
+  same way uninstall.ps1 -KeepCertificate would: the certificate store is
+  never touched here (issue #10). If phase 2 fails, it is rolled back --
+  the new package/Run value it managed to add are undone, and the old
+  `copilot-ask.exe` is restarted if it was running -- and the script throws
+  before phase 3 ever runs, so the pre-rename install is left intact. A
+  pre-rename config.toml is left alone either way -- src/config.rs migrates
+  it forward on first run of the new exe.
 
   One UAC prompt, the first time only, to trust the self-signed certificate.
   Design: docs/superpowers/specs/2026-09-15-packaging-and-install-design.md
@@ -110,7 +119,11 @@ function Build-Logos($dest) {
     }
 }
 
-# --- certificate -------------------------------------------------------------
+# --- certificate ---------------------------------------------------------
+# Deliberately not $InstallDir\wingman.cer: phase 1 (this function's caller)
+# must not touch $InstallDir at all, so a failure here can never look like a
+# half-installed Wingman. The .cer file is only ever read back by
+# Import-Certificate a few lines below; nothing later depends on where it sits.
 function Get-SigningCert {
     $cert = Get-ChildItem Cert:\CurrentUser\My |
             Where-Object { $_.Subject -eq $Identity.Current.CertSubject -and $_.NotAfter -gt (Get-Date) } |
@@ -146,12 +159,15 @@ function Ensure-CertTrusted($cert, $cerPath) {
     if (-not $ok) { throw "Certificate did not land in LocalMachine\TrustedPeople." }
 }
 
-# --- pre-rename cleanup (issue #10: uninstall the old package first) --------
-# Never touches the certificate store -- that is what makes this equivalent to
-# uninstall.ps1 -KeepCertificate. The old and new certificate subjects differ
-# ("O=copilot-ask" vs "O=Wingman"), so the old certificate is simply unused
-# from here on, not removed; removing it is uninstall.ps1's job if the user
-# asks for it explicitly.
+# --- pre-rename cleanup (phase 3; issue #165 moved this from first to last) -
+# Only ever called after Invoke-PackageRegistrationPhase has returned
+# successfully, i.e. after the new package is registered, verified and (unless
+# -NoAutostart) autostarting -- so a failure anywhere before that point can
+# never reach this function at all. Never touches the certificate store --
+# that is what makes this equivalent to uninstall.ps1 -KeepCertificate. The
+# old and new certificate subjects differ ("O=copilot-ask" vs "O=Wingman"), so
+# the old certificate is simply unused from here on, not removed; removing it
+# is uninstall.ps1's job if the user asks for it explicitly.
 function Remove-LegacyInstall {
     [CmdletBinding(SupportsShouldProcess)]
     param()
@@ -197,14 +213,15 @@ function Remove-LegacyInstall {
 }
 
 # =============================================================================
+# Phase 1 -- build, stage, sign, pack. No system side effects: nothing here
+# touches a process, the registry, an installed package or $InstallDir, so a
+# failure anywhere in this phase leaves the machine exactly as it was found.
+# =============================================================================
 $sdk     = Find-SdkTools
 $version = ConvertTo-MsixVersion -CargoVersion (Get-CargoVersionString -CargoTomlPath (Join-Path $Repo 'Cargo.toml'))
 Note "version $version"
 Note "sdk     $(Split-Path $sdk.MakeAppx -Parent)"
 
-Remove-LegacyInstall
-
-# --- build -------------------------------------------------------------------
 $built = Join-Path $Repo "target\release\$($Identity.Current.ExeName)"
 if (-not $SkipBuild) {
     Step "Building (cargo build --release)"
@@ -213,36 +230,22 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $built)) { throw "No executable at $built. Run without -SkipBuild." }
 
-# --- stop a running copy -----------------------------------------------------
-# The file is locked while it runs, and a stale instance would keep the old
-# keyboard hook and tray icon alive next to the new one.
-$running = Get-Process -Name $Identity.Current.ProcessName -ErrorAction SilentlyContinue
-if ($running) {
-    Step "Stopping the running copy"
-    $running | Stop-Process -Force
-    $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
-}
-
-# --- place the executable ----------------------------------------------------
-Step "Installing to $InstallDir"
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Copy-Item $built (Join-Path $InstallDir $Identity.Current.ExeName) -Force
-
-# --- sign --------------------------------------------------------------------
-$cert    = Get-SigningCert
-$cerPath = Join-Path $InstallDir 'wingman.cer'
-Ensure-CertTrusted $cert $cerPath
+# --- sign the build output directly, not an $InstallDir copy -----------------
+# Keeps this phase free of $InstallDir entirely; phase 2 copies the already-
+# signed exe in once it has stopped whatever might be locking that path.
+$cert = Get-SigningCert
+if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+Ensure-CertTrusted $cert (Join-Path $StageDir 'wingman.cer')
 
 Step "Signing the executable"
 # A sparse package's external executable must carry the package's signature;
 # an unsigned one is rejected at deployment time.
-& $sdk.SignTool sign /fd SHA256 /sha1 $cert.Thumbprint /s My `
-    (Join-Path $InstallDir $Identity.Current.ExeName) | Out-Null
+& $sdk.SignTool sign /fd SHA256 /sha1 $cert.Thumbprint /s My $built | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "signing the executable failed" }
 
 # --- stage and pack ----------------------------------------------------------
 Step "Building the package"
-if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'layout\Assets') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'layout\Public')  | Out-Null
 
@@ -262,27 +265,28 @@ if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
 & $sdk.SignTool sign /fd SHA256 /sha1 $cert.Thumbprint /s My $msix | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "signing the package failed" }
 
-# --- deploy ------------------------------------------------------------------
+# =============================================================================
+# Phase 2 -- stop the old and current processes, register the new package,
+# write the new Run value, verify the registration. The only phase with
+# system side effects that can fail partway through; Invoke-PackageRegistration-
+# Phase rolls itself back and throws rather than leaving a half-upgrade, so a
+# failure here never reaches phase 3.
+# =============================================================================
 Step "Registering the package with Windows"
 # -ExternalLocation is what makes this sparse: the executable stays at the real
 # path above rather than being copied into WindowsApps, which keeps the
 # autostart entry valid across upgrades and stops %APPDATA% being virtualized.
-Add-AppxPackage -Path $msix -ExternalLocation $InstallDir -ForceUpdateFromAnyVersion
+$registration = Invoke-PackageRegistrationPhase -Identity $Identity -BuiltExePath $built `
+    -InstallDir $InstallDir -LegacyDir $LegacyDir -MsixPath $msix -RunKeyPath $RunKey `
+    -NoAutostart:$NoAutostart
+$pkg = $registration.Package
 
-# --- autostart ---------------------------------------------------------------
-# Written directly rather than through the app's own Settings checkbox so a
-# fresh install is already enabled. Must match the format src/autostart.rs
-# writes -- a quoted absolute path -- or repair_if_stale rewrites it on launch.
-if (-not $NoAutostart) {
-    Step "Enabling start with Windows"
-    # Never New-Item -Force this key: on an existing registry key that recreates
-    # it, silently deleting every other startup entry the user has.
-    if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey | Out-Null }
-    Set-ItemProperty -Path $RunKey -Name $Identity.Current.RunValue -Value "`"$InstallDir\$($Identity.Current.ExeName)`""
-}
+# =============================================================================
+# Phase 3 -- only once phase 2 is verified: remove the pre-rename install.
+# =============================================================================
+Remove-LegacyInstall
 
 # --- report ------------------------------------------------------------------
-$pkg = Get-AppxPackage -Name $Identity.Current.PackageName
 Write-Host ""
 Step "Installed"
 Note "package   $($pkg.PackageFullName)"
