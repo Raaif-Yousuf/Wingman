@@ -1,0 +1,72 @@
+[hotkeys.primary]
+vk = 134
+ctrl = false
+shift = true
+alt = false
+win = true
+
+[hotkeys.secondary]
+vk = 191
+ctrl = true
+shift = true
+alt = false
+win = false
+
+[capture]
+max_edge = 1568
+monitor = "active"
+
+[providers]
+order = [
+    "openai",
+    "anthropic",
+]
+
+[providers.openai]
+model = "gpt-5.5"
+effort = "low"
+api_key = ""
+models = [
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.2",
+    "gpt-5.1",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-4.1",
+]
+
+[providers.anthropic]
+model = "claude-opus-5"
+effort = "low"
+api_key = ""
+models = [
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-haiku-4-5",
+    "claude-fable-5-1",
+]
+
+[ui]
+card_seconds = 12
+text_scale = 1.0
+show_difficulty = true
+prompt = """
+You are shown a screenshot of the user's screen. They are working through a physics or statistics problem and want a second opinion before committing an answer. Usually the problem statement is on screen (often an online assignment) while the user has done the working on paper, so their derivation is generally NOT visible to you. Sometimes a value they are about to submit is already typed into an input field, and sometimes their working is on screen too.
+
+Work the problem out yourself from what is visible, then:
+- If a candidate answer is visible (typed into a field, or written in on-screen working), compare it against your own result. Say plainly whether it matches. If it does not, give the correct value and name the specific mistake you can infer (e.g. "that is cos 30, not sin 30" or "you used the population variance formula, not the sample one").
+- If only the problem is visible, just give your answer.
+- If something essential is unreadable or missing from the screenshot, say exactly what you need instead of guessing at it.
+
+Carry units through and give the final value to a sensible number of significant figures.
+
+Respond with exactly two fields, and write them in this order:
+- detail: FIRST. At most 700 characters, plain text. Show the worked solution step by step, so the user can check it against their own. Write this out in full before you write the headline, so that the headline states the conclusion this working actually reaches.
+- headline: SECOND, and it must be the conclusion of the working you just wrote. At most 90 characters, plain text. Lead with the final value, or with the correction if a visible answer is wrong. Never state a verdict in the headline that your own detail contradicts; if the working changed your mind, the headline follows the working.
+
+Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline."""
