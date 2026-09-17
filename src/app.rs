@@ -498,8 +498,8 @@ impl App {
     /// proposal `calendar_event`, executor `calendar_add`, `confirm =
     /// true`) instead of a fixed request shape. Mirrors `ask()`'s pause/
     /// busy/readiness/capture steps (duplicated, not extracted into a
-    /// shared helper, precisely so `ask()`'s own code is untouched -- a
-    /// de-duplication follow-up is filed separately).
+    /// shared helper, precisely so `ask()`'s own code is untouched -- see
+    /// #214, filed for the de-duplication follow-up).
     fn add_event_from_screen(&mut self) {
         if self.busy {
             return;
@@ -1909,7 +1909,9 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // second PENDING_RESULT-shaped thread-local per message type).
         // WM_APP_CALENDAR_RESULT still carries a boxed payload, freed
         // explicitly in the Ignore arm below (mirroring WM_APP_LEARNED) so
-        // it never leaks; WM_APP_PREVIEW_DECIDED carries none.
+        // it never leaks; WM_APP_PREVIEW_DECIDED carries none. Filed as
+        // #213 for the same Defer*-shaped fix #152 already built for
+        // WM_APP_RESULT.
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
