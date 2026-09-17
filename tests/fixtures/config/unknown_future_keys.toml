@@ -1,0 +1,65 @@
+# Golden fixture for issue #135. A config.toml from a build newer than this
+# one: today's full shape (mode, gemini, ollama all present) plus keys no
+# version of this code has ever defined, scattered at the top level and
+# inside every section. `#[serde(default)]` with no `deny_unknown_fields`
+# anywhere in config.rs means these must be silently ignored rather than
+# failing the parse -- an upgrade must never see a downgrade-then-upgrade
+# (or a config shared from a newer build) blow away every setting because of
+# one field it does not recognize yet.
+
+future_top_level_field = "some-value-from-the-future"
+mode = "cloud"
+
+[hotkeys.primary]
+vk = 27
+ctrl = true
+shift = true
+alt = true
+win = false
+future_hotkey_field = "ignored"
+
+[hotkeys.secondary]
+vk = 9
+ctrl = false
+shift = false
+alt = false
+win = true
+
+[capture]
+max_edge = 3000
+monitor = "primary"
+
+[providers]
+order = ["anthropic", "ollama", "openai"]
+future_provider_field = "grok"
+
+[providers.openai]
+model = "gpt-5.5-pro"
+effort = "high"
+api_key = ""
+models = ["gpt-5.5-pro", "gpt-5.5"]
+
+[providers.anthropic]
+model = "claude-opus-5"
+effort = "high"
+api_key = ""
+models = ["claude-opus-5"]
+
+[providers.gemini]
+model = "gemini-3.8-flash"
+effort = "low"
+api_key = ""
+models = ["gemini-3.8-flash"]
+
+[providers.ollama]
+base_url = "http://127.0.0.1:11434"
+model = "gemma3:4b"
+effort = "low"
+some_future_ollama_setting = true
+
+[ui]
+card_seconds = 99
+text_scale = 2.0
+show_difficulty = true
+prompt = "Future config custom prompt."
+future_ui_field = "unused"

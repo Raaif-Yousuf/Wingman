@@ -35,8 +35,52 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Ensure the pinned toolchain (rust-toolchain.toml) is installed
+        run: rustup show
+
+      - name: Compute SOURCE_DATE_EPOCH from the release commit
+        id: epoch
+        shell: pwsh
+        run: |
+          $epoch = (git log -1 --format=%ct $env:GITHUB_SHA)
+          "epoch=$epoch" >> $env:GITHUB_OUTPUT
+
+      # Reproducible-build flags (issue #137; see docs/reproducible-builds.md
+      # for the full measurement). --locked refuses to silently repin
+      # Cargo.lock. SOURCE_DATE_EPOCH + CARGO_INCREMENTAL=0 make rustc's own
+      # output deterministic; RUSTFLAGS must restate the /Brepro linker flag
+      # that .cargo/config.toml sets by default, because a RUSTFLAGS env var
+      # replaces (does not merge with) that config file's rustflags. The
+      # --remap-path-prefix target is a fixed placeholder, not the runner's
+      # actual checkout path, so the string embedded in the binary does not
+      # vary between runners or between a CI build and a local reproduction.
       - name: cargo build --release
-        run: cargo build --release
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
+          CARGO_INCREMENTAL: 0
+          RUSTFLAGS: -C link-arg=/Brepro --remap-path-prefix=${{ github.workspace }}=C:\wingman-src
+        run: cargo build --release --locked
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      # cargo-cyclonedx is Apache-2.0 (permissive, CLAUDE.md rule 2; checked
+      # at https://crates.io/crates/cargo-cyclonedx before adding this step).
+      # It is a build-time tool installed into the runner, never added as a
+      # dependency of the shipped binary, so it needs no THIRD_PARTY_NOTICES.md
+      # or deny.toml entry.
+      - name: Generate CycloneDX SBOM
+        id: sbom
+        shell: pwsh
+        run: |
+          cargo cyclonedx --format json --override-filename wingman
+          # Match by prefix rather than a hardcoded exact name: the tool's
+          # exact suffix (wingman.json vs wingman.cdx.json) has moved
+          # between releases upstream, and glob-then-verify-exactly-one is
+          # more robust to that than guessing.
+          $sbom = Get-ChildItem -Path . -Filter 'wingman*.json' -File
+          if ($sbom.Count -ne 1) { throw "expected exactly one wingman*.json from cargo cyclonedx, found $($sbom.Count)" }
+          "sbom_path=$($sbom[0].FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Decode signing certificate, if configured
         id: cert
@@ -84,6 +128,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item '${{ steps.msix.outputs.exe_path }}' dist\wingman.exe -Force
           Copy-Item '${{ steps.msix.outputs.msix_path }}' dist\wingman.msix -Force
+          Copy-Item '${{ steps.sbom.outputs.sbom_path }}' dist\wingman.cdx.json -Force
           $hashes = Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$h  $($_.Name)"
@@ -111,9 +156,9 @@ jobs:
           Set-Content -Path $notesPath -Value $notes -Encoding utf8
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag dist\wingman.exe dist\wingman.msix dist\SHA256SUMS --clobber
+            gh release upload $tag dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS --clobber
             gh release edit $tag --notes-file $notesPath
           } else {
-            gh release create $tag dist\wingman.exe dist\wingman.msix dist\SHA256SUMS `
+            gh release create $tag dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS `
               --title $tag --notes-file $notesPath --target $env:GITHUB_SHA
           }
