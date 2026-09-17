@@ -1,5 +1,10 @@
+mod common;
 pub mod anthropic;
 pub mod openai;
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use serde_json::Value;
 
 pub use anthropic::Anthropic;
 pub use openai::OpenAi;
@@ -140,9 +145,139 @@ pub struct Shot {
     pub height: u32,
 }
 
+/// Raw PNG bytes for one image in a [`Request`].
+pub type Png = Vec<u8>;
+
+/// How hard a provider should think about a [`Request`]. `Unset` means "use
+/// whatever this provider is configured with" -- both Phase 0 providers keep
+/// their own configured default (`ProviderConfig::effort` in `config.rs`,
+/// parsed by [`Effort::parse`]) and only honour an explicit override here.
+/// Phase 2 actions that want to spend more or less on a particular request
+/// than the user's global default will set this directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Effort {
+    #[default]
+    Unset,
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    /// Parses a config string. Anything unrecognised -- including empty or
+    /// whitespace-only, a plausible hand-edit of config.toml -- is `Unset`,
+    /// matching the pre-existing "empty effort is never sent" behaviour of
+    /// both providers (#154).
+    pub fn parse(s: &str) -> Effort {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Effort::Low,
+            "medium" => Effort::Medium,
+            "high" => Effort::High,
+            _ => Effort::Unset,
+        }
+    }
+
+    /// The wire string, or `None` for `Unset` (meaning: omit the field
+    /// entirely, never send an empty string -- see #154).
+    pub fn as_str(&self) -> Option<&'static str> {
+        match self {
+            Effort::Unset => None,
+            Effort::Low => Some("low"),
+            Effort::Medium => Some("medium"),
+            Effort::High => Some("high"),
+        }
+    }
+}
+
+/// What a provider (for a given model) can do. Read by the intent router and
+/// action picker in Phase 2 to route around a provider that can't serve a
+/// given action -- e.g. a text-only local model still runs a screen action
+/// by falling back to OCR text plus the UIA tree instead of the screenshot
+/// (see the 2026-09-16 expansion plan, "Provider trait, extended").
+///
+/// Nothing in Phase 1 reads `capabilities()` yet -- there is no router or
+/// action picker to consult it -- so it and this type are unused outside
+/// tests until Phase 2 lands (`#[allow(dead_code)]`, same as `Shot`'s
+/// `width`/`height` below and `Chain::provider_names`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Caps {
+    pub vision: bool,
+    pub json_schema: bool,
+    pub thinking: bool,
+}
+
+/// Token accounting, when a provider's response reports it. Feeds
+/// `usage.rs` (Phase 2, not built yet); `None` for a provider or response
+/// that doesn't carry it, never a guessed value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+/// Why the provider stopped. A refusal, or an empty completion caused by
+/// running out of budget, is surfaced as `Err` before a `Completion` ever
+/// exists (see each provider's response parsing), so in practice this only
+/// distinguishes a clean finish from "hit the token budget but still said
+/// something".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    Complete,
+    MaxTokens,
+    Other,
+}
+
+/// A single-turn request. There is no multi-turn: Wingman is "no chat"
+/// (CLAUDE.md, owner decision 2026-09-16) — every `Request` is the whole
+/// conversation, always exactly one user turn, and a `Provider` never sees
+/// history.
+#[derive(Debug, Clone)]
+pub struct Request {
+    /// The system/instructions text.
+    pub system: String,
+    /// The one user turn.
+    pub user: String,
+    /// Zero or more images alongside `user`. A provider without vision for
+    /// the requested model should still attempt a text-only completion
+    /// rather than error outright -- the caller is expected to have already
+    /// substituted OCR text or the UIA tree into `user` when that matters
+    /// (Phase 2; today `images` is always exactly the one screenshot).
+    pub images: Vec<Png>,
+    /// The JSON Schema the completion text must satisfy, or `None` for a
+    /// plain-text answer. Never hard-coded inside a provider -- see
+    /// [`physics_request`] for the one schema Wingman uses today, and the
+    /// 2026-09-16 expansion plan's "Provider trait, extended" for why this
+    /// has to be a `Request` field rather than provider-side knowledge.
+    pub schema: Option<Value>,
+    /// `Unset` defers to the provider's own configured default effort.
+    pub effort: Effort,
+    /// `0` defers to the provider's own default token budget.
+    pub max_tokens: u32,
+}
+
+/// What a provider returns for one [`Request`]. `text` satisfies
+/// `Request::schema` when one was given, and is the plain answer otherwise.
+/// A provider never attempts to interpret `text` itself -- see
+/// [`parse_answer`] for the one place that happens today.
+///
+/// `usage`/`stop` are populated by both providers already (see each
+/// `parse_completion`) but nothing reads them back yet -- `usage.rs` and the
+/// action-preview "hit the token budget" card are Phase 2.
+#[derive(Debug, Clone)]
+pub struct Completion {
+    pub text: String,
+    #[allow(dead_code)]
+    pub usage: Option<Usage>,
+    #[allow(dead_code)]
+    pub stop: StopReason,
+}
+
 pub trait Provider: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn ask(&self, shot: &Shot, prompt: &str, want_difficulty: bool) -> anyhow::Result<Answer>;
+    /// Short, stable identifier ("openai", "anthropic", ...): used in
+    /// config (`providers.order`), the tray tooltip and diagnostics. Not
+    /// user-facing copy.
+    fn id(&self) -> &'static str;
 
     /// Whether this provider is usable, e.g. has a non-empty API key.
     ///
@@ -152,6 +287,20 @@ pub trait Provider: Send + Sync {
     fn ready(&self) -> bool {
         true
     }
+
+    /// What this provider can do for `model`. Vision, structured JSON
+    /// output and extended thinking/effort support all vary per model, not
+    /// just per provider. Unused outside tests until Phase 2's router and
+    /// action picker exist to consult it.
+    #[allow(dead_code)]
+    fn capabilities(&self, model: &str) -> Caps;
+
+    /// Runs one single-turn request and returns the whole result. No
+    /// streaming (owner decision, 2026-09-16, "No chat": every response is
+    /// a whole structured result or a short card, so the full response is
+    /// needed before anything can be shown, and streaming would only add a
+    /// thread-crossing path and a class of partial-state bugs).
+    fn complete(&self, req: &Request) -> anyhow::Result<Completion>;
 }
 
 /// Runs a list of providers in order, falling through to the next on any
@@ -168,15 +317,17 @@ impl Chain {
         Self { providers }
     }
 
-    pub fn ask(&self, shot: &Shot, prompt: &str, want_difficulty: bool) -> anyhow::Result<Answer> {
+    /// Tries each ready provider in order, returning the first success. See
+    /// the type-level doc for the exact fallback semantics.
+    pub fn complete(&self, req: &Request) -> anyhow::Result<Completion> {
         let mut first_err: Option<anyhow::Error> = None;
 
         for provider in &self.providers {
             if !provider.ready() {
                 continue;
             }
-            match provider.ask(shot, prompt, want_difficulty) {
-                Ok(answer) => return Ok(answer),
+            match provider.complete(req) {
+                Ok(completion) => return Ok(completion),
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -188,25 +339,71 @@ impl Chain {
         Err(first_err.unwrap_or_else(|| anyhow::anyhow!("no providers configured")))
     }
 
-    /// Names of every provider in the chain, in order, regardless of
+    /// Ids of every provider in the chain, in order, regardless of
     /// readiness. Mainly useful for introspection/testing and for surfacing
     /// the active provider in UI (e.g. a tray tooltip).
-    /// Every configured provider, ready or not. `ready_provider_names` is
-    /// what the tooltip uses; this one exists for diagnostics.
+    /// `ready_provider_names` is what the tooltip uses; this one exists for
+    /// diagnostics.
     #[allow(dead_code)]
     pub fn provider_names(&self) -> Vec<&'static str> {
-        self.providers.iter().map(|p| p.name()).collect()
+        self.providers.iter().map(|p| p.id()).collect()
     }
 
-    /// Names of only the providers that are currently `ready()` (e.g. have a
+    /// Ids of only the providers that are currently `ready()` (e.g. have a
     /// non-empty API key), in order.
     pub fn ready_provider_names(&self) -> Vec<&'static str> {
         self.providers
             .iter()
             .filter(|p| p.ready())
-            .map(|p| p.name())
+            .map(|p| p.id())
             .collect()
     }
+}
+
+/// Builds the `Request` for the one action Wingman has today: checking a
+/// physics/statistics screenshot. The structured-answer schema (`detail`,
+/// `headline`, optionally `difficulty`) is built here, not inside a
+/// provider, and handed over as `Request::schema` -- see the 2026-09-16
+/// expansion plan's "Provider trait, extended". This is what keeps the door
+/// open for Phase 2 actions, each with its own proposal schema, to reuse
+/// `Anthropic`/`OpenAi`/future providers without another trait change.
+pub fn physics_request(shot: &Shot, prompt: &str, want_difficulty: bool) -> Request {
+    Request {
+        system: common::augmented_system_prompt(prompt, want_difficulty),
+        user: "Check my working.".to_string(),
+        images: vec![shot.png.clone()],
+        schema: Some(common::answer_schema(want_difficulty)),
+        effort: Effort::Unset,
+        max_tokens: 0,
+    }
+}
+
+/// The wire shape of the model's JSON payload for the physics-check answer.
+/// Kept separate from the public `Answer` because `difficulty` arrives as a
+/// bare string ("7", "U", ...) that is not a `Difficulty`'s natural
+/// `Deserialize` form -- it is parsed explicitly below, and a bad/missing
+/// value must degrade to `None` rather than fail the whole parse.
+#[derive(Deserialize)]
+struct RawAnswer {
+    detail: String,
+    headline: String,
+    #[serde(default)]
+    difficulty: Option<String>,
+}
+
+/// Parses a `Completion::text` produced from a [`physics_request`] (i.e.
+/// matching `common::answer_schema`) into an `Answer`. This is the one place
+/// the physics-check schema is interpreted -- providers only ever hand back
+/// raw text.
+pub fn parse_answer(text: &str) -> Result<Answer> {
+    let raw: RawAnswer = serde_json::from_str(text).context("provider: completion text is not a valid Answer")?;
+    Ok(Answer {
+        detail: raw.detail,
+        headline: raw.headline,
+        // A missing or unparseable difficulty must yield `None`, never an
+        // error -- the answer itself is what matters.
+        difficulty: raw.difficulty.as_deref().and_then(Difficulty::parse),
+    })
 }
 
 #[cfg(test)]
@@ -215,32 +412,36 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct MockProvider {
-        name: &'static str,
+        id: &'static str,
         ready: bool,
         calls: AtomicU32,
-        result: fn() -> anyhow::Result<Answer>,
+        result: fn() -> anyhow::Result<Completion>,
     }
 
     impl Provider for MockProvider {
-        fn name(&self) -> &'static str {
-            self.name
+        fn id(&self) -> &'static str {
+            self.id
         }
 
         fn ready(&self) -> bool {
             self.ready
         }
 
-        fn ask(&self, _shot: &Shot, _prompt: &str, _want_difficulty: bool) -> anyhow::Result<Answer> {
+        fn capabilities(&self, _model: &str) -> Caps {
+            Caps::default()
+        }
+
+        fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             (self.result)()
         }
     }
 
-    fn ok_answer() -> anyhow::Result<Answer> {
-        Ok(Answer {
-            detail: "because reasons".into(),
-            headline: "42".into(),
-            difficulty: None,
+    fn ok_completion() -> anyhow::Result<Completion> {
+        Ok(Completion {
+            text: r#"{"detail":"because reasons","headline":"42"}"#.to_string(),
+            usage: None,
+            stop: StopReason::Complete,
         })
     }
 
@@ -252,23 +453,28 @@ mod tests {
         }
     }
 
+    fn req() -> Request {
+        physics_request(&shot(), "prompt", false)
+    }
+
     #[test]
     fn tries_providers_in_order_and_returns_first_success() {
         let calls_a = AtomicU32::new(0);
         let a = MockProvider {
-            name: "a",
+            id: "a",
             ready: true,
             calls: calls_a,
             result: || Err(anyhow::anyhow!("a failed")),
         };
         let b = MockProvider {
-            name: "b",
+            id: "b",
             ready: true,
             calls: AtomicU32::new(0),
-            result: ok_answer,
+            result: ok_completion,
         };
         let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
-        let answer = chain.ask(&shot(), "prompt", false).unwrap();
+        let completion = chain.complete(&req()).unwrap();
+        let answer = parse_answer(&completion.text).unwrap();
         assert_eq!(answer.headline, "42");
     }
 
@@ -276,25 +482,29 @@ mod tests {
     fn skips_provider_with_empty_key_without_failing() {
         struct PanicsIfCalled;
         impl Provider for PanicsIfCalled {
-            fn name(&self) -> &'static str {
+            fn id(&self) -> &'static str {
                 "skip-me"
             }
             fn ready(&self) -> bool {
                 false
             }
-            fn ask(&self, _shot: &Shot, _prompt: &str, _want_difficulty: bool) -> anyhow::Result<Answer> {
+            fn capabilities(&self, _model: &str) -> Caps {
+                Caps::default()
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
                 panic!("unready provider must not be asked");
             }
         }
 
         let good = MockProvider {
-            name: "good",
+            id: "good",
             ready: true,
             calls: AtomicU32::new(0),
-            result: ok_answer,
+            result: ok_completion,
         };
         let chain = Chain::new(vec![Box::new(PanicsIfCalled), Box::new(good)]);
-        let answer = chain.ask(&shot(), "prompt", false).unwrap();
+        let completion = chain.complete(&req()).unwrap();
+        let answer = parse_answer(&completion.text).unwrap();
         assert_eq!(answer.headline, "42");
     }
 
@@ -302,38 +512,41 @@ mod tests {
     fn all_unready_surfaces_no_providers_configured() {
         struct NeverReady;
         impl Provider for NeverReady {
-            fn name(&self) -> &'static str {
+            fn id(&self) -> &'static str {
                 "never"
             }
             fn ready(&self) -> bool {
                 false
             }
-            fn ask(&self, _shot: &Shot, _prompt: &str, _want_difficulty: bool) -> anyhow::Result<Answer> {
+            fn capabilities(&self, _model: &str) -> Caps {
+                Caps::default()
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
                 unreachable!("should never be called when not ready")
             }
         }
 
         let chain = Chain::new(vec![Box::new(NeverReady), Box::new(NeverReady)]);
-        let err = chain.ask(&shot(), "prompt", false).unwrap_err();
+        let err = chain.complete(&req()).unwrap_err();
         assert_eq!(err.to_string(), "no providers configured");
     }
 
     #[test]
     fn surfaces_first_error_when_all_fail() {
         let a = MockProvider {
-            name: "a",
+            id: "a",
             ready: true,
             calls: AtomicU32::new(0),
             result: || Err(anyhow::anyhow!("first error")),
         };
         let b = MockProvider {
-            name: "b",
+            id: "b",
             ready: true,
             calls: AtomicU32::new(0),
             result: || Err(anyhow::anyhow!("second error")),
         };
         let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
-        let err = chain.ask(&shot(), "prompt", false).unwrap_err();
+        let err = chain.complete(&req()).unwrap_err();
         assert_eq!(err.to_string(), "first error");
     }
 
@@ -341,24 +554,27 @@ mod tests {
     fn skip_does_not_become_first_error() {
         struct NeverReady;
         impl Provider for NeverReady {
-            fn name(&self) -> &'static str {
+            fn id(&self) -> &'static str {
                 "never"
             }
             fn ready(&self) -> bool {
                 false
             }
-            fn ask(&self, _shot: &Shot, _prompt: &str, _want_difficulty: bool) -> anyhow::Result<Answer> {
+            fn capabilities(&self, _model: &str) -> Caps {
+                Caps::default()
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
                 unreachable!("should never be called when not ready")
             }
         }
         let a = MockProvider {
-            name: "a",
+            id: "a",
             ready: true,
             calls: AtomicU32::new(0),
             result: || Err(anyhow::anyhow!("real error")),
         };
         let chain = Chain::new(vec![Box::new(NeverReady), Box::new(a)]);
-        let err = chain.ask(&shot(), "prompt", false).unwrap_err();
+        let err = chain.complete(&req()).unwrap_err();
         assert_eq!(err.to_string(), "real error");
     }
 
@@ -423,4 +639,83 @@ mod tests {
         assert_eq!(Difficulty::parse("U"), Some(Difficulty::Ultra));
     }
 
+    // -- Effort --------------------------------------------------------
+
+    #[test]
+    fn effort_parses_known_values_case_insensitively() {
+        for (s, expected) in [
+            ("low", Effort::Low),
+            ("LOW", Effort::Low),
+            (" Low ", Effort::Low),
+            ("medium", Effort::Medium),
+            ("high", Effort::High),
+        ] {
+            assert_eq!(Effort::parse(s), expected, "failed for {s:?}");
+        }
+    }
+
+    #[test]
+    fn effort_parse_degrades_unknown_and_empty_to_unset() {
+        for s in ["", "   ", "extreme", "none"] {
+            assert_eq!(Effort::parse(s), Effort::Unset, "failed for {s:?}");
+        }
+    }
+
+    #[test]
+    fn effort_as_str_omits_unset() {
+        assert_eq!(Effort::Unset.as_str(), None);
+        assert_eq!(Effort::Low.as_str(), Some("low"));
+        assert_eq!(Effort::Medium.as_str(), Some("medium"));
+        assert_eq!(Effort::High.as_str(), Some("high"));
+    }
+
+    // -- physics_request / parse_answer ---------------------------------
+
+    #[test]
+    fn physics_request_carries_the_screenshot_and_prompt_unmodified_without_difficulty() {
+        let s = shot();
+        let req = physics_request(&s, "system prompt text", false);
+        assert_eq!(req.system, "system prompt text");
+        assert_eq!(req.user, "Check my working.");
+        assert_eq!(req.images, vec![s.png]);
+        assert_eq!(req.effort, Effort::Unset);
+        assert_eq!(req.max_tokens, 0);
+        let schema = req.schema.expect("schema is always present for the physics check");
+        assert!(schema["properties"].get("difficulty").is_none());
+    }
+
+    #[test]
+    fn physics_request_appends_the_rubric_and_difficulty_property_when_requested() {
+        let req = physics_request(&shot(), "system prompt text", true);
+        assert!(req.system.starts_with("system prompt text"));
+        assert!(req.system.contains("difficulty"));
+        let schema = req.schema.unwrap();
+        assert_eq!(schema["required"], serde_json::json!(["detail", "headline", "difficulty"]));
+    }
+
+    #[test]
+    fn parse_answer_extracts_detail_headline_and_difficulty() {
+        let answer = parse_answer(r#"{"detail":"d","headline":"h","difficulty":"7"}"#).unwrap();
+        assert_eq!(answer.detail, "d");
+        assert_eq!(answer.headline, "h");
+        assert_eq!(answer.difficulty, Some(Difficulty::Level(7)));
+    }
+
+    #[test]
+    fn parse_answer_degrades_unparseable_difficulty_to_none() {
+        let answer = parse_answer(r#"{"detail":"d","headline":"h","difficulty":"way too hard"}"#).unwrap();
+        assert_eq!(answer.difficulty, None);
+    }
+
+    #[test]
+    fn parse_answer_missing_difficulty_key_is_none() {
+        let answer = parse_answer(r#"{"detail":"d","headline":"h"}"#).unwrap();
+        assert_eq!(answer.difficulty, None);
+    }
+
+    #[test]
+    fn parse_answer_rejects_invalid_json() {
+        let err = parse_answer("not json").unwrap_err();
+        assert!(err.to_string().contains("not a valid Answer"));
+    }
 }
