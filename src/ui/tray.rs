@@ -59,6 +59,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Posted by the shell to this app's window proc on tray icon activity.
+/// Adding another `WM_APP_*` constant anywhere in the crate also means
+/// adding it to `app.rs`'s `tests::ALL_WM_APP_IDS` (issue #163), which is
+/// enforced by `wm_app_ids_registry_is_exhaustive`.
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
 
 /// Registers the shell's `TaskbarCreated` message and returns its (runtime,
