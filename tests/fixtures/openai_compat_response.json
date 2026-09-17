@@ -1,0 +1,20 @@
+{
+  "id": "chatcmpl-test-fixture",
+  "object": "chat.completion",
+  "model": "some-model",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "{\"detail\": \"v = u + at = 0 + 4*3 = 12\", \"headline\": \"12 is correct\"}"
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 120,
+    "completion_tokens": 40,
+    "total_tokens": 160
+  }
+}

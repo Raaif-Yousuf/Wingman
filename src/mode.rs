@@ -139,11 +139,27 @@ pub(crate) static MODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new((
 
 /// Whether `name` identifies a "local" provider for mode-selection
 /// purposes: one that only ever talks to a loopback endpoint. Today that
-/// is exactly Ollama; a future loopback `openai_compat` entry (the
-/// expansion plan's Providers table: "Local: Ollama and any loopback
-/// endpoint") would extend this, not replace it.
+/// is exactly Ollama -- an `openai_compat` entry is NOT decided by name
+/// (see [`is_local_provider`], which every real caller uses instead): a
+/// compat endpoint's locality depends on where its `base_url` actually
+/// points, which this name-only function has no way to know.
 pub fn is_local_provider_name(name: &str) -> bool {
     name == "ollama"
+}
+
+/// The real local/cloud decision [`select_providers`] uses. `name` is a
+/// `providers.order` entry (`"ollama"`, `"openai"`, or `"compat:<name>"`).
+/// `local_compat_names` is the caller's precomputed set of `"compat:<name>"`
+/// order-entry strings whose *configured `base_url`* classifies as
+/// [`HostClass::Loopback`] via [`classify_host`] -- see
+/// `Providers::build_chain_for_mode` in `config.rs`, the only production
+/// caller, for how that set is built. Deciding by the configured host
+/// rather than by the name itself is deliberate: an OpenAI-compatible
+/// endpoint can point at OpenRouter (cloud) or at LM Studio on
+/// `127.0.0.1` (local) under the exact same provider kind, so only the
+/// `base_url` -- never the name -- can tell them apart.
+pub fn is_local_provider(name: &str, local_compat_names: &[String]) -> bool {
+    is_local_provider_name(name) || local_compat_names.iter().any(|n| n == name)
 }
 
 /// Filters and reorders `configured` (normally `Config.providers.order`,
@@ -157,6 +173,11 @@ pub fn is_local_provider_name(name: &str) -> bool {
 /// on the bool it is handed, which is what keeps it a pure, table-testable
 /// function.
 ///
+/// `local_compat_names` is passed straight through to [`is_local_provider`]
+/// -- see that function's doc for what it holds and why a compat entry's
+/// locality can't be decided from `configured` alone. Pass `&[]` when there
+/// are no compat providers configured (or none of them are local).
+///
 /// - `Cloud`: every non-local configured provider, in order.
 /// - `Local` / `Offline`: every local configured provider, in order.
 ///   (`Offline`'s additional non-loopback-host refusal is enforced
@@ -166,15 +187,20 @@ pub fn is_local_provider_name(name: &str) -> bool {
 ///   attempted at all, not even as a later fallback (matching the plan's
 ///   "local first if Ollama is up ... then Cloud", not "cloud, then try
 ///   local too").
-pub fn select_providers(mode: Mode, configured: &[String], ollama_ready: bool) -> Vec<String> {
+pub fn select_providers(
+    mode: Mode,
+    configured: &[String],
+    ollama_ready: bool,
+    local_compat_names: &[String],
+) -> Vec<String> {
     let local: Vec<String> = configured
         .iter()
-        .filter(|n| is_local_provider_name(n))
+        .filter(|n| is_local_provider(n, local_compat_names))
         .cloned()
         .collect();
     let cloud: Vec<String> = configured
         .iter()
-        .filter(|n| !is_local_provider_name(n))
+        .filter(|n| !is_local_provider(n, local_compat_names))
         .cloned()
         .collect();
 
@@ -294,7 +320,9 @@ fn extract_host(url: &str) -> Option<String> {
         Some(i) => &url[i + 3..],
         None => url,
     };
-    let end = after_scheme.find(['/', '?', '#']).unwrap_or(after_scheme.len());
+    let end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
     let authority = &after_scheme[..end];
     if authority.is_empty() {
         return None;
@@ -419,8 +447,9 @@ pub(crate) fn ollama_ready_from_tags_response<E>(result: Result<String, E>, mode
 /// latency guarantee this preserves.
 pub fn probe_ollama_ready(base_url: &str, model: &str) -> bool {
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
-    let result = crate::provider::common::get_text_with_timeout(&url, PROBE_TIMEOUT, "ollama-probe")
-        .map_err(|e| e.to_string());
+    let result =
+        crate::provider::common::get_text_with_timeout(&url, PROBE_TIMEOUT, "ollama-probe")
+            .map_err(|e| e.to_string());
     ollama_ready_from_tags_response(result, model)
 }
 
@@ -437,7 +466,12 @@ mod tests {
 
     #[test]
     fn mode_labels_are_capitalized_and_distinct() {
-        let labels = [Mode::Cloud.label(), Mode::Local.label(), Mode::Auto.label(), Mode::Offline.label()];
+        let labels = [
+            Mode::Cloud.label(),
+            Mode::Local.label(),
+            Mode::Auto.label(),
+            Mode::Offline.label(),
+        ];
         assert_eq!(labels, ["Cloud", "Local", "Auto", "Offline"]);
     }
 
@@ -494,7 +528,7 @@ mod tests {
         let configured = names(&["openai", "anthropic", "ollama"]);
         for ready in [true, false] {
             assert_eq!(
-                select_providers(Mode::Cloud, &configured, ready),
+                select_providers(Mode::Cloud, &configured, ready, &[]),
                 names(&["openai", "anthropic"]),
                 "ready={ready}"
             );
@@ -504,14 +538,21 @@ mod tests {
     #[test]
     fn cloud_mode_preserves_configured_order() {
         let configured = names(&["anthropic", "openai"]);
-        assert_eq!(select_providers(Mode::Cloud, &configured, false), names(&["anthropic", "openai"]));
+        assert_eq!(
+            select_providers(Mode::Cloud, &configured, false, &[]),
+            names(&["anthropic", "openai"])
+        );
     }
 
     #[test]
     fn local_mode_is_ollama_only_regardless_of_readiness() {
         let configured = names(&["openai", "anthropic", "ollama"]);
         for ready in [true, false] {
-            assert_eq!(select_providers(Mode::Local, &configured, ready), names(&["ollama"]), "ready={ready}");
+            assert_eq!(
+                select_providers(Mode::Local, &configured, ready, &[]),
+                names(&["ollama"]),
+                "ready={ready}"
+            );
         }
     }
 
@@ -520,8 +561,8 @@ mod tests {
         let configured = names(&["openai", "anthropic", "ollama"]);
         for ready in [true, false] {
             assert_eq!(
-                select_providers(Mode::Offline, &configured, ready),
-                select_providers(Mode::Local, &configured, ready),
+                select_providers(Mode::Offline, &configured, ready, &[]),
+                select_providers(Mode::Local, &configured, ready, &[]),
                 "ready={ready}"
             );
         }
@@ -530,15 +571,21 @@ mod tests {
     #[test]
     fn local_and_offline_are_empty_when_ollama_is_not_configured() {
         let configured = names(&["openai", "anthropic"]);
-        assert_eq!(select_providers(Mode::Local, &configured, true), Vec::<String>::new());
-        assert_eq!(select_providers(Mode::Offline, &configured, true), Vec::<String>::new());
+        assert_eq!(
+            select_providers(Mode::Local, &configured, true, &[]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            select_providers(Mode::Offline, &configured, true, &[]),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn auto_mode_puts_local_first_when_ready() {
         let configured = names(&["openai", "anthropic", "ollama"]);
         assert_eq!(
-            select_providers(Mode::Auto, &configured, true),
+            select_providers(Mode::Auto, &configured, true, &[]),
             names(&["ollama", "openai", "anthropic"])
         );
     }
@@ -546,20 +593,34 @@ mod tests {
     #[test]
     fn auto_mode_is_cloud_only_when_not_ready() {
         let configured = names(&["openai", "anthropic", "ollama"]);
-        assert_eq!(select_providers(Mode::Auto, &configured, false), names(&["openai", "anthropic"]));
+        assert_eq!(
+            select_providers(Mode::Auto, &configured, false, &[]),
+            names(&["openai", "anthropic"])
+        );
     }
 
     #[test]
     fn auto_mode_is_cloud_only_when_ollama_not_configured_even_if_ready_is_somehow_true() {
         let configured = names(&["openai", "anthropic"]);
-        assert_eq!(select_providers(Mode::Auto, &configured, true), names(&["openai", "anthropic"]));
+        assert_eq!(
+            select_providers(Mode::Auto, &configured, true, &[]),
+            names(&["openai", "anthropic"])
+        );
     }
 
     #[test]
     fn every_mode_on_empty_configuration_is_empty() {
         for mode in [Mode::Cloud, Mode::Local, Mode::Auto, Mode::Offline] {
-            assert_eq!(select_providers(mode, &[], true), Vec::<String>::new(), "failed for {mode:?}");
-            assert_eq!(select_providers(mode, &[], false), Vec::<String>::new(), "failed for {mode:?}");
+            assert_eq!(
+                select_providers(mode, &[], true, &[]),
+                Vec::<String>::new(),
+                "failed for {mode:?}"
+            );
+            assert_eq!(
+                select_providers(mode, &[], false, &[]),
+                Vec::<String>::new(),
+                "failed for {mode:?}"
+            );
         }
     }
 
@@ -572,52 +633,162 @@ mod tests {
         // separately drops names it doesn't recognize when constructing
         // providers, which is where an actually-unknown name has no effect.
         let configured = names(&["mystery-provider", "ollama"]);
-        assert_eq!(select_providers(Mode::Cloud, &configured, false), names(&["mystery-provider"]));
+        assert_eq!(
+            select_providers(Mode::Cloud, &configured, false, &[]),
+            names(&["mystery-provider"])
+        );
+    }
+
+    // -- is_local_provider / compat host-based classification (#16) -------
+
+    #[test]
+    fn is_local_provider_true_for_ollama_regardless_of_the_compat_set() {
+        assert!(is_local_provider("ollama", &[]));
+        assert!(is_local_provider("ollama", &names(&["compat:openrouter"])));
+    }
+
+    #[test]
+    fn is_local_provider_is_true_for_a_compat_name_only_when_listed_local() {
+        assert!(!is_local_provider("compat:openrouter", &[]));
+        assert!(is_local_provider(
+            "compat:lmstudio",
+            &names(&["compat:lmstudio"])
+        ));
+        // A different compat name in the local set must not match this one.
+        assert!(!is_local_provider(
+            "compat:openrouter",
+            &names(&["compat:lmstudio"])
+        ));
+    }
+
+    #[test]
+    fn select_providers_treats_a_local_compat_entry_as_local() {
+        let configured = names(&["openai", "compat:lmstudio"]);
+        let local = names(&["compat:lmstudio"]);
+        assert_eq!(
+            select_providers(Mode::Local, &configured, false, &local),
+            names(&["compat:lmstudio"])
+        );
+        assert_eq!(
+            select_providers(Mode::Cloud, &configured, false, &local),
+            names(&["openai"])
+        );
+    }
+
+    #[test]
+    fn select_providers_treats_an_unlisted_compat_entry_as_cloud() {
+        // The same order entry, but this time NOT in local_compat_names
+        // (e.g. its base_url points at a remote host) -- it must land on
+        // the cloud side instead.
+        let configured = names(&["openai", "compat:openrouter"]);
+        assert_eq!(
+            select_providers(Mode::Cloud, &configured, false, &[]),
+            names(&["openai", "compat:openrouter"])
+        );
+        assert_eq!(
+            select_providers(Mode::Local, &configured, false, &[]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn auto_mode_puts_a_local_compat_entry_first_alongside_ollama_when_ready() {
+        let configured = names(&["openai", "ollama", "compat:lmstudio"]);
+        let local = names(&["compat:lmstudio"]);
+        assert_eq!(
+            select_providers(Mode::Auto, &configured, true, &local),
+            names(&["ollama", "compat:lmstudio", "openai"])
+        );
     }
 
     // -- should_probe_ollama --------------------------------------------
 
     #[test]
     fn should_probe_only_when_ollama_is_named_and_has_a_base_url() {
-        assert!(should_probe_ollama(&names(&["openai", "ollama"]), "http://127.0.0.1:11434"));
-        assert!(!should_probe_ollama(&names(&["openai"]), "http://127.0.0.1:11434"), "ollama not opted in");
-        assert!(!should_probe_ollama(&names(&["ollama"]), ""), "blank base_url");
-        assert!(!should_probe_ollama(&names(&["ollama"]), "   "), "whitespace-only base_url");
+        assert!(should_probe_ollama(
+            &names(&["openai", "ollama"]),
+            "http://127.0.0.1:11434"
+        ));
+        assert!(
+            !should_probe_ollama(&names(&["openai"]), "http://127.0.0.1:11434"),
+            "ollama not opted in"
+        );
+        assert!(
+            !should_probe_ollama(&names(&["ollama"]), ""),
+            "blank base_url"
+        );
+        assert!(
+            !should_probe_ollama(&names(&["ollama"]), "   "),
+            "whitespace-only base_url"
+        );
     }
 
     // -- classify_host: IPv4 -----------------------------------------------
 
     #[test]
     fn ipv4_loopback_range_is_loopback() {
-        for host in ["http://127.0.0.1/", "http://127.0.0.2/", "http://127.255.255.255/", "http://127.1.2.3/"] {
-            assert_eq!(classify_host(host), HostClass::Loopback, "failed for {host}");
+        for host in [
+            "http://127.0.0.1/",
+            "http://127.0.0.2/",
+            "http://127.255.255.255/",
+            "http://127.1.2.3/",
+        ] {
+            assert_eq!(
+                classify_host(host),
+                HostClass::Loopback,
+                "failed for {host}"
+            );
         }
     }
 
     #[test]
     fn ipv4_outside_loopback_range_is_not_loopback() {
-        for host in ["http://126.0.0.1/", "http://128.0.0.1/", "http://10.0.0.1/", "http://8.8.8.8/"] {
-            assert_eq!(classify_host(host), HostClass::NotLoopback, "failed for {host}");
+        for host in [
+            "http://126.0.0.1/",
+            "http://128.0.0.1/",
+            "http://10.0.0.1/",
+            "http://8.8.8.8/",
+        ] {
+            assert_eq!(
+                classify_host(host),
+                HostClass::NotLoopback,
+                "failed for {host}"
+            );
         }
     }
 
     #[test]
     fn classify_host_respects_ports() {
-        assert_eq!(classify_host("http://127.0.0.1:11434/api/chat"), HostClass::Loopback);
-        assert_eq!(classify_host("http://evil.com:11434/"), HostClass::NotLoopback);
+        assert_eq!(
+            classify_host("http://127.0.0.1:11434/api/chat"),
+            HostClass::Loopback
+        );
+        assert_eq!(
+            classify_host("http://evil.com:11434/"),
+            HostClass::NotLoopback
+        );
     }
 
     #[test]
     fn classify_host_is_case_insensitive() {
-        assert_eq!(classify_host("HTTP://127.0.0.1:11434/"), HostClass::Loopback);
-        assert_eq!(classify_host("http://LOCALHOST:11434/"), HostClass::Localhost);
+        assert_eq!(
+            classify_host("HTTP://127.0.0.1:11434/"),
+            HostClass::Loopback
+        );
+        assert_eq!(
+            classify_host("http://LOCALHOST:11434/"),
+            HostClass::Localhost
+        );
     }
 
     // -- classify_host: localhost -------------------------------------------
 
     #[test]
     fn localhost_is_its_own_class_not_loopback() {
-        assert_eq!(classify_host("http://localhost:11434/"), HostClass::Localhost);
+        assert_eq!(
+            classify_host("http://localhost:11434/"),
+            HostClass::Localhost
+        );
         assert_ne!(HostClass::Localhost, HostClass::Loopback);
     }
 
@@ -625,25 +796,42 @@ mod tests {
 
     #[test]
     fn a_hostname_that_merely_starts_with_the_loopback_address_is_not_loopback() {
-        assert_eq!(classify_host("http://127.0.0.1.evil.com/"), HostClass::NotLoopback);
+        assert_eq!(
+            classify_host("http://127.0.0.1.evil.com/"),
+            HostClass::NotLoopback
+        );
     }
 
     #[test]
     fn userinfo_claiming_to_be_loopback_does_not_fool_the_real_host() {
-        assert_eq!(classify_host("http://127.0.0.1@evil.com/"), HostClass::NotLoopback);
+        assert_eq!(
+            classify_host("http://127.0.0.1@evil.com/"),
+            HostClass::NotLoopback
+        );
     }
 
     #[test]
     fn userinfo_before_a_genuinely_loopback_host_is_still_loopback() {
-        assert_eq!(classify_host("http://evil.com@127.0.0.1/"), HostClass::Loopback);
+        assert_eq!(
+            classify_host("http://evil.com@127.0.0.1/"),
+            HostClass::Loopback
+        );
     }
 
     // -- classify_host: IPv6 -------------------------------------------------
 
     #[test]
     fn ipv6_loopback_bracketed_forms_are_loopback() {
-        for host in ["http://[::1]/", "http://[::1]:11434/", "HTTP://[::1]:11434/api"] {
-            assert_eq!(classify_host(host), HostClass::Loopback, "failed for {host}");
+        for host in [
+            "http://[::1]/",
+            "http://[::1]:11434/",
+            "HTTP://[::1]:11434/api",
+        ] {
+            assert_eq!(
+                classify_host(host),
+                HostClass::Loopback,
+                "failed for {host}"
+            );
         }
     }
 
@@ -653,14 +841,24 @@ mod tests {
         // under the IPv4-mapped IPv6 convention -- recognizing it does not
         // widen what's allowed, it just recognizes another spelling of the
         // same allowed address. See `classify_host`'s doc comment.
-        for host in ["http://[::ffff:127.0.0.1]/", "http://[::FFFF:127.0.0.1]:11434/"] {
-            assert_eq!(classify_host(host), HostClass::Loopback, "failed for {host}");
+        for host in [
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::FFFF:127.0.0.1]:11434/",
+        ] {
+            assert_eq!(
+                classify_host(host),
+                HostClass::Loopback,
+                "failed for {host}"
+            );
         }
     }
 
     #[test]
     fn ipv4_mapped_ipv6_non_loopback_is_not_loopback() {
-        assert_eq!(classify_host("http://[::ffff:8.8.8.8]/"), HostClass::NotLoopback);
+        assert_eq!(
+            classify_host("http://[::ffff:8.8.8.8]/"),
+            HostClass::NotLoopback
+        );
     }
 
     #[test]
@@ -669,13 +867,20 @@ mod tests {
         // `::1` and `::ffff:a.b.c.d` are recognized. This fails closed
         // (refused), not open, so it is safe -- just narrower than a full
         // RFC 4291 implementation would be.
-        assert_eq!(classify_host("http://[0:0:0:0:0:0:0:1]/"), HostClass::NotLoopback);
+        assert_eq!(
+            classify_host("http://[0:0:0:0:0:0:0:1]/"),
+            HostClass::NotLoopback
+        );
     }
 
     #[test]
     fn unparseable_or_empty_host_fails_closed() {
         for host in ["", "http://", "http:///path", "not a url at all"] {
-            assert_eq!(classify_host(host), HostClass::NotLoopback, "failed for {host:?}");
+            assert_eq!(
+                classify_host(host),
+                HostClass::NotLoopback,
+                "failed for {host:?}"
+            );
         }
     }
 
