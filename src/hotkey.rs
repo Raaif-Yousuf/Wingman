@@ -358,6 +358,16 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
+    // Pause (issue #20): every chord passes through completely unchanged
+    // while paused, including the Copilot key -- no swallowing, no Ctrl-tap
+    // workaround, no STATE lock, no learn-mode interaction. This check comes
+    // before the STATE lookup so pausing costs the hot path exactly one
+    // atomic load plus a clock read (see `pause::is_paused_now`), never a
+    // lock and never an allocation.
+    if crate::pause::is_paused_now() {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
     let Some(state) = STATE.get() else {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     };

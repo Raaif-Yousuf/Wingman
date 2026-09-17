@@ -8,6 +8,7 @@ mod config;
 mod config_example;
 mod dismiss;
 mod hotkey;
+mod pause;
 mod provider;
 mod secrets;
 mod single_instance;
