@@ -118,7 +118,9 @@ pub const WM_APP_LEARNED: u32 = WM_APP + 4; // lparam = *mut Chord (learn mode c
 
 ## Config
 
-`%APPDATA%\copilot-ask\config.toml`, created on first run with owner-only ACLs.
+`%APPDATA%\Wingman\config.toml`, created on first run with owner-only ACLs.
+Renamed from `%APPDATA%\copilot-ask\config.toml` (issue #1); `Config::migrate_from`
+copies the old file forward once, on first run, and leaves the old file alone.
 Keys may also come from the `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` environment
 variables, which take precedence over the file.
 

@@ -125,7 +125,7 @@ pub struct Card {
 impl Card {
     pub fn new(instance: HINSTANCE) -> anyhow::Result<Self> {
         if !ensure_class_registered(instance) {
-            anyhow::bail!("copilot-ask: failed to register the card window class");
+            anyhow::bail!("Wingman: failed to register the card window class");
         }
 
         let theme = detect_theme();
@@ -150,7 +150,7 @@ impl Card {
         let raw = Box::into_raw(inner);
 
         let class_name = wide_z(CLASS_NAME);
-        let title = wide_z("copilot-ask");
+        let title = wide_z("Wingman");
         let create_result = unsafe {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
@@ -176,7 +176,7 @@ impl Card {
                 unsafe {
                     drop(Box::from_raw(raw));
                 }
-                return Err(anyhow::anyhow!("copilot-ask: CreateWindowExW failed: {e}"));
+                return Err(anyhow::anyhow!("Wingman: CreateWindowExW failed: {e}"));
             }
         };
 
@@ -277,7 +277,7 @@ impl Drop for Card {
 // Window class registration (once per process)
 // ---------------------------------------------------------------------------
 
-const CLASS_NAME: &str = "CopilotAsk.Card.Window.7f3c1a9e";
+const CLASS_NAME: &str = "Wingman.Card.Window.7f3c1a9e";
 
 static CLASS_INIT: Once = Once::new();
 static CLASS_OK: OnceLock<bool> = OnceLock::new();

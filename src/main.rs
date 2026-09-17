@@ -12,7 +12,7 @@ mod ui;
 
 fn main() {
     if let Err(e) = app::run() {
-        eprintln!("copilot-ask: {e:#}");
+        eprintln!("Wingman: {e:#}");
         std::process::exit(1);
     }
 }

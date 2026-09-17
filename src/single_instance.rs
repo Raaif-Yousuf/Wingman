@@ -18,7 +18,7 @@ use windows::Win32::System::Threading::CreateMutexW;
 /// `Local\` rather than `Global\`: the scope is the logged-in session, so two
 /// different users on the same machine each get their own instance, which is
 /// what they would expect — the config and the tray icon are per-user too.
-const MUTEX_NAME: windows::core::PCWSTR = w!("Local\\CopilotAsk.SingleInstance.4d1b62f0");
+const MUTEX_NAME: windows::core::PCWSTR = w!("Local\\Wingman.SingleInstance.4d1b62f0");
 
 /// Held for the lifetime of the process. Dropping it releases the name.
 pub struct InstanceLock(HANDLE);
@@ -94,7 +94,7 @@ pub fn poke_existing(activation: Activation) {
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_LBUTTONUP};
 
     unsafe {
-        let Ok(hwnd) = FindWindowW(w!("CopilotAsk.Owner.Window.4d1b62f0"), None) else {
+        let Ok(hwnd) = FindWindowW(w!("Wingman.Owner.Window.4d1b62f0"), None) else {
             return;
         };
         if hwnd.0.is_null() {
@@ -147,7 +147,7 @@ mod tests {
 
     /// A name only this test uses, so the result does not depend on whether
     /// the real app is running on the machine running the tests.
-    const TEST_NAME: windows::core::PCWSTR = w!("Local\\CopilotAsk.SingleInstance.test.9f2c");
+    const TEST_NAME: windows::core::PCWSTR = w!("Local\\Wingman.SingleInstance.test.9f2c");
 
     #[test]
     fn the_first_caller_wins_and_a_second_is_refused() {
@@ -185,7 +185,7 @@ mod tests {
         // this is the case that has to happen every time the hardware key is
         // pressed while the app is already running.
         assert!(matches!(
-            activation_from_args(args(&["copilot-ask.exe"])),
+            activation_from_args(args(&["wingman.exe"])),
             Activation::Ask
         ));
     }
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn the_settings_flag_means_settings() {
         assert!(matches!(
-            activation_from_args(args(&["copilot-ask.exe", "--settings"])),
+            activation_from_args(args(&["wingman.exe", "--settings"])),
             Activation::Settings
         ));
     }
@@ -203,7 +203,7 @@ mod tests {
         // Anything other than the exact flag falls back to the Copilot-key
         // behaviour, rather than silently opening Settings for a typo.
         assert!(matches!(
-            activation_from_args(args(&["copilot-ask.exe", "--frobnicate"])),
+            activation_from_args(args(&["wingman.exe", "--frobnicate"])),
             Activation::Ask
         ));
     }

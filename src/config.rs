@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::hotkey::Chord;
 use crate::provider::{Anthropic, Chain, OpenAi, Provider, DEFAULT_PROMPT};
 
-/// `%APPDATA%\copilot-ask\config.toml`. See the design spec's "Config"
+/// `%APPDATA%\Wingman\config.toml`. See the design spec's "Config"
 /// section for the authoritative shape.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -162,10 +162,44 @@ impl Default for Ui {
 }
 
 impl Config {
-    /// `%APPDATA%\copilot-ask\config.toml`.
+    /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {
         let base = dirs::config_dir().context("could not determine the platform config directory")?;
+        Ok(base.join("Wingman").join("config.toml"))
+    }
+
+    /// `%APPDATA%\copilot-ask\config.toml`, the pre-rename location. Only
+    /// [`Config::migrate_from`] touches this path, once, to copy the file
+    /// forward; nothing here ever reads its contents for any other purpose.
+    pub fn old_path() -> Result<PathBuf> {
+        let base = dirs::config_dir().context("could not determine the platform config directory")?;
         Ok(base.join("copilot-ask").join("config.toml"))
+    }
+
+    /// One-time config migration for the copilot-ask -> Wingman rename.
+    ///
+    /// If `new_path` already exists, the migration already happened (or the
+    /// user started fresh under the new name) and this is a no-op. Otherwise,
+    /// if `old_path` exists, its bytes are copied to `new_path` verbatim and
+    /// `old_path` is left untouched -- exactly what `uninstall.ps1` already
+    /// promises for the pre-rename file, so that promise keeps holding across
+    /// the rename too. Returns whether a copy happened.
+    ///
+    /// Pure w.r.t. paths (both are parameters, not read from `dirs`), so this
+    /// is exercised in tests against scratch directories and never against
+    /// the real `%APPDATA%`.
+    pub fn migrate_from(old_path: &Path, new_path: &Path) -> Result<bool> {
+        if new_path.exists() {
+            return Ok(false);
+        }
+        if !old_path.exists() {
+            return Ok(false);
+        }
+        if let Some(parent) = new_path.parent() {
+            fs::create_dir_all(parent).context("failed to create the new config directory")?;
+        }
+        fs::copy(old_path, new_path).context("failed to copy the old config forward")?;
+        Ok(true)
     }
 
     /// Loads the config from the well-known path, creating it from defaults
@@ -355,7 +389,7 @@ mod tests {
 
     fn scratch_path(tag: &str) -> PathBuf {
         let unique = format!(
-            "copilot-ask-test-{tag}-{}-{}",
+            "wingman-test-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -558,5 +592,110 @@ text_scale = 0.0
     #[test]
     fn the_shipped_default_contains_no_refusal_trigger() {
         assert!(!Config::default().ui.prompt.contains("scratchpad"));
+    }
+
+    // -- copilot-ask -> Wingman config migration -----------------------------
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let unique = format!(
+            "wingman-migrate-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn migrate_copies_the_old_file_when_the_new_one_is_absent() {
+        let root = scratch_dir("copies");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "[providers.openai]\napi_key = \"sk-old\"\n").unwrap();
+        assert!(!new_path.exists());
+
+        let migrated = Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
+
+        assert!(migrated, "a fresh old file with no new file should migrate");
+        assert!(new_path.exists(), "the new path should now hold the config");
+        assert_eq!(
+            fs::read_to_string(&new_path).unwrap(),
+            fs::read_to_string(&old_path).unwrap(),
+            "the copy must be byte-for-byte identical"
+        );
+        // The old file is left alone -- uninstall.ps1's promise not to
+        // delete it must keep holding across the rename.
+        assert!(old_path.exists(), "the old file must survive the migration");
+
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    fn migrate_does_nothing_when_the_new_file_already_exists() {
+        let root = scratch_dir("new-exists");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "old content").unwrap();
+        fs::write(&new_path, "new content, already set up").unwrap();
+
+        let migrated = Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
+
+        assert!(!migrated, "an existing new file must never be overwritten");
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "new content, already set up");
+
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    fn migrate_does_nothing_when_the_old_file_is_absent() {
+        let root = scratch_dir("no-old");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+        assert!(!old_path.exists());
+        assert!(!new_path.exists());
+
+        let migrated = Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
+
+        assert!(!migrated, "nothing to migrate when there was never an old file");
+        assert!(!new_path.exists(), "no new file should be created out of nothing");
+
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    fn migrate_creates_the_new_config_directory() {
+        // The new directory ("Wingman") never existed before the rename, so
+        // migration must create it -- unlike Config::save, which is only ever
+        // called after the directory has already been created once.
+        let root = scratch_dir("mkdir");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("brand-new-dir").join("nested").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "content").unwrap();
+        assert!(!new_path.parent().unwrap().exists());
+
+        Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
+
+        assert!(new_path.exists());
+
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    fn old_path_and_path_differ_only_in_the_app_directory_name() {
+        // Guards against the two paths silently pointing at the same place,
+        // which would make every migration test above pass while migrating
+        // nothing in production.
+        let old = Config::old_path().unwrap();
+        let new = Config::path().unwrap();
+        assert_ne!(old, new);
+        assert!(old.to_string_lossy().contains("copilot-ask"));
+        assert!(new.to_string_lossy().contains("Wingman"));
+        assert_eq!(old.parent().unwrap().parent(), new.parent().unwrap().parent());
     }
 }

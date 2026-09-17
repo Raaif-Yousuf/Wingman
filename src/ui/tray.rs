@@ -156,7 +156,7 @@ impl Tray {
             hIcon: icon,
             ..Default::default()
         };
-        set_sz_tip(&mut nid.szTip, "copilot-ask");
+        set_sz_tip(&mut nid.szTip, "Wingman");
 
         let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
         if !added.as_bool() {
