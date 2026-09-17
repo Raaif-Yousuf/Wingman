@@ -260,10 +260,16 @@ impl App {
             return;
         }
 
-        // Capture runs here, on the main thread, and must happen before the
-        // pending card is shown — otherwise the card is in its own screenshot.
-        let shot = match capture::grab(&self.config.capture.monitor, self.config.capture.max_edge) {
-            Ok(s) => s,
+        // Capture (grab the pixels and downscale) runs here, on the main
+        // thread, and must happen before the pending card is shown --
+        // otherwise the card is in its own screenshot. Encoding those pixels
+        // to PNG does NOT happen here: issue #177 measured
+        // `CompressionType::Best` PNG encoding at up to ~1s in a release
+        // build on a 1402x876 image, which froze the message loop for that
+        // whole time with nothing on screen after the key press. `encode`
+        // now runs on the worker thread below, after `show_pending`.
+        let raw = match capture::grab_raw(&self.config.capture.monitor, self.config.capture.max_edge) {
+            Ok(r) => r,
             Err(e) => {
                 self.card
                     .show_error("Couldn't capture the screen", &format!("{e:#}"));
@@ -282,8 +288,11 @@ impl App {
         let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
-            let result: std::result::Result<Answer, String> =
-                worker(&chain, &shot, &prompt, want_difficulty).map_err(|e| format!("{e:#}"));
+            let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
+                let shot = capture::encode(&raw)?;
+                worker(&chain, &shot, &prompt, want_difficulty)
+            })()
+            .map_err(|e| format!("{e:#}"));
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(

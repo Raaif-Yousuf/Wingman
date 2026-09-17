@@ -61,14 +61,32 @@ pub const OPENAI_TILE_MAX_LONG_EDGE: u32 = 2048;
 #[allow(dead_code)]
 pub const OPENAI_TILE_MAX_PIXELS: u64 = 2048 * 2048;
 
-/// Capture the target monitor (per `monitor_mode`), downscale so we never
+/// Raw RGBA8 pixels captured and downscaled on the main thread, not yet
+/// encoded to PNG.
+///
+/// Split out from the old `grab` (issue #177): `App::ask` captures via
+/// [`grab_raw`] and shows the pending card *before* calling [`encode`], which
+/// is the expensive step -- up to ~1s in a release build at the old `Best`
+/// compression setting on a 1402x876 image (see `encode_png`'s doc comment
+/// for the measured numbers) -- so `encode` now runs on the worker thread,
+/// after the card is already on screen, instead of blocking the main
+/// thread's message loop before it.
+pub struct RawShot {
+    /// Row-major RGBA8, `width * height * 4` bytes.
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Capture the target monitor (per `monitor_mode`) and downscale so we never
 /// send more pixels than the configured `max_edge` implies a provider would
-/// keep, and encode as PNG.
+/// keep. Does not encode -- see [`encode`] and this function's doc comment
+/// on [`RawShot`] for why that is a separate, later step.
 ///
 /// `monitor_mode` is `"active"` (the monitor under the foreground window) or
 /// `"primary"` (always the system's primary monitor). Anything else is
 /// treated as `"active"`.
-pub fn grab(monitor_mode: &str, max_edge: u32) -> Result<Shot> {
+pub fn grab_raw(monitor_mode: &str, max_edge: u32) -> Result<RawShot> {
     let rect = match monitor_mode {
         "primary" => primary_monitor_rect()?,
         _ => active_monitor_rect()?,
@@ -113,32 +131,97 @@ pub fn grab(monitor_mode: &str, max_edge: u32) -> Result<Shot> {
     };
 
     let (final_w, final_h) = (resized.width(), resized.height());
-    let png = encode_png(resized.as_raw(), final_w, final_h)?;
-
-    Ok(Shot {
-        png,
+    Ok(RawShot {
+        rgba: resized.into_raw(),
         width: final_w,
         height: final_h,
     })
 }
 
-/// Encode raw RGBA8 pixels as a PNG, using the smallest-output codec
-/// settings the `image` crate offers (`CompressionType::Best`,
-/// `FilterType::Adaptive`) rather than its `PngEncoder::new` default
-/// (`CompressionType::Fast`). This is a lossless trade of local CPU time for
-/// a smaller upload: base64-encoded, that payload is what crosses the
-/// network to the provider, so shrinking it helps latency without touching
-/// image quality or token cost.
+/// Encode a [`RawShot`] to PNG. The expensive half of the old `grab` --
+/// see [`RawShot`]'s doc comment for why the caller runs this on a worker
+/// thread, after the pending card is already shown, rather than inline with
+/// [`grab_raw`].
+pub fn encode(raw: &RawShot) -> Result<Shot> {
+    let png = encode_png(&raw.rgba, raw.width, raw.height)?;
+    Ok(Shot {
+        png,
+        width: raw.width,
+        height: raw.height,
+    })
+}
+
+/// Encode raw RGBA8 pixels as a PNG.
+///
+/// Uses `CompressionType::Default` (`FilterType::Adaptive`) -- neither the
+/// `image` crate's own `PngEncoder::new` default (`CompressionType::Fast`)
+/// nor the smallest-output `CompressionType::Best` this module used before
+/// issue #177.
+///
+/// MEASURED 2026-09-17 (release build, this crate's `opt-level = "z"` + LTO
+/// profile, `bench_png_compression_levels`, median of 5 runs, synthetic
+/// UI-like images at the two sizes `fit_for_model` actually produces for a
+/// typical screen at the default `max_edge` 1568):
+///
+/// | size | level | encode | bytes |
+/// |---|---|---|---|
+/// | 1402x876 | Fast | 16.1 ms | 76.6 KiB |
+/// | 1402x876 | Default | 23.5 ms | 8.2 KiB |
+/// | 1402x876 | Best | 25.2 ms | 8.2 KiB |
+/// | 1568x980 | Fast | 19.3 ms | 96.7 KiB |
+/// | 1568x980 | Default | 28.9 ms | 10.1 KiB |
+/// | 1568x980 | Best | 32.5 ms | 10.2 KiB |
+///
+/// Best barely beats Default on bytes here (this synthetic image's mostly
+/// flat background compresses much further than Fast's fixed window size
+/// allows, so the marginal gain from Best's slower search is tiny) while
+/// costing noticeably more encode time, so it is never the right choice on
+/// this shape of image. Assuming a 20 Mbit/s uplink (2500 bytes/ms) and
+/// summing encode time plus upload time, at 1402x876: Fast ~16.1 + 76.6*1024
+/// /2500 = ~47 ms, Default ~23.5 + 8.2*1024/2500 = ~27 ms, Best ~25.2 +
+/// 8.2*1024/2500 = ~29 ms -- Default wins outright, not just on encode time
+/// alone. `pick_compression_level` and its tests
+/// (`pick_compression_level_matches_this_module_s_actual_choice_at_20_mbit`)
+/// encode this same tradeoff as checked logic against these exact numbers,
+/// not just a one-off eyeball of the table above.
 fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     let mut png = Cursor::new(Vec::new());
     image::codecs::png::PngEncoder::new_with_quality(
         &mut png,
-        image::codecs::png::CompressionType::Best,
+        image::codecs::png::CompressionType::Default,
         image::codecs::png::FilterType::Adaptive,
     )
     .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
     .context("encoding PNG")?;
     Ok(png.into_inner())
+}
+
+/// Picks the compression level with the lowest total encode-plus-upload
+/// time, given each candidate's measured `(encode_ms, output_bytes)` and an
+/// assumed uplink in bits/second. Pure decision logic pulled out of
+/// `bench_png_compression_levels` so the tradeoff itself -- not just the
+/// numbers that went into it -- is unit-tested (issue #177's "pure decision
+/// tests where possible"). Only exercised by that test module today (the
+/// level `encode_png` actually uses is a `const`, chosen once from a live
+/// run of the numbers this proves the logic against), not called from
+/// production code.
+#[allow(dead_code)]
+fn pick_compression_level(
+    candidates: &[(image::codecs::png::CompressionType, f64, usize)],
+    uplink_bits_per_sec: f64,
+) -> image::codecs::png::CompressionType {
+    let uplink_bytes_per_ms = uplink_bits_per_sec / 8.0 / 1000.0;
+    candidates
+        .iter()
+        .min_by(|a, b| {
+            let total_a = a.1 + (a.2 as f64 / uplink_bytes_per_ms);
+            let total_b = b.1 + (b.2 as f64 / uplink_bytes_per_ms);
+            total_a
+                .partial_cmp(&total_b)
+                .expect("encode ms / byte counts are always finite")
+        })
+        .map(|(level, _, _)| *level)
+        .expect("candidates is never empty in practice")
 }
 
 /// Fit `(w, h)` within both a maximum long edge and a maximum total pixel
@@ -236,9 +319,10 @@ fn rect_from_hmonitor(hmon: HMONITOR) -> Result<RECT> {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_png, fit_for_model, fit_long_edge, Cursor, ANTHROPIC_HIGH_RES_MAX_LONG_EDGE,
-        ANTHROPIC_HIGH_RES_MAX_PIXELS, ANTHROPIC_STANDARD_MAX_LONG_EDGE,
-        ANTHROPIC_STANDARD_MAX_PIXELS, OPENAI_TILE_MAX_LONG_EDGE, OPENAI_TILE_MAX_PIXELS,
+        encode, encode_png, fit_for_model, fit_long_edge, pick_compression_level, Cursor,
+        RawShot, ANTHROPIC_HIGH_RES_MAX_LONG_EDGE, ANTHROPIC_HIGH_RES_MAX_PIXELS,
+        ANTHROPIC_STANDARD_MAX_LONG_EDGE, ANTHROPIC_STANDARD_MAX_PIXELS, OPENAI_TILE_MAX_LONG_EDGE,
+        OPENAI_TILE_MAX_PIXELS,
     };
     use image::ImageEncoder;
 
@@ -487,14 +571,15 @@ mod tests {
     }
 
     #[test]
-    fn encode_png_best_compression_not_larger_than_fast() {
+    fn encode_png_default_compression_not_larger_than_codec_fast_default() {
         let (w, h) = (256, 256);
         let rgba = checkerboard_rgba(w, h);
 
-        let best = encode_png(&rgba, w, h).expect("encode best");
+        let ours = encode_png(&rgba, w, h).expect("encode");
 
-        // Reproduce the codec's own previous default (Fast) directly to
-        // compare against -- this is the setting encode_png replaced.
+        // Reproduce the codec's own out-of-the-box default (Fast) directly
+        // to compare against -- this is the setting encode_png replaced
+        // before issue #177 moved it again, Best -> Default.
         let mut fast = Cursor::new(Vec::new());
         image::codecs::png::PngEncoder::new(&mut fast)
             .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
@@ -502,18 +587,205 @@ mod tests {
         let fast = fast.into_inner();
 
         assert!(
-            best.len() <= fast.len(),
-            "Best compression ({} bytes) should not exceed Fast ({} bytes)",
-            best.len(),
+            ours.len() <= fast.len(),
+            "encode_png's output ({} bytes) should not exceed codec-default Fast ({} bytes)",
+            ours.len(),
             fast.len()
         );
-        // On a patterned (non-flat) image, Best should meaningfully beat
+        // On a patterned (non-flat) image, Default should meaningfully beat
         // Fast, not just tie -- otherwise the setting isn't doing anything.
         assert!(
-            best.len() < fast.len(),
-            "expected Best compression ({} bytes) to beat Fast ({} bytes) on a patterned image",
-            best.len(),
+            ours.len() < fast.len(),
+            "expected encode_png's output ({} bytes) to beat Fast ({} bytes) on a patterned image",
+            ours.len(),
             fast.len()
         );
+    }
+
+    // -- RawShot / grab_raw / encode split (issue #177) ------------------
+
+    #[test]
+    fn encode_turns_a_raw_shot_into_a_valid_png_with_matching_dimensions() {
+        let (w, h) = (64, 48);
+        let raw = RawShot {
+            rgba: checkerboard_rgba(w, h),
+            width: w,
+            height: h,
+        };
+        let shot = encode(&raw).expect("encode");
+        assert_eq!(shot.width, w);
+        assert_eq!(shot.height, h);
+
+        let decoded = image::load_from_memory(&shot.png).expect("decode");
+        assert_eq!(decoded.width(), w);
+        assert_eq!(decoded.height(), h);
+    }
+
+    // -- pick_compression_level (issue #177) ------------------------------
+
+    use image::codecs::png::CompressionType;
+
+    /// A 20 Mbit/s uplink, the bandwidth `encode_png`'s doc comment and
+    /// `bench_png_compression_levels` assume for the encode-plus-upload
+    /// tradeoff (issue #177 names this explicitly: "assume a typical 20
+    /// Mbit uplink and state it").
+    const ASSUMED_UPLINK_BITS_PER_SEC: f64 = 20_000_000.0;
+
+    // MEASURED 2026-09-17: `cargo test --release
+    // capture::tests::bench_png_compression_levels -- --ignored --nocapture`,
+    // this crate's `opt-level = "z"` + LTO release profile, median of 5 runs,
+    // synthetic UI-like image at 1402x876 (the size `fit_for_model` gives a
+    // 16:9 screen at the default `max_edge` 1568). Bytes are the printed KiB
+    // (rounded to 1 decimal by that test) converted back to bytes, which is
+    // precise enough for this decision -- see `bench_png_compression_levels`
+    // for the exact reproduction command and full table (both sizes).
+    const MEASURED_1402X876_FAST_MS: f64 = 16.1;
+    const MEASURED_1402X876_FAST_BYTES: usize = 78_438; // 76.6 KiB
+    const MEASURED_1402X876_DEFAULT_MS: f64 = 23.5;
+    const MEASURED_1402X876_DEFAULT_BYTES: usize = 8_397; // 8.2 KiB
+    const MEASURED_1402X876_BEST_MS: f64 = 25.2;
+    const MEASURED_1402X876_BEST_BYTES: usize = 8_397; // 8.2 KiB (same rounded value as Default)
+
+    #[test]
+    fn pick_compression_level_prefers_lower_total_time_at_a_slow_uplink() {
+        // A slow uplink (1 Mbit/s = 125 bytes/ms) makes the byte-count
+        // difference dominate: the smallest candidate should win even
+        // though it costs more to encode.
+        let candidates = [
+            (CompressionType::Fast, 10.0, 200_000usize),
+            (CompressionType::Default, 30.0, 120_000usize),
+            (CompressionType::Best, 100.0, 118_000usize),
+        ];
+        assert_eq!(
+            pick_compression_level(&candidates, 1_000_000.0),
+            CompressionType::Default
+        );
+    }
+
+    #[test]
+    fn pick_compression_level_prefers_faster_encode_at_a_very_fast_uplink() {
+        // An extremely fast uplink makes bytes nearly free, so the
+        // candidate with the least encode time should win even though it
+        // produces the most bytes.
+        let candidates = [
+            (CompressionType::Fast, 10.0, 200_000usize),
+            (CompressionType::Default, 30.0, 120_000usize),
+            (CompressionType::Best, 100.0, 118_000usize),
+        ];
+        assert_eq!(
+            pick_compression_level(&candidates, 100_000_000_000.0),
+            CompressionType::Fast
+        );
+    }
+
+    #[test]
+    fn pick_compression_level_matches_this_module_s_actual_choice_at_20_mbit() {
+        // The tradeoff this module's own `encode_png` doc comment cites,
+        // using the real MEASURED bench_png_compression_levels numbers for
+        // the 1402x876 case (see that test) -- proves the shipped
+        // CompressionType::Default in encode_png is the one the decision
+        // function actually picks, not a value chosen by eyeballing the
+        // table and then hard-coded independently of it.
+        let candidates = [
+            (CompressionType::Fast, MEASURED_1402X876_FAST_MS, MEASURED_1402X876_FAST_BYTES),
+            (
+                CompressionType::Default,
+                MEASURED_1402X876_DEFAULT_MS,
+                MEASURED_1402X876_DEFAULT_BYTES,
+            ),
+            (CompressionType::Best, MEASURED_1402X876_BEST_MS, MEASURED_1402X876_BEST_BYTES),
+        ];
+        assert_eq!(pick_compression_level(&candidates, ASSUMED_UPLINK_BITS_PER_SEC), CompressionType::Default);
+    }
+
+    // -- bench_png_compression_levels (issue #177) ------------------------
+    //
+    // A synthetic UI-like image: alternating flat background bands (window
+    // chrome / panels) with dense rows of high-contrast strokes (glyph-like
+    // text), at the two sizes `fit_for_model` actually produces for a
+    // typical screen at the default `max_edge` (1402x876 for 16:9 at 1568,
+    // 1568x980 for 16:10). A flat fill or the `checkerboard_rgba` used by
+    // the roundtrip tests above is too easy for the codec and would not
+    // show a realistic gap between compression levels.
+    fn synthetic_ui_image(w: u32, h: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        let text_row_period = 18;
+        let text_row_height = 10;
+        // "Text" runs across about 70% of the row width, in short dashes
+        // like glyph strokes rather than one solid bar.
+        let text_extent = (w as u64 * 7 / 10).max(1) as u32;
+        for y in 0..h {
+            let band = (y / 40) % 2;
+            let bg: u8 = if band == 0 { 245 } else { 235 };
+            let in_text_row = (y % text_row_period) < text_row_height;
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                let glyph_on = in_text_row && x < text_extent && ((x / 3) % 4) < 2;
+                let v: u8 = if glyph_on { 20 } else { bg };
+                buf[idx] = v;
+                buf[idx + 1] = v;
+                buf[idx + 2] = v;
+                buf[idx + 3] = 255;
+            }
+        }
+        buf
+    }
+
+    /// Median encode time (ms) and output size (bytes) for `compression`
+    /// over several runs, to smooth scheduler noise -- same idea as issue
+    /// #177's own scratch-crate measurement (median of 7).
+    fn median_encode(
+        rgba: &[u8],
+        w: u32,
+        h: u32,
+        compression: CompressionType,
+        runs: usize,
+    ) -> (f64, usize) {
+        let mut ms_samples = Vec::with_capacity(runs);
+        let mut bytes = 0usize;
+        for _ in 0..runs {
+            let mut out = Cursor::new(Vec::new());
+            let start = std::time::Instant::now();
+            image::codecs::png::PngEncoder::new_with_quality(
+                &mut out,
+                compression,
+                image::codecs::png::FilterType::Adaptive,
+            )
+            .write_image(rgba, w, h, image::ExtendedColorType::Rgba8)
+            .expect("encode");
+            ms_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            bytes = out.into_inner().len();
+        }
+        ms_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (ms_samples[ms_samples.len() / 2], bytes)
+    }
+
+    /// Run manually in release, once (CLAUDE.md build rules): from the crate
+    /// root,
+    /// ```text
+    /// $env:CARGO_TARGET_DIR = "...\target\wt\<worktree>"; $env:RUSTC_WRAPPER = "sccache"; $env:CARGO_BUILD_JOBS = "2"
+    /// cargo test --release capture::tests::bench_png_compression_levels -- --ignored --nocapture
+    /// ```
+    /// Prints a `MEASURED 2026-09-17:` line per size/level; the numbers this
+    /// module's `encode_png` doc comment and the `MEASURED_1402X876_*`
+    /// constants above cite came from one such run.
+    #[test]
+    #[ignore = "release-only timing benchmark; run manually, see this test's doc comment"]
+    fn bench_png_compression_levels() {
+        for (w, h) in [(1402u32, 876u32), (1568u32, 980u32)] {
+            let rgba = synthetic_ui_image(w, h);
+            for (name, compression) in [
+                ("Fast", CompressionType::Fast),
+                ("Default", CompressionType::Default),
+                ("Best", CompressionType::Best),
+            ] {
+                let (ms, bytes) = median_encode(&rgba, w, h, compression, 5);
+                println!(
+                    "MEASURED 2026-09-17: {w}x{h} {name}: {:.1} ms, {:.1} KiB",
+                    ms,
+                    bytes as f64 / 1024.0
+                );
+            }
+        }
     }
 }
