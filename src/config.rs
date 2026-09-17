@@ -50,6 +50,8 @@ pub struct Config {
     pub capture: Capture,
     pub providers: Providers,
     pub ui: Ui,
+    /// #24: the intent router's settings (`[palette]` in config.toml).
+    pub palette: Palette,
     /// Provider names (`"openai"`, `"anthropic"`) [`Config::hydrate_secrets`]
     /// could not read a stored credential for (#175). Load-time diagnostic
     /// only -- never persisted (`#[serde(skip)]`), so a caller with access to
@@ -448,6 +450,28 @@ impl Default for Ui {
             text_scale: 1.0,
             show_difficulty: false,
             prompt: DEFAULT_PROMPT.to_string(),
+        }
+    }
+}
+
+/// #24: settings for the Quick Ask palette's intent router.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Palette {
+    /// Minimum `RouterResult::confidence` (0.0..=1.0) for the router's
+    /// suggestion to pre-select a row -- see `router::should_apply`, the one
+    /// place this value is actually consulted (`app.rs` reads it from
+    /// `Config` and passes it through). Kept as a plain `f64` rather than a
+    /// clamped type: an out-of-range hand-edit (`1.4`, `-1`) simply never
+    /// clears (or always clears) the threshold, which is a safe degradation,
+    /// not a crash.
+    pub router_threshold: f64,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            router_threshold: crate::router::DEFAULT_ROUTER_THRESHOLD,
         }
     }
 }
@@ -1109,6 +1133,19 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    // -- palette.router_threshold (issue #24) --------------------------------
+
+    #[test]
+    fn router_threshold_config_default_matches_router_module() {
+        // `router.rs`'s own `DEFAULT_ROUTER_THRESHOLD` doc comment promises
+        // this equality; keep both sides honest against drift.
+        assert_eq!(
+            Config::default().palette.router_threshold,
+            crate::router::DEFAULT_ROUTER_THRESHOLD
+        );
+        assert_eq!(Config::default().palette.router_threshold, 0.7);
     }
 
     // -- hotkeys.pause (issue #181) ------------------------------------------

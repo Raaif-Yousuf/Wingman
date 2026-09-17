@@ -196,13 +196,24 @@ fn flat_ranked_rows(actions: &[PaletteAction], query: &str) -> Vec<Row> {
 /// exactly.
 const VK_UP: u16 = 0x26;
 const VK_DOWN: u16 = 0x28;
+const VK_PRIOR: u16 = 0x21; // PageUp
+const VK_NEXT: u16 = 0x22; // PageDown
 const VK_RETURN: u16 = 0x0D;
 const VK_ESCAPE: u16 = 0x1B;
+
+/// #217: how many rows the palette paints at once. Used both for the
+/// window's fixed height (`ui::palette`'s `window_height`/`on_paint`) and as
+/// the page size for [`PaletteKey::PageUp`]/[`PaletteKey::PageDown`] and the
+/// viewport math below -- one number, so the page a PageDown press jumps
+/// always matches what's actually on screen.
+pub const MAX_VISIBLE_ROWS: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteKey {
     Up,
     Down,
+    PageUp,
+    PageDown,
     Enter,
     Escape,
 }
@@ -214,10 +225,61 @@ pub fn palette_key_from_vk(vk: u16) -> Option<PaletteKey> {
     match vk {
         VK_UP => Some(PaletteKey::Up),
         VK_DOWN => Some(PaletteKey::Down),
+        VK_PRIOR => Some(PaletteKey::PageUp),
+        VK_NEXT => Some(PaletteKey::PageDown),
         VK_RETURN => Some(PaletteKey::Enter),
         VK_ESCAPE => Some(PaletteKey::Escape),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Viewport math (#217): the palette shows only MAX_VISIBLE_ROWS rows at a
+// time once the catalogue grows past that; `PaletteState::offset` is the
+// index of the first row currently painted. Both scrolling paths in
+// `ui::palette` go through one of these two pure functions rather than each
+// doing its own clamping arithmetic.
+// ---------------------------------------------------------------------------
+
+/// Adjusts `offset` so row `selected` is inside the visible window
+/// `[offset, offset + visible_rows)`, moving it the minimum amount needed
+/// (never re-centers). The keyboard-scrolling half of #217:
+/// [`PaletteState::move_selection`] calls this after moving the selection,
+/// so Up/Down/PageUp/PageDown drag the viewport along only when the new
+/// selection actually fell outside it. Always clamped to
+/// `[0, total_rows.saturating_sub(visible_rows)]`, so the list never scrolls
+/// past its own last page; returns `0` when everything already fits
+/// (`total_rows <= visible_rows`) or `visible_rows == 0`.
+pub fn clamp_offset_to_selection(
+    offset: usize,
+    selected: usize,
+    total_rows: usize,
+    visible_rows: usize,
+) -> usize {
+    if visible_rows == 0 || total_rows <= visible_rows {
+        return 0;
+    }
+    let max_offset = total_rows - visible_rows;
+    let mut offset = offset.min(max_offset);
+    if selected < offset {
+        offset = selected;
+    } else if selected >= offset + visible_rows {
+        offset = selected + 1 - visible_rows;
+    }
+    offset.min(max_offset)
+}
+
+/// Moves the viewport by `delta_rows` (negative towards the top), clamped to
+/// `[0, total_rows.saturating_sub(visible_rows)]`. The mouse-wheel half of
+/// #217: unlike [`clamp_offset_to_selection`], this never touches
+/// `PaletteState::selected` -- wheeling the list does not change which row
+/// Enter would run.
+pub fn scroll_by(offset: usize, delta_rows: i32, total_rows: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 || total_rows <= visible_rows {
+        return 0;
+    }
+    let max_offset = (total_rows - visible_rows) as i32;
+    (offset as i32 + delta_rows).clamp(0, max_offset) as usize
 }
 
 /// The palette's selection state over a built row list. Rebuilt (via
@@ -227,6 +289,11 @@ pub fn palette_key_from_vk(vk: u16) -> Option<PaletteKey> {
 pub struct PaletteState {
     pub rows: Vec<Row>,
     pub selected: usize,
+    /// #217: index of the first row currently painted. Kept in lockstep
+    /// with `selected` by [`PaletteState::move_selection`]; the mouse wheel
+    /// (`ui::palette`'s `WM_MOUSEWHEEL` handler) moves it directly via
+    /// [`scroll_by`] instead, without touching `selected`.
+    pub offset: usize,
 }
 
 fn is_selectable(row: &Row) -> bool {
@@ -236,12 +303,22 @@ fn is_selectable(row: &Row) -> bool {
 impl PaletteState {
     pub fn new(rows: Vec<Row>) -> Self {
         let selected = rows.iter().position(is_selectable).unwrap_or(0);
-        Self { rows, selected }
+        let offset = clamp_offset_to_selection(0, selected, rows.len(), MAX_VISIBLE_ROWS);
+        Self {
+            rows,
+            selected,
+            offset,
+        }
     }
 
     /// Moves the selection by `delta` (+1 down, -1 up), skipping over
     /// headers/hints, and clamping (not wrapping) at the first/last
-    /// selectable row.
+    /// selectable row. `delta` may be larger than 1 (PageUp/PageDown use
+    /// `MAX_VISIBLE_ROWS`) -- the clamp already handles any magnitude.
+    ///
+    /// #217: also drags `offset` along via [`clamp_offset_to_selection`], so
+    /// every caller (Up, Down, PageUp, PageDown) gets keyboard scrolling for
+    /// free instead of having to remember to clamp the viewport itself.
     pub fn move_selection(&mut self, delta: i32) {
         let selectable: Vec<usize> = self
             .rows
@@ -259,6 +336,12 @@ impl PaletteState {
             .unwrap_or(0);
         let new_pos = (current_pos as i32 + delta).clamp(0, selectable.len() as i32 - 1);
         self.selected = selectable[new_pos as usize];
+        self.offset = clamp_offset_to_selection(
+            self.offset,
+            self.selected,
+            self.rows.len(),
+            MAX_VISIBLE_ROWS,
+        );
     }
 
     pub fn selected_action_id(&self) -> Option<&str> {
@@ -266,6 +349,30 @@ impl PaletteState {
             Some(Row::Action { id, .. }) => Some(id.as_str()),
             _ => None,
         }
+    }
+}
+
+/// #24: pre-selects the row whose action id is `action_id`, for the intent
+/// router's suggestion. `false` (a no-op, never a panic -- rule 7) when
+/// `action_id` isn't among today's ROWS at all -- e.g. the row only shows up
+/// once a provider is configured, and the grouped view currently has none,
+/// or the query has since filtered it out. Whether this should even be
+/// attempted (confidence vs. threshold, whether the user already
+/// typed/moved) is [`crate::router::should_apply`]'s job, not this
+/// function's -- this only performs the mechanical "does this id exist as a
+/// row right now, and if so select it" step, which is why it lives here
+/// (state mutation) rather than in `router.rs` (decision).
+pub fn preselect_action(state: &mut PaletteState, action_id: &str) -> bool {
+    match state
+        .rows
+        .iter()
+        .position(|r| matches!(r, Row::Action { id, .. } if id == action_id))
+    {
+        Some(idx) => {
+            state.selected = idx;
+            true
+        }
+        None => false,
     }
 }
 
@@ -290,6 +397,20 @@ pub fn handle_key(state: &mut PaletteState, key: PaletteKey) -> PaletteOutcome {
         }
         PaletteKey::Down => {
             state.move_selection(1);
+            PaletteOutcome::None
+        }
+        // #217: a page is `MAX_VISIBLE_ROWS` selectable positions -- an
+        // approximation (headers/hints in between mean a literal page of
+        // ROWS is not always exactly `MAX_VISIBLE_ROWS` selectable actions),
+        // but `move_selection`'s existing clamp already makes this safe at
+        // any magnitude, and it means PageDown always covers at least one
+        // full screen's worth of rows.
+        PaletteKey::PageUp => {
+            state.move_selection(-(MAX_VISIBLE_ROWS as i32));
+            PaletteOutcome::None
+        }
+        PaletteKey::PageDown => {
+            state.move_selection(MAX_VISIBLE_ROWS as i32);
             PaletteOutcome::None
         }
         PaletteKey::Enter => match state.selected_action_id() {
@@ -603,9 +724,11 @@ mod tests {
     // -- key handling state machine --------------------------------------
 
     #[test]
-    fn palette_key_from_vk_recognizes_the_four_keys() {
+    fn palette_key_from_vk_recognizes_the_six_keys() {
         assert_eq!(palette_key_from_vk(0x26), Some(PaletteKey::Up));
         assert_eq!(palette_key_from_vk(0x28), Some(PaletteKey::Down));
+        assert_eq!(palette_key_from_vk(0x21), Some(PaletteKey::PageUp));
+        assert_eq!(palette_key_from_vk(0x22), Some(PaletteKey::PageDown));
         assert_eq!(palette_key_from_vk(0x0D), Some(PaletteKey::Enter));
         assert_eq!(palette_key_from_vk(0x1B), Some(PaletteKey::Escape));
         assert_eq!(palette_key_from_vk(0x41), None); // 'A', ordinary typing
@@ -699,6 +822,126 @@ mod tests {
             handle_key(&mut state, PaletteKey::Down),
             PaletteOutcome::None
         );
+    }
+
+    // -- viewport math (#217) -----------------------------------------------
+
+    #[test]
+    fn clamp_offset_to_selection_is_zero_when_everything_fits() {
+        assert_eq!(clamp_offset_to_selection(0, 5, 10, 12), 0);
+        assert_eq!(clamp_offset_to_selection(3, 5, 10, 10), 0);
+    }
+
+    #[test]
+    fn clamp_offset_to_selection_scrolls_down_to_reveal_a_selection_below_the_window() {
+        // 20 rows, 5 visible, selection at row 10: offset must move so row
+        // 10 is the LAST visible row (minimum movement, no re-centering).
+        assert_eq!(clamp_offset_to_selection(0, 10, 20, 5), 6);
+    }
+
+    #[test]
+    fn clamp_offset_to_selection_scrolls_up_to_reveal_a_selection_above_the_window() {
+        // Viewport currently at rows 10..15; selection jumps to row 2.
+        assert_eq!(clamp_offset_to_selection(10, 2, 20, 5), 2);
+    }
+
+    #[test]
+    fn clamp_offset_to_selection_leaves_the_offset_alone_when_selection_is_already_visible() {
+        assert_eq!(clamp_offset_to_selection(4, 6, 20, 5), 4);
+    }
+
+    #[test]
+    fn clamp_offset_to_selection_never_scrolls_past_the_last_page() {
+        // 20 rows, 5 visible: max_offset is 15. A selection at the very
+        // last row (19) must not push offset past 15.
+        assert_eq!(clamp_offset_to_selection(0, 19, 20, 5), 15);
+    }
+
+    #[test]
+    fn clamp_offset_to_selection_zero_visible_rows_never_divides_by_zero() {
+        assert_eq!(clamp_offset_to_selection(3, 1, 20, 0), 0);
+    }
+
+    #[test]
+    fn scroll_by_moves_the_viewport_without_touching_selection() {
+        assert_eq!(scroll_by(5, 1, 20, 5), 6);
+        assert_eq!(scroll_by(5, -1, 20, 5), 4);
+    }
+
+    #[test]
+    fn scroll_by_clamps_to_the_first_and_last_page() {
+        assert_eq!(scroll_by(0, -1, 20, 5), 0);
+        assert_eq!(scroll_by(15, 1, 20, 5), 15);
+    }
+
+    #[test]
+    fn scroll_by_is_zero_when_everything_fits() {
+        assert_eq!(scroll_by(0, 5, 10, 12), 0);
+    }
+
+    /// #217's Done-when: a catalogue of 20+ visible actions is fully
+    /// reachable by keyboard, and the selection stays inside the viewport
+    /// as it moves past row `MAX_VISIBLE_ROWS`.
+    fn twenty_ungrouped_rows() -> Vec<Row> {
+        (0..20)
+            .map(|i| Row::Action {
+                id: format!("action-{i}"),
+                name: format!("Action {i}"),
+                score: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn down_past_max_visible_rows_scrolls_the_viewport_into_view() {
+        let mut state = PaletteState::new(twenty_ungrouped_rows());
+        assert_eq!(state.offset, 0);
+        for _ in 0..15 {
+            handle_key(&mut state, PaletteKey::Down);
+        }
+        assert_eq!(state.selected, 15);
+        // Row 15 must be inside [offset, offset + MAX_VISIBLE_ROWS).
+        assert!(state.offset <= 15 && 15 < state.offset + MAX_VISIBLE_ROWS);
+        assert!(state.offset > 0, "viewport must have scrolled");
+    }
+
+    #[test]
+    fn page_down_then_page_up_returns_to_the_top_of_the_viewport() {
+        let mut state = PaletteState::new(twenty_ungrouped_rows());
+        handle_key(&mut state, PaletteKey::PageDown);
+        assert_eq!(state.selected, MAX_VISIBLE_ROWS);
+        assert!(state.offset > 0);
+        handle_key(&mut state, PaletteKey::PageUp);
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.offset, 0);
+    }
+
+    #[test]
+    fn page_down_clamps_at_the_last_row_no_panic() {
+        let mut state = PaletteState::new(twenty_ungrouped_rows());
+        for _ in 0..5 {
+            handle_key(&mut state, PaletteKey::PageDown);
+        }
+        assert_eq!(state.selected, 19);
+        assert_eq!(state.offset, 20 - MAX_VISIBLE_ROWS);
+    }
+
+    // -- preselect_action (#24: the intent router's palette-side half) -----
+
+    #[test]
+    fn preselect_action_selects_the_matching_row() {
+        let mut state = PaletteState::new(three_action_rows());
+        assert_eq!(state.selected_action_id(), Some("a"));
+        assert!(preselect_action(&mut state, "c"));
+        assert_eq!(state.selected_action_id(), Some("c"));
+    }
+
+    #[test]
+    fn preselect_action_false_when_the_id_is_not_a_row_right_now() {
+        let mut state = PaletteState::new(three_action_rows());
+        assert!(!preselect_action(&mut state, "not-a-row"));
+        // Selection is untouched by a failed attempt.
+        assert_eq!(state.selected_action_id(), Some("a"));
     }
 
     // -- dispatch table: every built-in, tested (rule 8) ------------------

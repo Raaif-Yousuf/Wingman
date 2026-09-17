@@ -24,6 +24,7 @@ mod ocr;
 mod pause;
 mod profile;
 mod provider;
+mod router;
 mod secrets;
 mod single_instance;
 mod ui;
