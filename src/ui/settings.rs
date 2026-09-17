@@ -122,7 +122,7 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     let raw = Box::into_raw(inner);
 
     let class_name = wide_z(CLASS_NAME);
-    let title = wide_z("copilot-ask settings");
+    let title = wide_z("Wingman settings");
 
     // 96dpi guess for the very first CreateWindowExW call, before we have an
     // HWND to ask GetDpiForWindow about -- corrected immediately below, same
@@ -274,7 +274,7 @@ fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
 // Window class + WNDPROC
 // ---------------------------------------------------------------------------
 
-const CLASS_NAME: &str = "CopilotAsk.Settings.Window.9d4e2b71";
+const CLASS_NAME: &str = "Wingman.Settings.Window.9d4e2b71";
 
 static CLASS_INIT: std::sync::Once = std::sync::Once::new();
 static CLASS_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1725,7 +1725,7 @@ mod tests {
         let raw = Box::into_raw(inner);
 
         let class_name = wide_z(CLASS_NAME);
-        let title = wide_z("copilot-ask settings (test)");
+        let title = wide_z("Wingman settings (test)");
         let hwnd = unsafe {
             CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),

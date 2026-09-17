@@ -24,7 +24,7 @@ path registered against it.
 | What | Where |
 |---|---|
 | executable | `%LOCALAPPDATA%\Programs\copilot-ask\copilot-ask.exe` |
-| config (unchanged) | `%APPDATA%\copilot-ask\config.toml` |
+| config | `%APPDATA%\Wingman\config.toml` (renamed from `%APPDATA%\copilot-ask\config.toml`, issue #1; the old file is left in place and copied forward once, on first run) |
 | signing certificate | `%LOCALAPPDATA%\Programs\copilot-ask\copilot-ask.cer` |
 | sparse package | installed by identity; no payload on disk |
 

@@ -47,7 +47,7 @@ pub const WM_APP_RESULT: u32 = WM_APP + 3;
 /// modules (see the crate-wide grep for `WM_APP +` before picking another).
 pub const WM_APP_ACTIVATE: u32 = WM_APP + 6;
 
-const WINDOW_CLASS: PCWSTR = w!("CopilotAsk.Owner.Window.4d1b62f0");
+const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
 /// How long to wait after hiding a visible card before capturing, so the
 /// compositor has actually taken it off the screen. Without this the old card
@@ -98,6 +98,14 @@ pub fn run() -> Result<()> {
     // rebuilt elsewhere), point it back here. Otherwise it fails silently
     // while Settings still reports it as enabled.
     crate::autostart::repair_if_stale();
+
+    // One-time copilot-ask -> Wingman migration. Both steps are individually
+    // idempotent (a no-op once done), so this runs unconditionally on every
+    // launch rather than needing its own "have we migrated yet" flag.
+    if let (Ok(old_path), Ok(new_path)) = (Config::old_path(), Config::path()) {
+        let _ = Config::migrate_from(&old_path, &new_path);
+    }
+    let _ = crate::autostart::remove_old_run_value();
 
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let config = Config::load().unwrap_or_default();
@@ -164,7 +172,7 @@ fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             WINDOW_CLASS,
-            w!("copilot-ask"),
+            w!("Wingman"),
             WS_OVERLAPPED,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -495,9 +503,9 @@ impl App {
 
         let ready = self.chain.ready_provider_names();
         let tip = if ready.is_empty() {
-            "copilot-ask — no API key configured".to_string()
+            "Wingman — no API key configured".to_string()
         } else {
-            format!("copilot-ask — {} · {primary}", ready.join(", "))
+            format!("Wingman — {} · {primary}", ready.join(", "))
         };
         self.tray.set_tooltip(&tip);
     }

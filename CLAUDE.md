@@ -4,8 +4,11 @@
 > shortest enforceable form, the stack, the pitfalls that have already cost a
 > session, and where to look. Depth lives in [`docs/`](docs/README.md).
 
-**Name:** **Wingman** (decided 2026-09-16; the crate is still `copilot-ask`
-until Phase 0 renames it). GitHub: `Raaif-Yousuf/Wingman`.
+**Name:** **Wingman** (decided 2026-09-16; the crate, bin, window classes,
+mutex and config directory were renamed 2026-09-16, issue #1. The repo
+folder is still `copilot-ask` until it is physically moved; the package
+identity `RaaifYousuf.CopilotAsk` and icons are issue #10, not yet done).
+GitHub: `Raaif-Yousuf/Wingman`.
 
 **App:** a native Windows 11 tray assistant behind the Copilot key. Today: one
 press screenshots the active monitor, a vision model checks the physics problem
@@ -28,9 +31,11 @@ action framework is the product and actions are the contribution surface.
 1. **No secret ever enters the repo.** Keys come from env vars or Windows
    Credential Manager (planned), never from a tracked file. `config.toml` lives
    in `%APPDATA%` and is gitignored. Never read
-   `%APPDATA%\copilot-ask\config.toml`: the owner asked for the keys to stay
-   unread, and no task so far has needed them. Keys were rotated 2026-09-15;
-   do not re-raise that.
+   `%APPDATA%\Wingman\config.toml` or the pre-rename
+   `%APPDATA%\copilot-ask\config.toml` (still present; the rename migration
+   copies it forward and leaves it in place): the owner asked for the keys to
+   stay unread, and no task so far has needed them. Keys were rotated
+   2026-09-15; do not re-raise that.
 2. **Permissive licenses only.** Dependencies: MIT, Apache-2.0, BSD, ISC, Zlib,
    Unlicense. Code copied from another project: MIT only, attributed in
    `THIRD_PARTY_NOTICES.md`. Re-verify a license at adoption; two projects on
@@ -94,7 +99,7 @@ action framework is the product and actions are the contribution surface.
 | Windows | `windows` 0.62 (Win32 + WinRT). Per-monitor-v2 DPI. `Windows.Media.Ocr` (planned) needs package identity, so verify with `GetCurrentPackageFullName` before relying on it from an autostarted exe |
 | HTTP | `ureq` 3, blocking, on purpose. No tokio, no reqwest, no streaming: every response is a whole structured result |
 | Capture | `xcap` 0.9 (Apache-2.0, permissive but not MIT) + `image` PNG-only |
-| Config | `toml` in `%APPDATA%\copilot-ask\config.toml`, owner-only ACL, env overrides |
+| Config | `toml` in `%APPDATA%\Wingman\config.toml`, owner-only ACL, env overrides |
 | Packaging | sparse MSIX, self-signed cert, `install.ps1` self-elevates once; identity `RaaifYousuf.CopilotAsk` |
 | Local models | Ollama 0.34 on `127.0.0.1:11434`; Intel Arc 140T iGPU needs `OLLAMA_IGPU_ENABLE=1` or Vulkan drops it and runs CPU-only; the only oracle for GPU use is `size_vram > 0` on `/api/ps` |
 | Release profile | `opt-level = "z"`, LTO, `panic = "abort"`, stripped; ~2 MB exe, under 10 MB idle |

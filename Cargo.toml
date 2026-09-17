@@ -1,12 +1,12 @@
 [package]
-name = "copilot-ask"
+name = "wingman"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 build = "build.rs"
 
 [[bin]]
-name = "copilot-ask"
+name = "wingman"
 path = "src/main.rs"
 
 [build-dependencies]
