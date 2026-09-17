@@ -44,7 +44,9 @@ pub const WM_APP_RESULT: u32 = WM_APP + 3;
 /// Posted by a second launch (the Copilot key with no argv to steer it) to
 /// tell the running instance to act as if the hotkey fired. `WM_APP + 6`:
 /// `+1` through `+5` are already claimed by the tray, hotkey and dismiss
-/// modules (see the crate-wide grep for `WM_APP +` before picking another).
+/// modules. Add a new `WM_APP_*` constant to this module's
+/// `tests::ALL_WM_APP_IDS` too (issue #163); `wm_app_ids_are_pairwise_unique`
+/// and `wm_app_ids_registry_is_exhaustive` enforce the crate-wide list.
 pub const WM_APP_ACTIVATE: u32 = WM_APP + 6;
 
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
@@ -252,7 +254,7 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "config.toml".into());
             self.card.show_error(
-                "No API key — open Edit settings",
+                "No API key: open Edit settings",
                 &format!("Add a key under [providers.openai] or [providers.anthropic] in:\n{path}"),
             );
             return;
@@ -390,7 +392,7 @@ impl App {
         match saved {
             Ok(()) => self.card.show_answer(&format!("Bound to {name}"), "", 4, None),
             Err(e) => self.card.show_error(
-                &format!("Bound to {name} — but not saved"),
+                &format!("Bound to {name}: not saved"),
                 &format!("It will work until you quit.\n\n{e:#}"),
             ),
         }
@@ -544,7 +546,7 @@ impl App {
         match saved {
             Ok(()) => self.card.show_answer(&model, "", 3, None),
             Err(e) => self.card.show_error(
-                &format!("Using {model} — but not saved"),
+                &format!("Using {model}: not saved"),
                 &format!("It will revert when you quit.
 
 {e:#}"),
@@ -573,7 +575,7 @@ impl App {
         match saved {
             Ok(()) => self.card.show_answer(name, "", 3, None),
             Err(e) => self.card.show_error(
-                &format!("Using {name} — but not saved"),
+                &format!("Using {name}: not saved"),
                 &format!("It will revert when you quit.
 
 {e:#}"),
@@ -985,6 +987,72 @@ mod tests {
         assert_eq!(
             settings_reentrancy_policy(WM_DESTROY, FAKE_TASKBAR_CREATED_MSG),
             SettingsReentrancy::Fallback
+        );
+    }
+
+    // -- WM_APP ids (issue #163) ------------------------------------------
+    //
+    // Six `WM_APP_*` constants are declared across app.rs, dismiss.rs,
+    // hotkey.rs and ui/tray.rs. This module already imports all six above
+    // (it is the one place that depends on all four), so the
+    // pairwise-uniqueness check lives here rather than in each file
+    // separately -- same pattern as settings.rs's
+    // `control_ids_are_pairwise_unique` and tray.rs's
+    // `fixed_cmd_ids_are_pairwise_unique`.
+
+    /// Every `WM_APP_*` constant declared anywhere in the crate, paired with
+    /// its name. Add a new one here when adding the constant itself --
+    /// `wm_app_ids_registry_is_exhaustive` below fails loudly if this list
+    /// falls out of sync with the source.
+    const ALL_WM_APP_IDS: &[(&str, u32)] = &[
+        ("WM_APP_TRAY", WM_APP_TRAY),
+        ("WM_APP_HOTKEY", WM_APP_HOTKEY),
+        ("WM_APP_RESULT", WM_APP_RESULT),
+        ("WM_APP_LEARNED", WM_APP_LEARNED),
+        ("WM_APP_DISMISS", WM_APP_DISMISS),
+        ("WM_APP_ACTIVATE", WM_APP_ACTIVATE),
+    ];
+
+    #[test]
+    fn wm_app_ids_are_pairwise_unique() {
+        for (i, (name_a, id_a)) in ALL_WM_APP_IDS.iter().enumerate() {
+            for (name_b, id_b) in ALL_WM_APP_IDS.iter().skip(i + 1) {
+                assert_ne!(
+                    id_a, id_b,
+                    "{name_a} and {name_b} share WM_APP id {id_a} -- wnd_proc's match \
+                     would let one handler silently steal the other's messages"
+                );
+            }
+        }
+    }
+
+    /// Counts `pub const WM_APP_<NAME>: u32 = WM_APP + <n>;` declarations by
+    /// re-reading the four source files as text, so a new constant added to
+    /// any of them without a matching entry in `ALL_WM_APP_IDS` fails this
+    /// test instead of silently skipping the uniqueness check above.
+    #[test]
+    fn wm_app_ids_registry_is_exhaustive() {
+        fn count_declarations(src: &str) -> usize {
+            src.lines()
+                .filter(|line| {
+                    let t = line.trim_start();
+                    t.starts_with("pub const WM_APP_") && t.contains("= WM_APP + ")
+                })
+                .count()
+        }
+
+        let declared = count_declarations(include_str!("app.rs"))
+            + count_declarations(include_str!("dismiss.rs"))
+            + count_declarations(include_str!("hotkey.rs"))
+            + count_declarations(include_str!("ui/tray.rs"));
+
+        assert_eq!(
+            declared,
+            ALL_WM_APP_IDS.len(),
+            "found {declared} `pub const WM_APP_* = WM_APP + n;` declarations across \
+             app.rs/dismiss.rs/hotkey.rs/ui/tray.rs but ALL_WM_APP_IDS lists {}; add the \
+             new constant to ALL_WM_APP_IDS too",
+            ALL_WM_APP_IDS.len()
         );
     }
 

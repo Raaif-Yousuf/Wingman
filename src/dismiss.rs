@@ -28,7 +28,9 @@
 //! target `HWND`. It is defined here, matching the design spec's `WM_APP +
 //! n` numbering, since this is the module that owns posting it; the
 //! integrating agent should reference `dismiss::WM_APP_DISMISS` rather than
-//! redefining it.
+//! redefining it. Adding another `WM_APP_*` constant anywhere in the crate
+//! also means adding it to `app.rs`'s `tests::ALL_WM_APP_IDS` (issue #163),
+//! which is enforced by `wm_app_ids_registry_is_exhaustive`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;

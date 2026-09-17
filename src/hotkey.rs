@@ -22,7 +22,9 @@
 //! table). They are defined here, matching the spec's `WM_APP + n` values
 //! exactly, since this is the module that owns posting them; the integrating
 //! agent should reference `hotkey::WM_APP_HOTKEY` / `hotkey::WM_APP_LEARNED`
-//! rather than redefining them.
+//! rather than redefining them. Adding another `WM_APP_*` constant anywhere
+//! in the crate also means adding it to `app.rs`'s `tests::ALL_WM_APP_IDS`
+//! (issue #163), which is enforced by `wm_app_ids_registry_is_exhaustive`.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
