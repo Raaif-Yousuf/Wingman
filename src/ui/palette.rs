@@ -779,12 +779,10 @@ impl PaletteInner {
                     bottom: y + scale(ROUTER_SUMMARY_HEIGHT, self.dpi),
                 };
                 SetTextColor(hdc, COLORREF(0x0080_B080));
-                let mut buf = utf16(summary);
-                let mut r = band_rect;
-                DrawTextW(
+                draw_text_line(
                     hdc,
-                    &mut buf,
-                    &mut r,
+                    summary,
+                    band_rect,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                 );
             }
@@ -813,23 +811,19 @@ impl PaletteInner {
                 match row {
                     crate::ui::palette_model::Row::Header(name) => {
                         SetTextColor(hdc, COLORREF(0x0090_9090));
-                        let mut buf = utf16(name);
-                        let mut r = row_rect;
-                        DrawTextW(
+                        draw_text_line(
                             hdc,
-                            &mut buf,
-                            &mut r,
+                            name,
+                            row_rect,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                         );
                     }
                     crate::ui::palette_model::Row::Hint(text) => {
                         SetTextColor(hdc, COLORREF(0x0080_8080));
-                        let mut buf = utf16(text);
-                        let mut r = row_rect;
-                        DrawTextW(
+                        draw_text_line(
                             hdc,
-                            &mut buf,
-                            &mut r,
+                            text,
+                            row_rect,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                         );
                     }
@@ -840,12 +834,10 @@ impl PaletteInner {
                             let _ = DeleteObject(hl.into());
                         }
                         SetTextColor(hdc, COLORREF(0x00E6_E6E6));
-                        let mut buf = utf16(name);
-                        let mut r = row_rect;
-                        DrawTextW(
+                        draw_text_line(
                             hdc,
-                            &mut buf,
-                            &mut r,
+                            name,
+                            row_rect,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                         );
                     }
@@ -859,12 +851,10 @@ impl PaletteInner {
                 bottom: rc.bottom,
             };
             SetTextColor(hdc, COLORREF(0x0080_8080));
-            let mut footer_buf = utf16(&self.footer_text);
-            let mut fr = footer_rect;
-            DrawTextW(
+            draw_text_line(
                 hdc,
-                &mut footer_buf,
-                &mut fr,
+                &self.footer_text,
+                footer_rect,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
 
@@ -967,6 +957,40 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// explicit slice length rather than scanning for a terminator.
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
+}
+
+/// Draws one line of `text` in `rect` with `DrawTextW`, or does nothing at
+/// all when `text` is empty.
+///
+/// MEASURED 2026-09-17 (`app.rs`'s `render_gdi_lines_rgba_tolerates_a_blank_line`
+/// and the live test that first hit this): calling `DrawTextW` with a
+/// zero-length `&mut [u16]` buffer -- exactly what `utf16("")` produces --
+/// reliably crashes with `STATUS_ACCESS_VIOLATION` through this crate's
+/// `windows` binding. THEORY (unverified): the binding reads the buffer's
+/// length as "scan for a null terminator" rather than "nothing to draw"
+/// when it is zero, walking off the end of the `Vec`'s dangling-but-valid
+/// empty-allocation pointer.
+///
+/// Every row's text here ultimately comes from data this process does not
+/// fully control -- `router_summary` from a live model's JSON response
+/// (#24, `RouterResult::summary` has no `minLength`), `Row::Action`'s
+/// `name`/`Row::Header`'s group name from a hand-editable `actions.toml`
+/// (#23's `Action::name`/`Action::group` are plain, unvalidated `String`s)
+/// -- so this guard belongs at the one place every row's text funnels
+/// through for painting, not at each individual source.
+fn draw_text_line(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    text: &str,
+    mut rect: RECT,
+    format: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let mut buf = utf16(text);
+    unsafe {
+        DrawTextW(hdc, &mut buf, &mut rect, format);
+    }
 }
 
 #[cfg(test)]
@@ -1303,6 +1327,26 @@ mod tests {
     #[test]
     fn scale_grows_with_dpi() {
         assert_eq!(scale(96, 192), 192);
+    }
+
+    /// Regression check for `draw_text_line`'s doc comment: an empty string
+    /// must not reach `DrawTextW` at all. Before this guard existed, this
+    /// exact call crashed with `STATUS_ACCESS_VIOLATION` (see the doc
+    /// comment for the reproduction).
+    #[test]
+    fn draw_text_line_tolerates_an_empty_string() {
+        unsafe {
+            let hdc = windows::Win32::Graphics::Gdi::GetDC(None);
+            assert!(!hdc.is_invalid(), "GetDC failed");
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 20,
+            };
+            draw_text_line(hdc, "", rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
+        }
     }
 
     // -- show latency (#25's Done-when: under 100 ms) -----------------------
