@@ -226,6 +226,19 @@ pub fn visible(merged: Vec<Resolved>, disabled_groups: &[String]) -> Vec<Resolve
         .collect()
 }
 
+/// Resolves an action's `executor` field (today validated as present but
+/// never resolved to anything, per the action-model design doc's "What
+/// stays out of scope") to a real [`crate::executors::Executor`]. The one
+/// call site connecting the two: see
+/// `docs/superpowers/specs/2026-09-17-executor-design.md` ("Registry",
+/// "Minimal wiring into `actions/`"). Nothing calls this outside its own
+/// test yet -- wiring `app.rs`'s worker to run the resolved executor after
+/// a real confirm click is the confirm-card issue's job, not #31's.
+#[allow(dead_code)]
+pub fn resolve_executor(action: &Action) -> anyhow::Result<Box<dyn crate::executors::Executor>> {
+    crate::executors::registry::resolve(&action.executor)
+}
+
 /// Finds the default action (today, the only one the hotkey ever runs) in
 /// an already-merged, already-visibility-filtered list. `None` means the
 /// default action was disabled, disabled via its group, or removed by a
@@ -326,6 +339,25 @@ mod tests {
         assert_eq!(a.prompt, crate::provider::DEFAULT_PROMPT);
         assert!(!a.rate_difficulty, "#197 part 2: default off");
         assert!(a.enabled);
+    }
+
+    // -- executor resolution (#31) -------------------------------------------
+
+    #[test]
+    fn builtin_check_my_work_resolves_to_the_none_executor() {
+        let action = &builtin_actions()[0];
+        let executor = resolve_executor(action).expect("\"none\" is a built-in executor");
+        assert_eq!(executor.name(), "none");
+    }
+
+    #[test]
+    fn unknown_executor_name_is_a_named_error_not_a_panic() {
+        let mut action = builtin_actions()[0].clone();
+        action.executor = "does-not-exist".to_string();
+        let err = resolve_executor(&action)
+            .err()
+            .expect("an unknown executor name must be an error");
+        assert!(err.to_string().contains("does-not-exist"));
     }
 
     // -- TOML parse of the CONTRIBUTING example -----------------------------
