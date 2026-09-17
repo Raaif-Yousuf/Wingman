@@ -90,46 +90,23 @@ if ($PfxPath) {
 } else {
     Note "No -PfxPath given: building UNSIGNED artifacts."
 }
+$version = ConvertTo-MsixVersion -CargoVersion (Get-CargoVersionString -CargoTomlPath (Join-Path $Repo 'Cargo.toml'))
 $publisher = if ($cert) { $cert.Subject } else { $Identity.Current.CertSubject }
-
-# --- stage ---------------------------------------------------------------
-Step "Staging the package"
-if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
-New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'layout\Assets') | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'layout\Public')  | Out-Null
-
-Build-Logos -IconPath (Join-Path $Repo 'assets\icon.ico') -Destination (Join-Path $StageDir 'layout\Assets')
-# PublicFolder must exist in the package; makeappx drops empty directories.
-Set-Content -Path (Join-Path $StageDir 'layout\Public\README.txt') -Encoding utf8 `
-    -Value 'Declared by PublicFolder in the manifest. Intentionally empty.'
-
-$layoutExe = Join-Path $StageDir "layout\$($Identity.Current.ExeName)"
-Copy-Item $ExePath $layoutExe -Force
-
-$version  = ConvertTo-MsixVersion -CargoVersion (Get-CargoVersionString -CargoTomlPath (Join-Path $Repo 'Cargo.toml'))
-$manifest = Get-Content (Join-Path $Repo 'packaging\AppxManifest.xml.in') -Raw
-$manifest = $manifest.Replace('@VERSION@', $version).Replace('@PUBLISHER@', $publisher)
-Set-Content -Path (Join-Path $StageDir 'layout\AppxManifest.xml') -Value $manifest -Encoding utf8
 Note "version $version, publisher $publisher"
 
-# --- sign the executable (before packing, same order as install.ps1) --------
-if ($cert) {
-    Step "Signing the executable"
-    & $sdk.SignTool sign /fd SHA256 /sha1 $cert.Thumbprint /s My $layoutExe | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "signing the executable failed" }
-}
-
-# --- pack ----------------------------------------------------------------
-$msix = Join-Path $StageDir 'wingman.msix'
-Step "Packing $msix"
-& $sdk.MakeAppx pack /d (Join-Path $StageDir 'layout') /p $msix /nv /o | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
-
-if ($cert) {
-    Step "Signing the package"
-    & $sdk.SignTool sign /fd SHA256 /sha1 $cert.Thumbprint /s My $msix | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "signing the package failed" }
-}
+# --- stage, substitute the manifest, pack and (if signed) sign -----------------
+# Shared with install.ps1 via Publish-WingmanPackage (issue #172), so the two
+# scripts cannot drift on the staging/manifest-substitution/pack/sign
+# sequence the way #164's Find-SdkTool/Build-Logos duplication once did.
+# Unlike install.ps1 (whose sparse package never embeds wingman.exe -- it
+# stays external, at $InstallDir), -ExePath here embeds the exe in the
+# released .msix; -Cert is optional here (install.ps1 always has one).
+Step "Staging and packing the package"
+if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
+$published = Publish-WingmanPackage -Sdk $sdk -Repo $Repo -StageDir $StageDir `
+    -Identity $Identity -Version $version -ExePath $ExePath -Cert $cert
+$layoutExe = $published.LayoutExePath
+$msix = $published.MsixPath
 
 Step "Built"
 Note "exe  $layoutExe"

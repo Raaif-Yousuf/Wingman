@@ -235,6 +235,115 @@ function Build-Logos {
     }
 }
 
+# --- shared staging/manifest/pack/sign sequence (issue #172) -----------------
+# install.ps1 and packaging\Build-Msix.ps1 used to copy-paste the whole
+# layout-creation / README / manifest-substitution / MakeAppx pack / SignTool
+# sign sequence, drifting from each other exactly the way #164's
+# Find-SdkTool/Build-Logos duplication once did. Publish-WingmanPackage is the
+# one place that sequence now lives.
+#
+# Invoke-MakeAppxPack and Invoke-WingmanSignTool wrap the two external-tool
+# invocations as ordinary functions, rather than Publish-WingmanPackage
+# calling `& $Sdk.MakeAppx ...` / `& $Sdk.SignTool ...` directly, specifically
+# so Pester can `Mock -ModuleName Wingman.Common` them: a full literal path
+# invoked via `&` bypasses PowerShell command-name resolution entirely, so
+# Mock cannot intercept it the way it intercepts a cmdlet or a function call.
+
+function Invoke-MakeAppxPack {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$MakeAppxPath,
+        [Parameter(Mandatory)][string]$LayoutDir,
+        [Parameter(Mandatory)][string]$MsixPath
+    )
+    & $MakeAppxPath pack /d $LayoutDir /p $MsixPath /nv /o | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
+}
+
+function Invoke-WingmanSignTool {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SignToolPath,
+        [Parameter(Mandatory)][string]$Thumbprint,
+        [Parameter(Mandatory)][string]$TargetPath
+    )
+    & $SignToolPath sign /fd SHA256 /sha1 $Thumbprint /s My $TargetPath | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "signing '$TargetPath' failed" }
+}
+
+# Stages layout\Assets and layout\Public under $StageDir, renders the logos,
+# writes the PublicFolder placeholder, substitutes @VERSION@/@PUBLISHER@ into
+# AppxManifest.xml.in, packs it and (if a certificate is given) signs the
+# result -- the sequence install.ps1 and Build-Msix.ps1 both need, byte for
+# byte, so a GitHub release and a local install build the same package the
+# same way.
+#
+# The two real behavioural differences between the two callers become
+# parameters rather than copy-pasted branches:
+#   -ExePath   install.ps1 never embeds wingman.exe -- AllowExternalContent
+#              keeps the sparse package's executable at $InstallDir instead,
+#              so it omits -ExePath entirely. Build-Msix.ps1's release
+#              artifact always embeds it, so it always passes -ExePath.
+#   -Cert      install.ps1 always has a certificate by the time it calls
+#              this, so "sign if a certificate was given" degrades to
+#              "always signs" for that caller without changing its
+#              behaviour. Build-Msix.ps1's -PfxPath is optional, so -Cert
+#              may be $null there, producing unsigned artifacts (still a
+#              valid, sparse-package-shaped manifest either way).
+#
+# $StageDir is never created or wiped here -- both callers already manage
+# that themselves for their own reasons (install.ps1 must keep $StageDir
+# alive across Confirm-CertTrusted's certificate export; Build-Msix.ps1 wipes
+# it itself before staging) -- so this only ever creates the layout
+# subdirectories, with -Force, which is idempotent either way.
+function Publish-WingmanPackage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Sdk,
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$StageDir,
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)][string]$Version,
+        [string]$ExePath,
+        $Cert
+    )
+
+    $layoutDir = Join-Path $StageDir 'layout'
+    New-Item -ItemType Directory -Force -Path (Join-Path $layoutDir 'Assets') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $layoutDir 'Public')  | Out-Null
+
+    Build-Logos -IconPath (Join-Path $Repo 'assets\icon.ico') -Destination (Join-Path $layoutDir 'Assets')
+    # PublicFolder must exist in the package; makeappx drops empty directories.
+    Set-Content -Path (Join-Path $layoutDir 'Public\README.txt') -Encoding utf8 `
+        -Value 'Declared by PublicFolder in the manifest. Intentionally empty.'
+
+    $layoutExe = $null
+    if ($ExePath) {
+        $layoutExe = Join-Path $layoutDir $Identity.Current.ExeName
+        Copy-Item $ExePath $layoutExe -Force
+    }
+
+    $publisher = if ($Cert) { $Cert.Subject } else { $Identity.Current.CertSubject }
+    $manifest = Get-Content (Join-Path $Repo 'packaging\AppxManifest.xml.in') -Raw
+    $manifest = $manifest.Replace('@VERSION@', $Version).Replace('@PUBLISHER@', $publisher)
+    Set-Content -Path (Join-Path $layoutDir 'AppxManifest.xml') -Value $manifest -Encoding utf8
+
+    # Sign the embedded exe, if there is one, before packing -- same order
+    # both scripts always used.
+    if ($Cert -and $layoutExe) {
+        Invoke-WingmanSignTool -SignToolPath $Sdk.SignTool -Thumbprint $Cert.Thumbprint -TargetPath $layoutExe
+    }
+
+    $msix = Join-Path $StageDir 'wingman.msix'
+    Invoke-MakeAppxPack -MakeAppxPath $Sdk.MakeAppx -LayoutDir $layoutDir -MsixPath $msix
+
+    if ($Cert) {
+        Invoke-WingmanSignTool -SignToolPath $Sdk.SignTool -Thumbprint $Cert.Thumbprint -TargetPath $msix
+    }
+
+    [pscustomobject]@{ MsixPath = $msix; LayoutExePath = $layoutExe }
+}
+
 # --- install.ps1's real phase order (issue #168) ------------------------------
 # Get-InstallPhaseOrder (removed by issue #168) named the intended step order
 # but nothing read it back, so install.ps1 could drift from it silently in
@@ -502,6 +611,9 @@ Export-ModuleMember -Function @(
     'Find-SdkTool',
     'Get-LogoSpecs',
     'Build-Logos',
+    'Invoke-MakeAppxPack',
+    'Invoke-WingmanSignTool',
+    'Publish-WingmanPackage',
     'Get-TopLevelPhaseMarkers',
     'Test-InstallPhaseOrder'
 )
