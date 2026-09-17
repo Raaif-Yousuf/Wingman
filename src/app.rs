@@ -281,6 +281,50 @@ fn pump_messages() {
 }
 
 impl App {
+    /// Issue #192: the card `App::ask`'s pre-flight gate should show, or
+    /// `None` when at least one provider the current `Mode` would actually
+    /// try is ready. Decided entirely from `config` -- no network call, so
+    /// Auto mode's real Ollama reachability probe (`mode::probe_ollama_ready`,
+    /// which only ever runs on the worker thread) never runs here.
+    ///
+    /// The old gate checked `self.chain`, built mode-agnostically by
+    /// `Config::build_chain` -- every configured provider, regardless of
+    /// `Mode`. That meant e.g. Local mode with only a cloud key configured
+    /// passed the gate (the cloud provider is `ready()`), let capture run,
+    /// and only failed later, on the worker, with a less specific "no
+    /// providers configured" error. This selects with
+    /// `Providers::build_chain_for_mode` instead, the same selection the
+    /// worker itself uses.
+    ///
+    /// `ollama_ready: true` passed into `build_chain_for_mode` is the
+    /// optimistic upper bound that function's own doc comment describes: it
+    /// decides only whether Ollama counts as a candidate under Auto mode
+    /// (so a user who configured it is never blocked here just because this
+    /// gate cannot probe), never a claim that Ollama is actually reachable
+    /// right now -- that real check still happens only on the worker.
+    fn readiness_gate(mode: Mode, providers: &Providers, config_path: &str) -> Option<(String, String)> {
+        let selected = providers.build_chain_for_mode(mode, true);
+        if !selected.ready_provider_names().is_empty() {
+            return None;
+        }
+        Some(match mode {
+            Mode::Local | Mode::Offline => (
+                "Local mode needs Ollama configured".to_string(),
+                format!(
+                    "Add \"ollama\" to providers.order and a base_url and model under [providers.ollama] in:\n{config_path}"
+                ),
+            ),
+            Mode::Cloud => (
+                "No API key: open Edit settings".to_string(),
+                format!("Add a key under [providers.openai] or [providers.anthropic] in:\n{config_path}"),
+            ),
+            Mode::Auto => (
+                "No provider ready: open Edit settings".to_string(),
+                format!("Add a cloud API key, or configure Ollama, in:\n{config_path}"),
+            ),
+        })
+    }
+
     /// The whole flow: hide any stale card, check a provider is actually
     /// ready, grab the screen, then hand the bytes to a worker so the
     /// message loop stays responsive during the call.
@@ -310,14 +354,15 @@ impl App {
         // a machine with no key configured should never pay for a screenshot
         // grab (or have a capture failure mask the actually-actionable "No
         // API key" card) just to find out it has nothing to ask (issue #158).
-        if self.chain.ready_provider_names().is_empty() {
-            let path = Config::path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "config.toml".into());
-            self.card.show_error(
-                "No API key: open Edit settings",
-                &format!("Add a key under [providers.openai] or [providers.anthropic] in:\n{path}"),
-            );
+        // Issue #192: gated on the MODE-AWARE selection (matching what the
+        // worker will actually try), not the mode-agnostic self.chain --
+        // otherwise e.g. Local mode with only a cloud key, or Cloud mode
+        // with only Ollama, shows the less specific message.
+        let path = Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "config.toml".into());
+        if let Some((headline, detail)) = Self::readiness_gate(self.config.mode, &self.config.providers, &path) {
+            self.card.show_error(&headline, &detail);
             return;
         }
 
@@ -1345,8 +1390,10 @@ mod tests {
     use super::App;
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{WM_APP_ACTIVATE, WM_APP_RESULT};
+    use crate::config::Providers;
     use crate::dismiss::WM_APP_DISMISS;
     use crate::hotkey::{WM_APP_HOTKEY, WM_APP_LEARNED};
+    use crate::mode::Mode;
     use crate::ui::tray::WM_APP_TRAY;
     use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
 
@@ -1379,6 +1426,128 @@ mod tests {
         let (headline, detail) = unreadable_secrets_card(&["openai".to_string()]);
         assert!(!headline.contains('\u{2014}'));
         assert!(!detail.contains('\u{2014}'));
+    }
+
+    // -- readiness_gate (issue #192) ---------------------------------------
+    //
+    // App::ask's pre-flight "nothing configured" gate used to check
+    // self.chain, built mode-agnostically by Config::build_chain -- so in
+    // e.g. Local mode with only a cloud key, the gate passed (the cloud
+    // provider is ready), capture ran, and only the worker's later
+    // mode-filtered chain (empty, since Local excludes cloud) failed, with a
+    // less specific message. readiness_gate decides from config alone
+    // (Providers::build_chain_for_mode with an optimistic ollama_ready=true,
+    // matching that function's own doc comment) which card, if any, to show
+    // -- no network call, so Auto's real Ollama probe never runs here.
+
+    fn cloud_ready_providers() -> Providers {
+        let mut p = Providers {
+            order: vec!["openai".to_string(), "anthropic".to_string()],
+            ..Providers::default()
+        };
+        p.openai.api_key = "sk-real".to_string();
+        p
+    }
+
+    fn ollama_only_providers() -> Providers {
+        let mut p = Providers { order: vec!["ollama".to_string()], ..Providers::default() };
+        p.ollama.base_url = "http://127.0.0.1:11434".to_string();
+        p
+    }
+
+    fn nothing_configured_providers() -> Providers {
+        Providers {
+            order: vec!["openai".to_string(), "anthropic".to_string()],
+            ..Providers::default()
+        }
+    }
+
+    #[test]
+    fn readiness_gate_passes_when_a_cloud_key_is_set_in_cloud_mode() {
+        assert!(App::readiness_gate(Mode::Cloud, &cloud_ready_providers(), "config.toml").is_none());
+    }
+
+    #[test]
+    fn readiness_gate_blocks_cloud_mode_with_only_ollama_configured() {
+        // The exact scenario #192 reports: Cloud mode, only Ollama
+        // configured -- Ollama's ready() is true (no key needed), but Cloud
+        // mode never selects it, so the gate must still block.
+        let (headline, _) = App::readiness_gate(Mode::Cloud, &ollama_only_providers(), "config.toml")
+            .expect("must block: cloud mode has nothing cloud configured");
+        assert_eq!(headline, "No API key: open Edit settings");
+    }
+
+    #[test]
+    fn readiness_gate_passes_when_ollama_is_configured_in_local_mode() {
+        assert!(App::readiness_gate(Mode::Local, &ollama_only_providers(), "config.toml").is_none());
+    }
+
+    #[test]
+    fn readiness_gate_passes_when_ollama_is_configured_in_offline_mode() {
+        assert!(App::readiness_gate(Mode::Offline, &ollama_only_providers(), "config.toml").is_none());
+    }
+
+    #[test]
+    fn readiness_gate_blocks_local_mode_with_only_a_cloud_key() {
+        // The other #192 scenario: Local mode with only a cloud key
+        // configured must say Ollama is what's missing, not the generic
+        // "No API key" message meant for Cloud mode.
+        let (headline, detail) = App::readiness_gate(Mode::Local, &cloud_ready_providers(), "C:\\cfg\\config.toml")
+            .expect("must block: local mode has no ollama configured");
+        assert_eq!(headline, "Local mode needs Ollama configured");
+        assert!(detail.contains("ollama"), "{detail}");
+        assert!(detail.contains("C:\\cfg\\config.toml"), "{detail}");
+    }
+
+    #[test]
+    fn readiness_gate_blocks_offline_mode_with_only_a_cloud_key() {
+        let (headline, _) = App::readiness_gate(Mode::Offline, &cloud_ready_providers(), "config.toml")
+            .expect("must block: offline mode has no ollama configured");
+        assert_eq!(headline, "Local mode needs Ollama configured");
+    }
+
+    #[test]
+    fn readiness_gate_passes_in_auto_mode_when_only_ollama_is_configured() {
+        // Auto mode's optimistic ollama_ready=true upper bound must count
+        // Ollama as a candidate even though no real probe ran here.
+        assert!(App::readiness_gate(Mode::Auto, &ollama_only_providers(), "config.toml").is_none());
+    }
+
+    #[test]
+    fn readiness_gate_passes_in_auto_mode_when_only_a_cloud_key_is_configured() {
+        assert!(App::readiness_gate(Mode::Auto, &cloud_ready_providers(), "config.toml").is_none());
+    }
+
+    #[test]
+    fn readiness_gate_blocks_auto_mode_with_nothing_configured() {
+        let (headline, _) = App::readiness_gate(Mode::Auto, &nothing_configured_providers(), "config.toml")
+            .expect("must block: nothing is configured at all");
+        assert_eq!(headline, "No provider ready: open Edit settings");
+    }
+
+    #[test]
+    fn readiness_gate_blocks_cloud_mode_with_nothing_configured() {
+        assert!(App::readiness_gate(Mode::Cloud, &nothing_configured_providers(), "config.toml").is_some());
+    }
+
+    #[test]
+    fn readiness_gate_blocks_local_mode_with_nothing_configured() {
+        assert!(App::readiness_gate(Mode::Local, &nothing_configured_providers(), "config.toml").is_some());
+    }
+
+    #[test]
+    fn readiness_gate_cards_have_no_em_dash() {
+        // CLAUDE.md rule 11.
+        for (mode, providers) in [
+            (Mode::Cloud, nothing_configured_providers()),
+            (Mode::Local, nothing_configured_providers()),
+            (Mode::Auto, nothing_configured_providers()),
+        ] {
+            let (headline, detail) =
+                App::readiness_gate(mode, &providers, "config.toml").expect("must block");
+            assert!(!headline.contains('\u{2014}'), "{headline}");
+            assert!(!detail.contains('\u{2014}'), "{detail}");
+        }
     }
 
     // -- should_open_config_after_ensuring_it_exists (issue #174) ---------
