@@ -58,3 +58,21 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "fill-this-form"
+name = "Fill this form"
+group = "Work"
+inputs = [
+    "uia",
+    "screen",
+]
+proposal = "form_fill"
+executor = "fill_form"
+confirm = true
+prompt = 'You are shown a screenshot of a form and a short list of its fields Wingman could not confidently map to a profile field by label alone. For each one, decide whether a profile field (named below) is the right source, or whether you can read/infer a short, literal value directly from what is visible on screen. Never invent personal data that is not visible and not in the profile. Never fill a payment field (card number, CVV, expiry, IBAN, account or routing number) by any means; leave it as "skip". If you are unsure, choose "skip" rather than guessing.'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"

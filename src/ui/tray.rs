@@ -148,6 +148,13 @@ pub mod cmd {
     /// `app.rs`.
     pub const ADD_TO_CALENDAR: u32 = 1023;
 
+    /// Issue #40: runs the built-in "Fill this form" action (Look, Propose,
+    /// Confirm, Do). See `App::fill_form_from_screen` in `app.rs`.
+    pub const FILL_FORM: u32 = 1024;
+    /// Issue #40: Undo for the most recent successful `fill_form` run. See
+    /// `App::restore_last_form` in `app.rs`.
+    pub const RESTORE_LAST_FORM: u32 = 1025;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -469,6 +476,8 @@ impl Tray {
             !self.paused,
         )?;
         append_item(hmenu, cmd::ADD_TO_CALENDAR, "Add event from screen")?;
+        append_item(hmenu, cmd::FILL_FORM, "Fill this form")?;
+        append_item(hmenu, cmd::RESTORE_LAST_FORM, "Restore last form")?;
         append_separator(hmenu)?;
         if self.paused {
             append_item(hmenu, cmd::RESUME, "Resume")?;
@@ -1265,6 +1274,57 @@ mod tests {
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 
+    // -- #40: "Fill this form" and "Restore last form" are reachable --------
+
+    #[test]
+    fn fill_form_and_restore_last_form_items_are_present_in_the_built_menu() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetMenuItemInfoW, CW_USEDEFAULT, WINDOW_EX_STYLE,
+            WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray fill-form test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+
+        let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu).expect("build_menu");
+
+        let mut info = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STATE,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(hmenu, cmd::FILL_FORM, false, &mut info) }
+            .expect("cmd::FILL_FORM must be a real item id in the built menu, not orphaned data");
+        unsafe { GetMenuItemInfoW(hmenu, cmd::RESTORE_LAST_FORM, false, &mut info) }.expect(
+            "cmd::RESTORE_LAST_FORM must be a real item id in the built menu, not orphaned data",
+        );
+
+        let _ = unsafe { DestroyMenu(hmenu) };
+        drop(tray);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
     // -- submenu attach ordering (#147) -------------------------------------
 
     #[test]
@@ -1335,6 +1395,8 @@ mod tests {
         ("CALCULATE_SELECTION", cmd::CALCULATE_SELECTION),
         ("COPY_REGION", cmd::COPY_REGION),
         ("ADD_TO_CALENDAR", cmd::ADD_TO_CALENDAR),
+        ("FILL_FORM", cmd::FILL_FORM),
+        ("RESTORE_LAST_FORM", cmd::RESTORE_LAST_FORM),
     ];
 
     #[test]

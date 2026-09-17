@@ -149,6 +149,19 @@ impl From<windows::Win32::Foundation::RECT> for Rect {
 #[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSnapshot {
+    /// The window this field was walked from, as a raw `HWND` pointer value
+    /// stored plain (`isize`), the same identity shape
+    /// `executors::target::TargetRef::hwnd` uses -- so a
+    /// [`FieldSnapshot`] carries everything `executors::target::parse_target_ref`
+    /// needs to build a `TargetRef` (#40's "Fill this form": this snapshot
+    /// is what the action layer walks to build a `form_fill` proposal's
+    /// per-field target). `0` for a synthetic `FieldSnapshot` built directly
+    /// in a test, never a real window.
+    pub hwnd: isize,
+    /// This element's `GetRuntimeId()`, the other half of a `TargetRef`'s
+    /// identity (alongside `hwnd`/`automation_id`/`name`/`control_type`).
+    /// Empty for a synthetic test `FieldSnapshot`.
+    pub runtime_id: Vec<i32>,
     pub automation_id: String,
     pub name: String,
     /// Resolved by [`build_snapshot`]: `LabeledBy`'s name, else the nearest
@@ -179,6 +192,13 @@ pub struct Snapshot {
 #[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
 #[derive(Debug, Clone, Default)]
 struct RawElement {
+    /// See [`FieldSnapshot::hwnd`]. Set by [`com::walk`] from the window
+    /// handle it was called with (the same value for every element in one
+    /// walk), never by [`com::extract`] itself, which has no window handle
+    /// in scope.
+    hwnd: isize,
+    /// See [`FieldSnapshot::runtime_id`].
+    runtime_id: Vec<i32>,
     automation_id: String,
     name: String,
     help_text: String,
@@ -260,6 +280,8 @@ fn build_snapshot(elements: &[RawElement]) -> Vec<FieldSnapshot> {
         };
 
         fields.push(FieldSnapshot {
+            hwnd: el.hwnd,
+            runtime_id: el.runtime_id.clone(),
             automation_id: el.automation_id.clone(),
             name: el.name.clone(),
             label,
@@ -375,7 +397,11 @@ mod com {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
+        COINIT_APARTMENTTHREADED, SAFEARRAY,
+    };
+    use windows::Win32::System::Ole::{
+        SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
+        SafeArrayUnaccessData,
     };
     use windows::Win32::UI::Accessibility::{
         CUIAutomation8, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
@@ -484,10 +510,58 @@ mod com {
                 break;
             }
             let element = unsafe { found.GetElement(i as i32) }?;
-            raw.push(extract(&element)?);
+            let mut re = extract(&element)?;
+            // Set here, not in `extract` (which has no window handle in
+            // scope): every element from one `walk` call shares the same
+            // `hwnd`, the same identity shape `executors::target::com::walk`
+            // stamps onto its own `TargetRef`s.
+            re.hwnd = hwnd.0 as isize;
+            re.runtime_id = unsafe { element.GetRuntimeId() }
+                .ok()
+                .and_then(|psa| unsafe { runtime_id_from_safearray(psa) }.ok())
+                .unwrap_or_default();
+            raw.push(re);
         }
 
         Ok((raw, truncated))
+    }
+
+    /// Reads a `GetRuntimeId()` result (an owned `SAFEARRAY` of `VT_I4`
+    /// elements) into a plain `Vec<i32>`, freeing the array on every exit
+    /// path via `SafeArrayGuard`'s `Drop`. Duplicated from
+    /// `executors::target::com::runtime_id_from_safearray` rather than
+    /// shared -- that function is private to its own file, the same
+    /// "duplicated, not shared, because it's private to its own file"
+    /// trade-off `ComApartment` already makes in both modules.
+    unsafe fn runtime_id_from_safearray(psa: *mut SAFEARRAY) -> anyhow::Result<Vec<i32>> {
+        if psa.is_null() {
+            return Ok(Vec::new());
+        }
+
+        struct SafeArrayGuard(*mut SAFEARRAY);
+        impl Drop for SafeArrayGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SafeArrayDestroy(self.0);
+                }
+            }
+        }
+        let _guard = SafeArrayGuard(psa);
+
+        let lbound = unsafe { SafeArrayGetLBound(psa, 1) }?;
+        let ubound = unsafe { SafeArrayGetUBound(psa, 1) }?;
+        if ubound < lbound {
+            return Ok(Vec::new());
+        }
+        let count = (ubound - lbound + 1) as usize;
+
+        let mut data_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        unsafe { SafeArrayAccessData(psa, &mut data_ptr) }?;
+        let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const i32, count) };
+        let result = slice.to_vec();
+        unsafe { SafeArrayUnaccessData(psa) }?;
+
+        Ok(result)
     }
 
     fn extract(el: &IUIAutomationElement) -> anyhow::Result<RawElement> {
@@ -545,6 +619,11 @@ mod com {
         };
 
         Ok(RawElement {
+            // Filled in by `walk`, the only caller with a window handle (for
+            // `hwnd`) or a reason to pay for the extra `GetRuntimeId` round
+            // trip (for `runtime_id`) in scope -- see `walk`'s own comment.
+            hwnd: 0,
+            runtime_id: Vec::new(),
             automation_id,
             name,
             help_text,
@@ -608,6 +687,28 @@ mod tests {
             enabled: true,
             ..Default::default()
         }
+    }
+
+    // -- identity: hwnd / runtime_id carry through from RawElement ---------
+
+    #[test]
+    fn build_snapshot_carries_hwnd_and_runtime_id_through() {
+        let elements = vec![RawElement {
+            hwnd: 4242,
+            runtime_id: vec![1, 2, 3],
+            ..edit("firstName")
+        }];
+        let fields = build_snapshot(&elements);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].hwnd, 4242);
+        assert_eq!(fields[0].runtime_id, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn synthetic_raw_element_defaults_to_zero_hwnd_and_empty_runtime_id() {
+        let fields = build_snapshot(&[edit("firstName")]);
+        assert_eq!(fields[0].hwnd, 0);
+        assert!(fields[0].runtime_id.is_empty());
     }
 
     // -- label resolution: LabeledBy > nearest preceding Text > HelpText ---
@@ -807,6 +908,8 @@ mod tests {
 
     fn field(label: &str, value: FieldValue) -> FieldSnapshot {
         FieldSnapshot {
+            hwnd: 0,
+            runtime_id: Vec::new(),
             automation_id: String::new(),
             name: String::new(),
             label: label.to_string(),
@@ -1085,6 +1188,17 @@ mod tests {
                 .expect("the first-name field is present with its real value");
             assert_eq!(first_name.label, "First name");
             assert_eq!(first_name.control_type, ControlKind::Edit);
+            // #40 ("Fill this form"): the identity a `TargetRef` needs is
+            // really populated from the real walk, not left at the
+            // `RawElement::default()` placeholder `extract` returns.
+            assert_eq!(
+                first_name.hwnd, frame.0 as isize,
+                "hwnd must be the real window handle this snapshot was walked from"
+            );
+            assert!(
+                !first_name.runtime_id.is_empty(),
+                "a real UIA element's GetRuntimeId() must not be empty"
+            );
 
             let password = snapshot
                 .fields

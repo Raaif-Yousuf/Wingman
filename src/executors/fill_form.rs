@@ -44,14 +44,10 @@
 //!    account/routing number -- the profile has no payment fields to source
 //!    these from in the first place (expansion plan §6 rule 4), but a
 //!    provider could still propose one by label, so this is checked
-//!    independently of where the value came from. **Coordination note:**
-//!    the profile module (`src/profile/`, added tonight in parallel on the
-//!    still-unmerged `worktree-agent-a16f5b1a39aed9da0` branch that closed
-//!    #36) is not present on this branch as of this commit, but its own
-//!    closing comment names `profile::denylist::check_field`: a second,
-//!    independently written payment-shaped-*value* denylist (this file's
-//!    checks a proposal field's *label*, before any write). The two should
-//!    be reconciled once both branches land on master -- filed as #215.
+//!    independently of where the value came from, against the one shared
+//!    term table in [`crate::payment_denylist`] (#215, closed: this used to
+//!    be its own independently-worded table; `profile::denylist` now reads
+//!    from the same table for its own CVV/bank-label checks).
 //!
 //! Whatever survives all five checks is [`FieldOutcome::Filled`]: the prior
 //! value is recorded and the new value is written.
@@ -175,26 +171,6 @@ pub struct FieldResult {
     pub outcome: FieldOutcome,
 }
 
-/// Deny terms checked as a case-insensitive substring of a field's label.
-/// Not tokenized like `uia_guard`'s deny-list (these are prose labels, not
-/// invokable-element names: "Card number", "CVV/CVC", not camelCase
-/// identifiers), so a phrase-substring match is the right shape here, the
-/// same reasoning `uia_guard`'s `PHRASE_DENY` documents for "Place Order".
-/// See this file's module doc comment ("Coordination note") for why this is
-/// its own table rather than reusing `uia_guard`'s: they gate different
-/// things (an invokable element's name vs. a form field's label) and the
-/// profile module's own denylist, once it exists, is a third thing again.
-const PAYMENT_LABEL_TERMS: &[&str] = &[
-    "card number",
-    "cvv",
-    "cvc",
-    "expiry",
-    "expiration date",
-    "iban",
-    "account number",
-    "routing number",
-];
-
 /// Whether a form field's label reads as a payment field this executor must
 /// never fill, regardless of what the model proposed as its value (the
 /// profile has no payment fields to source one from -- expansion plan §6
@@ -203,12 +179,16 @@ const PAYMENT_LABEL_TERMS: &[&str] = &[
 /// number"), never bare "account" or "card" alone, so an ordinary "Card
 /// issuer" or "Account holder name" style field is not the target here --
 /// "Account holder name" in particular is accepted as a false negative
-/// (documented, not fixed): the profile's own about-me fields cover names,
-/// and #215 is where this table gets reconciled with
-/// `profile::denylist::check_field` once both branches are on master.
+/// (documented, not fixed): the profile's own about-me fields cover names.
+///
+/// #215 (closed): this used to hold its own `PAYMENT_LABEL_TERMS` table,
+/// independently worded from `profile::denylist`'s own CVV/bank-label
+/// tables. Both now read from the one shared
+/// [`crate::payment_denylist::is_payment_shaped_label`] table, so a term
+/// added to cover a gap in one caller is automatically covered in the
+/// other.
 pub fn is_payment_label(label: &str) -> bool {
-    let normalized = label.to_lowercase();
-    PAYMENT_LABEL_TERMS.iter().any(|t| normalized.contains(t))
+    crate::payment_denylist::is_payment_shaped_label(label)
 }
 
 /// The pure per-field decision, given the field's proposal data and its

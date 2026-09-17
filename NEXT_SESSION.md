@@ -123,6 +123,44 @@ the picker route is live; the hook route works regardless.
   marker -- that is the one observable that would differ if the "user
   scoped" claim were wrong.
 
+- **#40 "Fill this form"** (overnight agent session, 2026-09-17, branch
+  `agent-ac805472cc51981c0`). What was built and verified without the exe:
+  the two-stage propose pipeline (`actions::fill_form`: local mapping via
+  `profile::match_label`, the model request/response for whatever stage 1
+  cannot map, the merge, the final `{fields: [...]}` proposal
+  `executors::fill_form` -- already shipped by #33 -- consumes unchanged),
+  the preview translation into the existing `Card::show_preview`/
+  `PreviewModel` machinery (no new Win32 rendering path -- see
+  `actions::fill_form`'s module doc comment for why), `app.rs`'s
+  `fill_form_from_screen`/`on_form_fill_result`/`on_preview_decided`/
+  `restore_last_form` wiring, and the tray's "Fill this form"/"Restore last
+  form" items (`ui::tray`'s own real-window test confirms both ids are
+  real menu items, not orphaned data). 96 tests (`cargo test fill_form`,
+  `cargo test actions`, `cargo test config`, `cargo test ui::tray`,
+  `cargo test app::`), plus a live `#[ignore]`d integration test
+  (`actions::fill_form::tests::win32::fill_form_live_local_mapping_fills_a_whole_form_with_zero_model_calls`,
+  `cargo test fill_form_live -- --ignored`) against a real Win32 window with
+  three labelled EDIT controls and a "Place order" BUTTON: local mapping
+  alone fills all three (asserted `unmapped.is_empty()`, i.e. zero model
+  calls), the button is never even walked as a candidate (`inputs::uia`'s
+  own six-control-type filter), and its `BN_CLICKED` count stays `0`.
+  **Not yet checked**: #40's own literal Done-when ("A checkout page in
+  Chrome is filled with name, email, phone and address; payment fields are
+  untouched") on a REAL Chrome checkout page, and the actual GDI rendering
+  of the preview's translated rows (current -> proposed (from source), and
+  a sensitive field's editable "clear to skip" row) on a real screen --
+  both need a live desktop session and the Copilot key, which this task's
+  constraints rule out ("do not launch the exe"). Filed to #166 (issue
+  comment, this session) as the manual check owed: with a real profile
+  (name, email, phone, address populated, non-sensitive) saved via a
+  `profile.toml` import or a future settings page, open a Chrome checkout
+  form, press the "Fill this form" tray item, confirm the preview shows
+  the right fields with a plausible current/proposed/source line each,
+  press "Do it", and confirm the four fields land in the right controls
+  while every payment field (card number, CVV, expiry) stays untouched --
+  that is the one observable that would differ if this were wired to
+  nothing.
+
 ## Facts established this session, not derivable from the code
 
 - Git history contains no key-shaped strings (`git log -p --all` grep for

@@ -27,7 +27,13 @@ pub struct Field {
     /// [`PreviewModel::set_value`] takes and what [`PreviewModel::to_value`]
     /// emits as the object key -- never the display label.
     pub name: String,
-    /// A human-readable label derived from `name` (`"start"` -> `"Start"`).
+    /// A human-readable label. Derived from `name` (`"start"` -> `"Start"`)
+    /// unless the schema property carries its own `"label"` string (#40
+    /// "Fill this form": a form_fill-derived pseudo-schema names its rows
+    /// with a stable, unique-but-ugly property key like `"f2_value"` while
+    /// still wanting to show the real UIA field label, e.g. `"Date of
+    /// birth"`, which `label_for`'s snake_case-to-sentence-case derivation
+    /// could never produce from that key). See [`PreviewModel::from_schema`].
     pub label: String,
     /// The value currently shown for this field: the proposal's original
     /// value until [`PreviewModel::set_value`] overwrites it.
@@ -61,11 +67,16 @@ impl PreviewModel {
     /// ordering list that could drift from it.
     ///
     /// A property is editable when its schema entry sets `"editable":
-    /// true`; every other schema keyword (`"type"`, `"enum"`, ...) is
-    /// ignored here -- this is a rendering concern, not a validation one,
-    /// and reading an extra, non-standard keyword out of an otherwise
-    /// ordinary JSON Schema does not change what gets sent to a provider
-    /// (`actions::schema::schema_for` is the only thing that does that).
+    /// true`; a property's display label comes from its own `"label"`
+    /// string when present, else from [`label_for`]. Every other schema
+    /// keyword (`"type"`, `"enum"`, ...) is ignored here -- this is a
+    /// rendering concern, not a validation one, and reading an extra,
+    /// non-standard keyword out of an otherwise ordinary JSON Schema does
+    /// not change what gets sent to a provider (`actions::schema::schema_for`
+    /// is the only thing that does that; neither `"editable"` nor
+    /// `"label"` is ever set on a schema that function returns, only on a
+    /// pseudo-schema a caller builds purely to drive this card, e.g.
+    /// `actions::fill_form`'s form_fill preview).
     ///
     /// Missing or malformed schema/value shapes degrade to an empty model
     /// (no fields) rather than panicking: a card that renders nothing is
@@ -89,10 +100,15 @@ impl PreviewModel {
                         .get("editable")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    let label = def
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| label_for(name));
                     let field_value = value_obj.get(name).map(display_string).unwrap_or_default();
                     Field {
                         name: name.clone(),
-                        label: label_for(name),
+                        label,
                         value: field_value,
                         editable,
                         required: required.contains(&name.as_str()),
@@ -255,6 +271,29 @@ mod tests {
         let model = PreviewModel::from_schema(&schema, &serde_json::json!({}));
         let start = model.fields().iter().find(|f| f.name == "start").unwrap();
         assert_eq!(start.label, "Start");
+    }
+
+    // -- from_schema: the optional "label" override (#40) -------------------
+
+    #[test]
+    fn from_schema_prefers_an_explicit_label_over_the_derived_one() {
+        let schema = serde_json::json!({
+            "properties": {
+                "f2_value": {"type": "string", "label": "Date of birth"}
+            }
+        });
+        let model = PreviewModel::from_schema(&schema, &serde_json::json!({}));
+        assert_eq!(model.fields()[0].label, "Date of birth");
+    }
+
+    #[test]
+    fn from_schema_falls_back_to_the_derived_label_when_no_override_is_present() {
+        // Unchanged behaviour for every existing schema (calendar_event,
+        // verdict): neither sets "label", so this must still derive it.
+        let schema = calendar_schema();
+        let model = PreviewModel::from_schema(&schema, &serde_json::json!({}));
+        let title = model.fields().iter().find(|f| f.name == "title").unwrap();
+        assert_eq!(title.label, "Title");
     }
 
     #[test]
