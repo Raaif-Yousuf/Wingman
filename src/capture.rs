@@ -319,7 +319,13 @@ pub fn fit_long_edge(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
 /// The Win32 rect (in virtual-screen coordinates) of the monitor containing
 /// the foreground window, falling back to the primary monitor when there is
 /// no foreground window or the lookup fails.
-fn active_monitor_rect() -> Result<RECT> {
+///
+/// `pub(crate)` (added for #25): `ui::palette` reuses this exact function to
+/// center the Quick Ask palette on the active monitor, rather than
+/// duplicating the `MonitorFromWindow`/`GetMonitorInfoW` sequence -- see the
+/// `wired-to-nothing` skill's "a hard-coded list" row on why a sibling copy
+/// of monitor-lookup logic is worth avoiding.
+pub(crate) fn active_monitor_rect() -> Result<RECT> {
     let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.is_invalid() {
         return primary_monitor_rect();

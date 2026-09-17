@@ -148,6 +148,12 @@ pub mod cmd {
     /// `app.rs`.
     pub const ADD_TO_CALENDAR: u32 = 1023;
 
+    /// Issue #25: opens the Quick Ask palette. See `App::toggle_palette` in
+    /// `app.rs`. Highest existing fixed cmd id was 1023 (`ADD_TO_CALENDAR`);
+    /// this is appended after it per the uniqueness test's own convention
+    /// (`fixed_cmd_ids_are_pairwise_unique`).
+    pub const QUICK_ASK: u32 = 1024;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -455,6 +461,10 @@ impl Tray {
 
     fn build_menu(&self, hmenu: HMENU) -> Result<()> {
         append_item(hmenu, cmd::ASK_NOW, "Ask now")?;
+        // #25: honors Pause the same way "Calculate selection" does just
+        // below -- opening the palette to run an action defeats the point
+        // of pausing.
+        append_item_state(hmenu, cmd::QUICK_ASK, "Quick Ask", !self.paused)?;
         append_item(hmenu, cmd::EXTRACT_TEXT, "Copy text from screen")?;
         append_item(hmenu, cmd::COPY_REGION, "Copy region to clipboard")?;
         append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
@@ -1168,6 +1178,54 @@ mod tests {
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 
+    // -- #25: "Quick Ask" is reachable from the menu -------------------------
+
+    #[test]
+    fn quick_ask_item_is_present_in_the_built_menu() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetMenuItemInfoW, CW_USEDEFAULT, WINDOW_EX_STYLE,
+            WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray quick-ask test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+
+        let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu).expect("build_menu");
+
+        let mut info = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STATE,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(hmenu, cmd::QUICK_ASK, false, &mut info) }
+            .expect("cmd::QUICK_ASK must be a real item id in the built menu, not orphaned data");
+
+        let _ = unsafe { DestroyMenu(hmenu) };
+        drop(tray);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
     // -- #41: "Copy text from screen" is reachable from the menu ------------
 
     #[test]
@@ -1335,6 +1393,7 @@ mod tests {
         ("CALCULATE_SELECTION", cmd::CALCULATE_SELECTION),
         ("COPY_REGION", cmd::COPY_REGION),
         ("ADD_TO_CALENDAR", cmd::ADD_TO_CALENDAR),
+        ("QUICK_ASK", cmd::QUICK_ASK),
     ];
 
     #[test]
