@@ -24,6 +24,23 @@ use crate::secrets::{target_name, CredManagerStore, SecretStore};
 /// present-but-unreadable instead of masked stars.
 pub const UNREADABLE_KEY_MARKER: &str = "\u{1}wingman-credential-unreadable\u{1}";
 
+/// The cloud providers whose API key `Config::apply_env_overrides` lets an
+/// env var override, paired with that var's name -- the single source of
+/// truth [`Config::env_var_name`] and [`crate::diagnostics::env_overrides_present`]
+/// both read (issue #201). Before this fix `diagnostics.rs` kept its own
+/// hand-copied `ENV_OVERRIDE_VARS` list, which could name a provider (or an
+/// env var) this list had already changed for; a provider added here without
+/// also updating `Config::apply_env_overrides`'s explicit `if let Ok(key) =
+/// std::env::var(...)` arms is caught by
+/// `env_override_vars_agree_with_apply_env_overrides` below. Ollama and any
+/// `compat:*` provider have no env override at all (#16's "no single fixed
+/// env var name" call), so they are intentionally absent here.
+pub(crate) const ENV_OVERRIDE_VARS: &[(&str, &str)] = &[
+    ("openai", "OPENAI_API_KEY"),
+    ("anthropic", "ANTHROPIC_API_KEY"),
+    ("gemini", "GEMINI_API_KEY"),
+];
+
 /// `%APPDATA%\Wingman\config.toml`. See the design spec's "Config"
 /// section for the authoritative shape.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
@@ -556,14 +573,15 @@ impl Config {
     }
 
     /// The env var name each provider's key can be overridden by, mirroring
-    /// [`Config::apply_env_overrides`].
+    /// [`Config::apply_env_overrides`]. Looks up [`ENV_OVERRIDE_VARS`], the
+    /// single source of truth this and [`crate::diagnostics`] both read
+    /// (issue #201) -- before that fix, `diagnostics.rs` kept its own
+    /// hand-copied list that could silently drift from this one.
     fn env_var_name(provider: &str) -> Option<&'static str> {
-        match provider {
-            "openai" => Some("OPENAI_API_KEY"),
-            "anthropic" => Some("ANTHROPIC_API_KEY"),
-            "gemini" => Some("GEMINI_API_KEY"),
-            _ => None,
-        }
+        ENV_OVERRIDE_VARS
+            .iter()
+            .find(|(p, _)| *p == provider)
+            .map(|(_, var)| *var)
     }
 
     /// The save-path reconciler `Config::save` uses to keep the store in
@@ -832,6 +850,19 @@ fn unreadable_as_empty(key: &str) -> String {
     }
 }
 
+/// [`Providers::describe`]'s result: display-safe fields for one
+/// `providers.order` entry. `api_key` is never redacted here -- it is the
+/// raw (possibly empty, possibly [`UNREADABLE_KEY_MARKER`]) field, and
+/// `None` only for a provider with no key concept at all (Ollama). The
+/// caller (`diagnostics::provider_rows`) is responsible for turning it into
+/// a [`crate::diagnostics::KeyStatus`] before anything is displayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderDescriptor {
+    pub name: String,
+    pub model: String,
+    pub api_key: Option<String>,
+}
+
 impl Providers {
     /// Constructs the `Provider` for one `providers.order` name against
     /// `self`'s per-provider config, or `None` for an unrecognized name.
@@ -878,6 +909,45 @@ impl Providers {
                 )))
             }
         }
+    }
+
+    /// One `providers.order` entry resolved to its display-safe fields --
+    /// never a raw `api_key`, only whether the concept applies at all
+    /// (`Some` for a cloud/compat provider, `None` for Ollama, which has
+    /// nothing to authenticate with). The single source of truth for "what
+    /// does this order name mean" that a read-only consumer like
+    /// `diagnostics::provider_rows` reads instead of keeping its own copy of
+    /// [`Providers::provider_for`]'s match (issue #201) -- which also means
+    /// a `"compat:<name>"` entry, previously invisible to diagnostics
+    /// entirely, now shows up there too.
+    pub(crate) fn describe(&self, order_name: &str) -> Option<ProviderDescriptor> {
+        let (model, api_key) = match order_name {
+            "openai" => (self.openai.model.clone(), Some(self.openai.api_key.clone())),
+            "anthropic" => (
+                self.anthropic.model.clone(),
+                Some(self.anthropic.api_key.clone()),
+            ),
+            "gemini" => (self.gemini.model.clone(), Some(self.gemini.api_key.clone())),
+            "ollama" => (self.ollama.model.clone(), None),
+            _ => {
+                let compat_name = order_name.strip_prefix("compat:")?;
+                let cfg = self.compat.iter().find(|c| c.name == compat_name)?;
+                (cfg.model.clone(), Some(cfg.api_key.clone()))
+            }
+        };
+        Some(ProviderDescriptor {
+            name: order_name.to_string(),
+            model,
+            api_key,
+        })
+    }
+
+    /// Every `providers.order` entry this config can resolve, in order,
+    /// including compat entries -- unrecognized names are skipped, matching
+    /// [`Providers::build_chain`]'s own behavior. The list
+    /// `diagnostics::provider_rows` iterates (issue #201).
+    pub(crate) fn describe_all(&self) -> Vec<ProviderDescriptor> {
+        self.order.iter().filter_map(|name| self.describe(name)).collect()
     }
 
     /// [`Config::build_chain`]'s implementation, kept here (rather than
@@ -2516,5 +2586,122 @@ text_scale = 0.0
             !path.exists(),
             "the file must never be written when the store write fails"
         );
+    }
+
+    // -- Providers::describe / describe_all (issue #201) -------------------
+
+    #[test]
+    fn describe_resolves_a_cloud_provider_model_and_key() {
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-real".to_string();
+        let d = config.providers.describe("openai").expect("openai resolves");
+        assert_eq!(d.name, "openai");
+        assert_eq!(d.model, config.providers.openai.model);
+        assert_eq!(d.api_key.as_deref(), Some("sk-real"));
+    }
+
+    #[test]
+    fn describe_ollama_has_no_api_key_concept() {
+        let config = Config::default();
+        let d = config.providers.describe("ollama").expect("ollama resolves");
+        assert_eq!(d.api_key, None);
+    }
+
+    #[test]
+    fn describe_unrecognized_name_is_none() {
+        let config = Config::default();
+        assert!(config.providers.describe("bogus").is_none());
+    }
+
+    #[test]
+    fn describe_resolves_a_compat_entry_by_order_name() {
+        let mut config = Config::default();
+        config.providers.compat = vec![compat_entry("openrouter", "https://openrouter.ai/api/v1")];
+        let d = config
+            .providers
+            .describe("compat:openrouter")
+            .expect("compat entry resolves");
+        assert_eq!(d.name, "compat:openrouter");
+        assert_eq!(d.model, "some-model");
+        assert_eq!(d.api_key.as_deref(), Some("sk-compat-real"));
+    }
+
+    #[test]
+    fn describe_all_follows_order_and_includes_a_compat_entry() {
+        // The regression #201 exists to prevent: before `describe`/
+        // `describe_all` existed, `diagnostics::provider_rows` kept its own
+        // match with no `"compat:*"` arm at all, so a configured compat
+        // provider was silently invisible to diagnostics. `describe_all` is
+        // the shared source of truth both `build_chain` and
+        // `diagnostics::provider_rows` must agree with -- this proves the
+        // compat entry survives into it.
+        let mut config = Config::default();
+        config.providers.compat = vec![compat_entry("lmstudio", "http://127.0.0.1:1234/v1")];
+        config.providers.order = vec!["openai".to_string(), "compat:lmstudio".to_string()];
+        let rows = config.providers.describe_all();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "openai");
+        assert_eq!(rows[1].name, "compat:lmstudio");
+    }
+
+    #[test]
+    fn describe_all_skips_unrecognized_order_entries() {
+        let mut config = Config::default();
+        config.providers.order = vec!["bogus".to_string(), "ollama".to_string()];
+        let rows = config.providers.describe_all();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "ollama");
+    }
+
+    #[test]
+    fn describe_all_and_build_chain_agree_on_which_order_names_are_known() {
+        // A weaker but automatic guard against `provider_for` (chain
+        // construction) and `describe` (diagnostics data) drifting on
+        // *which* `providers.order` names resolve at all: if a future
+        // provider is ever added to one match but not the other, the
+        // resolved counts stop agreeing here without needing anyone to
+        // remember to add a dedicated test for the new provider (issue
+        // #201's "and/or a test... fails if the two lists diverge").
+        // `Chain::provider_names()` returns each provider's fixed `id()`
+        // (e.g. every compat entry reports "openai-compat"), not the order
+        // name, so the count -- not the exact names -- is what must agree.
+        let mut config = Config::default();
+        config.providers.compat = vec![compat_entry("openrouter", "https://openrouter.ai/api/v1")];
+        config.providers.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "gemini".to_string(),
+            "ollama".to_string(),
+            "compat:openrouter".to_string(),
+            "bogus".to_string(),
+        ];
+        let chain_count = config.build_chain().provider_names().len();
+        let describe_count = config.providers.describe_all().len();
+        assert_eq!(chain_count, describe_count);
+        assert_eq!(chain_count, 5, "bogus must be dropped by both");
+    }
+
+    // -- ENV_OVERRIDE_VARS agrees with apply_env_overrides (issue #201) ----
+
+    #[test]
+    fn env_override_vars_agree_with_apply_env_overrides() {
+        // The single source of truth `Config::env_var_name` and
+        // `diagnostics::env_overrides_present` both read must actually match
+        // what `apply_env_overrides` does -- proves the list was not just
+        // renamed but is the real thing the override logic uses.
+        let _guard = ENV_LOCK.lock().unwrap();
+        for (provider, var) in ENV_OVERRIDE_VARS {
+            std::env::set_var(var, "sentinel-value");
+            let mut config = Config::default();
+            config.apply_env_overrides();
+            let key = match *provider {
+                "openai" => &config.providers.openai.api_key,
+                "anthropic" => &config.providers.anthropic.api_key,
+                "gemini" => &config.providers.gemini.api_key,
+                other => panic!("unexpected provider {other} in ENV_OVERRIDE_VARS"),
+            };
+            assert_eq!(key, "sentinel-value", "{provider} via {var}");
+            std::env::remove_var(var);
+        }
     }
 }
