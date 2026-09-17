@@ -534,7 +534,10 @@ impl PullProgress {
         if self.total == 0 {
             None
         } else {
-            Some(self.completed as f32 / self.total as f32)
+            // #191: clamp -- a malformed/nonsensical line (`completed` >
+            // `total`) must never report a fraction outside 0.0..=1.0, even
+            // though no live UI reads this yet.
+            Some((self.completed as f32 / self.total as f32).clamp(0.0, 1.0))
         }
     }
 }
@@ -1011,6 +1014,19 @@ mod tests {
             error: None,
         };
         assert_eq!(progress.fraction(), None);
+    }
+
+    #[test]
+    fn fraction_clamps_when_completed_exceeds_total() {
+        // #191: a malformed/nonsensical pull-progress line must clamp to
+        // 1.0, not report a fraction over 100%.
+        let progress = PullProgress {
+            status: "downloading".to_string(),
+            completed: 2000,
+            total: 1000,
+            error: None,
+        };
+        assert_eq!(progress.fraction(), Some(1.0));
     }
 
     #[test]

@@ -4,6 +4,14 @@
 //! retry, #98), the image encoding, the answer JSON Schema and the
 //! difficulty-rubric prompt append.
 //!
+//! #191: "the HTTP send (with retry)" above is scoped to `post_json`/
+//! `post_json_with` -- the cloud providers' path, used by `anthropic.rs`
+//! and `openai.rs`. `ollama.rs` calls [`post_json_with_connect_timeout`]
+//! instead, which has no retry of its own (Ollama is local/loopback and
+//! unbilled, and that function's own doc comment explains its cold-model-
+//! load timeout rationale). Don't assume every entry point in this file
+//! gets the same retry/backoff treatment `post_json` does.
+//!
 //! `answer_schema`/`augmented_system_prompt` are physics-answer-specific
 //! today (the only action Wingman has), but neither provider calls them any
 //! more: `provider::physics_request` does, and hands the result over as
@@ -281,7 +289,16 @@ fn parse_http_date(s: &str) -> Option<u64> {
         "Dec" => 12,
         _ => return None,
     };
-    let year: i64 = parts[3].parse().ok()?;
+    // #191: IMF-fixdate mandates a 4-digit year; reject anything else
+    // before parsing so an absurd `Retry-After` header (e.g. a 15+ digit
+    // year) can never reach `days_from_civil`'s multiplication, which has
+    // no overflow guard of its own (silently wraps in the release profile,
+    // panics in a debug/test build).
+    let year_str = parts[3];
+    if year_str.len() != 4 || !year_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = year_str.parse().ok()?;
     let mut time = parts[4].split(':');
     let hour: i64 = time.next()?.parse().ok()?;
     let minute: i64 = time.next()?.parse().ok()?;
@@ -1139,6 +1156,28 @@ mod tests {
     #[test]
     fn parse_http_date_epoch_is_zero() {
         assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+    }
+
+    // -- #191: parse_http_date's year digit-count bound --------------------
+
+    #[test]
+    fn parse_http_date_rejects_a_year_with_the_wrong_digit_count() {
+        assert_eq!(parse_http_date("Wed, 21 Oct 26 07:28:00 GMT"), None, "2-digit year");
+        assert_eq!(parse_http_date("Wed, 21 Oct 20266 07:28:00 GMT"), None, "5-digit year");
+    }
+
+    #[test]
+    fn parse_http_date_rejects_a_non_numeric_year() {
+        assert_eq!(parse_http_date("Wed, 21 Oct 20-6 07:28:00 GMT"), None);
+    }
+
+    #[test]
+    fn parse_http_date_rejects_an_absurdly_long_numeric_year_without_overflowing() {
+        // A year this long would overflow days_from_civil's multiplication
+        // if it ever reached it (the digit-count guard must reject it
+        // first). This must return None, not panic (overflow checks are on
+        // in a debug/test build) or silently wrap (the release profile).
+        assert_eq!(parse_http_date("Wed, 21 Oct 999999999999999 07:28:00 GMT"), None);
     }
 
     #[test]
