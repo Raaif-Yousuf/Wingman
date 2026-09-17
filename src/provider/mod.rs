@@ -670,6 +670,30 @@ pub fn physics_request(shot: &Shot, prompt: &str, want_difficulty: bool) -> Requ
     }
 }
 
+/// Builds the `Request` for #39's "Add event from screen" action: the
+/// `calendar_event` proposal schema (registered in `actions::schema`,
+/// #26), a system prompt that already carries today's local date and UTC
+/// offset (`actions::calendar::build_prompt` -- `prompt` here is expected
+/// to be its output, not the bare action prompt), and no difficulty
+/// rubric (`common::augmented_system_prompt` is `physics_request`'s own
+/// concern; a calendar proposal has no difficulty field to rate). Mirrors
+/// `physics_request`'s shape exactly otherwise, so it reuses the same
+/// provider chain, retry, repair and non-vision fallback machinery with no
+/// changes to any of that code.
+pub fn calendar_request(shot: &Shot, prompt: &str) -> Request {
+    Request {
+        system: prompt.to_string(),
+        user: "Find the event on screen.".to_string(),
+        images: vec![shot.png.clone()],
+        schema: Some(
+            crate::actions::schema::schema_for("calendar_event", false)
+                .expect("\"calendar_event\" is always registered in actions::schema"),
+        ),
+        effort: Effort::Unset,
+        max_tokens: 0,
+    }
+}
+
 /// One provider's whole attempt at `req`: the call, the #200 local cleanup,
 /// and the #99 one-shot repair pass, exactly as [`Chain::complete_parsed`]
 /// always ran them inline. Factored out so
@@ -1528,6 +1552,38 @@ mod tests {
         );
     }
 
+    // -- calendar_request (#39) -----------------------------------------
+
+    #[test]
+    fn calendar_request_carries_the_screenshot_and_prompt_unmodified() {
+        let s = shot();
+        let req = calendar_request(&s, "system prompt text with today's date baked in");
+        assert_eq!(req.system, "system prompt text with today's date baked in");
+        assert_eq!(req.user, "Find the event on screen.");
+        assert_eq!(req.images, vec![s.png]);
+        assert_eq!(req.effort, Effort::Unset);
+        assert_eq!(req.max_tokens, 0);
+    }
+
+    #[test]
+    fn calendar_request_schema_matches_the_calendar_event_registry_entry() {
+        let req = calendar_request(&shot(), "prompt");
+        assert_eq!(
+            req.schema,
+            crate::actions::schema::schema_for("calendar_event", false)
+        );
+    }
+
+    #[test]
+    fn golden_calendar_request_schema_is_byte_identical() {
+        let req = calendar_request(&shot(), "irrelevant prompt");
+        let schema = req.schema.expect("schema always present");
+        assert_eq!(
+            serde_json::to_string(&schema).unwrap(),
+            r#"{"type":"object","properties":{"title":{"type":"string","editable":true},"start":{"type":"string","editable":true},"end":{"type":"string"},"location":{"type":"string"},"notes":{"type":"string"}},"required":["title","start","end","location","notes"],"additionalProperties":false}"#
+        );
+    }
+
     #[test]
     fn parse_answer_extracts_detail_headline_and_difficulty() {
         let answer = parse_answer(r#"{"detail":"d","headline":"h","difficulty":"7"}"#).unwrap();
@@ -2277,6 +2333,79 @@ mod tests {
         eprintln!(
             "MEASURED 2026-09-17: non_vision_fallback_live: model=llama3.2:3b elapsed={elapsed:?} headline={:?}",
             answer.headline
+        );
+    }
+
+    // -- live check: #39's "Add event from screen", real chain -> gemma3:4b -
+    //
+    // Not run by default. Run explicitly:
+    // `cargo test provider::tests::calendar_add_live -- --ignored --nocapture`
+    // Requires Ollama running locally on 127.0.0.1:11434 with `gemma3:4b`
+    // pulled (vision model, per `ollama::VISION_FAMILIES`).
+    #[test]
+    #[ignore = "live: a real local Ollama vision call; run manually, see this test's doc comment"]
+    fn calendar_add_live_extracts_a_friday_event_from_a_gdi_rendered_image() {
+        use crate::provider::ollama::{Ollama, DEFAULT_BASE_URL};
+
+        // GDI-rendered black-on-white text, the same technique
+        // `render_gdi_text_rgba_for_ocr` (below) and `ocr.rs`'s own live
+        // test use -- realistic enough for #39's Done-when to measure the
+        // real extraction path, not just wire-format round-tripping.
+        let (width, height) = (1000u32, 160u32);
+        let rgba =
+            unsafe { render_gdi_text_rgba_for_ocr("Team sync Friday 3pm, Room 4B", width, height) };
+        let mut png = Vec::new();
+        {
+            use image::ImageEncoder;
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
+                .expect("encode synthetic PNG");
+        }
+        let shot = Shot { png, width, height };
+
+        // A fixed reference date (2026-09-17, a Thursday -- MEASURED via
+        // `date -d 2026-09-17 +%A`), not "now": keeps the "Friday" -> a
+        // specific expected calendar date assertion below meaningful
+        // regardless of what day this is actually run on.
+        let today = crate::connectors::civil_time::CivilDate {
+            year: 2026,
+            month: 9,
+            day: 17,
+        };
+        let prompt = crate::actions::calendar::build_prompt(
+            crate::actions::calendar::BASE_PROMPT,
+            today,
+            0, // states UTC, so the model's answer is easy to check verbatim
+        );
+        let req = calendar_request(&shot, &prompt);
+
+        let mut provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        // Unload the model right after this one-off check (mirrors
+        // `ollama.rs`'s own live-check convention, and #13's Done-when).
+        provider.keep_alive = "0".to_string();
+
+        let started = std::time::Instant::now();
+        let completion = provider
+            .complete(&req)
+            .expect("live ollama request should succeed");
+        let elapsed = started.elapsed();
+
+        let proposal = crate::actions::calendar::parse_calendar_proposal(&completion.text)
+            .expect("response should parse as a calendar_event proposal");
+        eprintln!(
+            "MEASURED 2026-09-17: calendar_add_live: model=gemma3:4b elapsed={elapsed:?} proposal={proposal}"
+        );
+
+        assert!(
+            !crate::actions::calendar::is_no_event(&proposal),
+            "expected a real event, got the no-event sentinel: {proposal}"
+        );
+        assert!(!proposal["title"].as_str().unwrap_or_default().is_empty());
+        let start = proposal["start"].as_str().unwrap_or_default();
+        assert!(
+            start.starts_with("2026-09-18"),
+            "expected a Friday (2026-09-18, the day after the fixed 2026-09-17 Thursday \
+             reference date) start, got {start:?}"
         );
     }
 

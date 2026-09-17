@@ -5,6 +5,7 @@
 //! See `docs/superpowers/specs/2026-09-17-action-model-design.md` for the
 //! rules this file implements and why.
 
+pub mod calendar;
 pub mod schema;
 
 use std::fs;
@@ -157,23 +158,28 @@ pub struct Resolved {
     pub origin: Origin,
 }
 
-/// The one built-in action Wingman ships: today's physics/statistics check,
-/// unchanged in behaviour (expansion plan §6, "Check my work (exists)").
+/// The built-in actions Wingman ships: today's physics/statistics check
+/// (expansion plan §6, "Check my work (exists)"), unchanged in behaviour,
+/// plus #39's "Add event from screen" (`calendar::builtin_action`), the
+/// first action that runs the full Look/Propose/Confirm/Do loop.
 pub fn builtin_actions() -> Vec<Action> {
-    vec![Action {
-        id: DEFAULT_ACTION_ID.to_string(),
-        name: "Check my work".to_string(),
-        group: Some("Study".to_string()),
-        inputs: vec![InputKind::Screen],
-        proposal: "verdict".to_string(),
-        executor: "none".to_string(),
-        confirm: false,
-        prompt: crate::provider::DEFAULT_PROMPT.to_string(),
-        prefer: Prefer::default(),
-        hotkey: None,
-        rate_difficulty: false,
-        enabled: true,
-    }]
+    vec![
+        Action {
+            id: DEFAULT_ACTION_ID.to_string(),
+            name: "Check my work".to_string(),
+            group: Some("Study".to_string()),
+            inputs: vec![InputKind::Screen],
+            proposal: "verdict".to_string(),
+            executor: "none".to_string(),
+            confirm: false,
+            prompt: crate::provider::DEFAULT_PROMPT.to_string(),
+            prefer: Prefer::default(),
+            hotkey: None,
+            rate_difficulty: false,
+            enabled: true,
+        },
+        calendar::builtin_action(),
+    ]
 }
 
 /// Replaces each built-in whose `id` a user action matches (wholesale, not
@@ -327,8 +333,14 @@ mod tests {
     #[test]
     fn builtin_check_my_work_matches_todays_behaviour() {
         let builtins = builtin_actions();
-        assert_eq!(builtins.len(), 1);
-        let a = &builtins[0];
+        // #39 added a second built-in ("Add event from screen"); this test
+        // only cares about "Check my work", found by id so it stays valid
+        // regardless of how many other built-ins exist or what order they
+        // are in.
+        let a = builtins
+            .iter()
+            .find(|a| a.id == DEFAULT_ACTION_ID)
+            .expect("Check my work must be a built-in action");
         assert_eq!(a.id, DEFAULT_ACTION_ID);
         assert_eq!(a.name, "Check my work");
         assert_eq!(a.group.as_deref(), Some("Study"));
@@ -479,14 +491,18 @@ not_a_real_field = true
         let mut new_action = builtin_actions()[0].clone();
         new_action.id = "translate-selection".to_string();
         new_action.name = "Translate selection".to_string();
+        let builtin_count = builtin_actions().len();
         let merged = merge_actions(builtin_actions(), vec![new_action]);
-        assert_eq!(merged.len(), 2);
+        assert_eq!(merged.len(), builtin_count + 1);
         assert_eq!(
             merged[0].action.id, DEFAULT_ACTION_ID,
             "builtin stays first"
         );
-        assert_eq!(merged[1].action.id, "translate-selection");
-        assert_eq!(merged[1].origin, Origin::User);
+        let appended = merged
+            .iter()
+            .find(|r| r.action.id == "translate-selection")
+            .expect("the new user action must be appended, not merged into a builtin");
+        assert_eq!(appended.origin, Origin::User);
     }
 
     #[test]
@@ -548,9 +564,9 @@ not_a_real_field = true
         let path = scratch_path("missing");
         assert!(!path.exists());
         let resolved = load_actions_from(&path).expect("a missing file is not an error");
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].action.id, DEFAULT_ACTION_ID);
-        assert_eq!(resolved[0].origin, Origin::Builtin);
+        assert_eq!(resolved.len(), builtin_actions().len());
+        let default = default_action(&resolved).expect("check-my-work must still be present");
+        assert_eq!(default.origin, Origin::Builtin);
         assert!(!path.exists(), "load_actions_from never creates the file");
     }
 

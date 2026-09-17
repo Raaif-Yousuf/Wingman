@@ -125,6 +125,11 @@ pub mod cmd {
     /// the clipboard. See `App::copy_diagnostics` in `app.rs`.
     pub const COPY_DIAGNOSTICS: u32 = 1019;
 
+    /// Issue #39: runs the built-in "Add event from screen" action (Look,
+    /// Propose, Confirm, Do). See `App::add_event_from_screen` in
+    /// `app.rs`.
+    pub const ADD_TO_CALENDAR: u32 = 1020;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -433,6 +438,7 @@ impl Tray {
     fn build_menu(&self, hmenu: HMENU) -> Result<()> {
         append_item(hmenu, cmd::ASK_NOW, "Ask now")?;
         append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
+        append_item(hmenu, cmd::ADD_TO_CALENDAR, "Add event from screen")?;
         append_separator(hmenu)?;
         if self.paused {
             append_item(hmenu, cmd::RESUME, "Resume")?;
@@ -1198,6 +1204,7 @@ mod tests {
         ("MODE_AUTO", cmd::MODE_AUTO),
         ("MODE_OFFLINE", cmd::MODE_OFFLINE),
         ("COPY_DIAGNOSTICS", cmd::COPY_DIAGNOSTICS),
+        ("ADD_TO_CALENDAR", cmd::ADD_TO_CALENDAR),
     ];
 
     #[test]

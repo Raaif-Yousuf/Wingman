@@ -140,15 +140,47 @@ machine's local zone. If this proves too strict against a real model's
 output, loosening it is a follow-up with its own measurement, not a
 guess made here.
 
-`THEORY (unverified)`: whether Outlook or Windows Calendar accepts a bare
-`DTSTART;TZID=...:` line with no accompanying `VTIMEZONE` block (RFC 5545
-§3.6.5 says a `VTIMEZONE` component "MUST" be included for every `TZID`
-referenced, but many consumers tolerate a well-known Windows/IANA zone name
-without one) is unmeasured -- exercising it needs the manual check in issue
-#166 (open a generated `.ics` with the default calendar app), which this
-task cannot run (no exe launch). Filed as **#211** ("`ics` connector emits
-`TZID` with no `VTIMEZONE` block") to track adding one once `Local` has a
-real caller and the manual check can run.
+**Resolved (#211, 2026-09-17):** `ics.rs` no longer emits a bare
+`DTSTART;TZID=...:` line at all, so the RFC 5545 §3.6.5 question above is
+moot rather than answered -- the chosen fix avoids the violation instead of
+adding a `VTIMEZONE` block. The robust option, in order:
+
+1. **Upgrade to UTC via Win32**, the same `TzSpecificLocalTimeToSystemTime`
+   call `app.rs`'s `deadline_until_tomorrow` already uses for Pause
+   (`None` zone parameter = "the machine's own currently active zone",
+   DST-correct). This is the only zone conversion Win32 offers without a
+   separate IANA/Windows zone database this crate does not depend on (rule
+   2's "dependency list is short by design"), so a `Local { at, tzid }`
+   value is converted as if `at` were already a wall-clock time in the
+   machine's own zone, regardless of what `tzid` names. `EventTime::Local`
+   is still unreachable from the schema-driven `calendar_add` parser today
+   (unchanged from the paragraph above), so this path is exercised only by
+   `ics.rs`'s own tests and by a future zone-aware connector
+   (`google`/`microsoft`) until one exists.
+2. **Fall back to a floating local time** (RFC 5545 §3.3.5: no `TZID`
+   parameter, no trailing `Z`, no `VTIMEZONE` needed) when the Win32
+   conversion cannot be performed (an invalid/ambiguous wall-clock time
+   during a DST transition, or any other Win32 failure). `tzid` is dropped
+   silently in this case -- there is nothing else to do with a zone name
+   this connector cannot resolve, and floating is still RFC-valid, unlike
+   the old bare-`TZID` output.
+
+Implementation: `ics::LocalTimeConverter` (an injectable trait, same
+reasoning as `Opener` -- rule 9, tests never call the real Win32 API) plus
+`Win32LocalTimeConverter` (production); `create_calendar_event` runs every
+`Local` value in a `CalendarEvent` through `resolve_local_times` before
+rendering, and `format_event_time_property`'s `Local` arm renders whatever
+is left (i.e. a value the converter could not upgrade) as floating. Golden
+tests updated in `connectors::ics::tests` (`issue_211_local_event_time_...`
+and the `resolve_local_times_*`/`create_calendar_event_writes_*` tests) to
+assert the new byte-exact output for both the upgrade and fallback paths,
+with a scripted `FakeConverter` -- no real Win32 call and no real file
+handler in any test.
+
+The manual check in issue #166 (open a real generated `.ics` in the
+default calendar app) still cannot run from this task (no exe launch); it
+now verifies the UTC/floating output reads correctly, not the removed
+bare-`TZID` behaviour.
 
 ## The `ics` connector
 

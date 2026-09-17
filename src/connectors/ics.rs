@@ -66,25 +66,102 @@ impl Opener for ShellOpener {
     }
 }
 
+/// Converts a local wall-clock time to UTC, DST-correct. Abstracted so
+/// tests never call the real Win32 timezone API (rule 9's failure shape:
+/// same reasoning as [`Opener`]).
+///
+/// **Issue #211**: `TzSpecificLocalTimeToSystemTime(None, ...)` (the same
+/// call `app.rs`'s `deadline_until_tomorrow` already uses for Pause) only
+/// ever converts using the **machine's own currently active time zone**.
+/// Win32 exposes no API this crate calls to convert an arbitrary *named*
+/// zone (an IANA `tzid` such as `"America/New_York"`) without a zone
+/// database this crate does not depend on (rule 2: the dependency list is
+/// short by design, and no `chrono-tz`/`tzdata` crate is pulled in for
+/// this). A production [`Win32LocalTimeConverter`] therefore converts
+/// `at` as if it already were a wall-clock time in the machine's own zone,
+/// regardless of what `tzid` names; [`render_ics`]'s caller
+/// (`create_calendar_event`) only uses the result when this succeeds, and
+/// falls back to a floating local time (see `format_event_time_property`)
+/// otherwise -- see that function's doc comment for why a floating time,
+/// not a bare `TZID` with no `VTIMEZONE`, is the fallback.
+pub trait LocalTimeConverter: Send + Sync {
+    /// `None` when the conversion cannot be performed (an invalid or
+    /// ambiguous wall-clock time during a DST transition, or the
+    /// underlying Win32 call failing for any other reason).
+    fn to_utc(&self, at: &CivilDateTime) -> Option<CivilDateTime>;
+}
+
+/// Production [`LocalTimeConverter`]: `TzSpecificLocalTimeToSystemTime`
+/// against the machine's own currently active zone. Win32, so checked by
+/// hand per rule 8, not unit-tested directly -- the pure decision this
+/// feeds (`resolve_local_times`, below) is what is actually tested, with a
+/// scripted fake converter.
+pub struct Win32LocalTimeConverter;
+
+impl LocalTimeConverter for Win32LocalTimeConverter {
+    fn to_utc(&self, at: &CivilDateTime) -> Option<CivilDateTime> {
+        use windows::Win32::Foundation::SYSTEMTIME;
+        use windows::Win32::System::Time::TzSpecificLocalTimeToSystemTime;
+
+        let local = SYSTEMTIME {
+            wYear: at.date.year as u16,
+            wMonth: at.date.month as u16,
+            wDay: at.date.day as u16,
+            wHour: at.hour as u16,
+            wMinute: at.minute as u16,
+            wSecond: at.second as u16,
+            wMilliseconds: 0,
+            wDayOfWeek: 0,
+        };
+        let mut utc = SYSTEMTIME::default();
+        // SAFETY: both SYSTEMTIME values are stack-local and valid for the
+        // duration of this call; `None` for the zone parameter asks for
+        // the machine's own currently active time zone, the same call
+        // `app.rs`'s `deadline_until_tomorrow` already makes for Pause.
+        unsafe { TzSpecificLocalTimeToSystemTime(None, &local, &mut utc) }.ok()?;
+
+        Some(CivilDateTime {
+            date: CivilDate {
+                year: utc.wYear as i32,
+                month: utc.wMonth as u8,
+                day: utc.wDay as u8,
+            },
+            hour: utc.wHour as u8,
+            minute: utc.wMinute as u8,
+            second: utc.wSecond as u8,
+        })
+    }
+}
+
 /// The `ics` connector. `O: Opener = ShellOpener` mirrors
 /// `ClipboardExecutor<C: ClipboardAccess = ArboardClipboard>`: a real
 /// default type parameter for production, an explicit constructor for
 /// tests, so no test ever calls the real shell or writes into the real
-/// `%TEMP%\Wingman`.
+/// `%TEMP%\Wingman`. `local_time_converter` is a boxed trait object, not a
+/// second generic parameter: Rust does not apply a struct's default type
+/// parameters during ordinary call-site inference, so a second `<O, C =
+/// Win32LocalTimeConverter>` parameter would break every existing
+/// `IcsConnector::<SomeOpener>` call site that does not also name `C`
+/// explicitly (including this file's and `executors::calendar_add`'s own
+/// tests) -- a boxed trait object avoids that without touching any of
+/// them.
 pub struct IcsConnector<O: Opener = ShellOpener> {
     /// Injectable so tests use their own temp dir (rule 9): production is
     /// `%TEMP%\Wingman`, tests use `std::env::temp_dir()` joined with a
     /// per-test-process-unique subdirectory (see `mod tests`).
     temp_dir: PathBuf,
     opener: O,
+    local_time_converter: Box<dyn LocalTimeConverter>,
 }
 
 impl IcsConnector<ShellOpener> {
-    /// Production constructor: `%TEMP%\Wingman`, the real shell opener.
+    /// Production constructor: `%TEMP%\Wingman`, the real shell opener, the
+    /// real Win32 timezone converter.
     pub fn new() -> Self {
         Self {
             temp_dir: std::env::temp_dir().join("Wingman"),
             opener: ShellOpener,
+            local_time_converter: Box::new(Win32LocalTimeConverter),
         }
     }
 }
@@ -97,12 +174,36 @@ impl Default for IcsConnector<ShellOpener> {
 
 impl<O: Opener> IcsConnector<O> {
     /// Test/forward-wiring constructor: an explicit temp dir and opener, so
-    /// a test never touches `%TEMP%\Wingman` or the real shell. Unused
-    /// outside tests (this file's and `executors::calendar_add`'s) until a
-    /// non-test caller injects a non-default opener.
+    /// a test never touches `%TEMP%\Wingman` or the real shell. Still uses
+    /// the real [`Win32LocalTimeConverter`] (harmless: nothing in this
+    /// file's or `executors::calendar_add`'s existing tests constructs an
+    /// `EventTime::Local`, so it is never actually called by them). Use
+    /// [`IcsConnector::with_temp_dir_opener_and_converter`] to also inject
+    /// a fake converter.
     #[allow(dead_code)]
     pub fn with_temp_dir_and_opener(temp_dir: PathBuf, opener: O) -> Self {
-        Self { temp_dir, opener }
+        Self {
+            temp_dir,
+            opener,
+            local_time_converter: Box::new(Win32LocalTimeConverter),
+        }
+    }
+
+    /// Same as [`IcsConnector::with_temp_dir_and_opener`], plus an
+    /// explicit [`LocalTimeConverter`] -- what issue #211's tests use to
+    /// prove the UTC-upgrade and floating-fallback paths without ever
+    /// calling the real Win32 timezone API.
+    #[allow(dead_code)]
+    pub fn with_temp_dir_opener_and_converter(
+        temp_dir: PathBuf,
+        opener: O,
+        local_time_converter: Box<dyn LocalTimeConverter>,
+    ) -> Self {
+        Self {
+            temp_dir,
+            opener,
+            local_time_converter,
+        }
     }
 }
 
@@ -122,7 +223,13 @@ impl<O: Opener> Connector for IcsConnector<O> {
     fn create_calendar_event(&self, event: &CalendarEvent) -> Result<CalendarEventResult> {
         let uid = generate_uid();
         let dtstamp = civil_time::now_utc();
-        let content = render_ics(event, &uid, &dtstamp);
+        // #211: upgrade any `EventTime::Local` to `Utc` when the injected
+        // converter can do so; `render_ics` renders whatever is left as a
+        // `Local` at that point as a floating local time (never a bare
+        // `TZID` with no `VTIMEZONE`) -- see `resolve_local_times` and
+        // `format_event_time_property`'s doc comments.
+        let resolved_event = resolve_local_times(event, self.local_time_converter.as_ref());
+        let content = render_ics(&resolved_event, &uid, &dtstamp);
 
         std::fs::create_dir_all(&self.temp_dir)
             .with_context(|| format!("could not create {}", self.temp_dir.display()))?;
@@ -182,11 +289,55 @@ fn format_datetime(dt: &CivilDateTime) -> String {
 
 /// Formats one of `DTSTART`/`DTEND`/etc. with its value, per the connector
 /// design doc's "DTSTART/DTEND" rule.
+///
+/// **Issue #211**: `EventTime::Local` no longer renders `;TZID=<tzid>:...`
+/// with no accompanying `VTIMEZONE` component (RFC 5545 §3.6.5 says a
+/// `VTIMEZONE` "MUST" be included for every `TZID` referenced, and this
+/// connector never generates one). By the time `render_ics` runs, its
+/// caller (`create_calendar_event`) has already tried to upgrade every
+/// `Local` value to `Utc` via the injected `LocalTimeConverter`
+/// (`resolve_local_times`); a `Local` value that reaches this function
+/// unchanged is one that upgrade could not perform, so it is rendered as a
+/// **floating** local time instead -- no `TZID` parameter, no trailing
+/// `Z`, `tzid` dropped entirely. RFC 5545 §3.3.5 defines a floating
+/// date-time as valid with no `VTIMEZONE` at all (the consuming calendar
+/// app interprets it in whatever zone it is itself configured for), which
+/// is the honest thing to emit when this connector cannot itself resolve
+/// the zone -- unlike the old behaviour, it is never wrong about *which*
+/// zone the time is in, only silent about naming one.
 fn format_event_time_property(name: &str, t: &EventTime) -> String {
     match t {
         EventTime::AllDay(d) => format!("{name};VALUE=DATE:{}", format_date(d)),
         EventTime::Utc(dt) => format!("{name}:{}Z", format_datetime(dt)),
-        EventTime::Local { at, tzid } => format!("{name};TZID={tzid}:{}", format_datetime(at)),
+        EventTime::Local { at, .. } => format!("{name}:{}", format_datetime(at)),
+    }
+}
+
+/// Issue #211: upgrades every `EventTime::Local` in `event`'s `start`/`end`
+/// to `EventTime::Utc` when `converter` can convert it (see
+/// [`LocalTimeConverter`]'s doc comment for what "can" means); leaves it
+/// as `Local` otherwise, which `format_event_time_property` then renders
+/// as a floating local time. `AllDay`/`Utc` values pass through unchanged.
+/// Pure given `converter` (a fake in every test below; the real
+/// `Win32LocalTimeConverter` only in production), so this is what is
+/// actually unit-tested, not the Win32 call itself.
+fn resolve_local_times(event: &CalendarEvent, converter: &dyn LocalTimeConverter) -> CalendarEvent {
+    CalendarEvent {
+        title: event.title.clone(),
+        start: resolve_one_time(&event.start, converter),
+        end: event.end.as_ref().map(|t| resolve_one_time(t, converter)),
+        location: event.location.clone(),
+        description: event.description.clone(),
+    }
+}
+
+fn resolve_one_time(t: &EventTime, converter: &dyn LocalTimeConverter) -> EventTime {
+    match t {
+        EventTime::Local { at, .. } => match converter.to_utc(at) {
+            Some(utc) => EventTime::Utc(utc),
+            None => t.clone(),
+        },
+        other => other.clone(),
     }
 }
 
@@ -570,9 +721,8 @@ END:VCALENDAR\r\n";
         assert!(ics.contains("DTEND:20260920T150000Z\r\n"));
     }
 
-    #[test]
-    fn local_timezone_event_renders_a_tzid_parameter() {
-        let event = CalendarEvent {
+    fn sample_local_event() -> CalendarEvent {
+        CalendarEvent {
             title: "Local meeting".to_string(),
             start: EventTime::Local {
                 at: CivilDateTime {
@@ -590,10 +740,158 @@ END:VCALENDAR\r\n";
             end: None,
             location: None,
             description: None,
-        };
+        }
+    }
+
+    #[test]
+    fn issue_211_local_event_time_renders_as_a_floating_time_not_a_bare_tzid() {
+        // render_ics never sees a real Win32 conversion (it is pure) -- a
+        // `Local` value passed straight to it is exactly the "could not
+        // upgrade" case `resolve_local_times` leaves behind, and this is
+        // the byte-exact floating-time rendering that must produce (#211:
+        // never a `TZID` parameter with no accompanying `VTIMEZONE`).
+        let event = sample_local_event();
         let ics = render_ics(&event, "u@wingman.local", &fixed_dtstamp());
-        assert!(ics.contains("DTSTART;TZID=America/New_York:20260920T090000\r\n"));
-        assert!(ics.contains("DTEND;TZID=America/New_York:20260920T100000\r\n"));
+        assert!(ics.contains("DTSTART:20260920T090000\r\n"));
+        assert!(ics.contains("DTEND:20260920T100000\r\n"));
+        assert!(
+            !ics.contains("TZID"),
+            "a floating time must never carry a TZID parameter: {ics}"
+        );
+    }
+
+    // -- resolve_local_times / Win32-upgrade-or-floating-fallback (#211) ---
+
+    struct FakeConverter {
+        /// If `Some`, every call succeeds and returns this fixed UTC value
+        /// (real conversion logic is Win32's job, not this fake's -- it
+        /// only needs to prove which branch `resolve_local_times` took).
+        result: Option<CivilDateTime>,
+    }
+
+    impl LocalTimeConverter for FakeConverter {
+        fn to_utc(&self, _at: &CivilDateTime) -> Option<CivilDateTime> {
+            self.result
+        }
+    }
+
+    fn utc_noon() -> CivilDateTime {
+        CivilDateTime {
+            date: CivilDate {
+                year: 2026,
+                month: 9,
+                day: 20,
+            },
+            hour: 12,
+            minute: 0,
+            second: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_local_times_upgrades_local_to_utc_when_the_converter_succeeds() {
+        let event = sample_local_event();
+        let converter = FakeConverter {
+            result: Some(utc_noon()),
+        };
+        let resolved = resolve_local_times(&event, &converter);
+        assert_eq!(resolved.start, EventTime::Utc(utc_noon()));
+    }
+
+    #[test]
+    fn resolve_local_times_leaves_local_unchanged_when_the_converter_fails() {
+        let event = sample_local_event();
+        let converter = FakeConverter { result: None };
+        let resolved = resolve_local_times(&event, &converter);
+        assert_eq!(resolved.start, event.start);
+    }
+
+    #[test]
+    fn resolve_local_times_passes_all_day_and_utc_through_unchanged() {
+        let converter = FakeConverter {
+            result: Some(utc_noon()),
+        };
+        let all_day = CalendarEvent {
+            title: "x".to_string(),
+            start: EventTime::AllDay(CivilDate {
+                year: 2026,
+                month: 9,
+                day: 20,
+            }),
+            end: None,
+            location: None,
+            description: None,
+        };
+        let resolved = resolve_local_times(&all_day, &converter);
+        assert_eq!(resolved.start, all_day.start);
+
+        let utc_event = sample_event(); // start/end are both EventTime::Utc
+        let resolved = resolve_local_times(&utc_event, &converter);
+        assert_eq!(resolved.start, utc_event.start);
+        assert_eq!(resolved.end, utc_event.end);
+    }
+
+    #[test]
+    fn resolve_local_times_upgrades_both_start_and_end_independently() {
+        let mut event = sample_local_event();
+        event.end = Some(EventTime::Local {
+            at: CivilDateTime {
+                date: CivilDate {
+                    year: 2026,
+                    month: 9,
+                    day: 20,
+                },
+                hour: 10,
+                minute: 0,
+                second: 0,
+            },
+            tzid: "America/New_York".to_string(),
+        });
+        let converter = FakeConverter {
+            result: Some(utc_noon()),
+        };
+        let resolved = resolve_local_times(&event, &converter);
+        assert_eq!(resolved.start, EventTime::Utc(utc_noon()));
+        assert_eq!(resolved.end, Some(EventTime::Utc(utc_noon())));
+    }
+
+    #[test]
+    fn create_calendar_event_writes_utc_when_the_converter_succeeds() {
+        let dir = test_temp_dir("local-upgrade");
+        let connector = IcsConnector::with_temp_dir_opener_and_converter(
+            dir.clone(),
+            RecordingOpener::default(),
+            Box::new(FakeConverter {
+                result: Some(utc_noon()),
+            }),
+        );
+        let result = connector
+            .create_calendar_event(&sample_local_event())
+            .unwrap();
+        let written = std::fs::read_to_string(&result.path).unwrap();
+        assert!(written.contains("DTSTART:20260920T120000Z\r\n"));
+        assert!(!written.contains("TZID"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_calendar_event_writes_a_floating_time_when_the_converter_fails() {
+        let dir = test_temp_dir("local-fallback");
+        let connector = IcsConnector::with_temp_dir_opener_and_converter(
+            dir.clone(),
+            RecordingOpener::default(),
+            Box::new(FakeConverter { result: None }),
+        );
+        let result = connector
+            .create_calendar_event(&sample_local_event())
+            .unwrap();
+        let written = std::fs::read_to_string(&result.path).unwrap();
+        assert!(written.contains("DTSTART:20260920T090000\r\n"));
+        assert!(
+            !written.contains("TZID"),
+            "the RFC 5545 violation #211 reports must never be written: {written}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -- folding at 75 octets --------------------------------------------

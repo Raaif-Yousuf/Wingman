@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{FILETIME, HINSTANCE, HWND, LPARAM, LRESULT, SYSTEMTIME, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -34,15 +35,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::actions;
 use crate::capture;
 use crate::config::{Config, Providers};
+use crate::connectors::civil_time::{CivilDate, CivilDateTime};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
+use crate::executors;
 use crate::hotkey::{
     chord_to_string, Chord, HotkeyHook, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
     WM_APP_PAUSE_TOGGLE,
 };
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
-use crate::provider::{parse_answer, physics_request, Answer, Chain, Shot};
-use crate::ui::card::Card;
+use crate::provider::{calendar_request, parse_answer, physics_request, Answer, Chain, Shot};
+use crate::ui::card::{Card, WM_APP_PREVIEW_DECIDED};
+use crate::ui::confirm;
 use crate::ui::settings;
 use crate::ui::tray::{cmd, decode, register_taskbar_created, MenuChoice, Tray, WM_APP_TRAY};
 
@@ -58,6 +62,15 @@ pub const WM_APP_RESULT: u32 = WM_APP + 3;
 /// `tests::ALL_WM_APP_IDS` too (issue #163); `wm_app_ids_are_pairwise_unique`
 /// and `wm_app_ids_registry_is_exhaustive` enforce the crate-wide list.
 pub const WM_APP_ACTIVATE: u32 = WM_APP + 6;
+
+/// Posted by the calendar worker thread (issue #39, `add_event_from_screen`)
+/// when the provider chain finishes: `lparam` is
+/// `Box::into_raw(Box::new(Result<serde_json::Value, String>))`, the
+/// calendar-flow analogue of [`WM_APP_RESULT`]. Kept as its own message
+/// (not reusing `WM_APP_RESULT`) because the two carry different boxed
+/// payload types, and reconstructing the wrong one from a raw pointer is
+/// undefined behaviour.
+pub const WM_APP_CALENDAR_RESULT: u32 = WM_APP + 8;
 
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
@@ -158,6 +171,10 @@ pub fn run() -> Result<()> {
 
     let mut card = Card::new(instance).context("creating the notification card")?;
     card.set_text_scale(config.ui.text_scale);
+    // Issue #39: so the preview card can PostMessageW WM_APP_PREVIEW_DECIDED
+    // here when "Do it"/Cancel closes it -- see Card::set_owner's doc
+    // comment.
+    card.set_owner(hwnd);
     // #175: a stored key that could not be read is never silently dropped
     // (rule 7) -- the card is the first thing to exist that can show it.
     if !config.unreadable_secrets.is_empty() {
@@ -471,6 +488,238 @@ impl App {
                 );
             }
         });
+    }
+
+    /// #39: "Add event from screen", the action framework's first real
+    /// Look/Propose/Confirm/Do run -- the tray's second one-shot action,
+    /// parallel to `ask()` (which stays wired to "check-my-work" exactly
+    /// as before: this method does not touch it) but routed through the
+    /// `add-to-calendar` built-in action (`actions::calendar::ACTION_ID`:
+    /// proposal `calendar_event`, executor `calendar_add`, `confirm =
+    /// true`) instead of a fixed request shape. Mirrors `ask()`'s pause/
+    /// busy/readiness/capture steps (duplicated, not extracted into a
+    /// shared helper, precisely so `ask()`'s own code is untouched -- a
+    /// de-duplication follow-up is filed separately).
+    fn add_event_from_screen(&mut self) {
+        if self.busy {
+            return;
+        }
+
+        if pause::is_paused_now() {
+            self.card
+                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
+            return;
+        }
+
+        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
+            self.card.hide();
+            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
+        }
+
+        let path = Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "config.toml".into());
+        if let Some((headline, detail)) =
+            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+        {
+            self.card.show_error(&headline, &detail);
+            return;
+        }
+
+        let (today, offset_minutes) = match local_today_and_utc_offset() {
+            Ok(v) => v,
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't read the local date", &format!("{e:#}"));
+                return;
+            }
+        };
+
+        let optimistic_chain = self
+            .config
+            .providers
+            .build_chain_for_mode(self.config.mode, true);
+        let image_limits = optimistic_chain
+            .first_ready_caps()
+            .and_then(|caps| caps.image_limits);
+        let (max_long_edge, max_pixels) =
+            capture::resolve_limits(image_limits, self.config.capture.max_edge);
+        let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
+            Ok(r) => r,
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
+                return;
+            }
+        };
+        let foreground_hwnd_isize =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
+
+        self.busy = true;
+        self.set_watch(false);
+        self.card.show_pending();
+
+        let providers = self.config.providers.clone();
+        let mode = self.config.mode;
+        let target = self.hwnd_isize();
+        std::thread::spawn(move || {
+            let result: std::result::Result<Value, String> = (|| -> Result<Value> {
+                let shot = capture::encode(&raw)?;
+                calendar_worker(
+                    &providers,
+                    mode,
+                    &shot,
+                    &raw,
+                    foreground_hwnd_isize,
+                    today,
+                    offset_minutes,
+                )
+            })()
+            .map_err(|e| format!("{e:#}"));
+            let payload = Box::into_raw(Box::new(result));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_CALENDAR_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                );
+            }
+        });
+    }
+
+    /// Handles the calendar worker's result (#39). The documented "no
+    /// event" shape (`actions::calendar::is_no_event`) ends in a plain
+    /// informational card with nothing further to confirm -- Cancel/no-op,
+    /// per the flow's own `FlowState::Cancelled`. Any other successful
+    /// proposal shows the preview card (or, if a hypothetical
+    /// `actions.toml` override ever sets this action's `confirm = false`,
+    /// tries to auto-confirm -- `ui::confirm::auto_confirm_read_only`
+    /// correctly refuses that for a `Writes` executor, which is what
+    /// makes this branch dead in practice today; see that function's own
+    /// doc comment). A provider-chain failure shows an error card (rule
+    /// 7).
+    fn on_calendar_result(&mut self, result: std::result::Result<Value, String>) {
+        self.busy = false;
+
+        let proposal = match result {
+            Ok(p) => p,
+            Err(e) => {
+                let headline = first_line(&e, 88);
+                self.card.show_error(&headline, &e);
+                self.set_watch(true);
+                return;
+            }
+        };
+
+        if actions::calendar::is_no_event(&proposal) {
+            self.card.show_answer(
+                "No event found on screen",
+                "Point the Copilot key at something with a date and time, then try again.",
+                5,
+                None,
+            );
+            self.set_watch(true);
+            return;
+        }
+
+        let resolved = match actions::load_actions() {
+            Ok(r) => r,
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.set_watch(true);
+                return;
+            }
+        };
+        let action = resolved
+            .iter()
+            .find(|r| r.action.id == actions::calendar::ACTION_ID)
+            .map(|r| &r.action);
+
+        let confirm_required = action.map(|a| a.confirm).unwrap_or(true);
+        if confirm_required {
+            let schema = actions::schema::schema_for("calendar_event", false)
+                .expect("\"calendar_event\" is always registered in actions::schema");
+            self.card
+                .show_preview("Add event from screen", &schema, &proposal, false);
+            // Preview manages its own lifecycle (Do it / Cancel / Esc) and
+            // takes real focus -- unlike Collapsed/Expanded it is never
+            // dismissed by a click elsewhere (Card::show_preview's "Focus"
+            // doc comment), so the global click watcher stays disarmed.
+            return;
+        }
+
+        // `action.confirm == false`: only reachable via an actions.toml
+        // override, since the built-in always sets `confirm = true`.
+        let action = action.expect("checked above");
+        match actions::resolve_executor(action) {
+            Ok(executor) => {
+                match confirm::auto_confirm_read_only(
+                    executor.as_ref(),
+                    confirm::Proposal::new(proposal),
+                ) {
+                    Ok(confirmed) => self.run_calendar_executor(executor.as_ref(), confirmed),
+                    Err(e) => {
+                        self.card
+                            .show_error("Couldn't add the event", &format!("{e:#}"));
+                        self.set_watch(true);
+                    }
+                }
+            }
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't add the event", &format!("{e:#}"));
+                self.set_watch(true);
+            }
+        }
+    }
+
+    /// #39: the card's preview closed with a decision
+    /// (`ui::card::WM_APP_PREVIEW_DECIDED`). `Card::take_confirmed()` is
+    /// `None` for Cancel/Esc -- nothing runs, per Look/Propose/Confirm/Do:
+    /// "Do" never happens without an explicit confirm -- and `Some` for
+    /// "Do it". The executor is resolved fresh by the fixed
+    /// `"calendar_add"` name: today this is the only action that ever
+    /// reaches Preview, the same "fixed until a second confirm-required
+    /// action exists" status `CalendarAddExecutor::new`'s own fixed
+    /// `"ics"` connector choice has.
+    fn on_preview_decided(&mut self) {
+        let Some(confirmed) = self.card.take_confirmed() else {
+            return;
+        };
+        match executors::registry::resolve("calendar_add") {
+            Ok(executor) => self.run_calendar_executor(executor.as_ref(), confirmed),
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't add the event", &format!("{e:#}"));
+                self.set_watch(true);
+            }
+        }
+    }
+
+    /// Runs `executor` against `confirmed` and shows the result card:
+    /// honest per the connector design doc (`Undo.summary` already names
+    /// the generated file and that undo only deletes it, never touching
+    /// whatever the calendar app itself created) -- never a second action
+    /// taken automatically. This is as far as "Do" goes; Wingman never
+    /// presses Send, Submit, Buy or Pay.
+    fn run_calendar_executor(
+        &mut self,
+        executor: &dyn executors::Executor,
+        confirmed: confirm::Confirmed<Value>,
+    ) {
+        match executor.execute(confirmed) {
+            Ok(undo) => {
+                self.card
+                    .show_answer("Event opened in your calendar app", &undo.summary, 0, None);
+            }
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't add the event", &format!("{e:#}"));
+            }
+        }
+        self.set_watch(true);
     }
 
     fn on_result(&mut self, result: std::result::Result<Answer, String>) {
@@ -1178,6 +1427,91 @@ fn worker(
     )
 }
 
+/// #39: the calendar-flow analogue of [`worker`] -- loads and resolves the
+/// `add-to-calendar` action (respecting an `actions.toml` override of its
+/// `prompt`, the same precedence every action gets), builds the calendar
+/// request with today's local date and UTC offset baked into the prompt
+/// (`actions::calendar::build_prompt`), and runs it through the identical
+/// mode-aware provider chain, retry/repair and non-vision fallback
+/// [`worker`] already uses. The only real difference: `parse` is
+/// `actions::calendar::parse_calendar_proposal` (a raw `Value`) instead of
+/// [`parse_answer`] (a typed `Answer`), since the `calendar_event`
+/// proposal has no dedicated Rust struct -- see that function's doc
+/// comment.
+fn calendar_worker(
+    providers: &Providers,
+    mode: Mode,
+    shot: &Shot,
+    raw: &capture::RawShot,
+    foreground_hwnd: isize,
+    today: CivilDate,
+    utc_offset_minutes: i32,
+) -> Result<Value> {
+    let resolved = actions::load_actions().context("failed to load actions")?;
+    let action = resolved
+        .iter()
+        .find(|r| r.action.id == actions::calendar::ACTION_ID)
+        .map(|r| &r.action)
+        .with_context(|| {
+            format!(
+                "the \"{}\" action is disabled or missing; check actions.toml",
+                actions::calendar::ACTION_ID
+            )
+        })?;
+
+    let prompt = actions::calendar::build_prompt(&action.prompt, today, utc_offset_minutes);
+
+    let ollama_ready = mode == Mode::Auto
+        && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+        && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
+    let chain = providers.build_chain_for_mode(mode, ollama_ready);
+
+    let req = calendar_request(shot, &prompt);
+    chain.complete_parsed_with_fallback(
+        &req,
+        || non_vision_inputs(raw, foreground_hwnd),
+        |c| actions::calendar::parse_calendar_proposal(&c.text),
+    )
+}
+
+/// #39: today's local date and current local UTC offset, for the "Add
+/// event from screen" prompt -- DST-correct the same way
+/// `deadline_until_tomorrow` already is for Pause, via the identical
+/// `TzSpecificLocalTimeToSystemTime(None, ...)` call (the `None` zone asks
+/// for the machine's own currently active zone). Win32, so checked by
+/// hand (rule 8): press "Add event from screen" and confirm the preview's
+/// `start` field lands on the expected calendar day, per issue #166.
+fn local_today_and_utc_offset() -> Result<(CivilDate, i32)> {
+    let local_now = unsafe { GetLocalTime() };
+    let mut utc_now = SYSTEMTIME::default();
+    unsafe { TzSpecificLocalTimeToSystemTime(None, &local_now, &mut utc_now) }
+        .context("TzSpecificLocalTimeToSystemTime failed")?;
+
+    let today = CivilDate {
+        year: local_now.wYear as i32,
+        month: local_now.wMonth as u8,
+        day: local_now.wDay as u8,
+    };
+    let local_dt = CivilDateTime {
+        date: today,
+        hour: local_now.wHour as u8,
+        minute: local_now.wMinute as u8,
+        second: local_now.wSecond as u8,
+    };
+    let utc_dt = CivilDateTime {
+        date: CivilDate {
+            year: utc_now.wYear as i32,
+            month: utc_now.wMonth as u8,
+            day: utc_now.wDay as u8,
+        },
+        hour: utc_now.wHour as u8,
+        minute: utc_now.wMinute as u8,
+        second: utc_now.wSecond as u8,
+    };
+    let offset_minutes = actions::calendar::utc_offset_minutes(&local_dt, &utc_dt);
+    Ok((today, offset_minutes))
+}
+
 /// Issue #18/#206: computes the [`crate::provider::NonVisionInputs`] that
 /// stand in for the screenshot when a provider in the chain has no vision --
 /// OCR text of the captured screen (`raw`) plus a compact UIA field
@@ -1568,8 +1902,22 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
     }
     match msg {
         WM_APP_RESULT => SettingsReentrancy::DeferResult,
-        WM_APP_HOTKEY | WM_APP_ACTIVATE | WM_APP_TRAY | WM_APP_DISMISS | WM_APP_LEARNED
-        | WM_APP_PAUSE_TOGGLE => SettingsReentrancy::Ignore,
+        // Issue #39: WM_APP_CALENDAR_RESULT/WM_APP_PREVIEW_DECIDED are
+        // Ignored, not deferred like WM_APP_RESULT -- Settings being open
+        // while the "Add event from screen" flow is mid-flight is a corner
+        // case this task does not build full deferral plumbing for (a
+        // second PENDING_RESULT-shaped thread-local per message type).
+        // WM_APP_CALENDAR_RESULT still carries a boxed payload, freed
+        // explicitly in the Ignore arm below (mirroring WM_APP_LEARNED) so
+        // it never leaks; WM_APP_PREVIEW_DECIDED carries none.
+        WM_APP_HOTKEY
+        | WM_APP_ACTIVATE
+        | WM_APP_TRAY
+        | WM_APP_DISMISS
+        | WM_APP_LEARNED
+        | WM_APP_PAUSE_TOGGLE
+        | WM_APP_CALENDAR_RESULT
+        | WM_APP_PREVIEW_DECIDED => SettingsReentrancy::Ignore,
         _ => SettingsReentrancy::Fallback,
     }
 }
@@ -1614,10 +1962,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
         match settings_reentrancy_policy(msg, taskbar_created_msg) {
             SettingsReentrancy::Ignore => {
-                // WM_APP_LEARNED is the only ignored message carrying a
-                // boxed payload; free it so it doesn't leak.
+                // WM_APP_LEARNED and WM_APP_CALENDAR_RESULT are the only
+                // ignored messages carrying a boxed payload; free them so
+                // neither leaks.
                 if msg == WM_APP_LEARNED {
                     drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
+                } else if msg == WM_APP_CALENDAR_RESULT {
+                    drop(unsafe {
+                        Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
+                    });
                 }
                 return LRESULT(0);
             }
@@ -1662,6 +2015,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(),
                     MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
+                    MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
                     MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
                     MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
                     MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
@@ -1706,6 +2060,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>) };
             app.on_result(result);
+            LRESULT(0)
+        }
+        WM_APP_CALENDAR_RESULT => {
+            let result =
+                unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>) };
+            app.on_calendar_result(result);
+            LRESULT(0)
+        }
+        WM_APP_PREVIEW_DECIDED => {
+            app.on_preview_decided();
             LRESULT(0)
         }
         WM_APP_DISMISS => {
@@ -1778,12 +2142,13 @@ mod tests {
     use super::App;
     use super::{final_settings_card, SettingsFinalCard};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
-    use super::{WM_APP_ACTIVATE, WM_APP_RESULT};
+    use super::{WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_RESULT};
     use crate::actions::{self, Origin};
     use crate::config::Providers;
     use crate::dismiss::WM_APP_DISMISS;
     use crate::hotkey::{WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PAUSE_TOGGLE};
     use crate::mode::Mode;
+    use crate::ui::card::WM_APP_PREVIEW_DECIDED;
     use crate::ui::tray::WM_APP_TRAY;
     use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
 
@@ -2187,6 +2552,8 @@ mod tests {
             WM_APP_DISMISS,
             WM_APP_LEARNED,
             WM_APP_PAUSE_TOGGLE,
+            WM_APP_CALENDAR_RESULT,
+            WM_APP_PREVIEW_DECIDED,
         ] {
             assert_eq!(
                 settings_reentrancy_policy(msg, FAKE_TASKBAR_CREATED_MSG),
@@ -2230,6 +2597,8 @@ mod tests {
         ("WM_APP_DISMISS", WM_APP_DISMISS),
         ("WM_APP_ACTIVATE", WM_APP_ACTIVATE),
         ("WM_APP_PAUSE_TOGGLE", WM_APP_PAUSE_TOGGLE),
+        ("WM_APP_CALENDAR_RESULT", WM_APP_CALENDAR_RESULT),
+        ("WM_APP_PREVIEW_DECIDED", WM_APP_PREVIEW_DECIDED),
     ];
 
     #[test]
@@ -2263,14 +2632,15 @@ mod tests {
         let declared = count_declarations(include_str!("app.rs"))
             + count_declarations(include_str!("dismiss.rs"))
             + count_declarations(include_str!("hotkey.rs"))
-            + count_declarations(include_str!("ui/tray.rs"));
+            + count_declarations(include_str!("ui/tray.rs"))
+            + count_declarations(include_str!("ui/card.rs"));
 
         assert_eq!(
             declared,
             ALL_WM_APP_IDS.len(),
             "found {declared} `pub const WM_APP_* = WM_APP + n;` declarations across \
-             app.rs/dismiss.rs/hotkey.rs/ui/tray.rs but ALL_WM_APP_IDS lists {}; add the \
-             new constant to ALL_WM_APP_IDS too",
+             app.rs/dismiss.rs/hotkey.rs/ui/tray.rs/ui/card.rs but ALL_WM_APP_IDS lists {}; \
+             add the new constant to ALL_WM_APP_IDS too",
             ALL_WM_APP_IDS.len()
         );
     }
