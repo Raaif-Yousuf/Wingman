@@ -5,6 +5,7 @@ mod actions;
 mod actions_example;
 mod app;
 mod autostart;
+mod calc;
 mod capture;
 mod config;
 #[cfg(test)]

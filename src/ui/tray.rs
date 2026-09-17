@@ -125,6 +125,12 @@ pub mod cmd {
     /// the clipboard. See `App::copy_diagnostics` in `app.rs`.
     pub const COPY_DIAGNOSTICS: u32 = 1019;
 
+    /// Issue #115: evaluates the current selection as an arithmetic
+    /// expression or a unit conversion, no model involved. See
+    /// `App::calculate_selection` in `app.rs`. Stands in for a palette entry
+    /// until #25's action palette exists.
+    pub const CALCULATE_SELECTION: u32 = 1020;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -433,6 +439,16 @@ impl Tray {
     fn build_menu(&self, hmenu: HMENU) -> Result<()> {
         append_item(hmenu, cmd::ASK_NOW, "Ask now")?;
         append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
+        // #115: works with no provider at all, but still honors Pause
+        // (issue #20's rule: nothing Wingman does runs while paused, even
+        // the model-free actions), same greyed-while-paused treatment as
+        // the "Set ... key" items just below.
+        append_item_state(
+            hmenu,
+            cmd::CALCULATE_SELECTION,
+            "Calculate selection",
+            !self.paused,
+        )?;
         append_separator(hmenu)?;
         if self.paused {
             append_item(hmenu, cmd::RESUME, "Resume")?;
@@ -1198,6 +1214,7 @@ mod tests {
         ("MODE_AUTO", cmd::MODE_AUTO),
         ("MODE_OFFLINE", cmd::MODE_OFFLINE),
         ("COPY_DIAGNOSTICS", cmd::COPY_DIAGNOSTICS),
+        ("CALCULATE_SELECTION", cmd::CALCULATE_SELECTION),
     ];
 
     #[test]
