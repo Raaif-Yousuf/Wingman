@@ -32,12 +32,7 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn open(access: REG_SAM_FLAGS) -> Result<HKEY> {
-    open_at(RUN_KEY, access)
-}
-
-/// [`open`], with the subkey path injected so it can be pointed at a
-/// scratch key in tests instead of the real Run key (Hard Rule 9).
+/// Opens `RUN_KEY` (or, in tests, a scratch key) for `access`.
 fn open_at(key_path: &str, access: REG_SAM_FLAGS) -> Result<HKEY> {
     let mut key = HKEY::default();
     let sub = wide(key_path);
@@ -118,36 +113,33 @@ fn value_at(key_path: &str, value_name: &str) -> Option<String> {
 
 /// Whether Wingman is registered to start with Windows.
 pub fn is_enabled() -> bool {
-    current_value().is_some()
+    is_enabled_at(RUN_KEY, VALUE_NAME)
+}
+
+/// [`is_enabled`], with the key path and value name injected so tests can
+/// check a scratch key instead of the real Run key (Hard Rule 9).
+fn is_enabled_at(key_path: &str, value_name: &str) -> bool {
+    value_at(key_path, value_name).is_some()
 }
 
 /// Turn autostart on or off. Enabling always (re)writes the current
 /// executable path, so toggling it off and on is also the way to repair a
 /// stale entry after moving the exe.
 pub fn set_enabled(on: bool) -> Result<()> {
-    let key = open(KEY_WRITE)?;
-    let name = wide(VALUE_NAME);
+    set_enabled_at(RUN_KEY, VALUE_NAME, on)
+}
 
-    let result = if on {
-        let cmd = wide(&command()?);
-        let bytes = unsafe {
-            std::slice::from_raw_parts(cmd.as_ptr() as *const u8, cmd.len() * 2)
-        };
-        unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_SZ, Some(bytes)) }
-            .ok()
-            .context("writing the Run value")
+/// [`set_enabled`], with the key path and value name injected so tests can
+/// exercise this against a scratch key instead of the real Run key (Hard
+/// Rule 9). Goes through [`write_value_at`] / [`delete_value_at`] rather than
+/// opening the key itself, so the production path and the test path share
+/// one implementation of "write or delete a Run-shaped value".
+fn set_enabled_at(key_path: &str, value_name: &str, on: bool) -> Result<()> {
+    if on {
+        write_value_at(key_path, value_name, &command()?)
     } else {
-        let deleted = unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) };
-        // Already absent is the desired end state, not a failure.
-        if deleted == ERROR_FILE_NOT_FOUND {
-            Ok(())
-        } else {
-            deleted.ok().context("deleting the Run value")
-        }
-    };
-
-    unsafe { let _ = RegCloseKey(key); }
-    result
+        delete_value_at(key_path, value_name)
+    }
 }
 
 /// Removes the pre-rename `copilot-ask` Run value, if a pre-rename install
@@ -236,26 +228,42 @@ mod tests {
 
     #[test]
     fn toggling_round_trips() {
-        // Records the real state first and restores it, so running the suite
-        // never changes whether the user's machine autostarts this app.
-        let before = is_enabled();
+        // Exercises set_enabled_at / is_enabled_at against a scratch key, so
+        // running the suite never touches the real HKCU...\Run entry that
+        // controls whether this machine actually autostarts the app (Hard
+        // Rule 9; see `the_production_value_name_is_not_what_the_test_writes`
+        // below for the guard against this regressing).
+        let path = test_key_path();
+        let key = create_test_key(&path);
+        unsafe { let _ = RegCloseKey(key); }
+        let value_name = "wingman-autostart-test-value";
 
-        set_enabled(true).expect("enable");
-        assert!(is_enabled(), "should read back as enabled");
+        assert!(!is_enabled_at(&path, value_name), "scratch key starts empty");
+
+        set_enabled_at(&path, value_name, true).expect("enable");
+        assert!(is_enabled_at(&path, value_name), "should read back as enabled");
         assert_eq!(
-            current_value().as_deref(),
+            value_at(&path, value_name).as_deref(),
             Some(command().unwrap().as_str()),
             "enabling must point at the current executable"
         );
 
-        set_enabled(false).expect("disable");
-        assert!(!is_enabled(), "should read back as disabled");
+        set_enabled_at(&path, value_name, false).expect("disable");
+        assert!(!is_enabled_at(&path, value_name), "should read back as disabled");
 
         // Disabling twice is not an error.
-        set_enabled(false).expect("disabling an absent value is a no-op");
+        set_enabled_at(&path, value_name, false)
+            .expect("disabling an absent value is a no-op");
 
-        set_enabled(before).expect("restore original state");
-        assert_eq!(is_enabled(), before);
+        delete_test_key(&path);
+    }
+
+    #[test]
+    fn the_production_value_name_is_not_what_the_test_writes() {
+        // Guards against someone "simplifying" `toggling_round_trips` back
+        // onto `set_enabled`/`is_enabled`, which would make the suite flip
+        // the real autostart entry on this machine again.
+        assert_ne!("wingman-autostart-test-value", VALUE_NAME);
     }
 
     // -- old Run value removal ------------------------------------------------
