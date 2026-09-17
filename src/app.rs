@@ -96,6 +96,12 @@ struct App {
     /// Pause (issue #20). Not persisted across restart -- a restart is an
     /// explicit resume (see `pause.rs`'s module doc).
     pause: PauseState,
+    /// Issue #112: the `(slot, chord)` last warned about by
+    /// `hotkey_conflicts::decide`, so capturing the SAME conflicting chord
+    /// twice in a row applies it instead of warning forever. `None` after a
+    /// clean apply, a timeout, or a warn for a different pair -- see
+    /// `on_learned`.
+    pending_conflict: Option<(usize, Chord)>,
 }
 
 pub fn run() -> Result<()> {
@@ -178,6 +184,7 @@ pub fn run() -> Result<()> {
         busy: false,
         last: None,
         pause: PauseState::Running,
+        pending_conflict: None,
     });
     app.refresh_tray_labels();
     // Issue #19: reflect the loaded mode in the tray submenu/icon from the
@@ -624,6 +631,30 @@ impl App {
     }
 
     fn on_learned(&mut self, which: usize, chord: Chord) {
+        // Issue #112: a known system/app shortcut warns and keeps the
+        // previous binding, unless the user just confirmed by capturing the
+        // exact same chord again for this slot -- see
+        // `hotkey_conflicts`'s module doc comment for the full flow.
+        match crate::hotkey_conflicts::decide(self.pending_conflict, which, chord) {
+            crate::hotkey_conflicts::LearnDecision::Warn(conflict) => {
+                self.pending_conflict = Some((which, chord));
+                self.card.show_answer(
+                    &format!(
+                        "{} is already used by {}",
+                        chord_to_string(&chord),
+                        conflict.owner
+                    ),
+                    "Press the same key combo again to bind it anyway, or press a different one. The previous binding is unchanged.",
+                    8,
+                    None,
+                );
+                return;
+            }
+            crate::hotkey_conflicts::LearnDecision::Apply => {
+                self.pending_conflict = None;
+            }
+        }
+
         if which == HK_PRIMARY {
             self.config.hotkeys.primary = chord;
         } else {

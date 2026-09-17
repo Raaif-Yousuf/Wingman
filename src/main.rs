@@ -14,6 +14,7 @@ mod diagnostics;
 mod dismiss;
 mod executors;
 mod hotkey;
+mod hotkey_conflicts;
 mod inputs;
 mod known_folder;
 mod mode;
