@@ -43,6 +43,10 @@ features = [
   "Win32_System_LibraryLoader",
   "Win32_System_Registry",
   "Win32_System_Memory",
+  # inputs/selection.rs (#28): CF_UNICODETEXT/CF_HDROP/CF_DIB live under
+  # System::Ole in the windows crate, not System::DataExchange (which only
+  # has the clipboard *functions*, taking/returning plain u32 format ids).
+  "Win32_System_Ole",
   "Win32_System_DataExchange",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",

@@ -3,7 +3,8 @@
 //! router and `actions/` can use. Per the row's contract, nothing in here
 //! knows about providers, and nothing in here writes anything.
 //!
-//! Today this holds only [`uia`] (#27); `selection.rs` and `ocr.rs` are
-//! later rows in the same table, not built yet.
+//! Today this holds [`uia`] (#27) and [`selection`] (#28); `ocr.rs` is a
+//! later row in the same table, not built yet.
 
+pub mod selection;
 pub mod uia;
