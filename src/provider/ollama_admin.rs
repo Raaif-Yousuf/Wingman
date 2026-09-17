@@ -156,6 +156,20 @@ fn ends_with_path_component(path: &str, component: &str) -> bool {
     path.to_ascii_lowercase().ends_with(&needle)
 }
 
+/// #190: a `Vec<u32>` word count that comfortably holds `size_bytes` bytes
+/// (rounded up), extracted as a pure helper so the sizing arithmetic is
+/// unit-tested without a real `GetExtendedTcpTable` call. `Vec<u32>`'s
+/// allocation is guaranteed aligned to `align_of::<u32>()` (4 bytes), which
+/// is also `align_of::<MIB_TCPTABLE_OWNER_PID>()` (every field in that
+/// struct, and in `MIB_TCPROW_OWNER_PID`, is a `u32`) -- unlike a `Vec<u8>`,
+/// whose allocation is only guaranteed aligned to 1, this makes the later
+/// cast to `*const MIB_TCPTABLE_OWNER_PID` provably sound rather than
+/// working only because of how Windows' allocator happens to behave today.
+fn aligned_tcp_table_word_count(size_bytes: u32) -> usize {
+    const WORD: usize = std::mem::size_of::<u32>();
+    (size_bytes as usize).div_ceil(WORD)
+}
+
 /// `GetExtendedTcpTable(..., TCP_TABLE_OWNER_PID_LISTENER, ...)`: finds the
 /// owning PID of whichever LISTENING IPv4 socket is bound to `port`,
 /// regardless of local address (0.0.0.0 or 127.0.0.1) -- Wingman only ever
@@ -181,7 +195,8 @@ fn tcp_listener_pid(port: u16) -> Option<u32> {
             return None;
         }
 
-        let mut buf = vec![0u8; size as usize];
+        // #190: `Vec<u32>`, not `Vec<u8>` -- see `aligned_tcp_table_word_count`.
+        let mut buf = vec![0u32; aligned_tcp_table_word_count(size)];
         let ret = GetExtendedTcpTable(
             Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
             &mut size,
@@ -685,6 +700,47 @@ mod tests {
         for msg in messages {
             assert!(!msg.contains('\u{2014}'), "em dash in {msg:?}");
         }
+    }
+
+    // -- aligned_tcp_table_word_count (#190, pure) -------------------------
+
+    #[test]
+    fn aligned_tcp_table_word_count_rounds_up_to_whole_words() {
+        assert_eq!(aligned_tcp_table_word_count(0), 0);
+        assert_eq!(aligned_tcp_table_word_count(1), 1);
+        assert_eq!(aligned_tcp_table_word_count(3), 1);
+        assert_eq!(aligned_tcp_table_word_count(4), 1);
+        assert_eq!(aligned_tcp_table_word_count(5), 2);
+        assert_eq!(aligned_tcp_table_word_count(8), 2);
+        assert_eq!(aligned_tcp_table_word_count(9), 3);
+    }
+
+    #[test]
+    fn aligned_tcp_table_word_count_buffer_is_at_least_as_large_as_requested() {
+        for size_bytes in [0u32, 1, 3, 4, 5, 24, 100, 4_096, 65_537] {
+            let words = aligned_tcp_table_word_count(size_bytes);
+            assert!(
+                (words * std::mem::size_of::<u32>()) as u32 >= size_bytes,
+                "size_bytes={size_bytes}, words={words} -- buffer too small to hold what GetExtendedTcpTable asked for"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vec_u32_buffer_sized_by_the_helper_is_aligned_for_mib_tcptable_owner_pid() {
+        use windows::Win32::NetworkManagement::IpHelper::MIB_TCPTABLE_OWNER_PID;
+
+        // Provable by construction (Vec<u32>'s allocation is guaranteed
+        // aligned to align_of::<u32>(), which equals
+        // align_of::<MIB_TCPTABLE_OWNER_PID>() -- see this helper's doc
+        // comment), but asserted directly so the invariant is checked, not
+        // just claimed.
+        let buf: Vec<u32> = vec![0u32; aligned_tcp_table_word_count(37)];
+        assert_eq!(
+            buf.as_ptr() as usize % std::mem::align_of::<MIB_TCPTABLE_OWNER_PID>(),
+            0,
+            "buffer must be aligned enough to soundly cast to *const MIB_TCPTABLE_OWNER_PID"
+        );
     }
 
     // -- Win32 query (#15, one smoke test, no Ollama required) -----------
