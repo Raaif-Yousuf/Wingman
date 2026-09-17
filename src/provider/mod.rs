@@ -3,12 +3,13 @@
 // in `common.rs` (the one file every provider's HTTP send already funnels
 // through), and the Ollama-readiness probe needs to funnel through the
 // exact same guarded path rather than opening its own socket.
-pub(crate) mod common;
 pub mod anthropic;
+pub(crate) mod common;
 pub mod gemini;
 pub mod ollama;
 pub mod ollama_admin;
 pub mod openai;
+pub mod openai_compat;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -18,6 +19,7 @@ pub use anthropic::Anthropic;
 pub use gemini::Gemini;
 pub use ollama::Ollama;
 pub use openai::OpenAi;
+pub use openai_compat::OpenAiCompat;
 /// The system prompt. The user solves physics and statistics problems on paper,
 /// then screenshots the on-screen assignment to check their result before
 /// entering it. The screenshot shows the problem — not, usually, their working.
@@ -354,6 +356,22 @@ impl Chain {
     /// this fallback-on-invalid-schema behaviour lived inside each
     /// provider's own `ask`; `complete_parsed` restores it without teaching
     /// `Chain` about any one action's schema again).
+    ///
+    /// Issue #99: before falling through, a `parse` failure gets exactly
+    /// ONE repair attempt against the SAME provider -- see
+    /// [`repair_request`] for what that second request carries (the bad
+    /// text and the parse error, never the screenshot again, to save
+    /// tokens). No repair is attempted when `completion.stop ==
+    /// StopReason::MaxTokens`: a provider that already reported "ran out of
+    /// budget" asked to "try again" with the same budget would just fail
+    /// the same way, and a genuine refusal never reaches this point at all
+    /// -- every provider's own `complete` already turns a refusal into
+    /// `Err` before a `Completion` exists (see e.g. `anthropic.rs`'s
+    /// `stop_reason: "refusal"` handling), so it takes the plain
+    /// transport-error branch above, which this function has never retried.
+    /// If the repair attempt also fails to parse (or errors outright), the
+    /// *original* parse error is what counts as this provider's failure for
+    /// `first_err` purposes, and the chain falls through exactly as before.
     pub fn complete_parsed<T>(
         &self,
         req: &Request,
@@ -365,12 +383,31 @@ impl Chain {
             if !provider.ready() {
                 continue;
             }
-            let outcome = provider.complete(req).and_then(|completion| parse(&completion));
-            match outcome {
-                Ok(value) => return Ok(value),
+
+            let completion = match provider.complete(req) {
+                Ok(c) => c,
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
+                    }
+                    continue;
+                }
+            };
+
+            match parse(&completion) {
+                Ok(value) => return Ok(value),
+                Err(parse_err) => {
+                    if completion.stop != StopReason::MaxTokens {
+                        let repair_req =
+                            repair_request(req, &completion.text, &parse_err.to_string());
+                        if let Ok(repaired) = provider.complete(&repair_req) {
+                            if let Ok(value) = parse(&repaired) {
+                                return Ok(value);
+                            }
+                        }
+                    }
+                    if first_err.is_none() {
+                        first_err = Some(parse_err);
                     }
                 }
             }
@@ -418,6 +455,38 @@ pub fn physics_request(shot: &Shot, prompt: &str, want_difficulty: bool) -> Requ
     }
 }
 
+/// Issue #99's repair-request system prompt. Worded to ask only for
+/// corrected JSON, never for the model's reasoning or "how" it got the
+/// answer -- CLAUDE.md rule 10's `reasoning_extraction` trap (Anthropic's
+/// classifier refuses a prompt that reads as extracting internal reasoning,
+/// `stop_reason: "refusal"`, MEASURED 2026-09-15) applies just as much to a
+/// repair prompt as to the original one that rule 3's `detail`-before-
+/// `headline` ordering already works around.
+const REPAIR_SYSTEM: &str =
+    "The previous response to this request did not match the required JSON output. Return corrected JSON only, matching the same schema as before. Do not include any explanation, markdown formatting, or code fences.";
+
+/// Issue #99: builds the ONE-shot repair request sent back to the SAME
+/// provider that produced `bad_text`, after it fails `parse`. Carries the
+/// bad output and the parse error, but deliberately drops `original.images`
+/// -- the model already saw the screenshot on the first attempt, and a
+/// repair is about fixing the JSON shape, not re-reading the screen, so
+/// resending it would only cost tokens for no benefit (issue #99's "no
+/// screenshot re-sent, to save tokens"). `schema`, `effort` and
+/// `max_tokens` carry over unchanged, so the repair is held to the same
+/// contract as the original request.
+fn repair_request(original: &Request, bad_text: &str, parse_error: &str) -> Request {
+    Request {
+        system: REPAIR_SYSTEM.to_string(),
+        user: format!(
+            "The previous response was:\n\n{bad_text}\n\nIt did not parse: {parse_error}\n\nReturn corrected JSON only."
+        ),
+        images: Vec::new(),
+        schema: original.schema.clone(),
+        effort: original.effort,
+        max_tokens: original.max_tokens,
+    }
+}
+
 /// The wire shape of the model's JSON payload for the physics-check answer.
 /// Kept separate from the public `Answer` because `difficulty` arrives as a
 /// bare string ("7", "U", ...) that is not a `Difficulty`'s natural
@@ -436,7 +505,8 @@ struct RawAnswer {
 /// the physics-check schema is interpreted -- providers only ever hand back
 /// raw text.
 pub fn parse_answer(text: &str) -> Result<Answer> {
-    let raw: RawAnswer = serde_json::from_str(text).context("provider: completion text is not a valid Answer")?;
+    let raw: RawAnswer =
+        serde_json::from_str(text).context("provider: completion text is not a valid Answer")?;
     Ok(Answer {
         detail: raw.detail,
         headline: raw.headline,
@@ -475,6 +545,84 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             (self.result)()
         }
+    }
+
+    /// #99: a provider whose `complete` result varies call by call, so a
+    /// "bad then good" (repair succeeds) or "bad then bad" (repair also
+    /// fails) sequence can be scripted. `MockProvider` above always returns
+    /// the same thing every call, which can't express either shape.
+    type ScriptedResult = fn() -> anyhow::Result<Completion>;
+
+    struct SequencedProvider {
+        id: &'static str,
+        results: std::sync::Mutex<std::collections::VecDeque<ScriptedResult>>,
+        /// `Arc` (not a bare `AtomicU32`) so a test can clone the counter
+        /// *before* moving this provider into `Chain::new` (which takes
+        /// ownership via `Box<dyn Provider>`) and still read it back
+        /// afterwards -- see `SequencedProvider::new_counted`.
+        calls: std::sync::Arc<AtomicU32>,
+    }
+
+    impl SequencedProvider {
+        fn new(id: &'static str, results: Vec<ScriptedResult>) -> Self {
+            Self::new_counted(id, results).0
+        }
+
+        /// Like `new`, but also hands back a clone of the call counter so
+        /// the caller can inspect it after the provider has been moved into
+        /// a `Chain`.
+        fn new_counted(
+            id: &'static str,
+            results: Vec<ScriptedResult>,
+        ) -> (Self, std::sync::Arc<AtomicU32>) {
+            let calls = std::sync::Arc::new(AtomicU32::new(0));
+            (
+                Self {
+                    id,
+                    results: std::sync::Mutex::new(results.into()),
+                    calls: calls.clone(),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl Provider for SequencedProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn capabilities(&self, _model: &str) -> Caps {
+            Caps::default()
+        }
+
+        fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut queue = self.results.lock().unwrap();
+            let next = queue
+                .pop_front()
+                .expect("SequencedProvider called more times than scripted");
+            next()
+        }
+    }
+
+    fn repaired_completion() -> anyhow::Result<Completion> {
+        Ok(Completion {
+            text: r#"{"detail":"fixed on repair","headline":"repaired"}"#.to_string(),
+            usage: None,
+            stop: StopReason::Complete,
+        })
+    }
+
+    /// A 200 whose text is schema-invalid AND whose `stop` already says the
+    /// model ran out of budget -- the case #99 says must never get a repair
+    /// attempt (retrying with the same budget would just fail the same way).
+    fn max_tokens_completion() -> anyhow::Result<Completion> {
+        Ok(Completion {
+            text: r#"{"not":"an answer"}"#.to_string(),
+            usage: None,
+            stop: StopReason::MaxTokens,
+        })
     }
 
     fn ok_completion() -> anyhow::Result<Completion> {
@@ -643,7 +791,11 @@ mod tests {
     #[test]
     fn difficulty_parses_ultra_case_insensitively() {
         for s in ["u", "U", "ultra", "Ultra", "ULTRA"] {
-            assert_eq!(Difficulty::parse(s), Some(Difficulty::Ultra), "failed for {s:?}");
+            assert_eq!(
+                Difficulty::parse(s),
+                Some(Difficulty::Ultra),
+                "failed for {s:?}"
+            );
         }
     }
 
@@ -824,6 +976,149 @@ mod tests {
         assert_eq!(answer.headline, "42");
     }
 
+    // -- Chain::complete_parsed repair pass (issue #99) --------------------
+
+    #[test]
+    fn repair_succeeds_bad_then_good_returns_the_repaired_answer_without_a_second_provider() {
+        let a = SequencedProvider::new("a", vec![unparseable_completion, repaired_completion]);
+        let chain = Chain::new(vec![Box::new(a)]);
+        let answer = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap();
+        assert_eq!(answer.headline, "repaired");
+    }
+
+    #[test]
+    fn repair_bad_then_bad_falls_through_to_the_next_provider() {
+        let a = SequencedProvider::new("a", vec![unparseable_completion, unparseable_completion]);
+        let b = MockProvider {
+            id: "b",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: ok_completion,
+        };
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        let answer = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap();
+        assert_eq!(
+            answer.headline, "42",
+            "must have come from provider b, not a repaired a"
+        );
+    }
+
+    #[test]
+    fn repair_is_attempted_exactly_once_a_third_call_would_panic() {
+        // Only two results are scripted; if the repair pass ever attempted
+        // a second repair (or called the provider a third time for any
+        // reason), `SequencedProvider::complete` panics on the empty queue.
+        // `a` alone (no fallback provider) proves the chain doesn't recover
+        // by some other path if that happened.
+        let a = SequencedProvider::new("a", vec![unparseable_completion, unparseable_completion]);
+        let chain = Chain::new(vec![Box::new(a)]);
+        let err = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap_err();
+        assert!(err.to_string().contains("not a valid Answer"));
+    }
+
+    #[test]
+    fn repair_records_exactly_two_calls_for_bad_then_good() {
+        let (a, calls) =
+            SequencedProvider::new_counted("a", vec![unparseable_completion, repaired_completion]);
+        let chain = Chain::new(vec![Box::new(a)]);
+        let answer = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap();
+        assert_eq!(answer.headline, "repaired");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one original call plus one repair call"
+        );
+    }
+
+    #[test]
+    fn no_repair_when_the_provider_stop_reason_is_max_tokens() {
+        // Only one result scripted: if a repair were attempted, the second
+        // `complete()` call would panic on the empty queue instead of
+        // falling through cleanly to provider b.
+        let a = SequencedProvider::new("a", vec![max_tokens_completion]);
+        let b = MockProvider {
+            id: "b",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: ok_completion,
+        };
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        let answer = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap();
+        assert_eq!(answer.headline, "42");
+    }
+
+    #[test]
+    fn no_repair_on_a_refusal_the_provider_error_path_is_never_retried() {
+        // A refusal never reaches `parse` at all -- every provider turns it
+        // into `Err` from `complete()` itself (mirrors `anthropic.rs`'s
+        // `stop_reason: "refusal"` handling). Only one result scripted:
+        // `SequencedProvider` panics on a second call, so a passing test
+        // here proves no repair (retry) was attempted on the error path.
+        let a = SequencedProvider::new(
+            "a",
+            vec![|| Err(anyhow::anyhow!("anthropic: model refused to answer"))],
+        );
+        let b = MockProvider {
+            id: "b",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: ok_completion,
+        };
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        let answer = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap();
+        assert_eq!(answer.headline, "42");
+    }
+
+    #[test]
+    fn repair_request_drops_images_but_keeps_schema_effort_and_max_tokens() {
+        let mut original = req();
+        original.images = vec![vec![1, 2, 3]];
+        original.effort = Effort::High;
+        original.max_tokens = 999;
+
+        let repair = repair_request(&original, "bad text", "parse error text");
+
+        assert!(repair.images.is_empty(), "no screenshot re-sent (#99)");
+        assert_eq!(repair.schema, original.schema);
+        assert_eq!(repair.effort, Effort::High);
+        assert_eq!(repair.max_tokens, 999);
+        assert!(repair.user.contains("bad text"));
+        assert!(repair.user.contains("parse error text"));
+    }
+
+    /// CLAUDE.md rule 10's trap: a repair prompt that reads as asking for
+    /// the model's internal reasoning gets refused (MEASURED 2026-09-15).
+    /// The repair wording must never ask "why" or for a scratchpad -- only
+    /// for corrected JSON.
+    #[test]
+    fn repair_request_wording_never_asks_for_reasoning() {
+        let repair = repair_request(&req(), "bad", "err");
+        for banned in [
+            "scratchpad",
+            "reason it out",
+            "explain your reasoning",
+            "think step by step",
+        ] {
+            assert!(
+                !repair.system.to_lowercase().contains(banned),
+                "repair system prompt must not read as reasoning extraction: {:?}",
+                repair.system
+            );
+        }
+    }
+
     // -- physics_request / parse_answer ---------------------------------
 
     #[test]
@@ -835,7 +1130,9 @@ mod tests {
         assert_eq!(req.images, vec![s.png]);
         assert_eq!(req.effort, Effort::Unset);
         assert_eq!(req.max_tokens, 0);
-        let schema = req.schema.expect("schema is always present for the physics check");
+        let schema = req
+            .schema
+            .expect("schema is always present for the physics check");
         assert!(schema["properties"].get("difficulty").is_none());
     }
 
@@ -845,7 +1142,10 @@ mod tests {
         assert!(req.system.starts_with("system prompt text"));
         assert!(req.system.contains("difficulty"));
         let schema = req.schema.unwrap();
-        assert_eq!(schema["required"], serde_json::json!(["detail", "headline", "difficulty"]));
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["detail", "headline", "difficulty"])
+        );
     }
 
     #[test]
@@ -858,7 +1158,8 @@ mod tests {
 
     #[test]
     fn parse_answer_degrades_unparseable_difficulty_to_none() {
-        let answer = parse_answer(r#"{"detail":"d","headline":"h","difficulty":"way too hard"}"#).unwrap();
+        let answer =
+            parse_answer(r#"{"detail":"d","headline":"h","difficulty":"way too hard"}"#).unwrap();
         assert_eq!(answer.difficulty, None);
     }
 

@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::hotkey::Chord;
 use crate::mode::Mode;
-use crate::provider::{Anthropic, Chain, Gemini, Ollama, OpenAi, Provider, DEFAULT_PROMPT};
+use crate::provider::openai_compat::{CompatAuth, Structured};
+use crate::provider::{
+    Anthropic, Chain, Gemini, Ollama, OpenAi, OpenAiCompat, Provider, DEFAULT_PROMPT,
+};
 use crate::secrets::{target_name, CredManagerStore, SecretStore};
 
 /// Sentinel `hydrate_secrets` writes into a `ProviderConfig::api_key` field
@@ -102,6 +105,12 @@ pub struct Providers {
     pub anthropic: ProviderConfig,
     pub gemini: ProviderConfig,
     pub ollama: OllamaConfig,
+    /// #16: one entry per OpenAI-compatible endpoint (OpenRouter, Groq,
+    /// Mistral, DeepSeek, xAI, LM Studio, llama.cpp, vLLM, Azure, ...). Each
+    /// entry's `providers.order` name is `"compat:<name>"` -- see
+    /// [`compat_order_name`]. Empty by default: unlike `ollama`, there is no
+    /// sensible single default endpoint to ship.
+    pub compat: Vec<CompatConfig>,
 }
 
 impl Default for Providers {
@@ -180,6 +189,10 @@ impl Default for Providers {
                 ],
             },
             ollama: OllamaConfig::default(),
+            // #16: opt-in only, same reasoning as ollama above -- there is
+            // no compat endpoint every install should silently start
+            // talking to.
+            compat: Vec::new(),
         }
     }
 }
@@ -246,6 +259,64 @@ impl Default for OllamaConfig {
             effort: "low".to_string(),
         }
     }
+}
+
+/// #16: one `[[providers.compat]]` entry -- an OpenAI-compatible
+/// `/chat/completions` endpoint (OpenRouter, Groq, Mistral, DeepSeek, xAI,
+/// Together, LM Studio, llama.cpp, vLLM, Azure, ...). `Debug` is hand-rolled
+/// below to redact `api_key`, mirroring [`ProviderConfig`] (#157).
+#[derive(Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CompatConfig {
+    /// The endpoint's short, user-chosen id (`"openrouter"`, `"lmstudio"`).
+    /// Combined with `"compat:"` to make the `providers.order` entry and the
+    /// Credential Manager target name -- see [`compat_order_name`].
+    pub name: String,
+    /// e.g. `https://openrouter.ai/api/v1` or `http://127.0.0.1:1234/v1` --
+    /// no trailing `/chat/completions`, that suffix is added by
+    /// [`crate::provider::openai_compat::OpenAiCompat`]. Whether this
+    /// endpoint counts as local or cloud for mode selection is decided from
+    /// this URL's host via `mode::classify_host`, never from `name`.
+    pub base_url: String,
+    pub auth: CompatAuth,
+    /// The header name used when `auth == ApiKeyHeader` (e.g. `"X-Api-Key"`
+    /// for Mistral). Ignored for `Bearer`/`None`.
+    pub auth_header: String,
+    /// Stored in Credential Manager as `Wingman/compat:<name>` (#16), same
+    /// import/hydrate/blank lifecycle as the fixed cloud providers -- see
+    /// `Config::import_secrets_and_blank` et al. No env var override (#16's
+    /// "no env override unless trivial": a dynamic, user-named list of
+    /// endpoints has no single fixed env var name to override).
+    pub api_key: String,
+    pub model: String,
+    /// Offered in the tray's model submenu, same role as
+    /// [`ProviderConfig::models`].
+    pub models: Vec<String>,
+    pub structured: Structured,
+}
+
+impl std::fmt::Debug for CompatConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompatConfig")
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field("auth", &self.auth)
+            .field("auth_header", &self.auth_header)
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("models", &self.models)
+            .field("structured", &self.structured)
+            .finish()
+    }
+}
+
+/// The `providers.order` entry (and Credential Manager target-name suffix)
+/// for a compat endpoint named `name` -- `"compat:<name>"`. The one place
+/// this string is built, so `Providers::provider_for`,
+/// `Providers::build_chain_for_mode` and the secret-store loops can never
+/// drift apart on the spelling.
+pub fn compat_order_name(name: &str) -> String {
+    format!("compat:{name}")
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -402,6 +473,18 @@ impl Config {
                 changed = true;
             }
         }
+        // #16: same import-and-blank lifecycle for every configured compat
+        // endpoint, keyed `Wingman/compat:<name>` (see `compat_order_name`).
+        for entry in &mut self.providers.compat {
+            if entry.api_key.is_empty() {
+                continue;
+            }
+            let target = target_name(&compat_order_name(&entry.name));
+            if store.set(&target, &entry.api_key).is_ok() {
+                entry.api_key.clear();
+                changed = true;
+            }
+        }
         changed
     }
 
@@ -436,6 +519,18 @@ impl Config {
                 Err(_) => *key = UNREADABLE_KEY_MARKER.to_string(),
             }
         }
+        for entry in &mut self.providers.compat {
+            if !entry.api_key.is_empty() {
+                continue;
+            }
+            let target = target_name(&compat_order_name(&entry.name));
+            match store.get(&target) {
+                Ok(Some(secret)) => entry.api_key = secret,
+                Ok(None) => {}
+                Err(_) => entry.api_key = UNREADABLE_KEY_MARKER.to_string(),
+            }
+        }
+
         for (provider, key) in [
             ("openai", &self.providers.openai.api_key),
             ("anthropic", &self.providers.anthropic.api_key),
@@ -443,6 +538,11 @@ impl Config {
         ] {
             if key == UNREADABLE_KEY_MARKER {
                 self.unreadable_secrets.push(provider.to_string());
+            }
+        }
+        for entry in &self.providers.compat {
+            if entry.api_key == UNREADABLE_KEY_MARKER {
+                self.unreadable_secrets.push(compat_order_name(&entry.name));
             }
         }
     }
@@ -502,8 +602,8 @@ impl Config {
             ("anthropic", &mut self.providers.anthropic.api_key),
             ("gemini", &mut self.providers.gemini.api_key),
         ] {
-            let env_name =
-                Self::env_var_name(provider).expect("every provider iterated here has an env var name");
+            let env_name = Self::env_var_name(provider)
+                .expect("every provider iterated here has an env var name");
             if env_is_set(env_name) {
                 key.clear();
                 continue;
@@ -523,6 +623,27 @@ impl Config {
                     .set(&target, key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
                 key.clear();
+            }
+        }
+
+        // #16: no env override for compat entries (a dynamic, user-named
+        // list has no single fixed env var to check), so every entry goes
+        // straight through the non-env-overridden rules above.
+        for entry in &mut self.providers.compat {
+            let target = target_name(&compat_order_name(&entry.name));
+            if entry.api_key == UNREADABLE_KEY_MARKER {
+                entry.api_key.clear();
+                continue;
+            }
+            if entry.api_key.is_empty() {
+                store
+                    .delete(&target)
+                    .with_context(|| format!("failed to delete {target} from the secret store"))?;
+            } else {
+                store
+                    .set(&target, &entry.api_key)
+                    .with_context(|| format!("failed to save {target} to the secret store"))?;
+                entry.api_key.clear();
             }
         }
         Ok(())
@@ -732,7 +853,22 @@ impl Providers {
                 self.ollama.model.clone(),
                 self.ollama.effort.clone(),
             ))),
-            _ => None,
+            _ => {
+                // #16: `"compat:<name>"` order entries resolve against
+                // `self.compat` by `name`, not by position -- an entry
+                // reordered or removed in `providers.order` simply
+                // disappears from the chain, same as an unrecognized name.
+                let compat_name = name.strip_prefix("compat:")?;
+                let cfg = self.compat.iter().find(|c| c.name == compat_name)?;
+                Some(Box::new(OpenAiCompat::new(
+                    cfg.base_url.clone(),
+                    cfg.model.clone(),
+                    cfg.auth,
+                    cfg.auth_header.clone(),
+                    unreadable_as_empty(&cfg.api_key),
+                    cfg.structured,
+                )))
+            }
         }
     }
 
@@ -742,8 +878,11 @@ impl Providers {
     /// carries across the thread boundary, without also carrying
     /// `hotkeys`/`capture`/`ui` along for no reason.
     pub fn build_chain(&self) -> Chain {
-        let providers: Vec<Box<dyn Provider>> =
-            self.order.iter().filter_map(|name| self.provider_for(name)).collect();
+        let providers: Vec<Box<dyn Provider>> = self
+            .order
+            .iter()
+            .filter_map(|name| self.provider_for(name))
+            .collect();
         Chain::new(providers)
     }
 
@@ -758,9 +897,27 @@ impl Providers {
     /// change between two presses, and rule 5 rules out polling to keep a
     /// cached answer warm).
     pub fn build_chain_for_mode(&self, mode: Mode, ollama_ready: bool) -> Chain {
-        let selected = crate::mode::select_providers(mode, &self.order, ollama_ready);
-        let providers: Vec<Box<dyn Provider>> =
-            selected.iter().filter_map(|name| self.provider_for(name)).collect();
+        // #16: a compat endpoint's locality is decided by its configured
+        // `base_url` host, never by name (`mode::is_local_provider`'s doc) --
+        // this is the one place that host check happens, right before
+        // `select_providers` needs the answer.
+        let local_compat_names: Vec<String> = self
+            .compat
+            .iter()
+            .filter(|c| {
+                matches!(
+                    crate::mode::classify_host(&c.base_url),
+                    crate::mode::HostClass::Loopback
+                )
+            })
+            .map(|c| compat_order_name(&c.name))
+            .collect();
+        let selected =
+            crate::mode::select_providers(mode, &self.order, ollama_ready, &local_compat_names);
+        let providers: Vec<Box<dyn Provider>> = selected
+            .iter()
+            .filter_map(|name| self.provider_for(name))
+            .collect();
         Chain::new(providers)
     }
 }
@@ -978,9 +1135,15 @@ api_key = "sk-x"
     #[test]
     fn mode_persists_through_a_toml_round_trip() {
         for mode in [Mode::Cloud, Mode::Local, Mode::Auto, Mode::Offline] {
-            let config = Config { mode, ..Config::default() };
+            let config = Config {
+                mode,
+                ..Config::default()
+            };
             let text = toml::to_string_pretty(&config).expect("serialize");
-            assert!(text.contains(&format!("mode = \"{}\"", mode_wire_name(mode))), "{text}");
+            assert!(
+                text.contains(&format!("mode = \"{}\"", mode_wire_name(mode))),
+                "{text}"
+            );
             let parsed: Config = toml::from_str(&text).expect("deserialize");
             assert_eq!(parsed.mode, mode, "round trip failed for {mode:?}");
         }
@@ -1021,7 +1184,11 @@ model = "gpt-5.5"
         let config = Config::default();
         assert_eq!(config.providers.gemini.model, "gemini-3.8-flash");
         assert!(!config.providers.gemini.models.is_empty());
-        assert!(config.providers.gemini.models.contains(&"gemini-3.8-flash".to_string()));
+        assert!(config
+            .providers
+            .gemini
+            .models
+            .contains(&"gemini-3.8-flash".to_string()));
         assert_eq!(config.providers.gemini.api_key, "");
     }
 
@@ -1067,7 +1234,11 @@ model = "gpt-5.5"
     #[test]
     fn build_chain_for_mode_cloud_excludes_ollama() {
         let mut config = Config::default();
-        config.providers.order = vec!["openai".to_string(), "anthropic".to_string(), "ollama".to_string()];
+        config.providers.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "ollama".to_string(),
+        ];
         let chain = config.providers.build_chain_for_mode(Mode::Cloud, true);
         assert_eq!(chain.provider_names(), vec!["openai", "anthropic"]);
     }
@@ -1075,7 +1246,11 @@ model = "gpt-5.5"
     #[test]
     fn build_chain_for_mode_local_is_ollama_only() {
         let mut config = Config::default();
-        config.providers.order = vec!["openai".to_string(), "anthropic".to_string(), "ollama".to_string()];
+        config.providers.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "ollama".to_string(),
+        ];
         let chain = config.providers.build_chain_for_mode(Mode::Local, false);
         assert_eq!(chain.provider_names(), vec!["ollama"]);
     }
@@ -1083,7 +1258,11 @@ model = "gpt-5.5"
     #[test]
     fn build_chain_for_mode_offline_is_ollama_only() {
         let mut config = Config::default();
-        config.providers.order = vec!["openai".to_string(), "anthropic".to_string(), "ollama".to_string()];
+        config.providers.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "ollama".to_string(),
+        ];
         let chain = config.providers.build_chain_for_mode(Mode::Offline, false);
         assert_eq!(chain.provider_names(), vec!["ollama"]);
     }
@@ -1091,10 +1270,17 @@ model = "gpt-5.5"
     #[test]
     fn build_chain_for_mode_auto_puts_ollama_first_only_when_ready() {
         let mut config = Config::default();
-        config.providers.order = vec!["openai".to_string(), "anthropic".to_string(), "ollama".to_string()];
+        config.providers.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "ollama".to_string(),
+        ];
 
         let ready = config.providers.build_chain_for_mode(Mode::Auto, true);
-        assert_eq!(ready.provider_names(), vec!["ollama", "openai", "anthropic"]);
+        assert_eq!(
+            ready.provider_names(),
+            vec!["ollama", "openai", "anthropic"]
+        );
 
         let not_ready = config.providers.build_chain_for_mode(Mode::Auto, false);
         assert_eq!(not_ready.provider_names(), vec!["openai", "anthropic"]);
@@ -1109,8 +1295,251 @@ model = "gpt-5.5"
         let config = Config::default(); // order: ["openai", "anthropic"], no ollama
         let unfiltered = config.build_chain().provider_names();
         for mode in [Mode::Cloud, Mode::Auto] {
-            assert_eq!(config.providers.build_chain_for_mode(mode, true).provider_names(), unfiltered, "mode {mode:?}");
+            assert_eq!(
+                config
+                    .providers
+                    .build_chain_for_mode(mode, true)
+                    .provider_names(),
+                unfiltered,
+                "mode {mode:?}"
+            );
         }
+    }
+
+    // -- #16: OpenAI-compatible generic providers -------------------------
+
+    fn compat_entry(name: &str, base_url: &str) -> CompatConfig {
+        CompatConfig {
+            name: name.to_string(),
+            base_url: base_url.to_string(),
+            auth: CompatAuth::Bearer,
+            auth_header: String::new(),
+            api_key: "sk-compat-real".to_string(),
+            model: "some-model".to_string(),
+            models: vec!["some-model".to_string()],
+            structured: Structured::JsonSchema,
+        }
+    }
+
+    #[test]
+    fn compat_order_name_is_compat_colon_name() {
+        assert_eq!(compat_order_name("openrouter"), "compat:openrouter");
+    }
+
+    #[test]
+    fn build_chain_includes_a_compat_provider_named_in_order() {
+        let mut config = Config::default();
+        config.providers.compat = vec![compat_entry("openrouter", "https://openrouter.ai/api/v1")];
+        config.providers.order = vec!["openai".to_string(), "compat:openrouter".to_string()];
+        let chain = config.build_chain();
+        assert_eq!(chain.provider_names(), vec!["openai", "openai-compat"]);
+        // Has a key configured -> ready.
+        assert_eq!(chain.ready_provider_names(), vec!["openai-compat"]);
+    }
+
+    #[test]
+    fn build_chain_drops_a_compat_order_entry_with_no_matching_config() {
+        // "compat:ghost" names no entry in `providers.compat` -- dropped
+        // silently, same as any other unrecognized `providers.order` name
+        // (`build_chain_ignores_unknown_provider_names`'s neighbour).
+        let mut config = Config::default();
+        config.providers.order = vec!["openai".to_string(), "compat:ghost".to_string()];
+        let chain = config.build_chain();
+        assert_eq!(chain.provider_names(), vec!["openai"]);
+    }
+
+    #[test]
+    fn build_chain_marks_a_keyless_bearer_compat_provider_not_ready() {
+        let mut config = Config::default();
+        let mut entry = compat_entry("lmstudio", "http://127.0.0.1:1234/v1");
+        entry.api_key.clear();
+        config.providers.compat = vec![entry];
+        config.providers.order = vec!["compat:lmstudio".to_string()];
+        let chain = config.build_chain();
+        assert!(chain.ready_provider_names().is_empty());
+    }
+
+    /// The classification the task requires: a compat endpoint on a
+    /// loopback host counts as local, a remote one as cloud -- decided by
+    /// `base_url` via `mode::classify_host`, never by name.
+    #[test]
+    fn build_chain_for_mode_classifies_a_compat_provider_by_its_base_url_host() {
+        let mut config = Config::default();
+        config.providers.compat = vec![
+            compat_entry("lmstudio", "http://127.0.0.1:1234/v1"),
+            compat_entry("openrouter", "https://openrouter.ai/api/v1"),
+        ];
+        config.providers.order = vec![
+            "openai".to_string(),
+            "compat:lmstudio".to_string(),
+            "compat:openrouter".to_string(),
+        ];
+
+        let local = config.providers.build_chain_for_mode(Mode::Local, false);
+        assert_eq!(
+            local.provider_names(),
+            vec!["openai-compat"],
+            "only the loopback entry is local"
+        );
+
+        let cloud = config.providers.build_chain_for_mode(Mode::Cloud, false);
+        // Both resolve to the same `id()` ("openai-compat"); count instead.
+        assert_eq!(
+            cloud.provider_names().len(),
+            2,
+            "openai + the remote compat entry"
+        );
+    }
+
+    #[test]
+    fn build_chain_for_mode_auto_puts_a_local_compat_provider_first_alongside_ollama() {
+        let mut config = Config::default();
+        config.providers.ollama.model = "gemma3:4b".to_string();
+        config.providers.compat = vec![compat_entry("lmstudio", "http://127.0.0.1:1234/v1")];
+        config.providers.order = vec![
+            "openai".to_string(),
+            "ollama".to_string(),
+            "compat:lmstudio".to_string(),
+        ];
+
+        let chain = config.providers.build_chain_for_mode(Mode::Auto, true);
+        // ollama, then the local compat entry, then cloud -- both local
+        // providers precede openai.
+        let names = chain.provider_names();
+        assert_eq!(names, vec!["ollama", "openai-compat", "openai"]);
+    }
+
+    #[test]
+    fn compat_config_debug_never_contains_the_api_key() {
+        let entry = compat_entry("openrouter", "https://openrouter.ai/api/v1");
+        let debug_output = format!("{entry:?}");
+        assert!(!debug_output.contains("sk-compat-real"), "{debug_output}");
+        assert!(debug_output.contains("redacted"));
+    }
+
+    #[test]
+    fn compat_config_round_trips_through_toml() {
+        let mut config = Config::default();
+        config.providers.compat = vec![compat_entry("openrouter", "https://openrouter.ai/api/v1")];
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        let parsed: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(parsed.providers.compat.len(), 1);
+        assert_eq!(parsed.providers.compat[0].name, "openrouter");
+        assert_eq!(parsed.providers.compat[0].auth, CompatAuth::Bearer);
+        assert_eq!(
+            parsed.providers.compat[0].structured,
+            Structured::JsonSchema
+        );
+    }
+
+    #[test]
+    fn compat_auth_and_structured_serialize_to_the_documented_toml_strings() {
+        // A bare enum has no top-level TOML text form (TOML documents are
+        // always tables) -- `toml::Value::try_from` serializes through the
+        // same serde path without that document requirement, so this still
+        // exercises exactly what `#[serde(rename_all = ...)]` produces.
+        assert_eq!(
+            toml::Value::try_from(CompatAuth::Bearer).unwrap().as_str(),
+            Some("bearer")
+        );
+        assert_eq!(
+            toml::Value::try_from(CompatAuth::ApiKeyHeader)
+                .unwrap()
+                .as_str(),
+            Some("api-key-header")
+        );
+        assert_eq!(
+            toml::Value::try_from(CompatAuth::None).unwrap().as_str(),
+            Some("none")
+        );
+        assert_eq!(
+            toml::Value::try_from(Structured::JsonSchema)
+                .unwrap()
+                .as_str(),
+            Some("json_schema")
+        );
+        assert_eq!(
+            toml::Value::try_from(Structured::JsonObject)
+                .unwrap()
+                .as_str(),
+            Some("json_object")
+        );
+        assert_eq!(
+            toml::Value::try_from(Structured::Prompt).unwrap().as_str(),
+            Some("prompt")
+        );
+    }
+
+    // -- #16: compat secrets lifecycle (import / hydrate / push) -----------
+
+    #[test]
+    fn import_and_blank_moves_a_live_compat_key_into_the_store_and_blanks_the_field() {
+        let mut config = Config::default();
+        config.providers.compat = vec![compat_entry("openrouter", "https://openrouter.ai/api/v1")];
+        let store = crate::secrets::InMemoryStore::default();
+
+        let changed = config.import_secrets_and_blank(&store);
+        assert!(changed);
+        assert_eq!(config.providers.compat[0].api_key, "");
+        assert_eq!(
+            store.get("Wingman/compat:openrouter").unwrap().as_deref(),
+            Some("sk-compat-real")
+        );
+    }
+
+    #[test]
+    fn hydrate_fills_an_empty_compat_field_from_the_store() {
+        let mut config = Config::default();
+        config.providers.compat = vec![compat_entry("openrouter", "https://openrouter.ai/api/v1")];
+        config.providers.compat[0].api_key.clear();
+        let store = crate::secrets::InMemoryStore::default();
+        store
+            .set("Wingman/compat:openrouter", "sk-from-store")
+            .unwrap();
+
+        config.hydrate_secrets(&store);
+        assert_eq!(config.providers.compat[0].api_key, "sk-from-store");
+    }
+
+    #[test]
+    fn hydrate_marks_a_compat_field_unreadable_when_the_store_get_errors() {
+        let mut config = Config::default();
+        config.providers.compat = vec![compat_entry("openrouter", "https://openrouter.ai/api/v1")];
+        config.providers.compat[0].api_key.clear();
+        let store = crate::secrets::InMemoryStore::default();
+        store.poison("Wingman/compat:openrouter");
+
+        config.hydrate_secrets(&store);
+        assert_eq!(config.providers.compat[0].api_key, UNREADABLE_KEY_MARKER);
+        assert!(config
+            .unreadable_secrets
+            .contains(&"compat:openrouter".to_string()));
+    }
+
+    #[test]
+    fn push_secrets_to_store_saves_a_live_compat_key() {
+        let mut config = Config::default();
+        config.providers.compat = vec![compat_entry("openrouter", "https://openrouter.ai/api/v1")];
+        let store = crate::secrets::InMemoryStore::default();
+
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+        assert_eq!(config.providers.compat[0].api_key, "");
+        assert_eq!(
+            store.get("Wingman/compat:openrouter").unwrap().as_deref(),
+            Some("sk-compat-real")
+        );
+    }
+
+    #[test]
+    fn push_secrets_to_store_deletes_the_compat_credential_when_the_field_is_cleared() {
+        let mut config = Config::default();
+        config.providers.compat = vec![compat_entry("openrouter", "https://openrouter.ai/api/v1")];
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/compat:openrouter", "sk-old").unwrap();
+        config.providers.compat[0].api_key.clear();
+
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+        assert_eq!(store.get("Wingman/compat:openrouter").unwrap(), None);
     }
 
     #[test]
@@ -1135,7 +1564,10 @@ api_key = "AIza-x"
 models = ["gemini-2.5-pro"]
 "#;
         let cfg = Config::parse_or_default(custom);
-        assert_eq!(cfg.providers.gemini.models, vec!["gemini-2.5-pro".to_string()]);
+        assert_eq!(
+            cfg.providers.gemini.models,
+            vec!["gemini-2.5-pro".to_string()]
+        );
     }
 
     #[test]
@@ -1161,7 +1593,10 @@ models = ["gemini-2.5-pro"]
         let mut config = Config::default();
         config.providers.gemini.api_key = "AIza-real-secret-gemini".to_string();
         let debug_output = format!("{config:?}");
-        assert!(!debug_output.contains("AIza-real-secret-gemini"), "{debug_output}");
+        assert!(
+            !debug_output.contains("AIza-real-secret-gemini"),
+            "{debug_output}"
+        );
     }
 
     #[test]
@@ -1203,9 +1638,11 @@ models = ["claude-sonnet-5"]
 
     #[test]
     fn a_nonsense_text_scale_falls_back_to_the_default() {
-        let cfg = Config::parse_or_default("[ui]
+        let cfg = Config::parse_or_default(
+            "[ui]
 text_scale = 0.0
-");
+",
+        );
         assert_eq!(cfg.ui.text_scale, 1.0);
     }
 
@@ -1261,7 +1698,8 @@ text_scale = 0.0
         fs::write(&old_path, "[providers.openai]\napi_key = \"sk-old\"\n").unwrap();
         assert!(!new_path.exists());
 
-        let migrated = Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
+        let migrated =
+            Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
 
         assert!(migrated, "a fresh old file with no new file should migrate");
         assert!(new_path.exists(), "the new path should now hold the config");
@@ -1287,10 +1725,14 @@ text_scale = 0.0
         fs::write(&old_path, "old content").unwrap();
         fs::write(&new_path, "new content, already set up").unwrap();
 
-        let migrated = Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
+        let migrated =
+            Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
 
         assert!(!migrated, "an existing new file must never be overwritten");
-        assert_eq!(fs::read_to_string(&new_path).unwrap(), "new content, already set up");
+        assert_eq!(
+            fs::read_to_string(&new_path).unwrap(),
+            "new content, already set up"
+        );
 
         cleanup(&root.join("dummy"));
     }
@@ -1303,10 +1745,17 @@ text_scale = 0.0
         assert!(!old_path.exists());
         assert!(!new_path.exists());
 
-        let migrated = Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
+        let migrated =
+            Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
 
-        assert!(!migrated, "nothing to migrate when there was never an old file");
-        assert!(!new_path.exists(), "no new file should be created out of nothing");
+        assert!(
+            !migrated,
+            "nothing to migrate when there was never an old file"
+        );
+        assert!(
+            !new_path.exists(),
+            "no new file should be created out of nothing"
+        );
 
         cleanup(&root.join("dummy"));
     }
@@ -1318,7 +1767,10 @@ text_scale = 0.0
         // called after the directory has already been created once.
         let root = scratch_dir("mkdir");
         let old_path = root.join("old").join("config.toml");
-        let new_path = root.join("brand-new-dir").join("nested").join("config.toml");
+        let new_path = root
+            .join("brand-new-dir")
+            .join("nested")
+            .join("config.toml");
         fs::create_dir_all(old_path.parent().unwrap()).unwrap();
         fs::write(&old_path, "content").unwrap();
         assert!(!new_path.parent().unwrap().exists());
@@ -1340,7 +1792,10 @@ text_scale = 0.0
         assert_ne!(old, new);
         assert!(old.to_string_lossy().contains("copilot-ask"));
         assert!(new.to_string_lossy().contains("Wingman"));
-        assert_eq!(old.parent().unwrap().parent(), new.parent().unwrap().parent());
+        assert_eq!(
+            old.parent().unwrap().parent(),
+            new.parent().unwrap().parent()
+        );
     }
 
     /// #157: `{:?}` on `Config`/`ProviderConfig` must never leak the raw
@@ -1463,7 +1918,10 @@ text_scale = 0.0
 
         let changed = config.import_secrets_and_blank(&store);
 
-        assert!(!changed, "nothing to import must not be reported as a change");
+        assert!(
+            !changed,
+            "nothing to import must not be reported as a change"
+        );
         assert_eq!(store.get(&target_name("openai")).unwrap(), None);
         assert_eq!(store.get(&target_name("anthropic")).unwrap(), None);
     }
@@ -1523,7 +1981,9 @@ text_scale = 0.0
     fn hydrate_fills_an_empty_gemini_field_from_the_store() {
         let mut config = Config::default();
         let store = InMemoryStore::default();
-        store.set(&target_name("gemini"), "AIza-from-store").unwrap();
+        store
+            .set(&target_name("gemini"), "AIza-from-store")
+            .unwrap();
 
         config.hydrate_secrets(&store);
 
@@ -1533,7 +1993,9 @@ text_scale = 0.0
     #[test]
     fn hydrate_marks_gemini_unreadable_when_the_store_get_errors() {
         let store = InMemoryStore::default();
-        store.set(&target_name("gemini"), "AIza-really-there").unwrap();
+        store
+            .set(&target_name("gemini"), "AIza-really-there")
+            .unwrap();
         store.poison(&target_name("gemini"));
 
         let mut config = Config::default();
@@ -1831,7 +2293,9 @@ text_scale = 0.0
         // blank (it only acts on non-empty fields), so the old credential
         // stayed in the store and the next hydrate put it straight back.
         let store = InMemoryStore::default();
-        store.set(&target_name("openai"), "sk-should-be-removed").unwrap();
+        store
+            .set(&target_name("openai"), "sk-should-be-removed")
+            .unwrap();
 
         let mut config = Config::default(); // field already resolved to "" (user cleared it)
         config.push_secrets_to_store(&store, &|_| false).unwrap();
@@ -1885,13 +2349,18 @@ text_scale = 0.0
             store.get(&target_name("gemini")).unwrap().as_deref(),
             Some("AIza-brand-new")
         );
-        assert_eq!(config.providers.gemini.api_key, "", "the field must be blanked before the disk write");
+        assert_eq!(
+            config.providers.gemini.api_key, "",
+            "the field must be blanked before the disk write"
+        );
     }
 
     #[test]
     fn push_secrets_to_store_deletes_the_gemini_credential_when_the_field_is_cleared() {
         let store = InMemoryStore::default();
-        store.set(&target_name("gemini"), "AIza-should-be-removed").unwrap();
+        store
+            .set(&target_name("gemini"), "AIza-should-be-removed")
+            .unwrap();
         let mut config = Config::default();
         // gemini.api_key left empty (the default) -- a deliberate clear.
 
@@ -2006,6 +2475,9 @@ text_scale = 0.0
         })();
 
         assert!(result.is_err());
-        assert!(!path.exists(), "the file must never be written when the store write fails");
+        assert!(
+            !path.exists(),
+            "the file must never be written when the store write fails"
+        );
     }
 }
