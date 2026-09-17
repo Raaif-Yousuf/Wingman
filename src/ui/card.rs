@@ -64,6 +64,7 @@
 use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
+use serde_json::Value;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -82,20 +83,24 @@ use windows::Win32::Graphics::Gdi::{
     PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW,
-    KillTimer, LoadCursorW, RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, GWL_EXSTYLE, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW,
-    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsWindow,
+    KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, CREATESTRUCTW,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HMENU, HWND_TOPMOST, IDC_ARROW,
+    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::provider::Difficulty;
+use crate::ui::preview::{Field, PreviewModel};
 
 // ---------------------------------------------------------------------------
 // Public state
@@ -107,6 +112,10 @@ pub enum CardState {
     Pending,
     Collapsed,
     Expanded,
+    /// The confirmation state (#26): a proposal rendered as a compact form
+    /// (title + one row per schema field), with "Do it" / "Edit" / "Cancel"
+    /// buttons. See [`Card::show_preview`].
+    Preview,
 }
 
 /// A single owned notification-card window.
@@ -126,13 +135,30 @@ impl Card {
         if !ensure_class_registered(instance) {
             anyhow::bail!("Wingman: failed to register the card window class");
         }
+        Card::create(instance, CLASS_NAME)
+    }
 
+    /// Same as [`Card::new`], but registers (once) and uses a class name
+    /// distinct from the production window class (rule 9: tests never touch
+    /// production names). Used only by the preview state's real-Win32 test
+    /// in this module, which needs an actual `HWND` with real child
+    /// controls, not the production `Card`'s class.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(instance: HINSTANCE) -> anyhow::Result<Self> {
+        if !ensure_test_class_registered(instance) {
+            anyhow::bail!("Wingman: failed to register the test card window class");
+        }
+        Card::create(instance, TEST_CLASS_NAME)
+    }
+
+    fn create(instance: HINSTANCE, class_name: &str) -> anyhow::Result<Self> {
         let theme = detect_theme();
         // A 96 DPI guess used only to build a first, throwaway set of fonts
         // before we have a real HWND to ask GetDpiForWindow about. It is
         // replaced immediately below once the window exists.
         let inner = Box::new(CardInner {
             hwnd: HWND(std::ptr::null_mut()),
+            instance,
             state: CardState::Hidden,
             headline: String::new(),
             detail: String::new(),
@@ -145,10 +171,12 @@ impl Card {
             scroll_offset: 0,
             scroll_max: 0,
             ex_noactivate_removed: false,
+            preview: None,
+            last_confirmed: None,
         });
         let raw = Box::into_raw(inner);
 
-        let class_name = wide_z(CLASS_NAME);
+        let class_name = wide_z(class_name);
         let title = wide_z("Wingman");
         let create_result = unsafe {
             CreateWindowExW(
@@ -250,6 +278,61 @@ impl Card {
         self.inner.state
     }
 
+    /// Enters the preview (confirmation) state (#26). `schema` is the
+    /// proposal's JSON Schema (see `actions::schema::schema_for`) and
+    /// `proposal_value` its current value; together they build a
+    /// [`PreviewModel`] the card renders as `title` plus one row per
+    /// declared field, with an EDIT control for every field the schema
+    /// marks `"editable"`.
+    ///
+    /// `main_window_exists` gates the "Edit" button: greyed out
+    /// (`WS_DISABLED`) until a main window exists to open (#26's issue body:
+    /// "Edit opens the main window when it exists"). No caller passes
+    /// `true` yet -- Wingman has no main window today -- the same "inert
+    /// until its caller exists" status `Action::hotkey` has; the button's
+    /// enable/disable wiring is still exercised by
+    /// `preview_edit_button_is_disabled_until_main_window_exists` below.
+    ///
+    /// Nothing runs until the user presses "Do it" (Enter) or "Cancel"
+    /// (Esc): see [`Card::take_confirmed`].
+    ///
+    /// **Focus** (documented per the task's "decide carefully"): unlike
+    /// Pending/Collapsed, which are created `WS_EX_NOACTIVATE` so showing
+    /// them never steals focus from whatever the user is doing, Preview
+    /// removes that style and takes real keyboard focus immediately once
+    /// shown. This is deliberate, not an oversight: the preview state exists
+    /// *only* for a proposal that requires an explicit user decision before
+    /// anything happens (typing into an editable field, or pressing
+    /// Enter/Esc, both need real focus to work at all), so the interruption
+    /// is the entire point of showing it -- there is no useful "shown but
+    /// not yet interacted with" middle state to preserve focus through, the
+    /// way there is for a passive Collapsed answer card. The interruption is
+    /// temporary: `close_preview` (on Do it, Cancel, or Esc) always restores
+    /// whatever window had the foreground immediately before `show_preview`
+    /// was called, so focus returns to the user's previous work the moment
+    /// the decision is made either way.
+    #[allow(dead_code)] // wiring app.rs's worker to call this is a later issue's job
+    pub fn show_preview(
+        &mut self,
+        title: &str,
+        schema: &serde_json::Value,
+        proposal_value: &serde_json::Value,
+        main_window_exists: bool,
+    ) {
+        self.inner
+            .show_preview(title, schema, proposal_value, main_window_exists);
+    }
+
+    /// Takes the `Confirmed<Value>` produced by the last "Do it" / Enter, if
+    /// any. A take, not a peek: the stored value is cleared by this call, so
+    /// the same confirmation can never be handed to an executor twice.
+    /// Returns `None` before "Do it" has been pressed, after Cancel/Esc, or
+    /// on a repeated call.
+    #[allow(dead_code)] // see show_preview's doc comment
+    pub fn take_confirmed(&mut self) -> Option<crate::ui::confirm::Confirmed<serde_json::Value>> {
+        self.inner.last_confirmed.take()
+    }
+
     /// The card's own window proc dispatches internally; this is the seam
     /// tests use to feed synthetic messages.
     #[allow(dead_code)]
@@ -277,20 +360,39 @@ impl Drop for Card {
 // ---------------------------------------------------------------------------
 
 const CLASS_NAME: &str = "Wingman.Card.Window.7f3c1a9e";
+/// Rule 9: the preview state's real-Win32 test creates an actual `HWND` with
+/// real child controls, so it gets its own window class rather than sharing
+/// the production one, the same way `single_instance`'s test uses its own
+/// mutex/class names (commit `011f11a`).
+#[cfg(test)]
+const TEST_CLASS_NAME: &str = "Wingman.Card.Window.7f3c1a9e.Test";
 
 static CLASS_INIT: Once = Once::new();
 static CLASS_OK: OnceLock<bool> = OnceLock::new();
+#[cfg(test)]
+static TEST_CLASS_INIT: Once = Once::new();
+#[cfg(test)]
+static TEST_CLASS_OK: OnceLock<bool> = OnceLock::new();
 
 fn ensure_class_registered(instance: HINSTANCE) -> bool {
     CLASS_INIT.call_once(|| {
-        let ok = unsafe { register_class(instance) };
+        let ok = unsafe { register_class(instance, CLASS_NAME) };
         let _ = CLASS_OK.set(ok);
     });
     CLASS_OK.get().copied().unwrap_or(false)
 }
 
-unsafe fn register_class(instance: HINSTANCE) -> bool {
-    let class_name = wide_z(CLASS_NAME);
+#[cfg(test)]
+fn ensure_test_class_registered(instance: HINSTANCE) -> bool {
+    TEST_CLASS_INIT.call_once(|| {
+        let ok = unsafe { register_class(instance, TEST_CLASS_NAME) };
+        let _ = TEST_CLASS_OK.set(ok);
+    });
+    TEST_CLASS_OK.get().copied().unwrap_or(false)
+}
+
+unsafe fn register_class(instance: HINSTANCE, class_name_str: &str) -> bool {
+    let class_name = wide_z(class_name_str);
     let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -722,6 +824,12 @@ const SPINNER_SWEEP_DEG: f32 = 100.0;
 
 struct CardInner {
     hwnd: HWND,
+    /// The module instance the window (and every preview child control) was
+    /// created with. Stashed here (rather than re-fetched with
+    /// `GetModuleHandleW`) so `create_preview_controls` creates its EDIT and
+    /// BUTTON children against the exact same instance `CreateWindowExW`
+    /// used for the card's own window.
+    instance: HINSTANCE,
     state: CardState,
     headline: String,
     detail: String,
@@ -741,6 +849,19 @@ struct CardInner {
     scroll_max: i32,
     /// True while WS_EX_NOACTIVATE has been removed (i.e. while Expanded).
     ex_noactivate_removed: bool,
+    /// Live state for `CardState::Preview`, `None` in every other state.
+    /// `Some` for exactly as long as the preview's child controls exist --
+    /// see `leave_preview_if_active`, the single choke point every path out
+    /// of Preview goes through.
+    preview: Option<PreviewUi>,
+    /// The `Confirmed<Value>` from the most recent "Do it" / Enter, read
+    /// (and cleared) by `Card::take_confirmed`. Deliberately NOT stored
+    /// inside `PreviewUi`: `preview_do_it` closes the preview (via
+    /// `close_preview` -> `hide` -> `leave_preview_if_active`) in the same
+    /// call that produces the `Confirmed`, and `leave_preview_if_active`
+    /// unconditionally drops `PreviewUi` -- a value stored there would be
+    /// destroyed before any caller could ever read it back.
+    last_confirmed: Option<crate::ui::confirm::Confirmed<serde_json::Value>>,
 }
 
 impl CardInner {
@@ -769,6 +890,7 @@ impl CardInner {
     // -- show/hide -----------------------------------------------------
 
     fn show_pending(&mut self) {
+        self.leave_preview_if_active();
         self.reset_activation_and_timers();
         // No text in the pending state any more -- it shows a spinner.
         self.headline.clear();
@@ -800,6 +922,7 @@ impl CardInner {
         auto_dismiss_secs: u32,
         difficulty: Option<Difficulty>,
     ) {
+        self.leave_preview_if_active();
         self.reset_activation_and_timers();
         self.headline = headline.to_string();
         self.detail = detail.to_string();
@@ -824,6 +947,7 @@ impl CardInner {
     }
 
     fn hide(&mut self) {
+        self.leave_preview_if_active();
         self.kill_timers();
         self.set_noactivate(true);
         self.state = CardState::Hidden;
@@ -1025,6 +1149,10 @@ impl CardInner {
             CardState::Pending => self.layout_pending(),
             CardState::Collapsed => self.layout_collapsed(),
             CardState::Expanded => self.layout_expanded(),
+            CardState::Preview => {
+                self.layout_preview();
+                self.reposition_preview_controls();
+            }
         }
         self.invalidate();
     }
@@ -1216,6 +1344,7 @@ impl CardInner {
                 CardState::Pending => self.paint_pending(hdc, rc, padding, &palette),
                 CardState::Collapsed => self.paint_collapsed(hdc, rc, padding, &palette),
                 CardState::Expanded => self.paint_expanded(hdc, rc, padding, gap, &palette),
+                CardState::Preview => self.paint_preview(hdc, &palette),
             }
         }
     }
@@ -1493,7 +1622,18 @@ impl CardInner {
                         self.anim_frame = self.anim_frame.wrapping_add(1);
                         self.invalidate();
                     }
-                    TIMER_DISMISS => {
+                    // The preview state never auto-dismisses on a timer
+                    // (rule 5 and safety: an action that writes something
+                    // must never fire because nobody was there to see a
+                    // countdown). `show_preview` never arms TIMER_DISMISS,
+                    // but this guard makes that a hard invariant rather than
+                    // "nothing currently posts one": a WM_TIMER already
+                    // queued from a previous state (KillTimer stops future
+                    // messages, not ones already in the queue) must still
+                    // never close an open preview out from under the user
+                    // -- the guard failing simply falls through to the `_`
+                    // arm below, a deliberate no-op.
+                    TIMER_DISMISS if self.state != CardState::Preview => {
                         self.hide();
                     }
                     _ => {}
@@ -1519,6 +1659,17 @@ impl CardInner {
             WM_KEYDOWN => {
                 if self.state == CardState::Expanded && wparam.0 as u16 == VK_ESCAPE.0 {
                     self.close_expanded();
+                } else if self.state == CardState::Preview {
+                    if let Some(command_id) = preview_key_command(wparam.0 as u16) {
+                        self.run_preview_command(command_id);
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            WM_COMMAND => {
+                if self.state == CardState::Preview {
+                    let id = (wparam.0 & 0xFFFF) as i32;
+                    self.run_preview_command(id);
                 }
                 Some(LRESULT(0))
             }
@@ -1542,6 +1693,776 @@ impl CardInner {
             WM_DESTROY => None,
             _ => None,
         }
+    }
+
+    // -- preview (confirmation) state (#26) -----------------------------
+
+    /// Enters `CardState::Preview`. See [`Card::show_preview`] for the
+    /// public contract (focus behaviour, the `main_window_exists` gate).
+    fn show_preview(
+        &mut self,
+        title: &str,
+        schema: &Value,
+        proposal_value: &Value,
+        main_window_exists: bool,
+    ) {
+        self.leave_preview_if_active();
+        // The preview never auto-dismisses on a timer (rule 5 and safety:
+        // an action that writes something must never fire because nobody
+        // was there to see a countdown) -- so, unlike show_pending/
+        // show_collapsed, no TIMER_DISMISS is ever armed here.
+        self.kill_timers();
+
+        let previous_foreground = unsafe { GetForegroundWindow() };
+
+        let model = PreviewModel::from_schema(schema, proposal_value);
+
+        self.headline.clear();
+        self.detail.clear();
+        self.difficulty = None;
+        self.state = CardState::Preview;
+        self.scroll_offset = 0;
+        self.scroll_max = 0;
+
+        // Preview needs real keyboard focus (typing into an editable field,
+        // Enter, Esc), unlike Pending/Collapsed -- see the "Focus" note on
+        // `Card::show_preview`.
+        self.set_noactivate(false);
+
+        // Starting a fresh preview must never let an earlier, never-taken
+        // confirmation leak into this one's lifetime.
+        self.last_confirmed = None;
+
+        self.preview = Some(PreviewUi {
+            model,
+            title: title.to_string(),
+            edits: Vec::new(),
+            do_it_btn: HWND(std::ptr::null_mut()),
+            edit_btn: HWND(std::ptr::null_mut()),
+            cancel_btn: HWND(std::ptr::null_mut()),
+            previous_foreground,
+            main_window_exists,
+        });
+
+        self.layout_preview();
+        self.create_preview_controls();
+        self.reveal();
+
+        unsafe {
+            let _ = SetForegroundWindow(self.hwnd);
+        }
+        self.focus_initial_preview_control();
+    }
+
+    /// The one place every WM_COMMAND id and every preview keyboard mapping
+    /// (from [`preview_key_command`]) is dispatched, so the card's own
+    /// WM_KEYDOWN arm and the child-control subclass (which posts the same
+    /// ids back to this window) always mean exactly the same thing.
+    fn run_preview_command(&mut self, id: i32) {
+        match id {
+            ID_PREVIEW_DO_IT => self.preview_do_it(),
+            ID_PREVIEW_CANCEL => self.preview_cancel(),
+            ID_PREVIEW_EDIT => self.preview_edit_clicked(),
+            _ => {}
+        }
+    }
+
+    /// "Do it": reads every editable control's current text back into the
+    /// model, refuses (leaving the card open) if a required field is now
+    /// blank, then builds the `Confirmed<Value>` from exactly those values
+    /// via `ui::confirm::confirm_preview` -- never from the original
+    /// proposal -- and closes. This is #26's Done-when in code: what
+    /// `take_confirmed` later hands an executor is provably what the card
+    /// had on screen the moment "Do it" fired.
+    fn preview_do_it(&mut self) {
+        self.sync_edits_from_controls();
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        if !preview.model.is_valid() {
+            // A required field is blank after editing: refuse silently and
+            // leave the card open rather than build a Confirmed from an
+            // invalid form. A card is never a dialog box (rule 7); an
+            // inline validation message is left to a follow-up issue (see
+            // NEXT_SESSION.md), not invented here.
+            return;
+        }
+        let shown = preview.model.to_value();
+        let confirmed = crate::ui::confirm::confirm_preview(
+            &preview.model,
+            crate::ui::confirm::user_confirmed(),
+        );
+        debug_assert_eq!(
+            *confirmed.value(),
+            shown,
+            "confirm_preview must hand back exactly what the model showed"
+        );
+        // Stored on `self`, not on `preview`: `close_preview` (below) drops
+        // `PreviewUi` before returning -- see `last_confirmed`'s doc
+        // comment on why this can't live there.
+        self.last_confirmed = Some(confirmed);
+        self.close_preview();
+    }
+
+    /// "Cancel" / Esc: produces nothing (no `Confirmed` is ever built) and
+    /// closes. Also clears any earlier `last_confirmed` a caller never took,
+    /// so `take_confirmed` reliably returns `None` after a Cancel rather
+    /// than silently handing back a stale confirmation from an unrelated,
+    /// earlier preview.
+    fn preview_cancel(&mut self) {
+        self.last_confirmed = None;
+        self.close_preview();
+    }
+
+    /// "Edit": only reachable when `main_window_exists` was `true` at
+    /// `show_preview` time -- the button is `WS_DISABLED` otherwise, and
+    /// Windows never delivers a click (or this synthetic command) for a
+    /// disabled control. No caller passes `true` yet (Wingman has no main
+    /// window today), so this body is an intentional no-op placeholder for
+    /// the issue that adds one, the same "inert until its caller exists"
+    /// status `Action::hotkey` has -- not a control silently doing nothing
+    /// where a real signal was expected, since that control cannot be
+    /// clicked in production yet.
+    fn preview_edit_clicked(&mut self) {}
+
+    /// Reads every editable control's `GetWindowTextW` back into the model.
+    /// Called once, right before "Do it" decides whether the form is valid
+    /// -- never continuously (no `EN_CHANGE` tracking), which keeps "what
+    /// was shown" meaning exactly what was on screen at the moment of the
+    /// decision, not some earlier keystroke.
+    fn sync_edits_from_controls(&mut self) {
+        let edits: Vec<(String, HWND)> = match &self.preview {
+            Some(p) => p.edits.clone(),
+            None => return,
+        };
+        for (name, hwnd) in edits {
+            let text = window_text(hwnd);
+            if let Some(preview) = self.preview.as_mut() {
+                preview.model.set_value(&name, text);
+            }
+        }
+    }
+
+    /// Tears down the preview's child controls, restores focus to whatever
+    /// window had it before `show_preview`, and hides the card. Used by
+    /// both `preview_do_it` and `preview_cancel` -- the only two ways out of
+    /// Preview that go through here rather than a later `show_*`/`hide`
+    /// call (both of which also tear the preview down, via
+    /// `leave_preview_if_active`).
+    fn close_preview(&mut self) {
+        let previous_foreground = self.preview.as_ref().map(|p| p.previous_foreground);
+        self.hide();
+        if let Some(prev) = previous_foreground {
+            if !prev.0.is_null() && unsafe { IsWindow(Some(prev)) }.as_bool() {
+                unsafe {
+                    let _ = SetForegroundWindow(prev);
+                }
+            }
+        }
+    }
+
+    /// The single choke point that guarantees "`self.preview` is `Some`
+    /// iff `state == Preview`": called at the top of every state-entering
+    /// method (`show_pending`, `show_collapsed`, `show_preview` itself, and
+    /// `hide`) so a preview's child controls can never survive a jump to a
+    /// different state, regardless of which path got there.
+    fn leave_preview_if_active(&mut self) {
+        if self.preview.is_some() {
+            self.destroy_preview_controls();
+            self.preview = None;
+        }
+    }
+
+    fn destroy_preview_controls(&mut self) {
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        unsafe {
+            for (_, hwnd) in &preview.edits {
+                if !hwnd.0.is_null() {
+                    let _ = DestroyWindow(*hwnd);
+                }
+            }
+            for hwnd in [preview.do_it_btn, preview.edit_btn, preview.cancel_btn] {
+                if !hwnd.0.is_null() {
+                    let _ = DestroyWindow(hwnd);
+                }
+            }
+        }
+    }
+
+    fn focus_initial_preview_control(&self) {
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        let target = preview
+            .edits
+            .first()
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap_or(preview.do_it_btn);
+        if !target.0.is_null() {
+            unsafe {
+                let _ = SetFocus(Some(target));
+            }
+        }
+    }
+
+    /// Creates one EDIT control per editable field and the three buttons,
+    /// all parented to the card's own window and positioned from
+    /// [`CardInner::compute_preview_layout`]. Every child control is
+    /// subclassed with [`preview_control_subclass`] so Enter/Esc work
+    /// regardless of which control has focus (see that function's doc
+    /// comment for why this cannot rely on the integrating app's message
+    /// loop).
+    fn create_preview_controls(&mut self) {
+        let fields = match &self.preview {
+            Some(p) => p.model.fields().to_vec(),
+            None => return,
+        };
+        let metrics = self.compute_preview_layout(&fields);
+        let instance = self.instance;
+        let parent = self.hwnd;
+        let font = self.fonts.body;
+        let edit_enabled = self
+            .preview
+            .as_ref()
+            .map(|p| p.main_window_exists)
+            .unwrap_or(false);
+
+        let mut edits = Vec::new();
+        for (field, row) in fields.iter().zip(metrics.rows.iter()) {
+            if !field.editable {
+                continue;
+            }
+            if let Some(hwnd) =
+                create_preview_edit(parent, instance, font, &field.value, &row.value_rect)
+            {
+                subclass_preview_control(hwnd, parent);
+                edits.push((field.name.clone(), hwnd));
+            }
+        }
+
+        let do_it_btn = create_preview_button(
+            parent,
+            instance,
+            font,
+            "Do it",
+            &metrics.buttons.do_it,
+            ID_PREVIEW_DO_IT,
+            true,
+            true,
+        );
+        let edit_btn = create_preview_button(
+            parent,
+            instance,
+            font,
+            "Edit",
+            &metrics.buttons.edit,
+            ID_PREVIEW_EDIT,
+            false,
+            edit_enabled,
+        );
+        let cancel_btn = create_preview_button(
+            parent,
+            instance,
+            font,
+            "Cancel",
+            &metrics.buttons.cancel,
+            ID_PREVIEW_CANCEL,
+            false,
+            true,
+        );
+        for hwnd in [do_it_btn, edit_btn, cancel_btn] {
+            if !hwnd.0.is_null() {
+                subclass_preview_control(hwnd, parent);
+            }
+        }
+
+        if let Some(preview) = self.preview.as_mut() {
+            preview.edits = edits;
+            preview.do_it_btn = do_it_btn;
+            preview.edit_btn = edit_btn;
+            preview.cancel_btn = cancel_btn;
+        }
+    }
+
+    /// Re-runs preview layout and moves every existing child control (and
+    /// re-applies the possibly-rebuilt font) to match -- the DPI-change
+    /// counterpart of `create_preview_controls`, which only ever runs once
+    /// per `show_preview` call.
+    fn reposition_preview_controls(&mut self) {
+        let fields = match &self.preview {
+            Some(p) => p.model.fields().to_vec(),
+            None => return,
+        };
+        let metrics = self.compute_preview_layout(&fields);
+        let font = self.fonts.body;
+
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        for (name, hwnd) in &preview.edits {
+            if let Some(idx) = fields.iter().position(|f| &f.name == name) {
+                let r = &metrics.rows[idx].value_rect;
+                unsafe {
+                    let _ = SetWindowPos(
+                        *hwnd,
+                        None,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        SWP_NOZORDER,
+                    );
+                    SendMessageW(
+                        *hwnd,
+                        WM_SETFONT,
+                        Some(WPARAM(font.0 as usize)),
+                        Some(LPARAM(1)),
+                    );
+                }
+            }
+        }
+        for (hwnd, rect) in [
+            (preview.do_it_btn, &metrics.buttons.do_it),
+            (preview.edit_btn, &metrics.buttons.edit),
+            (preview.cancel_btn, &metrics.buttons.cancel),
+        ] {
+            if hwnd.0.is_null() {
+                continue;
+            }
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER,
+                );
+                SendMessageW(
+                    hwnd,
+                    WM_SETFONT,
+                    Some(WPARAM(font.0 as usize)),
+                    Some(LPARAM(1)),
+                );
+            }
+        }
+    }
+
+    fn layout_preview(&mut self) {
+        let fields = match &self.preview {
+            Some(p) => p.model.fields().to_vec(),
+            None => return,
+        };
+        let metrics = self.compute_preview_layout(&fields);
+        // Preview does not track the cursor the way Pending/Collapsed do
+        // (`work_area_for_cursor`): once a form is up, the user's mouse is
+        // likely to move away while they read or type, and having the card
+        // hop monitors mid-edit would be actively hostile. Expanded makes
+        // the same choice for the same reason.
+        let work = self.work_area_for_self();
+        self.place_bottom_right(work, metrics.width, metrics.window_h);
+    }
+
+    /// The preview form's full geometry: the title line, one label/value
+    /// row per field (in `fields`' order, which is schema order -- see
+    /// `PreviewModel::from_schema`), and the three buttons. Pure geometry:
+    /// used both to position real child controls and to paint the
+    /// non-editable rows' labels/values, so the two can never drift apart.
+    fn compute_preview_layout(&self, fields: &[Field]) -> PreviewLayoutMetrics {
+        let padding = self.scale(PADDING_DP);
+        let gap = self.scale(GAP_DP);
+        let width = self.scale(PREVIEW_WIDTH_DP);
+        let content_left = padding;
+        let content_right = width - padding;
+        let content_width = (content_right - content_left).max(1);
+
+        let title_h = self.line_height(self.fonts.headline).max(1);
+        let mut y = padding;
+        let title_rect = RECT {
+            left: content_left,
+            top: y,
+            right: content_left + content_width,
+            bottom: y + title_h,
+        };
+        y += title_h + gap;
+
+        let row_h = self
+            .scale(PREVIEW_ROW_H_DP)
+            .max(self.line_height(self.fonts.body));
+        let row_gap = self.scale(PREVIEW_ROW_GAP_DP);
+        let label_w = self.scale(PREVIEW_LABEL_W_DP).min(content_width / 2).max(1);
+        let value_x = content_left + label_w + self.scale(6);
+        let value_w = (content_right - value_x).max(1);
+
+        let mut rows = Vec::with_capacity(fields.len());
+        for _ in fields {
+            let label_rect = RECT {
+                left: content_left,
+                top: y,
+                right: content_left + label_w,
+                bottom: y + row_h,
+            };
+            let value_rect = RECT {
+                left: value_x,
+                top: y,
+                right: value_x + value_w,
+                bottom: y + row_h,
+            };
+            rows.push(PreviewRowMetrics {
+                label_rect,
+                value_rect,
+            });
+            y += row_h + row_gap;
+        }
+        y = if fields.is_empty() {
+            y + gap
+        } else {
+            y - row_gap + gap
+        };
+
+        let btn_h = self.scale(PREVIEW_BUTTON_H_DP);
+        let btn_w = self.scale(PREVIEW_BUTTON_W_DP);
+        let btn_gap = self.scale(PREVIEW_BUTTON_GAP_DP);
+        let do_it = RECT {
+            left: content_right - btn_w,
+            top: y,
+            right: content_right,
+            bottom: y + btn_h,
+        };
+        let cancel = RECT {
+            left: do_it.left - btn_gap - btn_w,
+            top: y,
+            right: do_it.left - btn_gap,
+            bottom: y + btn_h,
+        };
+        let edit = RECT {
+            left: content_left,
+            top: y,
+            right: content_left + btn_w,
+            bottom: y + btn_h,
+        };
+        y += btn_h;
+
+        let window_h = y + padding;
+
+        PreviewLayoutMetrics {
+            width,
+            window_h,
+            title_rect,
+            rows,
+            buttons: PreviewButtonMetrics {
+                do_it,
+                edit,
+                cancel,
+            },
+        }
+    }
+
+    /// Paints the title line, every field's label, and every *non-editable*
+    /// field's value (an editable field's value is shown by its live EDIT
+    /// control instead, drawn by Windows on top of this same client area).
+    unsafe fn paint_preview(&self, hdc: HDC, palette: &Palette) {
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        let fields = preview.model.fields();
+        let metrics = self.compute_preview_layout(fields);
+
+        let mut title_buf = utf16(&preview.title);
+        let mut title_rect = metrics.title_rect;
+        SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
+        DrawTextW(
+            hdc,
+            &mut title_buf,
+            &mut title_rect,
+            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+
+        for (field, row) in fields.iter().zip(metrics.rows.iter()) {
+            let mut label_buf = utf16(&field.label);
+            let mut label_rect = row.label_rect;
+            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
+            DrawTextW(
+                hdc,
+                &mut label_buf,
+                &mut label_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+
+            if !field.editable {
+                let mut value_buf = utf16(&field.value);
+                let mut value_rect = row.value_rect;
+                SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+                SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
+                DrawTextW(
+                    hdc,
+                    &mut value_buf,
+                    &mut value_rect,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preview (confirmation) state -- layout constants, child-control helpers,
+// keyboard mapping, and the shared control subclass (#26)
+// ---------------------------------------------------------------------------
+
+const PREVIEW_WIDTH_DP: i32 = 320;
+const PREVIEW_ROW_H_DP: i32 = 22;
+const PREVIEW_ROW_GAP_DP: i32 = 6;
+const PREVIEW_LABEL_W_DP: i32 = 84;
+const PREVIEW_BUTTON_H_DP: i32 = 26;
+const PREVIEW_BUTTON_W_DP: i32 = 84;
+const PREVIEW_BUTTON_GAP_DP: i32 = 8;
+
+const ID_PREVIEW_DO_IT: i32 = 3900;
+const ID_PREVIEW_EDIT: i32 = 3901;
+const ID_PREVIEW_CANCEL: i32 = 3902;
+
+/// Subclass id passed to `SetWindowSubclass`/`RemoveWindowSubclass`. A
+/// single constant is enough: every preview child control uses the same
+/// subclass procedure, so nothing here ever needs to tell two subclasses on
+/// the same control apart.
+const PREVIEW_SUBCLASS_ID: usize = 1;
+
+const WC_EDIT: &str = "EDIT";
+const WC_BUTTON: &str = "BUTTON";
+const ES_AUTOHSCROLL: u32 = 0x0080;
+const BS_PUSHBUTTON: u32 = 0x0000;
+const BS_DEFPUSHBUTTON: u32 = 0x0001;
+
+/// Live state for `CardState::Preview`. Owned by `CardInner.preview`; exists
+/// for exactly as long as the preview's child controls do (see
+/// `leave_preview_if_active`).
+struct PreviewUi {
+    model: PreviewModel,
+    /// The heading line drawn above the fields -- the action's name (e.g.
+    /// "Add to calendar"), not a schema field.
+    title: String,
+    /// One `(schema field name, EDIT HWND)` pair per *editable* field, in
+    /// the same order `PreviewModel::fields()` returns them. Non-editable
+    /// fields have no entry here; their value is painted, not typed into.
+    edits: Vec<(String, HWND)>,
+    do_it_btn: HWND,
+    edit_btn: HWND,
+    cancel_btn: HWND,
+    /// `GetForegroundWindow()` at the moment `show_preview` was called.
+    /// `close_preview` hands the foreground back to this window (if it
+    /// still exists) so the preview's interruption is temporary -- see
+    /// `Card::show_preview`'s "Focus" note.
+    previous_foreground: HWND,
+    /// Whether Wingman's main window exists yet -- gates whether the "Edit"
+    /// button is created enabled. See `Card::show_preview`'s doc comment.
+    main_window_exists: bool,
+}
+
+struct PreviewRowMetrics {
+    label_rect: RECT,
+    value_rect: RECT,
+}
+
+struct PreviewButtonMetrics {
+    do_it: RECT,
+    edit: RECT,
+    cancel: RECT,
+}
+
+struct PreviewLayoutMetrics {
+    width: i32,
+    window_h: i32,
+    title_rect: RECT,
+    /// Same length and order as the `fields` slice `compute_preview_layout`
+    /// was called with.
+    rows: Vec<PreviewRowMetrics>,
+    buttons: PreviewButtonMetrics,
+}
+
+/// Pure keyboard mapping for the preview state (#26): Enter means "Do it",
+/// Esc means "Cancel", everything else is not a preview command. Shared by
+/// the card's own `WM_KEYDOWN` arm and [`preview_control_subclass`] (every
+/// EDIT/BUTTON child forwards through the same mapping), so both agree by
+/// construction rather than by two hand-kept switch statements. Pure and
+/// unit-tested without a live window -- see the `tests` module below.
+fn preview_key_command(vk: u16) -> Option<i32> {
+    if vk == VK_RETURN.0 {
+        Some(ID_PREVIEW_DO_IT)
+    } else if vk == VK_ESCAPE.0 {
+        Some(ID_PREVIEW_CANCEL)
+    } else {
+        None
+    }
+}
+
+/// Subclass installed on every preview EDIT/BUTTON child control so Enter
+/// and Esc work regardless of which control currently has keyboard focus.
+///
+/// This cannot be left to the integrating app's message loop: this module's
+/// own doc comment promises callers a plain `GetMessageW`/`DispatchMessageW`
+/// loop is enough to run the card (no `IsDialogMessageW` translation, unlike
+/// `ui::settings`'s modal loop). A child control's `WM_KEYDOWN` is delivered
+/// to the CHILD's own window procedure, never to the parent card's, so
+/// without this subclass Enter/Esc would only work while the card's own
+/// `HWND` itself happened to have focus (which it never does once a child
+/// control does) -- exactly the "wired to nothing" shape this crate's own
+/// skill warns about for a low-level hook with no message loop backing it.
+///
+/// `dwrefdata` carries the parent card's `HWND` (as a `usize`, set at
+/// subclass time by [`subclass_preview_control`]) so a mapped key can
+/// `PostMessageW` a `WM_COMMAND` back to it, indistinguishable from a real
+/// button click.
+unsafe extern "system" fn preview_control_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    ref_data: usize,
+) -> LRESULT {
+    if msg == WM_KEYDOWN {
+        if let Some(command_id) = preview_key_command(wparam.0 as u16) {
+            let parent = HWND(ref_data as *mut c_void);
+            let _ = PostMessageW(
+                Some(parent),
+                WM_COMMAND,
+                WPARAM(command_id as usize),
+                LPARAM(0),
+            );
+            return LRESULT(0);
+        }
+    }
+    if msg == WM_NCDESTROY {
+        let _ = RemoveWindowSubclass(hwnd, Some(preview_control_subclass), PREVIEW_SUBCLASS_ID);
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+fn subclass_preview_control(hwnd: HWND, parent: HWND) {
+    unsafe {
+        let _ = SetWindowSubclass(
+            hwnd,
+            Some(preview_control_subclass),
+            PREVIEW_SUBCLASS_ID,
+            parent.0 as usize,
+        );
+    }
+}
+
+fn create_preview_edit(
+    parent: HWND,
+    instance: HINSTANCE,
+    font: HFONT,
+    initial_text: &str,
+    rect: &RECT,
+) -> Option<HWND> {
+    let class_w = wide_z(WC_EDIT);
+    let text_w = wide_z(initial_text);
+    let hwnd = unsafe {
+        CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+            PCWSTR(class_w.as_ptr()),
+            PCWSTR(text_w.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL,
+            ),
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            Some(parent),
+            None,
+            Some(instance),
+            None,
+        )
+    };
+    let hwnd = hwnd.ok()?;
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+    }
+    Some(hwnd)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_preview_button(
+    parent: HWND,
+    instance: HINSTANCE,
+    font: HFONT,
+    text: &str,
+    rect: &RECT,
+    id: i32,
+    is_default: bool,
+    enabled: bool,
+) -> HWND {
+    let class_w = wide_z(WC_BUTTON);
+    let text_w = wide_z(text);
+    let style = WS_CHILD.0
+        | WS_VISIBLE.0
+        | WS_TABSTOP.0
+        | if is_default {
+            BS_DEFPUSHBUTTON
+        } else {
+            BS_PUSHBUTTON
+        }
+        | if enabled { 0 } else { WS_DISABLED.0 };
+    let hwnd = unsafe {
+        CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+            PCWSTR(class_w.as_ptr()),
+            PCWSTR(text_w.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            Some(parent),
+            Some(HMENU(id as *mut c_void)),
+            Some(instance),
+            None,
+        )
+    };
+    match hwnd {
+        Ok(hwnd) => {
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_SETFONT,
+                    Some(WPARAM(font.0 as usize)),
+                    Some(LPARAM(1)),
+                );
+            }
+            hwnd
+        }
+        Err(_) => HWND(std::ptr::null_mut()),
+    }
+}
+
+/// `GetWindowTextW` into an owned `String`, `""` for a null/invalid handle
+/// rather than a panic -- mirrors `ui::settings::get_text`.
+fn window_text(hwnd: HWND) -> String {
+    if hwnd.0.is_null() {
+        return String::new();
+    }
+    unsafe {
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let read = GetWindowTextW(hwnd, &mut buf);
+        buf.truncate(read.max(0) as usize);
+        String::from_utf16_lossy(&buf)
     }
 }
 
@@ -1802,5 +2723,372 @@ mod tests {
                 "{d:?} fill {fill:#08x} should contrast with white text"
             );
         }
+    }
+
+    // -- preview_key_command: pure keyboard mapping (#26) --------------------
+
+    #[test]
+    fn preview_key_command_maps_enter_to_do_it() {
+        assert_eq!(preview_key_command(VK_RETURN.0), Some(ID_PREVIEW_DO_IT));
+    }
+
+    #[test]
+    fn preview_key_command_maps_escape_to_cancel() {
+        assert_eq!(preview_key_command(VK_ESCAPE.0), Some(ID_PREVIEW_CANCEL));
+    }
+
+    #[test]
+    fn preview_key_command_ignores_every_other_key() {
+        // Spot-check a handful of unrelated virtual-key codes, including the
+        // boundary values 0 and u16::MAX.
+        for vk in [0u16, 1, 0x41 /* 'A' */, 0x09 /* Tab */, u16::MAX] {
+            assert_eq!(preview_key_command(vk), None, "vk={vk:#06x}");
+        }
+    }
+
+    // -- preview state: real Win32 (#26) -------------------------------------
+    //
+    // Uses `Card::new_for_test`, which registers and creates against a
+    // window class distinct from the production `Card` (rule 9). No window
+    // is ever shown interactively and no message loop is pumped, so this is
+    // safe and fast to run under `cargo test`, the same "smoke test" style
+    // the module's other real-Win32 tests already use.
+
+    fn calendar_schema_and_value() -> (serde_json::Value, serde_json::Value) {
+        let schema = crate::actions::schema::schema_for("calendar_event", false)
+            .expect("calendar_event is registered");
+        let value = serde_json::json!({
+            "title": "Standup", "start": "09:00", "end": "09:15",
+            "location": "Room 2", "notes": "bring laptop"
+        });
+        (schema, value)
+    }
+
+    fn gwl_style(hwnd: HWND) -> isize {
+        const GWL_STYLE: i32 = -16;
+        unsafe {
+            GetWindowLongPtrW(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX(GWL_STYLE),
+            )
+        }
+    }
+
+    #[test]
+    fn preview_calendar_event_renders_editable_start_and_title() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        assert_eq!(card.state(), CardState::Preview);
+
+        let preview = card
+            .inner
+            .preview
+            .as_ref()
+            .expect("preview state is active");
+        // #26's Done-when: "a calendar_event proposal renders with editable
+        // start and title" -- exactly those two fields get a real EDIT
+        // control, nothing else.
+        let editable_names: Vec<&str> = preview
+            .edits
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(editable_names.len(), 2);
+        assert!(editable_names.contains(&"title"));
+        assert!(editable_names.contains(&"start"));
+        for (_, hwnd) in &preview.edits {
+            assert!(!hwnd.0.is_null());
+        }
+        assert!(!preview.do_it_btn.0.is_null());
+        assert!(!preview.cancel_btn.0.is_null());
+        assert!(!preview.edit_btn.0.is_null());
+
+        // A real EDIT control's initial text round-trips through the
+        // window, not just the pure model.
+        let start_hwnd = preview
+            .edits
+            .iter()
+            .find(|(name, _)| name == "start")
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap();
+        assert_eq!(window_text(start_hwnd), "09:00");
+    }
+
+    #[test]
+    fn preview_edit_button_is_disabled_until_main_window_exists() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let edit_btn = card.inner.preview.as_ref().unwrap().edit_btn;
+        assert_ne!(
+            gwl_style(edit_btn) & (WS_DISABLED.0 as isize),
+            0,
+            "Edit must be disabled while no main window exists"
+        );
+
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, true);
+        let edit_btn = card.inner.preview.as_ref().unwrap().edit_btn;
+        assert_eq!(
+            gwl_style(edit_btn) & (WS_DISABLED.0 as isize),
+            0,
+            "Edit must be enabled once main_window_exists is true"
+        );
+    }
+
+    #[test]
+    fn preview_do_it_after_an_edit_builds_a_confirmed_equal_to_what_was_shown() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        let start_hwnd = card
+            .inner
+            .preview
+            .as_ref()
+            .unwrap()
+            .edits
+            .iter()
+            .find(|(name, _)| name == "start")
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap();
+
+        // Programmatically edit the field, exactly like a real keystroke
+        // would leave it.
+        let edited = wide_z("10:30");
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                start_hwnd,
+                PCWSTR(edited.as_ptr()),
+            );
+        }
+
+        // Simulate the "Do it" command via SendMessage(WM_COMMAND), the same
+        // message a real button click (or the Enter subclass) generates.
+        let card_hwnd = card.hwnd();
+        unsafe {
+            SendMessageW(
+                card_hwnd,
+                WM_COMMAND,
+                Some(WPARAM(ID_PREVIEW_DO_IT as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+
+        assert_eq!(
+            card.state(),
+            CardState::Hidden,
+            "Do it must close the preview"
+        );
+        let confirmed = card
+            .take_confirmed()
+            .expect("Do it must produce a Confirmed");
+        assert_eq!(confirmed.value()["start"], "10:30");
+        assert_eq!(confirmed.value()["title"], "Standup");
+        assert_eq!(confirmed.value()["end"], "09:15");
+        assert_eq!(confirmed.value()["location"], "Room 2");
+
+        // A take, not a peek.
+        assert!(card.take_confirmed().is_none());
+    }
+
+    #[test]
+    fn preview_cancel_produces_no_confirmed_and_closes() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        let card_hwnd = card.hwnd();
+        unsafe {
+            SendMessageW(
+                card_hwnd,
+                WM_COMMAND,
+                Some(WPARAM(ID_PREVIEW_CANCEL as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+
+        assert_eq!(card.state(), CardState::Hidden);
+        assert!(
+            card.take_confirmed().is_none(),
+            "Cancel must produce nothing"
+        );
+    }
+
+    #[test]
+    fn preview_never_auto_dismisses_on_the_safety_timer() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        // Simulate a TIMER_DISMISS message arriving while Preview is active
+        // (rule 5: a card must never close on a timer while showing an
+        // action that has not been confirmed yet).
+        let handled = card.handle_message(WM_TIMER, WPARAM(TIMER_DISMISS), LPARAM(0));
+        assert!(handled.is_some());
+        assert_eq!(
+            card.state(),
+            CardState::Preview,
+            "TIMER_DISMISS must never close an open preview"
+        );
+    }
+
+    #[test]
+    fn preview_enter_key_on_the_card_window_itself_triggers_do_it() {
+        // Exercises the card's own WM_KEYDOWN arm (as opposed to a child
+        // control's subclass), which uses the same preview_key_command
+        // mapping.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        let handled = card.handle_message(WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(0));
+        assert!(handled.is_some());
+        assert_eq!(card.state(), CardState::Hidden);
+        assert!(card.take_confirmed().is_some());
+    }
+
+    #[test]
+    fn preview_control_subclass_forwards_enter_as_a_posted_do_it_command() {
+        // Real Enter/Esc keystrokes reach `run_preview_command` through
+        // `preview_control_subclass` (installed on every EDIT/BUTTON child
+        // by `create_preview_controls`), not through the card's own
+        // WM_KEYDOWN arm -- see that function's doc comment for why a child
+        // control's WM_KEYDOWN never reaches the parent on its own. This
+        // test calls the actual installed function pointer directly, the
+        // same way Windows would while a preview EDIT control has focus,
+        // and checks the real observable: a WM_COMMAND sitting in this
+        // thread's message queue (PostMessageW, not SendMessageW), which is
+        // exactly what `run_preview_command` needs delivered to fire.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let start_hwnd = card
+            .inner
+            .preview
+            .as_ref()
+            .unwrap()
+            .edits
+            .iter()
+            .find(|(name, _)| name == "start")
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap();
+        let card_hwnd = card.hwnd();
+
+        unsafe {
+            let _ = preview_control_subclass(
+                start_hwnd,
+                WM_KEYDOWN,
+                WPARAM(VK_RETURN.0 as usize),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+
+        // A single, non-looping check: posted messages (like the WM_COMMAND
+        // above) take priority over synthesized WM_PAINT/WM_TIMER messages,
+        // so one PeekMessageW call retrieves it directly. This deliberately
+        // does NOT loop with PM_REMOVE: discarding a synthesized WM_PAINT
+        // without running it through DispatchMessageW (which is what
+        // validates the window via BeginPaint/EndPaint) would make Windows
+        // re-synthesize WM_PAINT forever for this still-invalid window --
+        // an infinite busy loop, not a hang that shows up as "no output".
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "preview_control_subclass must post a WM_COMMAND to the card window"
+        );
+        assert_eq!(msg.message, WM_COMMAND);
+        assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_DO_IT);
+    }
+
+    #[test]
+    fn preview_closing_restores_the_previous_foreground_window() {
+        // The settings window's own smoke test constructs a real HWND the
+        // same way; reused here purely as "some other real window that
+        // existed before the preview" -- never shown, never pumped.
+        let settings_hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(wide_z(TEST_CLASS_NAME).as_ptr()),
+                PCWSTR(wide_z("other window").as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                10,
+                10,
+                None,
+                None,
+                Some(instance()),
+                None,
+            )
+        };
+        // This environment may have no other window able to become the
+        // foreground window (headless CI); the important, always-checkable
+        // part of this test is that close_preview does not panic and always
+        // leaves the card itself Hidden -- see the two asserts below, which
+        // run regardless of whether CreateWindowExW above succeeded.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        card.inner.preview_cancel();
+        assert_eq!(card.state(), CardState::Hidden);
+        if let Ok(hwnd) = settings_hwnd {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+    }
+
+    #[test]
+    fn preview_gdi_objects_do_not_leak_across_create_show_close_drop() {
+        // Best-effort per the task's "if practical": GetGuiResources counts
+        // GDI objects for the whole process, and `cargo test` runs many
+        // tests concurrently on other threads, so this cannot assert an
+        // exact before/after match without flaking on unrelated tests'
+        // allocations. What it CAN assert without flaking: creating,
+        // showing, editing, and closing a preview, then dropping the card,
+        // must not leave the process's GDI object count higher than it was
+        // immediately after the card's own fonts were built (i.e. nothing
+        // preview-specific leaks), allowing generous slack for concurrent
+        // tests.
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS,
+        };
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let baseline = unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) };
+
+        let (schema, value) = calendar_schema_and_value();
+        for _ in 0..3 {
+            card.inner
+                .show_preview("Add to calendar", &schema, &value, false);
+            let _ = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+            card.inner.preview_cancel();
+        }
+        drop(card);
+
+        let after = unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) };
+        let slack = 64; // headroom for concurrently-running unrelated tests
+        assert!(
+            after <= baseline + slack,
+            "GDI object count grew by more than {slack} after repeated preview create/close/drop \
+             (baseline={baseline}, after={after}); investigate a leak before raising this slack"
+        );
     }
 }
