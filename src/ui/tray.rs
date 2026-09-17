@@ -125,6 +125,13 @@ pub mod cmd {
     /// the clipboard. See `App::copy_diagnostics` in `app.rs`.
     pub const COPY_DIAGNOSTICS: u32 = 1019;
 
+    /// Issue #41: "Copy text from screen" -- OCR the active monitor and copy
+    /// the text to the clipboard, offline and model-free. See
+    /// `App::extract_text` in `app.rs` and `actions::extract_text`. The
+    /// palette (#25) does not exist yet, so this tray item is the only way
+    /// to reach the action today.
+    pub const EXTRACT_TEXT: u32 = 1020;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -432,6 +439,7 @@ impl Tray {
 
     fn build_menu(&self, hmenu: HMENU) -> Result<()> {
         append_item(hmenu, cmd::ASK_NOW, "Ask now")?;
+        append_item(hmenu, cmd::EXTRACT_TEXT, "Copy text from screen")?;
         append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
         append_separator(hmenu)?;
         if self.paused {
@@ -1132,6 +1140,55 @@ mod tests {
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 
+    // -- #41: "Copy text from screen" is reachable from the menu ------------
+
+    #[test]
+    fn extract_text_item_is_present_in_the_built_menu() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetMenuItemInfoW, CW_USEDEFAULT, WINDOW_EX_STYLE,
+            WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray extract-text test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+
+        let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu).expect("build_menu");
+
+        let mut info = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STATE,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(hmenu, cmd::EXTRACT_TEXT, false, &mut info) }.expect(
+            "cmd::EXTRACT_TEXT must be a real item id in the built menu, not orphaned data",
+        );
+
+        let _ = unsafe { DestroyMenu(hmenu) };
+        drop(tray);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
     // -- submenu attach ordering (#147) -------------------------------------
 
     #[test]
@@ -1198,6 +1255,7 @@ mod tests {
         ("MODE_AUTO", cmd::MODE_AUTO),
         ("MODE_OFFLINE", cmd::MODE_OFFLINE),
         ("COPY_DIAGNOSTICS", cmd::COPY_DIAGNOSTICS),
+        ("EXTRACT_TEXT", cmd::EXTRACT_TEXT),
     ];
 
     #[test]

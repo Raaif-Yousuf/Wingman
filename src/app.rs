@@ -453,6 +453,62 @@ impl App {
         });
     }
 
+    /// "Copy text from screen" (#41): OCR the active monitor and copy the
+    /// text to the clipboard, no model, no network. Mirrors `ask`'s
+    /// ordering (hide any stale card, capture on the MAIN thread before the
+    /// pending card shows, then do the expensive part -- here OCR, there
+    /// `encode` plus the provider call -- on a worker thread, reporting back
+    /// through the same `WM_APP_RESULT`/`on_result` path) except for one
+    /// thing `ask` does that this must NOT: no readiness gate, no provider
+    /// chain, no `Mode` is ever consulted -- this action works in every
+    /// Mode, including Offline with no provider configured at all, because
+    /// `actions::extract_text`'s functions have nowhere to get a chain from
+    /// (see that module's doc comment). The only gate is Paused, same as
+    /// `ask`.
+    fn extract_text(&mut self) {
+        if self.busy {
+            return;
+        }
+
+        if let Err((headline, detail)) = actions::extract_text::gate(pause::is_paused_now()) {
+            self.card.show_answer(headline, detail, 3, None);
+            return;
+        }
+
+        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
+            self.card.hide();
+            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
+        }
+
+        let raw = match actions::extract_text::capture_screen() {
+            Ok(r) => r,
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
+                return;
+            }
+        };
+
+        self.busy = true;
+        self.set_watch(false);
+        self.card.show_pending();
+
+        let target = self.hwnd_isize();
+        std::thread::spawn(move || {
+            let result: std::result::Result<Answer, String> =
+                actions::extract_text::recognize_and_copy(&raw).map_err(|e| format!("{e:#}"));
+            let payload = Box::into_raw(Box::new(result));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                );
+            }
+        });
+    }
+
     fn on_result(&mut self, result: std::result::Result<Answer, String>) {
         let is_err = result.is_err();
         let answer = self.record_last(result);
@@ -1562,6 +1618,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(),
+                    MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
                     MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
                     MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
                     MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),

@@ -28,3 +28,18 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "extract-text-to-clipboard"
+name = "Copy text from screen"
+group = "Work"
+inputs = ["screen"]
+proposal = "ocr_text"
+executor = "clipboard"
+confirm = false
+prompt = ""
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"

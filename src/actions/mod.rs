@@ -5,6 +5,7 @@
 //! See `docs/superpowers/specs/2026-09-17-action-model-design.md` for the
 //! rules this file implements and why.
 
+pub mod extract_text;
 pub mod schema;
 
 use std::fs;
@@ -157,23 +158,72 @@ pub struct Resolved {
     pub origin: Origin,
 }
 
-/// The one built-in action Wingman ships: today's physics/statistics check,
-/// unchanged in behaviour (expansion plan §6, "Check my work (exists)").
+/// The id of the "Copy text from screen" built-in action (#41). Not a
+/// second `DEFAULT_ACTION_ID`: nothing looks this id up today (the hotkey's
+/// default action is still, and only, [`DEFAULT_ACTION_ID`]) -- this path is
+/// reached from its own tray item (`ui::tray::cmd::EXTRACT_TEXT`), calling
+/// `actions::extract_text::capture_screen`/`recognize_and_copy` directly,
+/// never `worker`/`load_actions`. See `actions::extract_text`'s module doc
+/// for why.
+pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
+
+/// The built-in actions Wingman ships.
+///
+/// - `"check-my-work"`: today's physics/statistics check, unchanged in
+///   behaviour (expansion plan §6, "Check my work (exists)").
+/// - `"extract-text-to-clipboard"` (#41): OCR the screen, copy the text,
+///   offline and model-free. `group: "Work"`, chosen over "Writing" --
+///   reading text off whatever is on screen (a dialog, a PDF, a chat
+///   window) is a general capture utility, not a composition aid the way
+///   "Review this email" or "Rewrite for tone" (both squarely "Writing" in
+///   the expansion plan's catalogue) are. `proposal: "ocr_text"` is a
+///   deliberately UNREGISTERED schema name (`actions::schema::schema_for`
+///   has no `"ocr_text"` arm and never will need one): this action never
+///   asks a model for a proposal at all, so there is no JSON Schema to
+///   register -- the field exists only because `Action` requires it, the
+///   same "present but not resolved" status the design doc already gives
+///   an executor's `executor` field before its resolution exists. `prompt`
+///   is empty for the same reason: no model call, nothing to prompt.
+///   `confirm: false` matches the real behaviour: the `"clipboard"`
+///   executor is `Effect::ReadOnly`, so `actions::extract_text::run_pipeline`
+///   auto-confirms it, exactly like `"check-my-work"`'s `"none"` executor.
+///   This entry is catalogue metadata for the palette (#25, not yet built)
+///   -- nothing on the real execution path (`ui/tray.rs`'s
+///   `cmd::EXTRACT_TEXT` -> `App::extract_text` ->
+///   `actions::extract_text::{capture_screen, recognize_and_copy}`) reads
+///   this `Action` value back today, the same inert-until-its-caller-exists
+///   status `Action::hotkey` already has.
 pub fn builtin_actions() -> Vec<Action> {
-    vec![Action {
-        id: DEFAULT_ACTION_ID.to_string(),
-        name: "Check my work".to_string(),
-        group: Some("Study".to_string()),
-        inputs: vec![InputKind::Screen],
-        proposal: "verdict".to_string(),
-        executor: "none".to_string(),
-        confirm: false,
-        prompt: crate::provider::DEFAULT_PROMPT.to_string(),
-        prefer: Prefer::default(),
-        hotkey: None,
-        rate_difficulty: false,
-        enabled: true,
-    }]
+    vec![
+        Action {
+            id: DEFAULT_ACTION_ID.to_string(),
+            name: "Check my work".to_string(),
+            group: Some("Study".to_string()),
+            inputs: vec![InputKind::Screen],
+            proposal: "verdict".to_string(),
+            executor: "none".to_string(),
+            confirm: false,
+            prompt: crate::provider::DEFAULT_PROMPT.to_string(),
+            prefer: Prefer::default(),
+            hotkey: None,
+            rate_difficulty: false,
+            enabled: true,
+        },
+        Action {
+            id: EXTRACT_TEXT_ACTION_ID.to_string(),
+            name: "Copy text from screen".to_string(),
+            group: Some("Work".to_string()),
+            inputs: vec![InputKind::Screen],
+            proposal: "ocr_text".to_string(),
+            executor: "clipboard".to_string(),
+            confirm: false,
+            prompt: String::new(),
+            prefer: Prefer::default(),
+            hotkey: None,
+            rate_difficulty: false,
+            enabled: true,
+        },
+    ]
 }
 
 /// Replaces each built-in whose `id` a user action matches (wholesale, not
@@ -327,8 +377,15 @@ mod tests {
     #[test]
     fn builtin_check_my_work_matches_todays_behaviour() {
         let builtins = builtin_actions();
-        assert_eq!(builtins.len(), 1);
-        let a = &builtins[0];
+        assert_eq!(
+            builtins.len(),
+            2,
+            "check-my-work plus extract-text-to-clipboard (#41)"
+        );
+        let a = builtins
+            .iter()
+            .find(|a| a.id == DEFAULT_ACTION_ID)
+            .expect("check-my-work is built in");
         assert_eq!(a.id, DEFAULT_ACTION_ID);
         assert_eq!(a.name, "Check my work");
         assert_eq!(a.group.as_deref(), Some("Study"));
@@ -339,6 +396,38 @@ mod tests {
         assert_eq!(a.prompt, crate::provider::DEFAULT_PROMPT);
         assert!(!a.rate_difficulty, "#197 part 2: default off");
         assert!(a.enabled);
+    }
+
+    // -- builtin extract-text-to-clipboard (#41) ----------------------------
+
+    #[test]
+    fn builtin_extract_text_matches_the_design() {
+        let builtins = builtin_actions();
+        let a = builtins
+            .iter()
+            .find(|a| a.id == EXTRACT_TEXT_ACTION_ID)
+            .expect("extract-text-to-clipboard is built in");
+        assert_eq!(a.name, "Copy text from screen");
+        assert_eq!(a.group.as_deref(), Some("Work"));
+        assert_eq!(a.inputs, vec![InputKind::Screen]);
+        assert_eq!(a.executor, "clipboard");
+        assert!(!a.confirm, "read-only action, no confirm step");
+        assert!(!a.rate_difficulty);
+        assert!(a.enabled);
+        // Deliberately unregistered -- see builtin_actions()'s doc comment.
+        assert_eq!(schema::schema_for(&a.proposal, a.rate_difficulty), None);
+    }
+
+    #[test]
+    fn extract_text_action_stays_visible_by_default() {
+        let resolved = load_actions_from(&scratch_path("extract-text-default"));
+        let resolved = resolved.expect("a missing user file is not an error");
+        assert!(
+            resolved
+                .iter()
+                .any(|r| r.action.id == EXTRACT_TEXT_ACTION_ID),
+            "extract-text-to-clipboard must be visible with no actions.toml"
+        );
     }
 
     // -- executor resolution (#31) -------------------------------------------
@@ -479,14 +568,17 @@ not_a_real_field = true
         let mut new_action = builtin_actions()[0].clone();
         new_action.id = "translate-selection".to_string();
         new_action.name = "Translate selection".to_string();
-        let merged = merge_actions(builtin_actions(), vec![new_action]);
-        assert_eq!(merged.len(), 2);
+        let builtins = builtin_actions();
+        let builtin_count = builtins.len();
+        let merged = merge_actions(builtins, vec![new_action]);
+        assert_eq!(merged.len(), builtin_count + 1);
         assert_eq!(
             merged[0].action.id, DEFAULT_ACTION_ID,
             "builtin stays first"
         );
-        assert_eq!(merged[1].action.id, "translate-selection");
-        assert_eq!(merged[1].origin, Origin::User);
+        let appended = merged.last().expect("at least one entry");
+        assert_eq!(appended.action.id, "translate-selection");
+        assert_eq!(appended.origin, Origin::User);
     }
 
     #[test]
@@ -548,9 +640,12 @@ not_a_real_field = true
         let path = scratch_path("missing");
         assert!(!path.exists());
         let resolved = load_actions_from(&path).expect("a missing file is not an error");
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].action.id, DEFAULT_ACTION_ID);
-        assert_eq!(resolved[0].origin, Origin::Builtin);
+        assert_eq!(resolved.len(), builtin_actions().len());
+        let default = resolved
+            .iter()
+            .find(|r| r.action.id == DEFAULT_ACTION_ID)
+            .expect("check-my-work is present");
+        assert_eq!(default.origin, Origin::Builtin);
         assert!(!path.exists(), "load_actions_from never creates the file");
     }
 
