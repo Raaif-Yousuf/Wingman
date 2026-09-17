@@ -61,6 +61,6 @@ Unbounded parallel builds have frozen this machine by exhausting RAM.
   the full suite.
 - Build with `CARGO_BUILD_JOBS=4` and the shared target dir so builds queue
   behind a file lock instead of running in parallel:
-  `export CARGO_TARGET_DIR=C:/Users/raaif/copilot-ask/target-agents CARGO_BUILD_JOBS=4`
+  `export CARGO_TARGET_DIR=C:/Users/raaif/copilot-ask/target CARGO_BUILD_JOBS=4`
 - "Blocking waiting for file lock" is expected. Wait; do not delete locks.
 - No `cargo build --release` unless the task is about the release binary.
