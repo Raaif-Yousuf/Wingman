@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod actions;
+#[cfg(test)]
+mod actions_example;
 mod app;
 mod autostart;
 mod capture;

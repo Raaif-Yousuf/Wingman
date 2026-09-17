@@ -449,7 +449,15 @@ pub fn physics_request(shot: &Shot, prompt: &str, want_difficulty: bool) -> Requ
         system: common::augmented_system_prompt(prompt, want_difficulty),
         user: "Check my working.".to_string(),
         images: vec![shot.png.clone()],
-        schema: Some(common::answer_schema(want_difficulty)),
+        // #23: routed through the proposal schema registry instead of
+        // calling `common::answer_schema` directly -- the registry's
+        // `"verdict"` arm is that same call, so this is a no-op swap,
+        // proven byte-identical by the golden tests above (written before
+        // this line changed).
+        schema: Some(
+            crate::actions::schema::schema_for("verdict", want_difficulty)
+                .expect("\"verdict\" is always registered in actions::schema"),
+        ),
         effort: Effort::Unset,
         max_tokens: 0,
     }
@@ -1120,6 +1128,34 @@ mod tests {
     }
 
     // -- physics_request / parse_answer ---------------------------------
+
+    // -- #23: golden test, written BEFORE physics_request was switched to
+    // build its schema through actions::schema::schema_for, to prove the
+    // switch is a byte-identical no-op. Locks in the exact wire schema (not
+    // just "a schema" -- the literal JSON, property order included, since
+    // that order is load-bearing per rule 3) for both the with- and
+    // without-difficulty cases. If this test ever needs to change, the
+    // wire request changed, which is the one thing this refactor must not
+    // do.
+    #[test]
+    fn golden_physics_request_schema_without_difficulty_is_byte_identical() {
+        let req = physics_request(&shot(), "irrelevant prompt", false);
+        let schema = req.schema.expect("schema always present");
+        assert_eq!(
+            serde_json::to_string(&schema).unwrap(),
+            r#"{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"}},"required":["detail","headline"],"additionalProperties":false}"#
+        );
+    }
+
+    #[test]
+    fn golden_physics_request_schema_with_difficulty_is_byte_identical() {
+        let req = physics_request(&shot(), "irrelevant prompt", true);
+        let schema = req.schema.expect("schema always present");
+        assert_eq!(
+            serde_json::to_string(&schema).unwrap(),
+            r#"{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"},"difficulty":{"type":"string","enum":["1","2","3","4","5","6","7","8","9","10","U","N"]}},"required":["detail","headline","difficulty"],"additionalProperties":false}"#
+        );
+    }
 
     #[test]
     fn physics_request_carries_the_screenshot_and_prompt_unmodified_without_difficulty() {
