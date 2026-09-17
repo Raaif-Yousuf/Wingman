@@ -73,7 +73,7 @@ impl OpenAi {
             required.push("difficulty");
         }
 
-        json!({
+        let mut body = json!({
             "model": self.model,
             "instructions": instructions,
             "input": [{"role": "user", "content": [
@@ -88,7 +88,20 @@ impl OpenAi {
                     "properties": properties,
                     "required": required, "additionalProperties": false}
             }}
-        })
+        });
+
+        // Mirrors Anthropic's `!self.effort.is_empty()` guard: an empty
+        // `effort` is a plausible hand-edit of config.toml (`effort = ""`
+        // meaning "use the default"), and the Responses API validates
+        // `reasoning.effort` against a fixed enum -- sending an empty
+        // string is a hard 400 on every request, not a no-op (#154).
+        if self.effort.trim().is_empty() {
+            body.as_object_mut()
+                .expect("body is always an object")
+                .remove("reasoning");
+        }
+
+        body
     }
 
     /// Parses a successful (2xx) OpenAI Responses API body into an `Answer`.
@@ -321,5 +334,32 @@ mod tests {
     fn parse_response_rejects_invalid_json() {
         let err = OpenAi::parse_response("not json").unwrap_err();
         assert!(err.to_string().contains("not valid JSON"));
+    }
+
+    /// #154: mirrors Anthropic's `empty_effort_is_never_sent` -- an empty
+    /// `effort` string is a plausible hand-edit of config.toml and must
+    /// never be sent verbatim (OpenAI's Responses API 400s on it).
+    #[test]
+    fn empty_effort_is_never_sent() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "");
+        let body = provider.build_body(&sample_shot(), "sys", false);
+        assert!(body.get("reasoning").is_none());
+    }
+
+    /// Neighbour: whitespace-only is the same footgun as empty.
+    #[test]
+    fn whitespace_only_effort_is_never_sent() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "   ");
+        let body = provider.build_body(&sample_shot(), "sys", false);
+        assert!(body.get("reasoning").is_none());
+    }
+
+    /// Neighbour: a real effort value must still be sent (not swallowed by
+    /// the guard).
+    #[test]
+    fn non_empty_effort_is_still_sent() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
+        let body = provider.build_body(&sample_shot(), "sys", false);
+        assert_eq!(body["reasoning"]["effort"], "low");
     }
 }
