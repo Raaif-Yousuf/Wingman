@@ -33,12 +33,17 @@ mod tests {
                 .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
         }
 
-        let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!(
-                "failed to read {}: {e}. Run with UPDATE_EXAMPLES=1 to generate it, then commit the result.",
-                path.display()
-            )
-        });
+        // With core.autocrlf=true (the Git for Windows default, and GitHub's
+        // windows-latest runners) a checkout turns the committed LF file into
+        // CRLF, which is not drift.
+        let committed = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to read {}: {e}. Run with UPDATE_EXAMPLES=1 to generate it, then commit the result.",
+                    path.display()
+                )
+            })
+            .replace("\r\n", "\n");
 
         assert_eq!(
             committed, expected,
