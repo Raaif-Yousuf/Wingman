@@ -304,7 +304,7 @@ impl Default for OllamaConfig {
 /// `/chat/completions` endpoint (OpenRouter, Groq, Mistral, DeepSeek, xAI,
 /// Together, LM Studio, llama.cpp, vLLM, Azure, ...). `Debug` is hand-rolled
 /// below to redact `api_key`, mirroring [`ProviderConfig`] (#157).
-#[derive(Clone, PartialEq, Default, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CompatConfig {
     /// The endpoint's short, user-chosen id (`"openrouter"`, `"lmstudio"`).
@@ -332,6 +332,42 @@ pub struct CompatConfig {
     /// [`ProviderConfig::models`].
     pub models: Vec<String>,
     pub structured: Structured,
+    /// Issue #210: whether the configured model actually accepts an image.
+    /// Defaults to `true` (field-level default, not the container's derived
+    /// `Default`, so a `config.toml` written before this field existed --
+    /// missing the key entirely -- keeps today's always-vision behaviour
+    /// rather than silently losing it). Set `false` for a compat endpoint
+    /// pointed at a text-only model (LM Studio, llama.cpp, vLLM, ...) so
+    /// `Chain::complete_parsed_with_fallback` (#18/#206) routes it through
+    /// the OCR/UIA text fallback instead of sending it a screenshot it
+    /// cannot use.
+    #[serde(default = "default_compat_vision")]
+    pub vision: bool,
+}
+
+fn default_compat_vision() -> bool {
+    true
+}
+
+/// Hand-rolled (not derived) so `vision` defaults to `true` here too, the
+/// same value [`default_compat_vision`] gives a `config.toml` missing the
+/// key -- a derived `Default` would give `bool::default()` (`false`) for
+/// this one field, silently disagreeing with the deserialization default
+/// right above it.
+impl Default for CompatConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            base_url: String::new(),
+            auth: CompatAuth::default(),
+            auth_header: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            models: Vec::new(),
+            structured: Structured::default(),
+            vision: true,
+        }
+    }
 }
 
 impl std::fmt::Debug for CompatConfig {
@@ -345,6 +381,7 @@ impl std::fmt::Debug for CompatConfig {
             .field("model", &self.model)
             .field("models", &self.models)
             .field("structured", &self.structured)
+            .field("vision", &self.vision)
             .finish()
     }
 }
@@ -928,6 +965,7 @@ impl Providers {
                     cfg.auth_header.clone(),
                     unreadable_as_empty(&cfg.api_key),
                     cfg.structured,
+                    cfg.vision,
                 )))
             }
         }
@@ -1473,6 +1511,7 @@ model = "gpt-5.5"
             model: "some-model".to_string(),
             models: vec!["some-model".to_string()],
             structured: Structured::JsonSchema,
+            vision: true,
         }
     }
 
@@ -1585,6 +1624,53 @@ model = "gpt-5.5"
             parsed.providers.compat[0].structured,
             Structured::JsonSchema
         );
+        assert!(parsed.providers.compat[0].vision);
+    }
+
+    // -- #210: compat's `vision` field ---------------------------------------
+
+    #[test]
+    fn a_compat_entry_missing_the_vision_key_backfills_to_true() {
+        // A `config.toml` written before #210 has no `vision` key under
+        // `[[providers.compat]]` at all; the field-level
+        // `#[serde(default = "default_compat_vision")]` must still produce
+        // `true` (today's always-vision behaviour), not `false`
+        // (`bool::default()`, which a bare container-level `#[serde(default)]`
+        // would silently produce instead -- see `CompatConfig::vision`'s doc
+        // comment).
+        let old = r#"
+[[providers.compat]]
+name = "lmstudio"
+base_url = "http://127.0.0.1:1234/v1"
+auth = "none"
+auth_header = ""
+api_key = ""
+model = "some-model"
+models = []
+structured = "prompt"
+"#;
+        let cfg = Config::parse_or_default(old);
+        assert_eq!(cfg.providers.compat.len(), 1);
+        assert!(cfg.providers.compat[0].vision);
+    }
+
+    #[test]
+    fn a_compat_entry_with_vision_false_deserializes_and_round_trips() {
+        let mut config = Config::default();
+        let mut entry = compat_entry("lmstudio", "http://127.0.0.1:1234/v1");
+        entry.vision = false;
+        config.providers.compat = vec![entry];
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        let parsed: Config = toml::from_str(&text).expect("deserialize");
+        assert!(!parsed.providers.compat[0].vision);
+    }
+
+    #[test]
+    fn compat_config_default_defaults_vision_to_true() {
+        // The hand-rolled `Default` impl must agree with
+        // `default_compat_vision` -- see that impl's doc comment for why a
+        // derived `Default` would silently disagree.
+        assert!(CompatConfig::default().vision);
     }
 
     #[test]
