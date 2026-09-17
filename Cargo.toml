@@ -37,6 +37,9 @@ features = [
   "Win32_NetworkManagement_IpHelper",
   "Win32_Security",
   "Win32_Security_Credentials",
+  # dpapi.rs (#62): CryptProtectData/CryptUnprotectData for DPAPI
+  # encryption at rest.
+  "Win32_Security_Cryptography",
   "Win32_Storage_Packaging_Appx",
   "Win32_System_Com",
   "Win32_System_Diagnostics_ToolHelp",

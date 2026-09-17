@@ -13,6 +13,7 @@ mod config_example;
 mod connectors;
 mod diagnostics;
 mod dismiss;
+mod dpapi;
 mod executors;
 mod hotkey;
 mod hotkey_conflicts;
