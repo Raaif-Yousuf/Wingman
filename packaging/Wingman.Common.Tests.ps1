@@ -693,3 +693,174 @@ Describe 'Build-Logos (issue #164)' {
         }
     }
 }
+
+# --- shared staging/pack sequence (issue #172) --------------------------------
+# install.ps1 and packaging\Build-Msix.ps1 used to copy-paste the layout
+# creation, README placeholder, manifest substitution, MakeAppx pack and
+# SignTool sign calls. Invoke-MakeAppxPack / Invoke-WingmanSignTool wrap the
+# two external-tool invocations as ordinary functions (rather than raw `&
+# $path` calls) specifically so Publish-WingmanPackage's own tests can Mock
+# them without needing a real makeappx.exe/signtool.exe; these two Describe
+# blocks separately prove the wrappers really do propagate a non-zero exit
+# code from the external tool as a throw, using tiny .cmd stubs under
+# $TestDrive instead of the real SDK tools.
+
+Describe 'Invoke-MakeAppxPack (issue #172)' {
+    It 'does not throw when the packer exits zero' {
+        $fake = Join-Path $TestDrive 'fake-makeappx-ok.cmd'
+        Set-Content -Path $fake -Encoding ascii -Value @('@echo off', 'exit /b 0')
+
+        { Invoke-MakeAppxPack -MakeAppxPath $fake -LayoutDir (Join-Path $TestDrive 'layout') `
+            -MsixPath (Join-Path $TestDrive 'out.msix') } | Should -Not -Throw
+    }
+
+    It 'throws when the packer exits non-zero' {
+        $fake = Join-Path $TestDrive 'fake-makeappx-fail.cmd'
+        Set-Content -Path $fake -Encoding ascii -Value @('@echo off', 'exit /b 1')
+
+        { Invoke-MakeAppxPack -MakeAppxPath $fake -LayoutDir (Join-Path $TestDrive 'layout') `
+            -MsixPath (Join-Path $TestDrive 'out.msix') } | Should -Throw '*makeappx failed*'
+    }
+}
+
+Describe 'Invoke-WingmanSignTool (issue #172)' {
+    It 'does not throw when signtool exits zero' {
+        $fake = Join-Path $TestDrive 'fake-signtool-ok.cmd'
+        Set-Content -Path $fake -Encoding ascii -Value @('@echo off', 'exit /b 0')
+
+        { Invoke-WingmanSignTool -SignToolPath $fake -Thumbprint 'ABC123' `
+            -TargetPath (Join-Path $TestDrive 'wingman.exe') } | Should -Not -Throw
+    }
+
+    It 'throws when signtool exits non-zero' {
+        $fake = Join-Path $TestDrive 'fake-signtool-fail.cmd'
+        Set-Content -Path $fake -Encoding ascii -Value @('@echo off', 'exit /b 1')
+
+        { Invoke-WingmanSignTool -SignToolPath $fake -Thumbprint 'ABC123' `
+            -TargetPath (Join-Path $TestDrive 'wingman.exe') } | Should -Throw '*signing*failed*'
+    }
+}
+
+Describe 'Publish-WingmanPackage (issue #172)' {
+    # The one shared staging/manifest-substitution/pack/sign sequence used by
+    # both install.ps1 (never embeds the exe -- the sparse package keeps it
+    # external -- and always has a certificate) and packaging\Build-Msix.ps1
+    # (always embeds -ExePath into the layout; a certificate is optional).
+    BeforeAll {
+        $script:id  = Get-WingmanIdentity
+        $script:sdk = [pscustomobject]@{ MakeAppx = 'unused-makeappx.exe'; SignTool = 'unused-signtool.exe' }
+        $script:cert = [pscustomobject]@{ Thumbprint = 'DEADBEEF'; Subject = 'CN=Test Signer, O=Wingman' }
+
+        $script:repo = Join-Path $TestDrive 'fake-repo'
+        New-Item -ItemType Directory -Force -Path (Join-Path $repo 'packaging') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $repo 'assets') | Out-Null
+        Set-Content -Path (Join-Path $repo 'assets\icon.ico') -Encoding ascii -Value 'not-a-real-icon'
+        Set-Content -Path (Join-Path $repo 'packaging\AppxManifest.xml.in') -Encoding utf8 -Value @'
+<Package><Identity Publisher="@PUBLISHER@" Version="@VERSION@" /></Package>
+'@
+
+        $script:builtExe = Join-Path $TestDrive 'build\wingman.exe'
+        New-Item -ItemType Directory -Force -Path (Split-Path $builtExe -Parent) | Out-Null
+        Set-Content -Path $builtExe -Encoding ascii -Value 'stub exe bytes'
+    }
+
+    BeforeEach {
+        $script:stageDir = Join-Path $TestDrive "stage-$([guid]::NewGuid())"
+        Mock -ModuleName Wingman.Common Build-Logos { }
+        Mock -ModuleName Wingman.Common Invoke-MakeAppxPack { }
+        Mock -ModuleName Wingman.Common Invoke-WingmanSignTool { }
+    }
+
+    It 'creates the layout dirs, the PublicFolder placeholder and calls Build-Logos with the real icon' {
+        Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id `
+            -Version '0.4.0.0' -ExePath $builtExe -Cert $cert | Out-Null
+
+        Test-Path (Join-Path $stageDir 'layout\Assets') | Should -BeTrue
+        Test-Path (Join-Path $stageDir 'layout\Public')  | Should -BeTrue
+        (Get-Content (Join-Path $stageDir 'layout\Public\README.txt') -Raw).TrimEnd("`r", "`n") |
+            Should -Be 'Declared by PublicFolder in the manifest. Intentionally empty.'
+
+        Should -Invoke -ModuleName Wingman.Common Build-Logos -Times 1 -ParameterFilter {
+            $IconPath -eq (Join-Path $repo 'assets\icon.ico') -and
+            $Destination -eq (Join-Path $stageDir 'layout\Assets')
+        }
+    }
+
+    It 'substitutes @VERSION@ and @PUBLISHER@ from the certificate subject when a cert is given' {
+        Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id `
+            -Version '0.4.0.0' -ExePath $builtExe -Cert $cert | Out-Null
+
+        $manifest = Get-Content (Join-Path $stageDir 'layout\AppxManifest.xml') -Raw
+        $manifest | Should -Match '0\.4\.0\.0'
+        $manifest | Should -Match ([regex]::Escape($cert.Subject))
+        $manifest | Should -Not -Match '@VERSION@'
+        $manifest | Should -Not -Match '@PUBLISHER@'
+    }
+
+    It 'falls back to the identity''s default publisher when no certificate is given' {
+        Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id `
+            -Version '0.4.0.0' -ExePath $builtExe | Out-Null
+
+        $manifest = Get-Content (Join-Path $stageDir 'layout\AppxManifest.xml') -Raw
+        $manifest | Should -Match ([regex]::Escape($id.Current.CertSubject))
+    }
+
+    It 'embeds and signs the exe when both -ExePath and -Cert are given, and returns its path' {
+        $result = Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id `
+            -Version '0.4.0.0' -ExePath $builtExe -Cert $cert
+
+        $expectedLayoutExe = Join-Path $stageDir 'layout\wingman.exe'
+        $result.LayoutExePath | Should -Be $expectedLayoutExe
+        Test-Path $expectedLayoutExe | Should -BeTrue
+
+        Should -Invoke -ModuleName Wingman.Common Invoke-WingmanSignTool -Times 1 -ParameterFilter {
+            $SignToolPath -eq $sdk.SignTool -and $Thumbprint -eq $cert.Thumbprint -and $TargetPath -eq $expectedLayoutExe
+        }
+    }
+
+    It 'never embeds an exe when -ExePath is omitted, matching install.ps1''s external sparse exe' {
+        $result = Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id `
+            -Version '0.4.0.0' -Cert $cert
+
+        $result.LayoutExePath | Should -BeNullOrEmpty
+        Test-Path (Join-Path $stageDir 'layout\wingman.exe') | Should -BeFalse
+        # Only the .msix itself gets signed -- there is no layout-embedded exe to sign.
+        Should -Invoke -ModuleName Wingman.Common Invoke-WingmanSignTool -Times 1
+    }
+
+    It 'copies the exe unsigned when -ExePath is given but no certificate is given' {
+        $result = Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id `
+            -Version '0.4.0.0' -ExePath $builtExe
+
+        Test-Path $result.LayoutExePath | Should -BeTrue
+        Should -Invoke -ModuleName Wingman.Common Invoke-WingmanSignTool -Times 0
+    }
+
+    It 'signs neither the exe nor the package when no certificate and no -ExePath are given' {
+        Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id -Version '0.4.0.0' | Out-Null
+
+        Should -Invoke -ModuleName Wingman.Common Invoke-WingmanSignTool -Times 0
+    }
+
+    It 'packs after staging and signing the exe, passing the layout dir and msix path' {
+        Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id `
+            -Version '0.4.0.0' -ExePath $builtExe -Cert $cert | Out-Null
+
+        Should -Invoke -ModuleName Wingman.Common Invoke-MakeAppxPack -Times 1 -ParameterFilter {
+            $MakeAppxPath -eq $sdk.MakeAppx -and
+            $LayoutDir -eq (Join-Path $stageDir 'layout') -and
+            $MsixPath -eq (Join-Path $stageDir 'wingman.msix')
+        }
+    }
+
+    It 'signs the .msix after packing when a certificate is given, and returns its path' {
+        $result = Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id `
+            -Version '0.4.0.0' -ExePath $builtExe -Cert $cert
+
+        $expectedMsix = Join-Path $stageDir 'wingman.msix'
+        $result.MsixPath | Should -Be $expectedMsix
+        Should -Invoke -ModuleName Wingman.Common Invoke-WingmanSignTool -Times 1 -ParameterFilter {
+            $TargetPath -eq $expectedMsix
+        }
+    }
+}

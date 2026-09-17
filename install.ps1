@@ -74,10 +74,13 @@ function Write-ConsoleLine {
 function Step($m) { Write-ConsoleLine "==> $m" -ForegroundColor Cyan }
 function Note($m) { Write-ConsoleLine "    $m" -ForegroundColor DarkGray }
 
-# --- Windows SDK tools, package logos ---------------------------------------
+# --- Windows SDK tools, package logos, staging/pack/sign -----------------------
 # Find-SdkTool and Build-Logos used to be duplicated here and in
 # packaging\Build-Msix.ps1; both now live in Wingman.Common.psm1 (issue #164)
-# so the two scripts cannot drift against each other again.
+# so the two scripts cannot drift against each other again. The staging /
+# manifest-substitution / MakeAppx pack / SignTool sign sequence itself was
+# the same duplication one level up (issue #172); it now lives there too, as
+# Publish-WingmanPackage.
 
 # --- certificate ---------------------------------------------------------
 # Deliberately not $InstallDir\wingman.cer: phase 1 (this function's caller)
@@ -201,29 +204,18 @@ Confirm-CertTrusted $cert (Join-Path $StageDir 'wingman.cer')
 Step "Signing the executable"
 # A sparse package's external executable must carry the package's signature;
 # an unsigned one is rejected at deployment time.
-& $sdk.SignTool sign /fd SHA256 /sha1 $cert.Thumbprint /s My $built | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "signing the executable failed" }
+Invoke-WingmanSignTool -SignToolPath $sdk.SignTool -Thumbprint $cert.Thumbprint -TargetPath $built
 
-# --- stage and pack ----------------------------------------------------------
+# --- stage and pack -----------------------------------------------------------
+# Shared with packaging\Build-Msix.ps1 via Publish-WingmanPackage (issue
+# #172). No -ExePath here: the sparse package never embeds wingman.exe --
+# AllowExternalContent keeps it at $InstallDir instead, unlike Build-Msix.ps1's
+# release artifact, which does. install.ps1 always has a certificate by this
+# point, so the package is always signed.
 Step "Building the package"
-New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'layout\Assets') | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'layout\Public')  | Out-Null
-
-Build-Logos -IconPath (Join-Path $Repo 'assets\icon.ico') -Destination (Join-Path $StageDir 'layout\Assets')
-# PublicFolder must exist in the package; makeappx drops empty directories.
-Set-Content -Path (Join-Path $StageDir 'layout\Public\README.txt') -Encoding utf8 `
-    -Value 'Declared by PublicFolder in the manifest. Intentionally empty.'
-
-$manifest = Get-Content (Join-Path $Repo 'packaging\AppxManifest.xml.in') -Raw
-$manifest = $manifest.Replace('@VERSION@', $version).Replace('@PUBLISHER@', $cert.Subject)
-Set-Content -Path (Join-Path $StageDir 'layout\AppxManifest.xml') -Value $manifest -Encoding utf8
-
-$msix = Join-Path $StageDir 'wingman.msix'
-& $sdk.MakeAppx pack /d (Join-Path $StageDir 'layout') /p $msix /nv /o | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
-
-& $sdk.SignTool sign /fd SHA256 /sha1 $cert.Thumbprint /s My $msix | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "signing the package failed" }
+$published = Publish-WingmanPackage -Sdk $sdk -Repo $Repo -StageDir $StageDir `
+    -Identity $Identity -Version $version -Cert $cert
+$msix = $published.MsixPath
 
 # =============================================================================
 # Phase 2 -- stop the old and current processes, register the new package,
