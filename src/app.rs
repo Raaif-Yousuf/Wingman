@@ -252,7 +252,7 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "config.toml".into());
             self.card.show_error(
-                "No API key — open Edit settings",
+                "No API key: open Edit settings",
                 &format!("Add a key under [providers.openai] or [providers.anthropic] in:\n{path}"),
             );
             return;
@@ -390,7 +390,7 @@ impl App {
         match saved {
             Ok(()) => self.card.show_answer(&format!("Bound to {name}"), "", 4, None),
             Err(e) => self.card.show_error(
-                &format!("Bound to {name} — but not saved"),
+                &format!("Bound to {name}: not saved"),
                 &format!("It will work until you quit.\n\n{e:#}"),
             ),
         }
@@ -544,7 +544,7 @@ impl App {
         match saved {
             Ok(()) => self.card.show_answer(&model, "", 3, None),
             Err(e) => self.card.show_error(
-                &format!("Using {model} — but not saved"),
+                &format!("Using {model}: not saved"),
                 &format!("It will revert when you quit.
 
 {e:#}"),
@@ -573,7 +573,7 @@ impl App {
         match saved {
             Ok(()) => self.card.show_answer(name, "", 3, None),
             Err(e) => self.card.show_error(
-                &format!("Using {name} — but not saved"),
+                &format!("Using {name}: not saved"),
                 &format!("It will revert when you quit.
 
 {e:#}"),
