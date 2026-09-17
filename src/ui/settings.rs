@@ -883,7 +883,7 @@ fn build_ui(
     ctx.create(WC_STATIC, "OpenAI API key:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     ctx.create(
         WC_EDIT,
-        &config.providers.openai.api_key,
+        &mask_key(&config.providers.openai.api_key),
         (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
         WS_EX_BORDER,
         r.x + LABEL_W,
@@ -942,7 +942,7 @@ fn build_ui(
     ctx.create(WC_STATIC, "Anthropic API key:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     ctx.create(
         WC_EDIT,
-        &config.providers.anthropic.api_key,
+        &mask_key(&config.providers.anthropic.api_key),
         (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
         WS_EX_BORDER,
         r.x + LABEL_W,
@@ -1468,6 +1468,43 @@ fn clamp_text_scale(v: f32) -> f32 {
     }
 }
 
+/// The number of trailing characters of a stored key Settings ever shows
+/// (#2). A key no longer than this is short enough that showing it in full
+/// is the same thing as showing "the last four characters".
+const KEY_VISIBLE_TAIL: usize = 4;
+
+/// Masks all but the last [`KEY_VISIBLE_TAIL`] characters of `key` with
+/// `*`. An empty key masks to an empty string, so an unset key still shows
+/// as a genuinely empty field rather than a row of stars.
+fn mask_key(key: &str) -> String {
+    let len = key.chars().count();
+    if len <= KEY_VISIBLE_TAIL {
+        return key.to_string();
+    }
+    let tail: String = key.chars().skip(len - KEY_VISIBLE_TAIL).collect();
+    format!("{}{tail}", "*".repeat(len - KEY_VISIBLE_TAIL))
+}
+
+/// Resolves what a key field should become on Save. The field is populated
+/// with `mask_key(original)`, never the real key (#2's masking), so if the
+/// user never touched it the text on Save is still exactly that mask and
+/// the real key must be carried through unchanged. Any other text --
+/// including empty, which clears the key -- is what the user actually
+/// typed and becomes the new key.
+///
+/// Known limitation: if a user's real *new* key happens to be typed exactly
+/// as `mask_key(original)` (a run of `*` followed by 4 characters that
+/// happen to match), it is indistinguishable from "untouched" and the old
+/// key survives instead. Not worth a dirty-flag/EN_CHANGE tracker for how
+/// unlikely that string is to be a real key.
+fn resolve_key_field(original: &str, form_text: &str) -> String {
+    if form_text == mask_key(original) {
+        original.to_string()
+    } else {
+        form_text.to_string()
+    }
+}
+
 /// Merges parsed form values onto a clone of `original`. Any field the form
 /// could not produce a sane value for (a blank combo selection, unparsable
 /// numeric text) falls back to the value already in `original` rather than
@@ -1477,7 +1514,8 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
 
     cfg.providers.order = order_from_choice(raw.provider_choice);
 
-    cfg.providers.openai.api_key = raw.openai_key.clone();
+    cfg.providers.openai.api_key =
+        resolve_key_field(&original.providers.openai.api_key, &raw.openai_key);
     if !raw.openai_model.trim().is_empty() {
         cfg.providers.openai.model = raw.openai_model.clone();
     }
@@ -1485,7 +1523,8 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
         cfg.providers.openai.effort = raw.openai_effort.clone();
     }
 
-    cfg.providers.anthropic.api_key = raw.anthropic_key.clone();
+    cfg.providers.anthropic.api_key =
+        resolve_key_field(&original.providers.anthropic.api_key, &raw.anthropic_key);
     if !raw.anthropic_model.trim().is_empty() {
         cfg.providers.anthropic.model = raw.anthropic_model.clone();
     }
@@ -1631,6 +1670,56 @@ mod tests {
     fn choice_from_order_defaults_to_zero_for_unknown_or_empty() {
         assert_eq!(choice_from_order(&[]), 0);
         assert_eq!(choice_from_order(&["bogus".to_string()]), 0);
+    }
+
+    // -- mask_key / resolve_key_field (#2 settings masking) ---------------
+
+    #[test]
+    fn mask_key_shows_only_the_last_four_characters() {
+        assert_eq!(mask_key("sk-abcdefgh1234"), "***********1234");
+    }
+
+    #[test]
+    fn mask_key_of_empty_key_is_empty() {
+        assert_eq!(mask_key(""), "");
+    }
+
+    #[test]
+    fn mask_key_shorter_than_the_visible_tail_is_shown_in_full() {
+        assert_eq!(mask_key("ab"), "ab");
+        assert_eq!(mask_key("abcd"), "abcd"); // exactly four
+    }
+
+    #[test]
+    fn mask_key_just_over_the_visible_tail_masks_one_character() {
+        assert_eq!(mask_key("abcde"), "*bcde");
+    }
+
+    #[test]
+    fn resolve_key_field_keeps_the_real_key_when_the_form_still_shows_the_mask() {
+        let original = "sk-abcdefgh1234";
+        let form_text = mask_key(original);
+        assert_eq!(resolve_key_field(original, &form_text), original);
+    }
+
+    #[test]
+    fn resolve_key_field_takes_the_typed_value_when_the_form_differs_from_the_mask() {
+        let original = "sk-old-key-value";
+        assert_eq!(resolve_key_field(original, "sk-new-key"), "sk-new-key");
+    }
+
+    #[test]
+    fn resolve_key_field_treats_a_cleared_field_as_a_new_empty_key() {
+        let original = "sk-old-key-value";
+        assert_eq!(resolve_key_field(original, ""), "");
+    }
+
+    #[test]
+    fn resolve_key_field_on_an_untouched_empty_key_stays_empty() {
+        // original == "" -> mask_key("") == "" -> the field's untouched
+        // text is also "", which must resolve to "", not be mistaken for
+        // an intentional clear of a key that was never set.
+        assert_eq!(resolve_key_field("", ""), "");
     }
 
     // -- build_config --------------------------------------------------
@@ -1864,6 +1953,61 @@ mod tests {
         }
         let inner = unsafe { Box::from_raw(raw) };
         drop(inner);
+    }
+
+    /// #2: the real Win32 control must never be populated with the live
+    /// key. This is the "wired to nothing" check for `mask_key` -- a unit
+    /// test on the pure function proves the math, but only building the
+    /// real control and reading its text back proves `build_ui` actually
+    /// calls it instead of the raw field.
+    #[test]
+    fn build_ui_populates_the_key_field_with_the_masked_value_not_the_real_key() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        assert!(ensure_class_registered(instance));
+        ensure_common_controls();
+
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-live-secret-should-not-appear-1234".to_string();
+
+        let title = wide_z("Wingman settings (mask test)");
+        let class_name = wide_z(CLASS_NAME);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        let font = build_font(dpi);
+        build_ui(hwnd, instance, dpi, font, &config, WIN_H_DP);
+
+        let openai_edit = get_dlg_item(hwnd, ID_OPENAI_KEY).expect("openai key field exists");
+        let shown = get_text(openai_edit);
+        assert_eq!(shown, mask_key(&config.providers.openai.api_key));
+        assert!(
+            !shown.contains("sk-live-secret-should-not-appear-1234"),
+            "the real key must never reach the control's text: {shown}"
+        );
+        assert!(shown.ends_with("1234"), "the last four characters must still be visible: {shown}");
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     }
 
     #[test]

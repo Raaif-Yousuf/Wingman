@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hotkey::Chord;
 use crate::provider::{Anthropic, Chain, OpenAi, Provider, DEFAULT_PROMPT};
+use crate::secrets::{target_name, CredManagerStore, SecretStore};
 
 /// `%APPDATA%\Wingman\config.toml`. See the design spec's "Config"
 /// section for the authoritative shape.
@@ -221,19 +222,52 @@ impl Config {
     }
 
     /// Loads the config from the well-known path, creating it from defaults
-    /// on first run. Env vars always take precedence over the file, applied
-    /// after loading.
+    /// on first run. On top of [`Config::load_from`]'s file-only load, this
+    /// also runs the Credential Manager import/hydrate step (#2) against the
+    /// real store: any live `api_key` still sitting in the file is moved
+    /// into Credential Manager and blanked on disk, then every provider's
+    /// key (freshly imported or already store-only) is read back so the
+    /// in-memory `Config` has it, before env vars get their final say. Env
+    /// vars always take precedence, applied last.
+    ///
+    /// Only this entry point touches the real store -- [`Config::load_from`]
+    /// stays store-free so tests that exercise it against a scratch path
+    /// never write a fabricated test key into the real `Wingman/<provider>`
+    /// credentials (rule 9).
     pub fn load() -> Result<Config> {
         let path = Self::path()?;
-        Self::load_from(&path)
+        let mut config = Self::load_from_file(&path)?;
+
+        let store = CredManagerStore;
+        if config.import_secrets_and_blank(&store) {
+            // Best effort, same as the "repaired" write-back below: the
+            // in-memory value is already correct even if this fails.
+            let _ = config.save_to(&path);
+        }
+        config.hydrate_secrets(&store);
+        config.apply_env_overrides();
+        Ok(config)
     }
 
-    /// Same as [`Config::load`] but against an arbitrary path — the
-    /// filesystem-touching core of `load()`, factored out so it can be
-    /// exercised in tests against a scratch directory instead of the real
-    /// `%APPDATA%`.
+    /// Same as [`Config::load`] but against an arbitrary path, and without
+    /// any Credential Manager access — the filesystem-touching core of
+    /// `load()`, factored out so it can be exercised in tests against a
+    /// scratch directory instead of the real `%APPDATA%`, with no risk of a
+    /// test key reaching the real store. Only tests call this directly
+    /// (`load()` has its own store-aware copy of this same sequence); kept
+    /// `pub` as the documented store-free entry point for exactly that use.
+    #[allow(dead_code)]
     pub fn load_from(path: &Path) -> Result<Config> {
-        let mut config = if path.exists() {
+        let mut config = Self::load_from_file(path)?;
+        config.apply_env_overrides();
+        Ok(config)
+    }
+
+    /// The file-only core shared by [`Config::load`] and
+    /// [`Config::load_from`]: parse-or-default, repair-and-write-back, or
+    /// create-from-defaults. Never touches env vars or the secret store.
+    fn load_from_file(path: &Path) -> Result<Config> {
+        if path.exists() {
             let contents = fs::read_to_string(path).unwrap_or_default();
             let (cfg, repaired) = Self::parse_reporting_repair(&contents);
             if repaired {
@@ -241,14 +275,122 @@ impl Config {
                 // failed write here is not worth failing the load over.
                 let _ = cfg.save_to(path);
             }
-            cfg
+            Ok(cfg)
         } else {
             let defaults = Config::default();
             defaults.save_to(path)?;
-            defaults
-        };
-        config.apply_env_overrides();
-        Ok(config)
+            Ok(defaults)
+        }
+    }
+
+    /// Moves any non-empty `api_key` out of `self` and into `store` (target
+    /// `Wingman/<provider>`), blanking the field here in memory. Returns
+    /// whether anything was blanked, so the caller knows whether the file
+    /// needs rewriting. Idempotent per provider: once a field is empty
+    /// (already imported, or never set), calling this again is a no-op for
+    /// it. If the store write fails, the key is left in place rather than
+    /// blanked, so the next load retries the import instead of losing it.
+    fn import_secrets_and_blank(&mut self, store: &dyn SecretStore) -> bool {
+        let mut changed = false;
+        for (provider, key) in [
+            ("openai", &mut self.providers.openai.api_key),
+            ("anthropic", &mut self.providers.anthropic.api_key),
+        ] {
+            if key.is_empty() {
+                continue;
+            }
+            if store.set(&target_name(provider), key).is_ok() {
+                key.clear();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Fills any still-empty `api_key` field from `store`. Called after
+    /// [`Config::import_secrets_and_blank`] so a freshly imported key
+    /// round-trips straight back in, and on every load so a key that lives
+    /// only in the store still reaches the providers. Never overwrites a
+    /// non-empty field (in particular, one an env override already set),
+    /// which is what keeps env vars taking precedence.
+    fn hydrate_secrets(&mut self, store: &dyn SecretStore) {
+        for (provider, key) in [
+            ("openai", &mut self.providers.openai.api_key),
+            ("anthropic", &mut self.providers.anthropic.api_key),
+        ] {
+            if key.is_empty() {
+                if let Ok(Some(secret)) = store.get(&target_name(provider)) {
+                    *key = secret;
+                }
+            }
+        }
+    }
+
+    /// The env var name each provider's key can be overridden by, mirroring
+    /// [`Config::apply_env_overrides`].
+    fn env_var_name(provider: &str) -> Option<&'static str> {
+        match provider {
+            "openai" => Some("OPENAI_API_KEY"),
+            "anthropic" => Some("ANTHROPIC_API_KEY"),
+            _ => None,
+        }
+    }
+
+    /// The save-path reconciler `Config::save` uses to keep the store in
+    /// sync with `self` before writing the (always key-free) file. Distinct
+    /// from [`Config::import_secrets_and_blank`], which is load-only and
+    /// file-sourced: by the time `save` runs, `self`'s fields already carry
+    /// live, hydrated values (or an env override, or a deliberate clear),
+    /// so this needs different rules per provider:
+    ///
+    /// - **Env-overridden** (`env_is_set` returns true for its var name):
+    ///   skipped entirely -- the store is left exactly as it was, so a
+    ///   temporary env var for one run can never become a permanent
+    ///   Credential Manager entry just because *something* called `save()`
+    ///   while it was set. The field is still blanked so the file never
+    ///   shows it.
+    /// - **Non-empty, not overridden:** written to the store; a failed
+    ///   write returns `Err` instead of leaving the key in place for the
+    ///   caller to serialize to disk (rule 7: the caller shows a failure
+    ///   card, never a silent plaintext fallback).
+    /// - **Empty, not overridden:** any existing credential is deleted.
+    ///   This is what makes clearing a key field in Settings and saving
+    ///   actually remove it -- without this, the field reaching `save()`
+    ///   empty was indistinguishable from "never had a key", the old
+    ///   credential stayed put, and the next `hydrate_secrets` silently put
+    ///   it straight back.
+    ///
+    /// `env_is_set` is injected (rather than calling `std::env::var`
+    /// directly) so tests exercise this without touching real process env.
+    fn push_secrets_to_store(
+        &mut self,
+        store: &dyn SecretStore,
+        env_is_set: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
+        for (provider, key) in [
+            ("openai", &mut self.providers.openai.api_key),
+            ("anthropic", &mut self.providers.anthropic.api_key),
+        ] {
+            let env_name =
+                Self::env_var_name(provider).expect("both providers have an env var name");
+            if env_is_set(env_name) {
+                key.clear();
+                continue;
+            }
+
+            let target = target_name(provider);
+            if key.is_empty() {
+                store
+                    .delete(&target)
+                    .with_context(|| format!("failed to delete {target} from the secret store"))?;
+            } else {
+                store
+                    .set(&target, key)
+                    .with_context(|| format!("failed to save {target} to the secret store"))?;
+                key.clear();
+            }
+        }
+        Ok(())
     }
 
     /// Parses TOML into a `Config`, falling back to defaults field-by-field
@@ -333,19 +475,42 @@ impl Config {
         }
     }
 
-    /// Writes the config to the well-known path.
+    /// Writes the config to the well-known path. Any live, non-env-sourced
+    /// `api_key` is pushed to the real Credential Manager store first (#2)
+    /// and never reaches the file -- see [`Config::push_secrets_to_store`].
+    /// This only blanks the copy that gets serialized; `self` keeps the
+    /// real key the caller already has, so e.g. `self.build_chain()` right
+    /// after `save()` still works.
+    ///
+    /// On a store failure this returns `Err` *before* touching the file, so
+    /// a transient Credential Manager error can never fall back to writing
+    /// the real key to disk (rule 7: the caller shows a failure card).
+    ///
+    /// Like [`Config::load`], only this entry point touches the real store;
+    /// [`Config::save_to`] stays store-free for the same reason
+    /// [`Config::load_from`] does (rule 9).
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
-        self.save_to(&path)
+        let mut on_disk = self.clone();
+        on_disk.push_secrets_to_store(&CredManagerStore, &|name| std::env::var(name).is_ok())?;
+        on_disk.save_to(&path)
     }
 
-    /// Same as [`Config::save`] but against an arbitrary path.
+    /// Same as [`Config::save`] but against an arbitrary path, and without
+    /// any Credential Manager access -- whatever `api_key` is already on
+    /// `self` is what gets written. Writes atomically (temp file + rename)
+    /// so a reader never observes a half-written file.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context("failed to create config directory")?;
         }
         let toml_str = toml::to_string_pretty(self).context("failed to serialize config")?;
-        fs::write(path, toml_str).context("failed to write config file")?;
+
+        let mut tmp_name = path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_name);
+        fs::write(&tmp_path, &toml_str).context("failed to write config temp file")?;
+        fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
 
         #[cfg(windows)]
         Self::restrict_acl(path);
@@ -761,5 +926,343 @@ text_scale = 0.0
         let parsed: Config = toml::from_str(&text).expect("deserialize");
         assert_eq!(parsed.providers.openai.api_key, "sk-real-secret-value");
         assert_eq!(config, parsed);
+    }
+
+    // -- #2: Credential Manager import/hydrate, against a stub store --------
+    // Uses `secrets::InMemoryStore`, never `secrets::CredManagerStore`, so
+    // these tests never touch the real `Wingman/<provider>` credentials
+    // (rule 9). `Config::load`/`Config::save` (the only real-store entry
+    // points) are not called anywhere in this module's tests.
+
+    use crate::secrets::InMemoryStore;
+
+    #[test]
+    fn import_and_blank_moves_a_live_key_into_the_store_and_blanks_the_field() {
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-legacy-in-file".to_string();
+        let store = InMemoryStore::default();
+
+        let changed = config.import_secrets_and_blank(&store);
+
+        assert!(changed, "a live key must be reported as blanked");
+        assert_eq!(
+            config.providers.openai.api_key, "",
+            "the field must be blanked in memory, not just on disk"
+        );
+        assert_eq!(
+            store.get(&target_name("openai")).unwrap().as_deref(),
+            Some("sk-legacy-in-file"),
+            "the real value must have reached the store"
+        );
+    }
+
+    #[test]
+    fn import_and_blank_against_a_temp_config_file_never_writes_the_key_to_disk() {
+        // The scenario issue #2 names directly: an upgrade finds an old
+        // config.toml with a live key on disk.
+        let path = scratch_path("secrets-import");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "[providers.openai]\napi_key = \"sk-legacy-in-file\"\n",
+        )
+        .unwrap();
+
+        let mut config = Config::load_from(&path).expect("load should succeed");
+        assert_eq!(config.providers.openai.api_key, "sk-legacy-in-file");
+
+        let store = InMemoryStore::default();
+        assert!(config.import_secrets_and_blank(&store));
+        config.save_to(&path).expect("save should succeed");
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("sk-legacy-in-file"),
+            "the real key must never reach config.toml: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("api_key = \"\""),
+            "the file must show a blank openai key: {on_disk}"
+        );
+
+        // The next load's blank-field hydrate step gets the key back from
+        // the store, exactly like `Config::load()` does after `import`.
+        let mut reloaded = Config::load_from(&path).expect("reload should succeed");
+        assert_eq!(reloaded.providers.openai.api_key, "");
+        reloaded.hydrate_secrets(&store);
+        assert_eq!(reloaded.providers.openai.api_key, "sk-legacy-in-file");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn import_and_blank_is_a_no_op_once_the_field_is_already_blank() {
+        let mut config = Config::default(); // api_key fields start empty
+        let store = InMemoryStore::default();
+
+        let changed = config.import_secrets_and_blank(&store);
+
+        assert!(!changed, "nothing to import must not be reported as a change");
+        assert_eq!(store.get(&target_name("openai")).unwrap(), None);
+        assert_eq!(store.get(&target_name("anthropic")).unwrap(), None);
+    }
+
+    #[test]
+    fn hydrate_fills_an_empty_field_from_the_store() {
+        let mut config = Config::default();
+        let store = InMemoryStore::default();
+        store
+            .set(&target_name("anthropic"), "sk-ant-from-store")
+            .unwrap();
+
+        config.hydrate_secrets(&store);
+
+        assert_eq!(config.providers.anthropic.api_key, "sk-ant-from-store");
+        assert_eq!(
+            config.providers.openai.api_key, "",
+            "a provider absent from the store must stay blank, not error"
+        );
+    }
+
+    #[test]
+    fn hydrate_never_overwrites_an_already_populated_field() {
+        // This is what keeps env-var precedence intact: `Config::load()`
+        // calls `hydrate_secrets` before `apply_env_overrides`, but if
+        // something upstream already populated the field, hydrate must
+        // leave it alone rather than clobbering it with the store's value.
+        let mut config = Config::default();
+        config.providers.openai.api_key = "already-set".to_string();
+        let store = InMemoryStore::default();
+        store.set(&target_name("openai"), "store-value").unwrap();
+
+        config.hydrate_secrets(&store);
+
+        assert_eq!(config.providers.openai.api_key, "already-set");
+    }
+
+    #[test]
+    fn env_override_wins_over_a_hydrated_store_value() {
+        // Mirrors `Config::load()`'s exact ordering: hydrate, then
+        // apply_env_overrides. "Env vars still override" (#2) means env
+        // must win even when the store has a key.
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OPENAI_API_KEY", "env-wins");
+
+        let mut config = Config::default();
+        let store = InMemoryStore::default();
+        store.set(&target_name("openai"), "store-value").unwrap();
+
+        config.hydrate_secrets(&store);
+        assert_eq!(config.providers.openai.api_key, "store-value");
+
+        config.apply_env_overrides();
+        assert_eq!(
+            config.providers.openai.api_key, "env-wins",
+            "env must win over a hydrated store value"
+        );
+
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn save_to_never_touches_the_store_only_save_does() {
+        // save_to is the store-free core `load_from`'s sibling relies on
+        // (rule 9): saving a live key through it must write that key
+        // straight to disk, unlike `Config::save()`.
+        let path = scratch_path("secrets-save-to-is-store-free");
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-goes-straight-to-disk".to_string();
+
+        config.save_to(&path).expect("save_to should succeed");
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("sk-goes-straight-to-disk"),
+            "save_to must not blank or redirect the key -- only Config::save does: {on_disk}"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_to_writes_atomically_leaving_no_temp_file_behind() {
+        let path = scratch_path("secrets-atomic-save");
+        let config = Config::default();
+
+        config.save_to(&path).expect("save_to should succeed");
+
+        assert!(path.exists());
+        let mut tmp_name = path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        assert!(
+            !PathBuf::from(tmp_name).exists(),
+            "the temp file must be renamed away, not left behind"
+        );
+
+        cleanup(&path);
+    }
+
+    // -- #2 orchestrator review: push_secrets_to_store (the save-path -----
+    // reconciler used by `Config::save`, distinct from `import_secrets_and_
+    // blank`'s load-path, file-only semantics). Never mutates real process
+    // env; the env check is an injected closure throughout.
+
+    /// A [`SecretStore`] whose `set`/`delete` always fail, to prove a save
+    /// never falls back to writing a real key to disk when the store is
+    /// unreachable.
+    struct FailingStore;
+    impl SecretStore for FailingStore {
+        fn get(&self, _target: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn set(&self, target: &str, _secret: &str) -> Result<()> {
+            anyhow::bail!("simulated Credential Manager failure writing {target}")
+        }
+        fn delete(&self, target: &str) -> Result<()> {
+            anyhow::bail!("simulated Credential Manager failure deleting {target}")
+        }
+    }
+
+    #[test]
+    fn push_secrets_to_store_deletes_the_credential_when_the_field_is_cleared() {
+        // Bug: a cleared field was silently skipped by import_secrets_and_
+        // blank (it only acts on non-empty fields), so the old credential
+        // stayed in the store and the next hydrate put it straight back.
+        let store = InMemoryStore::default();
+        store.set(&target_name("openai"), "sk-should-be-removed").unwrap();
+
+        let mut config = Config::default(); // field already resolved to "" (user cleared it)
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+
+        assert_eq!(
+            store.get(&target_name("openai")).unwrap(),
+            None,
+            "clearing the field and saving must delete the stored credential"
+        );
+    }
+
+    #[test]
+    fn clearing_a_key_and_saving_stops_the_next_hydrate_from_reviving_it() {
+        let store = InMemoryStore::default();
+        store.set(&target_name("openai"), "sk-old").unwrap();
+
+        // As if Config::load() had hydrated this key, then the user cleared
+        // the field in Settings (resolve_key_field already covers that part).
+        let mut config = Config::default();
+        config.providers.openai.api_key = String::new();
+
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+
+        let mut reloaded = Config::default();
+        reloaded.hydrate_secrets(&store);
+        assert_eq!(
+            reloaded.providers.openai.api_key, "",
+            "a deleted credential must not be revived by the next hydrate"
+        );
+    }
+
+    #[test]
+    fn push_secrets_to_store_leaves_an_untouched_key_alone() {
+        // Saving without having cleared or changed anything must not issue
+        // a spurious delete for a provider that simply has no key.
+        let store = InMemoryStore::default();
+        let mut config = Config::default();
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+        assert_eq!(store.get(&target_name("anthropic")).unwrap(), None);
+    }
+
+    #[test]
+    fn push_secrets_to_store_never_persists_an_env_sourced_key() {
+        // Bug: apply_env_overrides bakes the env value into the same field
+        // Settings saves from, so any save while the env var was set wrote
+        // that temporary value permanently into the store.
+        let store = InMemoryStore::default();
+        let mut config = Config::default();
+        config.providers.openai.api_key = "env-temporary-value".to_string();
+
+        config
+            .push_secrets_to_store(&store, &|name| name == "OPENAI_API_KEY")
+            .unwrap();
+
+        assert_eq!(
+            store.get(&target_name("openai")).unwrap(),
+            None,
+            "an env-sourced key must never reach the store"
+        );
+        assert_eq!(
+            config.providers.openai.api_key, "",
+            "the field must still be blanked before the disk write"
+        );
+    }
+
+    #[test]
+    fn push_secrets_to_store_does_not_touch_an_existing_credential_while_env_overrides_it() {
+        // A real stored key must survive a save made while a temporary env
+        // var happens to be set for an unrelated reason.
+        let store = InMemoryStore::default();
+        store.set(&target_name("openai"), "sk-permanent").unwrap();
+
+        let mut config = Config::default();
+        config.providers.openai.api_key = "env-temporary-value".to_string();
+
+        config
+            .push_secrets_to_store(&store, &|name| name == "OPENAI_API_KEY")
+            .unwrap();
+
+        assert_eq!(
+            store.get(&target_name("openai")).unwrap().as_deref(),
+            Some("sk-permanent"),
+            "an env override must not disturb an already-stored key"
+        );
+    }
+
+    #[test]
+    fn push_secrets_to_store_only_skips_the_env_overridden_provider() {
+        let store = InMemoryStore::default();
+        let mut config = Config::default();
+        config.providers.openai.api_key = "env-temporary-value".to_string();
+        config.providers.anthropic.api_key = "sk-anthropic-real".to_string();
+
+        config
+            .push_secrets_to_store(&store, &|name| name == "OPENAI_API_KEY")
+            .unwrap();
+
+        assert_eq!(store.get(&target_name("openai")).unwrap(), None);
+        assert_eq!(
+            store.get(&target_name("anthropic")).unwrap().as_deref(),
+            Some("sk-anthropic-real")
+        );
+    }
+
+    #[test]
+    fn push_secrets_to_store_errors_on_store_failure_instead_of_falling_back_to_disk() {
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-should-never-reach-disk".to_string();
+
+        let result = config.push_secrets_to_store(&FailingStore, &|_| false);
+
+        assert!(
+            result.is_err(),
+            "a store write failure must propagate, not silently succeed"
+        );
+    }
+
+    #[test]
+    fn save_like_flow_never_writes_the_file_when_the_store_write_fails() {
+        // Mirrors exactly what Config::save() does: reconcile the store,
+        // then (only on success) write the file. Proves the file-write
+        // side never runs when the store side fails, so a transient
+        // Credential Manager error can never leave a plaintext key on disk.
+        let path = scratch_path("secrets-save-failure");
+        let mut on_disk = Config::default();
+        on_disk.providers.openai.api_key = "sk-should-not-reach-disk".to_string();
+
+        let result: Result<()> = (|| {
+            on_disk.push_secrets_to_store(&FailingStore, &|_| false)?;
+            on_disk.save_to(&path)
+        })();
+
+        assert!(result.is_err());
+        assert!(!path.exists(), "the file must never be written when the store write fails");
     }
 }

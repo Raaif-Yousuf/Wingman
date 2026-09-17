@@ -9,6 +9,7 @@ mod config_example;
 mod dismiss;
 mod hotkey;
 mod provider;
+mod secrets;
 mod single_instance;
 mod ui;
 

@@ -26,12 +26,13 @@ backlog.
 In scope:
 
 - **API keys.** How they are read, stored and sent. Today: `OPENAI_API_KEY` /
-  `ANTHROPIC_API_KEY` env vars, or `api_key` in `%APPDATA%\copilot-ask\config.toml`
-  (owner-only ACL, gitignored, never committed). A bug that leaks a key into a
-  log, a crash dump, a window title or a network request to the wrong host is
-  in scope. Planned: keys move to Windows Credential Manager (issue tracked
-  in the expansion plan); until that lands, `config.toml` on disk is the
-  attack surface.
+  `ANTHROPIC_API_KEY` env vars (take precedence when set), otherwise Windows
+  Credential Manager generic credentials named `Wingman/<provider>` (issue
+  #2). `config.toml`'s own `api_key` field is always blank; a build older
+  than #2 that still has a live key there gets it imported into Credential
+  Manager and blanked on first load. A bug that leaks a key into a log, a
+  crash dump, a window title, Settings (which must show only the last four
+  characters), or a network request to the wrong host is in scope.
 - **Screen capture.** What gets screenshotted, when, and where it goes. A
   capture triggered without a key press, a capture sent to a provider other
   than the one configured, or a capture that includes more than the active
