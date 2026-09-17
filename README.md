@@ -279,6 +279,9 @@ Packaging and install internals are in the
 [packaging spec](docs/superpowers/specs/2026-09-15-packaging-and-install-design.md).
 What comes next, in full, is the
 [expansion plan](docs/superpowers/specs/2026-09-16-expansion-plan-design.md).
+Per-provider request shapes, keys and retry behaviour are in
+[`docs/providers.md`](docs/providers.md); the four modes and the Offline
+guard are in [`docs/offline.md`](docs/offline.md).
 
 ## License
 
