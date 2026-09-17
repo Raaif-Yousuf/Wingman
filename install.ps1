@@ -60,64 +60,10 @@ $RunKey     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 function Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Note($m) { Write-Host "    $m" -ForegroundColor DarkGray }
 
-# --- Windows SDK tools -------------------------------------------------------
-# makeappx and signtool are not on PATH by default; pick the newest SDK that has
-# both rather than hard-coding a version that a machine may not have.
-function Find-SdkTools {
-    $roots = @(
-        "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
-        "$env:ProgramFiles\Windows Kits\10\bin"
-    ) | Where-Object { Test-Path $_ }
-
-    foreach ($root in $roots) {
-        $vers = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match '^10\.' } |
-                Sort-Object { [version]$_.Name } -Descending
-        foreach ($v in $vers) {
-            foreach ($arch in 'x64', 'x86') {
-                $bin = Join-Path $v.FullName $arch
-                if ((Test-Path "$bin\makeappx.exe") -and (Test-Path "$bin\signtool.exe")) {
-                    return [pscustomobject]@{
-                        MakeAppx = "$bin\makeappx.exe"
-                        SignTool = "$bin\signtool.exe"
-                    }
-                }
-            }
-        }
-    }
-    throw "Windows SDK not found. makeappx.exe and signtool.exe are needed to package the app. Install the Windows SDK, or the 'MSVC v143 build tools' workload in the Visual Studio Installer."
-}
-
-# --- package logos -----------------------------------------------------------
-# Derived from assets\icon.ico rather than checked in, so the tray icon and the
-# Start menu tile can never drift apart -- change the .ico and both follow.
-# NOTE (issue #10): this still draws from the pre-rename icon.ico; a new icon
-# set is issue #10's own scope, not this rename pass.
-function Build-Logos($dest) {
-    Add-Type -AssemblyName System.Drawing
-    $ico = New-Object System.Drawing.Icon((Join-Path $Repo 'assets\icon.ico'), 256, 256)
-    $src = $ico.ToBitmap()
-    try {
-        foreach ($spec in @(
-            @{ Name = 'Square44x44Logo';   Size = 44  },
-            @{ Name = 'Square150x150Logo'; Size = 150 },
-            @{ Name = 'StoreLogo';         Size = 50  }
-        )) {
-            $bmp = New-Object System.Drawing.Bitmap($spec.Size, $spec.Size)
-            $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-            $g.PixelOffsetMode   = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-            $g.Clear([System.Drawing.Color]::Transparent)
-            $g.DrawImage($src, 0, 0, $spec.Size, $spec.Size)
-            $g.Dispose()
-            $bmp.Save((Join-Path $dest "$($spec.Name).png"), [System.Drawing.Imaging.ImageFormat]::Png)
-            $bmp.Dispose()
-        }
-    } finally {
-        $src.Dispose()
-        $ico.Dispose()
-    }
-}
+# --- Windows SDK tools, package logos ---------------------------------------
+# Find-SdkTool and Build-Logos used to be duplicated here and in
+# packaging\Build-Msix.ps1; both now live in Wingman.Common.psm1 (issue #164)
+# so the two scripts cannot drift against each other again.
 
 # --- certificate ---------------------------------------------------------
 # Deliberately not $InstallDir\wingman.cer: phase 1 (this function's caller)
@@ -217,7 +163,7 @@ function Remove-LegacyInstall {
 # touches a process, the registry, an installed package or $InstallDir, so a
 # failure anywhere in this phase leaves the machine exactly as it was found.
 # =============================================================================
-$sdk     = Find-SdkTools
+$sdk     = Find-SdkTool
 $version = ConvertTo-MsixVersion -CargoVersion (Get-CargoVersionString -CargoTomlPath (Join-Path $Repo 'Cargo.toml'))
 Note "version $version"
 Note "sdk     $(Split-Path $sdk.MakeAppx -Parent)"
@@ -249,7 +195,7 @@ Step "Building the package"
 New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'layout\Assets') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'layout\Public')  | Out-Null
 
-Build-Logos (Join-Path $StageDir 'layout\Assets')
+Build-Logos -IconPath (Join-Path $Repo 'assets\icon.ico') -Destination (Join-Path $StageDir 'layout\Assets')
 # PublicFolder must exist in the package; makeappx drops empty directories.
 Set-Content -Path (Join-Path $StageDir 'layout\Public\README.txt') -Encoding utf8 `
     -Value 'Declared by PublicFolder in the manifest. Intentionally empty.'

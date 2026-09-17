@@ -283,3 +283,109 @@ Describe 'Test-AumidBelongsToWingman' {
         Test-AumidBelongsToWingman -Aumid '' -Identity $id | Should -BeFalse
     }
 }
+
+Describe 'Find-SdkTool (issue #164: shared with packaging\Build-Msix.ps1)' {
+    # -SdkRoots is injectable specifically so this never has to depend on (or
+    # search) the real Windows Kits install on the test machine. The helper
+    # is defined in BeforeAll (not inline in the Describe body) because
+    # Pester 6 runs each It block in its own scope, which cannot see a
+    # function only defined in the Describe block's own scope.
+    BeforeAll {
+        function New-FakeSdkVersion {
+            param([string]$Root, [string]$Version, [string[]]$Arches, [bool]$Complete = $true)
+            foreach ($arch in $Arches) {
+                $bin = Join-Path $Root "$Version\$arch"
+                New-Item -ItemType Directory -Force -Path $bin | Out-Null
+                Set-Content -Path (Join-Path $bin 'makeappx.exe') -Value 'stub' -Encoding utf8
+                if ($Complete) {
+                    Set-Content -Path (Join-Path $bin 'signtool.exe') -Value 'stub' -Encoding utf8
+                }
+            }
+        }
+    }
+
+    It 'picks the newest version that has both tools' {
+        $root = Join-Path $TestDrive 'sdk-newest'
+        New-FakeSdkVersion -Root $root -Version '10.0.19041.0' -Arches @('x64')
+        New-FakeSdkVersion -Root $root -Version '10.0.22621.0' -Arches @('x64')
+
+        $tools = Find-SdkTool -SdkRoots @($root)
+        $tools.MakeAppx | Should -Be (Join-Path $root '10.0.22621.0\x64\makeappx.exe')
+        $tools.SignTool | Should -Be (Join-Path $root '10.0.22621.0\x64\signtool.exe')
+    }
+
+    It 'skips a newer version whose tools are incomplete in favor of an older complete one' {
+        $root = Join-Path $TestDrive 'sdk-incomplete'
+        New-FakeSdkVersion -Root $root -Version '10.0.19041.0' -Arches @('x64') -Complete $true
+        New-FakeSdkVersion -Root $root -Version '10.0.26100.0' -Arches @('x64') -Complete $false
+
+        $tools = Find-SdkTool -SdkRoots @($root)
+        $tools.MakeAppx | Should -Be (Join-Path $root '10.0.19041.0\x64\makeappx.exe')
+    }
+
+    It 'falls back from x64 to x86 when only x86 has both tools' {
+        $root = Join-Path $TestDrive 'sdk-x86-only'
+        New-FakeSdkVersion -Root $root -Version '10.0.22621.0' -Arches @('x86')
+
+        $tools = Find-SdkTool -SdkRoots @($root)
+        $tools.MakeAppx | Should -Be (Join-Path $root '10.0.22621.0\x86\makeappx.exe')
+    }
+
+    It 'checks a second root when the first has no usable version' {
+        $emptyRoot = Join-Path $TestDrive 'sdk-empty'
+        New-Item -ItemType Directory -Force -Path $emptyRoot | Out-Null
+        $realRoot = Join-Path $TestDrive 'sdk-real'
+        New-FakeSdkVersion -Root $realRoot -Version '10.0.22621.0' -Arches @('x64')
+
+        $tools = Find-SdkTool -SdkRoots @($emptyRoot, $realRoot)
+        $tools.MakeAppx | Should -Be (Join-Path $realRoot '10.0.22621.0\x64\makeappx.exe')
+    }
+
+    It 'throws a message naming what is missing when no root has usable tools' {
+        $root = Join-Path $TestDrive 'sdk-none'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        { Find-SdkTool -SdkRoots @($root) } | Should -Throw '*Windows SDK not found*'
+    }
+
+    It 'throws when given no roots at all (e.g. neither ProgramFiles path exists)' {
+        { Find-SdkTool -SdkRoots @() } | Should -Throw
+    }
+}
+
+Describe 'Get-LogoSpecs (issue #164)' {
+    It 'names exactly the three logos AppxManifest.xml.in references' {
+        $specs = Get-LogoSpecs
+        ($specs | Select-Object -ExpandProperty Name | Sort-Object) |
+            Should -Be @('Square150x150Logo', 'Square44x44Logo', 'StoreLogo')
+    }
+
+    It 'matches the sizes install.ps1 and Build-Msix.ps1 always rendered' {
+        $specs = Get-LogoSpecs
+        ($specs | Where-Object Name -eq 'Square44x44Logo').Size   | Should -Be 44
+        ($specs | Where-Object Name -eq 'Square150x150Logo').Size | Should -Be 150
+        ($specs | Where-Object Name -eq 'StoreLogo').Size         | Should -Be 50
+    }
+}
+
+Describe 'Build-Logos (issue #164)' {
+    It 'renders one correctly-sized PNG per Get-LogoSpecs entry from the real icon' {
+        $iconPath = Join-Path $PSScriptRoot '..\assets\icon.ico'
+        $dest = Join-Path $TestDrive 'logos'
+        New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+        Build-Logos -IconPath $iconPath -Destination $dest
+
+        foreach ($spec in Get-LogoSpecs) {
+            $pngPath = Join-Path $dest "$($spec.Name).png"
+            Test-Path $pngPath | Should -BeTrue
+            Add-Type -AssemblyName System.Drawing
+            $img = [System.Drawing.Image]::FromFile($pngPath)
+            try {
+                $img.Width  | Should -Be $spec.Size
+                $img.Height | Should -Be $spec.Size
+            } finally {
+                $img.Dispose()
+            }
+        }
+    }
+}

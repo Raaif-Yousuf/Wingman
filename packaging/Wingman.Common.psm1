@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-  Pure, machine-untouching logic shared by install.ps1 and uninstall.ps1.
+  Logic shared by install.ps1, uninstall.ps1 and packaging\Build-Msix.ps1.
 
 .DESCRIPTION
-  Everything here is a function of its parameters only -- no registry, no
-  filesystem writes, no process control, no certificate store. That is what
-  makes it possible to unit-test the naming and cleanup-planning logic with
-  Pester without ever touching this machine's real install, and it is why
+  Most of this module is pure -- a function of its parameters only: no
+  registry, no process control, no certificate store. That is what makes it
+  possible to unit-test the naming and cleanup-planning logic with Pester
+  without ever touching this machine's real install, and it is why
   install.ps1 and uninstall.ps1 both import this module rather than each
   keeping their own copy (issue #1's rename already drifted once between the
   two scripts before this module existed).
@@ -17,6 +17,16 @@
   names "what to clean up" returns BOTH unless told otherwise, so
   uninstall.ps1 clears a machine regardless of which install.ps1 last ran on
   it.
+
+  Two exceptions to "pure", added by issue #164 because install.ps1 and
+  packaging\Build-Msix.ps1 had copy-pasted them verbatim: `Find-SdkTool`
+  (read-only filesystem probing for makeappx.exe/signtool.exe, injectable via
+  -SdkRoots so Pester can point it at a fake $TestDrive layout) and
+  `Build-Logos` (draws PNGs with System.Drawing into a caller-supplied
+  -Destination). Neither touches a registry key, a process, a certificate
+  store or any path the caller did not hand it, so they are still safe for
+  both install.ps1 (a real machine) and Build-Msix.ps1 (a CI runner) to share
+  -- the "no filesystem writes" claim above is otherwise still true.
 #>
 
 Set-StrictMode -Version Latest
@@ -131,6 +141,96 @@ function Test-AumidBelongsToWingman {
     if ([string]::IsNullOrEmpty($Aumid)) { return $false }
     ($Aumid -like "$($Identity.Current.PackageName)*") -or
     ($Aumid -like "$($Identity.Legacy.PackageName)*")
+}
+
+# --- packaging build helpers (issue #164) -------------------------------------
+# Shared by install.ps1 (a real machine) and packaging\Build-Msix.ps1 (a CI
+# runner headless build). Both used to keep byte-identical copies of these two
+# functions; see the module header for why they live here despite touching a
+# (caller-supplied) filesystem path.
+
+# makeappx and signtool are not on PATH by default; pick the newest SDK that
+# has both rather than hard-coding a version a machine may not have.
+# -SdkRoots is injectable so Pester can point this at a fake $TestDrive
+# layout instead of the real Windows Kits install -- the search/selection
+# logic is what has a bug surface (version sorting, arch fallback, "nothing
+# found"), and that is now testable without a real SDK on the test machine.
+function Find-SdkTool {
+    [CmdletBinding()]
+    param(
+        [string[]]$SdkRoots = (@(
+            "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
+            "$env:ProgramFiles\Windows Kits\10\bin"
+        ) | Where-Object { Test-Path $_ })
+    )
+
+    foreach ($root in $SdkRoots) {
+        if (-not (Test-Path $root)) { continue }
+        $vers = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '^10\.' } |
+                Sort-Object { [version]$_.Name } -Descending
+        foreach ($v in $vers) {
+            foreach ($arch in 'x64', 'x86') {
+                $bin = Join-Path $v.FullName $arch
+                if ((Test-Path "$bin\makeappx.exe") -and (Test-Path "$bin\signtool.exe")) {
+                    return [pscustomobject]@{
+                        MakeAppx = "$bin\makeappx.exe"
+                        SignTool = "$bin\signtool.exe"
+                    }
+                }
+            }
+        }
+    }
+    throw "Windows SDK not found under $($SdkRoots -join ', '). makeappx.exe and signtool.exe are needed to package the app. Install the Windows SDK, or the 'MSVC v143 build tools' workload in the Visual Studio Installer -- the windows-latest GitHub Actions runner ships one already."
+}
+
+# The three MSIX logo files AppxManifest.xml.in references (Square150x150Logo
+# and Square44x44Logo in <uap:VisualElements>, StoreLogo in <Properties>).
+# Pure and separated from Build-Logos below purely so the spec/sizes list
+# itself -- the part that actually drifts when the manifest changes -- is
+# unit-testable without System.Drawing or a real .ico file.
+function Get-LogoSpecs {
+    [CmdletBinding()]
+    param()
+    @(
+        [pscustomobject]@{ Name = 'Square44x44Logo';   Size = 44  }
+        [pscustomobject]@{ Name = 'Square150x150Logo'; Size = 150 }
+        [pscustomobject]@{ Name = 'StoreLogo';         Size = 50  }
+    )
+}
+
+# Renders assets\icon.ico into the sizes Get-LogoSpecs names. Derived from the
+# .ico rather than checked in, so the tray icon and the Start menu tile can
+# never drift apart -- change the .ico and both follow.
+# NOTE (issue #10): this still draws from the pre-rename icon.ico; a new icon
+# set is issue #10's own scope.
+function Build-Logos {
+    [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
+        Justification = 'It genuinely builds a set of logos (three files, one per Get-LogoSpecs entry); a singular Build-Logo would misdescribe what one call does.')]
+    param(
+        [Parameter(Mandatory)][string]$IconPath,
+        [Parameter(Mandatory)][string]$Destination
+    )
+    Add-Type -AssemblyName System.Drawing
+    $ico = New-Object System.Drawing.Icon($IconPath, 256, 256)
+    $src = $ico.ToBitmap()
+    try {
+        foreach ($spec in Get-LogoSpecs) {
+            $bmp = New-Object System.Drawing.Bitmap($spec.Size, $spec.Size)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.PixelOffsetMode   = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+            $g.Clear([System.Drawing.Color]::Transparent)
+            $g.DrawImage($src, 0, 0, $spec.Size, $spec.Size)
+            $g.Dispose()
+            $bmp.Save((Join-Path $Destination "$($spec.Name).png"), [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+        }
+    } finally {
+        $src.Dispose()
+        $ico.Dispose()
+    }
 }
 
 # --- phase ordering (issue #165) --------------------------------------------
@@ -280,5 +380,8 @@ Export-ModuleMember -Function @(
     'Test-AumidBelongsToWingman',
     'Get-InstallPhaseOrder',
     'Get-RollbackPlan',
-    'Invoke-PackageRegistrationPhase'
+    'Invoke-PackageRegistrationPhase',
+    'Find-SdkTool',
+    'Get-LogoSpecs',
+    'Build-Logos'
 )

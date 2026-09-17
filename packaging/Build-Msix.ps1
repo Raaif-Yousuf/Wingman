@@ -14,13 +14,10 @@
   release.yml can produce an MSIX on a CI runner with no interactive session
   and no admin rights, which install.ps1's Ensure-CertTrusted step requires.
 
-  Find-SdkTools and Build-Logos are intentionally duplicated from install.ps1
-  rather than shared, because Wingman.Common.psm1 documents itself as pure,
-  machine- and filesystem-untouching logic only, and these two functions are
-  neither (one shells out to makeappx/signtool, one draws bitmaps and writes
-  PNGs). A tech-debt issue is filed proposing a third, impure shared module
-  if the two copies ever drift, the way install.ps1 and uninstall.ps1 drifted
-  once before Wingman.Common.psm1 existed (see that module's own header).
+  Find-SdkTool and Build-Logos are shared with install.ps1 via
+  Wingman.Common.psm1 (issue #164) rather than duplicated, so the two scripts
+  cannot drift the way install.ps1 and uninstall.ps1 drifted once before that
+  module existed (see its own header).
 
 .PARAMETER ExePath
   Path to the already-built release executable. Defaults to
@@ -64,62 +61,9 @@ if (-not (Test-Path $ExePath)) {
     throw "No executable at $ExePath. Run 'cargo build --release' first."
 }
 
-# --- Windows SDK tools -------------------------------------------------------
-# Duplicated from install.ps1's Find-SdkTools; see the header note above.
-function Find-SdkTools {
-    $roots = @(
-        "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
-        "$env:ProgramFiles\Windows Kits\10\bin"
-    ) | Where-Object { Test-Path $_ }
-
-    foreach ($root in $roots) {
-        $vers = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match '^10\.' } |
-                Sort-Object { [version]$_.Name } -Descending
-        foreach ($v in $vers) {
-            foreach ($arch in 'x64', 'x86') {
-                $bin = Join-Path $v.FullName $arch
-                if ((Test-Path "$bin\makeappx.exe") -and (Test-Path "$bin\signtool.exe")) {
-                    return [pscustomobject]@{
-                        MakeAppx = "$bin\makeappx.exe"
-                        SignTool = "$bin\signtool.exe"
-                    }
-                }
-            }
-        }
-    }
-    throw "Windows SDK not found. makeappx.exe and signtool.exe are needed to package the app. The windows-latest GitHub Actions runner ships one; a local build needs the 'MSVC v143 build tools' workload in the Visual Studio Installer."
-}
-
-# --- package logos -----------------------------------------------------------
-# Duplicated from install.ps1's Build-Logos; see the header note above.
-function Build-Logos($dest) {
-    Add-Type -AssemblyName System.Drawing
-    $ico = New-Object System.Drawing.Icon((Join-Path $Repo 'assets\icon.ico'), 256, 256)
-    $src = $ico.ToBitmap()
-    try {
-        foreach ($spec in @(
-            @{ Name = 'Square44x44Logo';   Size = 44  },
-            @{ Name = 'Square150x150Logo'; Size = 150 },
-            @{ Name = 'StoreLogo';         Size = 50  }
-        )) {
-            $bmp = New-Object System.Drawing.Bitmap($spec.Size, $spec.Size)
-            $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-            $g.PixelOffsetMode   = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-            $g.Clear([System.Drawing.Color]::Transparent)
-            $g.DrawImage($src, 0, 0, $spec.Size, $spec.Size)
-            $g.Dispose()
-            $bmp.Save((Join-Path $dest "$($spec.Name).png"), [System.Drawing.Imaging.ImageFormat]::Png)
-            $bmp.Dispose()
-        }
-    } finally {
-        $src.Dispose()
-        $ico.Dispose()
-    }
-}
-
-$sdk = Find-SdkTools
+# Find-SdkTool and Build-Logos live in Wingman.Common.psm1, shared with
+# install.ps1 (issue #164).
+$sdk = Find-SdkTool
 Note "sdk $(Split-Path $sdk.MakeAppx -Parent)"
 
 # --- certificate (optional) ---------------------------------------------------
@@ -145,7 +89,7 @@ if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'layout\Assets') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $StageDir 'layout\Public')  | Out-Null
 
-Build-Logos (Join-Path $StageDir 'layout\Assets')
+Build-Logos -IconPath (Join-Path $Repo 'assets\icon.ico') -Destination (Join-Path $StageDir 'layout\Assets')
 # PublicFolder must exist in the package; makeappx drops empty directories.
 Set-Content -Path (Join-Path $StageDir 'layout\Public\README.txt') -Encoding utf8 `
     -Value 'Declared by PublicFolder in the manifest. Intentionally empty.'
