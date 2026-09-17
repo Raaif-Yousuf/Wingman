@@ -9,29 +9,69 @@ tagged release.
 
 ### Added
 
-- `LICENSE` (MIT, Raaif Yousuf, 2026).
-- `README.md` rewritten for the Wingman name and positioning: separates
-  what is built (one action, cloud-only) from what is planned (the
-  Look/Propose/Confirm/Do loop, local models, executors).
-- `SECURITY.md`, `PRIVACY.md`, `CODE_OF_CONDUCT.md`.
-- `CHANGELOG.md` (this file), `THIRD_PARTY_NOTICES.md`.
+- Ollama provider: local models over `127.0.0.1:11434`, with a health check
+  that tells apart a real server from the stock Ollama tray app's CPU-only
+  respawn, model discovery (`/api/tags`, `/api/show`) with a live or
+  static-allowlist vision badge, and a GPU/CPU status line from `/api/ps`
+  (issues #13, #14, #15).
+- Gemini provider (issue #17).
+- Mode switch: Cloud / Local / Auto (default) / Offline, from the tray. Auto
+  tries Ollama first when it is up with the configured model loaded, then
+  falls back to cloud providers. Offline refuses any non-loopback network
+  call in code, enforced at the one place every provider's HTTP send goes
+  through, before a socket ever opens (issue #19; see `docs/offline.md`).
+- Pause: 1 hour / until tomorrow / until resumed, from the tray. While
+  paused the hotkey passes every chord through untouched, no capture runs,
+  and no request can start (issue #20).
+- Automatic retry: a transport error or an HTTP 5xx retries with jittered
+  exponential backoff; a 429 retries once against the server's own
+  `retry-after` delay, or shows a card naming it if the delay is too long
+  to wait on (issue #98).
+- `docs/providers.md` and `docs/offline.md` (issue #22); `PROMISES.md`
+  (issue #134); a "Why not Copilot or Recall?" comparison table in the
+  README (issue #136).
+- Wingman icon set and brand assets: tray, app and package icons replaced
+  with the wing-and-spark mark (issue #10).
+- `LICENSE` (MIT, Raaif Yousuf, 2026), `SECURITY.md`, `PRIVACY.md`,
+  `CODE_OF_CONDUCT.md`, `THIRD_PARTY_NOTICES.md`.
 - `.github/workflows/release.yml`: on a `v*` tag, builds the release exe,
-  packages the sparse MSIX headlessly via the new `packaging/Build-Msix.ps1`,
-  signs both only if the `WINGMAN_MSIX_PFX_BASE64` / `WINGMAN_MSIX_PFX_PASSWORD`
-  secrets are set, computes `SHA256SUMS`, and creates or updates the GitHub
-  release with all three (issue #8).
-- `.github/ISSUE_TEMPLATE/`: issue forms for bug reports, feature requests,
-  new actions, new providers and new connectors, plus `config.yml` (blank
-  issues off, links to Discussions and `SECURITY.md`); a pull request
-  template (`.github/pull_request_template.md`) asking for the spec link,
-  red-then-green tests, docs, `cargo deny check`, and the wired-to-nothing
-  observable (issue #11).
+  packages the sparse MSIX headlessly via `packaging/Build-Msix.ps1`, signs
+  both only if the signing secrets are set, computes `SHA256SUMS`, and
+  creates or updates the GitHub release with all three (issue #8).
+- `.github/ISSUE_TEMPLATE/` issue forms and a pull request template asking
+  for the spec link, red-then-green tests, docs, `cargo deny check`, and
+  the wired-to-nothing observable (issue #11).
 
 ### Changed
 
 - Product name: the app is now referred to as Wingman in documentation; the
   crate, binary and installed paths still say `copilot-ask` until the Phase 0
   rename (issue #1) lands.
+- Provider API keys now live in Windows Credential Manager
+  (`Wingman/<provider>`), never in `config.toml` (issue #2).
+- `install.ps1` now restarts the previous `wingman.exe` if a phase-2
+  upgrade fails, instead of leaving neither version running (issue #173),
+  and cleans up the exported `wingman.cer` signing certificate on every
+  exit path (issue #184).
+- Settings save no longer silently drops `providers.order` entries beyond
+  `openai`/`anthropic` (issue #194); `App::ask`'s readiness gate is now
+  mode-aware, so it checks the providers the active Mode would actually
+  select rather than the whole configured order (issue #192).
+- The pending card now shows before the screenshot is PNG-encoded, instead
+  of the encode step (at best compression) freezing the UI for up to a
+  second first (issue #177).
+
+### Fixed
+
+- A credential `Config::hydrate_secrets` could not read is no longer
+  deleted by the next `Config::save`; it is now reported and left alone
+  (issue #175).
+- `edit_settings` no longer swallows a `Config::save()` error silently
+  (issue #174).
+- The provider fallback chain now re-validates a schema-invalid 200
+  response against every provider in the chain, not only the first, so a
+  malformed answer from provider 1 correctly falls through to provider 2
+  (issue #176).
 
 ## [0.1.0] - unreleased
 

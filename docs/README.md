@@ -55,7 +55,9 @@ before they run. Both scripts explain the replacement in their message.
 | [superpowers/specs/2026-09-14-copilot-ask-design.md](superpowers/specs/2026-09-14-copilot-ask-design.md) | Threading model, module contracts, config shape, provider request shapes (OpenAI Responses, Anthropic Messages), capture, the GDI card, tray, hotkeys and learn mode, error handling, test plan |
 | [superpowers/specs/2026-09-15-packaging-and-install-design.md](superpowers/specs/2026-09-15-packaging-and-install-design.md) | Install layout, why sparse MSIX and not full, manifest, signing, launch semantics, the Copilot-key picker registration and the one click that cannot be scripted |
 | [superpowers/specs/2026-09-16-expansion-plan-design.md](superpowers/specs/2026-09-16-expansion-plan-design.md) | Name candidates, target architecture, extended provider trait, Ollama and OpenAI-compatible and Gemini providers, modes and the offline guard, the Quick Ask palette and actions-as-data, the no-chat rule and the settings window, the awareness engine, secrets separation, repo and CI files for GitHub, open-source sources with verified licenses, decisions owed, phased roadmap and issue map |
+| [providers.md](providers.md) | Per-provider request shapes, auth and key storage, effort/thinking mapping, structured-output mechanism, retry/429 handling, Ollama-specific facts, how to add Ollama or Gemini to `providers.order` by hand |
+| [offline.md](offline.md) | The four modes exactly as `mode.rs` implements them, what the Offline guard blocks and where, what it cannot guarantee, how to verify it with pktmon or Resource Monitor |
 
-Planned, per the expansion plan § 10: `architecture.md`, `providers.md`,
-`offline.md`, `actions.md`, and at the root `PRIVACY.md`, `SECURITY.md`,
-`CONTRIBUTING.md`, `CHANGELOG.md`, `THIRD_PARTY_NOTICES.md`.
+Planned, per the expansion plan § 10: `architecture.md`, `actions.md`, and at
+the root `PRIVACY.md`, `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`,
+`THIRD_PARTY_NOTICES.md`.

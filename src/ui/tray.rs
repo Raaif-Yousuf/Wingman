@@ -78,11 +78,13 @@ pub fn register_taskbar_created() -> u32 {
 /// Identifies our one tray icon in every `NOTIFYICONDATAW` call.
 const TRAY_ICON_ID: u32 = 1;
 
-/// Resource id an embedded icon would be loaded from, if this build actually
-/// embedded one. There is no `.rc` build step in this project, so
-/// `LoadIconW` with this id always fails at runtime and [`load_icon`] falls
-/// through to `IDI_APPLICATION` -- that fallback is the code path that
-/// actually runs and must work.
+/// Resource id of the icon `build.rs` embeds: it compiles `assets/app.rc`
+/// (`1 ICON "icon.ico"`) via `embed_resource::compile` on a Windows target,
+/// so `LoadIconW(instance, 1)` in [`load_icon`] loads that embedded
+/// `assets/icon.ico` on a real Windows build. `IDI_APPLICATION` is still the
+/// fallback [`load_icon`] uses if the load ever fails (e.g. a non-Windows
+/// build, or a corrupt resource section), and that fallback path must keep
+/// working, but it is not the path that normally runs.
 const EMBEDDED_ICON_ID: u16 = 1;
 
 pub mod cmd {
