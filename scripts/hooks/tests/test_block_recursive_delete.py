@@ -127,6 +127,61 @@ class MsysPathTranslationTests(unittest.TestCase):
         self.assertIsNotNone(m.verdict(cmd), f"not blocked: {cmd!r}")
 
 
+class QuotedProseFalsePositiveTests(unittest.TestCase):
+    """Issue #148: a bare `(` in prose, inside a quoted string such as a
+    `gh issue create --body "..."` argument, satisfies `_CMD_POS`'s
+    `[;&|\\n(]` alternation and is wrongly treated as command position, so
+    the whole sentence is blocked as if it were a real destructive command.
+    Fix must make quoted-string contents not count as command position
+    without reopening #146 (a real subshell-wrapped `rm`, or a real command
+    whose own target argument happens to be quoted, must still be caught)."""
+
+    def test_prose_paren_inside_quoted_gh_body_is_not_blocked(self):
+        target = _to_msys(INSIDE_TARGET)
+        cmd = (
+            'gh issue create --title "x" --body '
+            f'"the docstring explains (rm -rf {target} as an example) '
+            'of what not to do"'
+        )
+        self.assertIsNone(m.verdict(cmd), f"prose false-positive still blocked: {cmd!r}")
+
+    def test_prose_semicolon_inside_quoted_body_is_not_blocked(self):
+        # The separator sits BEFORE `rm` here (not after), so it is the same
+        # command-position false positive as the `(` case, just spelled with
+        # `;` instead.
+        target = _to_msys(INSIDE_TARGET)
+        cmd = (
+            'gh issue create --title "x" --body '
+            f'"first clean it up; rm -rf {target} was suggested and rejected"'
+        )
+        self.assertIsNone(m.verdict(cmd), f"prose false-positive still blocked: {cmd!r}")
+
+    def test_real_subshell_wrapped_rm_still_blocked(self):
+        # No quotes anywhere: the leading `(` really is a subshell open, not
+        # prose punctuation, and must still be caught (guards #146).
+        target = _to_msys(INSIDE_TARGET)
+        cmd = f"true && (rm -rf {target})"
+        self.assertIsNotNone(m.verdict(cmd), f"real subshell rm not blocked: {cmd!r}")
+
+    def test_real_rm_with_quoted_target_still_blocked(self):
+        # The DANGEROUS command's own target is quoted (not prose describing
+        # it). Neutralising separators inside quotes must not blank out the
+        # target text itself, or this would reopen #146 via quoting.
+        target = _to_msys(INSIDE_TARGET)
+        cmd = f'rm -rf "{target}"'
+        self.assertIsNotNone(m.verdict(cmd), f"quoted-target rm not blocked: {cmd!r}")
+
+    def test_prose_mentioning_command_outside_any_quotes_is_still_blocked(self):
+        # #148 is scoped to QUOTED prose. A bare, unquoted mention with a
+        # real command-position `(` in front of it is unchanged behaviour
+        # (still a known, documented false-positive shape outside the scope
+        # of this fix) -- this test just pins today's behaviour so a future
+        # change to this exact case is a deliberate decision, not a surprise.
+        target = _to_msys(INSIDE_TARGET)
+        cmd = f"notes: explains (rm -rf {target} as an example) done"
+        self.assertIsNotNone(m.verdict(cmd))
+
+
 class EndToEndStdinStdoutProtocolTests(unittest.TestCase):
     """Pipe realistic PreToolUse JSON through the script exactly the way
     Claude Code invokes it, and check the real exit code and stdout."""

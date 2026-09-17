@@ -20,6 +20,11 @@ WHAT IT DOES NOT BLOCK
 - `git clean`, which respects `.gitignore`.
 - Prose that merely mentions the string: the pattern requires the command in
   command position, and `cat <<EOF` heredoc BODIES are blanked before scanning.
+- Prose inside a quoted string (e.g. a `gh issue create --body "..."`
+  argument) that parenthetically quotes a dangerous command as an example: a
+  `;`, `&`, `|`, newline or `(` only counts as command position OUTSIDE
+  quotes (issue #148). A real command's own quoted target argument is not
+  affected by this.
 
 CONTRACT
 --------
@@ -69,6 +74,48 @@ A recursive delete there is not blocked.
 To discard uncommitted changes to tracked files, `git checkout -- <paths>` is
 the right tool and is not blocked. To remove untracked files with .gitignore
 respected, `git clean` is not blocked either. `cargo clean` is not blocked."""
+
+
+def _neutralize_quoted_command_separators(command: str) -> str:
+    """A shell separator character (`;`, `&`, `|`, newline, `(`) has no
+    special meaning to the shell when it sits inside a quoted string: it is
+    ordinary prose punctuation, e.g. inside a `gh issue create --body "..."`
+    argument that parenthetically quotes a dangerous command as an example
+    (issue #148). Neutralise ONLY those separator characters, and ONLY while
+    inside a quoted span (single or double quotes tracked independently,
+    honouring a backslash escape inside double quotes the way a real shell
+    would). Everything else inside the quoted span is left untouched -- in
+    particular the text of a REAL command's own quoted target argument
+    (`rm -rf "/c/Users/x"`) survives byte-for-byte, so this cannot reopen
+    #146 by letting a target hide inside quotes. A real, unquoted `(` (an
+    actual subshell) is never touched, so a real `(rm -rf ...)` is still
+    caught."""
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for ch in command:
+        if quote is not None:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\" and quote == '"':
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == quote:
+                quote = None
+                out.append(ch)
+                continue
+            if ch in ";&|(\n":
+                out.append(" ")
+                continue
+            out.append(ch)
+            continue
+        if ch in "'\"":
+            quote = ch
+        out.append(ch)
+    return "".join(out)
 
 
 def _strip_cat_heredoc_bodies(command: str) -> str:
@@ -197,6 +244,7 @@ def _is_inside_repo(target: str) -> bool:
 
 def verdict(command: str) -> str | None:
     scanned = _strip_cat_heredoc_bodies(command or "")
+    scanned = _neutralize_quoted_command_separators(scanned)
     for pattern, is_rf in ((_RM, _posix_rm_is_recursive_force),
                            (_REMOVE_ITEM, _powershell_is_recursive_force)):
         for match in pattern.finditer(scanned):
