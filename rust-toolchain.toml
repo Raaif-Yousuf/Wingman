@@ -1,0 +1,10 @@
+# Pinned per issue #137 (reproducible builds): a moving `stable` channel
+# means a runner picking up a newer compiler on a later date can produce a
+# different (still correct, but not byte-identical) binary from the same
+# source, which defeats the point of a reproducibility doc. Pinned to the
+# version installed on this machine when the pin was added (`rustc -V`);
+# bump deliberately, in the same pull request as a docs/reproducible-builds.md
+# update noting the change, not as a drive-by.
+[toolchain]
+channel = "1.98.1"
+targets = ["x86_64-pc-windows-msvc"]

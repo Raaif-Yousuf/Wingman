@@ -1,5 +1,9 @@
 target/
 config.toml
+# Not the app's config.toml above (a stray local copy of that is what this
+# repo wants to keep out) -- cargo's own build config, committed for the
+# /Brepro reproducible-build flag (issue #137, docs/reproducible-builds.md).
+!.cargo/config.toml
 *.log
 .serena/
 .claude/worktrees/

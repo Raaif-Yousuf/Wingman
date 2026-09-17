@@ -1,0 +1,24 @@
+# Deterministic linking for reproducible release builds (issue #137).
+#
+# MSVC's link.exe embeds two non-deterministic values on every link, neither
+# of which SOURCE_DATE_EPOCH or `--remap-path-prefix` touches (those are
+# rustc/source-level knobs, not link.exe's):
+#   - the PE COFF header's TimeDateStamp (the current wall-clock time), and
+#   - the CodeView debug directory's PDB GUID (random, must match the .pdb
+#     link.exe writes alongside the .exe).
+# `/Brepro` replaces both with values derived from the binary's own
+# content instead. MEASURED 2026-09-17: two clean `cargo build --release`
+# runs from two different source directories (matching SOURCE_DATE_EPOCH,
+# --locked, CARGO_INCREMENTAL=0, matching --remap-path-prefix) produced a
+# wingman.exe that differed in exactly 20 of 1,888,256 bytes, clustered at
+# the COFF timestamp and the PDB GUID; with `/Brepro` added, both builds
+# produced byte-for-byte identical output (same SHA256, same size, 0 bytes
+# differing). See docs/reproducible-builds.md for the full measurement and
+# how to reproduce it.
+#
+# Filtered `cargo test` runs were re-checked with this flag present and
+# still pass (it only changes link.exe's output, not what compiles or
+# runs); see docs/reproducible-builds.md's "What this does not affect"
+# section.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/Brepro"]
