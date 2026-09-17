@@ -73,7 +73,7 @@ impl OpenAi {
             required.push("difficulty");
         }
 
-        json!({
+        let mut body = json!({
             "model": self.model,
             "instructions": instructions,
             "input": [{"role": "user", "content": [
@@ -88,7 +88,20 @@ impl OpenAi {
                     "properties": properties,
                     "required": required, "additionalProperties": false}
             }}
-        })
+        });
+
+        // Mirrors Anthropic's `!self.effort.is_empty()` guard: an empty
+        // `effort` is a plausible hand-edit of config.toml (`effort = ""`
+        // meaning "use the default"), and the Responses API validates
+        // `reasoning.effort` against a fixed enum -- sending an empty
+        // string is a hard 400 on every request, not a no-op (#154).
+        if self.effort.trim().is_empty() {
+            body.as_object_mut()
+                .expect("body is always an object")
+                .remove("reasoning");
+        }
+
+        body
     }
 
     /// Parses a successful (2xx) OpenAI Responses API body into an `Answer`.
@@ -119,6 +132,16 @@ impl OpenAi {
         }
 
         if text.is_empty() {
+            // `status: "incomplete"` with no `message` entry means the
+            // model spent its whole output-token budget on reasoning and
+            // never got to emit the answer -- a specific, reachable shape
+            // (see `tests/fixtures/openai_response_no_message.json`), not
+            // a generic malformed response (#155).
+            if value.get("status").and_then(Value::as_str) == Some("incomplete") {
+                return Err(anyhow!(
+                    "openai: The model ran out of room before answering. Lower the effort setting or raise the token limit."
+                ));
+            }
             return Err(anyhow!("openai: no message text found in output[]"));
         }
 
@@ -310,16 +333,60 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_rejects_body_with_no_message_output() {
-        let body = fs::read_to_string("tests/fixtures/openai_response_no_message.json")
-            .expect("fixture file should exist");
-        let err = OpenAi::parse_response(&body).unwrap_err();
-        assert!(err.to_string().contains("no message text"));
-    }
-
-    #[test]
     fn parse_response_rejects_invalid_json() {
         let err = OpenAi::parse_response("not json").unwrap_err();
         assert!(err.to_string().contains("not valid JSON"));
+    }
+
+    /// #155: `openai_response_no_message.json` is `status: "incomplete"`
+    /// with only a `reasoning` entry (empty summary) and no `message` at
+    /// all -- the model spent its whole output-token budget on reasoning.
+    /// That must surface as an actionable, specific message, not the
+    /// generic "no message text found" a genuinely malformed body gets.
+    #[test]
+    fn parse_response_reports_budget_exhaustion_for_incomplete_status_with_no_message() {
+        let body = fs::read_to_string("tests/fixtures/openai_response_no_message.json")
+            .expect("fixture file should exist");
+        let err = OpenAi::parse_response(&body).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ran out of room"), "{msg}");
+        assert!(!msg.contains("no message text"), "{msg}");
+    }
+
+    /// Neighbour of the above: a body with no message and no `status:
+    /// "incomplete"` is a genuinely malformed response, not budget
+    /// exhaustion, and must keep the generic message.
+    #[test]
+    fn parse_response_rejects_body_with_no_message_and_no_incomplete_status() {
+        let body = r#"{"output": []}"#;
+        let err = OpenAi::parse_response(body).unwrap_err();
+        assert!(err.to_string().contains("no message text"));
+    }
+
+    /// #154: mirrors Anthropic's `empty_effort_is_never_sent` -- an empty
+    /// `effort` string is a plausible hand-edit of config.toml and must
+    /// never be sent verbatim (OpenAI's Responses API 400s on it).
+    #[test]
+    fn empty_effort_is_never_sent() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "");
+        let body = provider.build_body(&sample_shot(), "sys", false);
+        assert!(body.get("reasoning").is_none());
+    }
+
+    /// Neighbour: whitespace-only is the same footgun as empty.
+    #[test]
+    fn whitespace_only_effort_is_never_sent() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "   ");
+        let body = provider.build_body(&sample_shot(), "sys", false);
+        assert!(body.get("reasoning").is_none());
+    }
+
+    /// Neighbour: a real effort value must still be sent (not swallowed by
+    /// the guard).
+    #[test]
+    fn non_empty_effort_is_still_sent() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
+        let body = provider.build_body(&sample_shot(), "sys", false);
+        assert_eq!(body["reasoning"]["effort"], "low");
     }
 }

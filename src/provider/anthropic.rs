@@ -113,7 +113,9 @@ impl Anthropic {
     fn parse_response(body: &str) -> Result<Answer> {
         let value: Value = serde_json::from_str(body).context("anthropic: response body is not valid JSON")?;
 
-        if value.get("stop_reason").and_then(Value::as_str) == Some("refusal") {
+        let stop_reason = value.get("stop_reason").and_then(Value::as_str);
+
+        if stop_reason == Some("refusal") {
             return Err(anyhow!("anthropic: model refused to answer"));
         }
 
@@ -126,8 +128,23 @@ impl Anthropic {
             .iter()
             .find(|block| block.get("type").and_then(Value::as_str) == Some("text"))
             .and_then(|block| block.get("text"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("anthropic: no text block found in content[]"))?;
+            .and_then(Value::as_str);
+
+        let text = match text {
+            Some(t) => t,
+            None => {
+                // `stop_reason: "max_tokens"` with no `text` block means the
+                // model spent its whole output-token budget on thinking and
+                // never got to emit the answer -- a specific, reachable
+                // shape, not a generic malformed response (#155).
+                if stop_reason == Some("max_tokens") {
+                    return Err(anyhow!(
+                        "anthropic: The model ran out of room before answering. Lower the effort setting or raise the token limit."
+                    ));
+                }
+                return Err(anyhow!("anthropic: no text block found in content[]"));
+            }
+        };
 
         let raw: RawAnswer =
             serde_json::from_str(text).context("anthropic: text block is not a valid Answer")?;
@@ -353,6 +370,30 @@ mod tests {
             .expect("fixture file should exist");
         let err = Anthropic::parse_response(&body).unwrap_err();
         assert!(err.to_string().contains("refused"));
+    }
+
+    /// #155: `stop_reason: "max_tokens"` with only a `thinking` block and
+    /// no `text` block -- the model spent its whole output-token budget on
+    /// thinking. Must be a specific, actionable message, not the generic
+    /// "no text block found" a genuinely malformed body gets.
+    #[test]
+    fn parse_response_reports_budget_exhaustion_for_max_tokens_with_no_text() {
+        let body = fs::read_to_string("tests/fixtures/anthropic_response_max_tokens.json")
+            .expect("fixture file should exist");
+        let err = Anthropic::parse_response(&body).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ran out of room"), "{msg}");
+        assert!(!msg.contains("no text block found"), "{msg}");
+    }
+
+    /// Neighbour of the above: a missing text block with a stop_reason
+    /// other than `max_tokens` is genuinely malformed, not budget
+    /// exhaustion, and must keep the generic message.
+    #[test]
+    fn parse_response_rejects_missing_text_block_when_not_max_tokens() {
+        let body = r#"{"stop_reason": "end_turn", "content": []}"#;
+        let err = Anthropic::parse_response(body).unwrap_err();
+        assert!(err.to_string().contains("no text block found"));
     }
 
     #[test]
