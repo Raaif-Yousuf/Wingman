@@ -5,6 +5,7 @@
 //! See `docs/superpowers/specs/2026-09-17-action-model-design.md` for the
 //! rules this file implements and why.
 
+pub mod calendar;
 pub mod extract_text;
 pub mod schema;
 
@@ -193,6 +194,8 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 ///   `actions::extract_text::{capture_screen, recognize_and_copy}`) reads
 ///   this `Action` value back today, the same inert-until-its-caller-exists
 ///   status `Action::hotkey` already has.
+/// - `"add-to-calendar"` (#39, `calendar::builtin_action`): the first action
+///   that runs the full Look/Propose/Confirm/Do loop end to end.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -223,6 +226,7 @@ pub fn builtin_actions() -> Vec<Action> {
             rate_difficulty: false,
             enabled: true,
         },
+        calendar::builtin_action(),
     ]
 }
 
@@ -379,13 +383,15 @@ mod tests {
         let builtins = builtin_actions();
         assert_eq!(
             builtins.len(),
-            2,
-            "check-my-work plus extract-text-to-clipboard (#41)"
+            3,
+            "check-my-work, extract-text-to-clipboard (#41), add-to-calendar (#39)"
         );
+        // Found by id, not by position, so this stays valid regardless of
+        // what order the built-ins are in.
         let a = builtins
             .iter()
             .find(|a| a.id == DEFAULT_ACTION_ID)
-            .expect("check-my-work is built in");
+            .expect("Check my work must be a built-in action");
         assert_eq!(a.id, DEFAULT_ACTION_ID);
         assert_eq!(a.name, "Check my work");
         assert_eq!(a.group.as_deref(), Some("Study"));
@@ -568,16 +574,17 @@ not_a_real_field = true
         let mut new_action = builtin_actions()[0].clone();
         new_action.id = "translate-selection".to_string();
         new_action.name = "Translate selection".to_string();
-        let builtins = builtin_actions();
-        let builtin_count = builtins.len();
-        let merged = merge_actions(builtins, vec![new_action]);
+        let builtin_count = builtin_actions().len();
+        let merged = merge_actions(builtin_actions(), vec![new_action]);
         assert_eq!(merged.len(), builtin_count + 1);
         assert_eq!(
             merged[0].action.id, DEFAULT_ACTION_ID,
             "builtin stays first"
         );
-        let appended = merged.last().expect("at least one entry");
-        assert_eq!(appended.action.id, "translate-selection");
+        let appended = merged
+            .iter()
+            .find(|r| r.action.id == "translate-selection")
+            .expect("the new user action must be appended, not merged into a builtin");
         assert_eq!(appended.origin, Origin::User);
     }
 

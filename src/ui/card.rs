@@ -93,11 +93,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HMENU, HWND_TOPMOST, IDC_ARROW,
     NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
+
+/// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
+/// preview state (#26) closes with a decision -- "Do it" or Cancel/Esc
+/// (issue #39). Carries no payload: `App::on_preview_decided` pulls the
+/// result via [`Card::take_confirmed`], the same take-not-peek shape that
+/// method already has, so there is nothing to box across the message
+/// boundary and nothing to free even if this arrives while Settings is
+/// open and gets dropped. Adding another `WM_APP_*` constant anywhere in
+/// the crate also means adding it to `app.rs`'s `tests::ALL_WM_APP_IDS`
+/// (issue #163) and its `count_declarations` file list -- see that test's
+/// doc comment.
+pub const WM_APP_PREVIEW_DECIDED: u32 = WM_APP + 9;
 
 use crate::provider::Difficulty;
 use crate::ui::preview::{Field, PreviewModel};
@@ -173,6 +185,7 @@ impl Card {
             ex_noactivate_removed: false,
             preview: None,
             last_confirmed: None,
+            owner: None,
         });
         let raw = Box::into_raw(inner);
 
@@ -234,6 +247,14 @@ impl Card {
 
     pub fn hwnd(&self) -> HWND {
         self.inner.hwnd
+    }
+
+    /// Issue #39: tells the card which window to `PostMessageW`
+    /// [`WM_APP_PREVIEW_DECIDED`] to when a preview closes with a
+    /// decision. Call once, right after [`Card::new`] -- see `owner`'s
+    /// doc comment on [`CardInner`].
+    pub fn set_owner(&mut self, hwnd: HWND) {
+        self.inner.owner = Some(hwnd);
     }
 
     pub fn show_pending(&mut self) {
@@ -862,6 +883,15 @@ struct CardInner {
     /// unconditionally drops `PreviewUi` -- a value stored there would be
     /// destroyed before any caller could ever read it back.
     last_confirmed: Option<crate::ui::confirm::Confirmed<serde_json::Value>>,
+    /// Issue #39: the owner window [`Card::set_owner`] was told about, if
+    /// any -- `preview_do_it`/`preview_cancel` `PostMessageW`
+    /// [`WM_APP_PREVIEW_DECIDED`] here so `App::on_preview_decided` can
+    /// call [`Card::take_confirmed`] and, for "Do it", actually run an
+    /// executor. `None` until `set_owner` is called (every production
+    /// caller does so once, right after `Card::new`); a preview shown with
+    /// no owner set still works, it just has nowhere to notify -- the same
+    /// degrade `Tray`'s own best-effort Win32 calls use elsewhere.
+    owner: Option<HWND>,
 }
 
 impl CardInner {
@@ -1802,6 +1832,7 @@ impl CardInner {
         // comment on why this can't live there.
         self.last_confirmed = Some(confirmed);
         self.close_preview();
+        self.notify_owner_of_preview_decision();
     }
 
     /// "Cancel" / Esc: produces nothing (no `Confirmed` is ever built) and
@@ -1812,6 +1843,22 @@ impl CardInner {
     fn preview_cancel(&mut self) {
         self.last_confirmed = None;
         self.close_preview();
+        self.notify_owner_of_preview_decision();
+    }
+
+    /// Issue #39: the one way `CardInner` (a plain Win32 window with no
+    /// reference back to `App`, and must stay that way) tells the owner
+    /// window a preview just closed with a decision. Carries no payload
+    /// (`wparam`/`lparam` are both `0`) -- see [`WM_APP_PREVIEW_DECIDED`]'s
+    /// doc comment for why that is safe even if this message is dropped
+    /// while Settings is open. A no-op if [`Card::set_owner`] was never
+    /// called.
+    fn notify_owner_of_preview_decision(&self) {
+        if let Some(owner) = self.owner {
+            unsafe {
+                let _ = PostMessageW(Some(owner), WM_APP_PREVIEW_DECIDED, WPARAM(0), LPARAM(0));
+            }
+        }
     }
 
     /// "Edit": only reachable when `main_window_exists` was `true` at
@@ -2920,6 +2967,82 @@ mod tests {
             card.take_confirmed().is_none(),
             "Cancel must produce nothing"
         );
+    }
+
+    #[test]
+    fn preview_do_it_notifies_the_owner_window_via_wm_app_preview_decided() {
+        // Issue #39: uses the card's own hwnd as a stand-in "owner" (a
+        // self-notify) so the real observable -- a posted message sitting
+        // in a real message queue -- can be checked with PeekMessageW, the
+        // same idiom `preview_control_subclass_forwards_enter_as_a_posted_do_it_command`
+        // already uses for the same reason.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        let card_hwnd = card.hwnd();
+        unsafe {
+            SendMessageW(
+                card_hwnd,
+                WM_COMMAND,
+                Some(WPARAM(ID_PREVIEW_DO_IT as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "preview_do_it must post WM_APP_PREVIEW_DECIDED to the owner window"
+        );
+        assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn preview_cancel_also_notifies_the_owner_window() {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        let card_hwnd = card.hwnd();
+        unsafe {
+            SendMessageW(
+                card_hwnd,
+                WM_COMMAND,
+                Some(WPARAM(ID_PREVIEW_CANCEL as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "preview_cancel must also post WM_APP_PREVIEW_DECIDED (App::on_preview_decided \
+             calls take_confirmed(), which is None for Cancel -- see that method's doc comment)"
+        );
+        assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn no_owner_set_means_preview_do_it_never_panics_and_posts_nothing() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        // No `set_owner` call: `preview_do_it` must degrade quietly, same
+        // as every other best-effort Win32 call in this module.
+        card.inner.preview_do_it();
+        assert!(card.take_confirmed().is_some());
     }
 
     #[test]

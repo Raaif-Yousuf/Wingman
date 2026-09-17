@@ -43,3 +43,18 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "add-to-calendar"
+name = "Add event from screen"
+group = "Work"
+inputs = ["screen"]
+proposal = "calendar_event"
+executor = "calendar_add"
+confirm = true
+prompt = "You are shown a screenshot of the user's screen. Find the ONE calendar event described or shown on screen (an email, a chat message, an invite, a flyer, a webpage, and so on) and extract it: its title, start time, end time if one is shown, location and any short notes worth keeping. If the screen shows more than one event, pick the one that is the clear focus of the screen (e.g. an open invite or the top message), not a list entry glimpsed in the background."
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
