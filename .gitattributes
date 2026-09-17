@@ -1,2 +1,5 @@
 # Shell scripts must keep LF: bash fails on CRLF line endings.
 *.sh text eol=lf
+# Generated examples are compared byte-for-byte by drift tests; multi-line
+# TOML strings would otherwise pick up CRLF on a Windows checkout.
+*.example.toml text eol=lf
