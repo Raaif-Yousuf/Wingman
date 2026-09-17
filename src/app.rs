@@ -130,6 +130,20 @@ pub fn run() -> Result<()> {
     });
     app.refresh_tray_labels();
 
+    // issue #149: install.ps1's post-install step launches the freshly
+    // installed exe with `--settings`, expecting Settings to open so the
+    // user can enter an API key. That only happened on the *duplicate*
+    // launch path (`Instance::Already`, via `poke_existing`); a fresh
+    // install is always the *first* instance, so nothing ever read argv
+    // here and the flag was silently dropped. A bare launch (every other
+    // caller: the Copilot key, the Start Menu entry, autostart at login)
+    // must still do nothing, which is what `FirstLaunchAction::None` is for.
+    if let crate::single_instance::FirstLaunchAction::OpenSettings =
+        crate::single_instance::first_launch_action(std::env::args())
+    {
+        app.open_settings();
+    }
+
     // The hook must be installed on the thread that pumps messages — this one.
     match HotkeyHook::install(
         hwnd,
@@ -503,9 +517,9 @@ impl App {
 
         let ready = self.chain.ready_provider_names();
         let tip = if ready.is_empty() {
-            "Wingman — no API key configured".to_string()
+            "Wingman: no API key configured".to_string()
         } else {
-            format!("Wingman — {} · {primary}", ready.join(", "))
+            format!("Wingman: {} · {primary}", ready.join(", "))
         };
         self.tray.set_tooltip(&tip);
     }

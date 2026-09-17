@@ -141,6 +141,34 @@ pub fn activation_from_args<I: IntoIterator<Item = String>>(args: I) -> Activati
     }
 }
 
+/// What a FIRST launch (nothing else running yet, i.e. `Instance::First`)
+/// should do once its own window exists.
+///
+/// Deliberately not [`Activation`]: on this path "no flag" means "start
+/// normally and do nothing more" rather than "ask", because every bare
+/// first launch -- the Copilot key, the Start Menu entry, autostart at
+/// login -- must not ask unasked (CLAUDE.md: "a bare launch must not ask").
+/// Only an explicit `--settings`, as `install.ps1` passes after a fresh
+/// install, opens Settings.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FirstLaunchAction {
+    /// Start normally; every bare first launch takes this branch.
+    None,
+    /// Open Settings once the window exists.
+    OpenSettings,
+}
+
+/// Decide what a first (non-duplicate) launch's argv means, without
+/// touching Win32 so it can be unit-tested without a window to open
+/// Settings on. Shares [`activation_from_args`]'s parsing so the flag can
+/// never drift between the two paths.
+pub fn first_launch_action<I: IntoIterator<Item = String>>(args: I) -> FirstLaunchAction {
+    match activation_from_args(args) {
+        Activation::Settings => FirstLaunchAction::OpenSettings,
+        Activation::Ask => FirstLaunchAction::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +244,46 @@ mod tests {
         assert!(matches!(
             activation_from_args(args(&["--settings"])),
             Activation::Ask
+        ));
+    }
+
+    // -- issue #149: what a FIRST launch (nothing else running yet) should do
+    // once its own window exists --------------------------------------------
+
+    #[test]
+    fn a_bare_first_launch_does_nothing() {
+        // The Copilot key, the Start Menu entry and autostart at login all
+        // activate the exe with no arguments, and none of them may open
+        // Settings unasked (CLAUDE.md: "a bare launch must not ask").
+        assert!(matches!(
+            first_launch_action(args(&["wingman.exe"])),
+            FirstLaunchAction::None
+        ));
+    }
+
+    #[test]
+    fn a_first_launch_with_settings_flag_opens_settings() {
+        // What install.ps1's post-install step relies on: a fresh install's
+        // *first* process, not a duplicate poking an already-running one.
+        assert!(matches!(
+            first_launch_action(args(&["wingman.exe", "--settings"])),
+            FirstLaunchAction::OpenSettings
+        ));
+    }
+
+    #[test]
+    fn a_first_launch_with_an_unrelated_flag_does_nothing() {
+        assert!(matches!(
+            first_launch_action(args(&["wingman.exe", "--frobnicate"])),
+            FirstLaunchAction::None
+        ));
+    }
+
+    #[test]
+    fn first_launch_argv0_named_like_the_flag_is_not_mistaken_for_it() {
+        assert!(matches!(
+            first_launch_action(args(&["--settings"])),
+            FirstLaunchAction::None
         ));
     }
 }
