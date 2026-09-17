@@ -73,3 +73,6 @@ Unbounded parallel builds have frozen this machine by exhausting RAM.
   compiles safely across target dirs.
 - "Blocking waiting for file lock" is expected. Wait; do not delete locks.
 - No `cargo build --release` unless the task is about the release binary.
+- The orchestrator's merge gate is `scripts/verify-all.sh` (fmt, clippy, full
+  suite, deny, hook tests, Pester, PSScriptAnalyzer; one line per step).
+  It runs the full suite, so agents do not run it.
