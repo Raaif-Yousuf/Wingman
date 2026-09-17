@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hotkey::Chord;
 use crate::mode::Mode;
-use crate::provider::{Anthropic, Chain, Ollama, OpenAi, Provider, DEFAULT_PROMPT};
+use crate::provider::{Anthropic, Chain, Gemini, Ollama, OpenAi, Provider, DEFAULT_PROMPT};
 use crate::secrets::{target_name, CredManagerStore, SecretStore};
 
 /// Sentinel `hydrate_secrets` writes into a `ProviderConfig::api_key` field
@@ -100,6 +100,7 @@ pub struct Providers {
     pub order: Vec<String>,
     pub openai: ProviderConfig,
     pub anthropic: ProviderConfig,
+    pub gemini: ProviderConfig,
     pub ollama: OllamaConfig,
 }
 
@@ -116,6 +117,18 @@ impl Default for Providers {
             // gates Auto mode's reachability probe on, which is what keeps
             // Auto free of added latency for a user who never configured
             // Ollama (see that function's doc comment).
+            //
+            // #17: gemini is a cloud provider (same "unusable until a key
+            // is pasted in" shape as openai/anthropic), so the ollama
+            // reasoning above does not apply to it -- but it is still left
+            // out of the default order, because `ui::settings::build_config`
+            // unconditionally rebuilds `order` from a two-way openai/
+            // anthropic toggle (`order_from_choice`) on every Settings save
+            // (see the filed finding). Adding gemini here today would make
+            // it silently vanish from a fresh install's order the first
+            // time the user opens Settings and saves anything. Opt-in via a
+            // hand-edited config.toml until Settings can represent a third
+            // cloud provider (tracked against #51).
             order: vec!["openai".to_string(), "anthropic".to_string()],
             openai: ProviderConfig {
                 model: "gpt-5.5".to_string(),
@@ -144,6 +157,24 @@ impl Default for Providers {
                     "claude-opus-4-8".to_string(),
                     "claude-haiku-4-5".to_string(),
                     "claude-fable-5-1".to_string(),
+                ],
+            },
+            // #17: current Gemini vision models per
+            // https://ai.google.dev/gemini-api/docs/models (fetched
+            // 2026-09-17). `gemini-3.8-flash` is the current flagship Flash
+            // model; the rest span the 3.x line plus the still-current
+            // 2.5-series (see `provider::gemini::supports_thinking`'s doc
+            // for why the 2.5 pair don't get `thinkingConfig.thinkingLevel`).
+            gemini: ProviderConfig {
+                model: "gemini-3.8-flash".to_string(),
+                effort: "low".to_string(),
+                api_key: String::new(),
+                models: vec![
+                    "gemini-3.8-flash".to_string(),
+                    "gemini-3.1-pro-preview".to_string(),
+                    "gemini-3.5-flash".to_string(),
+                    "gemini-2.5-pro".to_string(),
+                    "gemini-2.5-flash".to_string(),
                 ],
             },
             ollama: OllamaConfig::default(),
@@ -359,6 +390,7 @@ impl Config {
         for (provider, key) in [
             ("openai", &mut self.providers.openai.api_key),
             ("anthropic", &mut self.providers.anthropic.api_key),
+            ("gemini", &mut self.providers.gemini.api_key),
         ] {
             if key.is_empty() {
                 continue;
@@ -391,6 +423,7 @@ impl Config {
         for (provider, key) in [
             ("openai", &mut self.providers.openai.api_key),
             ("anthropic", &mut self.providers.anthropic.api_key),
+            ("gemini", &mut self.providers.gemini.api_key),
         ] {
             if !key.is_empty() {
                 continue;
@@ -404,6 +437,7 @@ impl Config {
         for (provider, key) in [
             ("openai", &self.providers.openai.api_key),
             ("anthropic", &self.providers.anthropic.api_key),
+            ("gemini", &self.providers.gemini.api_key),
         ] {
             if key == UNREADABLE_KEY_MARKER {
                 self.unreadable_secrets.push(provider.to_string());
@@ -417,6 +451,7 @@ impl Config {
         match provider {
             "openai" => Some("OPENAI_API_KEY"),
             "anthropic" => Some("ANTHROPIC_API_KEY"),
+            "gemini" => Some("GEMINI_API_KEY"),
             _ => None,
         }
     }
@@ -463,9 +498,10 @@ impl Config {
         for (provider, key) in [
             ("openai", &mut self.providers.openai.api_key),
             ("anthropic", &mut self.providers.anthropic.api_key),
+            ("gemini", &mut self.providers.gemini.api_key),
         ] {
             let env_name =
-                Self::env_var_name(provider).expect("both providers have an env var name");
+                Self::env_var_name(provider).expect("every provider iterated here has an env var name");
             if env_is_set(env_name) {
                 key.clear();
                 continue;
@@ -529,6 +565,9 @@ impl Config {
         if self.providers.anthropic.models.is_empty() {
             self.providers.anthropic.models = d.anthropic.models;
         }
+        if self.providers.gemini.models.is_empty() {
+            self.providers.gemini.models = d.gemini.models;
+        }
         if self.ui.text_scale <= 0.0 {
             self.ui.text_scale = Ui::default().text_scale;
         }
@@ -569,6 +608,9 @@ impl Config {
         }
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             self.providers.anthropic.api_key = key;
+        }
+        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+            self.providers.gemini.api_key = key;
         }
     }
 
@@ -677,6 +719,11 @@ impl Providers {
                 unreadable_as_empty(&self.anthropic.api_key),
                 self.anthropic.model.clone(),
                 self.anthropic.effort.clone(),
+            ))),
+            "gemini" => Some(Box::new(Gemini::new(
+                unreadable_as_empty(&self.gemini.api_key),
+                self.gemini.model.clone(),
+                self.gemini.effort.clone(),
             ))),
             "ollama" => Some(Box::new(Ollama::new(
                 self.ollama.base_url.clone(),
@@ -950,6 +997,64 @@ model = "gpt-5.5"
         assert_eq!(cfg.mode, Mode::Auto);
     }
 
+    // -- #17: Gemini --------------------------------------------------------
+
+    #[test]
+    fn gemini_default_is_not_in_the_default_order() {
+        // Unlike openai/anthropic, gemini is not yet reachable from the
+        // Win32 settings dialog: `ui::settings::order_from_choice` only
+        // ever produces `["openai", "anthropic"]` or
+        // `["anthropic", "openai"]`, and `build_config` unconditionally
+        // overwrites `providers.order` with its result on every Settings
+        // save (see the filed finding). Putting gemini in the default order
+        // today would make it vanish the first time a user opens Settings
+        // and saves anything, even a change unrelated to providers -- so it
+        // stays opt-in, like ollama (#13), until Settings can represent a
+        // third cloud provider.
+        let config = Config::default();
+        assert!(!config.providers.order.contains(&"gemini".to_string()));
+        assert_eq!(config.providers.order, vec!["openai", "anthropic"]);
+    }
+
+    #[test]
+    fn gemini_default_has_a_model_and_a_nonempty_model_list() {
+        let config = Config::default();
+        assert_eq!(config.providers.gemini.model, "gemini-3.8-flash");
+        assert!(!config.providers.gemini.models.is_empty());
+        assert!(config.providers.gemini.models.contains(&"gemini-3.8-flash".to_string()));
+        assert_eq!(config.providers.gemini.api_key, "");
+    }
+
+    #[test]
+    fn build_chain_includes_gemini_only_when_explicitly_ordered() {
+        let mut config = Config::default();
+        config.providers.order = vec!["openai".to_string(), "gemini".to_string()];
+        config.providers.gemini.api_key = "AIza-real".to_string();
+        let chain = config.build_chain();
+        assert_eq!(chain.provider_names(), vec!["openai", "gemini"]);
+        // Gemini needs a key to be ready -- unlike ollama.
+        assert_eq!(chain.ready_provider_names(), vec!["gemini"]);
+    }
+
+    #[test]
+    fn build_chain_never_hands_the_unreadable_marker_to_gemini() {
+        let mut config = Config::default();
+        config.providers.order = vec!["gemini".to_string()];
+        config.providers.gemini.api_key = UNREADABLE_KEY_MARKER.to_string();
+        assert!(config.build_chain().ready_provider_names().is_empty());
+    }
+
+    #[test]
+    fn a_gemini_section_missing_from_an_older_config_backfills_to_defaults() {
+        let old = r#"
+[providers.openai]
+model = "gpt-5.5"
+"#;
+        let cfg = Config::parse_or_default(old);
+        assert_eq!(cfg.providers.gemini.model, "gemini-3.8-flash");
+        assert!(!cfg.providers.gemini.models.is_empty());
+    }
+
     fn mode_wire_name(m: Mode) -> &'static str {
         match m {
             Mode::Cloud => "cloud",
@@ -1006,6 +1111,59 @@ model = "gpt-5.5"
         for mode in [Mode::Cloud, Mode::Auto] {
             assert_eq!(config.providers.build_chain_for_mode(mode, true).provider_names(), unfiltered, "mode {mode:?}");
         }
+        assert_eq!(cfg.providers.gemini.model, "gemini-3.8-flash");
+        assert!(!cfg.providers.gemini.models.is_empty());
+    }
+
+    #[test]
+    fn gemini_config_from_an_older_build_gets_its_model_list_backfilled() {
+        let old = r#"
+[providers.gemini]
+model = "gemini-3.8-flash"
+api_key = "AIza-x"
+"#;
+        let cfg = Config::parse_or_default(old);
+        assert!(
+            !cfg.providers.gemini.models.is_empty(),
+            "an absent models list must be backfilled, not left empty"
+        );
+        assert_eq!(cfg.providers.gemini.api_key, "AIza-x");
+    }
+
+    #[test]
+    fn a_customized_gemini_model_list_is_never_overwritten() {
+        let custom = r#"
+[providers.gemini]
+models = ["gemini-2.5-pro"]
+"#;
+        let cfg = Config::parse_or_default(custom);
+        assert_eq!(cfg.providers.gemini.models, vec!["gemini-2.5-pro".to_string()]);
+    }
+
+    #[test]
+    fn gemini_env_var_overrides_the_file_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::set_var("GEMINI_API_KEY", "env-gemini-key");
+
+        let toml_str = r#"
+            [providers.gemini]
+            api_key = "file-gemini-key"
+        "#;
+        let mut config = Config::parse_or_default(toml_str);
+        assert_eq!(config.providers.gemini.api_key, "file-gemini-key");
+        config.apply_env_overrides();
+        assert_eq!(config.providers.gemini.api_key, "env-gemini-key");
+
+        std::env::remove_var("GEMINI_API_KEY");
+    }
+
+    #[test]
+    fn gemini_debug_format_never_contains_the_api_key() {
+        let mut config = Config::default();
+        config.providers.gemini.api_key = "AIza-real-secret-gemini".to_string();
+        let debug_output = format!("{config:?}");
+        assert!(!debug_output.contains("AIza-real-secret-gemini"), "{debug_output}");
     }
 
     #[test]
@@ -1345,6 +1503,48 @@ text_scale = 0.0
         assert_eq!(config.providers.openai.api_key, "already-set");
     }
 
+    // -- #17: Gemini secrets, against the InMemoryStore stub ----------------
+
+    #[test]
+    fn import_and_blank_moves_a_live_gemini_key_into_the_store_and_blanks_the_field() {
+        let mut config = Config::default();
+        config.providers.gemini.api_key = "AIza-legacy-in-file".to_string();
+        let store = InMemoryStore::default();
+
+        let changed = config.import_secrets_and_blank(&store);
+
+        assert!(changed);
+        assert_eq!(config.providers.gemini.api_key, "");
+        assert_eq!(
+            store.get(&target_name("gemini")).unwrap().as_deref(),
+            Some("AIza-legacy-in-file")
+        );
+    }
+
+    #[test]
+    fn hydrate_fills_an_empty_gemini_field_from_the_store() {
+        let mut config = Config::default();
+        let store = InMemoryStore::default();
+        store.set(&target_name("gemini"), "AIza-from-store").unwrap();
+
+        config.hydrate_secrets(&store);
+
+        assert_eq!(config.providers.gemini.api_key, "AIza-from-store");
+    }
+
+    #[test]
+    fn hydrate_marks_gemini_unreadable_when_the_store_get_errors() {
+        let store = InMemoryStore::default();
+        store.set(&target_name("gemini"), "AIza-really-there").unwrap();
+        store.poison(&target_name("gemini"));
+
+        let mut config = Config::default();
+        config.hydrate_secrets(&store);
+
+        assert_eq!(config.providers.gemini.api_key, UNREADABLE_KEY_MARKER);
+        assert_eq!(config.unreadable_secrets, vec!["gemini".to_string()]);
+    }
+
     // -- #175: hydrate/push must never delete a credential it could not read --
 
     #[test]
@@ -1673,6 +1873,47 @@ text_scale = 0.0
         let mut config = Config::default();
         config.push_secrets_to_store(&store, &|_| false).unwrap();
         assert_eq!(store.get(&target_name("anthropic")).unwrap(), None);
+    }
+
+    #[test]
+    fn push_secrets_to_store_saves_a_live_gemini_key() {
+        let store = InMemoryStore::default();
+        let mut config = Config::default();
+        config.providers.gemini.api_key = "AIza-brand-new".to_string();
+
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+
+        assert_eq!(
+            store.get(&target_name("gemini")).unwrap().as_deref(),
+            Some("AIza-brand-new")
+        );
+        assert_eq!(config.providers.gemini.api_key, "", "the field must be blanked before the disk write");
+    }
+
+    #[test]
+    fn push_secrets_to_store_deletes_the_gemini_credential_when_the_field_is_cleared() {
+        let store = InMemoryStore::default();
+        store.set(&target_name("gemini"), "AIza-should-be-removed").unwrap();
+        let mut config = Config::default();
+        // gemini.api_key left empty (the default) -- a deliberate clear.
+
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+
+        assert_eq!(store.get(&target_name("gemini")).unwrap(), None);
+    }
+
+    #[test]
+    fn push_secrets_to_store_never_persists_an_env_sourced_gemini_key() {
+        let store = InMemoryStore::default();
+        let mut config = Config::default();
+        config.providers.gemini.api_key = "env-temporary-value".to_string();
+
+        config
+            .push_secrets_to_store(&store, &|name| name == "GEMINI_API_KEY")
+            .unwrap();
+
+        assert_eq!(store.get(&target_name("gemini")).unwrap(), None);
+        assert_eq!(config.providers.gemini.api_key, "");
     }
 
     #[test]
