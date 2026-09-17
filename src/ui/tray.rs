@@ -44,18 +44,22 @@
 //! is required.
 
 use anyhow::{anyhow, Context, Result};
-use windows::core::{w, PCWSTR};
+use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, RegisterWindowMessageW,
-    SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION,
-    MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MIIM_FTYPE, MIIM_STATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP,
-    WM_RBUTTONUP,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
+    GetIconInfo, LoadIconW, RegisterWindowMessageW, SetForegroundWindow, SetMenuItemInfoW,
+    TrackPopupMenu, HICON, HMENU, ICONINFO, IDI_APPLICATION, MENUITEMINFOW, MFS_CHECKED,
+    MFT_RADIOCHECK, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE, MIIM_STATE,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 /// Posted by the shell to this app's window proc on tray icon activity.
@@ -98,6 +102,15 @@ pub mod cmd {
     pub const USE_OPENAI: u32 = 1009;
     /// Make Claude the active provider.
     pub const USE_ANTHROPIC: u32 = 1010;
+
+    /// Pause (issue #20): 1 hour / until tomorrow / until resumed. Shown as
+    /// a "Pause" submenu while running; see [`super::cmd::RESUME`] for the
+    /// single item shown instead while already paused.
+    pub const PAUSE_1H: u32 = 1011;
+    pub const PAUSE_UNTIL_TOMORROW: u32 = 1012;
+    pub const PAUSE_UNTIL_RESUMED: u32 = 1013;
+    /// Shown in place of the "Pause" submenu while paused.
+    pub const RESUME: u32 = 1014;
 
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
@@ -164,6 +177,19 @@ pub struct Tray {
     openai_current: Option<usize>,
     anthropic_models: Vec<String>,
     anthropic_current: Option<usize>,
+    /// The icon loaded by [`add_icon`] (embedded resource or the
+    /// `IDI_APPLICATION` fallback). `LoadIconW`'s result is a *shared*
+    /// system handle -- unlike [`greyed_icon`](Self::greyed_icon), it is
+    /// never `DestroyIcon`'d.
+    base_icon: HICON,
+    /// Lazily derived from `base_icon` the first time pausing needs it (see
+    /// [`make_greyed_icon`]). Unlike `base_icon` this HICON is *owned*
+    /// (built via `CreateIconIndirect`) and must be `DestroyIcon`'d, which
+    /// happens in [`Tray::drop`] and whenever it is rebuilt.
+    greyed_icon: Option<HICON>,
+    /// Whether the tray is currently showing the paused icon/menu. Set via
+    /// [`Tray::set_paused`].
+    paused: bool,
 }
 
 impl Tray {
@@ -173,7 +199,7 @@ impl Tray {
     /// first; `IDI_APPLICATION` is the real fallback (see
     /// [`EMBEDDED_ICON_ID`]).
     pub fn new(hwnd: HWND, instance: HINSTANCE) -> Result<Self> {
-        add_icon(hwnd, instance)?;
+        let base_icon = add_icon(hwnd, instance)?;
 
         Ok(Self {
             hwnd,
@@ -185,6 +211,9 @@ impl Tray {
             openai_current: None,
             anthropic_models: Vec::new(),
             anthropic_current: None,
+            base_icon,
+            greyed_icon: None,
+            paused: false,
         })
     }
 
@@ -194,8 +223,39 @@ impl Tray {
     /// (they were never shell-side state), but the tooltip was, so the
     /// caller should re-issue [`Tray::set_tooltip`] afterwards (`app.rs`
     /// does this by calling its existing `refresh_tray_labels`).
-    pub fn readd(&self) -> Result<()> {
-        add_icon(self.hwnd, self.instance)
+    ///
+    /// `NIM_ADD` always sets the freshly loaded *base* icon, so if the tray
+    /// was showing the greyed paused icon before Explorer restarted, this
+    /// re-applies it (dropping any stale cached `greyed_icon`, since
+    /// `base_icon` may now be a different handle).
+    pub fn readd(&mut self) -> Result<()> {
+        self.base_icon = add_icon(self.hwnd, self.instance)?;
+        if let Some(icon) = self.greyed_icon.take() {
+            let _ = unsafe { DestroyIcon(icon) };
+        }
+        if self.paused {
+            self.set_paused(true);
+        }
+        Ok(())
+    }
+
+    /// Grey (or restore) the tray icon and switch the context menu between
+    /// the "Pause" submenu and the single "Resume" item (issue #20). The
+    /// greyed icon is derived once from `base_icon` and cached; if
+    /// derivation fails (best-effort, see [`make_greyed_icon`]), the icon
+    /// stays normal-colored -- the tooltip text ("Paused...") remains the
+    /// authoritative signal either way, this is cosmetic.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        let icon = if paused {
+            if self.greyed_icon.is_none() {
+                self.greyed_icon = make_greyed_icon(self.base_icon);
+            }
+            self.greyed_icon.unwrap_or(self.base_icon)
+        } else {
+            self.base_icon
+        };
+        apply_icon(self.hwnd, icon);
     }
 
     /// Update the tooltip shown when hovering the icon (the spec: "shows the
@@ -324,6 +384,12 @@ impl Tray {
         append_item(hmenu, cmd::ASK_NOW, "Ask now")?;
         append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
         append_separator(hmenu)?;
+        if self.paused {
+            append_item(hmenu, cmd::RESUME, "Resume")?;
+        } else {
+            append_pause_submenu(hmenu)?;
+        }
+        append_separator(hmenu)?;
         append_provider_submenu(hmenu, self.active_provider_openai)?;
         append_model_submenu(
             hmenu,
@@ -364,6 +430,13 @@ impl Drop for Tray {
             ..Default::default()
         };
         let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
+
+        // `base_icon` is a shared system handle (see its doc comment) and
+        // must not be destroyed; `greyed_icon`, if ever built, is owned by
+        // this struct and must be.
+        if let Some(icon) = self.greyed_icon.take() {
+            let _ = unsafe { DestroyIcon(icon) };
+        }
     }
 }
 
@@ -437,6 +510,18 @@ fn attach_submenu_or_destroy(parent: HMENU, submenu: HMENU, text: &str) -> Resul
         let _ = unsafe { DestroyMenu(submenu) };
         return Err(e);
     }
+    Ok(())
+}
+
+/// Build the "Pause" submenu shown while running (issue #20): the three
+/// choices from the spec, in the order the spec lists them. Swapped for a
+/// single "Resume" item while already paused -- see [`Tray::build_menu`].
+fn append_pause_submenu(parent: HMENU) -> Result<()> {
+    let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
+    attach_submenu_or_destroy(parent, sub, "Pause")?;
+    append_item(sub, cmd::PAUSE_1H, "1 hour")?;
+    append_item(sub, cmd::PAUSE_UNTIL_TOMORROW, "Until tomorrow")?;
+    append_item(sub, cmd::PAUSE_UNTIL_RESUMED, "Until resumed")?;
     Ok(())
 }
 
@@ -560,7 +645,7 @@ fn set_sz_tip(dst: &mut [u16], text: &str) {
 /// [`Tray::new`] and [`Tray::readd`] so the two can never drift apart.
 /// `instance` is used to try loading an embedded icon resource first;
 /// `IDI_APPLICATION` is the real fallback (see [`EMBEDDED_ICON_ID`]).
-fn add_icon(hwnd: HWND, instance: HINSTANCE) -> Result<()> {
+fn add_icon(hwnd: HWND, instance: HINSTANCE) -> Result<HICON> {
     let icon = load_icon(instance);
 
     // Best-effort: NIM_ADD fails outright if this (hWnd, uID) pair is
@@ -599,7 +684,23 @@ fn add_icon(hwnd: HWND, instance: HINSTANCE) -> Result<()> {
     nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
     let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &nid) };
 
-    Ok(())
+    Ok(icon)
+}
+
+/// `NIM_MODIFY` just the icon (used by [`Tray::set_paused`] to swap between
+/// the normal and greyed icon without touching the tooltip or message
+/// routing). Best-effort: a failure here leaves the previous icon showing,
+/// which is the same degrade [`Tray::set_paused`] already documents.
+fn apply_icon(hwnd: HWND, icon: HICON) {
+    let nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_ICON,
+        hIcon: icon,
+        ..Default::default()
+    };
+    let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
 }
 
 /// Try the embedded resource icon first (see [`EMBEDDED_ICON_ID`]); fall
@@ -612,6 +713,121 @@ fn load_icon(instance: HINSTANCE) -> HICON {
         }
     }
     unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or(HICON(std::ptr::null_mut()))
+}
+
+/// How much of the original color/alpha survives in the paused icon (issue
+/// #20): `0.0` = fully grey and transparent, `1.0` = unchanged. See
+/// [`grey_pixel`].
+const GREY_FACTOR: f32 = 0.45;
+
+/// Desaturate and dim a single 32bpp BGRA pixel toward the "greyed out"
+/// look, blending its color toward its own luma and scaling its alpha, both
+/// by `factor`. Pure and allocation-free so the transform itself is
+/// unit-tested without touching GDI -- [`make_greyed_icon`] is the only
+/// place that reads or writes real pixel memory, and is Win32-only (checked
+/// by hand per CLAUDE.md rule 8; the manual check itself is named on issue
+/// #20's closing comment and issue #166).
+fn grey_pixel([b, g, r, a]: [u8; 4], factor: f32) -> [u8; 4] {
+    let luma = 0.114 * b as f32 + 0.587 * g as f32 + 0.299 * r as f32;
+    let mix = |c: u8| -> u8 { (luma + (c as f32 - luma) * factor).round().clamp(0.0, 255.0) as u8 };
+    let new_a = (a as f32 * factor).round().clamp(0.0, 255.0) as u8;
+    [mix(b), mix(g), mix(r), new_a]
+}
+
+/// Derive a greyed version of `icon` at runtime (issue #20) by reading its
+/// 32bpp color bitmap, desaturating and dimming every pixel with
+/// [`grey_pixel`], and building a new icon from the result plus the
+/// original (untouched) mask bitmap.
+///
+/// Returns `None` on any GDI failure; callers fall back to the normal icon
+/// -- pausing is still fully in effect either way, this is cosmetic. Cleans
+/// up every GDI object it creates or that `GetIconInfo` hands back on every
+/// path, including the early-return failure paths.
+fn make_greyed_icon(icon: HICON) -> Option<HICON> {
+    unsafe {
+        let mut info = ICONINFO::default();
+        GetIconInfo(icon, &mut info).ok()?;
+        // GetIconInfo hands back NEW bitmaps this function owns; both must
+        // be deleted on every path below, success or failure.
+        let hbm_color = info.hbmColor;
+        let hbm_mask = info.hbmMask;
+
+        let mut bmp = BITMAP::default();
+        let got_size = GetObjectW(
+            hbm_color.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bmp as *mut _ as *mut _),
+        );
+        if got_size == 0 || bmp.bmWidth <= 0 || bmp.bmHeight <= 0 {
+            let _ = DeleteObject(hbm_color.into());
+            let _ = DeleteObject(hbm_mask.into());
+            return None;
+        }
+        let (width, height) = (bmp.bmWidth, bmp.bmHeight);
+
+        let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() {
+            let _ = DeleteObject(hbm_color.into());
+            let _ = DeleteObject(hbm_mask.into());
+            return None;
+        }
+
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height, // negative: top-down, matches the loop below
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut bits_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        let color_dib = match CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
+        {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = DeleteDC(dc);
+                let _ = DeleteObject(hbm_color.into());
+                let _ = DeleteObject(hbm_mask.into());
+                return None;
+            }
+        };
+
+        let lines = GetDIBits(dc, hbm_color, 0, height as u32, Some(bits_ptr), &mut bmi, DIB_RGB_COLORS);
+        let _ = DeleteDC(dc);
+        let _ = DeleteObject(hbm_color.into());
+        if lines == 0 {
+            let _ = DeleteObject(color_dib.into());
+            let _ = DeleteObject(hbm_mask.into());
+            return None;
+        }
+
+        let pixel_count = width as usize * height as usize;
+        let pixels = std::slice::from_raw_parts_mut(bits_ptr as *mut [u8; 4], pixel_count);
+        for px in pixels.iter_mut() {
+            *px = grey_pixel(*px, GREY_FACTOR);
+        }
+
+        let new_info = ICONINFO {
+            fIcon: BOOL(1),
+            xHotspot: info.xHotspot,
+            yHotspot: info.yHotspot,
+            hbmMask: hbm_mask,
+            hbmColor: color_dib,
+        };
+        let result = CreateIconIndirect(&new_info);
+
+        // CreateIconIndirect copies the bitmaps it's given internally, so
+        // both of ours are freed here regardless of whether it succeeded.
+        let _ = DeleteObject(color_dib.into());
+        let _ = DeleteObject(hbm_mask.into());
+
+        result.ok()
+    }
 }
 
 #[cfg(test)]
@@ -658,7 +874,7 @@ mod tests {
         }
         .expect("CreateWindowExW");
 
-        let tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+        let mut tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
         // The exact scenario #145 is about: re-adding after the icon was
         // dropped (here simulated by just calling it again on the same,
         // already-added icon id -- NIM_ADD is idempotent for that case).
@@ -725,6 +941,10 @@ mod tests {
         ("OPEN_SETTINGS", cmd::OPEN_SETTINGS),
         ("USE_OPENAI", cmd::USE_OPENAI),
         ("USE_ANTHROPIC", cmd::USE_ANTHROPIC),
+        ("PAUSE_1H", cmd::PAUSE_1H),
+        ("PAUSE_UNTIL_TOMORROW", cmd::PAUSE_UNTIL_TOMORROW),
+        ("PAUSE_UNTIL_RESUMED", cmd::PAUSE_UNTIL_RESUMED),
+        ("RESUME", cmd::RESUME),
     ];
 
     #[test]
@@ -754,5 +974,120 @@ mod tests {
                 "{name} ({id}) falls inside a model submenu's dynamic id range"
             );
         }
+    }
+
+    // -- grey_pixel (issue #20's paused icon) -------------------------------
+
+    #[test]
+    fn grey_pixel_scales_alpha_by_factor() {
+        let px = grey_pixel([10, 20, 30, 200], 0.5);
+        assert_eq!(px[3], 100);
+    }
+
+    #[test]
+    fn grey_pixel_leaves_a_neutral_grey_hue_unchanged() {
+        // A pixel that is already grey (b == g == r) has luma equal to its
+        // own channel value, so mix() must return it unchanged regardless
+        // of factor -- only the alpha moves.
+        let px = grey_pixel([128, 128, 128, 255], 0.45);
+        assert_eq!(&px[..3], &[128, 128, 128]);
+    }
+
+    #[test]
+    fn grey_pixel_fully_transparent_stays_transparent() {
+        let px = grey_pixel([1, 2, 3, 0], 0.45);
+        assert_eq!(px[3], 0);
+    }
+
+    #[test]
+    fn grey_pixel_factor_one_is_identity() {
+        let px = grey_pixel([10, 20, 30, 255], 1.0);
+        assert_eq!(px, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn grey_pixel_factor_zero_is_pure_luma_and_transparent() {
+        let px = grey_pixel([10, 20, 30, 255], 0.0);
+        assert_eq!(px[3], 0);
+        assert_eq!(px[0], px[1]);
+        assert_eq!(px[1], px[2]);
+    }
+
+    #[test]
+    fn grey_pixel_desaturates_a_saturated_color_toward_its_luma() {
+        // A saturated red should move toward grey, not stay saturated: the
+        // green/blue channels rise from 0 while red falls from 255, both
+        // toward the same luma value.
+        let px = grey_pixel([0, 0, 255, 255], GREY_FACTOR);
+        assert!(px[0] > 0, "blue should rise toward luma, got {}", px[0]);
+        assert!(px[1] > 0, "green should rise toward luma, got {}", px[1]);
+        assert!(px[2] < 255, "red should fall toward luma, got {}", px[2]);
+    }
+
+    // -- make_greyed_icon / Tray::set_paused, against real GDI (issue #20) --
+    //
+    // These exercise the actual Win32 path (not just the pure pixel
+    // transform above), in the same spirit as `tray_new_then_readd_...`
+    // above: this sandbox does have a real desktop session, so it is worth
+    // proving the GDI calls succeed and clean up rather than only asserting
+    // that on paper. Whether the result *looks* right in a live tray is
+    // still a named manual check (issue #20's closing comment / issue
+    // #166), not something a test can see.
+
+    #[test]
+    fn make_greyed_icon_succeeds_against_a_real_icon() {
+        let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }.expect("LoadIconW(IDI_APPLICATION)");
+        let grey = make_greyed_icon(icon);
+        assert!(
+            grey.is_some(),
+            "make_greyed_icon should derive a greyed icon from a real system icon"
+        );
+        if let Some(g) = grey {
+            let _ = unsafe { DestroyIcon(g) };
+        }
+    }
+
+    #[test]
+    fn tray_set_paused_derives_and_caches_the_greyed_icon_against_a_real_window() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, CW_USEDEFAULT, WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray pause test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let mut tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+        assert!(!tray.paused);
+
+        tray.set_paused(true);
+        assert!(tray.paused);
+        assert!(
+            tray.greyed_icon.is_some(),
+            "set_paused(true) should have derived and cached a greyed icon"
+        );
+
+        tray.set_paused(false);
+        assert!(!tray.paused);
+
+        drop(tray); // Drop must DestroyIcon(greyed_icon) without panicking.
+        let _ = unsafe { DestroyWindow(hwnd) };
     }
 }

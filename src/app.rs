@@ -8,21 +8,27 @@
 //! exclusively by `PostMessageW`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{FILETIME, HINSTANCE, HWND, LPARAM, LRESULT, SYSTEMTIME, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::Time::{
+    FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime,
+    TzSpecificLocalTimeToSystemTime,
+};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, TranslateMessage,
-    CW_USEDEFAULT, GWLP_USERDATA, MSG, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_DESTROY,
-    WM_NCCREATE, WNDCLASSEXW, WS_OVERLAPPED,
+    GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW,
+    TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, MSG, PBT_APMRESUMEAUTOMATIC, SW_SHOWNORMAL,
+    WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST, WM_TIMECHANGE, WM_TIMER,
+    WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use crate::capture;
@@ -31,6 +37,7 @@ use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::hotkey::{
     chord_to_string, Chord, HotkeyHook, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
 };
+use crate::pause::{self, PauseChoice, PauseState};
 use crate::provider::{parse_answer, physics_request, Answer, Chain, Shot};
 use crate::ui::card::Card;
 use crate::ui::settings;
@@ -56,6 +63,12 @@ const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 /// can end up inside the screenshot we send to the model.
 const CARD_SETTLE_MS: u64 = 60;
 
+/// `SetTimer`'s `nIDEvent` for the one-shot pause-expiry timer (issue #20).
+/// Killed as soon as it fires (turning it into a genuine one-shot -- a bare
+/// `SetTimer` would otherwise repeat forever, rule 5) or whenever pausing is
+/// re-armed or cancelled.
+const PAUSE_TIMER_ID: usize = 1;
+
 struct App {
     /// Kept so the settings window can be created on demand.
     instance: HINSTANCE,
@@ -77,6 +90,9 @@ struct App {
     /// A request is in flight; further triggers are ignored until it lands.
     busy: bool,
     last: Option<Answer>,
+    /// Pause (issue #20). Not persisted across restart -- a restart is an
+    /// explicit resume (see `pause.rs`'s module doc).
+    pause: PauseState,
 }
 
 pub fn run() -> Result<()> {
@@ -146,6 +162,7 @@ pub fn run() -> Result<()> {
         watcher: None,
         busy: false,
         last: None,
+        pause: PauseState::Running,
     });
     app.refresh_tray_labels();
 
@@ -237,6 +254,18 @@ impl App {
     /// message loop stays responsive during the call.
     fn ask(&mut self) {
         if self.busy {
+            return;
+        }
+
+        // Pause (issue #20): no network request may start while paused.
+        // The hotkey path never reaches here at all while paused (the hook
+        // in hotkey.rs passes the chord through before ever posting
+        // WM_APP_HOTKEY), so this guard exists for the other entry points --
+        // the tray's "Ask now" and a second Copilot-key launch
+        // (WM_APP_ACTIVATE) -- which don't go through the hook.
+        if pause::is_paused_now() {
+            self.card
+                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
             return;
         }
 
@@ -424,10 +453,10 @@ impl App {
     /// aliasing hazard, not just a logic bug). Every piece of state that a
     /// reentrant call needs to read or write therefore lives in a
     /// thread-local, not on `App`: `SETTINGS_OPEN` itself, `PENDING_RESULT`
-    /// (a worker's answer that arrived mid-edit) and
-    /// `TASKBAR_RECREATED_WHILE_SETTINGS`. All three are only touched here,
-    /// immediately before and after `show_modal`, when no reentrant call can
-    /// possibly be in flight.
+    /// (a worker's answer that arrived mid-edit),
+    /// `TASKBAR_RECREATED_WHILE_SETTINGS`, and `PAUSE_REEVALUATE_PENDING`
+    /// (issue #20). All four are only touched here, immediately before and
+    /// after `show_modal`, when no reentrant call can possibly be in flight.
     fn open_settings(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
@@ -442,6 +471,9 @@ impl App {
         let taskbar_recreated = TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false));
         if taskbar_recreated {
             self.on_taskbar_created();
+        }
+        if PAUSE_REEVALUATE_PENDING.with(|c| c.replace(false)) {
+            self.reevaluate_pause(self.hwnd());
         }
 
         let Some(edited) = edited else {
@@ -599,6 +631,22 @@ impl App {
             &p.anthropic.model,
         );
 
+        self.update_tooltip();
+    }
+
+    /// Set the tray tooltip for the current state: the pause text while
+    /// paused (issue #20), otherwise the normal "ready providers" summary
+    /// `refresh_tray_labels` always showed. Split out so pausing/resuming
+    /// can update just the tooltip without touching the key-binding labels
+    /// or model submenus, which haven't changed.
+    fn update_tooltip(&mut self) {
+        if let PauseState::Paused { choice, until } = self.pause {
+            let hour_min = until.and_then(local_hour_min);
+            self.tray.set_tooltip(&pause::tooltip_text(choice, hour_min));
+            return;
+        }
+
+        let primary = chord_to_string(&self.config.hotkeys.primary);
         let ready = self.chain.ready_provider_names();
         let tip = if ready.is_empty() {
             "Wingman: no API key configured".to_string()
@@ -606,6 +654,97 @@ impl App {
             format!("Wingman: {} · {primary}", ready.join(", "))
         };
         self.tray.set_tooltip(&tip);
+    }
+
+    /// Enter Pause for `choice` (issue #20): compute the deadline, publish
+    /// it to the lock-free flag the hook reads (`pause::set_paused`), arm
+    /// the one-shot expiry timer if there is a deadline, grey the tray icon,
+    /// and switch the tooltip.
+    ///
+    /// Deliberately does not cancel an in-flight request: the guard in
+    /// `ask` stops the *next* request from starting, it does not abort one
+    /// already running.
+    fn pause_for(&mut self, choice: PauseChoice) {
+        let now = SystemTime::now();
+        let until = match choice {
+            PauseChoice::OneHour => Some(pause::deadline_one_hour(now)),
+            PauseChoice::UntilTomorrow => match deadline_until_tomorrow() {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    self.card.show_error(
+                        "Couldn't compute tomorrow's pause deadline",
+                        &format!("{e:#}"),
+                    );
+                    return;
+                }
+            },
+            PauseChoice::UntilResumed => None,
+        };
+
+        self.pause = PauseState::Paused { choice, until };
+        pause::set_paused(until);
+
+        let hwnd = self.hwnd();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), PAUSE_TIMER_ID);
+        }
+        if let Some(t) = until {
+            arm_pause_timer(hwnd, t, now);
+        }
+
+        self.tray.set_paused(true);
+        self.card.hide();
+        self.set_watch(false);
+        self.update_tooltip();
+    }
+
+    /// Leave Pause (issue #20), whether from the "Resume" menu item or
+    /// because a deadline was reached ([`App::reevaluate_pause`]).
+    fn resume(&mut self) {
+        self.pause = PauseState::Running;
+        pause::set_running();
+        let hwnd = self.hwnd();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), PAUSE_TIMER_ID);
+        }
+        self.tray.set_paused(false);
+        self.update_tooltip();
+    }
+
+    /// `WM_TIMER` fired for [`PAUSE_TIMER_ID`]. `SetTimer` without a
+    /// `TIMERPROC` keeps re-posting `WM_TIMER` at the same interval until
+    /// `KillTimer` is called (rule 5: never a polling timer), so the very
+    /// first thing this does is kill it -- turning it into a genuine
+    /// one-shot -- before re-checking the deadline against the wall clock.
+    fn on_pause_timer(&mut self, hwnd: HWND) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), PAUSE_TIMER_ID);
+        }
+        self.reevaluate_pause(hwnd);
+    }
+
+    /// Re-check the pause deadline against the wall clock. Called when the
+    /// timer fires, and once on wake (`WM_POWERBROADCAST` /
+    /// `PBT_APMRESUMEAUTOMATIC`) and on `WM_TIMECHANGE`: a `SetTimer` does
+    /// not run during sleep, so the deadline may already have passed by the
+    /// time the machine wakes, and a manual clock change can move the
+    /// deadline without ever posting `WM_TIMER` at all. If the deadline
+    /// has passed, resume; otherwise re-arm the timer for the corrected
+    /// remaining delay (guards against both of those cases leaving a stale
+    /// timer behind).
+    fn reevaluate_pause(&mut self, hwnd: HWND) {
+        if let PauseState::Paused { until: Some(t), .. } = self.pause {
+            let now = SystemTime::now();
+            if self.pause.is_paused(now) {
+                arm_pause_timer(hwnd, t, now);
+            } else {
+                self.resume();
+            }
+        }
+    }
+
+    fn hwnd(&self) -> HWND {
+        HWND(self.hwnd_isize() as *mut _)
     }
 
     /// Handle the shell's `TaskbarCreated` broadcast (Explorer crashed or
@@ -672,6 +811,96 @@ fn worker(chain: &Chain, shot: &Shot, prompt: &str, want_difficulty: bool) -> Re
     parse_answer(&completion.text)
 }
 
+/// FILETIME's epoch (1601-01-01 UTC) precedes the Unix epoch (1970-01-01
+/// UTC) by this many seconds -- the well-known constant for converting
+/// between the two.
+const FILETIME_TO_UNIX_EPOCH_SECS: i64 = 11_644_473_600;
+
+/// Compute the deadline for [`PauseChoice::UntilTomorrow`] (issue #20):
+/// today's local date, plus one day ([`pause::next_day`], the pure part),
+/// at local midnight, converted to a wall-clock instant via Win32's
+/// timezone-aware `TzSpecificLocalTimeToSystemTime` -- which is what makes
+/// this DST-correct (a fixed 24h offset would land an hour off across a
+/// spring-forward or fall-back transition). Chosen as local midnight rather
+/// than a fixed hour like 06:00 because it is the least surprising reading
+/// of "until tomorrow" and needs no extra config.
+fn deadline_until_tomorrow() -> Result<SystemTime> {
+    let local_now = unsafe { GetLocalTime() };
+    let today = pause::LocalDate {
+        year: local_now.wYear as i32,
+        month: local_now.wMonth as u8,
+        day: local_now.wDay as u8,
+    };
+    let tomorrow = pause::next_day(today);
+
+    let local_midnight = SYSTEMTIME {
+        wYear: tomorrow.year as u16,
+        wMonth: tomorrow.month as u16,
+        wDay: tomorrow.day as u16,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+        wDayOfWeek: 0,
+    };
+    let mut utc = SYSTEMTIME::default();
+    unsafe { TzSpecificLocalTimeToSystemTime(None, &local_midnight, &mut utc) }
+        .context("TzSpecificLocalTimeToSystemTime failed")?;
+    systemtime_utc_to_std(&utc)
+}
+
+/// The local hour/minute of `t`, for the "Paused until HH:MM" tooltip.
+/// Best-effort (`None` on any conversion failure): the tooltip degrades to
+/// plain "Paused" rather than that being treated as a rule-7 failure --
+/// pausing itself is unaffected either way, only the tooltip's wording.
+fn local_hour_min(t: SystemTime) -> Option<(u8, u8)> {
+    let utc = std_to_systemtime_utc(t).ok()?;
+    let mut local = SYSTEMTIME::default();
+    unsafe { SystemTimeToTzSpecificLocalTime(None, &utc, &mut local) }.ok()?;
+    Some((local.wHour as u8, local.wMinute as u8))
+}
+
+/// Re-arm (kill then re-`SetTimer`) the one-shot pause-expiry timer for the
+/// delay remaining between `now` and `until`, clamped to at least 1ms and to
+/// `SetTimer`'s `u32` millisecond range (comfortably wide enough for both
+/// "1 hour" and "until tomorrow").
+fn arm_pause_timer(hwnd: HWND, until: SystemTime, now: SystemTime) {
+    let delay = until.duration_since(now).unwrap_or(Duration::from_millis(1));
+    let delay_ms = delay.as_millis().clamp(1, u32::MAX as u128) as u32;
+    unsafe {
+        let _ = KillTimer(Some(hwnd), PAUSE_TIMER_ID);
+        SetTimer(Some(hwnd), PAUSE_TIMER_ID, delay_ms, None);
+    }
+}
+
+/// Convert a UTC [`SYSTEMTIME`] to [`SystemTime`] via `SystemTimeToFileTime`
+/// plus pure epoch arithmetic (FILETIME's 100ns ticks since 1601 -> a
+/// [`Duration`] since the Unix epoch).
+fn systemtime_utc_to_std(utc: &SYSTEMTIME) -> Result<SystemTime> {
+    let mut ft = FILETIME::default();
+    unsafe { SystemTimeToFileTime(utc, &mut ft) }.context("SystemTimeToFileTime failed")?;
+    let ticks = ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+    let unix_100ns = ticks.saturating_sub((FILETIME_TO_UNIX_EPOCH_SECS as u64) * 10_000_000);
+    Ok(UNIX_EPOCH + Duration::from_nanos(unix_100ns * 100))
+}
+
+/// The inverse of [`systemtime_utc_to_std`]: [`SystemTime`] -> FILETIME
+/// ticks (pure arithmetic) -> UTC [`SYSTEMTIME`] via `FileTimeToSystemTime`.
+/// Assumes `t` is on or after the Unix epoch, true for every deadline this
+/// module ever builds (never before 1970).
+fn std_to_systemtime_utc(t: SystemTime) -> Result<SYSTEMTIME> {
+    let dur = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let unix_100ns = dur.as_secs() as i64 * 10_000_000 + (dur.subsec_nanos() / 100) as i64;
+    let ticks = unix_100ns + FILETIME_TO_UNIX_EPOCH_SECS * 10_000_000;
+    let ft = FILETIME {
+        dwLowDateTime: (ticks as u64 & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: ((ticks as u64) >> 32) as u32,
+    };
+    let mut st = SYSTEMTIME::default();
+    unsafe { FileTimeToSystemTime(&ft, &mut st) }.context("FileTimeToSystemTime failed")?;
+    Ok(st)
+}
+
 /// First line of an error, truncated on a char boundary, for the headline.
 fn first_line(text: &str, max: usize) -> String {
     let line = text.lines().next().unwrap_or(text).trim();
@@ -733,6 +962,17 @@ thread_local! {
     /// id -- can be reached. `0` (never a value `RegisterWindowMessageW`
     /// returns) means "not set yet".
     static TASKBAR_CREATED_MSG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+    /// A pause-relevant event (the `PAUSE_TIMER_ID` timer firing, a wake
+    /// from sleep, or a clock change) arrived while `SETTINGS_OPEN` was
+    /// true. `open_settings` re-evaluates the pause deadline
+    /// (`App::reevaluate_pause`) once `show_modal` returns, the same way
+    /// `TASKBAR_RECREATED_WHILE_SETTINGS` defers the taskbar re-add. See
+    /// `SETTINGS_OPEN` for why this can't be a field on `App`.
+    ///
+    /// The `WM_TIMER` case specifically must still be killed immediately,
+    /// not merely deferred -- see the `wnd_proc` guard that sets this flag.
+    static PAUSE_REEVALUATE_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 use std::os::windows::ffi::OsStrExt;
@@ -795,6 +1035,32 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     // so. See `SETTINGS_OPEN`'s doc comment for why even reading `app.*`
     // here, guard or no guard, would be unsound while it is true.
     if SETTINGS_OPEN.with(|c| c.get()) {
+        // Issue #20: these three need `hwnd` (to kill the pause timer) and
+        // so can't be folded into `settings_reentrancy_policy`'s pure,
+        // `hwnd`-free signature the way the other cases are -- handled here
+        // instead, before that policy even runs. WM_TIMER specifically must
+        // be killed immediately, not merely deferred: SetTimer without a
+        // TIMERPROC keeps re-posting at the same interval until KillTimer
+        // is called, so leaving it unhandled behind the modal would turn it
+        // into an actual polling timer (rule 5), not just a late check.
+        if msg == WM_TIMER && wparam.0 == PAUSE_TIMER_ID {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), PAUSE_TIMER_ID);
+            }
+            PAUSE_REEVALUATE_PENDING.with(|c| c.set(true));
+            return LRESULT(0);
+        }
+        if msg == WM_POWERBROADCAST {
+            if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC {
+                PAUSE_REEVALUATE_PENDING.with(|c| c.set(true));
+            }
+            return LRESULT(1);
+        }
+        if msg == WM_TIMECHANGE {
+            PAUSE_REEVALUATE_PENDING.with(|c| c.set(true));
+            return LRESULT(0);
+        }
+
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
         match settings_reentrancy_policy(msg, taskbar_created_msg) {
             SettingsReentrancy::Ignore => {
@@ -854,6 +1120,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
                     MenuChoice::Command(cmd::USE_OPENAI) => app.set_provider(true),
                     MenuChoice::Command(cmd::USE_ANTHROPIC) => app.set_provider(false),
+                    MenuChoice::Command(cmd::PAUSE_1H) => app.pause_for(PauseChoice::OneHour),
+                    MenuChoice::Command(cmd::PAUSE_UNTIL_TOMORROW) => {
+                        app.pause_for(PauseChoice::UntilTomorrow)
+                    }
+                    MenuChoice::Command(cmd::PAUSE_UNTIL_RESUMED) => {
+                        app.pause_for(PauseChoice::UntilResumed)
+                    }
+                    MenuChoice::Command(cmd::RESUME) => app.resume(),
                     MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
                     MenuChoice::Command(cmd::QUIT) => unsafe {
                         let _ = DestroyWindow(hwnd);
@@ -890,6 +1164,30 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_APP_LEARNED => {
             let chord = unsafe { *Box::from_raw(lparam.0 as *mut Chord) };
             app.on_learned(wparam.0, chord);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == PAUSE_TIMER_ID {
+                app.on_pause_timer(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            // Sleep does not stop wall-clock time, but it does stop a
+            // SetTimer from running (rule 5's flip side): re-check the
+            // pause deadline once against the real clock on wake, per
+            // issue #20.
+            if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC {
+                app.reevaluate_pause(hwnd);
+            }
+            // Returning TRUE grants the power-management request; every
+            // PBT_* code expects a nonzero return, not just this one.
+            LRESULT(1)
+        }
+        WM_TIMECHANGE => {
+            // A manual clock change (or a timezone/DST update) can move the
+            // pause deadline without ever posting WM_TIMER -- re-check once.
+            app.reevaluate_pause(hwnd);
             LRESULT(0)
         }
         // Not a compile-time constant (RegisterWindowMessageW is a runtime
