@@ -1,0 +1,62 @@
+name: New connector
+description: Propose a connector to an external service (a calendar, an email provider, and so on).
+title: "[Connector]: "
+labels:
+  - enhancement
+  - area:connectors
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A connector implements the `Connector` trait in `connectors/`: an
+        id, an auth kind (OAuth PKCE loopback, API key, or none), and its
+        capabilities. Tokens go through the secrets module into Windows
+        Credential Manager, never into `config.toml` and never logged. A
+        connector only ever does what a confirmed proposal already showed
+        the user: it never presses Send, Submit, Buy or Pay.
+
+  - type: input
+    id: service
+    attributes:
+      label: Service name
+      placeholder: "e.g. Google Calendar"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: auth-kind
+    attributes:
+      label: Auth kind
+      options:
+        - OAuth PKCE loopback
+        - API key
+        - None
+    validations:
+      required: true
+
+  - type: textarea
+    id: capabilities
+    attributes:
+      label: Capabilities
+      description: What this connector can read and/or write (e.g. read calendar events, create a draft email).
+    validations:
+      required: true
+
+  - type: textarea
+    id: data-flow
+    attributes:
+      label: What data crosses the network, and when
+      description: >-
+        What gets sent to this service, and only in response to what user
+        action. A connector that talks to its service without a confirmed
+        action behind it is a security bug per SECURITY.md, not a normal one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      description: One observable check, e.g. a specific confirmed action producing a specific real change in the connected service (and its undo, if the platform allows one).
+    validations:
+      required: true

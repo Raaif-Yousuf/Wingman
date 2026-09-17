@@ -1,0 +1,78 @@
+name: New model provider
+description: Propose support for a new cloud or local model provider.
+title: "[Provider]: "
+labels:
+  - enhancement
+  - area:providers
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Wingman's HTTP is `ureq`, blocking, on purpose: no tokio, no
+        reqwest, no streaming, every response is a whole structured result.
+        A provider whose API only offers streaming responses needs a plan
+        for turning that into one blocking call before it fits here. Local
+        providers reachable over HTTP (an Ollama-compatible server, for
+        example) must be dialed as `127.0.0.1`, never `localhost`
+        (IPv6-first resolution stalls about 2 seconds per connection on
+        Windows, measured against Ollama).
+
+  - type: input
+    id: provider-name
+    attributes:
+      label: Provider name
+    validations:
+      required: true
+
+  - type: input
+    id: api-base
+    attributes:
+      label: API base URL
+      placeholder: "e.g. https://api.example.com/v1, or 127.0.0.1:PORT for a local server"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: auth-kind
+    attributes:
+      label: Authentication
+      options:
+        - API key
+        - OAuth
+        - None (local, no auth)
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: request-shape
+    attributes:
+      label: Request and response shape
+      description: >-
+        How this provider's chat/vision request and response differ from
+        OpenAI's or Anthropic's (both already supported). Note anything that
+        needs `serde_json`'s `preserve_order` to keep property order intact,
+        per CLAUDE.md rule 3, if this provider is also given a JSON schema.
+    validations:
+      required: true
+
+  - type: textarea
+    id: license
+    attributes:
+      label: License of any SDK or reference code
+      description: >-
+        CLAUDE.md rule 2: dependencies and copied code must be MIT,
+        Apache-2.0, BSD, ISC, Zlib or Unlicense. Name the license of any
+        crate this would add or any code you'd want to adapt from an
+        existing SDK, verified as of today, not from memory of an older
+        license.
+    validations:
+      required: true
+
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      description: One observable check, e.g. a specific card result from a real request against this provider.
+    validations:
+      required: true

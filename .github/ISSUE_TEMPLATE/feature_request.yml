@@ -1,0 +1,59 @@
+name: Feature request
+description: A capability Wingman doesn't have yet.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Wingman is one press, one action, one card. **No chat, no
+        conversations, no follow-up questions, no streaming.** Frame the
+        request as an action (a proposal the model fills, that a user
+        confirms) or as making the existing Look, Propose, Confirm, Do loop
+        faster, safer or cheaper. If what you want is a new catalogue action
+        that reuses an existing executor, the "New action" template is a
+        better fit than this one.
+
+        Wingman never presses Send, Submit, Buy or Pay on your behalf, for
+        any request. A feature that needs it will be turned down for that
+        reason alone.
+
+  - type: textarea
+    id: capability
+    attributes:
+      label: What capability is missing
+      description: What you want Wingman to do that it can't today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it matters
+      description: The situation where the current app falls short.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: loop-step
+    attributes:
+      label: Where this fits in Look, Propose, Confirm, Do
+      description: Which part of the loop does this change, or does it add a new action entirely?
+      options:
+        - A new action (see the "New action" template instead)
+        - Look (capture, input, awareness)
+        - Propose (a model or prompt change)
+        - Confirm (the card, the preview)
+        - Do (an executor)
+        - Not part of the loop (settings, packaging, etc.)
+    validations:
+      required: true
+
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      description: One observable check that proves this is built and wired up, not just compiling.
+    validations:
+      required: true
