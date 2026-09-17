@@ -9,6 +9,7 @@ mod config_example;
 mod dismiss;
 mod hotkey;
 mod known_folder;
+mod mode;
 mod pause;
 mod provider;
 mod secrets;

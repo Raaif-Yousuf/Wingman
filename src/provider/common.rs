@@ -331,6 +331,8 @@ pub(crate) fn post_json_with(
     timeout: Duration,
     tag: &str,
 ) -> Result<String> {
+    offline_guard(url)?;
+
     let policy = env.policy;
     let mut retries = 0u32;
     let mut backoff_spent = Duration::ZERO;
@@ -400,6 +402,72 @@ pub(crate) fn post_json(url: &str, headers: &[(&str, &str)], body: &Value, timeo
     post_json_with(&env, url, headers, body, timeout, tag)
 }
 
+// ---------------------------------------------------------------------
+// Offline guard (#19)
+//
+// Every function below that actually opens a socket (`post_json_with`,
+// `post_json_with_connect_timeout`, `get_text_with_timeout`) calls this
+// FIRST, before any transport, before any DNS resolution -- `classify_host`
+// is pure string parsing, never a lookup, which is exactly what issue #19
+// requires ("resolve nothing via DNS for the check"). A provider that
+// somehow reached the network any other way would bypass this; there is
+// deliberately no other way to reach the network from `src/provider` --
+// see `no_provider_file_calls_ureq_directly_outside_common_rs` below, which
+// fails the build if one shows up.
+//
+// CONNECTORS HOOK (not built yet, Phase 3+): `connectors/*.rs` and the
+// opt-in update checker (Phase 5) must call `offline_guard` (or an
+// equivalent guarded send path) the same way once they exist. The Modes
+// table requires both to be disabled OUTRIGHT in Offline mode, stricter
+// than the loopback-only rule providers get here -- this function alone is
+// not sufficient for them, only necessary.
+// ---------------------------------------------------------------------
+
+fn offline_guard(url: &str) -> Result<()> {
+    if !crate::mode::is_offline_now() {
+        return Ok(());
+    }
+    match crate::mode::classify_host(url) {
+        crate::mode::HostClass::Loopback => Ok(()),
+        crate::mode::HostClass::Localhost => Err(anyhow!(
+            "Offline mode blocked a request to localhost. Wingman only allows 127.0.0.1 or [::1] while Offline: point the provider at 127.0.0.1, or turn Offline mode off."
+        )),
+        crate::mode::HostClass::NotLoopback => Err(anyhow!(
+            "Offline mode blocked a request to a non-local address. Turn off Offline mode, or point every provider at 127.0.0.1, to allow it."
+        )),
+    }
+}
+
+/// GET, single attempt, no retry (#19, for `mode::probe_ollama_ready`): the
+/// caller treats any failure as "not reachable" and degrades gracefully, so
+/// a retry here would only add latency to exactly the path issue #19
+/// requires add none of when Ollama is not configured. Goes through
+/// [`offline_guard`] like every other entry point in this file.
+pub(crate) fn get_text_with_timeout(url: &str, timeout: Duration, tag: &str) -> Result<String> {
+    offline_guard(url)?;
+
+    let response = ureq::get(url)
+        .config()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .build()
+        .call();
+    let mut response = response.map_err(|e| anyhow!("{tag}: transport error: {e}"))?;
+
+    let status = response.status();
+    let body_text = response
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("{tag}: failed to read response body"))?;
+
+    if !status.is_success() {
+        let truncated: String = body_text.chars().take(300).collect();
+        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+    }
+
+    Ok(body_text)
+}
+
 /// Same as [`post_json`] but with the connect phase timed out separately
 /// from the whole exchange. `post_json`'s single `timeout_global` is right
 /// for a cloud API, which is either reachable in well under a second or not
@@ -419,6 +487,8 @@ pub(crate) fn post_json_with_connect_timeout(
     total_timeout: Duration,
     tag: &str,
 ) -> Result<String> {
+    offline_guard(url)?;
+
     let mut builder = ureq::post(url);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
@@ -824,5 +894,148 @@ mod tests {
             assert!(jitter_millis(100) < 100);
         }
         assert_eq!(jitter_millis(0), 0);
+    }
+
+    // -- Offline guard (#19) ------------------------------------------------
+
+    fn mode_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::mode::MODE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn offline_guard_refuses_a_non_loopback_url_before_the_transport_runs() {
+        let _g = mode_guard();
+        crate::mode::set_current(crate::mode::Mode::Offline);
+
+        let transport = ScriptedTransport::new(vec![ok("should never be reached")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+
+        let err = post_json_with(
+            &env,
+            "https://api.openai.com/v1/responses",
+            &[],
+            &json!({}),
+            Duration::from_secs(1),
+            "openai",
+        )
+        .unwrap_err();
+
+        crate::mode::set_current(crate::mode::Mode::Auto);
+
+        assert_eq!(transport.call_count(), 0, "the guard must refuse before the transport is ever invoked");
+        assert!(sleeper.recorded().is_empty());
+        let msg = err.to_string();
+        assert!(msg.contains("Offline"), "{msg}");
+        assert!(!msg.contains('\u{2014}'), "rule 11: no em dash: {msg}");
+    }
+
+    #[test]
+    fn offline_guard_names_localhost_with_guidance() {
+        let _g = mode_guard();
+        crate::mode::set_current(crate::mode::Mode::Offline);
+
+        let transport = ScriptedTransport::new(vec![]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+
+        let err = post_json_with(
+            &env,
+            "http://localhost:11434/api/chat",
+            &[],
+            &json!({}),
+            Duration::from_secs(1),
+            "ollama",
+        )
+        .unwrap_err();
+
+        crate::mode::set_current(crate::mode::Mode::Auto);
+
+        assert_eq!(transport.call_count(), 0);
+        let msg = err.to_string();
+        assert!(msg.contains("127.0.0.1"), "should point at the fix: {msg}");
+    }
+
+    #[test]
+    fn offline_guard_allows_a_loopback_url_while_offline() {
+        let _g = mode_guard();
+        crate::mode::set_current(crate::mode::Mode::Offline);
+
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+
+        let result = post_json_with(
+            &env,
+            "http://127.0.0.1:11434/api/chat",
+            &[],
+            &json!({}),
+            Duration::from_secs(1),
+            "ollama",
+        );
+
+        crate::mode::set_current(crate::mode::Mode::Auto);
+
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(transport.call_count(), 1);
+    }
+
+    #[test]
+    fn offline_guard_is_inert_outside_offline_mode() {
+        let _g = mode_guard();
+        for mode in [crate::mode::Mode::Cloud, crate::mode::Mode::Local, crate::mode::Mode::Auto] {
+            crate::mode::set_current(mode);
+
+            let transport = ScriptedTransport::new(vec![ok("done")]);
+            let sleeper = RecordingSleeper::new();
+            let clock = FixedClock(0);
+            let policy = RetryPolicy::default();
+            let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+
+            let result = post_json_with(
+                &env,
+                "https://api.openai.com/v1/responses",
+                &[],
+                &json!({}),
+                Duration::from_secs(1),
+                "openai",
+            );
+
+            assert_eq!(result.unwrap(), "done", "mode {mode:?} must not block a non-loopback request");
+            assert_eq!(transport.call_count(), 1, "mode {mode:?}");
+        }
+        crate::mode::set_current(crate::mode::Mode::Auto);
+    }
+
+    /// #19: the guard lives entirely in this file. A provider that called
+    /// `ureq::` directly would bypass it -- this grep is the enforcement,
+    /// since Rust's module privacy alone can't stop a sibling module from
+    /// importing the crate and reaching the network its own way.
+    #[test]
+    fn no_provider_file_calls_ureq_directly_outside_common_rs() {
+        let provider_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/provider");
+        let entries = std::fs::read_dir(&provider_dir).expect("read src/provider");
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.file_name().and_then(|n| n.to_str()) == Some("common.rs") {
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read provider file");
+            assert!(
+                !text.contains("ureq::"),
+                "{} calls ureq:: directly; every HTTP send must go through \
+                 provider::common so the Offline guard (issue #19) cannot be bypassed",
+                path.display()
+            );
+        }
     }
 }

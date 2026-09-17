@@ -1,3 +1,5 @@
+mode = "auto"
+
 [hotkeys.primary]
 vk = 134
 ctrl = false
