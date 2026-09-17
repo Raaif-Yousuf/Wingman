@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(cargo test *)",
+      "Bash(cargo test)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt --check)",
+      "Bash(cargo fmt)",
+      "Bash(cargo build *)",
+      "Bash(cargo deny *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "PowerShell(Get-Content *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Get-Item *)",
+      "PowerShell(Get-ItemProperty *)",
+      "PowerShell(Get-Process *)",
+      "PowerShell(Get-CimInstance *)",
+      "PowerShell(Get-AppxPackage *)",
+      "PowerShell(Select-String *)",
+      "PowerShell(Select-Object *)",
+      "PowerShell(Test-Path *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && [ -f scripts/hooks/block_git_stash.py ] && \"$PY\" scripts/hooks/block_git_stash.py || true",
+            "shell": "bash",
+            "timeout": 10,
+            "statusMessage": "Checking for git stash..."
+          },
+          {
+            "type": "command",
+            "command": "PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && [ -f scripts/hooks/block_recursive_delete.py ] && \"$PY\" scripts/hooks/block_recursive_delete.py || true",
+            "shell": "bash",
+            "timeout": 10,
+            "statusMessage": "Checking for a recursive delete inside the repo..."
+          }
+        ]
+      }
+    ]
+  }
+}

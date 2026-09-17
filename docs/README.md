@@ -1,0 +1,61 @@
+# Documentation index
+
+> The detailed reference. `CLAUDE.md` at the repo root is the quick-reference
+> card and points here for depth.
+
+A native Windows 11 tray assistant behind the Copilot key. Rust, Win32, one
+exe, cloud or local models, MIT.
+
+## Who owns which fact
+
+Several files look like places to write the same sentence. Each owns a
+different kind of fact, on purpose. Before "simplifying" two of them into one,
+check whether the fact being moved is a backlog item, a design decision, a
+handoff snapshot, or a human-only action: those are four different things.
+
+| Surface | Owns | Lifecycle |
+|---|---|---|
+| GitHub Issues (once the public repo exists) | every bug, feature and roadmap item | open to closed; nothing duplicates it in markdown |
+| `docs/superpowers/specs/` | design decisions and their rationale, one dated file per topic | written before the code; superseded specs say so at the top and stay in git |
+| [`NEXT_SESSION.md`](../NEXT_SESSION.md) | where the last session stopped and what the next one should do first | fully overwritten each session; no history |
+| [`OWNER_TODO.md`](../OWNER_TODO.md) | actions only a human can take: a Settings click, a repo name, an account | rows deleted when done |
+| `CHANGELOG.md` (planned, Keep a Changelog) | what shipped, per version | append-only |
+
+## Reading order for a new contributor
+
+1. [`README.md`](../README.md) at the root: what it does and how to install it.
+2. [`CLAUDE.md`](../CLAUDE.md): the rules and the pitfalls, ten minutes.
+3. [`2026-09-14-copilot-ask-design.md`](superpowers/specs/2026-09-14-copilot-ask-design.md): the running app.
+4. [`2026-09-15-packaging-and-install-design.md`](superpowers/specs/2026-09-15-packaging-and-install-design.md): how it gets onto a machine.
+5. [`2026-09-16-expansion-plan-design.md`](superpowers/specs/2026-09-16-expansion-plan-design.md): where it is going.
+
+## Skills (`.claude/skills/`)
+
+Loaded with the `Skill` tool at the start of the matching task. The
+instructions live there, not duplicated here.
+
+| Skill | Reach for it when |
+|---|---|
+| `tests-first` | Before writing any feature, fix or behaviour change: failing test, red output, neighbouring tests, then code |
+| `fixing-a-bug` | Fixing any bug or regression, before writing fix code. Also when a fix "should work" but the symptom persists |
+| `wired-to-nothing` | Before reporting any change as done. The Win32-specific list of ways code compiles, passes and does nothing |
+| `working-an-issue` | Before starting or closing any GitHub issue |
+
+Agents (`.claude/agents/`): `cold-diff-reviewer` reviews a diff with no ticket
+or author framing, checking for this repo's recorded bug shapes.
+
+Hooks (`.claude/settings.json`, scripts in `scripts/hooks/`): a recursive
+force-delete aimed inside the repo and any mutating `git stash` are refused
+before they run. Both scripts explain the replacement in their message.
+
+## Index
+
+| Doc | What is in it |
+|---|---|
+| [superpowers/specs/2026-09-14-copilot-ask-design.md](superpowers/specs/2026-09-14-copilot-ask-design.md) | Threading model, module contracts, config shape, provider request shapes (OpenAI Responses, Anthropic Messages), capture, the GDI card, tray, hotkeys and learn mode, error handling, test plan |
+| [superpowers/specs/2026-09-15-packaging-and-install-design.md](superpowers/specs/2026-09-15-packaging-and-install-design.md) | Install layout, why sparse MSIX and not full, manifest, signing, launch semantics, the Copilot-key picker registration and the one click that cannot be scripted |
+| [superpowers/specs/2026-09-16-expansion-plan-design.md](superpowers/specs/2026-09-16-expansion-plan-design.md) | Name candidates, target architecture, extended provider trait, Ollama and OpenAI-compatible and Gemini providers, modes and the offline guard, the Quick Ask palette and actions-as-data, the no-chat rule and the settings window, the awareness engine, secrets separation, repo and CI files for GitHub, open-source sources with verified licenses, decisions owed, phased roadmap and issue map |
+
+Planned, per the expansion plan § 10: `architecture.md`, `providers.md`,
+`offline.md`, `actions.md`, and at the root `PRIVACY.md`, `SECURITY.md`,
+`CONTRIBUTING.md`, `CHANGELOG.md`, `THIRD_PARTY_NOTICES.md`.
