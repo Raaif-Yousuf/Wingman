@@ -87,15 +87,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsWindow,
-    KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, CREATESTRUCTW,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HMENU, HWND_TOPMOST, IDC_ARROW,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsChild,
+    IsWindow, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
+    HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -2348,6 +2348,24 @@ fn preview_key_command(vk: u16) -> Option<i32> {
     }
 }
 
+/// Issue #207: pure decision for a preview child control's `WM_KILLFOCUS`
+/// -- whether the new focus target means "click away" (cancel the preview,
+/// same as Esc) or staying within the card's own window group (do nothing:
+/// Tab moving between two preview fields, or focus landing on the Do
+/// it/Cancel button itself right before its own click fires).
+/// `new_focus_is_card_or_descendant` is
+/// `new_focus_hwnd == card_hwnd || IsChild(card_hwnd, new_focus_hwnd)`,
+/// computed by the caller (both need a live `HWND` comparison/`IsChild`
+/// call, so cannot be done here). `WM_KILLFOCUS`'s own "nothing is gaining
+/// focus" case (`wparam == 0`, e.g. the whole app losing the foreground to
+/// nothing in particular) needs no separate case: a null `HWND` is never
+/// the card's own and `IsChild` is never true for it, so it already
+/// computes `new_focus_is_card_or_descendant == false` the same as any
+/// other outside window.
+fn preview_focus_left_the_card(new_focus_is_card_or_descendant: bool) -> bool {
+    !new_focus_is_card_or_descendant
+}
+
 /// Subclass installed on every preview EDIT/BUTTON child control so Enter
 /// and Esc work regardless of which control currently has keyboard focus.
 ///
@@ -2365,6 +2383,16 @@ fn preview_key_command(vk: u16) -> Option<i32> {
 /// subclass time by [`subclass_preview_control`]) so a mapped key can
 /// `PostMessageW` a `WM_COMMAND` back to it, indistinguishable from a real
 /// button click.
+///
+/// Issue #207: the same `dwrefdata` is what makes click-away cancellation
+/// possible here too. `WM_KILLFOCUS` on the card's own `HWND` (handled in
+/// `CardInner::handle_message`) never fires while a preview is showing,
+/// because Preview's fields are real EDIT/BUTTON children -- focus moves
+/// between THEM, not off the card window itself, until it leaves the whole
+/// group. So this subclass, installed on every one of those children,
+/// checks each `WM_KILLFOCUS`'s own new-focus target (`wparam`) against the
+/// card window group via [`preview_focus_left_the_card`] and posts
+/// `ID_PREVIEW_CANCEL` the same way Enter/Esc already do when it has.
 unsafe extern "system" fn preview_control_subclass(
     hwnd: HWND,
     msg: u32,
@@ -2373,9 +2401,9 @@ unsafe extern "system" fn preview_control_subclass(
     _subclass_id: usize,
     ref_data: usize,
 ) -> LRESULT {
+    let parent = HWND(ref_data as *mut c_void);
     if msg == WM_KEYDOWN {
         if let Some(command_id) = preview_key_command(wparam.0 as u16) {
-            let parent = HWND(ref_data as *mut c_void);
             let _ = PostMessageW(
                 Some(parent),
                 WM_COMMAND,
@@ -2383,6 +2411,19 @@ unsafe extern "system" fn preview_control_subclass(
                 LPARAM(0),
             );
             return LRESULT(0);
+        }
+    }
+    if msg == WM_KILLFOCUS {
+        let new_focus = HWND(wparam.0 as *mut c_void);
+        let new_focus_is_card_or_descendant =
+            new_focus == parent || unsafe { IsChild(parent, new_focus) }.as_bool();
+        if preview_focus_left_the_card(new_focus_is_card_or_descendant) {
+            let _ = PostMessageW(
+                Some(parent),
+                WM_COMMAND,
+                WPARAM(ID_PREVIEW_CANCEL as usize),
+                LPARAM(0),
+            );
         }
     }
     if msg == WM_NCDESTROY {
@@ -2793,6 +2834,25 @@ mod tests {
         }
     }
 
+    // -- preview_focus_left_the_card: pure decision (#207) -------------------
+
+    #[test]
+    fn focus_staying_in_the_card_group_does_not_cancel() {
+        // Tab between two preview fields, or focus landing on the Do
+        // it/Cancel button right before its own click fires: the new focus
+        // target IS the card or a descendant of it.
+        assert!(!preview_focus_left_the_card(true));
+    }
+
+    #[test]
+    fn focus_leaving_the_card_group_cancels() {
+        // The new focus target is neither the card itself nor a descendant
+        // -- covers both "another window" and WM_KILLFOCUS's own
+        // wparam == 0 case (see this function's doc comment: both compute
+        // new_focus_is_card_or_descendant == false at the call site).
+        assert!(preview_focus_left_the_card(false));
+    }
+
     // -- preview state: real Win32 (#26) -------------------------------------
     //
     // Uses `Card::new_for_test`, which registers and creates against a
@@ -3137,6 +3197,170 @@ mod tests {
         );
         assert_eq!(msg.message, WM_COMMAND);
         assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_DO_IT);
+    }
+
+    // -- click-away cancels the preview (#207) --------------------------
+
+    #[test]
+    fn preview_control_subclass_posts_cancel_when_focus_leaves_the_card() {
+        // Simulates a real click-away: WM_KILLFOCUS on a preview field whose
+        // new focus target (wparam, per the real WM_KILLFOCUS contract) is
+        // some other, unrelated window -- not the card, not one of its
+        // children.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let start_hwnd = card
+            .inner
+            .preview
+            .as_ref()
+            .unwrap()
+            .edits
+            .iter()
+            .find(|(name, _)| name == "start")
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap();
+        let card_hwnd = card.hwnd();
+
+        let other_hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(wide_z(TEST_CLASS_NAME).as_ptr()),
+                PCWSTR(wide_z("unrelated window").as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                10,
+                10,
+                None,
+                None,
+                Some(instance()),
+                None,
+            )
+        }
+        .expect("CreateWindowExW for the unrelated window");
+
+        unsafe {
+            let _ = preview_control_subclass(
+                start_hwnd,
+                WM_KILLFOCUS,
+                WPARAM(other_hwnd.0 as usize),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "a click-away WM_KILLFOCUS must post a WM_COMMAND to the card window"
+        );
+        assert_eq!(msg.message, WM_COMMAND);
+        assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_CANCEL);
+
+        unsafe {
+            let _ = DestroyWindow(other_hwnd);
+        }
+    }
+
+    #[test]
+    fn preview_control_subclass_posts_cancel_when_nothing_gains_focus() {
+        // WM_KILLFOCUS's wparam is 0 when no window is gaining the focus at
+        // all (e.g. the whole app losing the foreground) -- must cancel the
+        // same as a click into another window, per preview_focus_left_the_card's
+        // doc comment.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let start_hwnd = card
+            .inner
+            .preview
+            .as_ref()
+            .unwrap()
+            .edits
+            .iter()
+            .find(|(name, _)| name == "start")
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap();
+        let card_hwnd = card.hwnd();
+
+        unsafe {
+            let _ = preview_control_subclass(
+                start_hwnd,
+                WM_KILLFOCUS,
+                WPARAM(0),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(found, "wparam == 0 must also be treated as a click-away");
+        assert_eq!(msg.message, WM_COMMAND);
+        assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_CANCEL);
+    }
+
+    #[test]
+    fn preview_control_subclass_does_not_cancel_on_focus_moving_to_another_preview_control() {
+        // Tab moving focus from the "start" EDIT to the Do it button (both
+        // preview children) must not cancel -- the exact scenario
+        // preview_focus_left_the_card's doc comment names.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let preview = card.inner.preview.as_ref().unwrap();
+        let start_hwnd = preview
+            .edits
+            .iter()
+            .find(|(name, _)| name == "start")
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap();
+        let do_it_btn = preview.do_it_btn;
+        let card_hwnd = card.hwnd();
+
+        unsafe {
+            let _ = preview_control_subclass(
+                start_hwnd,
+                WM_KILLFOCUS,
+                WPARAM(do_it_btn.0 as usize),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+
+        // Filtered to the WM_COMMAND range specifically (rather than 0..0,
+        // which every other real-Win32 test in this module uses): an EDIT
+        // control's OWN default WM_KILLFOCUS handling (reached via
+        // DefSubclassProc, since `preview_control_subclass` does not
+        // swallow WM_KILLFOCUS) legitimately posts its own WM_COMMAND
+        // (EN_KILLFOCUS) to its parent regardless of this fix, and an
+        // unfiltered peek would also pick up an unrelated synthesized
+        // WM_PAINT for this never-validated test window. Neither is what
+        // this test checks; only whether ID_PREVIEW_CANCEL specifically was
+        // posted.
+        let mut msg = MSG::default();
+        let found = unsafe {
+            PeekMessageW(&mut msg, Some(card_hwnd), WM_COMMAND, WM_COMMAND, PM_REMOVE).as_bool()
+        };
+        let cancelled = found && (msg.wParam.0 & 0xFFFF) as i32 == ID_PREVIEW_CANCEL;
+        assert!(
+            !cancelled,
+            "focus moving between two preview controls must not cancel the preview"
+        );
     }
 
     #[test]
