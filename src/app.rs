@@ -415,6 +415,18 @@ impl App {
                 return;
             }
         };
+        // Issue #18/#206: the foreground window's HWND, captured HERE on the
+        // main thread, right alongside the pixel capture -- both are "what
+        // was actually on screen at press time", and both must be read
+        // before `show_pending()` below puts Wingman's own card on top.
+        // Only the isize is carried into the worker closure (an `HWND`
+        // wraps a raw pointer and is not `Send`; `hwnd_isize`/`target`
+        // below already use the same pattern for the owner window). This
+        // HWND is used only lazily, inside the non-vision fallback -- see
+        // `non_vision_inputs` -- so capturing it costs nothing when every
+        // provider in the chain turns out to have vision.
+        let foreground_hwnd_isize =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
 
         self.busy = true;
         // Disarmed for the whole in-flight window: a click while the spinner
@@ -438,7 +450,15 @@ impl App {
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
                 let shot = capture::encode(&raw)?;
-                worker(&providers, mode, &shot, &prompt, want_difficulty)
+                worker(
+                    &providers,
+                    mode,
+                    &shot,
+                    &raw,
+                    foreground_hwnd_isize,
+                    &prompt,
+                    want_difficulty,
+                )
             })()
             .map_err(|e| format!("{e:#}"));
             let payload = Box::into_raw(Box::new(result));
@@ -1111,6 +1131,8 @@ fn worker(
     providers: &Providers,
     mode: Mode,
     shot: &Shot,
+    raw: &capture::RawShot,
+    foreground_hwnd: isize,
     ui_prompt: &str,
     ui_show_difficulty: bool,
 ) -> Result<Answer> {
@@ -1139,8 +1161,85 @@ fn worker(
     // (via `complete_parsed`), not after `complete` returns, so a
     // schema-invalid 200 from one provider falls through to the next ready
     // provider instead of failing the whole request.
+    //
+    // #18/#206: `complete_parsed_with_fallback` (not the plain
+    // `complete_parsed`) so that a provider in `chain` reporting
+    // `Caps.vision == false` gets OCR text plus the compact UIA field
+    // snapshot instead of `shot`'s image -- decided per provider, inside
+    // the chain's own fallback loop, never by rewriting `req` up front here.
+    // `non_vision_inputs` (below) is the lazy source: it only actually runs
+    // OCR/UIA the first time some provider in `chain` needs it, never for a
+    // chain where every ready provider has vision.
     let req = physics_request(shot, prompt, want_difficulty);
-    chain.complete_parsed(&req, |c| parse_answer(&c.text))
+    chain.complete_parsed_with_fallback(
+        &req,
+        || non_vision_inputs(raw, foreground_hwnd),
+        |c| parse_answer(&c.text),
+    )
+}
+
+/// Issue #18/#206: computes the [`crate::provider::NonVisionInputs`] that
+/// stand in for the screenshot when a provider in the chain has no vision --
+/// OCR text of the captured screen (`raw`) plus a compact UIA field
+/// snapshot of the foreground window at press time (`foreground_hwnd`,
+/// captured on the main thread in `App::ask`, before the card is shown --
+/// see that call site). Passed to [`crate::provider::Chain::complete_parsed_with_fallback`]
+/// as its lazy `fallback` closure, so this only ever runs when some
+/// provider in the chain actually needs it.
+///
+/// OCR runs on THIS thread (already a dedicated worker thread spawned by
+/// `App::ask`, never the hook thread -- `ocr::recognize`'s own doc comment
+/// requires that). The UIA snapshot deliberately runs on a SEPARATE, freshly
+/// spawned thread rather than here: `ocr::recognize` initializes a
+/// multithreaded WinRT apartment (`RO_INIT_MULTITHREADED`) on the calling
+/// thread, and `uia::snapshot_hwnd` initializes an apartment-threaded COM
+/// apartment (`COINIT_APARTMENTTHREADED`) on ITS calling thread -- the same
+/// OS thread cannot hold both concurrency models at once (a second
+/// `CoInitializeEx` call with a different model fails with
+/// `RPC_E_CHANGED_MODE`), so OCR and the UIA walk must never run on the same
+/// thread. Spawning a dedicated thread per press for the UIA half is cheap
+/// next to the OCR/network cost already paid on this path.
+///
+/// An OCR failure (no language pack installed, the engine unavailable, a
+/// timeout) fails this whole function -- CLAUDE.md rule 7 wants that
+/// surfaced as a clear, named skip reason for every provider that needed it
+/// (see `Chain::complete_parsed_with_fallback`'s doc comment), not silently
+/// degraded. A UIA failure (no foreground window, a hung app UIA can't
+/// reach, a COM error) degrades instead to an empty field list: OCR text
+/// alone is still a useful fallback, and UIA failing is a far more ordinary
+/// event than OCR being unavailable, so it must not sink an otherwise-usable
+/// OCR result.
+fn non_vision_inputs(
+    raw: &capture::RawShot,
+    foreground_hwnd: isize,
+) -> Result<crate::provider::NonVisionInputs> {
+    let ocr_output = crate::ocr::recognize(
+        &raw.rgba,
+        raw.width,
+        raw.height,
+        crate::ocr::DEFAULT_TIMEOUT,
+    )
+    .context("OCR unavailable")?;
+    let ocr_text = crate::ocr::serialize_lines(&ocr_output.lines);
+
+    let uia_fields = std::thread::spawn(move || {
+        let hwnd = HWND(foreground_hwnd as *mut _);
+        crate::inputs::uia::snapshot_hwnd(
+            hwnd,
+            crate::inputs::uia::DEFAULT_MAX_ELEMENTS,
+            crate::inputs::uia::DEFAULT_BUDGET,
+        )
+    })
+    .join()
+    .ok()
+    .and_then(|r| r.ok())
+    .map(|snapshot| crate::inputs::uia::format_compact(&snapshot.fields))
+    .unwrap_or_default();
+
+    Ok(crate::provider::NonVisionInputs {
+        ocr_text,
+        uia_fields,
+    })
 }
 
 /// #23: the precedence rule from the design spec's "Origin tracking"

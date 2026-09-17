@@ -272,11 +272,13 @@ pub struct Request {
     pub system: String,
     /// The one user turn.
     pub user: String,
-    /// Zero or more images alongside `user`. A provider without vision for
-    /// the requested model should still attempt a text-only completion
-    /// rather than error outright -- the caller is expected to have already
-    /// substituted OCR text or the UIA tree into `user` when that matters
-    /// (Phase 2; today `images` is always exactly the one screenshot).
+    /// Zero or more images alongside `user`. Built once per press with the
+    /// real screenshot attached. Issue #18/#206:
+    /// [`Chain::complete_parsed_with_fallback`] is what actually decides,
+    /// PER PROVIDER inside its own fallback loop, whether a given provider
+    /// gets this image or a text-only variant built by
+    /// [`non_vision_request`] instead -- nothing upstream of `Chain` needs
+    /// to know in advance that a provider lacks vision.
     pub images: Vec<Png>,
     /// The JSON Schema the completion text must satisfy, or `None` for a
     /// plain-text answer. Never hard-coded inside a provider -- see
@@ -305,6 +307,100 @@ pub struct Completion {
     pub usage: Option<Usage>,
     #[allow(dead_code)]
     pub stop: StopReason,
+}
+
+/// Issue #18/#206: the ingredients [`non_vision_request`] substitutes for
+/// the screenshot when a provider in a [`Chain`] reports `Caps.vision ==
+/// false` -- a text-only local model, or a compat endpoint configured
+/// without vision. `ocr_text` is the recognized on-screen text (see
+/// `crate::ocr::recognize` / `crate::ocr::serialize_lines`); `uia_fields`
+/// is the compact field-list serialization of the foreground window's
+/// editable controls (see `crate::inputs::uia::format_compact`), or an
+/// empty string when no UIA snapshot could be taken -- a missing UIA
+/// snapshot degrades gracefully (the OCR text alone is still useful) rather
+/// than failing the whole fallback the way an OCR failure does (see
+/// [`Chain::complete_parsed_with_fallback`]'s doc comment).
+#[derive(Debug, Clone, Default)]
+pub struct NonVisionInputs {
+    pub ocr_text: String,
+    pub uia_fields: String,
+}
+
+/// Size bound (characters, not bytes -- see [`truncate_chars`]) on the OCR
+/// text folded into a [`non_vision_request`]. A large document or a very
+/// text-dense screen could otherwise blow well past a small local model's
+/// context window; 12k characters is generous for the single on-screen
+/// problem this action is about, while still bounding worst-case token
+/// cost and latency for a local model this fallback path exists to serve.
+pub const MAX_NON_VISION_CHARS: usize = 12_000;
+
+/// Prefaced onto `system` by [`non_vision_request`], explaining the input
+/// shape to a model that is not shown the screenshot. Describes the INPUT
+/// format only -- it never asks the model to explain itself or its own
+/// reasoning, which is CLAUDE.md rule 10's reasoning-extraction trap
+/// (Anthropic's classifier refuses a prompt that reads that way,
+/// `stop_reason: "refusal"`, MEASURED 2026-09-15); that trap is about
+/// wording that asks FOR reasoning, not about describing what data the
+/// model was given, so this prefix does not trigger it.
+const NON_VISION_PREFACE: &str = "This model has no image input. Instead of a screenshot, you are given the on-screen text recognized by OCR, plus a compact list of the foreground window's editable fields (label and current value, where known). Layout and visual structure are lost; treat the text and fields below as everything visible on screen.";
+
+/// Truncates `s` to at most `max_chars` **characters** (never splitting a
+/// multi-byte UTF-8 codepoint, unlike a raw byte-length truncation), and
+/// reports whether truncation actually happened. `s.chars().count() <=
+/// max_chars` is the untruncated case -- checked up front so the common
+/// case (well under the bound) allocates nothing beyond the one owned
+/// `String` every caller needs anyway.
+pub fn truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
+    if s.chars().count() <= max_chars {
+        return (s.to_string(), false);
+    }
+    (s.chars().take(max_chars).collect(), true)
+}
+
+/// Issue #18/#206: builds the non-vision variant of `base` -- the image(s)
+/// are dropped entirely and `system`/`user` are rewritten to carry OCR text
+/// and the compact UIA field list instead. `schema`, `effort` and
+/// `max_tokens` carry over unchanged (mirrors [`repair_request`]'s same
+/// choice): the answer shape a provider must produce does not change just
+/// because its input did.
+///
+/// `ocr_text` is bounded to [`MAX_NON_VISION_CHARS`] characters (see
+/// [`truncate_chars`]); when that truncates, the system prompt says so
+/// explicitly, so the model does not mistake a cut-off screen for the whole
+/// picture. `uia_fields` is not size-bounded here -- `crate::inputs::uia`'s
+/// own `DEFAULT_MAX_ELEMENTS` walk cap already bounds it upstream.
+pub fn non_vision_request(base: &Request, ocr_text: &str, uia_fields: &str) -> Request {
+    let (ocr_text, truncated) = truncate_chars(ocr_text, MAX_NON_VISION_CHARS);
+
+    let mut system = format!("{NON_VISION_PREFACE}\n\n{}", base.system);
+    if truncated {
+        system.push_str(
+            "\n\nThe OCR text below was truncated to fit a length limit; it may be incomplete.",
+        );
+    }
+
+    let mut user = base.user.clone();
+    user.push_str("\n\n-- OCR text of the screen --\n");
+    user.push_str(if ocr_text.is_empty() {
+        "(no text recognized)"
+    } else {
+        &ocr_text
+    });
+    user.push_str("\n\n-- Foreground window fields --\n");
+    user.push_str(if uia_fields.is_empty() {
+        "(no fields found)"
+    } else {
+        uia_fields
+    });
+
+    Request {
+        system,
+        user,
+        images: Vec::new(),
+        schema: base.schema.clone(),
+        effort: base.effort,
+        max_tokens: base.max_tokens,
+    }
 }
 
 pub trait Provider: Send + Sync {
@@ -419,50 +515,93 @@ impl Chain {
             if !provider.ready() {
                 continue;
             }
-
-            let completion = match provider.complete(req) {
-                Ok(c) => c,
+            match attempt_provider(provider.as_ref(), req, &mut parse) {
+                Ok(value) => return Ok(value),
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
-                    continue;
                 }
+            }
+        }
+
+        Err(first_err.unwrap_or_else(|| anyhow::anyhow!("no providers configured")))
+    }
+
+    /// Issue #18/#206: like [`complete_parsed`](Self::complete_parsed), but
+    /// a provider whose `own_caps().vision` is `false` never sees `req`'s
+    /// image(s) at all -- it is sent [`non_vision_request`]'s rewrite (OCR
+    /// text plus the compact UIA field list) instead. A provider later in
+    /// the chain that DOES have vision still gets `req` untouched, image
+    /// included; the substitution is decided fresh for each provider, not
+    /// once for the whole chain.
+    ///
+    /// `fallback` computes the [`NonVisionInputs`] (real callers run OCR and
+    /// a UIA snapshot inside it -- see `app.rs`'s `non_vision_inputs`). It
+    /// is called **lazily and at most once**: never at all if every ready
+    /// provider has vision (or `req` carries no image to begin with), and
+    /// only on the first ready provider that actually needs it -- every
+    /// later non-vision provider in the same call reuses that one result.
+    /// This is the "never OCR for a vision-only chain" / "token and time
+    /// efficiency" requirement from issue #18: OCR and a UIA snapshot both
+    /// cost real wall-clock time, so neither runs unless something is
+    /// actually going to use it.
+    ///
+    /// If `fallback` itself errors (OCR engine unavailable, no language
+    /// pack installed, timeout -- see `ocr::recognize`'s error paths), every
+    /// provider that needed it is skipped, exactly like a transport error:
+    /// the chain still falls through to the next ready provider, and the
+    /// *first* such failure is what a full-chain failure surfaces, worded to
+    /// name both the provider and the reason (rule 7: a full-chain failure
+    /// must still end in a card naming why).
+    pub fn complete_parsed_with_fallback<T>(
+        &self,
+        req: &Request,
+        mut fallback: impl FnMut() -> anyhow::Result<NonVisionInputs>,
+        mut parse: impl FnMut(&Completion) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut first_err: Option<anyhow::Error> = None;
+        // Cached as a `String` error (not `anyhow::Error`) purely so this
+        // can be cloned/reused across every provider that needs it without
+        // `anyhow::Error: Clone` (it is not) forcing `fallback` to be
+        // called again per provider -- which would defeat the "at most
+        // once" guarantee this method promises.
+        let mut cached_fallback: Option<Result<NonVisionInputs, String>> = None;
+
+        for provider in &self.providers {
+            if !provider.ready() {
+                continue;
+            }
+
+            let needs_fallback = !req.images.is_empty() && !provider.own_caps().vision;
+            let effective: std::borrow::Cow<'_, Request> = if needs_fallback {
+                let cached =
+                    cached_fallback.get_or_insert_with(|| fallback().map_err(|e| format!("{e:#}")));
+                match cached {
+                    Ok(inputs) => std::borrow::Cow::Owned(non_vision_request(
+                        req,
+                        &inputs.ocr_text,
+                        &inputs.uia_fields,
+                    )),
+                    Err(msg) => {
+                        if first_err.is_none() {
+                            first_err = Some(anyhow::anyhow!(
+                                "{}: no vision, and the OCR/UIA fallback failed: {msg}",
+                                provider.id()
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                std::borrow::Cow::Borrowed(req)
             };
 
-            match parse(&completion) {
+            match attempt_provider(provider.as_ref(), effective.as_ref(), &mut parse) {
                 Ok(value) => return Ok(value),
-                Err(parse_err) => {
-                    // Issue #200: before spending a #99 network repair round
-                    // trip, try a local, zero-network cleanup of the near-JSON
-                    // text -- a fenced or prose-wrapped response is cheap and
-                    // deterministic to fix with string surgery, so this is
-                    // tried first and the network repair pass below is
-                    // reserved for genuinely wrong JSON (missing/malformed
-                    // fields), which is what it is actually good at.
-                    let cleaned = strip_near_json(&completion.text);
-                    if cleaned != completion.text {
-                        let cleaned_completion = Completion {
-                            text: cleaned,
-                            usage: completion.usage,
-                            stop: completion.stop,
-                        };
-                        if let Ok(value) = parse(&cleaned_completion) {
-                            return Ok(value);
-                        }
-                    }
-
-                    if completion.stop != StopReason::MaxTokens {
-                        let repair_req =
-                            repair_request(req, &completion.text, &parse_err.to_string());
-                        if let Ok(repaired) = provider.complete(&repair_req) {
-                            if let Ok(value) = parse(&repaired) {
-                                return Ok(value);
-                            }
-                        }
-                    }
+                Err(e) => {
                     if first_err.is_none() {
-                        first_err = Some(parse_err);
+                        first_err = Some(e);
                     }
                 }
             }
@@ -528,6 +667,57 @@ pub fn physics_request(shot: &Shot, prompt: &str, want_difficulty: bool) -> Requ
         ),
         effort: Effort::Unset,
         max_tokens: 0,
+    }
+}
+
+/// One provider's whole attempt at `req`: the call, the #200 local cleanup,
+/// and the #99 one-shot repair pass, exactly as [`Chain::complete_parsed`]
+/// always ran them inline. Factored out so
+/// [`Chain::complete_parsed_with_fallback`] can run the identical sequence
+/// against a per-provider `req` (the original, or [`non_vision_request`]'s
+/// rewrite) without duplicating this logic -- see each `Chain` method's own
+/// doc comment for what a `Err` return means to its caller (always "this
+/// provider failed", never "the whole chain failed", which only the caller
+/// decides once every provider has been tried).
+fn attempt_provider<T>(
+    provider: &dyn Provider,
+    req: &Request,
+    parse: &mut impl FnMut(&Completion) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let completion = provider.complete(req)?;
+
+    match parse(&completion) {
+        Ok(value) => Ok(value),
+        Err(parse_err) => {
+            // Issue #200: before spending a #99 network repair round trip,
+            // try a local, zero-network cleanup of the near-JSON text -- a
+            // fenced or prose-wrapped response is cheap and deterministic
+            // to fix with string surgery, so this is tried first and the
+            // network repair pass below is reserved for genuinely wrong
+            // JSON (missing/malformed fields), which is what it is
+            // actually good at.
+            let cleaned = strip_near_json(&completion.text);
+            if cleaned != completion.text {
+                let cleaned_completion = Completion {
+                    text: cleaned,
+                    usage: completion.usage,
+                    stop: completion.stop,
+                };
+                if let Ok(value) = parse(&cleaned_completion) {
+                    return Ok(value);
+                }
+            }
+
+            if completion.stop != StopReason::MaxTokens {
+                let repair_req = repair_request(req, &completion.text, &parse_err.to_string());
+                if let Ok(repaired) = provider.complete(&repair_req) {
+                    if let Ok(value) = parse(&repaired) {
+                        return Ok(value);
+                    }
+                }
+            }
+            Err(parse_err)
+        }
     }
 }
 
@@ -1560,6 +1750,433 @@ mod tests {
         assert_eq!(answer.headline, "h");
     }
 
+    // -- truncate_chars (issue #18/#206) ---------------------------------
+
+    #[test]
+    fn truncate_chars_is_a_no_op_under_the_limit() {
+        assert_eq!(truncate_chars("hello", 10), ("hello".to_string(), false));
+    }
+
+    #[test]
+    fn truncate_chars_is_a_no_op_exactly_at_the_limit() {
+        assert_eq!(truncate_chars("hello", 5), ("hello".to_string(), false));
+    }
+
+    #[test]
+    fn truncate_chars_cuts_one_char_over_the_limit_and_reports_truncated() {
+        assert_eq!(truncate_chars("hello", 4), ("hell".to_string(), true));
+    }
+
+    #[test]
+    fn truncate_chars_splits_on_char_boundaries_not_bytes() {
+        // Each of these is a multi-byte UTF-8 character; a byte-length
+        // truncation would split one in half and either panic or produce
+        // invalid UTF-8. Taking 2 *characters* must keep both whole.
+        let s = "héllo"; // 'é' is 2 bytes in UTF-8
+        let (out, truncated) = truncate_chars(s, 2);
+        assert_eq!(out, "hé");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn truncate_chars_empty_input_is_never_truncated() {
+        assert_eq!(truncate_chars("", 10), ("".to_string(), false));
+    }
+
+    #[test]
+    fn truncate_chars_zero_limit_on_nonempty_input_truncates_to_empty() {
+        assert_eq!(truncate_chars("hello", 0), ("".to_string(), true));
+    }
+
+    // -- non_vision_request: golden request-building (issue #18/#206) ----
+
+    fn base_req_with_image() -> Request {
+        physics_request(
+            &Shot {
+                png: vec![1, 2, 3],
+                width: 10,
+                height: 10,
+            },
+            "irrelevant system prompt",
+            false,
+        )
+    }
+
+    #[test]
+    fn non_vision_request_drops_every_image() {
+        let base = base_req_with_image();
+        assert!(
+            !base.images.is_empty(),
+            "test setup: base must carry an image"
+        );
+        let nv = non_vision_request(&base, "some ocr text", "");
+        assert!(
+            nv.images.is_empty(),
+            "image absent from the non-vision request"
+        );
+    }
+
+    #[test]
+    fn non_vision_request_preserves_schema_effort_and_max_tokens() {
+        let mut base = base_req_with_image();
+        base.effort = Effort::High;
+        base.max_tokens = 777;
+        let nv = non_vision_request(&base, "text", "fields");
+        assert_eq!(nv.schema, base.schema, "schema order/content unchanged");
+        assert_eq!(nv.effort, Effort::High);
+        assert_eq!(nv.max_tokens, 777);
+    }
+
+    #[test]
+    fn non_vision_request_schema_is_byte_identical_to_the_original() {
+        // The golden schema (#23) must not shift just because the request
+        // went through the non-vision rewrite -- property order is
+        // load-bearing (rule 3).
+        let base = base_req_with_image();
+        let nv = non_vision_request(&base, "text", "fields");
+        assert_eq!(
+            serde_json::to_string(&nv.schema.unwrap()).unwrap(),
+            r#"{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"}},"required":["detail","headline"],"additionalProperties":false}"#
+        );
+    }
+
+    #[test]
+    fn non_vision_request_system_carries_the_preface_before_the_original_system() {
+        let base = base_req_with_image();
+        let nv = non_vision_request(&base, "text", "fields");
+        assert!(nv.system.contains("no image input"));
+        assert!(nv.system.contains(&base.system));
+        assert!(
+            nv.system.find("no image input").unwrap() < nv.system.find(&base.system).unwrap(),
+            "the preface must come before the original system prompt"
+        );
+    }
+
+    #[test]
+    fn non_vision_request_preface_never_asks_for_reasoning() {
+        // CLAUDE.md rule 10's trap: wording that reads as asking the model
+        // to explain its own reasoning gets refused (MEASURED 2026-09-15).
+        // This describes the INPUT format only.
+        let base = base_req_with_image();
+        let nv = non_vision_request(&base, "text", "fields");
+        for banned in [
+            "scratchpad",
+            "reason it out",
+            "explain your reasoning",
+            "think step by step",
+        ] {
+            assert!(!nv.system.to_lowercase().contains(banned));
+        }
+    }
+
+    #[test]
+    fn non_vision_request_user_contains_the_ocr_text_and_uia_fields() {
+        let base = base_req_with_image();
+        let nv = non_vision_request(&base, "the quick brown fox", "Edit \"Name\": Jane");
+        assert!(nv.user.contains("the quick brown fox"));
+        assert!(nv.user.contains("Edit \"Name\": Jane"));
+        // The original user turn is preserved too, not replaced.
+        assert!(nv.user.contains(&base.user));
+    }
+
+    #[test]
+    fn non_vision_request_empty_ocr_and_uia_get_explicit_placeholders() {
+        let base = base_req_with_image();
+        let nv = non_vision_request(&base, "", "");
+        assert!(nv.user.contains("no text recognized"));
+        assert!(nv.user.contains("no fields found"));
+    }
+
+    #[test]
+    fn non_vision_request_truncates_long_ocr_text_and_notes_it_in_the_system_prompt() {
+        let base = base_req_with_image();
+        let long_text: String = "a".repeat(MAX_NON_VISION_CHARS + 500);
+        let nv = non_vision_request(&base, &long_text, "");
+        // The user text must not carry the untruncated blob.
+        assert!(!nv.user.contains(&long_text));
+        let kept: String = "a".repeat(MAX_NON_VISION_CHARS);
+        assert!(nv.user.contains(&kept));
+        assert!(
+            nv.system.contains("truncated"),
+            "system prompt must note the truncation: {:?}",
+            nv.system
+        );
+    }
+
+    #[test]
+    fn non_vision_request_short_ocr_text_is_not_flagged_as_truncated() {
+        let base = base_req_with_image();
+        let nv = non_vision_request(&base, "short text", "");
+        assert!(!nv.system.contains("truncated"));
+    }
+
+    // -- Chain::complete_parsed_with_fallback (issue #18/#206) -----------
+
+    /// A [`Provider`] test double whose vision capability is set directly
+    /// (not derived from a model string) and which records every [`Request`]
+    /// it was actually asked to complete, so a test can assert on the exact
+    /// request a given provider received -- whether the original (image
+    /// included) or [`non_vision_request`]'s rewrite. `seen` is an `Arc` so
+    /// a test can keep a handle to it after the provider is moved into a
+    /// `Chain` (mirrors `SequencedProvider::new_counted`'s same reason for
+    /// using `Arc` above).
+    struct VisionAwareProvider {
+        id: &'static str,
+        vision: bool,
+        ready: bool,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+        result: fn() -> anyhow::Result<Completion>,
+    }
+
+    impl VisionAwareProvider {
+        fn new(id: &'static str, vision: bool, result: fn() -> anyhow::Result<Completion>) -> Self {
+            Self {
+                id,
+                vision,
+                ready: true,
+                seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                result,
+            }
+        }
+
+        fn seen_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<Request>>> {
+            self.seen.clone()
+        }
+    }
+
+    impl Provider for VisionAwareProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn ready(&self) -> bool {
+            self.ready
+        }
+        fn capabilities(&self, _model: &str) -> Caps {
+            Caps {
+                vision: self.vision,
+                ..Caps::default()
+            }
+        }
+        fn own_caps(&self) -> Caps {
+            Caps {
+                vision: self.vision,
+                ..Caps::default()
+            }
+        }
+        fn complete(&self, req: &Request) -> anyhow::Result<Completion> {
+            self.seen.lock().unwrap().push(req.clone());
+            (self.result)()
+        }
+    }
+
+    fn non_vision_inputs_for_test() -> NonVisionInputs {
+        NonVisionInputs {
+            ocr_text: "OCR SAW: 17 + 25".to_string(),
+            uia_fields: "Edit \"Answer\": 42".to_string(),
+        }
+    }
+
+    #[test]
+    fn fallback_is_never_invoked_when_every_ready_provider_has_vision() {
+        let calls = std::cell::Cell::new(0u32);
+        let a = VisionAwareProvider::new("a", true, ok_completion);
+        let chain = Chain::new(vec![Box::new(a)]);
+
+        let answer = chain
+            .complete_parsed_with_fallback(
+                &req(),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(non_vision_inputs_for_test())
+                },
+                |c| parse_answer(&c.text),
+            )
+            .unwrap();
+
+        assert_eq!(answer.headline, "42");
+        assert_eq!(
+            calls.get(),
+            0,
+            "fallback must never run for a vision-only chain"
+        );
+    }
+
+    #[test]
+    fn fallback_is_never_invoked_when_the_request_carries_no_image() {
+        let calls = std::cell::Cell::new(0u32);
+        let mut no_image_req = req();
+        no_image_req.images = Vec::new();
+        let a = VisionAwareProvider::new("a", false, ok_completion);
+        let chain = Chain::new(vec![Box::new(a)]);
+
+        let answer = chain
+            .complete_parsed_with_fallback(
+                &no_image_req,
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(non_vision_inputs_for_test())
+                },
+                |c| parse_answer(&c.text),
+            )
+            .unwrap();
+
+        assert_eq!(answer.headline, "42");
+        assert_eq!(
+            calls.get(),
+            0,
+            "nothing to replace when there is no image to begin with"
+        );
+    }
+
+    #[test]
+    fn fallback_is_invoked_exactly_once_and_reused_across_two_non_vision_providers() {
+        let calls = std::cell::Cell::new(0u32);
+        let a = VisionAwareProvider::new("a", false, || Err(anyhow::anyhow!("a transport failed")));
+        let b = VisionAwareProvider::new("b", false, ok_completion);
+        let seen_b = b.seen_handle();
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+
+        let answer = chain
+            .complete_parsed_with_fallback(
+                &req(),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(non_vision_inputs_for_test())
+                },
+                |c| parse_answer(&c.text),
+            )
+            .unwrap();
+
+        assert_eq!(answer.headline, "42");
+        assert_eq!(
+            calls.get(),
+            1,
+            "computed once, reused for the second provider"
+        );
+
+        let b_requests = seen_b.lock().unwrap();
+        assert_eq!(b_requests.len(), 1);
+        assert!(b_requests[0].images.is_empty());
+        assert!(b_requests[0].user.contains("OCR SAW: 17 + 25"));
+        assert!(b_requests[0].user.contains("Edit \"Answer\": 42"));
+    }
+
+    #[test]
+    fn a_vision_provider_later_in_the_chain_still_receives_the_real_image() {
+        let a = VisionAwareProvider::new("a", false, || Err(anyhow::anyhow!("a transport failed")));
+        let b = VisionAwareProvider::new("b", true, ok_completion);
+        let seen_b = b.seen_handle();
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        let base = req();
+
+        let answer = chain
+            .complete_parsed_with_fallback(
+                &base,
+                || Ok(non_vision_inputs_for_test()),
+                |c| parse_answer(&c.text),
+            )
+            .unwrap();
+
+        assert_eq!(answer.headline, "42");
+        let b_requests = seen_b.lock().unwrap();
+        assert_eq!(b_requests.len(), 1);
+        assert_eq!(
+            b_requests[0].images, base.images,
+            "the vision provider must see the real, unmodified image"
+        );
+    }
+
+    #[test]
+    fn ocr_fallback_failure_skips_every_provider_that_needed_it_with_a_named_reason() {
+        struct PanicsIfCalled;
+        impl Provider for PanicsIfCalled {
+            fn id(&self) -> &'static str {
+                "panics"
+            }
+            fn capabilities(&self, _model: &str) -> Caps {
+                Caps {
+                    vision: false,
+                    ..Caps::default()
+                }
+            }
+            fn own_caps(&self) -> Caps {
+                Caps {
+                    vision: false,
+                    ..Caps::default()
+                }
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+                panic!("a provider that needed the failed fallback must never be asked");
+            }
+        }
+
+        let calls = std::cell::Cell::new(0u32);
+        let chain = Chain::new(vec![Box::new(PanicsIfCalled), Box::new(PanicsIfCalled)]);
+
+        let err = chain
+            .complete_parsed_with_fallback(
+                &req(),
+                || {
+                    calls.set(calls.get() + 1);
+                    Err(anyhow::anyhow!("no OCR language pack installed"))
+                },
+                |c| parse_answer(&c.text),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the failed fallback is cached too -- never retried per provider"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("panics"),
+            "must name the skipped provider: {msg:?}"
+        );
+        assert!(
+            msg.contains("no OCR language pack installed"),
+            "must carry the OCR failure reason: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn ocr_fallback_failure_still_falls_through_to_a_provider_that_has_vision() {
+        struct PanicsIfCalled;
+        impl Provider for PanicsIfCalled {
+            fn id(&self) -> &'static str {
+                "no-vision"
+            }
+            fn capabilities(&self, _model: &str) -> Caps {
+                Caps {
+                    vision: false,
+                    ..Caps::default()
+                }
+            }
+            fn own_caps(&self) -> Caps {
+                Caps {
+                    vision: false,
+                    ..Caps::default()
+                }
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+                panic!("must never be asked: its fallback failed");
+            }
+        }
+
+        let vision_provider = VisionAwareProvider::new("has-vision", true, ok_completion);
+        let chain = Chain::new(vec![Box::new(PanicsIfCalled), Box::new(vision_provider)]);
+
+        let answer = chain
+            .complete_parsed_with_fallback(
+                &req(),
+                || Err(anyhow::anyhow!("ocr unavailable")),
+                |c| parse_answer(&c.text),
+            )
+            .unwrap();
+        assert_eq!(answer.headline, "42");
+    }
+
     #[test]
     fn complete_parsed_local_cleanup_fails_falls_through_to_network_repair() {
         // Prose with no JSON object at all: local cleanup cannot recover
@@ -1587,5 +2204,174 @@ mod tests {
             .complete_parsed(&req(), |c| parse_answer(&c.text))
             .unwrap();
         assert_eq!(answer.headline, "repaired");
+    }
+
+    // -- live check: OCR -> real chain -> local text-only Ollama (#18/#206) --
+    //
+    // Not run by default (`cargo test` / `cargo test provider` never touch
+    // the network or OCR). Run explicitly:
+    // `cargo test provider::tests::non_vision_fallback_live -- --ignored --nocapture`
+    // Requires Ollama running locally on 127.0.0.1:11434 with `llama3.2:3b`
+    // pulled (a text-only model -- see `ollama::is_vision_model`, which does
+    // not list the `llama3.2` family).
+    #[test]
+    #[ignore = "live: OCR + a real local Ollama call; run manually, see this test's doc comment"]
+    fn non_vision_fallback_live_ocr_to_text_only_ollama_answers_arithmetic() {
+        use crate::provider::ollama::{Ollama, DEFAULT_BASE_URL};
+
+        // A synthetic "screenshot": black text on a white canvas rendered
+        // with GDI, the same technique `ocr.rs`'s own live test uses
+        // (duplicated here, deliberately small, rather than imported --
+        // this module's task is read-only USE of `crate::ocr`'s public
+        // API, not a dependency on that module's private test helpers).
+        let (width, height) = (900u32, 160u32);
+        let rgba = unsafe { render_gdi_text_rgba_for_ocr("What is 17 + 25 ?", width, height) };
+
+        let fallback_calls = std::cell::Cell::new(0u32);
+        let fallback = || -> anyhow::Result<NonVisionInputs> {
+            fallback_calls.set(fallback_calls.get() + 1);
+            let ocr_out = crate::ocr::recognize(&rgba, width, height, crate::ocr::DEFAULT_TIMEOUT)
+                .context("OCR unavailable for the live non-vision fallback check")?;
+            Ok(NonVisionInputs {
+                ocr_text: crate::ocr::serialize_lines(&ocr_out.lines),
+                uia_fields: String::new(),
+            })
+        };
+
+        // The base request carries a placeholder image -- never actually
+        // sent, since `llama3.2:3b` has no vision and the fallback above
+        // replaces it -- proving the SUBSTITUTION happens, not merely that
+        // a text-only chat call works.
+        let base_req = Request {
+            system: "Reply with exactly two JSON fields: headline (the numeric answer, at most ten words) and detail (a one-sentence explanation of the arithmetic).".to_string(),
+            user: "Solve the arithmetic question in the OCR text below.".to_string(),
+            images: vec![vec![0u8; 4]],
+            schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"detail": {"type": "string"}, "headline": {"type": "string"}},
+                "required": ["detail", "headline"],
+                "additionalProperties": false
+            })),
+            effort: Effort::Unset,
+            max_tokens: 0,
+        };
+
+        let mut provider = Ollama::new(DEFAULT_BASE_URL, "llama3.2:3b", "low");
+        // Unload the model right after this one-off check (mirrors
+        // `ollama.rs`'s own live-check convention).
+        provider.keep_alive = "0".to_string();
+        let chain = Chain::new(vec![Box::new(provider)]);
+
+        let started = std::time::Instant::now();
+        let answer = chain
+            .complete_parsed_with_fallback(&base_req, fallback, |c| parse_answer(&c.text))
+            .expect("live chain call with the non-vision fallback should succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            fallback_calls.get(),
+            1,
+            "OCR/UIA fallback runs exactly once"
+        );
+        assert!(!answer.headline.is_empty());
+        eprintln!(
+            "MEASURED 2026-09-17: non_vision_fallback_live: model=llama3.2:3b elapsed={elapsed:?} headline={:?}",
+            answer.headline
+        );
+    }
+
+    /// Test-only GDI text renderer for the live check above -- black text on
+    /// a white canvas, returned as opaque RGBA8 (matching what a real
+    /// screenshot's alpha channel always is). Deliberately duplicated from
+    /// (not imported from) `ocr.rs`'s own private test helper of the same
+    /// shape: this module's task scope is read-only USE of `crate::ocr`'s
+    /// public API, never a dependency on another module's `#[cfg(test)]`
+    /// internals.
+    #[cfg(test)]
+    unsafe fn render_gdi_text_rgba_for_ocr(text: &str, width: u32, height: u32) -> Vec<u8> {
+        use windows::Win32::Foundation::{COLORREF, RECT};
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
+            DeleteObject, DrawTextW, FillRect, SelectObject, SetBkColor, SetTextColor,
+            ANSI_CHARSET, BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, DEFAULT_PITCH,
+            DEFAULT_QUALITY, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
+            OUT_DEFAULT_PRECIS,
+        };
+
+        let hdc = CreateCompatibleDC(None);
+        assert!(!hdc.is_invalid(), "CreateCompatibleDC failed");
+
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hbitmap = CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+            .expect("CreateDIBSection failed");
+        assert!(!bits.is_null(), "CreateDIBSection returned a null buffer");
+
+        let old_bitmap = SelectObject(hdc, hbitmap.into());
+
+        let white = CreateSolidBrush(COLORREF(0x00FF_FFFF));
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        FillRect(hdc, &rect, white);
+        let _ = DeleteObject(white.into());
+
+        let hfont = CreateFontW(
+            -40,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            ANSI_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY,
+            DEFAULT_PITCH.0 as u32,
+            windows::core::w!("Segoe UI"),
+        );
+        let old_font = SelectObject(hdc, hfont.into());
+        SetTextColor(hdc, COLORREF(0x0000_0000));
+        SetBkColor(hdc, COLORREF(0x00FF_FFFF));
+
+        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+        DrawTextW(
+            hdc,
+            &mut text_wide,
+            &mut rect,
+            DT_SINGLELINE | DT_CENTER | DT_VCENTER,
+        );
+
+        let pixel_count = (width as usize) * (height as usize) * 4;
+        let bgra = std::slice::from_raw_parts(bits as *const u8, pixel_count).to_vec();
+
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(hfont.into());
+        SelectObject(hdc, old_bitmap);
+        let _ = DeleteObject(hbitmap.into());
+        let _ = DeleteDC(hdc);
+
+        let mut rgba = Vec::with_capacity(pixel_count);
+        for px in bgra.chunks_exact(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        }
+        rgba
     }
 }
