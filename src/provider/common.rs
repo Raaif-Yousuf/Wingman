@@ -145,6 +145,24 @@ pub(crate) struct RetryPolicy {
     /// it is at most this long; longer than this (or missing) means no
     /// retry, just a card naming the delay.
     pub max_retry_after: Duration,
+    /// #186: wall-clock budget across every attempt and backoff/retry-after
+    /// sleep in one `post_json_with` call, checked against a deadline
+    /// computed once at the very start. This is what keeps the retry loop
+    /// bounded independently of `max_retries` x the per-attempt `timeout`:
+    /// without it, a connection that hangs rather than fails fast (a
+    /// stalled TLS handshake, a server that accepts but never responds) can
+    /// burn the *full* per-attempt timeout on every single retry, so 3
+    /// attempts at 90s each is ~270s, not ~90s. Set comfortably above the
+    /// cloud providers' `REQUEST_TIMEOUT` (90s, see
+    /// `anthropic.rs`/`openai.rs`) so one legitimately slow single attempt
+    /// is unaffected -- only a second or third attempt gets shrunk to
+    /// whatever is left.
+    pub max_total_wall_clock: Duration,
+    /// Below this much remaining wall-clock budget, no further attempt is
+    /// started at all -- the loop returns the last error immediately
+    /// rather than sending one more request sized too small to plausibly
+    /// succeed.
+    pub retry_floor: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -154,6 +172,8 @@ impl Default for RetryPolicy {
             base_delay: Duration::from_millis(200),
             max_total_backoff: Duration::from_secs(3),
             max_retry_after: Duration::from_secs(5),
+            max_total_wall_clock: Duration::from_secs(150),
+            retry_floor: Duration::from_secs(5),
         }
     }
 }
@@ -338,12 +358,27 @@ pub(crate) fn post_json_with(
     let mut backoff_spent = Duration::ZERO;
     let mut retried_429 = false;
 
+    // #186: a wall-clock deadline computed once, up front -- never
+    // recomputed from a fresh "now" per attempt, or a slow attempt would
+    // keep resetting its own budget. `wall_clock_remaining()` shrinks every
+    // time it's called after real time (or, in a test, an injected `Clock`)
+    // has advanced.
+    let deadline_unix = env.clock.now_unix().saturating_add(policy.max_total_wall_clock.as_secs());
+    let wall_clock_remaining = || Duration::from_secs(deadline_unix.saturating_sub(env.clock.now_unix()));
+
     loop {
-        match env.transport.post_json(url, headers, body, timeout) {
+        // Each attempt gets the smaller of the caller's requested timeout
+        // and what's left of the wall-clock budget -- the first attempt is
+        // unaffected as long as the budget is at least the requested
+        // timeout (the default policy's is), but a second or third attempt
+        // only gets whatever remains.
+        let attempt_timeout = timeout.min(wall_clock_remaining());
+
+        match env.transport.post_json(url, headers, body, attempt_timeout) {
             Err(transport_err) => {
-                let remaining = policy.max_total_backoff.saturating_sub(backoff_spent);
-                if retries < policy.max_retries && !remaining.is_zero() {
-                    let delay = jittered_backoff(retries, policy.base_delay, remaining);
+                let backoff_remaining = policy.max_total_backoff.saturating_sub(backoff_spent);
+                if retries < policy.max_retries && !backoff_remaining.is_zero() && wall_clock_remaining() > policy.retry_floor {
+                    let delay = jittered_backoff(retries, policy.base_delay, backoff_remaining);
                     env.sleeper.sleep(delay);
                     backoff_spent += delay;
                     retries += 1;
@@ -358,7 +393,7 @@ pub(crate) fn post_json_with(
 
                 if resp.status == 429 {
                     let retry_after = parse_retry_after(&resp.headers, env.clock);
-                    if !retried_429 {
+                    if !retried_429 && wall_clock_remaining() > policy.retry_floor {
                         if let Some(delay) = retry_after {
                             if delay <= policy.max_retry_after {
                                 env.sleeper.sleep(delay);
@@ -371,9 +406,9 @@ pub(crate) fn post_json_with(
                 }
 
                 if resp.status >= 500 {
-                    let remaining = policy.max_total_backoff.saturating_sub(backoff_spent);
-                    if retries < policy.max_retries && !remaining.is_zero() {
-                        let delay = jittered_backoff(retries, policy.base_delay, remaining);
+                    let backoff_remaining = policy.max_total_backoff.saturating_sub(backoff_spent);
+                    if retries < policy.max_retries && !backoff_remaining.is_zero() && wall_clock_remaining() > policy.retry_floor {
+                        let delay = jittered_backoff(retries, policy.base_delay, backoff_remaining);
                         env.sleeper.sleep(delay);
                         backoff_spent += delay;
                         retries += 1;
@@ -872,6 +907,118 @@ mod tests {
 
         assert_eq!(result, "done");
         assert_eq!(sleeper.recorded(), vec![Duration::from_secs(0)]);
+    }
+
+    // -- #186: wall-clock budget across attempts --------------------------
+
+    /// Mutable so a transport double sharing it can simulate real elapsed
+    /// time without an actual sleep (`FixedClock` above is deliberately
+    /// immovable, which is right for the retry-after tests but wrong here).
+    struct FakeClock(std::cell::Cell<u64>);
+
+    impl FakeClock {
+        fn new(t: u64) -> Self {
+            Self(std::cell::Cell::new(t))
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now_unix(&self) -> u64 {
+            self.0.get()
+        }
+    }
+
+    /// Simulates a connection that always takes (almost) exactly the
+    /// timeout it was given before failing -- a stalled TLS handshake or a
+    /// server that accepts but never responds, the shape #186 is about.
+    /// Advances the shared `FakeClock` by the timeout it received, so the
+    /// retry loop's wall-clock bookkeeping is exercised without a real
+    /// sleep, and records every timeout it was called with so the test can
+    /// assert a later attempt's timeout actually shrank.
+    struct HangingTransport<'a> {
+        clock: &'a FakeClock,
+        timeouts_seen: Mutex<Vec<Duration>>,
+    }
+
+    impl<'a> HangingTransport<'a> {
+        fn new(clock: &'a FakeClock) -> Self {
+            Self { clock, timeouts_seen: Mutex::new(Vec::new()) }
+        }
+
+        fn timeouts_seen(&self) -> Vec<Duration> {
+            self.timeouts_seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Transport for HangingTransport<'_> {
+        fn post_json(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &Value,
+            timeout: Duration,
+        ) -> std::result::Result<RawResponse, String> {
+            self.timeouts_seen.lock().unwrap().push(timeout);
+            self.clock.0.set(self.clock.0.get() + timeout.as_secs());
+            Err("simulated hang".to_string())
+        }
+    }
+
+    #[test]
+    fn wall_clock_budget_shrinks_a_later_attempts_timeout_and_stays_bounded() {
+        let clock = FakeClock::new(0);
+        let transport = HangingTransport::new(&clock);
+        let sleeper = RecordingSleeper::new();
+        let policy = RetryPolicy {
+            max_total_wall_clock: Duration::from_secs(200),
+            retry_floor: Duration::from_secs(10),
+            ..RetryPolicy::default()
+        };
+        let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+
+        let err = post_json_with(&env, "https://example.invalid/", &[], &json!({}), Duration::from_secs(90), "anthropic")
+            .unwrap_err();
+
+        let timeouts = transport.timeouts_seen();
+        assert_eq!(timeouts.len(), 3, "max_retries=2 still allows 3 attempts here");
+        assert_eq!(timeouts[0], Duration::from_secs(90), "first attempt: full budget available, unaffected");
+        assert_eq!(timeouts[1], Duration::from_secs(90), "second attempt: still enough budget left");
+        assert_eq!(
+            timeouts[2],
+            Duration::from_secs(20),
+            "third attempt's timeout is capped by what's left of the wall-clock budget: {:?}",
+            timeouts[2]
+        );
+
+        // 90 + 90 + 20 = 200s, nowhere near 3 * 90s = 270s -- #186's worst case.
+        assert_eq!(clock.now_unix(), 200);
+        assert!(err.to_string().contains("transport error"));
+    }
+
+    #[test]
+    fn wall_clock_floor_stops_retrying_before_max_retries_is_reached() {
+        let clock = FakeClock::new(0);
+        let transport = HangingTransport::new(&clock);
+        let sleeper = RecordingSleeper::new();
+        let policy = RetryPolicy {
+            max_total_wall_clock: Duration::from_secs(95),
+            retry_floor: Duration::from_secs(10),
+            ..RetryPolicy::default()
+        };
+        let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+
+        let err = post_json_with(&env, "https://example.invalid/", &[], &json!({}), Duration::from_secs(90), "openai")
+            .unwrap_err();
+
+        let timeouts = transport.timeouts_seen();
+        assert_eq!(
+            timeouts.len(),
+            1,
+            "remaining budget (5s) is below the floor (10s) after the first attempt: no second attempt at all"
+        );
+        assert_eq!(timeouts[0], Duration::from_secs(90));
+        assert!(sleeper.recorded().is_empty(), "never slept for a retry it wasn't going to make");
+        assert!(err.to_string().contains("transport error"));
     }
 
     // -- retry-after parsing (unit-level) ---------------------------------
