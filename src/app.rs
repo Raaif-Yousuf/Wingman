@@ -351,6 +351,41 @@ fn pump_messages() {
     }
 }
 
+/// Issue #214: whether `begin_model_action` bails at its very first step
+/// (busy, then paused) or proceeds -- pulled out as a pure function so this
+/// PRECEDENCE is exhaustively testable without a real `HWND`/`Card`/`Tray`
+/// (an `App` cannot be constructed in a unit test at all -- see this
+/// module's other tests, which only ever exercise pure helpers like
+/// `readiness_gate` and `settings_reentrancy_policy` directly).
+/// `begin_model_action`'s own `match` on this result, immediately followed
+/// by its hide-stale-card/readiness-gate/`extra`/capture steps in that
+/// fixed order, is the rest of the sequence; those later steps are not
+/// folded into this table because the readiness gate needs `&Config` and
+/// `extra` is a caller-supplied closure that may itself show a card, so
+/// neither can be safely precomputed as a plain `bool` the way `busy` and
+/// `paused` can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelActionGate {
+    /// A request is already in flight; every pre-#214 caller returned here
+    /// silently (no card).
+    Busy,
+    /// Nothing Wingman does runs while paused (issue #20).
+    Paused,
+    /// Neither of the above: `begin_model_action` continues on to
+    /// hide-stale-card, the readiness gate, `extra`, then capture.
+    Proceed,
+}
+
+fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
+    if busy {
+        ModelActionGate::Busy
+    } else if paused {
+        ModelActionGate::Paused
+    } else {
+        ModelActionGate::Proceed
+    }
+}
+
 impl App {
     /// Issue #192: the card `App::ask`'s pre-flight gate should show, or
     /// `None` when at least one provider the current `Mode` would actually
@@ -400,24 +435,48 @@ impl App {
         })
     }
 
-    /// The whole flow: hide any stale card, check a provider is actually
-    /// ready, grab the screen, then hand the bytes to a worker so the
-    /// message loop stays responsive during the call.
-    fn ask(&mut self) {
-        if self.busy {
-            return;
-        }
-
-        // Pause (issue #20): no network request may start while paused.
-        // The hotkey path never reaches here at all while paused (the hook
-        // in hotkey.rs passes the chord through before ever posting
-        // WM_APP_HOTKEY), so this guard exists for the other entry points --
-        // the tray's "Ask now" and a second Copilot-key launch
-        // (WM_APP_ACTIVATE) -- which don't go through the hook.
-        if pause::is_paused_now() {
-            self.card
-                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
-            return;
+    /// Issue #214: the pause/busy/hide-stale-card/readiness/capture pipeline
+    /// shared by every action that shows a pending card, captures the
+    /// screen, and hands off to a worker thread which posts back one of the
+    /// `WM_APP_*` result messages. Before this existed, `ask()`,
+    /// `add_event_from_screen()` and `review_this_email()` each duplicated
+    /// roughly the same 40 lines almost verbatim (#214's own body: "the
+    /// overnight task instructions asked for app.rs edits to stay additive
+    /// and minimal since another agent was editing it concurrently"). A
+    /// future fill-form-from-screen action (fill_form.rs's own executor
+    /// already exists; nothing in `app.rs` calls it yet) should call this
+    /// too instead of adding a fourth near-copy.
+    ///
+    /// `model_action_gate` decides the first three steps' precedence (busy
+    /// beats paused beats readiness-blocked); this method's own `if`s
+    /// implement that same order, in the same sequence, so a future edit
+    /// that reorders one without the other is a visible diff, not a silent
+    /// drift. `extra` is the one point the three current callers differ at
+    /// -- it runs after readiness passes and before capture (matching
+    /// `add_event_from_screen`'s pre-#214 position for its
+    /// `local_today_and_utc_offset()` read); `ask`/`review_this_email` pass
+    /// one that does nothing. Like every other step here, `extra` must show
+    /// its own card and return `None` to bail; `Some(value)` continues, and
+    /// `value` is threaded back out unchanged so the caller can use it in
+    /// its own worker closure.
+    ///
+    /// Returns `None` once this has already shown whatever card explains
+    /// why (busy shows nothing at all, matching every pre-#214 caller; the
+    /// other gates show their own paused/error card); `Some((raw,
+    /// foreground_hwnd_isize, value))` once the pending card is showing and
+    /// `self.busy` is `true`.
+    fn begin_model_action<T>(
+        &mut self,
+        extra: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<(capture::RawShot, isize, T)> {
+        match model_action_gate(self.busy, pause::is_paused_now()) {
+            ModelActionGate::Busy => return None,
+            ModelActionGate::Paused => {
+                self.card
+                    .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
+                return None;
+            }
+            ModelActionGate::Proceed => {}
         }
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
@@ -440,8 +499,10 @@ impl App {
             Self::readiness_gate(self.config.mode, &self.config.providers, &path)
         {
             self.card.show_error(&headline, &detail);
-            return;
+            return None;
         }
+
+        let extra_value = extra(self)?;
 
         // Capture (grab the pixels and downscale) runs here, on the main
         // thread, and must happen before the pending card is shown --
@@ -450,10 +511,11 @@ impl App {
         // `CompressionType::Best` PNG encoding at up to ~1s in a release
         // build on a 1402x876 image, which froze the message loop for that
         // whole time with nothing on screen after the key press. `encode`
-        // now runs on the worker thread below, after `show_pending`.
+        // runs on each caller's own worker thread instead, after
+        // `show_pending`.
         //
-        // Issue #169: the downscale target comes from the FIRST provider
-        // `worker` (below) will actually try, not a provider-agnostic
+        // Issue #169: the downscale target comes from the FIRST provider a
+        // caller's own worker will actually try, not a provider-agnostic
         // heuristic. That real, mode-aware chain is only built on the
         // worker thread (its Ollama-reachability probe is a real network
         // call, and capture is the last thing allowed to block this
@@ -475,19 +537,20 @@ impl App {
             Err(e) => {
                 self.card
                     .show_error("Couldn't capture the screen", &format!("{e:#}"));
-                return;
+                return None;
             }
         };
         // Issue #18/#206: the foreground window's HWND, captured HERE on the
         // main thread, right alongside the pixel capture -- both are "what
         // was actually on screen at press time", and both must be read
         // before `show_pending()` below puts Wingman's own card on top.
-        // Only the isize is carried into the worker closure (an `HWND`
-        // wraps a raw pointer and is not `Send`; `hwnd_isize`/`target`
-        // below already use the same pattern for the owner window). This
-        // HWND is used only lazily, inside the non-vision fallback -- see
-        // `non_vision_inputs` -- so capturing it costs nothing when every
-        // provider in the chain turns out to have vision.
+        // Only the isize is carried into the caller's worker closure (an
+        // `HWND` wraps a raw pointer and is not `Send`; `hwnd_isize`/
+        // `target` at each call site already use the same pattern for the
+        // owner window). This HWND is used only lazily, inside the
+        // non-vision fallback -- see `non_vision_inputs` -- so capturing it
+        // costs nothing when every provider in the chain turns out to have
+        // vision.
         let foreground_hwnd_isize =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
 
@@ -496,6 +559,17 @@ impl App {
         // is up must not touch the card.
         self.set_watch(false);
         self.card.show_pending();
+
+        Some((raw, foreground_hwnd_isize, extra_value))
+    }
+
+    /// The whole flow: hide any stale card, check a provider is actually
+    /// ready, grab the screen, then hand the bytes to a worker so the
+    /// message loop stays responsive during the call.
+    fn ask(&mut self) {
+        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
+            return;
+        };
 
         // Issue #19: the mode-aware chain is built fresh on the WORKER
         // thread (inside `worker`, below), not here on the main thread --
@@ -759,68 +833,24 @@ impl App {
     /// as before: this method does not touch it) but routed through the
     /// `add-to-calendar` built-in action (`actions::calendar::ACTION_ID`:
     /// proposal `calendar_event`, executor `calendar_add`, `confirm =
-    /// true`) instead of a fixed request shape. Mirrors `ask()`'s pause/
-    /// busy/readiness/capture steps (duplicated, not extracted into a
-    /// shared helper, precisely so `ask()`'s own code is untouched -- see
-    /// #214, filed for the de-duplication follow-up).
+    /// true`) instead of a fixed request shape. Shares `ask()`'s pause/
+    /// busy/readiness/capture steps via `begin_model_action` (#214); the
+    /// one thing that differs is `local_today_and_utc_offset()`, passed as
+    /// that helper's `extra` closure so it still runs exactly where it did
+    /// before -- after the readiness gate, before capture.
     fn add_event_from_screen(&mut self) {
-        if self.busy {
+        let Some((raw, foreground_hwnd_isize, (today, offset_minutes))) =
+            self.begin_model_action(|app| match local_today_and_utc_offset() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    app.card
+                        .show_error("Couldn't read the local date", &format!("{e:#}"));
+                    None
+                }
+            })
+        else {
             return;
-        }
-
-        if pause::is_paused_now() {
-            self.card
-                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
-            return;
-        }
-
-        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
-            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
-        }
-
-        let path = Config::path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "config.toml".into());
-        if let Some((headline, detail)) =
-            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-        {
-            self.card.show_error(&headline, &detail);
-            return;
-        }
-
-        let (today, offset_minutes) = match local_today_and_utc_offset() {
-            Ok(v) => v,
-            Err(e) => {
-                self.card
-                    .show_error("Couldn't read the local date", &format!("{e:#}"));
-                return;
-            }
         };
-
-        let optimistic_chain = self
-            .config
-            .providers
-            .build_chain_for_mode(self.config.mode, true);
-        let image_limits = optimistic_chain
-            .first_ready_caps()
-            .and_then(|caps| caps.image_limits);
-        let (max_long_edge, max_pixels) =
-            capture::resolve_limits(image_limits, self.config.capture.max_edge);
-        let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
-            Ok(r) => r,
-            Err(e) => {
-                self.card
-                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
-                return;
-            }
-        };
-        let foreground_hwnd_isize =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
-
-        self.busy = true;
-        self.set_watch(false);
-        self.card.show_pending();
 
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
@@ -1001,65 +1031,20 @@ impl App {
     /// #38: "Review this email", the second action to run the full
     /// Look/Propose/Confirm/Do loop -- the tray's third one-shot action,
     /// parallel to `ask()`/`add_event_from_screen()` (neither of which this
-    /// method touches). Mirrors `add_event_from_screen`'s pause/busy/
-    /// readiness/capture steps, with one difference: the (potentially slow)
-    /// UIA compose-body/selection capture attempts run on the SPAWNED
-    /// worker thread, never here, per `inputs::uia`'s and
-    /// `inputs::selection`'s own module docs ("call from a dedicated worker
-    /// thread"); only the screenshot -- needed only as the last-resort
-    /// fallback, but cheap, and must happen before any card change per
-    /// `capture::grab_raw`'s existing "no stale card in the shot" rule --
-    /// is still grabbed here, eagerly, exactly like `add_event_from_screen`
-    /// already does.
+    /// method touches). Shares `add_event_from_screen`'s pause/busy/
+    /// readiness/capture steps via `begin_model_action` (#214), with one
+    /// difference `begin_model_action` does not need to know about: the
+    /// (potentially slow) UIA compose-body/selection capture attempts run
+    /// on the SPAWNED worker thread below, never here, per `inputs::uia`'s
+    /// and `inputs::selection`'s own module docs ("call from a dedicated
+    /// worker thread"); only the screenshot -- needed only as the
+    /// last-resort fallback, but cheap -- is still grabbed inside
+    /// `begin_model_action`, exactly like `add_event_from_screen`'s already
+    /// does.
     fn review_this_email(&mut self) {
-        if self.busy {
+        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
             return;
-        }
-
-        if pause::is_paused_now() {
-            self.card
-                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
-            return;
-        }
-
-        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
-            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
-        }
-
-        let path = Config::path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "config.toml".into());
-        if let Some((headline, detail)) =
-            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-        {
-            self.card.show_error(&headline, &detail);
-            return;
-        }
-
-        let optimistic_chain = self
-            .config
-            .providers
-            .build_chain_for_mode(self.config.mode, true);
-        let image_limits = optimistic_chain
-            .first_ready_caps()
-            .and_then(|caps| caps.image_limits);
-        let (max_long_edge, max_pixels) =
-            capture::resolve_limits(image_limits, self.config.capture.max_edge);
-        let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
-            Ok(r) => r,
-            Err(e) => {
-                self.card
-                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
-                return;
-            }
         };
-        let foreground_hwnd_isize =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
-
-        self.busy = true;
-        self.set_watch(false);
-        self.card.show_pending();
 
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
@@ -3058,6 +3043,59 @@ mod tests {
         Providers {
             order: vec!["openai".to_string(), "anthropic".to_string()],
             ..Providers::default()
+        }
+    }
+
+    // -- model_action_gate (issue #214) ------------------------------------
+
+    #[test]
+    fn model_action_gate_busy_wins_over_everything() {
+        for paused in [false, true] {
+            assert_eq!(
+                super::model_action_gate(true, paused),
+                super::ModelActionGate::Busy,
+                "busy=true, paused={paused}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_action_gate_paused_wins_when_not_busy() {
+        assert_eq!(
+            super::model_action_gate(false, true),
+            super::ModelActionGate::Paused
+        );
+    }
+
+    #[test]
+    fn model_action_gate_proceeds_when_neither_busy_nor_paused() {
+        assert_eq!(
+            super::model_action_gate(false, false),
+            super::ModelActionGate::Proceed
+        );
+    }
+
+    /// Exhaustive over all four `(busy, paused)` combinations -- the same
+    /// "sweep the dimensions the bug lives in" shape as the readiness-gate
+    /// matrix below, proving BOTH that busy strictly outranks paused and
+    /// that `Proceed` is reached only when neither gate blocks.
+    #[test]
+    fn model_action_gate_matches_precedence_table_exhaustively() {
+        for busy in [false, true] {
+            for paused in [false, true] {
+                let expected = if busy {
+                    super::ModelActionGate::Busy
+                } else if paused {
+                    super::ModelActionGate::Paused
+                } else {
+                    super::ModelActionGate::Proceed
+                };
+                assert_eq!(
+                    super::model_action_gate(busy, paused),
+                    expected,
+                    "busy={busy}, paused={paused}"
+                );
+            }
         }
     }
 
