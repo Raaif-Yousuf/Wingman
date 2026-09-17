@@ -454,26 +454,8 @@ pub fn gpu_status_for(entries: &[PsEntry], model: &str) -> GpuStatus {
 /// no-body discovery endpoints (`/api/tags`, `/api/ps`) that don't fit
 /// that helper's POST-only signature.
 fn get_body(url: &str, tag: &str) -> Result<String> {
-    let mut response = ureq::get(url)
-        .config()
-        .http_status_as_error(false)
-        .timeout_connect(Some(DISCOVERY_CONNECT_TIMEOUT))
-        .timeout_global(Some(DISCOVERY_TOTAL_TIMEOUT))
-        .build()
-        .call()
-        .map_err(|e| anyhow!("{tag}: transport error: {e}"))?;
-
-    let status = response.status();
-    let body_text = response
-        .body_mut()
-        .read_to_string()
-        .with_context(|| format!("{tag}: failed to read response body"))?;
-
-    if !status.is_success() {
-        let truncated: String = body_text.chars().take(300).collect();
-        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
-    }
-    Ok(body_text)
+    // #189: through `common` so the Offline guard (#19) covers discovery too.
+    super::common::get_text_with_timeout(url, DISCOVERY_TOTAL_TIMEOUT, tag)
 }
 
 /// Not called from any live path yet: pulling a model needs a worker-thread
@@ -570,26 +552,10 @@ pub fn pull(base_url: &str, model: &str, on_progress: impl FnMut(&PullProgress))
     let url = format!("{}/api/pull", base_url.trim_end_matches('/'));
     let body = json!({"model": model, "stream": true});
 
-    let mut response = ureq::post(&url)
-        .config()
-        .http_status_as_error(false)
-        .timeout_connect(Some(DISCOVERY_CONNECT_TIMEOUT))
-        // Deliberately no total timeout: a real pull can legitimately run
-        // for minutes. `stream_pull_progress` still returns promptly on an
-        // inline error line or a dropped connection.
-        .build()
-        .send_json(&body)
-        .map_err(|e| anyhow!("ollama: transport error: {e}"))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body_text = response.body_mut().read_to_string().unwrap_or_default();
-        let truncated: String = body_text.chars().take(300).collect();
-        return Err(anyhow!("ollama: HTTP {status}: {truncated}"));
-    }
-
-    let reader = std::io::BufReader::new(response.body_mut().as_reader());
-    stream_pull_progress(reader, on_progress)
+    // #189: through `common` so the Offline guard (#19) covers pulls too.
+    super::common::post_json_read_body(&url, &body, DISCOVERY_CONNECT_TIMEOUT, "ollama", |r| {
+        stream_pull_progress(std::io::BufReader::new(r), on_progress)
+    })
 }
 
 #[cfg(test)]

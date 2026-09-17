@@ -468,6 +468,40 @@ pub(crate) fn get_text_with_timeout(url: &str, timeout: Duration, tag: &str) -> 
     Ok(body_text)
 }
 
+/// POST whose response body is consumed incrementally by `read` (Ollama's
+/// `/api/pull` NDJSON download progress; not model output, so the
+/// no-streaming rule does not apply). Single attempt, only the connect phase
+/// is timed out: a model download can legitimately run for minutes. Goes
+/// through [`offline_guard`] like every other entry point in this file
+/// (#189).
+pub(crate) fn post_json_read_body<T>(
+    url: &str,
+    body: &Value,
+    connect_timeout: Duration,
+    tag: &str,
+    read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
+) -> Result<T> {
+    offline_guard(url)?;
+
+    let mut response = ureq::post(url)
+        .config()
+        .http_status_as_error(false)
+        .timeout_connect(Some(connect_timeout))
+        .build()
+        .send_json(body)
+        .map_err(|e| anyhow!("{tag}: transport error: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.body_mut().read_to_string().unwrap_or_default();
+        let truncated: String = body_text.chars().take(300).collect();
+        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+    }
+
+    let mut reader = response.body_mut().as_reader();
+    read(&mut reader)
+}
+
 /// Same as [`post_json`] but with the connect phase timed out separately
 /// from the whole exchange. `post_json`'s single `timeout_global` is right
 /// for a cloud API, which is either reachable in well under a second or not
