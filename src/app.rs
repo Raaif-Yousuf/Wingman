@@ -480,6 +480,25 @@ impl App {
         }
     }
 
+    /// Issue #124: "Copy diagnostics" tray item. Builds a plain-text report
+    /// (`diagnostics::render_report`) and puts it on the clipboard -- no
+    /// file writes, no network. See `diagnostics.rs`'s module doc for the
+    /// redaction guarantee.
+    fn copy_diagnostics(&mut self) {
+        let report = crate::diagnostics::render_report(&crate::diagnostics::collect(&self.config));
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
+            Ok(()) => self.card.show_answer(
+                "Diagnostics copied",
+                "Paste them into a bug report.",
+                6,
+                None,
+            ),
+            Err(e) => self
+                .card
+                .show_error("Couldn't copy diagnostics", &format!("{e}")),
+        }
+    }
+
     fn start_learning(&mut self, which: usize) {
         let Some(hook) = &self.hook else {
             self.card
@@ -560,6 +579,18 @@ impl App {
     /// `TASKBAR_RECREATED_WHILE_SETTINGS`, and `PAUSE_REEVALUATE_PENDING`
     /// (issue #20). All four are only touched here, immediately before and
     /// after `show_modal`, when no reentrant call can possibly be in flight.
+    ///
+    /// Issue #178: the card has a single slot, and every branch below can
+    /// show one -- a pending answer, a save error, or "Settings saved". If a
+    /// tray-icon restore failure (`TASKBAR_RECREATED_WHILE_SETTINGS`) showed
+    /// its card immediately, right here, every one of those branches would
+    /// silently replace it, leaving the user with no tray icon and no
+    /// explanation (rule 7). So the restore is still performed immediately
+    /// (`try_restore_tray_icon` re-adds the real icon and refreshes its
+    /// labels), but its error card, if any, is captured in
+    /// `tray_restore_error` and shown LAST, after every other branch below
+    /// has already shown whatever card it was going to show -- see
+    /// `final_settings_card` (test-only) for a pure model of this ordering.
     fn open_settings(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
@@ -572,9 +603,11 @@ impl App {
 
         let pending = PENDING_RESULT.with(|c| c.borrow_mut().take());
         let taskbar_recreated = TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false));
-        if taskbar_recreated {
-            self.on_taskbar_created();
-        }
+        let tray_restore_error = if taskbar_recreated {
+            self.try_restore_tray_icon()
+        } else {
+            None
+        };
         if PAUSE_REEVALUATE_PENDING.with(|c| c.replace(false)) {
             self.reevaluate_pause(self.hwnd());
         }
@@ -585,6 +618,7 @@ impl App {
             if let Some(result) = pending {
                 self.on_result(result);
             }
+            self.show_tray_restore_error(tray_restore_error);
             return;
         };
 
@@ -600,6 +634,7 @@ impl App {
             if let Some(result) = pending {
                 self.record_last(result);
             }
+            self.show_tray_restore_error(tray_restore_error);
             return;
         }
         self.apply_config();
@@ -610,6 +645,17 @@ impl App {
                 self.card.show_answer("Settings saved", "", 3, None);
                 self.set_watch(true);
             }
+        }
+        self.show_tray_restore_error(tray_restore_error);
+    }
+
+    /// Issue #178: shows the tray-restore error card if `error` is `Some`,
+    /// overwriting whatever card `open_settings` just showed -- called last,
+    /// on every `open_settings` path, so this failure (the app's only
+    /// persistent UI, per rule 7) is never the one silently dropped.
+    fn show_tray_restore_error(&mut self, error: Option<String>) {
+        if let Some(e) = error {
+            self.card.show_error("Couldn't restore the tray icon", &e);
         }
     }
 
@@ -905,13 +951,29 @@ impl App {
     /// Handle the shell's `TaskbarCreated` broadcast (Explorer crashed or
     /// was restarted): re-add the tray icon and restore its tooltip, which
     /// `NIM_ADD` resets to the default. Per rule 7, a failure here still
-    /// ends in a card rather than silently leaving the tray empty.
+    /// ends in a card rather than silently leaving the tray empty. Thin
+    /// wrapper around [`App::try_restore_tray_icon`] that shows the card
+    /// immediately -- correct for this method's only other caller
+    /// (`wnd_proc`'s direct, non-Settings path, where nothing else is about
+    /// to show a card right after). `open_settings` calls
+    /// `try_restore_tray_icon` directly instead, so it can defer the card
+    /// (issue #178 -- see that method's doc comment).
     fn on_taskbar_created(&mut self) {
+        if let Some(e) = self.try_restore_tray_icon() {
+            self.card.show_error("Couldn't restore the tray icon", &e);
+        }
+    }
+
+    /// Re-adds the tray icon and refreshes its labels, WITHOUT touching the
+    /// card. `Some(message)` on failure (never shown here -- the caller
+    /// decides when); `None` on success (labels already refreshed).
+    fn try_restore_tray_icon(&mut self) -> Option<String> {
         match self.tray.readd() {
-            Ok(()) => self.refresh_tray_labels(),
-            Err(e) => self
-                .card
-                .show_error("Couldn't restore the tray icon", &format!("{e:#}")),
+            Ok(()) => {
+                self.refresh_tray_labels();
+                None
+            }
+            Err(e) => Some(format!("{e:#}")),
         }
     }
 
@@ -1072,6 +1134,70 @@ fn std_to_systemtime_utc(t: SystemTime) -> Result<SYSTEMTIME> {
 }
 
 /// First line of an error, truncated on a char boundary, for the headline.
+/// Issue #178: the single card slot's final content after `open_settings`'s
+/// whole post-modal sequence, as a pure model (no `Card`, no `Tray`, no
+/// `HWND`) -- see that method's doc comment for the real, imperative
+/// version this mirrors. Each variant is one of the cards `open_settings`
+/// can show; `TrayRestoreError` is what proves the fix: it is the outcome
+/// whenever `tray_restore_failed` is true, regardless of every other input,
+/// because `open_settings` always shows that card last (every one of its
+/// branches ends with `self.show_tray_restore_error(tray_restore_error)`).
+/// Test-only (`#[cfg(test)]`, same pattern `secrets.rs`'s `InMemoryStore`
+/// uses for a test-only type living outside `mod tests`): this function is
+/// a verification model of the invariant, not itself called by
+/// `open_settings` -- the real enforcement is the unconditional final call
+/// on every path, checked directly in that method's source.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsFinalCard {
+    /// Cancelled/closed with nothing pending: no card shown at all.
+    None,
+    /// A worker answer that arrived mid-edit, shown via `on_result` (its own
+    /// success/error split does not matter for this ordering, only that
+    /// SOME card was shown).
+    PendingAnswer,
+    /// `Config::save` failed.
+    SaveError,
+    /// Saved successfully with nothing pending.
+    SettingsSaved,
+    /// The tray-icon restore failed. Always wins when `tray_restore_failed`
+    /// is true -- see this enum's doc comment.
+    TrayRestoreError,
+}
+
+/// Pure re-derivation of which card is left on screen after
+/// `open_settings`'s branches, in the exact order that method executes
+/// them. `edited` is whether Settings was saved (`Some`) vs.
+/// cancelled/closed (`None`); `save_ok` is only meaningful when `edited` is
+/// true.
+#[cfg(test)]
+fn final_settings_card(
+    edited: bool,
+    save_ok: bool,
+    pending_present: bool,
+    tray_restore_failed: bool,
+) -> SettingsFinalCard {
+    let without_tray_restore = if !edited {
+        if pending_present {
+            SettingsFinalCard::PendingAnswer
+        } else {
+            SettingsFinalCard::None
+        }
+    } else if !save_ok {
+        SettingsFinalCard::SaveError
+    } else if pending_present {
+        SettingsFinalCard::PendingAnswer
+    } else {
+        SettingsFinalCard::SettingsSaved
+    };
+
+    if tray_restore_failed {
+        SettingsFinalCard::TrayRestoreError
+    } else {
+        without_tray_restore
+    }
+}
+
 fn first_line(text: &str, max: usize) -> String {
     let line = text.lines().next().unwrap_or(text).trim();
     if line.chars().count() <= max {
@@ -1288,6 +1414,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
                     MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
+                    MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
                     MenuChoice::Command(cmd::USE_OPENAI) => app.set_provider(true),
                     MenuChoice::Command(cmd::USE_ANTHROPIC) => app.set_provider(false),
                     MenuChoice::Command(cmd::PAUSE_1H) => app.pause_for(PauseChoice::OneHour),
@@ -1388,6 +1515,7 @@ mod tests {
     use super::first_line;
     use super::unreadable_secrets_card;
     use super::App;
+    use super::{final_settings_card, SettingsFinalCard};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{WM_APP_ACTIVATE, WM_APP_RESULT};
     use crate::config::Providers;
@@ -1426,6 +1554,73 @@ mod tests {
         let (headline, detail) = unreadable_secrets_card(&["openai".to_string()]);
         assert!(!headline.contains('\u{2014}'));
         assert!(!detail.contains('\u{2014}'));
+    }
+
+    // -- final_settings_card (issue #178) -----------------------------------
+
+    #[test]
+    fn tray_restore_error_wins_over_every_other_outcome() {
+        // The core invariant: whatever else happened during open_settings,
+        // a failed tray-icon restore is always the LAST card shown, never
+        // silently replaced. Exhaustive over every other combination.
+        for edited in [false, true] {
+            for save_ok in [false, true] {
+                for pending_present in [false, true] {
+                    assert_eq!(
+                        final_settings_card(edited, save_ok, pending_present, true),
+                        SettingsFinalCard::TrayRestoreError,
+                        "edited={edited}, save_ok={save_ok}, pending_present={pending_present}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_with_nothing_pending_and_no_tray_failure_shows_no_card() {
+        assert_eq!(
+            final_settings_card(false, true, false, false),
+            SettingsFinalCard::None
+        );
+    }
+
+    #[test]
+    fn cancel_with_a_pending_answer_shows_it() {
+        assert_eq!(
+            final_settings_card(false, true, true, false),
+            SettingsFinalCard::PendingAnswer
+        );
+    }
+
+    #[test]
+    fn save_failure_shows_the_save_error() {
+        assert_eq!(
+            final_settings_card(true, false, false, false),
+            SettingsFinalCard::SaveError
+        );
+        // Even with an answer pending -- the save error still wins (matches
+        // the existing, unchanged behavior: the user just directly caused
+        // this one).
+        assert_eq!(
+            final_settings_card(true, false, true, false),
+            SettingsFinalCard::SaveError
+        );
+    }
+
+    #[test]
+    fn successful_save_with_nothing_pending_shows_settings_saved() {
+        assert_eq!(
+            final_settings_card(true, true, false, false),
+            SettingsFinalCard::SettingsSaved
+        );
+    }
+
+    #[test]
+    fn successful_save_with_a_pending_answer_shows_it_not_settings_saved() {
+        assert_eq!(
+            final_settings_card(true, true, true, false),
+            SettingsFinalCard::PendingAnswer
+        );
     }
 
     // -- readiness_gate (issue #192) ---------------------------------------
