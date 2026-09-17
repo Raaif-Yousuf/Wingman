@@ -3,10 +3,9 @@
 # Allowlist per issue #9 and CLAUDE.md rule 2 (permissive licenses only):
 # MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, Unicode-3.0, Unlicense.
 #
-# Three crates on the actual x86_64-pc-windows-msvc dependency graph sit
+# Two crates on the actual x86_64-pc-windows-msvc dependency graph sit
 # outside that list (see the comment on issue #9 and THIRD_PARTY_NOTICES.md
 # "Licensing note" for how each was found and verified):
-#   - option-ext 0.2.0 (via dirs -> dirs-sys): MPL-2.0, weak copyleft.
 #   - clipboard-win 5.4.1, error-code 3.4.0: BSL-1.0 (Boost Software
 #     License -- OSI-approved permissive; NOT the unrelated Business Source
 #     License that shares the abbreviation).
@@ -15,12 +14,16 @@
 # BSL-1.0 and CDLA-Permissive-2.0 are uncontroversially permissive, so they
 # get narrow per-crate exceptions below rather than widening the allowlist
 # CLAUDE.md rule 2 states, so anyone reading this file still sees exactly
-# which crates needed a judgment call and why. MPL-2.0/option-ext is a real
-# (if narrow) copyleft exception and is flagged TEMPORARY: see the tracking
-# issue filed alongside this file proposing to drop `dirs` in favor of
-# `SHGetKnownFolderPath(FOLDERID_RoamingAppData)` via the `windows` crate
-# this project already depends on. The owner decides whether to keep the
-# exception or take that route.
+# which crates needed a judgment call and why.
+#
+# A third exception used to live here for option-ext 0.2.0 (MPL-2.0, weak
+# copyleft), pulled in transitively by `dirs -> dirs-sys`. Issue #160
+# replaced `dirs::config_dir()` with a direct
+# `SHGetKnownFolderPath(FOLDERID_RoamingAppData)` call via the `windows`
+# crate this project already depends on (`src/known_folder.rs`), dropping
+# `dirs`/`dirs-sys`/`option-ext` from the tree entirely. The exception is
+# removed, not merely left unused, so a reintroduced `dirs` dependency fails
+# `cargo deny check` instead of silently passing under a stale allowance.
 
 [graph]
 targets = [
@@ -51,17 +54,6 @@ allow = [
 # Narrow, per-crate exceptions for the three crates above. Each is scoped to
 # exactly one crate name so it cannot silently cover an unrelated dependency
 # that later happens to carry the same license id.
-
-[[licenses.exceptions]]
-name = "option-ext"
-allow = ["MPL-2.0"]
-# TEMPORARY (owner has not yet decided, see the tracking issue filed with
-# this file): option-ext is pulled in transitively by the direct dependency
-# `dirs` (dirs -> dirs-sys -> option-ext), used only to resolve
-# %APPDATA%. MPL-2.0 is file-level weak copyleft; this crate is used
-# unmodified and statically linked, not copied from. Remove this exception
-# if `dirs` is dropped in favor of `windows::Win32::UI::Shell::
-# SHGetKnownFolderPath(FOLDERID_RoamingAppData)`.
 
 [[licenses.exceptions]]
 name = "clipboard-win"

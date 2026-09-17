@@ -1,10 +1,10 @@
 # Third-party notices
 
 Wingman is MIT-licensed. It links against the Rust crates below, all
-permissively licensed with one flagged exception (see **Licensing note**).
-No source code has been copied from another project into this repository
-yet; when that happens (CLAUDE.md rule 2: MIT-only, attributed here), the
-attribution goes in **Copied code**, below.
+permissively licensed with two flagged (non-blocking) exceptions (see
+**Licensing note**). No source code has been copied from another project
+into this repository yet; when that happens (CLAUDE.md rule 2: MIT-only,
+attributed here), the attribution goes in **Copied code**, below.
 
 ## How this list was generated
 
@@ -22,8 +22,12 @@ separate Phase 0 item) exists; regenerate this file whenever `Cargo.lock`
 changes materially, by rerunning the command above against the current lock
 file and updating the table.
 
-146 crates resolve for this target as of `Cargo.lock` at commit `fbc589d`
-(the LICENSE/README commit in this same session).
+142 crates resolve for this target as of `Cargo.lock` after issue #160
+dropped the direct dependency `dirs` (and its `dirs-sys` -> `option-ext`
+transitive chain, plus the `windows-sys` 0.61.2 pulled in only by
+`dirs-sys`) in favor of a direct `SHGetKnownFolderPath` call through the
+`windows` crate this project already depends on
+(`src/known_folder.rs`).
 
 ## Direct dependencies
 
@@ -32,7 +36,6 @@ file and updating the table.
 | anyhow | 1.0.104 | MIT OR Apache-2.0 | https://github.com/dtolnay/anyhow |
 | arboard | 3.6.1 | MIT OR Apache-2.0 | https://github.com/1Password/arboard |
 | base64 | 0.23.1 | MIT OR Apache-2.0 | https://github.com/marshallpierce/rust-base64 |
-| dirs | 7.0.0 | MIT OR Apache-2.0 | https://codeberg.org/dirs/dirs-rs |
 | embed-resource | 3.0.11 (build) | MIT | https://github.com/nabijaczleweli/rust-embed-resource |
 | image | 0.25.10 | MIT OR Apache-2.0 | https://github.com/image-rs/image |
 | serde | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde |
@@ -49,25 +52,19 @@ from, here).
 
 ## Licensing note (flagged, not blocking)
 
-One transitive dependency is not on the CLAUDE.md permissive allowlist (MIT,
-Apache-2.0, BSD, ISC, Zlib, Unlicense):
+Issue #160 removed the one non-permissive exception this file used to carry
+here: `option-ext` 0.2.0 (MPL-2.0, weak copyleft), pulled in transitively by
+the direct dependency `dirs` (`dirs` -> `dirs-sys` -> `option-ext`), used
+only to resolve `%APPDATA%`. `Config::path()`/`Config::old_path()` now call
+`SHGetKnownFolderPath(FOLDERID_RoamingAppData)` directly through the
+`windows` crate (`src/known_folder.rs`), so `dirs`, `dirs-sys` and
+`option-ext` are no longer in the dependency graph at all, and `deny.toml`'s
+matching per-crate exception has been removed alongside them (`cargo tree -i
+option-ext` finds nothing).
 
-- **`option-ext` 0.2.0, MPL-2.0**, pulled in by `dirs-sys` 0.5.0 (via the
-  direct dependency `dirs`), confirmed with
-  `cargo tree --target x86_64-pc-windows-msvc -p dirs-sys -e normal`. MPL-2.0
-  is file-level weak copyleft: it requires source availability only for the
-  MPL-licensed files themselves if they are modified and distributed, not
-  for the rest of the program, so static linking an unmodified copy is
-  widely treated as compatible with a proprietary or MIT-licensed
-  distribution. It is still not on this repo's stated allowlist, so it is
-  filed as an issue rather than silently accepted; see the issue filed in
-  this session for the decision to make (accept and add MPL-2.0 to
-  `deny.toml`'s allowlist, or replace `dirs` with a narrower path-lookup
-  crate).
-
-Two more crates use a permissive license not yet named in the plan's
-`deny.toml` allowlist (MIT, Apache-2.0, BSD-2/3, ISC, Zlib, Unicode-3.0,
-Unlicense):
+Two crates still use a permissive license named individually in
+`deny.toml`'s per-crate exceptions rather than folded into the allowlist
+(MIT, Apache-2.0, BSD-2/3, ISC, Zlib, Unicode-3.0, Unlicense):
 
 - **`clipboard-win` 5.4.1** and **`error-code` 3.4.0**, both BSL-1.0 (the
   Boost Software License, a short, OSI-approved permissive license, not to
@@ -77,9 +74,9 @@ Unlicense):
   certificate data it bundles, used transitively through `rustls` /
   `ureq`).
 
-Both are genuinely permissive and require no action beyond adding them to
-`deny.toml` when that file is created; noted here so that step does not
-silently drop a crate the build actually needs.
+Both are genuinely permissive; `deny.toml`'s narrow per-crate exceptions for
+them (rather than widening the allowlist) are the accepted, non-blocking
+state, not a pending action.
 
 ## All dependencies (this platform)
 
@@ -102,8 +99,6 @@ silently drop a crate the build actually needs.
 | cookie_store | 0.22.1 | MIT OR Apache-2.0 |
 | crc32fast | 1.5.2 | MIT OR Apache-2.0 |
 | deranged | 0.5.8 | MIT OR Apache-2.0 |
-| dirs | 7.0.0 | MIT OR Apache-2.0 |
-| dirs-sys | 0.5.0 | MIT OR Apache-2.0 |
 | displaydoc | 0.2.7 | MIT OR Apache-2.0 |
 | document-features | 0.2.12 | MIT OR Apache-2.0 |
 | embed-resource | 3.0.11 | MIT |
@@ -142,7 +137,6 @@ silently drop a crate the build actually needs.
 | num-conv | 0.2.2 | MIT OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
-| option-ext | 0.2.0 | MPL-2.0 |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 |
 | png | 0.18.1 | MIT OR Apache-2.0 |
 | potential_utf | 0.1.6 | Unicode-3.0 |
@@ -207,7 +201,6 @@ silently drop a crate the build actually needs.
 | windows-strings | 0.5.1 | MIT OR Apache-2.0 |
 | windows-sys | 0.59.0 | MIT OR Apache-2.0 |
 | windows-sys | 0.60.2 | MIT OR Apache-2.0 |
-| windows-sys | 0.61.2 | MIT OR Apache-2.0 |
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 |
 | windows-targets | 0.53.5 | MIT OR Apache-2.0 |
 | windows-threading | 0.2.1 | MIT OR Apache-2.0 |

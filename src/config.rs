@@ -215,7 +215,8 @@ impl Default for Ui {
 impl Config {
     /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {
-        let base = dirs::config_dir().context("could not determine the platform config directory")?;
+        let base = crate::known_folder::roaming_app_data()
+            .context("could not determine the platform config directory")?;
         Ok(base.join("Wingman").join("config.toml"))
     }
 
@@ -223,7 +224,8 @@ impl Config {
     /// [`Config::migrate_from`] touches this path, once, to copy the file
     /// forward; nothing here ever reads its contents for any other purpose.
     pub fn old_path() -> Result<PathBuf> {
-        let base = dirs::config_dir().context("could not determine the platform config directory")?;
+        let base = crate::known_folder::roaming_app_data()
+            .context("could not determine the platform config directory")?;
         Ok(base.join("copilot-ask").join("config.toml"))
     }
 
