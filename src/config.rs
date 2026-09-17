@@ -94,6 +94,27 @@ pub struct Hotkeys {
     /// the lock-free packed-chord path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pause: Option<Chord>,
+    /// Issue #25: optional chord that opens the Quick Ask palette. `None` by
+    /// default -- same "no default binding" decision `pause` already made
+    /// (unlike `primary`/`secondary`), since the tray's "Quick Ask" item and
+    /// the palette's own window are reachable without one. Set it by hand in
+    /// `config.toml`:
+    /// ```toml
+    /// [hotkeys.palette]
+    /// vk = 0x20    # VK_SPACE
+    /// ctrl = true
+    /// shift = false
+    /// alt = false
+    /// win = true
+    /// ```
+    /// `hotkey::HotkeyHook::set_palette_chord` is how the hook learns about
+    /// it. Unlike `pause`, this chord does NOT fire while paused (matching
+    /// `primary`/`secondary`'s own paused behaviour -- opening the palette
+    /// to run an action is exactly the kind of thing Pause exists to
+    /// suppress), so it lives in the hook's ordinary, locked `HookShared`
+    /// state rather than `pause`'s lock-free atomic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub palette: Option<Chord>,
 }
 
 impl Default for Hotkeys {
@@ -114,6 +135,7 @@ impl Default for Hotkeys {
                 win: false,
             },
             pause: None,
+            palette: None,
         }
     }
 }

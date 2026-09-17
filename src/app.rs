@@ -40,13 +40,15 @@ use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::executors;
 use crate::hotkey::{
     chord_to_string, Chord, HotkeyHook, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
-    WM_APP_PAUSE_TOGGLE,
+    WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
 };
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
 use crate::provider::{calendar_request, parse_answer, physics_request, Answer, Chain, Shot};
 use crate::ui::card::{Card, WM_APP_PREVIEW_DECIDED};
 use crate::ui::confirm;
+use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
+use crate::ui::palette_model::{self, DispatchTarget};
 use crate::ui::settings;
 use crate::ui::tray::{cmd, decode, register_taskbar_created, MenuChoice, Tray, WM_APP_TRAY};
 
@@ -98,6 +100,10 @@ struct App {
     config: Config,
     chain: Arc<Chain>,
     card: Card,
+    /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
+    /// hidden repeatedly (never re-created) -- see `ui::palette`'s module
+    /// doc comment.
+    palette: Palette,
     tray: Tray,
     hook: Option<HotkeyHook>,
     /// Global click watcher. Armed only while an answer is on screen, so a
@@ -189,12 +195,19 @@ pub fn run() -> Result<()> {
     }
     let tray = Tray::new(hwnd, instance).context("creating the tray icon")?;
 
+    // #25: pre-created hidden here (rule 5: zero work while hidden --
+    // App::toggle_palette only ever ShowWindow/HideWindow this, never
+    // re-creates it).
+    let mut palette = Palette::new(instance).context("creating the Quick Ask palette window")?;
+    palette.set_owner(hwnd);
+
     let mut app = Box::new(App {
         instance,
         taskbar_created_msg,
         config,
         chain,
         card,
+        palette,
         tray,
         hook: None,
         watcher: None,
@@ -234,6 +247,9 @@ pub fn run() -> Result<()> {
             // "unconfigured" sentinel) unless the owner hand-edited
             // config.toml.
             h.set_pause_chord(app.config.hotkeys.pause);
+            // #25: no default binding, same as `pause` -- a no-op unless the
+            // owner hand-edited config.toml.
+            h.set_palette_chord(app.config.hotkeys.palette);
             app.hook = Some(h);
         }
         Err(e) => app.card.show_error(
@@ -495,6 +511,104 @@ impl App {
                 );
             }
         });
+    }
+
+    /// #25: shows or hides the Quick Ask palette. Toggling hide-if-visible
+    /// (rather than always showing) matches both the tray item and the
+    /// configured hotkey feeling like a single on/off press, and lets Esc
+    /// (handled entirely inside `ui::palette`, no round trip through here)
+    /// and a second press agree on what "off" means.
+    ///
+    /// Honors Pause the same way `ask()` does (issue #20: nothing Wingman
+    /// does runs while paused) -- the hook already never posts
+    /// `WM_APP_PALETTE_TOGGLE` while paused, and the tray's "Quick Ask" item
+    /// is greyed while paused, but this guard is the one place both of
+    /// those paths (plus any future caller) actually converge, so it stays
+    /// here rather than trusting every caller to check first.
+    fn toggle_palette(&mut self) {
+        if self.palette.is_visible() {
+            self.palette.hide();
+            return;
+        }
+        if pause::is_paused_now() {
+            return;
+        }
+
+        let resolved = match actions::load_actions() {
+            Ok(r) => r,
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't load actions.toml", &format!("{e:#}"));
+                return;
+            }
+        };
+        let catalogue = palette_model::catalogue(&resolved);
+
+        // Same mode-aware, network-free "is anything configured" selection
+        // `ask()`'s `readiness_gate` and `worker`'s downscale-limit lookup
+        // already use -- see #192's reasoning on why this must be mode-aware
+        // rather than `self.chain` (built mode-agnostically).
+        let selected = self
+            .config
+            .providers
+            .build_chain_for_mode(self.config.mode, true);
+        let model_configured = !selected.ready_provider_names().is_empty();
+
+        let footer = palette_model::footer_line(
+            self.config.mode.label(),
+            self.first_provider_model_label().as_deref(),
+        );
+
+        self.palette.show(catalogue, model_configured, footer);
+    }
+
+    /// `"<name>:<model>"` for the first entry in `providers.order`, or just
+    /// `"<name>"` when that provider has no distinct model field set to a
+    /// non-empty value. `None` when nothing is configured at all -- the
+    /// palette footer then shows just the mode label (see
+    /// `palette_model::footer_line`).
+    fn first_provider_model_label(&self) -> Option<String> {
+        let name = self.config.providers.order.first()?;
+        let model: &str = match name.as_str() {
+            "openai" => &self.config.providers.openai.model,
+            "anthropic" => &self.config.providers.anthropic.model,
+            "gemini" => &self.config.providers.gemini.model,
+            "ollama" => &self.config.providers.ollama.model,
+            n if n.starts_with("compat:") => {
+                let compat_name = &n["compat:".len()..];
+                self.config
+                    .providers
+                    .compat
+                    .iter()
+                    .find(|c| c.name == compat_name)
+                    .map(|c| c.model.as_str())
+                    .unwrap_or("")
+            }
+            _ => "",
+        };
+        if model.is_empty() {
+            Some(name.clone())
+        } else {
+            Some(format!("{name}:{model}"))
+        }
+    }
+
+    /// #25: Enter in the palette routes here through the SAME dispatch table
+    /// its rows were built from (`palette_model::dispatch_target_for`),
+    /// which is unit tested to cover every built-in action id -- see that
+    /// function's doc comment. Each arm calls the EXACT method the
+    /// corresponding tray item already calls; there is no second,
+    /// palette-only code path. A `None` target (an id the palette itself
+    /// never produces) is a no-op, not a panic (rule 7).
+    fn dispatch_palette_action(&mut self, action_id: &str) {
+        match palette_model::dispatch_target_for(action_id) {
+            Some(DispatchTarget::CheckMyWork) => self.ask(),
+            Some(DispatchTarget::ExtractText) => self.extract_text(),
+            Some(DispatchTarget::AddToCalendar) => self.add_event_from_screen(),
+            Some(DispatchTarget::CalculateSelection) => self.calculate_selection(),
+            Some(DispatchTarget::CopyRegion) => self.copy_region(),
+            None => {}
+        }
     }
 
     /// "Copy text from screen" (#41): OCR the active monitor and copy the
@@ -2119,7 +2233,16 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
         | WM_APP_CALENDAR_RESULT
-        | WM_APP_PREVIEW_DECIDED => SettingsReentrancy::Ignore,
+        | WM_APP_PREVIEW_DECIDED
+        // #25: the palette cannot be shown while Settings is modal-open
+        // anyway (Settings takes the foreground; the hook's own chord check
+        // still passes the keydown through per the Ignore branch above), so
+        // both palette messages are simply dropped here, same treatment
+        // WM_APP_PAUSE_TOGGLE already gets. WM_APP_PALETTE_RUN's boxed
+        // `String` payload is freed explicitly below (mirroring
+        // WM_APP_LEARNED/WM_APP_CALENDAR_RESULT) so it never leaks.
+        | WM_APP_PALETTE_TOGGLE
+        | WM_APP_PALETTE_RUN => SettingsReentrancy::Ignore,
         _ => SettingsReentrancy::Fallback,
     }
 }
@@ -2164,15 +2287,17 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
         match settings_reentrancy_policy(msg, taskbar_created_msg) {
             SettingsReentrancy::Ignore => {
-                // WM_APP_LEARNED and WM_APP_CALENDAR_RESULT are the only
-                // ignored messages carrying a boxed payload; free them so
-                // neither leaks.
+                // WM_APP_LEARNED, WM_APP_CALENDAR_RESULT and
+                // WM_APP_PALETTE_RUN are the only ignored messages carrying
+                // a boxed payload; free them so none leaks.
                 if msg == WM_APP_LEARNED {
                     drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
                 } else if msg == WM_APP_CALENDAR_RESULT {
                     drop(unsafe {
                         Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
                     });
+                } else if msg == WM_APP_PALETTE_RUN {
+                    drop(unsafe { Box::from_raw(lparam.0 as *mut String) });
                 }
                 return LRESULT(0);
             }
@@ -2220,6 +2345,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
                     MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
                     MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
+                    MenuChoice::Command(cmd::QUICK_ASK) => app.toggle_palette(),
                     MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
                     MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
                     MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
@@ -2296,6 +2422,23 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.toggle_pause();
             LRESULT(0)
         }
+        WM_APP_PALETTE_TOGGLE => {
+            // #25: the hook already decided this keydown matches the
+            // configured `hotkeys.palette` chord; `toggle_palette` decides
+            // show vs. hide from the palette's own current visibility.
+            app.toggle_palette();
+            LRESULT(0)
+        }
+        WM_APP_PALETTE_RUN => {
+            // #25: Enter in the palette posted this with the selected
+            // action id boxed into lparam (ui::palette's own
+            // WM_APP_PALETTE_RUN doc comment). Take ownership, then run it
+            // through the same dispatch table the palette's rows were built
+            // from.
+            let action_id = unsafe { *Box::from_raw(lparam.0 as *mut String) };
+            app.dispatch_palette_action(&action_id);
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == PAUSE_TIMER_ID {
                 app.on_pause_timer(hwnd);
@@ -2351,9 +2494,12 @@ mod tests {
     use crate::actions::{self, Origin};
     use crate::config::Providers;
     use crate::dismiss::WM_APP_DISMISS;
-    use crate::hotkey::{WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PAUSE_TOGGLE};
+    use crate::hotkey::{
+        WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
+    };
     use crate::mode::Mode;
     use crate::ui::card::WM_APP_PREVIEW_DECIDED;
+    use crate::ui::palette::WM_APP_PALETTE_RUN;
     use crate::ui::tray::WM_APP_TRAY;
     use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
 
@@ -2804,6 +2950,8 @@ mod tests {
         ("WM_APP_PAUSE_TOGGLE", WM_APP_PAUSE_TOGGLE),
         ("WM_APP_CALENDAR_RESULT", WM_APP_CALENDAR_RESULT),
         ("WM_APP_PREVIEW_DECIDED", WM_APP_PREVIEW_DECIDED),
+        ("WM_APP_PALETTE_TOGGLE", WM_APP_PALETTE_TOGGLE),
+        ("WM_APP_PALETTE_RUN", WM_APP_PALETTE_RUN),
     ];
 
     #[test]
@@ -2838,14 +2986,15 @@ mod tests {
             + count_declarations(include_str!("dismiss.rs"))
             + count_declarations(include_str!("hotkey.rs"))
             + count_declarations(include_str!("ui/tray.rs"))
-            + count_declarations(include_str!("ui/card.rs"));
+            + count_declarations(include_str!("ui/card.rs"))
+            + count_declarations(include_str!("ui/palette.rs"));
 
         assert_eq!(
             declared,
             ALL_WM_APP_IDS.len(),
             "found {declared} `pub const WM_APP_* = WM_APP + n;` declarations across \
-             app.rs/dismiss.rs/hotkey.rs/ui/tray.rs/ui/card.rs but ALL_WM_APP_IDS lists {}; \
-             add the new constant to ALL_WM_APP_IDS too",
+             app.rs/dismiss.rs/hotkey.rs/ui/tray.rs/ui/card.rs/ui/palette.rs but \
+             ALL_WM_APP_IDS lists {}; add the new constant to ALL_WM_APP_IDS too",
             ALL_WM_APP_IDS.len()
         );
     }

@@ -56,6 +56,14 @@ pub const WM_APP_LEARNED: u32 = WM_APP + 4;
 /// and `lparam` are unused (0) -- `app.rs` decides pause vs. resume from its
 /// own current `PauseState`, not from anything carried on this message.
 pub const WM_APP_PAUSE_TOGGLE: u32 = WM_APP + 7;
+/// Posted to the target `HWND` when the configured Quick Ask palette chord
+/// fires (issue #25; `hotkeys.palette` in config, no default binding).
+/// `wparam`/`lparam` are unused (0) -- `App::toggle_palette` decides show
+/// vs. hide from the palette's own current visibility, not from anything
+/// carried on the message. Unlike [`WM_APP_PAUSE_TOGGLE`], this chord is
+/// checked in the ordinary (not-paused) match path alongside
+/// primary/secondary -- it does not fire while paused.
+pub const WM_APP_PALETTE_TOGGLE: u32 = WM_APP + 10;
 
 pub const HK_PRIMARY: usize = 1;
 pub const HK_SECONDARY: usize = 2;
@@ -314,6 +322,12 @@ struct HookShared {
     target_hwnd: isize,
     primary: Chord,
     secondary: Chord,
+    /// Issue #25: the Quick Ask palette chord, `None` by default (no default
+    /// binding, matching `pause`'s own decision). Unlike `pause`'s chord,
+    /// this lives in the ordinary locked state (not a lock-free atomic):
+    /// the paused fast path never checks it, since this chord must NOT fire
+    /// while paused -- see [`WM_APP_PALETTE_TOGGLE`]'s doc comment.
+    palette: Option<Chord>,
     learn: LearnState,
 }
 
@@ -341,6 +355,7 @@ impl HotkeyHook {
                 target_hwnd: target.0 as isize,
                 primary,
                 secondary,
+                palette: None,
                 learn: LearnState::Idle,
             }))
             .map_err(|_| anyhow::anyhow!("HotkeyHook::install called more than once"))?;
@@ -370,6 +385,20 @@ impl HotkeyHook {
     /// [`HotkeyHook::set_bindings`].
     pub fn set_pause_chord(&self, chord: Option<Chord>) {
         PAUSE_CHORD.store(chord.map(pack_chord).unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Set or clear the Quick Ask palette chord (issue #25; `hotkeys.palette`
+    /// in config, `None` by default -- no default binding). Locked, not
+    /// lock-free, unlike [`HotkeyHook::set_pause_chord`]: see [`HookShared::palette`]'s
+    /// doc comment for why this chord does not need the paused fast path at
+    /// all. Safe to call from the thread that owns the message loop while
+    /// the hook is live.
+    pub fn set_palette_chord(&self, chord: Option<Chord>) {
+        if let Some(state) = STATE.get() {
+            if let Ok(mut s) = state.lock() {
+                s.palette = chord;
+            }
+        }
     }
 
     /// Arm learn mode for binding slot `which`. The next non-modifier keydown
@@ -526,8 +555,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     // Snapshot what we need and release the lock before doing anything that
     // could take a while (PostMessage, SendInput) -- never hold it across
     // those calls.
-    let (target_hwnd, primary, secondary, learn) = match state.lock() {
-        Ok(s) => (s.target_hwnd, s.primary, s.secondary, s.learn),
+    let (target_hwnd, primary, secondary, palette, learn) = match state.lock() {
+        Ok(s) => (s.target_hwnd, s.primary, s.secondary, s.palette, s.learn),
         Err(_) => return unsafe { CallNextHookEx(None, code, wparam, lparam) },
     };
 
@@ -575,6 +604,22 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     if pause_hotkey_outcome(&chord, load_pause_chord()) == PauseHotkeyOutcome::Toggle {
         post_pause_toggle(&chord);
         return LRESULT(1);
+    }
+
+    // #25: the palette chord, checked alongside primary/secondary (not
+    // exempted from the paused early-return above, unlike the pause-toggle
+    // chord) -- opening the palette while paused would defeat the point of
+    // pausing.
+    if let Some(pc) = palette {
+        if matches(&chord, &pc) {
+            let hwnd = HWND(target_hwnd as *mut _);
+            let _ =
+                unsafe { PostMessageW(Some(hwnd), WM_APP_PALETTE_TOGGLE, WPARAM(0), LPARAM(0)) };
+            if needs_win_release_workaround(&pc) {
+                send_ctrl_tap();
+            }
+            return LRESULT(1);
+        }
     }
 
     let which = if matches(&chord, &primary) {

@@ -1,0 +1,805 @@
+//! Pure model for the Quick Ask palette (#25): fuzzy scoring, grouped vs.
+//! flat ranking (#199, #132), the key-handling state machine, and the
+//! action-id dispatch table. No `windows` crate dependency anywhere in this
+//! file (CLAUDE.md rule 8) -- see `ui::palette` for the real window that
+//! wraps this, and
+//! `docs/superpowers/specs/2026-09-17-palette-design.md` for the rules this
+//! file implements and why.
+
+/// One selectable action in the palette's catalogue, built fresh on every
+/// `show` from `actions::load_actions()` plus the two tray-only utility
+/// entries (see [`CALCULATE_SELECTION_ACTION_ID`] / [`COPY_REGION_ACTION_ID`]
+/// below) -- never persisted, never mutated in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteAction {
+    pub id: String,
+    pub name: String,
+    pub group: Option<String>,
+    /// Whether this action needs a configured, ready model to run at all.
+    /// `false` for the offline utilities (#132): "Copy text from screen",
+    /// "Calculate selection", "Copy region to clipboard".
+    pub requires_model: bool,
+}
+
+/// One row the palette shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Row {
+    /// A group name header (#199), shown only in the grouped (empty-query)
+    /// view.
+    Header(String),
+    /// #132: "Add a model in Settings to unlock more actions." Shown once,
+    /// only in the grouped view, only when no provider is configured.
+    Hint(String),
+    /// A runnable action. `score` is 0 in the grouped view (ranking is by
+    /// catalogue order there, not fuzzy score) and the real fuzzy score in
+    /// the flat, ranked (non-empty query) view.
+    Action {
+        id: String,
+        name: String,
+        score: i32,
+    },
+}
+
+/// The tray-only "Calculate selection" utility's palette id. Not a built-in
+/// `Action` (it has no proposal/executor/prompt -- `calc::run_on_selection`
+/// runs entirely offline, no model involved), so it needs its own id here
+/// rather than reusing anything from `actions::`.
+pub const CALCULATE_SELECTION_ACTION_ID: &str = "calculate-selection";
+/// The tray-only "Copy region to clipboard" utility's palette id. Same
+/// reasoning as [`CALCULATE_SELECTION_ACTION_ID`].
+pub const COPY_REGION_ACTION_ID: &str = "copy-region";
+
+/// #132's exact hint text. No em dash (rule 11).
+pub const NO_MODEL_HINT: &str = "Add a model in Settings to unlock more actions.";
+
+// ---------------------------------------------------------------------------
+// Fuzzy scoring
+// ---------------------------------------------------------------------------
+
+/// Subsequence match of `query` (case-insensitive) against `candidate`.
+/// `None` when `query` is not a subsequence of `candidate` at all (never a
+/// negative score standing in for "no match" -- callers filter on `None`).
+///
+/// Scoring, higher is a better match:
+/// - `+2` for a matched character that starts a word (position 0, or
+///   immediately after a space);
+/// - `+1` for any other matched character;
+/// - `+3` extra when the very first matched character is `candidate`'s own
+///   first character (the whole query matches as a prefix-anchored run).
+///
+/// An empty `query` matches everything with score `0` (used by the grouped,
+/// empty-query view, which never calls this for ranking but does for the
+/// `requires_model` filter's "does this row exist at all" check).
+pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
+    if query.trim().is_empty() {
+        return Some(0);
+    }
+
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    let c: Vec<char> = candidate.to_lowercase().chars().collect();
+
+    let mut qi = 0;
+    let mut score = 0;
+    let mut first_match_pos: Option<usize> = None;
+    for (ci, ch) in c.iter().enumerate() {
+        if qi < q.len() && *ch == q[qi] {
+            if first_match_pos.is_none() {
+                first_match_pos = Some(ci);
+            }
+            let word_start = ci == 0 || c[ci - 1] == ' ';
+            score += if word_start { 2 } else { 1 };
+            qi += 1;
+        }
+    }
+
+    if qi < q.len() {
+        return None; // query was not a full subsequence of candidate
+    }
+    if first_match_pos == Some(0) {
+        score += 3;
+    }
+    Some(score)
+}
+
+// ---------------------------------------------------------------------------
+// Grouping / ranking (#199, #132)
+// ---------------------------------------------------------------------------
+
+/// Builds the palette's rows for `actions` given the current `query` and
+/// whether a provider is configured and ready (`model_configured`). See the
+/// design spec's "Grouping and ranking" section.
+pub fn build_rows(actions: &[PaletteAction], query: &str, model_configured: bool) -> Vec<Row> {
+    if query.trim().is_empty() {
+        grouped_rows(actions, model_configured)
+    } else {
+        flat_ranked_rows(actions, query)
+    }
+}
+
+fn grouped_rows(actions: &[PaletteAction], model_configured: bool) -> Vec<Row> {
+    let mut rows = Vec::new();
+
+    let (free, gated): (Vec<&PaletteAction>, Vec<&PaletteAction>) = if model_configured {
+        (Vec::new(), actions.iter().collect())
+    } else {
+        (
+            actions.iter().filter(|a| !a.requires_model).collect(),
+            actions.iter().filter(|a| a.requires_model).collect(),
+        )
+    };
+
+    for a in &free {
+        rows.push(Row::Action {
+            id: a.id.clone(),
+            name: a.name.clone(),
+            score: 0,
+        });
+    }
+    if !model_configured {
+        // Shown right after the free actions (even when there are none), so
+        // it always sits before any grouped/gated section.
+        rows.push(Row::Hint(NO_MODEL_HINT.to_string()));
+    }
+
+    // Ungrouped actions among `gated` (or, when model_configured, among
+    // every action) go first, no header, preserving catalogue order.
+    let mut seen_groups: Vec<String> = Vec::new();
+    for a in gated.iter().filter(|a| a.group.is_none()) {
+        rows.push(Row::Action {
+            id: a.id.clone(),
+            name: a.name.clone(),
+            score: 0,
+        });
+    }
+    for a in &gated {
+        if let Some(group) = &a.group {
+            if !seen_groups.contains(group) {
+                seen_groups.push(group.clone());
+                rows.push(Row::Header(group.clone()));
+                for member in gated.iter().filter(|m| m.group.as_ref() == Some(group)) {
+                    rows.push(Row::Action {
+                        id: member.id.clone(),
+                        name: member.name.clone(),
+                        score: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    rows
+}
+
+fn flat_ranked_rows(actions: &[PaletteAction], query: &str) -> Vec<Row> {
+    let mut scored: Vec<(i32, &PaletteAction)> = actions
+        .iter()
+        .filter_map(|a| fuzzy_score(query, &a.name).map(|s| (s, a)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    scored
+        .into_iter()
+        .map(|(score, a)| Row::Action {
+            id: a.id.clone(),
+            name: a.name.clone(),
+            score,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Key handling state machine
+// ---------------------------------------------------------------------------
+
+/// Virtual-key codes this module cares about, spelled out as plain
+/// constants (not imported from `windows`) so this file stays free of a
+/// Win32 dependency. Values match `VK_UP`/`VK_DOWN`/`VK_RETURN`/`VK_ESCAPE`
+/// exactly.
+const VK_UP: u16 = 0x26;
+const VK_DOWN: u16 = 0x28;
+const VK_RETURN: u16 = 0x0D;
+const VK_ESCAPE: u16 = 0x1B;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteKey {
+    Up,
+    Down,
+    Enter,
+    Escape,
+}
+
+/// Maps a raw virtual-key code to the palette command it means, or `None`
+/// for anything the palette does not handle as a command (ordinary typing
+/// keys fall through to the edit control unchanged).
+pub fn palette_key_from_vk(vk: u16) -> Option<PaletteKey> {
+    match vk {
+        VK_UP => Some(PaletteKey::Up),
+        VK_DOWN => Some(PaletteKey::Down),
+        VK_RETURN => Some(PaletteKey::Enter),
+        VK_ESCAPE => Some(PaletteKey::Escape),
+        _ => None,
+    }
+}
+
+/// The palette's selection state over a built row list. Rebuilt (via
+/// [`PaletteState::new`]) every time the query changes; selection resets to
+/// the first selectable (non-header, non-hint) row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteState {
+    pub rows: Vec<Row>,
+    pub selected: usize,
+}
+
+fn is_selectable(row: &Row) -> bool {
+    matches!(row, Row::Action { .. })
+}
+
+impl PaletteState {
+    pub fn new(rows: Vec<Row>) -> Self {
+        let selected = rows.iter().position(is_selectable).unwrap_or(0);
+        Self { rows, selected }
+    }
+
+    /// Moves the selection by `delta` (+1 down, -1 up), skipping over
+    /// headers/hints, and clamping (not wrapping) at the first/last
+    /// selectable row.
+    pub fn move_selection(&mut self, delta: i32) {
+        let selectable: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| is_selectable(r))
+            .map(|(i, _)| i)
+            .collect();
+        if selectable.is_empty() {
+            return;
+        }
+        let current_pos = selectable
+            .iter()
+            .position(|&i| i == self.selected)
+            .unwrap_or(0);
+        let new_pos = (current_pos as i32 + delta).clamp(0, selectable.len() as i32 - 1);
+        self.selected = selectable[new_pos as usize];
+    }
+
+    pub fn selected_action_id(&self) -> Option<&str> {
+        match self.rows.get(self.selected) {
+            Some(Row::Action { id, .. }) => Some(id.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// What handling a key should cause the caller (the Win32 layer) to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteOutcome {
+    /// Selection moved (or tried to); repaint the list.
+    None,
+    /// Enter on a runnable row: dispatch this action id, then hide.
+    Run(String),
+    /// Esc: hide, no dispatch.
+    Hide,
+}
+
+/// The whole key-handling state machine in one pure function (CLAUDE.md
+/// rule 8): given the current state and a recognized key, what happens.
+pub fn handle_key(state: &mut PaletteState, key: PaletteKey) -> PaletteOutcome {
+    match key {
+        PaletteKey::Up => {
+            state.move_selection(-1);
+            PaletteOutcome::None
+        }
+        PaletteKey::Down => {
+            state.move_selection(1);
+            PaletteOutcome::None
+        }
+        PaletteKey::Enter => match state.selected_action_id() {
+            Some(id) => PaletteOutcome::Run(id.to_string()),
+            None => PaletteOutcome::None,
+        },
+        PaletteKey::Escape => PaletteOutcome::Hide,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch table: action id -> the same entry point the tray item uses
+// ---------------------------------------------------------------------------
+
+/// Closed set of everywhere Enter can route to. `ui::palette`'s Win32 layer
+/// matches this to call the exact `App` method the tray already calls for
+/// that id -- never a second, palette-only code path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchTarget {
+    CheckMyWork,
+    ExtractText,
+    AddToCalendar,
+    CalculateSelection,
+    CopyRegion,
+}
+
+/// The one lookup from a palette row's action id to what running it means.
+/// `None` for an id the palette itself never produces (defensive, not
+/// expected in practice -- see `ui::palette`'s `WM_APP_PALETTE_RUN` handler
+/// for why this degrades to a no-op rather than a panic, rule 7).
+///
+/// Every id this function recognizes is exercised by
+/// `dispatch_covers_every_built_in_action` below, so a built-in added to
+/// `actions::builtin_actions()` (or a new tray-only utility) without a
+/// matching arm here fails a test instead of silently being unrunnable from
+/// the palette (the "wired to nothing" shape CLAUDE.md rule 8 calls out).
+pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
+    match action_id {
+        crate::actions::DEFAULT_ACTION_ID => Some(DispatchTarget::CheckMyWork),
+        crate::actions::EXTRACT_TEXT_ACTION_ID => Some(DispatchTarget::ExtractText),
+        crate::actions::calendar::ACTION_ID => Some(DispatchTarget::AddToCalendar),
+        CALCULATE_SELECTION_ACTION_ID => Some(DispatchTarget::CalculateSelection),
+        COPY_REGION_ACTION_ID => Some(DispatchTarget::CopyRegion),
+        _ => None,
+    }
+}
+
+/// Whether `action_id` needs a model to run, the single rule
+/// [`catalogue`] uses to fill [`PaletteAction::requires_model`]. A small,
+/// explicit id list rather than deriving it from `Action::proposal` (empty
+/// vs. non-empty): the two tray-only utilities have no `Action` at all to
+/// read a proposal from, so one list covering every id (built-in or
+/// utility) is the only place this fact can live without splitting the rule
+/// across two different lookups.
+fn action_requires_model(action_id: &str) -> bool {
+    let model_free = action_id == crate::actions::EXTRACT_TEXT_ACTION_ID
+        || action_id == CALCULATE_SELECTION_ACTION_ID
+        || action_id == COPY_REGION_ACTION_ID;
+    !model_free
+}
+
+/// Builds the palette's catalogue from already-resolved, already-visible
+/// actions (`actions::load_actions()`'s return value) plus the two
+/// tray-only utilities, which have no `Action` entry to resolve from.
+pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
+    let mut out: Vec<PaletteAction> = resolved
+        .iter()
+        .map(|r| PaletteAction {
+            id: r.action.id.clone(),
+            name: r.action.name.clone(),
+            group: r.action.group.clone(),
+            requires_model: action_requires_model(&r.action.id),
+        })
+        .collect();
+    out.push(PaletteAction {
+        id: CALCULATE_SELECTION_ACTION_ID.to_string(),
+        name: "Calculate selection".to_string(),
+        group: None,
+        requires_model: false,
+    });
+    out.push(PaletteAction {
+        id: COPY_REGION_ACTION_ID.to_string(),
+        name: "Copy region to clipboard".to_string(),
+        group: None,
+        requires_model: false,
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Footer
+// ---------------------------------------------------------------------------
+
+/// `"mode: Auto - openai:gpt-5"`, or just `"mode: Auto"` when
+/// `provider_model` is `None` (nothing configured / ready). No em dash
+/// (rule 11) -- a hyphen, matching the rest of this crate's footer-style
+/// strings.
+pub fn footer_line(mode_label: &str, provider_model: Option<&str>) -> String {
+    match provider_model {
+        Some(pm) => format!("mode: {mode_label} - {pm}"),
+        None => format!("mode: {mode_label}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn action(id: &str, name: &str, group: Option<&str>, requires_model: bool) -> PaletteAction {
+        PaletteAction {
+            id: id.to_string(),
+            name: name.to_string(),
+            group: group.map(|g| g.to_string()),
+            requires_model,
+        }
+    }
+
+    // -- fuzzy_score ---------------------------------------------------
+
+    #[test]
+    fn empty_query_matches_everything_with_zero_score() {
+        assert_eq!(fuzzy_score("", "Check my work"), Some(0));
+        assert_eq!(fuzzy_score("   ", "Check my work"), Some(0));
+    }
+
+    #[test]
+    fn non_subsequence_does_not_match() {
+        assert_eq!(fuzzy_score("xyz", "Check my work"), None);
+        assert_eq!(fuzzy_score("workcheck", "Check my work"), None);
+    }
+
+    #[test]
+    fn subsequence_out_of_order_characters_do_not_match() {
+        // 'k' before 'c' -- not a subsequence of "Check".
+        assert_eq!(fuzzy_score("kc", "Check"), None);
+    }
+
+    #[test]
+    fn case_insensitive_match() {
+        assert!(fuzzy_score("CHECK", "check my work").is_some());
+        assert!(fuzzy_score("check", "CHECK MY WORK").is_some());
+    }
+
+    #[test]
+    fn prefix_match_scores_higher_than_mid_string_match() {
+        let prefix = fuzzy_score("che", "Check my work").unwrap();
+        let mid = fuzzy_score("y wo", "Check my work").unwrap();
+        assert!(prefix > mid, "prefix={prefix} should beat mid-string={mid}");
+    }
+
+    #[test]
+    fn word_start_bonus_beats_a_match_with_no_word_starts() {
+        // "cw": 'C' at position 0 (word start, prefix) + 'w' at the start of
+        // "work" (word start) -- both bonuses.
+        let word_starts = fuzzy_score("cw", "Check work").unwrap();
+        // "cw" against "acbw": 'c' matches mid-word (not position 0, not
+        // after a space), 'w' matches mid-word too -- no word-start bonus,
+        // no prefix bonus.
+        let no_word_starts = fuzzy_score("cw", "acbw").unwrap();
+        assert!(
+            word_starts > no_word_starts,
+            "word_starts={word_starts} should beat no_word_starts={no_word_starts}"
+        );
+    }
+
+    #[test]
+    fn exact_prefix_beats_non_prefix_subsequence_of_equal_length() {
+        let exact_prefix = fuzzy_score("add", "Add to calendar").unwrap();
+        let non_prefix = fuzzy_score("add", "Copy add region").unwrap();
+        assert!(exact_prefix > non_prefix);
+    }
+
+    // -- build_rows: grouping / ordering (#199) -------------------------
+
+    #[test]
+    fn empty_query_groups_by_group_with_headers_in_first_seen_order() {
+        let actions = vec![
+            action("a", "Check my work", Some("Study"), true),
+            action("b", "Add to calendar", Some("Work"), true),
+            action("c", "Define word", Some("Study"), true),
+        ];
+        let rows = build_rows(&actions, "", true);
+        assert_eq!(
+            rows,
+            vec![
+                Row::Header("Study".to_string()),
+                Row::Action {
+                    id: "a".into(),
+                    name: "Check my work".into(),
+                    score: 0
+                },
+                Row::Action {
+                    id: "c".into(),
+                    name: "Define word".into(),
+                    score: 0
+                },
+                Row::Header("Work".to_string()),
+                Row::Action {
+                    id: "b".into(),
+                    name: "Add to calendar".into(),
+                    score: 0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_query_ungrouped_actions_have_no_header_and_come_first() {
+        let actions = vec![
+            action("a", "Check my work", Some("Study"), true),
+            action("b", "Calculate selection", None, false),
+        ];
+        let rows = build_rows(&actions, "", true);
+        assert_eq!(
+            rows[0],
+            Row::Action {
+                id: "b".into(),
+                name: "Calculate selection".into(),
+                score: 0
+            }
+        );
+        assert!(rows.contains(&Row::Header("Study".to_string())));
+    }
+
+    #[test]
+    fn typing_a_query_produces_a_flat_list_with_no_headers() {
+        let actions = vec![
+            action("a", "Check my work", Some("Study"), true),
+            action("b", "Add to calendar", Some("Work"), true),
+        ];
+        let rows = build_rows(&actions, "check", true);
+        assert!(!rows.iter().any(|r| matches!(r, Row::Header(_))));
+        assert!(!rows.iter().any(|r| matches!(r, Row::Hint(_))));
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn typing_a_query_ranks_by_score_descending() {
+        let actions = vec![
+            action("a", "Add to calendar", None, true),
+            action("b", "Calculate selection", None, false),
+        ];
+        // "ca" is a prefix of "Calculate selection" but not of "Add to
+        // calendar" (it matches mid-string there via "...calendar" 'c','a').
+        let rows = build_rows(&actions, "ca", true);
+        let ids: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Action { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids[0], "b", "prefix match must rank first: {rows:?}");
+    }
+
+    // -- build_rows: no-model ordering (#132) ----------------------------
+
+    #[test]
+    fn no_model_configured_lists_model_free_actions_first_then_a_hint() {
+        let actions = vec![
+            action("a", "Check my work", Some("Study"), true),
+            action("b", "Copy text from screen", Some("Work"), false),
+            action("c", "Calculate selection", None, false),
+        ];
+        let rows = build_rows(&actions, "", false);
+        // First two rows: the model-free actions, in catalogue order, no
+        // header.
+        assert_eq!(
+            rows[0],
+            Row::Action {
+                id: "b".into(),
+                name: "Copy text from screen".into(),
+                score: 0
+            }
+        );
+        assert_eq!(
+            rows[1],
+            Row::Action {
+                id: "c".into(),
+                name: "Calculate selection".into(),
+                score: 0
+            }
+        );
+        assert_eq!(rows[2], Row::Hint(NO_MODEL_HINT.to_string()));
+        // The gated action still appears, grouped, after the hint.
+        assert!(rows.contains(&Row::Header("Study".to_string())));
+        assert!(rows.contains(&Row::Action {
+            id: "a".into(),
+            name: "Check my work".into(),
+            score: 0
+        }));
+    }
+
+    #[test]
+    fn model_configured_has_no_hint_and_no_free_gated_split() {
+        let actions = vec![
+            action("a", "Check my work", Some("Study"), true),
+            action("b", "Copy text from screen", Some("Work"), false),
+        ];
+        let rows = build_rows(&actions, "", true);
+        assert!(!rows.iter().any(|r| matches!(r, Row::Hint(_))));
+    }
+
+    #[test]
+    fn hint_appears_even_when_there_are_no_free_actions() {
+        let actions = vec![action("a", "Check my work", Some("Study"), true)];
+        let rows = build_rows(&actions, "", false);
+        assert!(rows.iter().any(|r| matches!(r, Row::Hint(_))));
+    }
+
+    // -- key handling state machine --------------------------------------
+
+    #[test]
+    fn palette_key_from_vk_recognizes_the_four_keys() {
+        assert_eq!(palette_key_from_vk(0x26), Some(PaletteKey::Up));
+        assert_eq!(palette_key_from_vk(0x28), Some(PaletteKey::Down));
+        assert_eq!(palette_key_from_vk(0x0D), Some(PaletteKey::Enter));
+        assert_eq!(palette_key_from_vk(0x1B), Some(PaletteKey::Escape));
+        assert_eq!(palette_key_from_vk(0x41), None); // 'A', ordinary typing
+    }
+
+    fn three_action_rows() -> Vec<Row> {
+        vec![
+            Row::Header("Study".to_string()),
+            Row::Action {
+                id: "a".into(),
+                name: "A".into(),
+                score: 0,
+            },
+            Row::Action {
+                id: "b".into(),
+                name: "B".into(),
+                score: 0,
+            },
+            Row::Header("Work".to_string()),
+            Row::Action {
+                id: "c".into(),
+                name: "C".into(),
+                score: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn new_state_selects_the_first_selectable_row_not_a_header() {
+        let state = PaletteState::new(three_action_rows());
+        assert_eq!(state.selected_action_id(), Some("a"));
+    }
+
+    #[test]
+    fn down_moves_past_headers_to_the_next_action() {
+        let mut state = PaletteState::new(three_action_rows());
+        let outcome = handle_key(&mut state, PaletteKey::Down);
+        assert_eq!(outcome, PaletteOutcome::None);
+        assert_eq!(state.selected_action_id(), Some("b"));
+        handle_key(&mut state, PaletteKey::Down);
+        assert_eq!(
+            state.selected_action_id(),
+            Some("c"),
+            "must skip the 'Work' header"
+        );
+    }
+
+    #[test]
+    fn down_clamps_at_the_last_action_no_wraparound() {
+        let mut state = PaletteState::new(three_action_rows());
+        for _ in 0..10 {
+            handle_key(&mut state, PaletteKey::Down);
+        }
+        assert_eq!(state.selected_action_id(), Some("c"));
+    }
+
+    #[test]
+    fn up_clamps_at_the_first_action_no_wraparound() {
+        let mut state = PaletteState::new(three_action_rows());
+        for _ in 0..10 {
+            handle_key(&mut state, PaletteKey::Up);
+        }
+        assert_eq!(state.selected_action_id(), Some("a"));
+    }
+
+    #[test]
+    fn enter_on_a_selected_action_returns_run_with_its_id() {
+        let mut state = PaletteState::new(three_action_rows());
+        handle_key(&mut state, PaletteKey::Down);
+        let outcome = handle_key(&mut state, PaletteKey::Enter);
+        assert_eq!(outcome, PaletteOutcome::Run("b".to_string()));
+    }
+
+    #[test]
+    fn escape_returns_hide() {
+        let mut state = PaletteState::new(three_action_rows());
+        assert_eq!(
+            handle_key(&mut state, PaletteKey::Escape),
+            PaletteOutcome::Hide
+        );
+    }
+
+    #[test]
+    fn enter_with_no_selectable_rows_is_a_no_op_not_a_panic() {
+        let mut state = PaletteState::new(vec![Row::Header("Empty".to_string())]);
+        assert_eq!(
+            handle_key(&mut state, PaletteKey::Enter),
+            PaletteOutcome::None
+        );
+        assert_eq!(
+            handle_key(&mut state, PaletteKey::Down),
+            PaletteOutcome::None
+        );
+    }
+
+    // -- dispatch table: every built-in, tested (rule 8) ------------------
+
+    #[test]
+    fn dispatch_covers_every_built_in_action() {
+        for a in crate::actions::builtin_actions() {
+            assert!(
+                dispatch_target_for(&a.id).is_some(),
+                "built-in action {:?} has no palette dispatch target -- it would be wired \
+                 to nothing from the palette",
+                a.id
+            );
+        }
+        assert_eq!(
+            dispatch_target_for(CALCULATE_SELECTION_ACTION_ID),
+            Some(DispatchTarget::CalculateSelection)
+        );
+        assert_eq!(
+            dispatch_target_for(COPY_REGION_ACTION_ID),
+            Some(DispatchTarget::CopyRegion)
+        );
+    }
+
+    #[test]
+    fn dispatch_targets_are_the_expected_distinct_values() {
+        assert_eq!(
+            dispatch_target_for(crate::actions::DEFAULT_ACTION_ID),
+            Some(DispatchTarget::CheckMyWork)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::EXTRACT_TEXT_ACTION_ID),
+            Some(DispatchTarget::ExtractText)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::calendar::ACTION_ID),
+            Some(DispatchTarget::AddToCalendar)
+        );
+    }
+
+    #[test]
+    fn unknown_action_id_dispatches_to_nothing_not_a_panic() {
+        assert_eq!(dispatch_target_for("not-a-real-action"), None);
+    }
+
+    // -- catalogue ---------------------------------------------------------
+
+    #[test]
+    fn catalogue_includes_every_resolved_action_plus_the_two_utilities() {
+        let resolved = crate::actions::merge_actions(crate::actions::builtin_actions(), vec![]);
+        let cat = catalogue(&resolved);
+        assert!(cat
+            .iter()
+            .any(|a| a.id == crate::actions::DEFAULT_ACTION_ID));
+        assert!(cat.iter().any(|a| a.id == CALCULATE_SELECTION_ACTION_ID));
+        assert!(cat.iter().any(|a| a.id == COPY_REGION_ACTION_ID));
+        assert_eq!(cat.len(), resolved.len() + 2);
+    }
+
+    #[test]
+    fn catalogue_marks_model_free_actions_correctly() {
+        let resolved = crate::actions::merge_actions(crate::actions::builtin_actions(), vec![]);
+        let cat = catalogue(&resolved);
+        let check_my_work = cat
+            .iter()
+            .find(|a| a.id == crate::actions::DEFAULT_ACTION_ID)
+            .unwrap();
+        assert!(check_my_work.requires_model);
+        let extract_text = cat
+            .iter()
+            .find(|a| a.id == crate::actions::EXTRACT_TEXT_ACTION_ID)
+            .unwrap();
+        assert!(!extract_text.requires_model);
+        let calc = cat
+            .iter()
+            .find(|a| a.id == CALCULATE_SELECTION_ACTION_ID)
+            .unwrap();
+        assert!(!calc.requires_model);
+    }
+
+    // -- footer_line ---------------------------------------------------------
+
+    #[test]
+    fn footer_line_with_a_provider() {
+        assert_eq!(
+            footer_line("Auto", Some("openai:gpt-5")),
+            "mode: Auto - openai:gpt-5"
+        );
+    }
+
+    #[test]
+    fn footer_line_with_no_provider() {
+        assert_eq!(footer_line("Offline", None), "mode: Offline");
+    }
+
+    #[test]
+    fn footer_line_has_no_em_dash() {
+        // CLAUDE.md rule 11.
+        let a = footer_line("Auto", Some("ollama:gemma3"));
+        let b = footer_line("Auto", None);
+        assert!(!a.contains('\u{2014}'));
+        assert!(!b.contains('\u{2014}'));
+    }
+}
