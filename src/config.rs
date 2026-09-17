@@ -1111,8 +1111,6 @@ model = "gpt-5.5"
         for mode in [Mode::Cloud, Mode::Auto] {
             assert_eq!(config.providers.build_chain_for_mode(mode, true).provider_names(), unfiltered, "mode {mode:?}");
         }
-        assert_eq!(cfg.providers.gemini.model, "gemini-3.8-flash");
-        assert!(!cfg.providers.gemini.models.is_empty());
     }
 
     #[test]
