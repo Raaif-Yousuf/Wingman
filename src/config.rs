@@ -120,15 +120,17 @@ impl Default for Providers {
             //
             // #17: gemini is a cloud provider (same "unusable until a key
             // is pasted in" shape as openai/anthropic), so the ollama
-            // reasoning above does not apply to it -- but it is still left
-            // out of the default order, because `ui::settings::build_config`
-            // unconditionally rebuilds `order` from a two-way openai/
-            // anthropic toggle (`order_from_choice`) on every Settings save
-            // (see the filed finding). Adding gemini here today would make
-            // it silently vanish from a fresh install's order the first
-            // time the user opens Settings and saves anything. Opt-in via a
-            // hand-edited config.toml until Settings can represent a third
-            // cloud provider (tracked against #51).
+            // reasoning above does not apply to it -- it is still left out
+            // of the default order for a simpler reason: Settings' Active
+            // provider control is a two-way openai/anthropic radio with no
+            // way to represent a third cloud provider at all (tracked
+            // against #51). #194 fixed `ui::settings::build_config` so a
+            // hand-added `"gemini"` entry now survives every Settings save
+            // untouched (it only reorders openai/anthropic relative to each
+            // other via `merge_provider_order`) -- so putting gemini in the
+            // default order is no longer blocked by data loss, only by
+            // Settings having nothing to show for it. Opt-in via a
+            // hand-edited config.toml until #51.
             order: vec!["openai".to_string(), "anthropic".to_string()],
             openai: ProviderConfig {
                 model: "gpt-5.5".to_string(),
@@ -1002,15 +1004,13 @@ model = "gpt-5.5"
     #[test]
     fn gemini_default_is_not_in_the_default_order() {
         // Unlike openai/anthropic, gemini is not yet reachable from the
-        // Win32 settings dialog: `ui::settings::order_from_choice` only
-        // ever produces `["openai", "anthropic"]` or
-        // `["anthropic", "openai"]`, and `build_config` unconditionally
-        // overwrites `providers.order` with its result on every Settings
-        // save (see the filed finding). Putting gemini in the default order
-        // today would make it vanish the first time a user opens Settings
-        // and saves anything, even a change unrelated to providers -- so it
-        // stays opt-in, like ollama (#13), until Settings can represent a
-        // third cloud provider.
+        // Win32 settings dialog at all: the Active provider control is a
+        // two-way openai/anthropic radio with no third option. #194 fixed
+        // `build_config` (now `merge_provider_order`) so a hand-added
+        // gemini entry survives every Settings save untouched -- so it
+        // stays opt-in, like ollama (#13), only until Settings can
+        // represent a third cloud provider (#51), not because saving would
+        // delete it.
         let config = Config::default();
         assert!(!config.providers.order.contains(&"gemini".to_string()));
         assert_eq!(config.providers.order, vec!["openai", "anthropic"]);
