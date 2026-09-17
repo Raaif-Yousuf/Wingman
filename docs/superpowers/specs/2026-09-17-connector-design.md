@@ -146,7 +146,7 @@ guess made here.
 referenced, but many consumers tolerate a well-known Windows/IANA zone name
 without one) is unmeasured -- exercising it needs the manual check in issue
 #166 (open a generated `.ics` with the default calendar app), which this
-task cannot run (no exe launch). Filed as **#205** ("`ics` connector emits
+task cannot run (no exe launch). Filed as **#211** ("`ics` connector emits
 `TZID` with no `VTIMEZONE` block") to track adding one once `Local` has a
 real caller and the manual check can run.
 
@@ -196,7 +196,7 @@ for the `TEXT` escaping):
 - **DTSTART/DTEND**: `EventTime::AllDay` writes `;VALUE=DATE:YYYYMMDD` (no
   time component, no `Z`); `EventTime::Utc` writes `:YYYYMMDDTHHMMSSZ`;
   `EventTime::Local` writes `;TZID=<tzid>:YYYYMMDDTHHMMSS` (see the
-  `VTIMEZONE` gap, #205, above).
+  `VTIMEZONE` gap, #211, above).
 - **Missing end** (`CalendarEvent.end: None`): documented default duration,
   not an omitted `DTEND` (an event with no end is a worse proposal-review
   experience than a documented guess the user can edit before confirming --
