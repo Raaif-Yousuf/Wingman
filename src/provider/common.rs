@@ -59,6 +59,53 @@ pub(crate) fn post_json(
     Ok(body_text)
 }
 
+/// Same as [`post_json`] but with the connect phase timed out separately
+/// from the whole exchange. `post_json`'s single `timeout_global` is right
+/// for a cloud API, which is either reachable in well under a second or not
+/// reachable at all -- one timeout for both phases loses nothing. A local
+/// Ollama server is the opposite: the TCP connect to loopback should be
+/// near-instant (so a slow/wedged server is detected quickly), but the
+/// first request after a model is not yet loaded can legitimately take tens
+/// of seconds while it loads into memory, so the overall exchange needs a
+/// much longer budget. Reusing `post_json`'s single timeout for both would
+/// force picking one of "detects a hung connect fast" or "doesn't abort a
+/// cold model load", so the two are split here instead.
+pub(crate) fn post_json_with_connect_timeout(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &Value,
+    connect_timeout: Duration,
+    total_timeout: Duration,
+    tag: &str,
+) -> Result<String> {
+    let mut builder = ureq::post(url);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+
+    let mut response = builder
+        .config()
+        .http_status_as_error(false)
+        .timeout_connect(Some(connect_timeout))
+        .timeout_global(Some(total_timeout))
+        .build()
+        .send_json(body)
+        .map_err(|e| anyhow!("{tag}: transport error: {e}"))?;
+
+    let status = response.status();
+    let body_text = response
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("{tag}: failed to read response body"))?;
+
+    if !status.is_success() {
+        let truncated: String = body_text.chars().take(300).collect();
+        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+    }
+
+    Ok(body_text)
+}
+
 /// Base64-encodes each image, in order. Both providers embed the screenshot
 /// as base64 PNG, just inside different envelope shapes.
 pub(crate) fn encode_images_base64(images: &[Vec<u8>]) -> Vec<String> {
