@@ -51,7 +51,11 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
 - **Structured output:** `text.format` with `type: "json_schema"`,
   `strict: true`, and the schema verbatim from `Request::schema`. Property
   order is preserved end to end (`serde_json`'s `preserve_order`, CLAUDE.md
-  rule 3): `detail` before `headline` before `difficulty`.
+  rule 3): `detail` before `headline` before `difficulty`. `difficulty` is
+  opt-in (`ui.show_difficulty`, default `false` as of issue #197): when off,
+  the property is left out of the schema entirely and nothing is appended to
+  the system prompt to ask for it, so it costs zero extra tokens unless the
+  user turns it on.
 - **Images:** `input_image` content parts with a `data:image/png;base64,...`
   URL, `detail: "high"`.
 - **Retry/429:** shared with Anthropic and Gemini via
