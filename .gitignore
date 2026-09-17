@@ -3,3 +3,4 @@ config.toml
 *.log
 .serena/
 .claude/worktrees/
+__pycache__/

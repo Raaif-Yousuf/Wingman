@@ -142,6 +142,36 @@ def _targets(tokens: list[str]) -> list[str]:
     return out
 
 
+# Git Bash / MSYS absolute paths: `/c/Users/...` or `/cygdrive/c/Users/...`.
+# A single drive letter between two slashes (or after `/cygdrive/`) at the
+# start of the string is the MSYS spelling of a Windows drive root.
+_CYGDRIVE_ABS = re.compile(r"^/cygdrive/([A-Za-z])(/.*)?$")
+_MSYS_ABS = re.compile(r"^/([A-Za-z])(/.*)?$")
+
+
+def _translate_msys_path(target: str) -> str:
+    """`pathlib.Path.resolve()` on Windows does not understand either MSYS
+    spelling: it treats the leading `/` as the root of the CURRENT drive and
+    the drive letter becomes a literal directory name, so `/c/Users/raaif/x`
+    resolves to `C:\\c\\Users\\raaif\\x`, never under `REPO_ROOT`
+    (MEASURED 2026-09-16: `pathlib.Path('/c/Users/raaif/copilot-ask/target').resolve()`
+    == `WindowsPath('C:/c/Users/raaif/copilot-ask/target')`). Translate both
+    MSYS spellings to a drive-rooted Windows path first. POSIX-only, since on
+    a real POSIX filesystem `/c/...` is an ordinary absolute path and must be
+    left alone."""
+    if os.name != "nt":
+        return target
+    m = _CYGDRIVE_ABS.match(target)
+    if m:
+        drive, rest = m.group(1), m.group(2) or "/"
+        return f"{drive}:{rest}"
+    m = _MSYS_ABS.match(target)
+    if m:
+        drive, rest = m.group(1), m.group(2) or "/"
+        return f"{drive}:{rest}"
+    return target
+
+
 def _is_inside_repo(target: str) -> bool:
     """A bare relative path counts as inside: the hook cannot know the shell's
     cwd and failing toward 'inside' is the protective direction. An absolute
@@ -149,6 +179,7 @@ def _is_inside_repo(target: str) -> bool:
     if not target or target.startswith("$") or "*" in target or "?" in target:
         return "*" not in target or not os.path.isabs(target)
     expanded = os.path.expandvars(os.path.expanduser(target))
+    expanded = _translate_msys_path(expanded)
     path = pathlib.Path(expanded)
     posix_rooted = expanded.startswith("/") or expanded.startswith("\\")
     if not path.is_absolute() and not posix_rooted:
