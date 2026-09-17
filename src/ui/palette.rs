@@ -52,9 +52,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_COMMAND,
-    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
-    WS_VISIBLE,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
+    WM_PAINT, WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 const WC_EDIT: &str = "EDIT";
@@ -79,6 +79,9 @@ const ID_PALETTE_DOWN: i32 = 9102;
 const ID_PALETTE_ENTER: i32 = 9103;
 const ID_PALETTE_ESCAPE: i32 = 9104;
 const ID_PALETTE_LOST_FOCUS: i32 = 9105;
+/// #217: PageUp/PageDown, forwarded the same way Up/Down already are.
+const ID_PALETTE_PAGE_UP: i32 = 9106;
+const ID_PALETTE_PAGE_DOWN: i32 = 9107;
 
 const PALETTE_SUBCLASS_ID: usize = 1;
 
@@ -97,10 +100,17 @@ const EDIT_HEIGHT: i32 = 30;
 const ROW_HEIGHT: i32 = 26;
 const FOOTER_HEIGHT: i32 = 22;
 const PADDING: i32 = 8;
-/// No scrolling in this first version (v1 scope, see the design spec):
-/// a catalogue longer than this is simply truncated. Filed as a follow-up
-/// if the catalogue grows past what fits.
-const MAX_VISIBLE_ROWS: usize = 12;
+/// #217: rows beyond `crate::ui::palette_model::MAX_VISIBLE_ROWS` are
+/// reachable by scrolling (keyboard: Up/Down/PageUp/PageDown drag the
+/// viewport via `PaletteState::offset`; mouse: `WM_MOUSEWHEEL` below) rather
+/// than being truncated -- that constant is the single source of truth for
+/// both the window's fixed height here and the palette-side viewport math in
+/// `palette_model.rs`.
+/// #24: height of the router's suggestion summary line, always reserved
+/// (never grows/shrinks the window -- rule 5's "pre-created, never
+/// re-created" applies to size too) between the query box and the row list;
+/// blank when [`PaletteInner::router_summary`] is `None`.
+const ROUTER_SUMMARY_HEIGHT: i32 = 18;
 
 fn scale(v: i32, dpi: u32) -> i32 {
     v * dpi as i32 / 96
@@ -108,7 +118,8 @@ fn scale(v: i32, dpi: u32) -> i32 {
 
 fn window_height(dpi: u32) -> i32 {
     scale(PADDING * 2 + EDIT_HEIGHT, dpi)
-        + scale(ROW_HEIGHT, dpi) * MAX_VISIBLE_ROWS as i32
+        + scale(ROUTER_SUMMARY_HEIGHT, dpi)
+        + scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32
         + scale(FOOTER_HEIGHT, dpi)
 }
 
@@ -152,6 +163,9 @@ impl Palette {
             footer_text: String::new(),
             state: crate::ui::palette_model::PaletteState::new(Vec::new()),
             visible: false,
+            router_generation: 0,
+            interacted: false,
+            router_summary: None,
         });
         let raw = Box::into_raw(inner);
 
@@ -246,6 +260,35 @@ impl Palette {
         self.inner.hide();
     }
 
+    /// #24: the generation number stamped on THIS showing of the palette --
+    /// `app.rs`'s router hook reads this right after [`Palette::show`]
+    /// returns and carries it across the worker thread, so the eventual
+    /// result can be checked against whatever this returns AT DELIVERY time
+    /// (`crate::router::is_stale`). Bumped on every [`Palette::show`] and
+    /// every hide (Esc, lost focus, a dispatched Enter, or a second
+    /// `toggle_palette`), so a result from any earlier showing is always
+    /// stale by the time it arrives.
+    pub fn router_generation(&self) -> u64 {
+        self.inner.router_generation
+    }
+
+    /// #24: applies (or silently drops) a router result against the
+    /// showing identified by `generation`. See
+    /// [`PaletteInner::apply_router_suggestion`] for the full decision
+    /// chain (staleness, visibility, confidence vs. `threshold`, and
+    /// whether the user already typed or moved the selection) -- this is
+    /// pure Win32 glue over `crate::router`'s pure decisions and
+    /// `palette_model::preselect_action`'s pure state mutation.
+    pub fn apply_router_suggestion(
+        &mut self,
+        generation: u64,
+        result: &crate::router::RouterResult,
+        threshold: f64,
+    ) {
+        self.inner
+            .apply_router_suggestion(generation, result, threshold);
+    }
+
     /// The palette's own window proc dispatches internally; this is the
     /// seam tests use to feed synthetic messages directly. Unused by this
     /// module's own tests today (they drive the palette through real posted
@@ -279,6 +322,11 @@ impl Palette {
     #[cfg(test)]
     pub(crate) fn set_query_for_test(&mut self, query: &str) {
         self.inner.set_query(query);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_offset(&self) -> usize {
+        self.inner.state.offset
     }
 }
 
@@ -430,6 +478,8 @@ unsafe extern "system" fn palette_edit_subclass(
             let command_id = match key {
                 crate::ui::palette_model::PaletteKey::Up => ID_PALETTE_UP,
                 crate::ui::palette_model::PaletteKey::Down => ID_PALETTE_DOWN,
+                crate::ui::palette_model::PaletteKey::PageUp => ID_PALETTE_PAGE_UP,
+                crate::ui::palette_model::PaletteKey::PageDown => ID_PALETTE_PAGE_DOWN,
                 crate::ui::palette_model::PaletteKey::Enter => ID_PALETTE_ENTER,
                 crate::ui::palette_model::PaletteKey::Escape => ID_PALETTE_ESCAPE,
             };
@@ -439,8 +489,9 @@ unsafe extern "system" fn palette_edit_subclass(
                 WPARAM(command_id as usize),
                 LPARAM(0),
             );
-            // Swallow: Up/Down/Enter/Esc must never edit the query text or
-            // otherwise be handled by the edit control's own default proc.
+            // Swallow: Up/Down/PageUp/PageDown/Enter/Esc must never edit the
+            // query text or otherwise be handled by the edit control's own
+            // default proc.
             return LRESULT(0);
         }
     }
@@ -478,6 +529,24 @@ struct PaletteInner {
     footer_text: String,
     state: crate::ui::palette_model::PaletteState,
     visible: bool,
+    /// #24: bumped on every [`PaletteInner::show`] AND every
+    /// [`PaletteInner::hide`] -- see [`Palette::router_generation`]'s doc
+    /// comment for the full staleness story. `u64::wrapping_add` because
+    /// this is a long-running tray app's counter, not a value that should
+    /// ever panic on overflow (which would take longer than the app's
+    /// uptime to reach in practice regardless).
+    router_generation: u64,
+    /// #24: whether the user has typed into the query box or moved the
+    /// selection (Up/Down/PageUp/PageDown) since THIS showing -- reset by
+    /// [`PaletteInner::show`], set by the `EN_CHANGE`/movement handlers
+    /// below. `crate::router::should_apply` reads this to decide whether a
+    /// late-arriving suggestion may still take the selection.
+    interacted: bool,
+    /// #24: the router's one-line summary, shown as a subtle line between
+    /// the query box and the row list once a suggestion is applied (see
+    /// `on_paint`). `None` most of the time -- no router result yet, the
+    /// result didn't clear the threshold, or the user already interacted.
+    router_summary: Option<String>,
 }
 
 impl PaletteInner {
@@ -490,6 +559,13 @@ impl PaletteInner {
         self.catalogue = catalogue;
         self.model_configured = model_configured;
         self.footer_text = footer_text;
+        // #24: a fresh showing starts a fresh router session -- any result
+        // still in flight for the PREVIOUS showing (this bump changes what
+        // `router_generation()` returns) is now stale, and the user hasn't
+        // interacted with this one yet.
+        self.router_generation = self.router_generation.wrapping_add(1);
+        self.interacted = false;
+        self.router_summary = None;
         unsafe {
             let _ = SetWindowTextW(self.edit_hwnd, PCWSTR(wide_z("").as_ptr()));
         }
@@ -526,6 +602,45 @@ impl PaletteInner {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.visible = false;
+        // #24: invalidates any router request still in flight for this
+        // showing -- see `router_generation`'s doc comment. Cheap and always
+        // safe to do even when nothing was in flight.
+        self.router_generation = self.router_generation.wrapping_add(1);
+        self.router_summary = None;
+    }
+
+    /// #24: see [`Palette::apply_router_suggestion`]'s doc comment for the
+    /// public entry point. Order matters: staleness and visibility are
+    /// checked before touching `crate::router::should_apply` at all, since
+    /// neither needs the confidence/threshold/interacted comparison to
+    /// already say no.
+    fn apply_router_suggestion(
+        &mut self,
+        generation: u64,
+        result: &crate::router::RouterResult,
+        threshold: f64,
+    ) {
+        if crate::router::is_stale(generation, self.router_generation) {
+            return;
+        }
+        if !self.visible {
+            return;
+        }
+        let Some(intent_id) = result.intent.as_deref() else {
+            return;
+        };
+        if !crate::router::should_apply(
+            Some(intent_id),
+            result.confidence,
+            threshold,
+            self.interacted,
+        ) {
+            return;
+        }
+        if crate::ui::palette_model::preselect_action(&mut self.state, intent_id) {
+            self.router_summary = Some(result.summary.clone());
+            self.invalidate();
+        }
     }
 
     fn reposition_centered(&self) {
@@ -601,6 +716,20 @@ impl PaletteInner {
     /// Takes the key-forwarded `WM_COMMAND` id, runs it through the pure
     /// state machine, and acts on the outcome: repaint, dispatch, or hide.
     fn on_palette_key_command(&mut self, key: crate::ui::palette_model::PaletteKey) {
+        // #24: moving the selection counts as "the user already chose" --
+        // `crate::router::should_apply` must never yank the selection back
+        // to a router suggestion after this. Also drops any summary line
+        // already shown, since it describes a selection the user just left.
+        if matches!(
+            key,
+            crate::ui::palette_model::PaletteKey::Up
+                | crate::ui::palette_model::PaletteKey::Down
+                | crate::ui::palette_model::PaletteKey::PageUp
+                | crate::ui::palette_model::PaletteKey::PageDown
+        ) {
+            self.interacted = true;
+            self.router_summary = None;
+        }
         match crate::ui::palette_model::handle_key(&mut self.state, key) {
             crate::ui::palette_model::PaletteOutcome::None => self.invalidate(),
             crate::ui::palette_model::PaletteOutcome::Hide => self.hide(),
@@ -639,33 +768,62 @@ impl PaletteInner {
             let row_h = scale(ROW_HEIGHT, self.dpi);
             let mut y = pad + scale(EDIT_HEIGHT, self.dpi) + pad;
 
-            for (i, row) in self.state.rows.iter().enumerate().take(MAX_VISIBLE_ROWS) {
-                let row_rect = RECT {
+            // #24: the router summary band is always reserved (see
+            // ROUTER_SUMMARY_HEIGHT's doc comment) so the window never
+            // resizes; only its text is conditional.
+            if let Some(summary) = &self.router_summary {
+                let band_rect = RECT {
                     left: pad,
                     top: y,
                     right: rc.right - pad,
-                    bottom: y + row_h,
+                    bottom: y + scale(ROUTER_SUMMARY_HEIGHT, self.dpi),
+                };
+                SetTextColor(hdc, COLORREF(0x0080_B080));
+                draw_text_line(
+                    hdc,
+                    summary,
+                    band_rect,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
+            y += scale(ROUTER_SUMMARY_HEIGHT, self.dpi);
+
+            // #217: only the rows inside [offset, offset + MAX_VISIBLE_ROWS)
+            // are painted; `i` stays the row's real index into `state.rows`
+            // (what `state.selected` compares against for the highlight),
+            // while `visible_pos` (i - offset) is what actually places it
+            // vertically.
+            for (i, row) in self
+                .state
+                .rows
+                .iter()
+                .enumerate()
+                .skip(self.state.offset)
+                .take(crate::ui::palette_model::MAX_VISIBLE_ROWS)
+            {
+                let visible_pos = (i - self.state.offset) as i32;
+                let row_rect = RECT {
+                    left: pad,
+                    top: y + row_h * visible_pos,
+                    right: rc.right - pad,
+                    bottom: y + row_h * (visible_pos + 1),
                 };
                 match row {
                     crate::ui::palette_model::Row::Header(name) => {
                         SetTextColor(hdc, COLORREF(0x0090_9090));
-                        let mut buf = utf16(name);
-                        let mut r = row_rect;
-                        DrawTextW(
+                        draw_text_line(
                             hdc,
-                            &mut buf,
-                            &mut r,
+                            name,
+                            row_rect,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                         );
                     }
                     crate::ui::palette_model::Row::Hint(text) => {
                         SetTextColor(hdc, COLORREF(0x0080_8080));
-                        let mut buf = utf16(text);
-                        let mut r = row_rect;
-                        DrawTextW(
+                        draw_text_line(
                             hdc,
-                            &mut buf,
-                            &mut r,
+                            text,
+                            row_rect,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                         );
                     }
@@ -676,17 +834,14 @@ impl PaletteInner {
                             let _ = DeleteObject(hl.into());
                         }
                         SetTextColor(hdc, COLORREF(0x00E6_E6E6));
-                        let mut buf = utf16(name);
-                        let mut r = row_rect;
-                        DrawTextW(
+                        draw_text_line(
                             hdc,
-                            &mut buf,
-                            &mut r,
+                            name,
+                            row_rect,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                         );
                     }
                 }
-                y += row_h;
             }
 
             let footer_rect = RECT {
@@ -696,12 +851,10 @@ impl PaletteInner {
                 bottom: rc.bottom,
             };
             SetTextColor(hdc, COLORREF(0x0080_8080));
-            let mut footer_buf = utf16(&self.footer_text);
-            let mut fr = footer_rect;
-            DrawTextW(
+            draw_text_line(
                 hdc,
-                &mut footer_buf,
-                &mut fr,
+                &self.footer_text,
+                footer_rect,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
 
@@ -722,6 +875,12 @@ impl PaletteInner {
                 let notify = (wp >> 16) & 0xFFFF;
                 let ctrl_id = (wp & 0xFFFF) as i32;
                 if notify == EN_CHANGE && ctrl_id == QUERY_EDIT_ID && lparam.0 != 0 {
+                    // #24: real user typing (never the programmatic clear in
+                    // `show`, which uses SetWindowTextW and never fires
+                    // EN_CHANGE) -- the router's suggestion must not steal
+                    // the selection back from here on for this showing.
+                    self.interacted = true;
+                    self.router_summary = None;
                     let query = self.current_query();
                     self.rebuild_state(&query);
                     self.invalidate();
@@ -734,6 +893,12 @@ impl PaletteInner {
                     ID_PALETTE_DOWN => {
                         self.on_palette_key_command(crate::ui::palette_model::PaletteKey::Down)
                     }
+                    ID_PALETTE_PAGE_UP => {
+                        self.on_palette_key_command(crate::ui::palette_model::PaletteKey::PageUp)
+                    }
+                    ID_PALETTE_PAGE_DOWN => {
+                        self.on_palette_key_command(crate::ui::palette_model::PaletteKey::PageDown)
+                    }
                     ID_PALETTE_ENTER => {
                         self.on_palette_key_command(crate::ui::palette_model::PaletteKey::Enter)
                     }
@@ -742,6 +907,34 @@ impl PaletteInner {
                     }
                     ID_PALETTE_LOST_FOCUS => self.hide(),
                     _ => {}
+                }
+                Some(LRESULT(0))
+            }
+            // #217: the mouse wheel moves the viewport only -- selection
+            // (and so what Enter would run) is untouched, matching every
+            // ordinary scrollable list's behaviour. `WM_MOUSEWHEEL` is
+            // delivered to whichever window is under the cursor (the
+            // default "scroll inactive windows" Windows setting), which for
+            // the row list is this HWND directly -- no subclass forwarding
+            // needed, unlike the query edit control's keys.
+            WM_MOUSEWHEEL => {
+                // HIWORD(wParam) is the signed wheel delta, in multiples of
+                // WHEEL_DELTA (120, winuser.h) -- spelled out here the same
+                // way this file already spells out EN_CHANGE.
+                const WHEEL_DELTA: i32 = 120;
+                let raw_delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+                let notches = raw_delta as i32 / WHEEL_DELTA;
+                if notches != 0 {
+                    // Wheel-up (positive notches) reveals earlier rows, i.e.
+                    // moves the viewport toward the top (negative delta_rows
+                    // in `scroll_by`'s convention).
+                    self.state.offset = crate::ui::palette_model::scroll_by(
+                        self.state.offset,
+                        -notches,
+                        self.state.rows.len(),
+                        crate::ui::palette_model::MAX_VISIBLE_ROWS,
+                    );
+                    self.invalidate();
                 }
                 Some(LRESULT(0))
             }
@@ -764,6 +957,40 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// explicit slice length rather than scanning for a terminator.
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
+}
+
+/// Draws one line of `text` in `rect` with `DrawTextW`, or does nothing at
+/// all when `text` is empty.
+///
+/// MEASURED 2026-09-17 (`app.rs`'s `render_gdi_lines_rgba_tolerates_a_blank_line`
+/// and the live test that first hit this): calling `DrawTextW` with a
+/// zero-length `&mut [u16]` buffer -- exactly what `utf16("")` produces --
+/// reliably crashes with `STATUS_ACCESS_VIOLATION` through this crate's
+/// `windows` binding. THEORY (unverified): the binding reads the buffer's
+/// length as "scan for a null terminator" rather than "nothing to draw"
+/// when it is zero, walking off the end of the `Vec`'s dangling-but-valid
+/// empty-allocation pointer.
+///
+/// Every row's text here ultimately comes from data this process does not
+/// fully control -- `router_summary` from a live model's JSON response
+/// (#24, `RouterResult::summary` has no `minLength`), `Row::Action`'s
+/// `name`/`Row::Header`'s group name from a hand-editable `actions.toml`
+/// (#23's `Action::name`/`Action::group` are plain, unvalidated `String`s)
+/// -- so this guard belongs at the one place every row's text funnels
+/// through for painting, not at each individual source.
+fn draw_text_line(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    text: &str,
+    mut rect: RECT,
+    format: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let mut buf = utf16(text);
+    unsafe {
+        DrawTextW(hdc, &mut buf, &mut rect, format);
+    }
 }
 
 #[cfg(test)]
@@ -948,6 +1175,118 @@ mod tests {
         );
     }
 
+    fn many_ungrouped_actions(n: usize) -> Vec<PaletteAction> {
+        (0..n)
+            .map(|i| PaletteAction {
+                id: format!("action-{i}"),
+                name: format!("Action {i}"),
+                group: None,
+                requires_model: false,
+            })
+            .collect()
+    }
+
+    /// #217's Done-when: with a catalogue past `MAX_VISIBLE_ROWS`, real
+    /// Down presses (through the real edit control and its subclass, same
+    /// as `real_win32_down_then_enter_dispatches_the_second_action` above)
+    /// must be able to reach a row past row 12, and the viewport must have
+    /// actually scrolled to keep it visible -- not just the pure model
+    /// (`palette_model`'s own viewport tests already cover that in
+    /// isolation), but the real Win32 wiring from keydown to `on_paint`'s
+    /// `state.offset`.
+    #[test]
+    fn real_win32_down_presses_scroll_the_viewport_past_row_twelve() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(many_ungrouped_actions(20), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        assert_eq!(p.state_offset(), 0);
+
+        for _ in 0..15 {
+            unsafe {
+                SendMessageW(
+                    p.edit_hwnd(),
+                    WM_KEYDOWN,
+                    Some(WPARAM(VK_DOWN.0 as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            pump_pending(p.hwnd());
+        }
+
+        assert_eq!(p.selected_action_id().as_deref(), Some("action-15"));
+        assert!(
+            p.state_offset() > 0,
+            "the viewport must have scrolled to keep row 15 visible"
+        );
+    }
+
+    /// #217's PageUp/PageDown, through the REAL edit control and its
+    /// subclass (`ID_PALETTE_PAGE_DOWN`/`ID_PALETTE_PAGE_UP`'s `WM_COMMAND`
+    /// forwarding), not just the pure `handle_key` unit tests in
+    /// `palette_model.rs` -- those prove the math, this proves the Win32
+    /// wiring from a real VK_NEXT/VK_PRIOR keydown reaches it at all.
+    #[test]
+    fn real_win32_page_down_then_page_up_through_the_real_subclass() {
+        const VK_NEXT: u16 = 0x22; // PageDown
+        const VK_PRIOR: u16 = 0x21; // PageUp
+
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(many_ungrouped_actions(20), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        assert_eq!(p.selected_action_id().as_deref(), Some("action-0"));
+
+        unsafe {
+            SendMessageW(
+                p.edit_hwnd(),
+                WM_KEYDOWN,
+                Some(WPARAM(VK_NEXT as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+        pump_pending(p.hwnd());
+        assert_eq!(p.selected_action_id().as_deref(), Some("action-12"));
+        assert!(
+            p.state_offset() > 0,
+            "PageDown must have scrolled the viewport too"
+        );
+
+        unsafe {
+            SendMessageW(
+                p.edit_hwnd(),
+                WM_KEYDOWN,
+                Some(WPARAM(VK_PRIOR as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+        pump_pending(p.hwnd());
+        assert_eq!(p.selected_action_id().as_deref(), Some("action-0"));
+        assert_eq!(p.state_offset(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_viewport_without_changing_the_selection() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(many_ungrouped_actions(20), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let selected_before = p.selected_action_id();
+        assert_eq!(p.state_offset(), 0);
+
+        // One wheel notch down: HIWORD(wParam) = -120 (winuser.h's
+        // WHEEL_DELTA, negated for "away from the user"/scroll down).
+        let wparam = WPARAM(((-120i16 as u16 as u32) as usize) << 16);
+        p.handle_message(WM_MOUSEWHEEL, wparam, LPARAM(0));
+
+        assert!(p.state_offset() > 0, "wheel-down must scroll the viewport");
+        assert_eq!(
+            p.selected_action_id(),
+            selected_before,
+            "the wheel must never change the selection"
+        );
+    }
+
     fn create_test_owner_window(instance: HINSTANCE) -> HWND {
         const OWNER_CLASS: &str = "Wingman.Palette.TestOwner.9c4e2b17";
         static OWNER_INIT: Once = Once::new();
@@ -988,6 +1327,26 @@ mod tests {
     #[test]
     fn scale_grows_with_dpi() {
         assert_eq!(scale(96, 192), 192);
+    }
+
+    /// Regression check for `draw_text_line`'s doc comment: an empty string
+    /// must not reach `DrawTextW` at all. Before this guard existed, this
+    /// exact call crashed with `STATUS_ACCESS_VIOLATION` (see the doc
+    /// comment for the reproduction).
+    #[test]
+    fn draw_text_line_tolerates_an_empty_string() {
+        unsafe {
+            let hdc = windows::Win32::Graphics::Gdi::GetDC(None);
+            assert!(!hdc.is_invalid(), "GetDC failed");
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 20,
+            };
+            draw_text_line(hdc, "", rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
+        }
     }
 
     // -- show latency (#25's Done-when: under 100 ms) -----------------------

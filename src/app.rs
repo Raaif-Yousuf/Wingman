@@ -34,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::actions;
 use crate::capture;
-use crate::config::{Config, Providers};
+use crate::config::{Config, Providers, UNREADABLE_KEY_MARKER};
 use crate::connectors::civil_time::{CivilDate, CivilDateTime};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::executors;
@@ -46,8 +46,10 @@ use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
 use crate::provider::{
     calendar_request, parse_answer, physics_request, review_request_from_screen,
-    review_request_from_text, Answer, Chain, Shot,
+    review_request_from_text, Answer, Anthropic, Chain, Gemini, Ollama, OpenAi, OpenAiCompat,
+    Provider, Shot,
 };
+use crate::router;
 use crate::ui::card::{Card, WM_APP_PREVIEW_DECIDED};
 use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
@@ -98,6 +100,19 @@ pub const WM_APP_REVIEW_RESULT: u32 = WM_APP + 12;
 /// `WM_APP_PREVIEW_DECIDED`/`WM_APP_PALETTE_TOGGLE`/`WM_APP_PALETTE_RUN`/
 /// `WM_APP_REVIEW_RESULT`.
 pub const WM_APP_FORM_FILL_RESULT: u32 = WM_APP + 13;
+
+/// #24: posted by the intent router's worker thread when its classification
+/// call finishes (success or failure). `lparam` is
+/// `Box::into_raw(Box::new((u64, Result<router::RouterResult, String>)))` --
+/// the `u64` is the generation the request was built for
+/// (`Palette::router_generation()`, read right after `Palette::show`), so
+/// the handler can tell a result for an already-hidden-or-reshown palette
+/// from one for the session still on screen (`router::is_stale`, applied
+/// inside `Palette::apply_router_suggestion`). The receiver takes ownership
+/// and must reconstruct the `Box` to free it. `WM_APP + 14`: `+9` through
+/// `+13` are already `WM_APP_PREVIEW_DECIDED`/`WM_APP_PALETTE_TOGGLE`/
+/// `WM_APP_PALETTE_RUN`/`WM_APP_REVIEW_RESULT`/`WM_APP_FORM_FILL_RESULT`.
+pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
 
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
@@ -613,7 +628,100 @@ impl App {
             self.first_provider_model_label().as_deref(),
         );
 
+        // #24: candidates are built from the SAME catalogue about to be
+        // shown, before it moves into `Palette::show` below.
+        let candidates = router::candidates_from_catalogue(&catalogue);
         self.palette.show(catalogue, model_configured, footer);
+        self.maybe_start_router(candidates);
+    }
+
+    /// #24: the intent router's hook, called right after
+    /// [`App::toggle_palette`]'s `Palette::show` -- the palette is already
+    /// visible and painted by the time this runs (`Palette::show` forces a
+    /// synchronous first paint), so nothing here can add to the palette's
+    /// own sub-100ms show latency; only the eventual card-free suggestion
+    /// arrives late. Mirrors `App::ask`'s own capture-on-main-thread-then-
+    /// spawn ordering.
+    ///
+    /// A silent no-op (never a card, never a hint) when: Paused; no
+    /// provider is ready at all (the cheap, optimistic "is anything
+    /// configured" check `ask`'s `readiness_gate` also uses); or the
+    /// screenshot capture fails. Issue #24's "skip entirely when no
+    /// provider is ready (no hint needed)" applies to every one of these --
+    /// the router is a background convenience, never something whose
+    /// failure the user is told about (rule 7's "every failure ends in a
+    /// card" is about the action the user actually asked for; the router
+    /// never was one).
+    fn maybe_start_router(&mut self, candidates: Vec<router::RouterCandidate>) {
+        if pause::is_paused_now() {
+            return;
+        }
+
+        let providers = self.config.providers.clone();
+        let mode = self.config.mode;
+        let optimistic_ready = !providers
+            .build_chain_for_mode(mode, true)
+            .ready_provider_names()
+            .is_empty();
+        if !optimistic_ready {
+            return;
+        }
+
+        // #24: a heavily downscaled capture -- see `router::ROUTER_IMAGE_LONG_EDGE`'s
+        // doc comment for why this is far smaller than the real action's
+        // capture. Runs on the MAIN thread (Win32 capture must not run on a
+        // worker thread, same constraint `ask` documents at its own capture
+        // call site); encoding to PNG happens below, on the worker thread,
+        // exactly like `ask` defers its own (more expensive) encode.
+        let raw = match capture::grab_raw(
+            &self.config.capture.monitor,
+            router::ROUTER_IMAGE_LONG_EDGE,
+            router::ROUTER_IMAGE_MAX_PIXELS,
+        ) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let generation = self.palette.router_generation();
+        let target = self.hwnd_isize();
+
+        std::thread::spawn(move || {
+            let result: std::result::Result<router::RouterResult, String> =
+                (|| -> Result<router::RouterResult> {
+                    let shot = capture::encode(&raw)?;
+                    router_worker(&providers, mode, shot.png, &candidates)
+                })()
+                .map_err(|e| format!("{e:#}"));
+            let payload = Box::into_raw(Box::new((generation, result)));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_ROUTER_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                );
+            }
+        });
+    }
+
+    /// #24: applies (or drops) the router's result against the palette's
+    /// CURRENT session. `Palette::apply_router_suggestion` performs the
+    /// actual staleness/threshold/interacted decision (`crate::router`'s
+    /// pure functions) -- this method only unwraps the worker's `Result`
+    /// and reads the live threshold from config. An `Err` (the router
+    /// failed, or no provider ended up ready by the time the worker thread
+    /// ran) is silently dropped, never a card -- see `maybe_start_router`'s
+    /// doc comment for why.
+    fn on_router_result(
+        &mut self,
+        generation: u64,
+        result: std::result::Result<router::RouterResult, String>,
+    ) {
+        if let Ok(result) = result {
+            let threshold = self.config.palette.router_threshold;
+            self.palette
+                .apply_router_suggestion(generation, &result, threshold);
+        }
     }
 
     /// `"<name>:<model>"` for the first entry in `providers.order`, or just
@@ -2404,6 +2512,136 @@ fn form_fill_worker(
     ))
 }
 
+/// #24: the intent router's worker-thread body, called from
+/// `App::maybe_start_router`'s spawned thread. Mirrors [`worker`]'s
+/// mode-aware chain construction (same Auto-mode Ollama probe, same
+/// "network I/O never happens on the main thread" reasoning), but picks the
+/// router's own cheapest ready provider/model
+/// ([`router::cheapest_router_target`]) instead of the user's configured
+/// chain, and runs it through a single-provider [`Chain`] -- issue #99's
+/// one-shot repair pass still applies (a schema-invalid response gets one
+/// repair attempt), but there is no multi-provider fallback: the router
+/// only ever tries the one cheapest ready provider, and if that fails, this
+/// press simply gets no suggestion.
+fn router_worker(
+    providers: &Providers,
+    mode: Mode,
+    image_png: Vec<u8>,
+    candidates: &[router::RouterCandidate],
+) -> Result<router::RouterResult> {
+    let ollama_ready = mode == Mode::Auto
+        && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+        && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
+    let ready: Vec<String> = providers
+        .build_chain_for_mode(mode, ollama_ready)
+        .ready_provider_names()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let target = router::cheapest_router_target(&ready, |name| router_models_for(providers, name))
+        .ok_or_else(|| anyhow::anyhow!("router: no ready provider"))?;
+    let provider = provider_for_router(providers, &target.provider, &target.model)
+        .ok_or_else(|| anyhow::anyhow!("router: unrecognized provider \"{}\"", target.provider))?;
+
+    let candidate_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+    let req = router::build_request(image_png, candidates);
+    Chain::new(vec![provider]).complete_parsed(&req, |c| {
+        router::parse_router_result(&c.text, &candidate_ids)
+    })
+}
+
+/// #24: the router's per-provider model LIST (never the user's configured
+/// "active" model alone) -- `router::cheapest_router_target` picks the
+/// cheapest entry from whichever of these it's handed. Reads the exact same
+/// `Providers` fields `config.rs`'s own `Providers::provider_for`/`describe`
+/// read, just the plural `models` field instead of the singular `model`
+/// where one exists; Ollama has no list of its own (see
+/// [`router::cheapest_router_target`]'s doc comment), so its one configured
+/// model is wrapped in a single-element `Vec` here.
+fn router_models_for(providers: &Providers, name: &str) -> Vec<String> {
+    match name {
+        "openai" => providers.openai.models.clone(),
+        "anthropic" => providers.anthropic.models.clone(),
+        "gemini" => providers.gemini.models.clone(),
+        "ollama" => vec![providers.ollama.model.clone()],
+        _ => {
+            let Some(compat_name) = name.strip_prefix("compat:") else {
+                return Vec::new();
+            };
+            providers
+                .compat
+                .iter()
+                .find(|c| c.name == compat_name)
+                .map(|c| c.models.clone())
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// #24: constructs the ONE provider the router will call, built with
+/// `model` (`router::cheapest_router_target`'s pick) instead of that
+/// provider's configured "active" model. Deliberately NOT
+/// `Providers::provider_for` (config.rs, `pub(crate)`... actually private
+/// and unreachable from here) -- this mirrors its exact name-to-provider
+/// mapping (same match arms, same config fields) so the two can never
+/// disagree on what a `providers.order` name constructs, just on which
+/// model string it gets built with.
+fn provider_for_router(
+    providers: &Providers,
+    name: &str,
+    model: &str,
+) -> Option<Box<dyn Provider>> {
+    match name {
+        "openai" => Some(Box::new(OpenAi::new(
+            router_key(&providers.openai.api_key),
+            model.to_string(),
+            providers.openai.effort.clone(),
+        ))),
+        "anthropic" => Some(Box::new(Anthropic::new(
+            router_key(&providers.anthropic.api_key),
+            model.to_string(),
+            providers.anthropic.effort.clone(),
+        ))),
+        "gemini" => Some(Box::new(Gemini::new(
+            router_key(&providers.gemini.api_key),
+            model.to_string(),
+            providers.gemini.effort.clone(),
+        ))),
+        "ollama" => Some(Box::new(Ollama::new(
+            providers.ollama.base_url.clone(),
+            model.to_string(),
+            providers.ollama.effort.clone(),
+        ))),
+        _ => {
+            let compat_name = name.strip_prefix("compat:")?;
+            let cfg = providers.compat.iter().find(|c| c.name == compat_name)?;
+            Some(Box::new(OpenAiCompat::new(
+                cfg.base_url.clone(),
+                model.to_string(),
+                cfg.auth,
+                cfg.auth_header.clone(),
+                router_key(&cfg.api_key),
+                cfg.structured,
+                cfg.vision,
+            )))
+        }
+    }
+}
+
+/// #175's unreadable-credential marker is a placeholder, not a key (see
+/// `config::UNREADABLE_KEY_MARKER`'s doc); a router provider built from it
+/// must report not-ready instead of sending it, same treatment
+/// `config.rs`'s own (private) `unreadable_as_empty` gives every other
+/// provider construction.
+fn router_key(key: &str) -> String {
+    if key == UNREADABLE_KEY_MARKER {
+        String::new()
+    } else {
+        key.to_string()
+    }
+}
+
 /// #39: today's local date and current local UTC offset, for the "Add
 /// event from screen" prompt -- DST-correct the same way
 /// `deadline_until_tomorrow` already is for Pause, via the identical
@@ -2863,8 +3101,13 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // WM_APP_PAUSE_TOGGLE already gets. WM_APP_PALETTE_RUN's boxed
         // `String` payload is freed explicitly below (mirroring
         // WM_APP_LEARNED/WM_APP_CALENDAR_RESULT) so it never leaks.
+        // #24: WM_APP_ROUTER_RESULT is dropped the same way -- the palette
+        // it belongs to cannot be visible while Settings is modal-open
+        // either, so there is nothing left to apply the suggestion to; its
+        // boxed `(u64, Result<...>)` payload is freed explicitly below too.
         | WM_APP_PALETTE_TOGGLE
-        | WM_APP_PALETTE_RUN => SettingsReentrancy::Ignore,
+        | WM_APP_PALETTE_RUN
+        | WM_APP_ROUTER_RESULT => SettingsReentrancy::Ignore,
         _ => SettingsReentrancy::Fallback,
     }
 }
@@ -2910,9 +3153,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         match settings_reentrancy_policy(msg, taskbar_created_msg) {
             SettingsReentrancy::Ignore => {
                 // WM_APP_LEARNED, WM_APP_CALENDAR_RESULT,
-                // WM_APP_FORM_FILL_RESULT and WM_APP_PALETTE_RUN are the
-                // only ignored messages carrying a boxed payload; free them
-                // so none leaks.
+                // WM_APP_FORM_FILL_RESULT, WM_APP_PALETTE_RUN,
+                // WM_APP_REVIEW_RESULT and WM_APP_ROUTER_RESULT are the only
+                // ignored messages carrying a boxed payload; free them so
+                // none leaks.
                 if msg == WM_APP_LEARNED {
                     drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
                 } else if msg == WM_APP_CALENDAR_RESULT || msg == WM_APP_FORM_FILL_RESULT {
@@ -2929,6 +3173,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                                     actions::review_email::ReviewOutcome,
                                     String,
                                 >,
+                        )
+                    });
+                } else if msg == WM_APP_ROUTER_RESULT {
+                    drop(unsafe {
+                        Box::from_raw(
+                            lparam.0
+                                as *mut (u64, std::result::Result<router::RouterResult, String>),
                         )
                     });
                 }
@@ -3091,6 +3342,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.dispatch_palette_action(&action_id);
             LRESULT(0)
         }
+        WM_APP_ROUTER_RESULT => {
+            // #24: take ownership of the (generation, result) box the
+            // router's worker thread leaked into the message (this
+            // constant's own doc comment).
+            let (generation, result) = unsafe {
+                *Box::from_raw(
+                    lparam.0 as *mut (u64, std::result::Result<router::RouterResult, String>),
+                )
+            };
+            app.on_router_result(generation, result);
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == PAUSE_TIMER_ID {
                 app.on_pause_timer(hwnd);
@@ -3144,17 +3407,21 @@ mod tests {
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT, WM_APP_RESULT,
-        WM_APP_REVIEW_RESULT,
+        WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
     };
     use crate::actions::{self, Origin};
+    use crate::capture;
     use crate::config::Providers;
     use crate::dismiss::WM_APP_DISMISS;
     use crate::hotkey::{
         WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
     };
     use crate::mode::Mode;
+    use crate::provider::Provider;
+    use crate::router;
     use crate::ui::card::WM_APP_PREVIEW_DECIDED;
     use crate::ui::palette::WM_APP_PALETTE_RUN;
+    use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
     use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
 
@@ -3571,6 +3838,27 @@ mod tests {
     }
 
     #[test]
+    fn settings_reentrancy_ignores_palette_and_router_messages() {
+        // #25/#24: these three share one match arm in
+        // `settings_reentrancy_policy` -- covered together here (a gap the
+        // pre-existing `..._hotkey_activate_tray_dismiss_learned_and_pause_toggle`
+        // test above never closed for WM_APP_PALETTE_TOGGLE/WM_APP_PALETTE_RUN;
+        // filed as a finding rather than folded into that test's name, which
+        // this commit does not otherwise touch).
+        for msg in [
+            WM_APP_PALETTE_TOGGLE,
+            WM_APP_PALETTE_RUN,
+            WM_APP_ROUTER_RESULT,
+        ] {
+            assert_eq!(
+                settings_reentrancy_policy(msg, FAKE_TASKBAR_CREATED_MSG),
+                SettingsReentrancy::Ignore,
+                "msg {msg:#x} should be Ignore while Settings is open"
+            );
+        }
+    }
+
+    #[test]
     fn settings_reentrancy_falls_back_to_def_window_proc_for_everything_else() {
         // WM_DESTROY is the concrete example named in the doc comment: it is
         // unreachable in practice (its only path, WM_APP_TRAY, is Ignore'd
@@ -3610,6 +3898,7 @@ mod tests {
         ("WM_APP_PALETTE_RUN", WM_APP_PALETTE_RUN),
         ("WM_APP_REVIEW_RESULT", WM_APP_REVIEW_RESULT),
         ("WM_APP_FORM_FILL_RESULT", WM_APP_FORM_FILL_RESULT),
+        ("WM_APP_ROUTER_RESULT", WM_APP_ROUTER_RESULT),
     ];
 
     #[test]
@@ -3679,5 +3968,270 @@ mod tests {
     #[test]
     fn first_line_leaves_short_text_alone() {
         assert_eq!(first_line("fine", 88), "fine");
+    }
+
+    // -- live intent router measurement (issue #24) --------------------------
+
+    /// Renders `lines` as separate black-on-white text lines via GDI into an
+    /// in-memory DIB (top-aligned, one `DrawTextW` call per line) -- the
+    /// synthetic "email compose window" `router_live_recognizes_email_compose`
+    /// runs the real router through. Small and duplicated rather than shared
+    /// with `ocr.rs`'s/`provider/mod.rs`'s own GDI-render test helpers -- an
+    /// established convention in this crate's live tests (see
+    /// `provider/mod.rs`'s `render_gdi_text_rgba_for_ocr` doc comment for the
+    /// same reasoning). Test-only; not reachable from production code.
+    unsafe fn render_gdi_lines_rgba(lines: &[&str], width: u32, height: u32) -> Vec<u8> {
+        use windows::Win32::Foundation::{COLORREF, RECT};
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
+            DeleteObject, DrawTextW, FillRect, SelectObject, SetBkColor, SetTextColor,
+            ANSI_CHARSET, BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, DEFAULT_PITCH,
+            DEFAULT_QUALITY, DIB_RGB_COLORS, DT_LEFT, DT_SINGLELINE, DT_TOP, FW_NORMAL,
+            OUT_DEFAULT_PRECIS,
+        };
+
+        let hdc = CreateCompatibleDC(None);
+        assert!(!hdc.is_invalid(), "CreateCompatibleDC failed");
+
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32), // negative => top-down, row 0 first
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0, // BI_RGB
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hbitmap = CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+            .expect("CreateDIBSection failed");
+        assert!(!bits.is_null(), "CreateDIBSection returned a null buffer");
+
+        let old_bitmap = SelectObject(hdc, hbitmap.into());
+
+        let white = CreateSolidBrush(COLORREF(0x00FF_FFFF));
+        let full_rect = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        FillRect(hdc, &full_rect, white);
+        let _ = DeleteObject(white.into());
+
+        let hfont = CreateFontW(
+            -24,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            ANSI_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY,
+            DEFAULT_PITCH.0 as u32,
+            windows::core::w!("Segoe UI"),
+        );
+        let old_font = SelectObject(hdc, hfont.into());
+        SetTextColor(hdc, COLORREF(0x0000_0000));
+        SetBkColor(hdc, COLORREF(0x00FF_FFFF));
+
+        let line_height = 28i32;
+        for (i, line) in lines.iter().enumerate() {
+            // MEASURED 2026-09-17: an empty (zero-length) buffer crashes
+            // `DrawTextW` here (STATUS_ACCESS_VIOLATION) -- THEORY
+            // (unverified): the `windows` crate's binding treats a
+            // zero-length `&mut [u16]` as "scan for a null terminator"
+            // rather than "draw nothing", walking off the end of the
+            // `Vec`'s dangling-but-valid empty-allocation pointer. A blank
+            // line in the synthetic email body is drawn as nothing by
+            // simply skipping the call, which is what an empty line should
+            // paint anyway.
+            if line.is_empty() {
+                continue;
+            }
+            let mut text_wide: Vec<u16> = line.encode_utf16().collect();
+            let mut rect = RECT {
+                left: 12,
+                top: 8 + line_height * i as i32,
+                right: width as i32 - 12,
+                bottom: 8 + line_height * (i as i32 + 1),
+            };
+            DrawTextW(
+                hdc,
+                &mut text_wide,
+                &mut rect,
+                DT_LEFT | DT_TOP | DT_SINGLELINE,
+            );
+        }
+
+        let pixel_count = (width as usize) * (height as usize) * 4;
+        let bgra = std::slice::from_raw_parts(bits as *const u8, pixel_count).to_vec();
+
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(hfont.into());
+        SelectObject(hdc, old_bitmap);
+        let _ = DeleteObject(hbitmap.into());
+        let _ = DeleteDC(hdc);
+
+        let mut rgba = Vec::with_capacity(pixel_count);
+        for px in bgra.chunks_exact(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        }
+        rgba
+    }
+
+    /// Regression check for the `DrawTextW`-on-an-empty-line crash
+    /// documented on `render_gdi_lines_rgba` and on
+    /// `router_live_recognizes_email_compose` below -- no network, so this
+    /// runs on every ordinary `cargo test`, unlike the live test that first
+    /// caught it.
+    #[test]
+    fn render_gdi_lines_rgba_tolerates_a_blank_line() {
+        let rgba = unsafe { render_gdi_lines_rgba(&["a", "", "b"], 200, 100) };
+        assert_eq!(rgba.len(), 200 * 100 * 4);
+    }
+
+    /// #24's live measurement: a synthetic email-compose window (To:,
+    /// Subject:, a typo'd body), rendered directly at
+    /// `router::ROUTER_IMAGE_LONG_EDGE` (the real production size, not a
+    /// larger draft downscaled afterward), through the REAL intent router
+    /// (`router::build_request`/`router::parse_router_result`, the same
+    /// functions `App::router_worker` calls) against local Ollama
+    /// `gemma3:4b`. Run manually (CLAUDE.md build rules -- never bare
+    /// `cargo test`):
+    /// ```text
+    /// CARGO_TARGET_DIR=... RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2 \
+    ///   cargo test router_live -- --ignored --nocapture
+    /// ```
+    /// Requires a local Ollama server on 127.0.0.1:11434 with `gemma3:4b`
+    /// pulled. Expects `intent == Some("review-email")` when that action
+    /// exists in `actions::load_actions()`'s catalogue (added by a sibling
+    /// agent in parallel, per #24's task description); otherwise only
+    /// requires SOME valid id was named, never "none" -- either way the
+    /// chosen id is printed. Unloads the model afterward (`keep_alive:
+    /// "0"`), the same convention `provider/mod.rs`'s and `ollama.rs`'s own
+    /// live checks already use.
+    ///
+    /// MEASURED 2026-09-17 (this crate's dev profile, `gemma3:4b`, catalogue
+    /// of 5 rows -- "review-email" not yet on master at measurement time):
+    /// elapsed 45.71s (cold: the model was not already loaded going in --
+    /// see `keep_alive`'s doc on why every OTHER live check in this crate
+    /// unloads immediately after too, which keeps every measurement a cold
+    /// one unless run back-to-back), 408 input tokens, 31 output tokens.
+    /// `intent` came back `Some("copy-region")` (a valid, non-"none" id,
+    /// satisfying this test's fallback assertion) rather than a more
+    /// obviously email-shaped choice, and `summary` echoed an action id
+    /// instead of describing the image -- THEORY (unverified): `gemma3:4b`
+    /// at this image size and prompt does not reliably follow the
+    /// `summary`-before-`intent` schema-order instruction (rule 3's
+    /// "commits to a verdict before doing the arithmetic" reasoning assumes
+    /// a model capable enough to use the ordering at all); filed as a
+    /// finding rather than reworked here, since #24's Done-when is the
+    /// router's WIRING (capture, request, threshold, staleness,
+    /// pre-selection), not this one model's answer quality, and the
+    /// expansion plan's own router default is `qwen3.5:4b`, not
+    /// `gemma3:4b` (this test's model choice is fixed by the task that
+    /// created it, not a production recommendation).
+    ///
+    /// Separately: an early draft of this test's GDI renderer crashed
+    /// (`STATUS_ACCESS_VIOLATION`) on a blank line in the body text --
+    /// MEASURED 2026-09-17: `DrawTextW` with a zero-length `&mut [u16]`
+    /// buffer reliably crashes through this crate's `windows` binding;
+    /// `render_gdi_lines_rgba` above now skips empty lines entirely rather
+    /// than calling `DrawTextW` with nothing to draw.
+    #[test]
+    #[ignore = "live: a real local Ollama call against a rendered image; run manually, see this test's doc comment"]
+    fn router_live_recognizes_email_compose() {
+        use crate::provider::ollama::{Ollama, DEFAULT_BASE_URL};
+
+        // Rendered directly at ROUTER_IMAGE_LONG_EDGE (not a larger canvas
+        // downscaled afterward): this is the actual pixel budget
+        // `App::maybe_start_router` sends in production, so a passing
+        // result here is real evidence for -- and a failing one real
+        // evidence against -- `router::ROUTER_IMAGE_LONG_EDGE`'s doc
+        // comment's THEORY that 512 stays legible enough for this kind of
+        // screen.
+        let width = router::ROUTER_IMAGE_LONG_EDGE;
+        let height = width * 260 / 1000; // same aspect ratio as the original 1000x260 draft
+        let rgba = unsafe {
+            render_gdi_lines_rgba(
+                &[
+                    "To: dana@example.com",
+                    "Subject: Q3 numbrs",
+                    "",
+                    "Hi Dana, pls find atached the Q3 numbrs, let me no if",
+                    "anything looks of. Thnks!",
+                ],
+                width,
+                height,
+            )
+        };
+        let raw = capture::RawShot {
+            rgba,
+            width,
+            height,
+        };
+        let shot = capture::encode(&raw).expect("encode synthetic PNG");
+
+        let resolved = actions::load_actions()
+            .expect("load_actions should succeed against whatever actions.toml (or none) is on this machine");
+        let catalogue = palette_model::catalogue(&resolved);
+        let candidates = router::candidates_from_catalogue(&catalogue);
+        let candidate_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+
+        let req = router::build_request(shot.png, &candidates);
+
+        let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        let started = std::time::Instant::now();
+        let completion = provider
+            .complete(&req)
+            .expect("live ollama router request should succeed");
+        let elapsed = started.elapsed();
+
+        // Unload right after the measurement (mirrors `provider/mod.rs`'s /
+        // `ollama.rs`'s own live-check convention) -- a trivial follow-up
+        // request purely to release VRAM; its own result is not the
+        // measurement, so a failure here is not fatal to the test.
+        let mut unload_provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        unload_provider.keep_alive = "0".to_string();
+        let _ = unload_provider.complete(&router::build_request(vec![], &[]));
+
+        let result = router::parse_router_result(&completion.text, &candidate_ids)
+            .expect("router completion should parse against its own schema");
+
+        eprintln!(
+            "MEASURED 2026-09-17: router_live: model=gemma3:4b elapsed={elapsed:?} \
+             summary={:?} intent={:?} confidence={}",
+            result.summary, result.intent, result.confidence
+        );
+        if let Some(usage) = completion.usage {
+            eprintln!(
+                "MEASURED 2026-09-17: router_live token usage: input={} output={}",
+                usage.input_tokens, usage.output_tokens
+            );
+        }
+
+        if candidate_ids.iter().any(|id| id == "review-email") {
+            assert_eq!(
+                result.intent.as_deref(),
+                Some("review-email"),
+                "the \"review-email\" action exists in this catalogue; expected the router \
+                 to pick it for an email compose window"
+            );
+        } else {
+            assert!(
+                result.intent.is_some(),
+                "expected the router to name some action id for an unambiguous email compose \
+                 window, got none (\"review-email\" is not in this catalogue yet)"
+            );
+        }
     }
 }

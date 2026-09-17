@@ -91,5 +91,8 @@ Respond with exactly two fields, and write them in this order:
 
 Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline."""
 
+[palette]
+router_threshold = 0.7
+
 [forms]
 require_tick_for = "sensitive"
