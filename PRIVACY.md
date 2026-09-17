@@ -34,12 +34,19 @@ turns up exactly the two endpoints above.
 
 ## What is stored locally
 
-- `%APPDATA%\copilot-ask\config.toml`: your API key(s) (unless supplied via
-  the `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` environment variables instead,
-  in which case the file has none), the system prompt, capture and UI
-  settings, and model choices. Owner-only ACL. Never read by any Wingman
-  code path except the settings window and the request-building code; never
-  uploaded anywhere as a file, only the individual fields the request needs.
+- **Windows Credential Manager**, generic credentials named
+  `Wingman/<provider>` (e.g. `Wingman/openai`, `Wingman/anthropic`): your API
+  key(s), unless supplied via the `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
+  environment variables instead, in which case nothing is stored on disk at
+  all. On first run after upgrading from a build that kept the key in
+  `config.toml`, that key is moved into Credential Manager and the file is
+  rewritten with an empty `api_key`. Settings shows only the last four
+  characters of a stored key.
+- `%APPDATA%\Wingman\config.toml`: the system prompt, capture and UI
+  settings, and model choices; `api_key` is always empty here now. Owner-only
+  ACL. Never read by any Wingman code path except the settings window and the
+  request-building code; never uploaded anywhere as a file, only the
+  individual fields the request needs.
 - Nothing else. No screenshot is written to disk. No history, log or cache of
   past answers persists across a restart.
 
