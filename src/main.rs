@@ -22,6 +22,7 @@ mod known_folder;
 mod mode;
 mod ocr;
 mod pause;
+mod profile;
 mod provider;
 mod secrets;
 mod single_instance;
