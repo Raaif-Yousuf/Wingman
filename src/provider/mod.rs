@@ -1,5 +1,6 @@
 mod common;
 pub mod anthropic;
+pub mod gemini;
 pub mod ollama;
 pub mod ollama_admin;
 pub mod openai;
@@ -9,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub use anthropic::Anthropic;
+pub use gemini::Gemini;
 pub use ollama::Ollama;
 pub use openai::OpenAi;
 /// The system prompt. The user solves physics and statistics problems on paper,

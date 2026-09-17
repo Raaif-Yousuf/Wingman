@@ -1,0 +1,22 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "{\"detail\": \"v = u + at = 0 + 9.8*4.3 = 42.1, rounds to 42.\", \"headline\": \"42 m/s is correct\"}"
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 1234,
+    "candidatesTokenCount": 56,
+    "totalTokenCount": 1290
+  },
+  "modelVersion": "gemini-3.8-flash"
+}

@@ -234,6 +234,7 @@ mod tests {
     fn target_name_is_wingman_slash_provider() {
         assert_eq!(target_name("openai"), "Wingman/openai");
         assert_eq!(target_name("anthropic"), "Wingman/anthropic");
+        assert_eq!(target_name("gemini"), "Wingman/gemini");
     }
 
     // -- InMemoryStore ------------------------------------------------------
