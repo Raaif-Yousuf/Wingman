@@ -179,39 +179,83 @@ Invoke-PackageRegistrationPhase
 }
 
 Describe 'Get-RollbackPlan' {
+    # CurrentProcessWasRunning/CurrentExeStillPresent (issue #173) mirror
+    # OldProcessWasRunning/OldInstallStillPresent, but for the CURRENT
+    # (Wingman-to-Wingman) identity: an in-place upgrade or a plain re-run of
+    # install.ps1 that fails must restart whichever wingman.exe was running
+    # before the attempt, exactly as a legacy copilot-ask install would be
+    # restarted -- not just the legacy path, which is all this plan covered
+    # before this fix.
+
     It 'undoes everything phase 2 finished and restarts the old process when it was running' {
         $plan = Get-RollbackPlan -NewPackageRegistered $true -NewRunValueWritten $true `
-            -OldProcessWasRunning $true -OldInstallStillPresent $true
+            -OldProcessWasRunning $true -OldInstallStillPresent $true `
+            -CurrentProcessWasRunning $false -CurrentExeStillPresent $true
         $plan.UnregisterNewPackage | Should -BeTrue
         $plan.RemoveNewRunValue | Should -BeTrue
         $plan.RestartOldProcess | Should -BeTrue
+        $plan.RestartCurrentProcess | Should -BeFalse
     }
 
     It 'does not try to unregister a package that never got registered' {
         $plan = Get-RollbackPlan -NewPackageRegistered $false -NewRunValueWritten $false `
-            -OldProcessWasRunning $true -OldInstallStillPresent $true
+            -OldProcessWasRunning $true -OldInstallStillPresent $true `
+            -CurrentProcessWasRunning $false -CurrentExeStillPresent $true
         $plan.UnregisterNewPackage | Should -BeFalse
         $plan.RemoveNewRunValue | Should -BeFalse
     }
 
     It 'does not restart the old process when it was never running' {
         $plan = Get-RollbackPlan -NewPackageRegistered $true -NewRunValueWritten $false `
-            -OldProcessWasRunning $false -OldInstallStillPresent $true
+            -OldProcessWasRunning $false -OldInstallStillPresent $true `
+            -CurrentProcessWasRunning $false -CurrentExeStillPresent $true
         $plan.RestartOldProcess | Should -BeFalse
     }
 
     It 'does not try to restart the old process when its install dir/exe is already gone' {
         $plan = Get-RollbackPlan -NewPackageRegistered $true -NewRunValueWritten $true `
-            -OldProcessWasRunning $true -OldInstallStillPresent $false
+            -OldProcessWasRunning $true -OldInstallStillPresent $false `
+            -CurrentProcessWasRunning $false -CurrentExeStillPresent $true
         $plan.RestartOldProcess | Should -BeFalse
     }
 
     It 'plans nothing when phase 2 had not done anything yet' {
         $plan = Get-RollbackPlan -NewPackageRegistered $false -NewRunValueWritten $false `
-            -OldProcessWasRunning $false -OldInstallStillPresent $true
+            -OldProcessWasRunning $false -OldInstallStillPresent $true `
+            -CurrentProcessWasRunning $false -CurrentExeStillPresent $true
         $plan.UnregisterNewPackage | Should -BeFalse
         $plan.RemoveNewRunValue | Should -BeFalse
         $plan.RestartOldProcess | Should -BeFalse
+        $plan.RestartCurrentProcess | Should -BeFalse
+    }
+
+    It 'restarts the current (Wingman) process when it was running and its exe is still present' {
+        $plan = Get-RollbackPlan -NewPackageRegistered $true -NewRunValueWritten $true `
+            -OldProcessWasRunning $false -OldInstallStillPresent $false `
+            -CurrentProcessWasRunning $true -CurrentExeStillPresent $true
+        $plan.RestartCurrentProcess | Should -BeTrue
+    }
+
+    It 'does not restart the current process when it was never running' {
+        $plan = Get-RollbackPlan -NewPackageRegistered $true -NewRunValueWritten $true `
+            -OldProcessWasRunning $false -OldInstallStillPresent $false `
+            -CurrentProcessWasRunning $false -CurrentExeStillPresent $true
+        $plan.RestartCurrentProcess | Should -BeFalse
+    }
+
+    It 'does not restart the current process when its exe is no longer present' {
+        $plan = Get-RollbackPlan -NewPackageRegistered $true -NewRunValueWritten $true `
+            -OldProcessWasRunning $false -OldInstallStillPresent $false `
+            -CurrentProcessWasRunning $true -CurrentExeStillPresent $false
+        $plan.RestartCurrentProcess | Should -BeFalse
+    }
+
+    It 'can restart both the old and current process independently when both were running' {
+        $plan = Get-RollbackPlan -NewPackageRegistered $true -NewRunValueWritten $true `
+            -OldProcessWasRunning $true -OldInstallStillPresent $true `
+            -CurrentProcessWasRunning $true -CurrentExeStillPresent $true
+        $plan.RestartOldProcess | Should -BeTrue
+        $plan.RestartCurrentProcess | Should -BeTrue
     }
 }
 
@@ -301,6 +345,220 @@ Describe 'Invoke-PackageRegistrationPhase' {
             -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey | Out-Null
 
         $order | Should -Be @('StopOldProcess', 'RegisterPackage')
+    }
+}
+
+Describe 'Invoke-PackageRegistrationPhase rollback matrix (issue #173)' {
+    # Phase 2 must leave "whatever was running before this attempt" running
+    # again, from its own previous binary, no matter which of three starting
+    # states the machine was in before install.ps1 ran, and no matter which
+    # step inside phase 2 is the one that throws. Before this fix, only the
+    # legacy copilot-ask process was ever tracked for restart; a Wingman-to-
+    # Wingman upgrade (or a plain re-run) killed the running wingman.exe,
+    # overwrote its file on disk unconditionally with Copy-Item -Force, and
+    # left nothing to restart it with on failure.
+
+    BeforeAll {
+        $script:id = Get-WingmanIdentity
+        $script:installDir = 'TestDrive:\Install\Wingman'
+        $script:legacyDir  = 'TestDrive:\Install\copilot-ask'
+        $script:msixPath   = 'TestDrive:\stage\wingman.msix'
+        $script:builtExe   = 'TestDrive:\build\wingman.exe'
+        $script:runKey     = 'TestDrive:\Run'
+        $script:currentExePath = Join-Path $installDir $id.Current.ExeName
+        $script:legacyExePath  = Join-Path $legacyDir $id.Legacy.ExeName
+        $script:backupExePath  = "$currentExePath.bak"
+    }
+
+    BeforeEach {
+        Mock -ModuleName Wingman.Common Stop-Process { }
+        Mock -ModuleName Wingman.Common Wait-Process { }
+        Mock -ModuleName Wingman.Common New-Item { }
+        Mock -ModuleName Wingman.Common Copy-Item { }
+        Mock -ModuleName Wingman.Common Remove-Item { }
+        Mock -ModuleName Wingman.Common Test-Path { $false }
+        Mock -ModuleName Wingman.Common Add-AppxPackage { }
+        Mock -ModuleName Wingman.Common Get-AppxPackage { [pscustomobject]@{ PackageFullName = 'RaaifYousuf.Wingman_1.0.0.0_x64__abc' } }
+        Mock -ModuleName Wingman.Common Set-ItemProperty { }
+        Mock -ModuleName Wingman.Common Remove-ItemProperty { }
+        Mock -ModuleName Wingman.Common Remove-AppxPackage { }
+        Mock -ModuleName Wingman.Common Start-Process { }
+    }
+
+    Context 'starting state (a): old copilot-ask installed and running, nothing current' {
+        BeforeEach {
+            Mock -ModuleName Wingman.Common Get-Process { [pscustomobject]@{ Id = 111 } } -ParameterFilter { $Name -eq $id.Legacy.ProcessName }
+            Mock -ModuleName Wingman.Common Get-Process { $null } -ParameterFilter { $Name -eq $id.Current.ProcessName }
+            Mock -ModuleName Wingman.Common Test-Path { $true } -ParameterFilter { $Path -eq $legacyExePath }
+        }
+
+        It 'restarts copilot-ask from LegacyDir, not wingman.exe, when Add-AppxPackage fails' {
+            Mock -ModuleName Wingman.Common Add-AppxPackage { throw 'deployment refused' }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 1 -ParameterFilter { $FilePath -eq $legacyExePath }
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0 -ParameterFilter { $FilePath -eq $currentExePath }
+            Should -Invoke -ModuleName Wingman.Common Remove-AppxPackage -Times 0 -ParameterFilter { $Package -like '*CopilotAsk*' }
+        }
+
+        It 'restarts copilot-ask when registration verification (Get-AppxPackage) finds nothing' {
+            Mock -ModuleName Wingman.Common Get-AppxPackage { $null }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 1 -ParameterFilter { $FilePath -eq $legacyExePath }
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0 -ParameterFilter { $FilePath -eq $currentExePath }
+        }
+
+        It 'restarts copilot-ask when writing the new Run value fails' {
+            Mock -ModuleName Wingman.Common Set-ItemProperty { throw 'access denied' }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 1 -ParameterFilter { $FilePath -eq $legacyExePath }
+        }
+
+        It 'restarts copilot-ask when copying the new exe into InstallDir fails' {
+            Mock -ModuleName Wingman.Common Copy-Item { throw 'sharing violation' }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 1 -ParameterFilter { $FilePath -eq $legacyExePath }
+            Should -Invoke -ModuleName Wingman.Common Add-AppxPackage -Times 0
+        }
+    }
+
+    Context 'starting state (b): Wingman already installed and running (re-run of the script)' {
+        BeforeEach {
+            Mock -ModuleName Wingman.Common Get-Process { $null } -ParameterFilter { $Name -eq $id.Legacy.ProcessName }
+            Mock -ModuleName Wingman.Common Get-Process { [pscustomobject]@{ Id = 222 } } -ParameterFilter { $Name -eq $id.Current.ProcessName }
+            Mock -ModuleName Wingman.Common Test-Path { $true } -ParameterFilter { $Path -eq $currentExePath }
+            # Once the phase backs the running exe up, the backup exists too;
+            # the fallback mock has no filesystem to see that, so the backup
+            # path is also reported present for the rollback's own check.
+            Mock -ModuleName Wingman.Common Test-Path { $true } -ParameterFilter { $Path -eq $backupExePath }
+        }
+
+        It 'restarts wingman.exe (not copilot-ask) and restores the previous exe when Add-AppxPackage fails' {
+            Mock -ModuleName Wingman.Common Add-AppxPackage { throw 'deployment refused' }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 1 -ParameterFilter { $FilePath -eq $currentExePath }
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0 -ParameterFilter { $FilePath -eq $legacyExePath }
+            # the backup taken before the overwrite is copied back over the
+            # (possibly half-written) new exe before anything is restarted
+            Should -Invoke -ModuleName Wingman.Common Copy-Item -ParameterFilter { $Path -eq $backupExePath -and $Destination -eq $currentExePath }
+            Should -Invoke -ModuleName Wingman.Common Remove-AppxPackage -Times 0 -ParameterFilter { $Package -like '*CopilotAsk*' }
+        }
+
+        It 'restarts wingman.exe and restores the previous exe when registration verification fails' {
+            Mock -ModuleName Wingman.Common Get-AppxPackage { $null }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 1 -ParameterFilter { $FilePath -eq $currentExePath }
+            Should -Invoke -ModuleName Wingman.Common Copy-Item -ParameterFilter { $Path -eq $backupExePath -and $Destination -eq $currentExePath }
+        }
+
+        It 'restarts wingman.exe and restores the previous exe when writing the new Run value fails' {
+            Mock -ModuleName Wingman.Common Set-ItemProperty { throw 'access denied' }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 1 -ParameterFilter { $FilePath -eq $currentExePath }
+            Should -Invoke -ModuleName Wingman.Common Copy-Item -ParameterFilter { $Path -eq $backupExePath -and $Destination -eq $currentExePath }
+        }
+
+        It 'backs the running exe up BEFORE overwriting it, and restores that exact backup when the overwrite itself fails' {
+            Mock -ModuleName Wingman.Common Copy-Item {
+                if ($Path -eq $builtExe) { throw 'disk full' }
+            }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            # backup taken before the failing overwrite attempt
+            Should -Invoke -ModuleName Wingman.Common Copy-Item -ParameterFilter { $Path -eq $currentExePath -and $Destination -eq $backupExePath }
+            # and restored afterward
+            Should -Invoke -ModuleName Wingman.Common Copy-Item -ParameterFilter { $Path -eq $backupExePath -and $Destination -eq $currentExePath }
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 1 -ParameterFilter { $FilePath -eq $currentExePath }
+            Should -Invoke -ModuleName Wingman.Common Add-AppxPackage -Times 0
+        }
+
+        It 'does not restart anything and cleans up the backup when registration succeeds' {
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Not -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0
+            Should -Invoke -ModuleName Wingman.Common Copy-Item -ParameterFilter { $Path -eq $currentExePath -and $Destination -eq $backupExePath }
+            Should -Invoke -ModuleName Wingman.Common Remove-Item -ParameterFilter { $Path -eq $backupExePath }
+        }
+    }
+
+    Context 'starting state (c): nothing installed, nothing running' {
+        BeforeEach {
+            Mock -ModuleName Wingman.Common Get-Process { $null }
+        }
+
+        It 'restarts nothing when Add-AppxPackage fails' {
+            Mock -ModuleName Wingman.Common Add-AppxPackage { throw 'deployment refused' }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0
+        }
+
+        It 'restarts nothing when registration verification fails' {
+            Mock -ModuleName Wingman.Common Get-AppxPackage { $null }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0
+        }
+
+        It 'restarts nothing when writing the new Run value fails' {
+            Mock -ModuleName Wingman.Common Set-ItemProperty { throw 'access denied' }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0
+        }
+
+        It 'restarts nothing when copying the new exe fails, and never attempts a backup (there was nothing to back up)' {
+            Mock -ModuleName Wingman.Common Copy-Item { throw 'sharing violation' }
+
+            { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+                -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+                Should -Throw
+
+            Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0
+            Should -Invoke -ModuleName Wingman.Common Copy-Item -Times 1
+            Should -Invoke -ModuleName Wingman.Common Copy-Item -Times 0 -ParameterFilter { $Destination -eq $backupExePath }
+        }
     }
 }
 

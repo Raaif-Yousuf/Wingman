@@ -183,18 +183,51 @@ The script now runs in three phases, in this order:
    running copy of the *current* `wingman` process if one exists (an
    in-place Wingman-to-Wingman upgrade) — the old one first, always, so the
    two low-level keyboard hooks are never both live and the new one is never
-   started while the old one still owns the key. Copy the now-signed exe into
+   started while the old one still owns the key. If a Wingman exe already
+   exists at `$InstallDir` (the upgrade/re-run case), back it up to
+   `<exe>.bak` before it is touched. Copy the now-signed exe into
    `$InstallDir`, `Add-AppxPackage -ExternalLocation`, verify the
    registration actually took (`Get-AppxPackage -Name RaaifYousuf.Wingman`
    must return something — `Add-AppxPackage` completing without throwing is
-   not itself proof), then write the new `Run` value unless `-NoAutostart`.
-   If anything in this phase throws, including the explicit verification
-   check, it is rolled back: the new package is unregistered if it got that
-   far, the new `Run` value is removed if it got written, and the old
-   `copilot-ask.exe` is restarted if it was running before this phase
-   stopped it and its install dir is still present. The script then throws a
-   message naming what failed and stating that the old install was left
-   intact (and restarted, if applicable) — never a silent partial state.
+   not itself proof), then write the new `Run` value unless `-NoAutostart`;
+   on success the backup is deleted. If anything in this phase throws,
+   including the explicit verification check, it is rolled back: the
+   `.bak` file, if one was taken, is copied back over `$InstallDir`'s exe
+   *first* — before any process is restarted, so rollback never offers to
+   relaunch a half-written or partially upgraded binary as "the previous"
+   one — then the new package is unregistered if it got that far, the new
+   `Run` value is removed if it got written, the old `copilot-ask.exe` is
+   restarted if it was running before this phase stopped it and its install
+   dir is still present, and (issue #173) the previous `wingman.exe` is
+   restarted the same way if IT was running before this phase stopped it and
+   its exe path still exists. The script then throws a message naming what
+   failed and stating that whatever was running before was left in place
+   (and restarted, if applicable) — never a silent partial state.
+
+   **Why back up and restore, not "stage the new exe aside and swap only
+   after" (issue #173's other option):** `Add-AppxPackage -ExternalLocation`
+   reads the exe from `$InstallDir` at registration time, so the new signed
+   exe has to already be at its final path *before* that call — staging it
+   under a different name and renaming it in only once `Add-AppxPackage`
+   returns would just move the same "what if the rename itself fails"
+   problem one step later, not remove it. Backing up first means any
+   failure from here on — including a `Copy-Item` that fails partway and
+   leaves `$InstallDir`'s exe truncated, `THEORY (unverified)`: nothing rules
+   out `File.Copy` failing mid-write on Windows — can restore the exact
+   previous binary rather than whatever a failed copy left behind.
+
+   **AppX upgrade atomicity, `THEORY (unverified on this machine)`:** if
+   `Add-AppxPackage -ForceUpdateFromAnyVersion` throws before returning, the
+   previously registered `RaaifYousuf.Wingman` package (whatever version)
+   is expected to remain registered exactly as it was — Windows' deployment
+   service is documented to apply an MSIX/sparse-package upgrade as a single
+   transaction, not in place over the old registration. That is why
+   `$state.NewPackageRegistered` only flips `$true` once `Add-AppxPackage`
+   returns without throwing: in the ordinary "it threw" case there is no
+   "new" package for the rollback to unregister, and `Get-AppxPackage` during
+   rollback would still report the old version, which must never be touched.
+   Not exercised against a real deployment failure in this session — see the
+   "Owed" list below.
 3. **Remove the legacy install.** Only reached if phase 2 returned
    successfully. Same shape as before (stop process, unregister package,
    remove Run value, delete install dir), and still never touches the
@@ -227,6 +260,20 @@ not a hand-synced description of it. See `packaging\Wingman.Common.Tests.ps1`.
 this repo may touch the real registry, certificate store, installed packages
 or processes). The owner's manual upgrade check is filed against issue #165.
 
+**Rollback matrix (issue #173):** `packaging\Wingman.Common.Tests.ps1`'s
+"Invoke-PackageRegistrationPhase rollback matrix" `Describe` block drives the
+same phase-2 failure through three starting states — (a) a running legacy
+`copilot-ask` and nothing current, (b) a running current `wingman.exe`
+(the upgrade/re-run case), (c) nothing installed — crossed with failing at
+`Add-AppxPackage`, at `Get-AppxPackage` verification, at writing the `Run`
+value, and at the `Copy-Item` that stages the new exe itself. Each case
+asserts which process (if any) is restarted, from which path, and that the
+`.bak` exe is copied back before that restart. Also owed against a real
+machine: whether `Add-AppxPackage` throwing mid-upgrade truly leaves the
+previous package version registered (the atomicity theory above), and
+whether a genuinely interrupted `Copy-Item` (killed process, full disk)
+leaves a truncated exe the way the backup step assumes it might.
+
 ## Verification
 
 `cargo test` covers argument parsing. Everything else is observable state, and
@@ -246,6 +293,7 @@ was checked directly on 2026-09-15 (Windows 11 build 26200):
 | phase-2 rollback on a simulated registration failure | `Invoke-Pester -Path packaging` — `Invoke-PackageRegistrationPhase`'s "simulates a registration-verification failure" test: mocks `Add-AppxPackage`/`Get-AppxPackage`/`Get-Process`/`Start-Process`, asserts the function throws, `Remove-AppxPackage` is never called against the legacy package, and the old `copilot-ask` process is restarted |
 | old process stopped before the new one is (re)started, and the two low-level keyboard hooks are never simultaneously live | `Invoke-PackageRegistrationPhase`'s "stops the old process before attempting to register" test, asserting call order via a mocked `Stop-Process`/`Add-AppxPackage` sequence. Owed: not checked against a real simultaneous-processes machine state -- `install.ps1` itself was never run for real in this session |
 | a real interrupted upgrade on the owner's machine (kill `powershell.exe` mid `Add-AppxPackage`, or run with Developer Mode off, and confirm `copilot-ask` is still running/autostarting afterward) | **Owed** -- explicitly out of scope for an unattended session; see issue #165 |
+| phase-2 rollback restarts the previous WINGMAN process too, not just legacy copilot-ask, and never overwrites the previous exe before registration succeeds (issue #173) | `Invoke-Pester -Path packaging` — "Invoke-PackageRegistrationPhase rollback matrix" crosses three starting states (legacy running / current Wingman running (re-run) / nothing installed) with four failing steps (`Add-AppxPackage`, verification, the `Run` value write, the exe `Copy-Item` itself); each case asserts the right process is restarted from the right path and that a `.bak` exe is restored first when one was taken. Mutation-checked: disabling the current-process restart call breaks exactly the 4 tests that exercise it. Owed: not checked against a real interrupted upgrade -- see the two THEORY notes above |
 
 ## Setting the key is the user's, not the installer's
 
