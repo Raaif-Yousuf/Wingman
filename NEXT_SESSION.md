@@ -100,6 +100,29 @@ the picker route is live; the hook route works regardless.
   answer (not "no providers configured", not a blank/error card) -- that is
   the one observable that would differ if this wiring were wired to nothing.
 
+- **#62/#36 DPAPI cross-account unreadability** (overnight agent session,
+  2026-09-17, branch `worktree-agent-a16f5b1a39aed9da0`, commits `ed264fb`
+  `src/dpapi.rs` and `ae9c104` `src/profile/`). What was built and verified
+  in this session: `dpapi::protect`/`unprotect` round-trip through the real
+  `CryptProtectData`/`CryptUnprotectData` (17 tests, `cargo test dpapi`,
+  including tamper and wrong/missing entropy failure cases, verified by a
+  temporary mutation that made the relevant tests go red then reverted);
+  `profile::Profile::save_to`/`load_from` round-trip through that envelope
+  at a scratch path, and `saved_file_is_not_plaintext_json` confirms the
+  on-disk bytes are neither the plaintext values nor the plaintext JSON
+  field names (49 tests, `cargo test profile`).
+  **Not yet checked**: actual cross-account unreadability -- this sandbox
+  has one Windows account, so "the database file read from another account
+  yields no plaintext" (#62's and #36's own wording) rests on DPAPI's
+  documented user-scoped contract, not a run against a second account. To
+  verify: on a machine with a second local Windows account, have this
+  build's user account call `Profile::save_to` (or `dpapi::protect`
+  directly) to write a file with a known plaintext marker string, log in as
+  the second account, and confirm `CryptUnprotectData` (or
+  `Profile::load_from`) fails against that file rather than returning the
+  marker -- that is the one observable that would differ if the "user
+  scoped" claim were wrong.
+
 ## Facts established this session, not derivable from the code
 
 - Git history contains no key-shaped strings (`git log -p --all` grep for
