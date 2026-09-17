@@ -18,17 +18,22 @@
   Runs in three phases so a failure never leaves the machine with neither app
   (issue #165): (1) build, stage, sign and pack the new package -- no system
   side effects, nothing here can leave the machine worse off; (2) stop the
-  old process and any running copy of the new one, register the new package,
+  old process and any running copy of the new one, back up an already-
+  installed wingman.exe before it is overwritten, register the new package,
   write the new Run value, and verify the registration actually took; only
   once that is verified (3) remove a pre-rename `copilot-ask` install if one
   is found (old package, old process, old install dir, old Run value), the
   same way uninstall.ps1 -KeepCertificate would: the certificate store is
   never touched here (issue #10). If phase 2 fails, it is rolled back --
-  the new package/Run value it managed to add are undone, and the old
-  `copilot-ask.exe` is restarted if it was running -- and the script throws
-  before phase 3 ever runs, so the pre-rename install is left intact. A
-  pre-rename config.toml is left alone either way -- src/config.rs migrates
-  it forward on first run of the new exe.
+  the backed-up exe (if any) is restored before anything is restarted, the
+  new package/Run value it managed to add are undone, and whichever of
+  `copilot-ask.exe` or the previous `wingman.exe` was running before this
+  attempt is restarted (issue #173: earlier, only copilot-ask was ever
+  tracked for restart, so a Wingman-to-Wingman upgrade or a plain re-run
+  that failed left no tray icon and a dead Copilot key) -- and the script
+  throws before phase 3 ever runs, so whatever was there before is left
+  intact. A pre-rename config.toml is left alone either way -- src/config.rs
+  migrates it forward on first run of the new exe.
 
   One UAC prompt, the first time only, to trust the self-signed certificate.
   Design: docs/superpowers/specs/2026-09-15-packaging-and-install-design.md

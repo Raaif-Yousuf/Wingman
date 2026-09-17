@@ -317,12 +317,20 @@ function Get-RollbackPlan {
         [Parameter(Mandatory)][bool]$NewPackageRegistered,
         [Parameter(Mandatory)][bool]$NewRunValueWritten,
         [Parameter(Mandatory)][bool]$OldProcessWasRunning,
-        [Parameter(Mandatory)][bool]$OldInstallStillPresent
+        [Parameter(Mandatory)][bool]$OldInstallStillPresent,
+        # CurrentProcessWasRunning/CurrentExeStillPresent (issue #173) mirror
+        # the two params above, but for the CURRENT (Wingman) identity: a
+        # Wingman-to-Wingman upgrade, or a plain re-run of install.ps1, stops
+        # a running wingman.exe just like an old copilot-ask process is
+        # stopped, and a failure afterward must restart it the same way.
+        [Parameter(Mandatory)][bool]$CurrentProcessWasRunning,
+        [Parameter(Mandatory)][bool]$CurrentExeStillPresent
     )
     [pscustomobject]@{
-        UnregisterNewPackage = $NewPackageRegistered
-        RemoveNewRunValue    = $NewRunValueWritten
-        RestartOldProcess    = $OldProcessWasRunning -and $OldInstallStillPresent
+        UnregisterNewPackage  = $NewPackageRegistered
+        RemoveNewRunValue     = $NewRunValueWritten
+        RestartOldProcess     = $OldProcessWasRunning -and $OldInstallStillPresent
+        RestartCurrentProcess = $CurrentProcessWasRunning -and $CurrentExeStillPresent
     }
 }
 
@@ -349,10 +357,21 @@ function Invoke-PackageRegistrationPhase {
     )
 
     $state = [pscustomobject]@{
-        NewPackageRegistered = $false
-        NewRunValueWritten   = $false
-        OldProcessWasRunning = $false
+        NewPackageRegistered     = $false
+        NewRunValueWritten       = $false
+        OldProcessWasRunning     = $false
+        # CurrentProcessWasRunning/PreviousExeBackupPath (issue #173): the old
+        # copilot-ask restart path above already existed, but nothing tracked
+        # whether a running WINGMAN (current identity) needed the same
+        # treatment, and the Copy-Item below overwrote $InstallDir's existing
+        # exe unconditionally, before Add-AppxPackage had even attempted
+        # registration -- so a Wingman-to-Wingman upgrade (or a plain re-run)
+        # that failed left no tray icon, no hook, and nothing to restart.
+        CurrentProcessWasRunning = $false
+        PreviousExeBackupPath    = $null
     }
+
+    $currentExePath = Join-Path $InstallDir $Identity.Current.ExeName
 
     try {
         # Old process first, then a running copy of the current identity (an
@@ -369,13 +388,43 @@ function Invoke-PackageRegistrationPhase {
 
         $currentProcess = Get-Process -Name $Identity.Current.ProcessName -ErrorAction SilentlyContinue
         if ($currentProcess) {
+            $state.CurrentProcessWasRunning = $true
             $currentProcess | Stop-Process -Force
             $currentProcess | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
         }
 
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-        Copy-Item $BuiltExePath (Join-Path $InstallDir $Identity.Current.ExeName) -Force
 
+        # Back up a previously installed Wingman exe before it is overwritten.
+        # Chosen over "stage the new exe aside and swap only after
+        # registration succeeds" (the packaging spec's other option) because
+        # Add-AppxPackage -ExternalLocation reads the exe from $InstallDir at
+        # registration time, so the new signed exe has to already be in place
+        # there before that call -- staging it under a different name and
+        # renaming it in only after Add-AppxPackage returns would just move
+        # this same "what if the rename step itself fails" problem one step
+        # later. Backing up first means ANY failure from here on, including a
+        # Copy-Item that fails partway through and leaves $currentExePath
+        # truncated (THEORY, unverified: not something File.Copy's failure
+        # modes are documented to rule out), can restore the exact previous
+        # binary rather than "whatever the failed copy left behind".
+        if (Test-Path $currentExePath) {
+            $backupPath = "$currentExePath.bak"
+            Copy-Item $currentExePath $backupPath -Force
+            $state.PreviousExeBackupPath = $backupPath
+        }
+
+        Copy-Item $BuiltExePath $currentExePath -Force
+
+        # THEORY (unverified on this machine): Add-AppxPackage / the AppX
+        # deployment service applies an upgrade atomically -- if this throws,
+        # the previously registered RaaifYousuf.Wingman package (any version)
+        # is documented to remain exactly as it was, so $state.NewPackageRegistered
+        # only flips true once this call returns without throwing, and the
+        # rollback below never has a "new" package to unregister in that case
+        # (Get-AppxPackage would still report the OLD version, which must not
+        # be touched). Not exercised against a real deployment failure in
+        # this session -- see the packaging spec's "Owed" list.
         Add-AppxPackage -Path $MsixPath -ExternalLocation $InstallDir -ForceUpdateFromAnyVersion
         $state.NewPackageRegistered = $true
 
@@ -387,8 +436,13 @@ function Invoke-PackageRegistrationPhase {
         if (-not $NoAutostart) {
             if (-not (Test-Path $RunKeyPath)) { New-Item -Path $RunKeyPath | Out-Null }
             Set-ItemProperty -Path $RunKeyPath -Name $Identity.Current.RunValue `
-                -Value "`"$InstallDir\$($Identity.Current.ExeName)`""
+                -Value "`"$currentExePath`""
             $state.NewRunValueWritten = $true
+        }
+
+        # Everything downstream of the backup succeeded; it is no longer needed.
+        if ($state.PreviousExeBackupPath) {
+            Remove-Item $state.PreviousExeBackupPath -Force -ErrorAction SilentlyContinue
         }
 
         [pscustomobject]@{ Success = $true; Package = $pkg }
@@ -396,10 +450,21 @@ function Invoke-PackageRegistrationPhase {
     catch {
         $originalError = $_
         $oldExePresent = Test-Path (Join-Path $LegacyDir $Identity.Legacy.ExeName)
+
+        # Restore the previous Wingman exe BEFORE deciding what to restart --
+        # rollback must never offer to relaunch a half-written or partially
+        # upgraded binary as "the previous" one.
+        if ($state.PreviousExeBackupPath -and (Test-Path $state.PreviousExeBackupPath)) {
+            Copy-Item $state.PreviousExeBackupPath $currentExePath -Force -ErrorAction SilentlyContinue
+            Remove-Item $state.PreviousExeBackupPath -Force -ErrorAction SilentlyContinue
+        }
+
         $plan = Get-RollbackPlan -NewPackageRegistered $state.NewPackageRegistered `
             -NewRunValueWritten $state.NewRunValueWritten `
             -OldProcessWasRunning $state.OldProcessWasRunning `
-            -OldInstallStillPresent $oldExePresent
+            -OldInstallStillPresent $oldExePresent `
+            -CurrentProcessWasRunning $state.CurrentProcessWasRunning `
+            -CurrentExeStillPresent (Test-Path $currentExePath)
 
         if ($plan.RemoveNewRunValue) {
             Remove-ItemProperty -Path $RunKeyPath -Name $Identity.Current.RunValue -ErrorAction SilentlyContinue
@@ -411,8 +476,16 @@ function Invoke-PackageRegistrationPhase {
         if ($plan.RestartOldProcess) {
             Start-Process -FilePath (Join-Path $LegacyDir $Identity.Legacy.ExeName) -ErrorAction SilentlyContinue
         }
+        if ($plan.RestartCurrentProcess) {
+            Start-Process -FilePath $currentExePath -ErrorAction SilentlyContinue
+        }
 
-        throw "Registering the new package failed: $($originalError.Exception.Message). The pre-rename copilot-ask install was left in place$(if ($plan.RestartOldProcess) { ' and restarted' }); re-run install.ps1 to try again."
+        $restarted = @()
+        if ($plan.RestartOldProcess) { $restarted += 'the pre-rename copilot-ask install' }
+        if ($plan.RestartCurrentProcess) { $restarted += 'the previous Wingman install' }
+        $restartNote = if ($restarted.Count -gt 0) { " ($($restarted -join ' and ') restarted)" } else { '' }
+
+        throw "Registering the new package failed: $($originalError.Exception.Message). Whatever was running before this attempt was left in place$restartNote; re-run install.ps1 to try again."
     }
 }
 
