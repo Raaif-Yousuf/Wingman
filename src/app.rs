@@ -517,6 +517,21 @@ impl App {
         self.refresh_tray_labels();
     }
 
+    /// #174: `edit_settings` only needs to save when the file did not exist
+    /// yet, and must open the shell only when that save (if attempted)
+    /// actually succeeded -- otherwise `ShellExecuteW` opens a path that
+    /// still does not exist, or exists with stale defaults, with nothing on
+    /// screen to say so. Pure so this one-branch decision is unit-tested
+    /// directly (CLAUDE.md rule 8) rather than only through a live
+    /// Credential-Manager failure, which `edit_settings` itself cannot be
+    /// unit-tested against (it owns a real `Card`/`HWND`).
+    fn should_open_config_after_ensuring_it_exists(
+        needed_create: bool,
+        save_result: &Result<()>,
+    ) -> bool {
+        !needed_create || save_result.is_ok()
+    }
+
     fn edit_settings(&mut self) {
         let Ok(path) = Config::path() else {
             self.card
@@ -524,8 +539,18 @@ impl App {
             return;
         };
         // Make sure the file exists before asking the shell to open it.
-        if !path.exists() {
-            let _ = self.config.save();
+        let needed_create = !path.exists();
+        let save_result = if needed_create { self.config.save() } else { Ok(()) };
+        if !Self::should_open_config_after_ensuring_it_exists(needed_create, &save_result) {
+            // Rule 7: the save the user's click just caused must not fail
+            // silently -- before this fix, `let _ = self.config.save();`
+            // dropped the error and still tried to open a file that might
+            // not exist.
+            if let Err(e) = &save_result {
+                self.card
+                    .show_error("Couldn't save settings", &format!("{e:#}"));
+            }
+            return;
         }
         let wide: Vec<u16> = path
             .as_os_str()
@@ -944,6 +969,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 mod tests {
     use super::first_line;
     use super::unreadable_secrets_card;
+    use super::App;
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{WM_APP_ACTIVATE, WM_APP_RESULT};
     use crate::dismiss::WM_APP_DISMISS;
@@ -980,6 +1006,36 @@ mod tests {
         let (headline, detail) = unreadable_secrets_card(&["openai".to_string()]);
         assert!(!headline.contains('\u{2014}'));
         assert!(!detail.contains('\u{2014}'));
+    }
+
+    // -- should_open_config_after_ensuring_it_exists (issue #174) ---------
+
+    #[test]
+    fn opens_when_the_file_already_existed_and_no_save_was_needed() {
+        // Whatever the placeholder Ok(()) carries is irrelevant here -- the
+        // file already existed, so no save was attempted at all.
+        assert!(App::should_open_config_after_ensuring_it_exists(
+            false,
+            &Ok(())
+        ));
+    }
+
+    #[test]
+    fn opens_when_creation_was_needed_and_the_save_succeeded() {
+        assert!(App::should_open_config_after_ensuring_it_exists(
+            true,
+            &Ok(())
+        ));
+    }
+
+    #[test]
+    fn does_not_open_when_creation_was_needed_and_the_save_failed() {
+        // The exact bug #174 reports: `let _ = self.config.save();` used to
+        // discard this and open the shell on a file that might not exist.
+        assert!(!App::should_open_config_after_ensuring_it_exists(
+            true,
+            &Err(anyhow::anyhow!("simulated Credential Manager failure"))
+        ));
     }
 
     // -- settings_reentrancy_policy (issue #152) --------------------------
