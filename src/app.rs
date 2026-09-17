@@ -7,6 +7,7 @@
 //! quick, the API call is not) happens on a worker thread, which reports back
 //! exclusively by `PostMessageW`.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1412,11 +1413,12 @@ impl App {
     /// it runs (see `SETTINGS_OPEN`'s doc comment for why that is a real
     /// aliasing hazard, not just a logic bug). Every piece of state that a
     /// reentrant call needs to read or write therefore lives in a
-    /// thread-local, not on `App`: `SETTINGS_OPEN` itself, `PENDING_RESULT`
-    /// (a worker's answer that arrived mid-edit),
-    /// `TASKBAR_RECREATED_WHILE_SETTINGS`, and `PAUSE_REEVALUATE_PENDING`
-    /// (issue #20). All four are only touched here, immediately before and
-    /// after `show_modal`, when no reentrant call can possibly be in flight.
+    /// thread-local, not on `App`: `SETTINGS_OPEN` itself, `PENDING_MESSAGES`
+    /// (issue #213: every worker result or preview decision that arrived
+    /// mid-edit, oldest first), `TASKBAR_RECREATED_WHILE_SETTINGS`, and
+    /// `PAUSE_REEVALUATE_PENDING` (issue #20). All four are only touched
+    /// here, immediately before and after `show_modal`, when no reentrant
+    /// call can possibly be in flight.
     ///
     /// Issue #178: the card has a single slot, and every branch below can
     /// show one -- a pending answer, a save error, or "Settings saved". If a
@@ -1429,6 +1431,22 @@ impl App {
     /// `tray_restore_error` and shown LAST, after every other branch below
     /// has already shown whatever card it was going to show -- see
     /// `final_settings_card` (test-only) for a pure model of this ordering.
+    ///
+    /// Issue #213: unlike the old single-slot `WM_APP_RESULT`-only version,
+    /// every deferred message is now delivered through its real handler
+    /// (`deliver_deferred`) on every one of the three paths below --
+    /// cancelled, save failed, and save succeeded -- rather than only being
+    /// silently recorded (`record_last`, no card) on the save-failed path.
+    /// A deferred `WM_APP_PREVIEW_DECIDED` "Do it" must actually run its
+    /// executor regardless of whether the unrelated Settings save
+    /// succeeded -- Look/Propose/Confirm/Do's contract, and rule 7, both
+    /// outrank leaving the save-error card undisturbed. On the save-failed
+    /// path specifically, `final_settings_card`'s `SaveError` invariant
+    /// (unchanged by #213: the save error the user just directly caused
+    /// always wins the single card slot) still holds -- each deferred
+    /// message's own card is shown, and its effects genuinely happen, but
+    /// the save-error card is re-shown immediately after so it is still the
+    /// one left on screen.
     fn open_settings(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
@@ -1439,7 +1457,8 @@ impl App {
         let edited = settings::show_modal(self.instance, &self.config);
         SETTINGS_OPEN.with(|c| c.set(false));
 
-        let pending = PENDING_RESULT.with(|c| c.borrow_mut().take());
+        let pending: VecDeque<DeferredMessage> =
+            PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
         let taskbar_recreated = TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false));
         let tray_restore_error = if taskbar_recreated {
             self.try_restore_tray_icon()
@@ -1451,40 +1470,60 @@ impl App {
         }
 
         let Some(edited) = edited else {
-            // Cancelled/closed without saving. An answer that finished
-            // mid-edit still gets its card.
-            if let Some(result) = pending {
-                self.on_result(result);
-            }
+            // Cancelled/closed without saving. Anything that finished
+            // mid-edit still gets delivered.
+            self.deliver_deferred(pending);
             self.show_tray_restore_error(tray_restore_error);
             return;
         };
 
         self.config = edited;
         if let Err(e) = self.config.save() {
-            // Rule 7: neither failure may be silently dropped. The save
-            // error is the one the user just directly caused (they clicked
-            // Save), so it gets the card; the deferred answer is not lost
-            // either, just not shown as a card here -- `record_last` still
-            // makes it available via "Copy last answer" until the next ask.
+            // Rule 7: neither failure may be silently dropped. Every
+            // deferred message is delivered for real (its executor runs,
+            // its own card shows) even though the unrelated config save
+            // just failed -- but the save error is the problem the user
+            // just directly caused, so it is re-shown last, restoring it as
+            // the single card slot's final content (`final_settings_card`'s
+            // `SaveError` case, unchanged by #213).
+            let had_pending = !pending.is_empty();
             self.card
                 .show_error("Couldn't save settings", &format!("{e:#}"));
-            if let Some(result) = pending {
-                self.record_last(result);
+            self.deliver_deferred(pending);
+            if had_pending {
+                self.card
+                    .show_error("Couldn't save settings", &format!("{e:#}"));
             }
             self.show_tray_restore_error(tray_restore_error);
             return;
         }
         self.apply_config();
 
-        match pending {
-            Some(result) => self.on_result(result),
-            None => {
-                self.card.show_answer("Settings saved", "", 3, None);
-                self.set_watch(true);
-            }
+        if pending.is_empty() {
+            self.card.show_answer("Settings saved", "", 3, None);
+            self.set_watch(true);
+        } else {
+            self.deliver_deferred(pending);
         }
         self.show_tray_restore_error(tray_restore_error);
+    }
+
+    /// Issue #213: delivers every message `wnd_proc` deferred while Settings
+    /// was open, in arrival (push) order, through the exact handler it would
+    /// have reached had Settings not been open. Each handler shows its own
+    /// card (and, for `PreviewDecided`, actually runs the confirmed
+    /// executor); a later item's card visibly supersedes an earlier one's,
+    /// same as if they had arrived that close together with no Settings
+    /// window involved at all. A no-op on an empty queue.
+    fn deliver_deferred(&mut self, pending: VecDeque<DeferredMessage>) {
+        for message in pending {
+            match message {
+                DeferredMessage::Result(result) => self.on_result(result),
+                DeferredMessage::CalendarResult(result) => self.on_calendar_result(result),
+                DeferredMessage::ReviewResult(result) => self.on_review_result(result),
+                DeferredMessage::PreviewDecided => self.on_preview_decided(),
+            }
+        }
     }
 
     /// Issue #178: shows the tray-restore error card if `error` is `Some`,
@@ -2415,13 +2454,18 @@ thread_local! {
     /// opaque TLS accessor call.
     static SETTINGS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
-    /// A `WM_APP_RESULT` payload that arrived while `SETTINGS_OPEN` was
-    /// true. `open_settings` delivers it once `show_modal` returns, so the
-    /// in-flight request still ends in a card (rule 7) instead of being
-    /// dropped or clobbered by "Settings saved". See `SETTINGS_OPEN` for why
-    /// this can't be a field on `App`.
-    static PENDING_RESULT: std::cell::RefCell<Option<std::result::Result<Answer, String>>> =
-        const { std::cell::RefCell::new(None) };
+    /// Every `WM_APP_RESULT`/`WM_APP_CALENDAR_RESULT`/`WM_APP_REVIEW_RESULT`/
+    /// `WM_APP_PREVIEW_DECIDED` message that arrived while `SETTINGS_OPEN`
+    /// was true, oldest first. `open_settings` drains and delivers all of
+    /// them, in this same arrival order, once `show_modal` returns, so an
+    /// in-flight request or a preview's "Do it"/Cancel decision still ends
+    /// in a card (rule 7) -- and, for a confirmed preview, still actually
+    /// runs its executor -- instead of being dropped while Settings
+    /// happened to be open (issue #213, generalizing the single-slot fix
+    /// #152 already built for `WM_APP_RESULT` alone). See `SETTINGS_OPEN`
+    /// for why this can't be a field on `App`.
+    static PENDING_MESSAGES: std::cell::RefCell<VecDeque<DeferredMessage>> =
+        const { std::cell::RefCell::new(VecDeque::new()) };
 
     /// The shell's `TaskbarCreated` broadcast arrived while `SETTINGS_OPEN`
     /// was true. `open_settings` re-adds the tray icon (`on_taskbar_created`)
@@ -2451,6 +2495,24 @@ thread_local! {
 
 use std::os::windows::ffi::OsStrExt;
 
+/// One message deferred by [`SettingsReentrancy::Defer`] while Settings was
+/// open (issue #213), holding whatever payload its `WM_APP_*` counterpart
+/// boxed into `lparam` -- already taken out of that box, so `PENDING_MESSAGES`
+/// never stores a raw pointer.
+#[derive(Debug)]
+enum DeferredMessage {
+    /// `WM_APP_RESULT`.
+    Result(std::result::Result<Answer, String>),
+    /// `WM_APP_CALENDAR_RESULT`.
+    CalendarResult(std::result::Result<Value, String>),
+    /// `WM_APP_REVIEW_RESULT`.
+    ReviewResult(std::result::Result<actions::review_email::ReviewOutcome, String>),
+    /// `WM_APP_PREVIEW_DECIDED` carries no payload of its own -- the
+    /// decision lives on `Card`/`App` (`take_confirmed`/`pending_review`),
+    /// read fresh when this is finally delivered by `on_preview_decided`.
+    PreviewDecided,
+}
+
 /// What `wnd_proc` should do with a message addressed to the owner window
 /// while `SETTINGS_OPEN` is true (issue #152): every arm here must be
 /// answerable without forming `&mut App` -- see that thread-local's doc
@@ -2467,15 +2529,25 @@ enum SettingsReentrancy {
     /// `WM_APP_LEARNED` (unreachable here in practice: every path that opens
     /// Settings cancels learn mode first, see `open_settings`'s call sites --
     /// but the boxed `Chord` payload is still freed rather than leaked, in
-    /// case that invariant ever changes), and `WM_APP_PAUSE_TOGGLE` (#181:
-    /// same treatment as the hotkey -- a chord press while Settings is open
-    /// is dropped, not queued).
+    /// case that invariant ever changes), `WM_APP_PAUSE_TOGGLE` (#181: same
+    /// treatment as the hotkey -- a chord press while Settings is open is
+    /// dropped, not queued), and the two palette messages (#25: the palette
+    /// cannot be shown while Settings is modal-open anyway; `WM_APP_PALETTE_RUN`'s
+    /// boxed `String` payload is freed rather than leaked, same as
+    /// `WM_APP_LEARNED`'s).
     Ignore,
-    /// Stash the worker's payload in `PENDING_RESULT`; `open_settings`
-    /// delivers it after `show_modal` returns, so an answer that finished
-    /// mid-edit still ends in a card (rule 7) instead of being silently
-    /// overwritten by "Settings saved".
-    DeferResult,
+    /// Push the message's payload onto `PENDING_MESSAGES`, oldest-last;
+    /// `open_settings` drains and delivers every one of them, in arrival
+    /// order, after `show_modal` returns, so a result that finished (or a
+    /// preview decided) mid-edit still ends in a card (rule 7) -- and, for
+    /// a confirmed preview, still actually runs its executor -- instead of
+    /// being silently overwritten or dropped. Issue #213: generalizes the
+    /// single-slot `WM_APP_RESULT`-only fix #152 built to every `WM_APP_*`
+    /// result/decision message in the crate (`WM_APP_RESULT`,
+    /// `WM_APP_CALENDAR_RESULT`, `WM_APP_REVIEW_RESULT`,
+    /// `WM_APP_PREVIEW_DECIDED`) -- add any FUTURE one here too, never to
+    /// `Ignore`, and to `DeferredMessage`/the `Defer` arm in `wnd_proc`.
+    Defer,
     /// Set `TASKBAR_RECREATED_WHILE_SETTINGS`; `open_settings` re-adds the
     /// tray icon after `show_modal` returns.
     DeferTaskbarCreated,
@@ -2492,33 +2564,18 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         return SettingsReentrancy::DeferTaskbarCreated;
     }
     match msg {
-        WM_APP_RESULT => SettingsReentrancy::DeferResult,
-        // Issue #39: WM_APP_CALENDAR_RESULT/WM_APP_PREVIEW_DECIDED are
-        // Ignored, not deferred like WM_APP_RESULT -- Settings being open
-        // while the "Add event from screen" flow is mid-flight is a corner
-        // case this task does not build full deferral plumbing for (a
-        // second PENDING_RESULT-shaped thread-local per message type).
-        // WM_APP_CALENDAR_RESULT still carries a boxed payload, freed
-        // explicitly in the Ignore arm below (mirroring WM_APP_LEARNED) so
-        // it never leaks; WM_APP_PREVIEW_DECIDED carries none. Filed as
-        // #213 for the same Defer*-shaped fix #152 already built for
-        // WM_APP_RESULT.
+        // Issue #213: every WM_APP_* message that carries a worker's result
+        // or a preview's Do it/Cancel decision is deferred, never Ignored --
+        // see DeferredMessage and the Defer variant's own doc comment.
+        WM_APP_RESULT | WM_APP_CALENDAR_RESULT | WM_APP_REVIEW_RESULT | WM_APP_PREVIEW_DECIDED => {
+            SettingsReentrancy::Defer
+        }
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
         | WM_APP_DISMISS
         | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
-        | WM_APP_CALENDAR_RESULT
-        | WM_APP_PREVIEW_DECIDED
-        | WM_APP_REVIEW_RESULT
-        // #25: the palette cannot be shown while Settings is modal-open
-        // anyway (Settings takes the foreground; the hook's own chord check
-        // still passes the keydown through per the Ignore branch above), so
-        // both palette messages are simply dropped here, same treatment
-        // WM_APP_PAUSE_TOGGLE already gets. WM_APP_PALETTE_RUN's boxed
-        // `String` payload is freed explicitly below (mirroring
-        // WM_APP_LEARNED/WM_APP_CALENDAR_RESULT) so it never leaks.
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN => SettingsReentrancy::Ignore,
         _ => SettingsReentrancy::Fallback,
@@ -2565,34 +2622,44 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
         match settings_reentrancy_policy(msg, taskbar_created_msg) {
             SettingsReentrancy::Ignore => {
-                // WM_APP_LEARNED, WM_APP_CALENDAR_RESULT and
-                // WM_APP_PALETTE_RUN are the only ignored messages carrying
-                // a boxed payload; free them so none leaks.
+                // WM_APP_LEARNED and WM_APP_PALETTE_RUN are the only ignored
+                // messages carrying a boxed payload; free them so neither
+                // leaks. (WM_APP_CALENDAR_RESULT/WM_APP_REVIEW_RESULT moved
+                // to Defer -- issue #213.)
                 if msg == WM_APP_LEARNED {
                     drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
-                } else if msg == WM_APP_CALENDAR_RESULT {
-                    drop(unsafe {
-                        Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
-                    });
                 } else if msg == WM_APP_PALETTE_RUN {
                     drop(unsafe { Box::from_raw(lparam.0 as *mut String) });
-                } else if msg == WM_APP_REVIEW_RESULT {
-                    drop(unsafe {
-                        Box::from_raw(
+                }
+                return LRESULT(0);
+            }
+            SettingsReentrancy::Defer => {
+                // Issue #213: take ownership of whatever payload this id
+                // carries (none, for WM_APP_PREVIEW_DECIDED) and queue it;
+                // `open_settings` delivers every queued message, in this
+                // same push order, once `show_modal` returns.
+                let deferred = match msg {
+                    WM_APP_RESULT => DeferredMessage::Result(unsafe {
+                        *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>)
+                    }),
+                    WM_APP_CALENDAR_RESULT => DeferredMessage::CalendarResult(unsafe {
+                        *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
+                    }),
+                    WM_APP_REVIEW_RESULT => DeferredMessage::ReviewResult(unsafe {
+                        *Box::from_raw(
                             lparam.0
                                 as *mut std::result::Result<
                                     actions::review_email::ReviewOutcome,
                                     String,
                                 >,
                         )
-                    });
-                }
-                return LRESULT(0);
-            }
-            SettingsReentrancy::DeferResult => {
-                let result =
-                    unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>) };
-                PENDING_RESULT.with(|c| *c.borrow_mut() = Some(result));
+                    }),
+                    WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided,
+                    _ => unreachable!(
+                        "settings_reentrancy_policy only returns Defer for the four ids above"
+                    ),
+                };
+                PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
                 return LRESULT(0);
             }
             SettingsReentrancy::DeferTaskbarCreated => {
@@ -3168,7 +3235,41 @@ mod tests {
         // reentrantly behind the modal.
         assert_eq!(
             settings_reentrancy_policy(WM_APP_RESULT, FAKE_TASKBAR_CREATED_MSG),
-            SettingsReentrancy::DeferResult
+            SettingsReentrancy::Defer
+        );
+    }
+
+    // Issue #213: WM_APP_CALENDAR_RESULT, WM_APP_REVIEW_RESULT and
+    // WM_APP_PREVIEW_DECIDED used to be Ignore'd here (their boxed payload,
+    // if any, freed and thrown away) instead of deferred like WM_APP_RESULT
+    // -- silently dropping a finished calendar/review flow, or a preview's
+    // "Do it" decision, if Settings happened to be open. All three now get
+    // exactly the same Defer treatment as WM_APP_RESULT.
+
+    #[test]
+    fn settings_reentrancy_defers_the_calendar_result() {
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_CALENDAR_RESULT, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_defers_the_review_result() {
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_REVIEW_RESULT, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_defers_preview_decided() {
+        // The most important of the three: a dropped WM_APP_PREVIEW_DECIDED
+        // meant a confirmed "Do it" never ran its executor at all, not just
+        // a missing card.
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_PREVIEW_DECIDED, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
         );
     }
 
@@ -3202,8 +3303,8 @@ mod tests {
             WM_APP_DISMISS,
             WM_APP_LEARNED,
             WM_APP_PAUSE_TOGGLE,
-            WM_APP_CALENDAR_RESULT,
-            WM_APP_PREVIEW_DECIDED,
+            WM_APP_PALETTE_TOGGLE,
+            WM_APP_PALETTE_RUN,
         ] {
             assert_eq!(
                 settings_reentrancy_policy(msg, FAKE_TASKBAR_CREATED_MSG),
@@ -3297,6 +3398,101 @@ mod tests {
              ALL_WM_APP_IDS lists {}; add the new constant to ALL_WM_APP_IDS too",
             ALL_WM_APP_IDS.len()
         );
+    }
+
+    // -- settings_reentrancy_policy exhaustiveness (issue #213) -----------
+    //
+    // #163's ALL_WM_APP_IDS/wm_app_ids_registry_is_exhaustive above already
+    // guarantee every WM_APP_* constant in the crate is listed once. This
+    // reuses that same list to guarantee every one of them is ALSO
+    // classified by settings_reentrancy_policy -- the exact gap that let
+    // WM_APP_CALENDAR_RESULT and WM_APP_PREVIEW_DECIDED quietly stay
+    // Ignore'd instead of Defer'd (and let WM_APP_PALETTE_TOGGLE/
+    // WM_APP_PALETTE_RUN go untested by name at all) until #213. Adding a
+    // WM_APP_* id to ALL_WM_APP_IDS without adding a matching entry here
+    // fails this test, so a future result/decision message cannot be
+    // silently forgotten the same way again.
+
+    /// Every id in `ALL_WM_APP_IDS`, paired with the `SettingsReentrancy`
+    /// `settings_reentrancy_policy` must return for it. `TaskbarCreated`
+    /// itself is not a `WM_APP_*` constant (it's a runtime-registered
+    /// window message, see `TASKBAR_CREATED_MSG`), so `DeferTaskbarCreated`
+    /// never appears here -- it is covered by
+    /// `settings_reentrancy_defers_taskbar_created` instead.
+    const REENTRANCY_POLICY_TABLE: &[(&str, u32, SettingsReentrancy)] = &[
+        ("WM_APP_TRAY", WM_APP_TRAY, SettingsReentrancy::Ignore),
+        ("WM_APP_HOTKEY", WM_APP_HOTKEY, SettingsReentrancy::Ignore),
+        ("WM_APP_RESULT", WM_APP_RESULT, SettingsReentrancy::Defer),
+        ("WM_APP_LEARNED", WM_APP_LEARNED, SettingsReentrancy::Ignore),
+        ("WM_APP_DISMISS", WM_APP_DISMISS, SettingsReentrancy::Ignore),
+        (
+            "WM_APP_ACTIVATE",
+            WM_APP_ACTIVATE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_PAUSE_TOGGLE",
+            WM_APP_PAUSE_TOGGLE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_CALENDAR_RESULT",
+            WM_APP_CALENDAR_RESULT,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_PREVIEW_DECIDED",
+            WM_APP_PREVIEW_DECIDED,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_PALETTE_TOGGLE",
+            WM_APP_PALETTE_TOGGLE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_PALETTE_RUN",
+            WM_APP_PALETTE_RUN,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_REVIEW_RESULT",
+            WM_APP_REVIEW_RESULT,
+            SettingsReentrancy::Defer,
+        ),
+    ];
+
+    #[test]
+    fn reentrancy_policy_table_matches_all_wm_app_ids() {
+        assert_eq!(
+            REENTRANCY_POLICY_TABLE.len(),
+            ALL_WM_APP_IDS.len(),
+            "ALL_WM_APP_IDS has {} entries but REENTRANCY_POLICY_TABLE has {} -- a WM_APP_* \
+             id was added to one without the other; classify every id in both places so a \
+             new result message cannot be silently dropped while Settings is open",
+            ALL_WM_APP_IDS.len(),
+            REENTRANCY_POLICY_TABLE.len()
+        );
+        for (name, id) in ALL_WM_APP_IDS {
+            assert!(
+                REENTRANCY_POLICY_TABLE
+                    .iter()
+                    .any(|(n, i, _)| n == name && i == id),
+                "{name} is in ALL_WM_APP_IDS but missing from REENTRANCY_POLICY_TABLE"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_reentrancy_policy_matches_the_table_for_every_wm_app_id() {
+        for (name, id, expected) in REENTRANCY_POLICY_TABLE {
+            assert_eq!(
+                settings_reentrancy_policy(*id, FAKE_TASKBAR_CREATED_MSG),
+                *expected,
+                "{name} is classified {expected:?} in REENTRANCY_POLICY_TABLE but \
+                 settings_reentrancy_policy disagrees"
+            );
+        }
     }
 
     #[test]
