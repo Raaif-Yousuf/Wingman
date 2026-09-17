@@ -841,6 +841,13 @@ mod tests {
         sleeper: &RecordingSleeper,
         clock: &FixedClock,
     ) -> Result<String> {
+        // The Offline guard reads process-wide mode state that the #19 guard
+        // tests flip to Offline; without this lock a retry test running in
+        // parallel is refused before its scripted transport (MEASURED
+        // 2026-09-17: `http_500_then_200_succeeds` failed once this way).
+        let _mode = crate::mode::MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let policy = RetryPolicy::default();
         let env = RetryEnv {
             transport,
