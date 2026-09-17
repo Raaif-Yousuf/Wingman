@@ -940,7 +940,7 @@ fn build_ui(
     ctx.create(WC_STATIC, "OpenAI API key:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     ctx.create(
         WC_EDIT,
-        &mask_key(&config.providers.openai.api_key),
+        &key_field_display(&config.providers.openai.api_key),
         (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
         WS_EX_BORDER,
         r.x + LABEL_W,
@@ -999,7 +999,7 @@ fn build_ui(
     ctx.create(WC_STATIC, "Anthropic API key:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     ctx.create(
         WC_EDIT,
-        &mask_key(&config.providers.anthropic.api_key),
+        &key_field_display(&config.providers.anthropic.api_key),
         (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
         WS_EX_BORDER,
         r.x + LABEL_W,
@@ -1585,6 +1585,25 @@ fn mask_key(key: &str) -> String {
     format!("{}{tail}", "*".repeat(len - KEY_VISIBLE_TAIL))
 }
 
+/// Shown in a key field instead of [`mask_key`]'s stars when the stored
+/// credential is [`crate::config::UNREADABLE_KEY_MARKER`] (#175): masking
+/// the marker's own control characters would render as garbage, and
+/// stars-only would look identical to a real key nobody can tell apart from
+/// "everything is fine". No em dash (rule 11).
+const UNREADABLE_KEY_PLACEHOLDER_TEXT: &str = "(stored key unreadable: retype to replace)";
+
+/// What a key field should actually show. [`mask_key`] for a real key (or an
+/// empty one); [`UNREADABLE_KEY_PLACEHOLDER_TEXT`] for the unreadable
+/// marker, so the raw marker's control characters never reach a visible
+/// Win32 control. `resolve_key_field` is this function's inverse for Save.
+fn key_field_display(key: &str) -> String {
+    if key == crate::config::UNREADABLE_KEY_MARKER {
+        UNREADABLE_KEY_PLACEHOLDER_TEXT.to_string()
+    } else {
+        mask_key(key)
+    }
+}
+
 /// Resolves what a key field should become on Save. The field is populated
 /// with `mask_key(original)`, never the real key (#2's masking), so if the
 /// user never touched it the text on Save is still exactly that mask and
@@ -1597,7 +1616,21 @@ fn mask_key(key: &str) -> String {
 /// happen to match), it is indistinguishable from "untouched" and the old
 /// key survives instead. Not worth a dirty-flag/EN_CHANGE tracker for how
 /// unlikely that string is to be a real key.
+///
+/// #175: when `original` is [`crate::config::UNREADABLE_KEY_MARKER`], the
+/// field was shown as [`UNREADABLE_KEY_PLACEHOLDER_TEXT`]
+/// ([`key_field_display`]), not `mask_key(original)` -- so the untouched
+/// check compares against that placeholder instead. Left untouched, the
+/// marker survives to `push_secrets_to_store`, which leaves the unreadable
+/// credential alone; typed over (including cleared to empty, a deliberate
+/// removal), it resolves like any other field.
 fn resolve_key_field(original: &str, form_text: &str) -> String {
+    if original == crate::config::UNREADABLE_KEY_MARKER {
+        if form_text == UNREADABLE_KEY_PLACEHOLDER_TEXT {
+            return original.to_string();
+        }
+        return form_text.to_string();
+    }
     if form_text == mask_key(original) {
         original.to_string()
     } else {
@@ -1840,6 +1873,57 @@ mod tests {
         // text is also "", which must resolve to "", not be mistaken for
         // an intentional clear of a key that was never set.
         assert_eq!(resolve_key_field("", ""), "");
+    }
+
+    // -- #175: the unreadable-credential marker in the settings field -------
+
+    #[test]
+    fn key_field_display_of_an_unreadable_marker_is_the_placeholder_not_stars() {
+        let shown = key_field_display(crate::config::UNREADABLE_KEY_MARKER);
+        assert_eq!(shown, UNREADABLE_KEY_PLACEHOLDER_TEXT);
+        assert!(
+            !shown.contains('\u{1}'),
+            "the raw marker must never reach a visible control: {shown}"
+        );
+    }
+
+    #[test]
+    fn key_field_display_of_a_real_key_still_masks() {
+        assert_eq!(
+            key_field_display("sk-abcdefgh1234"),
+            mask_key("sk-abcdefgh1234")
+        );
+    }
+
+    #[test]
+    fn key_field_display_of_an_empty_key_is_empty() {
+        assert_eq!(key_field_display(""), "");
+    }
+
+    #[test]
+    fn resolve_key_field_keeps_the_marker_when_the_placeholder_is_left_untouched() {
+        let original = crate::config::UNREADABLE_KEY_MARKER;
+        assert_eq!(
+            resolve_key_field(original, UNREADABLE_KEY_PLACEHOLDER_TEXT),
+            original,
+            "leaving the placeholder alone must not turn into a delete"
+        );
+    }
+
+    #[test]
+    fn resolve_key_field_replaces_the_marker_when_the_user_types_a_new_key() {
+        let original = crate::config::UNREADABLE_KEY_MARKER;
+        assert_eq!(resolve_key_field(original, "sk-brand-new"), "sk-brand-new");
+    }
+
+    #[test]
+    fn resolve_key_field_clears_the_marker_when_the_user_empties_the_field() {
+        let original = crate::config::UNREADABLE_KEY_MARKER;
+        assert_eq!(
+            resolve_key_field(original, ""),
+            "",
+            "an explicit clear over an unreadable marker must still delete the credential"
+        );
     }
 
     // -- build_config --------------------------------------------------
@@ -2124,6 +2208,59 @@ mod tests {
             "the real key must never reach the control's text: {shown}"
         );
         assert!(shown.ends_with("1234"), "the last four characters must still be visible: {shown}");
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    /// #175's "wired to nothing" check for `key_field_display`: the real
+    /// control must show the human-readable placeholder, never the raw
+    /// marker (whose control characters would render as garbage, or worse,
+    /// silently vanish and leave the field looking empty).
+    #[test]
+    fn build_ui_shows_the_unreadable_placeholder_not_the_raw_marker() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        assert!(ensure_class_registered(instance));
+        ensure_common_controls();
+
+        let mut config = Config::default();
+        config.providers.openai.api_key = crate::config::UNREADABLE_KEY_MARKER.to_string();
+
+        let title = wide_z("Wingman settings (unreadable-marker test)");
+        let class_name = wide_z(CLASS_NAME);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        let font = build_font(dpi);
+        build_ui(hwnd, instance, dpi, font, &config, WIN_H_DP);
+
+        let openai_edit = get_dlg_item(hwnd, ID_OPENAI_KEY).expect("openai key field exists");
+        let shown = get_text(openai_edit);
+        assert_eq!(shown, UNREADABLE_KEY_PLACEHOLDER_TEXT);
+        assert!(
+            !shown.contains('\u{1}'),
+            "the raw marker's control characters must never reach the real control: {shown:?}"
+        );
 
         unsafe {
             let _ = DestroyWindow(hwnd);
