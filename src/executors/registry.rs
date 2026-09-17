@@ -9,6 +9,7 @@ use super::calendar_add::CalendarAddExecutor;
 use super::clipboard::ClipboardExecutor;
 use super::image_clipboard::ImageClipboardExecutor;
 use super::none::NoneExecutor;
+use super::replace_text::ReplaceTextExecutor;
 use super::Executor;
 
 /// Resolves an executor by name, or fails with the exact text an
@@ -24,6 +25,7 @@ pub fn resolve(name: &str) -> anyhow::Result<Box<dyn Executor>> {
         "clipboard" => Ok(Box::new(ClipboardExecutor::new())),
         "calendar_add" => Ok(Box::new(CalendarAddExecutor::new())),
         "image_clipboard" => Ok(Box::new(ImageClipboardExecutor::new())),
+        "replace_text" => Ok(Box::new(ReplaceTextExecutor::new())),
         _ => anyhow::bail!(
             "No executor named \"{name}\". Check the action's executor field in actions.toml."
         ),
@@ -59,6 +61,13 @@ mod tests {
             resolve("image_clipboard").expect("\"image_clipboard\" is a built-in executor");
         assert_eq!(executor.name(), "image_clipboard");
         assert_eq!(executor.effect(), super::super::Effect::ReadOnly);
+    }
+
+    #[test]
+    fn resolves_replace_text_by_name() {
+        let executor = resolve("replace_text").expect("\"replace_text\" is a built-in executor");
+        assert_eq!(executor.name(), "replace_text");
+        assert_eq!(executor.effect(), super::super::Effect::Writes);
     }
 
     #[test]

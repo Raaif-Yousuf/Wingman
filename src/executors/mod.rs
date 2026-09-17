@@ -13,6 +13,7 @@ mod clipboard;
 mod image_clipboard;
 mod none;
 pub mod registry;
+mod replace_text;
 pub mod uia_guard;
 
 use crate::ui::confirm::Confirmed;
