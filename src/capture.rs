@@ -14,7 +14,10 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
 
 // The constants below are sensible per-provider/per-tier limits for
 // `fit_for_model`. Issue #169: now referenced from `src/provider/**` (each
@@ -347,11 +350,194 @@ fn rect_from_hmonitor(hmon: HMONITOR) -> Result<RECT> {
     Ok(mi.rcMonitor)
 }
 
+// ---------------------------------------------------------------------------
+// Virtual-desktop (all-monitors) capture -- issue #29's region/window
+// overlay (`ui::region`) freezes one composited frame of the whole desktop
+// before it shows its overlay window, so the crop it eventually returns
+// matches exactly what was on screen at the moment the user pressed the
+// hotkey, not a re-capture taken after the overlay (which would show up in
+// its own screenshot) is already on top.
+// ---------------------------------------------------------------------------
+
+/// The bounding rectangle of the entire virtual desktop (every monitor
+/// combined), in physical pixels. This is Win32's virtual-screen coordinate
+/// space, which a `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` process (set
+/// once, process-wide, in `App::run`) receives un-scaled: `left`/`top` can
+/// be negative when a monitor sits above or to the left of the primary
+/// monitor's own origin.
+pub fn virtual_desktop_rect() -> Result<RECT> {
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if width <= 0 || height <= 0 {
+        return Err(anyhow!(
+            "GetSystemMetrics reported an empty virtual desktop"
+        ));
+    }
+    Ok(RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    })
+}
+
+/// Captures every monitor at native resolution and composites the results
+/// into one RGBA8 buffer sized to [`virtual_desktop_rect`], each monitor's
+/// pixels placed at its own offset within that buffer via [`blit_into`]. No
+/// downscaling: the region overlay crops out of this buffer at native
+/// resolution, so shrinking it here would shrink the eventual crop too.
+///
+/// Pixels not covered by any monitor (possible when monitors of different
+/// physical sizes/DPI scale factors do not tile edge-to-edge) are left as
+/// opaque black -- harmless, since every rectangle `ui::region` can produce
+/// is clamped to the real desktop bounds first, so a gap pixel is never
+/// actually selectable.
+pub fn grab_virtual_desktop_raw() -> Result<RawShot> {
+    let desktop = virtual_desktop_rect()?;
+    let width = (desktop.right - desktop.left).max(1) as u32;
+    let height = (desktop.bottom - desktop.top).max(1) as u32;
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+
+    let monitors = xcap::Monitor::all().map_err(|e| anyhow!("enumerating monitors: {e}"))?;
+    if monitors.is_empty() {
+        return Err(anyhow!("no monitors found"));
+    }
+
+    for m in &monitors {
+        let (Ok(mx), Ok(my)) = (m.x(), m.y()) else {
+            continue;
+        };
+        let Ok(image) = m.capture_image() else {
+            continue;
+        };
+        let (mw, mh) = (image.width(), image.height());
+        blit_into(
+            &mut rgba,
+            width,
+            height,
+            image.as_raw(),
+            mw,
+            mh,
+            mx - desktop.left,
+            my - desktop.top,
+        );
+    }
+
+    Ok(RawShot {
+        rgba,
+        width,
+        height,
+    })
+}
+
+/// Copies `src` (an RGBA8 `src_w`x`src_h` buffer) into `dst` (an RGBA8
+/// `dst_w`x`dst_h` buffer) at offset `(ox, oy)`, clipping whatever part of
+/// `src` would fall outside `dst`'s bounds -- including a partially or
+/// fully negative offset, which is the normal case for every monitor except
+/// the one at the virtual desktop's own origin. Row-copies the clipped
+/// overlap rather than checking bounds per pixel, so this stays fast enough
+/// to run once per monitor on every region-overlay open.
+///
+/// Pure pixel arithmetic over plain slices -- no xcap or Win32 type
+/// anywhere in the signature -- so this is exercised directly against
+/// synthetic buffers, without a real multi-monitor capture.
+#[allow(clippy::too_many_arguments)] // a `Rect`-like bundle per buffer would
+                                     // just move these same 8 primitives
+                                     // into two structs only this function
+                                     // and its tests ever construct
+fn blit_into(
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    ox: i32,
+    oy: i32,
+) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
+
+    let src_x0 = (-ox).max(0) as u32;
+    let src_y0 = (-oy).max(0) as u32;
+    let src_x1 = (((dst_w as i32) - ox).max(0) as u32).min(src_w);
+    let src_y1 = (((dst_h as i32) - oy).max(0) as u32).min(src_h);
+    if src_x0 >= src_x1 || src_y0 >= src_y1 {
+        return; // src and dst do not overlap at all
+    }
+
+    let row_bytes = ((src_x1 - src_x0) as usize) * 4;
+    for sy in src_y0..src_y1 {
+        let dy = (oy + sy as i32) as u32;
+        let s_start = ((sy * src_w + src_x0) * 4) as usize;
+        let dx0 = (ox + src_x0 as i32) as u32;
+        let d_start = ((dy * dst_w + dx0) * 4) as usize;
+        if s_start + row_bytes <= src.len() && d_start + row_bytes <= dst.len() {
+            dst[d_start..d_start + row_bytes].copy_from_slice(&src[s_start..s_start + row_bytes]);
+        }
+    }
+}
+
+/// A pixel rectangle in the same buffer-local (non-negative) coordinate
+/// space as an already-captured [`RawShot`] -- what [`crop_rgba`] takes,
+/// unlike `ui::region::Rect`, which is virtual-desktop space and can be
+/// negative. `ui::region::to_buffer_rect` converts between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RectPx {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Crops `rect` out of an RGBA8 `width`x`height` buffer, clamping `rect` to
+/// the buffer's own bounds first rather than trusting the caller (CLAUDE.md
+/// rule 8: a parser/guard should not trust its input even when every
+/// current caller already clamps). Never returns a zero-size image: a
+/// completely out-of-bounds or zero-area `rect` clamps to a single pixel
+/// rather than an empty `RawShot` every downstream consumer would otherwise
+/// have to special-case.
+pub fn crop_rgba(rgba: &[u8], width: u32, height: u32, rect: RectPx) -> RawShot {
+    if width == 0 || height == 0 || rgba.len() < (width as usize) * (height as usize) * 4 {
+        return RawShot {
+            rgba: vec![0; 4],
+            width: 1,
+            height: 1,
+        };
+    }
+
+    let x0 = rect.x.min(width - 1);
+    let y0 = rect.y.min(height - 1);
+    let x1 = rect.x.saturating_add(rect.w).min(width).max(x0 + 1);
+    let y1 = rect.y.saturating_add(rect.h).min(height).max(y0 + 1);
+    let cw = x1 - x0;
+    let ch = y1 - y0;
+
+    let row_bytes = (cw as usize) * 4;
+    let mut out = vec![0u8; row_bytes * (ch as usize)];
+    for row in 0..ch {
+        let src_start = (((y0 + row) * width + x0) * 4) as usize;
+        let dst_start = (row as usize) * row_bytes;
+        out[dst_start..dst_start + row_bytes]
+            .copy_from_slice(&rgba[src_start..src_start + row_bytes]);
+    }
+
+    RawShot {
+        rgba: out,
+        width: cw,
+        height: ch,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        encode, encode_png, fit_for_model, fit_long_edge, pick_compression_level, resolve_limits,
-        Cursor, RawShot, ANTHROPIC_HIGH_RES_MAX_LONG_EDGE, ANTHROPIC_HIGH_RES_MAX_PIXELS,
+        blit_into, crop_rgba, encode, encode_png, fit_for_model, fit_long_edge,
+        pick_compression_level, resolve_limits, Cursor, RawShot, RectPx,
+        ANTHROPIC_HIGH_RES_MAX_LONG_EDGE, ANTHROPIC_HIGH_RES_MAX_PIXELS,
         ANTHROPIC_STANDARD_MAX_LONG_EDGE, ANTHROPIC_STANDARD_MAX_PIXELS, OPENAI_TILE_MAX_LONG_EDGE,
         OPENAI_TILE_MAX_PIXELS,
     };
@@ -892,5 +1078,191 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- blit_into (issue #29's virtual-desktop compositing) -------------
+
+    fn solid_rgba(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity((w as usize) * (h as usize) * 4);
+        for _ in 0..(w * h) {
+            buf.extend_from_slice(&px);
+        }
+        buf
+    }
+
+    /// Byte offset of pixel `(col, row)` in a `width`-wide RGBA8 buffer.
+    fn px_idx(row: u32, col: u32, width: u32) -> usize {
+        ((row * width + col) * 4) as usize
+    }
+
+    #[test]
+    fn blit_into_places_src_at_a_positive_offset() {
+        let mut dst = vec![0u8; 4 * 4 * 4]; // 4x4, transparent black
+        let src = solid_rgba(2, 2, [10, 20, 30, 255]);
+        blit_into(&mut dst, 4, 4, &src, 2, 2, 1, 1);
+
+        // Pixel (1,1) in dst should now be the src colour.
+        let idx = px_idx(1, 1, 4);
+        assert_eq!(&dst[idx..idx + 4], &[10, 20, 30, 255]);
+        // Pixel (0,0) untouched.
+        assert_eq!(&dst[0..4], &[0, 0, 0, 0]);
+        // Pixel (3,3) (outside the 2x2 src placed at (1,1)-(3,3)) untouched.
+        let idx33 = px_idx(3, 3, 4);
+        assert_eq!(&dst[idx33..idx33 + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn blit_into_clips_a_negative_offset() {
+        // src is 4x4 placed at (-2,-2): only its bottom-right 2x2 quadrant
+        // overlaps a 4x4 dst.
+        let mut dst = vec![0u8; 4 * 4 * 4];
+        let mut src = vec![0u8; 4 * 4 * 4];
+        // Mark the bottom-right 2x2 of src (rows/cols 2..4) distinctly.
+        for y in 2..4u32 {
+            for x in 2..4u32 {
+                let idx = px_idx(y, x, 4);
+                src[idx..idx + 4].copy_from_slice(&[7, 8, 9, 255]);
+            }
+        }
+        blit_into(&mut dst, 4, 4, &src, 4, 4, -2, -2);
+
+        // dst (0,0) should now hold what was src (2,2).
+        assert_eq!(&dst[0..4], &[7, 8, 9, 255]);
+        // dst (1,1) should hold src (3,3), still inside the marked quadrant.
+        let idx11 = px_idx(1, 1, 4);
+        assert_eq!(&dst[idx11..idx11 + 4], &[7, 8, 9, 255]);
+        // dst (2,2) is past the clipped 2x2 overlap; must stay untouched.
+        let idx22 = px_idx(2, 2, 4);
+        assert_eq!(&dst[idx22..idx22 + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn blit_into_clips_an_offset_past_the_far_edge() {
+        let mut dst = vec![0u8; 4 * 4 * 4];
+        let src = solid_rgba(4, 4, [1, 2, 3, 255]);
+        // Placed almost entirely off the right/bottom edge: only dst's
+        // (3,3) corner should be touched.
+        blit_into(&mut dst, 4, 4, &src, 4, 4, 3, 3);
+
+        let idx33 = ((3 * 4 + 3) * 4) as usize;
+        assert_eq!(&dst[idx33..idx33 + 4], &[1, 2, 3, 255]);
+        assert_eq!(&dst[0..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn blit_into_wholly_outside_dst_is_a_no_op() {
+        let mut dst = vec![9u8; 4 * 4 * 4];
+        let before = dst.clone();
+        let src = solid_rgba(2, 2, [1, 2, 3, 255]);
+        blit_into(&mut dst, 4, 4, &src, 2, 2, 100, 100);
+        assert_eq!(dst, before);
+    }
+
+    #[test]
+    fn blit_into_zero_size_src_is_a_no_op() {
+        let mut dst = vec![9u8; 4 * 4 * 4];
+        let before = dst.clone();
+        blit_into(&mut dst, 4, 4, &[], 0, 0, 0, 0);
+        assert_eq!(dst, before);
+    }
+
+    // -- crop_rgba (issue #29: region capture) ----------------------------
+
+    /// A distinct-per-pixel buffer (value = row*width + col) so a crop's
+    /// exact placement and size are checkable, not just "some pixels
+    /// copied".
+    fn indexed_rgba(w: u32, h: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity((w as usize) * (h as usize) * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (y * w + x) as u8;
+                buf.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn crop_rgba_extracts_exactly_the_requested_rectangle() {
+        let (w, h) = (10u32, 10u32);
+        let src = indexed_rgba(w, h);
+        let rect = RectPx {
+            x: 3,
+            y: 2,
+            w: 4,
+            h: 3,
+        };
+        let cropped = crop_rgba(&src, w, h, rect);
+
+        assert_eq!(cropped.width, 4);
+        assert_eq!(cropped.height, 3);
+        for row in 0..3u32 {
+            for col in 0..4u32 {
+                let src_v = ((2 + row) * w + (3 + col)) as u8;
+                let idx = ((row * 4 + col) * 4) as usize;
+                assert_eq!(
+                    cropped.rgba[idx], src_v,
+                    "mismatch at cropped ({col},{row})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crop_rgba_clamps_a_rect_that_overhangs_the_buffer() {
+        let (w, h) = (5u32, 5u32);
+        let src = indexed_rgba(w, h);
+        let rect = RectPx {
+            x: 3,
+            y: 3,
+            w: 10,
+            h: 10,
+        };
+        let cropped = crop_rgba(&src, w, h, rect);
+        assert_eq!(cropped.width, 2); // 5 - 3
+        assert_eq!(cropped.height, 2);
+    }
+
+    #[test]
+    fn crop_rgba_rect_entirely_past_the_buffer_still_returns_a_pixel() {
+        let (w, h) = (5u32, 5u32);
+        let src = indexed_rgba(w, h);
+        let rect = RectPx {
+            x: 50,
+            y: 50,
+            w: 10,
+            h: 10,
+        };
+        let cropped = crop_rgba(&src, w, h, rect);
+        assert_eq!(cropped.width, 1);
+        assert_eq!(cropped.height, 1);
+        assert_eq!(cropped.rgba.len(), 4);
+    }
+
+    #[test]
+    fn crop_rgba_zero_size_source_never_panics() {
+        let cropped = crop_rgba(
+            &[],
+            0,
+            0,
+            RectPx {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+        );
+        assert_eq!(cropped.width, 1);
+        assert_eq!(cropped.height, 1);
+    }
+
+    #[test]
+    fn crop_rgba_full_buffer_roundtrips_unchanged() {
+        let (w, h) = (6u32, 4u32);
+        let src = indexed_rgba(w, h);
+        let cropped = crop_rgba(&src, w, h, RectPx { x: 0, y: 0, w, h });
+        assert_eq!(cropped.width, w);
+        assert_eq!(cropped.height, h);
+        assert_eq!(cropped.rgba, src);
     }
 }
