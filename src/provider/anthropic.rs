@@ -20,7 +20,11 @@ pub struct Anthropic {
 }
 
 impl Anthropic {
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>, effort: impl Into<String>) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             model: model.into(),
@@ -56,14 +60,22 @@ impl Anthropic {
         if let Some(schema) = &req.schema {
             output_config["format"] = serde_json::json!({"type": "json_schema", "schema": schema});
         }
-        let effort = if req.effort != Effort::Unset { req.effort } else { self.effort };
+        let effort = if req.effort != Effort::Unset {
+            req.effort
+        } else {
+            self.effort
+        };
         if supports_effort(&self.model) {
             if let Some(e) = effort.as_str() {
                 output_config["effort"] = Value::String(e.to_string());
             }
         }
 
-        let max_tokens = if req.max_tokens > 0 { req.max_tokens } else { DEFAULT_MAX_TOKENS };
+        let max_tokens = if req.max_tokens > 0 {
+            req.max_tokens
+        } else {
+            DEFAULT_MAX_TOKENS
+        };
 
         serde_json::json!({
             "model": self.model,
@@ -79,7 +91,8 @@ impl Anthropic {
     /// answering. The text is returned as-is -- this provider never
     /// interprets it against a schema (#12).
     fn parse_completion(body: &str) -> Result<Completion> {
-        let value: Value = serde_json::from_str(body).context("anthropic: response body is not valid JSON")?;
+        let value: Value =
+            serde_json::from_str(body).context("anthropic: response body is not valid JSON")?;
 
         let stop_reason = value.get("stop_reason").and_then(Value::as_str);
 
@@ -202,7 +215,10 @@ mod tests {
         let provider = Anthropic::new("sk-ant-test", "claude-opus-5", "low");
         let body = provider.build_body(&req("system prompt text", false));
 
-        let expected_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sample_shot().png);
+        let expected_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &sample_shot().png,
+        );
 
         let expected = serde_json::json!({
             "model": "claude-opus-5",
@@ -245,7 +261,10 @@ mod tests {
     fn build_body_is_unchanged_when_difficulty_off() {
         let provider = Anthropic::new("sk-ant-test", "claude-opus-5", "low");
         let with_flag = provider.build_body(&req("system prompt text", false));
-        let expected_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sample_shot().png);
+        let expected_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &sample_shot().png,
+        );
         let today = serde_json::json!({
             "model": "claude-opus-5",
             "max_tokens": 4000,
@@ -276,7 +295,10 @@ mod tests {
             schema["properties"]["difficulty"],
             serde_json::json!({"type": "string", "enum": ["1","2","3","4","5","6","7","8","9","10","U","N"]})
         );
-        assert_eq!(schema["required"], serde_json::json!(["detail", "headline", "difficulty"]));
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["detail", "headline", "difficulty"])
+        );
         // Anthropic's format object still takes no `name`/`strict`.
         assert!(body["output_config"]["format"].get("name").is_none());
         assert!(body["output_config"]["format"].get("strict").is_none());

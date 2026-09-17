@@ -81,7 +81,10 @@ pub enum LearnState {
     Idle,
     /// Armed for binding slot `which` (see [`HK_PRIMARY`] / [`HK_SECONDARY`]),
     /// expiring at `deadline`.
-    Armed { which: usize, deadline: Instant },
+    Armed {
+        which: usize,
+        deadline: Instant,
+    },
 }
 
 /// Result of feeding a keydown into the learn-mode state machine.
@@ -112,7 +115,10 @@ pub fn on_keydown(state: LearnState, chord: Chord, now: Instant) -> (LearnState,
                 // A bare modifier keydown (e.g. the Shift the user is about
                 // to hold down before pressing the real trigger key) must
                 // not itself become the captured chord. Stay armed.
-                (LearnState::Armed { which, deadline }, LearnOutcome::PassThrough)
+                (
+                    LearnState::Armed { which, deadline },
+                    LearnOutcome::PassThrough,
+                )
             } else {
                 (LearnState::Idle, LearnOutcome::Captured { which, chord })
             }
@@ -634,7 +640,11 @@ mod tests {
 
     #[test]
     fn learn_idle_passes_everything_through() {
-        let (state, outcome) = on_keydown(LearnState::Idle, chord(0x41, false, false, false, false), Instant::now());
+        let (state, outcome) = on_keydown(
+            LearnState::Idle,
+            chord(0x41, false, false, false, false),
+            Instant::now(),
+        );
         assert_eq!(state, LearnState::Idle);
         assert_eq!(outcome, LearnOutcome::PassThrough);
     }
@@ -691,7 +701,11 @@ mod tests {
                 deadline: now + Duration::from_secs(5),
             };
             let (_, outcome) = on_keydown(armed, chord(vk, false, false, false, false), now);
-            assert_eq!(outcome, LearnOutcome::PassThrough, "vk=0x{vk:X} should be ignored");
+            assert_eq!(
+                outcome,
+                LearnOutcome::PassThrough,
+                "vk=0x{vk:X} should be ignored"
+            );
         }
     }
 
@@ -750,13 +764,17 @@ mod tests {
     #[test]
     fn win_chord_needs_the_release_workaround() {
         // The primary binding, Win+Shift+F23: swallowing it must run the tap.
-        assert!(needs_win_release_workaround(&chord(0x86, false, true, false, true)));
+        assert!(needs_win_release_workaround(&chord(
+            0x86, false, true, false, true
+        )));
     }
 
     #[test]
     fn non_win_chord_does_not_need_the_release_workaround() {
         // Ctrl+Shift+/: no Win key involved, no Start-menu tracking to cancel.
-        assert!(!needs_win_release_workaround(&chord(0xBF, true, true, false, false)));
+        assert!(!needs_win_release_workaround(&chord(
+            0xBF, true, true, false, false
+        )));
     }
 
     // -- chord_to_string -------------------------------------------------
@@ -775,8 +793,14 @@ mod tests {
 
     #[test]
     fn renders_letter_and_digit() {
-        assert_eq!(chord_to_string(&chord(0x41, false, false, false, false)), "A");
-        assert_eq!(chord_to_string(&chord(0x30, false, false, false, false)), "0");
+        assert_eq!(
+            chord_to_string(&chord(0x41, false, false, false, false)),
+            "A"
+        );
+        assert_eq!(
+            chord_to_string(&chord(0x30, false, false, false, false)),
+            "0"
+        );
     }
 
     #[test]
@@ -788,7 +812,10 @@ mod tests {
     #[test]
     fn falls_back_to_vk_hex_for_unmapped_codes() {
         // 0x07 is unassigned in the VK table.
-        assert_eq!(chord_to_string(&chord(0x07, false, false, false, false)), "VK(0x07)");
+        assert_eq!(
+            chord_to_string(&chord(0x07, false, false, false, false)),
+            "VK(0x07)"
+        );
     }
 
     // -- pack_chord / unpack_chord (issue #181) -----------------------------

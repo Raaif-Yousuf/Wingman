@@ -82,7 +82,9 @@ fn value_at(key_path: &str, value_name: &str) -> Option<String> {
         )
     };
     if probe.is_err() || len == 0 {
-        unsafe { let _ = RegCloseKey(key); }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
         return None;
     }
 
@@ -97,7 +99,9 @@ fn value_at(key_path: &str, value_name: &str) -> Option<String> {
             Some(&mut len),
         )
     };
-    unsafe { let _ = RegCloseKey(key); }
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
     if read.is_err() {
         return None;
     }
@@ -175,7 +179,9 @@ fn write_value_at(key_path: &str, value_name: &str, value: &str) -> Result<()> {
     let result = unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_SZ, Some(bytes)) }
         .ok()
         .context("writing a Run value");
-    unsafe { let _ = RegCloseKey(key); }
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
     result
 }
 
@@ -185,7 +191,9 @@ fn delete_value_at(key_path: &str, value_name: &str) -> Result<()> {
     let key = open_at(key_path, KEY_WRITE)?;
     let name = wide(value_name);
     let deleted = unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) };
-    unsafe { let _ = RegCloseKey(key); }
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
     if deleted == ERROR_FILE_NOT_FOUND {
         Ok(())
     } else {
@@ -235,13 +243,21 @@ mod tests {
         // below for the guard against this regressing).
         let path = test_key_path();
         let key = create_test_key(&path);
-        unsafe { let _ = RegCloseKey(key); }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
         let value_name = "wingman-autostart-test-value";
 
-        assert!(!is_enabled_at(&path, value_name), "scratch key starts empty");
+        assert!(
+            !is_enabled_at(&path, value_name),
+            "scratch key starts empty"
+        );
 
         set_enabled_at(&path, value_name, true).expect("enable");
-        assert!(is_enabled_at(&path, value_name), "should read back as enabled");
+        assert!(
+            is_enabled_at(&path, value_name),
+            "should read back as enabled"
+        );
         assert_eq!(
             value_at(&path, value_name).as_deref(),
             Some(command().unwrap().as_str()),
@@ -249,11 +265,13 @@ mod tests {
         );
 
         set_enabled_at(&path, value_name, false).expect("disable");
-        assert!(!is_enabled_at(&path, value_name), "should read back as disabled");
+        assert!(
+            !is_enabled_at(&path, value_name),
+            "should read back as disabled"
+        );
 
         // Disabling twice is not an error.
-        set_enabled_at(&path, value_name, false)
-            .expect("disabling an absent value is a no-op");
+        set_enabled_at(&path, value_name, false).expect("disabling an absent value is a no-op");
 
         delete_test_key(&path);
     }
@@ -285,7 +303,9 @@ mod tests {
     }
 
     fn create_test_key(path: &str) -> HKEY {
-        use windows::Win32::System::Registry::{RegCreateKeyExW, KEY_ALL_ACCESS, REG_OPTION_VOLATILE};
+        use windows::Win32::System::Registry::{
+            RegCreateKeyExW, KEY_ALL_ACCESS, REG_OPTION_VOLATILE,
+        };
         let sub = wide(path);
         let mut key = HKEY::default();
         unsafe {
@@ -309,7 +329,8 @@ mod tests {
     fn write_test_value(key: HKEY, value_name: &str, value: &str) {
         let name = wide(value_name);
         let data = wide(value);
-        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
         unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_SZ, Some(bytes)) }
             .ok()
             .expect("writing the scratch test value");
@@ -329,7 +350,9 @@ mod tests {
         let key = create_test_key(&path);
         write_test_value(key, OLD_VALUE_NAME, "leftover pre-rename entry");
         write_test_value(key, VALUE_NAME, "current entry, must survive");
-        unsafe { let _ = RegCloseKey(key); }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
 
         delete_value_at(&path, OLD_VALUE_NAME).expect("deleting the old value should succeed");
 
@@ -351,15 +374,21 @@ mod tests {
         let path = test_key_path();
         let key = create_test_key(&path);
         write_test_value(key, VALUE_NAME, "only the new value exists");
-        unsafe { let _ = RegCloseKey(key); }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
 
         // The old value was never written here -- this is the steady state
         // for anyone who installs Wingman fresh, never having run
         // copilot-ask. Deleting an absent value must not surface as a
         // startup error.
-        delete_value_at(&path, OLD_VALUE_NAME).expect("absent old value must be a no-op, not an error");
+        delete_value_at(&path, OLD_VALUE_NAME)
+            .expect("absent old value must be a no-op, not an error");
 
-        assert_eq!(value_at(&path, VALUE_NAME).as_deref(), Some("only the new value exists"));
+        assert_eq!(
+            value_at(&path, VALUE_NAME).as_deref(),
+            Some("only the new value exists")
+        );
 
         delete_test_key(&path);
     }
@@ -373,10 +402,17 @@ mod tests {
         let path = test_key_path();
         let key = create_test_key(&path);
         write_test_value(key, OLD_VALUE_NAME, "\"C:\\old\\copilot-ask.exe\"");
-        unsafe { let _ = RegCloseKey(key); }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
 
-        migrate_value_at(&path, OLD_VALUE_NAME, VALUE_NAME, "\"C:\\new\\wingman.exe\"")
-            .expect("migrating the value should succeed");
+        migrate_value_at(
+            &path,
+            OLD_VALUE_NAME,
+            VALUE_NAME,
+            "\"C:\\new\\wingman.exe\"",
+        )
+        .expect("migrating the value should succeed");
 
         assert!(
             value_at(&path, OLD_VALUE_NAME).is_none(),
@@ -399,17 +435,27 @@ mod tests {
         let key = create_test_key(&path);
         write_test_value(key, OLD_VALUE_NAME, "\"C:\\old\\copilot-ask.exe\"");
         write_test_value(key, VALUE_NAME, "\"C:\\already\\set\\wingman.exe\"");
-        unsafe { let _ = RegCloseKey(key); }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
 
-        migrate_value_at(&path, OLD_VALUE_NAME, VALUE_NAME, "\"C:\\would-be\\overwrite.exe\"")
-            .expect("migrating the value should succeed");
+        migrate_value_at(
+            &path,
+            OLD_VALUE_NAME,
+            VALUE_NAME,
+            "\"C:\\would-be\\overwrite.exe\"",
+        )
+        .expect("migrating the value should succeed");
 
         assert_eq!(
             value_at(&path, VALUE_NAME).as_deref(),
             Some("\"C:\\already\\set\\wingman.exe\""),
             "an already-registered new value must never be clobbered"
         );
-        assert!(value_at(&path, OLD_VALUE_NAME).is_none(), "the old value is still cleaned up");
+        assert!(
+            value_at(&path, OLD_VALUE_NAME).is_none(),
+            "the old value is still cleaned up"
+        );
 
         delete_test_key(&path);
     }
@@ -421,12 +467,22 @@ mod tests {
         let path = test_key_path();
         let key = create_test_key(&path);
         write_test_value(key, VALUE_NAME, "\"C:\\new\\wingman.exe\"");
-        unsafe { let _ = RegCloseKey(key); }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
 
-        migrate_value_at(&path, OLD_VALUE_NAME, VALUE_NAME, "\"C:\\should-not-be-written.exe\"")
-            .expect("migrating with no old value should still succeed");
+        migrate_value_at(
+            &path,
+            OLD_VALUE_NAME,
+            VALUE_NAME,
+            "\"C:\\should-not-be-written.exe\"",
+        )
+        .expect("migrating with no old value should still succeed");
 
-        assert_eq!(value_at(&path, VALUE_NAME).as_deref(), Some("\"C:\\new\\wingman.exe\""));
+        assert_eq!(
+            value_at(&path, VALUE_NAME).as_deref(),
+            Some("\"C:\\new\\wingman.exe\"")
+        );
 
         delete_test_key(&path);
     }
@@ -435,7 +491,9 @@ mod tests {
     fn migrate_value_at_with_neither_value_present_is_a_no_op() {
         let path = test_key_path();
         let key = create_test_key(&path);
-        unsafe { let _ = RegCloseKey(key); }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
 
         migrate_value_at(&path, OLD_VALUE_NAME, VALUE_NAME, "\"C:\\unused.exe\"")
             .expect("migrating an empty key should still succeed");

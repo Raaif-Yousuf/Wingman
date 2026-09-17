@@ -27,8 +27,8 @@ mod tests {
 
     #[test]
     fn actions_example_matches_builtin_actions() {
-        let expected = toml::to_string_pretty(&example_file())
-            .expect("ActionsFile must serialize to TOML");
+        let expected =
+            toml::to_string_pretty(&example_file()).expect("ActionsFile must serialize to TOML");
 
         let path = example_path();
 

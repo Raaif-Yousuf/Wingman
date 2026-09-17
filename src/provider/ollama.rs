@@ -47,7 +47,9 @@ const VISION_FAMILIES: [&str; 3] = ["gemma3", "gemma4", "qwen3.5"];
 /// `pub(crate)`: also used by `ollama_admin.rs` as the fallback when a
 /// `/api/show` response carries no live `capabilities` array (#14).
 pub(crate) fn is_vision_model(model: &str) -> bool {
-    VISION_FAMILIES.iter().any(|family| model.starts_with(family))
+    VISION_FAMILIES
+        .iter()
+        .any(|family| model.starts_with(family))
 }
 
 pub struct Ollama {
@@ -61,7 +63,11 @@ pub struct Ollama {
 }
 
 impl Ollama {
-    pub fn new(base_url: impl Into<String>, model: impl Into<String>, effort: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             model: model.into(),
@@ -108,8 +114,16 @@ impl Ollama {
             user_message["images"] = json!(images);
         }
 
-        let effort = if req.effort != Effort::Unset { req.effort } else { self.effort };
-        let max_tokens = if req.max_tokens > 0 { req.max_tokens } else { DEFAULT_MAX_TOKENS };
+        let effort = if req.effort != Effort::Unset {
+            req.effort
+        } else {
+            self.effort
+        };
+        let max_tokens = if req.max_tokens > 0 {
+            req.max_tokens
+        } else {
+            DEFAULT_MAX_TOKENS
+        };
 
         let mut body = json!({
             "model": self.model,
@@ -138,7 +152,8 @@ impl Ollama {
     /// model) is discarded -- only `message.content` is ever returned as
     /// `Completion::text`.
     fn parse_completion(body: &str) -> Result<Completion> {
-        let value: Value = serde_json::from_str(body).context("ollama: response body is not valid JSON")?;
+        let value: Value =
+            serde_json::from_str(body).context("ollama: response body is not valid JSON")?;
 
         let done_reason = value.get("done_reason").and_then(Value::as_str);
 
@@ -277,8 +292,13 @@ mod tests {
         let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
         let body = provider.build_body(&req("system prompt text", false));
 
-        let expected_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sample_shot().png);
-        let images = body["messages"][1]["images"].as_array().expect("images array");
+        let expected_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &sample_shot().png,
+        );
+        let images = body["messages"][1]["images"]
+            .as_array()
+            .expect("images array");
         assert_eq!(images.len(), 1);
         assert_eq!(images[0], expected_b64);
         // No "data:image/png;base64," prefix, unlike OpenAI/Anthropic.
@@ -332,7 +352,10 @@ mod tests {
         for effort in ["", "low", "medium", "high"] {
             let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", effort);
             let body = provider.build_body(&req("sys", false));
-            assert!(body.get("think").is_some(), "effort {effort:?} must still send think");
+            assert!(
+                body.get("think").is_some(),
+                "effort {effort:?} must still send think"
+            );
             assert!(body["think"].is_boolean());
         }
     }
@@ -399,7 +422,8 @@ mod tests {
 
     #[test]
     fn parse_completion_round_trips_a_recorded_fixture() {
-        let body = fs::read_to_string("tests/fixtures/ollama_response.json").expect("fixture file should exist");
+        let body = fs::read_to_string("tests/fixtures/ollama_response.json")
+            .expect("fixture file should exist");
         let completion = Ollama::parse_completion(&body).expect("should parse");
         let answer = parse_answer(&completion.text).expect("should parse as an Answer");
         assert_eq!(answer.headline, "Four");
@@ -474,8 +498,18 @@ mod tests {
     #[test]
     fn capabilities_reports_vision_for_known_families() {
         let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
-        for model in ["gemma3:4b", "gemma3:12b", "gemma4:12b", "qwen3.5:2b", "qwen3.5:4b", "qwen3.5:9b"] {
-            assert!(provider.capabilities(model).vision, "{model} should report vision");
+        for model in [
+            "gemma3:4b",
+            "gemma3:12b",
+            "gemma4:12b",
+            "qwen3.5:2b",
+            "qwen3.5:4b",
+            "qwen3.5:9b",
+        ] {
+            assert!(
+                provider.capabilities(model).vision,
+                "{model} should report vision"
+            );
         }
     }
 
@@ -483,7 +517,10 @@ mod tests {
     fn capabilities_reports_no_vision_for_known_text_only_families() {
         let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
         for model in ["qwen3:14b", "deepseek-r1:14b", "llama3.1:8b"] {
-            assert!(!provider.capabilities(model).vision, "{model} should not report vision");
+            assert!(
+                !provider.capabilities(model).vision,
+                "{model} should not report vision"
+            );
         }
         // Guards the prefix match: "qwen3:14b" must not false-positive on
         // the "qwen3.5" family check.
@@ -500,7 +537,10 @@ mod tests {
 
     #[test]
     fn id_is_ollama() {
-        assert_eq!(Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low").id(), "ollama");
+        assert_eq!(
+            Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low").id(),
+            "ollama"
+        );
     }
 
     // -- live check (#13 Done-when) --------------------------------------
@@ -564,7 +604,9 @@ mod tests {
         };
 
         let started = std::time::Instant::now();
-        let completion = provider.complete(&request).expect("live ollama request should succeed");
+        let completion = provider
+            .complete(&request)
+            .expect("live ollama request should succeed");
         let elapsed = started.elapsed();
 
         let answer = parse_answer(&completion.text).expect("response should parse as an Answer");

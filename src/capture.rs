@@ -319,8 +319,8 @@ fn rect_from_hmonitor(hmon: HMONITOR) -> Result<RECT> {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode, encode_png, fit_for_model, fit_long_edge, pick_compression_level, Cursor,
-        RawShot, ANTHROPIC_HIGH_RES_MAX_LONG_EDGE, ANTHROPIC_HIGH_RES_MAX_PIXELS,
+        encode, encode_png, fit_for_model, fit_long_edge, pick_compression_level, Cursor, RawShot,
+        ANTHROPIC_HIGH_RES_MAX_LONG_EDGE, ANTHROPIC_HIGH_RES_MAX_PIXELS,
         ANTHROPIC_STANDARD_MAX_LONG_EDGE, ANTHROPIC_STANDARD_MAX_PIXELS, OPENAI_TILE_MAX_LONG_EDGE,
         OPENAI_TILE_MAX_PIXELS,
     };
@@ -687,15 +687,26 @@ mod tests {
         // function actually picks, not a value chosen by eyeballing the
         // table and then hard-coded independently of it.
         let candidates = [
-            (CompressionType::Fast, MEASURED_1402X876_FAST_MS, MEASURED_1402X876_FAST_BYTES),
+            (
+                CompressionType::Fast,
+                MEASURED_1402X876_FAST_MS,
+                MEASURED_1402X876_FAST_BYTES,
+            ),
             (
                 CompressionType::Default,
                 MEASURED_1402X876_DEFAULT_MS,
                 MEASURED_1402X876_DEFAULT_BYTES,
             ),
-            (CompressionType::Best, MEASURED_1402X876_BEST_MS, MEASURED_1402X876_BEST_BYTES),
+            (
+                CompressionType::Best,
+                MEASURED_1402X876_BEST_MS,
+                MEASURED_1402X876_BEST_BYTES,
+            ),
         ];
-        assert_eq!(pick_compression_level(&candidates, ASSUMED_UPLINK_BITS_PER_SEC), CompressionType::Default);
+        assert_eq!(
+            pick_compression_level(&candidates, ASSUMED_UPLINK_BITS_PER_SEC),
+            CompressionType::Default
+        );
     }
 
     // -- bench_png_compression_levels (issue #177) ------------------------

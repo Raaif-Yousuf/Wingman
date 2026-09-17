@@ -58,8 +58,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
     GetIconInfo, LoadIconW, RegisterWindowMessageW, SetForegroundWindow, SetMenuItemInfoW,
     TrackPopupMenu, HICON, HMENU, ICONINFO, IDI_APPLICATION, MENUITEMINFOW, MFS_CHECKED,
-    MFT_RADIOCHECK, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE, MIIM_STATE,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
+    MFT_RADIOCHECK, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE,
+    MIIM_STATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 /// Posted by the shell to this app's window proc on tray icon activity.
@@ -522,8 +522,15 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 fn append_item(hmenu: HMENU, id: u32, text: &str) -> Result<()> {
     let wide = to_wide(text);
-    unsafe { AppendMenuW(hmenu, MF_STRING, id as usize, PCWSTR::from_raw(wide.as_ptr())) }
-        .context("AppendMenuW failed")
+    unsafe {
+        AppendMenuW(
+            hmenu,
+            MF_STRING,
+            id as usize,
+            PCWSTR::from_raw(wide.as_ptr()),
+        )
+    }
+    .context("AppendMenuW failed")
 }
 
 /// Same as [`append_item`], but greyed out and disabled when `enabled` is
@@ -847,7 +854,11 @@ const OFFLINE_TINT_FACTOR: f32 = 0.35;
 /// on issue #20's closing comment and issue #166).
 fn grey_pixel([b, g, r, a]: [u8; 4], factor: f32) -> [u8; 4] {
     let luma = 0.114 * b as f32 + 0.587 * g as f32 + 0.299 * r as f32;
-    let mix = |c: u8| -> u8 { (luma + (c as f32 - luma) * factor).round().clamp(0.0, 255.0) as u8 };
+    let mix = |c: u8| -> u8 {
+        (luma + (c as f32 - luma) * factor)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
     let new_a = (a as f32 * factor).round().clamp(0.0, 255.0) as u8;
     [mix(b), mix(g), mix(r), new_a]
 }
@@ -858,8 +869,11 @@ fn grey_pixel([b, g, r, a]: [u8; 4], factor: f32) -> [u8; 4] {
 /// normal icon at a glance. Pure and allocation-free, same reasoning as
 /// `grey_pixel`'s doc comment.
 fn offline_tint_pixel([b, g, r, a]: [u8; 4], factor: f32) -> [u8; 4] {
-    let bluer = (b as f32 + (255.0 - b as f32) * factor).round().clamp(0.0, 255.0) as u8;
-    let shrink = |c: u8| -> u8 { (c as f32 * (1.0 - factor * 0.5)).round().clamp(0.0, 255.0) as u8 };
+    let bluer = (b as f32 + (255.0 - b as f32) * factor)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    let shrink =
+        |c: u8| -> u8 { (c as f32 * (1.0 - factor * 0.5)).round().clamp(0.0, 255.0) as u8 };
     [bluer, shrink(g), shrink(r), a]
 }
 
@@ -893,7 +907,10 @@ fn make_offline_icon(icon: HICON) -> Option<HICON> {
 /// either way, this is cosmetic. Cleans up every GDI object it creates or
 /// that `GetIconInfo` hands back on every path, including the early-return
 /// failure paths.
-fn derive_icon_with_transform(icon: HICON, transform: impl Fn([u8; 4]) -> [u8; 4]) -> Option<HICON> {
+fn derive_icon_with_transform(
+    icon: HICON,
+    transform: impl Fn([u8; 4]) -> [u8; 4],
+) -> Option<HICON> {
     unsafe {
         let mut info = ICONINFO::default();
         GetIconInfo(icon, &mut info).ok()?;
@@ -936,18 +953,26 @@ fn derive_icon_with_transform(icon: HICON, transform: impl Fn([u8; 4]) -> [u8; 4
         };
 
         let mut bits_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
-        let color_dib = match CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
-        {
-            Ok(h) => h,
-            Err(_) => {
-                let _ = DeleteDC(dc);
-                let _ = DeleteObject(hbm_color.into());
-                let _ = DeleteObject(hbm_mask.into());
-                return None;
-            }
-        };
+        let color_dib =
+            match CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0) {
+                Ok(h) => h,
+                Err(_) => {
+                    let _ = DeleteDC(dc);
+                    let _ = DeleteObject(hbm_color.into());
+                    let _ = DeleteObject(hbm_mask.into());
+                    return None;
+                }
+            };
 
-        let lines = GetDIBits(dc, hbm_color, 0, height as u32, Some(bits_ptr), &mut bmi, DIB_RGB_COLORS);
+        let lines = GetDIBits(
+            dc,
+            hbm_color,
+            0,
+            height as u32,
+            Some(bits_ptr),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
         let _ = DeleteDC(dc);
         let _ = DeleteObject(hbm_color.into());
         if lines == 0 {
@@ -1077,7 +1102,8 @@ mod tests {
         }
 
         let hmenu_running = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
-        tray.build_menu(hmenu_running).expect("build_menu while running");
+        tray.build_menu(hmenu_running)
+            .expect("build_menu while running");
         assert!(
             !item_is_greyed(hmenu_running, cmd::SET_PRIMARY),
             "SET_PRIMARY must not be greyed while running"
@@ -1090,7 +1116,8 @@ mod tests {
 
         tray.set_paused(true);
         let hmenu_paused = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
-        tray.build_menu(hmenu_paused).expect("build_menu while paused");
+        tray.build_menu(hmenu_paused)
+            .expect("build_menu while paused");
         assert!(
             item_is_greyed(hmenu_paused, cmd::SET_PRIMARY),
             "SET_PRIMARY must be greyed while paused -- arming learn mode can never capture"
@@ -1348,7 +1375,10 @@ mod tests {
     fn make_offline_icon_succeeds_against_a_real_icon() {
         let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }.expect("LoadIconW(IDI_APPLICATION)");
         let tinted = make_offline_icon(icon);
-        assert!(tinted.is_some(), "make_offline_icon should derive a tinted icon from a real system icon");
+        assert!(
+            tinted.is_some(),
+            "make_offline_icon should derive a tinted icon from a real system icon"
+        );
         if let Some(t) = tinted {
             let _ = unsafe { DestroyIcon(t) };
         }
@@ -1435,7 +1465,8 @@ mod tests {
         // states are active -- see `resolve_icon`'s doc comment.
         let resolved = tray.resolve_icon();
         assert_eq!(
-            resolved, tray.greyed_icon.unwrap(),
+            resolved,
+            tray.greyed_icon.unwrap(),
             "Paused must be visually dominant over the Offline tint"
         );
 

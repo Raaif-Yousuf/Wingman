@@ -310,7 +310,11 @@ impl App {
     /// (so a user who configured it is never blocked here just because this
     /// gate cannot probe), never a claim that Ollama is actually reachable
     /// right now -- that real check still happens only on the worker.
-    fn readiness_gate(mode: Mode, providers: &Providers, config_path: &str) -> Option<(String, String)> {
+    fn readiness_gate(
+        mode: Mode,
+        providers: &Providers,
+        config_path: &str,
+    ) -> Option<(String, String)> {
         let selected = providers.build_chain_for_mode(mode, true);
         if !selected.ready_provider_names().is_empty() {
             return None;
@@ -369,7 +373,9 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        if let Some((headline, detail)) = Self::readiness_gate(self.config.mode, &self.config.providers, &path) {
+        if let Some((headline, detail)) =
+            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+        {
             self.card.show_error(&headline, &detail);
             return;
         }
@@ -382,14 +388,15 @@ impl App {
         // build on a 1402x876 image, which froze the message loop for that
         // whole time with nothing on screen after the key press. `encode`
         // now runs on the worker thread below, after `show_pending`.
-        let raw = match capture::grab_raw(&self.config.capture.monitor, self.config.capture.max_edge) {
-            Ok(r) => r,
-            Err(e) => {
-                self.card
-                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
-                return;
-            }
-        };
+        let raw =
+            match capture::grab_raw(&self.config.capture.monitor, self.config.capture.max_edge) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.card
+                        .show_error("Couldn't capture the screen", &format!("{e:#}"));
+                    return;
+                }
+            };
 
         self.busy = true;
         // Disarmed for the whole in-flight window: a click while the spinner
@@ -541,7 +548,9 @@ impl App {
 
         let name = chord_to_string(&chord);
         match saved {
-            Ok(()) => self.card.show_answer(&format!("Bound to {name}"), "", 4, None),
+            Ok(()) => self
+                .card
+                .show_answer(&format!("Bound to {name}"), "", 4, None),
             Err(e) => self.card.show_error(
                 &format!("Bound to {name}: not saved"),
                 &format!("It will work until you quit.\n\n{e:#}"),
@@ -705,7 +714,11 @@ impl App {
         };
         // Make sure the file exists before asking the shell to open it.
         let needed_create = !path.exists();
-        let save_result = if needed_create { self.config.save() } else { Ok(()) };
+        let save_result = if needed_create {
+            self.config.save()
+        } else {
+            Ok(())
+        };
         if !Self::should_open_config_after_ensuring_it_exists(needed_create, &save_result) {
             // Rule 7: the save the user's click just caused must not fail
             // silently -- before this fix, `let _ = self.config.save();`
@@ -766,9 +779,11 @@ impl App {
             Ok(()) => self.card.show_answer(&model, "", 3, None),
             Err(e) => self.card.show_error(
                 &format!("Using {model}: not saved"),
-                &format!("It will revert when you quit.
+                &format!(
+                    "It will revert when you quit.
 
-{e:#}"),
+{e:#}"
+                ),
             ),
         }
         self.set_watch(true);
@@ -795,9 +810,11 @@ impl App {
             Ok(()) => self.card.show_answer(name, "", 3, None),
             Err(e) => self.card.show_error(
                 &format!("Using {name}: not saved"),
-                &format!("It will revert when you quit.
+                &format!(
+                    "It will revert when you quit.
 
-{e:#}"),
+{e:#}"
+                ),
             ),
         }
         self.set_watch(true);
@@ -822,9 +839,11 @@ impl App {
             Ok(()) => self.card.show_answer(mode.label(), "", 3, None),
             Err(e) => self.card.show_error(
                 &format!("Using {}: not saved", mode.label()),
-                &format!("It will revert when you quit.
+                &format!(
+                    "It will revert when you quit.
 
-{e:#}"),
+{e:#}"
+                ),
             ),
         }
         self.set_watch(true);
@@ -856,7 +875,8 @@ impl App {
     fn update_tooltip(&mut self) {
         if let PauseState::Paused { choice, until } = self.pause {
             let hour_min = until.and_then(local_hour_min);
-            self.tray.set_tooltip(&pause::tooltip_text(choice, hour_min));
+            self.tray
+                .set_tooltip(&pause::tooltip_text(choice, hour_min));
             return;
         }
 
@@ -1211,7 +1231,9 @@ fn local_hour_min(t: SystemTime) -> Option<(u8, u8)> {
 /// `SetTimer`'s `u32` millisecond range (comfortably wide enough for both
 /// "1 hour" and "until tomorrow").
 fn arm_pause_timer(hwnd: HWND, until: SystemTime, now: SystemTime) {
-    let delay = until.duration_since(now).unwrap_or(Duration::from_millis(1));
+    let delay = until
+        .duration_since(now)
+        .unwrap_or(Duration::from_millis(1));
     let delay_ms = delay.as_millis().clamp(1, u32::MAX as u128) as u32;
     unsafe {
         let _ = KillTimer(Some(hwnd), PAUSE_TIMER_ID);
@@ -1483,9 +1505,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 return LRESULT(0);
             }
             SettingsReentrancy::DeferResult => {
-                let result = unsafe {
-                    *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>)
-                };
+                let result =
+                    unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>) };
                 PENDING_RESULT.with(|c| *c.borrow_mut() = Some(result));
                 return LRESULT(0);
             }
@@ -1513,8 +1534,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 // would silently swallow the next key pressed anywhere.
                 if !matches!(
                     decode(id),
-                    MenuChoice::Command(cmd::SET_PRIMARY)
-                        | MenuChoice::Command(cmd::SET_SECONDARY)
+                    MenuChoice::Command(cmd::SET_PRIMARY) | MenuChoice::Command(cmd::SET_SECONDARY)
                 ) {
                     if let Some(h) = &app.hook {
                         h.cancel_learning();
@@ -1566,9 +1586,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         }
         WM_APP_RESULT => {
             // Take ownership of the box the worker leaked into the message.
-            let result = unsafe {
-                *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>)
-            };
+            let result =
+                unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>) };
             app.on_result(result);
             LRESULT(0)
         }
@@ -1828,7 +1847,10 @@ mod tests {
     }
 
     fn ollama_only_providers() -> Providers {
-        let mut p = Providers { order: vec!["ollama".to_string()], ..Providers::default() };
+        let mut p = Providers {
+            order: vec!["ollama".to_string()],
+            ..Providers::default()
+        };
         p.ollama.base_url = "http://127.0.0.1:11434".to_string();
         p
     }
@@ -1842,7 +1864,9 @@ mod tests {
 
     #[test]
     fn readiness_gate_passes_when_a_cloud_key_is_set_in_cloud_mode() {
-        assert!(App::readiness_gate(Mode::Cloud, &cloud_ready_providers(), "config.toml").is_none());
+        assert!(
+            App::readiness_gate(Mode::Cloud, &cloud_ready_providers(), "config.toml").is_none()
+        );
     }
 
     #[test]
@@ -1850,19 +1874,24 @@ mod tests {
         // The exact scenario #192 reports: Cloud mode, only Ollama
         // configured -- Ollama's ready() is true (no key needed), but Cloud
         // mode never selects it, so the gate must still block.
-        let (headline, _) = App::readiness_gate(Mode::Cloud, &ollama_only_providers(), "config.toml")
-            .expect("must block: cloud mode has nothing cloud configured");
+        let (headline, _) =
+            App::readiness_gate(Mode::Cloud, &ollama_only_providers(), "config.toml")
+                .expect("must block: cloud mode has nothing cloud configured");
         assert_eq!(headline, "No API key: open Edit settings");
     }
 
     #[test]
     fn readiness_gate_passes_when_ollama_is_configured_in_local_mode() {
-        assert!(App::readiness_gate(Mode::Local, &ollama_only_providers(), "config.toml").is_none());
+        assert!(
+            App::readiness_gate(Mode::Local, &ollama_only_providers(), "config.toml").is_none()
+        );
     }
 
     #[test]
     fn readiness_gate_passes_when_ollama_is_configured_in_offline_mode() {
-        assert!(App::readiness_gate(Mode::Offline, &ollama_only_providers(), "config.toml").is_none());
+        assert!(
+            App::readiness_gate(Mode::Offline, &ollama_only_providers(), "config.toml").is_none()
+        );
     }
 
     #[test]
@@ -1870,8 +1899,12 @@ mod tests {
         // The other #192 scenario: Local mode with only a cloud key
         // configured must say Ollama is what's missing, not the generic
         // "No API key" message meant for Cloud mode.
-        let (headline, detail) = App::readiness_gate(Mode::Local, &cloud_ready_providers(), "C:\\cfg\\config.toml")
-            .expect("must block: local mode has no ollama configured");
+        let (headline, detail) = App::readiness_gate(
+            Mode::Local,
+            &cloud_ready_providers(),
+            "C:\\cfg\\config.toml",
+        )
+        .expect("must block: local mode has no ollama configured");
         assert_eq!(headline, "Local mode needs Ollama configured");
         assert!(detail.contains("ollama"), "{detail}");
         assert!(detail.contains("C:\\cfg\\config.toml"), "{detail}");
@@ -1879,8 +1912,9 @@ mod tests {
 
     #[test]
     fn readiness_gate_blocks_offline_mode_with_only_a_cloud_key() {
-        let (headline, _) = App::readiness_gate(Mode::Offline, &cloud_ready_providers(), "config.toml")
-            .expect("must block: offline mode has no ollama configured");
+        let (headline, _) =
+            App::readiness_gate(Mode::Offline, &cloud_ready_providers(), "config.toml")
+                .expect("must block: offline mode has no ollama configured");
         assert_eq!(headline, "Local mode needs Ollama configured");
     }
 
@@ -1898,19 +1932,26 @@ mod tests {
 
     #[test]
     fn readiness_gate_blocks_auto_mode_with_nothing_configured() {
-        let (headline, _) = App::readiness_gate(Mode::Auto, &nothing_configured_providers(), "config.toml")
-            .expect("must block: nothing is configured at all");
+        let (headline, _) =
+            App::readiness_gate(Mode::Auto, &nothing_configured_providers(), "config.toml")
+                .expect("must block: nothing is configured at all");
         assert_eq!(headline, "No provider ready: open Edit settings");
     }
 
     #[test]
     fn readiness_gate_blocks_cloud_mode_with_nothing_configured() {
-        assert!(App::readiness_gate(Mode::Cloud, &nothing_configured_providers(), "config.toml").is_some());
+        assert!(
+            App::readiness_gate(Mode::Cloud, &nothing_configured_providers(), "config.toml")
+                .is_some()
+        );
     }
 
     #[test]
     fn readiness_gate_blocks_local_mode_with_nothing_configured() {
-        assert!(App::readiness_gate(Mode::Local, &nothing_configured_providers(), "config.toml").is_some());
+        assert!(
+            App::readiness_gate(Mode::Local, &nothing_configured_providers(), "config.toml")
+                .is_some()
+        );
     }
 
     #[test]

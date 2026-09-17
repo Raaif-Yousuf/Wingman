@@ -59,29 +59,27 @@ use std::time::Duration;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
 use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, DeleteObject, FW_NORMAL, HFONT, HGDIOBJ, LOGFONTW,
 };
-use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX,
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgItem, GetMessageW,
     GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsChild, IsDialogMessageW,
     LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW,
-    MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_HSCROLL,
-    WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
-    WS_DISABLED, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG,
+    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_HSCROLL, WM_KEYDOWN,
+    WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_DISABLED,
+    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 
 use crate::config::{Config, OllamaConfig};
@@ -229,14 +227,18 @@ fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
             break;
         }
 
-        let belongs_to_us =
-            msg.hwnd == hwnd || unsafe { IsChild(hwnd, msg.hwnd) }.as_bool();
+        let belongs_to_us = msg.hwnd == hwnd || unsafe { IsChild(hwnd, msg.hwnd) }.as_bool();
 
         if belongs_to_us && msg.message == WM_KEYDOWN {
             let vk = msg.wParam.0 as u32;
             if vk == VK_ESCAPE.0 as u32 {
                 unsafe {
-                    let _ = PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(ID_CANCEL as usize), LPARAM(0));
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_COMMAND,
+                        WPARAM(ID_CANCEL as usize),
+                        LPARAM(0),
+                    );
                 }
                 continue;
             }
@@ -244,7 +246,8 @@ fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
             // ES_WANTRETURN means Enter should insert a newline instead.
             if vk == VK_RETURN.0 as u32 && msg.hwnd != prompt_edit {
                 unsafe {
-                    let _ = PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(ID_SAVE as usize), LPARAM(0));
+                    let _ =
+                        PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(ID_SAVE as usize), LPARAM(0));
                 }
                 continue;
             }
@@ -422,9 +425,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
 
 fn toggle_password(hwnd: HWND, checkbox_id: i32, edit_id: i32) {
     let checked = get_dlg_item(hwnd, checkbox_id)
-        .map(|h| unsafe {
-            SendMessageW(h, BM_GETCHECK, None, None).0 as i32 == BST_CHECKED
-        })
+        .map(|h| unsafe { SendMessageW(h, BM_GETCHECK, None, None).0 as i32 == BST_CHECKED })
         .unwrap_or(false);
     if let Some(edit) = get_dlg_item(hwnd, edit_id) {
         let ch: u32 = if checked { 0 } else { '*' as u32 };
@@ -553,8 +554,8 @@ const BS_PUSHBUTTON: i32 = 0x0000;
 const BS_DEFPUSHBUTTON: i32 = 0x0001;
 const TBS_HORZ: i32 = 0x0000;
 
-use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
 // ---------------------------------------------------------------------------
 // Layout (logical pixels at 96 DPI; scaled per-window by `to_px`)
@@ -705,10 +706,12 @@ fn build_font(dpi: u32) -> HFONT {
 
         let f = CreateFontIndirectW(&lf);
         if f.0.is_null() {
-            HFONT(windows::Win32::Graphics::Gdi::GetStockObject(
-                windows::Win32::Graphics::Gdi::DEFAULT_GUI_FONT,
+            HFONT(
+                windows::Win32::Graphics::Gdi::GetStockObject(
+                    windows::Win32::Graphics::Gdi::DEFAULT_GUI_FONT,
+                )
+                .0,
             )
-            .0)
         } else {
             f
         }
@@ -773,7 +776,9 @@ impl Ctx {
                 to_px(w, self.dpi),
                 to_px(h, self.dpi),
                 Some(self.parent),
-                Some(windows::Win32::UI::WindowsAndMessaging::HMENU(id as *mut c_void)),
+                Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                    id as *mut c_void,
+                )),
                 Some(self.instance),
                 None,
             )
@@ -802,12 +807,7 @@ const WC_COMBOBOX: &str = "COMBOBOX";
 fn combo_add(hwnd: HWND, item: &str) {
     let w = wide_z(item);
     unsafe {
-        SendMessageW(
-            hwnd,
-            CB_ADDSTRING,
-            None,
-            Some(LPARAM(w.as_ptr() as isize)),
-        );
+        SendMessageW(hwnd, CB_ADDSTRING, None, Some(LPARAM(w.as_ptr() as isize)));
     }
 }
 
@@ -942,7 +942,12 @@ fn build_ui(
     config: &Config,
     win_h_dp: i32,
 ) -> HWND {
-    let ctx = Ctx { parent: hwnd, instance, dpi, font };
+    let ctx = Ctx {
+        parent: hwnd,
+        instance,
+        dpi,
+        font,
+    };
     let content_x = MARGIN;
     let content_w = WIN_W_DP - 2 * MARGIN;
 
@@ -953,8 +958,19 @@ fn build_ui(
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
 
-    ctx.create(WC_STATIC, "Active provider:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
-    let active_is_anthropic = config.providers.order.first().map(|s| s.as_str()) == Some("anthropic");
+    ctx.create(
+        WC_STATIC,
+        "Active provider:",
+        0,
+        0,
+        r.x,
+        r.y,
+        LABEL_W,
+        ROW_H,
+        0,
+    );
+    let active_is_anthropic =
+        config.providers.order.first().map(|s| s.as_str()) == Some("anthropic");
     let active_combo = ctx.create(
         WC_COMBOBOX,
         "",
@@ -972,7 +988,17 @@ fn build_ui(
     r.advance();
 
     // OpenAI
-    ctx.create(WC_STATIC, "OpenAI API key:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "OpenAI API key:",
+        0,
+        0,
+        r.x,
+        r.y,
+        LABEL_W,
+        ROW_H,
+        0,
+    );
     ctx.create(
         WC_EDIT,
         &key_field_display(&config.providers.openai.api_key),
@@ -1010,9 +1036,23 @@ fn build_ui(
         ROW_H * 8,
         ID_OPENAI_MODEL,
     );
-    fill_model_combo(openai_model, &config.providers.openai.models, &config.providers.openai.model);
+    fill_model_combo(
+        openai_model,
+        &config.providers.openai.models,
+        &config.providers.openai.model,
+    );
 
-    ctx.create(WC_STATIC, "Effort:", 0, 0, r.x + half + 12, r.y, 50, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "Effort:",
+        0,
+        0,
+        r.x + half + 12,
+        r.y,
+        50,
+        ROW_H,
+        0,
+    );
     let openai_effort = ctx.create(
         WC_COMBOBOX,
         "",
@@ -1031,7 +1071,17 @@ fn build_ui(
     r.advance();
 
     // Anthropic
-    ctx.create(WC_STATIC, "Anthropic API key:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "Anthropic API key:",
+        0,
+        0,
+        r.x,
+        r.y,
+        LABEL_W,
+        ROW_H,
+        0,
+    );
     ctx.create(
         WC_EDIT,
         &key_field_display(&config.providers.anthropic.api_key),
@@ -1074,7 +1124,17 @@ fn build_ui(
         &config.providers.anthropic.model,
     );
 
-    ctx.create(WC_STATIC, "Effort:", 0, 0, r.x + half + 12, r.y, 50, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "Effort:",
+        0,
+        0,
+        r.x + half + 12,
+        r.y,
+        50,
+        ROW_H,
+        0,
+    );
     let anthropic_effort = ctx.create(
         WC_COMBOBOX,
         "",
@@ -1251,7 +1311,17 @@ fn build_ui(
     }
     set_text(max_edge, &config.capture.max_edge.to_string());
 
-    ctx.create(WC_STATIC, "Monitor:", 0, 0, r.x + half + 12, r.y, 60, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "Monitor:",
+        0,
+        0,
+        r.x + half + 12,
+        r.y,
+        60,
+        ROW_H,
+        0,
+    );
     let monitor = ctx.create(
         WC_COMBOBOX,
         "",
@@ -1336,11 +1406,21 @@ fn build_ui(
         ID_TEXT_SCALE_TRACK,
     );
     unsafe {
-        SendMessageW(track, TBM_SETRANGE, Some(WPARAM(1)), Some(LPARAM(((200u32) << 16 | 50u32) as isize)));
+        SendMessageW(
+            track,
+            TBM_SETRANGE,
+            Some(WPARAM(1)),
+            Some(LPARAM(((200u32) << 16 | 50u32) as isize)),
+        );
         SendMessageW(track, TBM_SETLINESIZE, None, Some(LPARAM(5)));
         SendMessageW(track, TBM_SETPAGESIZE, None, Some(LPARAM(10)));
         let pos = (clamp_text_scale(config.ui.text_scale) * 100.0).round() as i32;
-        SendMessageW(track, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(pos as isize)));
+        SendMessageW(
+            track,
+            TBM_SETPOS,
+            Some(WPARAM(1)),
+            Some(LPARAM(pos as isize)),
+        );
     }
     let scale_label = ctx.create(
         WC_STATIC,
@@ -1454,7 +1534,13 @@ fn build_ui(
 
     // Tab order / grouping: give the first control of each visual group
     // WS_GROUP so arrow-key navigation and Tab-between-groups behave.
-    for id in [ID_ACTIVE_PROVIDER, ID_MAX_EDGE, ID_CARD_SECONDS, ID_PROMPT_EDIT, ID_SAVE] {
+    for id in [
+        ID_ACTIVE_PROVIDER,
+        ID_MAX_EDGE,
+        ID_CARD_SECONDS,
+        ID_PROMPT_EDIT,
+        ID_SAVE,
+    ] {
         if let Some(h) = get_dlg_item(hwnd, id) {
             add_style(h, WS_GROUP.0);
         }
@@ -1542,20 +1628,28 @@ fn read_form(inner: &SettingsInner) -> Config {
             )
             .0 as usize
         },
-        openai_key: get_dlg_item(hwnd, ID_OPENAI_KEY).map(get_text).unwrap_or_default(),
+        openai_key: get_dlg_item(hwnd, ID_OPENAI_KEY)
+            .map(get_text)
+            .unwrap_or_default(),
         openai_model: combo_selected_text(hwnd, ID_OPENAI_MODEL),
         openai_effort: combo_selected_text(hwnd, ID_OPENAI_EFFORT),
-        anthropic_key: get_dlg_item(hwnd, ID_ANTHROPIC_KEY).map(get_text).unwrap_or_default(),
+        anthropic_key: get_dlg_item(hwnd, ID_ANTHROPIC_KEY)
+            .map(get_text)
+            .unwrap_or_default(),
         anthropic_model: combo_selected_text(hwnd, ID_ANTHROPIC_MODEL),
         anthropic_effort: combo_selected_text(hwnd, ID_ANTHROPIC_EFFORT),
         max_edge_text: combo_selected_text(hwnd, ID_MAX_EDGE),
         monitor: combo_selected_text(hwnd, ID_MONITOR),
-        card_seconds_text: get_dlg_item(hwnd, ID_CARD_SECONDS).map(get_text).unwrap_or_default(),
+        card_seconds_text: get_dlg_item(hwnd, ID_CARD_SECONDS)
+            .map(get_text)
+            .unwrap_or_default(),
         show_difficulty: checkbox_checked(hwnd, ID_SHOW_DIFFICULTY),
         text_scale_raw: get_dlg_item(hwnd, ID_TEXT_SCALE_TRACK)
             .map(|h| unsafe { SendMessageW(h, TBM_GETPOS, None, None).0 as f32 / 100.0 })
             .unwrap_or(inner.original.ui.text_scale),
-        prompt: get_dlg_item(hwnd, ID_PROMPT_EDIT).map(get_text).unwrap_or_default(),
+        prompt: get_dlg_item(hwnd, ID_PROMPT_EDIT)
+            .map(get_text)
+            .unwrap_or_default(),
     };
     build_config(&inner.original, &raw)
 }
@@ -1877,7 +1971,10 @@ mod tests {
 
     #[test]
     fn should_query_ollama_details_is_false_when_nothing_is_listening() {
-        assert!(!should_query_ollama_details(true, &OllamaHealth::NotListening));
+        assert!(!should_query_ollama_details(
+            true,
+            &OllamaHealth::NotListening
+        ));
     }
 
     #[test]
@@ -1933,7 +2030,10 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert!(!saw_connection, "#188: no /api/ps or /api/tags request when Ollama isn't in providers.order");
+        assert!(
+            !saw_connection,
+            "#188: no /api/ps or /api/tags request when Ollama isn't in providers.order"
+        );
     }
 
     // -- parse_u32_or / parse_max_edge_or --------------------------------
@@ -2018,34 +2118,61 @@ mod tests {
 
     #[test]
     fn merge_order_both_present_already_matching_choice_is_unchanged() {
-        assert_eq!(merge_provider_order(&names(&["openai", "anthropic"]), 0), names(&["openai", "anthropic"]));
-        assert_eq!(merge_provider_order(&names(&["anthropic", "openai"]), 1), names(&["anthropic", "openai"]));
+        assert_eq!(
+            merge_provider_order(&names(&["openai", "anthropic"]), 0),
+            names(&["openai", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&names(&["anthropic", "openai"]), 1),
+            names(&["anthropic", "openai"])
+        );
     }
 
     #[test]
     fn merge_order_both_present_mismatched_choice_swaps_only_those_two_slots() {
-        assert_eq!(merge_provider_order(&names(&["openai", "anthropic"]), 1), names(&["anthropic", "openai"]));
-        assert_eq!(merge_provider_order(&names(&["anthropic", "openai"]), 0), names(&["openai", "anthropic"]));
+        assert_eq!(
+            merge_provider_order(&names(&["openai", "anthropic"]), 1),
+            names(&["anthropic", "openai"])
+        );
+        assert_eq!(
+            merge_provider_order(&names(&["anthropic", "openai"]), 0),
+            names(&["openai", "anthropic"])
+        );
     }
 
     #[test]
     fn merge_order_ollama_first_is_left_in_place() {
         let configured = names(&["ollama", "openai", "anthropic"]);
-        assert_eq!(merge_provider_order(&configured, 0), names(&["ollama", "openai", "anthropic"]));
-        assert_eq!(merge_provider_order(&configured, 1), names(&["ollama", "anthropic", "openai"]));
+        assert_eq!(
+            merge_provider_order(&configured, 0),
+            names(&["ollama", "openai", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&configured, 1),
+            names(&["ollama", "anthropic", "openai"])
+        );
     }
 
     #[test]
     fn merge_order_gemini_in_the_middle_stays_in_the_middle() {
         let configured = names(&["openai", "gemini", "anthropic"]);
-        assert_eq!(merge_provider_order(&configured, 0), names(&["openai", "gemini", "anthropic"]));
-        assert_eq!(merge_provider_order(&configured, 1), names(&["anthropic", "gemini", "openai"]));
+        assert_eq!(
+            merge_provider_order(&configured, 0),
+            names(&["openai", "gemini", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&configured, 1),
+            names(&["anthropic", "gemini", "openai"])
+        );
     }
 
     #[test]
     fn merge_order_duplicate_entries_only_the_first_occurrence_participates() {
         let configured = names(&["openai", "openai", "anthropic"]);
-        assert_eq!(merge_provider_order(&configured, 1), names(&["anthropic", "openai", "openai"]));
+        assert_eq!(
+            merge_provider_order(&configured, 1),
+            names(&["anthropic", "openai", "openai"])
+        );
     }
 
     #[test]
@@ -2060,28 +2187,52 @@ mod tests {
     #[test]
     fn merge_order_missing_anthropic_inserts_it_adjacent_to_openai() {
         let configured = names(&["ollama", "openai"]);
-        assert_eq!(merge_provider_order(&configured, 0), names(&["ollama", "openai", "anthropic"]));
-        assert_eq!(merge_provider_order(&configured, 1), names(&["ollama", "anthropic", "openai"]));
+        assert_eq!(
+            merge_provider_order(&configured, 0),
+            names(&["ollama", "openai", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&configured, 1),
+            names(&["ollama", "anthropic", "openai"])
+        );
     }
 
     #[test]
     fn merge_order_missing_openai_inserts_it_adjacent_to_anthropic() {
         let configured = names(&["anthropic", "ollama"]);
-        assert_eq!(merge_provider_order(&configured, 0), names(&["openai", "anthropic", "ollama"]));
-        assert_eq!(merge_provider_order(&configured, 1), names(&["anthropic", "openai", "ollama"]));
+        assert_eq!(
+            merge_provider_order(&configured, 0),
+            names(&["openai", "anthropic", "ollama"])
+        );
+        assert_eq!(
+            merge_provider_order(&configured, 1),
+            names(&["anthropic", "openai", "ollama"])
+        );
     }
 
     #[test]
     fn merge_order_neither_present_appends_both_in_choice_order() {
         let configured = names(&["ollama"]);
-        assert_eq!(merge_provider_order(&configured, 0), names(&["ollama", "openai", "anthropic"]));
-        assert_eq!(merge_provider_order(&configured, 1), names(&["ollama", "anthropic", "openai"]));
+        assert_eq!(
+            merge_provider_order(&configured, 0),
+            names(&["ollama", "openai", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&configured, 1),
+            names(&["ollama", "anthropic", "openai"])
+        );
     }
 
     #[test]
     fn merge_order_empty_configured_matches_old_order_from_choice_behavior() {
-        assert_eq!(merge_provider_order(&[], 0), names(&["openai", "anthropic"]));
-        assert_eq!(merge_provider_order(&[], 1), names(&["anthropic", "openai"]));
+        assert_eq!(
+            merge_provider_order(&[], 0),
+            names(&["openai", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&[], 1),
+            names(&["anthropic", "openai"])
+        );
     }
 
     // -- mask_key / resolve_key_field (#2 settings masking) ---------------
@@ -2217,8 +2368,14 @@ mod tests {
         assert_eq!(cfg.ui.prompt, original.ui.prompt);
         // Fields the UI never touches must be carried through untouched.
         assert_eq!(cfg.hotkeys, original.hotkeys);
-        assert_eq!(cfg.providers.openai.models, original.providers.openai.models);
-        assert_eq!(cfg.providers.anthropic.models, original.providers.anthropic.models);
+        assert_eq!(
+            cfg.providers.openai.models,
+            original.providers.openai.models
+        );
+        assert_eq!(
+            cfg.providers.anthropic.models,
+            original.providers.anthropic.models
+        );
     }
 
     #[test]
@@ -2234,7 +2391,10 @@ mod tests {
         raw.prompt = "custom prompt".to_string();
 
         let cfg = build_config(&original, &raw);
-        assert_eq!(cfg.providers.order, vec!["anthropic".to_string(), "openai".to_string()]);
+        assert_eq!(
+            cfg.providers.order,
+            vec!["anthropic".to_string(), "openai".to_string()]
+        );
         assert_eq!(cfg.providers.openai.api_key, "sk-new");
         assert_eq!(cfg.capture.max_edge, 2048);
         assert_eq!(cfg.ui.card_seconds, 30);
@@ -2250,12 +2410,20 @@ mod tests {
         // user added by hand -- which is also how Ollama is opted into Auto
         // mode (see the comment on `Providers::default`).
         let mut original = Config::default();
-        original.providers.order = vec!["ollama".to_string(), "openai".to_string(), "anthropic".to_string()];
+        original.providers.order = vec![
+            "ollama".to_string(),
+            "openai".to_string(),
+            "anthropic".to_string(),
+        ];
         let raw = raw_from(&original); // provider_choice: 0, nothing else touched
         let cfg = build_config(&original, &raw);
         assert_eq!(
             cfg.providers.order,
-            vec!["ollama".to_string(), "openai".to_string(), "anthropic".to_string()],
+            vec![
+                "ollama".to_string(),
+                "openai".to_string(),
+                "anthropic".to_string()
+            ],
             "ollama must survive an untouched Settings save"
         );
     }
@@ -2298,7 +2466,10 @@ mod tests {
         raw.openai_effort = "".to_string();
         let cfg = build_config(&original, &raw);
         assert_eq!(cfg.providers.openai.model, original.providers.openai.model);
-        assert_eq!(cfg.providers.openai.effort, original.providers.openai.effort);
+        assert_eq!(
+            cfg.providers.openai.effort,
+            original.providers.openai.effort
+        );
     }
 
     // -- to_px --------------------------------------------------------
@@ -2483,7 +2654,10 @@ mod tests {
             !shown.contains("sk-live-secret-should-not-appear-1234"),
             "the real key must never reach the control's text: {shown}"
         );
-        assert!(shown.ends_with("1234"), "the last four characters must still be visible: {shown}");
+        assert!(
+            shown.ends_with("1234"),
+            "the last four characters must still be visible: {shown}"
+        );
 
         unsafe {
             let _ = DestroyWindow(hwnd);

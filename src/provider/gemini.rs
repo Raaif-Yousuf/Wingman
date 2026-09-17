@@ -60,7 +60,11 @@ pub struct Gemini {
 }
 
 impl Gemini {
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>, effort: impl Into<String>) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             model: model.into(),
@@ -109,14 +113,22 @@ impl Gemini {
             generation_config["responseJsonSchema"] = schema.clone();
         }
 
-        let effort = if req.effort != Effort::Unset { req.effort } else { self.effort };
+        let effort = if req.effort != Effort::Unset {
+            req.effort
+        } else {
+            self.effort
+        };
         if supports_thinking(&self.model) {
             if let Some(level) = effort.as_str() {
                 generation_config["thinkingConfig"] = json!({"thinkingLevel": level});
             }
         }
 
-        let max_tokens = if req.max_tokens > 0 { req.max_tokens } else { DEFAULT_MAX_TOKENS };
+        let max_tokens = if req.max_tokens > 0 {
+            req.max_tokens
+        } else {
+            DEFAULT_MAX_TOKENS
+        };
         generation_config["maxOutputTokens"] = json!(max_tokens);
 
         json!({
@@ -132,9 +144,13 @@ impl Gemini {
     /// (`promptFeedback.blockReason` with no candidates at all) rather than
     /// treating either as a malformed response.
     fn parse_completion(body: &str) -> Result<Completion> {
-        let value: Value = serde_json::from_str(body).context("gemini: response body is not valid JSON")?;
+        let value: Value =
+            serde_json::from_str(body).context("gemini: response body is not valid JSON")?;
 
-        let candidates = value.get("candidates").and_then(Value::as_array).filter(|c| !c.is_empty());
+        let candidates = value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .filter(|c| !c.is_empty());
 
         let candidates = match candidates {
             Some(c) => c,
@@ -156,7 +172,10 @@ impl Gemini {
         let candidate = &candidates[0];
         let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
 
-        if matches!(finish_reason, Some("SAFETY") | Some("RECITATION") | Some("PROHIBITED_CONTENT")) {
+        if matches!(
+            finish_reason,
+            Some("SAFETY") | Some("RECITATION") | Some("PROHIBITED_CONTENT")
+        ) {
             return Err(anyhow!(
                 "gemini: the model declined to answer ({})",
                 finish_reason.unwrap_or("unknown reason")
@@ -164,7 +183,11 @@ impl Gemini {
         }
 
         let mut text = String::new();
-        if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(Value::as_array) {
+        if let Some(parts) = candidate
+            .get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(Value::as_array)
+        {
             for part in parts {
                 if let Some(t) = part.get("text").and_then(Value::as_str) {
                     text.push_str(t);
@@ -192,8 +215,14 @@ impl Gemini {
         };
 
         let usage = value.get("usageMetadata").map(|u| Usage {
-            input_tokens: u.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32,
-            output_tokens: u.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32,
+            input_tokens: u
+                .get("promptTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+            output_tokens: u
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
         });
 
         Ok(Completion { text, usage, stop })
@@ -299,7 +328,10 @@ mod tests {
         let provider = Gemini::new("AIza-test", "gemini-3.8-flash", "low");
         let body = provider.build_body(&req("system prompt text", false));
 
-        let expected_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sample_shot().png);
+        let expected_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &sample_shot().png,
+        );
 
         let expected = json!({
             "systemInstruction": {"parts": [{"text": "system prompt text"}]},
@@ -321,7 +353,9 @@ mod tests {
 
         // Guard against the deprecated/wrong spellings.
         assert!(body["generationConfig"].get("responseSchema").is_none());
-        assert!(body["generationConfig"]["responseJsonSchema"].get("propertyOrdering").is_none());
+        assert!(body["generationConfig"]["responseJsonSchema"]
+            .get("propertyOrdering")
+            .is_none());
     }
 
     #[test]
@@ -329,7 +363,10 @@ mod tests {
         let provider = Gemini::new("k", "gemini-3.8-flash", "low");
         let body = provider.build_body(&req("sys", false));
         let parts = body["contents"][0]["parts"].as_array().unwrap();
-        assert!(parts[0].get("inline_data").is_some(), "image part must come first: {parts:?}");
+        assert!(
+            parts[0].get("inline_data").is_some(),
+            "image part must come first: {parts:?}"
+        );
         assert_eq!(parts.last().unwrap()["text"], "Check my working.");
     }
 
@@ -345,7 +382,10 @@ mod tests {
         assert!(parts[0].get("inline_data").is_some());
         assert!(parts[1].get("inline_data").is_some());
         assert!(parts[2].get("text").is_some());
-        assert_ne!(parts[0]["inline_data"]["data"], parts[1]["inline_data"]["data"]);
+        assert_ne!(
+            parts[0]["inline_data"]["data"],
+            parts[1]["inline_data"]["data"]
+        );
     }
 
     #[test]
@@ -358,9 +398,14 @@ mod tests {
             schema["properties"]["difficulty"],
             json!({"type": "string", "enum": ["1","2","3","4","5","6","7","8","9","10","U","N"]})
         );
-        assert_eq!(schema["required"], json!(["detail", "headline", "difficulty"]));
+        assert_eq!(
+            schema["required"],
+            json!(["detail", "headline", "difficulty"])
+        );
 
-        let system = body["systemInstruction"]["parts"][0]["text"].as_str().unwrap();
+        let system = body["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
         assert!(system.starts_with("system prompt text"));
         assert!(system.contains("difficulty"));
     }
@@ -369,10 +414,15 @@ mod tests {
     fn build_body_is_unchanged_when_difficulty_off() {
         let provider = Gemini::new("k", "gemini-3.8-flash", "low");
         let with_flag = provider.build_body(&req("system prompt text", false));
-        assert_eq!(with_flag["systemInstruction"]["parts"][0]["text"], "system prompt text");
-        assert!(with_flag["generationConfig"]["responseJsonSchema"]["properties"]
-            .get("difficulty")
-            .is_none());
+        assert_eq!(
+            with_flag["systemInstruction"]["parts"][0]["text"],
+            "system prompt text"
+        );
+        assert!(
+            with_flag["generationConfig"]["responseJsonSchema"]["properties"]
+                .get("difficulty")
+                .is_none()
+        );
     }
 
     #[test]
@@ -396,11 +446,14 @@ mod tests {
     fn response_json_schema_preserves_property_order() {
         let provider = Gemini::new("k", "gemini-3.8-flash", "low");
         let body = provider.build_body(&req("sys", true));
-        let schema_str = serde_json::to_string(&body["generationConfig"]["responseJsonSchema"]).unwrap();
+        let schema_str =
+            serde_json::to_string(&body["generationConfig"]["responseJsonSchema"]).unwrap();
 
         let detail_pos = schema_str.find("\"detail\"").expect("detail present");
         let headline_pos = schema_str.find("\"headline\"").expect("headline present");
-        let difficulty_pos = schema_str.find("\"difficulty\"").expect("difficulty present");
+        let difficulty_pos = schema_str
+            .find("\"difficulty\"")
+            .expect("difficulty present");
         assert!(detail_pos < headline_pos, "{schema_str}");
         assert!(headline_pos < difficulty_pos, "{schema_str}");
     }
@@ -456,7 +509,10 @@ mod tests {
     fn non_empty_effort_is_still_sent_for_a_3x_model() {
         let provider = Gemini::new("k", "gemini-3.8-flash", "high");
         let body = provider.build_body(&req("sys", false));
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
     }
 
     #[test]
@@ -475,7 +531,10 @@ mod tests {
         let mut r = req("sys", false);
         r.effort = Effort::High;
         let body = provider.build_body(&r);
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
     }
 
     // -- ready / capabilities ------------------------------------------------
@@ -505,11 +564,15 @@ mod tests {
 
     #[test]
     fn parse_completion_extracts_text_and_usage_from_the_fixture() {
-        let body = fs::read_to_string("tests/fixtures/gemini_response.json").expect("fixture file should exist");
+        let body = fs::read_to_string("tests/fixtures/gemini_response.json")
+            .expect("fixture file should exist");
         let completion = Gemini::parse_completion(&body).expect("should parse");
         let answer = parse_answer(&completion.text).expect("should parse as an Answer");
         assert_eq!(answer.headline, "42 m/s is correct");
-        assert_eq!(answer.detail, "v = u + at = 0 + 9.8*4.3 = 42.1, rounds to 42.");
+        assert_eq!(
+            answer.detail,
+            "v = u + at = 0 + 9.8*4.3 = 42.1, rounds to 42."
+        );
         assert_eq!(answer.difficulty, None);
         assert_eq!(completion.stop, StopReason::Complete);
         let usage = completion.usage.expect("usageMetadata present in fixture");
@@ -590,7 +653,8 @@ mod tests {
 
     #[test]
     fn parse_completion_rejects_safety_finish_reason() {
-        let body = fs::read_to_string("tests/fixtures/gemini_response_safety.json").expect("fixture file should exist");
+        let body = fs::read_to_string("tests/fixtures/gemini_response_safety.json")
+            .expect("fixture file should exist");
         let err = Gemini::parse_completion(&body).unwrap_err();
         assert!(err.to_string().contains("declined to answer"), "{err}");
         assert!(err.to_string().contains("SAFETY"), "{err}");
@@ -606,7 +670,8 @@ mod tests {
 
     #[test]
     fn parse_completion_rejects_prohibited_content_finish_reason() {
-        let body = r#"{"candidates": [{"finishReason": "PROHIBITED_CONTENT", "content": {"parts": []}}]}"#;
+        let body =
+            r#"{"candidates": [{"finishReason": "PROHIBITED_CONTENT", "content": {"parts": []}}]}"#;
         let err = Gemini::parse_completion(body).unwrap_err();
         assert!(err.to_string().contains("declined to answer"), "{err}");
         assert!(err.to_string().contains("PROHIBITED_CONTENT"), "{err}");

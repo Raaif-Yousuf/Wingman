@@ -180,7 +180,14 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         // Never hold any lock across this call (there is none to hold
         // here, but keep the property explicit: no allocation, no lock,
         // just a post) and never let its result change what we return.
-        let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_DISMISS, WPARAM(0), LPARAM(packed as isize)) };
+        let _ = unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_APP_DISMISS,
+                WPARAM(0),
+                LPARAM(packed as isize),
+            )
+        };
     }
 
     // Never swallow the click: it must still reach whatever the user

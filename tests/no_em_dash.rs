@@ -80,7 +80,11 @@ fn scan(path: &Path, src: &str) -> Vec<Violation> {
                     continue;
                 }
                 if c == '*' && chars.get(i + 1) == Some(&'/') {
-                    state = if d > 1 { State::BlockComment(d - 1) } else { State::Normal };
+                    state = if d > 1 {
+                        State::BlockComment(d - 1)
+                    } else {
+                        State::Normal
+                    };
                     i += 2;
                     continue;
                 }
@@ -106,7 +110,10 @@ fn scan(path: &Path, src: &str) -> Vec<Violation> {
                         if chars.get(k) == Some(&'}') {
                             if let Ok(cp) = u32::from_str_radix(&hex, 16) {
                                 if cp == 0x2014 && test_mod_depths.is_empty() {
-                                    violations.push(Violation { file: path.to_path_buf(), line });
+                                    violations.push(Violation {
+                                        file: path.to_path_buf(),
+                                        line,
+                                    });
                                 }
                             }
                             i = k + 1;
@@ -126,7 +133,10 @@ fn scan(path: &Path, src: &str) -> Vec<Violation> {
                     continue;
                 }
                 if c == '\u{2014}' && test_mod_depths.is_empty() {
-                    violations.push(Violation { file: path.to_path_buf(), line });
+                    violations.push(Violation {
+                        file: path.to_path_buf(),
+                        line,
+                    });
                 }
                 i += 1;
                 continue;
@@ -141,7 +151,10 @@ fn scan(path: &Path, src: &str) -> Vec<Violation> {
                     }
                 }
                 if c == '\u{2014}' && test_mod_depths.is_empty() {
-                    violations.push(Violation { file: path.to_path_buf(), line });
+                    violations.push(Violation {
+                        file: path.to_path_buf(),
+                        line,
+                    });
                 }
                 i += 1;
                 continue;
@@ -248,7 +261,9 @@ fn scan(path: &Path, src: &str) -> Vec<Violation> {
         }
         if pending_test_attr && !c.is_whitespace() {
             let next3: String = chars[i..].iter().take(3).collect();
-            let word_boundary = !chars.get(i + 3).is_some_and(|c| c.is_alphanumeric() || *c == '_');
+            let word_boundary = !chars
+                .get(i + 3)
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_');
             if next3 == "mod" && word_boundary {
                 awaiting_test_mod_brace = true;
             }
@@ -302,8 +317,12 @@ fn deliberate_exemption_matches_its_named_line_only() {
     ));
     // Narrow, not a blanket match on any mention of a scratchpad or an em
     // dash: an unrelated line must still be caught.
-    assert!(!is_deliberately_exempt("let bad = \"oops \\u{2014} scratchpad em dash\";"));
-    assert!(!is_deliberately_exempt("let bad = \"an unrelated em dash \\u{2014} here\";"));
+    assert!(!is_deliberately_exempt(
+        "let bad = \"oops \\u{2014} scratchpad em dash\";"
+    ));
+    assert!(!is_deliberately_exempt(
+        "let bad = \"an unrelated em dash \\u{2014} here\";"
+    ));
 }
 
 #[test]
@@ -314,12 +333,15 @@ fn no_em_dash_in_user_facing_string_literals() {
     let mut files = Vec::new();
     collect_rs_files(&src_dir, &mut files);
     files.sort();
-    assert!(!files.is_empty(), "expected to find *.rs files under {src_dir:?}");
+    assert!(
+        !files.is_empty(),
+        "expected to find *.rs files under {src_dir:?}"
+    );
 
     let mut violations = Vec::new();
     for file in &files {
-        let src =
-            std::fs::read_to_string(file).unwrap_or_else(|e| panic!("failed to read {file:?}: {e}"));
+        let src = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("failed to read {file:?}: {e}"));
         for v in scan(file, &src) {
             let line_text = src.lines().nth(v.line.saturating_sub(1)).unwrap_or("");
             if is_deliberately_exempt(line_text) {
@@ -367,7 +389,11 @@ mod tests {
 ";
     let violations = scan(Path::new("fixture.rs"), src);
     let lines: Vec<usize> = violations.iter().map(|v| v.line).collect();
-    assert_eq!(lines, vec![5, 6], "expected exactly the two real-code violations, got {lines:?}");
+    assert_eq!(
+        lines,
+        vec![5, 6],
+        "expected exactly the two real-code violations, got {lines:?}"
+    );
 }
 
 /// Issue #179: a normal string literal that spells the em dash as the Rust
@@ -388,7 +414,11 @@ fn f() {
 ";
     let violations = scan(Path::new("fixture.rs"), src);
     let lines: Vec<usize> = violations.iter().map(|v| v.line).collect();
-    assert_eq!(lines, vec![2], "expected the \\u{{2014}} escape to be caught on its line");
+    assert_eq!(
+        lines,
+        vec![2],
+        "expected the \\u{{2014}} escape to be caught on its line"
+    );
 }
 
 /// The escape-decoding fix must compare the actual decoded codepoint, not

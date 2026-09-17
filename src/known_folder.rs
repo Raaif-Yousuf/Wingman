@@ -16,9 +16,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use windows::core::GUID;
 use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::UI::Shell::{
-    SHGetKnownFolderPath, FOLDERID_RoamingAppData, KNOWN_FOLDER_FLAG,
-};
+use windows::Win32::UI::Shell::{FOLDERID_RoamingAppData, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG};
 
 /// Resolves a known-folder GUID (e.g. `FOLDERID_RoamingAppData`) to its path
 /// via `SHGetKnownFolderPath`.

@@ -114,7 +114,10 @@ pub fn days_in_month(year: i32, month: u8) -> u8 {
 pub fn next_day(d: LocalDate) -> LocalDate {
     let last = days_in_month(d.year, d.month);
     if d.day < last {
-        LocalDate { day: d.day + 1, ..d }
+        LocalDate {
+            day: d.day + 1,
+            ..d
+        }
     } else if d.month < 12 {
         LocalDate {
             year: d.year,
@@ -205,24 +208,48 @@ mod tests {
     #[test]
     fn next_day_within_month() {
         assert_eq!(
-            next_day(LocalDate { year: 2026, month: 9, day: 16 }),
-            LocalDate { year: 2026, month: 9, day: 17 }
+            next_day(LocalDate {
+                year: 2026,
+                month: 9,
+                day: 16
+            }),
+            LocalDate {
+                year: 2026,
+                month: 9,
+                day: 17
+            }
         );
     }
 
     #[test]
     fn next_day_rolls_month() {
         assert_eq!(
-            next_day(LocalDate { year: 2026, month: 9, day: 30 }),
-            LocalDate { year: 2026, month: 10, day: 1 }
+            next_day(LocalDate {
+                year: 2026,
+                month: 9,
+                day: 30
+            }),
+            LocalDate {
+                year: 2026,
+                month: 10,
+                day: 1
+            }
         );
     }
 
     #[test]
     fn next_day_rolls_year() {
         assert_eq!(
-            next_day(LocalDate { year: 2026, month: 12, day: 31 }),
-            LocalDate { year: 2027, month: 1, day: 1 }
+            next_day(LocalDate {
+                year: 2026,
+                month: 12,
+                day: 31
+            }),
+            LocalDate {
+                year: 2027,
+                month: 1,
+                day: 1
+            }
         );
     }
 
@@ -231,8 +258,16 @@ mod tests {
         // 2028 is a leap year: Feb 28 -> Feb 29, not straight to March.
         assert!(is_leap_year(2028));
         assert_eq!(
-            next_day(LocalDate { year: 2028, month: 2, day: 28 }),
-            LocalDate { year: 2028, month: 2, day: 29 }
+            next_day(LocalDate {
+                year: 2028,
+                month: 2,
+                day: 28
+            }),
+            LocalDate {
+                year: 2028,
+                month: 2,
+                day: 29
+            }
         );
     }
 
@@ -240,8 +275,16 @@ mod tests {
     fn next_day_non_leap_february() {
         assert!(!is_leap_year(2026));
         assert_eq!(
-            next_day(LocalDate { year: 2026, month: 2, day: 28 }),
-            LocalDate { year: 2026, month: 3, day: 1 }
+            next_day(LocalDate {
+                year: 2026,
+                month: 2,
+                day: 28
+            }),
+            LocalDate {
+                year: 2026,
+                month: 3,
+                day: 1
+            }
         );
     }
 
@@ -259,8 +302,16 @@ mod tests {
     #[test]
     fn next_day_leap_day_rolls_to_march() {
         assert_eq!(
-            next_day(LocalDate { year: 2028, month: 2, day: 29 }),
-            LocalDate { year: 2028, month: 3, day: 1 }
+            next_day(LocalDate {
+                year: 2028,
+                month: 2,
+                day: 29
+            }),
+            LocalDate {
+                year: 2028,
+                month: 3,
+                day: 1
+            }
         );
     }
 

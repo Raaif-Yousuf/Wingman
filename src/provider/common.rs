@@ -113,14 +113,27 @@ impl Transport for UreqTransport {
         let headers = response
             .headers()
             .iter()
-            .map(|(name, value)| (name.as_str().to_string(), value.to_str().unwrap_or_default().to_string()))
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
             .collect();
-        let body = response.body_mut().read_to_string().map_err(|e| TransportError::BodyReadFailed {
-            status,
-            error: format!("failed to read response body: {e}"),
-        })?;
+        let body =
+            response
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| TransportError::BodyReadFailed {
+                    status,
+                    error: format!("failed to read response body: {e}"),
+                })?;
 
-        Ok(RawResponse { status, headers, body })
+        Ok(RawResponse {
+            status,
+            headers,
+            body,
+        })
     }
 }
 
@@ -246,7 +259,10 @@ fn jittered_backoff(attempt: u32, base: Duration, cap: Duration) -> Duration {
 /// (`Retry-After` vs `retry-after`) and HTTP header names are
 /// case-insensitive by spec regardless.
 fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
 }
 
 /// Parses a `retry-after` header value: either delta-seconds (`"30"`, both
@@ -254,7 +270,10 @@ fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a st
 /// (`"Wed, 21 Oct 2026 07:28:00 GMT"`). `clock` resolves the date form to a
 /// duration from "now", which is what makes this testable without the real
 /// clock. Returns `None` when the header is absent or neither form parses.
-pub(crate) fn parse_retry_after(headers: &[(String, String)], clock: &dyn Clock) -> Option<Duration> {
+pub(crate) fn parse_retry_after(
+    headers: &[(String, String)],
+    clock: &dyn Clock,
+) -> Option<Duration> {
     let raw = find_header(headers, "retry-after")?.trim();
     if let Ok(secs) = raw.parse::<u64>() {
         return Some(Duration::from_secs(secs));
@@ -344,7 +363,10 @@ fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
 /// (rule 11).
 fn rate_limited_error(tag: &str, retry_after: Option<Duration>) -> anyhow::Error {
     match retry_after {
-        Some(d) => anyhow!("{tag}: too many requests. Retry after {} seconds.", d.as_secs()),
+        Some(d) => anyhow!(
+            "{tag}: too many requests. Retry after {} seconds.",
+            d.as_secs()
+        ),
         None => anyhow!("{tag}: too many requests. No retry-after time was given."),
     }
 }
@@ -405,8 +427,12 @@ pub(crate) fn post_json_with(
     // keep resetting its own budget. `wall_clock_remaining()` shrinks every
     // time it's called after real time (or, in a test, an injected `Clock`)
     // has advanced.
-    let deadline_unix = env.clock.now_unix().saturating_add(policy.max_total_wall_clock.as_secs());
-    let wall_clock_remaining = || Duration::from_secs(deadline_unix.saturating_sub(env.clock.now_unix()));
+    let deadline_unix = env
+        .clock
+        .now_unix()
+        .saturating_add(policy.max_total_wall_clock.as_secs());
+    let wall_clock_remaining =
+        || Duration::from_secs(deadline_unix.saturating_sub(env.clock.now_unix()));
 
     loop {
         // Each attempt gets the smaller of the caller's requested timeout
@@ -423,11 +449,16 @@ pub(crate) fn post_json_with(
             // as a fresh attempt; surfaces immediately, naming the status
             // that was received so the card is honest about what's known.
             Err(TransportError::BodyReadFailed { status, error }) => {
-                return Err(anyhow!("{tag}: HTTP {status} received, then failed reading the response body: {error}"));
+                return Err(anyhow!(
+                    "{tag}: HTTP {status} received, then failed reading the response body: {error}"
+                ));
             }
             Err(TransportError::NoResponse(transport_err)) => {
                 let backoff_remaining = policy.max_total_backoff.saturating_sub(backoff_spent);
-                if retries < policy.max_retries && !backoff_remaining.is_zero() && wall_clock_remaining() > policy.retry_floor {
+                if retries < policy.max_retries
+                    && !backoff_remaining.is_zero()
+                    && wall_clock_remaining() > policy.retry_floor
+                {
                     let delay = jittered_backoff(retries, policy.base_delay, backoff_remaining);
                     env.sleeper.sleep(delay);
                     backoff_spent += delay;
@@ -457,7 +488,10 @@ pub(crate) fn post_json_with(
 
                 if resp.status >= 500 {
                     let backoff_remaining = policy.max_total_backoff.saturating_sub(backoff_spent);
-                    if retries < policy.max_retries && !backoff_remaining.is_zero() && wall_clock_remaining() > policy.retry_floor {
+                    if retries < policy.max_retries
+                        && !backoff_remaining.is_zero()
+                        && wall_clock_remaining() > policy.retry_floor
+                    {
                         let delay = jittered_backoff(retries, policy.base_delay, backoff_remaining);
                         env.sleeper.sleep(delay);
                         backoff_spent += delay;
@@ -476,7 +510,13 @@ pub(crate) fn post_json_with(
 /// retries per [`RetryPolicy::default`] (#98: transport errors, 5xx, and a
 /// bounded single 429 retry), and returns the raw response body text for
 /// any 2xx status. See [`post_json_with`] for the exact retry semantics.
-pub(crate) fn post_json(url: &str, headers: &[(&str, &str)], body: &Value, timeout: Duration, tag: &str) -> Result<String> {
+pub(crate) fn post_json(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &Value,
+    timeout: Duration,
+    tag: &str,
+) -> Result<String> {
     let policy = RetryPolicy::default();
     let env = RetryEnv {
         transport: &UreqTransport,
@@ -718,7 +758,10 @@ mod tests {
         ) -> std::result::Result<RawResponse, TransportError> {
             *self.calls.lock().unwrap() += 1;
             let mut responses = self.responses.lock().unwrap();
-            assert!(!responses.is_empty(), "transport called more times than scripted");
+            assert!(
+                !responses.is_empty(),
+                "transport called more times than scripted"
+            );
             responses.remove(0)
         }
     }
@@ -729,7 +772,9 @@ mod tests {
 
     impl RecordingSleeper {
         fn new() -> Self {
-            Self { sleeps: Mutex::new(Vec::new()) }
+            Self {
+                sleeps: Mutex::new(Vec::new()),
+            }
         }
 
         fn recorded(&self) -> Vec<Duration> {
@@ -764,18 +809,31 @@ mod tests {
         })
     }
 
-    fn status(code: u16, headers: Vec<(&str, &str)>, body: &str) -> std::result::Result<RawResponse, TransportError> {
+    fn status(
+        code: u16,
+        headers: Vec<(&str, &str)>,
+        body: &str,
+    ) -> std::result::Result<RawResponse, TransportError> {
         Ok(RawResponse {
             status: code,
-            headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             body: body.to_string(),
         })
     }
 
     /// A scripted #187 failure: a status was received, then reading the
     /// body failed.
-    fn body_read_failed(status: u16, msg: &str) -> std::result::Result<RawResponse, TransportError> {
-        Err(TransportError::BodyReadFailed { status, error: msg.to_string() })
+    fn body_read_failed(
+        status: u16,
+        msg: &str,
+    ) -> std::result::Result<RawResponse, TransportError> {
+        Err(TransportError::BodyReadFailed {
+            status,
+            error: msg.to_string(),
+        })
     }
 
     fn run(
@@ -790,7 +848,14 @@ mod tests {
             clock,
             policy: &policy,
         };
-        post_json_with(&env, "https://example.invalid/", &[], &json!({}), Duration::from_secs(1), "anthropic")
+        post_json_with(
+            &env,
+            "https://example.invalid/",
+            &[],
+            &json!({}),
+            Duration::from_secs(1),
+            "anthropic",
+        )
     }
 
     // -- #98: retry policy -------------------------------------------------
@@ -810,7 +875,8 @@ mod tests {
 
     #[test]
     fn http_500_then_200_succeeds() {
-        let transport = ScriptedTransport::new(vec![status(500, vec![], "server error"), ok("done")]);
+        let transport =
+            ScriptedTransport::new(vec![status(500, vec![], "server error"), ok("done")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
 
@@ -848,8 +914,11 @@ mod tests {
 
     #[test]
     fn transport_errors_stop_after_max_retries_within_the_backoff_budget() {
-        let transport =
-            ScriptedTransport::new(vec![no_response("e1"), no_response("e2"), no_response("e3")]);
+        let transport = ScriptedTransport::new(vec![
+            no_response("e1"),
+            no_response("e2"),
+            no_response("e3"),
+        ]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
 
@@ -879,10 +948,19 @@ mod tests {
             1,
             "#187: never retried -- the vendor almost certainly already received (and may have billed) the request"
         );
-        assert!(sleeper.recorded().is_empty(), "no retry means no backoff sleep either");
+        assert!(
+            sleeper.recorded().is_empty(),
+            "no retry means no backoff sleep either"
+        );
         let msg = err.to_string();
-        assert!(msg.contains("200"), "names the status that was received: {msg}");
-        assert!(msg.contains("connection reset"), "names the underlying error: {msg}");
+        assert!(
+            msg.contains("200"),
+            "names the status that was received: {msg}"
+        );
+        assert!(
+            msg.contains("connection reset"),
+            "names the underlying error: {msg}"
+        );
     }
 
     #[test]
@@ -932,10 +1010,22 @@ mod tests {
             clock: &clock,
             policy: &policy,
         };
-        let err = post_json_with(&env, "https://example.invalid/", &[], &json!({}), Duration::from_secs(1), "openai").unwrap_err();
+        let err = post_json_with(
+            &env,
+            "https://example.invalid/",
+            &[],
+            &json!({}),
+            Duration::from_secs(1),
+            "openai",
+        )
+        .unwrap_err();
 
         assert_eq!(transport.call_count(), 2, "exactly one 429 retry");
-        assert_eq!(sleeper.recorded(), vec![Duration::from_secs(3)], "the stated delay, not jittered");
+        assert_eq!(
+            sleeper.recorded(),
+            vec![Duration::from_secs(3)],
+            "the stated delay, not jittered"
+        );
         let msg = err.to_string();
         assert!(msg.contains("openai"), "names the provider: {msg}");
         assert!(msg.contains("3 seconds"), "names the retry-after: {msg}");
@@ -944,7 +1034,10 @@ mod tests {
 
     #[test]
     fn http_429_that_recovers_on_retry_succeeds() {
-        let transport = ScriptedTransport::new(vec![status(429, vec![("retry-after", "2")], "slow down"), ok("done")]);
+        let transport = ScriptedTransport::new(vec![
+            status(429, vec![("retry-after", "2")], "slow down"),
+            ok("done"),
+        ]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
 
@@ -956,13 +1049,18 @@ mod tests {
 
     #[test]
     fn http_429_with_long_retry_after_never_retries() {
-        let transport = ScriptedTransport::new(vec![status(429, vec![("retry-after", "30")], "slow down")]);
+        let transport =
+            ScriptedTransport::new(vec![status(429, vec![("retry-after", "30")], "slow down")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
 
         let err = run(&transport, &sleeper, &clock).unwrap_err();
 
-        assert_eq!(transport.call_count(), 1, "delay over the threshold: no retry");
+        assert_eq!(
+            transport.call_count(),
+            1,
+            "delay over the threshold: no retry"
+        );
         assert!(sleeper.recorded().is_empty());
         assert!(err.to_string().contains("30 seconds"));
     }
@@ -982,7 +1080,10 @@ mod tests {
 
     #[test]
     fn http_429_retry_after_is_case_insensitive() {
-        let transport = ScriptedTransport::new(vec![status(429, vec![("Retry-After", "1")], "slow down"), ok("done")]);
+        let transport = ScriptedTransport::new(vec![
+            status(429, vec![("Retry-After", "1")], "slow down"),
+            ok("done"),
+        ]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
 
@@ -995,7 +1096,11 @@ mod tests {
     #[test]
     fn http_429_retry_after_http_date_is_resolved_against_the_injected_clock() {
         let transport = ScriptedTransport::new(vec![
-            status(429, vec![("retry-after", "Thu, 01 Jan 1970 00:00:04 GMT")], "slow down"),
+            status(
+                429,
+                vec![("retry-after", "Thu, 01 Jan 1970 00:00:04 GMT")],
+                "slow down",
+            ),
             ok("done"),
         ]);
         let sleeper = RecordingSleeper::new();
@@ -1010,7 +1115,11 @@ mod tests {
     #[test]
     fn http_429_http_date_already_in_the_past_retries_immediately() {
         let transport = ScriptedTransport::new(vec![
-            status(429, vec![("retry-after", "Thu, 01 Jan 1970 00:00:01 GMT")], "slow down"),
+            status(
+                429,
+                vec![("retry-after", "Thu, 01 Jan 1970 00:00:01 GMT")],
+                "slow down",
+            ),
             ok("done"),
         ]);
         let sleeper = RecordingSleeper::new();
@@ -1055,7 +1164,10 @@ mod tests {
 
     impl<'a> HangingTransport<'a> {
         fn new(clock: &'a FakeClock) -> Self {
-            Self { clock, timeouts_seen: Mutex::new(Vec::new()) }
+            Self {
+                clock,
+                timeouts_seen: Mutex::new(Vec::new()),
+            }
         }
 
         fn timeouts_seen(&self) -> Vec<Duration> {
@@ -1087,15 +1199,39 @@ mod tests {
             retry_floor: Duration::from_secs(10),
             ..RetryPolicy::default()
         };
-        let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
 
-        let err = post_json_with(&env, "https://example.invalid/", &[], &json!({}), Duration::from_secs(90), "anthropic")
-            .unwrap_err();
+        let err = post_json_with(
+            &env,
+            "https://example.invalid/",
+            &[],
+            &json!({}),
+            Duration::from_secs(90),
+            "anthropic",
+        )
+        .unwrap_err();
 
         let timeouts = transport.timeouts_seen();
-        assert_eq!(timeouts.len(), 3, "max_retries=2 still allows 3 attempts here");
-        assert_eq!(timeouts[0], Duration::from_secs(90), "first attempt: full budget available, unaffected");
-        assert_eq!(timeouts[1], Duration::from_secs(90), "second attempt: still enough budget left");
+        assert_eq!(
+            timeouts.len(),
+            3,
+            "max_retries=2 still allows 3 attempts here"
+        );
+        assert_eq!(
+            timeouts[0],
+            Duration::from_secs(90),
+            "first attempt: full budget available, unaffected"
+        );
+        assert_eq!(
+            timeouts[1],
+            Duration::from_secs(90),
+            "second attempt: still enough budget left"
+        );
         assert_eq!(
             timeouts[2],
             Duration::from_secs(20),
@@ -1118,10 +1254,22 @@ mod tests {
             retry_floor: Duration::from_secs(10),
             ..RetryPolicy::default()
         };
-        let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
 
-        let err = post_json_with(&env, "https://example.invalid/", &[], &json!({}), Duration::from_secs(90), "openai")
-            .unwrap_err();
+        let err = post_json_with(
+            &env,
+            "https://example.invalid/",
+            &[],
+            &json!({}),
+            Duration::from_secs(90),
+            "openai",
+        )
+        .unwrap_err();
 
         let timeouts = transport.timeouts_seen();
         assert_eq!(
@@ -1130,7 +1278,10 @@ mod tests {
             "remaining budget (5s) is below the floor (10s) after the first attempt: no second attempt at all"
         );
         assert_eq!(timeouts[0], Duration::from_secs(90));
-        assert!(sleeper.recorded().is_empty(), "never slept for a retry it wasn't going to make");
+        assert!(
+            sleeper.recorded().is_empty(),
+            "never slept for a retry it wasn't going to make"
+        );
         assert!(err.to_string().contains("transport error"));
     }
 
@@ -1139,14 +1290,23 @@ mod tests {
     #[test]
     fn parse_retry_after_reads_delta_seconds() {
         let headers = vec![("retry-after".to_string(), "45".to_string())];
-        assert_eq!(parse_retry_after(&headers, &FixedClock(0)), Some(Duration::from_secs(45)));
+        assert_eq!(
+            parse_retry_after(&headers, &FixedClock(0)),
+            Some(Duration::from_secs(45))
+        );
     }
 
     #[test]
     fn parse_retry_after_reads_http_date() {
-        let headers = vec![("retry-after".to_string(), "Wed, 21 Oct 2026 07:28:00 GMT".to_string())];
+        let headers = vec![(
+            "retry-after".to_string(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+        )];
         // Reference value cross-checked against `date -u -d ... +%s`.
-        assert_eq!(parse_http_date("Wed, 21 Oct 2026 07:28:00 GMT"), Some(1_792_567_680));
+        assert_eq!(
+            parse_http_date("Wed, 21 Oct 2026 07:28:00 GMT"),
+            Some(1_792_567_680)
+        );
         assert_eq!(
             parse_retry_after(&headers, &FixedClock(1_792_567_680 - 10)),
             Some(Duration::from_secs(10))
@@ -1162,8 +1322,16 @@ mod tests {
 
     #[test]
     fn parse_http_date_rejects_a_year_with_the_wrong_digit_count() {
-        assert_eq!(parse_http_date("Wed, 21 Oct 26 07:28:00 GMT"), None, "2-digit year");
-        assert_eq!(parse_http_date("Wed, 21 Oct 20266 07:28:00 GMT"), None, "5-digit year");
+        assert_eq!(
+            parse_http_date("Wed, 21 Oct 26 07:28:00 GMT"),
+            None,
+            "2-digit year"
+        );
+        assert_eq!(
+            parse_http_date("Wed, 21 Oct 20266 07:28:00 GMT"),
+            None,
+            "5-digit year"
+        );
     }
 
     #[test]
@@ -1177,7 +1345,10 @@ mod tests {
         // if it ever reached it (the digit-count guard must reject it
         // first). This must return None, not panic (overflow checks are on
         // in a debug/test build) or silently wrap (the release profile).
-        assert_eq!(parse_http_date("Wed, 21 Oct 999999999999999 07:28:00 GMT"), None);
+        assert_eq!(
+            parse_http_date("Wed, 21 Oct 999999999999999 07:28:00 GMT"),
+            None
+        );
     }
 
     #[test]
@@ -1215,7 +1386,9 @@ mod tests {
     // -- Offline guard (#19) ------------------------------------------------
 
     fn mode_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::mode::MODE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::mode::MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -1227,7 +1400,12 @@ mod tests {
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
         let policy = RetryPolicy::default();
-        let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
 
         let err = post_json_with(
             &env,
@@ -1241,7 +1419,11 @@ mod tests {
 
         crate::mode::set_current(crate::mode::Mode::Auto);
 
-        assert_eq!(transport.call_count(), 0, "the guard must refuse before the transport is ever invoked");
+        assert_eq!(
+            transport.call_count(),
+            0,
+            "the guard must refuse before the transport is ever invoked"
+        );
         assert!(sleeper.recorded().is_empty());
         let msg = err.to_string();
         assert!(msg.contains("Offline"), "{msg}");
@@ -1257,7 +1439,12 @@ mod tests {
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
         let policy = RetryPolicy::default();
-        let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
 
         let err = post_json_with(
             &env,
@@ -1285,7 +1472,12 @@ mod tests {
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
         let policy = RetryPolicy::default();
-        let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
 
         let result = post_json_with(
             &env,
@@ -1305,14 +1497,23 @@ mod tests {
     #[test]
     fn offline_guard_is_inert_outside_offline_mode() {
         let _g = mode_guard();
-        for mode in [crate::mode::Mode::Cloud, crate::mode::Mode::Local, crate::mode::Mode::Auto] {
+        for mode in [
+            crate::mode::Mode::Cloud,
+            crate::mode::Mode::Local,
+            crate::mode::Mode::Auto,
+        ] {
             crate::mode::set_current(mode);
 
             let transport = ScriptedTransport::new(vec![ok("done")]);
             let sleeper = RecordingSleeper::new();
             let clock = FixedClock(0);
             let policy = RetryPolicy::default();
-            let env = RetryEnv { transport: &transport, sleeper: &sleeper, clock: &clock, policy: &policy };
+            let env = RetryEnv {
+                transport: &transport,
+                sleeper: &sleeper,
+                clock: &clock,
+                policy: &policy,
+            };
 
             let result = post_json_with(
                 &env,
@@ -1323,7 +1524,11 @@ mod tests {
                 "openai",
             );
 
-            assert_eq!(result.unwrap(), "done", "mode {mode:?} must not block a non-loopback request");
+            assert_eq!(
+                result.unwrap(),
+                "done",
+                "mode {mode:?} must not block a non-loopback request"
+            );
             assert_eq!(transport.call_count(), 1, "mode {mode:?}");
         }
         crate::mode::set_current(crate::mode::Mode::Auto);

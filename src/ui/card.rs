@@ -76,24 +76,23 @@ use windows::Win32::Graphics::Gdi::{
     ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject, GetTextMetricsW,
     IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect, SelectClipRgn,
     SelectObject, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT, DT_CENTER,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP,
-    DT_VCENTER, DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
+    DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND,
     PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
-    GetWindowLongPtrW, KillTimer, LoadCursorW, RegisterClassExW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HWND_TOPMOST, IDC_ARROW,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_DESTROY, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW,
+    KillTimer, LoadCursorW, RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, GWL_EXSTYLE, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW,
+    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::provider::Difficulty;
@@ -317,12 +316,7 @@ unsafe fn register_class(instance: HINSTANCE) -> bool {
 /// `GWLP_USERDATA` on `WM_NCCREATE`, then forwards every subsequent message to
 /// [`CardInner::handle_message`], falling back to `DefWindowProcW` for
 /// anything that method does not claim.
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         let cs = &*(lparam.0 as *const CREATESTRUCTW);
         if !cs.lpCreateParams.is_null() {
@@ -628,7 +622,11 @@ fn build_fonts(dpi: u32, text_scale: f32) -> Fonts {
 fn scaled_height(base_height: i32, factor: f32) -> i32 {
     let v = (base_height as f32 * factor).round() as i32;
     if v == 0 {
-        if base_height < 0 { -1 } else { 1 }
+        if base_height < 0 {
+            -1
+        } else {
+            1
+        }
     } else {
         v
     }
@@ -1095,7 +1093,12 @@ impl CardInner {
             }
             let old = SelectObject(hdc, HGDIOBJ(font.0));
             let mut buf = utf16(text);
-            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
             DrawTextW(
                 hdc,
                 &mut buf,
@@ -1104,7 +1107,10 @@ impl CardInner {
             );
             SelectObject(hdc, old);
             ReleaseDC(None, hdc);
-            ((rect.right - rect.left).max(1), (rect.bottom - rect.top).max(1))
+            (
+                (rect.right - rect.left).max(1),
+                (rect.bottom - rect.top).max(1),
+            )
         }
     }
 
@@ -1324,7 +1330,13 @@ impl CardInner {
 
         // Clip to the padded content area so scrolled text never bleeds into
         // the border/padding.
-        IntersectClipRect(hdc, content_left, content_top, rc.right - padding, content_bottom);
+        IntersectClipRect(
+            hdc,
+            content_left,
+            content_top,
+            rc.right - padding,
+            content_bottom,
+        );
 
         let headline_w = self.headline_content_width(content_w);
         let headline_h = self
@@ -1450,7 +1462,12 @@ impl CardInner {
         let _ = DeleteObject(HGDIOBJ(brush.0));
 
         let mut label = utf16(difficulty.label());
-        let mut label_rect = RECT { left, top, right, bottom };
+        let mut label_rect = RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
         SelectObject(hdc, HGDIOBJ(self.fonts.badge.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_color));
         DrawTextW(
@@ -1687,11 +1704,9 @@ mod tests {
         card.show_answer(&long_headline, "detail", 0, Some(Difficulty::Level(10)));
         let narrowed_w = card.inner.headline_content_width(content_w);
         assert!(narrowed_w < content_w);
-        let badge_h = card.inner.measure_wrapped(
-            card.inner.fonts.headline,
-            &card.inner.headline,
-            narrowed_w,
-        );
+        let badge_h =
+            card.inner
+                .measure_wrapped(card.inner.fonts.headline, &card.inner.headline, narrowed_w);
         assert!(badge_h >= no_badge_h);
 
         // The card must still lay out and paint without panicking for every
@@ -1723,22 +1738,34 @@ mod tests {
     fn difficulty_color_gradient_is_sane() {
         // Rank 1: dominantly green.
         let (r, g, b) = channels(difficulty_color(Difficulty::Level(1)));
-        assert!(g > r && g > b, "rank 1 should read as green (r={r} g={g} b={b})");
+        assert!(
+            g > r && g > b,
+            "rank 1 should read as green (r={r} g={g} b={b})"
+        );
 
         // Rank 10: dominantly red.
         let (r, g, b) = channels(difficulty_color(Difficulty::Level(10)));
-        assert!(r > g && r > b, "rank 10 should read as red (r={r} g={g} b={b})");
+        assert!(
+            r > g && r > b,
+            "rank 10 should read as red (r={r} g={g} b={b})"
+        );
 
         // Rank 5 sits at the amber midpoint stop: not muddy brown, i.e. red
         // and green channels should both be well above blue and reasonably
         // close to each other.
         let (r, g, b) = channels(difficulty_color(Difficulty::Level(5)));
-        assert!(r > b && g > b, "rank 5 should read as amber (r={r} g={g} b={b})");
+        assert!(
+            r > b && g > b,
+            "rank 5 should read as amber (r={r} g={g} b={b})"
+        );
 
         // Ultra: purple, outside the gradient -- blue and red both clearly
         // above green.
         let (r, g, b) = channels(difficulty_color(Difficulty::Ultra));
-        assert!(b > g && r > g, "Ultra should read as purple (r={r} g={g} b={b})");
+        assert!(
+            b > g && r > g,
+            "Ultra should read as purple (r={r} g={g} b={b})"
+        );
 
         // All 11 ranks (Level(1..=10) plus Ultra) must be visually
         // distinguishable from one another.
@@ -1763,7 +1790,11 @@ mod tests {
         assert_eq!(badge_text_color(amber), rgb(0x20, 0x20, 0x20));
 
         // Darker fills (green, red, purple) must get white ink.
-        for d in [Difficulty::Level(1), Difficulty::Level(10), Difficulty::Ultra] {
+        for d in [
+            Difficulty::Level(1),
+            Difficulty::Level(10),
+            Difficulty::Ultra,
+        ] {
             let fill = difficulty_color(d);
             assert_eq!(
                 badge_text_color(fill),

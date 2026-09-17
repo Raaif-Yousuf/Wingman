@@ -112,8 +112,14 @@ impl SecretStore for CredManagerStore {
     fn get(&self, target: &str) -> Result<Option<String>> {
         let target_w = wide_z(target);
         let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
-        let result =
-            unsafe { CredReadW(PCWSTR(target_w.as_ptr()), CRED_TYPE_GENERIC, None, &mut cred) };
+        let result = unsafe {
+            CredReadW(
+                PCWSTR(target_w.as_ptr()),
+                CRED_TYPE_GENERIC,
+                None,
+                &mut cred,
+            )
+        };
         match result {
             Ok(()) => {
                 // SAFETY: CredReadW just reported success, so `cred` is a
@@ -265,7 +271,10 @@ mod tests {
         let store = InMemoryStore::default();
         store.set("Wingman/openai", "sk-should-not-appear").unwrap();
         let debug_output = format!("{store:?}");
-        assert!(!debug_output.contains("sk-should-not-appear"), "{debug_output}");
+        assert!(
+            !debug_output.contains("sk-should-not-appear"),
+            "{debug_output}"
+        );
     }
 
     // -- InMemoryStore::poison (#175 test scaffolding) -----------------------
@@ -310,10 +319,7 @@ mod tests {
         // The CredWriteW-convention encoding, in case something other than
         // this module's own `set` (always UTF-8) wrote the blob.
         let text = "sk-utf16-secret";
-        let bytes: Vec<u8> = text
-            .encode_utf16()
-            .flat_map(|u| u.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         assert_eq!(decode_blob(&bytes).unwrap(), text);
     }
 
@@ -398,10 +404,17 @@ mod tests {
 
         // Overwrite: set must replace, not fail or duplicate.
         store.set(&target, "replacement-value").unwrap();
-        assert_eq!(store.get(&target).unwrap().as_deref(), Some("replacement-value"));
+        assert_eq!(
+            store.get(&target).unwrap().as_deref(),
+            Some("replacement-value")
+        );
 
         store.delete(&target).expect("CredDeleteW should succeed");
-        assert_eq!(store.get(&target).unwrap(), None, "deleted target must read back absent");
+        assert_eq!(
+            store.get(&target).unwrap(),
+            None,
+            "deleted target must read back absent"
+        );
 
         // Deleting an already-absent credential is not an error.
         store

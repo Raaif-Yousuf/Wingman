@@ -19,7 +19,11 @@ pub struct OpenAi {
 }
 
 impl OpenAi {
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>, effort: impl Into<String>) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             model: model.into(),
@@ -47,8 +51,16 @@ impl OpenAi {
             }));
         }
 
-        let effort = if req.effort != Effort::Unset { req.effort } else { self.effort };
-        let max_tokens = if req.max_tokens > 0 { req.max_tokens } else { DEFAULT_MAX_TOKENS };
+        let effort = if req.effort != Effort::Unset {
+            req.effort
+        } else {
+            self.effort
+        };
+        let max_tokens = if req.max_tokens > 0 {
+            req.max_tokens
+        } else {
+            DEFAULT_MAX_TOKENS
+        };
 
         let mut body = json!({
             "model": self.model,
@@ -97,7 +109,8 @@ impl OpenAi {
     /// `message` entry on reasoning models, so non-`message` entries are
     /// skipped rather than assumed absent.
     fn parse_completion(body: &str) -> Result<Completion> {
-        let value: Value = serde_json::from_str(body).context("openai: response body is not valid JSON")?;
+        let value: Value =
+            serde_json::from_str(body).context("openai: response body is not valid JSON")?;
 
         let output = value
             .get("output")
@@ -235,7 +248,10 @@ mod tests {
 
         let expected_data_url = format!(
             "data:image/png;base64,{}",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sample_shot().png)
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &sample_shot().png
+            )
         );
 
         let expected = json!({
@@ -297,7 +313,10 @@ mod tests {
             schema["properties"]["difficulty"],
             json!({"type": "string", "enum": ["1","2","3","4","5","6","7","8","9","10","U","N"]})
         );
-        assert_eq!(schema["required"], json!(["detail", "headline", "difficulty"]));
+        assert_eq!(
+            schema["required"],
+            json!(["detail", "headline", "difficulty"])
+        );
 
         // The rubric is appended, not merged into the caller's prompt text.
         let instructions = body["instructions"].as_str().unwrap();
@@ -360,7 +379,10 @@ mod tests {
         let completion = OpenAi::parse_completion(&body).expect("should parse");
         let answer = parse_answer(&completion.text).expect("should parse as an Answer");
         assert_eq!(answer.headline, "42 m/s is correct");
-        assert_eq!(answer.detail, "v = u + at = 0 + 9.8*4.3 = 42.1, rounds to 42.");
+        assert_eq!(
+            answer.detail,
+            "v = u + at = 0 + 9.8*4.3 = 42.1, rounds to 42."
+        );
         // The fixture predates the difficulty field entirely.
         assert_eq!(answer.difficulty, None);
     }
@@ -372,7 +394,10 @@ mod tests {
         ]}]}"#;
         let completion = OpenAi::parse_completion(body).expect("should parse");
         let answer = parse_answer(&completion.text).unwrap();
-        assert_eq!(answer.difficulty, Some(crate::provider::Difficulty::Level(7)));
+        assert_eq!(
+            answer.difficulty,
+            Some(crate::provider::Difficulty::Level(7))
+        );
     }
 
     #[test]

@@ -969,7 +969,10 @@ impl Providers {
     /// [`Providers::build_chain`]'s own behavior. The list
     /// `diagnostics::provider_rows` iterates (issue #201).
     pub(crate) fn describe_all(&self) -> Vec<ProviderDescriptor> {
-        self.order.iter().filter_map(|name| self.describe(name)).collect()
+        self.order
+            .iter()
+            .filter_map(|name| self.describe(name))
+            .collect()
     }
 
     /// [`Config::build_chain`]'s implementation, kept here (rather than
@@ -2919,7 +2922,10 @@ text_scale = 0.0
     fn describe_resolves_a_cloud_provider_model_and_key() {
         let mut config = Config::default();
         config.providers.openai.api_key = "sk-real".to_string();
-        let d = config.providers.describe("openai").expect("openai resolves");
+        let d = config
+            .providers
+            .describe("openai")
+            .expect("openai resolves");
         assert_eq!(d.name, "openai");
         assert_eq!(d.model, config.providers.openai.model);
         assert_eq!(d.api_key.as_deref(), Some("sk-real"));
@@ -2928,7 +2934,10 @@ text_scale = 0.0
     #[test]
     fn describe_ollama_has_no_api_key_concept() {
         let config = Config::default();
-        let d = config.providers.describe("ollama").expect("ollama resolves");
+        let d = config
+            .providers
+            .describe("ollama")
+            .expect("ollama resolves");
         assert_eq!(d.api_key, None);
     }
 

@@ -389,7 +389,10 @@ mode = "auto"
         assert_eq!(a.prefer.mode, "auto");
         assert!(a.group.is_none());
         assert!(a.enabled, "enabled defaults to true when absent");
-        assert!(!a.rate_difficulty, "rate_difficulty defaults to false when absent");
+        assert!(
+            !a.rate_difficulty,
+            "rate_difficulty defaults to false when absent"
+        );
     }
 
     #[test]
@@ -478,7 +481,10 @@ not_a_real_field = true
         new_action.name = "Translate selection".to_string();
         let merged = merge_actions(builtin_actions(), vec![new_action]);
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].action.id, DEFAULT_ACTION_ID, "builtin stays first");
+        assert_eq!(
+            merged[0].action.id, DEFAULT_ACTION_ID,
+            "builtin stays first"
+        );
         assert_eq!(merged[1].action.id, "translate-selection");
         assert_eq!(merged[1].origin, Origin::User);
     }
@@ -495,7 +501,10 @@ not_a_real_field = true
         disabled.enabled = false;
         let merged = merge_actions(builtin_actions(), vec![disabled]);
         let shown = visible(merged, &[]);
-        assert!(default_action(&shown).is_none(), "disabled action must not be visible");
+        assert!(
+            default_action(&shown).is_none(),
+            "disabled action must not be visible"
+        );
     }
 
     #[test]
