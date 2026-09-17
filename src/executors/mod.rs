@@ -10,6 +10,7 @@
 
 mod calendar_add;
 mod clipboard;
+mod image_clipboard;
 mod none;
 pub mod registry;
 pub mod uia_guard;

@@ -137,6 +137,12 @@ pub mod cmd {
     /// until #25's action palette exists.
     pub const CALCULATE_SELECTION: u32 = 1021;
 
+    /// Issue #29: "Copy region to clipboard" -- opens the full-desktop
+    /// region/window-selection overlay (`ui::region::select_region`) and
+    /// copies the chosen crop to the clipboard as `CF_DIB`. See
+    /// `App::copy_region` in `app.rs`.
+    pub const COPY_REGION: u32 = 1022;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -445,6 +451,7 @@ impl Tray {
     fn build_menu(&self, hmenu: HMENU) -> Result<()> {
         append_item(hmenu, cmd::ASK_NOW, "Ask now")?;
         append_item(hmenu, cmd::EXTRACT_TEXT, "Copy text from screen")?;
+        append_item(hmenu, cmd::COPY_REGION, "Copy region to clipboard")?;
         append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
         // #115: works with no provider at all, but still honors Pause
         // (issue #20's rule: nothing Wingman does runs while paused, even
@@ -1204,6 +1211,54 @@ mod tests {
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 
+    // -- #29: "Copy region to clipboard" is reachable from the menu --------
+
+    #[test]
+    fn copy_region_item_is_present_in_the_built_menu() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetMenuItemInfoW, CW_USEDEFAULT, WINDOW_EX_STYLE,
+            WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray copy-region test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+
+        let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu).expect("build_menu");
+
+        let mut info = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STATE,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(hmenu, cmd::COPY_REGION, false, &mut info) }
+            .expect("cmd::COPY_REGION must be a real item id in the built menu, not orphaned data");
+
+        let _ = unsafe { DestroyMenu(hmenu) };
+        drop(tray);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
     // -- submenu attach ordering (#147) -------------------------------------
 
     #[test]
@@ -1272,6 +1327,7 @@ mod tests {
         ("COPY_DIAGNOSTICS", cmd::COPY_DIAGNOSTICS),
         ("EXTRACT_TEXT", cmd::EXTRACT_TEXT),
         ("CALCULATE_SELECTION", cmd::CALCULATE_SELECTION),
+        ("COPY_REGION", cmd::COPY_REGION),
     ];
 
     #[test]

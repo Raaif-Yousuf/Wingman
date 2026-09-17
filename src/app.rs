@@ -536,6 +536,68 @@ impl App {
         });
     }
 
+    /// "Copy region to clipboard" (#29): opens the region/window-selection
+    /// overlay and, on confirm, copies the crop to the clipboard as
+    /// `CF_DIB` via the `"image_clipboard"` executor. Unlike `ask`/
+    /// `extract_text`, this needs no worker thread: opening the overlay
+    /// already blocks the caller (it pumps its own message loop --
+    /// `ui::region::Overlay::run`) until the user is done, and the
+    /// clipboard write itself is local CPU-only work, not a network call --
+    /// there is nothing left here that would justify a second thread. On
+    /// cancel (Esc/right-click) this shows no card at all, the same
+    /// "backing out is not a failure" status `Ok(None)` gets everywhere
+    /// else in this crate (e.g. a declined confirm-card proposal).
+    fn copy_region(&mut self) {
+        if self.busy {
+            return;
+        }
+
+        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
+            self.card.hide();
+            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
+        }
+
+        let raw = match crate::ui::region::select_region(self.instance) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return, // cancelled: no card, nothing changed
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't open the region selector", &format!("{e:#}"));
+                return;
+            }
+        };
+
+        let (width, height) = (raw.width, raw.height);
+        let proposal_value = serde_json::json!({
+            "rgba_base64": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &raw.rgba,
+            ),
+            "width": width,
+            "height": height,
+        });
+
+        let result: Result<()> = (|| {
+            let executor = crate::executors::registry::resolve("image_clipboard")?;
+            let confirmed = crate::ui::confirm::auto_confirm_read_only(
+                executor.as_ref(),
+                crate::ui::confirm::Proposal::new(proposal_value),
+            )?;
+            executor.execute(confirmed)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.card
+                    .show_answer(&format!("Copied {width}x{height} region"), "", 3, None)
+            }
+            Err(e) => self
+                .card
+                .show_error("Couldn't copy the region", &format!("{e:#}")),
+        }
+    }
+
     fn on_result(&mut self, result: std::result::Result<Answer, String>) {
         let is_err = result.is_err();
         let answer = self.record_last(result);
@@ -1800,6 +1862,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
+                    MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
                     MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
                     MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
                     MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
