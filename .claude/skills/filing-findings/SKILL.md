@@ -58,7 +58,10 @@ Unbounded parallel builds have frozen this machine by exhausting RAM.
 
 - **Never run bare `cargo test`** or `cargo test --release`. Run the tests
   you touched: `cargo test <module_or_test_name>`. The orchestrator runs
-  the full suite.
+  the full suite. `scripts/hooks/block_unfiltered_cargo_test.py` enforces
+  this: it denies any `cargo test` invocation with no test-name filter. The
+  orchestrator's full-suite run sets `WINGMAN_FULL_SUITE=1` on the command
+  to bypass the check; that override is not for individual agents to use.
 - Build with `CARGO_BUILD_JOBS=4` and the shared target dir so builds queue
   behind a file lock instead of running in parallel:
   `export CARGO_TARGET_DIR=C:/Users/raaif/copilot-ask/target CARGO_BUILD_JOBS=4`
