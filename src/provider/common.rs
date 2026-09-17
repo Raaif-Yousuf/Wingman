@@ -1,23 +1,21 @@
 //! Shared helpers between `anthropic.rs` and `openai.rs` (#156). Both wrap a
 //! different vendor API, so their request/response *shapes* stay separate —
 //! only the genuinely identical boilerplate lives here: the HTTP send, the
-//! image encoding, the answer JSON Schema, the difficulty-rubric prompt
-//! append, and the answer text parse.
+//! image encoding, the answer JSON Schema and the difficulty-rubric prompt
+//! append.
 //!
-//! `schema_and_prompt`/`parse_answer_text` are physics-answer-specific today
-//! (the only action Wingman has). #12 moves the *call site* of the schema
-//! builder and the prompt augmentation up into `provider::physics_request`
-//! (so a provider never hard-codes the schema again — see the 2026-09-16
-//! expansion plan's "Provider trait, extended"), but the functions
-//! themselves stay here unchanged; only who calls them moves.
+//! `answer_schema`/`augmented_system_prompt` are physics-answer-specific
+//! today (the only action Wingman has), but neither provider calls them any
+//! more: `provider::physics_request` does, and hands the result over as
+//! opaque `Request` fields (see the 2026-09-16 expansion plan's "Provider
+//! trait, extended"). They stay in this file rather than `mod.rs` simply
+//! because that's where the JSON-building imports already are.
 
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use serde_json::{json, Value};
-
-use super::{Answer, Difficulty};
 
 /// POSTs `body` as JSON to `url` with `headers`, waits up to `timeout`, and
 /// returns the raw response body text for any 2xx status.
@@ -68,34 +66,6 @@ pub(crate) fn encode_images_base64(images: &[Vec<u8>]) -> Vec<String> {
         .iter()
         .map(|png| base64::engine::general_purpose::STANDARD.encode(png))
         .collect()
-}
-
-/// The wire shape of the model's JSON payload for the physics-check answer.
-/// Kept separate from the public `Answer` because `difficulty` arrives as a
-/// bare string ("7", "U", ...) that is not a `Difficulty`'s natural
-/// `Deserialize` form — it is parsed explicitly below, and a bad/missing
-/// value must degrade to `None` rather than fail the whole parse.
-#[derive(serde::Deserialize)]
-struct RawAnswer {
-    detail: String,
-    headline: String,
-    #[serde(default)]
-    difficulty: Option<String>,
-}
-
-/// Parses a model's raw JSON answer text (matching [`answer_schema`]) into
-/// an `Answer`. Identical between providers once each has extracted the
-/// text from its own response envelope.
-pub(crate) fn parse_answer_text(tag: &str, text: &str) -> Result<Answer> {
-    let raw: RawAnswer =
-        serde_json::from_str(text).with_context(|| format!("{tag}: text is not a valid Answer"))?;
-    Ok(Answer {
-        detail: raw.detail,
-        headline: raw.headline,
-        // A missing or unparseable difficulty must yield `None`, never an
-        // error -- the answer itself is what matters.
-        difficulty: raw.difficulty.as_deref().and_then(Difficulty::parse),
-    })
 }
 
 /// The JSON Schema for the physics-check `Answer`: `detail` is listed (and

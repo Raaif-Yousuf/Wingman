@@ -4,15 +4,18 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use super::common;
-use super::{Answer, Provider, Shot};
+use super::{Caps, Completion, Effort, Provider, Request, StopReason};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const ENDPOINT: &str = "https://api.openai.com/v1/responses";
+/// Used when `Request::max_tokens` is `0` (the caller has no opinion).
+const DEFAULT_MAX_TOKENS: u32 = 2500;
 
 pub struct OpenAi {
     pub api_key: String,
     pub model: String,
-    pub effort: String,
+    /// The configured default, used when `Request::effort` is `Effort::Unset`.
+    pub effort: Effort,
 }
 
 impl OpenAi {
@@ -20,46 +23,54 @@ impl OpenAi {
         Self {
             api_key: api_key.into(),
             model: model.into(),
-            effort: effort.into(),
+            effort: Effort::parse(&effort.into()),
         }
     }
 
     /// Builds the exact request body documented in the design spec's OpenAI
     /// section. Pure and network-free so it can be unit tested directly.
     ///
-    /// When `want_difficulty` is false this must stay byte-identical to the
-    /// pre-difficulty shape: no `difficulty` property, no rubric text in
-    /// `instructions` (see `build_body_is_unchanged_when_difficulty_off`).
-    fn build_body(&self, shot: &Shot, prompt: &str, want_difficulty: bool) -> Value {
-        let b64 = common::encode_images_base64(std::slice::from_ref(&shot.png))
-            .pop()
-            .expect("exactly one image was passed in");
-        let data_url = format!("data:image/png;base64,{b64}");
+    /// The schema, instructions text and image bytes all come from `req`:
+    /// this provider never builds the physics-check schema itself (#12; see
+    /// the 2026-09-16 expansion plan's "Provider trait, extended").
+    ///
+    /// When `req` has no difficulty rubric folded into `system` this must
+    /// stay byte-identical to the pre-#12 shape (see
+    /// `build_body_is_unchanged_when_difficulty_off`).
+    fn build_body(&self, req: &Request) -> Value {
+        let mut content = vec![json!({"type": "input_text", "text": req.user})];
+        for b64 in common::encode_images_base64(&req.images) {
+            content.push(json!({
+                "type": "input_image",
+                "image_url": format!("data:image/png;base64,{b64}"),
+                "detail": "high"
+            }));
+        }
 
-        let instructions = common::augmented_system_prompt(prompt, want_difficulty);
-        let schema = common::answer_schema(want_difficulty);
+        let effort = if req.effort != Effort::Unset { req.effort } else { self.effort };
+        let max_tokens = if req.max_tokens > 0 { req.max_tokens } else { DEFAULT_MAX_TOKENS };
 
         let mut body = json!({
             "model": self.model,
-            "instructions": instructions,
-            "input": [{"role": "user", "content": [
-                {"type": "input_text", "text": "Check my working."},
-                {"type": "input_image", "image_url": data_url, "detail": "high"}
-            ]}],
-            "reasoning": {"effort": self.effort},
-            "max_output_tokens": 2500,
-            "text": {"format": {
-                "type": "json_schema", "name": "answer", "strict": true,
-                "schema": schema
-            }}
+            "instructions": req.system,
+            "input": [{"role": "user", "content": content}],
+            "reasoning": {"effort": effort.as_str().unwrap_or("")},
+            "max_output_tokens": max_tokens,
         });
 
-        // Mirrors Anthropic's `!self.effort.is_empty()` guard: an empty
-        // `effort` is a plausible hand-edit of config.toml (`effort = ""`
-        // meaning "use the default"), and the Responses API validates
-        // `reasoning.effort` against a fixed enum -- sending an empty
-        // string is a hard 400 on every request, not a no-op (#154).
-        if self.effort.trim().is_empty() {
+        if let Some(schema) = &req.schema {
+            body["text"] = json!({"format": {
+                "type": "json_schema", "name": "answer", "strict": true,
+                "schema": schema
+            }});
+        }
+
+        // Mirrors Anthropic's `effort.as_str().is_none()` guard: `Unset` is
+        // a plausible hand-edit of config.toml (`effort = ""` meaning "use
+        // the default"), and the Responses API validates `reasoning.effort`
+        // against a fixed enum -- sending an empty string is a hard 400 on
+        // every request, not a no-op (#154).
+        if effort.as_str().is_none() {
             body.as_object_mut()
                 .expect("body is always an object")
                 .remove("reasoning");
@@ -68,12 +79,14 @@ impl OpenAi {
         body
     }
 
-    /// Parses a successful (2xx) OpenAI Responses API body into an `Answer`.
+    /// Parses a successful (2xx) OpenAI Responses API body into a
+    /// `Completion`. The text is returned as-is -- this provider never
+    /// interprets it against a schema (#12).
     ///
     /// The `output` array may contain a `reasoning` entry before the
     /// `message` entry on reasoning models, so non-`message` entries are
     /// skipped rather than assumed absent.
-    fn parse_response(body: &str) -> Result<Answer> {
+    fn parse_completion(body: &str) -> Result<Completion> {
         let value: Value = serde_json::from_str(body).context("openai: response body is not valid JSON")?;
 
         let output = value
@@ -95,13 +108,15 @@ impl OpenAi {
             }
         }
 
+        let status = value.get("status").and_then(Value::as_str);
+
         if text.is_empty() {
             // `status: "incomplete"` with no `message` entry means the
             // model spent its whole output-token budget on reasoning and
             // never got to emit the answer -- a specific, reachable shape
             // (see `tests/fixtures/openai_response_no_message.json`), not
             // a generic malformed response (#155).
-            if value.get("status").and_then(Value::as_str) == Some("incomplete") {
+            if status == Some("incomplete") {
                 return Err(anyhow!(
                     "openai: The model ran out of room before answering. Lower the effort setting or raise the token limit."
                 ));
@@ -109,12 +124,22 @@ impl OpenAi {
             return Err(anyhow!("openai: no message text found in output[]"));
         }
 
-        common::parse_answer_text("openai", &text)
+        let stop = match status {
+            Some("incomplete") => StopReason::MaxTokens,
+            Some("completed") => StopReason::Complete,
+            _ => StopReason::Other,
+        };
+
+        Ok(Completion {
+            text,
+            usage: None,
+            stop,
+        })
     }
 }
 
 impl Provider for OpenAi {
-    fn name(&self) -> &'static str {
+    fn id(&self) -> &'static str {
         "openai"
     }
 
@@ -122,8 +147,19 @@ impl Provider for OpenAi {
         !self.api_key.trim().is_empty()
     }
 
-    fn ask(&self, shot: &Shot, prompt: &str, want_difficulty: bool) -> Result<Answer> {
-        let body = self.build_body(shot, prompt, want_difficulty);
+    fn capabilities(&self, _model: &str) -> Caps {
+        // Every model currently offered in Settings (see `Providers::default`
+        // in config.rs) is a gpt-5.x/gpt-4.1 Responses-API model: vision,
+        // strict json_schema and `reasoning.effort` are all supported.
+        Caps {
+            vision: true,
+            json_schema: true,
+            thinking: true,
+        }
+    }
+
+    fn complete(&self, req: &Request) -> Result<Completion> {
+        let body = self.build_body(req);
 
         let auth = format!("Bearer {}", self.api_key);
         let body_text = common::post_json(
@@ -137,14 +173,14 @@ impl Provider for OpenAi {
             "openai",
         )?;
 
-        Self::parse_response(&body_text)
+        Self::parse_completion(&body_text)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
+    use crate::provider::{parse_answer, physics_request, Shot};
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -155,14 +191,18 @@ mod tests {
         }
     }
 
+    fn req(prompt: &str, want_difficulty: bool) -> Request {
+        physics_request(&sample_shot(), prompt, want_difficulty)
+    }
+
     #[test]
     fn build_body_matches_spec_shape() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
-        let body = provider.build_body(&sample_shot(), "system prompt text", false);
+        let body = provider.build_body(&req("system prompt text", false));
 
         let expected_data_url = format!(
             "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(&sample_shot().png)
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sample_shot().png)
         );
 
         let expected = json!({
@@ -190,7 +230,7 @@ mod tests {
     #[test]
     fn build_body_is_unchanged_when_difficulty_off() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
-        let with_flag = provider.build_body(&sample_shot(), "system prompt text", false);
+        let with_flag = provider.build_body(&req("system prompt text", false));
         let today = json!({
             "model": "gpt-5.5",
             "instructions": "system prompt text",
@@ -198,7 +238,7 @@ mod tests {
                 {"type": "input_text", "text": "Check my working."},
                 {"type": "input_image", "image_url": format!(
                     "data:image/png;base64,{}",
-                    base64::engine::general_purpose::STANDARD.encode(&sample_shot().png)
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sample_shot().png)
                 ), "detail": "high"}
             ]}],
             "reasoning": {"effort": "low"},
@@ -217,7 +257,7 @@ mod tests {
     #[test]
     fn build_body_adds_difficulty_property_when_requested() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
-        let body = provider.build_body(&sample_shot(), "system prompt text", true);
+        let body = provider.build_body(&req("system prompt text", true));
 
         let schema = &body["text"]["format"]["schema"];
         assert_eq!(
@@ -239,7 +279,7 @@ mod tests {
     #[test]
     fn golden_request_body_no_difficulty_is_byte_identical() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
-        let body = provider.build_body(&sample_shot(), "system prompt text", false);
+        let body = provider.build_body(&req("system prompt text", false));
         let golden = r#"{"model":"gpt-5.5","instructions":"system prompt text","input":[{"role":"user","content":[{"type":"input_text","text":"Check my working."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw==","detail":"high"}]}],"reasoning":{"effort":"low"},"max_output_tokens":2500,"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"}},"required":["detail","headline"],"additionalProperties":false}}}}"#;
         assert_eq!(serde_json::to_string(&body).unwrap(), golden);
     }
@@ -247,7 +287,7 @@ mod tests {
     #[test]
     fn golden_request_body_with_difficulty_is_byte_identical() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
-        let body = provider.build_body(&sample_shot(), "system prompt text", true);
+        let body = provider.build_body(&req("system prompt text", true));
         let golden = r#"{"model":"gpt-5.5","instructions":"system prompt text\n\nAlso rate how difficult the PROBLEM ON SCREEN is for a HUMAN STUDENT. Add a third field:\n- difficulty: THIRD, after headline, once you have actually worked the problem through. Exactly one of \"1\" through \"10\", or \"U\".\n\nCalibration is the hard part, so read this carefully. You solve nearly all of these easily; that is NOT the scale. Do not rate your own confidence, your own effort, or how quickly you found the answer. Rate how hard the problem would be for a student at the level it is aimed at. Rating by your own effort compresses everything into 1-5 and makes the whole scale useless.\n\nAnchors:\n1 = an easy high-school question. One step, one formula. (speed = distance / time)\n2 = high-school, a couple of steps.\n3 = easy university intro-course level. (a block on an incline; moment of inertia of a disk)\n4 = intro university, several steps or a small subtlety.\n5 = medium university level. Mid-degree material: multi-step, and you must choose the method rather than being told it.\n6 = upper-undergraduate, harder than routine homework.\n7 = hard university level. Typically GRADUATE coursework: quantum perturbation theory, Lagrangian mechanics with constraints, a non-obvious statistical derivation.\n8 = graduate coursework that most of the class would get wrong.\n9 = very hard for an undergraduate. Qualifying-exam standard.\n10 = a PhD student in the field would struggle. Open-ended derivations and proofs requiring a specialist technique, not just more algebra.\nU = Ultra: a professor would struggle. Research-level, or a known-hard proof.\n\nUse the WHOLE range. Most routine homework is 2-5. If the problem is recognisably graduate-level, it starts at 7, not 5. If it asks you to PROVE a general theorem rather than compute a value, it is almost never below 8.\n\nIf there is no problem to rate at all -- the screen shows no question, or you are asking for something to be made visible -- answer \"N\". Do NOT reach for \"U\" in that case: \"U\" means the problem is extraordinarily hard, not that you could not find one.","input":[{"role":"user","content":[{"type":"input_text","text":"Check my working."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw==","detail":"high"}]}],"reasoning":{"effort":"low"},"max_output_tokens":2500,"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"},"difficulty":{"type":"string","enum":["1","2","3","4","5","6","7","8","9","10","U","N"]}},"required":["detail","headline","difficulty"],"additionalProperties":false}}}}"#;
         assert_eq!(serde_json::to_string(&body).unwrap(), golden);
     }
@@ -260,10 +300,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_skips_reasoning_entry_and_extracts_message() {
+    fn capabilities_report_vision_json_schema_and_thinking() {
+        let provider = OpenAi::new("k", "gpt-5.5", "low");
+        let caps = provider.capabilities("gpt-5.5");
+        assert!(caps.vision);
+        assert!(caps.json_schema);
+        assert!(caps.thinking);
+    }
+
+    #[test]
+    fn parse_completion_skips_reasoning_entry_and_extracts_message() {
         let body = fs::read_to_string("tests/fixtures/openai_response.json")
             .expect("fixture file should exist");
-        let answer = OpenAi::parse_response(&body).expect("should parse");
+        let completion = OpenAi::parse_completion(&body).expect("should parse");
+        let answer = parse_answer(&completion.text).expect("should parse as an Answer");
         assert_eq!(answer.headline, "42 m/s is correct");
         assert_eq!(answer.detail, "v = u + at = 0 + 9.8*4.3 = 42.1, rounds to 42.");
         // The fixture predates the difficulty field entirely.
@@ -271,35 +321,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_parses_a_valid_difficulty() {
+    fn parse_completion_parses_a_valid_difficulty() {
         let body = r#"{"output": [{"type": "message", "content": [
             {"text": "{\"detail\": \"d\", \"headline\": \"h\", \"difficulty\": \"7\"}"}
         ]}]}"#;
-        let answer = OpenAi::parse_response(body).expect("should parse");
+        let completion = OpenAi::parse_completion(body).expect("should parse");
+        let answer = parse_answer(&completion.text).unwrap();
         assert_eq!(answer.difficulty, Some(crate::provider::Difficulty::Level(7)));
     }
 
     #[test]
-    fn parse_response_degrades_unparseable_difficulty_to_none_without_erroring() {
+    fn parse_completion_degrades_unparseable_difficulty_to_none_without_erroring() {
         let body = r#"{"output": [{"type": "message", "content": [
             {"text": "{\"detail\": \"d\", \"headline\": \"h\", \"difficulty\": \"not-a-level\"}"}
         ]}]}"#;
-        let answer = OpenAi::parse_response(body).expect("should still parse the answer");
+        let completion = OpenAi::parse_completion(body).expect("should still parse");
+        let answer = parse_answer(&completion.text).expect("should still parse the answer");
         assert_eq!(answer.difficulty, None);
     }
 
     #[test]
-    fn parse_response_missing_difficulty_key_is_none() {
+    fn parse_completion_missing_difficulty_key_is_none() {
         let body = r#"{"output": [{"type": "message", "content": [
             {"text": "{\"detail\": \"d\", \"headline\": \"h\"}"}
         ]}]}"#;
-        let answer = OpenAi::parse_response(body).expect("should parse");
+        let completion = OpenAi::parse_completion(body).expect("should parse");
+        let answer = parse_answer(&completion.text).unwrap();
         assert_eq!(answer.difficulty, None);
     }
 
     #[test]
-    fn parse_response_rejects_invalid_json() {
-        let err = OpenAi::parse_response("not json").unwrap_err();
+    fn parse_completion_rejects_invalid_json() {
+        let err = OpenAi::parse_completion("not json").unwrap_err();
         assert!(err.to_string().contains("not valid JSON"));
     }
 
@@ -309,10 +362,10 @@ mod tests {
     /// That must surface as an actionable, specific message, not the
     /// generic "no message text found" a genuinely malformed body gets.
     #[test]
-    fn parse_response_reports_budget_exhaustion_for_incomplete_status_with_no_message() {
+    fn parse_completion_reports_budget_exhaustion_for_incomplete_status_with_no_message() {
         let body = fs::read_to_string("tests/fixtures/openai_response_no_message.json")
             .expect("fixture file should exist");
-        let err = OpenAi::parse_response(&body).unwrap_err();
+        let err = OpenAi::parse_completion(&body).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ran out of room"), "{msg}");
         assert!(!msg.contains("no message text"), "{msg}");
@@ -322,9 +375,9 @@ mod tests {
     /// "incomplete"` is a genuinely malformed response, not budget
     /// exhaustion, and must keep the generic message.
     #[test]
-    fn parse_response_rejects_body_with_no_message_and_no_incomplete_status() {
+    fn parse_completion_rejects_body_with_no_message_and_no_incomplete_status() {
         let body = r#"{"output": []}"#;
-        let err = OpenAi::parse_response(body).unwrap_err();
+        let err = OpenAi::parse_completion(body).unwrap_err();
         assert!(err.to_string().contains("no message text"));
     }
 
@@ -334,7 +387,7 @@ mod tests {
     #[test]
     fn empty_effort_is_never_sent() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "");
-        let body = provider.build_body(&sample_shot(), "sys", false);
+        let body = provider.build_body(&req("sys", false));
         assert!(body.get("reasoning").is_none());
     }
 
@@ -342,7 +395,7 @@ mod tests {
     #[test]
     fn whitespace_only_effort_is_never_sent() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "   ");
-        let body = provider.build_body(&sample_shot(), "sys", false);
+        let body = provider.build_body(&req("sys", false));
         assert!(body.get("reasoning").is_none());
     }
 
@@ -351,7 +404,29 @@ mod tests {
     #[test]
     fn non_empty_effort_is_still_sent() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
-        let body = provider.build_body(&sample_shot(), "sys", false);
+        let body = provider.build_body(&req("sys", false));
         assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    /// #12 neighbour: a `Request::effort` override takes precedence over
+    /// the provider's own configured default.
+    #[test]
+    fn request_effort_override_takes_precedence_over_configured_default() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
+        let mut r = req("sys", false);
+        r.effort = Effort::High;
+        let body = provider.build_body(&r);
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    /// #12 neighbour: a request with no schema (a future plain-text action)
+    /// must not fabricate a `text` key.
+    #[test]
+    fn no_schema_request_omits_text_format() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
+        let mut r = req("sys", false);
+        r.schema = None;
+        let body = provider.build_body(&r);
+        assert!(body.get("text").is_none());
     }
 }

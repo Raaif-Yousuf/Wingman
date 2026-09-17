@@ -31,7 +31,7 @@ use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::hotkey::{
     chord_to_string, Chord, HotkeyHook, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
 };
-use crate::provider::{Answer, Chain, Shot};
+use crate::provider::{parse_answer, physics_request, Answer, Chain, Shot};
 use crate::ui::card::Card;
 use crate::ui::settings;
 use crate::ui::tray::{cmd, decode, MenuChoice, Tray, WM_APP_TRAY};
@@ -550,7 +550,15 @@ impl App {
 }
 
 fn worker(chain: &Chain, shot: &Shot, prompt: &str, want_difficulty: bool) -> Result<Answer> {
-    chain.ask(shot, prompt, want_difficulty)
+    // #12: the trait moved from `Provider::ask(shot, prompt, want_difficulty)
+    // -> Answer` to `Provider::complete(&Request) -> Completion`, so the
+    // physics-check schema is now built here (via `physics_request`) instead
+    // of inside each provider, and the raw completion text is parsed back
+    // into an `Answer` here too (via `parse_answer`) instead of inside each
+    // provider's response parsing.
+    let req = physics_request(shot, prompt, want_difficulty);
+    let completion = chain.complete(&req)?;
+    parse_answer(&completion.text)
 }
 
 /// First line of an error, truncated on a char boundary, for the headline.
