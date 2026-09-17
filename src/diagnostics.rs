@@ -470,6 +470,7 @@ mod tests {
             model: "some-model".to_string(),
             models: vec!["some-model".to_string()],
             structured: Structured::JsonSchema,
+            vision: true,
         }];
         config.providers.order = vec!["compat:openrouter".to_string()];
 

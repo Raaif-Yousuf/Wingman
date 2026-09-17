@@ -5,6 +5,7 @@ mod actions;
 mod actions_example;
 mod app;
 mod autostart;
+mod calc;
 mod capture;
 mod config;
 #[cfg(test)]
@@ -14,6 +15,7 @@ mod diagnostics;
 mod dismiss;
 mod executors;
 mod hotkey;
+mod hotkey_conflicts;
 mod inputs;
 mod known_folder;
 mod mode;

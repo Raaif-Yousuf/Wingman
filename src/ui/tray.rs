@@ -131,6 +131,11 @@ pub mod cmd {
     /// palette (#25) does not exist yet, so this tray item is the only way
     /// to reach the action today.
     pub const EXTRACT_TEXT: u32 = 1020;
+    /// Issue #115: evaluates the current selection as an arithmetic
+    /// expression or a unit conversion, no model involved. See
+    /// `App::calculate_selection` in `app.rs`. Stands in for a palette entry
+    /// until #25's action palette exists.
+    pub const CALCULATE_SELECTION: u32 = 1021;
 
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
@@ -441,6 +446,16 @@ impl Tray {
         append_item(hmenu, cmd::ASK_NOW, "Ask now")?;
         append_item(hmenu, cmd::EXTRACT_TEXT, "Copy text from screen")?;
         append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
+        // #115: works with no provider at all, but still honors Pause
+        // (issue #20's rule: nothing Wingman does runs while paused, even
+        // the model-free actions), same greyed-while-paused treatment as
+        // the "Set ... key" items just below.
+        append_item_state(
+            hmenu,
+            cmd::CALCULATE_SELECTION,
+            "Calculate selection",
+            !self.paused,
+        )?;
         append_separator(hmenu)?;
         if self.paused {
             append_item(hmenu, cmd::RESUME, "Resume")?;
@@ -1256,6 +1271,7 @@ mod tests {
         ("MODE_OFFLINE", cmd::MODE_OFFLINE),
         ("COPY_DIAGNOSTICS", cmd::COPY_DIAGNOSTICS),
         ("EXTRACT_TEXT", cmd::EXTRACT_TEXT),
+        ("CALCULATE_SELECTION", cmd::CALCULATE_SELECTION),
     ];
 
     #[test]

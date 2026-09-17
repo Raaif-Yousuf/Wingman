@@ -68,6 +68,14 @@ pub struct OpenAiCompat {
     pub auth_header: String,
     pub api_key: String,
     pub structured: Structured,
+    /// Issue #210: whether the configured model actually accepts an image.
+    /// `true` preserves this provider's original behaviour (every compat
+    /// endpoint reported as vision-capable, unconditionally); `false` is
+    /// what lets `capabilities()` report `vision: false`, which is what
+    /// routes this provider through `Chain::complete_parsed_with_fallback`'s
+    /// OCR/UIA text fallback (#18/#206) instead of sending it a screenshot a
+    /// text-only backend can't use.
+    pub vision: bool,
 }
 
 impl OpenAiCompat {
@@ -79,6 +87,7 @@ impl OpenAiCompat {
         auth_header: impl Into<String>,
         api_key: impl Into<String>,
         structured: Structured,
+        vision: bool,
     ) -> Self {
         Self {
             base_url: base_url.into(),
@@ -87,6 +96,7 @@ impl OpenAiCompat {
             auth_header: auth_header.into(),
             api_key: api_key.into(),
             structured,
+            vision,
         }
     }
 
@@ -261,9 +271,12 @@ impl Provider for OpenAiCompat {
 
     /// No live discovery (mirrors Ollama pre-#14, Gemini, OpenAI). `vision`
     /// and `json_schema` are reported from what the endpoint is configured
-    /// to accept, not probed -- a compat endpoint the user pointed at a
-    /// text-only model, or one configured `structured = "prompt"`, is not
-    /// distinguishable from here.
+    /// to accept, not probed: `vision` comes straight from `self.vision`
+    /// (issue #210's `CompatConfig::vision`, `true` by default), the user's
+    /// own declaration of whether the configured model accepts an image --
+    /// there is no way to ask an arbitrary OpenAI-compatible endpoint this
+    /// directly, so unlike Ollama's `is_vision_model` (a model-name
+    /// heuristic) this provider has no independent way to check it.
     ///
     /// `image_limits` (issue #169) is deliberately `None`, unlike the other
     /// four providers: this covers ANY OpenAI-compatible endpoint
@@ -276,7 +289,7 @@ impl Provider for OpenAiCompat {
     /// for this provider.
     fn capabilities(&self, _model: &str) -> Caps {
         Caps {
-            vision: true,
+            vision: self.vision,
             json_schema: matches!(self.structured, Structured::JsonSchema),
             thinking: false,
             image_limits: None,
@@ -349,6 +362,19 @@ mod tests {
             "X-Api-Key",
             "sk-test-key",
             structured,
+            true,
+        )
+    }
+
+    fn provider_vision(auth: CompatAuth, structured: Structured, vision: bool) -> OpenAiCompat {
+        OpenAiCompat::new(
+            "https://example.invalid/v1",
+            "some-model",
+            auth,
+            "X-Api-Key",
+            "sk-test-key",
+            structured,
+            vision,
         )
     }
 
@@ -363,6 +389,7 @@ mod tests {
             "",
             "",
             Structured::Prompt,
+            true,
         );
         assert_eq!(p.endpoint(), "https://example.invalid/v1/chat/completions");
     }
@@ -541,6 +568,7 @@ mod tests {
             "",
             "",
             Structured::Prompt,
+            true,
         );
         assert!(!no_key_bearer.ready());
         let no_key_header = OpenAiCompat::new(
@@ -550,6 +578,7 @@ mod tests {
             "X-Api-Key",
             "",
             Structured::Prompt,
+            true,
         );
         assert!(!no_key_header.ready());
         let no_key_none = OpenAiCompat::new(
@@ -559,20 +588,24 @@ mod tests {
             "",
             "",
             Structured::Prompt,
+            true,
         );
         assert!(no_key_none.ready());
     }
 
     #[test]
     fn ready_is_false_for_an_empty_base_url_regardless_of_auth() {
-        assert!(!OpenAiCompat::new("", "m", CompatAuth::None, "", "", Structured::Prompt).ready());
+        assert!(
+            !OpenAiCompat::new("", "m", CompatAuth::None, "", "", Structured::Prompt, true).ready()
+        );
         assert!(!OpenAiCompat::new(
             "   ",
             "m",
             CompatAuth::Bearer,
             "",
             "sk-x",
-            Structured::Prompt
+            Structured::Prompt,
+            true,
         )
         .ready());
     }
@@ -614,10 +647,62 @@ mod tests {
         );
     }
 
+    // -- vision (issue #210) -----------------------------------------------
+
+    #[test]
+    fn capabilities_reports_vision_true_by_default() {
+        assert!(
+            provider(CompatAuth::None, Structured::Prompt)
+                .capabilities("m")
+                .vision
+        );
+    }
+
+    #[test]
+    fn capabilities_reports_vision_false_when_configured_false() {
+        let p = provider_vision(CompatAuth::None, Structured::Prompt, false);
+        assert!(!p.capabilities("m").vision);
+    }
+
     #[test]
     fn own_caps_matches_capabilities_for_the_configured_model() {
         let p = provider(CompatAuth::None, Structured::Prompt);
         assert_eq!(p.own_caps(), p.capabilities("m"));
+
+        let text_only = provider_vision(CompatAuth::None, Structured::Prompt, false);
+        assert_eq!(text_only.own_caps(), text_only.capabilities("m"));
+        assert!(!text_only.own_caps().vision);
+    }
+
+    /// #210's Done-when, via `Chain::complete_parsed_with_fallback`
+    /// (`provider/mod.rs`): a compat provider configured `vision = false`
+    /// must be the one `Chain` routes through the OCR/UIA fallback instead
+    /// of the raw screenshot -- `Chain` decides this from
+    /// `provider.own_caps().vision` alone (see that method's own doc
+    /// comment), so proving `own_caps().vision` is `false` for a
+    /// `vision:false` `OpenAiCompat` IS proving the wiring end to end. This
+    /// stops short of actually calling `complete_parsed_with_fallback` (the
+    /// shape `provider::mod`'s own
+    /// `fallback_is_invoked_exactly_once_and_reused_across_two_non_vision_providers`
+    /// test uses, against an in-process `Provider` test double) because
+    /// doing that against a REAL `OpenAiCompat` would need its `complete()`
+    /// to actually run, which means a real HTTP call -- forbidden for an
+    /// automated test in this repo (see the ignored live check below
+    /// instead, and CLAUDE.md's "no live API calls").
+    #[test]
+    fn a_compat_provider_configured_text_only_reports_non_vision_to_the_chain() {
+        use crate::provider::Chain;
+
+        let text_only = provider_vision(CompatAuth::None, Structured::JsonSchema, false);
+        let chain = Chain::new(vec![Box::new(text_only)]);
+        let caps = chain
+            .first_ready_caps()
+            .expect("the sole provider has no api key requirement under CompatAuth::None");
+        assert!(
+            !caps.vision,
+            "a vision:false compat entry must report vision:false to Chain, \
+             which is exactly what routes it through the #18/#206 OCR/UIA fallback"
+        );
     }
 
     #[test]
@@ -762,6 +847,7 @@ mod tests {
             "",
             "",
             Structured::JsonSchema,
+            true,
         );
 
         let request = Request {

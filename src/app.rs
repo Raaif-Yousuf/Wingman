@@ -96,6 +96,12 @@ struct App {
     /// Pause (issue #20). Not persisted across restart -- a restart is an
     /// explicit resume (see `pause.rs`'s module doc).
     pause: PauseState,
+    /// Issue #112: the `(slot, chord)` last warned about by
+    /// `hotkey_conflicts::decide`, so capturing the SAME conflicting chord
+    /// twice in a row applies it instead of warning forever. `None` after a
+    /// clean apply, a timeout, or a warn for a different pair -- see
+    /// `on_learned`.
+    pending_conflict: Option<(usize, Chord)>,
 }
 
 pub fn run() -> Result<()> {
@@ -178,6 +184,7 @@ pub fn run() -> Result<()> {
         busy: false,
         last: None,
         pause: PauseState::Running,
+        pending_conflict: None,
     });
     app.refresh_tray_labels();
     // Issue #19: reflect the loaded mode in the tray submenu/icon from the
@@ -608,6 +615,57 @@ impl App {
         }
     }
 
+    /// Issue #115: "Calculate selection" tray item. Model-free: reads the
+    /// current selection (UIA, falling back to a clipboard-safe Ctrl+C --
+    /// see `inputs::selection`) and evaluates it locally via `calc`, with no
+    /// provider involved at all. Still honors Pause (the tray item is
+    /// greyed out while paused, `ui::tray::build_menu`; this guard covers
+    /// every other entry point the same way `ask`'s does) and still runs on
+    /// a worker thread, because `get_selection_foreground` can block on a
+    /// slow UIA provider or another app's own clipboard handling -- the
+    /// message loop must stay responsive regardless.
+    fn calculate_selection(&mut self) {
+        if self.busy {
+            return;
+        }
+        if pause::is_paused_now() {
+            self.card
+                .show_answer("Paused", "Resume from the tray menu to calculate.", 3, None);
+            return;
+        }
+
+        self.busy = true;
+        self.set_watch(false);
+        self.card.show_pending();
+
+        let target = self.hwnd_isize();
+        std::thread::spawn(move || {
+            let result: std::result::Result<Answer, String> = match crate::calc::run_on_selection(
+                &crate::calc::ForegroundSelection,
+            ) {
+                crate::calc::SelectionCalcOutcome::Result { headline } => Ok(Answer {
+                    headline,
+                    detail: String::new(),
+                    difficulty: None,
+                }),
+                crate::calc::SelectionCalcOutcome::NoSelection => Err(
+                    "Nothing selected. Select an expression or a \"<number> <unit> in <unit>\" query first."
+                        .to_string(),
+                ),
+                crate::calc::SelectionCalcOutcome::Error(e) => Err(e.to_string()),
+            };
+            let payload = Box::into_raw(Box::new(result));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                );
+            }
+        });
+    }
+
     fn start_learning(&mut self, which: usize) {
         let Some(hook) = &self.hook else {
             self.card
@@ -629,6 +687,30 @@ impl App {
     }
 
     fn on_learned(&mut self, which: usize, chord: Chord) {
+        // Issue #112: a known system/app shortcut warns and keeps the
+        // previous binding, unless the user just confirmed by capturing the
+        // exact same chord again for this slot -- see
+        // `hotkey_conflicts`'s module doc comment for the full flow.
+        match crate::hotkey_conflicts::decide(self.pending_conflict, which, chord) {
+            crate::hotkey_conflicts::LearnDecision::Warn(conflict) => {
+                self.pending_conflict = Some((which, chord));
+                self.card.show_answer(
+                    &format!(
+                        "{} is already used by {}",
+                        chord_to_string(&chord),
+                        conflict.owner
+                    ),
+                    "Press the same key combo again to bind it anyway, or press a different one. The previous binding is unchanged.",
+                    8,
+                    None,
+                );
+                return;
+            }
+            crate::hotkey_conflicts::LearnDecision::Apply => {
+                self.pending_conflict = None;
+            }
+        }
+
         if which == HK_PRIMARY {
             self.config.hotkeys.primary = chord;
         } else {
@@ -1724,6 +1806,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
                     MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
+                    MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
                     MenuChoice::Command(cmd::USE_OPENAI) => app.set_provider(true),
                     MenuChoice::Command(cmd::USE_ANTHROPIC) => app.set_provider(false),
                     MenuChoice::Command(cmd::PAUSE_1H) => app.pause_for(PauseChoice::OneHour),
