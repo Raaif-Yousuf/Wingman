@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use super::common;
-use super::{Caps, Completion, Effort, Provider, Request, StopReason};
+use super::{Caps, Completion, Effort, ImageLimits, Provider, Request, StopReason};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -150,12 +150,34 @@ impl Provider for Anthropic {
         !self.api_key.trim().is_empty()
     }
 
+    /// Issue #169: `image_limits` is Anthropic's high-resolution tier for
+    /// Claude 4.7+ ([`supports_high_res_tier`]), else the standard tier --
+    /// see `capture.rs`'s `ANTHROPIC_*` constants for the MEASURED source.
     fn capabilities(&self, model: &str) -> Caps {
+        let (max_long_edge, max_pixels) = if supports_high_res_tier(model) {
+            (
+                crate::capture::ANTHROPIC_HIGH_RES_MAX_LONG_EDGE,
+                crate::capture::ANTHROPIC_HIGH_RES_MAX_PIXELS,
+            )
+        } else {
+            (
+                crate::capture::ANTHROPIC_STANDARD_MAX_LONG_EDGE,
+                crate::capture::ANTHROPIC_STANDARD_MAX_PIXELS,
+            )
+        };
         Caps {
             vision: true,
             json_schema: true,
             thinking: supports_effort(model),
+            image_limits: Some(ImageLimits {
+                max_long_edge,
+                max_pixels,
+            }),
         }
+    }
+
+    fn own_caps(&self) -> Caps {
+        self.capabilities(&self.model)
     }
 
     fn complete(&self, req: &Request) -> Result<Completion> {
@@ -190,6 +212,28 @@ impl Provider for Anthropic {
 fn supports_effort(model: &str) -> bool {
     const NO_EFFORT: [&str; 2] = ["claude-haiku-4-5", "claude-sonnet-4-5"];
     !NO_EFFORT.iter().any(|m| model.starts_with(m))
+}
+
+/// Whether `model` is on Anthropic's "high-resolution" image tier (Claude
+/// 4.7 and later: long edge 2576, 4784 visual tokens) rather than the
+/// "standard" tier (long edge 1568, 1568 visual tokens) -- see
+/// `capture.rs`'s `ANTHROPIC_HIGH_RES_MAX_LONG_EDGE`/`ANTHROPIC_STANDARD_MAX_LONG_EDGE`
+/// doc comments for the MEASURED 2026-09-17 source of the two tiers
+/// themselves.
+///
+/// THEORY (unverified): which SPECIFIC models fall in the standard tier is
+/// inferred, not independently confirmed against Anthropic's docs per
+/// model -- this reuses `supports_effort`'s excluded 4.5-generation models
+/// (`claude-haiku-4-5`, `claude-sonnet-4-5`) on the reasoning that a model
+/// old enough to reject `output_config.effort` predates the 4.7+
+/// high-resolution tier too. Everything else in `Providers::default`'s
+/// model list (`claude-opus-5`, `claude-sonnet-5`, `claude-opus-4-8`,
+/// `claude-fable-5-1`) is 4.7 or later by version number, so this degrades
+/// to "not explicitly a known-old model" the same way `supports_effort`
+/// does, rather than a hand-maintained allowlist that silently excludes a
+/// new model release.
+fn supports_high_res_tier(model: &str) -> bool {
+    supports_effort(model)
 }
 
 #[cfg(test)]
@@ -352,6 +396,64 @@ mod tests {
         assert!(caps.vision);
         assert!(caps.json_schema);
         assert!(!caps.thinking);
+    }
+
+    // -- image_limits (issue #169) ---------------------------------------
+
+    #[test]
+    fn capabilities_reports_high_res_image_limits_for_4_7_plus_models() {
+        let provider = Anthropic::new("k", "claude-opus-5", "low");
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-fable-5-1",
+        ] {
+            let limits = provider
+                .capabilities(model)
+                .image_limits
+                .unwrap_or_else(|| panic!("expected image_limits for {model}"));
+            assert_eq!(
+                limits.max_long_edge,
+                crate::capture::ANTHROPIC_HIGH_RES_MAX_LONG_EDGE,
+                "failed for {model}"
+            );
+            assert_eq!(
+                limits.max_pixels,
+                crate::capture::ANTHROPIC_HIGH_RES_MAX_PIXELS,
+                "failed for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_reports_standard_image_limits_for_4_5_generation_models() {
+        let provider = Anthropic::new("k", "claude-opus-5", "low");
+        for model in ["claude-haiku-4-5", "claude-sonnet-4-5"] {
+            let limits = provider
+                .capabilities(model)
+                .image_limits
+                .unwrap_or_else(|| panic!("expected image_limits for {model}"));
+            assert_eq!(
+                limits.max_long_edge,
+                crate::capture::ANTHROPIC_STANDARD_MAX_LONG_EDGE,
+                "failed for {model}"
+            );
+            assert_eq!(
+                limits.max_pixels,
+                crate::capture::ANTHROPIC_STANDARD_MAX_PIXELS,
+                "failed for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_caps_matches_capabilities_for_the_configured_model() {
+        let provider = Anthropic::new("k", "claude-haiku-4-5", "low");
+        assert_eq!(
+            provider.own_caps(),
+            provider.capabilities("claude-haiku-4-5")
+        );
     }
 
     #[test]

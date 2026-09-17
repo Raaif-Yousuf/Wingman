@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use super::common;
-use super::{Caps, Completion, Effort, Provider, Request, StopReason};
+use super::{Caps, Completion, Effort, ImageLimits, Provider, Request, StopReason};
 
 /// Local loopback only -- never `localhost` (CLAUDE.md rule 6: IPv6-first
 /// resolution on Windows stalls ~2 s per connection, MEASURED in the
@@ -236,7 +236,19 @@ impl Provider for Ollama {
             vision: is_vision_model(model),
             json_schema: true,
             thinking: false,
+            // Issue #169: `capture.rs`'s conservative default
+            // (`OLLAMA_CONSERVATIVE_*`) for every model -- there is no
+            // vendor-documented image limit for a user-pulled local model,
+            // see that constant's doc comment (THEORY, unverified).
+            image_limits: Some(ImageLimits {
+                max_long_edge: crate::capture::OLLAMA_CONSERVATIVE_MAX_LONG_EDGE,
+                max_pixels: crate::capture::OLLAMA_CONSERVATIVE_MAX_PIXELS,
+            }),
         }
+    }
+
+    fn own_caps(&self) -> Caps {
+        self.capabilities(&self.model)
     }
 
     fn complete(&self, req: &Request) -> Result<Completion> {
@@ -533,6 +545,33 @@ mod tests {
         let caps = provider.capabilities("gemma3:4b");
         assert!(caps.json_schema);
         assert!(!caps.thinking);
+    }
+
+    // -- image_limits (issue #169) ---------------------------------------
+
+    #[test]
+    fn capabilities_reports_the_conservative_default_regardless_of_model() {
+        let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        for model in ["gemma3:4b", "qwen3:14b"] {
+            let limits = provider
+                .capabilities(model)
+                .image_limits
+                .unwrap_or_else(|| panic!("expected image_limits for {model}"));
+            assert_eq!(
+                limits.max_long_edge,
+                crate::capture::OLLAMA_CONSERVATIVE_MAX_LONG_EDGE
+            );
+            assert_eq!(
+                limits.max_pixels,
+                crate::capture::OLLAMA_CONSERVATIVE_MAX_PIXELS
+            );
+        }
+    }
+
+    #[test]
+    fn own_caps_matches_capabilities_for_the_configured_model() {
+        let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        assert_eq!(provider.own_caps(), provider.capabilities("gemma3:4b"));
     }
 
     #[test]

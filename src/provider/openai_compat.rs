@@ -264,12 +264,27 @@ impl Provider for OpenAiCompat {
     /// to accept, not probed -- a compat endpoint the user pointed at a
     /// text-only model, or one configured `structured = "prompt"`, is not
     /// distinguishable from here.
+    ///
+    /// `image_limits` (issue #169) is deliberately `None`, unlike the other
+    /// four providers: this covers ANY OpenAI-compatible endpoint
+    /// (OpenRouter, Groq, Mistral, DeepSeek, xAI, LM Studio, llama.cpp,
+    /// vLLM, Azure, ...), each potentially proxying a different model with
+    /// a different real limit, so there is no single conservative default
+    /// that is more honest than "unknown" here. A caller sees `None` and
+    /// falls back to the user's own `config.capture.max_edge` heuristic
+    /// (`capture::resolve_limits`), which is exactly the pre-#169 behaviour
+    /// for this provider.
     fn capabilities(&self, _model: &str) -> Caps {
         Caps {
             vision: true,
             json_schema: matches!(self.structured, Structured::JsonSchema),
             thinking: false,
+            image_limits: None,
         }
+    }
+
+    fn own_caps(&self) -> Caps {
+        self.capabilities(&self.model)
     }
 
     fn complete(&self, req: &Request) -> Result<Completion> {
@@ -581,6 +596,28 @@ mod tests {
                 .capabilities("m")
                 .json_schema
         );
+    }
+
+    // -- image_limits (issue #169) ---------------------------------------
+
+    #[test]
+    fn capabilities_reports_no_image_limits_unknown_backend() {
+        // Deliberately `None`, not a conservative default: this provider
+        // covers any OpenAI-compatible endpoint, each potentially proxying
+        // a different model with a different real limit (see this file's
+        // `capabilities()` doc comment).
+        assert_eq!(
+            provider(CompatAuth::None, Structured::Prompt)
+                .capabilities("m")
+                .image_limits,
+            None
+        );
+    }
+
+    #[test]
+    fn own_caps_matches_capabilities_for_the_configured_model() {
+        let p = provider(CompatAuth::None, Structured::Prompt);
+        assert_eq!(p.own_caps(), p.capabilities("m"));
     }
 
     #[test]

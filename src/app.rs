@@ -388,15 +388,33 @@ impl App {
         // build on a 1402x876 image, which froze the message loop for that
         // whole time with nothing on screen after the key press. `encode`
         // now runs on the worker thread below, after `show_pending`.
-        let raw =
-            match capture::grab_raw(&self.config.capture.monitor, self.config.capture.max_edge) {
-                Ok(r) => r,
-                Err(e) => {
-                    self.card
-                        .show_error("Couldn't capture the screen", &format!("{e:#}"));
-                    return;
-                }
-            };
+        //
+        // Issue #169: the downscale target comes from the FIRST provider
+        // `worker` (below) will actually try, not a provider-agnostic
+        // heuristic. That real, mode-aware chain is only built on the
+        // worker thread (its Ollama-reachability probe is a real network
+        // call, and capture is the last thing allowed to block this
+        // thread), so this reuses `readiness_gate`'s same optimistic,
+        // network-free selection (`build_chain_for_mode(mode, true)`) --
+        // "ready" here means "configured", not "reachable right now", which
+        // is exactly the upper bound that gate's own doc comment describes.
+        let optimistic_chain = self
+            .config
+            .providers
+            .build_chain_for_mode(self.config.mode, true);
+        let image_limits = optimistic_chain
+            .first_ready_caps()
+            .and_then(|caps| caps.image_limits);
+        let (max_long_edge, max_pixels) =
+            capture::resolve_limits(image_limits, self.config.capture.max_edge);
+        let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
+            Ok(r) => r,
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
+                return;
+            }
+        };
 
         self.busy = true;
         // Disarmed for the whole in-flight window: a click while the spinner

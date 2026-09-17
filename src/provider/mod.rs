@@ -207,16 +207,38 @@ impl Effort {
 /// by falling back to OCR text plus the UIA tree instead of the screenshot
 /// (see the 2026-09-16 expansion plan, "Provider trait, extended").
 ///
-/// Nothing in Phase 1 reads `capabilities()` yet -- there is no router or
-/// action picker to consult it -- so it and this type are unused outside
-/// tests until Phase 2 lands (`#[allow(dead_code)]`, same as `Shot`'s
-/// `width`/`height` below and `Chain::provider_names`).
-#[allow(dead_code)]
+/// `image_limits` is issue #169's addition and IS read in production today
+/// (via [`Provider::own_caps`] / [`Chain::first_ready_caps`] and
+/// `App::ask`'s capture call site) -- everything else on this type is still
+/// only read by tests, unused until Phase 2's router and action picker exist
+/// to consult it (same status as `Shot`'s `width`/`height` below and
+/// `Chain::provider_names`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Caps {
     pub vision: bool,
     pub json_schema: bool,
     pub thinking: bool,
+    /// This model's real image-size limit, when known -- see
+    /// [`ImageLimits`]. `None` means "not known for this provider/model",
+    /// which the caller (`capture::resolve_limits`) treats as "fall back to
+    /// the user's own `config.capture.max_edge` heuristic", never as "no
+    /// limit at all".
+    pub image_limits: Option<ImageLimits>,
+}
+
+/// A provider's real per-model image-size limit (issue #169): the same
+/// two-constraint shape [`crate::capture::fit_for_model`] already fits
+/// against -- a maximum long edge in pixels, and a maximum total pixel
+/// count (the `u64` avoids an overflow computing `width * height` for a
+/// generous budget). Each provider's `capabilities()` fills this in from
+/// the constants in `capture.rs` (Anthropic's standard/high-res tiers,
+/// OpenAI's tile budget) or a documented/conservative default -- see each
+/// provider file's `capabilities()` doc comment for the source and its
+/// MEASURED/THEORY status (CLAUDE.md rule 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageLimits {
+    pub max_long_edge: u32,
+    pub max_pixels: u64,
 }
 
 /// Token accounting, when a provider's response reports it. Feeds
@@ -302,10 +324,24 @@ pub trait Provider: Send + Sync {
 
     /// What this provider can do for `model`. Vision, structured JSON
     /// output and extended thinking/effort support all vary per model, not
-    /// just per provider. Unused outside tests until Phase 2's router and
-    /// action picker exist to consult it.
-    #[allow(dead_code)]
+    /// just per provider. `image_limits` (issue #169) is read in production
+    /// via [`own_caps`](Provider::own_caps); the rest is still only read by
+    /// tests until Phase 2's router and action picker exist to consult it.
     fn capabilities(&self, model: &str) -> Caps;
+
+    /// This provider's own `Caps` -- i.e. `capabilities()` for whatever
+    /// model it is actually configured with. Lets a caller holding only a
+    /// `Chain` (not the concrete provider objects; see
+    /// [`Chain::first_ready_caps`]) learn what the first ready provider will
+    /// actually do, without needing to know its model string itself (issue
+    /// #169: the capture step needs the image limits of the model the chain
+    /// will use). Defaults to `Caps::default()` -- every real provider
+    /// (`Anthropic`, `OpenAi`, `Gemini`, `Ollama`, `OpenAiCompat`) overrides
+    /// this with `self.capabilities(&self.model)`; only test doubles that
+    /// have no single configured model to report on rely on the default.
+    fn own_caps(&self) -> Caps {
+        Caps::default()
+    }
 
     /// Runs one single-turn request and returns the whole result. No
     /// streaming (owner decision, 2026-09-16, "No chat": every response is
@@ -453,6 +489,19 @@ impl Chain {
             .filter(|p| p.ready())
             .map(|p| p.id())
             .collect()
+    }
+
+    /// The `Caps` -- notably [`Caps::image_limits`] -- of the first `ready()`
+    /// provider in this chain, i.e. the one [`complete_parsed`](Self::complete_parsed)
+    /// will actually try first. `None` when no provider in the chain is
+    /// ready. Issue #169: lets the capture step downscale for whichever
+    /// provider is really going to be asked, instead of a provider-agnostic
+    /// heuristic.
+    pub fn first_ready_caps(&self) -> Option<Caps> {
+        self.providers
+            .iter()
+            .find(|p| p.ready())
+            .map(|p| p.own_caps())
     }
 }
 
@@ -1314,6 +1363,124 @@ mod tests {
     fn parse_answer_rejects_invalid_json() {
         let err = parse_answer("not json").unwrap_err();
         assert!(err.to_string().contains("not a valid Answer"));
+    }
+
+    // -- Caps / ImageLimits / Chain::first_ready_caps (issue #169) -------
+
+    #[test]
+    fn caps_default_has_no_image_limits() {
+        assert_eq!(Caps::default().image_limits, None);
+    }
+
+    #[test]
+    fn provider_default_own_caps_is_caps_default() {
+        // MockProvider does not override `own_caps`, so it must fall back
+        // to the trait's default (`Caps::default()`), proving the default
+        // method itself works without every test double needing its own
+        // impl.
+        let p = MockProvider {
+            id: "a",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: ok_completion,
+        };
+        assert_eq!(p.own_caps(), Caps::default());
+    }
+
+    /// A provider whose `own_caps` is a fixed, non-default value -- lets
+    /// `Chain::first_ready_caps` be tested against a real, distinguishable
+    /// `Caps` rather than only the trait's default.
+    struct FakeCapsProvider {
+        id: &'static str,
+        ready: bool,
+        caps: Caps,
+    }
+
+    impl Provider for FakeCapsProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn ready(&self) -> bool {
+            self.ready
+        }
+        fn capabilities(&self, _model: &str) -> Caps {
+            self.caps
+        }
+        fn own_caps(&self) -> Caps {
+            self.caps
+        }
+        fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+            unreachable!("first_ready_caps must never call complete")
+        }
+    }
+
+    #[test]
+    fn first_ready_caps_returns_the_first_ready_providers_caps() {
+        let limits = ImageLimits {
+            max_long_edge: 1234,
+            max_pixels: 5678,
+        };
+        let a = FakeCapsProvider {
+            id: "a",
+            ready: true,
+            caps: Caps {
+                image_limits: Some(limits),
+                ..Caps::default()
+            },
+        };
+        let b = FakeCapsProvider {
+            id: "b",
+            ready: true,
+            caps: Caps::default(),
+        };
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        assert_eq!(
+            chain.first_ready_caps().and_then(|c| c.image_limits),
+            Some(limits)
+        );
+    }
+
+    #[test]
+    fn first_ready_caps_skips_unready_providers() {
+        let limits = ImageLimits {
+            max_long_edge: 42,
+            max_pixels: 99,
+        };
+        let unready = FakeCapsProvider {
+            id: "unready",
+            ready: false,
+            caps: Caps {
+                image_limits: Some(ImageLimits {
+                    max_long_edge: 1,
+                    max_pixels: 1,
+                }),
+                ..Caps::default()
+            },
+        };
+        let ready = FakeCapsProvider {
+            id: "ready",
+            ready: true,
+            caps: Caps {
+                image_limits: Some(limits),
+                ..Caps::default()
+            },
+        };
+        let chain = Chain::new(vec![Box::new(unready), Box::new(ready)]);
+        assert_eq!(
+            chain.first_ready_caps().and_then(|c| c.image_limits),
+            Some(limits)
+        );
+    }
+
+    #[test]
+    fn first_ready_caps_is_none_when_nothing_is_ready() {
+        let unready = FakeCapsProvider {
+            id: "unready",
+            ready: false,
+            caps: Caps::default(),
+        };
+        let chain = Chain::new(vec![Box::new(unready)]);
+        assert_eq!(chain.first_ready_caps(), None);
     }
 
     // -- strip_near_json (issue #200) ------------------------------------
