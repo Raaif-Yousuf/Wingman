@@ -664,12 +664,14 @@ fn worker(chain: &Chain, shot: &Shot, prompt: &str, want_difficulty: bool) -> Re
     // #12: the trait moved from `Provider::ask(shot, prompt, want_difficulty)
     // -> Answer` to `Provider::complete(&Request) -> Completion`, so the
     // physics-check schema is now built here (via `physics_request`) instead
-    // of inside each provider, and the raw completion text is parsed back
-    // into an `Answer` here too (via `parse_answer`) instead of inside each
-    // provider's response parsing.
+    // of inside each provider.
+    //
+    // #176: `parse_answer` has to run *inside* the chain's fallback loop
+    // (via `complete_parsed`), not after `complete` returns, so a
+    // schema-invalid 200 from one provider falls through to the next ready
+    // provider instead of failing the whole request.
     let req = physics_request(shot, prompt, want_difficulty);
-    let completion = chain.complete(&req)?;
-    parse_answer(&completion.text)
+    chain.complete_parsed(&req, |c| parse_answer(&c.text))
 }
 
 /// First line of an error, truncated on a char boundary, for the headline.
