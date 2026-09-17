@@ -598,6 +598,51 @@ function Invoke-PackageRegistrationPhase {
     }
 }
 
+# --- certificate trust (issue #184) -------------------------------------
+# Windows' deployment service runs as SYSTEM, so it cannot see the per-user
+# store the signing certificate lives in: it has to be exported to a .cer
+# and re-imported into LocalMachine\TrustedPeople by an elevated child
+# process. Idempotent -- if the certificate is already trusted machine-wide,
+# this returns immediately and $CerPath is never created or touched.
+#
+# Moved out of install.ps1 (issue #184) so Pester can Mock -ModuleName
+# Wingman.Common every cmdlet it calls (Get-ChildItem, Export-Certificate,
+# Start-Process, Remove-Item) instead of only being reachable by actually
+# elevating on a real machine. install.ps1 prints its own Step/Note lines
+# around the call; this function is silent so it stays callable the same
+# way from a test.
+#
+# The exported .cer used to be left behind under $CerPath's directory (only
+# ever overwritten by the next run's stage-dir wipe, never deleted): a
+# successful install left a stale wingman.cer sitting around indefinitely.
+# The try/finally below removes it on every path out of this function --
+# the elevated import succeeding, the elevated process exiting non-zero, the
+# post-import verification finding nothing -- not only the success path, so
+# a caller never has to remember to clean it up itself.
+function Confirm-CertTrusted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Cert,
+        [Parameter(Mandatory)][string]$CerPath
+    )
+    $already = Get-ChildItem Cert:\LocalMachine\TrustedPeople -ErrorAction SilentlyContinue |
+               Where-Object { $_.Thumbprint -eq $Cert.Thumbprint }
+    if ($already) { return }
+
+    try {
+        Export-Certificate -Cert $Cert -FilePath $CerPath -Force | Out-Null
+        $inner = "Import-Certificate -FilePath '$CerPath' -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null"
+        $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru `
+             -ArgumentList '-NoProfile', '-NonInteractive', '-Command', $inner
+        if ($p.ExitCode -ne 0) { throw "Trusting the certificate failed (exit $($p.ExitCode)). Without it Windows will refuse the package." }
+
+        $ok = Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object { $_.Thumbprint -eq $Cert.Thumbprint }
+        if (-not $ok) { throw "Certificate did not land in LocalMachine\TrustedPeople." }
+    } finally {
+        Remove-Item $CerPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-WingmanIdentity',
     'Get-CargoVersionString',
@@ -615,5 +660,6 @@ Export-ModuleMember -Function @(
     'Invoke-WingmanSignTool',
     'Publish-WingmanPackage',
     'Get-TopLevelPhaseMarkers',
-    'Test-InstallPhaseOrder'
+    'Test-InstallPhaseOrder',
+    'Confirm-CertTrusted'
 )

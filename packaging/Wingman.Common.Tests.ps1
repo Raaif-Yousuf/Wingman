@@ -864,3 +864,90 @@ Describe 'Publish-WingmanPackage (issue #172)' {
         }
     }
 }
+
+Describe 'Confirm-CertTrusted (issue #184)' {
+    # Moved out of install.ps1 so every cmdlet it calls (Get-ChildItem,
+    # Export-Certificate, Start-Process, Remove-Item) can be mocked here
+    # instead of only being reachable by actually elevating on a real
+    # machine. The function calls Get-ChildItem Cert:\LocalMachine\
+    # TrustedPeople twice for two different purposes -- once to decide
+    # whether trust work is needed at all, once (after a successful
+    # elevated import) to verify it actually took. Both calls target the
+    # same path with -ErrorAction bound only on the first, and that flag is
+    # a PowerShell common parameter that a Pester ParameterFilter cannot
+    # reliably see, so the two calls are told apart by order (a call
+    # counter) instead.
+    BeforeAll {
+        # A genuine (in-memory, never written to any store) X509Certificate2
+        # rather than a fake pscustomobject: Export-Certificate's real -Cert
+        # parameter is typed Microsoft.CertificateServices.Commands.Certificate,
+        # and Pester's Mock preserves that real parameter's argument-
+        # transformation, so a plain pscustomobject fails to bind even though
+        # this whole cmdlet is mocked.
+        $rsa  = [System.Security.Cryptography.RSA]::Create(2048)
+        $req  = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            'CN=Wingman Test Signer', $rsa, [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $script:cert    = $req.CreateSelfSigned([datetimeoffset]::Now.AddDays(-1), [datetimeoffset]::Now.AddYears(1))
+        $script:cerPath = 'TestDrive:\stage\wingman.cer'
+    }
+
+    BeforeEach {
+        $script:getChildItemCall  = 0
+        $script:alreadyTrustedResult = $null  # 1st call: not yet trusted
+        $script:verifiedResult       = $cert  # 2nd call: elevated import took
+
+        Mock -ModuleName Wingman.Common Export-Certificate { }
+        Mock -ModuleName Wingman.Common Remove-Item { }
+        Mock -ModuleName Wingman.Common Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+        Mock -ModuleName Wingman.Common Get-ChildItem {
+            # A real Get-ChildItem with no matches emits nothing at all, not
+            # a null item -- and Where-Object piped a literal $null throws
+            # under this module's Set-StrictMode -Version Latest when it
+            # reads $_.Thumbprint. Mirror the real "no matches" shape (no
+            # output) rather than emitting $null.
+            $script:getChildItemCall++
+            $result = if ($script:getChildItemCall -eq 1) { $script:alreadyTrustedResult } else { $script:verifiedResult }
+            if ($null -ne $result) { $result }
+        }
+    }
+
+    It 'removes the exported .cer after a successful trust' {
+        Confirm-CertTrusted -Cert $cert -CerPath $cerPath
+
+        Should -Invoke -ModuleName Wingman.Common Export-Certificate -Times 1
+        Should -Invoke -ModuleName Wingman.Common Remove-Item -Times 1 -ParameterFilter {
+            $Path -eq $cerPath
+        }
+    }
+
+    It 'removes the exported .cer even when the elevated import exits non-zero' {
+        Mock -ModuleName Wingman.Common Start-Process { [pscustomobject]@{ ExitCode = 1 } }
+
+        { Confirm-CertTrusted -Cert $cert -CerPath $cerPath } | Should -Throw
+
+        Should -Invoke -ModuleName Wingman.Common Remove-Item -Times 1 -ParameterFilter {
+            $Path -eq $cerPath
+        }
+    }
+
+    It 'removes the exported .cer even when post-import verification finds nothing' {
+        $script:verifiedResult = $null
+
+        { Confirm-CertTrusted -Cert $cert -CerPath $cerPath } | Should -Throw
+
+        Should -Invoke -ModuleName Wingman.Common Remove-Item -Times 1 -ParameterFilter {
+            $Path -eq $cerPath
+        }
+    }
+
+    It 'does not export a certificate or attempt any cleanup when already trusted machine-wide' {
+        $script:alreadyTrustedResult = $cert
+
+        Confirm-CertTrusted -Cert $cert -CerPath $cerPath
+
+        Should -Invoke -ModuleName Wingman.Common Export-Certificate -Times 0
+        Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0
+        Should -Invoke -ModuleName Wingman.Common Remove-Item -Times 0
+    }
+}
