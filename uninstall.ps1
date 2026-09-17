@@ -38,8 +38,17 @@ $LegacyDir  = Get-InstallDirPath -LocalAppData $env:LOCALAPPDATA -InstallDirName
 $RunKey     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $BrandedKey = 'HKCU:\Software\Microsoft\Windows\Shell\BrandedKey'
 
-function Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
-function Note($m) { Write-Host "    $m" -ForegroundColor DarkGray }
+function Write-ConsoleLine {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
+        Justification = 'Interactive uninstaller console output. Needs -ForegroundColor for the phase/status coloring this script prints as it runs; Write-Output/Write-Information do not render that the same way in every host, and this text is not meant to be captured by a caller.')]
+    param(
+        [string]$Message = '',
+        [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray
+    )
+    Write-Host $Message -ForegroundColor $ForegroundColor
+}
+function Step($m) { Write-ConsoleLine "==> $m" -ForegroundColor Cyan }
+function Note($m) { Write-ConsoleLine "    $m" -ForegroundColor DarkGray }
 
 # --- stop it -------------------------------------------------------------
 # Killed rather than asked to Quit, so the tray icon can linger as a ghost
@@ -119,14 +128,14 @@ if (-not $KeepCertificate) {
     Note "certificate(s) kept (-KeepCertificate)"
 }
 
-Write-Host ""
+Write-ConsoleLine
 Step "Removed"
 Note "Your config and API keys were left alone, at:"
 Note "  $env:APPDATA\Wingman\config.toml"
 Note "  $env:APPDATA\copilot-ask\config.toml (pre-rename, if present)"
-Write-Host ""
-Write-Host "  To delete those too:" -ForegroundColor Yellow
-Write-Host "  Remove-Item `"`$env:APPDATA\Wingman`" -Recurse -Force" -ForegroundColor Yellow
-Write-Host "  Remove-Item `"`$env:APPDATA\copilot-ask`" -Recurse -Force" -ForegroundColor Yellow
-Write-Host "  Rotate any API key they held -- deleting the file does not revoke it." -ForegroundColor Yellow
-Write-Host ""
+Write-ConsoleLine
+Write-ConsoleLine "  To delete those too:" -ForegroundColor Yellow
+Write-ConsoleLine "  Remove-Item `"`$env:APPDATA\Wingman`" -Recurse -Force" -ForegroundColor Yellow
+Write-ConsoleLine "  Remove-Item `"`$env:APPDATA\copilot-ask`" -Recurse -Force" -ForegroundColor Yellow
+Write-ConsoleLine "  Rotate any API key they held -- deleting the file does not revoke it." -ForegroundColor Yellow
+Write-ConsoleLine

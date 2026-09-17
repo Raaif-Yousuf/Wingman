@@ -191,6 +191,8 @@ function Find-SdkTool {
 # unit-testable without System.Drawing or a real .ico file.
 function Get-LogoSpecs {
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
+        Justification = 'Returns the whole list of logo specs (one per Get-LogoSpecs entry, three today); a singular Get-LogoSpec would misdescribe what one call returns, the same reasoning as Build-Logos above.')]
     param()
     @(
         [pscustomobject]@{ Name = 'Square44x44Logo';   Size = 44  }
@@ -247,6 +249,8 @@ function Build-Logos {
 # when the script itself performs that phase.
 function Get-TopLevelPhaseMarkers {
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
+        Justification = 'Returns one object bundling three named phase markers (Build/RegisterPackage/RemoveLegacyInstall); Get-TopLevelPhaseMarker would misdescribe a single marker when the whole point is comparing all three.')]
     param([Parameter(Mandatory)][string]$ScriptPath)
 
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$null, [ref]$null)

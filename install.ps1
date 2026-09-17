@@ -57,8 +57,17 @@ $LegacyDir  = Get-InstallDirPath -LocalAppData $env:LOCALAPPDATA -InstallDirName
 $StageDir   = Join-Path $Repo 'target\msix'
 $RunKey     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 
-function Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
-function Note($m) { Write-Host "    $m" -ForegroundColor DarkGray }
+function Write-ConsoleLine {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
+        Justification = 'Interactive installer console output. Needs -ForegroundColor for the phase/status coloring this script prints as it runs; Write-Output/Write-Information do not render that the same way in every host, and this text is not meant to be captured by a caller.')]
+    param(
+        [string]$Message = '',
+        [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray
+    )
+    Write-Host $Message -ForegroundColor $ForegroundColor
+}
+function Step($m) { Write-ConsoleLine "==> $m" -ForegroundColor Cyan }
+function Note($m) { Write-ConsoleLine "    $m" -ForegroundColor DarkGray }
 
 # --- Windows SDK tools, package logos ---------------------------------------
 # Find-SdkTool and Build-Logos used to be duplicated here and in
@@ -89,7 +98,7 @@ function Get-SigningCert {
 # Windows' deployment service runs as SYSTEM, so it cannot see a per-user store:
 # the certificate has to reach LocalMachine\TrustedPeople, and that needs admin.
 # This is the only elevated step, and only the first time.
-function Ensure-CertTrusted($cert, $cerPath) {
+function Confirm-CertTrusted($cert, $cerPath) {
     $already = Get-ChildItem Cert:\LocalMachine\TrustedPeople -ErrorAction SilentlyContinue |
                Where-Object { $_.Thumbprint -eq $cert.Thumbprint }
     if ($already) { Note "certificate already trusted machine-wide"; return }
@@ -182,7 +191,7 @@ if (-not (Test-Path $built)) { throw "No executable at $built. Run without -Skip
 $cert = Get-SigningCert
 if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
-Ensure-CertTrusted $cert (Join-Path $StageDir 'wingman.cer')
+Confirm-CertTrusted $cert (Join-Path $StageDir 'wingman.cer')
 
 Step "Signing the executable"
 # A sparse package's external executable must carry the package's signature;
@@ -233,17 +242,17 @@ $pkg = $registration.Package
 Remove-LegacyInstall
 
 # --- report ------------------------------------------------------------------
-Write-Host ""
+Write-ConsoleLine
 Step "Installed"
 Note "package   $($pkg.PackageFullName)"
 Note "exe       $InstallDir\$($Identity.Current.ExeName)"
 Note "autostart $(if ($NoAutostart) { 'skipped' } else { 'on' })"
 Note "config    $env:APPDATA\Wingman\config.toml (untouched; a pre-rename copilot-ask\config.toml, if any, is migrated forward on first run)"
-Write-Host ""
-Write-Host "  Set the Copilot key to it:" -ForegroundColor Yellow
-Write-Host "  Settings > Bluetooth & devices > Keyboard > Customize Copilot key" -ForegroundColor Yellow
-Write-Host "  on keyboard > Custom > Wingman" -ForegroundColor Yellow
-Write-Host ""
+Write-ConsoleLine
+Write-ConsoleLine "  Set the Copilot key to it:" -ForegroundColor Yellow
+Write-ConsoleLine "  Settings > Bluetooth & devices > Keyboard > Customize Copilot key" -ForegroundColor Yellow
+Write-ConsoleLine "  on keyboard > Custom > Wingman" -ForegroundColor Yellow
+Write-ConsoleLine
 
 Step "Starting it"
 Start-Process (Join-Path $InstallDir $Identity.Current.ExeName) -ArgumentList '--settings'

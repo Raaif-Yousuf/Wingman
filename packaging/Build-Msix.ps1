@@ -12,7 +12,7 @@
   store or the HKCU Run key: it only builds and (if a certificate is
   supplied) signs the two artifacts a GitHub release needs. It exists so
   release.yml can produce an MSIX on a CI runner with no interactive session
-  and no admin rights, which install.ps1's Ensure-CertTrusted step requires.
+  and no admin rights, which install.ps1's Confirm-CertTrusted step requires.
 
   Find-SdkTool and Build-Logos are shared with install.ps1 via
   Wingman.Common.psm1 (issue #164) rather than duplicated, so the two scripts
@@ -54,8 +54,17 @@ $Repo     = Split-Path $PSScriptRoot -Parent
 $Identity = Get-WingmanIdentity
 $StageDir = Join-Path $Repo 'target\msix'
 
-function Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
-function Note($m) { Write-Host "    $m" -ForegroundColor DarkGray }
+function Write-ConsoleLine {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
+        Justification = 'Interactive/CI-log console output. Needs -ForegroundColor for the phase/status coloring this script prints as it runs; Write-Output/Write-Information do not render that the same way in every host, and this text is not meant to be captured by a caller.')]
+    param(
+        [string]$Message = '',
+        [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray
+    )
+    Write-Host $Message -ForegroundColor $ForegroundColor
+}
+function Step($m) { Write-ConsoleLine "==> $m" -ForegroundColor Cyan }
+function Note($m) { Write-ConsoleLine "    $m" -ForegroundColor DarkGray }
 
 if (-not (Test-Path $ExePath)) {
     throw "No executable at $ExePath. Run 'cargo build --release' first."
@@ -71,7 +80,7 @@ $cert = $null
 if ($PfxPath) {
     if (-not $PfxPassword) { throw "-PfxPassword is required with -PfxPath." }
     Step "Importing the signing certificate"
-    # CurrentUser store: no admin needed. Unlike install.ps1's Ensure-CertTrusted,
+    # CurrentUser store: no admin needed. Unlike install.ps1's Confirm-CertTrusted,
     # this never reaches LocalMachine\TrustedPeople, so it never elevates -- the
     # resulting package can be built and signed, just not deployed with
     # Add-AppxPackage on THIS machine (that needs the cert trusted machine-wide

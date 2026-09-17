@@ -336,6 +336,8 @@ Describe 'Find-SdkTool (issue #164: shared with packaging\Build-Msix.ps1)' {
     # function only defined in the Describe block's own scope.
     BeforeAll {
         function New-FakeSdkVersion {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+                Justification = 'Test-only fixture helper that writes exclusively under $TestDrive; ShouldProcess ceremony would add nothing a Pester test needs to confirm before creating its own fixture files.')]
             param([string]$Root, [string]$Version, [string[]]$Arches, [bool]$Complete = $true)
             foreach ($arch in $Arches) {
                 $bin = Join-Path $Root "$Version\$arch"
