@@ -8,6 +8,18 @@ use crate::hotkey::Chord;
 use crate::provider::{Anthropic, Chain, Ollama, OpenAi, Provider, DEFAULT_PROMPT};
 use crate::secrets::{target_name, CredManagerStore, SecretStore};
 
+/// Sentinel `hydrate_secrets` writes into a `ProviderConfig::api_key` field
+/// when the store has a credential for that provider but [`SecretStore::get`]
+/// returned `Err` (#175: a transient `CredReadW` failure, or a blob this
+/// build cannot decode). Never a real key -- the control characters make it
+/// impossible for a pasted key to collide with it by accident.
+/// `push_secrets_to_store` recognises this marker and leaves that provider's
+/// credential in the store untouched (instead of deleting it) unless the
+/// field no longer holds the marker, i.e. the user typed something else;
+/// `ui::settings` recognises it too, to show the field as
+/// present-but-unreadable instead of masked stars.
+pub const UNREADABLE_KEY_MARKER: &str = "\u{1}wingman-credential-unreadable\u{1}";
+
 /// `%APPDATA%\Wingman\config.toml`. See the design spec's "Config"
 /// section for the authoritative shape.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
@@ -17,6 +29,13 @@ pub struct Config {
     pub capture: Capture,
     pub providers: Providers,
     pub ui: Ui,
+    /// Provider names (`"openai"`, `"anthropic"`) [`Config::hydrate_secrets`]
+    /// could not read a stored credential for (#175). Load-time diagnostic
+    /// only -- never persisted (`#[serde(skip)]`), so a caller with access to
+    /// the card (`app.rs`) can surface it once right after `Config::load()`
+    /// without config.toml ever carrying it forward.
+    #[serde(skip)]
+    pub unreadable_secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -345,15 +364,36 @@ impl Config {
     /// only in the store still reaches the providers. Never overwrites a
     /// non-empty field (in particular, one an env override already set),
     /// which is what keeps env vars taking precedence.
+    ///
+    /// Tri-state per #175, matching [`SecretStore::get`]'s own contract:
+    /// `Ok(None)` (absent) leaves the field blank, exactly as before;
+    /// `Ok(Some(secret))` fills it; `Err` (unreadable -- a transient
+    /// `CredReadW` failure, or an undecodable blob) writes
+    /// [`UNREADABLE_KEY_MARKER`] instead of leaving the field blank, and
+    /// records the provider in [`Config::unreadable_secrets`]. The old code
+    /// only matched `Ok(Some(_))`, so `Err` fell through to "leave blank" --
+    /// indistinguishable from "never had a key" -- and the next `save()`
+    /// deleted the credential this hydrate could not even read.
     fn hydrate_secrets(&mut self, store: &dyn SecretStore) {
         for (provider, key) in [
             ("openai", &mut self.providers.openai.api_key),
             ("anthropic", &mut self.providers.anthropic.api_key),
         ] {
-            if key.is_empty() {
-                if let Ok(Some(secret)) = store.get(&target_name(provider)) {
-                    *key = secret;
-                }
+            if !key.is_empty() {
+                continue;
+            }
+            match store.get(&target_name(provider)) {
+                Ok(Some(secret)) => *key = secret,
+                Ok(None) => {}
+                Err(_) => *key = UNREADABLE_KEY_MARKER.to_string(),
+            }
+        }
+        for (provider, key) in [
+            ("openai", &self.providers.openai.api_key),
+            ("anthropic", &self.providers.anthropic.api_key),
+        ] {
+            if key == UNREADABLE_KEY_MARKER {
+                self.unreadable_secrets.push(provider.to_string());
             }
         }
     }
@@ -391,6 +431,14 @@ impl Config {
     ///   empty was indistinguishable from "never had a key", the old
     ///   credential stayed put, and the next `hydrate_secrets` silently put
     ///   it straight back.
+    /// - **Still [`UNREADABLE_KEY_MARKER`] (#175):** the field carries
+    ///   [`Config::hydrate_secrets`]'s marker for a credential that could
+    ///   not be read, untouched by the user (a real key or a deliberate
+    ///   clear would have overwritten it with something else). The store is
+    ///   left exactly as it was -- neither deleted nor overwritten -- so a
+    ///   save the user never intended for this field can never destroy a
+    ///   credential this build simply could not read back. The field is
+    ///   still blanked so the marker itself never reaches config.toml.
     ///
     /// `env_is_set` is injected (rather than calling `std::env::var`
     /// directly) so tests exercise this without touching real process env.
@@ -411,6 +459,10 @@ impl Config {
             }
 
             let target = target_name(provider);
+            if key == UNREADABLE_KEY_MARKER {
+                key.clear();
+                continue;
+            }
             if key.is_empty() {
                 store
                     .delete(&target)
@@ -1125,6 +1177,205 @@ text_scale = 0.0
         config.hydrate_secrets(&store);
 
         assert_eq!(config.providers.openai.api_key, "already-set");
+    }
+
+    // -- #175: hydrate/push must never delete a credential it could not read --
+
+    #[test]
+    fn hydrate_marks_the_field_unreadable_when_the_store_get_errors() {
+        // Bug: `hydrate_secrets` only matched `Ok(Some(_))`, so an `Err`
+        // (a transient CredReadW failure) fell through to "leave the field
+        // blank" -- indistinguishable from "never had a key" (#175).
+        let store = InMemoryStore::default();
+        store
+            .set(&target_name("openai"), "sk-really-there")
+            .unwrap();
+        store.poison(&target_name("openai"));
+
+        let mut config = Config::default();
+        config.hydrate_secrets(&store);
+
+        assert_eq!(
+            config.providers.openai.api_key, UNREADABLE_KEY_MARKER,
+            "an unreadable credential must be marked, not left blank"
+        );
+        assert_eq!(
+            config.unreadable_secrets,
+            vec!["openai".to_string()],
+            "the provider must be reported so a caller can show a card"
+        );
+    }
+
+    #[test]
+    fn hydrate_of_a_genuinely_absent_credential_stays_blank_and_unreported() {
+        // The other half of the matrix: Ok(None) (no credential at all)
+        // must NOT be confused with Err (a credential that exists but could
+        // not be read).
+        let store = InMemoryStore::default();
+        let mut config = Config::default();
+
+        config.hydrate_secrets(&store);
+
+        assert_eq!(config.providers.openai.api_key, "");
+        assert!(config.unreadable_secrets.is_empty());
+    }
+
+    /// Wraps [`InMemoryStore`], recording every `set`/`delete` target so a
+    /// test can assert push_secrets_to_store issued NEITHER for an
+    /// unreadable provider -- stronger than checking the end state, which a
+    /// delete-then-reset could satisfy by accident.
+    struct RecordingStore {
+        inner: InMemoryStore,
+        set_calls: std::sync::Mutex<Vec<String>>,
+        delete_calls: std::sync::Mutex<Vec<String>>,
+    }
+    impl RecordingStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryStore::default(),
+                set_calls: std::sync::Mutex::new(Vec::new()),
+                delete_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl SecretStore for RecordingStore {
+        fn get(&self, target: &str) -> Result<Option<String>> {
+            self.inner.get(target)
+        }
+        fn set(&self, target: &str, secret: &str) -> Result<()> {
+            self.set_calls.lock().unwrap().push(target.to_string());
+            self.inner.set(target, secret)
+        }
+        fn delete(&self, target: &str) -> Result<()> {
+            self.delete_calls.lock().unwrap().push(target.to_string());
+            self.inner.delete(target)
+        }
+    }
+
+    #[test]
+    fn push_secrets_to_store_never_deletes_a_credential_it_could_not_read() {
+        // The exact scenario #175 names: hydrate fails to read a real,
+        // still-present credential, then something calls save() (pick_model,
+        // set_provider, on_learned, open_settings, edit_settings all do).
+        // Recording set/delete calls is a stronger check than the end
+        // state: a delete-then-recreate could satisfy an end-state-only
+        // assertion by accident.
+        let store = RecordingStore::new();
+        store
+            .inner
+            .set(&target_name("openai"), "sk-must-survive")
+            .unwrap();
+        store.inner.poison(&target_name("openai"));
+
+        let mut config = Config::default();
+        config.hydrate_secrets(&store);
+        assert_eq!(config.providers.openai.api_key, UNREADABLE_KEY_MARKER);
+
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+
+        // anthropic legitimately gets a `delete` call here too (it has no
+        // key, and that is the normal, correct empty-field path -- see
+        // `push_secrets_to_store_leaves_an_untouched_key_alone`), so the
+        // assertion below targets the openai entry specifically.
+        let openai_target = target_name("openai");
+        assert!(
+            !store.delete_calls.lock().unwrap().contains(&openai_target),
+            "an unreadable credential must never be deleted"
+        );
+        assert!(
+            !store.set_calls.lock().unwrap().contains(&openai_target),
+            "an unreadable credential must never be overwritten either"
+        );
+        assert_eq!(
+            config.providers.openai.api_key, "",
+            "the field must still be blanked before the disk write, so the marker never reaches config.toml"
+        );
+    }
+
+    #[test]
+    fn push_secrets_to_store_leaves_the_stored_credential_readable_after_an_unreadable_push() {
+        // A store that was never poisoned in the first place is the direct
+        // proof that push's marker path issues no delete/set call at all:
+        // reading it back afterwards (through a fresh, unpoisoned target)
+        // still finds it.
+        let store = InMemoryStore::default();
+        store
+            .set(&target_name("anthropic"), "sk-must-survive")
+            .unwrap();
+        store.poison(&target_name("openai")); // a DIFFERENT provider is unreadable
+
+        let mut config = Config::default();
+        config.hydrate_secrets(&store);
+        assert_eq!(config.providers.openai.api_key, UNREADABLE_KEY_MARKER);
+        assert_eq!(config.providers.anthropic.api_key, "sk-must-survive");
+
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+
+        assert_eq!(
+            store.get(&target_name("anthropic")).unwrap().as_deref(),
+            Some("sk-must-survive"),
+            "anthropic's own hydrated key must still reach the store normally"
+        );
+    }
+
+    #[test]
+    fn push_secrets_to_store_lets_a_retyped_key_replace_an_unreadable_marker() {
+        // The user CAN still fix an unreadable credential by typing a new
+        // key over it in Settings -- resolve_key_field (ui/settings.rs)
+        // replaces the marker with whatever was typed, so by the time
+        // push_secrets_to_store runs the field is a real key, not the
+        // marker, and the normal set path must run.
+        let store = InMemoryStore::default();
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-brand-new".to_string();
+
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+
+        assert_eq!(
+            store.get(&target_name("openai")).unwrap().as_deref(),
+            Some("sk-brand-new")
+        );
+    }
+
+    #[test]
+    fn push_secrets_to_store_lets_the_user_clear_an_unreadable_marker() {
+        // Typing nothing (clearing the field) over an unreadable marker is a
+        // deliberate "remove this key" -- not the marker anymore, so the
+        // ordinary empty-field delete path must run, same as any other
+        // clear.
+        let store = InMemoryStore::default();
+        store
+            .set(&target_name("openai"), "sk-old-and-unreadable")
+            .unwrap();
+
+        let mut config = Config::default();
+        config.providers.openai.api_key = String::new(); // as resolve_key_field would set it
+
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+
+        assert_eq!(store.get(&target_name("openai")).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unreadable_marker_never_reaches_the_saved_file() {
+        let path = scratch_path("secrets-unreadable-marker-never-on-disk");
+        let store = InMemoryStore::default();
+        store.set(&target_name("openai"), "sk-hidden").unwrap();
+        store.poison(&target_name("openai"));
+
+        let mut config = Config::default();
+        config.hydrate_secrets(&store);
+        config.push_secrets_to_store(&store, &|_| false).unwrap();
+        config.save_to(&path).unwrap();
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("wingman-credential-unreadable"),
+            "the marker must never reach config.toml: {on_disk}"
+        );
+        assert!(on_disk.contains("api_key = \"\""));
+
+        cleanup(&path);
     }
 
     #[test]

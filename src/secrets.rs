@@ -14,8 +14,20 @@
 //!
 //! No error path here ever includes a secret value -- only the target name
 //! (e.g. `"Wingman/openai"`, never secret) and the Win32 error code.
+//!
+//! # Blob encoding (issue #175)
+//!
+//! [`CredManagerStore::set`] always writes the secret as UTF-8 bytes
+//! (`secret.as_bytes()`). [`CredManagerStore::get`] decodes UTF-8 first and,
+//! if that fails, falls back to UTF-16LE (the encoding `CredWriteW`'s own
+//! documentation examples use for a generic credential's blob) before giving
+//! up -- see [`decode_blob`]. A blob that is neither is reported as `Err`,
+//! never as `Ok(None)`: before this fix a non-UTF-8 blob under a
+//! `Wingman/<provider>` target name (written by something other than this
+//! module) was silently treated as "no credential", and the next `save()`
+//! deleted it.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::ERROR_NOT_FOUND;
 use windows::Win32::Security::Credentials::{
@@ -27,9 +39,14 @@ use windows::Win32::Security::Credentials::{
 /// Windows Credential Manager ([`CredManagerStore`]) and, under
 /// `#[cfg(test)]`, an in-memory stub ([`InMemoryStore`]).
 pub trait SecretStore {
-    /// `Ok(None)` when no credential exists under `target`. Never returns
-    /// the secret in an `Err` -- a read failure carries only the target name
-    /// and the underlying error code.
+    /// Tri-state per issue #175: `Ok(None)` when no credential exists under
+    /// `target`; `Ok(Some(secret))` when one was read cleanly; `Err` when a
+    /// credential exists but could not be read (a transient `CredReadW`
+    /// failure, or a blob [`decode_blob`] cannot parse). Callers must never
+    /// treat `Err` the same as `Ok(None)` -- doing so is exactly what let a
+    /// save delete a credential the caller never got to see (#175). Never
+    /// returns the secret in an `Err` -- a read failure carries only the
+    /// target name and the underlying error code.
     fn get(&self, target: &str) -> Result<Option<String>>;
     /// Writes (overwriting) the secret under `target`.
     fn set(&self, target: &str, secret: &str) -> Result<()>;
@@ -52,6 +69,39 @@ fn wide_z(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Decodes a Credential Manager blob into a secret string. Tries UTF-8
+/// first (what this module's own `set` always writes) and accepts it
+/// outright *unless* it contains an embedded NUL: plain ASCII text written
+/// as UTF-16LE (the `CredWriteW` convention, in case something else wrote
+/// this blob) also happens to parse as "valid" UTF-8, one NUL byte between
+/// every character, which is never what a real secret looks like. In that
+/// case -- or if UTF-8 parsing failed outright -- UTF-16LE is tried next; a
+/// NUL-laden UTF-8 reading is kept only as the last resort, if UTF-16LE
+/// itself does not decode cleanly either. Pure and Win32-free on purpose so
+/// the decode logic -- the part issue #175 actually needed fixed -- is
+/// unit-testable without touching the real store (CLAUDE.md rule 8).
+fn decode_blob(bytes: &[u8]) -> Result<String> {
+    let utf8: Option<String> = std::str::from_utf8(bytes).ok().map(|s| s.to_string());
+    if let Some(s) = &utf8 {
+        if !s.contains('\u{0}') {
+            return Ok(s.clone());
+        }
+    }
+    if bytes.len() % 2 == 0 {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        if let Ok(s) = String::from_utf16(&units) {
+            return Ok(s);
+        }
+    }
+    if let Some(s) = utf8 {
+        return Ok(s);
+    }
+    bail!("credential blob is neither valid UTF-8 nor valid UTF-16LE")
+}
+
 /// The real store: Windows Credential Manager generic credentials via
 /// `CredWriteW`/`CredReadW`/`CredDeleteW`. Zero-sized -- there is no state
 /// to hold, every call goes straight to the OS.
@@ -68,15 +118,21 @@ impl SecretStore for CredManagerStore {
             Ok(()) => {
                 // SAFETY: CredReadW just reported success, so `cred` is a
                 // valid, non-null pointer that CredFree must release.
-                let secret = unsafe {
+                let bytes = unsafe {
                     let c = &*cred;
                     let bytes =
-                        std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize);
-                    let owned = String::from_utf8(bytes.to_vec()).ok();
+                        std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize)
+                            .to_vec();
                     CredFree(cred as *const _);
-                    owned
+                    bytes
                 };
-                Ok(secret)
+                // #175: a blob this build cannot decode is a real
+                // credential that could not be read, never "no credential".
+                // Confusing the two is exactly what let a later save delete
+                // it -- never fold this back into `Ok(None)`.
+                decode_blob(&bytes)
+                    .map(Some)
+                    .with_context(|| format!("CredReadW returned an unreadable blob for {target}"))
             }
             Err(e) if e.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0) => Ok(None),
             Err(e) => bail!("CredReadW failed for {target}: {}", e.code()),
@@ -118,6 +174,21 @@ impl SecretStore for CredManagerStore {
 #[derive(Default)]
 pub struct InMemoryStore {
     entries: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Test-only, issue #175: targets `get` must report `Err` for, to
+    /// simulate a Credential Manager read failure independently of whether
+    /// `set`/`delete` still work against `entries`.
+    poisoned: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+#[cfg(test)]
+impl InMemoryStore {
+    /// Makes every future `get(target)` call return `Err`, without touching
+    /// `entries` -- so a credential can be seeded via `set` first and then
+    /// made unreadable, exactly like a real credential that exists but
+    /// whose `CredReadW` fails or whose blob cannot be decoded.
+    pub fn poison(&self, target: &str) {
+        self.poisoned.lock().unwrap().insert(target.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -133,6 +204,9 @@ impl std::fmt::Debug for InMemoryStore {
 #[cfg(test)]
 impl SecretStore for InMemoryStore {
     fn get(&self, target: &str) -> Result<Option<String>> {
+        if self.poisoned.lock().unwrap().contains(target) {
+            bail!("simulated unreadable credential for {target}");
+        }
         Ok(self.entries.lock().unwrap().get(target).cloned())
     }
 
@@ -191,6 +265,92 @@ mod tests {
         store.set("Wingman/openai", "sk-should-not-appear").unwrap();
         let debug_output = format!("{store:?}");
         assert!(!debug_output.contains("sk-should-not-appear"), "{debug_output}");
+    }
+
+    // -- InMemoryStore::poison (#175 test scaffolding) -----------------------
+
+    #[test]
+    fn poisoning_a_target_makes_get_fail_without_touching_entries() {
+        let store = InMemoryStore::default();
+        store.set("Wingman/openai", "sk-still-here").unwrap();
+        store.poison("Wingman/openai");
+
+        assert!(
+            store.get("Wingman/openai").is_err(),
+            "a poisoned target must report Err, not Ok(None) and not the old value"
+        );
+
+        // set/delete must still work normally -- poison only affects get.
+        store.set("Wingman/openai", "sk-overwritten").unwrap();
+    }
+
+    #[test]
+    fn poisoning_one_target_leaves_another_readable() {
+        let store = InMemoryStore::default();
+        store.set("Wingman/anthropic", "sk-ant-fine").unwrap();
+        store.poison("Wingman/openai");
+
+        assert_eq!(
+            store.get("Wingman/anthropic").unwrap().as_deref(),
+            Some("sk-ant-fine")
+        );
+    }
+
+    // -- decode_blob (#175: pure, Win32-free) --------------------------------
+
+    #[test]
+    fn decode_blob_accepts_valid_utf8() {
+        let bytes = "sk-real-secret".as_bytes();
+        assert_eq!(decode_blob(bytes).unwrap(), "sk-real-secret");
+    }
+
+    #[test]
+    fn decode_blob_accepts_valid_utf16le() {
+        // The CredWriteW-convention encoding, in case something other than
+        // this module's own `set` (always UTF-8) wrote the blob.
+        let text = "sk-utf16-secret";
+        let bytes: Vec<u8> = text
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        assert_eq!(decode_blob(&bytes).unwrap(), text);
+    }
+
+    #[test]
+    fn decode_blob_rejects_bytes_that_are_neither_utf8_nor_utf16le() {
+        // [0x00, 0xD8] as UTF-8: NUL, then a lead byte (0xD8 = 110xxxxx)
+        // with no continuation byte -- truncated, invalid. As UTF-16LE: one
+        // code unit, 0xD800, a lone (unpaired) high surrogate -- also
+        // invalid. Neither fallback accepts it.
+        let bytes: [u8; 2] = [0x00, 0xD8];
+        assert!(
+            decode_blob(&bytes).is_err(),
+            "a lone UTF-16 surrogate must not decode as either encoding"
+        );
+    }
+
+    #[test]
+    fn decode_blob_rejects_odd_length_bytes_that_are_not_utf8() {
+        // Not valid UTF-8 (0xFF is never a valid lead byte), and odd-length
+        // so the UTF-16LE fallback cannot even be attempted.
+        let bytes: [u8; 3] = [0xFF, 0xFF, 0xFF];
+        assert!(decode_blob(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_blob_prefers_utf16le_over_a_nul_laden_utf8_reading() {
+        // Two-byte "ab" written as UTF-16LE ('a', 0x00, 'b', 0x00) is *also*
+        // technically valid UTF-8 ("a\0b\0"), which is never what a real
+        // secret looks like -- the UTF-16LE reading must win.
+        let bytes: [u8; 4] = [b'a', 0x00, b'b', 0x00];
+        assert_eq!(decode_blob(&bytes).unwrap(), "ab");
+    }
+
+    #[test]
+    fn decode_blob_of_empty_bytes_is_empty_string() {
+        // An empty blob is valid (empty) UTF-8; nothing here needs to treat
+        // it as unreadable.
+        assert_eq!(decode_blob(&[]).unwrap(), "");
     }
 
     // -- CredManagerStore: real Win32 round trip -----------------------------
