@@ -1,0 +1,109 @@
+name: New action
+description: Propose a new catalogue action (the framework and contribution surface Wingman is built around).
+title: "[Action]: "
+labels:
+  - enhancement
+  - area:actions
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The actions framework (`actions/`, the proposal schema registry, the
+        intent router, the palette) does not exist in the code yet: it is
+        the target shape from the expansion plan, §6, written down so its
+        format is settled before it's built. Read `CONTRIBUTING.md`'s "Add
+        an action in 20 minutes" section before filing this: it walks
+        through the exact worked example (Translate selection) this form's
+        fields below are shaped around.
+
+        Every action is one press, one action, one card: no chat, no
+        follow-up. It never presses Send, Submit, Buy or Pay.
+
+  - type: input
+    id: name
+    attributes:
+      label: Action name
+      placeholder: "e.g. Translate selection"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: inputs
+    attributes:
+      label: Inputs
+      description: What the action reads to build its proposal.
+      options:
+        - label: Screen (a screenshot)
+        - label: Selection (the current text selection)
+        - label: Clipboard
+        - label: Awareness / context
+        - label: Nothing beyond the model's own prompt
+
+  - type: dropdown
+    id: proposal-schema
+    attributes:
+      label: Proposal schema
+      description: >-
+        The typed shape the model fills. Pick an existing one if it fits;
+        pick "needs a new schema" only if none of text_answer, verdict,
+        calendar_event, form_fill or text_review cover this action.
+      options:
+        - text_answer
+        - verdict
+        - calendar_event
+        - form_fill
+        - text_review
+        - Needs a new schema (describe it below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: executor
+    attributes:
+      label: Executor
+      description: >-
+        "none" means read-only: the card shows the result and nothing is
+        confirmed or executed. Anything else needs a new or existing
+        executor, and every executor takes a Confirmed<Proposal>, does
+        exactly what the confirmed preview showed, and never presses Send,
+        Submit, Buy or Pay.
+      options:
+        - "none (read-only, no confirm step)"
+        - An existing executor
+        - Needs a new executor (describe it below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: connector
+    attributes:
+      label: Connector
+      description: Only for actions that talk to an external service.
+      options:
+        - "none"
+        - An existing connector
+        - Needs a new connector (describe it below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: sketch
+    attributes:
+      label: actions.toml sketch and any new schema/executor/connector notes
+      description: >-
+        A rough `[[actions]]` block (see CONTRIBUTING.md for the format), plus
+        a description of any new proposal schema, executor or connector this
+        needs and why an existing one doesn't fit.
+      render: toml
+    validations:
+      required: true
+
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      description: >-
+        The manual check per CONTRIBUTING.md step 5, e.g. "press the hotkey
+        with the action selected, confirm the card shows X".
+    validations:
+      required: true

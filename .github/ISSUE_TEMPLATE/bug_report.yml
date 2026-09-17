@@ -1,0 +1,107 @@
+name: Bug report
+description: Something in the running app is wrong.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste an API key or the contents of `config.toml` anywhere in
+        this form, not even redacted.** If you suspect a key leaked, follow
+        `SECURITY.md` instead of filing a public issue.
+
+        Wingman is one press, one action, one card: no chat, no follow-up
+        questions. If what you are describing is Wingman asking a follow-up
+        or holding a conversation, that alone is the bug; say so below.
+
+  - type: input
+    id: version
+    attributes:
+      label: Wingman version
+      description: >-
+        From the tray menu, or the version in `Cargo.toml` if you built from
+        source (`git log -1` if you're on an unreleased checkout).
+      placeholder: "0.1.0, or a commit sha"
+    validations:
+      required: true
+
+  - type: input
+    id: windows-build
+    attributes:
+      label: Windows build
+      description: Run `winver` and copy the build number.
+      placeholder: "e.g. 26200"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      description: Which model provider was configured when this happened?
+      options:
+        - OpenAI (cloud)
+        - Anthropic (cloud)
+        - Ollama (local)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: The specific model selected in Settings, if you know it.
+      placeholder: "e.g. gpt-4o, claude-sonnet-4-5, llama3.2-vision"
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did (the key press, the menu click) and what happened instead of what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: card-text
+    attributes:
+      label: The card text
+      description: >-
+        Paste the exact text the card showed (or "no card appeared" if none
+        did). This is the single most useful piece of evidence for a wrong
+        verdict or a garbled response. Do not paste anything from
+        `config.toml` or an API key even if it happened to appear somewhere
+        on screen.
+      render: text
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps, from a cold launch if that matters.
+      placeholder: |
+        1. Press the Copilot key with a physics problem on screen
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      description: >-
+        One observable check that proves this is fixed: a specific card
+        text, a specific exit code, a specific log line. See the
+        `filing-findings` skill in this repo for the format.
+      placeholder: "e.g. pressing the key with the same screen shows a card with a numeric verdict, not the U rating"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: no-secrets
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have not pasted an API key or the contents of config.toml anywhere in this report.
+          required: true
