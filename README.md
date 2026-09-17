@@ -42,9 +42,26 @@ verdict as a small GDI card in the corner, with a 1-10 (or U) difficulty
 rating. Click the card for the full working; click anywhere else and it goes
 away.
 
-That is the whole app today: one hotkey, one screenshot, one cloud model call
-(OpenAI or Anthropic, your key), one read-only card. No local models, no
-confirm-and-execute loop, no other actions yet.
+That is the whole app today: one hotkey, one screenshot, one model call, one
+read-only card. No confirm-and-execute loop, no other actions yet. What has
+landed around that one action:
+
+- **Four providers**: OpenAI, Anthropic and Gemini (cloud, your key) plus
+  Ollama (local, your own machine). See
+  [`docs/providers.md`](docs/providers.md) for request shapes and how to add
+  Ollama or Gemini to the fallback order today (Settings only exposes
+  OpenAI/Anthropic so far).
+- **Modes**: Cloud, Local, Auto (default) or Offline, from the tray's
+  **Mode** submenu. Offline refuses any non-loopback network call in code;
+  see [`docs/offline.md`](docs/offline.md).
+- **Pause**: 1 hour, until tomorrow, or until resumed, from the tray's
+  **Pause** submenu. While paused the hotkey passes through untouched, no
+  capture runs, no request can start.
+- **Keys in Windows Credential Manager**, not in `config.toml`: a saved key
+  never touches disk in plaintext. See [`docs/providers.md`](docs/providers.md#where-a-key-lives).
+- **Retry with backoff**: a transport error or a 5xx retries automatically;
+  a 429 retries once against the server's own `retry-after`, or shows a
+  card naming the delay.
 
 ## Where it's going
 
@@ -71,10 +88,12 @@ presses these four buttons for you:
 It fills, drafts and proposes; you finish. That rule is permanent, not a
 version-1 limitation to be relaxed later.
 
-Planned and not yet built: local models via Ollama, a Cloud/Local/Auto/Offline
-mode switch, the actions-as-data framework, the confirm-and-execute loop,
-executors (form fill, calendar add, text replace), connectors, and awareness.
-Track them in [GitHub Issues](https://github.com/Raaif-Yousuf/Wingman/issues).
+Planned and not yet built: the actions-as-data framework, the
+confirm-and-execute loop, executors (form fill, calendar add, text replace),
+connectors, and awareness. Local models (Ollama) and the Cloud/Local/Auto/
+Offline mode switch mentioned in earlier drafts of this README are now built;
+see "What works today" above. Track what remains in
+[GitHub Issues](https://github.com/Raaif-Yousuf/Wingman/issues).
 
 ## Install
 
@@ -115,20 +134,32 @@ Launch it. A tray icon appears and `%APPDATA%\copilot-ask\config.toml` is
 created. Left-click the tray icon to open **Settings**, and paste your key
 into **OpenAI API key** or **Anthropic API key**, both in the Providers group
 at the top. Everything else lives there too: model, effort, capture size,
-card timeout, text size, the difficulty toggle and the prompt.
+card timeout, text size, the difficulty toggle and the prompt. A saved key
+moves into Windows Credential Manager, not the file; Settings shows only its
+last four characters afterward.
 
-There is no local-model or offline option yet: every request today goes to
-whichever cloud provider you configure.
+Settings exposes OpenAI and Anthropic today; Gemini and Ollama both work but
+need one hand-edit of `config.toml` to enable, since the fixed-layout
+Settings dialog does not have a field group for either yet. See
+[`docs/providers.md`](docs/providers.md#how-to-add-ollama-or-gemini-to-providersorder-by-hand-today)
+for the exact steps and the limitation to know about (a Settings save can
+discard the hand-edit).
+
+Local (Ollama) and Offline are both real options now, via the tray's
+**Mode** submenu: Cloud, Local, Auto (default: local first if Ollama is up,
+otherwise cloud) or Offline (loopback only, enforced in code). See
+[`docs/offline.md`](docs/offline.md) for exactly what each mode does.
 
 The config file is still there (`Open config.toml` in the tray menu) if you
 want to edit it by hand.
 
-`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` in the environment override the file,
-so you can keep keys out of the config entirely if you prefer.
+`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` in the environment
+override the file, so you can keep keys out of the config entirely if you
+prefer.
 
-Configure one provider or both. With both set, Anthropic is the automatic
-fallback when OpenAI fails: a provider with an empty key is skipped, not
-treated as an error.
+Configure one cloud provider or several. With more than one set, the rest
+are the automatic fallback in `providers.order` when the first fails: a
+provider with an empty key is skipped, not treated as an error.
 
 Switch models from the tray at any time; the choice is written straight back
 to the config. To offer a model that isn't listed, add it to `models` under
@@ -195,6 +226,9 @@ call every boot. With start-with-Windows on it is always running anyway.
 - **Copy last answer**: headline and working to the clipboard
 - **Provider ▸**: which service answers (ChatGPT or Claude)
 - **ChatGPT model ▸** / **Claude model ▸**: switch models, saved immediately
+- **Mode ▸**: Cloud / Local / Auto / Offline, radio-checked
+- **Pause ▸**: 1 hour / until tomorrow / until resumed; shown as **Resume**
+  instead while already paused
 - **Set Copilot key...** / **Set secondary key...**: rebind by pressing the
   key
 - **Edit settings**: opens `config.toml`
@@ -205,14 +239,16 @@ call every boot. With start-with-Windows on it is always running anyway.
 
 | key | default | what it does |
 |---|---|---|
+| `mode` | `"auto"` | `cloud` / `local` / `auto` / `offline`; see [`docs/offline.md`](docs/offline.md) |
 | `capture.max_edge` | `1568` | long-edge downscale before upload; lower cuts cost |
 | `capture.monitor` | `"active"` | `"active"` follows the focused window; `"primary"` pins it |
-| `providers.order` | `["openai", "anthropic"]` | fallback order |
+| `providers.order` | `["openai", "anthropic"]` | fallback order; add `"ollama"`/`"gemini"` by hand, see [`docs/providers.md`](docs/providers.md) |
 | `providers.*.effort` | `"low"` | reasoning depth; raise for harder problems |
+| `providers.ollama.base_url` | `"http://127.0.0.1:11434"` | never `localhost`, see [`docs/providers.md`](docs/providers.md#ollama) |
 | `ui.card_seconds` | `12` | auto-dismiss for the collapsed card; `0` = never |
 | `ui.text_scale` | `1.0` | multiplies the card's font size; lower is smaller |
 | `ui.show_difficulty` | `true` | the 1-10/U badge; when off it is not requested at all |
-| `providers.*.models` | see file | what the tray's model submenu offers |
+| `providers.*.models` | see file | what the tray's model submenu offers (Ollama has no list; it uses `providers.ollama.model` directly) |
 | `ui.prompt` | see file | the system prompt, edit it to change what it checks |
 
 Roughly 1-2 cents and 3-8 seconds per check at the defaults.
