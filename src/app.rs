@@ -34,7 +34,7 @@ use crate::hotkey::{
 use crate::provider::{Answer, Chain, Shot};
 use crate::ui::card::Card;
 use crate::ui::settings;
-use crate::ui::tray::{cmd, decode, MenuChoice, Tray, WM_APP_TRAY};
+use crate::ui::tray::{cmd, decode, register_taskbar_created, MenuChoice, Tray, WM_APP_TRAY};
 
 /// Posted by the worker when a request finishes. `lparam` is
 /// `Box::into_raw(Box::new(Result<Answer, String>))`; the handler takes
@@ -57,6 +57,10 @@ const CARD_SETTLE_MS: u64 = 60;
 struct App {
     /// Kept so the settings window can be created on demand.
     instance: HINSTANCE,
+    /// The runtime id of the shell's `TaskbarCreated` message (see
+    /// `ui::tray`'s module docs). Compared against `msg` in `wnd_proc` to
+    /// re-add the tray icon after Explorer crashes or restarts.
+    taskbar_created_msg: u32,
     config: Config,
     chain: Arc<Chain>,
     card: Card,
@@ -105,12 +109,18 @@ pub fn run() -> Result<()> {
 
     let hwnd = create_owner_window(instance)?;
 
+    // Registering does not depend on the window existing yet, but doing it
+    // right after keeps every piece of startup wiring for the tray icon
+    // together (see ui::tray's module docs on TaskbarCreated).
+    let taskbar_created_msg = register_taskbar_created();
+
     let mut card = Card::new(instance).context("creating the notification card")?;
     card.set_text_scale(config.ui.text_scale);
     let tray = Tray::new(hwnd, instance).context("creating the tray icon")?;
 
     let mut app = Box::new(App {
         instance,
+        taskbar_created_msg,
         config,
         chain,
         card,
@@ -502,6 +512,19 @@ impl App {
         self.tray.set_tooltip(&tip);
     }
 
+    /// Handle the shell's `TaskbarCreated` broadcast (Explorer crashed or
+    /// was restarted): re-add the tray icon and restore its tooltip, which
+    /// `NIM_ADD` resets to the default. Per rule 7, a failure here still
+    /// ends in a card rather than silently leaving the tray empty.
+    fn on_taskbar_created(&mut self) {
+        match self.tray.readd() {
+            Ok(()) => self.refresh_tray_labels(),
+            Err(e) => self
+                .card
+                .show_error("Couldn't restore the tray icon", &format!("{e:#}")),
+        }
+    }
+
     fn set_watch(&self, on: bool) {
         if let Some(w) = &self.watcher {
             if on {
@@ -636,6 +659,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_APP_LEARNED => {
             let chord = unsafe { *Box::from_raw(lparam.0 as *mut Chord) };
             app.on_learned(wparam.0, chord);
+            LRESULT(0)
+        }
+        // Not a compile-time constant (RegisterWindowMessageW is a runtime
+        // registration), so it cannot be an ordinary match arm -- see
+        // ui::tray's module docs on TaskbarCreated.
+        id if id == app.taskbar_created_msg => {
+            app.on_taskbar_created();
             LRESULT(0)
         }
         WM_DESTROY => {

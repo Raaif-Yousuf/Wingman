@@ -27,24 +27,46 @@
 //! This module owns [`WM_APP_TRAY`], the value passed to the shell as
 //! `uCallbackMessage`; the integrating agent should route `WM_APP_TRAY` in
 //! the main window proc to [`Tray::on_tray_message`].
+//!
+//! # `TaskbarCreated` (icon survives an Explorer restart)
+//!
+//! `NIM_ADD` only adds the icon to the taskbar's *current* notification
+//! area; if Explorer crashes or is restarted, that area is destroyed along
+//! with every process's icon in it, and nothing re-adds ours automatically.
+//! The documented recovery is the shell's `TaskbarCreated` message,
+//! broadcast to every top-level window once a new taskbar exists. The
+//! integrating agent must call [`register_taskbar_created`] once at
+//! startup and route the id it returns, in the main window proc, to
+//! [`Tray::readd`] -- see `app.rs`'s `wnd_proc` for the wiring. Unlike
+//! [`WM_APP_TRAY`] this id is not a compile-time constant (it comes from
+//! `RegisterWindowMessageW` at runtime), so it cannot be matched as an
+//! ordinary `match` arm; a guard (`id if id == app.taskbar_created_msg`)
+//! is required.
 
 use anyhow::{anyhow, Context, Result};
-use windows::core::PCWSTR;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, SetForegroundWindow,
-    SetMenuItemInfoW, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION, MENUITEMINFOW,
-    MFS_CHECKED, MFT_RADIOCHECK, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE,
-    MIIM_STATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP,
-    WM_RBUTTONUP,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, RegisterWindowMessageW,
+    SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION,
+    MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    MIIM_FTYPE, MIIM_STATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU,
+    WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 /// Posted by the shell to this app's window proc on tray icon activity.
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
+
+/// Registers the shell's `TaskbarCreated` message and returns its (runtime,
+/// not compile-time) id. Call once at startup; see the module docs' section
+/// on `TaskbarCreated` for how to route the result.
+pub fn register_taskbar_created() -> u32 {
+    unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) }
+}
 
 /// Identifies our one tray icon in every `NOTIFYICONDATAW` call.
 const TRAY_ICON_ID: u32 = 1;
@@ -120,6 +142,9 @@ pub fn decode(id: u32) -> MenuChoice {
 
 pub struct Tray {
     hwnd: HWND,
+    /// Kept so [`Tray::readd`] can reload the icon exactly as [`Tray::new`]
+    /// did, without the caller having to thread it through again.
+    instance: HINSTANCE,
     /// Display strings for the current primary/secondary bindings (e.g.
     /// `"Win+Shift+F23"`), shown in the "Set ... key" menu labels. Set via
     /// [`Tray::set_key_bindings`]; empty until then, in which case the
@@ -145,31 +170,11 @@ impl Tray {
     /// first; `IDI_APPLICATION` is the real fallback (see
     /// [`EMBEDDED_ICON_ID`]).
     pub fn new(hwnd: HWND, instance: HINSTANCE) -> Result<Self> {
-        let icon = load_icon(instance);
-
-        let mut nid = NOTIFYICONDATAW {
-            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-            hWnd: hwnd,
-            uID: TRAY_ICON_ID,
-            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
-            uCallbackMessage: WM_APP_TRAY,
-            hIcon: icon,
-            ..Default::default()
-        };
-        set_sz_tip(&mut nid.szTip, "copilot-ask");
-
-        let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
-        if !added.as_bool() {
-            return Err(anyhow!("Shell_NotifyIconW(NIM_ADD) failed"));
-        }
-
-        // Best-effort: if the shell won't upgrade us to v4 we still work,
-        // just with legacy (non-semantic) mouse messages.
-        nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &nid) };
+        add_icon(hwnd, instance)?;
 
         Ok(Self {
             hwnd,
+            instance,
             primary_label: String::new(),
             secondary_label: String::new(),
             active_provider_openai: true,
@@ -178,6 +183,16 @@ impl Tray {
             anthropic_models: Vec::new(),
             anthropic_current: None,
         })
+    }
+
+    /// Re-add the icon after the shell's `TaskbarCreated` broadcast (see the
+    /// module docs). Runs the exact same `NIM_ADD` + `NIM_SETVERSION` calls
+    /// as [`Tray::new`]; the cached labels/models on `self` are untouched
+    /// (they were never shell-side state), but the tooltip was, so the
+    /// caller should re-issue [`Tray::set_tooltip`] afterwards (`app.rs`
+    /// does this by calling its existing `refresh_tray_labels`).
+    pub fn readd(&self) -> Result<()> {
+        add_icon(self.hwnd, self.instance)
     }
 
     /// Update the tooltip shown when hovering the icon (the spec: "shows the
@@ -537,6 +552,53 @@ fn set_sz_tip(dst: &mut [u16], text: &str) {
     }
 }
 
+/// `NIM_ADD` the icon and switch it to `NOTIFYICON_VERSION_4`
+/// (`NIM_SETVERSION`) -- see the module docs for why. Shared by
+/// [`Tray::new`] and [`Tray::readd`] so the two can never drift apart.
+/// `instance` is used to try loading an embedded icon resource first;
+/// `IDI_APPLICATION` is the real fallback (see [`EMBEDDED_ICON_ID`]).
+fn add_icon(hwnd: HWND, instance: HINSTANCE) -> Result<()> {
+    let icon = load_icon(instance);
+
+    // Best-effort: NIM_ADD fails outright if this (hWnd, uID) pair is
+    // already registered with the shell -- e.g. Tray::readd running while
+    // the previous registration is still live, which is exactly what
+    // happens in a test with no real Explorer restart in between. After a
+    // genuine Explorer crash this NIM_DELETE itself fails harmlessly (the
+    // shell's own icon table died with the old Explorer process), so it is
+    // safe to attempt unconditionally in both cases.
+    let del = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        ..Default::default()
+    };
+    let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &del) };
+
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
+        uCallbackMessage: WM_APP_TRAY,
+        hIcon: icon,
+        ..Default::default()
+    };
+    set_sz_tip(&mut nid.szTip, "copilot-ask");
+
+    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
+    if !added.as_bool() {
+        return Err(anyhow!("Shell_NotifyIconW(NIM_ADD) failed"));
+    }
+
+    // Best-effort: if the shell won't upgrade us to v4 we still work, just
+    // with legacy (non-semantic) mouse messages.
+    nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+    let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &nid) };
+
+    Ok(())
+}
+
 /// Try the embedded resource icon first (see [`EMBEDDED_ICON_ID`]); fall
 /// back to the system's generic application icon, which always exists.
 fn load_icon(instance: HINSTANCE) -> HICON {
@@ -552,6 +614,56 @@ fn load_icon(instance: HINSTANCE) -> HICON {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- TaskbarCreated recovery (#145) -------------------------------------
+
+    #[test]
+    fn register_taskbar_created_returns_a_nonzero_id() {
+        // RegisterWindowMessageW returns 0 on failure; a real id is always
+        // in the 0xC000-0xFFFF range, but the only contract this module
+        // relies on is "nonzero and stable for the process".
+        assert_ne!(register_taskbar_created(), 0);
+    }
+
+    #[test]
+    fn tray_new_then_readd_both_succeed_against_a_real_window() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, CW_USEDEFAULT, WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+
+        // "STATIC" is a predefined system window class -- no RegisterClassExW
+        // needed, unlike settings.rs's own smoke test.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("copilot-ask tray test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+        // The exact scenario #145 is about: re-adding after the icon was
+        // dropped (here simulated by just calling it again on the same,
+        // already-added icon id -- NIM_ADD is idempotent for that case).
+        tray.readd().expect("Tray::readd should re-add the icon");
+
+        drop(tray); // NIM_DELETE via Drop
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
 
     // -- submenu attach ordering (#147) -------------------------------------
 
