@@ -334,6 +334,16 @@ fn send_ctrl_tap() {
     }
 }
 
+/// Whether swallowing this chord's keydown (returning 1 from the hook, as
+/// both an ordinary matched hotkey and a captured learn-mode chord do) needs
+/// the [`send_ctrl_tap`] workaround for the Win-key release problem. Pure
+/// and allocation-free so the hook callback can call it on every swallowed
+/// event without risking the "hook takes too long, Windows silently unhooks
+/// it" failure mode.
+fn needs_win_release_workaround(chord: &Chord) -> bool {
+    chord.win
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Per the WH_KEYBOARD_LL contract: if code < 0, pass through untouched
     // and do not swallow, regardless of anything else.
@@ -378,6 +388,16 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                         LPARAM(boxed as isize),
                     )
                 };
+
+                // Learn mode swallows this keydown the same way the ordinary
+                // match branch below swallows a bound hotkey; a captured
+                // chord that involves Win needs the same workaround, or
+                // learning a Win-involving chord flickers the Start menu
+                // (issue #151).
+                if needs_win_release_workaround(&chord) {
+                    send_ctrl_tap();
+                }
+
                 LRESULT(1)
             }
             LearnOutcome::PassThrough => unsafe { CallNextHookEx(None, code, wparam, lparam) },
@@ -396,7 +416,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         let hwnd = HWND(target_hwnd as *mut _);
         let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_HOTKEY, WPARAM(which), LPARAM(0)) };
 
-        if matched.win {
+        if needs_win_release_workaround(&matched) {
             send_ctrl_tap();
         }
 
@@ -518,6 +538,20 @@ mod tests {
         let (state, outcome) = on_keydown(armed, chord(0x41, false, false, false, false), now);
         assert_eq!(state, LearnState::Idle);
         assert_eq!(outcome, LearnOutcome::PassThrough);
+    }
+
+    // -- needs_win_release_workaround -------------------------------------
+
+    #[test]
+    fn win_chord_needs_the_release_workaround() {
+        // The primary binding, Win+Shift+F23: swallowing it must run the tap.
+        assert!(needs_win_release_workaround(&chord(0x86, false, true, false, true)));
+    }
+
+    #[test]
+    fn non_win_chord_does_not_need_the_release_workaround() {
+        // Ctrl+Shift+/: no Win key involved, no Start-menu tracking to cancel.
+        assert!(!needs_win_release_workaround(&chord(0xBF, true, true, false, false)));
     }
 
     // -- chord_to_string -------------------------------------------------
