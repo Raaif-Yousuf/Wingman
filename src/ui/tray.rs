@@ -148,6 +148,14 @@ pub mod cmd {
     /// `app.rs`.
     pub const ADD_TO_CALENDAR: u32 = 1023;
 
+    /// Issue #38: runs the built-in "Review this email" action (Look,
+    /// Propose, Confirm, Do). See `App::review_this_email` in `app.rs`. The
+    /// palette (#25) does not exist on master yet, so -- same as
+    /// `EXTRACT_TEXT` above -- this tray item is the only way to reach the
+    /// action today; the palette's own action dispatch table should add
+    /// `actions::review_email::ACTION_ID` to its built-ins once it lands.
+    pub const REVIEW_EMAIL: u32 = 1024;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -469,6 +477,7 @@ impl Tray {
             !self.paused,
         )?;
         append_item(hmenu, cmd::ADD_TO_CALENDAR, "Add event from screen")?;
+        append_item(hmenu, cmd::REVIEW_EMAIL, "Review this email")?;
         append_separator(hmenu)?;
         if self.paused {
             append_item(hmenu, cmd::RESUME, "Resume")?;
@@ -1265,6 +1274,55 @@ mod tests {
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 
+    // -- #38: "Review this email" is reachable from the menu -----------------
+
+    #[test]
+    fn review_email_item_is_present_in_the_built_menu() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetMenuItemInfoW, CW_USEDEFAULT, WINDOW_EX_STYLE,
+            WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray review-email test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+
+        let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu).expect("build_menu");
+
+        let mut info = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STATE,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(hmenu, cmd::REVIEW_EMAIL, false, &mut info) }.expect(
+            "cmd::REVIEW_EMAIL must be a real item id in the built menu, not orphaned data",
+        );
+
+        let _ = unsafe { DestroyMenu(hmenu) };
+        drop(tray);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
     // -- submenu attach ordering (#147) -------------------------------------
 
     #[test]
@@ -1335,6 +1393,7 @@ mod tests {
         ("CALCULATE_SELECTION", cmd::CALCULATE_SELECTION),
         ("COPY_REGION", cmd::COPY_REGION),
         ("ADD_TO_CALENDAR", cmd::ADD_TO_CALENDAR),
+        ("REVIEW_EMAIL", cmd::REVIEW_EMAIL),
     ];
 
     #[test]

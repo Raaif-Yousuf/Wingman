@@ -44,7 +44,10 @@ use crate::hotkey::{
 };
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
-use crate::provider::{calendar_request, parse_answer, physics_request, Answer, Chain, Shot};
+use crate::provider::{
+    calendar_request, parse_answer, physics_request, review_request_from_screen,
+    review_request_from_text, Answer, Chain, Shot,
+};
 use crate::ui::card::{Card, WM_APP_PREVIEW_DECIDED};
 use crate::ui::confirm;
 use crate::ui::settings;
@@ -71,6 +74,14 @@ pub const WM_APP_ACTIVATE: u32 = WM_APP + 6;
 /// payload types, and reconstructing the wrong one from a raw pointer is
 /// undefined behaviour.
 pub const WM_APP_CALENDAR_RESULT: u32 = WM_APP + 8;
+
+/// Posted by the review-email worker thread (issue #38, `review_this_email`)
+/// when the provider chain finishes: `lparam` is
+/// `Box::into_raw(Box::new(Result<actions::review_email::ReviewOutcome, String>))`,
+/// the review-flow analogue of [`WM_APP_CALENDAR_RESULT`]. `WM_APP + 10`:
+/// `+9` is already [`crate::ui::card::WM_APP_PREVIEW_DECIDED`]. Add any new
+/// `WM_APP_*` constant to `tests::ALL_WM_APP_IDS` too (issue #163).
+pub const WM_APP_REVIEW_RESULT: u32 = WM_APP + 10;
 
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
@@ -115,6 +126,16 @@ struct App {
     /// clean apply, a timeout, or a warn for a different pair -- see
     /// `on_learned`.
     pending_conflict: Option<(usize, Chord)>,
+    /// Issue #38: the captured target and already-applied new text for a
+    /// "Review this email" preview currently on screen, so
+    /// `on_preview_decided` knows to build and run a `replace_text`
+    /// proposal instead of resolving `"calendar_add"`. `Some` only between
+    /// `on_review_result` showing the preview and the next
+    /// `WM_APP_PREVIEW_DECIDED` (taken, and always cleared, by that
+    /// handler regardless of Do it/Cancel) -- `None` the rest of the time,
+    /// including while a calendar preview is on screen, so the two flows'
+    /// previews can never be confused with each other.
+    pending_review: Option<actions::review_email::ReviewContext>,
 }
 
 pub fn run() -> Result<()> {
@@ -202,6 +223,7 @@ pub fn run() -> Result<()> {
         last: None,
         pause: PauseState::Running,
         pending_conflict: None,
+        pending_review: None,
     });
     app.refresh_tray_labels();
     // Issue #19: reflect the loaded mode in the tray submenu/icon from the
@@ -800,19 +822,32 @@ impl App {
         }
     }
 
-    /// #39: the card's preview closed with a decision
+    /// The card's preview closed with a decision
     /// (`ui::card::WM_APP_PREVIEW_DECIDED`). `Card::take_confirmed()` is
     /// `None` for Cancel/Esc -- nothing runs, per Look/Propose/Confirm/Do:
     /// "Do" never happens without an explicit confirm -- and `Some` for
-    /// "Do it". The executor is resolved fresh by the fixed
-    /// `"calendar_add"` name: today this is the only action that ever
-    /// reaches Preview, the same "fixed until a second confirm-required
-    /// action exists" status `CalendarAddExecutor::new`'s own fixed
-    /// `"ics"` connector choice has.
+    /// "Do it".
+    ///
+    /// #38: `self.pending_review` is `Some` exactly when the preview
+    /// currently closing was "Review this email"'s, not "Add event from
+    /// screen"'s (only one preview is ever on screen at a time, so this is
+    /// an unambiguous branch, not a guess) -- taken and cleared
+    /// unconditionally here, on Cancel/Esc as much as on "Do it", so a
+    /// cancelled review preview never leaves a stale target behind for the
+    /// next one. When it is `None`, this is calendar's own flow: the
+    /// executor is resolved fresh by the fixed `"calendar_add"` name, the
+    /// same "fixed until a second confirm-required action exists" status
+    /// `CalendarAddExecutor::new`'s own fixed `"ics"` connector choice had
+    /// before #38 landed.
     fn on_preview_decided(&mut self) {
+        let pending_review = self.pending_review.take();
         let Some(confirmed) = self.card.take_confirmed() else {
             return;
         };
+        if let Some(ctx) = pending_review {
+            self.run_review_executor(ctx);
+            return;
+        }
         match executors::registry::resolve("calendar_add") {
             Ok(executor) => self.run_calendar_executor(executor.as_ref(), confirmed),
             Err(e) => {
@@ -842,6 +877,190 @@ impl App {
             Err(e) => {
                 self.card
                     .show_error("Couldn't add the event", &format!("{e:#}"));
+            }
+        }
+        self.set_watch(true);
+    }
+
+    /// #38: "Review this email", the second action to run the full
+    /// Look/Propose/Confirm/Do loop -- the tray's third one-shot action,
+    /// parallel to `ask()`/`add_event_from_screen()` (neither of which this
+    /// method touches). Mirrors `add_event_from_screen`'s pause/busy/
+    /// readiness/capture steps, with one difference: the (potentially slow)
+    /// UIA compose-body/selection capture attempts run on the SPAWNED
+    /// worker thread, never here, per `inputs::uia`'s and
+    /// `inputs::selection`'s own module docs ("call from a dedicated worker
+    /// thread"); only the screenshot -- needed only as the last-resort
+    /// fallback, but cheap, and must happen before any card change per
+    /// `capture::grab_raw`'s existing "no stale card in the shot" rule --
+    /// is still grabbed here, eagerly, exactly like `add_event_from_screen`
+    /// already does.
+    fn review_this_email(&mut self) {
+        if self.busy {
+            return;
+        }
+
+        if pause::is_paused_now() {
+            self.card
+                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
+            return;
+        }
+
+        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
+            self.card.hide();
+            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
+        }
+
+        let path = Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "config.toml".into());
+        if let Some((headline, detail)) =
+            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+        {
+            self.card.show_error(&headline, &detail);
+            return;
+        }
+
+        let optimistic_chain = self
+            .config
+            .providers
+            .build_chain_for_mode(self.config.mode, true);
+        let image_limits = optimistic_chain
+            .first_ready_caps()
+            .and_then(|caps| caps.image_limits);
+        let (max_long_edge, max_pixels) =
+            capture::resolve_limits(image_limits, self.config.capture.max_edge);
+        let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
+            Ok(r) => r,
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
+                return;
+            }
+        };
+        let foreground_hwnd_isize =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
+
+        self.busy = true;
+        self.set_watch(false);
+        self.card.show_pending();
+
+        let providers = self.config.providers.clone();
+        let mode = self.config.mode;
+        let target = self.hwnd_isize();
+        std::thread::spawn(move || {
+            let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
+                (|| -> Result<actions::review_email::ReviewOutcome> {
+                    let shot = capture::encode(&raw)?;
+                    review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
+                })()
+                .map_err(|e| format!("{e:#}"));
+            let payload = Box::into_raw(Box::new(result));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_REVIEW_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                );
+            }
+        });
+    }
+
+    /// Handles the review-email worker's result (#38). `verdict ==
+    /// "good_to_go"` ends in a plain informational card, no preview, no "Do
+    /// it" -- the task brief's own wording. Otherwise: edits are applied
+    /// deterministically (`actions::review_email::apply_edits`) once, here,
+    /// before the preview ever shows, so "Do it" later never re-derives
+    /// anything. Only a [`actions::review_email::CapturedTarget`] (i.e. a
+    /// `ComposeBody`-sourced review) gets a real preview with "Do it";
+    /// `Selection`/`Screen` sources show the proposal as a read-only
+    /// informational card instead, since there is nothing "Do it" could
+    /// write back to (rule 7: never offer a button that cannot work).
+    fn on_review_result(
+        &mut self,
+        result: std::result::Result<actions::review_email::ReviewOutcome, String>,
+    ) {
+        self.busy = false;
+
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                let headline = first_line(&e, 88);
+                self.card.show_error(&headline, &e);
+                self.set_watch(true);
+                return;
+            }
+        };
+
+        if actions::review_email::is_good_to_go(&outcome.proposal) {
+            self.card
+                .show_answer("Good to go", "No changes needed.", 5, None);
+            self.set_watch(true);
+            return;
+        }
+
+        if !actions::review_email::source_has_target(outcome.source) {
+            // Selection- or Screen-sourced: informational only, no target
+            // to write back through (see this method's doc comment).
+            let edits = actions::review_email::edits_from_value(&outcome.proposal);
+            let detail = if edits.is_empty() {
+                "No specific edits proposed.".to_string()
+            } else {
+                edits
+                    .iter()
+                    .map(|e| format!("{} -> {} ({})", e.before, e.after, e.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            self.card
+                .show_answer("Review needs edits", &detail, 0, None);
+            self.set_watch(true);
+            return;
+        }
+        let target = outcome
+            .target
+            .clone()
+            .expect("source_has_target(outcome.source) is true, so ComposeBody always set target");
+
+        let edits = actions::review_email::edits_from_value(&outcome.proposal);
+        let applied = actions::review_email::apply_edits(&outcome.original_text, &edits);
+
+        self.pending_review = Some(actions::review_email::ReviewContext {
+            target,
+            original_text: outcome.original_text.clone(),
+            new_text: applied.new_text,
+        });
+
+        let schema = actions::schema::schema_for("text_review", false)
+            .expect("\"text_review\" is always registered in actions::schema");
+        self.card
+            .show_preview("Review this email", &schema, &outcome.proposal, false);
+        // Same "Preview manages its own lifecycle" reasoning as
+        // `on_calendar_result`'s own return here -- the global click
+        // watcher stays disarmed.
+    }
+
+    /// #38: the review flow's half of `on_preview_decided` -- resolves the
+    /// `replace_text` executor and runs it against the stashed
+    /// `pending_review` context via `actions::review_email::do_review_confirmed`.
+    fn run_review_executor(&mut self, ctx: actions::review_email::ReviewContext) {
+        match executors::registry::resolve("replace_text") {
+            Ok(executor) => {
+                match actions::review_email::do_review_confirmed(executor.as_ref(), &ctx) {
+                    Ok(undo) => {
+                        self.card
+                            .show_answer("Email updated", &undo.summary, 0, None);
+                    }
+                    Err(e) => {
+                        self.card
+                            .show_error("Couldn't update the email", &format!("{e:#}"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.card
+                    .show_error("Couldn't update the email", &format!("{e:#}"));
             }
         }
         self.set_watch(true);
@@ -1674,6 +1893,63 @@ fn calendar_worker(
     )
 }
 
+/// #38: the review-email flow's analogue of [`worker`]/[`calendar_worker`].
+/// Unlike those two, the "what does the model actually see" decision is not
+/// fixed to a screenshot: [`actions::review_email::capture_input`] runs
+/// FIRST, on this worker thread (never the main thread -- see
+/// `App::review_this_email`'s doc comment), and its result decides whether
+/// the request carries the captured text (`review_request_from_text`) or
+/// falls back to `shot` (`review_request_from_screen`). The provider chain,
+/// retry/repair and non-vision fallback machinery are otherwise identical
+/// to `worker`/`calendar_worker`.
+fn review_worker(
+    providers: &Providers,
+    mode: Mode,
+    shot: &Shot,
+    raw: &capture::RawShot,
+    foreground_hwnd: isize,
+) -> Result<actions::review_email::ReviewOutcome> {
+    let resolved = actions::load_actions().context("failed to load actions")?;
+    let action = resolved
+        .iter()
+        .find(|r| r.action.id == actions::review_email::ACTION_ID)
+        .map(|r| &r.action)
+        .with_context(|| {
+            format!(
+                "the \"{}\" action is disabled or missing; check actions.toml",
+                actions::review_email::ACTION_ID
+            )
+        })?;
+
+    let captured = actions::review_email::capture_input(foreground_hwnd);
+    let source = captured.source();
+    let original_text = captured.text().unwrap_or_default().to_string();
+    let target = captured.target().cloned();
+
+    let req = match captured.text() {
+        Some(text) => review_request_from_text(&action.prompt, text),
+        None => review_request_from_screen(&action.prompt, shot),
+    };
+
+    let ollama_ready = mode == Mode::Auto
+        && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+        && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
+    let chain = providers.build_chain_for_mode(mode, ollama_ready);
+
+    let proposal = chain.complete_parsed_with_fallback(
+        &req,
+        || non_vision_inputs(raw, foreground_hwnd),
+        |c| actions::review_email::parse_text_review_proposal(&c.text),
+    )?;
+
+    Ok(actions::review_email::ReviewOutcome {
+        proposal,
+        original_text,
+        target,
+        source,
+    })
+}
+
 /// #39: today's local date and current local UTC offset, for the "Add
 /// event from screen" prompt -- DST-correct the same way
 /// `deadline_until_tomorrow` already is for Pause, via the identical
@@ -2119,6 +2395,7 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
         | WM_APP_CALENDAR_RESULT
+        | WM_APP_REVIEW_RESULT
         | WM_APP_PREVIEW_DECIDED => SettingsReentrancy::Ignore,
         _ => SettingsReentrancy::Fallback,
     }
@@ -2173,6 +2450,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     drop(unsafe {
                         Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
                     });
+                } else if msg == WM_APP_REVIEW_RESULT {
+                    drop(unsafe {
+                        Box::from_raw(
+                            lparam.0
+                                as *mut std::result::Result<
+                                    actions::review_email::ReviewOutcome,
+                                    String,
+                                >,
+                        )
+                    });
                 }
                 return LRESULT(0);
             }
@@ -2220,6 +2507,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
                     MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
                     MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
+                    MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
                     MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
                     MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
                     MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
@@ -2271,6 +2559,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>) };
             app.on_calendar_result(result);
+            LRESULT(0)
+        }
+        WM_APP_REVIEW_RESULT => {
+            let result = unsafe {
+                *Box::from_raw(
+                    lparam.0
+                        as *mut std::result::Result<actions::review_email::ReviewOutcome, String>,
+                )
+            };
+            app.on_review_result(result);
             LRESULT(0)
         }
         WM_APP_PREVIEW_DECIDED => {
@@ -2347,7 +2645,7 @@ mod tests {
     use super::App;
     use super::{final_settings_card, SettingsFinalCard};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
-    use super::{WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_RESULT};
+    use super::{WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_RESULT, WM_APP_REVIEW_RESULT};
     use crate::actions::{self, Origin};
     use crate::config::Providers;
     use crate::dismiss::WM_APP_DISMISS;
@@ -2804,6 +3102,7 @@ mod tests {
         ("WM_APP_PAUSE_TOGGLE", WM_APP_PAUSE_TOGGLE),
         ("WM_APP_CALENDAR_RESULT", WM_APP_CALENDAR_RESULT),
         ("WM_APP_PREVIEW_DECIDED", WM_APP_PREVIEW_DECIDED),
+        ("WM_APP_REVIEW_RESULT", WM_APP_REVIEW_RESULT),
     ];
 
     #[test]

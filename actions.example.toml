@@ -58,3 +58,22 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "review-this-email"
+name = "Review this email"
+group = "Writing"
+inputs = [
+    "uia",
+    "selection",
+    "screen",
+]
+proposal = "text_review"
+executor = "replace_text"
+confirm = true
+prompt = """You are shown the text of an email the user is writing (or, if no compose box could be read directly, a screenshot of one). Proofread it: fix spelling and grammar mistakes, and flag anything that reads as unintentionally harsh or unclear in tone. For each individual problem, propose one edit: the EXACT original text to find ("before"), what it should become ("after"), and a short reason. Keep each edit as small and specific as possible -- one edit per individual mistake (e.g. one misspelled word), never one edit spanning an entire sentence or paragraph just because it contains more than one mistake. Only propose an edit for a real problem -- never rewrite text that is already fine just to have something to say, and never propose an edit whose "after" is identical to its "before": if there is nothing to change, do not propose that edit at all. If nothing needs fixing, set "verdict" to "good_to_go" and leave "edits" empty. Otherwise set "verdict" to "needs_edits". Separately, note the overall tone in one short sentence ("tone_note"), and set "missing_attachment" to true only when the text itself mentions an attachment (e.g. "see attached", "I've attached") since you cannot see whether a real attachment is present -- this is a heuristic on the wording alone, not a real attachment check. Never suggest sending, submitting or otherwise finishing the email; only propose edits to its text."""
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
