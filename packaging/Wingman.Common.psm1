@@ -233,30 +233,72 @@ function Build-Logos {
     }
 }
 
-# --- phase ordering (issue #165) --------------------------------------------
-# The fixed sequence install.ps1 follows. Purely declarative -- nothing here
-# runs a step -- so a test can assert the ordering itself never regresses back
-# to issue #165's shape: the legacy install removed before the new one is
-# proven to work. install.ps1 does not read this list to drive its own
-# control flow (a linear script does not need to); it exists so the invariant
-# has one written-down, testable place to live.
-function Get-InstallPhaseOrder {
+# --- install.ps1's real phase order (issue #168) ------------------------------
+# Get-InstallPhaseOrder (removed by issue #168) named the intended step order
+# but nothing read it back, so install.ps1 could drift from it silently in
+# either direction. These two functions instead parse install.ps1's own AST
+# and check the order of its actual top-level, side-effecting statements --
+# the real control flow, not a hand-synced description of it -- so a test
+# against the real file fails the moment install.ps1's phase order regresses.
+#
+# Only top-level statements count (Parent-walked past any FunctionDefinitionAst):
+# a marker name appearing merely inside a function body -- e.g. as a nested
+# helper call -- must not satisfy the check, because that says nothing about
+# when the script itself performs that phase.
+function Get-TopLevelPhaseMarkers {
     [CmdletBinding()]
-    param()
-    @(
-        'Build',
-        'StageAndSignExecutable',
-        'PackAndSignMsix',
-        'StopOldProcess',
-        'StopCurrentProcess',
-        'DeployExecutable',
-        'RegisterPackage',
-        'VerifyRegistration',
-        'WriteRunValue',
-        'RemoveLegacyPackage',
-        'RemoveLegacyRunValue',
-        'RemoveLegacyInstallDir'
-    )
+    param([Parameter(Mandatory)][string]$ScriptPath)
+
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$null, [ref]$null)
+    $commands = $ast.FindAll(
+        { param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)
+
+    $markers = [ordered]@{
+        Build               = $null
+        RegisterPackage     = $null
+        RemoveLegacyInstall = $null
+    }
+
+    foreach ($cmd in $commands) {
+        $ancestor = $cmd.Parent
+        $inFunction = $false
+        while ($ancestor) {
+            if ($ancestor -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                $inFunction = $true
+                break
+            }
+            $ancestor = $ancestor.Parent
+        }
+        if ($inFunction) { continue }
+
+        $name = $cmd.GetCommandName()
+        if ($name -eq 'cargo' -and -not $markers.Build) {
+            $markers.Build = $cmd.Extent.StartLineNumber
+        } elseif ($name -eq 'Invoke-PackageRegistrationPhase' -and -not $markers.RegisterPackage) {
+            $markers.RegisterPackage = $cmd.Extent.StartLineNumber
+        } elseif ($name -eq 'Remove-LegacyInstall' -and -not $markers.RemoveLegacyInstall) {
+            $markers.RemoveLegacyInstall = $cmd.Extent.StartLineNumber
+        }
+    }
+
+    [pscustomobject]$markers
+}
+
+# Throws if a required marker is missing entirely (the check cannot be
+# performed -- e.g. install.ps1 stopped calling Invoke-PackageRegistrationPhase
+# by name), otherwise returns whether Build < RegisterPackage <
+# RemoveLegacyInstall holds, at the top level of $ScriptPath.
+function Test-InstallPhaseOrder {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ScriptPath)
+
+    $m = Get-TopLevelPhaseMarkers -ScriptPath $ScriptPath
+    foreach ($name in 'Build', 'RegisterPackage', 'RemoveLegacyInstall') {
+        if (-not $m.$name) {
+            throw "Top-level phase marker '$name' not found in $ScriptPath; Test-InstallPhaseOrder cannot verify ordering (issue #168)."
+        }
+    }
+    ($m.Build -lt $m.RegisterPackage) -and ($m.RegisterPackage -lt $m.RemoveLegacyInstall)
 }
 
 # --- rollback decision (issue #165) ------------------------------------------
@@ -378,10 +420,11 @@ Export-ModuleMember -Function @(
     'Get-ConfigDirPath',
     'Get-CleanupPlan',
     'Test-AumidBelongsToWingman',
-    'Get-InstallPhaseOrder',
     'Get-RollbackPlan',
     'Invoke-PackageRegistrationPhase',
     'Find-SdkTool',
     'Get-LogoSpecs',
-    'Build-Logos'
+    'Build-Logos',
+    'Get-TopLevelPhaseMarkers',
+    'Test-InstallPhaseOrder'
 )

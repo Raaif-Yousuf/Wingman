@@ -112,25 +112,69 @@ Describe 'Get-CleanupPlan' {
     }
 }
 
-Describe 'Get-InstallPhaseOrder' {
-    It 'orders every legacy-removal step after registration is verified (issue #165)' {
-        $order = Get-InstallPhaseOrder
-        $order.IndexOf('VerifyRegistration') | Should -BeGreaterThan -1
-        foreach ($legacyStep in 'RemoveLegacyPackage', 'RemoveLegacyRunValue', 'RemoveLegacyInstallDir') {
-            $order.IndexOf($legacyStep) | Should -BeGreaterThan $order.IndexOf('VerifyRegistration')
-        }
+Describe 'Test-InstallPhaseOrder (issue #168)' {
+    # Get-InstallPhaseOrder (removed) described the intended order but nothing
+    # ever read it back against install.ps1, so it could drift silently in
+    # either direction. Test-InstallPhaseOrder instead parses a script's real
+    # AST. These first two tests prove the guard actually catches a planted
+    # violation -- and accepts a correct fixture -- on synthetic scripts
+    # before the last test trusts it against the real install.ps1.
+
+    It 'catches a planted violation: legacy removal moved before registration' {
+        $bad = Join-Path $TestDrive 'bad-install.ps1'
+        Set-Content -Path $bad -Encoding utf8 -Value @'
+function Invoke-PackageRegistrationPhase { }
+function Remove-LegacyInstall { }
+
+& cargo build --release
+Remove-LegacyInstall
+Invoke-PackageRegistrationPhase
+'@
+        Test-InstallPhaseOrder -ScriptPath $bad | Should -BeFalse
     }
 
-    It 'stops the old process before the current one is (re)started' {
-        $order = Get-InstallPhaseOrder
-        $order.IndexOf('StopOldProcess') | Should -BeLessThan $order.IndexOf('RegisterPackage')
+    It 'accepts a correctly ordered fixture: build, then register, then remove legacy' {
+        $good = Join-Path $TestDrive 'good-install.ps1'
+        Set-Content -Path $good -Encoding utf8 -Value @'
+function Invoke-PackageRegistrationPhase { }
+function Remove-LegacyInstall { }
+
+& cargo build --release
+Invoke-PackageRegistrationPhase
+Remove-LegacyInstall
+'@
+        Test-InstallPhaseOrder -ScriptPath $good | Should -BeTrue
     }
 
-    It 'never lists a legacy-removal step before RegisterPackage' {
-        $order = Get-InstallPhaseOrder
-        foreach ($legacyStep in 'RemoveLegacyPackage', 'RemoveLegacyRunValue', 'RemoveLegacyInstallDir') {
-            $order.IndexOf($legacyStep) | Should -BeGreaterThan $order.IndexOf('RegisterPackage')
-        }
+    It 'throws when a phase marker is missing entirely, rather than reporting a false pass' {
+        $missing = Join-Path $TestDrive 'missing-install.ps1'
+        Set-Content -Path $missing -Encoding utf8 -Value @'
+& cargo build --release
+'@
+        { Test-InstallPhaseOrder -ScriptPath $missing } | Should -Throw
+    }
+
+    It 'ignores a marker that only appears nested inside a function body, not at the top level' {
+        $nested = Join-Path $TestDrive 'nested-install.ps1'
+        Set-Content -Path $nested -Encoding utf8 -Value @'
+function Invoke-PackageRegistrationPhase { }
+function Wrapper {
+    Remove-LegacyInstall
+}
+function Remove-LegacyInstall { }
+
+& cargo build --release
+Invoke-PackageRegistrationPhase
+'@
+        # Remove-LegacyInstall is never actually reached at the top level here,
+        # so the marker is (correctly) reported missing rather than satisfied
+        # by the call hidden inside Wrapper.
+        { Test-InstallPhaseOrder -ScriptPath $nested } | Should -Throw
+    }
+
+    It 'verifies the real install.ps1 keeps build < register < remove-legacy (issue #165)' {
+        $real = Join-Path $PSScriptRoot '..\install.ps1'
+        Test-InstallPhaseOrder -ScriptPath $real | Should -BeTrue
     }
 }
 

@@ -207,11 +207,20 @@ decision it calls on failure (`Get-RollbackPlan`) live in
 cmdlet (`Get-Process`, `Add-AppxPackage`, `Get-AppxPackage`, `Start-Process`,
 …) and drive a simulated registration failure end to end — including
 asserting the legacy package is never named by the rollback path — without
-touching a real machine. `Get-InstallPhaseOrder` is a third, purely
-declarative pure function naming the fixed step order, so a regression back
-to "legacy removed before the new one is proven" fails a fast unit test
-instead of waiting for the next real upgrade to discover it. See
-`packaging\Wingman.Common.Tests.ps1`.
+touching a real machine.
+
+A first version of this (`Get-InstallPhaseOrder`) named the intended step
+order as a hard-coded list, but nothing ever read it back against
+`install.ps1`, so the list and the real script could drift from each other
+in either direction without a test noticing (issue #168). It was replaced by
+`Test-InstallPhaseOrder` (and its helper `Get-TopLevelPhaseMarkers`), which
+parses `install.ps1`'s own AST and checks the order of its real top-level,
+side-effecting statements — the build (`cargo`), the registration call
+(`Invoke-PackageRegistrationPhase`) and the legacy-removal call
+(`Remove-LegacyInstall`) — ignoring any same-named call that only appears
+nested inside a function body. A regression back to "legacy removed before
+the new one is proven" now fails a fast unit test run against the real file,
+not a hand-synced description of it. See `packaging\Wingman.Common.Tests.ps1`.
 
 **Owed:** this reordering has not been run against the owner's real machine
 (that run is explicitly out of scope for an unattended session — no script in
@@ -233,7 +242,7 @@ was checked directly on 2026-09-15 (Windows 11 build 26200):
 | no-argument launch while running | one process throughout; spinner then a real card with a model answer |
 | `config.toml` | untouched by install |
 | `wingman.exe --settings` as the FIRST instance (nothing running yet) | Settings window opens once the tray icon and hook exist, before message pumping starts (issue #149). Owed: not yet checked by hand on this machine. `cargo test single_instance` covers only the pure argv decision (`first_launch_action`); a bare `wingman.exe` launch under the same conditions must NOT open Settings -- check both. |
-| phase ordering (issue #165): legacy install removed only after the new one registers and verifies | `Invoke-Pester -Path packaging` — `Get-InstallPhaseOrder` asserts `RemoveLegacyPackage`/`RemoveLegacyRunValue`/`RemoveLegacyInstallDir` all sort after `VerifyRegistration`, and after `RegisterPackage` |
+| phase ordering (issues #165, #168): legacy install removed only after the new one registers and verifies, checked against install.ps1's real AST, not a hand-synced list | `Invoke-Pester -Path packaging` — `Test-InstallPhaseOrder` parses `install.ps1` and asserts the top-level `cargo` build call sorts before the `Invoke-PackageRegistrationPhase` call, which sorts before the `Remove-LegacyInstall` call; synthetic-fixture tests prove it also catches a planted violation of that order |
 | phase-2 rollback on a simulated registration failure | `Invoke-Pester -Path packaging` — `Invoke-PackageRegistrationPhase`'s "simulates a registration-verification failure" test: mocks `Add-AppxPackage`/`Get-AppxPackage`/`Get-Process`/`Start-Process`, asserts the function throws, `Remove-AppxPackage` is never called against the legacy package, and the old `copilot-ask` process is restarted |
 | old process stopped before the new one is (re)started, and the two low-level keyboard hooks are never simultaneously live | `Invoke-PackageRegistrationPhase`'s "stops the old process before attempting to register" test, asserting call order via a mocked `Stop-Process`/`Add-AppxPackage` sequence. Owed: not checked against a real simultaneous-processes machine state -- `install.ps1` itself was never run for real in this session |
 | a real interrupted upgrade on the owner's machine (kill `powershell.exe` mid `Add-AppxPackage`, or run with Developer Mode off, and confirm `copilot-ask` is still running/autostarting afterward) | **Owed** -- explicitly out of scope for an unattended session; see issue #165 |
