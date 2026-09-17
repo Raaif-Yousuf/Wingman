@@ -58,15 +58,18 @@ Unbounded parallel builds have frozen this machine by exhausting RAM.
 
 - **Never run bare `cargo test`** or `cargo test --release`. Run the tests
   you touched: `cargo test <module_or_test_name>`. The orchestrator runs
-  the full suite.
+  the full suite. `scripts/hooks/block_unfiltered_cargo_test.py` enforces
+  this: it denies any `cargo test` invocation with no test-name filter. The
+  orchestrator's full-suite run sets `WINGMAN_FULL_SUITE=1` on the command
+  to bypass the check; that override is not for individual agents to use.
 - In a worktree, use **your own** target dir plus the shared sccache, and cap
   jobs:
   `export CARGO_TARGET_DIR=C:/Users/raaif/copilot-ask/target/wt/$(basename "$PWD") RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2`
-  Do not share one target dir between worktrees. MEASURED 2026-09-16: cargo
-  hashes a workspace member's artifacts by its workspace-relative path, so two
-  worktrees of this crate write the same test binary, and a filtered run
-  silently executed a binary built from another worktree's source (new tests
-  missing from `--list` until a `touch`). sccache shares the dependency
+  Do not share one target dir between worktrees. MEASURED 2026-09-16: with a
+  shared dir, a filtered run in one worktree did not list tests that existed
+  in its source until a `touch` forced a rebuild. THEORY (unverified): cargo
+  hashes a workspace member by its workspace-relative path, so every worktree
+  of this crate writes the same test binary. sccache shares the dependency
   compiles safely across target dirs.
 - "Blocking waiting for file lock" is expected. Wait; do not delete locks.
 - No `cargo build --release` unless the task is about the release binary.

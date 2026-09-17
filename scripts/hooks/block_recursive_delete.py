@@ -20,6 +20,11 @@ WHAT IT DOES NOT BLOCK
 - `git clean`, which respects `.gitignore`.
 - Prose that merely mentions the string: the pattern requires the command in
   command position, and `cat <<EOF` heredoc BODIES are blanked before scanning.
+- Prose inside a quoted string (e.g. a `gh issue create --body "..."`
+  argument) that parenthetically quotes a dangerous command as an example: a
+  `;`, `&`, `|`, newline or `(` only counts as command position OUTSIDE
+  quotes (issue #148). A real command's own quoted target argument is not
+  affected by this.
 
 CONTRACT
 --------
@@ -69,6 +74,48 @@ A recursive delete there is not blocked.
 To discard uncommitted changes to tracked files, `git checkout -- <paths>` is
 the right tool and is not blocked. To remove untracked files with .gitignore
 respected, `git clean` is not blocked either. `cargo clean` is not blocked."""
+
+
+def _neutralize_quoted_command_separators(command: str) -> str:
+    """A shell separator character (`;`, `&`, `|`, newline, `(`) has no
+    special meaning to the shell when it sits inside a quoted string: it is
+    ordinary prose punctuation, e.g. inside a `gh issue create --body "..."`
+    argument that parenthetically quotes a dangerous command as an example
+    (issue #148). Neutralise ONLY those separator characters, and ONLY while
+    inside a quoted span (single or double quotes tracked independently,
+    honouring a backslash escape inside double quotes the way a real shell
+    would). Everything else inside the quoted span is left untouched -- in
+    particular the text of a REAL command's own quoted target argument
+    (`rm -rf "/c/Users/x"`) survives byte-for-byte, so this cannot reopen
+    #146 by letting a target hide inside quotes. A real, unquoted `(` (an
+    actual subshell) is never touched, so a real `(rm -rf ...)` is still
+    caught."""
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for ch in command:
+        if quote is not None:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\" and quote == '"':
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == quote:
+                quote = None
+                out.append(ch)
+                continue
+            if ch in ";&|(\n":
+                out.append(" ")
+                continue
+            out.append(ch)
+            continue
+        if ch in "'\"":
+            quote = ch
+        out.append(ch)
+    return "".join(out)
 
 
 def _strip_cat_heredoc_bodies(command: str) -> str:
@@ -142,6 +189,36 @@ def _targets(tokens: list[str]) -> list[str]:
     return out
 
 
+# Git Bash / MSYS absolute paths: `/c/Users/...` or `/cygdrive/c/Users/...`.
+# A single drive letter between two slashes (or after `/cygdrive/`) at the
+# start of the string is the MSYS spelling of a Windows drive root.
+_CYGDRIVE_ABS = re.compile(r"^/cygdrive/([A-Za-z])(/.*)?$")
+_MSYS_ABS = re.compile(r"^/([A-Za-z])(/.*)?$")
+
+
+def _translate_msys_path(target: str) -> str:
+    """`pathlib.Path.resolve()` on Windows does not understand either MSYS
+    spelling: it treats the leading `/` as the root of the CURRENT drive and
+    the drive letter becomes a literal directory name, so `/c/Users/raaif/x`
+    resolves to `C:\\c\\Users\\raaif\\x`, never under `REPO_ROOT`
+    (MEASURED 2026-09-16: `pathlib.Path('/c/Users/raaif/copilot-ask/target').resolve()`
+    == `WindowsPath('C:/c/Users/raaif/copilot-ask/target')`). Translate both
+    MSYS spellings to a drive-rooted Windows path first. POSIX-only, since on
+    a real POSIX filesystem `/c/...` is an ordinary absolute path and must be
+    left alone."""
+    if os.name != "nt":
+        return target
+    m = _CYGDRIVE_ABS.match(target)
+    if m:
+        drive, rest = m.group(1), m.group(2) or "/"
+        return f"{drive}:{rest}"
+    m = _MSYS_ABS.match(target)
+    if m:
+        drive, rest = m.group(1), m.group(2) or "/"
+        return f"{drive}:{rest}"
+    return target
+
+
 def _is_inside_repo(target: str) -> bool:
     """A bare relative path counts as inside: the hook cannot know the shell's
     cwd and failing toward 'inside' is the protective direction. An absolute
@@ -149,6 +226,7 @@ def _is_inside_repo(target: str) -> bool:
     if not target or target.startswith("$") or "*" in target or "?" in target:
         return "*" not in target or not os.path.isabs(target)
     expanded = os.path.expandvars(os.path.expanduser(target))
+    expanded = _translate_msys_path(expanded)
     path = pathlib.Path(expanded)
     posix_rooted = expanded.startswith("/") or expanded.startswith("\\")
     if not path.is_absolute() and not posix_rooted:
@@ -166,6 +244,7 @@ def _is_inside_repo(target: str) -> bool:
 
 def verdict(command: str) -> str | None:
     scanned = _strip_cat_heredoc_bodies(command or "")
+    scanned = _neutralize_quoted_command_separators(scanned)
     for pattern, is_rf in ((_RM, _posix_rm_is_recursive_force),
                            (_REMOVE_ITEM, _powershell_is_recursive_force)):
         for match in pattern.finditer(scanned):
