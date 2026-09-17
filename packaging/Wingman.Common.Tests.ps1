@@ -112,6 +112,154 @@ Describe 'Get-CleanupPlan' {
     }
 }
 
+Describe 'Get-InstallPhaseOrder' {
+    It 'orders every legacy-removal step after registration is verified (issue #165)' {
+        $order = Get-InstallPhaseOrder
+        $order.IndexOf('VerifyRegistration') | Should -BeGreaterThan -1
+        foreach ($legacyStep in 'RemoveLegacyPackage', 'RemoveLegacyRunValue', 'RemoveLegacyInstallDir') {
+            $order.IndexOf($legacyStep) | Should -BeGreaterThan $order.IndexOf('VerifyRegistration')
+        }
+    }
+
+    It 'stops the old process before the current one is (re)started' {
+        $order = Get-InstallPhaseOrder
+        $order.IndexOf('StopOldProcess') | Should -BeLessThan $order.IndexOf('RegisterPackage')
+    }
+
+    It 'never lists a legacy-removal step before RegisterPackage' {
+        $order = Get-InstallPhaseOrder
+        foreach ($legacyStep in 'RemoveLegacyPackage', 'RemoveLegacyRunValue', 'RemoveLegacyInstallDir') {
+            $order.IndexOf($legacyStep) | Should -BeGreaterThan $order.IndexOf('RegisterPackage')
+        }
+    }
+}
+
+Describe 'Get-RollbackPlan' {
+    It 'undoes everything phase 2 finished and restarts the old process when it was running' {
+        $plan = Get-RollbackPlan -NewPackageRegistered $true -NewRunValueWritten $true `
+            -OldProcessWasRunning $true -OldInstallStillPresent $true
+        $plan.UnregisterNewPackage | Should -BeTrue
+        $plan.RemoveNewRunValue | Should -BeTrue
+        $plan.RestartOldProcess | Should -BeTrue
+    }
+
+    It 'does not try to unregister a package that never got registered' {
+        $plan = Get-RollbackPlan -NewPackageRegistered $false -NewRunValueWritten $false `
+            -OldProcessWasRunning $true -OldInstallStillPresent $true
+        $plan.UnregisterNewPackage | Should -BeFalse
+        $plan.RemoveNewRunValue | Should -BeFalse
+    }
+
+    It 'does not restart the old process when it was never running' {
+        $plan = Get-RollbackPlan -NewPackageRegistered $true -NewRunValueWritten $false `
+            -OldProcessWasRunning $false -OldInstallStillPresent $true
+        $plan.RestartOldProcess | Should -BeFalse
+    }
+
+    It 'does not try to restart the old process when its install dir/exe is already gone' {
+        $plan = Get-RollbackPlan -NewPackageRegistered $true -NewRunValueWritten $true `
+            -OldProcessWasRunning $true -OldInstallStillPresent $false
+        $plan.RestartOldProcess | Should -BeFalse
+    }
+
+    It 'plans nothing when phase 2 had not done anything yet' {
+        $plan = Get-RollbackPlan -NewPackageRegistered $false -NewRunValueWritten $false `
+            -OldProcessWasRunning $false -OldInstallStillPresent $true
+        $plan.UnregisterNewPackage | Should -BeFalse
+        $plan.RemoveNewRunValue | Should -BeFalse
+        $plan.RestartOldProcess | Should -BeFalse
+    }
+}
+
+Describe 'Invoke-PackageRegistrationPhase' {
+    BeforeAll {
+        $script:id = Get-WingmanIdentity
+        $script:installDir = 'TestDrive:\Install\Wingman'
+        $script:legacyDir  = 'TestDrive:\Install\copilot-ask'
+        $script:msixPath   = 'TestDrive:\stage\wingman.msix'
+        $script:builtExe   = 'TestDrive:\build\wingman.exe'
+        $script:runKey     = 'TestDrive:\Run'
+    }
+
+    BeforeEach {
+        Mock -ModuleName Wingman.Common Get-Process { $null }
+        Mock -ModuleName Wingman.Common Stop-Process { }
+        Mock -ModuleName Wingman.Common Wait-Process { }
+        Mock -ModuleName Wingman.Common New-Item { }
+        Mock -ModuleName Wingman.Common Copy-Item { }
+        Mock -ModuleName Wingman.Common Test-Path { $false }
+        Mock -ModuleName Wingman.Common Add-AppxPackage { }
+        Mock -ModuleName Wingman.Common Get-AppxPackage { $null }
+        Mock -ModuleName Wingman.Common Set-ItemProperty { }
+        Mock -ModuleName Wingman.Common Remove-ItemProperty { }
+        Mock -ModuleName Wingman.Common Remove-AppxPackage { }
+        Mock -ModuleName Wingman.Common Start-Process { }
+    }
+
+    It 'reports success and never touches the legacy package when registration verifies' {
+        Mock -ModuleName Wingman.Common Get-AppxPackage { [pscustomobject]@{ PackageFullName = 'RaaifYousuf.Wingman_1.0.0.0_x64__abc' } }
+
+        $result = Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+            -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey
+
+        $result.Success | Should -BeTrue
+        Should -Invoke -ModuleName Wingman.Common Remove-AppxPackage -Times 0
+        Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0
+    }
+
+    It 'simulates a registration-verification failure and asserts the legacy install is never removed' {
+        # Add-AppxPackage "succeeds" but Get-AppxPackage then finds nothing --
+        # the exact shape issue #165 is about: a step downstream of
+        # Remove-LegacyInstall throws after the legacy install is gone.
+        Mock -ModuleName Wingman.Common Get-Process {
+            if ($Name -eq $id.Legacy.ProcessName) { [pscustomobject]@{ Id = 4242 } } else { $null }
+        }
+        Mock -ModuleName Wingman.Common Test-Path { $true } # old exe still present
+        Mock -ModuleName Wingman.Common Get-AppxPackage { $null }
+
+        { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+            -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+            Should -Throw
+
+        # The legacy package/Run value/install dir are never named by this
+        # function at all -- asserting that is the strongest form of "never
+        # removed" available without wiring in Remove-LegacyInstall itself.
+        Should -Invoke -ModuleName Wingman.Common Remove-AppxPackage -Times 0 -ParameterFilter {
+            $Package -like "*CopilotAsk*"
+        }
+        # Rollback undid the new package registration attempt and restarted
+        # the still-running-before-we-stopped-it old process.
+        Should -Invoke -ModuleName Wingman.Common Start-Process -Times 1
+        Should -Invoke -ModuleName Wingman.Common Stop-Process -Times 1
+    }
+
+    It 'does not restart the old process on failure if it was never running' {
+        Mock -ModuleName Wingman.Common Get-Process { $null }
+        Mock -ModuleName Wingman.Common Add-AppxPackage { throw 'deployment refused: 0x80073CF2' }
+
+        { Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+            -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey } |
+            Should -Throw
+
+        Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0
+    }
+
+    It 'stops the old process before attempting to register the new package' {
+        $script:order = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName Wingman.Common Get-Process {
+            if ($Name -eq $id.Legacy.ProcessName) { [pscustomobject]@{ Id = 99 } } else { $null }
+        }
+        Mock -ModuleName Wingman.Common Stop-Process { $script:order.Add('StopOldProcess') }
+        Mock -ModuleName Wingman.Common Add-AppxPackage { $script:order.Add('RegisterPackage') }
+        Mock -ModuleName Wingman.Common Get-AppxPackage { [pscustomobject]@{ PackageFullName = 'x' } }
+
+        Invoke-PackageRegistrationPhase -Identity $id -BuiltExePath $builtExe `
+            -InstallDir $installDir -LegacyDir $legacyDir -MsixPath $msixPath -RunKeyPath $runKey | Out-Null
+
+        $order | Should -Be @('StopOldProcess', 'RegisterPackage')
+    }
+}
+
 Describe 'Test-AumidBelongsToWingman' {
     BeforeAll { $script:id = Get-WingmanIdentity }
 

@@ -133,6 +133,143 @@ function Test-AumidBelongsToWingman {
     ($Aumid -like "$($Identity.Legacy.PackageName)*")
 }
 
+# --- phase ordering (issue #165) --------------------------------------------
+# The fixed sequence install.ps1 follows. Purely declarative -- nothing here
+# runs a step -- so a test can assert the ordering itself never regresses back
+# to issue #165's shape: the legacy install removed before the new one is
+# proven to work. install.ps1 does not read this list to drive its own
+# control flow (a linear script does not need to); it exists so the invariant
+# has one written-down, testable place to live.
+function Get-InstallPhaseOrder {
+    [CmdletBinding()]
+    param()
+    @(
+        'Build',
+        'StageAndSignExecutable',
+        'PackAndSignMsix',
+        'StopOldProcess',
+        'StopCurrentProcess',
+        'DeployExecutable',
+        'RegisterPackage',
+        'VerifyRegistration',
+        'WriteRunValue',
+        'RemoveLegacyPackage',
+        'RemoveLegacyRunValue',
+        'RemoveLegacyInstallDir'
+    )
+}
+
+# --- rollback decision (issue #165) ------------------------------------------
+# Phase 2 (registering the new package) is the only phase with both system
+# side effects and a way to fail partway through. This decides what to undo
+# from a snapshot of what phase 2 had actually finished when it failed, so the
+# decision -- not the Remove-AppxPackage / Start-Process calls that carry it
+# out -- is what Pester exercises directly.
+function Get-RollbackPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool]$NewPackageRegistered,
+        [Parameter(Mandatory)][bool]$NewRunValueWritten,
+        [Parameter(Mandatory)][bool]$OldProcessWasRunning,
+        [Parameter(Mandatory)][bool]$OldInstallStillPresent
+    )
+    [pscustomobject]@{
+        UnregisterNewPackage = $NewPackageRegistered
+        RemoveNewRunValue    = $NewRunValueWritten
+        RestartOldProcess    = $OldProcessWasRunning -and $OldInstallStillPresent
+    }
+}
+
+# --- phase 2: register the new package (issue #165) -------------------------
+# Everything here has a system side effect, which is exactly why it is its own
+# function: Pester can mock every cmdlet it calls (Mock -ModuleName
+# Wingman.Common) and drive a simulated failure without touching this
+# machine's real processes, packages, registry or filesystem.
+#
+# On success the caller (install.ps1) may proceed to remove the legacy
+# install. On failure this rolls back what it did (via Get-RollbackPlan) and
+# throws, so the caller never reaches legacy removal at all -- the old install
+# stays in place (and the old process, if it was running, is restarted).
+function Invoke-PackageRegistrationPhase {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)][string]$BuiltExePath,
+        [Parameter(Mandatory)][string]$InstallDir,
+        [Parameter(Mandatory)][string]$LegacyDir,
+        [Parameter(Mandatory)][string]$MsixPath,
+        [Parameter(Mandatory)][string]$RunKeyPath,
+        [switch]$NoAutostart
+    )
+
+    $state = [pscustomobject]@{
+        NewPackageRegistered = $false
+        NewRunValueWritten   = $false
+        OldProcessWasRunning = $false
+    }
+
+    try {
+        # Old process first, then a running copy of the current identity (an
+        # in-place Wingman-to-Wingman upgrade): with both possibly holding a
+        # low-level keyboard hook, the old one must be gone before the new one
+        # is ever (re)started, and its file must be unlocked before it is
+        # overwritten below.
+        $oldProcess = Get-Process -Name $Identity.Legacy.ProcessName -ErrorAction SilentlyContinue
+        if ($oldProcess) {
+            $state.OldProcessWasRunning = $true
+            $oldProcess | Stop-Process -Force
+            $oldProcess | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+        }
+
+        $currentProcess = Get-Process -Name $Identity.Current.ProcessName -ErrorAction SilentlyContinue
+        if ($currentProcess) {
+            $currentProcess | Stop-Process -Force
+            $currentProcess | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+        }
+
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        Copy-Item $BuiltExePath (Join-Path $InstallDir $Identity.Current.ExeName) -Force
+
+        Add-AppxPackage -Path $MsixPath -ExternalLocation $InstallDir -ForceUpdateFromAnyVersion
+        $state.NewPackageRegistered = $true
+
+        $pkg = Get-AppxPackage -Name $Identity.Current.PackageName
+        if (-not $pkg) {
+            throw "Add-AppxPackage completed but Get-AppxPackage -Name $($Identity.Current.PackageName) found nothing; registration did not verify."
+        }
+
+        if (-not $NoAutostart) {
+            if (-not (Test-Path $RunKeyPath)) { New-Item -Path $RunKeyPath | Out-Null }
+            Set-ItemProperty -Path $RunKeyPath -Name $Identity.Current.RunValue `
+                -Value "`"$InstallDir\$($Identity.Current.ExeName)`""
+            $state.NewRunValueWritten = $true
+        }
+
+        [pscustomobject]@{ Success = $true; Package = $pkg }
+    }
+    catch {
+        $originalError = $_
+        $oldExePresent = Test-Path (Join-Path $LegacyDir $Identity.Legacy.ExeName)
+        $plan = Get-RollbackPlan -NewPackageRegistered $state.NewPackageRegistered `
+            -NewRunValueWritten $state.NewRunValueWritten `
+            -OldProcessWasRunning $state.OldProcessWasRunning `
+            -OldInstallStillPresent $oldExePresent
+
+        if ($plan.RemoveNewRunValue) {
+            Remove-ItemProperty -Path $RunKeyPath -Name $Identity.Current.RunValue -ErrorAction SilentlyContinue
+        }
+        if ($plan.UnregisterNewPackage) {
+            $newPkg = Get-AppxPackage -Name $Identity.Current.PackageName -ErrorAction SilentlyContinue
+            if ($newPkg) { Remove-AppxPackage -Package $newPkg.PackageFullName -ErrorAction SilentlyContinue }
+        }
+        if ($plan.RestartOldProcess) {
+            Start-Process -FilePath (Join-Path $LegacyDir $Identity.Legacy.ExeName) -ErrorAction SilentlyContinue
+        }
+
+        throw "Registering the new package failed: $($originalError.Exception.Message). The pre-rename copilot-ask install was left in place$(if ($plan.RestartOldProcess) { ' and restarted' }); re-run install.ps1 to try again."
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-WingmanIdentity',
     'Get-CargoVersionString',
@@ -140,5 +277,8 @@ Export-ModuleMember -Function @(
     'Get-InstallDirPath',
     'Get-ConfigDirPath',
     'Get-CleanupPlan',
-    'Test-AumidBelongsToWingman'
+    'Test-AumidBelongsToWingman',
+    'Get-InstallPhaseOrder',
+    'Get-RollbackPlan',
+    'Invoke-PackageRegistrationPhase'
 )

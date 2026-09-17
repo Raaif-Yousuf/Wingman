@@ -155,6 +155,69 @@ this hardware.
 
 No `Uninstall` registry key is written; package identity supplies that entry.
 
+## Install sequence: build/register/cleanup, not cleanup/build/register (issue #165)
+
+Until 2026-09-16, `install.ps1` removed the pre-rename `copilot-ask` install
+(process, package, Run value, install dir) *before* building, signing,
+packing and registering the new one. Under `$ErrorActionPreference = 'Stop'`,
+any failure between those two things — a `cargo build` error, a signing
+hiccup, `MakeAppx` rejecting the manifest, `Add-AppxPackage` refusing the
+deployment (Developer Mode off, a stale registration, `0x800B0109`) — threw
+past the point where the old install still existed, leaving the owner with
+neither app running nor autostarting and only a script error to recover from.
+None of those failure modes are about the rename itself; `Add-AppxPackage` in
+particular is exactly the kind of step that can fail on a machine's first run
+of a new install script even when everything upstream worked.
+
+The script now runs in three phases, in this order:
+
+1. **Build, stage, sign, pack.** `cargo build --release`, sign
+   `target\release\wingman.exe` directly (not an `$InstallDir` copy — this
+   phase never touches `$InstallDir` at all), build the package layout and
+   logos, `MakeAppx pack`, sign the `.msix`. No process is stopped, no
+   package is (un)registered, no registry value is touched, no install
+   directory is deleted. A failure anywhere in this phase leaves the machine
+   exactly as it was found — old and new installs both still whatever they
+   were before the script ran.
+2. **Register.** Stop the old `copilot-ask` process if running, then stop a
+   running copy of the *current* `wingman` process if one exists (an
+   in-place Wingman-to-Wingman upgrade) — the old one first, always, so the
+   two low-level keyboard hooks are never both live and the new one is never
+   started while the old one still owns the key. Copy the now-signed exe into
+   `$InstallDir`, `Add-AppxPackage -ExternalLocation`, verify the
+   registration actually took (`Get-AppxPackage -Name RaaifYousuf.Wingman`
+   must return something — `Add-AppxPackage` completing without throwing is
+   not itself proof), then write the new `Run` value unless `-NoAutostart`.
+   If anything in this phase throws, including the explicit verification
+   check, it is rolled back: the new package is unregistered if it got that
+   far, the new `Run` value is removed if it got written, and the old
+   `copilot-ask.exe` is restarted if it was running before this phase
+   stopped it and its install dir is still present. The script then throws a
+   message naming what failed and stating that the old install was left
+   intact (and restarted, if applicable) — never a silent partial state.
+3. **Remove the legacy install.** Only reached if phase 2 returned
+   successfully. Same shape as before (stop process, unregister package,
+   remove Run value, delete install dir), and still never touches the
+   certificate store or `%APPDATA%\copilot-ask`, matching
+   `uninstall.ps1 -KeepCertificate`.
+
+The phase-2 orchestration (`Invoke-PackageRegistrationPhase`) and the pure
+decision it calls on failure (`Get-RollbackPlan`) live in
+`packaging\Wingman.Common.psm1`, so Pester can mock every side-effecting
+cmdlet (`Get-Process`, `Add-AppxPackage`, `Get-AppxPackage`, `Start-Process`,
+…) and drive a simulated registration failure end to end — including
+asserting the legacy package is never named by the rollback path — without
+touching a real machine. `Get-InstallPhaseOrder` is a third, purely
+declarative pure function naming the fixed step order, so a regression back
+to "legacy removed before the new one is proven" fails a fast unit test
+instead of waiting for the next real upgrade to discover it. See
+`packaging\Wingman.Common.Tests.ps1`.
+
+**Owed:** this reordering has not been run against the owner's real machine
+(that run is explicitly out of scope for an unattended session — no script in
+this repo may touch the real registry, certificate store, installed packages
+or processes). The owner's manual upgrade check is filed against issue #165.
+
 ## Verification
 
 `cargo test` covers argument parsing. Everything else is observable state, and
@@ -170,6 +233,10 @@ was checked directly on 2026-09-15 (Windows 11 build 26200):
 | no-argument launch while running | one process throughout; spinner then a real card with a model answer |
 | `config.toml` | untouched by install |
 | `wingman.exe --settings` as the FIRST instance (nothing running yet) | Settings window opens once the tray icon and hook exist, before message pumping starts (issue #149). Owed: not yet checked by hand on this machine. `cargo test single_instance` covers only the pure argv decision (`first_launch_action`); a bare `wingman.exe` launch under the same conditions must NOT open Settings -- check both. |
+| phase ordering (issue #165): legacy install removed only after the new one registers and verifies | `Invoke-Pester -Path packaging` — `Get-InstallPhaseOrder` asserts `RemoveLegacyPackage`/`RemoveLegacyRunValue`/`RemoveLegacyInstallDir` all sort after `VerifyRegistration`, and after `RegisterPackage` |
+| phase-2 rollback on a simulated registration failure | `Invoke-Pester -Path packaging` — `Invoke-PackageRegistrationPhase`'s "simulates a registration-verification failure" test: mocks `Add-AppxPackage`/`Get-AppxPackage`/`Get-Process`/`Start-Process`, asserts the function throws, `Remove-AppxPackage` is never called against the legacy package, and the old `copilot-ask` process is restarted |
+| old process stopped before the new one is (re)started, and the two low-level keyboard hooks are never simultaneously live | `Invoke-PackageRegistrationPhase`'s "stops the old process before attempting to register" test, asserting call order via a mocked `Stop-Process`/`Add-AppxPackage` sequence. Owed: not checked against a real simultaneous-processes machine state -- `install.ps1` itself was never run for real in this session |
+| a real interrupted upgrade on the owner's machine (kill `powershell.exe` mid `Add-AppxPackage`, or run with Developer Mode off, and confirm `copilot-ask` is still running/autostarting afterward) | **Owed** -- explicitly out of scope for an unattended session; see issue #165 |
 
 ## Setting the key is the user's, not the installer's
 
