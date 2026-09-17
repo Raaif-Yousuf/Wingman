@@ -54,8 +54,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, RegisterWindowMessageW,
     SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION,
     MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MIIM_FTYPE, MIIM_STATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU,
-    WM_LBUTTONUP, WM_RBUTTONUP,
+    MIIM_FTYPE, MIIM_STATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP,
+    WM_RBUTTONUP,
 };
 
 /// Posted by the shell to this app's window proc on tray icon activity.
