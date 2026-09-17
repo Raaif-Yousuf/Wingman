@@ -1,0 +1,49 @@
+# Golden fixture for issue #135. Represents the config.toml shape written by
+# a Wingman build just after the copilot-ask -> Wingman rename (303074a) but
+# before Ollama (#13, commit 05a3829) and before Gemini (#17, commit
+# 74796d8) existed -- concretely, the shape at commit 05a3829~1. Both
+# [providers.ollama] and [providers.gemini] are absent, and there is still
+# no top-level `mode` key (#19 came later still).
+#
+# Every value below is deliberately non-default so a regression that resets
+# a field to its built-in default is caught, not masked by a value that
+# happens to already match the default.
+
+[hotkeys.primary]
+vk = 66
+ctrl = true
+shift = true
+alt = false
+win = false
+
+[hotkeys.secondary]
+vk = 219
+ctrl = false
+shift = true
+alt = true
+win = true
+
+[capture]
+max_edge = 1800
+monitor = "active"
+
+[providers]
+order = ["openai", "anthropic"]
+
+[providers.openai]
+model = "gpt-5.1"
+effort = "low"
+api_key = ""
+models = ["gpt-5.1", "gpt-5", "custom-openai-pre-ollama"]
+
+[providers.anthropic]
+model = "claude-fable-5-1"
+effort = "low"
+api_key = ""
+models = ["claude-fable-5-1", "claude-opus-5", "custom-claude-pre-ollama"]
+
+[ui]
+card_seconds = 8
+text_scale = 1.5
+show_difficulty = false
+prompt = "Post-rename, pre-expansion custom prompt."

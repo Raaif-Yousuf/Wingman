@@ -1,0 +1,51 @@
+# Golden fixture for issue #135. Represents the config.toml shape written by
+# a copilot-ask build as of commit 80b2dcc ("Make Windows aware the app
+# exists"): before the Wingman rename, before Mode (#19), before Gemini
+# (#17) and before Ollama (#13). At this point in history the file lived at
+# %APPDATA%\copilot-ask\config.toml, but the *contents* -- the only thing
+# `Config::load_from` ever reads -- were exactly this shape:
+# [hotkeys], [capture], [providers] with only openai/anthropic, and [ui].
+# No [providers.ollama], no [providers.gemini], no top-level `mode` key.
+#
+# Every value below is deliberately non-default so a regression that resets
+# a field to its built-in default is caught, not masked by a value that
+# happens to already match the default.
+
+[hotkeys.primary]
+vk = 112
+ctrl = true
+shift = false
+alt = true
+win = false
+
+[hotkeys.secondary]
+vk = 75
+ctrl = true
+shift = true
+alt = false
+win = true
+
+[capture]
+max_edge = 2048
+monitor = "primary"
+
+[providers]
+order = ["anthropic", "openai"]
+
+[providers.openai]
+model = "gpt-5.4-mini"
+effort = "medium"
+api_key = ""
+models = ["gpt-5.4-mini", "gpt-4.1", "custom-openai-model"]
+
+[providers.anthropic]
+model = "claude-sonnet-5"
+effort = "high"
+api_key = ""
+models = ["claude-sonnet-5", "claude-haiku-4-5", "custom-claude-model"]
+
+[ui]
+card_seconds = 45
+text_scale = 1.25
+show_difficulty = false
+prompt = "Pre-rename custom prompt: check only the arithmetic."

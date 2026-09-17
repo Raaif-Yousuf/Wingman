@@ -2008,4 +2008,256 @@ text_scale = 0.0
         assert!(result.is_err());
         assert!(!path.exists(), "the file must never be written when the store write fails");
     }
+
+    // -- #135: golden-config compatibility across the app's shape history ---
+    //
+    // Each fixture under `tests/fixtures/config/` is a config.toml written
+    // by an earlier build (or, for the last one, a hypothetically newer
+    // one), with every user-set value deliberately non-default so a
+    // regression that silently resets a field to its built-in default is
+    // caught rather than masked by a value that already matches it.
+    // `write_fixture` copies the committed fixture text into a scratch temp
+    // dir before `Config::load_from` ever sees it (rule 9: never touch the
+    // real `%APPDATA%`).
+
+    fn write_fixture(tag: &str, contents: &str) -> PathBuf {
+        let path = scratch_path(tag);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn pre_rename_copilot_ask_config_survives_upgrade() {
+        // Commit 80b2dcc's shape: no [providers.ollama], no
+        // [providers.gemini], no top-level `mode` key at all.
+        let contents = include_str!("../tests/fixtures/config/pre_rename_copilot_ask.toml");
+        let path = write_fixture("golden-pre-rename", contents);
+
+        let cfg = Config::load_from(&path).expect("load should succeed");
+
+        assert_eq!(
+            cfg.hotkeys.primary,
+            Chord {
+                vk: 112,
+                ctrl: true,
+                shift: false,
+                alt: true,
+                win: false
+            }
+        );
+        assert_eq!(
+            cfg.hotkeys.secondary,
+            Chord {
+                vk: 75,
+                ctrl: true,
+                shift: true,
+                alt: false,
+                win: true
+            }
+        );
+        assert_eq!(cfg.capture.max_edge, 2048);
+        assert_eq!(cfg.capture.monitor, "primary");
+        assert_eq!(cfg.ui.card_seconds, 45);
+        assert_eq!(cfg.ui.text_scale, 1.25);
+        assert!(!cfg.ui.show_difficulty);
+        assert_eq!(
+            cfg.ui.prompt,
+            "Pre-rename custom prompt: check only the arithmetic."
+        );
+        assert_eq!(cfg.providers.order, vec!["anthropic", "openai"]);
+        assert_eq!(cfg.providers.openai.model, "gpt-5.4-mini");
+        assert_eq!(cfg.providers.openai.effort, "medium");
+        assert_eq!(
+            cfg.providers.openai.models,
+            vec!["gpt-5.4-mini", "gpt-4.1", "custom-openai-model"]
+        );
+        assert_eq!(cfg.providers.anthropic.model, "claude-sonnet-5");
+        assert_eq!(cfg.providers.anthropic.effort, "high");
+        assert_eq!(
+            cfg.providers.anthropic.models,
+            vec!["claude-sonnet-5", "claude-haiku-4-5", "custom-claude-model"]
+        );
+        // Fields this era's config.toml has no key for at all must still
+        // backfill to something usable, never a parse failure or an empty
+        // hole a newer build depends on.
+        assert_eq!(cfg.mode, Mode::Auto);
+        assert!(!cfg.providers.ollama.base_url.is_empty());
+        assert!(!cfg.providers.ollama.model.is_empty());
+        assert!(!cfg.providers.gemini.models.is_empty());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn before_gemini_and_ollama_config_survives_upgrade() {
+        // Commit 05a3829~1's shape: renamed to Wingman, but still before
+        // Ollama (#13) and Gemini (#17) -- neither [providers.ollama] nor
+        // [providers.gemini] exists yet, and there is still no `mode` key.
+        let contents = include_str!("../tests/fixtures/config/before_gemini_ollama.toml");
+        let path = write_fixture("golden-before-gemini-ollama", contents);
+
+        let cfg = Config::load_from(&path).expect("load should succeed");
+
+        assert_eq!(
+            cfg.hotkeys.primary,
+            Chord {
+                vk: 66,
+                ctrl: true,
+                shift: true,
+                alt: false,
+                win: false
+            }
+        );
+        assert_eq!(
+            cfg.hotkeys.secondary,
+            Chord {
+                vk: 219,
+                ctrl: false,
+                shift: true,
+                alt: true,
+                win: true
+            }
+        );
+        assert_eq!(cfg.capture.max_edge, 1800);
+        assert_eq!(cfg.capture.monitor, "active");
+        assert_eq!(cfg.ui.card_seconds, 8);
+        assert_eq!(cfg.ui.text_scale, 1.5);
+        assert!(!cfg.ui.show_difficulty);
+        assert_eq!(cfg.ui.prompt, "Post-rename, pre-expansion custom prompt.");
+        assert_eq!(cfg.providers.order, vec!["openai", "anthropic"]);
+        assert_eq!(cfg.providers.openai.model, "gpt-5.1");
+        assert_eq!(
+            cfg.providers.openai.models,
+            vec!["gpt-5.1", "gpt-5", "custom-openai-pre-ollama"]
+        );
+        assert_eq!(cfg.providers.anthropic.model, "claude-fable-5-1");
+        assert_eq!(
+            cfg.providers.anthropic.models,
+            vec![
+                "claude-fable-5-1",
+                "claude-opus-5",
+                "custom-claude-pre-ollama"
+            ]
+        );
+        assert_eq!(cfg.mode, Mode::Auto);
+        assert!(!cfg.providers.ollama.base_url.is_empty());
+        assert!(!cfg.providers.gemini.models.is_empty());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn before_modes_config_survives_upgrade() {
+        // Commit f8789e6~1's shape: Ollama (#13) exists, but Mode (#19) and
+        // Gemini (#17) do not -- [providers.ollama] is present, there is no
+        // `mode` key and no [providers.gemini].
+        let contents = include_str!("../tests/fixtures/config/before_modes.toml");
+        let path = write_fixture("golden-before-modes", contents);
+
+        let cfg = Config::load_from(&path).expect("load should succeed");
+
+        assert_eq!(
+            cfg.hotkeys.primary,
+            Chord {
+                vk: 122,
+                ctrl: false,
+                shift: true,
+                alt: true,
+                win: false
+            }
+        );
+        assert_eq!(
+            cfg.hotkeys.secondary,
+            Chord {
+                vk: 190,
+                ctrl: true,
+                shift: false,
+                alt: false,
+                win: true
+            }
+        );
+        assert_eq!(cfg.capture.max_edge, 1200);
+        assert_eq!(cfg.capture.monitor, "primary");
+        assert_eq!(cfg.ui.card_seconds, 30);
+        assert_eq!(cfg.ui.text_scale, 0.9);
+        assert!(cfg.ui.show_difficulty);
+        assert_eq!(cfg.ui.prompt, "Before-Modes custom prompt: focus on units.");
+        assert_eq!(cfg.providers.order, vec!["ollama", "anthropic", "openai"]);
+        assert_eq!(cfg.providers.openai.model, "gpt-5.2");
+        assert_eq!(
+            cfg.providers.openai.models,
+            vec!["gpt-5.2", "gpt-5.1", "custom-openai-before-modes"]
+        );
+        assert_eq!(cfg.providers.anthropic.model, "claude-opus-4-8");
+        assert_eq!(
+            cfg.providers.anthropic.models,
+            vec![
+                "claude-opus-4-8",
+                "claude-sonnet-5",
+                "custom-claude-before-modes"
+            ]
+        );
+        assert_eq!(cfg.providers.ollama.base_url, "http://127.0.0.1:11434");
+        assert_eq!(cfg.providers.ollama.model, "llava:13b");
+        assert_eq!(cfg.providers.ollama.effort, "high");
+        // No `mode` key in this era's file -- must backfill to Auto rather
+        // than failing to parse or silently landing on some other variant.
+        assert_eq!(cfg.mode, Mode::Auto);
+        assert!(!cfg.providers.gemini.models.is_empty());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unknown_future_keys_do_not_fail_parsing_or_evict_known_values() {
+        // A config.toml from a build newer than this one: today's full
+        // shape plus keys nothing in this codebase has ever defined, at the
+        // top level and inside every section. No struct in this module
+        // carries `#[serde(deny_unknown_fields)]`, so these must be
+        // silently ignored, never turn the load into a fallback-to-defaults
+        // (which `parse_or_default`/`load_from` only do for text that fails
+        // to parse as TOML at all, not for unrecognized keys within valid
+        // TOML).
+        let contents = include_str!("../tests/fixtures/config/unknown_future_keys.toml");
+        let path = write_fixture("golden-unknown-keys", contents);
+
+        let cfg = Config::load_from(&path).expect("load should succeed despite unknown keys");
+
+        assert_eq!(
+            cfg.hotkeys.primary,
+            Chord {
+                vk: 27,
+                ctrl: true,
+                shift: true,
+                alt: true,
+                win: false
+            }
+        );
+        assert_eq!(
+            cfg.hotkeys.secondary,
+            Chord {
+                vk: 9,
+                ctrl: false,
+                shift: false,
+                alt: false,
+                win: true
+            }
+        );
+        assert_eq!(cfg.capture.max_edge, 3000);
+        assert_eq!(cfg.ui.card_seconds, 99);
+        assert_eq!(cfg.ui.text_scale, 2.0);
+        assert_eq!(cfg.ui.prompt, "Future config custom prompt.");
+        assert_eq!(cfg.providers.order, vec!["anthropic", "ollama", "openai"]);
+        assert_eq!(cfg.providers.openai.model, "gpt-5.5-pro");
+        assert_eq!(cfg.providers.anthropic.model, "claude-opus-5");
+        assert_eq!(cfg.providers.gemini.model, "gemini-3.8-flash");
+        assert_eq!(cfg.providers.ollama.model, "gemma3:4b");
+        assert_eq!(cfg.mode, Mode::Cloud);
+        // The whole point: a parse that tripped over an unknown key and
+        // fell back wholesale would produce exactly `Config::default()`.
+        assert_ne!(cfg, Config::default());
+
+        cleanup(&path);
+    }
 }

@@ -1,0 +1,53 @@
+# Golden fixture for issue #135. Represents the config.toml shape written by
+# a Wingman build after Ollama (#13, commit 05a3829) but before Mode (#19,
+# commit f8789e6) existed -- concretely, the shape at commit f8789e6~1.
+# [providers.ollama] is present; there is still no top-level `mode` key and
+# no [providers.gemini] (#17 came later still).
+#
+# Every value below is deliberately non-default so a regression that resets
+# a field to its built-in default is caught, not masked by a value that
+# happens to already match the default.
+
+[hotkeys.primary]
+vk = 122
+ctrl = false
+shift = true
+alt = true
+win = false
+
+[hotkeys.secondary]
+vk = 190
+ctrl = true
+shift = false
+alt = false
+win = true
+
+[capture]
+max_edge = 1200
+monitor = "primary"
+
+[providers]
+order = ["ollama", "anthropic", "openai"]
+
+[providers.openai]
+model = "gpt-5.2"
+effort = "low"
+api_key = ""
+models = ["gpt-5.2", "gpt-5.1", "custom-openai-before-modes"]
+
+[providers.anthropic]
+model = "claude-opus-4-8"
+effort = "medium"
+api_key = ""
+models = ["claude-opus-4-8", "claude-sonnet-5", "custom-claude-before-modes"]
+
+[providers.ollama]
+base_url = "http://127.0.0.1:11434"
+model = "llava:13b"
+effort = "high"
+
+[ui]
+card_seconds = 30
+text_scale = 0.9
+show_difficulty = true
+prompt = "Before-Modes custom prompt: focus on units."

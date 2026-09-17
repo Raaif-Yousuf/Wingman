@@ -71,6 +71,21 @@ observable that would differ if the change were wired to nothing, and check
 it by hand before calling the change done. The `wired-to-nothing` skill in
 this repo exists for exactly this.
 
+## Config compatibility
+
+`config.toml`'s shape only ever grows: `#[serde(default)]` on every struct
+in `src/config.rs` means a field missing from an older file falls back to
+that field's own default, and `Config::backfill` repairs the handful of
+cases where the field-level default is not the value a fresh install would
+actually ship (an empty `models` list, a pre-#19 file with no `mode` key,
+and so on). When you add or rename a field in `src/config.rs`, add a golden
+fixture under `tests/fixtures/config/` containing a config.toml shaped like
+the *previous* release (non-default values for whatever it already had) and
+a test in `config::tests` asserting every one of those values still loads
+correctly under the new code, alongside the new field's default. This is
+issue #135's regression net: a settings or hotkey reset across an upgrade
+should fail a fixture test, not get discovered by a user.
+
 ## Commit sign-off (DCO)
 
 Every commit needs a Developer Certificate of Origin sign-off, certifying
