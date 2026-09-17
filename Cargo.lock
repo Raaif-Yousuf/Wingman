@@ -2768,6 +2768,7 @@ dependencies = [
  "toml",
  "ureq",
  "windows",
+ "windows-future",
  "xcap",
 ]
 

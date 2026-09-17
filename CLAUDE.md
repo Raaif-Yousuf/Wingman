@@ -96,7 +96,7 @@ action framework is the product and actions are the contribution surface.
 
 | Layer | Technology and the gotcha |
 |---|---|
-| Windows | `windows` 0.62 (Win32 + WinRT). Per-monitor-v2 DPI. `Windows.Media.Ocr` (planned) needs package identity, so verify with `GetCurrentPackageFullName` before relying on it from an autostarted exe |
+| Windows | `windows` 0.62 (Win32 + WinRT). Per-monitor-v2 DPI. `Windows.Media.Ocr` (`src/ocr.rs`, issue #30) does not need package identity for a direct-path launch -- MEASURED 2026-09-17, see the pitfall below |
 | HTTP | `ureq` 3, blocking, on purpose. No tokio, no reqwest, no streaming: every response is a whole structured result |
 | Capture | `xcap` 0.9 (Apache-2.0, permissive but not MIT) + `image` PNG-only |
 | Config | `toml` in `%APPDATA%\Wingman\config.toml`, owner-only ACL, env overrides |
@@ -126,10 +126,21 @@ regardless, so "the key responds" does not mean the picker route is live.
 killed, CPU-only. A health check that only asks "did something answer" reports
 false success. Check the listener's owning process path, then `size_vram`.
 
-**Windows OCR under a sparse package.** WinRT OCR is documented as requiring
-package identity. A sparse package grants identity when launched via AUMID;
-whether a direct-path launch (the `Run` key) also gets it is
-`THEORY (unverified)` until measured on this machine.
+**Windows OCR under a sparse package.** MEASURED 2026-09-17 (issue #30,
+`src/ocr.rs`'s `ocr_live_recognizes_gdi_rendered_text`, `#[ignore]`d, run
+manually with `cargo test ocr_live -- --ignored --nocapture`): a plain
+`cargo test` binary has no package identity
+(`GetCurrentPackageFullName` returns `APPMODEL_ERROR_NO_PACKAGE`, confirmed
+by `ocr::has_package_identity()`), and `OcrEngine::RecognizeAsync` over a
+synthetic GDI-rendered image still succeeded from it: cold call 36 ms, warm
+call 22 ms, recognizer language `en-US`, `MaxImageDimension` 10000. WinRT
+OCR does **not** require package identity for a direct-path-launched
+process on this machine -- the earlier THEORY below is disproven.
+`THEORY (unverified)`: whether an exe launched from the `Run` key while the
+sparse package is installed elsewhere on the machine differs from this
+measurement; no mechanism is known by which installing an unrelated package
+would change this process's own identity, so this is not expected to be
+revisited without a concrete reason to doubt it.
 
 ---
 

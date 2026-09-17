@@ -191,7 +191,7 @@ New modules and the one-line contract each keeps:
 | `inputs/` | `Input` enum and gathering: screen, window, region, selection, clipboard, text, UIA tree, context | know about providers |
 | `inputs/selection.rs` | selected text via UI Automation `TextPattern`, fallback synthetic Ctrl+C with byte-exact clipboard restore | leave the clipboard changed |
 | `inputs/uia.rs` | the foreground window's editable controls as a flat list: automation id, name, label, control type, current value, bounding rect | write anything |
-| `inputs/ocr.rs` | `Windows.Media.Ocr` over a `Shot`. Documented as requiring package identity; the first task here measures whether the sparse package grants it to a direct-path launch (`GetCurrentPackageFullName` at startup) and the card says "OCR unavailable" when not | call the network |
+| `inputs/ocr.rs` (built as `src/ocr.rs`, issue #30; move planned at merge) | `Windows.Media.Ocr` over raw RGBA8 pixels. MEASURED 2026-09-17: does not need package identity, see § 16's risk row; the card says "OCR unavailable" for the failure modes `recognize` does return (no OCR language installed, timeout, a WinRT call failing) | call the network |
 | `executors/` | one file per executor: `replace_text`, `fill_form`, `calendar_add`, `clipboard`, `open_url`, `insert_text`; each takes a typed proposal and returns an `Outcome` with an undo closure where possible | run without a confirmed proposal (the type system enforces it: executors take `Confirmed<P>`) |
 | `connectors/` | `Connector` trait: id, auth kind (OAuth PKCE loopback, API key, none), capabilities; `google.rs`, `microsoft.rs`, `ics.rs`, later `mcp.rs` | store a token anywhere but Credential Manager |
 | `profile.rs` | "About me": names, emails, phones, addresses, company, preferences. Local, DPAPI-encrypted. **Never payment data** | be sent to a provider except as the fields an action needs |
@@ -642,7 +642,7 @@ Enforced by `cargo deny` (`[licenses] allow = [...]`).
 | Community project dies of breadth | actions are TOML plus a prompt over a small fixed executor set; every catalogue item is one issue; `good first issue` on the ones needing no new executor |
 | An executor does something the user did not preview | executors take `Confirmed<Proposal>`; the preview and the execution share one value; never the final button |
 | UIA does not expose a form | fall back to selection and typed input per field, or report "could not reach the fields" in the card; never coordinates in Phase 2 |
-| Windows OCR refuses an exe without package identity | `THEORY (unverified)`: the sparse package grants identity to a direct-path launch. Measured first in Phase 2; if false, autostart launches via AUMID |
+| Windows OCR refuses an exe without package identity | Disproven. MEASURED 2026-09-17 (issue #30, `src/ocr.rs`'s `ocr_live_recognizes_gdi_rendered_text`): a process with no package identity (`GetCurrentPackageFullName` = `APPMODEL_ERROR_NO_PACKAGE`) still gets a working `OcrEngine::RecognizeAsync` -- cold 36 ms, warm 22 ms, `en-US`. `THEORY (unverified)`: whether the sparse package's own installed presence changes anything for a `Run`-key launch specifically; no mechanism is known by which it would, and this is not expected to be revisited |
 | Ollama silently on CPU | Settings shows `size_vram`; first-run help names `OLLAMA_IGPU_ENABLE=1` |
 | Ollama cold start | `keep_alive` 30 m; warm-up on detection |
 | Awareness on by default alarms users | consent screen quoting `PRIVACY.md`, tray indicator, exclusions, 24 h retention, one-click off and wipe |
@@ -691,7 +691,7 @@ is one issue; the bracketed tag is its `area:` label.
 - [inputs] UIA tree of the foreground window: editable controls with labels and values
 - [inputs] Selection via UIA TextPattern with clipboard-safe fallback and password-field skip
 - [inputs] Region and window capture with crosshair overlay
-- [inputs] Windows OCR, including the package-identity measurement
+- [inputs] Windows OCR: done as `src/ocr.rs` (issue #30, MEASURED 2026-09-17 -- see § 16); still owed: wiring into `App::ask`'s non-vision fallback and the "OCR unavailable" card
 - [executors] Executor trait with Confirmed<Proposal> and undo closures
 - [executors] replace_text via UIA ValuePattern and TextPattern
 - [executors] fill_form via UIA with prior-value recording and Restore
