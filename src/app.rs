@@ -72,6 +72,16 @@ struct App {
     /// A request is in flight; further triggers are ignored until it lands.
     busy: bool,
     last: Option<Answer>,
+    /// True for the whole duration `open_settings` is suspended inside
+    /// `settings::show_modal`'s own message loop (issue #152). `wnd_proc`
+    /// checks this before acting on a message that would otherwise touch
+    /// `App` state reentrantly, aliasing the `&mut self` still on the stack.
+    /// See `settings_reentrancy_policy`.
+    settings_open: bool,
+    /// A `WM_APP_RESULT` that arrived while `settings_open` was true, deferred
+    /// rather than shown or dropped so the in-flight answer still ends in a
+    /// card (rule 7) once Settings closes and `open_settings` resumes.
+    pending_settings_result: Option<std::result::Result<Answer, String>>,
 }
 
 pub fn run() -> Result<()> {
@@ -137,6 +147,8 @@ pub fn run() -> Result<()> {
         watcher: None,
         busy: false,
         last: None,
+        settings_open: false,
+        pending_settings_result: None,
     });
     app.refresh_tray_labels();
 
@@ -383,13 +395,32 @@ impl App {
     /// Open the GUI settings window. Modal: it runs its own message loop, so
     /// the hotkey is inert until it closes. On Save the new config is applied
     /// in full — the same path `reload` takes — so nothing gets half-applied.
+    ///
+    /// `settings_open` guards `wnd_proc` against the reentrant dispatch
+    /// `show_modal`'s own loop can produce (issue #152; see
+    /// `settings_reentrancy_policy`): a hotkey or tray press while Settings
+    /// is open is dropped, and a worker's `WM_APP_RESULT` is deferred into
+    /// `pending_settings_result` rather than handled inline. Delivering that
+    /// deferred answer takes priority over the "Settings saved" toast below,
+    /// so the in-flight request still ends in a card (rule 7) instead of
+    /// being clobbered by it.
     fn open_settings(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
         self.card.hide();
         self.set_watch(false);
 
-        let Some(edited) = settings::show_modal(self.instance, &self.config) else {
+        self.settings_open = true;
+        let edited = settings::show_modal(self.instance, &self.config);
+        self.settings_open = false;
+        let pending = self.pending_settings_result.take();
+
+        let Some(edited) = edited else {
+            // Cancelled/closed without saving. An answer that finished
+            // mid-edit still gets its card.
+            if let Some(result) = pending {
+                self.on_result(result);
+            }
             return;
         };
 
@@ -397,11 +428,23 @@ impl App {
         if let Err(e) = self.config.save() {
             self.card
                 .show_error("Couldn't save settings", &format!("{e:#}"));
+            // Rare double-fault (a save failure racing a delivered answer):
+            // the answer still wins the card, per rule 7's priority on the
+            // in-flight request; the save error is not re-shown afterward.
+            if let Some(result) = pending {
+                self.on_result(result);
+            }
             return;
         }
         self.apply_config();
-        self.card.show_answer("Settings saved", "", 3, None);
-        self.set_watch(true);
+
+        match pending {
+            Some(result) => self.on_result(result),
+            None => {
+                self.card.show_answer("Settings saved", "", 3, None);
+                self.set_watch(true);
+            }
+        }
     }
 
     /// Push `self.config` into everything that caches a piece of it.
@@ -607,6 +650,40 @@ thread_local! {
 
 use std::os::windows::ffi::OsStrExt;
 
+/// What `wnd_proc` should do with a message addressed to the owner window
+/// while `App::settings_open` is true (issue #152).
+///
+/// `settings::show_modal` pumps every thread message so its own child
+/// controls receive input, which means a message addressed to the *owner*
+/// window can still reach `wnd_proc` reentrantly while `open_settings`'s
+/// `&mut self` is suspended on the stack inside that call. Extracted as pure
+/// logic (no `HWND`, no `App`) so the policy is unit-tested directly rather
+/// than only exercised by clicking through a live modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsReentrancy {
+    /// Process the message normally; nothing about it can conflict with a
+    /// Settings session (e.g. a global-click dismiss on an already-hidden
+    /// card, or the shell's `TaskbarCreated` broadcast).
+    Allow,
+    /// Drop it. A hotkey or a second Copilot-key launch that arrives while
+    /// Settings is open starts nothing; the user can press it again once
+    /// Settings closes. Also covers the tray callback itself, so the tray
+    /// menu does not pop up (and its commands cannot fire) over the modal.
+    Ignore,
+    /// Stash the payload; `open_settings` delivers it after `show_modal`
+    /// returns, so an answer that finished mid-edit still ends in a card
+    /// (rule 7) instead of being silently overwritten by "Settings saved".
+    Defer,
+}
+
+fn settings_reentrancy_policy(msg: u32) -> SettingsReentrancy {
+    match msg {
+        WM_APP_RESULT => SettingsReentrancy::Defer,
+        WM_APP_HOTKEY | WM_APP_ACTIVATE | WM_APP_TRAY => SettingsReentrancy::Ignore,
+        _ => SettingsReentrancy::Allow,
+    }
+}
+
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         OWNER_HWND.with(|h| h.set(hwnd.0 as isize));
@@ -618,6 +695,29 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
     let app: &mut App = unsafe { &mut *ptr };
+
+    // Issue #152: `settings::show_modal`'s own message loop pumps every
+    // thread message, so a message addressed to this owner window can land
+    // here reentrantly while `App::open_settings` is suspended further down
+    // the stack, still holding `&mut self`. Apply the policy before doing
+    // anything else so no arm below ever runs against that aliased state.
+    if app.settings_open {
+        match settings_reentrancy_policy(msg) {
+            SettingsReentrancy::Ignore => return LRESULT(0),
+            SettingsReentrancy::Defer => {
+                // WM_APP_RESULT is the only deferred message today. Take
+                // ownership of the worker's boxed payload now (it must be
+                // freed either way) and hand it to `open_settings` once
+                // `show_modal` returns.
+                let result = unsafe {
+                    *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>)
+                };
+                app.pending_settings_result = Some(result);
+                return LRESULT(0);
+            }
+            SettingsReentrancy::Allow => {}
+        }
+    }
 
     match msg {
         WM_APP_TRAY => {
@@ -705,6 +805,62 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 #[cfg(test)]
 mod tests {
     use super::first_line;
+    use super::{settings_reentrancy_policy, SettingsReentrancy};
+    use super::{WM_APP_ACTIVATE, WM_APP_RESULT};
+    use crate::dismiss::WM_APP_DISMISS;
+    use crate::hotkey::{WM_APP_HOTKEY, WM_APP_LEARNED};
+    use crate::ui::tray::WM_APP_TRAY;
+    use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
+
+    // -- settings_reentrancy_policy (issue #152) --------------------------
+
+    #[test]
+    fn settings_reentrancy_defers_the_worker_result() {
+        // The in-flight answer must still end in a card (rule 7) once
+        // Settings closes, so it is deferred rather than dropped or shown
+        // reentrantly behind the modal.
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_RESULT),
+            SettingsReentrancy::Defer
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_ignores_hotkey_activate_and_tray() {
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_HOTKEY),
+            SettingsReentrancy::Ignore
+        );
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_ACTIVATE),
+            SettingsReentrancy::Ignore
+        );
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_TRAY),
+            SettingsReentrancy::Ignore
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_allows_messages_that_cannot_conflict() {
+        // Dismiss clicks are harmless (the card is already hidden while
+        // Settings is open); TaskbarCreated and WM_APP_LEARNED don't touch
+        // anything Settings owns; WM_DESTROY is unreachable while Settings
+        // is open because WM_APP_TRAY (the only path to the Quit command)
+        // is ignored above, but the policy itself has no reason to block it.
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_DISMISS),
+            SettingsReentrancy::Allow
+        );
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_LEARNED),
+            SettingsReentrancy::Allow
+        );
+        assert_eq!(
+            settings_reentrancy_policy(WM_DESTROY),
+            SettingsReentrancy::Allow
+        );
+    }
 
     #[test]
     fn first_line_takes_only_the_first_line() {

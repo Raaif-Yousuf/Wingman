@@ -116,6 +116,36 @@ pub const WM_APP_RESULT:  u32 = WM_APP + 3; // lparam = *mut Result<Answer, Stri
 pub const WM_APP_LEARNED: u32 = WM_APP + 4; // lparam = *mut Chord (learn mode captured a key)
 ```
 
+### Settings modal re-entrancy (issue #152)
+
+`ui::settings::show_modal` runs its own `GetMessageW` loop so its child
+controls receive input; that loop pumps *every* thread message, not just the
+settings window's, so a message addressed to the owner window (any
+`WM_APP_*`) can still reach `wnd_proc` while `App::open_settings`'s `&mut
+self` is suspended on the stack inside `show_modal`. `App::settings_open`
+guards against that:
+
+- **Ignored**: `WM_APP_HOTKEY`, `WM_APP_ACTIVATE`, `WM_APP_TRAY`. A hotkey
+  press or a second Copilot-key launch while Settings is open starts
+  nothing; the tray callback is ignored too, so its context menu does not
+  pop up over the modal. The user can press the key again once Settings
+  closes.
+- **Deferred**: `WM_APP_RESULT`. A worker's answer that finishes while
+  Settings is open is stashed in `App::pending_settings_result` rather than
+  shown immediately or dropped. Once `show_modal` returns,
+  `open_settings` delivers it via `on_result` -- taking priority over the
+  "Settings saved" toast, so the in-flight request still ends in its own
+  card (rule 7) instead of being clobbered by the save confirmation.
+- **Allowed**: everything else (`WM_APP_DISMISS`, `WM_APP_LEARNED`, the
+  `TaskbarCreated` broadcast, `WM_DESTROY`). None of these can conflict with
+  Settings state -- the card is already hidden and its click watcher
+  disarmed before `show_modal` runs, and `WM_DESTROY` is unreachable while
+  Settings is open because the only path to it (the tray's Quit command) is
+  itself ignored above.
+
+The decision table is `app::settings_reentrancy_policy`, a pure function
+independent of any `HWND`, unit-tested in `app::tests`.
+
 ## Config
 
 `%APPDATA%\Wingman\config.toml`, created on first run with owner-only ACLs.
