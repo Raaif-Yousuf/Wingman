@@ -1,5 +1,9 @@
 # Wingman
 
+<p align="center">
+  <img src="assets/brand/wingman-mark.png" alt="Wingman logo" width="120">
+</p>
+
 **It's the Copilot key. It's actually yours now.**
 
 Wingman is a native Windows 11 tray app that lives behind the Copilot key.

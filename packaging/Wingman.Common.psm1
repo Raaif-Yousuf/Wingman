@@ -204,8 +204,10 @@ function Get-LogoSpecs {
 # Renders assets\icon.ico into the sizes Get-LogoSpecs names. Derived from the
 # .ico rather than checked in, so the tray icon and the Start menu tile can
 # never drift apart -- change the .ico and both follow.
-# NOTE (issue #10): this still draws from the pre-rename icon.ico; a new icon
-# set is issue #10's own scope.
+# NOTE (issue #10, closed): assets\icon.ico now embeds the Wingman wing/spark
+# mark (see assets\brand\README.md for provenance and palette), so these
+# package logos and the tray icon are drawn from the same source and cannot
+# drift from each other.
 function Build-Logos {
     [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
