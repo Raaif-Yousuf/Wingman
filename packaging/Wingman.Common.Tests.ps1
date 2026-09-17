@@ -112,25 +112,69 @@ Describe 'Get-CleanupPlan' {
     }
 }
 
-Describe 'Get-InstallPhaseOrder' {
-    It 'orders every legacy-removal step after registration is verified (issue #165)' {
-        $order = Get-InstallPhaseOrder
-        $order.IndexOf('VerifyRegistration') | Should -BeGreaterThan -1
-        foreach ($legacyStep in 'RemoveLegacyPackage', 'RemoveLegacyRunValue', 'RemoveLegacyInstallDir') {
-            $order.IndexOf($legacyStep) | Should -BeGreaterThan $order.IndexOf('VerifyRegistration')
-        }
+Describe 'Test-InstallPhaseOrder (issue #168)' {
+    # Get-InstallPhaseOrder (removed) described the intended order but nothing
+    # ever read it back against install.ps1, so it could drift silently in
+    # either direction. Test-InstallPhaseOrder instead parses a script's real
+    # AST. These first two tests prove the guard actually catches a planted
+    # violation -- and accepts a correct fixture -- on synthetic scripts
+    # before the last test trusts it against the real install.ps1.
+
+    It 'catches a planted violation: legacy removal moved before registration' {
+        $bad = Join-Path $TestDrive 'bad-install.ps1'
+        Set-Content -Path $bad -Encoding utf8 -Value @'
+function Invoke-PackageRegistrationPhase { }
+function Remove-LegacyInstall { }
+
+& cargo build --release
+Remove-LegacyInstall
+Invoke-PackageRegistrationPhase
+'@
+        Test-InstallPhaseOrder -ScriptPath $bad | Should -BeFalse
     }
 
-    It 'stops the old process before the current one is (re)started' {
-        $order = Get-InstallPhaseOrder
-        $order.IndexOf('StopOldProcess') | Should -BeLessThan $order.IndexOf('RegisterPackage')
+    It 'accepts a correctly ordered fixture: build, then register, then remove legacy' {
+        $good = Join-Path $TestDrive 'good-install.ps1'
+        Set-Content -Path $good -Encoding utf8 -Value @'
+function Invoke-PackageRegistrationPhase { }
+function Remove-LegacyInstall { }
+
+& cargo build --release
+Invoke-PackageRegistrationPhase
+Remove-LegacyInstall
+'@
+        Test-InstallPhaseOrder -ScriptPath $good | Should -BeTrue
     }
 
-    It 'never lists a legacy-removal step before RegisterPackage' {
-        $order = Get-InstallPhaseOrder
-        foreach ($legacyStep in 'RemoveLegacyPackage', 'RemoveLegacyRunValue', 'RemoveLegacyInstallDir') {
-            $order.IndexOf($legacyStep) | Should -BeGreaterThan $order.IndexOf('RegisterPackage')
-        }
+    It 'throws when a phase marker is missing entirely, rather than reporting a false pass' {
+        $missing = Join-Path $TestDrive 'missing-install.ps1'
+        Set-Content -Path $missing -Encoding utf8 -Value @'
+& cargo build --release
+'@
+        { Test-InstallPhaseOrder -ScriptPath $missing } | Should -Throw
+    }
+
+    It 'ignores a marker that only appears nested inside a function body, not at the top level' {
+        $nested = Join-Path $TestDrive 'nested-install.ps1'
+        Set-Content -Path $nested -Encoding utf8 -Value @'
+function Invoke-PackageRegistrationPhase { }
+function Wrapper {
+    Remove-LegacyInstall
+}
+function Remove-LegacyInstall { }
+
+& cargo build --release
+Invoke-PackageRegistrationPhase
+'@
+        # Remove-LegacyInstall is never actually reached at the top level here,
+        # so the marker is (correctly) reported missing rather than satisfied
+        # by the call hidden inside Wrapper.
+        { Test-InstallPhaseOrder -ScriptPath $nested } | Should -Throw
+    }
+
+    It 'verifies the real install.ps1 keeps build < register < remove-legacy (issue #165)' {
+        $real = Join-Path $PSScriptRoot '..\install.ps1'
+        Test-InstallPhaseOrder -ScriptPath $real | Should -BeTrue
     }
 }
 
@@ -281,5 +325,113 @@ Describe 'Test-AumidBelongsToWingman' {
     It 'does not match null or empty' {
         Test-AumidBelongsToWingman -Aumid $null -Identity $id | Should -BeFalse
         Test-AumidBelongsToWingman -Aumid '' -Identity $id | Should -BeFalse
+    }
+}
+
+Describe 'Find-SdkTool (issue #164: shared with packaging\Build-Msix.ps1)' {
+    # -SdkRoots is injectable specifically so this never has to depend on (or
+    # search) the real Windows Kits install on the test machine. The helper
+    # is defined in BeforeAll (not inline in the Describe body) because
+    # Pester 6 runs each It block in its own scope, which cannot see a
+    # function only defined in the Describe block's own scope.
+    BeforeAll {
+        function New-FakeSdkVersion {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+                Justification = 'Test-only fixture helper that writes exclusively under $TestDrive; ShouldProcess ceremony would add nothing a Pester test needs to confirm before creating its own fixture files.')]
+            param([string]$Root, [string]$Version, [string[]]$Arches, [bool]$Complete = $true)
+            foreach ($arch in $Arches) {
+                $bin = Join-Path $Root "$Version\$arch"
+                New-Item -ItemType Directory -Force -Path $bin | Out-Null
+                Set-Content -Path (Join-Path $bin 'makeappx.exe') -Value 'stub' -Encoding utf8
+                if ($Complete) {
+                    Set-Content -Path (Join-Path $bin 'signtool.exe') -Value 'stub' -Encoding utf8
+                }
+            }
+        }
+    }
+
+    It 'picks the newest version that has both tools' {
+        $root = Join-Path $TestDrive 'sdk-newest'
+        New-FakeSdkVersion -Root $root -Version '10.0.19041.0' -Arches @('x64')
+        New-FakeSdkVersion -Root $root -Version '10.0.22621.0' -Arches @('x64')
+
+        $tools = Find-SdkTool -SdkRoots @($root)
+        $tools.MakeAppx | Should -Be (Join-Path $root '10.0.22621.0\x64\makeappx.exe')
+        $tools.SignTool | Should -Be (Join-Path $root '10.0.22621.0\x64\signtool.exe')
+    }
+
+    It 'skips a newer version whose tools are incomplete in favor of an older complete one' {
+        $root = Join-Path $TestDrive 'sdk-incomplete'
+        New-FakeSdkVersion -Root $root -Version '10.0.19041.0' -Arches @('x64') -Complete $true
+        New-FakeSdkVersion -Root $root -Version '10.0.26100.0' -Arches @('x64') -Complete $false
+
+        $tools = Find-SdkTool -SdkRoots @($root)
+        $tools.MakeAppx | Should -Be (Join-Path $root '10.0.19041.0\x64\makeappx.exe')
+    }
+
+    It 'falls back from x64 to x86 when only x86 has both tools' {
+        $root = Join-Path $TestDrive 'sdk-x86-only'
+        New-FakeSdkVersion -Root $root -Version '10.0.22621.0' -Arches @('x86')
+
+        $tools = Find-SdkTool -SdkRoots @($root)
+        $tools.MakeAppx | Should -Be (Join-Path $root '10.0.22621.0\x86\makeappx.exe')
+    }
+
+    It 'checks a second root when the first has no usable version' {
+        $emptyRoot = Join-Path $TestDrive 'sdk-empty'
+        New-Item -ItemType Directory -Force -Path $emptyRoot | Out-Null
+        $realRoot = Join-Path $TestDrive 'sdk-real'
+        New-FakeSdkVersion -Root $realRoot -Version '10.0.22621.0' -Arches @('x64')
+
+        $tools = Find-SdkTool -SdkRoots @($emptyRoot, $realRoot)
+        $tools.MakeAppx | Should -Be (Join-Path $realRoot '10.0.22621.0\x64\makeappx.exe')
+    }
+
+    It 'throws a message naming what is missing when no root has usable tools' {
+        $root = Join-Path $TestDrive 'sdk-none'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        { Find-SdkTool -SdkRoots @($root) } | Should -Throw '*Windows SDK not found*'
+    }
+
+    It 'throws when given no roots at all (e.g. neither ProgramFiles path exists)' {
+        { Find-SdkTool -SdkRoots @() } | Should -Throw
+    }
+}
+
+Describe 'Get-LogoSpecs (issue #164)' {
+    It 'names exactly the three logos AppxManifest.xml.in references' {
+        $specs = Get-LogoSpecs
+        ($specs | Select-Object -ExpandProperty Name | Sort-Object) |
+            Should -Be @('Square150x150Logo', 'Square44x44Logo', 'StoreLogo')
+    }
+
+    It 'matches the sizes install.ps1 and Build-Msix.ps1 always rendered' {
+        $specs = Get-LogoSpecs
+        ($specs | Where-Object Name -eq 'Square44x44Logo').Size   | Should -Be 44
+        ($specs | Where-Object Name -eq 'Square150x150Logo').Size | Should -Be 150
+        ($specs | Where-Object Name -eq 'StoreLogo').Size         | Should -Be 50
+    }
+}
+
+Describe 'Build-Logos (issue #164)' {
+    It 'renders one correctly-sized PNG per Get-LogoSpecs entry from the real icon' {
+        $iconPath = Join-Path $PSScriptRoot '..\assets\icon.ico'
+        $dest = Join-Path $TestDrive 'logos'
+        New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+        Build-Logos -IconPath $iconPath -Destination $dest
+
+        foreach ($spec in Get-LogoSpecs) {
+            $pngPath = Join-Path $dest "$($spec.Name).png"
+            Test-Path $pngPath | Should -BeTrue
+            Add-Type -AssemblyName System.Drawing
+            $img = [System.Drawing.Image]::FromFile($pngPath)
+            try {
+                $img.Width  | Should -Be $spec.Size
+                $img.Height | Should -Be $spec.Size
+            } finally {
+                $img.Dispose()
+            }
+        }
     }
 }
