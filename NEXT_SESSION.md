@@ -71,11 +71,34 @@ text is capped at 50k characters and breaks strict JSON parsing).
 
 ## To verify by hand
 
-Nothing outstanding from this session. Carried over from the packaging work:
-the owner may still owe the one Settings click that points the Copilot key at
-the app (Settings ▸ Bluetooth & devices ▸ Keyboard ▸ Customize Copilot key ▸
-Custom). Ask before assuming the picker route is live; the hook route works
-regardless.
+Carried over from the packaging work: the owner may still owe the one
+Settings click that points the Copilot key at the app (Settings ▸ Bluetooth
+& devices ▸ Keyboard ▸ Customize Copilot key ▸ Custom). Ask before assuming
+the picker route is live; the hook route works regardless.
+
+- **#18/#206 non-vision fallback, end-to-end through a real key press**
+  (overnight agent session, 2026-09-17, branch `worktree-agent-a6dd7c51956060b22`).
+  What was built and verified without the exe: `provider::Chain::complete_parsed_with_fallback`
+  + `provider::non_vision_request` (unit-tested: golden request bodies,
+  laziness, truncation, OCR-failure skip semantics -- see
+  `src/provider/mod.rs`'s new tests) and `app.rs`'s `worker`/`non_vision_inputs`
+  wiring (compiles, clippy/fmt clean, all existing `app::`/`provider::`/`ocr`
+  tests still pass). The live `#[ignore]`d check
+  `provider::tests::non_vision_fallback_live_ocr_to_text_only_ollama_answers_arithmetic`
+  ran for real against this machine's Ollama: a GDI-rendered "What is 17 + 25
+  ?" image, OCR'd, answered by `llama3.2:3b` (text-only, no vision) through
+  the real chain, MEASURED 2026-09-17 elapsed 11.9s, headline `"42"`, model
+  confirmed unloaded afterwards (`/api/ps` empty).
+  **Not yet checked**: the actual Copilot-key path through `App::ask` --
+  `GetForegroundWindow()` captured before `show_pending()`, the UIA snapshot
+  running on its own spawned thread, and `worker()` actually reaching
+  `non_vision_inputs`. Could not run (no live desktop / exe launch in this
+  session; CLAUDE.md rule 8's "checked by hand" observable). To verify: set
+  `providers.order = ["ollama"]` with `[providers.ollama]` `model =
+  "llama3.2:3b"` (or another text-only model), put a readable arithmetic
+  problem on screen, press the Copilot key, and confirm the card shows an
+  answer (not "no providers configured", not a blank/error card) -- that is
+  the one observable that would differ if this wiring were wired to nothing.
 
 ## Facts established this session, not derivable from the code
 
