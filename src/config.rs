@@ -73,6 +73,27 @@ pub struct Hotkeys {
     pub primary: Chord,
     /// Secondary, always active alongside the primary. Ctrl+Shift+/.
     pub secondary: Chord,
+    /// Issue #181: optional third chord that toggles Pause (running ->
+    /// paused until resumed; paused, for any reason -> resume). `None` by
+    /// default -- deliberately no default binding, since the owner never
+    /// asked for one (unlike `primary`/`secondary`, which the app is not
+    /// useful without). Set it by hand in `config.toml`:
+    /// ```toml
+    /// [hotkeys.pause]
+    /// vk = 0x13    # VK_PAUSE
+    /// ctrl = false
+    /// shift = false
+    /// alt = false
+    /// win = false
+    /// ```
+    /// No tray "Set pause key..." learn-mode entry yet -- config.toml only;
+    /// see the follow-up issue this one filed for that (learn mode needs a
+    /// third `HK_*` slot and tray menu item, which is not the "small
+    /// extension" #181 scoped itself to). `hotkey::HotkeyHook::set_pause_chord`
+    /// is how the hook learns about it; see that method's doc comment for
+    /// the lock-free packed-chord path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause: Option<Chord>,
 }
 
 impl Default for Hotkeys {
@@ -92,6 +113,7 @@ impl Default for Hotkeys {
                 alt: false,
                 win: false,
             },
+            pause: None,
         }
     }
 }
@@ -1024,6 +1046,57 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    // -- hotkeys.pause (issue #181) ------------------------------------------
+
+    #[test]
+    fn default_pause_chord_is_none() {
+        // No default binding -- the owner did not ask for one.
+        assert_eq!(Config::default().hotkeys.pause, None);
+    }
+
+    #[test]
+    fn pause_chord_is_absent_from_the_serialized_toml_by_default() {
+        let text = toml::to_string_pretty(&Config::default()).expect("serialize");
+        assert!(
+            !text.contains("[hotkeys.pause]"),
+            "an unconfigured pause chord must not appear in config.toml at all:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_configured_pause_chord_round_trips_through_toml() {
+        let mut config = Config::default();
+        config.hotkeys.pause = Some(Chord {
+            vk: 0x13,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            win: false,
+        });
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        assert!(text.contains("[hotkeys.pause]"), "{text}");
+        let parsed: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(parsed.hotkeys.pause, config.hotkeys.pause);
+    }
+
+    #[test]
+    fn an_older_config_missing_the_pause_key_backfills_to_none() {
+        // A config.toml written before #181 has no `[hotkeys.pause]` table
+        // at all; `#[serde(default)]` on `Hotkeys` must still produce
+        // `None`, not a parse failure.
+        let old = r#"
+[hotkeys.primary]
+vk = 134
+ctrl = false
+shift = true
+alt = false
+win = true
+"#;
+        let cfg = Config::parse_or_default(old);
+        assert_eq!(cfg.hotkeys.pause, None);
+        assert_eq!(cfg.hotkeys.primary.vk, 134);
     }
 
     #[test]

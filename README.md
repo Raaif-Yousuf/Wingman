@@ -177,6 +177,22 @@ If the Copilot key does nothing, use **Set Copilot key...** in the tray menu
 and press it once: whatever your firmware actually emits gets captured and
 saved. Same for the secondary binding.
 
+A third, optional chord toggles Pause: running -> paused until resumed;
+paused, for any reason -> resume. Unlike primary/secondary it has no default
+binding and no tray "Set..." entry yet, so set it by hand in `config.toml`:
+
+```toml
+[hotkeys.pause]
+vk = 0x13    # VK_PAUSE
+ctrl = false
+shift = false
+alt = false
+win = false
+```
+
+then **Reload settings** (or restart) to pick it up. It is the one chord
+that still works while paused.
+
 ### Through Windows Settings instead
 
 Once installed, Wingman can also be made the Copilot key's target the
@@ -230,6 +246,7 @@ call every boot. With start-with-Windows on it is always running anyway.
 | `ui.text_scale` | `1.0` | multiplies the card's font size; lower is smaller |
 | `providers.*.models` | see file | what the tray's model submenu offers (Ollama has no list; it uses `providers.ollama.model` directly) |
 | `ui.prompt` | see file | the system prompt, edit it to change what it checks |
+| `hotkeys.pause` | unset (absent from the file) | optional third chord: toggles Pause until resumed / Resume; no default, no tray learn button yet, see [Hotkeys](#hotkeys) |
 
 Roughly 1-2 cents and 3-8 seconds per check at the defaults.
 

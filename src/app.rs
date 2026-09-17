@@ -36,6 +36,7 @@ use crate::config::{Config, Providers};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::hotkey::{
     chord_to_string, Chord, HotkeyHook, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
+    WM_APP_PAUSE_TOGGLE,
 };
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
@@ -203,7 +204,13 @@ pub fn run() -> Result<()> {
         app.config.hotkeys.primary,
         app.config.hotkeys.secondary,
     ) {
-        Ok(h) => app.hook = Some(h),
+        Ok(h) => {
+            // #181: no default binding, so this is a no-op (packs to the
+            // "unconfigured" sentinel) unless the owner hand-edited
+            // config.toml.
+            h.set_pause_chord(app.config.hotkeys.pause);
+            app.hook = Some(h);
+        }
         Err(e) => app.card.show_error(
             "Hotkeys unavailable",
             &format!("{e:#}\n\nUse Ask now from the tray menu instead."),
@@ -665,6 +672,11 @@ impl App {
         self.card.set_text_scale(self.config.ui.text_scale);
         if let Some(hook) = &self.hook {
             hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
+            // #181: a Reload/Settings-save always re-syncs the pause chord
+            // too, the same way it already does for primary/secondary --
+            // otherwise a hand-edited `[hotkeys.pause]` in config.toml would
+            // only take effect after a full app restart.
+            hook.set_pause_chord(self.config.hotkeys.pause);
         }
         self.refresh_tray_labels();
     }
@@ -912,6 +924,21 @@ impl App {
         self.update_tooltip();
     }
 
+    /// #181: flips Pause on a pause-toggle-chord press -- resume if
+    /// currently paused (any choice, any deadline), otherwise pause "until
+    /// resumed", the one direction a bare keypress can express (1h /
+    /// until-tomorrow remain tray-menu-only, same as before). Mirrors the
+    /// `cmd::RESUME` / `cmd::PAUSE_UNTIL_RESUMED` tray commands exactly --
+    /// see [`pause_toggle_action`] for the pure paused/not-paused decision
+    /// this dispatches on.
+    fn toggle_pause(&mut self) {
+        let now = SystemTime::now();
+        match pause_toggle_action(self.pause.is_paused(now)) {
+            PauseToggleAction::Resume => self.resume(),
+            PauseToggleAction::PauseUntilResumed => self.pause_for(PauseChoice::UntilResumed),
+        }
+    }
+
     /// `WM_TIMER` fired for [`PAUSE_TIMER_ID`]. `SetTimer` without a
     /// `TIMERPROC` keeps re-posting `WM_TIMER` at the same interval until
     /// `KillTimer` is called (rule 5: never a polling timer), so the very
@@ -1041,6 +1068,31 @@ fn worker(providers: &Providers, mode: Mode, shot: &Shot, prompt: &str, want_dif
     // provider instead of failing the whole request.
     let req = physics_request(shot, prompt, want_difficulty);
     chain.complete_parsed(&req, |c| parse_answer(&c.text))
+}
+
+/// Issue #181: which action a pause-toggle-chord press should take. Pure
+/// (just a bool in, an enum out) so the toggle direction is unit-tested
+/// directly (CLAUDE.md rule 8) without a real `App` -- `App::toggle_pause`
+/// is the thin Win32-touching wrapper (checked by hand: press the
+/// configured chord while running, confirm the tray greys and the card
+/// shows "Paused"; press it again, confirm it un-greys, per issue #166).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PauseToggleAction {
+    Resume,
+    PauseUntilResumed,
+}
+
+/// `paused` is `self.pause.is_paused(now)` -- true for any [`PauseState::Paused`]
+/// whose deadline (if any) has not passed. A single keypress can only ever
+/// express one pause duration (there is no way to choose 1h vs. until-tomorrow
+/// from a bare hotkey press), so [`PauseChoice::UntilResumed`] is it; the
+/// tray's `Pause ▸` submenu remains the only way to reach the other two.
+fn pause_toggle_action(paused: bool) -> PauseToggleAction {
+    if paused {
+        PauseToggleAction::Resume
+    } else {
+        PauseToggleAction::PauseUntilResumed
+    }
 }
 
 /// FILETIME's epoch (1601-01-01 UTC) precedes the Unix epoch (1970-01-01
@@ -1285,11 +1337,13 @@ enum SettingsReentrancy {
     /// hotkey, a second Copilot-key launch, the tray callback itself (so its
     /// menu does not pop up, and none of its commands can fire, over the
     /// modal), a dismiss click (the card is already hidden and its watcher
-    /// disarmed before `show_modal` runs, so there is nothing to do), and
+    /// disarmed before `show_modal` runs, so there is nothing to do),
     /// `WM_APP_LEARNED` (unreachable here in practice: every path that opens
     /// Settings cancels learn mode first, see `open_settings`'s call sites --
     /// but the boxed `Chord` payload is still freed rather than leaked, in
-    /// case that invariant ever changes).
+    /// case that invariant ever changes), and `WM_APP_PAUSE_TOGGLE` (#181:
+    /// same treatment as the hotkey -- a chord press while Settings is open
+    /// is dropped, not queued).
     Ignore,
     /// Stash the worker's payload in `PENDING_RESULT`; `open_settings`
     /// delivers it after `show_modal` returns, so an answer that finished
@@ -1313,9 +1367,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
     }
     match msg {
         WM_APP_RESULT => SettingsReentrancy::DeferResult,
-        WM_APP_HOTKEY | WM_APP_ACTIVATE | WM_APP_TRAY | WM_APP_DISMISS | WM_APP_LEARNED => {
-            SettingsReentrancy::Ignore
-        }
+        WM_APP_HOTKEY | WM_APP_ACTIVATE | WM_APP_TRAY | WM_APP_DISMISS | WM_APP_LEARNED
+        | WM_APP_PAUSE_TOGGLE => SettingsReentrancy::Ignore,
         _ => SettingsReentrancy::Fallback,
     }
 }
@@ -1467,6 +1520,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_learned(wparam.0, chord);
             LRESULT(0)
         }
+        WM_APP_PAUSE_TOGGLE => {
+            // #181: the hook already decided this keydown matches the
+            // configured pause chord (`hotkey::pause_hotkey_outcome`); all
+            // that is left is which direction to toggle, which only `App`
+            // knows (its current `PauseState`, not anything carried on the
+            // message).
+            app.toggle_pause();
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == PAUSE_TIMER_ID {
                 app.on_pause_timer(hwnd);
@@ -1520,7 +1582,7 @@ mod tests {
     use super::{WM_APP_ACTIVATE, WM_APP_RESULT};
     use crate::config::Providers;
     use crate::dismiss::WM_APP_DISMISS;
-    use crate::hotkey::{WM_APP_HOTKEY, WM_APP_LEARNED};
+    use crate::hotkey::{WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PAUSE_TOGGLE};
     use crate::mode::Mode;
     use crate::ui::tray::WM_APP_TRAY;
     use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
@@ -1775,6 +1837,28 @@ mod tests {
         ));
     }
 
+    // -- pause_toggle_action (issue #181) ----------------------------------
+
+    #[test]
+    fn while_running_the_toggle_chord_pauses_until_resumed() {
+        assert_eq!(
+            super::pause_toggle_action(false),
+            super::PauseToggleAction::PauseUntilResumed
+        );
+    }
+
+    #[test]
+    fn while_paused_the_toggle_chord_resumes() {
+        // The task's own framing: "paused + event matches pause chord ->
+        // toggle". `pause_toggle_action` is the pure "which direction"
+        // half of that toggle; `hotkey::pause_hotkey_outcome` (hotkey.rs)
+        // is the pure "does this event match at all" half.
+        assert_eq!(
+            super::pause_toggle_action(true),
+            super::PauseToggleAction::Resume
+        );
+    }
+
     // -- settings_reentrancy_policy (issue #152) --------------------------
 
     /// An arbitrary but fixed stand-in for the runtime-registered
@@ -1816,13 +1900,14 @@ mod tests {
     }
 
     #[test]
-    fn settings_reentrancy_ignores_hotkey_activate_tray_dismiss_and_learned() {
+    fn settings_reentrancy_ignores_hotkey_activate_tray_dismiss_learned_and_pause_toggle() {
         for msg in [
             WM_APP_HOTKEY,
             WM_APP_ACTIVATE,
             WM_APP_TRAY,
             WM_APP_DISMISS,
             WM_APP_LEARNED,
+            WM_APP_PAUSE_TOGGLE,
         ] {
             assert_eq!(
                 settings_reentrancy_policy(msg, FAKE_TASKBAR_CREATED_MSG),
@@ -1865,6 +1950,7 @@ mod tests {
         ("WM_APP_LEARNED", WM_APP_LEARNED),
         ("WM_APP_DISMISS", WM_APP_DISMISS),
         ("WM_APP_ACTIVATE", WM_APP_ACTIVATE),
+        ("WM_APP_PAUSE_TOGGLE", WM_APP_PAUSE_TOGGLE),
     ];
 
     #[test]
