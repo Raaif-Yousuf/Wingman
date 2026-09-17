@@ -723,6 +723,31 @@ mod tests {
         drop(listener);
     }
 
+    /// Live, opt-in check against whatever is actually running on the real
+    /// Ollama port on this machine right now (not run by default, same
+    /// convention as `ollama.rs`'s `ollama_live_*` check: `cargo test
+    /// ollama_admin::tests::query_ollama_health_classifies_the_real_listener
+    /// -- --ignored --nocapture`). MEASURED 2026-09-17 via PowerShell
+    /// (`Get-NetTCPConnection`/`Get-CimInstance Win32_Process`) that the
+    /// real listener was pid 13980, image
+    /// `...\Programs\Ollama\ollama.exe`, parent pid 25324 image
+    /// `...\Programs\Ollama\ollama app.exe` -- this test re-derives the
+    /// same classification through this crate's own Win32 code path
+    /// instead of trusting the PowerShell measurement alone.
+    #[test]
+    #[ignore]
+    fn query_ollama_health_classifies_the_real_listener() {
+        let health = query_ollama_health(11434);
+        eprintln!("query_ollama_health_classifies_the_real_listener: {health:?}");
+        eprintln!("message: {}", health.message());
+        match health {
+            OllamaHealth::NotListening => {
+                panic!("expected something listening on 11434 on this machine")
+            }
+            OllamaHealth::Listening { .. } => {}
+        }
+    }
+
     #[test]
     fn query_ollama_health_reports_not_listening_after_the_socket_closes() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
