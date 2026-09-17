@@ -465,10 +465,41 @@ const ID_SHOW_DIFFICULTY: i32 = 112;
 const ID_TEXT_SCALE_TRACK: i32 = 113;
 const ID_TEXT_SCALE_LABEL: i32 = 114;
 const ID_PROMPT_EDIT: i32 = 115;
-const ID_AUTOSTART: i32 = 118;
 const ID_RESET_PROMPT: i32 = 116;
 const ID_SAVE: i32 = 117;
-const ID_CANCEL: i32 = 118;
+const ID_AUTOSTART: i32 = 118;
+const ID_CANCEL: i32 = 119;
+
+/// Every control id declared above, paired with its constant name for a
+/// legible test failure. Two controls sharing an id means `GetDlgItem`
+/// resolves to whichever was created last and a `WM_COMMAND` from one fires
+/// the other's handler (issue #144: `ID_AUTOSTART` and `ID_CANCEL` both being
+/// `118` made the autostart checkbox close the dialog instead of toggling).
+/// Add new `ID_*` constants here too -- `control_ids_are_pairwise_unique`
+/// below iterates this array, so an omitted id is invisible to the test.
+#[cfg(test)]
+const ALL_CONTROL_IDS: &[(&str, i32)] = &[
+    ("ID_ACTIVE_PROVIDER", ID_ACTIVE_PROVIDER),
+    ("ID_OPENAI_KEY", ID_OPENAI_KEY),
+    ("ID_OPENAI_SHOW_KEY", ID_OPENAI_SHOW_KEY),
+    ("ID_OPENAI_MODEL", ID_OPENAI_MODEL),
+    ("ID_OPENAI_EFFORT", ID_OPENAI_EFFORT),
+    ("ID_ANTHROPIC_KEY", ID_ANTHROPIC_KEY),
+    ("ID_ANTHROPIC_SHOW_KEY", ID_ANTHROPIC_SHOW_KEY),
+    ("ID_ANTHROPIC_MODEL", ID_ANTHROPIC_MODEL),
+    ("ID_ANTHROPIC_EFFORT", ID_ANTHROPIC_EFFORT),
+    ("ID_MAX_EDGE", ID_MAX_EDGE),
+    ("ID_MONITOR", ID_MONITOR),
+    ("ID_CARD_SECONDS", ID_CARD_SECONDS),
+    ("ID_SHOW_DIFFICULTY", ID_SHOW_DIFFICULTY),
+    ("ID_TEXT_SCALE_TRACK", ID_TEXT_SCALE_TRACK),
+    ("ID_TEXT_SCALE_LABEL", ID_TEXT_SCALE_LABEL),
+    ("ID_PROMPT_EDIT", ID_PROMPT_EDIT),
+    ("ID_RESET_PROMPT", ID_RESET_PROMPT),
+    ("ID_SAVE", ID_SAVE),
+    ("ID_AUTOSTART", ID_AUTOSTART),
+    ("ID_CANCEL", ID_CANCEL),
+];
 
 // ---------------------------------------------------------------------------
 // Win32 constants this crate's `windows` feature set doesn't expose
@@ -1521,6 +1552,21 @@ fn put_on_clipboard(owner: HWND, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- control ids -----------------------------------------------------
+
+    #[test]
+    fn control_ids_are_pairwise_unique() {
+        for (i, (name_a, id_a)) in ALL_CONTROL_IDS.iter().enumerate() {
+            for (name_b, id_b) in ALL_CONTROL_IDS.iter().skip(i + 1) {
+                assert_ne!(
+                    id_a, id_b,
+                    "{name_a} and {name_b} share control id {id_a} -- \
+                     GetDlgItem/WM_COMMAND cannot tell them apart"
+                );
+            }
+        }
+    }
 
     // -- parse_u32_or / parse_max_edge_or --------------------------------
 
