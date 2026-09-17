@@ -1524,6 +1524,7 @@ fn read_form(inner: &SettingsInner) -> Config {
     build_config(&inner.original, &raw)
 }
 
+#[allow(dead_code)] // exercised by tests; #194 replaced its build_config call site with merge_provider_order
 fn order_from_choice(choice: usize) -> Vec<String> {
     if choice == 1 {
         vec!["anthropic".to_string(), "openai".to_string()]
@@ -1538,6 +1539,56 @@ fn choice_from_order(order: &[String]) -> usize {
         Some("anthropic") => 1,
         _ => 0,
     }
+}
+
+/// #194: `build_config`'s provider-order merge. `choice` (the Settings
+/// radio: 0 = openai first, 1 = anthropic first) only ever decides the
+/// relative order of `"openai"` and `"anthropic"` within `configured` --
+/// every other entry (a hand-added `"ollama"` or `"gemini"`, a duplicate, an
+/// unrecognized name) keeps its exact position. This is what replaced
+/// `order_from_choice`'s old unconditional `cfg.providers.order =
+/// order_from_choice(choice)`, which silently deleted everything else
+/// `providers.order` held on every Settings save -- see the filed finding.
+///
+/// The precise rule, by how many of the two are present in `configured`
+/// (first occurrence of each, so a duplicate's later copies are untouched):
+/// - **Both present:** if their current relative order already matches
+///   `choice`, nothing changes. Otherwise the two entries simply swap array
+///   slots (only those two index positions change; everything else,
+///   including anything between them, keeps its position).
+/// - **Exactly one present:** the missing one is inserted immediately
+///   adjacent to the present one, on the correct side for `choice` (right
+///   before it if it must come first, right after if it must come second).
+/// - **Neither present:** both are appended to the end, in `choice`'s order
+///   -- matching what `order_from_choice` always produced when `configured`
+///   was empty.
+fn merge_provider_order(configured: &[String], choice: usize) -> Vec<String> {
+    let (first, second) = if choice == 1 {
+        ("anthropic", "openai")
+    } else {
+        ("openai", "anthropic")
+    };
+
+    let mut order = configured.to_vec();
+    let idx_first = order.iter().position(|s| s == first);
+    let idx_second = order.iter().position(|s| s == second);
+
+    match (idx_first, idx_second) {
+        (Some(i), Some(j)) => {
+            // `first` must end up before `second`. If it already is
+            // (i < j), nothing to do; otherwise swap just those two slots.
+            if i > j {
+                order.swap(i, j);
+            }
+        }
+        (Some(i), None) => order.insert(i + 1, second.to_string()),
+        (None, Some(j)) => order.insert(j, first.to_string()),
+        (None, None) => {
+            order.push(first.to_string());
+            order.push(second.to_string());
+        }
+    }
+    order
 }
 
 /// Parses a `u32`, falling back to `fallback` on anything that doesn't
@@ -1645,7 +1696,7 @@ fn resolve_key_field(original: &str, form_text: &str) -> String {
 fn build_config(original: &Config, raw: &RawForm) -> Config {
     let mut cfg = original.clone();
 
-    cfg.providers.order = order_from_choice(raw.provider_choice);
+    cfg.providers.order = merge_provider_order(&original.providers.order, raw.provider_choice);
 
     cfg.providers.openai.api_key =
         resolve_key_field(&original.providers.openai.api_key, &raw.openai_key);
@@ -1825,6 +1876,89 @@ mod tests {
         assert_eq!(choice_from_order(&["bogus".to_string()]), 0);
     }
 
+    // -- merge_provider_order (#194: Settings save must not drop entries
+    // beyond openai/anthropic) -------------------------------------------
+    //
+    // Rule: `choice` only decides the relative order of openai and
+    // anthropic. Every other entry (including duplicates and unrecognized
+    // names) keeps its exact position. When both are already present, they
+    // simply swap array slots if the current relative order disagrees with
+    // `choice`; nothing else moves. When one is missing, it is inserted
+    // immediately adjacent to the one that is present, on the correct side.
+    // When neither is present, both are appended, in `choice`'s order.
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn merge_order_both_present_already_matching_choice_is_unchanged() {
+        assert_eq!(merge_provider_order(&names(&["openai", "anthropic"]), 0), names(&["openai", "anthropic"]));
+        assert_eq!(merge_provider_order(&names(&["anthropic", "openai"]), 1), names(&["anthropic", "openai"]));
+    }
+
+    #[test]
+    fn merge_order_both_present_mismatched_choice_swaps_only_those_two_slots() {
+        assert_eq!(merge_provider_order(&names(&["openai", "anthropic"]), 1), names(&["anthropic", "openai"]));
+        assert_eq!(merge_provider_order(&names(&["anthropic", "openai"]), 0), names(&["openai", "anthropic"]));
+    }
+
+    #[test]
+    fn merge_order_ollama_first_is_left_in_place() {
+        let configured = names(&["ollama", "openai", "anthropic"]);
+        assert_eq!(merge_provider_order(&configured, 0), names(&["ollama", "openai", "anthropic"]));
+        assert_eq!(merge_provider_order(&configured, 1), names(&["ollama", "anthropic", "openai"]));
+    }
+
+    #[test]
+    fn merge_order_gemini_in_the_middle_stays_in_the_middle() {
+        let configured = names(&["openai", "gemini", "anthropic"]);
+        assert_eq!(merge_provider_order(&configured, 0), names(&["openai", "gemini", "anthropic"]));
+        assert_eq!(merge_provider_order(&configured, 1), names(&["anthropic", "gemini", "openai"]));
+    }
+
+    #[test]
+    fn merge_order_duplicate_entries_only_the_first_occurrence_participates() {
+        let configured = names(&["openai", "openai", "anthropic"]);
+        assert_eq!(merge_provider_order(&configured, 1), names(&["anthropic", "openai", "openai"]));
+    }
+
+    #[test]
+    fn merge_order_unknown_provider_names_are_untouched() {
+        let configured = names(&["mystery-provider", "openai", "anthropic"]);
+        assert_eq!(
+            merge_provider_order(&configured, 1),
+            names(&["mystery-provider", "anthropic", "openai"])
+        );
+    }
+
+    #[test]
+    fn merge_order_missing_anthropic_inserts_it_adjacent_to_openai() {
+        let configured = names(&["ollama", "openai"]);
+        assert_eq!(merge_provider_order(&configured, 0), names(&["ollama", "openai", "anthropic"]));
+        assert_eq!(merge_provider_order(&configured, 1), names(&["ollama", "anthropic", "openai"]));
+    }
+
+    #[test]
+    fn merge_order_missing_openai_inserts_it_adjacent_to_anthropic() {
+        let configured = names(&["anthropic", "ollama"]);
+        assert_eq!(merge_provider_order(&configured, 0), names(&["openai", "anthropic", "ollama"]));
+        assert_eq!(merge_provider_order(&configured, 1), names(&["anthropic", "openai", "ollama"]));
+    }
+
+    #[test]
+    fn merge_order_neither_present_appends_both_in_choice_order() {
+        let configured = names(&["ollama"]);
+        assert_eq!(merge_provider_order(&configured, 0), names(&["ollama", "openai", "anthropic"]));
+        assert_eq!(merge_provider_order(&configured, 1), names(&["ollama", "anthropic", "openai"]));
+    }
+
+    #[test]
+    fn merge_order_empty_configured_matches_old_order_from_choice_behavior() {
+        assert_eq!(merge_provider_order(&[], 0), names(&["openai", "anthropic"]));
+        assert_eq!(merge_provider_order(&[], 1), names(&["anthropic", "openai"]));
+    }
+
     // -- mask_key / resolve_key_field (#2 settings masking) ---------------
 
     #[test]
@@ -1982,6 +2116,23 @@ mod tests {
         assert!(!cfg.ui.show_difficulty);
         assert!((cfg.ui.text_scale - 1.5).abs() < f32::EPSILON);
         assert_eq!(cfg.ui.prompt, "custom prompt");
+    }
+
+    #[test]
+    fn build_config_preserves_a_hand_added_ollama_entry_on_an_untouched_save() {
+        // #194: opening Settings and saving (even a change unrelated to
+        // providers) must not silently delete a provider.order entry the
+        // user added by hand -- which is also how Ollama is opted into Auto
+        // mode (see the comment on `Providers::default`).
+        let mut original = Config::default();
+        original.providers.order = vec!["ollama".to_string(), "openai".to_string(), "anthropic".to_string()];
+        let raw = raw_from(&original); // provider_choice: 0, nothing else touched
+        let cfg = build_config(&original, &raw);
+        assert_eq!(
+            cfg.providers.order,
+            vec!["ollama".to_string(), "openai".to_string(), "anthropic".to_string()],
+            "ollama must survive an untouched Settings save"
+        );
     }
 
     #[test]
