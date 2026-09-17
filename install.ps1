@@ -106,21 +106,12 @@ function Get-SigningCert {
 # Windows' deployment service runs as SYSTEM, so it cannot see a per-user store:
 # the certificate has to reach LocalMachine\TrustedPeople, and that needs admin.
 # This is the only elevated step, and only the first time.
-function Confirm-CertTrusted($cert, $cerPath) {
-    $already = Get-ChildItem Cert:\LocalMachine\TrustedPeople -ErrorAction SilentlyContinue |
-               Where-Object { $_.Thumbprint -eq $cert.Thumbprint }
-    if ($already) { Note "certificate already trusted machine-wide"; return }
-
-    Step "Trusting the certificate (one UAC prompt)"
-    Export-Certificate -Cert $cert -FilePath $cerPath -Force | Out-Null
-    $inner = "Import-Certificate -FilePath '$cerPath' -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null"
-    $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru `
-         -ArgumentList '-NoProfile', '-NonInteractive', '-Command', $inner
-    if ($p.ExitCode -ne 0) { throw "Trusting the certificate failed (exit $($p.ExitCode)). Without it Windows will refuse the package." }
-
-    $ok = Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object { $_.Thumbprint -eq $cert.Thumbprint }
-    if (-not $ok) { throw "Certificate did not land in LocalMachine\TrustedPeople." }
-}
+#
+# Confirm-CertTrusted itself now lives in Wingman.Common.psm1 (issue #184),
+# so it can be Pester-mocked instead of only exercised by actually elevating
+# on a real machine; it also deletes the exported wingman.cer on every path
+# out (success, a non-zero elevated exit, a failed post-import verification)
+# rather than leaving it under $StageDir until the next run's wipe.
 
 # --- pre-rename cleanup (phase 3; issue #165 moved this from first to last) -
 # Only ever called after Invoke-PackageRegistrationPhase has returned
@@ -199,7 +190,8 @@ if (-not (Test-Path $built)) { throw "No executable at $built. Run without -Skip
 $cert = Get-SigningCert
 if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
-Confirm-CertTrusted $cert (Join-Path $StageDir 'wingman.cer')
+Step "Trusting the certificate if it isn't already (one UAC prompt the first time)"
+Confirm-CertTrusted -Cert $cert -CerPath (Join-Path $StageDir 'wingman.cer')
 
 Step "Signing the executable"
 # A sparse package's external executable must carry the package's signature;
