@@ -2,3 +2,5 @@ target/
 config.toml
 *.log
 .serena/
+target-agents/
+.claude/worktrees/
