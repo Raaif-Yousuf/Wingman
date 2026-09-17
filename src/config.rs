@@ -111,7 +111,10 @@ impl Default for Providers {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+/// `Debug` is hand-rolled below to redact `api_key`; every other derive
+/// still applies, including `Serialize`/`Deserialize`, so config.toml round
+/// trips are unaffected (#157).
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProviderConfig {
     pub model: String,
@@ -121,6 +124,21 @@ pub struct ProviderConfig {
     /// be added without a rebuild; the active `model` is always shown even if
     /// it is missing from this list.
     pub models: Vec<String>,
+}
+
+/// Redacts `api_key` so a future `eprintln!("{cfg:?}")`, panic hook or
+/// diagnostics dump can never print a live key by accident (#157). `Config`
+/// and `Providers` keep their derived `Debug`, which calls into this impl
+/// for the nested field.
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("model", &self.model)
+            .field("effort", &self.effort)
+            .field("api_key", &"<redacted>")
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 impl Default for ProviderConfig {
@@ -558,5 +576,51 @@ text_scale = 0.0
     #[test]
     fn the_shipped_default_contains_no_refusal_trigger() {
         assert!(!Config::default().ui.prompt.contains("scratchpad"));
+    }
+
+    /// #157: `{:?}` on `Config`/`ProviderConfig` must never leak the raw
+    /// `api_key`, however deeply nested.
+    #[test]
+    fn debug_format_never_contains_the_api_key() {
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-real-secret-openai".to_string();
+        config.providers.anthropic.api_key = "sk-ant-real-secret-anthropic".to_string();
+
+        let debug_output = format!("{config:?}");
+        assert!(
+            !debug_output.contains("sk-real-secret-openai"),
+            "{debug_output}"
+        );
+        assert!(
+            !debug_output.contains("sk-ant-real-secret-anthropic"),
+            "{debug_output}"
+        );
+        assert!(debug_output.contains("redacted"), "{debug_output}");
+
+        // Same check directly on the sub-struct, in case `Config`'s own
+        // Debug impl is ever hand-rolled and stops delegating.
+        let provider_debug = format!("{:?}", config.providers.openai);
+        assert!(
+            !provider_debug.contains("sk-real-secret-openai"),
+            "{provider_debug}"
+        );
+    }
+
+    /// #157: the redaction must be Debug-only. Serde/TOML round trips keep
+    /// the real key, byte for byte.
+    #[test]
+    fn api_key_round_trips_through_toml_unredacted() {
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-real-secret-value".to_string();
+
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            text.contains("sk-real-secret-value"),
+            "config.toml must keep the real key on disk; only Debug redacts"
+        );
+
+        let parsed: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(parsed.providers.openai.api_key, "sk-real-secret-value");
+        assert_eq!(config, parsed);
     }
 }
