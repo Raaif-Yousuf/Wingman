@@ -58,7 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
     GetIconInfo, LoadIconW, RegisterWindowMessageW, SetForegroundWindow, SetMenuItemInfoW,
     TrackPopupMenu, HICON, HMENU, ICONINFO, IDI_APPLICATION, MENUITEMINFOW, MFS_CHECKED,
-    MFT_RADIOCHECK, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE, MIIM_STATE,
+    MFT_RADIOCHECK, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE, MIIM_STATE,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
@@ -454,11 +454,23 @@ impl Tray {
             self.anthropic_current,
         )?;
         append_separator(hmenu)?;
-        append_item(hmenu, cmd::SET_PRIMARY, &key_label("Set Copilot key", &self.primary_label))?;
-        append_item(
+        // #185: greyed out while paused. Arming learn mode can never
+        // capture while paused (the WH_KEYBOARD_LL hook passes every
+        // keydown straight through, per hotkey.rs's pause bypass), so
+        // offering it would show a "press now" prompt that can never
+        // succeed and leaves a stale armed deadline behind. Mirrors the
+        // Pause/Resume item swap just above.
+        append_item_state(
+            hmenu,
+            cmd::SET_PRIMARY,
+            &key_label("Set Copilot key", &self.primary_label),
+            !self.paused,
+        )?;
+        append_item_state(
             hmenu,
             cmd::SET_SECONDARY,
             &key_label("Set secondary key", &self.secondary_label),
+            !self.paused,
         )?;
         append_item(hmenu, cmd::OPEN_SETTINGS, "Settings...")?;
         append_item(hmenu, cmd::EDIT_SETTINGS, "Open config.toml")?;
@@ -506,6 +518,24 @@ fn to_wide(s: &str) -> Vec<u16> {
 fn append_item(hmenu: HMENU, id: u32, text: &str) -> Result<()> {
     let wide = to_wide(text);
     unsafe { AppendMenuW(hmenu, MF_STRING, id as usize, PCWSTR::from_raw(wide.as_ptr())) }
+        .context("AppendMenuW failed")
+}
+
+/// Same as [`append_item`], but greyed out and disabled when `enabled` is
+/// false -- a disabled item sends no `WM_COMMAND` when clicked. Used by
+/// [`Tray::build_menu`] for #185. Passes both `MF_GRAYED` and `MF_DISABLED`
+/// explicitly, rather than relying on `MF_GRAYED` alone: MSDN documents
+/// `MF_GRAYED` as "functionally equivalent" to `MF_DISABLED`, but a real
+/// `GetMenuItemInfoW` readback (this module's own test) found the
+/// `MFS_DISABLED` bit is not set by `MF_GRAYED` alone.
+fn append_item_state(hmenu: HMENU, id: u32, text: &str, enabled: bool) -> Result<()> {
+    let wide = to_wide(text);
+    let flags = if enabled {
+        MF_STRING
+    } else {
+        MF_STRING | MF_GRAYED | MF_DISABLED
+    };
+    unsafe { AppendMenuW(hmenu, flags, id as usize, PCWSTR::from_raw(wide.as_ptr())) }
         .context("AppendMenuW failed")
 }
 
@@ -996,6 +1026,77 @@ mod tests {
         tray.readd().expect("Tray::readd should re-add the icon");
 
         drop(tray); // NIM_DELETE via Drop
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    // -- #185: SET_PRIMARY/SET_SECONDARY greyed while paused ---------------
+
+    #[test]
+    fn set_primary_and_secondary_are_greyed_out_only_while_paused() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetMenuItemInfoW, CW_USEDEFAULT, MFS_GRAYED,
+            WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray menu test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let mut tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+
+        fn item_is_greyed(hmenu: HMENU, id: u32) -> bool {
+            let mut info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_STATE,
+                ..Default::default()
+            };
+            unsafe { GetMenuItemInfoW(hmenu, id, false, &mut info) }.expect("GetMenuItemInfoW");
+            (info.fState.0 & MFS_GRAYED.0) == MFS_GRAYED.0
+        }
+
+        let hmenu_running = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu_running).expect("build_menu while running");
+        assert!(
+            !item_is_greyed(hmenu_running, cmd::SET_PRIMARY),
+            "SET_PRIMARY must not be greyed while running"
+        );
+        assert!(
+            !item_is_greyed(hmenu_running, cmd::SET_SECONDARY),
+            "SET_SECONDARY must not be greyed while running"
+        );
+        let _ = unsafe { DestroyMenu(hmenu_running) };
+
+        tray.set_paused(true);
+        let hmenu_paused = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu_paused).expect("build_menu while paused");
+        assert!(
+            item_is_greyed(hmenu_paused, cmd::SET_PRIMARY),
+            "SET_PRIMARY must be greyed while paused -- arming learn mode can never capture"
+        );
+        assert!(
+            item_is_greyed(hmenu_paused, cmd::SET_SECONDARY),
+            "SET_SECONDARY must be greyed while paused"
+        );
+        let _ = unsafe { DestroyMenu(hmenu_paused) };
+
+        drop(tray);
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 

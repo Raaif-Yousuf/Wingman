@@ -114,6 +114,24 @@ pub fn on_keydown(state: LearnState, chord: Chord, now: Instant) -> (LearnState,
     }
 }
 
+/// #185: whether the keydown that produced `outcome` from [`on_keydown`]
+/// should still be checked against the ordinary primary/secondary hotkey
+/// match, rather than being treated as fully handled by learn mode.
+///
+/// Only [`LearnOutcome::Captured`] is fully handled (it was consumed as the
+/// new binding). Every `PassThrough` -- a bare modifier kept armed, *or* a
+/// stale/expired deadline -- must still get its normal chance to fire the
+/// hotkey. Without this, the very keydown whose learn-mode deadline just
+/// expired is silently handed to `CallNextHookEx` without ever being
+/// compared against `primary`/`secondary`: if that keydown happens to BE
+/// the user's actual configured hotkey (the likely case for the first press
+/// after Resume, when learn mode was armed and then the deadline went stale
+/// while paused -- issue #185's second-order effect), `ask()` never fires
+/// on that press, only on the next one.
+pub fn should_check_hotkey_match(outcome: LearnOutcome) -> bool {
+    !matches!(outcome, LearnOutcome::Captured { .. })
+}
+
 /// True for a virtual-key that is itself a modifier (either the generic or
 /// left/right-specific form): Shift, Ctrl, Alt, or Win alone.
 fn is_bare_modifier(vk: u32) -> bool {
@@ -388,32 +406,36 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         if let Ok(mut s) = state.lock() {
             s.learn = new_learn;
         }
-        return match outcome {
-            LearnOutcome::Captured { which, chord } => {
-                let boxed = Box::into_raw(Box::new(chord));
-                let hwnd = HWND(target_hwnd as *mut _);
-                let _ = unsafe {
-                    PostMessageW(
-                        Some(hwnd),
-                        WM_APP_LEARNED,
-                        WPARAM(which),
-                        LPARAM(boxed as isize),
-                    )
-                };
+        if let LearnOutcome::Captured { which, chord } = outcome {
+            let boxed = Box::into_raw(Box::new(chord));
+            let hwnd = HWND(target_hwnd as *mut _);
+            let _ = unsafe {
+                PostMessageW(
+                    Some(hwnd),
+                    WM_APP_LEARNED,
+                    WPARAM(which),
+                    LPARAM(boxed as isize),
+                )
+            };
 
-                // Learn mode swallows this keydown the same way the ordinary
-                // match branch below swallows a bound hotkey; a captured
-                // chord that involves Win needs the same workaround, or
-                // learning a Win-involving chord flickers the Start menu
-                // (issue #151).
-                if needs_win_release_workaround(&chord) {
-                    send_ctrl_tap();
-                }
-
-                LRESULT(1)
+            // Learn mode swallows this keydown the same way the ordinary
+            // match branch below swallows a bound hotkey; a captured
+            // chord that involves Win needs the same workaround, or
+            // learning a Win-involving chord flickers the Start menu
+            // (issue #151).
+            if needs_win_release_workaround(&chord) {
+                send_ctrl_tap();
             }
-            LearnOutcome::PassThrough => unsafe { CallNextHookEx(None, code, wparam, lparam) },
-        };
+
+            return LRESULT(1);
+        }
+        // #185: `LearnOutcome::PassThrough` here means either a bare
+        // modifier kept armed, or the deadline just expired -- neither
+        // consumed this keydown, so (unlike a `return` here in the old
+        // code) fall through to the ordinary hotkey match below instead of
+        // handing it straight to `CallNextHookEx`. `should_check_hotkey_match`
+        // exists only to make this decision unit-testable.
+        debug_assert!(should_check_hotkey_match(outcome));
     }
 
     let which = if matches(&chord, &primary) {
@@ -550,6 +572,44 @@ mod tests {
         let (state, outcome) = on_keydown(armed, chord(0x41, false, false, false, false), now);
         assert_eq!(state, LearnState::Idle);
         assert_eq!(outcome, LearnOutcome::PassThrough);
+    }
+
+    // -- should_check_hotkey_match (#185, pure) ----------------------------
+
+    #[test]
+    fn captured_should_not_be_checked_against_hotkey_match() {
+        assert!(!should_check_hotkey_match(LearnOutcome::Captured {
+            which: HK_PRIMARY,
+            chord: chord(0x41, false, false, false, false),
+        }));
+    }
+
+    #[test]
+    fn pass_through_should_still_be_checked_against_hotkey_match() {
+        assert!(should_check_hotkey_match(LearnOutcome::PassThrough));
+    }
+
+    #[test]
+    fn a_keydown_whose_deadline_just_expired_still_falls_through_to_hotkey_matching() {
+        // #185's second-order effect, exercised end to end through the pure
+        // functions `hook_proc` calls (not `hook_proc` itself, which is
+        // Win32 glue -- see the module's `hook_proc` for the wiring this
+        // proves is correct): a stale `Armed` deadline must not cause the
+        // keydown that discovers it to be dropped from hotkey matching.
+        let now = Instant::now();
+        let armed = LearnState::Armed {
+            which: HK_PRIMARY,
+            deadline: now - Duration::from_millis(1), // already expired
+        };
+        let real_hotkey_chord = chord(0x86, false, true, false, true); // Win+Shift+F23-ish
+        let (state, outcome) = on_keydown(armed, real_hotkey_chord, now);
+        assert_eq!(state, LearnState::Idle);
+        assert_eq!(outcome, LearnOutcome::PassThrough);
+        assert!(
+            should_check_hotkey_match(outcome),
+            "the same keydown that timed out learn mode must still get a chance to match \
+             the ordinary hotkey -- otherwise it's silently dropped instead of triggering ask()"
+        );
     }
 
     // -- needs_win_release_workaround -------------------------------------
