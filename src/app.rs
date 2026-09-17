@@ -59,7 +59,10 @@ struct App {
     instance: HINSTANCE,
     /// The runtime id of the shell's `TaskbarCreated` message (see
     /// `ui::tray`'s module docs). Compared against `msg` in `wnd_proc` to
-    /// re-add the tray icon after Explorer crashes or restarts.
+    /// re-add the tray icon after Explorer crashes or restarts. Also mirrored
+    /// into the `TASKBAR_CREATED_MSG` thread-local at startup, so `wnd_proc`
+    /// can recognise it before `&mut App` exists -- see that thread-local's
+    /// doc comment.
     taskbar_created_msg: u32,
     config: Config,
     chain: Arc<Chain>,
@@ -121,6 +124,10 @@ pub fn run() -> Result<()> {
     // right after keeps every piece of startup wiring for the tray icon
     // together (see ui::tray's module docs on TaskbarCreated).
     let taskbar_created_msg = register_taskbar_created();
+    // Mirror it before any message can arrive: `wnd_proc` needs this id to
+    // recognise a TaskbarCreated broadcast while `SETTINGS_OPEN` is set,
+    // i.e. before it is allowed to form `&mut App` at all.
+    TASKBAR_CREATED_MSG.with(|c| c.set(taskbar_created_msg));
 
     let mut card = Card::new(instance).context("creating the notification card")?;
     card.set_text_scale(config.ui.text_scale);
@@ -288,30 +295,47 @@ impl App {
     }
 
     fn on_result(&mut self, result: std::result::Result<Answer, String>) {
+        let is_err = result.is_err();
+        let answer = self.record_last(result);
+        if is_err {
+            self.card.show_error(&answer.headline, &answer.detail);
+        } else {
+            self.card.show_answer(
+                &answer.headline,
+                &answer.detail,
+                self.config.ui.card_seconds,
+                answer.difficulty,
+            );
+        }
+        self.set_watch(true);
+    }
+
+    /// The part of `on_result` that doesn't touch the card: clears `busy`
+    /// (the request really did finish, whether or not anything shows it) and
+    /// records `self.last` so "Copy last answer" works, converting an `Err`
+    /// into the same `Answer` shape `on_result` would have shown. Split out
+    /// for issue #152: `open_settings` needs this half on its own, for the
+    /// rare double-fault where a deferred answer arrives in the same
+    /// Settings session as a `Config::save` failure -- the save error gets
+    /// the card (the user just caused it directly), and the answer is not
+    /// lost, just not shown as a card until the user checks "Copy last
+    /// answer" or asks again.
+    fn record_last(&mut self, result: std::result::Result<Answer, String>) -> Answer {
         self.busy = false;
-        match result {
-            Ok(answer) => {
-                self.card.show_answer(
-                    &answer.headline,
-                    &answer.detail,
-                    self.config.ui.card_seconds,
-                    answer.difficulty,
-                );
-                self.last = Some(answer);
-                self.set_watch(true);
-            }
+        let answer = match result {
+            Ok(answer) => answer,
             Err(e) => {
                 let headline = first_line(&e, 88);
-                self.card.show_error(&headline, &e);
-                self.last = Some(Answer {
+                Answer {
                     headline,
                     detail: e,
                     // An error has no difficulty to report.
                     difficulty: None,
-                });
-                self.set_watch(true);
+                }
             }
-        }
+        };
+        self.last = Some(answer.clone());
+        answer
     }
 
     fn copy_last(&mut self) {
@@ -388,25 +412,68 @@ impl App {
     /// Open the GUI settings window. Modal: it runs its own message loop, so
     /// the hotkey is inert until it closes. On Save the new config is applied
     /// in full — the same path `reload` takes — so nothing gets half-applied.
+    ///
+    /// Issue #152: for the whole duration of `settings::show_modal` below,
+    /// `wnd_proc` can be reentered -- that call never receives `self`, but it
+    /// pumps every thread message on this thread, including ones addressed
+    /// to *this* window. `open_settings` holds `&mut self` across that call,
+    /// so nothing reachable from `self` may be written anywhere else while
+    /// it runs (see `SETTINGS_OPEN`'s doc comment for why that is a real
+    /// aliasing hazard, not just a logic bug). Every piece of state that a
+    /// reentrant call needs to read or write therefore lives in a
+    /// thread-local, not on `App`: `SETTINGS_OPEN` itself, `PENDING_RESULT`
+    /// (a worker's answer that arrived mid-edit) and
+    /// `TASKBAR_RECREATED_WHILE_SETTINGS`. All three are only touched here,
+    /// immediately before and after `show_modal`, when no reentrant call can
+    /// possibly be in flight.
     fn open_settings(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
         self.card.hide();
         self.set_watch(false);
 
-        let Some(edited) = settings::show_modal(self.instance, &self.config) else {
+        SETTINGS_OPEN.with(|c| c.set(true));
+        let edited = settings::show_modal(self.instance, &self.config);
+        SETTINGS_OPEN.with(|c| c.set(false));
+
+        let pending = PENDING_RESULT.with(|c| c.borrow_mut().take());
+        let taskbar_recreated = TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false));
+        if taskbar_recreated {
+            self.on_taskbar_created();
+        }
+
+        let Some(edited) = edited else {
+            // Cancelled/closed without saving. An answer that finished
+            // mid-edit still gets its card.
+            if let Some(result) = pending {
+                self.on_result(result);
+            }
             return;
         };
 
         self.config = edited;
         if let Err(e) = self.config.save() {
+            // Rule 7: neither failure may be silently dropped. The save
+            // error is the one the user just directly caused (they clicked
+            // Save), so it gets the card; the deferred answer is not lost
+            // either, just not shown as a card here -- `record_last` still
+            // makes it available via "Copy last answer" until the next ask.
             self.card
                 .show_error("Couldn't save settings", &format!("{e:#}"));
+            if let Some(result) = pending {
+                self.record_last(result);
+            }
             return;
         }
         self.apply_config();
-        self.card.show_answer("Settings saved", "", 3, None);
-        self.set_watch(true);
+
+        match pending {
+            Some(result) => self.on_result(result),
+            None => {
+                self.card.show_answer("Settings saved", "", 3, None);
+                self.set_watch(true);
+            }
+        }
     }
 
     /// Push `self.config` into everything that caches a piece of it.
@@ -608,14 +675,141 @@ fn first_line(text: &str, max: usize) -> String {
 
 thread_local! {
     static OWNER_HWND: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+
+    /// True for the whole duration `App::open_settings` is suspended inside
+    /// `settings::show_modal`'s own message loop (issue #152).
+    ///
+    /// This -- and every other piece of state a reentrant `wnd_proc` call
+    /// needs while it is true -- deliberately lives outside `App`, behind a
+    /// thread-local `Cell`/`RefCell`, not as a field on `App` guarded by a
+    /// bool. The earlier version of this fix used an `App` field, which is
+    /// unsound: `open_settings(&mut self)` holds a unique `&mut self` across
+    /// the entire `show_modal` call. Rust's aliasing model (and the LLVM
+    /// `noalias` it lowers to) licenses the compiler to assume nothing
+    /// reachable from that `&mut self` is read or written by an opaque call
+    /// that is never handed `self` -- `show_modal` is exactly that, since
+    /// the reentrant path reaches `App` only through the raw `GWLP_USERDATA`
+    /// pointer, a completely different provenance. Concretely: the store to
+    /// an `App` field made just before the call and the store made just
+    /// after it are, as far as the optimizer can see, two writes to the same
+    /// location with nothing in between that reads or aliases it -- a
+    /// textbook dead-store-elimination candidate, which in release/LTO could
+    /// make the guard silently never take effect. A `Cell` reached only
+    /// through its own thread-local accessor (never through `&App`/`&mut
+    /// App`) has no aliasing relationship with `&mut self` at all, so none
+    /// of this applies: both the read in `wnd_proc` and the writes in
+    /// `open_settings` are plain, unoptimizable-away side effects through an
+    /// opaque TLS accessor call.
+    static SETTINGS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// A `WM_APP_RESULT` payload that arrived while `SETTINGS_OPEN` was
+    /// true. `open_settings` delivers it once `show_modal` returns, so the
+    /// in-flight request still ends in a card (rule 7) instead of being
+    /// dropped or clobbered by "Settings saved". See `SETTINGS_OPEN` for why
+    /// this can't be a field on `App`.
+    static PENDING_RESULT: std::cell::RefCell<Option<std::result::Result<Answer, String>>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// The shell's `TaskbarCreated` broadcast arrived while `SETTINGS_OPEN`
+    /// was true. `open_settings` re-adds the tray icon (`on_taskbar_created`)
+    /// once `show_modal` returns, rather than never doing so.
+    static TASKBAR_RECREATED_WHILE_SETTINGS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
+    /// The runtime id of the shell's `TaskbarCreated` message, mirrored from
+    /// `App::taskbar_created_msg` at startup (see that field's doc comment).
+    /// `wnd_proc` needs it to recognise the broadcast *before* `&mut App`
+    /// may be formed at all, i.e. before `App` -- and its own copy of this
+    /// id -- can be reached. `0` (never a value `RegisterWindowMessageW`
+    /// returns) means "not set yet".
+    static TASKBAR_CREATED_MSG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 use std::os::windows::ffi::OsStrExt;
+
+/// What `wnd_proc` should do with a message addressed to the owner window
+/// while `SETTINGS_OPEN` is true (issue #152): every arm here must be
+/// answerable without forming `&mut App` -- see that thread-local's doc
+/// comment for why. Extracted as pure logic (no `HWND`, no thread-local, no
+/// `App`) so the policy is unit-tested directly rather than only exercised
+/// by clicking through a live modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsReentrancy {
+    /// Swallow it: return `LRESULT(0)` without touching `App`. Covers the
+    /// hotkey, a second Copilot-key launch, the tray callback itself (so its
+    /// menu does not pop up, and none of its commands can fire, over the
+    /// modal), a dismiss click (the card is already hidden and its watcher
+    /// disarmed before `show_modal` runs, so there is nothing to do), and
+    /// `WM_APP_LEARNED` (unreachable here in practice: every path that opens
+    /// Settings cancels learn mode first, see `open_settings`'s call sites --
+    /// but the boxed `Chord` payload is still freed rather than leaked, in
+    /// case that invariant ever changes).
+    Ignore,
+    /// Stash the worker's payload in `PENDING_RESULT`; `open_settings`
+    /// delivers it after `show_modal` returns, so an answer that finished
+    /// mid-edit still ends in a card (rule 7) instead of being silently
+    /// overwritten by "Settings saved".
+    DeferResult,
+    /// Set `TASKBAR_RECREATED_WHILE_SETTINGS`; `open_settings` re-adds the
+    /// tray icon after `show_modal` returns.
+    DeferTaskbarCreated,
+    /// Not one of ours: hand it to `DefWindowProcW`, same as the normal
+    /// unmatched-message path, without ever forming `&mut App`. In practice
+    /// the only message this could plausibly be is `WM_DESTROY`, and that is
+    /// itself unreachable while Settings is open: its only path is the
+    /// tray's Quit command, and `WM_APP_TRAY` is `Ignore`d above.
+    Fallback,
+}
+
+fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
+    if taskbar_created_msg != 0 && msg == taskbar_created_msg {
+        return SettingsReentrancy::DeferTaskbarCreated;
+    }
+    match msg {
+        WM_APP_RESULT => SettingsReentrancy::DeferResult,
+        WM_APP_HOTKEY | WM_APP_ACTIVATE | WM_APP_TRAY | WM_APP_DISMISS | WM_APP_LEARNED => {
+            SettingsReentrancy::Ignore
+        }
+        _ => SettingsReentrancy::Fallback,
+    }
+}
 
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         OWNER_HWND.with(|h| h.set(hwnd.0 as isize));
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+
+    // Issue #152: apply the reentrancy policy BEFORE forming `&mut App` --
+    // not merely before using it -- and using only thread-local state to do
+    // so. See `SETTINGS_OPEN`'s doc comment for why even reading `app.*`
+    // here, guard or no guard, would be unsound while it is true.
+    if SETTINGS_OPEN.with(|c| c.get()) {
+        let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
+        match settings_reentrancy_policy(msg, taskbar_created_msg) {
+            SettingsReentrancy::Ignore => {
+                // WM_APP_LEARNED is the only ignored message carrying a
+                // boxed payload; free it so it doesn't leak.
+                if msg == WM_APP_LEARNED {
+                    drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
+                }
+                return LRESULT(0);
+            }
+            SettingsReentrancy::DeferResult => {
+                let result = unsafe {
+                    *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>)
+                };
+                PENDING_RESULT.with(|c| *c.borrow_mut() = Some(result));
+                return LRESULT(0);
+            }
+            SettingsReentrancy::DeferTaskbarCreated => {
+                TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.set(true));
+                return LRESULT(0);
+            }
+            SettingsReentrancy::Fallback => {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+        }
     }
 
     let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
@@ -710,6 +904,81 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 #[cfg(test)]
 mod tests {
     use super::first_line;
+    use super::{settings_reentrancy_policy, SettingsReentrancy};
+    use super::{WM_APP_ACTIVATE, WM_APP_RESULT};
+    use crate::dismiss::WM_APP_DISMISS;
+    use crate::hotkey::{WM_APP_HOTKEY, WM_APP_LEARNED};
+    use crate::ui::tray::WM_APP_TRAY;
+    use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
+
+    // -- settings_reentrancy_policy (issue #152) --------------------------
+
+    /// An arbitrary but fixed stand-in for the runtime-registered
+    /// `TaskbarCreated` id, distinct from every `WM_APP_*` constant and from
+    /// `WM_DESTROY`, so tests can exercise that branch without depending on
+    /// an actual `RegisterWindowMessageW` call.
+    const FAKE_TASKBAR_CREATED_MSG: u32 = 0xC123;
+
+    #[test]
+    fn settings_reentrancy_defers_the_worker_result() {
+        // The in-flight answer must still end in a card (rule 7) once
+        // Settings closes, so it is deferred rather than dropped or handled
+        // reentrantly behind the modal.
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_RESULT, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::DeferResult
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_defers_taskbar_created() {
+        // Explorer restarting while Settings is open must still get the
+        // tray icon back, just after Settings closes rather than reentrantly.
+        assert_eq!(
+            settings_reentrancy_policy(FAKE_TASKBAR_CREATED_MSG, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::DeferTaskbarCreated
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_treats_unset_taskbar_id_as_never_matching() {
+        // `0` means "not registered yet" (see TASKBAR_CREATED_MSG's doc
+        // comment) and must never itself be treated as the broadcast, even
+        // though `msg` could theoretically be 0.
+        assert_eq!(
+            settings_reentrancy_policy(0, 0),
+            SettingsReentrancy::Fallback
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_ignores_hotkey_activate_tray_dismiss_and_learned() {
+        for msg in [
+            WM_APP_HOTKEY,
+            WM_APP_ACTIVATE,
+            WM_APP_TRAY,
+            WM_APP_DISMISS,
+            WM_APP_LEARNED,
+        ] {
+            assert_eq!(
+                settings_reentrancy_policy(msg, FAKE_TASKBAR_CREATED_MSG),
+                SettingsReentrancy::Ignore,
+                "msg {msg:#x} should be Ignore while Settings is open"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_reentrancy_falls_back_to_def_window_proc_for_everything_else() {
+        // WM_DESTROY is the concrete example named in the doc comment: it is
+        // unreachable in practice (its only path, WM_APP_TRAY, is Ignore'd
+        // above), but the policy itself has no special-case for it -- an
+        // unrecognised message always goes to DefWindowProcW, never to App.
+        assert_eq!(
+            settings_reentrancy_policy(WM_DESTROY, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Fallback
+        );
+    }
 
     #[test]
     fn first_line_takes_only_the_first_line() {
