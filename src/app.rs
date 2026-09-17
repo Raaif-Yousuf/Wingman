@@ -199,8 +199,9 @@ fn pump_messages() {
 }
 
 impl App {
-    /// The whole flow: hide any stale card, grab the screen, then hand the
-    /// bytes to a worker so the message loop stays responsive during the call.
+    /// The whole flow: hide any stale card, check a provider is actually
+    /// ready, grab the screen, then hand the bytes to a worker so the
+    /// message loop stays responsive during the call.
     fn ask(&mut self) {
         if self.busy {
             return;
@@ -209,6 +210,21 @@ impl App {
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
             self.card.hide();
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
+        }
+
+        // Checked before capture: readiness is a cheap synchronous check, and
+        // a machine with no key configured should never pay for a screenshot
+        // grab (or have a capture failure mask the actually-actionable "No
+        // API key" card) just to find out it has nothing to ask (issue #158).
+        if self.chain.ready_provider_names().is_empty() {
+            let path = Config::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "config.toml".into());
+            self.card.show_error(
+                "No API key — open Edit settings",
+                &format!("Add a key under [providers.openai] or [providers.anthropic] in:\n{path}"),
+            );
+            return;
         }
 
         // Capture runs here, on the main thread, and must happen before the
@@ -221,17 +237,6 @@ impl App {
                 return;
             }
         };
-
-        if self.chain.ready_provider_names().is_empty() {
-            let path = Config::path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "config.toml".into());
-            self.card.show_error(
-                "No API key — open Edit settings",
-                &format!("Add a key under [providers.openai] or [providers.anthropic] in:\n{path}"),
-            );
-            return;
-        }
 
         self.busy = true;
         // Disarmed for the whole in-flight window: a click while the spinner
