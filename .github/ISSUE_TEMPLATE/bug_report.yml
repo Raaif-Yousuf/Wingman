@@ -15,6 +15,11 @@ body:
         questions. If what you are describing is Wingman asking a follow-up
         or holding a conversation, that alone is the bug; say so below.
 
+        **Tip:** right-click the tray icon and choose "Copy diagnostics" to
+        fill in most of the fields below in one paste (version, Windows
+        build, mode, provider order and model, whether each provider's key
+        is set, and so on). It never includes a key, not even a fragment.
+
   - type: input
     id: version
     attributes:
@@ -62,6 +67,17 @@ body:
       description: What you did (the key press, the menu click) and what happened instead of what you expected.
     validations:
       required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: >-
+        Paste the output of the tray menu's "Copy diagnostics" item, if you
+        can still reach it. Optional, but it answers most of the fields
+        above in one paste and is safe to post here: it never contains a
+        key, not even a fragment, only whether one is set.
+      render: text
 
   - type: textarea
     id: card-text

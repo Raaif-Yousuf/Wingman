@@ -6,6 +6,7 @@ mod capture;
 mod config;
 #[cfg(test)]
 mod config_example;
+mod diagnostics;
 mod dismiss;
 mod hotkey;
 mod known_folder;

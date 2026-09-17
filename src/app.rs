@@ -480,6 +480,25 @@ impl App {
         }
     }
 
+    /// Issue #124: "Copy diagnostics" tray item. Builds a plain-text report
+    /// (`diagnostics::render_report`) and puts it on the clipboard -- no
+    /// file writes, no network. See `diagnostics.rs`'s module doc for the
+    /// redaction guarantee.
+    fn copy_diagnostics(&mut self) {
+        let report = crate::diagnostics::render_report(&crate::diagnostics::collect(&self.config));
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
+            Ok(()) => self.card.show_answer(
+                "Diagnostics copied",
+                "Paste them into a bug report.",
+                6,
+                None,
+            ),
+            Err(e) => self
+                .card
+                .show_error("Couldn't copy diagnostics", &format!("{e}")),
+        }
+    }
+
     fn start_learning(&mut self, which: usize) {
         let Some(hook) = &self.hook else {
             self.card
@@ -1288,6 +1307,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
                     MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
+                    MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
                     MenuChoice::Command(cmd::USE_OPENAI) => app.set_provider(true),
                     MenuChoice::Command(cmd::USE_ANTHROPIC) => app.set_provider(false),
                     MenuChoice::Command(cmd::PAUSE_1H) => app.pause_for(PauseChoice::OneHour),

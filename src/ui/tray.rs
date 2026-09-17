@@ -121,6 +121,10 @@ pub mod cmd {
     pub const MODE_AUTO: u32 = 1017;
     pub const MODE_OFFLINE: u32 = 1018;
 
+    /// Issue #124: builds a plain-text diagnostics report and copies it to
+    /// the clipboard. See `App::copy_diagnostics` in `app.rs`.
+    pub const COPY_DIAGNOSTICS: u32 = 1019;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -475,6 +479,7 @@ impl Tray {
         append_item(hmenu, cmd::OPEN_SETTINGS, "Settings...")?;
         append_item(hmenu, cmd::EDIT_SETTINGS, "Open config.toml")?;
         append_item(hmenu, cmd::RELOAD, "Reload settings")?;
+        append_item(hmenu, cmd::COPY_DIAGNOSTICS, "Copy diagnostics")?;
         append_separator(hmenu)?;
         append_item(hmenu, cmd::QUIT, "Quit")?;
         Ok(())
@@ -1165,6 +1170,7 @@ mod tests {
         ("MODE_LOCAL", cmd::MODE_LOCAL),
         ("MODE_AUTO", cmd::MODE_AUTO),
         ("MODE_OFFLINE", cmd::MODE_OFFLINE),
+        ("COPY_DIAGNOSTICS", cmd::COPY_DIAGNOSTICS),
     ];
 
     #[test]
