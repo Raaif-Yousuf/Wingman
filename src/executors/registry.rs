@@ -7,6 +7,7 @@
 
 use super::calendar_add::CalendarAddExecutor;
 use super::clipboard::ClipboardExecutor;
+use super::fill_form::FillFormExecutor;
 use super::image_clipboard::ImageClipboardExecutor;
 use super::none::NoneExecutor;
 use super::replace_text::ReplaceTextExecutor;
@@ -26,6 +27,7 @@ pub fn resolve(name: &str) -> anyhow::Result<Box<dyn Executor>> {
         "calendar_add" => Ok(Box::new(CalendarAddExecutor::new())),
         "image_clipboard" => Ok(Box::new(ImageClipboardExecutor::new())),
         "replace_text" => Ok(Box::new(ReplaceTextExecutor::new())),
+        "fill_form" => Ok(Box::new(FillFormExecutor::new())),
         _ => anyhow::bail!(
             "No executor named \"{name}\". Check the action's executor field in actions.toml."
         ),
@@ -67,6 +69,13 @@ mod tests {
     fn resolves_replace_text_by_name() {
         let executor = resolve("replace_text").expect("\"replace_text\" is a built-in executor");
         assert_eq!(executor.name(), "replace_text");
+        assert_eq!(executor.effect(), super::super::Effect::Writes);
+    }
+
+    #[test]
+    fn resolves_fill_form_by_name() {
+        let executor = resolve("fill_form").expect("\"fill_form\" is a built-in executor");
+        assert_eq!(executor.name(), "fill_form");
         assert_eq!(executor.effect(), super::super::Effect::Writes);
     }
 

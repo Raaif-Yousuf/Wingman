@@ -10,10 +10,12 @@
 
 mod calendar_add;
 mod clipboard;
+mod fill_form;
 mod image_clipboard;
 mod none;
 pub mod registry;
 mod replace_text;
+mod target;
 pub mod uia_guard;
 
 use crate::ui::confirm::Confirmed;

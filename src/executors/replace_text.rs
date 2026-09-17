@@ -14,12 +14,17 @@
 //! refusal, never a silent write:
 //!
 //! 1. **The element itself cannot be found again**, or more than one
-//!    element now matches (ambiguous) -- [`MatchOutcome`], checked by
-//!    [`resolve_index`] against a fresh walk of the window's descendants.
+//!    element now matches (ambiguous) -- [`super::target::MatchOutcome`],
+//!    checked by [`super::target::resolve_index`] against a fresh walk of
+//!    the window's descendants.
 //! 2. **The element's current text no longer equals the text the preview
 //!    showed** -- someone typed in the field between Look and Do.
 //!    [`is_stale`], checked against [`ReplaceTextProposal::expected_current_text`]
 //!    before any write.
+//!
+//! `TargetRef` re-resolution, staleness and the real UIA walk/read/write
+//! machinery live in [`super::target`] (#33: extracted so `fill_form`
+//! shares them instead of duplicating).
 //!
 //! [`Undo`] restores the exact prior text the same way: re-resolve, check
 //! the text still equals what THIS executor wrote (not the original -- see
@@ -59,25 +64,12 @@ use std::sync::Arc;
 
 use crate::ui::confirm::Confirmed;
 
+use super::target::{self, is_stale, parse_target_ref, TargetRef, TextElementAccess};
 use super::{Effect, Executor, Undo};
 
 // ---------------------------------------------------------------------------
 // Pure types
 // ---------------------------------------------------------------------------
-
-/// Identifies one UIA element, captured at "Look" time and re-resolved at
-/// "Do" time. `hwnd` is the window whose descendants are walked to find the
-/// match (a raw `HWND`'s pointer value, stored as `isize` rather than the
-/// `windows` crate's `HWND` type so this struct stays plain data -- `Send`,
-/// `Eq`, constructible from JSON with no Win32 dependency).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TargetRef {
-    pub hwnd: isize,
-    pub runtime_id: Vec<i32>,
-    pub automation_id: String,
-    pub name: String,
-    pub control_type: String,
-}
 
 /// Which write path a `replace_text` proposal asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,53 +92,6 @@ pub struct ReplaceTextProposal {
     /// UTF-16 code-unit offsets `(start, end)` into `expected_current_text`,
     /// present only for `ReplaceSelection`.
     pub selection: Option<(usize, usize)>,
-}
-
-/// The live state of one re-resolved element, as read by a
-/// [`TextElementAccess`] implementation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedElement {
-    pub name: String,
-    pub automation_id: String,
-    pub control_type: String,
-    pub is_password: bool,
-    /// Empty for a password field -- its real value is never read (see the
-    /// module doc comment).
-    pub current_text: String,
-}
-
-/// Result of matching a [`TargetRef`] against a fresh walk of candidates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchOutcome {
-    Found(usize),
-    NotFound,
-    Ambiguous,
-}
-
-/// The single decision point for "which candidate is the target, if any".
-/// Pure: exact equality on every [`TargetRef`] field. More than one exact
-/// match is [`MatchOutcome::Ambiguous`] -- this function never guesses.
-pub fn resolve_index(candidates: &[TargetRef], target: &TargetRef) -> MatchOutcome {
-    let mut found = None;
-    for (i, candidate) in candidates.iter().enumerate() {
-        if candidate == target {
-            if found.is_some() {
-                return MatchOutcome::Ambiguous;
-            }
-            found = Some(i);
-        }
-    }
-    match found {
-        Some(i) => MatchOutcome::Found(i),
-        None => MatchOutcome::NotFound,
-    }
-}
-
-/// Whether the element's current text has drifted from what the preview
-/// showed -- the stale-target check the task brief names explicitly
-/// ("someone typed in between").
-pub fn is_stale(expected_current_text: &str, actual_current_text: &str) -> bool {
-    expected_current_text != actual_current_text
 }
 
 /// Why [`splice_utf16`] refused to produce a spliced string.
@@ -263,47 +208,6 @@ pub fn plan_new_value(
 // Parsing: JSON Value -> ReplaceTextProposal (calendar_add.rs's shape)
 // ---------------------------------------------------------------------------
 
-fn parse_target_ref(value: &Value) -> Result<TargetRef> {
-    let hwnd = value
-        .get("hwnd")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| anyhow!("replace_text: proposal has no \"target.hwnd\" field"))?
-        as isize;
-    let runtime_id = value
-        .get("runtime_id")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_i64)
-                .map(|n| n as i32)
-                .collect()
-        })
-        .unwrap_or_default();
-    let automation_id = value
-        .get("automation_id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let name = value
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let control_type = value
-        .get("control_type")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    Ok(TargetRef {
-        hwnd,
-        runtime_id,
-        automation_id,
-        name,
-        control_type,
-    })
-}
-
 /// Parses a confirmed `replace_text` proposal's `Value`. Everything past
 /// this function in the executor's call chain acts on the typed
 /// [`ReplaceTextProposal`], never the raw JSON again (see the module doc
@@ -371,31 +275,6 @@ fn parse_replace_text(value: &Value) -> Result<ReplaceTextProposal> {
 }
 
 // ---------------------------------------------------------------------------
-// The injectable seam (mirrors executors::clipboard::ClipboardAccess)
-// ---------------------------------------------------------------------------
-
-/// Abstracts "re-resolve a target and read its live state" / "write a
-/// target's value" so the refusal logic in [`do_replace`] (stale-target,
-/// password, forbidden-target, undo round trip) is tested against a fake
-/// element model with no live UIA element, the same shape
-/// `executors::clipboard::ClipboardAccess` gives the clipboard executor.
-/// The real implementation is [`com::UiaTextElementAccess`].
-pub trait TextElementAccess: Send + Sync {
-    /// Re-resolves `target` (a fresh walk of its window's descendants, an
-    /// exact match on every `TargetRef` field) and returns its live state.
-    /// Errs if the element cannot be found again or more than one element
-    /// now matches -- never guesses.
-    fn resolve(&self, target: &TargetRef) -> Result<ResolvedElement>;
-
-    /// Re-resolves `target` again (independently of any earlier `resolve`
-    /// call -- see the module doc comment on why each call is
-    /// self-contained) and writes `new_text` via `ValuePattern.SetValue`.
-    /// Errs if the element cannot be found, is a password field, or does
-    /// not support `ValuePattern`.
-    fn write(&self, target: &TargetRef, new_text: &str) -> Result<()>;
-}
-
-// ---------------------------------------------------------------------------
 // The executor
 // ---------------------------------------------------------------------------
 
@@ -410,14 +289,14 @@ impl ReplaceTextExecutor {
     /// Production constructor: the real UIA-backed access.
     pub fn new() -> Self {
         Self {
-            access: Arc::new(com::UiaTextElementAccess),
+            access: Arc::new(target::com::UiaTextElementAccess),
         }
     }
 
     /// Test constructor: an injected fake, so the refusal/undo logic in
     /// [`do_replace`] can be exercised with no live UIA element (this
-    /// file's own tests) -- and, once real integration tests need it, the
-    /// real `com::UiaTextElementAccess` explicitly.
+    /// file's own tests) -- and, for the real integration tests below, the
+    /// real `target::com::UiaTextElementAccess` explicitly.
     #[allow(dead_code)]
     pub fn with_access(access: Arc<dyn TextElementAccess>) -> Self {
         Self { access }
@@ -510,321 +389,9 @@ fn do_replace(access: &Arc<dyn TextElementAccess>, proposal: &ReplaceTextProposa
     }))
 }
 
-// ---------------------------------------------------------------------------
-// Win32 / UI Automation
-// ---------------------------------------------------------------------------
-
-mod com {
-    #![allow(dead_code)]
-
-    use super::{resolve_index, MatchOutcome, ResolvedElement, TargetRef, TextElementAccess};
-    use anyhow::Result;
-    use windows::core::{Interface, BSTR};
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED, SAFEARRAY,
-    };
-    use windows::Win32::System::Ole::{
-        SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
-        SafeArrayUnaccessData,
-    };
-    use windows::Win32::UI::Accessibility::{
-        CUIAutomation8, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
-        TreeScope_Descendants, UIA_AutomationIdPropertyId, UIA_ControlTypePropertyId,
-        UIA_IsPasswordPropertyId, UIA_NamePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
-    };
-
-    /// Same RAII pairing as `inputs::uia::com::ComApartment` /
-    /// `inputs::selection::com::ComApartment`, duplicated rather than
-    /// shared -- those are private to their own files, and this task's
-    /// scope is this file plus one `executors/mod.rs` line and one
-    /// `registry.rs` line, not a cross-module refactor.
-    struct ComApartment;
-
-    impl ComApartment {
-        fn enter() -> Result<Self> {
-            let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-            hr.ok()?;
-            Ok(Self)
-        }
-    }
-
-    impl Drop for ComApartment {
-        fn drop(&mut self) {
-            unsafe { CoUninitialize() };
-        }
-    }
-
-    fn is_null<I: Interface>(i: &I) -> bool {
-        i.as_raw().is_null()
-    }
-
-    /// One element found while walking a window's descendants, plus enough
-    /// state to build both a [`TargetRef`] (for matching) and a
-    /// [`ResolvedElement`] (for the caller) without a second COM round trip.
-    struct MatchedElement {
-        element: IUIAutomationElement,
-        name: String,
-        automation_id: String,
-        control_type: String,
-        is_password: bool,
-        current_text: String,
-    }
-
-    /// One walked candidate's non-identity extras (password/value), kept
-    /// parallel to `walk`'s `Vec<TargetRef>`/`Vec<IUIAutomationElement>`
-    /// rather than folded into `TargetRef` itself, since `TargetRef` is
-    /// pure identity data shared with the JSON proposal shape.
-    type WalkExtra = (bool, Option<String>);
-
-    /// `walk`'s result: parallel `TargetRef`/element/extra vectors, one
-    /// entry per candidate, in the same order.
-    type WalkResult = (Vec<TargetRef>, Vec<IUIAutomationElement>, Vec<WalkExtra>);
-
-    /// The one bulk COM call this module makes: walks `hwnd`'s descendants
-    /// with a single `FindAllBuildCache`, same shape as
-    /// `inputs::uia::com::walk` (a `True` condition over `Descendants`, one
-    /// cache request, no per-element property round trip except
-    /// `GetRuntimeId`, which has no cached form -- see
-    /// [`runtime_id_from_safearray`]'s call site).
-    fn walk(automation: &IUIAutomation, hwnd: HWND) -> Result<WalkResult> {
-        let cache_request = unsafe { automation.CreateCacheRequest() }?;
-        unsafe {
-            cache_request.AddProperty(UIA_NamePropertyId)?;
-            cache_request.AddProperty(UIA_AutomationIdPropertyId)?;
-            cache_request.AddProperty(UIA_ControlTypePropertyId)?;
-            cache_request.AddProperty(UIA_IsPasswordPropertyId)?;
-            cache_request.AddPattern(UIA_ValuePatternId)?;
-            // A cached pattern's own cached property additionally needs its
-            // property cached, or reading it fails with E_INVALIDARG --
-            // MEASURED 2026-09-17 in `inputs::uia::com::walk` against this
-            // exact call shape; carried over here rather than re-measured.
-            cache_request.AddProperty(UIA_ValueValuePropertyId)?;
-        }
-
-        let root = unsafe { automation.ElementFromHandle(hwnd) }?;
-        let condition = unsafe { automation.CreateTrueCondition() }?;
-        let found =
-            unsafe { root.FindAllBuildCache(TreeScope_Descendants, &condition, &cache_request) }?;
-        let total = unsafe { found.Length() }?.max(0) as usize;
-
-        let mut candidates = Vec::with_capacity(total);
-        let mut elements = Vec::with_capacity(total);
-        let mut extra = Vec::with_capacity(total);
-
-        for i in 0..total {
-            let element = unsafe { found.GetElement(i as i32) }?;
-            let name = unsafe { element.CachedName() }
-                .map(|b| b.to_string())
-                .unwrap_or_default();
-            let automation_id = unsafe { element.CachedAutomationId() }
-                .map(|b| b.to_string())
-                .unwrap_or_default();
-            let control_type = control_type_to_string(unsafe { element.CachedControlType() }?);
-            let is_password = unsafe { element.CachedIsPassword() }
-                .map(|b| b.as_bool())
-                .unwrap_or(false);
-
-            // NEVER read the value of a password field -- checked before
-            // any pattern lookup, same guard shape as
-            // `inputs::uia::com::extract`.
-            let value = if is_password {
-                None
-            } else {
-                unsafe { element.GetCachedPattern(UIA_ValuePatternId) }
-                    .ok()
-                    .and_then(|unknown| {
-                        if is_null(&unknown) {
-                            return None;
-                        }
-                        let pattern: IUIAutomationValuePattern = unknown.cast().ok()?;
-                        unsafe { pattern.CachedValue() }.ok().map(|b| b.to_string())
-                    })
-            };
-
-            // `GetRuntimeId` has no cached form on `IUIAutomationElement`
-            // (only a non-cached method exists in the UIA COM interface),
-            // so this is one extra round trip per element -- acceptable at
-            // this executor's scale (one target window, not a bulk
-            // snapshot).
-            let runtime_id = unsafe { element.GetRuntimeId() }
-                .ok()
-                .and_then(|psa| unsafe { runtime_id_from_safearray(psa) }.ok())
-                .unwrap_or_default();
-
-            candidates.push(TargetRef {
-                hwnd: hwnd.0 as isize,
-                runtime_id,
-                automation_id,
-                name,
-                control_type,
-            });
-            elements.push(element);
-            extra.push((is_password, value));
-        }
-
-        Ok((candidates, elements, extra))
-    }
-
-    /// Walks, then matches `target` against the walk via the pure
-    /// [`resolve_index`] -- errs with a clear, no-em-dash message for
-    /// "not found" and "ambiguous", never guesses.
-    fn find_and_match(
-        automation: &IUIAutomation,
-        hwnd: HWND,
-        target: &TargetRef,
-    ) -> Result<MatchedElement> {
-        let (candidates, elements, extra) = walk(automation, hwnd)?;
-
-        match resolve_index(&candidates, target) {
-            MatchOutcome::Found(i) => {
-                let (is_password, value) = extra[i].clone();
-                Ok(MatchedElement {
-                    element: elements[i].clone(),
-                    name: candidates[i].name.clone(),
-                    automation_id: candidates[i].automation_id.clone(),
-                    control_type: candidates[i].control_type.clone(),
-                    is_password,
-                    current_text: value.unwrap_or_default(),
-                })
-            }
-            MatchOutcome::NotFound => anyhow::bail!(
-                "replace_text: the target element could not be found; it may have closed, moved, or changed"
-            ),
-            MatchOutcome::Ambiguous => anyhow::bail!(
-                "replace_text: more than one element matches the target; refusing to guess which one to write to"
-            ),
-        }
-    }
-
-    fn control_type_to_string(id: windows::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID) -> String {
-        use windows::Win32::UI::Accessibility::{
-            UIA_CheckBoxControlTypeId as CHECKBOX, UIA_ComboBoxControlTypeId as COMBOBOX,
-            UIA_DocumentControlTypeId as DOCUMENT, UIA_EditControlTypeId as EDIT,
-            UIA_ListControlTypeId as LIST, UIA_RadioButtonControlTypeId as RADIOBUTTON,
-            UIA_TextControlTypeId as TEXT,
-        };
-        if id == EDIT {
-            "Edit"
-        } else if id == COMBOBOX {
-            "ComboBox"
-        } else if id == DOCUMENT {
-            "Document"
-        } else if id == CHECKBOX {
-            "CheckBox"
-        } else if id == RADIOBUTTON {
-            "RadioButton"
-        } else if id == LIST {
-            "List"
-        } else if id == TEXT {
-            "Text"
-        } else {
-            "Other"
-        }
-        .to_string()
-    }
-
-    /// Reads a `GetRuntimeId()` result (an owned `SAFEARRAY` of `VT_I4`
-    /// elements) into a plain `Vec<i32>`, freeing the array on every exit
-    /// path via `SafeArrayGuard`'s `Drop`.
-    unsafe fn runtime_id_from_safearray(psa: *mut SAFEARRAY) -> Result<Vec<i32>> {
-        if psa.is_null() {
-            return Ok(Vec::new());
-        }
-
-        struct SafeArrayGuard(*mut SAFEARRAY);
-        impl Drop for SafeArrayGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    let _ = SafeArrayDestroy(self.0);
-                }
-            }
-        }
-        let _guard = SafeArrayGuard(psa);
-
-        let lbound = unsafe { SafeArrayGetLBound(psa, 1) }?;
-        let ubound = unsafe { SafeArrayGetUBound(psa, 1) }?;
-        if ubound < lbound {
-            return Ok(Vec::new());
-        }
-        let count = (ubound - lbound + 1) as usize;
-
-        let mut data_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
-        unsafe { SafeArrayAccessData(psa, &mut data_ptr) }?;
-        let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const i32, count) };
-        let result = slice.to_vec();
-        unsafe { SafeArrayUnaccessData(psa) }?;
-
-        Ok(result)
-    }
-
-    fn value_pattern_of(element: &IUIAutomationElement) -> Result<IUIAutomationValuePattern> {
-        let unknown = unsafe { element.GetCurrentPattern(UIA_ValuePatternId) }?;
-        anyhow::ensure!(
-            !is_null(&unknown),
-            "replace_text: the target element does not support ValuePattern; cannot write to it"
-        );
-        Ok(unknown.cast()?)
-    }
-
-    /// The real, UIA-backed [`TextElementAccess`]. Each call is a
-    /// self-contained COM apartment enter/walk/exit -- never shares a live
-    /// COM pointer across two calls, so `resolve` and `write` are each
-    /// independently safe to call at any time (see the module doc comment
-    /// on "each call is self-contained").
-    pub(super) struct UiaTextElementAccess;
-
-    impl TextElementAccess for UiaTextElementAccess {
-        fn resolve(&self, target: &TargetRef) -> Result<ResolvedElement> {
-            let _apartment = ComApartment::enter()?;
-            let automation: IUIAutomation =
-                unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
-            let hwnd = HWND(target.hwnd as *mut core::ffi::c_void);
-
-            let matched = find_and_match(&automation, hwnd, target)?;
-            Ok(ResolvedElement {
-                name: matched.name,
-                automation_id: matched.automation_id,
-                control_type: matched.control_type,
-                is_password: matched.is_password,
-                current_text: matched.current_text,
-            })
-        }
-
-        fn write(&self, target: &TargetRef, new_text: &str) -> Result<()> {
-            let _apartment = ComApartment::enter()?;
-            let automation: IUIAutomation =
-                unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
-            let hwnd = HWND(target.hwnd as *mut core::ffi::c_void);
-
-            let matched = find_and_match(&automation, hwnd, target)?;
-            anyhow::ensure!(
-                !matched.is_password,
-                "replace_text: refusing to write to a password field"
-            );
-            let pattern = value_pattern_of(&matched.element)?;
-            unsafe { pattern.SetValue(&BSTR::from(new_text)) }?;
-            Ok(())
-        }
-    }
-
-    /// Test-only seam: the full candidate list for a window, so an
-    /// integration test can capture a real, exact [`TargetRef`] (including
-    /// its real `runtime_id`) the same way a future "Look" step would,
-    /// instead of hand-constructing one.
-    #[cfg(test)]
-    pub(super) fn list_all_for_test(hwnd: HWND) -> Result<Vec<TargetRef>> {
-        let _apartment = ComApartment::enter()?;
-        let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
-        let (candidates, _elements, _extra) = walk(&automation, hwnd)?;
-        Ok(candidates)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::target::ResolvedElement;
     use super::*;
     use std::cell::RefCell;
 
@@ -1028,47 +595,9 @@ mod tests {
         assert!(err.to_string().contains("selection_start"));
     }
 
-    // -- resolve_index ----------------------------------------------------
-
-    #[test]
-    fn finds_the_single_exact_match() {
-        let target = sample_target();
-        let other = TargetRef {
-            name: "Other field".to_string(),
-            ..target.clone()
-        };
-        let candidates = vec![other, target.clone()];
-        assert_eq!(resolve_index(&candidates, &target), MatchOutcome::Found(1));
-    }
-
-    #[test]
-    fn reports_not_found_when_nothing_matches() {
-        let target = sample_target();
-        let candidates = vec![TargetRef {
-            name: "Different".to_string(),
-            ..target.clone()
-        }];
-        assert_eq!(resolve_index(&candidates, &target), MatchOutcome::NotFound);
-    }
-
-    #[test]
-    fn reports_ambiguous_when_more_than_one_candidate_matches() {
-        let target = sample_target();
-        let candidates = vec![target.clone(), target.clone()];
-        assert_eq!(resolve_index(&candidates, &target), MatchOutcome::Ambiguous);
-    }
-
-    // -- is_stale -----------------------------------------------------------
-
-    #[test]
-    fn identical_text_is_not_stale() {
-        assert!(!is_stale("Hello world", "Hello world"));
-    }
-
-    #[test]
-    fn different_text_is_stale() {
-        assert!(is_stale("Hello world", "Hello there"));
-    }
+    // resolve_index and is_stale are now tested in `executors::target`
+    // (#33: extracted, not duplicated -- see this file's module doc comment
+    // and `executors::target`'s own doc comment).
 
     // -- splice_utf16 ---------------------------------------------------
 
@@ -1451,8 +980,8 @@ mod tests {
         }
 
         fn edit_target(frame: HWND) -> TargetRef {
-            let candidates = crate::executors::replace_text::com::list_all_for_test(frame)
-                .expect("list_all_for_test");
+            let candidates =
+                crate::executors::target::com::list_all_for_test(frame).expect("list_all_for_test");
             candidates
                 .into_iter()
                 .find(|c| c.control_type == "Edit")
@@ -1460,7 +989,7 @@ mod tests {
         }
 
         fn current_edit_text(frame: HWND) -> String {
-            let access = com::UiaTextElementAccess;
+            let access = crate::executors::target::com::UiaTextElementAccess;
             let target = edit_target(frame);
             access.resolve(&target).expect("resolve").current_text
         }
@@ -1471,7 +1000,8 @@ mod tests {
             let (frame, _edit) = build_test_window(w!("Hello world"));
 
             let target = edit_target(frame);
-            let access: Arc<dyn TextElementAccess> = Arc::new(com::UiaTextElementAccess);
+            let access: Arc<dyn TextElementAccess> =
+                Arc::new(crate::executors::target::com::UiaTextElementAccess);
             let executor = ReplaceTextExecutor::with_access(access);
 
             let start = std::time::Instant::now();
@@ -1509,7 +1039,8 @@ mod tests {
                 let _ = SetWindowTextW(edit, w!("Someone typed this"));
             }
 
-            let access: Arc<dyn TextElementAccess> = Arc::new(com::UiaTextElementAccess);
+            let access: Arc<dyn TextElementAccess> =
+                Arc::new(crate::executors::target::com::UiaTextElementAccess);
             let executor = ReplaceTextExecutor::with_access(access);
             let proposal = replace_all_proposal(&target, "Replaced!", "Hello world");
 
