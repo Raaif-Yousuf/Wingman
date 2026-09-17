@@ -11,6 +11,7 @@ mod config;
 mod config_example;
 mod diagnostics;
 mod dismiss;
+mod executors;
 mod hotkey;
 mod known_folder;
 mod mode;
