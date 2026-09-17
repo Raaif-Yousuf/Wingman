@@ -4,6 +4,8 @@ mod app;
 mod autostart;
 mod capture;
 mod config;
+#[cfg(test)]
+mod config_example;
 mod dismiss;
 mod hotkey;
 mod provider;
