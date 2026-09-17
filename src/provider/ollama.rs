@@ -44,7 +44,9 @@ const DEFAULT_KEEP_ALIVE: &str = "30m";
 /// here silently drops vision support for models that have it.
 const VISION_FAMILIES: [&str; 3] = ["gemma3", "gemma4", "qwen3.5"];
 
-fn is_vision_model(model: &str) -> bool {
+/// `pub(crate)`: also used by `ollama_admin.rs` as the fallback when a
+/// `/api/show` response carries no live `capabilities` array (#14).
+pub(crate) fn is_vision_model(model: &str) -> bool {
     VISION_FAMILIES.iter().any(|family| model.starts_with(family))
 }
 

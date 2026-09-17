@@ -83,8 +83,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_VISIBLE, WS_VSCROLL,
 };
 
-use crate::config::Config;
+use crate::config::{Config, OllamaConfig};
 use crate::hotkey::chord_to_string;
+use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::DEFAULT_PROMPT;
 
 // ---------------------------------------------------------------------------
@@ -469,6 +470,10 @@ const ID_RESET_PROMPT: i32 = 116;
 const ID_SAVE: i32 = 117;
 const ID_AUTOSTART: i32 = 118;
 const ID_CANCEL: i32 = 119;
+/// Read-only status line combining #15's health check and #14's GPU/CPU
+/// indicator (see [`ollama_status_line`]). Not a form field -- never read
+/// back in `read_form`/`build_config`.
+const ID_OLLAMA_STATUS: i32 = 120;
 
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
@@ -499,6 +504,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_SAVE", ID_SAVE),
     ("ID_AUTOSTART", ID_AUTOSTART),
     ("ID_CANCEL", ID_CANCEL),
+    ("ID_OLLAMA_STATUS", ID_OLLAMA_STATUS),
 ];
 
 // ---------------------------------------------------------------------------
@@ -840,6 +846,57 @@ fn fill_model_combo(hwnd: HWND, models: &[String], active: &str) {
     }
 }
 
+/// Combines #15's health check with #14's GPU/CPU indicator into the one
+/// status line Settings shows for Ollama. Computed once, synchronously,
+/// when Settings opens (CLAUDE.md rule 5: discovery happens on demand,
+/// never on a timer): the health check is Win32-only (no network at all),
+/// and the two HTTP calls it can make (`/api/ps`, `/api/tags`) are
+/// loopback-only with short timeouts, so this does not meaningfully delay
+/// the window appearing even when nothing is listening.
+fn ollama_status_line(cfg: &OllamaConfig) -> String {
+    let port = ollama_admin::port_from_base_url(&cfg.base_url).unwrap_or(11434);
+    let health = ollama_admin::query_ollama_health(port);
+    let health_msg = health.message();
+
+    if !matches!(
+        health,
+        OllamaHealth::Listening {
+            kind: ListenerKind::Other,
+            ..
+        }
+    ) {
+        // Not running, or it's the stock tray app's CPU-only server --
+        // either way there is no point asking it for GPU/CPU or model
+        // details.
+        return health_msg;
+    }
+
+    let gpu_line = match ollama_admin::ps(&cfg.base_url) {
+        Ok(entries) => match ollama_admin::gpu_status_for(&entries, &cfg.model) {
+            GpuStatus::Gpu => format!("{} is loaded on GPU.", cfg.model),
+            GpuStatus::Cpu => format!("{} is loaded on CPU.", cfg.model),
+            GpuStatus::NotLoaded => format!("{} is not loaded yet.", cfg.model),
+        },
+        Err(_) => return health_msg,
+    };
+
+    let vision_line = match ollama_admin::list_tags(&cfg.base_url) {
+        Ok(models) if !models.is_empty() => {
+            let vision_count = models
+                .iter()
+                .filter(|m| ollama_admin::vision_from_tags_entry(m))
+                .count();
+            format!(
+                " {vision_count} of {} local models support vision.",
+                models.len()
+            )
+        }
+        _ => String::new(),
+    };
+
+    format!("{health_msg} {gpu_line}{vision_line}")
+}
+
 /// Builds every child control and returns the prompt edit's `HWND` (the
 /// caller needs it to exempt Enter-as-newline from the Enter-submits rule).
 fn build_ui(
@@ -1020,6 +1077,49 @@ fn build_ui(
     );
 
     y = providers_bottom + GROUP_GAP;
+
+    // -- Ollama status (#14, #15) ----------------------------------------
+    // One read-only line: whether anything answers on the configured
+    // Ollama port, whether it's the stock tray app's CPU-only server
+    // (CLAUDE.md's "Stock Ollama's tray app steals port 11434" pitfall),
+    // and -- once it's confirmed to be a real server -- whether the
+    // configured model is currently loaded on GPU or CPU and how many
+    // local models support vision. See `ollama_status_line`.
+    //
+    // Read-only by design: editing `base_url`/`model`/enabling Ollama as
+    // an active provider here would need a model combo and an "enabled"
+    // control the same way OpenAI/Anthropic have above, which is a bigger
+    // Win32 UI addition than fits this pass -- filed as a follow-up
+    // referencing #51's upcoming WebView2 settings window instead of
+    // built here.
+    let ollama_top = y;
+    y += GROUP_LABEL_TOP;
+    let ollama_status = ollama_status_line(&config.providers.ollama);
+    ctx.create(
+        WC_STATIC,
+        &ollama_status,
+        0,
+        0,
+        content_x + MARGIN,
+        y,
+        content_w - 2 * MARGIN,
+        ROW_H * 2,
+        ID_OLLAMA_STATUS,
+    );
+    y += ROW_H * 2;
+    let ollama_bottom = y + 8;
+    ctx.create(
+        WC_BUTTON,
+        "Ollama",
+        BS_GROUPBOX as u32,
+        0,
+        content_x,
+        ollama_top,
+        content_w,
+        ollama_bottom - ollama_top,
+        0,
+    );
+    y = ollama_bottom + GROUP_GAP;
 
     // -- Hotkeys --------------------------------------------------------
     let hotkeys_top = y;
@@ -1605,6 +1705,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- ollama_status_line (#14, #15) ------------------------------------
+
+    #[test]
+    fn ollama_status_line_reports_not_running_when_nothing_listens() {
+        // Deterministic and network-free: bind our own ephemeral port, then
+        // close it immediately, guaranteeing nothing is listening there --
+        // mirrors `ollama_admin`'s own health-check smoke test rather than
+        // depending on whether this machine happens to have Ollama up.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+
+        let cfg = OllamaConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "gemma3:4b".to_string(),
+            effort: "low".to_string(),
+        };
+        assert_eq!(ollama_status_line(&cfg), "Ollama is not running.");
     }
 
     // -- parse_u32_or / parse_max_edge_or --------------------------------
