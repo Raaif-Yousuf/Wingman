@@ -121,30 +121,54 @@ pub const WM_APP_LEARNED: u32 = WM_APP + 4; // lparam = *mut Chord (learn mode c
 `ui::settings::show_modal` runs its own `GetMessageW` loop so its child
 controls receive input; that loop pumps *every* thread message, not just the
 settings window's, so a message addressed to the owner window (any
-`WM_APP_*`) can still reach `wnd_proc` while `App::open_settings`'s `&mut
-self` is suspended on the stack inside `show_modal`. `App::settings_open`
-guards against that:
+`WM_APP_*`, or the shell's `TaskbarCreated` broadcast) can still reach
+`wnd_proc` while `App::open_settings`'s `&mut self` is suspended on the stack
+inside `show_modal`.
 
-- **Ignored**: `WM_APP_HOTKEY`, `WM_APP_ACTIVATE`, `WM_APP_TRAY`. A hotkey
-  press or a second Copilot-key launch while Settings is open starts
-  nothing; the tray callback is ignored too, so its context menu does not
-  pop up over the modal. The user can press the key again once Settings
-  closes.
-- **Deferred**: `WM_APP_RESULT`. A worker's answer that finishes while
-  Settings is open is stashed in `App::pending_settings_result` rather than
-  shown immediately or dropped. Once `show_modal` returns,
-  `open_settings` delivers it via `on_result` -- taking priority over the
-  "Settings saved" toast, so the in-flight request still ends in its own
-  card (rule 7) instead of being clobbered by the save confirmation.
-- **Allowed**: everything else (`WM_APP_DISMISS`, `WM_APP_LEARNED`, the
-  `TaskbarCreated` broadcast, `WM_DESTROY`). None of these can conflict with
-  Settings state -- the card is already hidden and its click watcher
-  disarmed before `show_modal` runs, and `WM_DESTROY` is unreachable while
-  Settings is open because the only path to it (the tray's Quit command) is
-  itself ignored above.
+The guard state (`SETTINGS_OPEN`, `PENDING_RESULT`,
+`TASKBAR_RECREATED_WHILE_SETTINGS`, `TASKBAR_CREATED_MSG`) lives in
+thread-locals in `app.rs`, not as fields on `App`, and `wnd_proc` checks
+`SETTINGS_OPEN` *before* it forms `&mut App` from `GWLP_USERDATA` -- not
+merely before acting on it. An `App` field guarded from inside `wnd_proc`
+after `&mut App` already exists was tried first and is unsound: `open_settings`
+holds a unique `&mut self` across the whole `show_modal` call, which is never
+handed `self`, so the compiler may assume nothing reachable from that
+`&mut self` changes for its duration and is free to treat the "settings
+open" store made just before the call and the "settings closed" store made
+just after it as a dead pair with nothing in between -- a real
+release/LTO-only failure mode, not merely a style preference. A thread-local
+`Cell`/`RefCell`, reached only through its own accessor and never through
+`&App`, has no such aliasing relationship with `&mut self`.
 
-The decision table is `app::settings_reentrancy_policy`, a pure function
-independent of any `HWND`, unit-tested in `app::tests`.
+While `SETTINGS_OPEN` is true, no message may cause `wnd_proc` to form
+`&mut App` at all:
+
+- **Ignored** (swallowed, `LRESULT(0)`, `App` never touched): `WM_APP_HOTKEY`,
+  `WM_APP_ACTIVATE`, `WM_APP_TRAY` (so its context menu does not pop up over
+  the modal and none of its commands can fire), `WM_APP_DISMISS` (the card is
+  already hidden and its click watcher disarmed before `show_modal` runs) and
+  `WM_APP_LEARNED` (its boxed `Chord` payload is freed to avoid a leak, but
+  otherwise dropped -- every path that opens Settings cancels learn mode
+  first, so this is unreachable in practice, not merely unhandled).
+- **Deferred into a thread-local, delivered by `open_settings` once
+  `show_modal` returns**: `WM_APP_RESULT` into `PENDING_RESULT`, delivered via
+  `on_result` -- taking priority over the "Settings saved" toast, so the
+  in-flight request still ends in its own card (rule 7) instead of being
+  clobbered by the save confirmation. If `Config::save` itself then fails
+  *and* a result was deferred (a rare double fault), the save-error card wins
+  -- it is the failure the user's own Save click just caused -- and the
+  answer is recorded via `App::record_last` (so "Copy last answer" still
+  returns it) without a card of its own; the `TaskbarCreated` broadcast into
+  `TASKBAR_RECREATED_WHILE_SETTINGS`, applied via `on_taskbar_created`.
+- **Fallback to `DefWindowProcW`**: everything else, unmatched exactly as the
+  normal (non-reentrant) path would. In practice the only message this could
+  plausibly be is `WM_DESTROY`, and that is itself unreachable while Settings
+  is open, because its only path -- the tray's Quit command -- requires
+  `WM_APP_TRAY`, which is ignored above.
+
+The decision table is `app::settings_reentrancy_policy(msg, taskbar_created_msg)`,
+a pure function independent of any `HWND` or thread-local, unit-tested (and
+mutation-checked) in `app::tests`.
 
 ## Config
 
