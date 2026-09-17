@@ -1,5 +1,6 @@
 mod common;
 pub mod anthropic;
+pub mod ollama;
 pub mod openai;
 
 use anyhow::{Context, Result};
@@ -7,6 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub use anthropic::Anthropic;
+pub use ollama::Ollama;
 pub use openai::OpenAi;
 /// The system prompt. The user solves physics and statistics problems on paper,
 /// then screenshots the on-screen assignment to check their result before

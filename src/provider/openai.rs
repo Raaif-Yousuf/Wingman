@@ -65,12 +65,22 @@ impl OpenAi {
             }});
         }
 
-        // Mirrors Anthropic's `effort.as_str().is_none()` guard: `Unset` is
-        // a plausible hand-edit of config.toml (`effort = ""` meaning "use
-        // the default"), and the Responses API validates `reasoning.effort`
-        // against a fixed enum -- sending an empty string is a hard 400 on
-        // every request, not a no-op (#154).
-        if effort.as_str().is_none() {
+        // Two independent reasons to drop `reasoning` entirely, mirrored
+        // from Anthropic's `supports_effort` gate:
+        // - `effort.as_str().is_none()`: `Unset` is a plausible hand-edit
+        //   of config.toml (`effort = ""` meaning "use the default"), and
+        //   the Responses API validates `reasoning.effort` against a fixed
+        //   enum -- sending an empty string is a hard 400 on every request,
+        //   not a no-op (#154).
+        // - `!supports_reasoning(&self.model)`: `gpt-4.1` (shipped in
+        //   `Providers::default`'s OpenAI model list, config.rs) predates
+        //   `reasoning.effort` on the Responses API (#167). By analogy with
+        //   Anthropic's 4.5-generation 400 (MEASURED 2026-09-15, rule 10),
+        //   sending it here is assumed unsupported -- THEORY (unverified):
+        //   no live OpenAI call has confirmed whether this 400s or is
+        //   silently ignored; replace this comment with MEASURED when it
+        //   is checked.
+        if effort.as_str().is_none() || !supports_reasoning(&self.model) {
             body.as_object_mut()
                 .expect("body is always an object")
                 .remove("reasoning");
@@ -138,6 +148,28 @@ impl OpenAi {
     }
 }
 
+/// Whether a model accepts `reasoning.effort` on the Responses API.
+///
+/// #167: `gpt-4.1` (shipped in `Providers::default`'s OpenAI model list,
+/// config.rs) predates the reasoning-effort parameter -- it is not a
+/// reasoning model, unlike the gpt-5.x/o* lines. By analogy with
+/// Anthropic's `supports_effort` gate (a hard 400 on unsupported models,
+/// MEASURED 2026-09-15, CLAUDE.md rule 10), `gpt-4.1` is carved out here
+/// too.
+///
+/// THEORY (unverified): no live OpenAI call has confirmed whether sending
+/// `reasoning.effort` to `gpt-4.1` actually 400s, is silently ignored, or
+/// errors some other way -- this task explicitly does not make live OpenAI
+/// calls. Replace this comment with `MEASURED <date>:` once checked, per
+/// #167's "Done when".
+///
+/// Also used as this provider's `thinking` capability, mirroring
+/// Anthropic's `supports_effort` doing double duty the same way.
+fn supports_reasoning(model: &str) -> bool {
+    const NO_REASONING: [&str; 1] = ["gpt-4.1"];
+    !NO_REASONING.iter().any(|m| model.starts_with(m))
+}
+
 impl Provider for OpenAi {
     fn id(&self) -> &'static str {
         "openai"
@@ -147,14 +179,15 @@ impl Provider for OpenAi {
         !self.api_key.trim().is_empty()
     }
 
-    fn capabilities(&self, _model: &str) -> Caps {
+    fn capabilities(&self, model: &str) -> Caps {
         // Every model currently offered in Settings (see `Providers::default`
-        // in config.rs) is a gpt-5.x/gpt-4.1 Responses-API model: vision,
-        // strict json_schema and `reasoning.effort` are all supported.
+        // in config.rs) is a Responses-API model with vision and strict
+        // json_schema support. `reasoning.effort` support varies by model --
+        // see `supports_reasoning` (#167).
         Caps {
             vision: true,
             json_schema: true,
-            thinking: true,
+            thinking: supports_reasoning(model),
         }
     }
 
@@ -308,6 +341,18 @@ mod tests {
         assert!(caps.thinking);
     }
 
+    /// #167: `gpt-4.1` is not a reasoning model. `capabilities().thinking`
+    /// must say so, mirroring Anthropic's per-model
+    /// `capabilities_report_vision_and_json_schema_always_and_thinking_per_model`.
+    #[test]
+    fn capabilities_reports_no_thinking_for_gpt_4_1() {
+        let provider = OpenAi::new("k", "gpt-4.1", "low");
+        let caps = provider.capabilities("gpt-4.1");
+        assert!(caps.vision);
+        assert!(caps.json_schema);
+        assert!(!caps.thinking);
+    }
+
     #[test]
     fn parse_completion_skips_reasoning_entry_and_extracts_message() {
         let body = fs::read_to_string("tests/fixtures/openai_response.json")
@@ -406,6 +451,36 @@ mod tests {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
         let body = provider.build_body(&req("sys", false));
         assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    /// #167: `gpt-4.1` predates `reasoning.effort` on the Responses API
+    /// (it is not a reasoning model, unlike the gpt-5.x/o* lines). Sending
+    /// it a non-empty configured effort must not add the `reasoning` key --
+    /// mirrors Anthropic's `effort_is_omitted_for_models_that_reject_it`.
+    #[test]
+    fn reasoning_is_omitted_for_models_that_do_not_support_it() {
+        let provider = OpenAi::new("sk-test", "gpt-4.1", "low");
+        let body = provider.build_body(&req("sys", false));
+        assert!(
+            body.get("reasoning").is_none(),
+            "gpt-4.1 must not carry reasoning.effort"
+        );
+        // The schema must still be there -- only reasoning is dropped.
+        assert!(body.get("text").is_some());
+    }
+
+    /// Neighbour: a model that does support it must still get it, i.e. the
+    /// new gate doesn't accidentally swallow the gpt-5.x/o* lines too.
+    #[test]
+    fn reasoning_is_still_sent_for_models_that_support_it() {
+        for model in ["gpt-5.5", "gpt-5", "gpt-5-mini", "o3"] {
+            let provider = OpenAi::new("sk-test", model, "low");
+            let body = provider.build_body(&req("sys", false));
+            assert_eq!(
+                body["reasoning"]["effort"], "low",
+                "{model} should still send reasoning.effort"
+            );
+        }
     }
 
     /// #12 neighbour: a `Request::effort` override takes precedence over

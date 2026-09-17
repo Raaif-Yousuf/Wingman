@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::hotkey::Chord;
-use crate::provider::{Anthropic, Chain, OpenAi, Provider, DEFAULT_PROMPT};
+use crate::provider::{Anthropic, Chain, Ollama, OpenAi, Provider, DEFAULT_PROMPT};
 
 /// `%APPDATA%\Wingman\config.toml`. See the design spec's "Config"
 /// section for the authoritative shape.
@@ -72,11 +72,19 @@ pub struct Providers {
     pub order: Vec<String>,
     pub openai: ProviderConfig,
     pub anthropic: ProviderConfig,
+    pub ollama: OllamaConfig,
 }
 
 impl Default for Providers {
     fn default() -> Self {
         Self {
+            // #13: Ollama is deliberately NOT in the default order. Unlike
+            // openai/anthropic (unusable until the user pastes in a key,
+            // so listing them by default costs nothing), a freshly
+            // installed Ollama with a vision model pulled would start
+            // answering silently for a user who never asked for a local
+            // provider at all. Opt-in only, until the Mode work (#19)
+            // decides what "Auto" should default to.
             order: vec!["openai".to_string(), "anthropic".to_string()],
             openai: ProviderConfig {
                 model: "gpt-5.5".to_string(),
@@ -107,6 +115,7 @@ impl Default for Providers {
                     "claude-fable-5-1".to_string(),
                 ],
             },
+            ollama: OllamaConfig::default(),
         }
     }
 }
@@ -148,6 +157,29 @@ impl Default for ProviderConfig {
             effort: "low".to_string(),
             api_key: String::new(),
             models: Vec::new(),
+        }
+    }
+}
+
+/// #13: local Ollama server. No `api_key` field -- a local server has
+/// nothing to authenticate with, unlike `ProviderConfig`'s cloud providers.
+/// Not in `Providers::order` by default; see the comment on
+/// `Providers::default`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OllamaConfig {
+    /// `http://127.0.0.1:11434`, never `localhost` (CLAUDE.md rule 6).
+    pub base_url: String,
+    pub model: String,
+    pub effort: String,
+}
+
+impl Default for OllamaConfig {
+    fn default() -> Self {
+        Self {
+            base_url: crate::provider::ollama::DEFAULT_BASE_URL.to_string(),
+            model: "gemma3:4b".to_string(),
+            effort: "low".to_string(),
         }
     }
 }
@@ -390,6 +422,11 @@ impl Config {
                     self.providers.anthropic.model.clone(),
                     self.providers.anthropic.effort.clone(),
                 ))),
+                "ollama" => providers.push(Box::new(Ollama::new(
+                    self.providers.ollama.base_url.clone(),
+                    self.providers.ollama.model.clone(),
+                    self.providers.ollama.effort.clone(),
+                ))),
                 _ => {}
             }
         }
@@ -525,6 +562,56 @@ mod tests {
         config.providers.order = vec!["bogus".to_string(), "openai".to_string()];
         let chain = config.build_chain();
         assert_eq!(chain.provider_names(), vec!["openai"]);
+    }
+
+    // -- #13: Ollama config ---------------------------------------------
+
+    #[test]
+    fn default_order_does_not_include_ollama() {
+        // Opt-in only -- see the comment on `Providers::default`. A
+        // freshly installed Ollama with a vision model pulled must not
+        // start answering for a user who never configured a local
+        // provider.
+        let config = Config::default();
+        assert!(!config.providers.order.contains(&"ollama".to_string()));
+    }
+
+    #[test]
+    fn ollama_default_base_url_is_never_localhost() {
+        let config = Config::default();
+        assert_eq!(config.providers.ollama.base_url, "http://127.0.0.1:11434");
+        assert!(!config.providers.ollama.base_url.contains("localhost"));
+    }
+
+    #[test]
+    fn ollama_default_model_is_a_vision_model() {
+        let config = Config::default();
+        assert_eq!(config.providers.ollama.model, "gemma3:4b");
+    }
+
+    #[test]
+    fn build_chain_includes_ollama_only_when_explicitly_ordered() {
+        let mut config = Config::default();
+        config.providers.order = vec!["openai".to_string(), "ollama".to_string()];
+        let chain = config.build_chain();
+        assert_eq!(chain.provider_names(), vec!["openai", "ollama"]);
+        // Ollama needs no API key to be ready -- unlike openai here.
+        assert_eq!(chain.ready_provider_names(), vec!["ollama"]);
+    }
+
+    #[test]
+    fn an_ollama_section_missing_from_an_older_config_backfills_to_defaults() {
+        // A config.toml written before #13 has no [providers.ollama] table
+        // at all; #[serde(default)] on `Providers` must still produce a
+        // usable, non-empty OllamaConfig rather than an all-empty one.
+        let old = r#"
+[providers.openai]
+model = "gpt-5.5"
+api_key = "sk-x"
+"#;
+        let cfg = Config::parse_or_default(old);
+        assert_eq!(cfg.providers.ollama.base_url, "http://127.0.0.1:11434");
+        assert_eq!(cfg.providers.ollama.model, "gemma3:4b");
     }
 
     #[test]

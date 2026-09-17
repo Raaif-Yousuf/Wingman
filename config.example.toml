@@ -51,6 +51,11 @@ models = [
     "claude-fable-5-1",
 ]
 
+[providers.ollama]
+base_url = "http://127.0.0.1:11434"
+model = "gemma3:4b"
+effort = "low"
+
 [ui]
 card_seconds = 12
 text_scale = 1.0
