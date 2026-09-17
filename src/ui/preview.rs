@@ -160,15 +160,54 @@ impl PreviewModel {
 /// Strings are shown as-is (no quotes); everything else falls back to
 /// `Value`'s own `Display`-ish `to_string()` (numbers/bools render plainly;
 /// `null` and anything else become empty, since there is nothing useful to
-/// show in a text field for them).
+/// show in a text field for them). An array (#38's `text_review` proposal's
+/// `edits` field is the first schema property ever shaped this way) renders
+/// as one line per item via [`display_array_item`], newline-joined -- the
+/// card's multi-line rendering already exists for `detail`-length text, so
+/// this needs no new card-side layout code, only a wider set of values this
+/// function knows how to turn into a string.
 fn display_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
+        Value::Array(items) => items
+            .iter()
+            .map(display_array_item)
+            .collect::<Vec<_>>()
+            .join("\n"),
         other => other.to_string(),
     }
+}
+
+/// Renders one array item for [`display_string`]. An `{before, after,
+/// reason}` object -- `actions::schema`'s `text_review` schema's `edits`
+/// item shape -- renders as `"before -> after (reason)"` (an ASCII arrow,
+/// not a Unicode one or an em dash: rule 11's spirit for any card-facing
+/// text is to keep it in plain characters no font/rendering path needs to
+/// specially support), or `"before -> after"` when `reason` is empty.
+/// Anything else (a plain string/number array, or an object without that
+/// shape) falls back to [`display_string`] recursively, so a schema this
+/// function doesn't specially know about still shows something reasonable
+/// rather than raw JSON -- this deliberately does not hard-code the field
+/// name `"edits"` anywhere: any future schema whose array items happen to
+/// share the `{before, after, reason}` shape renders the same way for free.
+fn display_array_item(v: &Value) -> String {
+    if let Some(obj) = v.as_object() {
+        if let (Some(before), Some(after)) = (
+            obj.get("before").and_then(Value::as_str),
+            obj.get("after").and_then(Value::as_str),
+        ) {
+            let reason = obj.get("reason").and_then(Value::as_str).unwrap_or("");
+            return if reason.is_empty() {
+                format!("{before} -> {after}")
+            } else {
+                format!("{before} -> {after} ({reason})")
+            };
+        }
+    }
+    display_string(v)
 }
 
 /// `"start"` -> `"Start"`, `"rate_difficulty"` -> `"Rate difficulty"`: a
@@ -366,6 +405,90 @@ mod tests {
         assert_eq!(shown["title"], "Standup");
         assert_eq!(shown["end"], "09:15");
         assert_eq!(shown["location"], "Room 2");
+    }
+
+    // -- #38: text_review's `edits` array field ------------------------------
+
+    fn text_review_schema() -> Value {
+        crate::actions::schema::schema_for("text_review", false).expect("text_review is registered")
+    }
+
+    #[test]
+    fn from_schema_renders_text_review_edits_as_before_arrow_after_reason_lines() {
+        let schema = text_review_schema();
+        let value = serde_json::json!({
+            "edits": [
+                {"before": "wnated", "after": "wanted", "reason": "typo"},
+                {"before": "folow", "after": "follow", "reason": "typo"}
+            ],
+            "verdict": "needs_edits",
+            "tone_note": "Friendly.",
+            "missing_attachment": false
+        });
+        let model = PreviewModel::from_schema(&schema, &value);
+        let edits = model.fields().iter().find(|f| f.name == "edits").unwrap();
+        assert_eq!(
+            edits.value,
+            "wnated -> wanted (typo)\nfolow -> follow (typo)"
+        );
+    }
+
+    #[test]
+    fn from_schema_renders_an_edit_with_an_empty_reason_without_trailing_parens() {
+        let schema = text_review_schema();
+        let value = serde_json::json!({
+            "edits": [{"before": "a", "after": "b", "reason": ""}],
+            "verdict": "needs_edits",
+            "tone_note": "",
+            "missing_attachment": false
+        });
+        let model = PreviewModel::from_schema(&schema, &value);
+        let edits = model.fields().iter().find(|f| f.name == "edits").unwrap();
+        assert_eq!(edits.value, "a -> b");
+    }
+
+    #[test]
+    fn from_schema_renders_an_empty_edits_array_as_an_empty_string() {
+        let schema = text_review_schema();
+        let value = serde_json::json!({
+            "edits": [],
+            "verdict": "good_to_go",
+            "tone_note": "Clear.",
+            "missing_attachment": false
+        });
+        let model = PreviewModel::from_schema(&schema, &value);
+        let edits = model.fields().iter().find(|f| f.name == "edits").unwrap();
+        assert_eq!(edits.value, "");
+    }
+
+    #[test]
+    fn from_schema_text_review_fields_are_never_editable() {
+        let schema = text_review_schema();
+        let model = PreviewModel::from_schema(&schema, &serde_json::json!({}));
+        for field in model.fields() {
+            assert!(
+                !field.editable,
+                "field {:?} must not be editable",
+                field.name
+            );
+        }
+    }
+
+    #[test]
+    fn display_array_item_falls_back_to_raw_display_for_a_non_edit_shaped_object() {
+        let schema = text_review_schema();
+        // A malformed "edit" missing before/after still renders as SOMETHING
+        // (never panics) via the generic fallback, not the before/after
+        // formatter.
+        let value = serde_json::json!({
+            "edits": [{"reason": "no before or after"}],
+            "verdict": "needs_edits",
+            "tone_note": "",
+            "missing_attachment": false
+        });
+        let model = PreviewModel::from_schema(&schema, &value);
+        let edits = model.fields().iter().find(|f| f.name == "edits").unwrap();
+        assert!(edits.value.contains("no before or after"));
     }
 
     #[test]

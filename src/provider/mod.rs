@@ -694,6 +694,46 @@ pub fn calendar_request(shot: &Shot, prompt: &str) -> Request {
     }
 }
 
+/// Builds the `text_review` `Request` (#38) for a `ComposeBody`- or
+/// `Selection`-sourced review: `captured_text` becomes the whole user turn,
+/// with no image at all. Every provider (vision-capable or not) handles a
+/// text-only request uniformly, so `app.rs`'s `review_worker` still routes
+/// this through `Chain::complete_parsed_with_fallback` (never the plain
+/// `complete_parsed`) purely for call-site symmetry with `review_request_from_screen`
+/// below -- the fallback closure is simply never invoked, since
+/// `complete_parsed_with_fallback` only calls it when `req.images` is
+/// non-empty.
+pub fn review_request_from_text(prompt: &str, captured_text: &str) -> Request {
+    Request {
+        system: prompt.to_string(),
+        user: captured_text.to_string(),
+        images: vec![],
+        schema: Some(
+            crate::actions::schema::schema_for("text_review", false)
+                .expect("\"text_review\" is always registered in actions::schema"),
+        ),
+        effort: Effort::Unset,
+        max_tokens: 0,
+    }
+}
+
+/// Builds the `text_review` `Request` (#38) for the `Screen` fallback
+/// source: same shape as [`calendar_request`], a screenshot with no
+/// separately-captured text.
+pub fn review_request_from_screen(prompt: &str, shot: &Shot) -> Request {
+    Request {
+        system: prompt.to_string(),
+        user: "Find the email on screen and review it.".to_string(),
+        images: vec![shot.png.clone()],
+        schema: Some(
+            crate::actions::schema::schema_for("text_review", false)
+                .expect("\"text_review\" is always registered in actions::schema"),
+        ),
+        effort: Effort::Unset,
+        max_tokens: 0,
+    }
+}
+
 /// One provider's whole attempt at `req`: the call, the #200 local cleanup,
 /// and the #99 one-shot repair pass, exactly as [`Chain::complete_parsed`]
 /// always ran them inline. Factored out so
@@ -1581,6 +1621,39 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&schema).unwrap(),
             r#"{"type":"object","properties":{"title":{"type":"string","editable":true},"start":{"type":"string","editable":true},"end":{"type":"string"},"location":{"type":"string"},"notes":{"type":"string"}},"required":["title","start","end","location","notes"],"additionalProperties":false}"#
+        );
+    }
+
+    // -- review_request_from_text / review_request_from_screen (#38) ------
+
+    #[test]
+    fn review_request_from_text_has_no_image_and_carries_the_captured_text() {
+        let req = review_request_from_text("system prompt", "captured email body");
+        assert_eq!(req.system, "system prompt");
+        assert_eq!(req.user, "captured email body");
+        assert!(req.images.is_empty());
+        assert_eq!(req.effort, Effort::Unset);
+        assert_eq!(req.max_tokens, 0);
+    }
+
+    #[test]
+    fn review_request_from_text_schema_matches_the_text_review_registry_entry() {
+        let req = review_request_from_text("prompt", "text");
+        assert_eq!(
+            req.schema,
+            crate::actions::schema::schema_for("text_review", false)
+        );
+    }
+
+    #[test]
+    fn review_request_from_screen_carries_the_screenshot() {
+        let s = shot();
+        let req = review_request_from_screen("system prompt", &s);
+        assert_eq!(req.system, "system prompt");
+        assert_eq!(req.images, vec![s.png]);
+        assert_eq!(
+            req.schema,
+            crate::actions::schema::schema_for("text_review", false)
         );
     }
 

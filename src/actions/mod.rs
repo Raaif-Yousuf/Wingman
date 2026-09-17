@@ -7,6 +7,7 @@
 
 pub mod calendar;
 pub mod extract_text;
+pub mod review_email;
 pub mod schema;
 
 use std::fs;
@@ -196,6 +197,10 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 ///   status `Action::hotkey` already has.
 /// - `"add-to-calendar"` (#39, `calendar::builtin_action`): the first action
 ///   that runs the full Look/Propose/Confirm/Do loop end to end.
+/// - `"review-this-email"` (#38, `review_email::builtin_action`): the
+///   second Look/Propose/Confirm/Do action, and the first whose "Do" step
+///   writes text into an arbitrary UIA-editable control (`replace_text`)
+///   instead of opening a generated file.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -227,6 +232,7 @@ pub fn builtin_actions() -> Vec<Action> {
             enabled: true,
         },
         calendar::builtin_action(),
+        review_email::builtin_action(),
     ]
 }
 
@@ -383,8 +389,9 @@ mod tests {
         let builtins = builtin_actions();
         assert_eq!(
             builtins.len(),
-            3,
-            "check-my-work, extract-text-to-clipboard (#41), add-to-calendar (#39)"
+            4,
+            "check-my-work, extract-text-to-clipboard (#41), add-to-calendar (#39), \
+             review-this-email (#38)"
         );
         // Found by id, not by position, so this stays valid regardless of
         // what order the built-ins are in.

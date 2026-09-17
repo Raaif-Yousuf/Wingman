@@ -8,12 +8,12 @@
 //! model should commit to (`headline`, `difficulty`) after the field that
 //! justifies it (`detail`), never before.
 //!
-//! `"verdict"` and `"calendar_event"` (#26) are registered today.
-//! `text_answer`, `form_fill` and `text_review` (named in CONTRIBUTING.md's
-//! "Add an action in 20 minutes" and the expansion plan's §6) get their own
-//! `match` arm here the same day their first action lands, not before -- an
-//! unimplemented arm would be untestable dead code (see the
-//! `wired-to-nothing` skill).
+//! `"verdict"`, `"calendar_event"` (#26) and `"text_review"` (#38) are
+//! registered today. `text_answer` and `form_fill` (named in
+//! CONTRIBUTING.md's "Add an action in 20 minutes" and the expansion plan's
+//! §6) get their own `match` arm here the same day their first action
+//! lands, not before -- an unimplemented arm would be untestable dead code
+//! (see the `wired-to-nothing` skill).
 //!
 //! A property can carry `"editable": true` -- a non-standard JSON Schema
 //! keyword a provider's completion never sees echoed back (it only reads
@@ -47,6 +47,7 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         // call it replaces.
         "verdict" => Some(crate::provider::common::answer_schema(rate_difficulty)),
         "calendar_event" => Some(calendar_event_schema()),
+        "text_review" => Some(text_review_schema()),
         _ => None,
     }
 }
@@ -83,6 +84,52 @@ fn calendar_event_schema() -> Value {
             "notes": {"type": "string"}
         },
         "required": ["title", "start", "end", "location", "notes"],
+        "additionalProperties": false
+    })
+}
+
+/// The `text_review` proposal schema (#38): edits, verdict, tone_note,
+/// missing_attachment.
+///
+/// Property order is load-bearing (rule 3), for the same reason
+/// `answer_schema`'s `detail`-before-`headline` and `calendar_event_schema`'s
+/// `title`-before-`start` are: `edits` comes first so the model has to work
+/// out and commit to the concrete list of problems (if any) before it ever
+/// writes the summary verdict that follows from that list -- a model asked
+/// for `verdict` first could commit to "good_to_go" or "needs_edits" before
+/// having actually enumerated what, if anything, is wrong, and then pad or
+/// contradict `edits` to match a verdict it already picked. `tone_note` and
+/// `missing_attachment` trail last: both are supplementary observations that
+/// never change whether the text itself is good to go, so nothing upstream
+/// needs them committed first.
+///
+/// No property is `"editable"`: unlike `calendar_event`'s `title`/`start`,
+/// nothing here is meant to be hand-edited in the preview card -- `edits` is
+/// the model's own list of proposed changes (accepted or not as a whole via
+/// "Do it"/"Cancel", never edited field-by-field), and `verdict`/`tone_note`/
+/// `missing_attachment` are read-only observations.
+fn text_review_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "before": {"type": "string"},
+                        "after": {"type": "string"},
+                        "reason": {"type": "string"}
+                    },
+                    "required": ["before", "after", "reason"],
+                    "additionalProperties": false
+                }
+            },
+            "verdict": {"type": "string", "enum": ["good_to_go", "needs_edits"]},
+            "tone_note": {"type": "string"},
+            "missing_attachment": {"type": "boolean"}
+        },
+        "required": ["edits", "verdict", "tone_note", "missing_attachment"],
         "additionalProperties": false
     })
 }
@@ -190,6 +237,87 @@ mod tests {
         assert_eq!(
             schema_for("calendar_event", false),
             schema_for("calendar_event", true)
+        );
+    }
+
+    // -- text_review (#38) --------------------------------------------------
+
+    #[test]
+    fn text_review_is_registered() {
+        assert!(schema_for("text_review", false).is_some());
+    }
+
+    #[test]
+    fn text_review_declares_top_level_fields_in_load_bearing_order() {
+        // "Golden" order test (task brief): edits before verdict, then
+        // tone_note, then missing_attachment.
+        let schema = schema_for("text_review", false).expect("text_review is registered");
+        let names: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("properties is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["edits", "verdict", "tone_note", "missing_attachment"]
+        );
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["edits", "verdict", "tone_note", "missing_attachment"])
+        );
+    }
+
+    #[test]
+    fn text_review_edits_item_declares_before_after_reason_in_order() {
+        let schema = schema_for("text_review", false).expect("text_review is registered");
+        let item_props = schema["properties"]["edits"]["items"]["properties"]
+            .as_object()
+            .expect("edits.items.properties is an object");
+        let names: Vec<&str> = item_props.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["before", "after", "reason"]);
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["required"],
+            serde_json::json!(["before", "after", "reason"])
+        );
+    }
+
+    #[test]
+    fn text_review_verdict_enum_is_exactly_the_two_documented_values() {
+        let schema = schema_for("text_review", false).expect("text_review is registered");
+        assert_eq!(
+            schema["properties"]["verdict"]["enum"],
+            serde_json::json!(["good_to_go", "needs_edits"])
+        );
+    }
+
+    #[test]
+    fn text_review_has_no_editable_fields() {
+        let schema = schema_for("text_review", false).expect("text_review is registered");
+        let props = schema["properties"].as_object().unwrap();
+        for (name, def) in props {
+            assert!(
+                def.get("editable").is_none(),
+                "property {name:?} must not be marked editable"
+            );
+        }
+    }
+
+    #[test]
+    fn text_review_rejects_additional_properties() {
+        let schema = schema_for("text_review", false).expect("text_review is registered");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn text_review_ignores_rate_difficulty() {
+        assert_eq!(
+            schema_for("text_review", false),
+            schema_for("text_review", true)
         );
     }
 }
