@@ -17,15 +17,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 // The constants below are sensible per-provider/per-tier limits for
-// `fit_for_model`, exercised by the tests in this module. Nothing in
-// production code references them by name yet: `grab` derives its pixel
-// budget from the single shared `max_edge` setting (see its comment), because
-// wiring the real, model-specific limits requires knowing which provider is
-// configured, and `src/provider/**`, `src/config.rs` and `src/ui/settings.rs`
-// are out of scope for this change (other agents are editing them; the
-// Provider trait extension that would carry this, #12, is in flight). Filed
-// as a follow-up issue to thread these through once #12 lands.
-#[allow(dead_code)]
+// `fit_for_model`. Issue #169: now referenced from `src/provider/**` (each
+// provider's `capabilities()` fills `Caps::image_limits` from these), and
+// from this module's own `resolve_limits`/`grab_raw` via `App::ask`'s
+// capture call site -- no longer dead code outside tests.
 /// Anthropic's "standard" resolution tier (all current models except Claude
 /// 4.7 and later): long edge at most 1568 px, and total visual tokens (Claude
 /// tiles images into 28x28-pixel patches; `tokens = ceil(w/28) * ceil(h/28)`)
@@ -36,30 +31,48 @@ use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 /// the real per-image cap is tighter (patch-quantized), so this is a safe
 /// upper bound, not an exact reproduction of Claude's own rounding.
 pub const ANTHROPIC_STANDARD_MAX_LONG_EDGE: u32 = 1568;
-#[allow(dead_code)]
 pub const ANTHROPIC_STANDARD_MAX_PIXELS: u64 = 1568 * 28 * 28;
 
-#[allow(dead_code)]
 /// Claude 4.7 and later, "high-resolution" tier: long edge at most 2576 px,
 /// visual tokens at most 4784. Same source and date as the standard tier
 /// above.
 pub const ANTHROPIC_HIGH_RES_MAX_LONG_EDGE: u32 = 2576;
-#[allow(dead_code)]
 pub const ANTHROPIC_HIGH_RES_MAX_PIXELS: u64 = 4784 * 28 * 28;
 
-#[allow(dead_code)]
 /// OpenAI's legacy tile-based vision models (gpt-4o, gpt-4.1 class) with
 /// `detail: "high"`: the first resize stage fits the image within a
 /// 2048x2048 square. MEASURED 2026-09-17 from
 /// <https://developers.openai.com/api/docs/guides/images-vision> (512px
 /// tiles, 85 base tokens + 170 tokens/tile). OpenAI's real second stage then
 /// further rescales so the *shortest* side is 768 px -- a short-edge
-/// constraint this module does not model (see the follow-up issue above), so
-/// `OPENAI_TILE_MAX_PIXELS` is only the 2048x2048 first-stage bound, not the
-/// true token-minimal size.
+/// constraint this module does not model (see `openai.rs`'s `capabilities()`
+/// doc comment), so `OPENAI_TILE_MAX_PIXELS` is only the 2048x2048
+/// first-stage bound, not the true token-minimal size.
 pub const OPENAI_TILE_MAX_LONG_EDGE: u32 = 2048;
-#[allow(dead_code)]
 pub const OPENAI_TILE_MAX_PIXELS: u64 = 2048 * 2048;
+
+/// Gemini's conservative default (issue #169): Gemini's own docs (fetched
+/// 2026-09-17, <https://ai.google.dev/gemini-api/docs/image-understanding>)
+/// describe tiling into 768x768-pixel tiles at 258 tokens/tile but document
+/// no hard maximum image dimension at all. THEORY (unverified): rather than
+/// send an unbounded image, this caps at 2x2 tiles per edge (~4 tiles,
+/// roughly 1032 tokens for a typical screen aspect ratio) to keep upload
+/// size and token cost in the same order of magnitude as Anthropic's
+/// standard tier above -- a deliberately conservative choice, not a
+/// documented Gemini limit.
+pub const GEMINI_CONSERVATIVE_MAX_LONG_EDGE: u32 = 1536;
+pub const GEMINI_CONSERVATIVE_MAX_PIXELS: u64 = 1536 * 1536;
+
+/// Ollama's conservative default (issue #169): Ollama runs whatever
+/// user-pulled model is configured, so there is no single vendor-documented
+/// image limit the way there is for a hosted API. THEORY (unverified): reuse
+/// Anthropic's standard-tier numbers as a reasonable, already-justified
+/// budget (most local vision encoders in the 2026-09-16 expansion plan's
+/// hardware table -- gemma3/gemma4/qwen3.5 -- are ViT-based at a similar
+/// patch scale), which also keeps local CPU/GPU decode time bounded on this
+/// machine's iGPU (CLAUDE.md's battery-drain concern).
+pub const OLLAMA_CONSERVATIVE_MAX_LONG_EDGE: u32 = ANTHROPIC_STANDARD_MAX_LONG_EDGE;
+pub const OLLAMA_CONSERVATIVE_MAX_PIXELS: u64 = ANTHROPIC_STANDARD_MAX_PIXELS;
 
 /// Raw RGBA8 pixels captured and downscaled on the main thread, not yet
 /// encoded to PNG.
@@ -78,15 +91,44 @@ pub struct RawShot {
     pub height: u32,
 }
 
-/// Capture the target monitor (per `monitor_mode`) and downscale so we never
-/// send more pixels than the configured `max_edge` implies a provider would
-/// keep. Does not encode -- see [`encode`] and this function's doc comment
-/// on [`RawShot`] for why that is a separate, later step.
+/// Resolves the `(max_long_edge, max_pixels)` [`fit_for_model`] should use
+/// for one capture (issue #169), from the actually-configured provider's
+/// real per-model image limits plus the user's own `config.capture.max_edge`
+/// setting.
+///
+/// `provider_limits` is `Caps::image_limits` for the model the FIRST
+/// provider the chain will try is configured with (see
+/// `Chain::first_ready_caps`) -- `None` when that is not known (e.g. no
+/// provider is ready yet), in which case this falls back entirely to the
+/// old max_edge-derived heuristic (`max_edge * 28 * 28`, which reduces to
+/// Anthropic's own standard-tier pixel budget at the config default of
+/// 1568).
+///
+/// When the provider's real limits ARE known, `user_max_edge` only ever
+/// tightens the long edge further -- it is a cap on top of the provider's
+/// own limit, never a request for more resolution than the provider would
+/// keep. The provider's own pixel budget is used as-is: the user has no
+/// separate pixel-budget setting to combine it with.
+pub fn resolve_limits(
+    provider_limits: Option<crate::provider::ImageLimits>,
+    user_max_edge: u32,
+) -> (u32, u64) {
+    match provider_limits {
+        Some(limits) => (limits.max_long_edge.min(user_max_edge), limits.max_pixels),
+        None => (user_max_edge, (user_max_edge as u64) * 28 * 28),
+    }
+}
+
+/// Capture the target monitor (per `monitor_mode`) and downscale to fit
+/// within `max_long_edge`/`max_pixels` (see [`resolve_limits`] for how a
+/// caller derives those from the configured provider's real limits and the
+/// user's own cap). Does not encode -- see [`encode`] and this function's
+/// doc comment on [`RawShot`] for why that is a separate, later step.
 ///
 /// `monitor_mode` is `"active"` (the monitor under the foreground window) or
 /// `"primary"` (always the system's primary monitor). Anything else is
 /// treated as `"active"`.
-pub fn grab_raw(monitor_mode: &str, max_edge: u32) -> Result<RawShot> {
+pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Result<RawShot> {
     let rect = match monitor_mode {
         "primary" => primary_monitor_rect()?,
         _ => active_monitor_rect()?,
@@ -111,18 +153,7 @@ pub fn grab_raw(monitor_mode: &str, max_edge: u32) -> Result<RawShot> {
         .map_err(|e| anyhow!("capturing monitor: {e}"))?;
 
     let (w, h) = (image.width(), image.height());
-    // `max_edge` is a single setting shared by whichever provider is
-    // configured (config.rs / ui/settings.rs, out of scope here -- see the
-    // follow-up issue on threading real per-provider limits through the
-    // Provider trait, #12). Pair it with the pixel budget implied by
-    // Anthropic's standard tier scaled to that long edge
-    // (`max_edge * 28 * 28`, which reduces to `ANTHROPIC_STANDARD_MAX_PIXELS`
-    // at the config default of 1568) so raising the long edge in settings
-    // still raises the effective resolution, while typical screen aspect
-    // ratios (16:9, 16:10 and wider) get the tighter, token-shaped cap that
-    // `fit_long_edge` alone could not express.
-    let max_pixels = (max_edge as u64) * 28 * 28;
-    let (nw, nh) = fit_for_model(w, h, max_edge, max_pixels);
+    let (nw, nh) = fit_for_model(w, h, max_long_edge, max_pixels);
 
     let resized = if (nw, nh) == (w, h) {
         image
@@ -319,12 +350,75 @@ fn rect_from_hmonitor(hmon: HMONITOR) -> Result<RECT> {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode, encode_png, fit_for_model, fit_long_edge, pick_compression_level, Cursor, RawShot,
-        ANTHROPIC_HIGH_RES_MAX_LONG_EDGE, ANTHROPIC_HIGH_RES_MAX_PIXELS,
+        encode, encode_png, fit_for_model, fit_long_edge, pick_compression_level, resolve_limits,
+        Cursor, RawShot, ANTHROPIC_HIGH_RES_MAX_LONG_EDGE, ANTHROPIC_HIGH_RES_MAX_PIXELS,
         ANTHROPIC_STANDARD_MAX_LONG_EDGE, ANTHROPIC_STANDARD_MAX_PIXELS, OPENAI_TILE_MAX_LONG_EDGE,
         OPENAI_TILE_MAX_PIXELS,
     };
+    use crate::provider::ImageLimits;
     use image::ImageEncoder;
+
+    // -- resolve_limits (issue #169) -------------------------------------
+
+    #[test]
+    fn resolve_limits_falls_back_to_user_max_edge_heuristic_when_provider_unknown() {
+        let (edge, pixels) = resolve_limits(None, 1568);
+        assert_eq!(edge, 1568);
+        assert_eq!(pixels, 1568 * 28 * 28);
+    }
+
+    #[test]
+    fn resolve_limits_uses_providers_pixel_budget_as_is() {
+        let limits = ImageLimits {
+            max_long_edge: ANTHROPIC_HIGH_RES_MAX_LONG_EDGE,
+            max_pixels: ANTHROPIC_HIGH_RES_MAX_PIXELS,
+        };
+        // User cap looser than the provider's own long edge: the provider's
+        // limit wins, unchanged.
+        let (edge, pixels) = resolve_limits(Some(limits), 4000);
+        assert_eq!(edge, ANTHROPIC_HIGH_RES_MAX_LONG_EDGE);
+        assert_eq!(pixels, ANTHROPIC_HIGH_RES_MAX_PIXELS);
+    }
+
+    #[test]
+    fn resolve_limits_user_max_edge_tightens_a_looser_provider_limit() {
+        let limits = ImageLimits {
+            max_long_edge: ANTHROPIC_HIGH_RES_MAX_LONG_EDGE, // 2576
+            max_pixels: ANTHROPIC_HIGH_RES_MAX_PIXELS,
+        };
+        // User has capped max_edge below the provider's own limit: the
+        // user's cap wins for the long edge (min of both), but the
+        // provider's pixel budget is unaffected -- the user has no
+        // separate pixel-budget setting.
+        let (edge, pixels) = resolve_limits(Some(limits), 1000);
+        assert_eq!(edge, 1000);
+        assert_eq!(pixels, ANTHROPIC_HIGH_RES_MAX_PIXELS);
+    }
+
+    #[test]
+    fn resolve_limits_switching_provider_changes_the_downscale_target() {
+        // Issue #169's own "Done when": switching the configured provider
+        // changes the downscale target for a fixed input image. Anthropic
+        // standard vs. OpenAI's tile budget give different fit_for_model
+        // results for the same 1920x1080 input.
+        let anthropic = ImageLimits {
+            max_long_edge: ANTHROPIC_STANDARD_MAX_LONG_EDGE,
+            max_pixels: ANTHROPIC_STANDARD_MAX_PIXELS,
+        };
+        let openai = ImageLimits {
+            max_long_edge: OPENAI_TILE_MAX_LONG_EDGE,
+            max_pixels: OPENAI_TILE_MAX_PIXELS,
+        };
+        let user_max_edge = 4000; // loose enough that both providers bind first
+        let (a_edge, a_pixels) = resolve_limits(Some(anthropic), user_max_edge);
+        let (o_edge, o_pixels) = resolve_limits(Some(openai), user_max_edge);
+        let a_fit = fit_for_model(1920, 1080, a_edge, a_pixels);
+        let o_fit = fit_for_model(1920, 1080, o_edge, o_pixels);
+        assert_ne!(
+            a_fit, o_fit,
+            "switching provider must change the downscale target"
+        );
+    }
 
     #[test]
     fn landscape_downscales_to_long_edge() {

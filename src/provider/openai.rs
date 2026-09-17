@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use super::common;
-use super::{Caps, Completion, Effort, Provider, Request, StopReason};
+use super::{Caps, Completion, Effort, ImageLimits, Provider, Request, StopReason};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -192,6 +192,11 @@ impl Provider for OpenAi {
         !self.api_key.trim().is_empty()
     }
 
+    /// Issue #169: `image_limits` is `capture.rs`'s `OPENAI_TILE_*` budget
+    /// for every model -- `build_body` always sends `detail: "high"` (see
+    /// above), and every model currently offered is a Responses-API model
+    /// on that same tile pipeline, so this is not model-dependent the way
+    /// Anthropic's tiers are.
     fn capabilities(&self, model: &str) -> Caps {
         // Every model currently offered in Settings (see `Providers::default`
         // in config.rs) is a Responses-API model with vision and strict
@@ -201,7 +206,15 @@ impl Provider for OpenAi {
             vision: true,
             json_schema: true,
             thinking: supports_reasoning(model),
+            image_limits: Some(ImageLimits {
+                max_long_edge: crate::capture::OPENAI_TILE_MAX_LONG_EDGE,
+                max_pixels: crate::capture::OPENAI_TILE_MAX_PIXELS,
+            }),
         }
+    }
+
+    fn own_caps(&self) -> Caps {
+        self.capabilities(&self.model)
     }
 
     fn complete(&self, req: &Request) -> Result<Completion> {
@@ -370,6 +383,30 @@ mod tests {
         assert!(caps.vision);
         assert!(caps.json_schema);
         assert!(!caps.thinking);
+    }
+
+    // -- image_limits (issue #169) ---------------------------------------
+
+    #[test]
+    fn capabilities_reports_the_tile_image_budget_regardless_of_model() {
+        let provider = OpenAi::new("k", "gpt-5.5", "low");
+        for model in ["gpt-5.5", "gpt-4.1"] {
+            let limits = provider
+                .capabilities(model)
+                .image_limits
+                .unwrap_or_else(|| panic!("expected image_limits for {model}"));
+            assert_eq!(
+                limits.max_long_edge,
+                crate::capture::OPENAI_TILE_MAX_LONG_EDGE
+            );
+            assert_eq!(limits.max_pixels, crate::capture::OPENAI_TILE_MAX_PIXELS);
+        }
+    }
+
+    #[test]
+    fn own_caps_matches_capabilities_for_the_configured_model() {
+        let provider = OpenAi::new("k", "gpt-4.1", "low");
+        assert_eq!(provider.own_caps(), provider.capabilities("gpt-4.1"));
     }
 
     #[test]

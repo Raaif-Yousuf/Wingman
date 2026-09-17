@@ -207,16 +207,38 @@ impl Effort {
 /// by falling back to OCR text plus the UIA tree instead of the screenshot
 /// (see the 2026-09-16 expansion plan, "Provider trait, extended").
 ///
-/// Nothing in Phase 1 reads `capabilities()` yet -- there is no router or
-/// action picker to consult it -- so it and this type are unused outside
-/// tests until Phase 2 lands (`#[allow(dead_code)]`, same as `Shot`'s
-/// `width`/`height` below and `Chain::provider_names`).
-#[allow(dead_code)]
+/// `image_limits` is issue #169's addition and IS read in production today
+/// (via [`Provider::own_caps`] / [`Chain::first_ready_caps`] and
+/// `App::ask`'s capture call site) -- everything else on this type is still
+/// only read by tests, unused until Phase 2's router and action picker exist
+/// to consult it (same status as `Shot`'s `width`/`height` below and
+/// `Chain::provider_names`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Caps {
     pub vision: bool,
     pub json_schema: bool,
     pub thinking: bool,
+    /// This model's real image-size limit, when known -- see
+    /// [`ImageLimits`]. `None` means "not known for this provider/model",
+    /// which the caller (`capture::resolve_limits`) treats as "fall back to
+    /// the user's own `config.capture.max_edge` heuristic", never as "no
+    /// limit at all".
+    pub image_limits: Option<ImageLimits>,
+}
+
+/// A provider's real per-model image-size limit (issue #169): the same
+/// two-constraint shape [`crate::capture::fit_for_model`] already fits
+/// against -- a maximum long edge in pixels, and a maximum total pixel
+/// count (the `u64` avoids an overflow computing `width * height` for a
+/// generous budget). Each provider's `capabilities()` fills this in from
+/// the constants in `capture.rs` (Anthropic's standard/high-res tiers,
+/// OpenAI's tile budget) or a documented/conservative default -- see each
+/// provider file's `capabilities()` doc comment for the source and its
+/// MEASURED/THEORY status (CLAUDE.md rule 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageLimits {
+    pub max_long_edge: u32,
+    pub max_pixels: u64,
 }
 
 /// Token accounting, when a provider's response reports it. Feeds
@@ -302,10 +324,24 @@ pub trait Provider: Send + Sync {
 
     /// What this provider can do for `model`. Vision, structured JSON
     /// output and extended thinking/effort support all vary per model, not
-    /// just per provider. Unused outside tests until Phase 2's router and
-    /// action picker exist to consult it.
-    #[allow(dead_code)]
+    /// just per provider. `image_limits` (issue #169) is read in production
+    /// via [`own_caps`](Provider::own_caps); the rest is still only read by
+    /// tests until Phase 2's router and action picker exist to consult it.
     fn capabilities(&self, model: &str) -> Caps;
+
+    /// This provider's own `Caps` -- i.e. `capabilities()` for whatever
+    /// model it is actually configured with. Lets a caller holding only a
+    /// `Chain` (not the concrete provider objects; see
+    /// [`Chain::first_ready_caps`]) learn what the first ready provider will
+    /// actually do, without needing to know its model string itself (issue
+    /// #169: the capture step needs the image limits of the model the chain
+    /// will use). Defaults to `Caps::default()` -- every real provider
+    /// (`Anthropic`, `OpenAi`, `Gemini`, `Ollama`, `OpenAiCompat`) overrides
+    /// this with `self.capabilities(&self.model)`; only test doubles that
+    /// have no single configured model to report on rely on the default.
+    fn own_caps(&self) -> Caps {
+        Caps::default()
+    }
 
     /// Runs one single-turn request and returns the whole result. No
     /// streaming (owner decision, 2026-09-16, "No chat": every response is
@@ -397,6 +433,25 @@ impl Chain {
             match parse(&completion) {
                 Ok(value) => return Ok(value),
                 Err(parse_err) => {
+                    // Issue #200: before spending a #99 network repair round
+                    // trip, try a local, zero-network cleanup of the near-JSON
+                    // text -- a fenced or prose-wrapped response is cheap and
+                    // deterministic to fix with string surgery, so this is
+                    // tried first and the network repair pass below is
+                    // reserved for genuinely wrong JSON (missing/malformed
+                    // fields), which is what it is actually good at.
+                    let cleaned = strip_near_json(&completion.text);
+                    if cleaned != completion.text {
+                        let cleaned_completion = Completion {
+                            text: cleaned,
+                            usage: completion.usage,
+                            stop: completion.stop,
+                        };
+                        if let Ok(value) = parse(&cleaned_completion) {
+                            return Ok(value);
+                        }
+                    }
+
                     if completion.stop != StopReason::MaxTokens {
                         let repair_req =
                             repair_request(req, &completion.text, &parse_err.to_string());
@@ -434,6 +489,19 @@ impl Chain {
             .filter(|p| p.ready())
             .map(|p| p.id())
             .collect()
+    }
+
+    /// The `Caps` -- notably [`Caps::image_limits`] -- of the first `ready()`
+    /// provider in this chain, i.e. the one [`complete_parsed`](Self::complete_parsed)
+    /// will actually try first. `None` when no provider in the chain is
+    /// ready. Issue #169: lets the capture step downscale for whichever
+    /// provider is really going to be asked, instead of a provider-agnostic
+    /// heuristic.
+    pub fn first_ready_caps(&self) -> Option<Caps> {
+        self.providers
+            .iter()
+            .find(|p| p.ready())
+            .map(|p| p.own_caps())
     }
 }
 
@@ -493,6 +561,92 @@ fn repair_request(original: &Request, bad_text: &str, parse_error: &str) -> Requ
         effort: original.effort,
         max_tokens: original.max_tokens,
     }
+}
+
+/// Issue #200: a cheap, deterministic, zero-network cleanup of near-JSON
+/// model output, tried in [`Chain::complete_parsed`] before the first
+/// `parse` failure escalates to a #99 network repair round trip. Strips a
+/// single surrounding markdown code fence (` ```json ... ``` ` or
+/// ` ``` ... ``` `), then trims any prose before the first `{` and after
+/// that object's matching closing `}` (found with [`extract_balanced_object`],
+/// a scan that respects strings and escapes so a `{`/`}` inside a JSON
+/// string value never miscounts depth). Returns the input unchanged (as an
+/// owned `String`, for a uniform return type) when neither cleanup applies,
+/// or when the text has no balanced top-level object at all -- an unbalanced
+/// input is left exactly as-is so the caller's next `parse` attempt still
+/// fails and falls through to the network repair pass unchanged.
+fn strip_near_json(text: &str) -> String {
+    let fenced = strip_code_fence(text.trim());
+    match extract_balanced_object(fenced) {
+        Some(obj) => obj.to_string(),
+        None => fenced.to_string(),
+    }
+}
+
+/// Strips one surrounding ` ``` ` fence, with or without a language tag
+/// (` ```json `) on the opening line. Returns `text` unchanged if it is not
+/// fenced (no leading/trailing ` ``` `) -- `text` is expected already
+/// trimmed by the caller.
+fn strip_code_fence(text: &str) -> &str {
+    let Some(after_open) = text.strip_prefix("```") else {
+        return text;
+    };
+    let Some(body) = after_open.strip_suffix("```") else {
+        return text;
+    };
+    match body.split_once('\n') {
+        // The first line is a bare alphabetic tag ("json"): drop it and the
+        // newline that ends it. Guarded on "letters only" so a NO-tag fence
+        // whose content happens to start on the very first line is never
+        // mistaken for one (its first line would contain `{`, `"`, digits,
+        // etc., none of which are ASCII-alphabetic-only).
+        Some((first_line, rest))
+            if !first_line.is_empty() && first_line.chars().all(|c| c.is_ascii_alphabetic()) =>
+        {
+            rest.trim()
+        }
+        _ => body.trim(),
+    }
+}
+
+/// Finds the first `{` in `text` and scans forward tracking brace depth to
+/// find ITS matching `}` (where depth returns to zero), skipping over the
+/// contents of any JSON string (so a brace inside a string value, or an
+/// escaped `"`, never affects depth). Returns the slice from the first `{`
+/// through that matching `}` inclusive -- i.e. exactly the first balanced
+/// top-level object, discarding anything before or after it (including a
+/// second top-level object, if the text happens to contain two). Returns
+/// `None` when the text has no `{` at all, or the braces never balance.
+fn extract_balanced_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (rel_i, c) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + rel_i + c.len_utf8();
+                    return Some(&text[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The wire shape of the model's JSON payload for the physics-check answer.
@@ -1209,5 +1363,229 @@ mod tests {
     fn parse_answer_rejects_invalid_json() {
         let err = parse_answer("not json").unwrap_err();
         assert!(err.to_string().contains("not a valid Answer"));
+    }
+
+    // -- Caps / ImageLimits / Chain::first_ready_caps (issue #169) -------
+
+    #[test]
+    fn caps_default_has_no_image_limits() {
+        assert_eq!(Caps::default().image_limits, None);
+    }
+
+    #[test]
+    fn provider_default_own_caps_is_caps_default() {
+        // MockProvider does not override `own_caps`, so it must fall back
+        // to the trait's default (`Caps::default()`), proving the default
+        // method itself works without every test double needing its own
+        // impl.
+        let p = MockProvider {
+            id: "a",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: ok_completion,
+        };
+        assert_eq!(p.own_caps(), Caps::default());
+    }
+
+    /// A provider whose `own_caps` is a fixed, non-default value -- lets
+    /// `Chain::first_ready_caps` be tested against a real, distinguishable
+    /// `Caps` rather than only the trait's default.
+    struct FakeCapsProvider {
+        id: &'static str,
+        ready: bool,
+        caps: Caps,
+    }
+
+    impl Provider for FakeCapsProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn ready(&self) -> bool {
+            self.ready
+        }
+        fn capabilities(&self, _model: &str) -> Caps {
+            self.caps
+        }
+        fn own_caps(&self) -> Caps {
+            self.caps
+        }
+        fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+            unreachable!("first_ready_caps must never call complete")
+        }
+    }
+
+    #[test]
+    fn first_ready_caps_returns_the_first_ready_providers_caps() {
+        let limits = ImageLimits {
+            max_long_edge: 1234,
+            max_pixels: 5678,
+        };
+        let a = FakeCapsProvider {
+            id: "a",
+            ready: true,
+            caps: Caps {
+                image_limits: Some(limits),
+                ..Caps::default()
+            },
+        };
+        let b = FakeCapsProvider {
+            id: "b",
+            ready: true,
+            caps: Caps::default(),
+        };
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        assert_eq!(
+            chain.first_ready_caps().and_then(|c| c.image_limits),
+            Some(limits)
+        );
+    }
+
+    #[test]
+    fn first_ready_caps_skips_unready_providers() {
+        let limits = ImageLimits {
+            max_long_edge: 42,
+            max_pixels: 99,
+        };
+        let unready = FakeCapsProvider {
+            id: "unready",
+            ready: false,
+            caps: Caps {
+                image_limits: Some(ImageLimits {
+                    max_long_edge: 1,
+                    max_pixels: 1,
+                }),
+                ..Caps::default()
+            },
+        };
+        let ready = FakeCapsProvider {
+            id: "ready",
+            ready: true,
+            caps: Caps {
+                image_limits: Some(limits),
+                ..Caps::default()
+            },
+        };
+        let chain = Chain::new(vec![Box::new(unready), Box::new(ready)]);
+        assert_eq!(
+            chain.first_ready_caps().and_then(|c| c.image_limits),
+            Some(limits)
+        );
+    }
+
+    #[test]
+    fn first_ready_caps_is_none_when_nothing_is_ready() {
+        let unready = FakeCapsProvider {
+            id: "unready",
+            ready: false,
+            caps: Caps::default(),
+        };
+        let chain = Chain::new(vec![Box::new(unready)]);
+        assert_eq!(chain.first_ready_caps(), None);
+    }
+
+    // -- strip_near_json (issue #200) ------------------------------------
+
+    #[test]
+    fn strip_near_json_table() {
+        let cases: &[(&str, &str)] = &[
+            // Already valid: passes through unchanged.
+            (r#"{"a":1}"#, r#"{"a":1}"#),
+            // A ```json ... ``` fence.
+            ("```json\n{\"a\":1}\n```", r#"{"a":1}"#),
+            // A bare ``` ... ``` fence with no language tag.
+            ("```\n{\"a\":1}\n```", r#"{"a":1}"#),
+            // A fence with no surrounding newlines at all.
+            ("```{\"a\":1}```", r#"{"a":1}"#),
+            // Prose before and after the object.
+            (
+                "Sure, here is the JSON you asked for:\n{\"a\":1}\nHope that helps!",
+                r#"{"a":1}"#,
+            ),
+            // Nested braces inside a string value must not confuse the
+            // balanced scan -- both the depth-affecting chars and the
+            // escaped quote inside the string are on one side of it.
+            (r#"{"a":"a { b } \" c { d"}"#, r#"{"a":"a { b } \" c { d"}"#),
+            // Nested (legitimate) object structure.
+            (r#"{"a":{"b":2}}"#, r#"{"a":{"b":2}}"#),
+            // Two top-level JSON objects: only the first is kept.
+            (r#"{"a":1} {"b":2}"#, r#"{"a":1}"#),
+            // Fenced AND prose-wrapped together.
+            ("Here you go:\n```json\n{\"a\":1}\n```\nDone.", r#"{"a":1}"#),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                strip_near_json(input),
+                *expected,
+                "failed for input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_near_json_unbalanced_is_returned_unchanged() {
+        // No matching close brace: strip_near_json must not fabricate one,
+        // so the caller's subsequent parse attempt still fails and the
+        // network repair pass still runs.
+        let input = r#"{"a":1"#;
+        assert_eq!(strip_near_json(input), input);
+    }
+
+    #[test]
+    fn strip_near_json_no_object_at_all_is_returned_unchanged() {
+        let input = "I cannot see a problem on the screen.";
+        assert_eq!(strip_near_json(input), input);
+    }
+
+    #[test]
+    fn complete_parsed_local_cleanup_succeeds_no_repair_request_sent() {
+        // Only ONE result is scripted: a fenced-JSON response. If a repair
+        // round trip were attempted (the pre-#200 behaviour), the second
+        // `complete()` call would panic on the empty queue. A passing test
+        // here proves the local cleanup alone recovered the answer.
+        let fenced = SequencedProvider::new(
+            "a",
+            vec![|| {
+                Ok(Completion {
+                    text: "```json\n{\"detail\":\"d\",\"headline\":\"h\"}\n```".to_string(),
+                    usage: None,
+                    stop: StopReason::Complete,
+                })
+            }],
+        );
+        let chain = Chain::new(vec![Box::new(fenced)]);
+        let answer = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap();
+        assert_eq!(answer.detail, "d");
+        assert_eq!(answer.headline, "h");
+    }
+
+    #[test]
+    fn complete_parsed_local_cleanup_fails_falls_through_to_network_repair() {
+        // Prose with no JSON object at all: local cleanup cannot recover
+        // it, so the existing #99 repair pass must still run. Two results
+        // scripted (bad, then a valid repair) -- if local cleanup wrongly
+        // "succeeded" on garbage, only one call would happen and the
+        // second scripted result would be left unused (still fine), but if
+        // local cleanup wrongly reported success with WRONG content the
+        // assertion below would catch it.
+        let a = SequencedProvider::new(
+            "a",
+            vec![
+                || {
+                    Ok(Completion {
+                        text: "I don't know what you mean.".to_string(),
+                        usage: None,
+                        stop: StopReason::Complete,
+                    })
+                },
+                repaired_completion,
+            ],
+        );
+        let chain = Chain::new(vec![Box::new(a)]);
+        let answer = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap();
+        assert_eq!(answer.headline, "repaired");
     }
 }
