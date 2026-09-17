@@ -1,8 +1,8 @@
 name: CI
 
+# Manual only (owner decision 2026-09-17): run from the Actions tab.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
