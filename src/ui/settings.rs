@@ -55,6 +55,7 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::time::Duration;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -846,32 +847,58 @@ fn fill_model_combo(hwnd: HWND, models: &[String], active: &str) {
     }
 }
 
+/// #188: total budget for the (at most two) optional HTTP calls
+/// `ollama_status_line` can make (`/api/ps` for GPU/CPU, `/api/tags` for
+/// vision counts). Tighter than `ollama_admin`'s general discovery timeout
+/// (5s each, 10s worst case combined) because this runs synchronously on
+/// the UI thread before the Settings window is shown -- a hung/wedged
+/// server must not visibly stall opening Settings for more than a couple
+/// of seconds.
+const OLLAMA_STATUS_HTTP_BUDGET: Duration = Duration::from_secs(3);
+
+/// #188: whether the status line should make its two optional HTTP calls at
+/// all, on top of the Win32-only listener check. Pure so the gate itself is
+/// unit-tested without a socket.
+///
+/// Only when BOTH:
+/// - `ollama_configured` -- Ollama is actually in `providers.order`, this
+///   codebase's own signal that the user opted in (see `config.rs`'s
+///   `Providers::default` and `mode::should_probe_ollama`, which gates
+///   Auto mode's own reachability probe the same way). A user who never
+///   touched Ollama but happens to have something else listening on the
+///   configured port must see zero added HTTP calls or latency here.
+/// - the Win32-only health check found a real, non-stock-tray-app server
+///   listening -- there is nothing useful to ask a not-listening server,
+///   and the stock tray app is already known to be CPU-only.
+fn should_query_ollama_details(ollama_configured: bool, health: &OllamaHealth) -> bool {
+    ollama_configured
+        && matches!(
+            health,
+            OllamaHealth::Listening {
+                kind: ListenerKind::Other,
+                ..
+            }
+        )
+}
+
 /// Combines #15's health check with #14's GPU/CPU indicator into the one
 /// status line Settings shows for Ollama. Computed once, synchronously,
 /// when Settings opens (CLAUDE.md rule 5: discovery happens on demand,
-/// never on a timer): the health check is Win32-only (no network at all),
-/// and the two HTTP calls it can make (`/api/ps`, `/api/tags`) are
-/// loopback-only with short timeouts, so this does not meaningfully delay
-/// the window appearing even when nothing is listening.
-fn ollama_status_line(cfg: &OllamaConfig) -> String {
+/// never on a timer): the health check is Win32-only (no network at all)
+/// and always runs; the two HTTP calls it can make (`/api/ps`, `/api/tags`)
+/// only run when [`should_query_ollama_details`] says so (#188), and are
+/// bounded by [`OLLAMA_STATUS_HTTP_BUDGET`] in total when they do.
+fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> String {
     let port = ollama_admin::port_from_base_url(&cfg.base_url).unwrap_or(11434);
     let health = ollama_admin::query_ollama_health(port);
     let health_msg = health.message();
 
-    if !matches!(
-        health,
-        OllamaHealth::Listening {
-            kind: ListenerKind::Other,
-            ..
-        }
-    ) {
-        // Not running, or it's the stock tray app's CPU-only server --
-        // either way there is no point asking it for GPU/CPU or model
-        // details.
+    if !should_query_ollama_details(ollama_configured, &health) {
         return health_msg;
     }
 
-    let gpu_line = match ollama_admin::ps(&cfg.base_url) {
+    let budget_start = std::time::Instant::now();
+    let gpu_line = match ollama_admin::ps_with_timeout(&cfg.base_url, OLLAMA_STATUS_HTTP_BUDGET) {
         Ok(entries) => match ollama_admin::gpu_status_for(&entries, &cfg.model) {
             GpuStatus::Gpu => format!("{} is loaded on GPU.", cfg.model),
             GpuStatus::Cpu => format!("{} is loaded on CPU.", cfg.model),
@@ -880,18 +907,26 @@ fn ollama_status_line(cfg: &OllamaConfig) -> String {
         Err(_) => return health_msg,
     };
 
-    let vision_line = match ollama_admin::list_tags(&cfg.base_url) {
-        Ok(models) if !models.is_empty() => {
-            let vision_count = models
-                .iter()
-                .filter(|m| ollama_admin::vision_from_tags_entry(m))
-                .count();
-            format!(
-                " {vision_count} of {} local models support vision.",
-                models.len()
-            )
+    // Whatever's left of the budget after `/api/ps`, capped at zero rather
+    // than going negative -- a slow first call must not hand the second
+    // call a needlessly long timeout of its own.
+    let remaining = OLLAMA_STATUS_HTTP_BUDGET.saturating_sub(budget_start.elapsed());
+    let vision_line = if remaining.is_zero() {
+        String::new()
+    } else {
+        match ollama_admin::list_tags_with_timeout(&cfg.base_url, remaining) {
+            Ok(models) if !models.is_empty() => {
+                let vision_count = models
+                    .iter()
+                    .filter(|m| ollama_admin::vision_from_tags_entry(m))
+                    .count();
+                format!(
+                    " {vision_count} of {} local models support vision.",
+                    models.len()
+                )
+            }
+            _ => String::new(),
         }
-        _ => String::new(),
     };
 
     format!("{health_msg} {gpu_line}{vision_line}")
@@ -1094,7 +1129,8 @@ fn build_ui(
     // built here.
     let ollama_top = y;
     y += GROUP_LABEL_TOP;
-    let ollama_status = ollama_status_line(&config.providers.ollama);
+    let ollama_configured = config.providers.order.iter().any(|p| p == "ollama");
+    let ollama_status = ollama_status_line(&config.providers.ollama, ollama_configured);
     ctx.create(
         WC_STATIC,
         &ollama_status,
@@ -1757,7 +1793,96 @@ mod tests {
             model: "gemma3:4b".to_string(),
             effort: "low".to_string(),
         };
-        assert_eq!(ollama_status_line(&cfg), "Ollama is not running.");
+        assert_eq!(ollama_status_line(&cfg, true), "Ollama is not running.");
+    }
+
+    // -- should_query_ollama_details (#188, pure) -------------------------
+
+    fn listening_other() -> OllamaHealth {
+        OllamaHealth::Listening {
+            pid: 1,
+            image_path: String::new(),
+            kind: ListenerKind::Other,
+        }
+    }
+
+    fn listening_stock_tray() -> OllamaHealth {
+        OllamaHealth::Listening {
+            pid: 1,
+            image_path: String::new(),
+            kind: ListenerKind::StockTrayServer,
+        }
+    }
+
+    #[test]
+    fn should_query_ollama_details_is_false_when_not_configured_even_if_listening() {
+        assert!(!should_query_ollama_details(false, &listening_other()));
+    }
+
+    #[test]
+    fn should_query_ollama_details_is_true_when_configured_and_something_other_is_listening() {
+        assert!(should_query_ollama_details(true, &listening_other()));
+    }
+
+    #[test]
+    fn should_query_ollama_details_is_false_when_nothing_is_listening() {
+        assert!(!should_query_ollama_details(true, &OllamaHealth::NotListening));
+    }
+
+    #[test]
+    fn should_query_ollama_details_is_false_for_the_stock_tray_server_even_if_configured() {
+        assert!(!should_query_ollama_details(true, &listening_stock_tray()));
+    }
+
+    // -- #188: no HTTP call when Ollama isn't configured -------------------
+
+    #[test]
+    fn ollama_status_line_makes_no_http_call_when_not_configured_even_if_something_listens() {
+        // A real listener that is NOT the stock tray app and IS reachable --
+        // exactly the case #188 is about: the Win32-only health check will
+        // report `Listening { kind: Other, .. }`, so the old code would go
+        // on to call `/api/ps` and `/api/tags`. With `ollama_configured =
+        // false` neither must ever be attempted.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        listener.set_nonblocking(true).expect("set_nonblocking");
+        let port = listener.local_addr().expect("local_addr").port();
+
+        let cfg = OllamaConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "gemma3:4b".to_string(),
+            effort: "low".to_string(),
+        };
+
+        let status = ollama_status_line(&cfg, false);
+        // The Win32-only health check still runs (it's cheap) and is all
+        // this status line shows when not configured -- no GPU/CPU or
+        // vision-count sentence appended, which is what the HTTP calls
+        // would have produced.
+        assert!(status.starts_with("Ollama is running"), "{status}");
+        assert!(
+            !status.contains("is loaded") && !status.contains("support vision"),
+            "no GPU/CPU or vision-count detail when not configured: {status}"
+        );
+
+        // Poll briefly rather than asserting instantaneously: any HTTP
+        // attempt would already have connected synchronously before
+        // `ollama_status_line` returned above, so this is only guarding
+        // against the connection having not yet reached the accept queue,
+        // never against one arriving later.
+        let mut saw_connection = false;
+        for _ in 0..20 {
+            match listener.accept() {
+                Ok(_) => {
+                    saw_connection = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(!saw_connection, "#188: no /api/ps or /api/tags request when Ollama isn't in providers.order");
     }
 
     // -- parse_u32_or / parse_max_edge_or --------------------------------

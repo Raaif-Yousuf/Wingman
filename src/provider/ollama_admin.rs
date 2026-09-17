@@ -326,10 +326,25 @@ pub fn vision_from_tags_entry(model: &TagsModel) -> bool {
     }
 }
 
-/// `GET /api/tags` -- every model pulled locally.
+/// `GET /api/tags` -- every model pulled locally, at the ordinary discovery
+/// timeout. Not called from any live path today: Settings' Ollama status
+/// line (#188) needs an explicit, tighter total budget and calls
+/// [`list_tags_with_timeout`] directly instead. Kept as the general-purpose
+/// entry point for a future caller that just wants the ordinary default --
+/// same "reserved for a consumer that doesn't exist yet" shape as
+/// `show_capabilities` above.
+#[allow(dead_code)]
 pub fn list_tags(base_url: &str) -> Result<Vec<TagsModel>> {
+    list_tags_with_timeout(base_url, DISCOVERY_TOTAL_TIMEOUT)
+}
+
+/// Same as [`list_tags`] but with an explicit timeout, rather than the
+/// general discovery default. Settings' Ollama status line (#188) needs a
+/// stricter, explicitly bounded total for its (at most two) HTTP calls,
+/// since it runs synchronously on the UI thread before the window is shown.
+pub(crate) fn list_tags_with_timeout(base_url: &str, timeout: Duration) -> Result<Vec<TagsModel>> {
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
-    let body = get_body(&url, "ollama")?;
+    let body = get_body_with_timeout(&url, "ollama", timeout)?;
     let parsed: TagsResponse =
         serde_json::from_str(&body).context("ollama: /api/tags response is not valid JSON")?;
     Ok(parsed.models)
@@ -406,10 +421,19 @@ struct PsResponse {
     models: Vec<PsEntry>,
 }
 
-/// `GET /api/ps` -- currently loaded models.
+/// `GET /api/ps` -- currently loaded models, at the ordinary discovery
+/// timeout. See [`list_tags`]'s doc comment for why this has no current
+/// caller and is kept anyway.
+#[allow(dead_code)]
 pub fn ps(base_url: &str) -> Result<Vec<PsEntry>> {
+    ps_with_timeout(base_url, DISCOVERY_TOTAL_TIMEOUT)
+}
+
+/// Same as [`ps`] but with an explicit timeout -- see
+/// [`list_tags_with_timeout`]'s doc comment for why (#188).
+pub(crate) fn ps_with_timeout(base_url: &str, timeout: Duration) -> Result<Vec<PsEntry>> {
     let url = format!("{}/api/ps", base_url.trim_end_matches('/'));
-    let body = get_body(&url, "ollama")?;
+    let body = get_body_with_timeout(&url, "ollama", timeout)?;
     let parsed: PsResponse =
         serde_json::from_str(&body).context("ollama: /api/ps response is not valid JSON")?;
     Ok(parsed.models)
@@ -453,9 +477,9 @@ pub fn gpu_status_for(entries: &[PsEntry], model: &str) -> GpuStatus {
 /// A blocking GET, mirroring `common::post_json`'s shape but for the
 /// no-body discovery endpoints (`/api/tags`, `/api/ps`) that don't fit
 /// that helper's POST-only signature.
-fn get_body(url: &str, tag: &str) -> Result<String> {
+fn get_body_with_timeout(url: &str, tag: &str, timeout: Duration) -> Result<String> {
     // #189: through `common` so the Offline guard (#19) covers discovery too.
-    super::common::get_text_with_timeout(url, DISCOVERY_TOTAL_TIMEOUT, tag)
+    super::common::get_text_with_timeout(url, timeout, tag)
 }
 
 /// Not called from any live path yet: pulling a model needs a worker-thread
