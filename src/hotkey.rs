@@ -26,6 +26,7 @@
 //! in the crate also means adding it to `app.rs`'s `tests::ALL_WM_APP_IDS`
 //! (issue #163), which is enforced by `wm_app_ids_registry_is_exhaustive`.
 
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,11 @@ pub const WM_APP_HOTKEY: u32 = WM_APP + 2;
 /// and must reconstruct the `Box` (e.g. `Box::from_raw(lparam.0 as *mut
 /// Chord)`) to free it.
 pub const WM_APP_LEARNED: u32 = WM_APP + 4;
+/// Posted to the target `HWND` when the configured pause-toggle chord fires
+/// (issue #181; `hotkeys.pause` in config, no default binding). `wparam`
+/// and `lparam` are unused (0) -- `app.rs` decides pause vs. resume from its
+/// own current `PauseState`, not from anything carried on this message.
+pub const WM_APP_PAUSE_TOGGLE: u32 = WM_APP + 7;
 
 pub const HK_PRIMARY: usize = 1;
 pub const HK_SECONDARY: usize = 2;
@@ -163,6 +169,79 @@ fn matches(chord: &Chord, binding: &Chord) -> bool {
         && chord.win == binding.win
 }
 
+/// Packs a [`Chord`] into a single `u64` for [`PAUSE_CHORD`] (issue #181):
+/// the lock-free atomic the hook's paused fast path reads instead of taking
+/// `STATE`'s `Mutex`. `vk` (a Windows virtual-key code, always in `0..=255`
+/// in practice) sits in the low 16 bits, one bit each for the four
+/// modifiers above that. `0` is never produced by a real chord -- every
+/// Windows virtual-key code is nonzero -- so it doubles as the "no pause
+/// chord configured" sentinel ([`unpack_pause_chord`] relies on this).
+fn pack_chord(c: Chord) -> u64 {
+    (c.vk as u64 & 0xFFFF)
+        | (c.ctrl as u64) << 16
+        | (c.shift as u64) << 17
+        | (c.alt as u64) << 18
+        | (c.win as u64) << 19
+}
+
+/// Inverse of [`pack_chord`].
+fn unpack_chord(packed: u64) -> Chord {
+    Chord {
+        vk: (packed & 0xFFFF) as u32,
+        ctrl: packed & (1 << 16) != 0,
+        shift: packed & (1 << 17) != 0,
+        alt: packed & (1 << 18) != 0,
+        win: packed & (1 << 19) != 0,
+    }
+}
+
+/// Outcome of checking a keydown's chord against the configured
+/// pause-toggle chord (issue #181), independent of Win32/atomics so it is
+/// unit-tested directly (CLAUDE.md rule 8). Fires the same whether the app
+/// is currently paused or running -- `app.rs`'s `WM_APP_PAUSE_TOGGLE`
+/// handler decides pause-vs-resume from its own `PauseState`, not from
+/// anything computed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseHotkeyOutcome {
+    /// The keydown matched the configured pause chord: swallow it and post
+    /// [`WM_APP_PAUSE_TOGGLE`]. This is the one outcome that must still be
+    /// checked while paused -- see `hook_proc`'s doc comment on the paused
+    /// fast path.
+    Toggle,
+    /// No match, or no pause chord configured at all (`pause_chord` is
+    /// `None` -- issue #181's "no default binding" decision): ordinary
+    /// paused/not-paused handling decides what happens to this keydown.
+    PassThrough,
+}
+
+/// Pure decision `hook_proc` makes both on the paused fast path and on the
+/// ordinary (not-paused) path, so the two can never disagree on what counts
+/// as a pause-toggle press.
+pub fn pause_hotkey_outcome(chord: &Chord, pause_chord: Option<Chord>) -> PauseHotkeyOutcome {
+    match pause_chord {
+        Some(pc) if matches(chord, &pc) => PauseHotkeyOutcome::Toggle,
+        _ => PauseHotkeyOutcome::PassThrough,
+    }
+}
+
+/// Target `HWND` [`WM_APP_PAUSE_TOGGLE`] is posted to, mirrored from
+/// `HookShared::target_hwnd` into its own atomic (set once at
+/// [`HotkeyHook::install`], never mutated afterward) so the paused fast path
+/// can reach it without taking `STATE`'s `Mutex` -- see [`PAUSE_CHORD`]'s
+/// doc comment for why that matters.
+static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Lock-free packed pause-toggle chord the hook's hot path reads on every
+/// keydown, paused or not (issue #181). `0` = unconfigured (see
+/// [`pack_chord`]'s doc comment). Written only by
+/// [`HotkeyHook::set_pause_chord`], read only by `hook_proc` via
+/// [`pause_hotkey_outcome`] -- this is what lets the paused fast path check
+/// "does this keydown toggle Pause" without ever touching `STATE`'s `Mutex`,
+/// matching `pause.rs`'s own `PAUSE_DEADLINE` pattern (see that module's
+/// "hook's fast path" doc section) for exactly the same reason: Windows
+/// silently unhooks a `WH_KEYBOARD_LL` callback that takes too long.
+static PAUSE_CHORD: AtomicU64 = AtomicU64::new(0);
+
 /// Render a chord for display, e.g. `Ctrl+Shift+/` or `Win+Shift+F23`.
 ///
 /// Modifier order is Ctrl, Alt, Win, Shift, so Shift (when present) always
@@ -242,9 +321,15 @@ pub struct HotkeyHook {
 
 impl HotkeyHook {
     /// Installs the hook. `target` receives [`WM_APP_HOTKEY`] /
-    /// [`WM_APP_LEARNED`]. Must be called on the thread that runs the
-    /// message loop, and only once per process (a second call fails).
+    /// [`WM_APP_LEARNED`] / [`WM_APP_PAUSE_TOGGLE`]. Must be called on the
+    /// thread that runs the message loop, and only once per process (a
+    /// second call fails).
     pub fn install(target: HWND, primary: Chord, secondary: Chord) -> Result<Self> {
+        // Mirrored outside STATE's Mutex so the paused fast path can reach
+        // it lock-free (see TARGET_HWND's doc comment). Set once, here,
+        // before the hook can possibly fire.
+        TARGET_HWND.store(target.0 as isize, Ordering::Relaxed);
+
         STATE
             .set(Mutex::new(HookShared {
                 target_hwnd: target.0 as isize,
@@ -269,6 +354,16 @@ impl HotkeyHook {
                 s.secondary = secondary;
             }
         }
+    }
+
+    /// Set or clear the pause-toggle chord (issue #181; `hotkeys.pause` in
+    /// config, `None` by default -- no default binding). Lock-free: writes
+    /// straight to [`PAUSE_CHORD`], the atomic the hot path reads; there is
+    /// nothing here for `STATE`'s `Mutex` to protect. Safe to call from the
+    /// thread that owns the message loop while the hook is live, same as
+    /// [`HotkeyHook::set_bindings`].
+    pub fn set_pause_chord(&self, chord: Option<Chord>) {
+        PAUSE_CHORD.store(chord.map(pack_chord).unwrap_or(0), Ordering::Relaxed);
     }
 
     /// Arm learn mode for binding slot `which`. The next non-modifier keydown
@@ -364,6 +459,28 @@ fn needs_win_release_workaround(chord: &Chord) -> bool {
     chord.win
 }
 
+/// Reads [`PAUSE_CHORD`] and unpacks it, lock-free. `None` if no pause
+/// chord is configured (the packed sentinel `0`).
+fn load_pause_chord() -> Option<Chord> {
+    match PAUSE_CHORD.load(Ordering::Relaxed) {
+        0 => None,
+        packed => Some(unpack_chord(packed)),
+    }
+}
+
+/// Posts [`WM_APP_PAUSE_TOGGLE`] to the installed hook's target window and
+/// runs the Win-release workaround if `chord` needs it -- the two things
+/// both call sites in `hook_proc` do when [`pause_hotkey_outcome`] returns
+/// `Toggle`. Reads [`TARGET_HWND`] rather than `STATE`'s locked copy so the
+/// paused call site stays lock-free.
+fn post_pause_toggle(chord: &Chord) {
+    let hwnd = HWND(TARGET_HWND.load(Ordering::Relaxed) as *mut _);
+    let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_PAUSE_TOGGLE, WPARAM(0), LPARAM(0)) };
+    if needs_win_release_workaround(chord) {
+        send_ctrl_tap();
+    }
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Per the WH_KEYBOARD_LL contract: if code < 0, pass through untouched
     // and do not swallow, regardless of anything else.
@@ -376,22 +493,29 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
-    // Pause (issue #20): every chord passes through completely unchanged
-    // while paused, including the Copilot key -- no swallowing, no Ctrl-tap
-    // workaround, no STATE lock, no learn-mode interaction. This check comes
-    // before the STATE lookup so pausing costs the hot path exactly one
-    // atomic load plus a clock read (see `pause::is_paused_now`), never a
-    // lock and never an allocation.
+    let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    let chord = current_chord(kb.vkCode);
+
+    // Pause (issue #20) / pause-toggle chord (issue #181): while paused,
+    // every chord passes through completely unchanged EXCEPT the configured
+    // pause-toggle chord, which still fires -- the one chord the paused
+    // hook does not pass through, and the hook's only exception to "no
+    // swallowing, no Ctrl-tap workaround, no STATE lock, no learn-mode
+    // interaction" while paused. Both checks here are lock-free
+    // (`is_paused_now`: one atomic load plus a clock read; `load_pause_chord`:
+    // one more atomic load) -- no STATE mutex, so pausing still costs the
+    // hot path no more than a couple of atomic loads, never a lock.
     if crate::pause::is_paused_now() {
+        if pause_hotkey_outcome(&chord, load_pause_chord()) == PauseHotkeyOutcome::Toggle {
+            post_pause_toggle(&chord);
+            return LRESULT(1);
+        }
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
     let Some(state) = STATE.get() else {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     };
-
-    let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-    let chord = current_chord(kb.vkCode);
 
     // Snapshot what we need and release the lock before doing anything that
     // could take a while (PostMessage, SendInput) -- never hold it across
@@ -436,6 +560,15 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         // handing it straight to `CallNextHookEx`. `should_check_hotkey_match`
         // exists only to make this decision unit-testable.
         debug_assert!(should_check_hotkey_match(outcome));
+    }
+
+    // #181: pause-toggle chord, checked after learn mode (which takes
+    // priority above -- learning a binding is never hijacked by this) and
+    // before the ordinary primary/secondary match, using the same
+    // lock-free atomic the paused branch above reads.
+    if pause_hotkey_outcome(&chord, load_pause_chord()) == PauseHotkeyOutcome::Toggle {
+        post_pause_toggle(&chord);
+        return LRESULT(1);
     }
 
     let which = if matches(&chord, &primary) {
@@ -656,5 +789,98 @@ mod tests {
     fn falls_back_to_vk_hex_for_unmapped_codes() {
         // 0x07 is unassigned in the VK table.
         assert_eq!(chord_to_string(&chord(0x07, false, false, false, false)), "VK(0x07)");
+    }
+
+    // -- pack_chord / unpack_chord (issue #181) -----------------------------
+
+    #[test]
+    fn pack_unpack_round_trips_every_modifier_combination() {
+        for ctrl in [false, true] {
+            for shift in [false, true] {
+                for alt in [false, true] {
+                    for win in [false, true] {
+                        let c = chord(0x86, ctrl, shift, alt, win);
+                        assert_eq!(unpack_chord(pack_chord(c)), c);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pack_unpack_round_trips_win_shift_f23() {
+        // The Copilot key -- also the one chord most likely to collide with
+        // the primary binding, so worth its own named case.
+        let c = chord(0x86, false, true, false, true);
+        assert_eq!(unpack_chord(pack_chord(c)), c);
+    }
+
+    #[test]
+    fn pack_unpack_round_trips_ctrl_shift_slash() {
+        let c = chord(0xBF, true, true, false, false);
+        assert_eq!(unpack_chord(pack_chord(c)), c);
+    }
+
+    #[test]
+    fn a_chord_with_no_modifiers_and_a_real_vk_never_packs_to_the_unset_sentinel() {
+        // Every real Windows virtual-key code is nonzero, so `0` (the
+        // "unconfigured" sentinel `load_pause_chord` relies on) can only
+        // come from `vk == 0`, which no learn-mode capture or hand-edited
+        // config can plausibly produce for a genuine trigger key.
+        let c = chord(0x41, false, false, false, false); // 'A', no modifiers
+        assert_ne!(pack_chord(c), 0);
+    }
+
+    #[test]
+    fn zero_is_the_unset_sentinel() {
+        let c = chord(0, false, false, false, false);
+        assert_eq!(pack_chord(c), 0);
+    }
+
+    // -- pause_hotkey_outcome (issue #181, pure) -----------------------------
+
+    #[test]
+    fn matching_chord_toggles_pause() {
+        // The task's own framing: while paused, an event matching the
+        // configured pause chord must toggle. `pause_hotkey_outcome` does
+        // not look at the paused/running state at all -- it is the same
+        // decision either way, which is exactly what lets `hook_proc` reuse
+        // it on both the paused fast path and the ordinary path.
+        let pause_chord = chord(0x13, false, false, false, false); // Pause/Break
+        assert_eq!(
+            pause_hotkey_outcome(&pause_chord, Some(pause_chord)),
+            PauseHotkeyOutcome::Toggle
+        );
+    }
+
+    #[test]
+    fn other_chords_pass_through_while_a_pause_chord_is_configured() {
+        let pause_chord = chord(0x13, false, false, false, false);
+        let other = chord(0x41, false, false, false, false); // 'A'
+        assert_eq!(
+            pause_hotkey_outcome(&other, Some(pause_chord)),
+            PauseHotkeyOutcome::PassThrough
+        );
+    }
+
+    #[test]
+    fn every_chord_passes_through_when_no_pause_chord_is_configured() {
+        // Issue #181's "no default binding" decision: `None` must never be
+        // treated as "matches everything".
+        let any = chord(0x86, false, true, false, true); // the Copilot key
+        assert_eq!(
+            pause_hotkey_outcome(&any, None),
+            PauseHotkeyOutcome::PassThrough
+        );
+    }
+
+    #[test]
+    fn pause_chord_match_respects_modifiers_like_the_ordinary_match_does() {
+        let pause_chord = chord(0x13, true, false, false, false); // Ctrl+Pause
+        let same_key_no_ctrl = chord(0x13, false, false, false, false);
+        assert_eq!(
+            pause_hotkey_outcome(&same_key_no_ctrl, Some(pause_chord)),
+            PauseHotkeyOutcome::PassThrough
+        );
     }
 }

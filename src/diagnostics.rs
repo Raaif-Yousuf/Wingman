@@ -95,60 +95,40 @@ pub struct DiagnosticsInput {
     pub ollama_health: String,
 }
 
-/// The env vars `Config::apply_env_overrides` recognizes, in the same order
-/// it checks them. Kept as its own list rather than reaching into
-/// `config.rs` (out of this task's scope, and `config.rs`'s provider
-/// sections are owned by a parallel change) -- same "two lists that must be
-/// kept in sync by hand" shape the `wired-to-nothing` skill calls out for a
-/// hard-coded list; if a new provider's env override is ever added there,
-/// it must be added here too.
-const ENV_OVERRIDE_VARS: &[&str] = &["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"];
-
 /// Reduces `config.providers` to the report's provider table, in
 /// `providers.order`, the same order the tray tooltip and `build_chain` use.
-/// Mirrors `config.rs`'s private `Providers::provider_for` name-to-provider
-/// mapping (kept as a separate list for the same reason `ENV_OVERRIDE_VARS`
-/// is: this task's scope does not touch `config.rs`'s provider sections).
-/// An unrecognized name is skipped, matching `build_chain`'s own behavior.
+/// Reads [`crate::config::Providers::describe_all`], the single source of
+/// truth `config.rs` and this module now share (issue #201) instead of each
+/// keeping its own copy of the provider-name-to-config mapping -- before
+/// this fix, this function's own hand-copied match had no `"compat:*"` arm
+/// at all, so a configured compat provider was silently invisible in every
+/// diagnostics report. `KeyStatus::from_key` is applied here, at the one
+/// place a raw `api_key` value is ever looked at, rather than inside
+/// `describe_all` (which stays a plain data accessor, not diagnostics-aware).
 pub fn provider_rows(config: &Config) -> Vec<ProviderRow> {
     config
         .providers
-        .order
-        .iter()
-        .filter_map(|name| match name.as_str() {
-            "openai" => Some(ProviderRow {
-                name: "openai".to_string(),
-                model: config.providers.openai.model.clone(),
-                key: Some(KeyStatus::from_key(&config.providers.openai.api_key)),
-            }),
-            "anthropic" => Some(ProviderRow {
-                name: "anthropic".to_string(),
-                model: config.providers.anthropic.model.clone(),
-                key: Some(KeyStatus::from_key(&config.providers.anthropic.api_key)),
-            }),
-            "gemini" => Some(ProviderRow {
-                name: "gemini".to_string(),
-                model: config.providers.gemini.model.clone(),
-                key: Some(KeyStatus::from_key(&config.providers.gemini.api_key)),
-            }),
-            "ollama" => Some(ProviderRow {
-                name: "ollama".to_string(),
-                model: config.providers.ollama.model.clone(),
-                key: None,
-            }),
-            _ => None,
+        .describe_all()
+        .into_iter()
+        .map(|d| ProviderRow {
+            name: d.name,
+            model: d.model,
+            key: d.api_key.as_deref().map(KeyStatus::from_key),
         })
         .collect()
 }
 
-/// The env var names from [`ENV_OVERRIDE_VARS`] that are currently set in
-/// this process's environment. Names only -- never `std::env::var`'s `Ok`
-/// value.
+/// The env var names from [`crate::config::ENV_OVERRIDE_VARS`] that are
+/// currently set in this process's environment. Names only -- never
+/// `std::env::var`'s `Ok` value. Reads the same list `Config::env_var_name`
+/// does (issue #201), rather than a hand-copied local one that could drift
+/// from it.
 fn env_overrides_present() -> Vec<String> {
-    ENV_OVERRIDE_VARS
+    crate::config::ENV_OVERRIDE_VARS
         .iter()
-        .filter(|name| std::env::var(name).is_ok())
-        .map(|name| name.to_string())
+        .map(|(_, var)| *var)
+        .filter(|var| std::env::var(var).is_ok())
+        .map(|var| var.to_string())
         .collect()
 }
 
@@ -470,6 +450,36 @@ mod tests {
         assert_eq!(rows[1].key, Some(KeyStatus::Unset));
     }
 
+    #[test]
+    fn provider_rows_shows_a_configured_compat_provider() {
+        // Issue #201's core repro: `provider_rows` used to keep its own
+        // hand-copied match with no `"compat:*"` arm, so a provider that
+        // genuinely exists in `config.providers.compat` and is named in
+        // `providers.order` never showed up in a diagnostics report at all
+        // -- silently, with no error. Reading `Providers::describe_all`
+        // (the shared source of truth) fixes that; this test fails again if
+        // `provider_rows` ever grows its own copy of the provider list.
+        use crate::provider::openai_compat::{CompatAuth, Structured};
+        let mut config = Config::default();
+        config.providers.compat = vec![crate::config::CompatConfig {
+            name: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            auth: CompatAuth::Bearer,
+            auth_header: String::new(),
+            api_key: "sk-compat-real".to_string(),
+            model: "some-model".to_string(),
+            models: vec!["some-model".to_string()],
+            structured: Structured::JsonSchema,
+        }];
+        config.providers.order = vec!["compat:openrouter".to_string()];
+
+        let rows = provider_rows(&config);
+        assert_eq!(rows.len(), 1, "the compat provider must be visible");
+        assert_eq!(rows[0].name, "compat:openrouter");
+        assert_eq!(rows[0].model, "some-model");
+        assert_eq!(rows[0].key, Some(KeyStatus::Set));
+    }
+
     // -- render_report: content -----------------------------------------------
 
     #[test]
@@ -627,7 +637,12 @@ mod tests {
         // fixed allowlist, never an arbitrary env var (which could carry
         // anything, including a secret set by an unrelated tool).
         for name in env_overrides_present() {
-            assert!(ENV_OVERRIDE_VARS.contains(&name.as_str()), "{name}");
+            assert!(
+                crate::config::ENV_OVERRIDE_VARS
+                    .iter()
+                    .any(|(_, var)| *var == name),
+                "{name}"
+            );
         }
     }
 }
