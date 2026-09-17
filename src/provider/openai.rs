@@ -132,6 +132,16 @@ impl OpenAi {
         }
 
         if text.is_empty() {
+            // `status: "incomplete"` with no `message` entry means the
+            // model spent its whole output-token budget on reasoning and
+            // never got to emit the answer -- a specific, reachable shape
+            // (see `tests/fixtures/openai_response_no_message.json`), not
+            // a generic malformed response (#155).
+            if value.get("status").and_then(Value::as_str) == Some("incomplete") {
+                return Err(anyhow!(
+                    "openai: The model ran out of room before answering. Lower the effort setting or raise the token limit."
+                ));
+            }
             return Err(anyhow!("openai: no message text found in output[]"));
         }
 
@@ -323,17 +333,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_rejects_body_with_no_message_output() {
-        let body = fs::read_to_string("tests/fixtures/openai_response_no_message.json")
-            .expect("fixture file should exist");
-        let err = OpenAi::parse_response(&body).unwrap_err();
-        assert!(err.to_string().contains("no message text"));
-    }
-
-    #[test]
     fn parse_response_rejects_invalid_json() {
         let err = OpenAi::parse_response("not json").unwrap_err();
         assert!(err.to_string().contains("not valid JSON"));
+    }
+
+    /// #155: `openai_response_no_message.json` is `status: "incomplete"`
+    /// with only a `reasoning` entry (empty summary) and no `message` at
+    /// all -- the model spent its whole output-token budget on reasoning.
+    /// That must surface as an actionable, specific message, not the
+    /// generic "no message text found" a genuinely malformed body gets.
+    #[test]
+    fn parse_response_reports_budget_exhaustion_for_incomplete_status_with_no_message() {
+        let body = fs::read_to_string("tests/fixtures/openai_response_no_message.json")
+            .expect("fixture file should exist");
+        let err = OpenAi::parse_response(&body).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ran out of room"), "{msg}");
+        assert!(!msg.contains("no message text"), "{msg}");
+    }
+
+    /// Neighbour of the above: a body with no message and no `status:
+    /// "incomplete"` is a genuinely malformed response, not budget
+    /// exhaustion, and must keep the generic message.
+    #[test]
+    fn parse_response_rejects_body_with_no_message_and_no_incomplete_status() {
+        let body = r#"{"output": []}"#;
+        let err = OpenAi::parse_response(body).unwrap_err();
+        assert!(err.to_string().contains("no message text"));
     }
 
     /// #154: mirrors Anthropic's `empty_effort_is_never_sent` -- an empty
