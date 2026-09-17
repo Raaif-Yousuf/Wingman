@@ -22,6 +22,7 @@ enum State {
     Char,
 }
 
+#[derive(Debug)]
 struct Violation {
     file: PathBuf,
     line: usize,
@@ -88,6 +89,34 @@ fn scan(path: &Path, src: &str) -> Vec<Violation> {
             }
             State::Str => {
                 if c == '\\' {
+                    // A `\u{XXXX}` Unicode escape is more than the 2 source
+                    // characters every other escape (`\n`, `\"`, `\\`, ...)
+                    // takes. Blindly skipping 2 chars left the cursor on
+                    // `{`, so the remaining hex digits and `}` were then
+                    // scanned as ordinary string text -- never matching the
+                    // real U+2014 codepoint the escape spells (issue #179).
+                    // Decode it explicitly and compare the codepoint instead.
+                    if chars.get(i + 1) == Some(&'u') && chars.get(i + 2) == Some(&'{') {
+                        let mut k = i + 3;
+                        let mut hex = String::new();
+                        while chars.get(k).is_some_and(|hc| *hc != '}') {
+                            hex.push(chars[k]);
+                            k += 1;
+                        }
+                        if chars.get(k) == Some(&'}') {
+                            if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                                if cp == 0x2014 && test_mod_depths.is_empty() {
+                                    violations.push(Violation { file: path.to_path_buf(), line });
+                                }
+                            }
+                            i = k + 1;
+                            continue;
+                        }
+                        // No closing brace found before the string ended or
+                        // EOF was reached: not a well-formed unicode escape.
+                        // Fall through to the generic skip below rather than
+                        // having scanned all the way to EOF for nothing.
+                    }
                     i += 2; // skip the escaped character, whatever it is
                     continue;
                 }
@@ -233,6 +262,50 @@ fn scan(path: &Path, src: &str) -> Vec<Violation> {
     violations
 }
 
+/// Deliberate, narrow exemptions from the scan above (issue #179): a string
+/// literal that legitimately needs to CONTAIN a real em dash in order to
+/// MATCH one, rather than DISPLAY one to the user, so it is not what CLAUDE.md
+/// rule 11 is actually about even though it is a string literal outside a
+/// comment or `#[cfg(test)]` module.
+///
+/// Matched by a substring of the violating line's own source text, not by
+/// file+line number (line numbers drift) -- so an edit that removes the
+/// exempted text stops exempting anything on that line, rather than
+/// silently exempting whatever code ends up there instead. Adding an entry
+/// here is a conscious decision, not a general escape hatch: name the exact
+/// function and why.
+///
+/// `Config::repair_refusal_trigger`'s `TRIGGER` constant (`src/config.rs`,
+/// owned by a different agent in this session, hence not edited directly)
+/// matches a real, historical em dash already sitting inside users' saved
+/// `config.toml` prompts, written before rule 11 existed, so that sentence
+/// can be rewritten away; `TRIGGER` itself is never shown to the user. Fixing
+/// this scanner's `\u{2014}`-escape blind spot (the rest of this issue) is
+/// what makes that constant visible to `scan` at all -- previously it was
+/// only invisible by accident of the parser, which is exactly the hole issue
+/// #179 was filed about. This is the "mark it deliberately" resolution its
+/// "Done when" names as an alternative to rewriting `TRIGGER`.
+const DELIBERATE_EM_DASH_MATCH_EXEMPTIONS: &[&str] = &["This is your scratchpad"];
+
+/// Whether `line_text` (the exact source line a violation was found on)
+/// matches one of `DELIBERATE_EM_DASH_MATCH_EXEMPTIONS`.
+fn is_deliberately_exempt(line_text: &str) -> bool {
+    DELIBERATE_EM_DASH_MATCH_EXEMPTIONS
+        .iter()
+        .any(|needle| line_text.contains(needle))
+}
+
+#[test]
+fn deliberate_exemption_matches_its_named_line_only() {
+    assert!(is_deliberately_exempt(
+        "    \"This is your scratchpad \\u{2014} reason it out before committing to a verdict.\""
+    ));
+    // Narrow, not a blanket match on any mention of a scratchpad or an em
+    // dash: an unrelated line must still be caught.
+    assert!(!is_deliberately_exempt("let bad = \"oops \\u{2014} scratchpad em dash\";"));
+    assert!(!is_deliberately_exempt("let bad = \"an unrelated em dash \\u{2014} here\";"));
+}
+
 #[test]
 fn no_em_dash_in_user_facing_string_literals() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -247,7 +320,13 @@ fn no_em_dash_in_user_facing_string_literals() {
     for file in &files {
         let src =
             std::fs::read_to_string(file).unwrap_or_else(|e| panic!("failed to read {file:?}: {e}"));
-        violations.extend(scan(file, &src));
+        for v in scan(file, &src) {
+            let line_text = src.lines().nth(v.line.saturating_sub(1)).unwrap_or("");
+            if is_deliberately_exempt(line_text) {
+                continue;
+            }
+            violations.push(v);
+        }
     }
 
     if !violations.is_empty() {
@@ -289,4 +368,77 @@ mod tests {
     let violations = scan(Path::new("fixture.rs"), src);
     let lines: Vec<usize> = violations.iter().map(|v| v.line).collect();
     assert_eq!(lines, vec![5, 6], "expected exactly the two real-code violations, got {lines:?}");
+}
+
+/// Issue #179: a normal string literal that spells the em dash as the Rust
+/// escape sequence `\u{2014}` (8 source characters: `\`, `u`, `{`, `2`, `0`,
+/// `1`, `4`, `}`) rather than pasting the literal U+2014 character. The old
+/// `State::Str` escape handling unconditionally skipped 2 characters for
+/// every backslash escape, which is right for `\n`/`\"`/`\\` but leaves the
+/// cursor sitting on `{` for a unicode escape -- the remaining `2014}` is
+/// then scanned as ordinary text, none of which is the real codepoint, so
+/// the violation was invisible. This must be caught exactly like a pasted
+/// literal em dash.
+#[test]
+fn scan_detects_em_dash_written_as_a_unicode_escape_in_a_normal_string() {
+    let src = "\
+fn f() {
+    let bad = \"scratchpad \\u{2014} reason it out\";
+}
+";
+    let violations = scan(Path::new("fixture.rs"), src);
+    let lines: Vec<usize> = violations.iter().map(|v| v.line).collect();
+    assert_eq!(lines, vec![2], "expected the \\u{{2014}} escape to be caught on its line");
+}
+
+/// The escape-decoding fix must compare the actual decoded codepoint, not
+/// just recognise the `\u{...}` shape -- an unrelated unicode escape (here,
+/// U+2013 EN DASH, one codepoint below the em dash) must not false-positive.
+#[test]
+fn scan_does_not_flag_an_unrelated_unicode_escape() {
+    let src = "\
+fn f() {
+    let ok = \"an en dash \\u{2013} is not an em dash\";
+}
+";
+    let violations = scan(Path::new("fixture.rs"), src);
+    assert!(
+        violations.is_empty(),
+        "a non-em-dash unicode escape must not be flagged, got {violations:?}"
+    );
+}
+
+/// A raw string has no escapes at all in real Rust syntax, so the literal
+/// text `\u{2014}` inside one is 8 ordinary characters, not a codepoint --
+/// this must keep behaving exactly like today (no violation), proving the
+/// new escape-decoding logic is scoped to `State::Str` only.
+#[test]
+fn scan_does_not_decode_escapes_inside_raw_strings() {
+    let src = "\
+fn f() {
+    let ok = r\"literal backslash-u-brace text \\u{2014} in a raw string\";
+}
+";
+    let violations = scan(Path::new("fixture.rs"), src);
+    assert!(
+        violations.is_empty(),
+        "a raw string must never decode escapes, got {violations:?}"
+    );
+}
+
+/// A malformed/unterminated unicode escape (no closing brace before the
+/// string itself closes) must not panic or hang the scanner; it degrades to
+/// the old best-effort 2-character skip.
+#[test]
+fn scan_tolerates_an_unterminated_unicode_escape() {
+    let src = "\
+fn f() {
+    let odd = \"broken \\u{2014 no closing brace\";
+}
+";
+    // Must not panic; the exact violation set here isn't the point (the
+    // string's own closing quote is inside the "escape", so the parse of
+    // this single malformed literal is inherently ambiguous) -- the test
+    // asserts only that `scan` returns rather than looping or panicking.
+    let _ = scan(Path::new("fixture.rs"), src);
 }
