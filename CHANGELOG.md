@@ -60,6 +60,15 @@ tagged release.
 - The pending card now shows before the screenshot is PNG-encoded, instead
   of the encode step (at best compression) freezing the UI for up to a
   second first (issue #177).
+- `ui.show_difficulty` now defaults to `false` (issue #197 part 1, owner
+  decision 2026-09-17): a fresh config no longer requests or pays for the
+  difficulty rubric unless the user turns it back on in Settings. An
+  existing `config.toml` with `show_difficulty = true` already written to
+  disk is unaffected, since `#[serde(default)]` only applies to an absent
+  key. The difficulty rating is being moved into the future "Check my work"
+  action (#37) as an opt-in option; README's "Difficulty rating" section is
+  removed, and `docs/providers.md` now notes the rubric is opt-in where it
+  documents the schema property order.
 
 ### Fixed
 

@@ -38,9 +38,8 @@ about Wingman is checked against the code in this repo, not aspirational.
 One action, built and running: **Check my work**. Press the key, Wingman
 screenshots your active monitor, sends it to a vision model with a prompt
 tuned for checking a hand-worked physics or statistics problem, and shows the
-verdict as a small GDI card in the corner, with a 1-10 (or U) difficulty
-rating. Click the card for the full working; click anywhere else and it goes
-away.
+verdict as a small GDI card in the corner. Click the card for the full
+working; click anywhere else and it goes away.
 
 That is the whole app today: one hotkey, one screenshot, one model call, one
 read-only card. No confirm-and-execute loop, no other actions yet. What has
@@ -134,9 +133,9 @@ Launch it. A tray icon appears and `%APPDATA%\copilot-ask\config.toml` is
 created. Left-click the tray icon to open **Settings**, and paste your key
 into **OpenAI API key** or **Anthropic API key**, both in the Providers group
 at the top. Everything else lives there too: model, effort, capture size,
-card timeout, text size, the difficulty toggle and the prompt. A saved key
-moves into Windows Credential Manager, not the file; Settings shows only its
-last four characters afterward.
+card timeout, text size and the prompt. A saved key moves into Windows
+Credential Manager, not the file; Settings shows only its last four
+characters afterward.
 
 Settings exposes OpenAI and Anthropic today; Gemini and Ollama both work but
 need one hand-edit of `config.toml` to enable, since the fixed-layout
@@ -164,24 +163,6 @@ provider with an empty key is skipped, not treated as an error.
 Switch models from the tray at any time; the choice is written straight back
 to the config. To offer a model that isn't listed, add it to `models` under
 the relevant provider; no rebuild needed.
-
-## Difficulty rating
-
-Each answer carries a 1-10 rating of the problem in the card's bottom-right
-corner, green through amber to red, with a purple **U** above 10.
-
-| | |
-|---|---|
-| 1 | easy high-school |
-| 3 | easy university intro course |
-| 5 | medium university |
-| 7 | hard university, typically graduate coursework |
-| 9 | very hard for an undergraduate |
-| 10 | a PhD student would struggle |
-| U | a professor would struggle |
-
-Turn it off with **Show difficulty rating** in Settings. Off means the rating
-is never requested, not merely hidden, so it costs nothing.
 
 ## Hotkeys
 
@@ -247,7 +228,6 @@ call every boot. With start-with-Windows on it is always running anyway.
 | `providers.ollama.base_url` | `"http://127.0.0.1:11434"` | never `localhost`, see [`docs/providers.md`](docs/providers.md#ollama) |
 | `ui.card_seconds` | `12` | auto-dismiss for the collapsed card; `0` = never |
 | `ui.text_scale` | `1.0` | multiplies the card's font size; lower is smaller |
-| `ui.show_difficulty` | `true` | the 1-10/U badge; when off it is not requested at all |
 | `providers.*.models` | see file | what the tray's model submenu offers (Ollama has no list; it uses `providers.ollama.model` directly) |
 | `ui.prompt` | see file | the system prompt, edit it to change what it checks |
 

@@ -258,7 +258,15 @@ pub struct Ui {
     pub text_scale: f32,
     /// Show the 1-10/Ultra difficulty badge in the card's bottom-right
     /// corner. When off, the rating is not requested from the model at all,
-    /// so the rubric costs nothing on every call.
+    /// so the rubric costs nothing on every call. Defaults to `false`
+    /// (issue #197, owner decision 2026-09-17): the rating is being moved
+    /// out of the core app and into the "Check my work" action (#37) as an
+    /// opt-in, student-oriented option, so no user should pay its ~500
+    /// system-prompt tokens per press unless they turn it on. `#[serde(default)]`
+    /// only fills this in when the key is *absent* from config.toml, so an
+    /// existing user who already has `show_difficulty = true` on disk keeps
+    /// seeing the badge; only a fresh config (or one where the user never set
+    /// the key) picks up the new `false` default.
     pub show_difficulty: bool,
     /// System prompt, editable by the user in the TOML file.
     pub prompt: String,
@@ -269,7 +277,7 @@ impl Default for Ui {
         Self {
             card_seconds: 12,
             text_scale: 1.0,
-            show_difficulty: true,
+            show_difficulty: false,
             prompt: DEFAULT_PROMPT.to_string(),
         }
     }
@@ -809,6 +817,7 @@ mod tests {
         assert_eq!(config.hotkeys.primary.vk, 0x86);
         assert_eq!(config.capture.max_edge, 1568);
         assert_eq!(config.ui.card_seconds, 12);
+        assert!(!config.ui.show_difficulty);
         // The file should now exist, created from defaults.
         assert!(path.exists());
 
@@ -1236,6 +1245,34 @@ text_scale = 0.0
     #[test]
     fn the_shipped_default_contains_no_refusal_trigger() {
         assert!(!Config::default().ui.prompt.contains("scratchpad"));
+    }
+
+    // -- #197: show_difficulty default flipped to false ---------------------
+
+    #[test]
+    fn default_show_difficulty_is_false() {
+        // Owner decision 2026-09-17: the difficulty rating is being moved
+        // out of the core app, so a fresh config must not request or pay
+        // for the rubric unless the user opts in.
+        assert!(!Config::default().ui.show_difficulty);
+    }
+
+    #[test]
+    fn an_existing_config_with_show_difficulty_true_keeps_it_on_load() {
+        // #[serde(default)] only fills a field in when the key is absent
+        // from the TOML text. A config.toml written by an older build (or
+        // hand-edited) with `show_difficulty = true` must not be silently
+        // flipped off just because the shipped default changed.
+        let toml_str = "[ui]\nshow_difficulty = true\n";
+        let cfg = Config::parse_or_default(toml_str);
+        assert!(cfg.ui.show_difficulty);
+    }
+
+    #[test]
+    fn an_older_config_missing_show_difficulty_backfills_to_the_new_default() {
+        let toml_str = "[capture]\nmax_edge = 999\n";
+        let cfg = Config::parse_or_default(toml_str);
+        assert!(!cfg.ui.show_difficulty);
     }
 
     // -- copilot-ask -> Wingman config migration -----------------------------
