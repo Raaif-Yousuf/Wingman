@@ -628,16 +628,18 @@ impl Config {
     /// chain but report themselves not-`ready()`, so `Chain::ask` skips
     /// them without failing.
     pub fn build_chain(&self) -> Chain {
+        // #175: the unreadable-credential marker is a placeholder, not a key.
+        let key = |k: &str| if k == UNREADABLE_KEY_MARKER { String::new() } else { k.to_string() };
         let mut providers: Vec<Box<dyn Provider>> = Vec::new();
         for name in &self.providers.order {
             match name.as_str() {
                 "openai" => providers.push(Box::new(OpenAi::new(
-                    self.providers.openai.api_key.clone(),
+                    key(&self.providers.openai.api_key),
                     self.providers.openai.model.clone(),
                     self.providers.openai.effort.clone(),
                 ))),
                 "anthropic" => providers.push(Box::new(Anthropic::new(
-                    self.providers.anthropic.api_key.clone(),
+                    key(&self.providers.anthropic.api_key),
                     self.providers.anthropic.model.clone(),
                     self.providers.anthropic.effort.clone(),
                 ))),
@@ -765,6 +767,18 @@ mod tests {
         let mut config = Config::parse_or_default(toml_str);
         config.apply_env_overrides();
         assert_eq!(config.providers.openai.api_key, "file-openai-key");
+    }
+
+    #[test]
+    fn build_chain_never_hands_the_unreadable_marker_to_a_provider() {
+        // #175's marker keeps an unreadable credential from being deleted on
+        // save; it is not a key. A provider built from it must report not
+        // ready rather than send the marker as an API key.
+        let mut config = Config::default();
+        config.providers.order = vec!["openai".to_string(), "anthropic".to_string()];
+        config.providers.openai.api_key = UNREADABLE_KEY_MARKER.to_string();
+        config.providers.anthropic.api_key = UNREADABLE_KEY_MARKER.to_string();
+        assert!(config.build_chain().ready_provider_names().is_empty());
     }
 
     #[test]
