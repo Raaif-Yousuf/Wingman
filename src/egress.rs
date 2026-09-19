@@ -296,28 +296,120 @@ pub fn model_from(url: &str, body: &Value) -> Option<String> {
 /// consecutive base64/URL-safe characters (the shape every vendor's API key
 /// takes -- `sk-...`, `sk-ant-...`, `AIza...`) is scrubbed before the
 /// message is ever written to the log.
+///
+/// #273 widened it. The original alphabet was base64url and nothing else,
+/// so a credential written in standard base64 (`+`, `/`, `=`) or split by a
+/// vendor's own punctuation was seen as several short fragments, each under
+/// the threshold, and every one of them survived: an AWS-style
+/// `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` passed through completely
+/// intact. Those characters cannot simply join the alphabet, because a URL
+/// and a filesystem path are long runs over exactly them, so a wide run is
+/// scrubbed whole only when it also [`looks_like_a_credential`]. See that
+/// function for the discriminator and its one known false positive.
+///
+/// #253 made this matter twice over: it is now the same function that
+/// scrubs the error text `provider::common` returns to the caller, which
+/// rule 7 puts on the card and which a user pastes into a bug report.
 pub fn redact_opaque_tokens(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut token = String::new();
+    let mut run = String::new();
     for c in s.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-            token.push(c);
+        if is_wide_token_char(c) {
+            run.push(c);
         } else {
-            flush_token(&mut token, &mut out);
+            flush_run(&mut run, &mut out);
             out.push(c);
         }
     }
-    flush_token(&mut token, &mut out);
+    flush_run(&mut run, &mut out);
     out
 }
 
-fn flush_token(token: &mut String, out: &mut String) {
-    if token.chars().count() >= 20 {
+/// The narrow alphabet the threshold rule applies to on length alone:
+/// base64url plus the separators every vendor prefix uses (`sk-ant-...`,
+/// `AIza...`). Unchanged since the first version of this function.
+fn is_narrow_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// The narrow alphabet plus the characters that split a credential into
+/// short, individually-innocent fragments: standard-base64's `+`, `/` and
+/// `=`, and the `.` a JWT joins its segments with (#273).
+///
+/// These cannot be added to the narrow set directly, because a URL and a
+/// filesystem path are both long runs over exactly them, and scrubbing
+/// those would cost the reader the one thing that makes a transport error
+/// actionable. They only ever join a run that [`looks_like_a_credential`]
+/// also accepts.
+fn is_wide_token_char(c: char) -> bool {
+    is_narrow_token_char(c) || matches!(c, '+' | '/' | '=' | '.')
+}
+
+/// Whether a wide run should be scrubbed whole rather than fragment by
+/// fragment.
+///
+/// The discriminator is a mix of upper case, lower case and digit within
+/// one unbroken run. Every credential shape has it, because the alphabet is
+/// chosen for entropy. The things a wide run would otherwise swallow do
+/// not: `//api.openai.com/v1/responses` is lower case and digits with no
+/// upper case, `/Users/someone/AppData/Roaming` is upper and lower with no
+/// digit, and prose is lower case with spaces that break the run anyway.
+///
+/// THEORY (unverified): a hostname or path that happens to carry all three
+/// classes in one run, such as a versioned CDN path with a hash in it, will
+/// be scrubbed. That is the safe direction to be wrong in, and the length
+/// floor keeps it rare.
+fn looks_like_a_credential(run: &str) -> bool {
+    let mut upper = false;
+    let mut lower = false;
+    let mut digit = false;
+    for c in run.chars() {
+        upper |= c.is_ascii_uppercase();
+        lower |= c.is_ascii_lowercase();
+        digit |= c.is_ascii_digit();
+    }
+    upper && lower && digit
+}
+
+/// Scrub one maximal wide run, then fall back to the original per-fragment
+/// rule inside it.
+///
+/// Order matters: the wide test runs first so a credential split across
+/// separators is caught as one thing, and only what it declines is handed
+/// to the narrow rule, which still scrubs a long run on length alone with
+/// no character-class test. Nothing the original function redacted stops
+/// being redacted.
+fn flush_run(run: &mut String, out: &mut String) {
+    if run.chars().count() >= MIN_TOKEN_CHARS && looks_like_a_credential(run) {
+        out.push_str("[redacted]");
+        run.clear();
+        return;
+    }
+
+    let mut fragment = String::new();
+    for c in run.chars() {
+        if is_narrow_token_char(c) {
+            fragment.push(c);
+        } else {
+            flush_fragment(&mut fragment, out);
+            out.push(c);
+        }
+    }
+    flush_fragment(&mut fragment, out);
+    run.clear();
+}
+
+/// The shape every vendor's API key takes is at least this long; below it,
+/// a run is a word, a status code or a short identifier.
+const MIN_TOKEN_CHARS: usize = 20;
+
+fn flush_fragment(fragment: &mut String, out: &mut String) {
+    if fragment.chars().count() >= MIN_TOKEN_CHARS {
         out.push_str("[redacted]");
     } else {
-        out.push_str(token);
+        out.push_str(fragment);
     }
-    token.clear();
+    fragment.clear();
 }
 
 /// Builds the row [`record`] will persist for one HTTP attempt. `provider`
@@ -671,6 +763,103 @@ mod tests {
     fn redact_opaque_tokens_leaves_short_tokens_and_prose_alone() {
         let message = "HTTP 429: too many requests, retry in 30s";
         assert_eq!(redact_opaque_tokens(message), message);
+    }
+
+    // -- #273: the separator characters the first pass did not know about --
+    //
+    // The original scrubber's token alphabet was `[A-Za-z0-9_-]`, which is
+    // base64url and nothing else. A credential written in standard base64
+    // (`+`, `/`, `=`) or split by a vendor's own punctuation is therefore
+    // seen as several short fragments, each under the 20-character
+    // threshold, and every one of them survives. These tests are the shapes
+    // that leaked.
+
+    /// The worst case: an AWS-style secret whose `/` separators leave three
+    /// fragments, none of them long enough to trip the old threshold, so the
+    /// whole credential passed through intact.
+    #[test]
+    fn redact_opaque_tokens_scrubs_a_key_split_by_slashes() {
+        let fake = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let message = format!("HTTP 403: signature mismatch for {fake} in request");
+        let redacted = redact_opaque_tokens(&message);
+        assert!(!redacted.contains(fake), "{redacted}");
+        assert!(
+            !redacted.contains("wJalrXUtnFEMI"),
+            "no fragment may survive: {redacted}"
+        );
+        assert!(redacted.contains("HTTP 403"), "{redacted}");
+    }
+
+    #[test]
+    fn redact_opaque_tokens_scrubs_a_standard_base64_key() {
+        let fake = "QUJDRGVmZ2hpSktMTU5vcHFyc3R1dnd4+Kg/4Q==";
+        let message = format!("auth failed: token {fake} rejected");
+        let redacted = redact_opaque_tokens(&message);
+        assert!(!redacted.contains(fake), "{redacted}");
+        assert!(
+            !redacted.contains("QUJDRGVmZ2hpSktMTU5vcHFyc3R1dnd4"),
+            "{redacted}"
+        );
+    }
+
+    /// A JWT is three base64url segments joined by dots. Each segment can be
+    /// under 20 characters on a small payload.
+    #[test]
+    fn redact_opaque_tokens_scrubs_a_dot_separated_token() {
+        let fake = "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.SflKxwRJSMeKKF2QT4";
+        let message = format!("401: bearer {fake} expired");
+        let redacted = redact_opaque_tokens(&message);
+        assert!(!redacted.contains(fake), "{redacted}");
+        assert!(redacted.contains("401"), "{redacted}");
+    }
+
+    /// The reason the fix cannot simply add `/` and `.` to the token
+    /// alphabet: a URL is a long run over exactly those characters, and
+    /// scrubbing it would cost the reader the one thing that makes a
+    /// transport error actionable. The extra characters only join a run
+    /// when the run also looks like a credential, which a lowercase
+    /// hostname and path do not.
+    #[test]
+    fn redact_opaque_tokens_leaves_a_url_intact() {
+        let message = "transport error: failed to connect to https://api.openai.com/v1/responses";
+        assert_eq!(redact_opaque_tokens(message), message);
+    }
+
+    #[test]
+    fn redact_opaque_tokens_leaves_a_windows_path_intact() {
+        let message = r"could not read C:/Users/someone/AppData/Roaming/Wingman/actions.toml";
+        assert_eq!(redact_opaque_tokens(message), message);
+    }
+
+    /// Prose is prose however long the sentence is: without a mix of upper,
+    /// lower and digit in one unbroken run there is nothing credential
+    /// shaped about it.
+    #[test]
+    fn redact_opaque_tokens_leaves_long_prose_intact() {
+        let message = "the model did not return any message text in the response body";
+        assert_eq!(redact_opaque_tokens(message), message);
+    }
+
+    /// The original guarantee must not regress: a single run over the old
+    /// alphabet is still scrubbed on length alone, with no character-class
+    /// test, because that is what caught `sk-ant-...` and `AIza...`.
+    #[test]
+    fn redact_opaque_tokens_still_scrubs_a_lowercase_only_run_on_length_alone() {
+        let fake = "abcdefghijklmnopqrstuvwxyz";
+        let redacted = redact_opaque_tokens(&format!("key {fake} rejected"));
+        assert!(!redacted.contains(fake), "{redacted}");
+    }
+
+    /// The 20-character boundary is unchanged either side of it.
+    #[test]
+    fn redact_opaque_tokens_threshold_is_unchanged_at_nineteen_and_twenty() {
+        let nineteen = "a1B".repeat(6) + "z"; // 19
+        assert_eq!(nineteen.chars().count(), 19);
+        assert!(redact_opaque_tokens(&nineteen).contains(&nineteen));
+
+        let twenty = nineteen.clone() + "z"; // 20
+        assert_eq!(twenty.chars().count(), 20);
+        assert!(!redact_opaque_tokens(&twenty).contains(&twenty));
     }
 
     #[test]
