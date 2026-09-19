@@ -1,173 +1,156 @@
-# Handoff: after the 2026-09-16 planning session
+# Handoff: after the 2026-09-18/19 overnight fan-out
 
-Written 2026-09-16. First handoff for this repo. Re-check `git log -1` before
-trusting any sha here.
+Written 2026-09-19. `master` = `327dbc6`. Re-check `git log -1` before trusting
+any sha here. Nothing pushed; the owner pushes.
 
-`master` = `80b2dcc` ("Make Windows aware the app exists"). Working tree has
-uncommitted additions from this session (listed below). Nothing pushed; no
-GitHub repo exists yet.
+The run ended early: at roughly 12:05am the Anthropic account hit its monthly
+spend limit and **ten agents were terminated mid-task in one burst**. Three had
+already finished and merged. The rest left unfinished work, which is preserved
+(see "Unfinished work" below) but is **not verified and may not compile**.
 
-## What this session was
+## What landed on master
 
-Planning only, by owner instruction. No app code changed. The project moved
-from `Downloads\copilot-ask` to `C:\Users\raaif\copilot-ask`; the Claude memory
-directory was copied across and the project memory's path updated.
+| Commit | What |
+|---|---|
+| `b409114` | Completed the merge the previous session left half-done (`#213`, `#214`, `#207`, `#209`). `src/app.rs` was in an unmerged `UU` state with the conflict already resolved but never staged. |
+| `e0a00d1` | Merged the `#221` DrawTextW empty-text fix (adds `src/ui/text.rs`). |
+| `cef9945` | Codex mirrors (`AGENTS.md`, `.agents/skills/`, `.codex/agents/`) committed; shared-machine cargo rules scaled for a 15-agent run. |
+| `98461ac` | `scripts/rename-repo-folder-to-wingman.ps1`. |
+| `cebdbbb` | `scripts/merge-agent-branches.sh`. |
+| `63f41fd` | **#220**: value-shape payment denylist at both fill_form layers. |
+| `1d51811` | **#222**: router/chain provider-name matching consolidated into `config.rs`. |
+| `327dbc6` | **#203** compile-fail gate for `Confirmed`, **#43** `docs/actions.md` + `docs/executors.md`. |
 
-Produced, all uncommitted:
+Gate at `327dbc6`: fmt, clippy, deny, hooks, Pester, PSScriptAnalyzer all
+clean; **1485 unit tests + 1 trybuild + 7 no-em-dash, 0 failures**.
 
-- `docs/superpowers/specs/2026-09-16-expansion-plan-design.md`: the plan.
-  Name candidates, architecture, providers (Ollama, OpenAI-compatible, Gemini),
-  modes and the offline guard, the palette and actions-as-data, settings window
-  options, awareness engine, secrets separation, GitHub repo files, verified
-  open-source sources, decisions owed, roadmap and issue map.
-- `CLAUDE.md`, `docs/README.md`, `.claude/skills/{tests-first,fixing-a-bug,
-  wired-to-nothing,working-an-issue}`, `.claude/agents/cold-diff-reviewer.md`,
-  `.claude/settings.json` with two PreToolUse hooks under `scripts/hooks/`,
-  `OWNER_TODO.md`, this file. All ported from the sibling CLAIR repo and cut to
-  what applies to an 8k-LOC Rust crate.
+Issues closed this run: **#220, #222, #203, #43, #218, #205**. Open went from
+105 to 127 because the auditors filed 28 new findings; the owner said the count
+is irrelevant.
 
-## Decisions made by the owner this session
+## Do this first
 
-Name **Wingman**, **no chat at all** (one press, one action, one card; the
-WebView2 window via `wry` is a rarely opened settings window only), keys in
-Credential Manager,
-awareness **on** by default (consent screen required), copied code MIT-only.
-Scope reframed: a universal act-on-what-is-on-screen assistant (Look, Propose,
-Confirm, Do), not a homework tool; community project. Recorded in the plan's
-header table and § 1, § 6.
+1. **Run the rename.** `scripts/rename-repo-folder-to-wingman.ps1`, from a
+   PowerShell window rooted somewhere other than the repo, with no Claude Code
+   session open and after the worktrees below are dealt with. `-WhatIf` first.
+   It cannot be run from inside a session: Windows holds an open handle on a
+   process's current directory. It also moves
+   `~\.claude\projects\C--Users-raaif-copilot-ask` (which holds the memory
+   files) and fixes the absolute `CARGO_TARGET_DIR` in both `filing-findings`
+   SKILL.md copies. Never run, so read it before trusting it.
+2. **Decide the three highest-severity findings.** They are listed below and
+   none of them is fixed.
+3. **Then either finish or discard the unfinished branches.** Do not merge one
+   without finishing it and re-running `scripts/verify-all.sh`.
 
-GitHub repo `Raaif-Yousuf/Wingman` exists (empty, public); the logged-in `gh`
-account has admin. Filed from this session: 14 labels, 7 milestones (Phases
-0 to 5 plus "Phase 3b — Knowledge and memory"), issues #1 to #130 each with a
-"Done when" criterion, roadmap #80 pinned, seven `good first issue` actions.
-Late additions: the knowledge-and-memory subsystem (plan § 18, issues #81 to
-#97) and an additional-functionality sweep (plan § 19, #98 to #130). `origin`
-remote added locally; **nothing pushed** (owner pushes).
+## The three findings that matter most
 
-## Positioning and launch (added late in the session)
+- **#242 (dead wire, and the worst one for a community project).** Any action
+  from a user's `actions.toml`, including CONTRIBUTING.md's own "add an action
+  in 20 minutes" tutorial example, appears in the palette and **silently does
+  nothing** when clicked. `ui/palette_model.rs`'s `dispatch_target_for` is a
+  closed 7-arm match with `_ => None`, and `app.rs`'s `dispatch_palette_action`
+  no-ops on `None` with no card. `catalogue()` meanwhile adds every action
+  unconditionally. A contributor following the docs gets a working-looking
+  action that does nothing.
+- **#225 (P1, breaks Confirm).** `Card::hide()` destroys an in-flight preview
+  without posting `WM_APP_PREVIEW_DECIDED`, so `pending_review` /
+  `pending_form_fill` is never cleared. Five call sites hide unconditionally.
+  Two slots can then both be `Some`, and because `on_preview_decided` checks
+  `pending_review` first, **pressing "Do it" on a visible form-fill preview can
+  run a stale abandoned email replace-text instead**, dropping the confirmed
+  action with no card. A fixer agent had written the red tests and was about to
+  run them when it was killed; see `worktree-agent-a8b00fdc77b61f899`.
+- **#236 / #237 (P1, local attack surface).** `WM_APP_ACTIVATE` is posted to a
+  hardcoded public window class and handled with no sender authentication, so
+  any process in the session can drive a screenshot plus a billed cloud request
+  with no key press. And the single-instance mutex name is a fixed public
+  string, so any process can pre-hold it and make Wingman exit silently forever,
+  including at autostart. #237 also fires benignly: `app::run()` takes the mutex
+  well before the owner window exists, so a slow duplicate launch hits the same
+  silent exit with no adversary.
 
-`docs/positioning.md` holds the research read-out: five differentiators
-against Copilot, the WinRAR/Greenshot/Notepad++ test, the ranked demand
-list, the distrust triggers turned into rules, and a 10-step launch
-sequence. The recommendation is that **the attention moment is v0.2 (Phase
-2 complete plus a no-model tier)**, timed to Microsoft's Copilot-key remap
-setting reaching GA (Release Preview 2026-09-10) and before the Windows 10
-ESU end on 2026-10-13. Reddit was unreachable from automated tools, so
-the owner connected the Chrome extension and the threads were read by hand
-through `old.reddit.com` JSON pages; findings are in the doc's "What Reddit
-actually says" section. Reusable extractor: the session scratchpad's
-`comments.py` pattern (regex over saved `get_page_text` dumps, since the page
-text is capped at 50k characters and breaks strict JSON parsing).
+Also worth reading early: **#227** (no `catch_unwind` in any worker, and
+`panic = "abort"` in release, so a worker panic kills the process with no card),
+**#229** (desktop-sized GDI bitmap leaks on every region-overlay open),
+**#245** (`units::convert` lets NaN/Infinity reach the card, and the module's
+own doc comment falsely claims otherwise), **#247** (the calendar and fill_form
+prompts open with "You are shown a screenshot", contradicting the non-vision
+OCR preface on every local-model press), **#250** (README still documents the
+pre-rename paths), **#252** (the `fill_form` real-window test is flaky under
+parallel Win32 tests: a stray keystroke prepended an `l` to an email field, a
+false-green risk on the only automated evidence the write path works).
 
-## What the next session does first
+## Unfinished work: nine WIP branches
 
-1. `git push -u origin master` if the owner has not, so the issues' spec links
-   resolve. Commit this session's files first (owner's call on the message).
-2. Phase 0 (milestone "Phase 0 — Rename and go public"): start with
-   `superpowers:writing-plans` against the approved spec, then `tests-first`
-   per task. First issue: the rename with config migration.
-3. Before any task: `working-an-issue`. Before reporting any task done:
-   `wired-to-nothing`.
+Each was committed on its own branch as a single WIP commit so nothing is lost.
+**None is verified. Several will not compile.** Each carries a commit message
+saying so. Finish or discard; do not merge blind.
 
-## To verify by hand
+| Branch suffix | Issues | Where it stopped | New modules it adds |
+|---|---|---|---|
+| `a8b00fdc77b61f899` | #225 | red tests written, about to run them | -- |
+| `ad2368162a616561d` | #236, #237, #238 | nothing on disk; had only read the code | -- |
+| `ac4408ff852377671` | #229, #212 | mid-replacement of `build_background`/`free_background` with an RAII `Background` struct | -- |
+| `a7930078964f7d912` | #224, #216 | DirectWrite palette written, waiting on its first `cargo test ui::palette` | -- |
+| `ad7cea07323f6fcf0` | #219 | clippy clean, re-running tests after fmt | -- |
+| `ac841e1594a42647f` | #109 | adding a `WM_DPICHANGED` test | `src/ui/placement.rs` |
+| `a3881048d133bc867` | #111, #103 | post-fmt test re-run, then the live OCR measurements | `src/redact.rs` |
+| `addbadcfdd437435f` | #21, #101 | updating call sites for a new budget argument | `src/usage.rs`, `src/cost.rs` |
+| `a16117ca859523463` | #42, #202 | checking the test build compiles | -- |
+| `ae8f016c17046c58e` | #105, #106 | testing `known_folder` and `config` | `src/egress.rs`, `src/known_folder.rs` |
 
-Carried over from the packaging work: the owner may still owe the one
-Settings click that points the Copilot key at the app (Settings ▸ Bluetooth
-& devices ▸ Keyboard ▸ Customize Copilot key ▸ Custom). Ask before assuming
-the picker route is live; the hook route works regardless.
+The three merged branches' worktrees are clean and can be removed. All of them
+must be removed and pruned before the folder rename, because a worktree's
+`gitdir` file carries an absolute path.
 
-- **#18/#206 non-vision fallback, end-to-end through a real key press**
-  (overnight agent session, 2026-09-17, branch `worktree-agent-a6dd7c51956060b22`).
-  What was built and verified without the exe: `provider::Chain::complete_parsed_with_fallback`
-  + `provider::non_vision_request` (unit-tested: golden request bodies,
-  laziness, truncation, OCR-failure skip semantics -- see
-  `src/provider/mod.rs`'s new tests) and `app.rs`'s `worker`/`non_vision_inputs`
-  wiring (compiles, clippy/fmt clean, all existing `app::`/`provider::`/`ocr`
-  tests still pass). The live `#[ignore]`d check
-  `provider::tests::non_vision_fallback_live_ocr_to_text_only_ollama_answers_arithmetic`
-  ran for real against this machine's Ollama: a GDI-rendered "What is 17 + 25
-  ?" image, OCR'd, answered by `llama3.2:3b` (text-only, no vision) through
-  the real chain, MEASURED 2026-09-17 elapsed 11.9s, headline `"42"`, model
-  confirmed unloaded afterwards (`/api/ps` empty).
-  **Not yet checked**: the actual Copilot-key path through `App::ask` --
-  `GetForegroundWindow()` captured before `show_pending()`, the UIA snapshot
-  running on its own spawned thread, and `worker()` actually reaching
-  `non_vision_inputs`. Could not run (no live desktop / exe launch in this
-  session; CLAUDE.md rule 8's "checked by hand" observable). To verify: set
-  `providers.order = ["ollama"]` with `[providers.ollama]` `model =
-  "llama3.2:3b"` (or another text-only model), put a readable arithmetic
-  problem on screen, press the Copilot key, and confirm the card shows an
-  answer (not "no providers configured", not a blank/error card) -- that is
-  the one observable that would differ if this wiring were wired to nothing.
+## New tooling this run
 
-- **#62/#36 DPAPI cross-account unreadability** (overnight agent session,
-  2026-09-17, branch `worktree-agent-a16f5b1a39aed9da0`, commits `ed264fb`
-  `src/dpapi.rs` and `ae9c104` `src/profile/`). What was built and verified
-  in this session: `dpapi::protect`/`unprotect` round-trip through the real
-  `CryptProtectData`/`CryptUnprotectData` (17 tests, `cargo test dpapi`,
-  including tamper and wrong/missing entropy failure cases, verified by a
-  temporary mutation that made the relevant tests go red then reverted);
-  `profile::Profile::save_to`/`load_from` round-trip through that envelope
-  at a scratch path, and `saved_file_is_not_plaintext_json` confirms the
-  on-disk bytes are neither the plaintext values nor the plaintext JSON
-  field names (49 tests, `cargo test profile`).
-  **Not yet checked**: actual cross-account unreadability -- this sandbox
-  has one Windows account, so "the database file read from another account
-  yields no plaintext" (#62's and #36's own wording) rests on DPAPI's
-  documented user-scoped contract, not a run against a second account. To
-  verify: on a machine with a second local Windows account, have this
-  build's user account call `Profile::save_to` (or `dpapi::protect`
-  directly) to write a file with a known plaintext marker string, log in as
-  the second account, and confirm `CryptUnprotectData` (or
-  `Profile::load_from`) fails against that file rather than returning the
-  marker -- that is the one observable that would differ if the "user
-  scoped" claim were wrong.
+- **`scripts/merge-agent-branches.sh`** -- merges agent branches one at a time,
+  aborts (never resolves) a conflicting merge, rolls back a merge that does not
+  build, and runs the full suite exactly once at the end. `--dry-run` lists each
+  branch with the files it touches, which is how you plan the merge order.
+  Already used for all three merges above.
+- **`scripts/rename-repo-folder-to-wingman.ps1`** -- see "Do this first".
+- **`.claude/skills/filing-findings/SKILL.md`** -- the shared-machine cargo
+  rules now scale past five agents: `CARGO_BUILD_JOBS=1` from six agents up,
+  plus `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`, because the
+  linker is the RAM peak and debug info is most of what it holds.
+- **`tests/compile_fail.rs`** -- `trybuild` gate for `Confirmed`'s privacy
+  boundary. It does not link against the crate (impossible: bin-only, and
+  `pub(crate)` is invisible from outside anyway). It regenerates a copy of
+  `src/ui/confirm.rs` into a fixture and recreates the intra-crate relationship
+  `src/executors/*.rs` has to it. Proven to fail when `value` is widened to
+  `pub(crate)`. The old `compile_fail` doc example it replaced would never have
+  failed: struct and fabricating fn shared one module.
 
-- **#40 "Fill this form"** (overnight agent session, 2026-09-17, branch
-  `agent-ac805472cc51981c0`). What was built and verified without the exe:
-  the two-stage propose pipeline (`actions::fill_form`: local mapping via
-  `profile::match_label`, the model request/response for whatever stage 1
-  cannot map, the merge, the final `{fields: [...]}` proposal
-  `executors::fill_form` -- already shipped by #33 -- consumes unchanged),
-  the preview translation into the existing `Card::show_preview`/
-  `PreviewModel` machinery (no new Win32 rendering path -- see
-  `actions::fill_form`'s module doc comment for why), `app.rs`'s
-  `fill_form_from_screen`/`on_form_fill_result`/`on_preview_decided`/
-  `restore_last_form` wiring, and the tray's "Fill this form"/"Restore last
-  form" items (`ui::tray`'s own real-window test confirms both ids are
-  real menu items, not orphaned data). 96 tests (`cargo test fill_form`,
-  `cargo test actions`, `cargo test config`, `cargo test ui::tray`,
-  `cargo test app::`), plus a live `#[ignore]`d integration test
-  (`actions::fill_form::tests::win32::fill_form_live_local_mapping_fills_a_whole_form_with_zero_model_calls`,
-  `cargo test fill_form_live -- --ignored`) against a real Win32 window with
-  three labelled EDIT controls and a "Place order" BUTTON: local mapping
-  alone fills all three (asserted `unmapped.is_empty()`, i.e. zero model
-  calls), the button is never even walked as a candidate (`inputs::uia`'s
-  own six-control-type filter), and its `BN_CLICKED` count stays `0`.
-  **Not yet checked**: #40's own literal Done-when ("A checkout page in
-  Chrome is filled with name, email, phone and address; payment fields are
-  untouched") on a REAL Chrome checkout page, and the actual GDI rendering
-  of the preview's translated rows (current -> proposed (from source), and
-  a sensitive field's editable "clear to skip" row) on a real screen --
-  both need a live desktop session and the Copilot key, which this task's
-  constraints rule out ("do not launch the exe"). Filed to #166 (issue
-  comment, this session) as the manual check owed: with a real profile
-  (name, email, phone, address populated, non-sensitive) saved via a
-  `profile.toml` import or a future settings page, open a Chrome checkout
-  form, press the "Fill this form" tray item, confirm the preview shows
-  the right fields with a plausible current/proposed/source line each,
-  press "Do it", and confirm the four fields land in the right controls
-  while every payment field (card number, CVV, expiry) stays untouched --
-  that is the one observable that would differ if this were wired to
-  nothing.
+## What the fan-out shape taught us
 
-## Facts established this session, not derivable from the code
+Ten build agents plus five read-only auditors on one 31 GB machine held fine
+(low was 4.9 GB free, CPU ~52 percent). **The auditors were the better value**:
+they cost no RAM, never touched the tree, and produced 28 findings including all
+three P1s, while the build agents produced three merged issues in the same
+window. On a fixed budget, weight the split further toward auditors. Distinct
+per-agent insertion anchors in `config.rs` worked: zero conflicts across five
+agents adding fields to one 3264-line file.
 
-- Git history contains no key-shaped strings (`git log -p --all` grep for
-  `sk-` patterns, 2026-09-16). The repo is safe to push as it stands.
-- Ollama 0.34.1 is installed. Vision-capable local models: `gemma3:4b`,
-  `gemma3:12b`, `gemma4:12b`, `qwen3.5:2b/4b/9b`. Text-only: `llama3.1:8b`,
-  `qwen3:14b`, `deepseek-r1:14b`, `mistral:7b`, `llama3.2:3b`.
-- Hardware: Core Ultra 7 255H, Intel Arc 140T (shared memory), 31 GB RAM.
-- Screenpipe relicensed to a proprietary commercial license; Piper's successor
-  is GPL-3.0; Open WebUI carries a branding clause. None may be copied from.
+## Manual checks still owed
+
+`#166` is the tracker and got several new entries this run. The #32 bullet's
+stale "nothing calls `ui::confirm::confirm` for a real user click yet" claim was
+corrected (issue #218): that flow has existed since #39/#38 and the box is
+checkable today against a real Notepad field.
+
+Still owed from before: the one Settings click that points the Copilot key at
+the app (Settings > Bluetooth & devices > Keyboard > Customize Copilot key >
+Custom). No script can do it; `HKCU\...\Shell\BrandedKey` is write-protected by
+the shell even in HKCU. The low-level hook works regardless, so "the key
+responds" does not mean the picker route is live.
+
+## Owner decision owed
+
+**#170**: whether to allow lossy JPEG/WebP screenshot encoding instead of
+PNG-only. The issue's own Done-when says this is an owner decision, not a
+technical one. Recommendation: keep PNG and do not add the option. Lossy
+artifacts hurt exactly the small on-screen text the app exists to read, and the
+pixel-budget downscaling already captures most of the payload win.
