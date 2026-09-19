@@ -13,7 +13,7 @@ than the repo, with no Claude Code session open and nothing building.
 
 It cannot be run from inside a session: Windows keeps an open handle on a
 process's current directory. It also moves
-`~\.claude\projects\C--Users-raaif-copilot-ask` (which holds the memory files),
+`~\.claude\projects\C--Users-raaif-Wingman` (which holds the memory files),
 fixes the absolute `CARGO_TARGET_DIR` in both `filing-findings` SKILL.md
 copies, and updates the `Repo:` line in CLAUDE.md and AGENTS.md. Never run, so
 read it before trusting it.

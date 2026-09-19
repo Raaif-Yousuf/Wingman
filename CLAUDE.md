@@ -21,7 +21,7 @@ Cloud or local (Ollama), a purely offline mode, one switch that turns it off.
 follow-ups (owner decision 2026-09-16). Meant to be a community project: the
 action framework is the product and actions are the contribution surface.
 
-**Repo:** `C:\Users\raaif\copilot-ask` | single Rust crate, ~8k LOC, Win32 via
+**Repo:** `C:\Users\raaif\Wingman` | single Rust crate, ~8k LOC, Win32 via
 `windows` 0.62, no async runtime | open source, MIT.
 
 ---

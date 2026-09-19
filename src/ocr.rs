@@ -615,7 +615,7 @@ mod tests {
     ///
     /// Run manually (CLAUDE.md build rules -- never bare `cargo test`):
     /// ```text
-    /// export CARGO_TARGET_DIR=C:/Users/raaif/copilot-ask/target/wt/<worktree> RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2
+    /// export CARGO_TARGET_DIR=C:/Users/raaif/Wingman/target/wt/<worktree> RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2
     /// cargo test ocr_live -- --ignored --nocapture
     /// ```
     /// Prints `MEASURED 2026-09-17:` lines with the cold/warm latency and
