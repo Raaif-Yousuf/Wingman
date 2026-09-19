@@ -19,11 +19,85 @@
 //! trait, extended"). They stay in this file rather than `mod.rs` simply
 //! because that's where the JSON-building imports already are.
 
+use std::cell::Cell;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use serde_json::{json, Value};
+
+use crate::egress;
+use crate::ui::confirm::SendAuthorized;
+
+// ---------------------------------------------------------------------
+// "Show me what you're sending" (#105): a structural send gate.
+//
+// `SEND_AUTHORIZED` is thread-local, not a shared/global flag, because the
+// only real caller (a future `App::ask` once the preview card is wired up,
+// see this section's doc comment below) already crosses from the main
+// thread (which shows the card and gets the user's decision) to a fresh
+// worker thread (which alone calls into this module) per request -- see
+// `app.rs`'s `ask`. [`with_send_authorized`] is meant to wrap exactly that
+// worker closure's call into `Chain::complete`/`complete_parsed*`, so the
+// authorization is scoped to the one request it was granted for and can
+// never leak into an unrelated later request on a reused thread (a fresh
+// `std::thread::spawn` per request already means there is no reuse today,
+// but the explicit reset at the end of `with_send_authorized` keeps that
+// true even if that ever changes).
+//
+// STILL OWED (out of this agent's file scope -- app.rs is contended
+// tonight, see the task's file-scope note): nothing calls
+// `with_send_authorized` yet. Until `App::ask` is wired to show
+// `ui::preview::RequestPreview` via the existing `Card::show_preview`/
+// `PreviewModel` machinery (#26) and calls `ui::confirm::user_confirmed_send`
+// only on "Send", turning `config.egress_preview.enabled` on makes EVERY
+// request fail closed with [`send_preview_guard`]'s error (a card naming
+// why, rule 7) rather than silently sending unreviewed -- which is the
+// correct fail-safe direction for a half-wired safety feature, but is not
+// yet the full "Send/Cancel preview" UX #105 describes.
+// ---------------------------------------------------------------------
+
+thread_local! {
+    static SEND_AUTHORIZED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The only way anything in this crate can make [`send_preview_guard`] pass
+/// while the toggle is on: `authorized` can only have come from
+/// [`crate::ui::confirm::authorize_send`], whose only input is a
+/// `SendToken`, whose only source is
+/// [`crate::ui::confirm::user_confirmed_send`] -- the real preview card's
+/// "Send" handler, once wired (see this module's doc comment above). `f`
+/// runs with the authorization in effect and the flag is always reset
+/// afterward, success or panic-unwind alike (`Drop` guard), so one
+/// confirmed "Send" can never be reused for a second, later request.
+pub(crate) fn with_send_authorized<R>(authorized: SendAuthorized, f: impl FnOnce() -> R) -> R {
+    let _ = authorized;
+    struct ResetOnDrop;
+    impl Drop for ResetOnDrop {
+        fn drop(&mut self) {
+            SEND_AUTHORIZED.with(|c| c.set(false));
+        }
+    }
+    SEND_AUTHORIZED.with(|c| c.set(true));
+    let _reset = ResetOnDrop;
+    f()
+}
+
+/// #105: refuses to proceed when `config::egress_preview_enabled()` is on
+/// and this thread has no live [`with_send_authorized`] scope. No em dash
+/// (rule 11) -- this text reaches the result card verbatim.
+fn send_preview_guard() -> Result<()> {
+    if !crate::config::egress_preview_enabled() {
+        return Ok(());
+    }
+    if SEND_AUTHORIZED.with(|c| c.get()) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "\"Show me what you're sending\" is on, and this request was not shown and confirmed. Nothing was sent."
+        ))
+    }
+}
 
 // ---------------------------------------------------------------------
 // Transport / clock / sleep abstractions (#98)
@@ -415,12 +489,17 @@ pub(crate) fn post_json_with(
     timeout: Duration,
     tag: &str,
 ) -> Result<String> {
+    send_preview_guard()?;
     offline_guard(url)?;
 
     let policy = env.policy;
     let mut retries = 0u32;
     let mut backoff_spent = Duration::ZERO;
     let mut retried_429 = false;
+    // #106: computed once -- `body` never changes across retries of the
+    // same logical request, so every logged attempt for this call shares
+    // the same "bytes sent" figure.
+    let bytes_sent = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
 
     // #186: a wall-clock deadline computed once, up front -- never
     // recomputed from a fresh "now" per attempt, or a slow attempt would
@@ -441,8 +520,17 @@ pub(crate) fn post_json_with(
         // timeout (the default policy's is), but a second or third attempt
         // only gets whatever remains.
         let attempt_timeout = timeout.min(wall_clock_remaining());
+        // #106: this attempt is a retry iff an earlier attempt in THIS call
+        // already failed and asked for another try (a transport/5xx retry
+        // bumps `retries`, a 429 retry-after sets `retried_429`) -- read
+        // before either can change again below, so it describes the
+        // attempt about to happen, not the one that just finished.
+        let is_retry = retries > 0 || retried_429;
 
-        match env.transport.post_json(url, headers, body, attempt_timeout) {
+        let attempt = env.transport.post_json(url, headers, body, attempt_timeout);
+        log_attempt(tag, url, body, is_retry, bytes_sent, &attempt);
+
+        match attempt {
             // #187: a status was already received -- the request almost
             // certainly reached the vendor (and, for a billed completion
             // API, was almost certainly already processed). Never retried
@@ -504,6 +592,65 @@ pub(crate) fn post_json_with(
             }
         }
     }
+}
+
+/// #106: logs one HTTP attempt (success or failure) to the local egress
+/// log, from exactly the values `post_json_with`'s loop already has on
+/// hand -- see `egress.rs`'s module doc comment for what is and is not
+/// recorded. Never touches `headers` (where a key actually lives): it is
+/// not even a parameter here, so there is structurally no path for one to
+/// reach the log through this function.
+fn log_attempt(
+    tag: &str,
+    url: &str,
+    body: &Value,
+    is_retry: bool,
+    bytes_sent: usize,
+    attempt: &std::result::Result<RawResponse, TransportError>,
+) {
+    let entry = match attempt {
+        Ok(resp) if (200..300).contains(&resp.status) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            resp.body.len(),
+            egress::Outcome::Success,
+            None,
+        ),
+        Ok(resp) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            resp.body.len(),
+            egress::Outcome::Failure,
+            Some(&format!("HTTP {}", resp.status)),
+        ),
+        Err(TransportError::NoResponse(e)) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            0,
+            egress::Outcome::Failure,
+            Some(&format!("transport error: {e}")),
+        ),
+        Err(TransportError::BodyReadFailed { status, error }) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            0,
+            egress::Outcome::Failure,
+            Some(&format!("HTTP {status} then body read failed: {error}")),
+        ),
+    };
+    egress::record(&entry);
 }
 
 /// POSTs `body` as JSON to `url` with `headers`, waits up to `timeout`,
@@ -646,33 +793,86 @@ pub(crate) fn post_json_with_connect_timeout(
     total_timeout: Duration,
     tag: &str,
 ) -> Result<String> {
+    send_preview_guard()?;
     offline_guard(url)?;
+
+    // #191: no retry loop here (Ollama is local/loopback and unbilled), so
+    // an attempt logged from this function is never a retry.
+    let bytes_sent = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
 
     let mut builder = ureq::post(url);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
 
-    let mut response = builder
+    let sent = builder
         .config()
         .http_status_as_error(false)
         .timeout_connect(Some(connect_timeout))
         .timeout_global(Some(total_timeout))
         .build()
-        .send_json(body)
-        .map_err(|e| anyhow!("{tag}: transport error: {e}"))?;
+        .send_json(body);
+
+    let mut response = match sent {
+        Ok(r) => r,
+        Err(e) => {
+            egress::record(&egress::build_entry(
+                tag,
+                url,
+                body,
+                false,
+                bytes_sent,
+                0,
+                egress::Outcome::Failure,
+                Some(&format!("transport error: {e}")),
+            ));
+            return Err(anyhow!("{tag}: transport error: {e}"));
+        }
+    };
 
     let status = response.status();
-    let body_text = response
-        .body_mut()
-        .read_to_string()
-        .with_context(|| format!("{tag}: failed to read response body"))?;
+    let body_text = match response.body_mut().read_to_string() {
+        Ok(t) => t,
+        Err(e) => {
+            egress::record(&egress::build_entry(
+                tag,
+                url,
+                body,
+                false,
+                bytes_sent,
+                0,
+                egress::Outcome::Failure,
+                Some(&format!("failed to read response body: {e}")),
+            ));
+            return Err(anyhow!("{tag}: failed to read response body: {e}"));
+        }
+    };
 
     if !status.is_success() {
         let truncated: String = body_text.chars().take(300).collect();
+        egress::record(&egress::build_entry(
+            tag,
+            url,
+            body,
+            false,
+            bytes_sent,
+            body_text.len(),
+            egress::Outcome::Failure,
+            Some(&format!("HTTP {status}: {truncated}")),
+        ));
         return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
     }
 
+    egress::record(&egress::build_entry(
+        tag,
+        url,
+        body,
+        false,
+        bytes_sent,
+        body_text.len(),
+        egress::Outcome::Success,
+        None,
+    ));
     Ok(body_text)
 }
 
@@ -1565,5 +1765,175 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    // -- #105 "Show me what you're sending": the structural send gate ------
+    //
+    // `EGRESS_PREVIEW_TEST_LOCK` is shared with `config.rs`'s and
+    // `ui::confirm`'s own tests -- see that lock's doc comment -- because
+    // `EGRESS_PREVIEW_ENABLED` is one process-wide `AtomicBool` for the
+    // whole test binary.
+
+    #[test]
+    fn post_json_with_never_reaches_the_transport_when_preview_is_on_and_not_authorized() {
+        let _lock = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(true);
+
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let result = run(&transport, &sleeper, &clock);
+
+        crate::config::set_egress_preview_enabled(false);
+
+        let err = result.expect_err("must be refused before any HTTP attempt");
+        assert!(
+            err.to_string().contains("Show me what you're sending"),
+            "{err}"
+        );
+        assert_eq!(
+            transport.call_count(),
+            0,
+            "the transport must never be reached while unconfirmed"
+        );
+    }
+
+    #[test]
+    fn post_json_with_reaches_the_transport_once_authorized_even_with_preview_on() {
+        let _lock = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(true);
+
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let authorized =
+            crate::ui::confirm::authorize_send(crate::ui::confirm::user_confirmed_send());
+        let result = with_send_authorized(authorized, || run(&transport, &sleeper, &clock));
+
+        crate::config::set_egress_preview_enabled(false);
+
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(transport.call_count(), 1);
+    }
+
+    #[test]
+    fn post_json_with_is_unaffected_by_the_gate_when_preview_is_off() {
+        let _lock = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(false);
+
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let result = run(&transport, &sleeper, &clock);
+
+        assert_eq!(result.unwrap(), "done", "default behaviour must be unchanged");
+        assert_eq!(transport.call_count(), 1);
+    }
+
+    #[test]
+    fn with_send_authorized_resets_the_flag_after_the_closure_returns() {
+        let _lock = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(true);
+
+        let authorized =
+            crate::ui::confirm::authorize_send(crate::ui::confirm::user_confirmed_send());
+        with_send_authorized(authorized, || {});
+        // Authorization must not outlive the closure it was granted for --
+        // a second, unrelated attempt on the same thread must be refused
+        // again.
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let result = run(&transport, &sleeper, &clock);
+
+        crate::config::set_egress_preview_enabled(false);
+
+        assert!(result.is_err(), "authorization must not leak past its scope");
+        assert_eq!(transport.call_count(), 0);
+    }
+
+    // -- #106: egress logging from the real HTTP boundary -------------------
+
+    #[test]
+    fn post_json_with_logs_a_successful_attempt_to_the_egress_log() {
+        let _lock = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        run(&transport, &sleeper, &clock).unwrap();
+
+        let log = crate::egress::read_all();
+        assert!(log.contains("\"provider\":\"anthropic\""), "{log}");
+        assert!(log.contains("\"outcome\":\"success\""), "{log}");
+    }
+
+    #[test]
+    fn post_json_with_logs_the_retry_attempt_as_retried() {
+        let _lock = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+
+        let transport = ScriptedTransport::new(vec![no_response("connection refused"), ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        run(&transport, &sleeper, &clock).unwrap();
+
+        let log = crate::egress::read_all();
+        // One failed (not retried) attempt, then one successful retried one.
+        assert!(log.contains("\"retried\":false"), "{log}");
+        assert!(log.contains("\"retried\":true"), "{log}");
+        assert!(log.contains("\"outcome\":\"failure\""), "{log}");
+    }
+
+    /// #106's single most important test, at the real HTTP boundary: a fake
+    /// key in the `Authorization` header AND echoed back in a vendor error
+    /// body must appear NOWHERE in the resulting egress log.
+    #[test]
+    fn post_json_with_never_logs_a_fake_key_from_headers_or_a_failing_response_body() {
+        let _lock = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+
+        let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
+        let body_text = format!("{{\"error\": \"invalid api key {fake_key}\"}}");
+        let auth_header = format!("Bearer {fake_key}");
+        let headers: [(&str, &str); 1] = [("authorization", &auth_header)];
+
+        let transport = ScriptedTransport::new(vec![status(401, vec![], &body_text)]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
+
+        let _ = post_json_with(
+            &env,
+            "https://example.invalid/",
+            &headers,
+            &json!({"model": "claude-opus-5"}),
+            Duration::from_secs(1),
+            "anthropic",
+        );
+
+        let log = crate::egress::read_all();
+        assert!(!log.contains(fake_key), "{log}");
     }
 }

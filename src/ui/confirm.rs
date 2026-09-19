@@ -157,6 +157,51 @@ pub(crate) fn auto_confirm_read_only(
     })
 }
 
+// ---------------------------------------------------------------------
+// #105 "Show me what you're sending": the same type-state shape as
+// `ConfirmationToken`/`Confirmed<P>` above, applied to a different
+// decision -- not "run the executor on this proposal" but "let this
+// request actually leave the machine". See `provider::common`'s
+// `send_preview_guard`/`with_send_authorized` for where the resulting
+// `SendAuthorized` is spent, and that module's doc comment for what still
+// has to call `user_confirmed_send` before this is wired end to end.
+// ---------------------------------------------------------------------
+
+/// Proof the user pressed "Send" on the egress preview card (#105). A
+/// private-field newtype, exactly like [`ConfirmationToken`]: the only way
+/// to obtain one is [`user_confirmed_send`].
+pub struct SendToken(());
+
+/// The one thing [`crate::provider::common::with_send_authorized`] accepts.
+/// Unlike [`Confirmed<P>`], this carries no value -- the request itself
+/// never passes through this module on the send path, only proof that a
+/// decision happened. Field-private for the same reason `Confirmed`'s is:
+/// nothing outside this module can construct one directly.
+#[allow(dead_code)]
+pub struct SendAuthorized(());
+
+/// Stand-in for the future preview card's "Send" / Enter handler, mirroring
+/// [`user_confirmed`]'s doc comment: nothing calls this yet (#105's
+/// remaining wiring is `App::ask` showing `ui::preview::RequestPreview` via
+/// the existing `Card::show_preview` machinery and calling this only on
+/// "Send"), so it exists now purely so [`authorize_send`] has exactly one
+/// sanctioned caller shape to compile against.
+#[allow(dead_code)]
+pub(crate) fn user_confirmed_send() -> SendToken {
+    SendToken(())
+}
+
+/// The only way to turn a [`SendToken`] into a [`SendAuthorized`]. Since
+/// `token` can only have come from [`user_confirmed_send`], and
+/// `SendAuthorized`'s field is private to this module, nothing outside this
+/// module can ever produce a `SendAuthorized` -- which is exactly what
+/// makes `provider::common::send_preview_guard` a structural gate rather
+/// than a checked boolean a caller could simply forget to set.
+#[allow(dead_code)]
+pub(crate) fn authorize_send(_token: SendToken) -> SendAuthorized {
+    SendAuthorized(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +325,25 @@ mod tests {
             !err.to_string().contains('\u{2014}'),
             "no em dashes in card-facing text (rule 11): {err}"
         );
+    }
+
+    // -- #105: SendToken / SendAuthorized ---------------------------------
+
+    #[test]
+    fn user_confirmed_send_then_authorize_send_produces_a_send_authorized() {
+        // The compile-time property is the real guarantee here (this
+        // function's whole body would fail to compile if `SendAuthorized`
+        // could be built any other way -- see the module doc comment's
+        // "Rust field privacy" note) -- this test just exercises the
+        // sanctioned path end to end.
+        let token = user_confirmed_send();
+        let _authorized: SendAuthorized = authorize_send(token);
+    }
+
+    #[test]
+    fn with_send_authorized_runs_the_closure_and_returns_its_value() {
+        let authorized = authorize_send(user_confirmed_send());
+        let result = crate::provider::common::with_send_authorized(authorized, || 42);
+        assert_eq!(result, 42);
     }
 }

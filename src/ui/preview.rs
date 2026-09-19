@@ -250,6 +250,145 @@ fn label_for(name: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------
+// #105 "Show me what you're sending": the pending-request analogue of the
+// proposal preview above. `PreviewModel` renders what a MODEL is about to
+// return; `RequestPreview` renders what is about to be SENT to the model --
+// deliberately built to feed the exact same `PreviewModel::from_schema`/
+// `Card::show_preview` machinery (a pseudo-schema plus a value, the same
+// shape `actions::fill_form`'s form_fill preview already uses) rather than
+// a second rendering path.
+// ---------------------------------------------------------------------
+
+/// One image about to be sent, reduced to what's safe and useful to show:
+/// its size and pixel dimensions, never a rendered thumbnail -- `card.rs`'s
+/// preview state only ever draws text rows today (see [`Field`] above), so
+/// there is no image-rendering surface yet for this to hand a thumbnail to
+/// even if it wanted to. This is the issue's own documented fallback ("the
+/// image, or its dimensions and size if you cannot render it").
+///
+/// If issue #103's redaction work has landed by the time a real thumbnail
+/// preview is built, that later code must render the REDACTED image here,
+/// never the original -- showing the unredacted image in a "here's what's
+/// being sent" preview would be exactly the lie #103 exists to prevent.
+/// This type carries no pixels at all, so that dependency does not apply to
+/// it, only to whatever eventually adds real image rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestImagePreview {
+    pub size_bytes: usize,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+/// Everything about to be sent in one [`crate::provider::Request`], reduced
+/// to what a confirm-before-send preview should show. Unlike the egress
+/// log (`egress.rs`), which deliberately never stores content, this DOES
+/// carry the real `system`/`user` text -- it exists only transiently on
+/// screen for the user to read before confirming, which is a fundamentally
+/// different privacy posture than writing it to a persistent file (see
+/// `egress.rs`'s module doc comment for that contrast spelled out).
+///
+/// Never carries anything from a request's HTTP headers (where a key
+/// actually lives) -- [`RequestPreview::from_request`] only ever reads a
+/// [`crate::provider::Request`], which has no field for one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestPreview {
+    pub images: Vec<RequestImagePreview>,
+    pub system_text: String,
+    pub user_text: String,
+    /// Always `0` today -- knowledge snippets are unbuilt Phase 3b work
+    /// (#85 onwards). Kept as a field so #85 only has to populate it.
+    pub snippet_count: usize,
+}
+
+impl RequestPreview {
+    pub fn from_request(req: &crate::provider::Request) -> Self {
+        let images = req
+            .images
+            .iter()
+            .map(|png| {
+                let dims = crate::egress::png_dimensions(png);
+                RequestImagePreview {
+                    size_bytes: png.len(),
+                    width: dims.map(|d| d.0),
+                    height: dims.map(|d| d.1),
+                }
+            })
+            .collect();
+        Self {
+            images,
+            system_text: req.system.clone(),
+            user_text: req.user.clone(),
+            snippet_count: 0,
+        }
+    }
+
+    /// Builds a `(schema, value)` pair compatible with the existing
+    /// `PreviewModel::from_schema`/`Card::show_preview` (#26) so the real
+    /// preview card, once wired (see `provider::common`'s module doc
+    /// comment on what's still owed), needs no second rendering path.
+    /// Every property is display-only: none sets `"editable": true`, so
+    /// `PreviewModel::from_schema` builds every field non-editable by
+    /// construction -- confirming this preview can never "edit" the value
+    /// into something the request being sent doesn't actually carry.
+    pub fn to_schema_and_value(&self) -> (Value, Value) {
+        let mut properties = Map::new();
+        let mut value = Map::new();
+
+        for (i, img) in self.images.iter().enumerate() {
+            let key = format!("image_{i}");
+            let label = match (img.width, img.height) {
+                (Some(w), Some(h)) => format!("Image {} ({w} x {h})", i + 1),
+                _ => format!("Image {}", i + 1),
+            };
+            properties.insert(key.clone(), serde_json::json!({"type": "string", "label": label}));
+            value.insert(key, Value::String(human_bytes(img.size_bytes)));
+        }
+
+        if !self.system_text.is_empty() {
+            properties.insert(
+                "system".to_string(),
+                serde_json::json!({"type": "string", "label": "System prompt"}),
+            );
+            value.insert("system".to_string(), Value::String(self.system_text.clone()));
+        }
+
+        properties.insert(
+            "user".to_string(),
+            serde_json::json!({"type": "string", "label": "Text"}),
+        );
+        value.insert("user".to_string(), Value::String(self.user_text.clone()));
+
+        properties.insert(
+            "snippets".to_string(),
+            serde_json::json!({"type": "string", "label": "Knowledge snippets"}),
+        );
+        value.insert(
+            "snippets".to_string(),
+            Value::String(if self.snippet_count == 0 {
+                "none".to_string()
+            } else {
+                self.snippet_count.to_string()
+            }),
+        );
+
+        (
+            serde_json::json!({"properties": Value::Object(properties)}),
+            Value::Object(value),
+        )
+    }
+}
+
+fn human_bytes(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1} MB", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1} KB", n as f64 / 1_000.0)
+    } else {
+        format!("{n} bytes")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +680,129 @@ mod tests {
         let changed = model.set_value("location", "Room 9");
         assert!(!changed);
         assert_eq!(model.to_value()["location"], "Room 2");
+    }
+}
+
+#[cfg(test)]
+mod request_preview_tests {
+    use super::*;
+    use crate::provider::{Effort, Request};
+
+    fn tiny_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&[0, 0, 0, 13]);
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        bytes
+    }
+
+    fn request_with(system: &str, user: &str, images: Vec<Vec<u8>>) -> Request {
+        Request {
+            system: system.to_string(),
+            user: user.to_string(),
+            images,
+            schema: None,
+            effort: Effort::Unset,
+            max_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn from_request_carries_the_real_text_verbatim() {
+        // #105: unlike the egress log, the preview shows the actual text --
+        // it exists only transiently on screen, never persisted.
+        let req = request_with("Be helpful.", "What is on screen?", vec![]);
+        let preview = RequestPreview::from_request(&req);
+        assert_eq!(preview.system_text, "Be helpful.");
+        assert_eq!(preview.user_text, "What is on screen?");
+        assert!(preview.images.is_empty());
+        assert_eq!(preview.snippet_count, 0);
+    }
+
+    #[test]
+    fn from_request_reads_real_dimensions_from_the_png() {
+        let req = request_with("", "Check my working.", vec![tiny_png(340, 200)]);
+        let preview = RequestPreview::from_request(&req);
+        assert_eq!(preview.images.len(), 1);
+        assert_eq!(preview.images[0].width, Some(340));
+        assert_eq!(preview.images[0].height, Some(200));
+        assert_eq!(preview.images[0].size_bytes, tiny_png(340, 200).len());
+    }
+
+    #[test]
+    fn from_request_degrades_to_no_dimensions_for_an_undecodable_image() {
+        let req = request_with("", "hi", vec![vec![1, 2, 3]]);
+        let preview = RequestPreview::from_request(&req);
+        assert_eq!(preview.images.len(), 1);
+        assert_eq!(preview.images[0].width, None);
+        assert_eq!(preview.images[0].height, None);
+        assert_eq!(preview.images[0].size_bytes, 3);
+    }
+
+    #[test]
+    fn to_schema_and_value_feeds_previewmodel_directly() {
+        // The whole point of building a (schema, value) pair: it must be
+        // usable by the EXISTING `PreviewModel::from_schema` with no
+        // adapter code, proving there is one preview rendering path, not
+        // two.
+        let req = request_with("Be helpful.", "What is on screen?", vec![tiny_png(340, 200)]);
+        let preview = RequestPreview::from_request(&req);
+        let (schema, value) = preview.to_schema_and_value();
+        let model = PreviewModel::from_schema(&schema, &value);
+
+        let user_field = model.fields().iter().find(|f| f.name == "user").unwrap();
+        assert_eq!(user_field.value, "What is on screen?");
+
+        let image_field = model
+            .fields()
+            .iter()
+            .find(|f| f.name == "image_0")
+            .unwrap();
+        assert!(image_field.label.contains("340 x 200"), "{image_field:?}");
+    }
+
+    #[test]
+    fn to_schema_and_value_never_marks_any_field_editable() {
+        // Confirming what's about to be sent must never let the card "edit"
+        // it into something the actual request doesn't carry.
+        let req = request_with("sys", "hi", vec![tiny_png(1, 1)]);
+        let preview = RequestPreview::from_request(&req);
+        let (schema, value) = preview.to_schema_and_value();
+        let model = PreviewModel::from_schema(&schema, &value);
+        for field in model.fields() {
+            assert!(!field.editable, "{field:?} must not be editable");
+        }
+    }
+
+    #[test]
+    fn to_schema_and_value_shows_none_for_snippets_today() {
+        let req = request_with("", "hi", vec![]);
+        let preview = RequestPreview::from_request(&req);
+        let (schema, value) = preview.to_schema_and_value();
+        let model = PreviewModel::from_schema(&schema, &value);
+        let snippets = model
+            .fields()
+            .iter()
+            .find(|f| f.name == "snippets")
+            .unwrap();
+        assert_eq!(snippets.value, "none");
+    }
+
+    #[test]
+    fn from_request_never_carries_a_fake_key_that_is_not_even_a_request_field() {
+        // #105's safety requirement, exercised at the preview layer: a
+        // `Request` has no field a key could occupy in the first place, so
+        // building a preview from one structurally cannot leak a key --
+        // this test documents and locks in that guarantee against a future
+        // change that might add a `headers` field to `Request` and
+        // naively thread it through here too.
+        let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
+        let req = request_with("Be helpful.", "What is on screen?", vec![]);
+        let preview = RequestPreview::from_request(&req);
+        let (schema, value) = preview.to_schema_and_value();
+        assert!(!schema.to_string().contains(fake_key));
+        assert!(!value.to_string().contains(fake_key));
     }
 }
