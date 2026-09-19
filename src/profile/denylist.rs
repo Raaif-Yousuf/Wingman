@@ -49,148 +49,29 @@ pub fn check_field(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-// -- card numbers: Luhn-valid 12-19 digit runs, separators allowed --------
+// -- card numbers, IBAN: value-shape checks -------------------------------
+//
+// #220 (closed): these used to be their own implementation here, read by
+// nothing else, on the theory that only a profile write/load ever needed a
+// value-shape check (a `"model"`-sourced form_fill value had no equivalent
+// guarantee, and neither `actions::fill_form::merge_model_response` nor
+// `executors::fill_form::evaluate_resolved_field` called anything here).
+// Both now read from `crate::payment_denylist`, which owns the Luhn/IBAN
+// logic canonically, the same reconciliation #215 already did for the
+// label-shaped term tables just below. `luhn_valid` is exposed there as
+// `pub(crate)` purely so this file's own tests can still exercise the
+// checksum in isolation, the same way they did before the move.
 
-/// True if `text` contains a run of digits, optionally separated by spaces
-/// or hyphens, whose digit count is 12 to 19 (the range real card numbers
-/// fall in) and which passes the Luhn checksum.
 fn contains_card_number(text: &str) -> bool {
-    for run in digit_runs_with_separators(text) {
-        let len = run.len();
-        if (12..=19).contains(&len) && luhn_valid(&run) {
-            return true;
-        }
-    }
-    false
+    crate::payment_denylist::contains_card_number(text)
 }
 
-/// Extracts maximal runs of `[0-9 -]` from `text`, returning just the
-/// digits of each run (separators stripped), split wherever a character
-/// outside that set appears. A run with fewer than 2 digits is not
-/// emitted; a lone digit can never be a card number.
-fn digit_runs_with_separators(text: &str) -> Vec<String> {
-    let mut runs = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_digit() {
-            current.push(ch);
-        } else if ch == ' ' || ch == '-' {
-            // separator inside a run: keep scanning, contributes no digit
-        } else {
-            if current.len() >= 2 {
-                runs.push(std::mem::take(&mut current));
-            } else {
-                current.clear();
-            }
-        }
-    }
-    if current.len() >= 2 {
-        runs.push(current);
-    }
-    runs
-}
-
-/// Standard Luhn checksum over an all-digit string.
 fn luhn_valid(digits: &str) -> bool {
-    let mut sum = 0u32;
-    let mut double = false;
-    for ch in digits.chars().rev() {
-        let mut d = ch.to_digit(10).expect("digits() only yields ASCII digits");
-        if double {
-            d *= 2;
-            if d > 9 {
-                d -= 9;
-            }
-        }
-        sum += d;
-        double = !double;
-    }
-    sum % 10 == 0
+    crate::payment_denylist::luhn_valid(digits)
 }
 
-// -- IBAN: mod-97 valid ----------------------------------------------------
-
-/// True if `text` contains a substring shaped like a real IBAN (2 letters +
-/// 2 check digits + 11-30 more alphanumerics, spaces allowed between every
-/// 4 characters as IBANs are conventionally printed) that passes the
-/// ISO 7064 MOD97-10 check.
 fn contains_iban(text: &str) -> bool {
-    for run in alnum_runs_with_spaces(text) {
-        let len = run.len();
-        if (15..=34).contains(&len) && iban_mod97_valid(&run) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Extracts maximal runs of ASCII letters/digits from `text`, treating
-/// spaces as separators that do not end a run (so `"GB29 NWBK 6016 1331
-/// 9268 19"` becomes one run), split wherever any other character appears.
-fn alnum_runs_with_spaces(text: &str) -> Vec<String> {
-    let mut runs = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() {
-            current.push(ch.to_ascii_uppercase());
-        } else if ch == ' ' {
-            // separator inside a run
-        } else {
-            if current.len() >= 4 {
-                runs.push(std::mem::take(&mut current));
-            } else {
-                current.clear();
-            }
-        }
-    }
-    if current.len() >= 4 {
-        runs.push(current);
-    }
-    runs
-}
-
-/// ISO 7064 MOD97-10: move the first 4 characters to the end, convert every
-/// letter to two digits (A=10 .. Z=35), and check the resulting number is
-/// congruent to 1 mod 97. Requires the first two characters to be letters
-/// (the IBAN country code) and the next two to be digits (the IBAN check
-/// digits) before attempting the arithmetic, so an arbitrary 15+ char
-/// alphanumeric string (a long ID, a hex hash) is rejected up front rather
-/// than by coincidentally failing the checksum.
-fn iban_mod97_valid(candidate: &str) -> bool {
-    let chars: Vec<char> = candidate.chars().collect();
-    if chars.len() < 15 {
-        return false;
-    }
-    if !chars[0].is_ascii_alphabetic() || !chars[1].is_ascii_alphabetic() {
-        return false;
-    }
-    if !chars[2].is_ascii_digit() || !chars[3].is_ascii_digit() {
-        return false;
-    }
-
-    let rearranged: String = chars[4..].iter().chain(chars[0..4].iter()).collect();
-
-    // Fold each character into the running remainder mod 97: a digit
-    // contributes one decimal digit, a letter contributes its two-digit
-    // A=10..Z=35 value, one digit at a time so the running number never
-    // needs to be materialized in full.
-    let mut remainder: u64 = 0;
-    for ch in rearranged.chars() {
-        let value = if ch.is_ascii_digit() {
-            ch.to_digit(10).unwrap() as u64
-        } else if ch.is_ascii_alphabetic() {
-            (ch as u64) - ('A' as u64) + 10
-        } else {
-            return false;
-        };
-        if value >= 10 {
-            remainder = (remainder * 10 + value / 10) % 97;
-            remainder = (remainder * 10 + value % 10) % 97;
-        } else {
-            remainder = (remainder * 10 + value) % 97;
-        }
-    }
-    remainder == 1
+    crate::payment_denylist::contains_iban(text)
 }
 
 // -- CVV / bank-account / routing labels ------------------------------------
