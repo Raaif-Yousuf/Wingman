@@ -234,6 +234,12 @@ pub fn run() -> Result<()> {
     // and `provider::common`'s Offline guard must be correctly configured
     // from the very first request, not just from the first tray click).
     mode::set_current(config.mode);
+    // #105: same reason as the mode above. `provider::common`'s send
+    // guard reads this process-wide mirror, not `Config`, so it has to
+    // be published before anything can reach the HTTP boundary. Without
+    // this line the toggle is permanently off and the preview never
+    // appears, whatever config.toml says.
+    crate::config::set_egress_preview_enabled(config.egress_preview.enabled);
     let chain = Arc::new(config.build_chain());
 
     let hwnd = create_owner_window(instance)?;
@@ -1593,6 +1599,31 @@ impl App {
         }
     }
 
+    /// #106: puts the whole local egress log on the clipboard, human
+    /// readable. The on-disk format stays JSON lines (machine readable,
+    /// ready for #46's SQLite import); nobody should have to read raw JSON
+    /// pasted into a bug report, so `egress::read_all_human` renders it.
+    ///
+    /// This is the "see it" half of #106. The log has no page of its own
+    /// because the WebView2 settings host does not exist yet (#44/#51);
+    /// this is the same answer #124 gave diagnostics, and it is what makes
+    /// `egress::read_all`/`render_human`/`read_all_human` reachable from a
+    /// real user gesture rather than from tests only.
+    fn copy_egress_log(&mut self) {
+        let report = crate::diagnostics::egress_report();
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
+            Ok(()) => self.card.show_answer(
+                "Egress log copied",
+                "Every request this app has made, oldest first.",
+                6,
+                None,
+            ),
+            Err(e) => self
+                .card
+                .show_error("Couldn't copy the egress log", &format!("{e}")),
+        }
+    }
+
     /// Issue #115: "Calculate selection" tray item. Model-free: reads the
     /// current selection (UIA, falling back to a clipboard-safe Ctrl+C --
     /// see `inputs::selection`) and evaluates it locally via `calc`, with no
@@ -1872,6 +1903,10 @@ impl App {
     /// Push `self.config` into everything that caches a piece of it.
     fn apply_config(&mut self) {
         self.chain = Arc::new(self.config.build_chain());
+        // #105: keep the process-wide mirror in sync with a Reload or a
+        // Settings save, the same way `set_mode` already does for the mode.
+        // A hand-edited `[egress_preview]` otherwise needs a full restart.
+        crate::config::set_egress_preview_enabled(self.config.egress_preview.enabled);
         self.card.set_text_scale(self.config.ui.text_scale);
         if let Some(hook) = &self.hook {
             hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
@@ -3222,6 +3257,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
                     MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
+                    MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
                     MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
                     MenuChoice::Command(cmd::USE_OPENAI) => app.set_provider(true),
                     MenuChoice::Command(cmd::USE_ANTHROPIC) => app.set_provider(false),

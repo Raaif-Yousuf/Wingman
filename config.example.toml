@@ -96,3 +96,6 @@ router_threshold = 0.7
 
 [forms]
 require_tick_for = "sensitive"
+
+[egress_preview]
+enabled = false

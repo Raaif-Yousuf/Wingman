@@ -125,6 +125,13 @@ pub mod cmd {
     /// the clipboard. See `App::copy_diagnostics` in `app.rs`.
     pub const COPY_DIAGNOSTICS: u32 = 1019;
 
+    /// Issue #106: copies the local egress log (every request this app has
+    /// made: time, provider, model, what was attached, bytes, outcome) to
+    /// the clipboard. There is no settings window to give it a page yet
+    /// (#44/#51), so this is the same answer #124 gave diagnostics. See
+    /// `App::copy_egress_log` in `app.rs` and `egress::read_all_human`.
+    pub const COPY_EGRESS_LOG: u32 = 1028;
+
     /// Issue #41: "Copy text from screen" -- OCR the active monitor and copy
     /// the text to the clipboard, offline and model-free. See
     /// `App::extract_text` in `app.rs` and `actions::extract_text`. The
@@ -542,6 +549,7 @@ impl Tray {
         append_item(hmenu, cmd::EDIT_SETTINGS, "Open config.toml")?;
         append_item(hmenu, cmd::RELOAD, "Reload settings")?;
         append_item(hmenu, cmd::COPY_DIAGNOSTICS, "Copy diagnostics")?;
+        append_item(hmenu, cmd::COPY_EGRESS_LOG, "Copy egress log")?;
         append_separator(hmenu)?;
         append_item(hmenu, cmd::QUIT, "Quit")?;
         Ok(())
@@ -1339,6 +1347,53 @@ mod tests {
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 
+    #[test]
+    fn copy_egress_log_item_is_present_in_the_built_menu() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetMenuItemInfoW, CW_USEDEFAULT, WINDOW_EX_STYLE,
+            WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray copy-egress-log test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+
+        let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu).expect("build_menu");
+
+        let mut info = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STATE,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(hmenu, cmd::COPY_EGRESS_LOG, false, &mut info) }.expect(
+            "cmd::COPY_EGRESS_LOG must be a real item id in the built menu, not orphaned data",
+        );
+
+        let _ = unsafe { DestroyMenu(hmenu) };
+        drop(tray);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
     // -- #38: "Review this email" is reachable from the menu -----------------
 
     #[test]
@@ -1505,6 +1560,7 @@ mod tests {
         ("MODE_AUTO", cmd::MODE_AUTO),
         ("MODE_OFFLINE", cmd::MODE_OFFLINE),
         ("COPY_DIAGNOSTICS", cmd::COPY_DIAGNOSTICS),
+        ("COPY_EGRESS_LOG", cmd::COPY_EGRESS_LOG),
         ("EXTRACT_TEXT", cmd::EXTRACT_TEXT),
         ("CALCULATE_SELECTION", cmd::CALCULATE_SELECTION),
         ("COPY_REGION", cmd::COPY_REGION),
@@ -1514,6 +1570,84 @@ mod tests {
         ("FILL_FORM", cmd::FILL_FORM),
         ("RESTORE_LAST_FORM", cmd::RESTORE_LAST_FORM),
     ];
+
+    /// Issue #234, half of it: every id in [`ALL_FIXED_CMD_IDS`] must be a
+    /// real item in some menu the user can open, not orphaned data. This
+    /// generalizes the hand-written `*_item_is_present_in_the_built_menu`
+    /// tests above so a newly added id cannot be forgotten.
+    ///
+    /// The menu is state-dependent, so "some menu" means the union over
+    /// both pause states: `RESUME` appears only while paused, and the whole
+    /// `PAUSE_*` submenu only while running (see `build_menu`). Checking one
+    /// state alone reports the other state's items as orphaned, which is
+    /// how this test failed the first time it ran.
+    ///
+    /// The other half of #234 (proving each id also has a `WM_COMMAND` arm
+    /// in `app.rs`'s `wnd_proc`) is not covered here: that match lives in
+    /// another module and a test cannot see it.
+    #[test]
+    fn every_fixed_cmd_id_is_a_real_item_in_the_built_menu() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetMenuItemInfoW, CW_USEDEFAULT, WINDOW_EX_STYLE,
+            WS_OVERLAPPED,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray cmd-id exhaustiveness test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let mut tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+
+        let mut found = std::collections::HashSet::new();
+        for paused in [false, true] {
+            tray.set_paused(paused);
+            let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+            tray.build_menu(hmenu).expect("build_menu");
+            for (_, id) in ALL_FIXED_CMD_IDS {
+                let mut info = MENUITEMINFOW {
+                    cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_STATE,
+                    ..Default::default()
+                };
+                if unsafe { GetMenuItemInfoW(hmenu, *id, false, &mut info) }.is_ok() {
+                    found.insert(*id);
+                }
+            }
+            let _ = unsafe { DestroyMenu(hmenu) };
+        }
+
+        let missing: Vec<String> = ALL_FIXED_CMD_IDS
+            .iter()
+            .filter(|(_, id)| !found.contains(id))
+            .map(|(name, id)| format!("{name} ({id})"))
+            .collect();
+
+        drop(tray);
+        let _ = unsafe { DestroyWindow(hwnd) };
+
+        assert!(
+            missing.is_empty(),
+            "these cmd ids exist but are in no menu the user can open, in either pause state: {}",
+            missing.join(", ")
+        );
+    }
 
     #[test]
     fn fixed_cmd_ids_are_pairwise_unique() {

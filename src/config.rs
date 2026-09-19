@@ -69,6 +69,13 @@ pub struct Config {
     /// #40 "Fill this form". See [`Forms`]'s own doc comment for the
     /// still-owed owner decision this carries.
     pub forms: Forms,
+    /// #105 "Show me what you're sending". Default off (existing behaviour
+    /// unchanged): there is no Settings UI to flip this yet
+    /// (`ui/settings.rs`, Phase 3), so today the only way to turn it on is
+    /// hand-editing `config.toml`. See [`EgressPreview`]'s own doc comment
+    /// and `provider::common`'s `send_preview_guard` for what turning it on
+    /// actually does today versus what still has to be wired up.
+    pub egress_preview: EgressPreview,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -3332,5 +3339,96 @@ text_scale = 0.0
             assert_eq!(key, "sentinel-value", "{provider} via {var}");
             std::env::remove_var(var);
         }
+    }
+}
+
+/// #105 "Show me what you're sending": a toggle that shows the exact
+/// request about to leave the machine (image dims/size, text, snippets)
+/// with a Send or Cancel before it does. `enabled` alone does not, by
+/// itself, make that preview happen -- see `provider::common`'s
+/// `send_preview_guard`/`with_send_authorized` and `ui::confirm`'s
+/// `SendToken`/`SendAuthorized` for the structural gate this flag feeds,
+/// and that module's doc comment for exactly what still needs wiring
+/// (`App::ask` showing `ui::preview::RequestPreview`) before turning this on
+/// produces the real Send/Cancel UX rather than every request failing
+/// closed with a card naming why.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EgressPreview {
+    pub enabled: bool,
+}
+
+/// Process-wide mirror of `Config::egress_preview.enabled`, read by
+/// `provider::common::send_preview_guard` on every completion request --
+/// the same "decision lives in `mode.rs`/config, enforcement lives in
+/// `provider/common.rs`" division of labor `mode::is_offline_now` already
+/// uses, and for the same reason: `post_json_with` has a `Config`
+/// reference nowhere in its call chain, only a URL/body/headers/tag.
+///
+/// STILL OWED (app.rs is out of this agent's file scope tonight, see the
+/// task's file-scope note): nothing calls [`set_egress_preview_enabled`]
+/// yet. `App::run` needs to call it once at startup right alongside its
+/// existing `mode::set_current(config.mode)` call, and `ui::settings`
+/// needs to call it again whenever the user changes the setting (once a
+/// Settings UI for it exists -- Phase 3, `ui/settings_window.rs`). Until
+/// then this defaults to `false`, so `egress_preview_enabled()` always
+/// returns `false` and every existing request path is completely
+/// unaffected -- verified by
+/// `egress_preview_enabled_defaults_to_false_until_something_sets_it` below.
+static EGRESS_PREVIEW_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Serializes every test in the crate that mutates
+/// [`EGRESS_PREVIEW_ENABLED`] -- it is process-wide, so `cargo test`'s
+/// default parallelism means a test in `provider::common` toggling it can
+/// otherwise interleave with one here or in `ui::confirm`. Not `#[cfg(test)]`
+/// itself (a `pub(crate)` item gated that way could not be named from
+/// another module's own `#[cfg(test)]` code in a normal build), but it is
+/// only ever locked from test code.
+#[allow(dead_code)] // Only locked from test code; see the doc comment above.
+pub(crate) static EGRESS_PREVIEW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn set_egress_preview_enabled(on: bool) {
+    EGRESS_PREVIEW_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn egress_preview_enabled() -> bool {
+    EGRESS_PREVIEW_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod egress_preview_tests {
+    use super::*;
+
+    // A process-wide `static` is shared across every test in the crate
+    // (including `provider::common`'s and `ui::confirm`'s, which also
+    // exercise this flag), so every mutating test locks the SAME shared
+    // `EGRESS_PREVIEW_TEST_LOCK`, not a module-local one, and always
+    // restores the default before releasing it.
+
+    #[test]
+    fn egress_preview_defaults_to_disabled_in_a_fresh_config() {
+        let config = Config::default();
+        assert!(!config.egress_preview.enabled);
+    }
+
+    #[test]
+    fn set_egress_preview_enabled_is_reflected_by_the_getter() {
+        let _guard = EGRESS_PREVIEW_TEST_LOCK.lock().unwrap();
+        set_egress_preview_enabled(true);
+        assert!(egress_preview_enabled());
+        set_egress_preview_enabled(false);
+        assert!(!egress_preview_enabled());
+    }
+
+    #[test]
+    fn egress_preview_enabled_defaults_to_false_until_something_sets_it() {
+        let _guard = EGRESS_PREVIEW_TEST_LOCK.lock().unwrap();
+        // Simulates a fresh process that never called `set_egress_preview_enabled`
+        // at all (today's real state, per this module's doc comment: nothing
+        // calls it yet) by explicitly resetting to the documented default
+        // before asserting it.
+        set_egress_preview_enabled(false);
+        assert!(!egress_preview_enabled());
     }
 }

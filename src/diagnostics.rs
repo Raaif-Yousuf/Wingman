@@ -222,6 +222,18 @@ pub fn render_report(input: &DiagnosticsInput) -> String {
     out
 }
 
+/// Issue #106's "way to see it that works today": the "Copy egress log"
+/// tray item, alongside "Copy diagnostics" above. There is no settings
+/// window yet to give the log its own page (#44/#51 -- the WebView2
+/// settings host does not exist), so this is the same "no page, but not
+/// invisible either" answer #124 already gave diagnostics: read the real
+/// `egress.log` (`egress::read_all_human`) and put it on the clipboard,
+/// human-readable, ready to paste into a bug report. See `app.rs`'s
+/// `copy_egress_log` for the clipboard write itself.
+pub fn egress_report() -> String {
+    crate::egress::read_all_human()
+}
+
 // ===========================================================================
 // Win32/Config data collection -- checked by hand (CLAUDE.md rule 8), never
 // unit tested against the real process. The manual check: run the app, open
@@ -629,6 +641,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- egress_report (#106) ------------------------------------------------
+
+    #[test]
+    fn egress_report_never_panics_and_returns_readable_text() {
+        // This module's own tests don't stub the log file (that's
+        // `provider::common`'s and `egress`'s job); it just proves the
+        // wrapper never panics and always hands back SOMETHING pasteable,
+        // whatever this test-binary run's shared temp egress log happens to
+        // contain at the moment.
+        let text = egress_report();
+        assert!(
+            !text.is_empty(),
+            "must never be blank, even with nothing logged"
+        );
     }
 
     #[test]
