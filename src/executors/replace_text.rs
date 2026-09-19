@@ -71,6 +71,20 @@
 //! [`TargetRef`] identity in the common case, but it is cheap and the task
 //! brief asks for it explicitly as a second line of defense against a
 //! corrupted or mismatched target.
+//!
+//! Never writes to a target whose name reads as payment-shaped, and never
+//! writes a value that IS payment-shaped by structure (a Luhn-valid card
+//! number, a mod-97-valid IBAN), regardless of the target's name (#267):
+//! [`crate::payment_denylist::is_payment_shaped_label`] against
+//! [`super::target::ResolvedElement::name`] (this executor's closest analog
+//! to `fill_form`'s per-field label) and
+//! [`crate::payment_denylist::is_payment_shaped_value`] against the full
+//! planned text [`plan_new_value`] is about to write -- the same one
+//! canonical table `executors::fill_form::evaluate_resolved_field` reads,
+//! never a second copy of the rules. `replace_text` is a plainly resolvable,
+//! generically-targetable executor (`executors::registry::resolve`), not a
+//! `fill_form`-only implementation detail, so CLAUDE.md's "never touches
+//! payment data, no exceptions" applies to it exactly the same way.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
@@ -356,8 +370,21 @@ impl Executor for ReplaceTextExecutor {
 }
 
 /// The refusal chain, in order: re-resolve -> refuse a password field ->
-/// refuse a forbidden (final-action-looking) target -> refuse a stale
-/// target -> plan the write -> write -> record an honest [`Undo`].
+/// refuse a forbidden (final-action-looking) target -> refuse a
+/// payment-shaped target name -> refuse a stale target -> plan the write ->
+/// refuse a payment-shaped planned value -> write -> record an honest
+/// [`Undo`].
+///
+/// The two payment checks (#267) reuse the one canonical
+/// `crate::payment_denylist` table `executors::fill_form::evaluate_resolved_field`
+/// already calls, rather than a second copy of the rules: `resolved.name`
+/// is this executor's closest analog to `fill_form`'s per-field `label`
+/// (this executor has no separate label of its own), and the planned FULL
+/// text about to be written (`new_full_text`, after `plan_new_value` has
+/// already spliced a `ReplaceSelection` into it) is the analog of
+/// `fill_form`'s `field.value` -- checking the spliced result, not just the
+/// raw `new_text` fragment, catches a payment-shaped value assembled across
+/// the splice, not only one written whole via `ReplaceAll`.
 fn do_replace(access: &Arc<dyn TextElementAccess>, proposal: &ReplaceTextProposal) -> Result<Undo> {
     let resolved = access
         .resolve(&proposal.target)
@@ -377,6 +404,15 @@ fn do_replace(access: &Arc<dyn TextElementAccess>, proposal: &ReplaceTextProposa
         }
     );
     anyhow::ensure!(
+        !crate::payment_denylist::is_payment_shaped_label(&resolved.name),
+        "replace_text: refusing to write to \"{}\"; its name reads as a payment field",
+        if resolved.name.is_empty() {
+            resolved.automation_id.as_str()
+        } else {
+            resolved.name.as_str()
+        }
+    );
+    anyhow::ensure!(
         !is_stale(&proposal.expected_current_text, &resolved.current_text),
         "replace_text: the text has changed since the preview was shown; refusing to overwrite it"
     );
@@ -388,6 +424,11 @@ fn do_replace(access: &Arc<dyn TextElementAccess>, proposal: &ReplaceTextProposa
         proposal.selection,
     )
     .map_err(|e| anyhow!("replace_text: {e}"))?;
+
+    anyhow::ensure!(
+        !crate::payment_denylist::is_payment_shaped_value(&new_full_text),
+        "replace_text: refusing to write a value that reads as a payment card number or IBAN"
+    );
 
     access
         .write(&proposal.target, &new_full_text)
@@ -855,6 +896,65 @@ mod tests {
             .expect("a forbidden target must be refused");
 
         assert!(err.to_string().contains("Send"));
+        assert_eq!(*access.write_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn payment_looking_target_name_is_refused_and_never_written() {
+        let access = fake_access_named("1234", false, "Card number");
+        let executor = ReplaceTextExecutor::with_access(access.clone());
+        let proposal = replace_all_proposal(&sample_target(), "5678", "1234");
+
+        let err = executor
+            .execute(confirmed(proposal))
+            .err()
+            .expect("a payment-looking target name must be refused");
+
+        assert!(err.to_string().contains("payment"));
+        assert!(!err.to_string().contains('\u{2014}'), "no em dashes: {err}");
+        assert_eq!(*access.write_calls.borrow(), 0);
+        assert_eq!(*access.element.text.borrow(), "1234");
+    }
+
+    #[test]
+    fn payment_shaped_value_behind_an_ordinary_name_is_refused_and_never_written() {
+        let access = fake_access_named("old value", false, "Reference number");
+        let executor = ReplaceTextExecutor::with_access(access.clone());
+        let proposal = replace_all_proposal(&sample_target(), "4111 1111 1111 1111", "old value");
+
+        let err = executor
+            .execute(confirmed(proposal))
+            .err()
+            .expect("a payment-shaped value must be refused even behind an ordinary name");
+
+        assert!(err.to_string().contains("payment"));
+        assert_eq!(*access.write_calls.borrow(), 0);
+        assert_eq!(*access.element.text.borrow(), "old value");
+    }
+
+    #[test]
+    fn payment_shaped_value_inserted_via_replace_selection_is_refused() {
+        let access = fake_access("Card: 0000000000000000");
+        let executor = ReplaceTextExecutor::with_access(access.clone());
+        // "Card: " is 6 UTF-16 code units; the 16 zeros that follow are the
+        // selection. Splicing "4111111111111111" (a Luhn-valid Visa test
+        // number) into that range produces a payment-shaped FINAL text even
+        // though neither the base text nor the inserted fragment alone would
+        // trip a naive check on `new_text` in isolation.
+        let proposal = replace_selection_proposal(
+            &sample_target(),
+            "4111111111111111",
+            "Card: 0000000000000000",
+            6,
+            22,
+        );
+
+        let err = executor
+            .execute(confirmed(proposal))
+            .err()
+            .expect("a payment-shaped spliced result must be refused");
+
+        assert!(err.to_string().contains("payment"));
         assert_eq!(*access.write_calls.borrow(), 0);
     }
 
