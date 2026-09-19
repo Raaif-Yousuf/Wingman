@@ -3034,6 +3034,121 @@ mod tests {
     }
 
     #[test]
+    fn hide_while_preview_is_open_notifies_the_owner_with_no_confirmation() {
+        // Issue #225: every one of app.rs's "hide the stale card" call
+        // sites (ask, extract_text, copy_region, open_settings,
+        // pause_for, add_event_from_screen, review_this_email,
+        // fill_form_from_screen) calls exactly this public `Card::hide()`
+        // with no check for `CardState::Preview`. Before the fix,
+        // `CardInner::hide` routed to `leave_preview_if_active`, which
+        // destroyed the preview's controls and reset `state` to `Hidden`
+        // -- but never posted `WM_APP_PREVIEW_DECIDED`, so whichever
+        // pending-preview context `App` had stashed for it was never
+        // cleared, and a later, unrelated preview's confirm could pick up
+        // the stale one instead (or run neither, dropping the new one).
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        card.show_preview("Add to calendar", &schema, &value, false);
+        assert_eq!(card.state(), CardState::Preview);
+
+        // The bug: hiding the card for an unrelated reason while a
+        // preview is open (Settings opening, Pause, a second action
+        // starting...), instead of the user pressing "Do it" or "Cancel".
+        card.hide();
+
+        assert_eq!(card.state(), CardState::Hidden, "hide() must still hide");
+        assert!(
+            card.take_confirmed().is_none(),
+            "an externally-hidden preview must never look like a Do it"
+        );
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "hide() must post WM_APP_PREVIEW_DECIDED when it destroys an \
+             active preview, so App::on_preview_decided can clear its \
+             pending-preview slot instead of leaving it to hijack a \
+             later, unrelated preview's decision (#225)"
+        );
+        assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn show_preview_interrupting_an_active_preview_notifies_before_replacing_it() {
+        // Same shape as the hide() case above, but for the path where a
+        // NEW preview interrupts an active one directly (on_calendar_result
+        // / on_review_result / on_form_fill_result all call show_preview
+        // without checking for an existing one first).
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        card.show_preview("Add to calendar", &schema, &value, false);
+        assert_eq!(card.state(), CardState::Preview);
+
+        card.show_preview("Fill this form", &schema, &value, false);
+        assert_eq!(
+            card.state(),
+            CardState::Preview,
+            "the second preview must still show"
+        );
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "replacing an active preview with a new one must notify the \
+             owner about the FIRST one before showing the second"
+        );
+        assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn preview_do_it_posts_exactly_one_wm_app_preview_decided() {
+        // Mutation guard for #225's fix: `leave_preview_if_active` now
+        // does the notifying (so an external `hide()` is covered too),
+        // and `preview_do_it`'s own explicit call was removed -- if it
+        // had not been, "Do it" would double-post and this would go red.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        let card_hwnd = card.hwnd();
+        unsafe {
+            SendMessageW(
+                card_hwnd,
+                WM_COMMAND,
+                Some(WPARAM(ID_PREVIEW_DO_IT as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+
+        let mut count = 0;
+        let mut msg = MSG::default();
+        while unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() } {
+            if msg.message == WM_APP_PREVIEW_DECIDED {
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 1,
+            "leave_preview_if_active must not double-post alongside a \
+             separate explicit notify"
+        );
+    }
+
+    #[test]
     fn no_owner_set_means_preview_do_it_never_panics_and_posts_nothing() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
