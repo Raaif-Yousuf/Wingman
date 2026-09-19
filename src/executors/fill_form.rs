@@ -60,8 +60,17 @@
 //!    any payment check on what the user typed), so it is the one place a
 //!    payment-shaped value can be caught regardless of how it slipped past
 //!    every check upstream of "Do it".
+//! 7. **Stale field** ([`super::target::is_stale`]) -> [`RefuseReason::Stale`]
+//!    (#266). `FieldFill::expected_current_text` (the proposal's `"current"`
+//!    key, the field's live text at "Look" time -- possibly empty, for a
+//!    field that was genuinely blank) is compared against the SAME
+//!    `resolved.current_text` re-read at the top of this field's iteration
+//!    of the forward loop. Mismatch means the field changed between Look
+//!    and Do -- refuse rather than clobber it, the same way
+//!    `replace_text::do_replace` already refused before this fix; a field
+//!    unchanged since Look (empty-to-empty included) proceeds normally.
 //!
-//! Whatever survives all six checks is [`FieldOutcome::Filled`]: the prior
+//! Whatever survives all seven checks is [`FieldOutcome::Filled`]: the prior
 //! value is recorded and the new value is written.
 //!
 //! # Restore
@@ -106,6 +115,18 @@ pub struct FieldFill {
     /// consulted when `sensitive` is true; ignored otherwise. Also never
     /// defaulted -- see [`parse_field_fill`].
     pub approved: bool,
+    /// The field's live text at "Look" time, read from the proposal's
+    /// `"current"` key -- the SAME value `actions::fill_form::build_proposal`
+    /// already writes there for the preview card's display, now also read
+    /// on the write path (#266). Legitimately empty for a field that was
+    /// blank when captured; the staleness check this powers
+    /// ([`evaluate_resolved_field`]'s last step) compares this against the
+    /// field's freshly re-resolved live text the same way
+    /// `replace_text::do_replace` compares
+    /// `ReplaceTextProposal::expected_current_text`, so an untouched blank
+    /// field still fills (`"" == ""`) while one someone typed into between
+    /// Look and Do is refused (`"" != "whatever they typed"`).
+    pub expected_current_text: String,
 }
 
 /// A confirmed `form_fill` proposal, parsed once from JSON by
@@ -153,6 +174,11 @@ pub enum RefuseReason {
     /// Luhn-valid card number or a mod-97-valid IBAN), independently of
     /// what the field is labeled (#220).
     PaymentValue,
+    /// The field's live text no longer equals what the preview showed at
+    /// "Look" time (#266): someone, or something else, changed it between
+    /// Look and Do. Same shape as `replace_text::do_replace`'s stale-target
+    /// refusal, via the same [`super::target::is_stale`] check.
+    Stale,
     /// Re-resolution and every check above passed, but the write itself
     /// failed (no `ValuePattern`, no editable fallback, or a live Win32
     /// error). Carries the underlying write error's message.
@@ -170,6 +196,7 @@ impl std::fmt::Display for RefuseReason {
             RefuseReason::PaymentValue => {
                 write!(f, "its value reads as a payment card number or IBAN")
             }
+            RefuseReason::Stale => write!(f, "its text has changed since the preview was shown"),
             RefuseReason::WriteFailed(msg) => write!(f, "the write failed: {msg}"),
         }
     }
@@ -214,7 +241,8 @@ pub fn is_payment_label(label: &str) -> bool {
 /// freshly re-resolved live state. `None` means "proceed to write"; `Some`
 /// is the exact outcome to record instead. Checked in the order the module
 /// doc comment names: password, then sensitive/unapproved, then
-/// invokable-or-forbidden, then payment label, then payment-shaped value.
+/// invokable-or-forbidden, then payment label, then payment-shaped value,
+/// then staleness (#266).
 pub fn evaluate_resolved_field(
     field: &FieldFill,
     resolved: &target::ResolvedElement,
@@ -241,6 +269,15 @@ pub fn evaluate_resolved_field(
     // source -- see this module's doc comment, point 6.
     if crate::payment_denylist::is_payment_shaped_value(&field.value) {
         return Some(FieldOutcome::Refused(RefuseReason::PaymentValue));
+    }
+    // #266: the field's live text no longer matches what the preview showed
+    // at "Look" time -- someone (or something) changed it before "Do it"
+    // ran. `expected_current_text` is legitimately empty for a field that
+    // was blank at Look time, so an untouched blank field is NOT stale
+    // ("" == "") and proceeds normally -- see this module's doc comment,
+    // point 7.
+    if is_stale(&field.expected_current_text, &resolved.current_text) {
+        return Some(FieldOutcome::Refused(RefuseReason::Stale));
     }
     None
 }
@@ -335,6 +372,16 @@ fn parse_field_fill(value: &Value) -> Result<FieldFill> {
         .get("approved")
         .and_then(Value::as_bool)
         .ok_or_else(|| anyhow!("fill_form: field \"{label}\" has no \"approved\" field"))?;
+    // #266: required, never defaulted, same posture as `sensitive`/`approved`
+    // above -- `actions::fill_form::build_proposal` always writes this key
+    // (it already exists for the preview card's display; see `FieldFill`'s
+    // own doc comment), so a proposal missing it is malformed, not merely
+    // "no baseline known".
+    let expected_current_text = value
+        .get("current")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("fill_form: field \"{label}\" has no \"current\" field"))?
+        .to_string();
 
     Ok(FieldFill {
         target,
@@ -342,6 +389,7 @@ fn parse_field_fill(value: &Value) -> Result<FieldFill> {
         value: field_value,
         sensitive,
         approved,
+        expected_current_text,
     })
 }
 
@@ -629,10 +677,18 @@ mod tests {
         })
     }
 
-    fn field_json(id: &str, label: &str, value: &str, sensitive: bool, approved: bool) -> Value {
+    fn field_json(
+        id: &str,
+        label: &str,
+        value: &str,
+        sensitive: bool,
+        approved: bool,
+        current: &str,
+    ) -> Value {
         serde_json::json!({
             "target": target_json(&target_for(id)),
             "label": label,
+            "current": current,
             "value": value,
             "sensitive": sensitive,
             "approved": approved,
@@ -647,13 +703,21 @@ mod tests {
 
     #[test]
     fn parses_a_full_form() {
-        let value = form_json(vec![field_json("name", "Full name", "Ada", false, false)]);
+        let value = form_json(vec![field_json(
+            "name",
+            "Full name",
+            "Ada",
+            false,
+            false,
+            "prior text",
+        )]);
         let form = parse_form_fill(&value).unwrap();
         assert_eq!(form.fields.len(), 1);
         assert_eq!(form.fields[0].label, "Full name");
         assert_eq!(form.fields[0].value, "Ada");
         assert!(!form.fields[0].sensitive);
         assert!(!form.fields[0].approved);
+        assert_eq!(form.fields[0].expected_current_text, "prior text");
     }
 
     #[test]
@@ -673,7 +737,7 @@ mod tests {
 
     #[test]
     fn field_missing_target_is_a_named_error() {
-        let mut value = field_json("name", "Full name", "Ada", false, false);
+        let mut value = field_json("name", "Full name", "Ada", false, false, "");
         value.as_object_mut().unwrap().remove("target");
         let err = parse_form_fill(&form_json(vec![value])).expect_err("no target must error");
         assert!(err.to_string().contains("target"));
@@ -681,7 +745,7 @@ mod tests {
 
     #[test]
     fn field_missing_label_is_a_named_error() {
-        let mut value = field_json("name", "Full name", "Ada", false, false);
+        let mut value = field_json("name", "Full name", "Ada", false, false, "");
         value.as_object_mut().unwrap().remove("label");
         let err = parse_form_fill(&form_json(vec![value])).expect_err("no label must error");
         assert!(err.to_string().contains("label"));
@@ -689,7 +753,7 @@ mod tests {
 
     #[test]
     fn field_missing_value_is_a_named_error() {
-        let mut value = field_json("name", "Full name", "Ada", false, false);
+        let mut value = field_json("name", "Full name", "Ada", false, false, "");
         value.as_object_mut().unwrap().remove("value");
         let err = parse_form_fill(&form_json(vec![value])).expect_err("no value must error");
         assert!(err.to_string().contains("value"));
@@ -697,7 +761,7 @@ mod tests {
 
     #[test]
     fn field_missing_sensitive_is_a_named_error_no_default_is_assumed() {
-        let mut value = field_json("name", "Full name", "Ada", false, false);
+        let mut value = field_json("name", "Full name", "Ada", false, false, "");
         value.as_object_mut().unwrap().remove("sensitive");
         let err = parse_form_fill(&form_json(vec![value])).expect_err("no sensitive must error");
         assert!(err.to_string().contains("sensitive"));
@@ -705,10 +769,23 @@ mod tests {
 
     #[test]
     fn field_missing_approved_is_a_named_error_no_default_is_assumed() {
-        let mut value = field_json("name", "Full name", "Ada", false, false);
+        let mut value = field_json("name", "Full name", "Ada", false, false, "");
         value.as_object_mut().unwrap().remove("approved");
         let err = parse_form_fill(&form_json(vec![value])).expect_err("no approved must error");
         assert!(err.to_string().contains("approved"));
+    }
+
+    #[test]
+    fn field_missing_current_is_a_named_error_no_default_is_assumed() {
+        // #266: `expected_current_text` is required, the same posture
+        // `sensitive`/`approved` already have -- a proposal missing it
+        // never falls back to "" (which would make every field look
+        // legitimately blank and defeat the staleness check entirely).
+        let mut value = field_json("name", "Full name", "Ada", false, false, "");
+        value.as_object_mut().unwrap().remove("current");
+        let err = parse_form_fill(&form_json(vec![value])).expect_err("no current must error");
+        assert!(err.to_string().contains("current"));
+        assert!(!err.to_string().contains('\u{2014}'), "no em dashes: {err}");
     }
 
     // -- is_payment_label ---------------------------------------------------
@@ -747,23 +824,31 @@ mod tests {
     // -- evaluate_resolved_field: the pure per-field decision table --------
 
     fn resolved(control_type: &str, is_password: bool, name: &str) -> target::ResolvedElement {
+        // "" here pairs with `ordinary_field`/`field_with_value`'s own ""
+        // `expected_current_text` default below, so neither is ever stale
+        // by construction -- tests that specifically want the #266 stale
+        // path use `resolved_with_text` and set `expected_current_text`
+        // explicitly instead.
+        resolved_with_text(control_type, is_password, name, "")
+    }
+
+    fn resolved_with_text(
+        control_type: &str,
+        is_password: bool,
+        name: &str,
+        current_text: &str,
+    ) -> target::ResolvedElement {
         target::ResolvedElement {
             name: name.to_string(),
             automation_id: String::new(),
             control_type: control_type.to_string(),
             is_password,
-            current_text: String::new(),
+            current_text: current_text.to_string(),
         }
     }
 
     fn ordinary_field(label: &str, sensitive: bool, approved: bool) -> FieldFill {
-        FieldFill {
-            target: target_for("f"),
-            label: label.to_string(),
-            value: "value".to_string(),
-            sensitive,
-            approved,
-        }
+        field_with_value(label, "value", sensitive, approved)
     }
 
     fn field_with_value(label: &str, value: &str, sensitive: bool, approved: bool) -> FieldFill {
@@ -773,6 +858,7 @@ mod tests {
             value: value.to_string(),
             sensitive,
             approved,
+            expected_current_text: String::new(),
         }
     }
 
@@ -921,6 +1007,48 @@ mod tests {
         assert_eq!(outcome, None);
     }
 
+    // -- #266: a field whose live text no longer matches what the preview
+    // showed at "Look" time must be refused, never silently overwritten --
+    // the SAME `is_stale` check `replace_text::do_replace` already ran
+    // before this fix, now also run here (module doc comment, point 7) ----
+
+    #[test]
+    fn stale_field_is_refused_by_evaluate_resolved_field() {
+        let mut field = ordinary_field("Full name", false, false);
+        field.expected_current_text = "Ada".to_string();
+        let outcome = evaluate_resolved_field(
+            &field,
+            &resolved_with_text("Edit", false, "Full name", "someone typed this"),
+        );
+        assert_eq!(outcome, Some(FieldOutcome::Refused(RefuseReason::Stale)));
+    }
+
+    #[test]
+    fn a_field_legitimately_empty_at_look_time_is_not_stale_when_still_empty() {
+        // `ordinary_field` defaults `expected_current_text` to "": a field
+        // that was genuinely blank when captured, and is still blank now,
+        // must proceed -- getting the empty case wrong in the strict
+        // direction (treating "unknown baseline" as "always stale") would
+        // refuse every ordinary fill of a blank field, which is most of
+        // them.
+        let outcome = evaluate_resolved_field(
+            &ordinary_field("Full name", false, false),
+            &resolved_with_text("Edit", false, "Full name", ""),
+        );
+        assert_eq!(outcome, None);
+    }
+
+    #[test]
+    fn a_field_that_was_populated_and_is_unchanged_is_not_stale() {
+        let mut field = ordinary_field("Full name", false, false);
+        field.expected_current_text = "existing text".to_string();
+        let outcome = evaluate_resolved_field(
+            &field,
+            &resolved_with_text("Edit", false, "Full name", "existing text"),
+        );
+        assert_eq!(outcome, None);
+    }
+
     // -- decide_restore_action ----------------------------------------------
 
     #[test]
@@ -982,8 +1110,8 @@ mod tests {
         ]);
         let executor = FillFormExecutor::with_access(access.clone());
         let form = form_json(vec![
-            field_json("name", "Full name", "Ada Lovelace", false, false),
-            field_json("email", "Email", "ada@example.com", false, false),
+            field_json("name", "Full name", "Ada Lovelace", false, false, ""),
+            field_json("email", "Email", "ada@example.com", false, false, ""),
         ]);
 
         let undo = executor
@@ -1013,6 +1141,7 @@ mod tests {
             "new-secret",
             false,
             false,
+            "secret",
         )]);
 
         executor
@@ -1030,8 +1159,8 @@ mod tests {
         ]);
         let executor = FillFormExecutor::with_access(access.clone());
         let form = form_json(vec![
-            field_json("dob", "Date of birth", "2000-01-01", true, false),
-            field_json("name", "Full name", "Ada", false, false),
+            field_json("dob", "Date of birth", "2000-01-01", true, false, ""),
+            field_json("name", "Full name", "Ada", false, false, ""),
         ]);
 
         let undo = executor
@@ -1053,8 +1182,8 @@ mod tests {
         ]);
         let executor = FillFormExecutor::with_access(access.clone());
         let form = form_json(vec![
-            field_json("btn", "Place order", "clicked", false, false),
-            field_json("name", "Full name", "Ada", false, false),
+            field_json("btn", "Place order", "clicked", false, false, "Place order"),
+            field_json("name", "Full name", "Ada", false, false, ""),
         ]);
 
         executor
@@ -1082,6 +1211,7 @@ mod tests {
             "4111 1111 1111 1111",
             false,
             false,
+            "",
         )]);
 
         let undo = executor
@@ -1104,6 +1234,7 @@ mod tests {
             "4111 1111 1111 1111",
             false,
             false,
+            "",
         )]);
 
         let undo = executor
@@ -1127,8 +1258,8 @@ mod tests {
         });
         let executor = FillFormExecutor::with_access(access.clone());
         let form = form_json(vec![
-            field_json("missing", "Ghost field", "value", false, false),
-            field_json("name", "Full name", "Ada", false, false),
+            field_json("missing", "Ghost field", "value", false, false, ""),
+            field_json("name", "Full name", "Ada", false, false, ""),
         ]);
 
         let undo = executor
@@ -1137,6 +1268,80 @@ mod tests {
         assert_eq!(*access.fields[&target_for("name")].text.borrow(), "Ada");
         assert!(undo.summary.contains("Ghost field"));
         assert!(undo.summary.contains("Filled 1 of 2 fields"));
+    }
+
+    // -- #266, at the symptom level: `do_fill` (via `execute`) must never
+    // write a field whose live text no longer matches what the proposal
+    // captured at "Look" time, and a field genuinely blank at Look time
+    // must still fill normally when nothing else touched it ------------
+
+    #[test]
+    fn a_field_whose_live_text_changed_since_the_preview_is_refused_and_never_written() {
+        let access = access(vec![(
+            "name",
+            // The live field now reads something other than what "Look"
+            // captured -- someone typed into it before "Do" ran.
+            field(
+                "name",
+                "Edit",
+                false,
+                "Full name",
+                "someone typed this instead",
+            ),
+        )]);
+        let executor = FillFormExecutor::with_access(access.clone());
+        // The proposal's "current" ("old name") is the text the preview
+        // showed at "Look" time.
+        let form = form_json(vec![field_json(
+            "name",
+            "Full name",
+            "Ada",
+            false,
+            false,
+            "old name",
+        )]);
+
+        let undo = executor
+            .execute(confirmed(form))
+            .expect("execute must succeed (fill_form never aborts the whole run)");
+
+        assert_eq!(
+            *access.fields[&target_for("name")].text.borrow(),
+            "someone typed this instead",
+            "a stale field must never be overwritten"
+        );
+        assert!(access.write_calls.borrow().is_empty());
+        assert!(undo.summary.contains("Full name"));
+        assert!(undo.summary.contains("changed"));
+        assert!(
+            !undo.summary.contains('\u{2014}'),
+            "no em dashes: {}",
+            undo.summary
+        );
+    }
+
+    #[test]
+    fn a_field_legitimately_empty_at_look_time_still_fills_when_unchanged() {
+        let access = access(vec![(
+            "name",
+            field("name", "Edit", false, "Full name", ""),
+        )]);
+        let executor = FillFormExecutor::with_access(access.clone());
+        let form = form_json(vec![field_json(
+            "name",
+            "Full name",
+            "Ada",
+            false,
+            false,
+            "",
+        )]);
+
+        let undo = executor
+            .execute(confirmed(form))
+            .expect("execute must succeed");
+
+        assert_eq!(*access.fields[&target_for("name")].text.borrow(), "Ada");
+        assert!(undo.summary.contains("Filled 1 of 1 field"));
     }
 
     // -- Undo / Restore -----------------------------------------------------
@@ -1155,8 +1360,15 @@ mod tests {
         ]);
         let executor = FillFormExecutor::with_access(access.clone());
         let form = form_json(vec![
-            field_json("name", "Full name", "Ada", false, false),
-            field_json("email", "Email", "ada@example.com", false, false),
+            field_json("name", "Full name", "Ada", false, false, "old name"),
+            field_json(
+                "email",
+                "Email",
+                "ada@example.com",
+                false,
+                false,
+                "old@example.com",
+            ),
         ]);
 
         let undo = executor.execute(confirmed(form)).unwrap();
@@ -1186,8 +1398,15 @@ mod tests {
         ]);
         let executor = FillFormExecutor::with_access(access.clone());
         let form = form_json(vec![
-            field_json("name", "Full name", "Ada", false, false),
-            field_json("email", "Email", "ada@example.com", false, false),
+            field_json("name", "Full name", "Ada", false, false, "old name"),
+            field_json(
+                "email",
+                "Email",
+                "ada@example.com",
+                false,
+                false,
+                "old@example.com",
+            ),
         ]);
 
         let undo = executor.execute(confirmed(form)).unwrap();
@@ -1438,19 +1657,19 @@ mod tests {
 
             let form = form_json(vec![
                 serde_json::json!({
-                    "target": target_json(&edit_a), "label": "Full name",
+                    "target": target_json(&edit_a), "label": "Full name", "current": "",
                     "value": "Ada Lovelace", "sensitive": false, "approved": false
                 }),
                 serde_json::json!({
-                    "target": target_json(&edit_b), "label": "Email",
+                    "target": target_json(&edit_b), "label": "Email", "current": "",
                     "value": "ada@example.com", "sensitive": false, "approved": false
                 }),
                 serde_json::json!({
-                    "target": target_json(&password_target), "label": "Password",
+                    "target": target_json(&password_target), "label": "Password", "current": "",
                     "value": "new-secret", "sensitive": false, "approved": false
                 }),
                 serde_json::json!({
-                    "target": target_json(&button_target), "label": "Place order",
+                    "target": target_json(&button_target), "label": "Place order", "current": "",
                     "value": "clicked", "sensitive": false, "approved": false
                 }),
             ]);
@@ -1502,6 +1721,82 @@ mod tests {
             pump_pending_messages();
             assert_eq!(window_text(win.name), "");
             assert_eq!(window_text(win.email), "");
+
+            unsafe {
+                let _ = DestroyWindow(win.frame);
+            }
+        }
+
+        /// #266: the observable that would differ if the staleness check
+        /// were wired to nothing -- a real EDIT control whose live text is
+        /// changed (via the same real `TextElementAccess::write` this
+        /// executor itself uses) between "Look" (when the proposal's
+        /// `"current": ""` was captured) and "Do" must be refused, not
+        /// overwritten, while an unaffected sibling field still fills.
+        #[test]
+        fn stale_field_is_refused_against_a_real_edit_control_others_still_fill() {
+            let _uia = crate::inputs::lock_uia_test();
+            let win = build_test_window();
+
+            let real_access = target::com::UiaTextElementAccess;
+            let edits: Vec<TargetRef> = target::com::list_all_for_test(win.frame)
+                .expect("list_all_for_test")
+                .into_iter()
+                .filter(|c| c.control_type == "Edit")
+                .collect();
+            let mut plain_targets = Vec::new();
+            for edit in edits {
+                let resolved = real_access
+                    .resolve(&edit)
+                    .expect("resolve a real EDIT control");
+                if !resolved.is_password {
+                    plain_targets.push(edit);
+                }
+            }
+            assert_eq!(
+                plain_targets.len(),
+                2,
+                "expected two non-password EDIT controls"
+            );
+            let (edit_a, edit_b) = (plain_targets[0].clone(), plain_targets[1].clone());
+
+            // Someone (or something) changes edit_a's real, live text
+            // between "Look" (both controls still blank, "current": ""
+            // captured for each) and "Do".
+            real_access
+                .write(&edit_a, "typed after look")
+                .expect("simulate a live edit before Do runs");
+
+            let access: Arc<dyn TextElementAccess> = Arc::new(target::com::UiaTextElementAccess);
+            let executor = FillFormExecutor::with_access(access);
+
+            let form = form_json(vec![
+                serde_json::json!({
+                    "target": target_json(&edit_a), "label": "Full name", "current": "",
+                    "value": "Ada Lovelace", "sensitive": false, "approved": false
+                }),
+                serde_json::json!({
+                    "target": target_json(&edit_b), "label": "Email", "current": "",
+                    "value": "ada@example.com", "sensitive": false, "approved": false
+                }),
+            ]);
+
+            let undo = executor
+                .execute(confirmed(form))
+                .expect("execute must succeed against real controls");
+
+            assert_eq!(
+                real_access.resolve(&edit_a).unwrap().current_text,
+                "typed after look",
+                "the stale field must never be overwritten"
+            );
+            assert_eq!(
+                real_access.resolve(&edit_b).unwrap().current_text,
+                "ada@example.com",
+                "the unaffected field must still fill"
+            );
+            assert!(undo.summary.contains("Full name"));
+            assert!(undo.summary.contains("changed"));
 
             unsafe {
                 let _ = DestroyWindow(win.frame);
