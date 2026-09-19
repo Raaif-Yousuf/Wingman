@@ -533,14 +533,17 @@ impl<'a, C: RawClipboard> ClipboardGuard<'a, C> {
         }
     }
 
-    /// Restores and verifies now. Idempotent: a second call (including the
-    /// one `Drop` would otherwise make) is a no-op `Ok(())`.
+    /// Restores and verifies now. Idempotent on SUCCESS: a second call after
+    /// a successful restore (including the one `Drop` would otherwise make)
+    /// is a no-op `Ok(())`. On FAILURE, `done` is left `false` so `Drop`
+    /// still gets its documented one more attempt (#262: a failed restore
+    /// must not forfeit the safety net at exactly the moment it is needed).
     pub fn restore_now(&mut self) -> anyhow::Result<()> {
         if self.done {
             return Ok(());
         }
         let result = restore_and_verify(self.clipboard, &self.snapshot);
-        self.done = true;
+        self.done = result.is_ok();
         result
     }
 }
@@ -1831,6 +1834,39 @@ mod tests {
             clipboard.sequence_number(),
             seq_after_first_restore,
             "Drop must not perform a second restore after restore_now already ran"
+        );
+    }
+
+    #[test]
+    fn restore_now_leaves_done_false_on_failure_so_drop_still_retries() {
+        // #262: a failed restore_now must not forfeit Drop's safety net.
+        let clipboard = FakeClipboard::seeded(&[(FMT_TEXT, b"original")]);
+        let mut guard = ClipboardGuard::capture(&clipboard, &[FMT_TEXT]);
+        clipboard
+            .set_formats(&[(FMT_TEXT, b"injected".to_vec())])
+            .unwrap();
+
+        // Make the first restore attempt fail (a silent no-op write, the
+        // same fake behaviour `restore_and_verify_errs_when_the_write_silently_no_ops`
+        // uses).
+        *clipboard.fail_restore_silently.borrow_mut() = true;
+        let err = guard.restore_now().unwrap_err();
+        assert!(err.to_string().contains("sequence number"));
+        assert_eq!(
+            clipboard.get_format(FMT_TEXT).unwrap(),
+            b"injected",
+            "restore_now failed, so the injected copy must still be on the clipboard"
+        );
+
+        // Let a later attempt (Drop's safety net) succeed.
+        *clipboard.fail_restore_silently.borrow_mut() = false;
+        drop(guard);
+
+        assert_eq!(
+            clipboard.get_format(FMT_TEXT).unwrap(),
+            b"original",
+            "Drop must still attempt a restore after a failed restore_now, per the \
+             doc comment's stated safety-net guarantee"
         );
     }
 
