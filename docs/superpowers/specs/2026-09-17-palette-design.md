@@ -94,14 +94,31 @@ a subsequence match (case-insensitive) with a prefix bonus (whole match
 starts at position 0) and a per-character word-start bonus (matched
 character is the first of a word), ties broken alphabetically.
 
-## Rendering: GDI, not DirectWrite
+## Rendering: GDI, then DirectWrite/Direct2D (#216)
 
-Issue #25's body mentions DirectWrite. This implementation uses GDI
+Issue #25's body mentions DirectWrite. The first implementation used GDI
 (`TextOutW`/`DrawTextW`, the same primitives `ui/card.rs` and `ui/region.rs`
 already use), consistent with rule 12's "match the shape already pinned" and
 with keeping a pre-created window's first paint on the sub-100ms path with no
-new dependency. A DirectWrite rendering pass is filed as a follow-up issue
-rather than built here (see the closing comment on #25).
+new dependency. A DirectWrite rendering pass was filed as a follow-up issue
+rather than built there (see the closing comment on #25).
+
+**Superseded 2026-09-18 (issue #216):** the row list, router summary line and
+footer now render through `ID2D1HwndRenderTarget` + a cached
+`IDWriteTextFormat` (`ui/palette.rs`'s `PaletteRenderer`), created once at
+window-creation time and never per paint -- see that module's doc comment
+for the full design, the MEASURED show-latency numbers, and why
+`ID2D1RenderTarget::DrawText` is used instead of building a per-row
+`IDWriteTextLayout` (the `DrawTextLayout` render call needs
+`windows_numerics::Vector2`, a type the `windows` crate does not re-export,
+which would need a new direct Cargo dependency outside this task's
+`Cargo.toml` scope). The original GDI path is kept, byte-for-byte, as a
+fallback for a window whose Direct2D factory creation failed, or that hits
+`D2DERR_RECREATE_TARGET` (device loss) -- rule 7: every failure ends in a
+card, never a blank palette. Per-monitor-v2 DPI now updates the render
+target's DPI on `WM_DPICHANGED` rather than reading it once (a gap the GDI
+path also had, closed as part of this work since the render target's own
+DPI tracking made it unavoidable to look at).
 
 ## Footer
 
