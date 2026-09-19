@@ -4397,6 +4397,22 @@ mod tests {
         &rest[..end]
     }
 
+    /// Slice `App::run`'s body out of the source text, the same technique
+    /// [`wnd_proc_body`] uses for `wnd_proc`. `run` is a top-level function,
+    /// so like `wnd_proc` its closing brace sits at column 0. Takes
+    /// already-`lf`-normalised source; see [`lf`]'s doc comment for why.
+    fn run_body(app_src: &str) -> &str {
+        const SIG: &str = "pub fn run() -> Result<()> {";
+        let start = app_src
+            .find(SIG)
+            .expect("app.rs no longer contains a `pub fn run() -> Result<()> {` signature; this scanner is no longer looking at anything");
+        let rest = &app_src[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("no column-0 closing brace found after run's signature");
+        &rest[..end]
+    }
+
     /// Every id in `ALL_WM_APP_IDS` must be dispatched somewhere in
     /// `wnd_proc`, or the message posted to the owner window falls through
     /// to `DefWindowProcW` and nothing happens. The sender looks correct,
@@ -4555,6 +4571,88 @@ mod tests {
         assert!(
             body.contains("set_palette_chord("),
             "apply_config never calls hook.set_palette_chord, so a Reload/Settings-save with a changed hotkeys.palette leaves the OLD chord live until a full restart (#269):\n{body}"
+        );
+    }
+
+    // -- every startup config-mirror setter is resynced by apply_config ----
+    //
+    // #283 (mode::set_current / tray.set_mode) and #269
+    // (hook.set_palette_chord) are two instances of one root cause: a
+    // subsystem holds its OWN copy of a `Config` value (a process-wide
+    // atomic, the tray's radio-check, the keyboard hook's packed chord),
+    // `App::run` publishes it there at startup, and `apply_config` -- the
+    // function both `reload()` (tray "Reload") and a Settings save call
+    // after replacing `self.config` wholesale -- forgets to publish it
+    // again. The two tests immediately above catch exactly those two rows;
+    // this generalises the check so a THIRD row cannot ship silently.
+
+    /// A "config mirror setter" is any `set_*(...)` call in `App::run`
+    /// whose own source line also mentions `config.` -- i.e. it is
+    /// threading a value straight out of the freshly loaded `Config` into
+    /// some setter, unlike e.g. `card.set_owner(hwnd)` (no `config.` on
+    /// that line) or `HotkeyHook::install(hwnd, primary, secondary)` (not a
+    /// `set_*` call at all -- a constructor call has no `apply_config`-time
+    /// equivalent to check against, so it is correctly out of scope).
+    /// Matches by NAME only, not by receiver: the hook's local variable is
+    /// `h` in `run` and `hook` in `apply_config`, and the tray is
+    /// `app.tray` versus `self.tray`.
+    fn config_mirror_setter_names(body: &str) -> Vec<&str> {
+        fn setter_name(line: &str) -> Option<&str> {
+            let at = line.find("set_")?;
+            let after = &line[at..];
+            let paren = after.find('(')?;
+            let name = &after[..paren];
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                .then_some(name)
+        }
+
+        let mut names: Vec<&str> = body
+            .lines()
+            .filter(|line| line.contains("config."))
+            .filter_map(setter_name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Mutation-checked 2026-09-19: with `hook.set_palette_chord(...)`
+    /// deleted from `apply_config` (not merely commented out -- a comment
+    /// still contains the call text and would pass this test vacuously,
+    /// which is exactly how the first draft of this check on this machine
+    /// tonight failed to catch its own planted mutation), this test failed
+    /// with `["set_current", "set_mode", "set_palette_chord"]` in the
+    /// message (the same run also had #283's two calls deleted); restored,
+    /// it passes.
+    #[test]
+    fn every_startup_config_mirror_setter_is_resynced_by_apply_config() {
+        let app_src = lf(include_str!("app.rs"));
+        let run_src = run_body(&app_src);
+        let apply_src = apply_config_body(&app_src);
+
+        let candidates = config_mirror_setter_names(run_src);
+
+        // Non-empty-candidate-set check (issue #281 was exactly a guard
+        // that skipped this and passed vacuously once its own scan broke):
+        // today there are 6 (set_current, set_egress_preview_enabled,
+        // set_text_scale, set_mode, set_pause_chord, set_palette_chord);
+        // require a comfortable margin under that so losing one candidate
+        // to a future refactor cannot silently zero out this check.
+        assert!(
+            candidates.len() >= 4,
+            "scanner found only {} config-mirror setter names in App::run; the scan or run's shape has changed and this test is no longer checking anything: {candidates:?}",
+            candidates.len()
+        );
+
+        let unresynced: Vec<&str> = candidates
+            .iter()
+            .filter(|name| !apply_src.contains(&format!("{name}(")))
+            .copied()
+            .collect();
+
+        assert!(
+            unresynced.is_empty(),
+            "these config-mirror setters run at startup (App::run) but apply_config never calls a setter of the same name, so a Reload/Settings-save leaves their mirror on whatever was true at the last full restart: {unresynced:?}"
         );
     }
 
