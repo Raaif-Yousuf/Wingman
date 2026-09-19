@@ -4174,6 +4174,169 @@ mod tests {
         );
     }
 
+    // -- WM_APP_* wiring, both ends ---------------------------------------
+    //
+    // #163's `wm_app_ids_registry_is_exhaustive` proves every `WM_APP_*`
+    // constant in the crate is listed in `ALL_WM_APP_IDS`, and #213's
+    // `reentrancy_policy_table_matches_all_wm_app_ids` proves every listed
+    // id is classified. Neither proves the id is *connected to anything*: a
+    // constant can be declared, listed, classified, and still have no arm
+    // in `wnd_proc` (so the sender's message is silently swallowed by
+    // `DefWindowProcW`) or no sender at all (so the handler is dead code
+    // that reads as a live feature). Both are the wired-to-nothing bug this
+    // repo's skill of that name exists for, and neither shows up as a
+    // compile error, a clippy warning or a failing test.
+    //
+    // The two tests below close each end. They are source scans for the
+    // same reason `every_tray_cmd_id_has_a_wnd_proc_arm` is one: the match
+    // arms and the `PostMessageW` call sites are ordinary code that no type
+    // system ties back to the constant list.
+
+    /// Slice `app.rs`'s `wnd_proc` body out of the source text.
+    ///
+    /// Scanning the whole file would let `settings_reentrancy_policy`'s own
+    /// `WM_APP_* =>` arms satisfy the dispatch check, which is exactly the
+    /// vacuous pass this test exists to prevent: an id can be classified
+    /// there and still have no arm in `wnd_proc`. rustfmt keeps a top-level
+    /// item's closing brace in column 0, so the first `\n}\n` after the
+    /// signature ends the function.
+    ///
+    /// Takes already-normalised source: the working copy on this machine is
+    /// CRLF (`.gitattributes`/`core.autocrlf`), so `include_str!` hands back
+    /// `\r\n` and every `\n`-anchored pattern below would silently miss.
+    /// [`lf`] does the normalising, once, for both tests.
+    fn wnd_proc_body(app_src: &str) -> &str {
+        const SIG: &str = "extern \"system\" fn wnd_proc(";
+        let start = app_src
+            .find(SIG)
+            .expect("app.rs no longer contains a `extern \"system\" fn wnd_proc(` signature; this scanner is no longer looking at anything");
+        let rest = &app_src[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("no column-0 closing brace found after wnd_proc's signature");
+        &rest[..end]
+    }
+
+    /// Strip `\r` so these source scans read the same whether the working
+    /// copy checked out LF or CRLF. Without it both tests pass vacuously on
+    /// one of the two, which is the worse failure: a guard that reports
+    /// green while checking nothing.
+    fn lf(src: &str) -> String {
+        src.replace('\r', "")
+    }
+
+    /// Every id in `ALL_WM_APP_IDS` must be dispatched somewhere in
+    /// `wnd_proc`, or the message posted to the owner window falls through
+    /// to `DefWindowProcW` and nothing happens. The sender looks correct,
+    /// the constant is registered, the reentrancy table classifies it, and
+    /// the feature is dead.
+    ///
+    /// Two arm shapes count, because `wnd_proc` uses both: a `match msg`
+    /// arm (`WM_APP_RESULT => {`) and the `if msg == WM_APP_PALETTE_RUN`
+    /// chain that runs before the match for the ids needing `hwnd`.
+    #[test]
+    fn every_wm_app_id_has_a_wnd_proc_arm() {
+        let app_src = lf(include_str!("app.rs"));
+        let body = wnd_proc_body(&app_src);
+
+        assert!(
+            body.len() > 5_000,
+            "wnd_proc's extracted body is only {} bytes; the slicing in `wnd_proc_body` has broken and this test is no longer checking anything",
+            body.len()
+        );
+
+        let undispatched: Vec<&str> = ALL_WM_APP_IDS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| {
+                !body.contains(&format!("{name} =>"))
+                    && !body.contains(&format!("{name}\n"))
+                    && !body.contains(&format!("msg == {name}"))
+            })
+            .collect();
+
+        assert!(
+            undispatched.is_empty(),
+            "these WM_APP_* ids have no dispatch in wnd_proc, so a message posted with them is swallowed by DefWindowProcW and the feature silently does nothing: {undispatched:?}"
+        );
+    }
+
+    /// Every id in `ALL_WM_APP_IDS` must be posted by somebody. A handler
+    /// with no sender is dead code that reads as a live feature, and it
+    /// survives every other check in this file: the constant is declared,
+    /// listed, classified and dispatched, and nothing ever sends it.
+    ///
+    /// Scans each `PostMessageW(`/`SendMessageW(` call site's argument list
+    /// rather than the whole file, so a mention in a doc comment (there are
+    /// dozens) cannot satisfy it.
+    #[test]
+    fn every_wm_app_id_is_posted_somewhere() {
+        /// Every file in the crate that posts a window message. A new one
+        /// added here without being listed would make this test report a
+        /// false positive, which is the safe direction: it fails loudly
+        /// rather than passing vacuously.
+        const POSTING_SOURCES: &[&str] = &[
+            include_str!("app.rs"),
+            include_str!("dismiss.rs"),
+            include_str!("hotkey.rs"),
+            include_str!("single_instance.rs"),
+            include_str!("ui/card.rs"),
+            include_str!("ui/palette.rs"),
+            include_str!("ui/region.rs"),
+            include_str!("ui/settings.rs"),
+            include_str!("ui/tray.rs"),
+            include_str!("inputs/selection.rs"),
+        ];
+
+        /// The argument text of every `PostMessageW`/`SendMessageW` call,
+        /// capped at a fixed span rather than brace-matched: the calls are
+        /// rustfmt'd to at most a handful of short lines, and a fixed span
+        /// cannot be fooled by a brace inside a string literal.
+        fn call_argument_text(sources: &[&str]) -> String {
+            const SPAN: usize = 240;
+            let mut out = String::new();
+            for raw in sources {
+                let src = &lf(raw);
+                for pat in ["PostMessageW(", "SendMessageW("] {
+                    let mut from = 0;
+                    while let Some(i) = src[from..].find(pat) {
+                        let start = from + i + pat.len();
+                        let end = src.len().min(start + SPAN);
+                        // Never slice inside a UTF-8 sequence: these files
+                        // contain non-ASCII in comments and card strings.
+                        let end = (start..=end)
+                            .rev()
+                            .find(|&e| src.is_char_boundary(e))
+                            .unwrap_or(start);
+                        out.push_str(&src[start..end]);
+                        out.push('\n');
+                        from = start;
+                    }
+                }
+            }
+            out
+        }
+
+        let posted = call_argument_text(POSTING_SOURCES);
+
+        assert!(
+            posted.len() > 2_000,
+            "the PostMessageW/SendMessageW scanner collected only {} bytes of argument text; the call format must have changed and this test is no longer checking anything",
+            posted.len()
+        );
+
+        let never_posted: Vec<&str> = ALL_WM_APP_IDS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !posted.contains(*name))
+            .collect();
+
+        assert!(
+            never_posted.is_empty(),
+            "these WM_APP_* ids are never passed to PostMessageW/SendMessageW anywhere in the crate, so their wnd_proc arms are dead code that reads as a live feature: {never_posted:?}"
+        );
+    }
+
     // -- settings_reentrancy_policy exhaustiveness (issue #213) -----------
     //
     // #163's ALL_WM_APP_IDS/wm_app_ids_registry_is_exhaustive above already
