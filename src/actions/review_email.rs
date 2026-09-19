@@ -39,12 +39,16 @@
 //! 3. **[`InputSource::Screen`]**: a screenshot, exactly like
 //!    `actions::calendar`'s flow.
 //!
-//! [`source_has_target`] is the one place that turns this into a Do-it/no
-//! Do-it decision: only `ComposeBody` ever carries a [`CapturedTarget`], so
-//! it is the only source `app.rs` ever shows the preview's "Do it" for.
-//! `Selection` and `Screen` both end in an informational card -- honest
-//! about what Wingman can act on rather than offering a button that would
-//! fail every time it was pressed (rule 7).
+//! [`source_has_target`] says which *category* of source can ever carry a
+//! target: `ComposeBody` always does; `Screen` never does; `Selection`
+//! *can*, but does not always (#219) -- see [`CapturedInput::Selection`]'s
+//! doc comment. `app.rs`'s actual "show Do it or not" gate therefore checks
+//! [`ReviewOutcome::target`] itself (`Some`/`None`), not
+//! `source_has_target` alone; `source_has_target` remains useful as the
+//! pure, testable "this category is even eligible" classification.
+//! `Selection` (when no target was captured) and `Screen` both end in an
+//! informational card -- honest about what Wingman can act on rather than
+//! offering a button that would fail every time it was pressed (rule 7).
 //!
 //! # Deterministic edit application
 //!
@@ -298,14 +302,18 @@ pub fn choose_input_source(compose_body_available: bool, selection_available: bo
     }
 }
 
-/// Whether `source` carries a [`CapturedTarget`] "Do it" can write through.
-/// Only [`InputSource::ComposeBody`] ever does (see the module doc
-/// comment): a plain text selection has no re-resolvable UIA element
-/// attached to it, and the screen fallback is read-only by design. `app.rs`
-/// is the one caller -- this is the whole "confirm=true but only sometimes
-/// show Do it" decision, in one testable place.
+/// Whether `source` is even the KIND of source that can ever carry a
+/// target "Do it" could write through. `ComposeBody` always can;
+/// `Selection` can too (#219: when the UIA `TextPattern` path captured the
+/// owning element's identity and offsets -- see
+/// [`CapturedInput::Selection`]'s doc comment for the cases where it still
+/// does not); `Screen` never can, by design. This is necessary but NOT
+/// sufficient for "show Do it": a `Selection`-sourced review can still end
+/// up with no target (a `ValuePattern`-only control, a clipboard-fallback
+/// capture, a discontiguous multi-range selection), so `app.rs`'s actual
+/// gate also checks [`ReviewOutcome::target`] itself.
 pub fn source_has_target(source: InputSource) -> bool {
-    matches!(source, InputSource::ComposeBody)
+    matches!(source, InputSource::ComposeBody | InputSource::Selection)
 }
 
 /// Identifies one UIA element, captured at "Look" time. Field-for-field the
@@ -325,8 +333,28 @@ pub struct CapturedTarget {
     pub control_type: String,
 }
 
+/// Which UIA element (if any) "Do it" would write through, and how --
+/// [`ReplaceTarget::Whole`] for a `ComposeBody` capture (`replace_text`'s
+/// `ReplaceMode::ReplaceAll`), [`ReplaceTarget::Selection`] for a
+/// `Selection` capture that carried a
+/// [`crate::inputs::selection::SelectionTarget`] (`ReplaceMode::ReplaceSelection`,
+/// #219). `Screen`, and a `Selection` with no captured target, have no
+/// `ReplaceTarget` at all -- see [`source_has_target`] and
+/// [`CapturedInput::target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceTarget {
+    Whole(CapturedTarget),
+    Selection(crate::inputs::selection::SelectionTarget),
+}
+
 /// What "Look" gathered before asking the model, tagged by which
-/// [`InputSource`] supplied it.
+/// [`InputSource`] supplied it. `Selection`'s `target` is `Some` only when
+/// `inputs::selection::get_selection_foreground_with_target`'s UIA path
+/// found a single contiguous selection with everything readable (#219) --
+/// it is `None` for a `ValuePattern`-only control (no `TextPattern` at
+/// all), a discontiguous multi-range selection, or a capture that fell back
+/// to the clipboard, all of which have text but no re-resolvable element to
+/// write back through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapturedInput {
     ComposeBody {
@@ -335,6 +363,7 @@ pub enum CapturedInput {
     },
     Selection {
         text: String,
+        target: Option<crate::inputs::selection::SelectionTarget>,
     },
     Screen,
 }
@@ -351,14 +380,22 @@ impl CapturedInput {
     pub fn text(&self) -> Option<&str> {
         match self {
             CapturedInput::ComposeBody { text, .. } => Some(text.as_str()),
-            CapturedInput::Selection { text } => Some(text.as_str()),
+            CapturedInput::Selection { text, .. } => Some(text.as_str()),
             CapturedInput::Screen => None,
         }
     }
 
-    pub fn target(&self) -> Option<&CapturedTarget> {
+    /// The [`ReplaceTarget`] "Do it" would write through, if any. Owned
+    /// (not a reference) since `ComposeBody` and `Selection` carry two
+    /// different underlying types -- see [`ReplaceTarget`]'s own doc
+    /// comment.
+    pub fn target(&self) -> Option<ReplaceTarget> {
         match self {
-            CapturedInput::ComposeBody { target, .. } => Some(target),
+            CapturedInput::ComposeBody { target, .. } => Some(ReplaceTarget::Whole(target.clone())),
+            CapturedInput::Selection {
+                target: Some(target),
+                ..
+            } => Some(ReplaceTarget::Selection(target.clone())),
             _ => None,
         }
     }
@@ -383,7 +420,8 @@ pub fn capture_input(foreground_hwnd: isize) -> CapturedInput {
         .flatten()
         .filter(|(_, text)| !text.trim().is_empty());
 
-    let selection = crate::inputs::selection::get_selection_foreground(
+    let selection = crate::inputs::selection::get_selection_foreground_with_target(
+        foreground_hwnd,
         crate::inputs::selection::DEFAULT_MAX_CHARS,
         crate::inputs::selection::DEFAULT_CLIPBOARD_WAIT_BUDGET,
     )
@@ -404,6 +442,7 @@ pub fn capture_input(foreground_hwnd: isize) -> CapturedInput {
             let selection = selection.expect("just matched Some above");
             CapturedInput::Selection {
                 text: selection.text,
+                target: selection.target,
             }
         }
         InputSource::Screen => CapturedInput::Screen,
@@ -425,14 +464,13 @@ pub fn capture_input(foreground_hwnd: isize) -> CapturedInput {
 pub struct ReviewOutcome {
     pub proposal: Value,
     pub original_text: String,
-    pub target: Option<CapturedTarget>,
+    pub target: Option<ReplaceTarget>,
     /// Which [`InputSource`] supplied `original_text`/`target`. `app.rs`
-    /// calls [`source_has_target`] on this to decide "Do it", rather than
-    /// re-deriving the same decision from `target.is_some()` -- the two are
-    /// equivalent by construction (only `ComposeBody` ever sets `target`),
-    /// but naming the source directly is what makes `source_has_target`
-    /// itself a real, reachable decision point instead of untested dead
-    /// code.
+    /// calls [`source_has_target`] on this as the coarse "this category can
+    /// ever have a target" check; since #219 that is necessary but not
+    /// sufficient, so `app.rs` also checks `target.is_some()` directly (a
+    /// `Selection` source does not always set `target` -- see
+    /// [`CapturedInput::Selection`]'s doc comment).
     pub source: InputSource,
 }
 
@@ -444,7 +482,7 @@ pub struct ReviewOutcome {
 /// model again and never re-derives the edit application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewContext {
-    pub target: CapturedTarget,
+    pub target: ReplaceTarget,
     pub original_text: String,
     pub new_text: String,
 }
@@ -452,22 +490,48 @@ pub struct ReviewContext {
 /// Builds the JSON proposal `executors::replace_text`'s
 /// `parse_target_ref`/`parse_replace_text` expect (verified by hand against
 /// that module's source: `target.{hwnd,runtime_id,automation_id,name,control_type}`,
-/// `new_text`, `mode`, `expected_current_text`). Always `"replace_all"`:
-/// #38's task brief is explicit that "Do it" replaces the whole captured
-/// text with the edited version, never a partial `ReplaceSelection` splice.
+/// `new_text`, `mode`, `expected_current_text`, and for `ReplaceSelection`
+/// also `selection_start`/`selection_end`).
+///
+/// [`ReplaceTarget::Whole`] (a `ComposeBody` capture) always uses
+/// `"replace_all"`: #38's task brief is explicit that "Do it" replaces the
+/// whole captured text with the edited version there. [`ReplaceTarget::Selection`]
+/// (#219) uses `"replace_selection"`: `ctx.new_text` is the edited SELECTED
+/// snippet only (`apply_edits` ran against `ctx.original_text`, which for a
+/// `Selection` capture is just the selected text -- see
+/// [`CapturedInput::Selection`]'s doc comment), and `expected_current_text`
+/// is the element's WHOLE current text (`sel.full_text`, not
+/// `ctx.original_text`) -- the base `replace_text::splice_utf16` splices
+/// `new_text` into at `[sel.start, sel.end)`.
 fn build_replace_text_proposal(ctx: &ReviewContext) -> Value {
-    serde_json::json!({
-        "target": {
-            "hwnd": ctx.target.hwnd as i64,
-            "runtime_id": ctx.target.runtime_id,
-            "automation_id": ctx.target.automation_id,
-            "name": ctx.target.name,
-            "control_type": ctx.target.control_type
-        },
-        "new_text": ctx.new_text,
-        "mode": "replace_all",
-        "expected_current_text": ctx.original_text
-    })
+    match &ctx.target {
+        ReplaceTarget::Whole(target) => serde_json::json!({
+            "target": {
+                "hwnd": target.hwnd as i64,
+                "runtime_id": target.runtime_id,
+                "automation_id": target.automation_id,
+                "name": target.name,
+                "control_type": target.control_type
+            },
+            "new_text": ctx.new_text,
+            "mode": "replace_all",
+            "expected_current_text": ctx.original_text
+        }),
+        ReplaceTarget::Selection(sel) => serde_json::json!({
+            "target": {
+                "hwnd": sel.hwnd as i64,
+                "runtime_id": sel.runtime_id,
+                "automation_id": sel.automation_id,
+                "name": sel.name,
+                "control_type": sel.control_type
+            },
+            "new_text": ctx.new_text,
+            "mode": "replace_selection",
+            "expected_current_text": sel.full_text,
+            "selection_start": sel.start,
+            "selection_end": sel.end
+        }),
+    }
 }
 
 /// Runs `executor` (the real `replace_text` executor from
@@ -1039,9 +1103,12 @@ mod tests {
     }
 
     #[test]
-    fn source_has_target_only_for_compose_body() {
+    fn source_has_target_for_compose_body_and_selection_never_for_screen() {
         assert!(source_has_target(InputSource::ComposeBody));
-        assert!(!source_has_target(InputSource::Selection));
+        assert!(
+            source_has_target(InputSource::Selection),
+            "#219: Selection CAN carry a target, even though it does not always"
+        );
         assert!(!source_has_target(InputSource::Screen));
     }
 
@@ -1057,6 +1124,21 @@ mod tests {
         }
     }
 
+    /// #219: a UIA-identified selection target, mirroring
+    /// `inputs::selection`'s own `sample_identity`-shaped test fixtures.
+    fn sample_selection_target() -> crate::inputs::selection::SelectionTarget {
+        crate::inputs::selection::SelectionTarget {
+            hwnd: 4343,
+            runtime_id: vec![4, 5, 6],
+            automation_id: "selection-field".to_string(),
+            name: "Body".to_string(),
+            control_type: "Edit".to_string(),
+            full_text: "I wnated to help".to_string(),
+            start: 2,
+            end: 8,
+        }
+    }
+
     #[test]
     fn captured_input_compose_body_reports_its_own_source_text_and_target() {
         let c = CapturedInput::ComposeBody {
@@ -1065,17 +1147,34 @@ mod tests {
         };
         assert_eq!(c.source(), InputSource::ComposeBody);
         assert_eq!(c.text(), Some("hi there"));
-        assert_eq!(c.target(), Some(&sample_target()));
+        assert_eq!(c.target(), Some(ReplaceTarget::Whole(sample_target())));
     }
 
     #[test]
-    fn captured_input_selection_has_text_but_no_target() {
+    fn captured_input_selection_has_text_but_no_target_when_none_was_captured() {
         let c = CapturedInput::Selection {
             text: "hi there".to_string(),
+            target: None,
         };
         assert_eq!(c.source(), InputSource::Selection);
         assert_eq!(c.text(), Some("hi there"));
         assert_eq!(c.target(), None);
+    }
+
+    #[test]
+    fn captured_input_selection_with_identity_reports_a_replace_target() {
+        // #219: a Selection source CAN carry a target when the UIA path
+        // captured one.
+        let c = CapturedInput::Selection {
+            text: "wnated".to_string(),
+            target: Some(sample_selection_target()),
+        };
+        assert_eq!(c.source(), InputSource::Selection);
+        assert_eq!(c.text(), Some("wnated"));
+        assert_eq!(
+            c.target(),
+            Some(ReplaceTarget::Selection(sample_selection_target()))
+        );
     }
 
     #[test]
@@ -1093,9 +1192,21 @@ mod tests {
 
     fn sample_ctx() -> ReviewContext {
         ReviewContext {
-            target: sample_target(),
+            target: ReplaceTarget::Whole(sample_target()),
             original_text: "I wnated to help".to_string(),
             new_text: "I wanted to help".to_string(),
+        }
+    }
+
+    /// #219: a `Selection`-sourced context -- `original_text`/`new_text`
+    /// are the SELECTED snippet only (before/after `apply_edits`), while
+    /// `expected_current_text` in the built proposal comes from
+    /// `sel.full_text` (the whole element), not from `original_text`.
+    fn sample_selection_ctx() -> ReviewContext {
+        ReviewContext {
+            target: ReplaceTarget::Selection(sample_selection_target()),
+            original_text: "wnated".to_string(),
+            new_text: "wanted".to_string(),
         }
     }
 
@@ -1111,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn build_replace_text_proposal_is_always_replace_all() {
+    fn build_replace_text_proposal_is_replace_all_for_a_whole_target() {
         let ctx = sample_ctx();
         let v = build_replace_text_proposal(&ctx);
         assert_eq!(v["mode"], "replace_all");
@@ -1123,6 +1234,41 @@ mod tests {
         let v = build_replace_text_proposal(&ctx);
         assert_eq!(v["new_text"], "I wanted to help");
         assert_eq!(v["expected_current_text"], "I wnated to help");
+    }
+
+    // -- build_replace_text_proposal: ReplaceSelection target (#219) --------
+
+    #[test]
+    fn build_replace_text_proposal_is_replace_selection_for_a_selection_target() {
+        let ctx = sample_selection_ctx();
+        let v = build_replace_text_proposal(&ctx);
+        assert_eq!(v["mode"], "replace_selection");
+    }
+
+    #[test]
+    fn build_replace_text_proposal_selection_target_has_the_expected_target_fields() {
+        let ctx = sample_selection_ctx();
+        let v = build_replace_text_proposal(&ctx);
+        assert_eq!(v["target"]["hwnd"], serde_json::json!(4343i64));
+        assert_eq!(v["target"]["runtime_id"], serde_json::json!([4, 5, 6]));
+        assert_eq!(v["target"]["automation_id"], "selection-field");
+        assert_eq!(v["target"]["name"], "Body");
+        assert_eq!(v["target"]["control_type"], "Edit");
+    }
+
+    #[test]
+    fn build_replace_text_proposal_selection_target_uses_full_text_not_original_text() {
+        let ctx = sample_selection_ctx();
+        let v = build_replace_text_proposal(&ctx);
+        // `expected_current_text` must be the element's WHOLE text
+        // (`sel.full_text`), never `ctx.original_text` (the selected
+        // snippet only) -- `replace_text::splice_utf16` needs the whole
+        // string to splice into.
+        assert_eq!(v["expected_current_text"], "I wnated to help");
+        assert_ne!(v["expected_current_text"], ctx.original_text.as_str());
+        assert_eq!(v["new_text"], "wanted");
+        assert_eq!(v["selection_start"], serde_json::json!(2usize));
+        assert_eq!(v["selection_end"], serde_json::json!(8usize));
     }
 
     // -- do_review_confirmed: injectable executor ----------------------------
@@ -1166,6 +1312,23 @@ mod tests {
         let seen = seen.as_ref().expect("execute must have been called");
         assert_eq!(seen["new_text"], "I wanted to help");
         assert_eq!(seen["mode"], "replace_all");
+    }
+
+    #[test]
+    fn do_review_confirmed_builds_a_replace_selection_proposal_for_a_selection_target() {
+        let fake = FakeReplaceExecutor {
+            result: std::sync::Mutex::new(Some(Ok(crate::executors::Undo::none("wrote it")))),
+            seen: std::sync::Mutex::new(None),
+        };
+        let ctx = sample_selection_ctx();
+        do_review_confirmed(&fake, &ctx).expect("fake executor succeeds");
+
+        let seen = fake.seen.lock().unwrap();
+        let seen = seen.as_ref().expect("execute must have been called");
+        assert_eq!(seen["mode"], "replace_selection");
+        assert_eq!(seen["new_text"], "wanted");
+        assert_eq!(seen["selection_start"], serde_json::json!(2usize));
+        assert_eq!(seen["selection_end"], serde_json::json!(8usize));
     }
 
     #[test]
