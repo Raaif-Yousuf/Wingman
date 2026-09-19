@@ -14,14 +14,16 @@ radio-checked "Mode" submenu in the tray (`append_mode_submenu`,
 | mode | providers selected | network |
 |---|---|---|
 | **Cloud** | every configured non-local provider (everything except Ollama), in `providers.order` | yes |
-| **Local** | every configured local provider (Ollama only, today) | loopback only |
+| **Local** | Ollama plus any `[[providers.compat]]` endpoint whose `base_url` is loopback | loopback only |
 | **Auto** (default) | Local first, but only if Ollama is reachable and has the configured model loaded right now; otherwise Cloud only | yes, unless Ollama alone is used |
 | **Offline** | same selection as Local | loopback only, **enforced in code**, not just by selection |
 
-`mode::select_providers(mode, configured, ollama_ready)` (pure, unit-tested
-with a full table of cases) is the only place this selection logic lives;
-`Providers::build_chain_for_mode` (`src/config.rs`) calls it to build the
-actual provider chain for a request.
+`mode::select_providers(mode, configured, ollama_ready, local_compat_names)`
+(pure, unit-tested with a full table of cases) is the only place this
+selection logic lives; `Providers::build_chain_for_mode` (`src/config.rs`)
+computes `local_compat_names` from each `[[providers.compat]]` entry's
+`base_url` (via `mode::classify_host`) and calls `select_providers` to build
+the actual provider chain for a request.
 
 ### Cloud
 
@@ -30,9 +32,16 @@ excluded even if it is present in the order and even if it is ready.
 
 ### Local
 
-Every provider in `providers.order` that Wingman classifies as local
-(`mode::is_local_provider_name`, currently just `name == "ollama"`), in
-order. If Ollama is not in `providers.order` at all, Local mode has no
+Every provider in `providers.order` that Wingman classifies as local via
+`mode::is_local_provider(name, local_compat_names)`, in order. That is
+Ollama (`is_local_provider_name`, `name == "ollama"`) **plus** any
+`[[providers.compat]]` entry (`openai_compat.rs`, issue #16) whose
+configured `base_url` classifies as `HostClass::Loopback`
+(`Providers::build_chain_for_mode`, `src/config.rs`) -- an `openai_compat`
+endpoint's locality is decided by where its `base_url` actually points, not
+by its name, so a local LM Studio, llama.cpp or vLLM server (or a second,
+`/v1`-shaped Ollama endpoint) pointed at `127.0.0.1` is selected under Local
+too. If none of that is configured in `providers.order`, Local mode has no
 providers and every request fails immediately with "no providers
 configured".
 

@@ -1,9 +1,8 @@
 # Providers
 
 What Wingman actually sends to each provider today, checked against the code
-in `src/provider/`. Planned providers (OpenAI-compatible endpoints) are
-labelled **Planned** and do not exist in code yet; see the
-[expansion plan](superpowers/specs/2026-09-16-expansion-plan-design.md) §5.
+in `src/provider/`: OpenAI, Anthropic, Gemini, Ollama, and the generic
+OpenAI-compatible endpoint (`openai-compat`, issue #16, closed).
 
 Every provider implements the same `Provider` trait
 (`src/provider/mod.rs`): `id`, `ready`, `capabilities`, `complete`. A
@@ -27,6 +26,7 @@ override always takes precedence and is never written to the store:
 | Anthropic | `ANTHROPIC_API_KEY` | `Wingman/anthropic` |
 | Gemini | `GEMINI_API_KEY` | `Wingman/gemini` |
 | Ollama | none (no key concept) | not applicable |
+| OpenAI-compatible (`compat:<name>`) | none (no fixed env var; a dynamic, user-named list has no single name to override) | `Wingman/compat:<name>` |
 
 Ollama has no `api_key` field at all (`OllamaConfig` in `src/config.rs`):
 a local server has nothing to authenticate against. Settings shows only the
@@ -206,19 +206,60 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   status line shows the result, including a message that says exactly this
   and tells the user to quit the stock tray app.
 
-### Planned: OpenAI-compatible endpoints
+## OpenAI-compatible endpoints (`openai-compat`)
 
-Not built. The expansion plan §5 describes a generic OpenAI-compatible
-provider (`POST {base_url}/chat/completions`, `response_format:
-json_schema` where supported, `auth: bearer | api-key-header | none`) meant
-to cover OpenRouter, Groq, Mistral, DeepSeek, xAI, Together, LM Studio,
-llama.cpp, vLLM and Azure without a new provider implementation per vendor.
-No code for this exists in `src/provider/` today.
+- **Built** (issue #16, closed): `src/provider/openai_compat.rs`
+  (`OpenAiCompat`, `impl Provider for OpenAiCompat`), covering any server
+  that speaks the OpenAI Chat Completions wire shape -- OpenRouter, Groq,
+  Mistral, DeepSeek, xAI, Together, LM Studio, llama.cpp, vLLM, Azure
+  OpenAI, and a local Ollama server's own `/v1` surface. One
+  `[[providers.compat]]` config entry (`CompatConfig`, `src/config.rs`) per
+  endpoint, resolved into a `"compat:<name>"` `providers.order` entry by
+  `compat_order_name`.
+- **Endpoint:** `POST {base_url}/chat/completions`, where `base_url` has no
+  trailing `/chat/completions` (e.g. `https://openrouter.ai/api/v1` or
+  `http://127.0.0.1:1234/v1`).
+- **Auth:** `CompatConfig::auth`, one of three modes: `bearer`
+  (`Authorization: Bearer <api_key>`), `api-key-header` (a caller-named
+  header, `CompatConfig::auth_header`, carrying the raw key -- e.g.
+  Mistral's `X-Api-Key`), or `none` (no credential sent, for a local server
+  with nothing to authenticate against). The key never goes in the URL,
+  only in a header.
+- **Models:** `providers.compat.<name>.model`, with `models` offered in the
+  tray's model submenu the same way as the fixed cloud providers.
+- **Structured output:** `CompatConfig::structured`, one of three modes:
+  `json_schema` (`response_format: {"type": "json_schema", ...}`,
+  schema-enforced by the server), `json_object`
+  (`response_format: {"type": "json_object"}`, valid JSON guaranteed but not
+  the specific shape, so the schema is also described in the system
+  prompt), or `prompt` (the default: no `response_format` field at all, the
+  schema described in the system prompt only -- the safest choice, since
+  not every OpenAI-compatible server recognizes the field and an
+  unrecognized field is a 400 on some stricter servers).
+- **Images:** `image_url` content parts with a
+  `data:image/png;base64,...` URL, the OpenAI Chat Completions convention.
+  Whether the configured model actually accepts an image is a user
+  declaration (`CompatConfig::vision`, issue #210, defaults to `true`), not
+  probed -- there is no way to ask an arbitrary compat endpoint this
+  directly.
+- **Locality:** never decided by name. `mode::is_local_provider` and
+  `Providers::build_chain_for_mode` (`src/config.rs`) classify a compat
+  endpoint as local or cloud from its configured `base_url` host via
+  `mode::classify_host` -- a `base_url` pointed at `127.0.0.1` (LM Studio,
+  llama.cpp, vLLM, a local Ollama `/v1` surface) is selected under Local and
+  Offline mode; see `docs/offline.md`.
+- **Retry/429:** shared with OpenAI, Anthropic and Gemini via
+  `provider/common.rs::post_json` (see "Retry and 429 handling" below);
+  this provider calls it with the tag `"openai-compat"`. Timeout is 90
+  seconds total (`REQUEST_TIMEOUT`).
+- **Refusal/budget exhaustion:** a non-empty `message.refusal` is reported
+  as "openai-compat: model refused to answer"; `finish_reason: "length"` is
+  reported as the same "ran out of room" message the other providers use.
 
 ## Retry and 429 handling
 
-Shared by OpenAI, Anthropic and Gemini through
-`provider/common.rs::post_json` / `post_json_with` (issue #98). Ollama uses
+Shared by OpenAI, Anthropic, Gemini and the OpenAI-compatible provider
+through `provider/common.rs::post_json` / `post_json_with` (issue #98). Ollama uses
 a different helper (`post_json_with_connect_timeout`) with no retry policy,
 since a local server has no rate limit to retry against.
 
@@ -242,30 +283,41 @@ since a local server has no rate limit to retry against.
   before any transport call, retry or sleep, when Offline mode is active
   and the URL's host is not loopback.
 
-## How to add Ollama or Gemini to `providers.order` by hand today
+## How to add Ollama, Gemini or a compat endpoint to `providers.order` by hand today
 
 Settings (`src/ui/settings.rs`) only exposes OpenAI and Anthropic:
 `ID_OPENAI_KEY`/`ID_ANTHROPIC_KEY` and their model/effort combos, plus a
 two-way `order_from_choice` toggle (`0` -> `["openai", "anthropic"]`, `1`
 -> `["anthropic", "openai"]`) that **rebuilds `providers.order` from
-scratch on every Settings save**. There is no UI path to add `"ollama"` or
-`"gemini"` to the order, and Gemini has no key/model/effort fields in
-Settings at all (issue #195).
+scratch on every Settings save**. There is no UI path to add `"ollama"`,
+`"gemini"` or a `"compat:<name>"` entry to the order, and Gemini has no
+key/model/effort fields in Settings at all (issue #195).
 
-To use Ollama or Gemini today, edit `%APPDATA%\Wingman\config.toml` by hand
-(**Open config.toml** in the tray menu) and add the provider name to
-`providers.order`, e.g.:
+To use Ollama, Gemini or an OpenAI-compatible endpoint today, edit
+`%APPDATA%\Wingman\config.toml` by hand (**Open config.toml** in the tray
+menu) and add the provider name to `providers.order`, e.g.:
 
 ```toml
 [providers]
-order = ["ollama", "openai", "anthropic"]
+order = ["ollama", "openai", "anthropic", "compat:openrouter"]
+
+[[providers.compat]]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+auth = "bearer"
+api_key = "..."
+model = "..."
 ```
 
 Gemini additionally needs `providers.gemini.api_key` set (or the
 `GEMINI_API_KEY` environment variable) since it has no Settings field to
 paste a key into. Ollama needs nothing beyond the order entry: its
 `base_url`/`model`/`effort` already have working defaults in
-`OllamaConfig::default`.
+`OllamaConfig::default`. A compat endpoint needs its own
+`[[providers.compat]]` table (`CompatConfig`, `src/config.rs`), one entry
+per endpoint, matched to the order by its `name` (`"compat:<name>"` in
+`providers.order` resolves to the `[[providers.compat]]` entry with that
+`name`).
 
 **The Settings limitation, precisely:** any edit made by hand to
 `providers.order` beyond `openai`/`anthropic` survives a **Reload
@@ -276,8 +328,8 @@ rewrites `order` to one of its two fixed two-provider lists on save
 #195 as the reason a Gemini field group has not been added). Until #51
 (retiring the fixed-layout Win32 Settings dialog for a main-window
 settings surface) lands with a proper N-provider order editor, a
-hand-edited order that includes Ollama or Gemini must not be re-saved from
-Settings, or it reverts to `openai`/`anthropic` only.
+hand-edited order that includes Ollama, Gemini or a compat endpoint must
+not be re-saved from Settings, or it reverts to `openai`/`anthropic` only.
 
 ## Model discovery
 
@@ -291,5 +343,8 @@ newline-delimited JSON progress and is built and tested, but nothing calls
 it yet either; both are reserved for a future settings surface (see each
 function's doc comment in `src/provider/ollama_admin.rs`).
 
-OpenAI-compatible `/v1/models` discovery is **planned**, not built (there is
-no OpenAI-compatible provider to discover models for yet).
+OpenAI-compatible: the provider exists (`openai_compat.rs`, issue #16,
+closed), but `/v1/models` discovery for it is **planned**, not built --
+there is no code in `src/provider/` today that calls a compat endpoint's
+`/v1/models` (or equivalent) to list what it serves; a compat endpoint's
+`model`/`models` are set by hand in `config.toml`.
