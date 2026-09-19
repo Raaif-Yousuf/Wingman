@@ -51,6 +51,12 @@ so the next round shares one brief instead of twelve hand-written ones.
 | `6ef81f7` | #253, #273, #260 and #281: provider error text redacted, the scrubber widened, the provider test race closed |
 | `7817f0f` | the documentation truth pass, #250 and #286 to #293 |
 | `8898a47` | the folder-rename claim the docs pass left contradicting itself |
+| `98ee978` | #279 the bypassable cargo-test hook, #257 the config ACL window |
+| `e605cc1` | #271 the region click-select, #272 the overlay stranded on Alt-Tab |
+| `27c755c` | #262 the clipboard restore, #263 IsPassword fail-open, #265 CF_DIBV5 |
+| `6188cb0` | #266 fill_form staleness, #267 replace_text payment checks |
+| `7b48a2d` | #269, #283, #268, plus a guard for the apply_config-forgets-a-mirror class |
+| `ff30d24` | the two ways the merged suite did not pass, both introduced tonight |
 
 ### The two findings worth carrying forward
 
@@ -72,41 +78,61 @@ because a URL and a filesystem path are long runs over exactly them. A wide
 run is now scrubbed whole only when it also carries upper case, lower case
 and a digit.
 
+**The gate on master is green:** fmt, clippy, deny, hooks, Pester and
+PSScriptAnalyzer all clean, **1611 unit tests + 1 trybuild + 7 no-em-dash, 0
+failures**. Thirteen of tonight's issues are fixed and merged; the rest are
+filed.
+
+### What the merge gate caught that no agent's own run did
+
+Worth knowing before the next fan-out, because both were invisible to the
+filtered runs each agent was told to use.
+
+**The suite hung, and the cause was mine.** Rewriting `provider::common`'s
+tests onto one `network_guard()` left one test taking it twice, because that
+test had had both a mode lock and an egress lock and two separate rewrites
+each matched it. `std::sync::Mutex` is not reentrant, so it deadlocked and
+took the whole run with it. Found by running the binary with
+`--test-threads=1` and reading which test the log stopped after.
+
+**Two `ui::region` tests were racy, and fixing them improved the product
+code.** The overlay under test is a real top-level window, and the rest of
+the suite creates and destroys real windows constantly, so genuine
+`WA_INACTIVE` messages arrive mid-test and any "the overlay was NOT
+cancelled" assertion fails whenever one does. `on_activate` now cancels only
+once the overlay has actually been activated, which is also the more correct
+production behaviour, and the decision moved into a pure function tested
+exhaustively.
+
 ## Do these next
 
-Ranked. The first three are the ones a user would notice.
+Ranked. Seven of the original list are now done; what remains is below.
 
-1. **#271 (P1), the region overlay's click-select-window path is
-   unconditionally broken.** The overlay is opaque and topmost with no
-   hit-test exemption, so `WindowFromPoint` can only ever return the overlay
-   itself. Every such click stages the whole desktop. Advertised behaviour,
-   never worked, no test inspects the staged rect's value.
-2. **#262 (P1), a failed clipboard restore permanently disables the retry.**
-   `restore_now` sets `done = true` whether or not the restore succeeded, so
-   `Drop`'s safety net is disabled at exactly the moment it is needed and
-   the user loses their clipboard. Proven by execution.
-3. **#266 and #267 (both P1), the executors.** `fill_form` writes a field
-   with no staleness check, so it can silently overwrite something changed
-   after the preview was shown and report success; `docs/executors.md`
-   claims it does check. `replace_text` has no payment check at all, so
-   "never touches payment data, no exceptions" currently has zero
-   enforcement on it.
-4. **#279 (P1), the cargo-test hook is bypassable** by any command prefix or
-   nested shell. It is the only thing stopping a fan-out agent from
-   exhausting this machine's RAM, and `time cargo test`, `cargo nextest run`
-   and `bash -c "cargo test"` all walk straight through.
-5. **#283 and #269 (P1, P2), `apply_config` forgets subsystems.** The mode
-   mirror the Offline guard reads is never re-synced on Reload, and neither
-   is the palette chord. The seam audit wrote the whole `Config` field
-   propagation table into #283; only those two rows were wrong, but nothing
-   stops a fourth.
-6. **#257 (P1), the config ACL.** Applied after the write rather than
-   before, swallowed on failure, and never applied at all by the
-   `copilot-ask` migration, which copies a live key into a file with
-   inherited permissions.
-7. **#294 (P1)**, the main Ask path's own prompt says "You are shown a
+1. **#294 (P1)**, the main Ask path's own prompt says "You are shown a
    screenshot" on the non-vision path. #247 named this gap and declined to
-   file it because the constant was outside its scope.
+   file it because the constant was outside its scope, so it has been known
+   and unowned for two rounds.
+2. **#261 (P1), UIA calls have no timeout**, so a hung foreground app wedges
+   `self.busy` forever and the app stops responding to the key with no card.
+   Needs a decision about what a timeout does to a half-read element, which
+   is why it was not handed to a fix agent tonight.
+3. **#263's live check.** The fix landed, but it is fail-closed now: a field
+   whose password status cannot be read is treated as a password. Confirm on
+   a real desktop that this does not make ordinary fields unusable.
+4. **#236 and #237 (both P1)**, blocked on the spec above. Nothing should be
+   written for them until you have answered its § 7.
+5. **#298 (P2), a new consequence of #257's fix.** `Config::save()` can now
+   return `Err` on an ACL failure where it previously could not, and no
+   caller turns that into a card. Rule 7 says it must.
+6. **#242 (P2), custom actions.toml actions do nothing when clicked.** Still
+   the worst one open for a project whose pitch is that actions are the
+   contribution surface.
+7. **#227 (P2), no `catch_unwind` in any worker**, with `panic = "abort"` in
+   release, so a worker panic kills the process with no card.
+
+The full ranked list is the tracker: 43 issues carry P1, and
+`docs/audit-coverage.md` says which parts of the tree the round actually
+read.
 
 ## The five older unmerged branches
 
@@ -127,12 +153,24 @@ proceed independently.
 
 ## Manual checks owed
 
-`#166` is the tracker. Tonight's verifier named four findings that cannot be
-closed without a live desktop, and they should go on it: #271 needs a real
-click on a second window under the overlay; #261 needs a genuinely hung UIA
-provider; #263 needs an injected failing `IsPassword` call; #255 needs a
-real focused control destroyed with `DestroyWindow` to see what
-`WM_KILLFOCUS` Windows actually delivers.
+`#166` is the tracker, and `OWNER_TODO.md` carries the same list. Tonight's
+verifier named four findings that cannot be closed without a live desktop,
+and two of them are now checks against fixes that have already landed:
+
+- **#271**, fixed: open the overlay over two overlapping real windows and
+  click without dragging on the front one; the size label must match that
+  window, not the whole desktop. Also click bare desktop background: the
+  fixing agent flagged, as an unverified theory, that Progman or WorkerW may
+  appear in the window snapshot with a full-monitor rect.
+- **#272**, fixed: open the overlay, Alt-Tab away, and it must disappear
+  rather than stranding unresponsive to Escape.
+- **#263**, fixed: the `IsPassword` read now fails closed, so confirm a real
+  form still fills normally and only a genuinely unreadable field is
+  skipped.
+- **#261**, not fixed: needs a genuinely hung UIA provider to observe `busy`
+  wedging.
+- **#255**, not fixed: needs a real focused preview control destroyed with
+  `DestroyWindow`, to see what `WM_KILLFOCUS` Windows actually delivers.
 
 Still owed from before: the one Settings click that points the Copilot key
 at the app. No script can do it.
