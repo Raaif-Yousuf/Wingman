@@ -81,6 +81,16 @@ Unbounded parallel builds have frozen this machine by exhausting RAM.
   hashes a workspace member by its workspace-relative path, so every worktree
   of this crate writes the same test binary. sccache shares the dependency
   compiles safely across target dirs.
+- **The orchestrator needs its own target dir too, not just the worktree
+  agents.** MEASURED 2026-09-19: with several agents running filtered tests
+  in the main checkout's shared `target/`, the orchestrator's own build
+  failed repeatedly with `LNK1104: cannot open file ...exe`. Cargo's file
+  lock serializes compilation but not the linker's output path, so two
+  processes building the same test binary collide. Run the orchestrator with
+  `CARGO_TARGET_DIR=<repo>/target/orch`.
+- **Never run two cargo commands against the same target dir at once**, your
+  own included: backgrounding a build and then starting another is the same
+  collision with only one agent involved.
 - "Blocking waiting for file lock" is expected. Wait; do not delete locks.
 - No `cargo build --release` unless the task is about the release binary.
 - master is `cargo fmt` clean (since #161): run `cargo fmt --all` in your
