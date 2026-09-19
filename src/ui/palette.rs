@@ -31,7 +31,7 @@
 //! The D2D factory, DirectWrite factory and the `IDWriteTextFormat` are
 //! created once, in [`Palette::create`], right after the `HWND` exists --
 //! never per paint (that is what would blow the sub-100ms show-latency
-//! budget: MEASURED 2026-09-18 below). The `ID2D1HwndRenderTarget` is
+//! budget: see the MEASURED block below). The `ID2D1HwndRenderTarget` is
 //! created lazily on first use from the same call (so it always exists
 //! before the first real paint) and is resized in place
 //! (`ID2D1HwndRenderTarget::Resize`) on every window-size or DPI change
@@ -43,6 +43,24 @@
 //! falls back to the exact GDI `DrawTextW` path this module used before
 //! #216 rather than paint nothing -- device loss additionally drops the
 //! render target so the next paint recreates it from scratch.
+//!
+//! MEASURED 2026-09-19, this machine, `dev` profile, machine otherwise idle,
+//! `cargo test ui::palette::tests::measure_show_latency -- --ignored
+//! --nocapture`, 20 shows of a real palette window: **avg 12.94 ms, max
+//! 44.11 ms**, the max being the first-show outlier (44.11 ms; every
+//! subsequent sample is 9.2 to 12.9 ms). The GDI baseline this replaced was
+//! avg 11.84 ms / max 34.53 ms (MEASURED 2026-09-17, same harness), so
+//! DirectWrite costs roughly 1 ms on average here and stays far inside
+//! #25's under-100 ms Done-when. Not re-measured in release; the debug
+//! number already clears the budget by a factor of seven, and `opt-level =
+//! "z"` plus LTO only moves it down.
+//!
+//! The fallback above is the reason
+//! [`tests::show_leaves_a_live_direct2d_renderer_not_a_silent_gdi_fallback`]
+//! exists: a DirectWrite path that never initializes at all paints
+//! identically, passes every other test, and keeps this latency number in
+//! budget, because GDI was fast too. That test asserts the renderer, its
+//! render target and its text format are really there after a real show.
 //!
 //! Per-monitor-v2 DPI: `WM_DPICHANGED` updates `self.dpi`, re-lays-out the
 //! query edit control, resizes the window to the system's suggested rect
@@ -94,8 +112,8 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -1097,7 +1115,10 @@ impl PaletteInner {
         // `EndDraw` device-loss branch below can still mutate
         // `renderer`/`self.d2d` without fighting the borrow checker over a
         // live `&self.d2d` reference.
-        let target = renderer.target.clone().expect("ensure_target just confirmed Some");
+        let target = renderer
+            .target
+            .clone()
+            .expect("ensure_target just confirmed Some");
         let format = renderer
             .text_format
             .clone()
@@ -1812,6 +1833,44 @@ mod tests {
             draw_text_line(hdc, "", rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
         }
+    }
+
+    // -- the DirectWrite path is really taken (#216) -------------------------
+
+    /// #216's "wired to nothing" observable, and the reason it needs its own
+    /// test: [`PaletteInner::try_paint_d2d`] returns `false` and falls back to
+    /// [`PaletteInner::paint_gdi`] whenever the Direct2D renderer is missing or
+    /// a device is lost. That fallback is the right behaviour, but it means a
+    /// DirectWrite path that never initializes at all looks exactly like a
+    /// working one: the palette still paints, every other test still passes,
+    /// and the show-latency number stays in budget because GDI was fast too.
+    ///
+    /// So assert the renderer is actually there after a real show, not just
+    /// that painting happened. If this fails while the palette still renders,
+    /// #216 has silently regressed to GDI.
+    #[test]
+    fn show_leaves_a_live_direct2d_renderer_not_a_silent_gdi_fallback() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).expect("palette window creation must succeed");
+        p.show(
+            free_actions(),
+            true,
+            "mode: Auto - openai:gpt-5".to_string(),
+        );
+
+        let renderer = p
+            .inner
+            .d2d
+            .as_ref()
+            .expect("PaletteRenderer::new returned None: Direct2D/DirectWrite factories                      were never created, so every paint silently falls back to GDI");
+        assert!(
+            renderer.target.is_some(),
+            "no ID2D1HwndRenderTarget after a real show: try_paint_d2d returns false              every time and the palette is still a GDI surface"
+        );
+        assert!(
+            renderer.text_format.is_some(),
+            "no IDWriteTextFormat after a real show: rows would draw with no text"
+        );
     }
 
     // -- show latency (#25's Done-when: under 100 ms) -----------------------
