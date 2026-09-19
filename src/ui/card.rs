@@ -187,6 +187,8 @@ impl Card {
             preview: None,
             last_confirmed: None,
             owner: None,
+            preview_decision_pending: false,
+            preview_generation: 0,
         });
         let raw = Box::into_raw(inner);
 
@@ -334,15 +336,22 @@ impl Card {
     /// was called, so focus returns to the user's previous work the moment
     /// the decision is made either way.
     #[allow(dead_code)] // wiring app.rs's worker to call this is a later issue's job
+    /// Shows the preview and returns its generation (#225). Store it: the
+    /// `WM_APP_PREVIEW_DECIDED` that eventually arrives carries the
+    /// generation it belongs to in its `WPARAM`, and anything older is a
+    /// late abandonment for a preview that is already gone, not a decision
+    /// about this one.
+    #[must_use = "store the generation; on_preview_decided needs it to reject a stale notification"]
     pub fn show_preview(
         &mut self,
         title: &str,
         schema: &serde_json::Value,
         proposal_value: &serde_json::Value,
         main_window_exists: bool,
-    ) {
+    ) -> u32 {
         self.inner
             .show_preview(title, schema, proposal_value, main_window_exists);
+        self.inner.preview_generation
     }
 
     /// Takes the `Confirmed<Value>` produced by the last "Do it" / Enter, if
@@ -893,6 +902,30 @@ struct CardInner {
     /// no owner set still works, it just has nowhere to notify -- the same
     /// degrade `Tray`'s own best-effort Win32 calls use elsewhere.
     owner: Option<HWND>,
+    /// Issue #225: `true` from the moment a preview is shown until a
+    /// decision has been reported for it. "Do it" and Cancel clear it and
+    /// notify the owner themselves; anything else that tears the preview
+    /// down (hiding the card, starting another action, opening Settings,
+    /// pausing, or replacing this preview with a different one) leaves it
+    /// set, and [`CardInner::leave_preview_if_active`] then reports the
+    /// abandonment so the owner can drop whatever it was holding.
+    ///
+    /// Without this, a preview could be destroyed with no
+    /// [`WM_APP_PREVIEW_DECIDED`] ever posted, `App`'s `pending_review` /
+    /// `pending_form_fill` would stay `Some`, and a later "Do it" on a
+    /// different preview could run the abandoned action instead of the one
+    /// the user actually confirmed.
+    preview_decision_pending: bool,
+    /// Issue #225: incremented on every [`CardInner::show_preview`], and
+    /// posted as `WM_APP_PREVIEW_DECIDED`'s `WPARAM` so the owner can tell
+    /// WHICH preview a decision belongs to.
+    ///
+    /// The notification is a `PostMessageW`, so it is delivered after the
+    /// call that triggered it has returned. Replacing a live preview posts
+    /// the old one's abandonment and then arms the new one in the same turn;
+    /// without a generation the owner would process that abandonment later
+    /// and clear the state belonging to the preview now on screen.
+    preview_generation: u32,
 }
 
 impl CardInner {
@@ -1769,6 +1802,12 @@ impl CardInner {
             previous_foreground,
             main_window_exists,
         });
+        // #225: from here until a decision is reported, tearing this
+        // preview down is an abandonment and the owner has to be told. Set
+        // AFTER the `leave_preview_if_active` above, so replacing a live
+        // preview reports the OLD one exactly once and then arms the new.
+        self.preview_decision_pending = true;
+        self.preview_generation = self.preview_generation.wrapping_add(1);
 
         self.layout_preview();
         self.create_preview_controls();
@@ -1827,8 +1866,13 @@ impl CardInner {
         // `PreviewUi` before returning -- see `last_confirmed`'s doc
         // comment on why this can't live there.
         self.last_confirmed = Some(confirmed);
+        // #225: claim the decision before `close_preview` reaches
+        // `leave_preview_if_active`, so it does not also report this as an
+        // abandonment (and does not clear the `Confirmed` just stored).
+        let generation = self.preview_generation;
+        self.preview_decision_pending = false;
         self.close_preview();
-        self.notify_owner_of_preview_decision();
+        self.notify_owner_of_preview_decision(generation);
     }
 
     /// "Cancel" / Esc: produces nothing (no `Confirmed` is ever built) and
@@ -1838,8 +1882,12 @@ impl CardInner {
     /// earlier preview.
     fn preview_cancel(&mut self) {
         self.last_confirmed = None;
+        // #225: same as `preview_do_it` -- this path reports its own
+        // decision, so it is not an abandonment.
+        let generation = self.preview_generation;
+        self.preview_decision_pending = false;
         self.close_preview();
-        self.notify_owner_of_preview_decision();
+        self.notify_owner_of_preview_decision(generation);
     }
 
     /// Issue #39: the one way `CardInner` (a plain Win32 window with no
@@ -1849,10 +1897,18 @@ impl CardInner {
     /// doc comment for why that is safe even if this message is dropped
     /// while Settings is open. A no-op if [`Card::set_owner`] was never
     /// called.
-    fn notify_owner_of_preview_decision(&self) {
+    /// #225: `WPARAM` is the generation of the preview this decision is
+    /// about, so a late-delivered abandonment cannot be mistaken for a
+    /// decision on whatever preview is on screen by the time it arrives.
+    fn notify_owner_of_preview_decision(&self, generation: u32) {
         if let Some(owner) = self.owner {
             unsafe {
-                let _ = PostMessageW(Some(owner), WM_APP_PREVIEW_DECIDED, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(
+                    Some(owner),
+                    WM_APP_PREVIEW_DECIDED,
+                    WPARAM(generation as usize),
+                    LPARAM(0),
+                );
             }
         }
     }
@@ -1909,10 +1965,24 @@ impl CardInner {
     /// method (`show_pending`, `show_collapsed`, `show_preview` itself, and
     /// `hide`) so a preview's child controls can never survive a jump to a
     /// different state, regardless of which path got there.
+    /// The single choke point every path out of `CardState::Preview` goes
+    /// through. Issue #225: it is also where an ABANDONED preview is
+    /// reported. "Do it" and Cancel clear `preview_decision_pending` before
+    /// they get here and post their own notification, so they do not double
+    /// post (`preview_do_it_posts_exactly_one_wm_app_preview_decided`
+    /// guards that). Every other way out of Preview leaves the flag set,
+    /// and the owner is told here.
     fn leave_preview_if_active(&mut self) {
         if self.preview.is_some() {
             self.destroy_preview_controls();
             self.preview = None;
+        }
+        if self.preview_decision_pending {
+            self.preview_decision_pending = false;
+            // No `Confirmed` is produced, and any stale one is dropped: an
+            // abandoned preview must never look like a confirmation.
+            self.last_confirmed = None;
+            self.notify_owner_of_preview_decision(self.preview_generation);
         }
     }
 
@@ -3084,6 +3154,121 @@ mod tests {
              calls take_confirmed(), which is None for Cancel -- see that method's doc comment)"
         );
         assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn hide_while_preview_is_open_notifies_the_owner_with_no_confirmation() {
+        // Issue #225: every one of app.rs's "hide the stale card" call
+        // sites (ask, extract_text, copy_region, open_settings,
+        // pause_for, add_event_from_screen, review_this_email,
+        // fill_form_from_screen) calls exactly this public `Card::hide()`
+        // with no check for `CardState::Preview`. Before the fix,
+        // `CardInner::hide` routed to `leave_preview_if_active`, which
+        // destroyed the preview's controls and reset `state` to `Hidden`
+        // -- but never posted `WM_APP_PREVIEW_DECIDED`, so whichever
+        // pending-preview context `App` had stashed for it was never
+        // cleared, and a later, unrelated preview's confirm could pick up
+        // the stale one instead (or run neither, dropping the new one).
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_preview("Add to calendar", &schema, &value, false);
+        assert_eq!(card.state(), CardState::Preview);
+
+        // The bug: hiding the card for an unrelated reason while a
+        // preview is open (Settings opening, Pause, a second action
+        // starting...), instead of the user pressing "Do it" or "Cancel".
+        card.hide();
+
+        assert_eq!(card.state(), CardState::Hidden, "hide() must still hide");
+        assert!(
+            card.take_confirmed().is_none(),
+            "an externally-hidden preview must never look like a Do it"
+        );
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "hide() must post WM_APP_PREVIEW_DECIDED when it destroys an \
+             active preview, so App::on_preview_decided can clear its \
+             pending-preview slot instead of leaving it to hijack a \
+             later, unrelated preview's decision (#225)"
+        );
+        assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn show_preview_interrupting_an_active_preview_notifies_before_replacing_it() {
+        // Same shape as the hide() case above, but for the path where a
+        // NEW preview interrupts an active one directly (on_calendar_result
+        // / on_review_result / on_form_fill_result all call show_preview
+        // without checking for an existing one first).
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_preview("Add to calendar", &schema, &value, false);
+        assert_eq!(card.state(), CardState::Preview);
+
+        let _ = card.show_preview("Fill this form", &schema, &value, false);
+        assert_eq!(
+            card.state(),
+            CardState::Preview,
+            "the second preview must still show"
+        );
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "replacing an active preview with a new one must notify the \
+             owner about the FIRST one before showing the second"
+        );
+        assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn preview_do_it_posts_exactly_one_wm_app_preview_decided() {
+        // Mutation guard for #225's fix: `leave_preview_if_active` now
+        // does the notifying (so an external `hide()` is covered too),
+        // and `preview_do_it`'s own explicit call was removed -- if it
+        // had not been, "Do it" would double-post and this would go red.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        let card_hwnd = card.hwnd();
+        unsafe {
+            SendMessageW(
+                card_hwnd,
+                WM_COMMAND,
+                Some(WPARAM(ID_PREVIEW_DO_IT as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+
+        let mut count = 0;
+        let mut msg = MSG::default();
+        while unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() } {
+            if msg.message == WM_APP_PREVIEW_DECIDED {
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 1,
+            "leave_preview_if_active must not double-post alongside a \
+             separate explicit notify"
+        );
     }
 
     #[test]

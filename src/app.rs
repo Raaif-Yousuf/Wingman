@@ -165,22 +165,28 @@ struct App {
     /// "Review this email" preview currently on screen, so
     /// `on_preview_decided` knows to build and run a `replace_text`
     /// proposal instead of resolving `"calendar_add"`. `Some` only between
-    /// `on_review_result` showing the preview and the next
-    /// `WM_APP_PREVIEW_DECIDED` (taken, and always cleared, by that
-    /// handler regardless of Do it/Cancel) -- `None` the rest of the time,
-    /// including while a calendar preview is on screen, so the two flows'
-    /// previews can never be confused with each other.
-    pending_review: Option<actions::review_email::ReviewContext>,
-    /// #40: the merged, pre-approval `form_fill` proposal
-    /// `actions::fill_form::build_proposal` built, kept between
-    /// `on_form_fill_result` (which shows its translated preview) and
-    /// `on_preview_decided` (which rebuilds the real proposal from it once
-    /// "Do it" fires -- see `actions::fill_form::rebuild_after_confirm`).
-    /// `None` whenever no fill_form preview is currently on screen; always
-    /// taken (never merely read) at the top of `on_preview_decided`, so a
-    /// Cancel on this preview can never leak into an unrelated LATER
-    /// preview's decision.
-    pending_form_fill: Option<Value>,
+
+    /// Issue #225: the one action awaiting a preview decision, if any.
+    ///
+    /// This was two independent `Option`s (`pending_review`,
+    /// `pending_form_fill`) that "could never both be `Some`, because only
+    /// one preview is on screen at a time". They could. `Card::hide` tore a
+    /// preview down without reporting a decision, so a slot outlived its
+    /// preview, and `on_preview_decided` checked review before form-fill, so
+    /// pressing "Do it" on a form-fill preview ran the abandoned email
+    /// replace-text instead and dropped the confirmed fill with no card.
+    ///
+    /// One slot holding a kind makes that unrepresentable rather than
+    /// re-checked: showing a second preview overwrites the first, and the
+    /// compiler finds every site that has to handle a new kind. `None` means
+    /// the calendar flow, which needs no carried context.
+    pending_preview: Option<PendingPreview>,
+    /// Issue #225: the generation of the preview whose decision this `App`
+    /// is still waiting for. `WM_APP_PREVIEW_DECIDED` carries a generation
+    /// in its `WPARAM`; anything that does not match is a late-delivered
+    /// abandonment for a preview that has already been replaced, and acting
+    /// on it would clear the state belonging to the preview now on screen.
+    pending_preview_generation: u32,
     /// #40: the `Undo` the most recent successful `fill_form` run returned,
     /// so "Restore last form" (tray) can put its fields back. `FnOnce`
     /// (`executors::Undo::undo` consumes it), so this is `take()`n on use --
@@ -287,8 +293,8 @@ pub fn run() -> Result<()> {
         last: None,
         pause: PauseState::Running,
         pending_conflict: None,
-        pending_review: None,
-        pending_form_fill: None,
+        pending_preview: None,
+        pending_preview_generation: 0,
         last_form_undo: None,
     });
     app.refresh_tray_labels();
@@ -1080,8 +1086,9 @@ impl App {
         if confirm_required {
             let schema = actions::schema::schema_for("calendar_event", false)
                 .expect("\"calendar_event\" is always registered in actions::schema");
-            self.card
-                .show_preview("Add event from screen", &schema, &proposal, false);
+            self.pending_preview_generation =
+                self.card
+                    .show_preview("Add event from screen", &schema, &proposal, false);
             // Preview manages its own lifecycle (Do it / Cancel / Esc) and
             // takes real focus -- unlike Collapsed/Expanded it is never
             // dismissed by a click elsewhere (Card::show_preview's "Focus"
@@ -1120,46 +1127,61 @@ impl App {
     /// "Do" never happens without an explicit confirm -- and `Some` for
     /// "Do it".
     ///
-    /// Three actions can leave a preview on screen (`add_event_from_screen`,
-    /// `review_this_email`, `fill_form_from_screen`) and only one preview is
-    /// ever on screen at a time, so exactly one of `self.pending_review` /
-    /// `self.pending_form_fill` is `Some` -- or neither, for calendar's own
-    /// flow. Both are `take()`n unconditionally, before `take_confirmed()`
-    /// is even consulted, on Cancel/Esc as much as on "Do it", so a
-    /// cancelled preview of either kind can never leave a stale slot behind
-    /// for the next, unrelated preview's decision to pick up by mistake
-    /// (#38, #40).
-    ///
-    /// #38: when `pending_review` is `Some`, this is "Review this email"'s
-    /// decision -- `run_review_executor` resolves the `replace_text`
-    /// executor against the stashed target.
-    ///
-    /// #40: when `pending_form_fill` is `Some`, this is "Fill this form"'s
-    /// decision. The flat value the card confirmed is only the PREVIEW's
-    /// translation (`actions::fill_form::build_preview_schema_and_value`),
-    /// so it is rebuilt against the real merged proposal
-    /// (`actions::fill_form::rebuild_after_confirm`) before running the
-    /// `fill_form` executor.
-    ///
-    /// Otherwise (`pending_review` and `pending_form_fill` both `None`),
-    /// this is calendar's own flow: the executor is resolved fresh by the
-    /// fixed `"calendar_add"` name, the same "fixed until a second
+    /// Three actions can leave a preview on screen
+    /// (`add_event_from_screen`, `review_this_email`,
+    /// `fill_form_from_screen`), and which one this decision belongs to is
+    /// [`App::pending_preview`]: `Review` for #38, `FormFill` for #40, and
+    /// `None` for calendar's own flow, whose executor is resolved fresh by
+    /// the fixed `"calendar_add"` name (the same "fixed until a second
     /// confirm-required action exists" status `CalendarAddExecutor::new`'s
-    /// own fixed `"ics"` connector choice had before #38/#40 landed.
-    fn on_preview_decided(&mut self) {
-        let pending_review = self.pending_review.take();
-        let pending_form_fill = self.pending_form_fill.take();
+    /// own fixed `"ics"` connector choice had before #38/#40 landed).
+    ///
+    /// It is `take()`n unconditionally, before `take_confirmed()` is even
+    /// consulted, so Cancel, Esc and an abandoned preview all clear it just
+    /// as "Do it" does.
+    ///
+    /// #225 changed two things here, and both are load-bearing:
+    ///
+    /// One slot, not two. It used to be a `pending_review` and a
+    /// `pending_form_fill` that "could never both be `Some`". They could,
+    /// and when they were, this handler checked review first and ran the
+    /// abandoned email edit instead of the form fill the user had just
+    /// confirmed. A single slot makes that unrepresentable.
+    ///
+    /// `generation` is the preview this notification is about, taken from
+    /// the message's `WPARAM`. The notification is a `PostMessageW`, so
+    /// replacing a live preview posts the old one's abandonment and then
+    /// arms the new one before that message is delivered. Without the
+    /// match, the stale abandonment would clear the state belonging to the
+    /// preview now on screen, and its "Do it" would then fall through to
+    /// the calendar arm.
+    fn on_preview_decided(&mut self, generation: u32) {
+        if generation != self.pending_preview_generation {
+            return;
+        }
+        // Taken unconditionally, before `take_confirmed` is consulted, so a
+        // Cancel or an abandonment clears it just as a "Do it" does.
+        let pending = self.pending_preview.take();
         let Some(confirmed) = self.card.take_confirmed() else {
             return;
         };
 
-        if let Some(ctx) = pending_review {
-            self.run_review_executor(ctx);
-            return;
+        match pending {
+            Some(PendingPreview::Review(ctx)) => {
+                self.run_review_executor(ctx);
+            }
+            Some(PendingPreview::FormFill(original)) => {
+                self.run_confirmed_form_fill(&original, confirmed);
+            }
+            None => self.run_confirmed_calendar_add(confirmed),
         }
+    }
 
-        if let Some(original) = pending_form_fill {
-            let rebuilt = actions::fill_form::rebuild_after_confirm(&original, confirmed.value());
+    /// #40's half of [`App::on_preview_decided`], split out so that handler
+    /// is a flat match over [`PendingPreview`] with one arm per kind.
+    fn run_confirmed_form_fill(&mut self, original: &Value, confirmed: confirm::Confirmed<Value>) {
+        {
+            let rebuilt = actions::fill_form::rebuild_after_confirm(original, confirmed.value());
             let token = confirm::user_confirmed();
             let final_confirmed = confirm::confirm(confirm::Proposal::new(rebuilt), token);
             match executors::registry::resolve("fill_form") {
@@ -1170,9 +1192,12 @@ impl App {
                     self.set_watch(true);
                 }
             }
-            return;
         }
+    }
 
+    /// The default arm of [`App::on_preview_decided`]: no carried context
+    /// means the calendar flow.
+    fn run_confirmed_calendar_add(&mut self, confirmed: confirm::Confirmed<Value>) {
         match executors::registry::resolve("calendar_add") {
             Ok(executor) => self.run_calendar_executor(executor.as_ref(), confirmed),
             Err(e) => {
@@ -1315,16 +1340,19 @@ impl App {
         let edits = actions::review_email::edits_from_value(&outcome.proposal);
         let applied = actions::review_email::apply_edits(&outcome.original_text, &edits);
 
-        self.pending_review = Some(actions::review_email::ReviewContext {
-            target,
-            original_text: outcome.original_text.clone(),
-            new_text: applied.new_text,
-        });
+        self.pending_preview = Some(PendingPreview::Review(
+            actions::review_email::ReviewContext {
+                target,
+                original_text: outcome.original_text.clone(),
+                new_text: applied.new_text,
+            },
+        ));
 
         let schema = actions::schema::schema_for("text_review", false)
             .expect("\"text_review\" is always registered in actions::schema");
-        self.card
-            .show_preview("Review this email", &schema, &outcome.proposal, false);
+        self.pending_preview_generation =
+            self.card
+                .show_preview("Review this email", &schema, &outcome.proposal, false);
         // Same "Preview manages its own lifecycle" reasoning as
         // `on_calendar_result`'s own return here -- the global click
         // watcher stays disarmed.
@@ -1457,9 +1485,10 @@ impl App {
         }
 
         let (schema, preview_value) = actions::fill_form::build_preview_schema_and_value(&value);
-        self.pending_form_fill = Some(value);
-        self.card
-            .show_preview("Fill this form", &schema, &preview_value, false);
+        self.pending_preview = Some(PendingPreview::FormFill(value));
+        self.pending_preview_generation =
+            self.card
+                .show_preview("Fill this form", &schema, &preview_value, false);
     }
 
     /// Runs the `fill_form` executor and shows the result card (rule 5:
@@ -1885,7 +1914,7 @@ impl App {
                 DeferredMessage::CalendarResult(result) => self.on_calendar_result(result),
                 DeferredMessage::ReviewResult(result) => self.on_review_result(result),
                 DeferredMessage::FormFillResult(result) => self.on_form_fill_result(result),
-                DeferredMessage::PreviewDecided => self.on_preview_decided(),
+                DeferredMessage::PreviewDecided(generation) => self.on_preview_decided(generation),
             }
         }
     }
@@ -3013,10 +3042,26 @@ enum DeferredMessage {
     /// style rather than the plain free-and-drop `WM_APP_ROUTER_RESULT`
     /// still gets).
     FormFillResult(std::result::Result<Value, String>),
-    /// `WM_APP_PREVIEW_DECIDED` carries no payload of its own -- the
-    /// decision lives on `Card`/`App` (`take_confirmed`/`pending_review`),
-    /// read fresh when this is finally delivered by `on_preview_decided`.
-    PreviewDecided,
+    /// `WM_APP_PREVIEW_DECIDED`. The decision itself lives on `Card`/`App`
+    /// (`take_confirmed`/`pending_review`), read fresh when this is finally
+    /// delivered by `on_preview_decided`; the `u32` is #225's preview
+    /// generation, carried through from the message's `WPARAM` so a
+    /// deferred notification is still matched against the right preview
+    /// when Settings closes and the queue drains.
+    PreviewDecided(u32),
+}
+
+/// Issue #225: which action is waiting on the preview currently on screen.
+/// See [`App::pending_preview`] for why this is one slot rather than one
+/// `Option` per kind.
+enum PendingPreview {
+    /// #38 "Review this email": the stashed target to write the edits back
+    /// through, consumed by `run_review_executor`.
+    Review(actions::review_email::ReviewContext),
+    /// #40 "Fill this form": the merged, pre-approval proposal. The value
+    /// the card confirmed is only the preview's flat translation, so this is
+    /// what `actions::fill_form::rebuild_after_confirm` rebuilds against.
+    FormFill(Value),
 }
 
 /// What `wnd_proc` should do with a message addressed to the owner window
@@ -3202,7 +3247,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     WM_APP_FORM_FILL_RESULT => DeferredMessage::FormFillResult(unsafe {
                         *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
                     }),
-                    WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided,
+                    WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
                     _ => unreachable!(
                         "settings_reentrancy_policy only returns Defer for the five ids above"
                     ),
@@ -3323,7 +3368,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_APP_PREVIEW_DECIDED => {
-            app.on_preview_decided();
+            app.on_preview_decided(wparam.0 as u32);
             LRESULT(0)
         }
         WM_APP_DISMISS => {
