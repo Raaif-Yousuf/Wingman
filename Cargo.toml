@@ -83,6 +83,15 @@ version = "0.3"
 default-features = false
 features = ["std"]
 
+[dev-dependencies]
+# #203: drives tests/compile_fail.rs, which proves `ui::confirm::Confirmed`'s
+# field-privacy boundary actually fails to compile if it is ever widened,
+# instead of only being documented in a `compile_fail` doc comment that
+# `cargo test` never runs (wingman has no [lib] target, see Cargo.toml's
+# [[bin]] section and tests/no_em_dash.rs's own doc comment for the same
+# fact). MIT OR Apache-2.0, re-verified at adoption 2026-09-18.
+trybuild = "1"
+
 [profile.release]
 opt-level = "z"
 lto = true

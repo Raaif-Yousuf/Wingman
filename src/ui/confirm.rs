@@ -48,19 +48,37 @@ pub struct ConfirmationToken(());
 /// An executor cannot fabricate one of these: the field is private to this
 /// module, and the only constructor is `pub(crate)`, in this module only.
 ///
+/// This is now an automated gate, not just a doc comment (#203):
+/// `tests/compile_fail.rs` (via `tests/compile_fail/confirmed_is_private.rs`)
+/// `include!`s this very file into a throwaway crate with a sibling
+/// `attacker` module -- the same module relationship `src/executors/*.rs`
+/// has to this file -- and proves that module still cannot write the
+/// `value` field. `cargo test` (or an equivalent gate) now fails if that
+/// boundary is ever widened enough for `src/executors/*.rs` to construct one
+/// directly, which the illustrative snippet below never could: `wingman` is
+/// a `[[bin]]`-only crate (no `[lib]` target in `Cargo.toml`), and Cargo only
+/// extracts and runs doctests against a library target, so `cargo test
+/// --doc` finds nothing to run here regardless of what this comment says.
+///
+/// The two-module shape matters: a `struct`/`fn` pair with no `mod`
+/// boundary between them sit in the SAME module, where a private field is
+/// always visible, so a flattened one-module version of this snippet would
+/// compile fine and silently prove nothing (MEASURED 2026-09-18, in the
+/// course of building the automated gate above). The illustration below
+/// keeps the module split for that reason.
+///
 /// ```compile_fail
-/// // This snippet documents the boundary; it is NOT run by `cargo test`.
-/// // wingman is a [[bin]]-only crate (no [lib] target in Cargo.toml), and
-/// // Cargo only extracts and runs doc tests against a library target, so
-/// // `cargo test --doc` finds nothing to test here regardless of what this
-/// // comment says. See the 2026-09-17 executor design doc, "The
-/// // compile-fail doc test, and why it cannot run here". The privacy
-/// // violation itself was verified with a standalone `rustc` compile
-/// // (MEASURED 2026-09-17, same doc), not through this doctest.
-/// # struct Confirmed<P> { value: P }
-/// # fn from_outside_the_module<P>(p: P) -> Confirmed<P> {
-/// Confirmed { value: p } // error[E0451]: field `value` is private
-/// # }
+/// // Illustrative only; not run by `cargo test` (see above) -- the real
+/// // check is tests/compile_fail.rs.
+/// mod confirm {
+///     pub struct Confirmed<P> { value: P }
+/// }
+/// mod executors {
+///     fn fabricate<P>(p: P) -> super::confirm::Confirmed<P> {
+///         super::confirm::Confirmed { value: p } // error[E0451]: field `value` is private
+///     }
+/// }
+/// # fn main() {}
 /// ```
 #[allow(dead_code)]
 pub struct Confirmed<P> {

@@ -1,0 +1,5 @@
+error[E0451]: field `value` of struct `Confirmed` is private
+  --> tests/compile_fail/confirmed_is_private.rs:52:37
+   |
+52 |         super::confirm::Confirmed { value: 1 } // error[E0451]: field `value` is private
+   |                                     ^^^^^ private field
