@@ -1208,12 +1208,30 @@ impl App {
         }
     }
 
+    /// #268: `run_calendar_executor`'s headline, derived from what actually
+    /// happened rather than hardcoded. `CalendarAddExecutor::execute`
+    /// (`src/executors/calendar_add.rs`) appends ", but it could not be
+    /// opened automatically; open ... yourself" to `Undo.summary` exactly
+    /// when `result.opened == false` -- `Undo` exposes only `summary:
+    /// String` (no `opened` field), so that fixed substring is the only
+    /// signal available here without touching `src/executors/`, which
+    /// another agent owns tonight.
+    fn calendar_headline(summary: &str) -> &'static str {
+        if summary.contains("could not be opened automatically") {
+            "Event added, not opened"
+        } else {
+            "Event opened in your calendar app"
+        }
+    }
+
     /// Runs `executor` against `confirmed` and shows the result card:
     /// honest per the connector design doc (`Undo.summary` already names
     /// the generated file and that undo only deletes it, never touching
     /// whatever the calendar app itself created) -- never a second action
     /// taken automatically. This is as far as "Do" goes; Wingman never
-    /// presses Send, Submit, Buy or Pay.
+    /// presses Send, Submit, Buy or Pay. #268: the headline must agree
+    /// with `summary`'s own body text instead of always claiming the
+    /// event was opened (see [`Self::calendar_headline`]).
     fn run_calendar_executor(
         &mut self,
         executor: &dyn executors::Executor,
@@ -1221,8 +1239,8 @@ impl App {
     ) {
         match executor.execute(confirmed) {
             Ok(undo) => {
-                self.card
-                    .show_answer("Event opened in your calendar app", &undo.summary, 0, None);
+                let headline = Self::calendar_headline(&undo.summary);
+                self.card.show_answer(headline, &undo.summary, 0, None);
             }
             Err(e) => {
                 self.card
@@ -1491,11 +1509,51 @@ impl App {
                 .show_preview("Fill this form", &schema, &preview_value, false);
     }
 
+    /// #268: `run_form_fill_executor`'s headline, derived from what
+    /// actually happened rather than hardcoded. `executors::fill_form::
+    /// do_fill` (see its module doc, "Refuse the field, not the whole
+    /// fill") returns `Ok` even when every field ended up `Skipped` or
+    /// `Refused`, and `format_outcomes` (which builds `Undo.summary`)
+    /// always starts that summary with the fixed prefix `"Filled {filled}
+    /// of {total} field..."` -- see `format_outcomes`'s definition and its
+    /// own test `format_outcomes_counts_filled_and_lists_the_rest` in
+    /// `src/executors/fill_form.rs`. `src/executors/` is owned by another
+    /// agent tonight (and mid-change for #266, which will only make the
+    /// zero-filled case more common), so this reads that already-stable
+    /// prefix rather than adding any new field to `Undo` -- `Undo` exposes
+    /// only `summary: String`.
+    ///
+    /// Falls back to the old "Form filled" text if the prefix cannot be
+    /// parsed (should not happen given `format_outcomes`'s own coverage of
+    /// that prefix; a change to it that broke this would also break that
+    /// test first).
+    fn form_fill_headline(summary: &str) -> &'static str {
+        match Self::parse_filled_of_total(summary) {
+            Some((0, _)) => "Nothing filled",
+            Some((filled, total)) if filled < total => "Form partially filled",
+            Some(_) => "Form filled",
+            None => "Form filled",
+        }
+    }
+
+    /// Parses the `"Filled {filled} of {total} field..."` prefix
+    /// `executors::fill_form::format_outcomes` always writes. Returns
+    /// `None` for anything else rather than guessing.
+    fn parse_filled_of_total(summary: &str) -> Option<(usize, usize)> {
+        let rest = summary.strip_prefix("Filled ")?;
+        let (filled_str, rest) = rest.split_once(" of ")?;
+        let total_str = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+        let filled = filled_str.parse().ok()?;
+        let total = total_str.parse().ok()?;
+        Some((filled, total))
+    }
+
     /// Runs the `fill_form` executor and shows the result card (rule 5:
     /// what happened, not what was intended -- `Undo.summary`, built by
     /// `executors::fill_form::format_outcomes`, already lists filled,
-    /// skipped and refused fields by name). On success, stashes the `Undo`
-    /// for "Restore last form" (tray, `restore_last_form`).
+    /// skipped and refused fields by name; #268: the headline above it
+    /// must agree, via [`Self::form_fill_headline`]). On success, stashes
+    /// the `Undo` for "Restore last form" (tray, `restore_last_form`).
     fn run_form_fill_executor(
         &mut self,
         executor: &dyn executors::Executor,
@@ -1503,7 +1561,8 @@ impl App {
     ) {
         match executor.execute(confirmed) {
             Ok(undo) => {
-                self.card.show_answer("Form filled", &undo.summary, 0, None);
+                let headline = Self::form_fill_headline(&undo.summary);
+                self.card.show_answer(headline, &undo.summary, 0, None);
                 self.last_form_undo = Some(undo);
             }
             Err(e) => {
@@ -3854,6 +3913,87 @@ mod tests {
                 App::readiness_gate(mode, &providers, "config.toml").expect("must block");
             assert!(!headline.contains('\u{2014}'), "{headline}");
             assert!(!detail.contains('\u{2014}'), "{detail}");
+        }
+    }
+
+    // -- form_fill_headline / calendar_headline (issue #268) ---------------
+
+    #[test]
+    fn form_fill_headline_says_nothing_filled_when_every_field_was_skipped_or_refused() {
+        // The exact shape `executors::fill_form::format_outcomes` produces
+        // when every field is skipped or refused -- see its own test
+        // `format_outcomes_counts_filled_and_lists_the_rest`'s style.
+        let summary = "Filled 0 of 3 fields. Skipped \"Password\": password control. \
+                        Refused \"Place order\": invokable or forbidden target. \
+                        Refused \"Total\": payment-shaped label.";
+        assert_eq!(App::form_fill_headline(summary), "Nothing filled");
+    }
+
+    #[test]
+    fn form_fill_headline_says_form_filled_when_every_field_was_filled() {
+        let summary = "Filled 2 of 2 fields.";
+        assert_eq!(App::form_fill_headline(summary), "Form filled");
+    }
+
+    #[test]
+    fn form_fill_headline_says_partially_filled_for_a_mixed_outcome() {
+        let summary = "Filled 1 of 3 fields. Skipped \"Password\": password control.";
+        assert_eq!(App::form_fill_headline(summary), "Form partially filled");
+    }
+
+    #[test]
+    fn form_fill_headline_falls_back_safely_on_an_unparseable_summary() {
+        // Defensive only: `format_outcomes` is the sole producer of this
+        // string and is itself covered by
+        // `format_outcomes_counts_filled_and_lists_the_rest`, so this
+        // should never fire in production. Proves the fallback doesn't
+        // panic rather than asserting a specific string.
+        let _ = App::form_fill_headline("not the expected shape at all");
+    }
+
+    #[test]
+    fn form_fill_headlines_never_use_an_em_dash() {
+        for summary in [
+            "Filled 0 of 3 fields. Skipped \"Password\": password control.",
+            "Filled 2 of 2 fields.",
+            "Filled 1 of 3 fields. Skipped \"Password\": password control.",
+        ] {
+            let headline = App::form_fill_headline(summary);
+            assert!(!headline.contains('\u{2014}'), "{headline}");
+        }
+    }
+
+    #[test]
+    fn calendar_headline_says_opened_when_the_connector_opened_it() {
+        // The exact shape `CalendarAddExecutor::execute` produces when
+        // `result.opened` is `true` (`opened_note` is empty).
+        let summary = "Added \"Standup\" to your calendar via ics. Undo removes this file; \
+                        removing the event from your calendar app is a manual step.";
+        assert_eq!(
+            App::calendar_headline(summary),
+            "Event opened in your calendar app"
+        );
+    }
+
+    #[test]
+    fn calendar_headline_says_not_opened_when_the_connector_could_not_open_it() {
+        // The exact shape when `result.opened` is `false`: `opened_note`
+        // appends "...it could not be opened automatically; open ...
+        // yourself" before the fixed Undo sentence.
+        let summary = "Added \"Standup\" to your calendar via ics, but it could not be opened \
+                        automatically; open C:\\temp\\standup.ics yourself. Undo removes this \
+                        file; removing the event from your calendar app is a manual step.";
+        assert_eq!(App::calendar_headline(summary), "Event added, not opened");
+    }
+
+    #[test]
+    fn calendar_headlines_never_use_an_em_dash() {
+        for summary in [
+            "Added \"Standup\" to your calendar via ics.",
+            "Added \"Standup\" to your calendar via ics, but it could not be opened automatically; open x yourself.",
+        ] {
+            let headline = App::calendar_headline(summary);
+            assert!(!headline.contains('\u{2014}'), "{headline}");
         }
     }
 
