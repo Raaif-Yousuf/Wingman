@@ -40,6 +40,8 @@ instructions live there, not duplicated here.
 | `fixing-a-bug` | Fixing any bug or regression, before writing fix code. Also when a fix "should work" but the symptom persists |
 | `wired-to-nothing` | Before reporting any change as done. The Win32-specific list of ways code compiles, passes and does nothing |
 | `working-an-issue` | Before starting or closing any GitHub issue |
+| `filing-findings` | Before filing an issue about something you noticed, and for the shared-machine cargo RAM rules |
+| `auditing-a-module` | Auditing a module or file set for defects worth filing, and when dispatched as a read-only auditor in a fan-out |
 
 Agents (`.claude/agents/`): `cold-diff-reviewer` reviews a diff with no ticket
 or author framing, checking for this repo's recorded bug shapes.
@@ -60,6 +62,7 @@ before they run. Both scripts explain the replacement in their message.
 | [reproducible-builds.md](reproducible-builds.md) | What is and is not verified byte-for-byte reproducible (`wingman.exe` is, `wingman.msix` is not yet), the `/Brepro`/`SOURCE_DATE_EPOCH`/toolchain-pin measurement, how to reproduce it, and the CycloneDX SBOM `release.yml` attaches to every release |
 | [actions.md](actions.md) | The `actions.toml` schema field by field, two worked examples, the proposal schema registry, and why `serde_json` keeps `preserve_order` |
 | [executors.md](executors.md) | The executor contract, the four rules, the `Confirmed<P>` privacy boundary, the stale-target check, and the never-Send/Submit/Buy/Pay rule |
+| [audit-coverage.md](audit-coverage.md) | Which parts of the tree an auditor has actually read, when, and what came out. The issue tracker cannot tell you where nobody has looked |
 
 Planned, per the expansion plan § 10: `architecture.md`, and at
 the root `PRIVACY.md`, `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`,
