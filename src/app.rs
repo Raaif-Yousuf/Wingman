@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::actions;
 use crate::capture;
-use crate::config::{Config, Providers, UNREADABLE_KEY_MARKER};
+use crate::config::{Config, Providers};
 use crate::connectors::civil_time::{CivilDate, CivilDateTime};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::executors;
@@ -47,8 +47,7 @@ use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
 use crate::provider::{
     calendar_request, parse_answer, physics_request, review_request_from_screen,
-    review_request_from_text, Answer, Anthropic, Chain, Gemini, Ollama, OpenAi, OpenAiCompat,
-    Provider, Shot,
+    review_request_from_text, Answer, Chain, Provider, Shot,
 };
 use crate::router;
 use crate::ui::card::{Card, WM_APP_PREVIEW_DECIDED};
@@ -2541,93 +2540,26 @@ fn router_worker(
 
 /// #24: the router's per-provider model LIST (never the user's configured
 /// "active" model alone) -- `router::cheapest_router_target` picks the
-/// cheapest entry from whichever of these it's handed. Reads the exact same
-/// `Providers` fields `config.rs`'s own `Providers::provider_for`/`describe`
-/// read, just the plural `models` field instead of the singular `model`
-/// where one exists; Ollama has no list of its own (see
-/// [`router::cheapest_router_target`]'s doc comment), so its one configured
-/// model is wrapped in a single-element `Vec` here.
+/// cheapest entry from whichever of these it's handed. Issue #222: a
+/// one-line call into [`Providers::models_for`] (`config.rs`), which used
+/// to be hand-mirrored here -- see that function's doc for why keeping
+/// exactly one copy of this name-to-model-list mapping matters.
 fn router_models_for(providers: &Providers, name: &str) -> Vec<String> {
-    match name {
-        "openai" => providers.openai.models.clone(),
-        "anthropic" => providers.anthropic.models.clone(),
-        "gemini" => providers.gemini.models.clone(),
-        "ollama" => vec![providers.ollama.model.clone()],
-        _ => {
-            let Some(compat_name) = name.strip_prefix("compat:") else {
-                return Vec::new();
-            };
-            providers
-                .compat
-                .iter()
-                .find(|c| c.name == compat_name)
-                .map(|c| c.models.clone())
-                .unwrap_or_default()
-        }
-    }
+    providers.models_for(name)
 }
 
 /// #24: constructs the ONE provider the router will call, built with
 /// `model` (`router::cheapest_router_target`'s pick) instead of that
-/// provider's configured "active" model. Deliberately NOT
-/// `Providers::provider_for` (config.rs, `pub(crate)`... actually private
-/// and unreachable from here) -- this mirrors its exact name-to-provider
-/// mapping (same match arms, same config fields) so the two can never
-/// disagree on what a `providers.order` name constructs, just on which
-/// model string it gets built with.
+/// provider's configured "active" model. Issue #222: a one-line call into
+/// [`Providers::provider_for_named_model`] (`config.rs`) with
+/// `Some(model)`, which used to be a hand-mirrored match with the same five
+/// arms here -- see that function's doc for the drift this closed off.
 fn provider_for_router(
     providers: &Providers,
     name: &str,
     model: &str,
 ) -> Option<Box<dyn Provider>> {
-    match name {
-        "openai" => Some(Box::new(OpenAi::new(
-            router_key(&providers.openai.api_key),
-            model.to_string(),
-            providers.openai.effort.clone(),
-        ))),
-        "anthropic" => Some(Box::new(Anthropic::new(
-            router_key(&providers.anthropic.api_key),
-            model.to_string(),
-            providers.anthropic.effort.clone(),
-        ))),
-        "gemini" => Some(Box::new(Gemini::new(
-            router_key(&providers.gemini.api_key),
-            model.to_string(),
-            providers.gemini.effort.clone(),
-        ))),
-        "ollama" => Some(Box::new(Ollama::new(
-            providers.ollama.base_url.clone(),
-            model.to_string(),
-            providers.ollama.effort.clone(),
-        ))),
-        _ => {
-            let compat_name = name.strip_prefix("compat:")?;
-            let cfg = providers.compat.iter().find(|c| c.name == compat_name)?;
-            Some(Box::new(OpenAiCompat::new(
-                cfg.base_url.clone(),
-                model.to_string(),
-                cfg.auth,
-                cfg.auth_header.clone(),
-                router_key(&cfg.api_key),
-                cfg.structured,
-                cfg.vision,
-            )))
-        }
-    }
-}
-
-/// #175's unreadable-credential marker is a placeholder, not a key (see
-/// `config::UNREADABLE_KEY_MARKER`'s doc); a router provider built from it
-/// must report not-ready instead of sending it, same treatment
-/// `config.rs`'s own (private) `unreadable_as_empty` gives every other
-/// provider construction.
-fn router_key(key: &str) -> String {
-    if key == UNREADABLE_KEY_MARKER {
-        String::new()
-    } else {
-        key.to_string()
-    }
+    providers.provider_for_named_model(name, Some(model))
 }
 
 /// #39: today's local date and current local UTC offset, for the "Add
@@ -3447,6 +3379,7 @@ mod tests {
     use super::unreadable_secrets_card;
     use super::App;
     use super::{final_settings_card, SettingsFinalCard};
+    use super::{provider_for_router, router_models_for};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT, WM_APP_RESULT,
@@ -4220,6 +4153,85 @@ mod tests {
     #[test]
     fn first_line_leaves_short_text_alone() {
         assert_eq!(first_line("fine", 88), "fine");
+    }
+
+    // -- router/chain provider-name agreement (issue #222) -------------------
+    //
+    // provider_for_router/router_models_for used to hand-mirror config.rs's
+    // provider_for match arms; a provider kind added to config.rs without a
+    // matching arm here silently made the router skip it forever (no error
+    // card by design). Both are now one-line calls into
+    // Providers::provider_for_named_model/models_for, but structural dedup
+    // can be undone by a future refactor without anyone noticing -- this
+    // test is the guard: it walks a fixture's providers.order through BOTH
+    // the real chain-building path (Providers::build_chain, config.rs) and
+    // the router's own entry points (provider_for_router/router_models_for,
+    // called here exactly as router_worker calls them) and asserts they
+    // agree on which names resolve to a provider at all.
+    //
+    // Proof this guard has teeth (see the commit message for the full
+    // transcript): provider_for_router was temporarily given a throwaway
+    // arm recognizing "not-a-real-provider" (already in this fixture's
+    // order, as the name nothing should recognize) without touching
+    // config.rs's match at all. This test then failed:
+    // `assertion `left == right` failed: chain path and router path
+    // disagree on provider name "not-a-real-provider"` with `left: false,
+    // right: true` (chain path still says unrecognized; router path now
+    // says recognized). The throwaway arm was reverted before committing.
+
+    #[test]
+    fn router_and_chain_paths_agree_on_which_provider_names_resolve() {
+        let mut providers = Providers::default();
+        providers.compat.push(crate::config::CompatConfig {
+            name: "custom".to_string(),
+            models: vec!["compat-cheap".to_string(), "compat-flagship".to_string()],
+            ..Default::default()
+        });
+        // The fixture: one entry per recognized kind, plus a compat entry
+        // and a name nothing should ever recognize.
+        providers.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "gemini".to_string(),
+            "ollama".to_string(),
+            "compat:custom".to_string(),
+            "not-a-real-provider".to_string(),
+        ];
+
+        for name in providers.order.clone() {
+            // The real chain-building path: Providers::build_chain (via the
+            // private provider_for) omits an unrecognized name entirely and
+            // includes every recognized one, ready or not (config.rs's own
+            // doc on build_chain). Isolating `order` to just this one name
+            // turns that inclusion into a yes/no per name.
+            let mut isolated = providers.clone();
+            isolated.order = vec![name.clone()];
+            let chain_recognizes = !isolated.build_chain().provider_names().is_empty();
+
+            // The router's own path, called exactly as router_worker calls
+            // it: router_models_for for the model list, provider_for_router
+            // to build the provider from a name plus one of those models
+            // (or a placeholder, for the "recognized at all" question this
+            // test asks -- issue #222 is explicit that this is about names,
+            // not which model gets picked).
+            let router_models = router_models_for(&providers, &name);
+            let router_recognizes =
+                provider_for_router(&providers, &name, "placeholder-model").is_some();
+
+            assert_eq!(
+                chain_recognizes, router_recognizes,
+                "chain path and router path disagree on provider name {name:?}"
+            );
+
+            // And the two model-list mirrors agree too (issue #222's second
+            // mirror): whatever config.rs's own Providers::models_for says
+            // for this name is exactly what the router asked for.
+            assert_eq!(
+                router_models,
+                providers.models_for(&name),
+                "router and config model lists disagree for provider name {name:?}"
+            );
+        }
     }
 
     // -- live intent router measurement (issue #24) --------------------------

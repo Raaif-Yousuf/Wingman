@@ -1009,31 +1009,71 @@ pub(crate) struct ProviderDescriptor {
 
 impl Providers {
     /// Constructs the `Provider` for one `providers.order` name against
-    /// `self`'s per-provider config, or `None` for an unrecognized name.
-    /// The one name-to-provider mapping [`Providers::build_chain`] and
-    /// [`Providers::build_chain_for_mode`] (#19) both build from, so the
-    /// two can never drift apart from each other (see the
-    /// `wired-to-nothing` skill's "hard-coded list" row).
+    /// `self`'s per-provider config, using that provider's configured
+    /// "active" model. Thin wrapper over
+    /// [`Providers::provider_for_named_model`] with `model: None` -- see
+    /// that function's doc for why it, not this one, is now the single
+    /// name-to-provider match arm list in the crate (issue #222).
     fn provider_for(&self, name: &str) -> Option<Box<dyn Provider>> {
+        self.provider_for_named_model(name, None)
+    }
+
+    /// Constructs the `Provider` for one `providers.order` name against
+    /// `self`'s per-provider config, or `None` for an unrecognized name.
+    /// `model`, when given, is used in place of that provider's configured
+    /// "active" model (every other field -- API key, effort, base URL,
+    /// auth -- still comes from `self`); `None` uses the configured model,
+    /// exactly like the old `provider_for` did before this function existed.
+    ///
+    /// This is the ONE name-to-provider match arm list in the whole crate
+    /// (issue #222). Before this fix, [`Providers::build_chain`] and
+    /// [`Providers::build_chain_for_mode`] (#19) built from this match (via
+    /// the old, model-less `provider_for`), while `app.rs`'s intent router
+    /// (`router_worker`, via `provider_for_router`) kept its own hand-copied
+    /// match with the same five arms (`"openai"`/`"anthropic"`/`"gemini"`/
+    /// `"ollama"`/`"compat:<name>"`) so it could build a provider with the
+    /// router's own cheaper picked model instead of the configured one. A
+    /// provider kind added to this match without a matching arm in that
+    /// hand-copy silently made the router skip it forever, with no error
+    /// card by design (see `App::maybe_start_router`'s doc comment) --
+    /// exactly the `wired-to-nothing` skill's "hard-coded list" row. Now
+    /// `app.rs`'s `provider_for_router` is a one-line call into this
+    /// function with `model: Some(&target.model)`, so there is nowhere else
+    /// for that arm to go missing from; see
+    /// `router_and_chain_paths_agree_on_which_provider_names_resolve` in
+    /// `app.rs`'s test module for the regression guard.
+    pub(crate) fn provider_for_named_model(
+        &self,
+        name: &str,
+        model: Option<&str>,
+    ) -> Option<Box<dyn Provider>> {
         match name {
             "openai" => Some(Box::new(OpenAi::new(
                 unreadable_as_empty(&self.openai.api_key),
-                self.openai.model.clone(),
+                model
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.openai.model.clone()),
                 self.openai.effort.clone(),
             ))),
             "anthropic" => Some(Box::new(Anthropic::new(
                 unreadable_as_empty(&self.anthropic.api_key),
-                self.anthropic.model.clone(),
+                model
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.anthropic.model.clone()),
                 self.anthropic.effort.clone(),
             ))),
             "gemini" => Some(Box::new(Gemini::new(
                 unreadable_as_empty(&self.gemini.api_key),
-                self.gemini.model.clone(),
+                model
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.gemini.model.clone()),
                 self.gemini.effort.clone(),
             ))),
             "ollama" => Some(Box::new(Ollama::new(
                 self.ollama.base_url.clone(),
-                self.ollama.model.clone(),
+                model
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.ollama.model.clone()),
                 self.ollama.effort.clone(),
             ))),
             _ => {
@@ -1045,13 +1085,45 @@ impl Providers {
                 let cfg = self.compat.iter().find(|c| c.name == compat_name)?;
                 Some(Box::new(OpenAiCompat::new(
                     cfg.base_url.clone(),
-                    cfg.model.clone(),
+                    model
+                        .map(str::to_string)
+                        .unwrap_or_else(|| cfg.model.clone()),
                     cfg.auth,
                     cfg.auth_header.clone(),
                     unreadable_as_empty(&cfg.api_key),
                     cfg.structured,
                     cfg.vision,
                 )))
+            }
+        }
+    }
+
+    /// Every model configured for one `providers.order` name, in the
+    /// crate's authored newest/flagship-first order -- the model-LIST
+    /// counterpart to [`Providers::provider_for_named_model`], and (issue
+    /// #222) the second mirror `app.rs`'s router used to keep by hand
+    /// (`router_models_for`, now a one-line call into this function).
+    /// `router::cheapest_router_target` picks its own cheapest entry from
+    /// whichever of these it is handed. Ollama has no list of its own, so
+    /// its one configured model is wrapped in a single-element `Vec` here.
+    /// Empty for an unrecognized name or a `"compat:<name>"` entry with no
+    /// matching `self.compat` config, same "just skip it" behavior as
+    /// [`Providers::provider_for_named_model`].
+    pub(crate) fn models_for(&self, name: &str) -> Vec<String> {
+        match name {
+            "openai" => self.openai.models.clone(),
+            "anthropic" => self.anthropic.models.clone(),
+            "gemini" => self.gemini.models.clone(),
+            "ollama" => vec![self.ollama.model.clone()],
+            _ => {
+                let Some(compat_name) = name.strip_prefix("compat:") else {
+                    return Vec::new();
+                };
+                self.compat
+                    .iter()
+                    .find(|c| c.name == compat_name)
+                    .map(|c| c.models.clone())
+                    .unwrap_or_default()
             }
         }
     }
