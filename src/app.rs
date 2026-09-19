@@ -7,6 +7,7 @@
 //! quick, the API call is not) happens on a worker thread, which reports back
 //! exclusively by `PostMessageW`.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -397,6 +398,41 @@ fn pump_messages() {
     }
 }
 
+/// Issue #214: whether `begin_model_action` bails at its very first step
+/// (busy, then paused) or proceeds -- pulled out as a pure function so this
+/// PRECEDENCE is exhaustively testable without a real `HWND`/`Card`/`Tray`
+/// (an `App` cannot be constructed in a unit test at all -- see this
+/// module's other tests, which only ever exercise pure helpers like
+/// `readiness_gate` and `settings_reentrancy_policy` directly).
+/// `begin_model_action`'s own `match` on this result, immediately followed
+/// by its hide-stale-card/readiness-gate/`extra`/capture steps in that
+/// fixed order, is the rest of the sequence; those later steps are not
+/// folded into this table because the readiness gate needs `&Config` and
+/// `extra` is a caller-supplied closure that may itself show a card, so
+/// neither can be safely precomputed as a plain `bool` the way `busy` and
+/// `paused` can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelActionGate {
+    /// A request is already in flight; every pre-#214 caller returned here
+    /// silently (no card).
+    Busy,
+    /// Nothing Wingman does runs while paused (issue #20).
+    Paused,
+    /// Neither of the above: `begin_model_action` continues on to
+    /// hide-stale-card, the readiness gate, `extra`, then capture.
+    Proceed,
+}
+
+fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
+    if busy {
+        ModelActionGate::Busy
+    } else if paused {
+        ModelActionGate::Paused
+    } else {
+        ModelActionGate::Proceed
+    }
+}
+
 impl App {
     /// Issue #192: the card `App::ask`'s pre-flight gate should show, or
     /// `None` when at least one provider the current `Mode` would actually
@@ -446,24 +482,48 @@ impl App {
         })
     }
 
-    /// The whole flow: hide any stale card, check a provider is actually
-    /// ready, grab the screen, then hand the bytes to a worker so the
-    /// message loop stays responsive during the call.
-    fn ask(&mut self) {
-        if self.busy {
-            return;
-        }
-
-        // Pause (issue #20): no network request may start while paused.
-        // The hotkey path never reaches here at all while paused (the hook
-        // in hotkey.rs passes the chord through before ever posting
-        // WM_APP_HOTKEY), so this guard exists for the other entry points --
-        // the tray's "Ask now" and a second Copilot-key launch
-        // (WM_APP_ACTIVATE) -- which don't go through the hook.
-        if pause::is_paused_now() {
-            self.card
-                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
-            return;
+    /// Issue #214: the pause/busy/hide-stale-card/readiness/capture pipeline
+    /// shared by every action that shows a pending card, captures the
+    /// screen, and hands off to a worker thread which posts back one of the
+    /// `WM_APP_*` result messages. Before this existed, `ask()`,
+    /// `add_event_from_screen()` and `review_this_email()` each duplicated
+    /// roughly the same 40 lines almost verbatim (#214's own body: "the
+    /// overnight task instructions asked for app.rs edits to stay additive
+    /// and minimal since another agent was editing it concurrently"). A
+    /// future fill-form-from-screen action (fill_form.rs's own executor
+    /// already exists; nothing in `app.rs` calls it yet) should call this
+    /// too instead of adding a fourth near-copy.
+    ///
+    /// `model_action_gate` decides the first three steps' precedence (busy
+    /// beats paused beats readiness-blocked); this method's own `if`s
+    /// implement that same order, in the same sequence, so a future edit
+    /// that reorders one without the other is a visible diff, not a silent
+    /// drift. `extra` is the one point the three current callers differ at
+    /// -- it runs after readiness passes and before capture (matching
+    /// `add_event_from_screen`'s pre-#214 position for its
+    /// `local_today_and_utc_offset()` read); `ask`/`review_this_email` pass
+    /// one that does nothing. Like every other step here, `extra` must show
+    /// its own card and return `None` to bail; `Some(value)` continues, and
+    /// `value` is threaded back out unchanged so the caller can use it in
+    /// its own worker closure.
+    ///
+    /// Returns `None` once this has already shown whatever card explains
+    /// why (busy shows nothing at all, matching every pre-#214 caller; the
+    /// other gates show their own paused/error card); `Some((raw,
+    /// foreground_hwnd_isize, value))` once the pending card is showing and
+    /// `self.busy` is `true`.
+    fn begin_model_action<T>(
+        &mut self,
+        extra: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<(capture::RawShot, isize, T)> {
+        match model_action_gate(self.busy, pause::is_paused_now()) {
+            ModelActionGate::Busy => return None,
+            ModelActionGate::Paused => {
+                self.card
+                    .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
+                return None;
+            }
+            ModelActionGate::Proceed => {}
         }
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
@@ -486,8 +546,10 @@ impl App {
             Self::readiness_gate(self.config.mode, &self.config.providers, &path)
         {
             self.card.show_error(&headline, &detail);
-            return;
+            return None;
         }
+
+        let extra_value = extra(self)?;
 
         // Capture (grab the pixels and downscale) runs here, on the main
         // thread, and must happen before the pending card is shown --
@@ -496,10 +558,11 @@ impl App {
         // `CompressionType::Best` PNG encoding at up to ~1s in a release
         // build on a 1402x876 image, which froze the message loop for that
         // whole time with nothing on screen after the key press. `encode`
-        // now runs on the worker thread below, after `show_pending`.
+        // runs on each caller's own worker thread instead, after
+        // `show_pending`.
         //
-        // Issue #169: the downscale target comes from the FIRST provider
-        // `worker` (below) will actually try, not a provider-agnostic
+        // Issue #169: the downscale target comes from the FIRST provider a
+        // caller's own worker will actually try, not a provider-agnostic
         // heuristic. That real, mode-aware chain is only built on the
         // worker thread (its Ollama-reachability probe is a real network
         // call, and capture is the last thing allowed to block this
@@ -521,19 +584,20 @@ impl App {
             Err(e) => {
                 self.card
                     .show_error("Couldn't capture the screen", &format!("{e:#}"));
-                return;
+                return None;
             }
         };
         // Issue #18/#206: the foreground window's HWND, captured HERE on the
         // main thread, right alongside the pixel capture -- both are "what
         // was actually on screen at press time", and both must be read
         // before `show_pending()` below puts Wingman's own card on top.
-        // Only the isize is carried into the worker closure (an `HWND`
-        // wraps a raw pointer and is not `Send`; `hwnd_isize`/`target`
-        // below already use the same pattern for the owner window). This
-        // HWND is used only lazily, inside the non-vision fallback -- see
-        // `non_vision_inputs` -- so capturing it costs nothing when every
-        // provider in the chain turns out to have vision.
+        // Only the isize is carried into the caller's worker closure (an
+        // `HWND` wraps a raw pointer and is not `Send`; `hwnd_isize`/
+        // `target` at each call site already use the same pattern for the
+        // owner window). This HWND is used only lazily, inside the
+        // non-vision fallback -- see `non_vision_inputs` -- so capturing it
+        // costs nothing when every provider in the chain turns out to have
+        // vision.
         let foreground_hwnd_isize =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
 
@@ -542,6 +606,17 @@ impl App {
         // is up must not touch the card.
         self.set_watch(false);
         self.card.show_pending();
+
+        Some((raw, foreground_hwnd_isize, extra_value))
+    }
+
+    /// The whole flow: hide any stale card, check a provider is actually
+    /// ready, grab the screen, then hand the bytes to a worker so the
+    /// message loop stays responsive during the call.
+    fn ask(&mut self) {
+        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
+            return;
+        };
 
         // Issue #19: the mode-aware chain is built fresh on the WORKER
         // thread (inside `worker`, below), not here on the main thread --
@@ -899,68 +974,24 @@ impl App {
     /// as before: this method does not touch it) but routed through the
     /// `add-to-calendar` built-in action (`actions::calendar::ACTION_ID`:
     /// proposal `calendar_event`, executor `calendar_add`, `confirm =
-    /// true`) instead of a fixed request shape. Mirrors `ask()`'s pause/
-    /// busy/readiness/capture steps (duplicated, not extracted into a
-    /// shared helper, precisely so `ask()`'s own code is untouched -- see
-    /// #214, filed for the de-duplication follow-up).
+    /// true`) instead of a fixed request shape. Shares `ask()`'s pause/
+    /// busy/readiness/capture steps via `begin_model_action` (#214); the
+    /// one thing that differs is `local_today_and_utc_offset()`, passed as
+    /// that helper's `extra` closure so it still runs exactly where it did
+    /// before -- after the readiness gate, before capture.
     fn add_event_from_screen(&mut self) {
-        if self.busy {
+        let Some((raw, foreground_hwnd_isize, (today, offset_minutes))) =
+            self.begin_model_action(|app| match local_today_and_utc_offset() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    app.card
+                        .show_error("Couldn't read the local date", &format!("{e:#}"));
+                    None
+                }
+            })
+        else {
             return;
-        }
-
-        if pause::is_paused_now() {
-            self.card
-                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
-            return;
-        }
-
-        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
-            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
-        }
-
-        let path = Config::path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "config.toml".into());
-        if let Some((headline, detail)) =
-            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-        {
-            self.card.show_error(&headline, &detail);
-            return;
-        }
-
-        let (today, offset_minutes) = match local_today_and_utc_offset() {
-            Ok(v) => v,
-            Err(e) => {
-                self.card
-                    .show_error("Couldn't read the local date", &format!("{e:#}"));
-                return;
-            }
         };
-
-        let optimistic_chain = self
-            .config
-            .providers
-            .build_chain_for_mode(self.config.mode, true);
-        let image_limits = optimistic_chain
-            .first_ready_caps()
-            .and_then(|caps| caps.image_limits);
-        let (max_long_edge, max_pixels) =
-            capture::resolve_limits(image_limits, self.config.capture.max_edge);
-        let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
-            Ok(r) => r,
-            Err(e) => {
-                self.card
-                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
-                return;
-            }
-        };
-        let foreground_hwnd_isize =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
-
-        self.busy = true;
-        self.set_watch(false);
-        self.card.show_pending();
 
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
@@ -1174,65 +1205,20 @@ impl App {
     /// #38: "Review this email", the second action to run the full
     /// Look/Propose/Confirm/Do loop -- the tray's third one-shot action,
     /// parallel to `ask()`/`add_event_from_screen()` (neither of which this
-    /// method touches). Mirrors `add_event_from_screen`'s pause/busy/
-    /// readiness/capture steps, with one difference: the (potentially slow)
-    /// UIA compose-body/selection capture attempts run on the SPAWNED
-    /// worker thread, never here, per `inputs::uia`'s and
-    /// `inputs::selection`'s own module docs ("call from a dedicated worker
-    /// thread"); only the screenshot -- needed only as the last-resort
-    /// fallback, but cheap, and must happen before any card change per
-    /// `capture::grab_raw`'s existing "no stale card in the shot" rule --
-    /// is still grabbed here, eagerly, exactly like `add_event_from_screen`
-    /// already does.
+    /// method touches). Shares `add_event_from_screen`'s pause/busy/
+    /// readiness/capture steps via `begin_model_action` (#214), with one
+    /// difference `begin_model_action` does not need to know about: the
+    /// (potentially slow) UIA compose-body/selection capture attempts run
+    /// on the SPAWNED worker thread below, never here, per `inputs::uia`'s
+    /// and `inputs::selection`'s own module docs ("call from a dedicated
+    /// worker thread"); only the screenshot -- needed only as the
+    /// last-resort fallback, but cheap -- is still grabbed inside
+    /// `begin_model_action`, exactly like `add_event_from_screen`'s already
+    /// does.
     fn review_this_email(&mut self) {
-        if self.busy {
+        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
             return;
-        }
-
-        if pause::is_paused_now() {
-            self.card
-                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
-            return;
-        }
-
-        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
-            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
-        }
-
-        let path = Config::path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "config.toml".into());
-        if let Some((headline, detail)) =
-            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-        {
-            self.card.show_error(&headline, &detail);
-            return;
-        }
-
-        let optimistic_chain = self
-            .config
-            .providers
-            .build_chain_for_mode(self.config.mode, true);
-        let image_limits = optimistic_chain
-            .first_ready_caps()
-            .and_then(|caps| caps.image_limits);
-        let (max_long_edge, max_pixels) =
-            capture::resolve_limits(image_limits, self.config.capture.max_edge);
-        let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
-            Ok(r) => r,
-            Err(e) => {
-                self.card
-                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
-                return;
-            }
         };
-        let foreground_hwnd_isize =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
-
-        self.busy = true;
-        self.set_watch(false);
-        self.card.show_pending();
 
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
@@ -1356,63 +1342,26 @@ impl App {
     }
 
     /// #40: "Fill this form", the tray's fourth one-shot Look/Propose/Confirm/Do
-    /// action, mirroring `add_event_from_screen`'s pause/busy/readiness/
-    /// capture steps (duplicated, not extracted -- same #214-filed reason
-    /// `add_event_from_screen`'s own doc comment gives for not touching
-    /// `ask()`'s code either). Unlike calendar, this needs no today/UTC
-    /// offset; it needs the foreground window's handle (for the worker's
-    /// own UIA walk, run off this thread so the message loop stays
-    /// responsive) and `config.forms.require_tick_for` (#40, expansion plan
-    /// §15's still-owed owner decision -- see `config::RequireTickFor`).
+    /// action. Shares `add_event_from_screen`/`review_this_email`'s pause/
+    /// busy/readiness/capture steps via `begin_model_action` (#214, closing
+    /// the "duplicated, not extracted" gap this doc comment used to note --
+    /// #214 landed after this action was first written). Unlike calendar,
+    /// this needs no today/UTC offset; it needs the foreground window's
+    /// handle (for the worker's own UIA walk, run off this thread so the
+    /// message loop stays responsive) and `config.forms.require_tick_for`
+    /// (#40, expansion plan §15's still-owed owner decision -- see
+    /// `config::RequireTickFor`), neither of which `begin_model_action`
+    /// needs to know about, same as `review_this_email`'s `extra`. The
+    /// model-free path (`form_fill_worker`'s call into
+    /// `actions::fill_form::map_candidates_locally`, skipped entirely when
+    /// every field maps from the local profile) lives inside the worker
+    /// closure below, unaffected by this: `begin_model_action`'s readiness
+    /// gate runs first either way, exactly as it did before this used the
+    /// shared helper.
     fn fill_form_from_screen(&mut self) {
-        if self.busy {
+        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
             return;
-        }
-
-        if pause::is_paused_now() {
-            self.card
-                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
-            return;
-        }
-
-        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
-            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
-        }
-
-        let path = Config::path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "config.toml".into());
-        if let Some((headline, detail)) =
-            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-        {
-            self.card.show_error(&headline, &detail);
-            return;
-        }
-
-        let optimistic_chain = self
-            .config
-            .providers
-            .build_chain_for_mode(self.config.mode, true);
-        let image_limits = optimistic_chain
-            .first_ready_caps()
-            .and_then(|caps| caps.image_limits);
-        let (max_long_edge, max_pixels) =
-            capture::resolve_limits(image_limits, self.config.capture.max_edge);
-        let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
-            Ok(r) => r,
-            Err(e) => {
-                self.card
-                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
-                return;
-            }
         };
-        let foreground_hwnd_isize =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
-
-        self.busy = true;
-        self.set_watch(false);
-        self.card.show_pending();
 
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
@@ -1788,11 +1737,12 @@ impl App {
     /// it runs (see `SETTINGS_OPEN`'s doc comment for why that is a real
     /// aliasing hazard, not just a logic bug). Every piece of state that a
     /// reentrant call needs to read or write therefore lives in a
-    /// thread-local, not on `App`: `SETTINGS_OPEN` itself, `PENDING_RESULT`
-    /// (a worker's answer that arrived mid-edit),
-    /// `TASKBAR_RECREATED_WHILE_SETTINGS`, and `PAUSE_REEVALUATE_PENDING`
-    /// (issue #20). All four are only touched here, immediately before and
-    /// after `show_modal`, when no reentrant call can possibly be in flight.
+    /// thread-local, not on `App`: `SETTINGS_OPEN` itself, `PENDING_MESSAGES`
+    /// (issue #213: every worker result or preview decision that arrived
+    /// mid-edit, oldest first), `TASKBAR_RECREATED_WHILE_SETTINGS`, and
+    /// `PAUSE_REEVALUATE_PENDING` (issue #20). All four are only touched
+    /// here, immediately before and after `show_modal`, when no reentrant
+    /// call can possibly be in flight.
     ///
     /// Issue #178: the card has a single slot, and every branch below can
     /// show one -- a pending answer, a save error, or "Settings saved". If a
@@ -1805,6 +1755,22 @@ impl App {
     /// `tray_restore_error` and shown LAST, after every other branch below
     /// has already shown whatever card it was going to show -- see
     /// `final_settings_card` (test-only) for a pure model of this ordering.
+    ///
+    /// Issue #213: unlike the old single-slot `WM_APP_RESULT`-only version,
+    /// every deferred message is now delivered through its real handler
+    /// (`deliver_deferred`) on every one of the three paths below --
+    /// cancelled, save failed, and save succeeded -- rather than only being
+    /// silently recorded (`record_last`, no card) on the save-failed path.
+    /// A deferred `WM_APP_PREVIEW_DECIDED` "Do it" must actually run its
+    /// executor regardless of whether the unrelated Settings save
+    /// succeeded -- Look/Propose/Confirm/Do's contract, and rule 7, both
+    /// outrank leaving the save-error card undisturbed. On the save-failed
+    /// path specifically, `final_settings_card`'s `SaveError` invariant
+    /// (unchanged by #213: the save error the user just directly caused
+    /// always wins the single card slot) still holds -- each deferred
+    /// message's own card is shown, and its effects genuinely happen, but
+    /// the save-error card is re-shown immediately after so it is still the
+    /// one left on screen.
     fn open_settings(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
@@ -1815,7 +1781,8 @@ impl App {
         let edited = settings::show_modal(self.instance, &self.config);
         SETTINGS_OPEN.with(|c| c.set(false));
 
-        let pending = PENDING_RESULT.with(|c| c.borrow_mut().take());
+        let pending: VecDeque<DeferredMessage> =
+            PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
         let taskbar_recreated = TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false));
         let tray_restore_error = if taskbar_recreated {
             self.try_restore_tray_icon()
@@ -1827,40 +1794,61 @@ impl App {
         }
 
         let Some(edited) = edited else {
-            // Cancelled/closed without saving. An answer that finished
-            // mid-edit still gets its card.
-            if let Some(result) = pending {
-                self.on_result(result);
-            }
+            // Cancelled/closed without saving. Anything that finished
+            // mid-edit still gets delivered.
+            self.deliver_deferred(pending);
             self.show_tray_restore_error(tray_restore_error);
             return;
         };
 
         self.config = edited;
         if let Err(e) = self.config.save() {
-            // Rule 7: neither failure may be silently dropped. The save
-            // error is the one the user just directly caused (they clicked
-            // Save), so it gets the card; the deferred answer is not lost
-            // either, just not shown as a card here -- `record_last` still
-            // makes it available via "Copy last answer" until the next ask.
+            // Rule 7: neither failure may be silently dropped. Every
+            // deferred message is delivered for real (its executor runs,
+            // its own card shows) even though the unrelated config save
+            // just failed -- but the save error is the problem the user
+            // just directly caused, so it is re-shown last, restoring it as
+            // the single card slot's final content (`final_settings_card`'s
+            // `SaveError` case, unchanged by #213).
+            let had_pending = !pending.is_empty();
             self.card
                 .show_error("Couldn't save settings", &format!("{e:#}"));
-            if let Some(result) = pending {
-                self.record_last(result);
+            self.deliver_deferred(pending);
+            if had_pending {
+                self.card
+                    .show_error("Couldn't save settings", &format!("{e:#}"));
             }
             self.show_tray_restore_error(tray_restore_error);
             return;
         }
         self.apply_config();
 
-        match pending {
-            Some(result) => self.on_result(result),
-            None => {
-                self.card.show_answer("Settings saved", "", 3, None);
-                self.set_watch(true);
-            }
+        if pending.is_empty() {
+            self.card.show_answer("Settings saved", "", 3, None);
+            self.set_watch(true);
+        } else {
+            self.deliver_deferred(pending);
         }
         self.show_tray_restore_error(tray_restore_error);
+    }
+
+    /// Issue #213: delivers every message `wnd_proc` deferred while Settings
+    /// was open, in arrival (push) order, through the exact handler it would
+    /// have reached had Settings not been open. Each handler shows its own
+    /// card (and, for `PreviewDecided`, actually runs the confirmed
+    /// executor); a later item's card visibly supersedes an earlier one's,
+    /// same as if they had arrived that close together with no Settings
+    /// window involved at all. A no-op on an empty queue.
+    fn deliver_deferred(&mut self, pending: VecDeque<DeferredMessage>) {
+        for message in pending {
+            match message {
+                DeferredMessage::Result(result) => self.on_result(result),
+                DeferredMessage::CalendarResult(result) => self.on_calendar_result(result),
+                DeferredMessage::ReviewResult(result) => self.on_review_result(result),
+                DeferredMessage::FormFillResult(result) => self.on_form_fill_result(result),
+                DeferredMessage::PreviewDecided => self.on_preview_decided(),
+            }
+        }
     }
 
     /// Issue #178: shows the tray-restore error card if `error` is `Some`,
@@ -2992,13 +2980,18 @@ thread_local! {
     /// opaque TLS accessor call.
     static SETTINGS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
-    /// A `WM_APP_RESULT` payload that arrived while `SETTINGS_OPEN` was
-    /// true. `open_settings` delivers it once `show_modal` returns, so the
-    /// in-flight request still ends in a card (rule 7) instead of being
-    /// dropped or clobbered by "Settings saved". See `SETTINGS_OPEN` for why
-    /// this can't be a field on `App`.
-    static PENDING_RESULT: std::cell::RefCell<Option<std::result::Result<Answer, String>>> =
-        const { std::cell::RefCell::new(None) };
+    /// Every `WM_APP_RESULT`/`WM_APP_CALENDAR_RESULT`/`WM_APP_REVIEW_RESULT`/
+    /// `WM_APP_PREVIEW_DECIDED` message that arrived while `SETTINGS_OPEN`
+    /// was true, oldest first. `open_settings` drains and delivers all of
+    /// them, in this same arrival order, once `show_modal` returns, so an
+    /// in-flight request or a preview's "Do it"/Cancel decision still ends
+    /// in a card (rule 7) -- and, for a confirmed preview, still actually
+    /// runs its executor -- instead of being dropped while Settings
+    /// happened to be open (issue #213, generalizing the single-slot fix
+    /// #152 already built for `WM_APP_RESULT` alone). See `SETTINGS_OPEN`
+    /// for why this can't be a field on `App`.
+    static PENDING_MESSAGES: std::cell::RefCell<VecDeque<DeferredMessage>> =
+        const { std::cell::RefCell::new(VecDeque::new()) };
 
     /// The shell's `TaskbarCreated` broadcast arrived while `SETTINGS_OPEN`
     /// was true. `open_settings` re-adds the tray icon (`on_taskbar_created`)
@@ -3028,6 +3021,28 @@ thread_local! {
 
 use std::os::windows::ffi::OsStrExt;
 
+/// One message deferred by [`SettingsReentrancy::Defer`] while Settings was
+/// open (issue #213), holding whatever payload its `WM_APP_*` counterpart
+/// boxed into `lparam` -- already taken out of that box, so `PENDING_MESSAGES`
+/// never stores a raw pointer.
+#[derive(Debug)]
+enum DeferredMessage {
+    /// `WM_APP_RESULT`.
+    Result(std::result::Result<Answer, String>),
+    /// `WM_APP_CALENDAR_RESULT`.
+    CalendarResult(std::result::Result<Value, String>),
+    /// `WM_APP_REVIEW_RESULT`.
+    ReviewResult(std::result::Result<actions::review_email::ReviewOutcome, String>),
+    /// `WM_APP_FORM_FILL_RESULT` (#40, joining the Defer group in #213's
+    /// style rather than the plain free-and-drop `WM_APP_ROUTER_RESULT`
+    /// still gets).
+    FormFillResult(std::result::Result<Value, String>),
+    /// `WM_APP_PREVIEW_DECIDED` carries no payload of its own -- the
+    /// decision lives on `Card`/`App` (`take_confirmed`/`pending_review`),
+    /// read fresh when this is finally delivered by `on_preview_decided`.
+    PreviewDecided,
+}
+
 /// What `wnd_proc` should do with a message addressed to the owner window
 /// while `SETTINGS_OPEN` is true (issue #152): every arm here must be
 /// answerable without forming `&mut App` -- see that thread-local's doc
@@ -3044,15 +3059,34 @@ enum SettingsReentrancy {
     /// `WM_APP_LEARNED` (unreachable here in practice: every path that opens
     /// Settings cancels learn mode first, see `open_settings`'s call sites --
     /// but the boxed `Chord` payload is still freed rather than leaked, in
-    /// case that invariant ever changes), and `WM_APP_PAUSE_TOGGLE` (#181:
-    /// same treatment as the hotkey -- a chord press while Settings is open
-    /// is dropped, not queued).
+    /// case that invariant ever changes), `WM_APP_PAUSE_TOGGLE` (#181: same
+    /// treatment as the hotkey -- a chord press while Settings is open is
+    /// dropped, not queued), and the two palette messages (#25: the palette
+    /// cannot be shown while Settings is modal-open anyway; `WM_APP_PALETTE_RUN`'s
+    /// boxed `String` payload is freed rather than leaked, same as
+    /// `WM_APP_LEARNED`'s), and `WM_APP_ROUTER_RESULT` (#24: the palette a
+    /// router suggestion belongs to cannot be visible while Settings is
+    /// modal-open either, so there is nothing left to apply it to -- a
+    /// router suggestion is advisory, unlike a finished action's own
+    /// result, so rule 7 does not require it to survive Settings the way
+    /// `Defer`'s ids must; its boxed `(u64, Result<...>)` payload is freed
+    /// rather than leaked, same as `WM_APP_LEARNED`'s).
     Ignore,
-    /// Stash the worker's payload in `PENDING_RESULT`; `open_settings`
-    /// delivers it after `show_modal` returns, so an answer that finished
-    /// mid-edit still ends in a card (rule 7) instead of being silently
-    /// overwritten by "Settings saved".
-    DeferResult,
+    /// Push the message's payload onto `PENDING_MESSAGES`, oldest-last;
+    /// `open_settings` drains and delivers every one of them, in arrival
+    /// order, after `show_modal` returns, so a result that finished (or a
+    /// preview decided) mid-edit still ends in a card (rule 7) -- and, for
+    /// a confirmed preview, still actually runs its executor -- instead of
+    /// being silently overwritten or dropped. Issue #213: generalizes the
+    /// single-slot `WM_APP_RESULT`-only fix #152 built to every `WM_APP_*`
+    /// result/decision message in the crate (`WM_APP_RESULT`,
+    /// `WM_APP_CALENDAR_RESULT`, `WM_APP_REVIEW_RESULT`,
+    /// `WM_APP_PREVIEW_DECIDED`); #40's `WM_APP_FORM_FILL_RESULT` joins the
+    /// same group for the same reason -- a finished "Fill this form" run
+    /// must not silently lose its card just because Settings happened to be
+    /// open -- add any FUTURE one here too, never to `Ignore`, and to
+    /// `DeferredMessage`/the `Defer` arm in `wnd_proc`.
+    Defer,
     /// Set `TASKBAR_RECREATED_WHILE_SETTINGS`; `open_settings` re-adds the
     /// tray icon after `show_modal` returns.
     DeferTaskbarCreated,
@@ -3069,42 +3103,35 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         return SettingsReentrancy::DeferTaskbarCreated;
     }
     match msg {
-        WM_APP_RESULT => SettingsReentrancy::DeferResult,
-        // Issue #39: WM_APP_CALENDAR_RESULT/WM_APP_PREVIEW_DECIDED are
-        // Ignored, not deferred like WM_APP_RESULT -- Settings being open
-        // while the "Add event from screen" flow is mid-flight is a corner
-        // case this task does not build full deferral plumbing for (a
-        // second PENDING_RESULT-shaped thread-local per message type).
-        // WM_APP_CALENDAR_RESULT still carries a boxed payload, freed
-        // explicitly in the Ignore arm below (mirroring WM_APP_LEARNED) so
-        // it never leaks; WM_APP_PREVIEW_DECIDED carries none. Filed as
-        // #213 for the same Defer*-shaped fix #152 already built for
-        // WM_APP_RESULT.
+        // Issue #213: every WM_APP_* message that carries a worker's result
+        // or a preview's Do it/Cancel decision is deferred, never Ignored --
+        // see DeferredMessage and the Defer variant's own doc comment. #40:
+        // WM_APP_FORM_FILL_RESULT joins the same group for the same reason
+        // -- its boxed `Result<Value, String>` payload is taken (not freed)
+        // in the Defer arm below.
+        WM_APP_RESULT
+        | WM_APP_CALENDAR_RESULT
+        | WM_APP_REVIEW_RESULT
+        | WM_APP_PREVIEW_DECIDED
+        | WM_APP_FORM_FILL_RESULT => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
         | WM_APP_DISMISS
         | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
-        | WM_APP_CALENDAR_RESULT
-        | WM_APP_PREVIEW_DECIDED
-        | WM_APP_REVIEW_RESULT
-        // #40: same reasoning as WM_APP_REVIEW_RESULT just above -- Settings
-        // being open while "Fill this form" is mid-flight is the same corner
-        // case, and WM_APP_FORM_FILL_RESULT's boxed `Result<Value, String>`
-        // payload is freed explicitly in the Ignore arm below.
-        | WM_APP_FORM_FILL_RESULT
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
         // both palette messages are simply dropped here, same treatment
         // WM_APP_PAUSE_TOGGLE already gets. WM_APP_PALETTE_RUN's boxed
         // `String` payload is freed explicitly below (mirroring
-        // WM_APP_LEARNED/WM_APP_CALENDAR_RESULT) so it never leaks.
-        // #24: WM_APP_ROUTER_RESULT is dropped the same way -- the palette
-        // it belongs to cannot be visible while Settings is modal-open
-        // either, so there is nothing left to apply the suggestion to; its
-        // boxed `(u64, Result<...>)` payload is freed explicitly below too.
+        // WM_APP_LEARNED's) so it never leaks.
+        // #24: WM_APP_ROUTER_RESULT is dropped the same way -- a router
+        // suggestion is advisory, and the palette it belongs to cannot be
+        // visible while Settings is modal-open either, so there is nothing
+        // left to apply it to; its boxed `(u64, Result<...>)` payload is
+        // freed explicitly below too.
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
         | WM_APP_ROUTER_RESULT => SettingsReentrancy::Ignore,
@@ -3152,29 +3179,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
         match settings_reentrancy_policy(msg, taskbar_created_msg) {
             SettingsReentrancy::Ignore => {
-                // WM_APP_LEARNED, WM_APP_CALENDAR_RESULT,
-                // WM_APP_FORM_FILL_RESULT, WM_APP_PALETTE_RUN,
-                // WM_APP_REVIEW_RESULT and WM_APP_ROUTER_RESULT are the only
-                // ignored messages carrying a boxed payload; free them so
-                // none leaks.
+                // WM_APP_LEARNED, WM_APP_PALETTE_RUN and WM_APP_ROUTER_RESULT
+                // are the only ignored messages carrying a boxed payload;
+                // free them so none leaks. (WM_APP_CALENDAR_RESULT,
+                // WM_APP_REVIEW_RESULT and WM_APP_FORM_FILL_RESULT are all
+                // Defer, not Ignore -- issue #213/#40.)
                 if msg == WM_APP_LEARNED {
                     drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
-                } else if msg == WM_APP_CALENDAR_RESULT || msg == WM_APP_FORM_FILL_RESULT {
-                    drop(unsafe {
-                        Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
-                    });
                 } else if msg == WM_APP_PALETTE_RUN {
                     drop(unsafe { Box::from_raw(lparam.0 as *mut String) });
-                } else if msg == WM_APP_REVIEW_RESULT {
-                    drop(unsafe {
-                        Box::from_raw(
-                            lparam.0
-                                as *mut std::result::Result<
-                                    actions::review_email::ReviewOutcome,
-                                    String,
-                                >,
-                        )
-                    });
                 } else if msg == WM_APP_ROUTER_RESULT {
                     drop(unsafe {
                         Box::from_raw(
@@ -3185,10 +3198,40 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 }
                 return LRESULT(0);
             }
-            SettingsReentrancy::DeferResult => {
-                let result =
-                    unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>) };
-                PENDING_RESULT.with(|c| *c.borrow_mut() = Some(result));
+            SettingsReentrancy::Defer => {
+                // Issue #213: take ownership of whatever payload this id
+                // carries (none, for WM_APP_PREVIEW_DECIDED) and queue it;
+                // `open_settings` delivers every queued message, in this
+                // same push order, once `show_modal` returns.
+                let deferred = match msg {
+                    WM_APP_RESULT => DeferredMessage::Result(unsafe {
+                        *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>)
+                    }),
+                    WM_APP_CALENDAR_RESULT => DeferredMessage::CalendarResult(unsafe {
+                        *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
+                    }),
+                    WM_APP_REVIEW_RESULT => DeferredMessage::ReviewResult(unsafe {
+                        *Box::from_raw(
+                            lparam.0
+                                as *mut std::result::Result<
+                                    actions::review_email::ReviewOutcome,
+                                    String,
+                                >,
+                        )
+                    }),
+                    // #40: same treatment as WM_APP_CALENDAR_RESULT just
+                    // above -- a finished "Fill this form" run must not
+                    // silently lose its card just because Settings happened
+                    // to be open.
+                    WM_APP_FORM_FILL_RESULT => DeferredMessage::FormFillResult(unsafe {
+                        *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
+                    }),
+                    WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided,
+                    _ => unreachable!(
+                        "settings_reentrancy_policy only returns Defer for the five ids above"
+                    ),
+                };
+                PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
                 return LRESULT(0);
             }
             SettingsReentrancy::DeferTaskbarCreated => {
@@ -3617,6 +3660,59 @@ mod tests {
         }
     }
 
+    // -- model_action_gate (issue #214) ------------------------------------
+
+    #[test]
+    fn model_action_gate_busy_wins_over_everything() {
+        for paused in [false, true] {
+            assert_eq!(
+                super::model_action_gate(true, paused),
+                super::ModelActionGate::Busy,
+                "busy=true, paused={paused}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_action_gate_paused_wins_when_not_busy() {
+        assert_eq!(
+            super::model_action_gate(false, true),
+            super::ModelActionGate::Paused
+        );
+    }
+
+    #[test]
+    fn model_action_gate_proceeds_when_neither_busy_nor_paused() {
+        assert_eq!(
+            super::model_action_gate(false, false),
+            super::ModelActionGate::Proceed
+        );
+    }
+
+    /// Exhaustive over all four `(busy, paused)` combinations -- the same
+    /// "sweep the dimensions the bug lives in" shape as the readiness-gate
+    /// matrix below, proving BOTH that busy strictly outranks paused and
+    /// that `Proceed` is reached only when neither gate blocks.
+    #[test]
+    fn model_action_gate_matches_precedence_table_exhaustively() {
+        for busy in [false, true] {
+            for paused in [false, true] {
+                let expected = if busy {
+                    super::ModelActionGate::Busy
+                } else if paused {
+                    super::ModelActionGate::Paused
+                } else {
+                    super::ModelActionGate::Proceed
+                };
+                assert_eq!(
+                    super::model_action_gate(busy, paused),
+                    expected,
+                    "busy={busy}, paused={paused}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn readiness_gate_passes_when_a_cloud_key_is_set_in_cloud_mode() {
         assert!(
@@ -3791,7 +3887,53 @@ mod tests {
         // reentrantly behind the modal.
         assert_eq!(
             settings_reentrancy_policy(WM_APP_RESULT, FAKE_TASKBAR_CREATED_MSG),
-            SettingsReentrancy::DeferResult
+            SettingsReentrancy::Defer
+        );
+    }
+
+    // Issue #213: WM_APP_CALENDAR_RESULT, WM_APP_REVIEW_RESULT and
+    // WM_APP_PREVIEW_DECIDED used to be Ignore'd here (their boxed payload,
+    // if any, freed and thrown away) instead of deferred like WM_APP_RESULT
+    // -- silently dropping a finished calendar/review flow, or a preview's
+    // "Do it" decision, if Settings happened to be open. All three now get
+    // exactly the same Defer treatment as WM_APP_RESULT.
+
+    #[test]
+    fn settings_reentrancy_defers_the_calendar_result() {
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_CALENDAR_RESULT, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_defers_the_review_result() {
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_REVIEW_RESULT, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_defers_the_form_fill_result() {
+        // #40: a finished "Fill this form" run joins the same Defer
+        // treatment as the calendar/review results just above -- it must
+        // not silently lose its card just because Settings happened to be
+        // open (rule 7).
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_FORM_FILL_RESULT, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_defers_preview_decided() {
+        // The most important of the three: a dropped WM_APP_PREVIEW_DECIDED
+        // meant a confirmed "Do it" never ran its executor at all, not just
+        // a missing card.
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_PREVIEW_DECIDED, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
         );
     }
 
@@ -3818,6 +3960,10 @@ mod tests {
 
     #[test]
     fn settings_reentrancy_ignores_hotkey_activate_tray_dismiss_learned_and_pause_toggle() {
+        // Issue #213: WM_APP_CALENDAR_RESULT, WM_APP_REVIEW_RESULT,
+        // WM_APP_PREVIEW_DECIDED and (#40) WM_APP_FORM_FILL_RESULT used to
+        // be asserted Ignore here too, before they moved to Defer -- see
+        // the `..._defers_...` tests above instead.
         for msg in [
             WM_APP_HOTKEY,
             WM_APP_ACTIVATE,
@@ -3825,9 +3971,6 @@ mod tests {
             WM_APP_DISMISS,
             WM_APP_LEARNED,
             WM_APP_PAUSE_TOGGLE,
-            WM_APP_CALENDAR_RESULT,
-            WM_APP_PREVIEW_DECIDED,
-            WM_APP_FORM_FILL_RESULT,
         ] {
             assert_eq!(
                 settings_reentrancy_policy(msg, FAKE_TASKBAR_CREATED_MSG),
@@ -3844,7 +3987,11 @@ mod tests {
         // pre-existing `..._hotkey_activate_tray_dismiss_learned_and_pause_toggle`
         // test above never closed for WM_APP_PALETTE_TOGGLE/WM_APP_PALETTE_RUN;
         // filed as a finding rather than folded into that test's name, which
-        // this commit does not otherwise touch).
+        // this commit does not otherwise touch). WM_APP_ROUTER_RESULT is
+        // advisory (unlike WM_APP_FORM_FILL_RESULT, a finished action's own
+        // result, which is Defer instead), so it stays Ignore here rather
+        // than joining the Defer group -- see `SettingsReentrancy::Ignore`'s
+        // own doc comment.
         for msg in [
             WM_APP_PALETTE_TOGGLE,
             WM_APP_PALETTE_RUN,
@@ -3944,6 +4091,111 @@ mod tests {
              ALL_WM_APP_IDS lists {}; add the new constant to ALL_WM_APP_IDS too",
             ALL_WM_APP_IDS.len()
         );
+    }
+
+    // -- settings_reentrancy_policy exhaustiveness (issue #213) -----------
+    //
+    // #163's ALL_WM_APP_IDS/wm_app_ids_registry_is_exhaustive above already
+    // guarantee every WM_APP_* constant in the crate is listed once. This
+    // reuses that same list to guarantee every one of them is ALSO
+    // classified by settings_reentrancy_policy -- the exact gap that let
+    // WM_APP_CALENDAR_RESULT and WM_APP_PREVIEW_DECIDED quietly stay
+    // Ignore'd instead of Defer'd (and let WM_APP_PALETTE_TOGGLE/
+    // WM_APP_PALETTE_RUN go untested by name at all) until #213. Adding a
+    // WM_APP_* id to ALL_WM_APP_IDS without adding a matching entry here
+    // fails this test, so a future result/decision message cannot be
+    // silently forgotten the same way again.
+
+    /// Every id in `ALL_WM_APP_IDS`, paired with the `SettingsReentrancy`
+    /// `settings_reentrancy_policy` must return for it. `TaskbarCreated`
+    /// itself is not a `WM_APP_*` constant (it's a runtime-registered
+    /// window message, see `TASKBAR_CREATED_MSG`), so `DeferTaskbarCreated`
+    /// never appears here -- it is covered by
+    /// `settings_reentrancy_defers_taskbar_created` instead.
+    const REENTRANCY_POLICY_TABLE: &[(&str, u32, SettingsReentrancy)] = &[
+        ("WM_APP_TRAY", WM_APP_TRAY, SettingsReentrancy::Ignore),
+        ("WM_APP_HOTKEY", WM_APP_HOTKEY, SettingsReentrancy::Ignore),
+        ("WM_APP_RESULT", WM_APP_RESULT, SettingsReentrancy::Defer),
+        ("WM_APP_LEARNED", WM_APP_LEARNED, SettingsReentrancy::Ignore),
+        ("WM_APP_DISMISS", WM_APP_DISMISS, SettingsReentrancy::Ignore),
+        (
+            "WM_APP_ACTIVATE",
+            WM_APP_ACTIVATE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_PAUSE_TOGGLE",
+            WM_APP_PAUSE_TOGGLE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_CALENDAR_RESULT",
+            WM_APP_CALENDAR_RESULT,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_PREVIEW_DECIDED",
+            WM_APP_PREVIEW_DECIDED,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_PALETTE_TOGGLE",
+            WM_APP_PALETTE_TOGGLE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_PALETTE_RUN",
+            WM_APP_PALETTE_RUN,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_REVIEW_RESULT",
+            WM_APP_REVIEW_RESULT,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_FORM_FILL_RESULT",
+            WM_APP_FORM_FILL_RESULT,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_ROUTER_RESULT",
+            WM_APP_ROUTER_RESULT,
+            SettingsReentrancy::Ignore,
+        ),
+    ];
+
+    #[test]
+    fn reentrancy_policy_table_matches_all_wm_app_ids() {
+        assert_eq!(
+            REENTRANCY_POLICY_TABLE.len(),
+            ALL_WM_APP_IDS.len(),
+            "ALL_WM_APP_IDS has {} entries but REENTRANCY_POLICY_TABLE has {} -- a WM_APP_* \
+             id was added to one without the other; classify every id in both places so a \
+             new result message cannot be silently dropped while Settings is open",
+            ALL_WM_APP_IDS.len(),
+            REENTRANCY_POLICY_TABLE.len()
+        );
+        for (name, id) in ALL_WM_APP_IDS {
+            assert!(
+                REENTRANCY_POLICY_TABLE
+                    .iter()
+                    .any(|(n, i, _)| n == name && i == id),
+                "{name} is in ALL_WM_APP_IDS but missing from REENTRANCY_POLICY_TABLE"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_reentrancy_policy_matches_the_table_for_every_wm_app_id() {
+        for (name, id, expected) in REENTRANCY_POLICY_TABLE {
+            assert_eq!(
+                settings_reentrancy_policy(*id, FAKE_TASKBAR_CREATED_MSG),
+                *expected,
+                "{name} is classified {expected:?} in REENTRANCY_POLICY_TABLE but \
+                 settings_reentrancy_policy disagrees"
+            );
+        }
     }
 
     #[test]

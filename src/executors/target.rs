@@ -273,6 +273,8 @@ pub mod com {
         VIRTUAL_KEY,
     };
 
+    use crate::hotkey::INJECTED_MARKER;
+
     /// Same RAII pairing as `inputs::uia::com::ComApartment` /
     /// `inputs::selection::com::ComApartment`, duplicated rather than shared
     /// -- those are private to their own files.
@@ -553,18 +555,16 @@ pub mod com {
         }
     }
 
-    /// Same marker style as `inputs::selection::INJECTED_MARKER` (a
-    /// recognizable, arbitrary `dwExtraInfo` tag distinguishing this
-    /// process's own synthetic input from a real user keystroke); duplicated
-    /// rather than shared because that constant is private to its own file.
-    const INJECTED_MARKER: usize = 0x57494E47; // ASCII "WING"
-
     /// `SendInput`s the typed-input fallback plan. Never called by this
     /// module's own automated tests -- see the module doc comment's "The
     /// typed-input fallback" section and `fill_form.rs`'s tests, none of
     /// which target a control lacking `ValuePattern`, so this function is
     /// only ever reached in production. Covered by [`plan_typed_input`]'s
-    /// own pure tests plus the manual check filed to #166.
+    /// own pure tests plus the manual check filed to #166. `dwExtraInfo` is
+    /// tagged with `crate::hotkey::INJECTED_MARKER` (issue #209: the single
+    /// constant every `SendInput` call site in the crate now shares) so
+    /// `hook_proc` never treats this typed fallback's own keystrokes as a
+    /// real hotkey press.
     fn inject_unicode_events(events: &[UnicodeKeyEvent]) {
         let inputs: Vec<INPUT> = events.iter().map(to_unicode_input).collect();
         if inputs.is_empty() {
