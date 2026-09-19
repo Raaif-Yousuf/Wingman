@@ -310,6 +310,21 @@ pub fn plan_from_probe(probe: UiaProbe, max_chars: usize) -> SelectionPlan {
     }
 }
 
+/// #263: resolves a `CurrentIsPassword` read to a plain `bool`, failing
+/// CLOSED (treated as a password field) rather than open when the read
+/// itself errors. This module's own doc comment says the whole point of
+/// checking `IsPassword` first is that "neither the UIA read nor the
+/// clipboard fallback ever touches a password field's contents" -- a COM
+/// error on the read itself (a hung provider, a non-conformant control)
+/// must not silently take the less-safe "not a password" branch. Generic
+/// over the error type so this stays in the pure, no-`windows`-crate-types
+/// section and gets a plain unit test with no COM call involved;
+/// `com::probe_from_element` is the sole caller.
+#[allow(dead_code)] // see the module doc comment's "not wired yet"
+fn resolve_is_password<E>(read: Result<bool, E>) -> bool {
+    read.unwrap_or(true)
+}
+
 /// Truncates `text` to at most `max_chars` Unicode scalar values (never a
 /// byte count -- see the neighbouring test with multi-byte characters),
 /// returning the truncated flag the task brief asks for. `total ==
@@ -598,7 +613,7 @@ pub struct Selection {
 mod com {
     #![allow(dead_code)] // see the module doc comment's "not wired yet"
 
-    use super::{SelectionIdentity, UiaProbe};
+    use super::{resolve_is_password, SelectionIdentity, UiaProbe};
     use windows::core::Interface;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
@@ -672,10 +687,10 @@ mod com {
     fn probe_from_element(element: &IUIAutomationElement) -> anyhow::Result<UiaProbe> {
         // NEVER read anything else from a password field's selection --
         // checked before any pattern lookup, same shape as
-        // `inputs::uia::com::extract`'s `is_password` guard.
-        let is_password = unsafe { element.CurrentIsPassword() }
-            .map(|b| b.as_bool())
-            .unwrap_or(false);
+        // `inputs::uia::com::extract`'s `is_password` guard. #263: a failed
+        // read fails CLOSED via `resolve_is_password`, never open.
+        let is_password =
+            resolve_is_password(unsafe { element.CurrentIsPassword() }.map(|b| b.as_bool()));
         if is_password {
             return Ok(UiaProbe::FocusedIsPassword);
         }
@@ -1323,6 +1338,19 @@ mod tests {
             plan_from_probe(UiaProbe::FocusedIsPassword, DEFAULT_MAX_CHARS),
             SelectionPlan::SkipPasswordField
         );
+    }
+
+    #[test]
+    fn resolve_is_password_fails_closed_when_the_read_itself_errors() {
+        // #263: a COM error reading IsPassword must be treated as "this is
+        // a password field", never as "this is not".
+        assert!(resolve_is_password::<()>(Err(())));
+    }
+
+    #[test]
+    fn resolve_is_password_reports_a_successful_read_unchanged() {
+        assert!(!resolve_is_password::<()>(Ok(false)));
+        assert!(resolve_is_password::<()>(Ok(true)));
     }
 
     #[test]
