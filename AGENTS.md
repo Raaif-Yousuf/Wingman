@@ -1,4 +1,4 @@
-# copilot-ask — Quick-Reference Card
+# Wingman: quick-reference card
 
 > Loaded into every session, so it stays small on purpose. Rules in their
 > shortest enforceable form, the stack, the pitfalls that have already cost a
@@ -6,9 +6,9 @@
 
 **Name:** **Wingman** (decided 2026-09-16; the crate, bin, window classes,
 mutex, config directory, package identity and icons were renamed
-2026-09-16, issues #1 and #10, both closed. The repo folder is still
-`copilot-ask` until it is physically moved; the current package identity
-is `RaaifYousuf.Wingman`, per `packaging\Wingman.Common.psm1`'s
+2026-09-16, issues #1 and #10, both closed. The repo folder was renamed by
+hand on 2026-09-19 and is now `C:\Users\raaif\Wingman`; the current package
+identity is `RaaifYousuf.Wingman`, per `packaging\Wingman.Common.psm1`'s
 `Get-WingmanIdentity`). GitHub: `Raaif-Yousuf/Wingman`.
 
 **App:** a native Windows 11 tray assistant behind the Copilot key. Today: one
