@@ -3,9 +3,9 @@
 //! live selection rectangle with a pixel-size label. Drag selects a region;
 //! click-without-drag on a window selects that window's bounds (DWM
 //! extended frame bounds, resolved from a window snapshot taken before the
-//! overlay itself existed -- see [`SnapshotEntry`], #271). Esc or
-//! right-click cancels; Enter confirms the current rectangle -- a drag or a
-//! click only STAGES a
+//! overlay itself existed -- see [`SnapshotEntry`], #271). Esc, right-click,
+//! or losing activation (Alt-Tab, Win+Tab, a Snap layout -- #272) cancels;
+//! Enter confirms the current rectangle -- a drag or a click only STAGES a
 //! rectangle (drawn, not yet returned); Enter is the one thing that turns a
 //! staged rectangle into the overlay's result. See [`select_region`] for the
 //! public entry point.
@@ -23,7 +23,7 @@
 //!   values with no real window, monitor or DPI call involved.
 //! - **Win32** ([`Overlay`], [`win32`]): the real window (its own class,
 //!   `WM_LBUTTONDOWN`/`WM_MOUSEMOVE`/`WM_LBUTTONUP`/`WM_KEYDOWN`/
-//!   `WM_RBUTTONDOWN`/`WM_PAINT` handling) and
+//!   `WM_RBUTTONDOWN`/`WM_ACTIVATE`/`WM_PAINT` handling) and
 //!   `win32::capture_window_snapshot` (`EnumWindows` ->
 //!   `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`, falling back to
 //!   `GetWindowRect`, for every visible top-level window, captured ONCE
@@ -73,9 +73,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     GetWindowLongPtrW, LoadCursorW, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST,
-    IDC_CROSS, MSG, SWP_NOACTIVATE, SW_SHOW, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    IDC_CROSS, MSG, SWP_NOACTIVATE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::{self, RawShot, RectPx};
@@ -812,6 +812,21 @@ impl OverlayInner {
         self.outcome = Some(OverlayOutcome::Cancelled);
     }
 
+    /// #272: the overlay is a top-level `WS_POPUP` with no child control
+    /// (unlike `ui::palette`'s query edit, which forwards its own
+    /// `WM_KILLFOCUS` to the parent), so losing activation -- Alt-Tab,
+    /// Win+Tab, a Snap layout, Win+L -- arrives at THIS window as
+    /// `WM_ACTIVATE(WA_INACTIVE)`, not `WM_KILLFOCUS`. Cancel the same way
+    /// a right-click already does, so a topmost, full-desktop overlay never
+    /// gets stranded on screen, unresponsive to Escape, once focus moves
+    /// elsewhere.
+    fn on_activate(&mut self, wparam: WPARAM) {
+        let state = (wparam.0 as u32) & 0xFFFF; // LOWORD: activation state
+        if state == WA_INACTIVE {
+            self.outcome = Some(OverlayOutcome::Cancelled);
+        }
+    }
+
     fn visible_rect(&self) -> Option<Rect> {
         if self.dragging {
             Some(normalize_drag(self.drag_start, self.current_point))
@@ -871,6 +886,10 @@ impl OverlayInner {
             }
             WM_KEYDOWN => {
                 self.on_keydown(wparam.0 as u32);
+                Some(LRESULT(0))
+            }
+            WM_ACTIVATE => {
+                self.on_activate(wparam);
                 Some(LRESULT(0))
             }
             WM_DESTROY | WM_NCDESTROY => Some(LRESULT(0)),
@@ -1769,6 +1788,65 @@ mod tests {
                 bottom: 300
             },
             "must never fall back to the overlay's own full-desktop bounds"
+        );
+    }
+
+    // -- #272: losing activation (Alt-Tab etc.) must cancel, the same way -
+    // -- a right-click already does ----------------------------------------
+
+    #[test]
+    fn overlay_losing_activation_cancels() {
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+        let instance = test_instance();
+        let desktop = Rect {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 300,
+        };
+        let overlay = Overlay::open_for_test(instance, desktop).expect("Overlay::open_for_test");
+        let hwnd = overlay.hwnd();
+
+        unsafe {
+            // WM_ACTIVATE, LOWORD(wParam) = WA_INACTIVE (0): the window is
+            // being deactivated, e.g. by Alt-Tab away.
+            let _ = PostMessageW(Some(hwnd), WM_ACTIVATE, WPARAM(0), LPARAM(0));
+        }
+        pump_until(hwnd, 20, || overlay.outcome().is_some());
+
+        assert_eq!(
+            overlay.outcome(),
+            Some(OverlayOutcome::Cancelled),
+            "losing activation must cancel the overlay, the same as a right-click"
+        );
+    }
+
+    #[test]
+    fn overlay_gaining_activation_does_not_cancel() {
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+        let instance = test_instance();
+        let desktop = Rect {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 300,
+        };
+        let overlay = Overlay::open_for_test(instance, desktop).expect("Overlay::open_for_test");
+        let hwnd = overlay.hwnd();
+
+        unsafe {
+            // WM_ACTIVATE, LOWORD(wParam) = WA_ACTIVE (1): being (re)
+            // activated must NOT be mistaken for losing focus.
+            let _ = PostMessageW(Some(hwnd), WM_ACTIVATE, WPARAM(1), LPARAM(0));
+        }
+        pump_until(hwnd, 20, || overlay.outcome().is_some());
+
+        assert_eq!(
+            overlay.outcome(),
+            None,
+            "gaining activation must not cancel the overlay"
         );
     }
 
