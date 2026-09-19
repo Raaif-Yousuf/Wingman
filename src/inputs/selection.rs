@@ -77,8 +77,12 @@
 //!
 //! Snapshotted and restored byte-exact, via `HGLOBAL` buffers copied
 //! straight off the real clipboard with no reinterpretation:
-//! `CF_UNICODETEXT`, `CF_HDROP`, `CF_DIB`, the registered `"HTML Format"`
-//! and `"Rich Text Format"` formats.
+//! `CF_UNICODETEXT`, `CF_HDROP`, `CF_DIB`, `CF_DIBV5` (#265: a distinct
+//! registered format from `CF_DIB`, carrying a `BITMAPV5HEADER`, that
+//! several common copy sources -- Snipping Tool/Snip & Sketch, some browser
+//! image copies -- put on the clipboard, sometimes with no parallel
+//! `CF_DIB` entry), the registered `"HTML Format"` and `"Rich Text Format"`
+//! formats.
 //!
 //! **`CF_BITMAP` is NOT byte-copied.** It is a GDI bitmap *handle*, not an
 //! `HGLOBAL` buffer -- there is no byte buffer to snapshot without decoding
@@ -310,6 +314,21 @@ pub fn plan_from_probe(probe: UiaProbe, max_chars: usize) -> SelectionPlan {
     }
 }
 
+/// #263: resolves a `CurrentIsPassword` read to a plain `bool`, failing
+/// CLOSED (treated as a password field) rather than open when the read
+/// itself errors. This module's own doc comment says the whole point of
+/// checking `IsPassword` first is that "neither the UIA read nor the
+/// clipboard fallback ever touches a password field's contents" -- a COM
+/// error on the read itself (a hung provider, a non-conformant control)
+/// must not silently take the less-safe "not a password" branch. Generic
+/// over the error type so this stays in the pure, no-`windows`-crate-types
+/// section and gets a plain unit test with no COM call involved;
+/// `com::probe_from_element` is the sole caller.
+#[allow(dead_code)] // see the module doc comment's "not wired yet"
+fn resolve_is_password<E>(read: Result<bool, E>) -> bool {
+    read.unwrap_or(true)
+}
+
 /// Truncates `text` to at most `max_chars` Unicode scalar values (never a
 /// byte count -- see the neighbouring test with multi-byte characters),
 /// returning the truncated flag the task brief asks for. `total ==
@@ -533,14 +552,17 @@ impl<'a, C: RawClipboard> ClipboardGuard<'a, C> {
         }
     }
 
-    /// Restores and verifies now. Idempotent: a second call (including the
-    /// one `Drop` would otherwise make) is a no-op `Ok(())`.
+    /// Restores and verifies now. Idempotent on SUCCESS: a second call after
+    /// a successful restore (including the one `Drop` would otherwise make)
+    /// is a no-op `Ok(())`. On FAILURE, `done` is left `false` so `Drop`
+    /// still gets its documented one more attempt (#262: a failed restore
+    /// must not forfeit the safety net at exactly the moment it is needed).
     pub fn restore_now(&mut self) -> anyhow::Result<()> {
         if self.done {
             return Ok(());
         }
         let result = restore_and_verify(self.clipboard, &self.snapshot);
-        self.done = true;
+        self.done = result.is_ok();
         result
     }
 }
@@ -595,7 +617,7 @@ pub struct Selection {
 mod com {
     #![allow(dead_code)] // see the module doc comment's "not wired yet"
 
-    use super::{SelectionIdentity, UiaProbe};
+    use super::{resolve_is_password, SelectionIdentity, UiaProbe};
     use windows::core::Interface;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
@@ -669,10 +691,10 @@ mod com {
     fn probe_from_element(element: &IUIAutomationElement) -> anyhow::Result<UiaProbe> {
         // NEVER read anything else from a password field's selection --
         // checked before any pattern lookup, same shape as
-        // `inputs::uia::com::extract`'s `is_password` guard.
-        let is_password = unsafe { element.CurrentIsPassword() }
-            .map(|b| b.as_bool())
-            .unwrap_or(false);
+        // `inputs::uia::com::extract`'s `is_password` guard. #263: a failed
+        // read fails CLOSED via `resolve_is_password`, never open.
+        let is_password =
+            resolve_is_password(unsafe { element.CurrentIsPassword() }.map(|b| b.as_bool()));
         if is_password {
             return Ok(UiaProbe::FocusedIsPassword);
         }
@@ -876,7 +898,7 @@ mod win32 {
         RemoveClipboardFormatListener, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
-    use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+    use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
         KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
@@ -890,6 +912,12 @@ mod win32 {
     pub(super) const CF_UNICODETEXT_U32: u32 = CF_UNICODETEXT.0 as u32;
     pub(super) const CF_HDROP_U32: u32 = CF_HDROP.0 as u32;
     pub(super) const CF_DIB_U32: u32 = CF_DIB.0 as u32;
+    /// #265: a distinct registered format from `CF_DIB` (carries a
+    /// `BITMAPV5HEADER`, used for images with an embedded ICC profile or a
+    /// real alpha channel). Several common copy sources (Snipping
+    /// Tool/Snip & Sketch, some browser image copies) put this on the
+    /// clipboard, sometimes with no parallel `CF_DIB` entry.
+    pub(super) const CF_DIBV5_U32: u32 = CF_DIBV5.0 as u32;
 
     fn html_format() -> u32 {
         static FMT: OnceLock<u32> = OnceLock::new();
@@ -901,13 +929,14 @@ mod win32 {
         *FMT.get_or_init(|| unsafe { RegisterClipboardFormatW(w!("Rich Text Format")) })
     }
 
-    /// The five formats [`super::snapshot`]/[`super::restore`] round-trip.
+    /// The six formats [`super::snapshot`]/[`super::restore`] round-trip.
     /// See the module doc comment's "what is and is not preserved".
-    pub(super) fn preserved_formats() -> [u32; 5] {
+    pub(super) fn preserved_formats() -> [u32; 6] {
         [
             CF_UNICODETEXT_U32,
             CF_HDROP_U32,
             CF_DIB_U32,
+            CF_DIBV5_U32,
             html_format(),
             rtf_format(),
         ]
@@ -1323,6 +1352,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_is_password_fails_closed_when_the_read_itself_errors() {
+        // #263: a COM error reading IsPassword must be treated as "this is
+        // a password field", never as "this is not".
+        assert!(resolve_is_password::<()>(Err(())));
+    }
+
+    #[test]
+    fn resolve_is_password_reports_a_successful_read_unchanged() {
+        assert!(!resolve_is_password::<()>(Ok(false)));
+        assert!(resolve_is_password::<()>(Ok(true)));
+    }
+
+    #[test]
     fn no_text_pattern_falls_back() {
         assert_eq!(
             plan_from_probe(UiaProbe::NoTextPattern, DEFAULT_MAX_CHARS),
@@ -1720,6 +1762,26 @@ mod tests {
     }
 
     #[test]
+    fn a_cf_dibv5_only_snapshot_round_trips_through_the_production_format_list() {
+        // #265: CF_DIBV5 (BITMAPV5HEADER images -- Snipping Tool/Snip &
+        // Sketch, some browser image copies, sometimes with no parallel
+        // CF_DIB) must not be silently dropped by a selection-fallback
+        // round trip, the same way CF_DIB already is not.
+        let cf_dibv5 = windows::Win32::System::Ole::CF_DIBV5.0 as u32;
+        let clipboard = FakeClipboard::seeded(&[(cf_dibv5, b"fake-dibv5-bytes")]);
+
+        let snap = snapshot(&clipboard, &win32::preserved_formats());
+        clipboard.set_formats(&[]).unwrap(); // the injected Ctrl+C clearing the clipboard
+        restore(&clipboard, &snap).unwrap();
+
+        assert_eq!(
+            clipboard.get_format(cf_dibv5),
+            Some(b"fake-dibv5-bytes".to_vec()),
+            "a CF_DIBV5 image must survive a selection-fallback clipboard round trip"
+        );
+    }
+
+    #[test]
     fn restore_writes_back_exactly_the_captured_formats() {
         let clipboard = FakeClipboard::seeded(&[(FMT_TEXT, b"original")]);
         let snap = snapshot(&clipboard, &[FMT_TEXT]);
@@ -1831,6 +1893,39 @@ mod tests {
             clipboard.sequence_number(),
             seq_after_first_restore,
             "Drop must not perform a second restore after restore_now already ran"
+        );
+    }
+
+    #[test]
+    fn restore_now_leaves_done_false_on_failure_so_drop_still_retries() {
+        // #262: a failed restore_now must not forfeit Drop's safety net.
+        let clipboard = FakeClipboard::seeded(&[(FMT_TEXT, b"original")]);
+        let mut guard = ClipboardGuard::capture(&clipboard, &[FMT_TEXT]);
+        clipboard
+            .set_formats(&[(FMT_TEXT, b"injected".to_vec())])
+            .unwrap();
+
+        // Make the first restore attempt fail (a silent no-op write, the
+        // same fake behaviour `restore_and_verify_errs_when_the_write_silently_no_ops`
+        // uses).
+        *clipboard.fail_restore_silently.borrow_mut() = true;
+        let err = guard.restore_now().unwrap_err();
+        assert!(err.to_string().contains("sequence number"));
+        assert_eq!(
+            clipboard.get_format(FMT_TEXT).unwrap(),
+            b"injected",
+            "restore_now failed, so the injected copy must still be on the clipboard"
+        );
+
+        // Let a later attempt (Drop's safety net) succeed.
+        *clipboard.fail_restore_silently.borrow_mut() = false;
+        drop(guard);
+
+        assert_eq!(
+            clipboard.get_format(FMT_TEXT).unwrap(),
+            b"original",
+            "Drop must still attempt a restore after a failed restore_now, per the \
+             doc comment's stated safety-net guarantee"
         );
     }
 

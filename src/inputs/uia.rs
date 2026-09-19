@@ -296,6 +296,21 @@ fn build_snapshot(elements: &[RawElement]) -> Vec<FieldSnapshot> {
     fields
 }
 
+/// #263: resolves a `CachedIsPassword`/`CurrentIsPassword` read to a plain
+/// `bool`, failing CLOSED (treated as a password field) rather than open
+/// when the read itself errors. This module's own doc comment says the
+/// point of checking `is_password` first is that "the real text is never
+/// even transiently held as a Rust value" for a password field -- a COM
+/// error on the read itself (a hung provider, a non-conformant control)
+/// must not silently take the less-safe "not a password" branch. Generic
+/// over the error type so this stays in the pure, no-`windows`-crate-types
+/// section and gets a plain unit test with no COM call involved;
+/// `com::extract` is the sole caller.
+#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+fn resolve_is_password<E>(read: Result<bool, E>) -> bool {
+    read.unwrap_or(true)
+}
+
 /// How many of `total` walked elements to keep, and whether that is fewer
 /// than `total` (the caller must then report `truncated: true`). Pure so
 /// the boundary is unit-tested without a COM call: `total == max_elements`
@@ -391,7 +406,7 @@ mod com {
     // is reached only through `super::snapshot_hwnd`, itself unwired.
     #![allow(dead_code)]
 
-    use super::{RawControlType, RawElement, Rect};
+    use super::{resolve_is_password, RawControlType, RawElement, Rect};
     use std::time::{Duration, Instant};
     use windows::core::Interface;
     use windows::Win32::Foundation::HWND;
@@ -575,9 +590,10 @@ mod com {
         let help_text = unsafe { el.CachedHelpText() }
             .map(|b| b.to_string())
             .unwrap_or_default();
-        let is_password = unsafe { el.CachedIsPassword() }
-            .map(|b| b.as_bool())
-            .unwrap_or(false);
+        // #263: a failed read fails CLOSED via `resolve_is_password`, never
+        // open -- see this module's doc comment's "NEVER" language above.
+        let is_password =
+            resolve_is_password(unsafe { el.CachedIsPassword() }.map(|b| b.as_bool()));
         let enabled = unsafe { el.CachedIsEnabled() }
             .map(|b| b.as_bool())
             .unwrap_or(true);
@@ -837,6 +853,19 @@ mod tests {
     }
 
     // -- password redaction ---------------------------------------------------
+
+    #[test]
+    fn resolve_is_password_fails_closed_when_the_read_itself_errors() {
+        // #263: a COM error reading IsPassword must be treated as "this is
+        // a password field", never as "this is not".
+        assert!(resolve_is_password::<()>(Err(())));
+    }
+
+    #[test]
+    fn resolve_is_password_reports_a_successful_read_unchanged() {
+        assert!(!resolve_is_password::<()>(Ok(false)));
+        assert!(resolve_is_password::<()>(Ok(true)));
+    }
 
     #[test]
     fn password_field_is_redacted_even_if_a_raw_value_was_supplied() {
