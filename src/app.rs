@@ -4071,6 +4071,64 @@ mod tests {
         );
     }
 
+    /// Issue #234, the half `ui::tray`'s own menu test cannot cover: every
+    /// command id declared in `ui::tray::cmd` must have a `WM_COMMAND` arm
+    /// in `wnd_proc`, or the user clicks a real menu item and nothing
+    /// happens. Same source-scanning technique as
+    /// `wm_app_ids_registry_is_exhaustive` above, for the same reason: the
+    /// match arms are ordinary code that no type system ties to the
+    /// constant list.
+    ///
+    /// Filed after a real instance: `cmd::COPY_EGRESS_LOG` was first given
+    /// id 1020, already held by `EXTRACT_TEXT`. That one the compiler caught
+    /// as an unreachable arm, but a NEW id with no arm at all is silent.
+    ///
+    /// The three ids excluded below are not fixed menu commands: the two
+    /// `*_MODEL_BASE` values are the starts of the dynamic model-submenu
+    /// ranges, dispatched through `MenuChoice::{OpenAiModel, AnthropicModel}`
+    /// rather than by exact id, and `MODEL_RANGE` is that range's width.
+    #[test]
+    fn every_tray_cmd_id_has_a_wnd_proc_arm() {
+        // Not fixed menu commands. The two *_MODEL_BASE values start the
+        // dynamic model-submenu ranges (dispatched by MenuChoice::OpenAiModel /
+        // AnthropicModel, not by exact id) and MODEL_RANGE is that width.
+        const DYNAMIC: &[&str] = &["MODEL_RANGE", "OPENAI_MODEL_BASE", "ANTHROPIC_MODEL_BASE"];
+
+        let tray_src = include_str!("ui/tray.rs");
+        let app_src = include_str!("app.rs");
+
+        let declared: Vec<&str> = tray_src
+            .lines()
+            .filter_map(|line| {
+                let t = line.trim_start();
+                let rest = t.strip_prefix("pub const ")?;
+                let name = rest.split(':').next()?.trim();
+                (rest.contains(": u32 =")
+                    && !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+                .then_some(name)
+            })
+            .filter(|name| !DYNAMIC.contains(name) && !name.starts_with("WM_APP_"))
+            .collect();
+
+        assert!(
+            declared.len() > 20,
+            "scanner found only {} cmd constants in ui/tray.rs; the declaration format must have changed and this test is no longer checking anything",
+            declared.len()
+        );
+
+        let unhandled: Vec<&str> = declared
+            .iter()
+            .filter(|name| !app_src.contains(&format!("MenuChoice::Command(cmd::{name})")))
+            .copied()
+            .collect();
+
+        assert!(
+            unhandled.is_empty(),
+            "these ui::tray::cmd ids have no `MenuChoice::Command(cmd::NAME)` arm in wnd_proc, so clicking their menu item does nothing: {unhandled:?}"
+        );
+    }
+
     // -- settings_reentrancy_policy exhaustiveness (issue #213) -----------
     //
     // #163's ALL_WM_APP_IDS/wm_app_ids_registry_is_exhaustive above already

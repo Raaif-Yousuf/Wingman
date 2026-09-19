@@ -1649,6 +1649,39 @@ mod tests {
         );
     }
 
+    /// Issue #234: the registry above has to stay exhaustive, or the
+    /// uniqueness and menu-presence tests quietly stop covering a new id.
+    /// Same source-scanning technique `app.rs` uses for `ALL_WM_APP_IDS`.
+    #[test]
+    fn all_fixed_cmd_ids_lists_every_declared_command() {
+        // Not fixed menu commands. The two *_MODEL_BASE values start the
+        // dynamic model-submenu ranges (dispatched by MenuChoice::OpenAiModel /
+        // AnthropicModel, not by exact id) and MODEL_RANGE is that width.
+        const DYNAMIC: &[&str] = &["MODEL_RANGE", "OPENAI_MODEL_BASE", "ANTHROPIC_MODEL_BASE"];
+
+        let declared: Vec<&str> = include_str!("tray.rs")
+            .lines()
+            .filter_map(|line| {
+                let t = line.trim_start();
+                let rest = t.strip_prefix("pub const ")?;
+                let name = rest.split(':').next()?.trim();
+                (rest.contains(": u32 =")
+                    && !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+                .then_some(name)
+            })
+            .filter(|name| !DYNAMIC.contains(name) && !name.starts_with("WM_APP_"))
+            .collect();
+
+        let listed: Vec<&str> = ALL_FIXED_CMD_IDS.iter().map(|(n, _)| *n).collect();
+        let missing: Vec<&&str> = declared.iter().filter(|n| !listed.contains(n)).collect();
+
+        assert!(
+            missing.is_empty(),
+            "these cmd constants are declared but absent from ALL_FIXED_CMD_IDS, so the uniqueness and menu-presence tests do not cover them: {missing:?}"
+        );
+    }
+
     #[test]
     fn fixed_cmd_ids_are_pairwise_unique() {
         for (i, (name_a, id_a)) in ALL_FIXED_CMD_IDS.iter().enumerate() {
