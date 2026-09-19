@@ -2000,8 +2000,6 @@ mod tests {
     #[test]
     fn post_json_with_never_logs_a_fake_key_from_headers_or_a_failing_response_body() {
         let _g = network_guard();
-
-        let _g = network_guard();
         let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
 
         let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";

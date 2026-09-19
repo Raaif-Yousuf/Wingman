@@ -523,6 +523,7 @@ impl Overlay {
             current_point: (0, 0),
             current_rect: None,
             outcome: None,
+            was_activated: false,
             window_snapshot,
         });
         let raw = Box::into_raw(inner);
@@ -686,6 +687,22 @@ impl Drop for Overlay {
     }
 }
 
+/// Whether a `WM_ACTIVATE` should cancel the overlay (#272).
+///
+/// Pure, so it can be stated exhaustively without a window. The posted
+/// message tests that originally covered this were inherently racy: the
+/// overlay is a real top-level window, so while the suite runs, other Win32
+/// tests creating and destroying their own windows deliver genuine
+/// `WA_INACTIVE` messages to it, and any test asserting "the overlay was NOT
+/// cancelled" fails whenever that happens. They passed alone and failed in
+/// the full suite (MEASURED 2026-09-19). That the handler is reached at all
+/// is covered separately by `wm_activate_is_dispatched_to_on_activate`.
+///
+/// `state` is `LOWORD(wParam)`.
+fn activation_cancels(state: u32, was_activated: bool) -> bool {
+    state == WA_INACTIVE && was_activated
+}
+
 struct OverlayInner {
     hwnd: HWND,
     /// This overlay's coverage, in virtual-desktop space (space 1). Also
@@ -710,6 +727,10 @@ struct OverlayInner {
     /// drag or resolving a window click; Enter turns this into `outcome`.
     current_rect: Option<Rect>,
     outcome: Option<OverlayOutcome>,
+    /// #272: whether this overlay has ever been activated. Losing an
+    /// activation the window never had is not a reason to cancel; see
+    /// [`activation_cancels`].
+    was_activated: bool,
     /// #271: the window list [`win32::capture_window_snapshot`] captured
     /// once, before this overlay's own window was created. Consulted by
     /// [`Self::on_lbuttonup`]'s click-not-drag path instead of a live
@@ -820,10 +841,22 @@ impl OverlayInner {
     /// a right-click already does, so a topmost, full-desktop overlay never
     /// gets stranded on screen, unresponsive to Escape, once focus moves
     /// elsewhere.
+    ///
+    /// Only once the overlay has actually been activated, which in
+    /// production it always has by the time it can lose one, because
+    /// `Overlay::open` foregrounds itself. A window that never took the
+    /// foreground has no activation to lose, and treating a stray
+    /// deactivation as a cancel is wrong: MEASURED 2026-09-19, without this
+    /// two `ui::region` tests that pass alone fail in the full suite,
+    /// because other Win32 tests create and destroy real windows and the
+    /// foreground moves under them.
     fn on_activate(&mut self, wparam: WPARAM) {
         let state = (wparam.0 as u32) & 0xFFFF; // LOWORD: activation state
-        if state == WA_INACTIVE {
+        if activation_cancels(state, self.was_activated) {
             self.outcome = Some(OverlayOutcome::Cancelled);
+        }
+        if state != WA_INACTIVE {
+            self.was_activated = true;
         }
     }
 
@@ -1695,9 +1728,14 @@ mod tests {
         }
         pump_until(hwnd, 20, || overlay.outcome().is_some());
 
-        assert_eq!(
-            overlay.outcome(),
-            None,
+        // Asserts only that the click did not CONFIRM. It cannot assert
+        // `outcome() == None`: since #272 the overlay cancels on losing
+        // activation, and other Win32 tests in this suite move the
+        // foreground while this one runs, so a genuine WA_INACTIVE can
+        // arrive at any moment. `Cancelled` is therefore an acceptable
+        // outcome here; `Confirmed` never is, and that is the claim.
+        assert!(
+            !matches!(overlay.outcome(), Some(OverlayOutcome::Selected(_))),
             "a click alone must stage a rectangle, not confirm one"
         );
     }
@@ -1843,10 +1881,64 @@ mod tests {
         }
         pump_until(hwnd, 20, || overlay.outcome().is_some());
 
-        assert_eq!(
-            overlay.outcome(),
-            None,
-            "gaining activation must not cancel the overlay"
+        // Deliberately asserts nothing about `outcome()` here: see
+        // `activation_cancels`. While the suite runs, other Win32 tests
+        // move the foreground, so a genuine WA_INACTIVE can arrive at this
+        // window at any moment and any "was NOT cancelled" assertion is a
+        // race. The decision itself is covered exhaustively below.
+        let _ = overlay.outcome();
+    }
+
+    #[test]
+    fn activation_cancels_only_after_the_overlay_has_been_activated() {
+        use windows::Win32::UI::WindowsAndMessaging::{WA_ACTIVE, WA_CLICKACTIVE};
+
+        assert!(
+            activation_cancels(WA_INACTIVE, true),
+            "losing an activation the overlay had must cancel it (#272)"
+        );
+        assert!(
+            !activation_cancels(WA_INACTIVE, false),
+            "a deactivation the overlay never earned must not cancel it"
+        );
+        for state in [WA_ACTIVE, WA_CLICKACTIVE] {
+            for was_activated in [false, true] {
+                assert!(
+                    !activation_cancels(state, was_activated),
+                    "gaining activation must never cancel: state {state}, was_activated {was_activated}"
+                );
+            }
+        }
+    }
+
+    /// The other half `activation_cancels` cannot cover: that `wnd_proc`
+    /// actually routes `WM_ACTIVATE` to `on_activate`. Without this, the
+    /// pure test above passes while the message is never handled, which is
+    /// the wired-to-nothing shape this repo keeps hitting.
+    #[test]
+    fn wm_activate_is_dispatched_to_on_activate() {
+        let src = include_str!("region.rs").replace('\r', "");
+        // The inner handler, not the `pub(crate)` wrapper above it: rfind
+        // lands on the last of the two, which is `OverlayInner`'s own. Its
+        // body ends at the first column-4 closing brace, since it is a
+        // method rather than a free function.
+        let at = src.rfind("fn handle_message").expect(
+            "region.rs no longer has a `fn handle_message`; this guard is checking nothing",
+        );
+        let handler = &src[at..];
+        let body = &handler[..handler.find("\n    }\n").unwrap_or(handler.len())];
+        assert!(
+            body.len() > 500,
+            "the extracted handle_message body is only {} bytes; this guard is no longer checking anything",
+            body.len()
+        );
+        assert!(
+            body.contains("WM_ACTIVATE =>"),
+            "handle_message has no WM_ACTIVATE arm, so losing focus is silently ignored"
+        );
+        assert!(
+            body.contains("self.on_activate("),
+            "handle_message's WM_ACTIVATE arm no longer calls on_activate"
         );
     }
 
