@@ -77,8 +77,12 @@
 //!
 //! Snapshotted and restored byte-exact, via `HGLOBAL` buffers copied
 //! straight off the real clipboard with no reinterpretation:
-//! `CF_UNICODETEXT`, `CF_HDROP`, `CF_DIB`, the registered `"HTML Format"`
-//! and `"Rich Text Format"` formats.
+//! `CF_UNICODETEXT`, `CF_HDROP`, `CF_DIB`, `CF_DIBV5` (#265: a distinct
+//! registered format from `CF_DIB`, carrying a `BITMAPV5HEADER`, that
+//! several common copy sources -- Snipping Tool/Snip & Sketch, some browser
+//! image copies -- put on the clipboard, sometimes with no parallel
+//! `CF_DIB` entry), the registered `"HTML Format"` and `"Rich Text Format"`
+//! formats.
 //!
 //! **`CF_BITMAP` is NOT byte-copied.** It is a GDI bitmap *handle*, not an
 //! `HGLOBAL` buffer -- there is no byte buffer to snapshot without decoding
@@ -894,7 +898,7 @@ mod win32 {
         RemoveClipboardFormatListener, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
-    use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+    use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
         KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
@@ -908,6 +912,12 @@ mod win32 {
     pub(super) const CF_UNICODETEXT_U32: u32 = CF_UNICODETEXT.0 as u32;
     pub(super) const CF_HDROP_U32: u32 = CF_HDROP.0 as u32;
     pub(super) const CF_DIB_U32: u32 = CF_DIB.0 as u32;
+    /// #265: a distinct registered format from `CF_DIB` (carries a
+    /// `BITMAPV5HEADER`, used for images with an embedded ICC profile or a
+    /// real alpha channel). Several common copy sources (Snipping
+    /// Tool/Snip & Sketch, some browser image copies) put this on the
+    /// clipboard, sometimes with no parallel `CF_DIB` entry.
+    pub(super) const CF_DIBV5_U32: u32 = CF_DIBV5.0 as u32;
 
     fn html_format() -> u32 {
         static FMT: OnceLock<u32> = OnceLock::new();
@@ -919,13 +929,14 @@ mod win32 {
         *FMT.get_or_init(|| unsafe { RegisterClipboardFormatW(w!("Rich Text Format")) })
     }
 
-    /// The five formats [`super::snapshot`]/[`super::restore`] round-trip.
+    /// The six formats [`super::snapshot`]/[`super::restore`] round-trip.
     /// See the module doc comment's "what is and is not preserved".
-    pub(super) fn preserved_formats() -> [u32; 5] {
+    pub(super) fn preserved_formats() -> [u32; 6] {
         [
             CF_UNICODETEXT_U32,
             CF_HDROP_U32,
             CF_DIB_U32,
+            CF_DIBV5_U32,
             html_format(),
             rtf_format(),
         ]
@@ -1748,6 +1759,26 @@ mod tests {
         let clipboard = FakeClipboard::default();
         let snap = snapshot(&clipboard, &[FMT_TEXT, FMT_HDROP]);
         assert!(snap.formats.is_empty());
+    }
+
+    #[test]
+    fn a_cf_dibv5_only_snapshot_round_trips_through_the_production_format_list() {
+        // #265: CF_DIBV5 (BITMAPV5HEADER images -- Snipping Tool/Snip &
+        // Sketch, some browser image copies, sometimes with no parallel
+        // CF_DIB) must not be silently dropped by a selection-fallback
+        // round trip, the same way CF_DIB already is not.
+        let cf_dibv5 = windows::Win32::System::Ole::CF_DIBV5.0 as u32;
+        let clipboard = FakeClipboard::seeded(&[(cf_dibv5, b"fake-dibv5-bytes")]);
+
+        let snap = snapshot(&clipboard, &win32::preserved_formats());
+        clipboard.set_formats(&[]).unwrap(); // the injected Ctrl+C clearing the clipboard
+        restore(&clipboard, &snap).unwrap();
+
+        assert_eq!(
+            clipboard.get_format(cf_dibv5),
+            Some(b"fake-dibv5-bytes".to_vec()),
+            "a CF_DIBV5 image must survive a selection-fallback clipboard round trip"
+        );
     }
 
     #[test]
