@@ -522,6 +522,18 @@ impl Default for Palette {
     }
 }
 
+// #257: a per-thread test seam that makes `Config::restrict_acl` report
+// failure deterministically, so tests can prove the "abort the write rather
+// than leave a live key in an unprotected file" contract without mutating
+// process-wide state (`USERNAME`) that unrelated tests running on other
+// threads also depend on. `cargo test` runs each test function on its own
+// OS thread, so a `thread_local` is exactly as isolated as the test itself
+// and cannot leak into a concurrently-running test.
+#[cfg(test)]
+thread_local! {
+    static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Config {
     /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {
@@ -561,7 +573,29 @@ impl Config {
         if let Some(parent) = new_path.parent() {
             fs::create_dir_all(parent).context("failed to create the new config directory")?;
         }
-        fs::copy(old_path, new_path).context("failed to copy the old config forward")?;
+
+        // #257: copy to a temp file and restrict its ACL before it is ever
+        // visible under `new_path`, the same abort-on-failure discipline as
+        // `save_to`. Before this fix, `migrate_from` never restricted the
+        // ACL at all, so a live `api_key` carried forward by the rename
+        // migration landed in a file with whatever permissions it inherited.
+        let mut tmp_name = new_path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_name);
+        fs::copy(old_path, &tmp_path).context("failed to copy the old config forward")?;
+
+        #[cfg(windows)]
+        if let Err(e) = Self::restrict_acl(&tmp_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e).context(
+                "failed to restrict permissions on the migrated config file; the \
+                 migration was aborted rather than leave an API key in an \
+                 unprotected file",
+            );
+        }
+
+        fs::rename(&tmp_path, new_path)
+            .context("failed to move the migrated config file into place")?;
         Ok(true)
     }
 
@@ -949,30 +983,62 @@ impl Config {
         tmp_name.push(".tmp");
         let tmp_path = PathBuf::from(tmp_name);
         fs::write(&tmp_path, &toml_str).context("failed to write config temp file")?;
-        fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
 
+        // #257: restrict the ACL on the TEMP file, before it is ever visible
+        // under the real name, and never rename an unrestricted file into
+        // place. The old order (rename, then restrict) left a window where
+        // the finally-named file existed, held a live key, and had whatever
+        // ACL the rename happened to produce; it also swallowed a failure
+        // there and let the write stand regardless. Now a failure aborts
+        // the write entirely instead.
         #[cfg(windows)]
-        Self::restrict_acl(path);
+        if let Err(e) = Self::restrict_acl(&tmp_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e).context(
+                "failed to restrict the config file's permissions to the current \
+                 user; the write was aborted rather than leave an API key in an \
+                 unprotected file",
+            );
+        }
+
+        fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
 
         Ok(())
     }
 
-    /// Restricts the config file's ACL to the current user only, via
-    /// `icacls`. Best-effort: any failure (missing binary, non-NTFS volume,
-    /// etc.) is ignored rather than propagated, since the config file is
-    /// still perfectly usable without it.
+    /// Restricts a file's ACL to the current user only, via `icacls`.
+    /// Returns an error rather than swallowing one (#257): a caller that
+    /// cannot show a card itself (this module never does, per rule 7) must
+    /// propagate this so whichever caller CAN show one does.
     #[cfg(windows)]
-    fn restrict_acl(path: &Path) {
-        let username = match std::env::var("USERNAME") {
-            Ok(u) if !u.is_empty() => u,
-            _ => return,
-        };
-        let _ = std::process::Command::new("icacls")
+    fn restrict_acl(path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.get()) {
+            anyhow::bail!("ACL restriction forced to fail for a test");
+        }
+
+        let username = std::env::var("USERNAME")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .context(
+                "the USERNAME environment variable is not set; cannot restrict \
+                 the config file to the current user",
+            )?;
+        let output = std::process::Command::new("icacls")
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
             .arg(format!("{username}:F"))
-            .output();
+            .output()
+            .context("failed to run icacls to restrict the config file's permissions")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "icacls exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
     }
 
     /// Builds the provider fallback chain per `providers.order`, ignoring
@@ -2281,6 +2347,205 @@ text_scale = 0.0
             old.parent().unwrap().parent(),
             new.parent().unwrap().parent()
         );
+    }
+
+    // -- #257: owner-only ACL on config.toml ---------------------------------
+    //
+    // Three confirmed problems: `migrate_from` never called `restrict_acl`
+    // at all; `save_to` applied it only AFTER the rename, leaving a window
+    // where the finally-named file exists, holds a key, and is unrestricted,
+    // and swallowed a failure there so the write still counted as a success;
+    // and `load_from_file`'s repair-write-back could persist a live,
+    // not-yet-imported key through that same unguarded window before
+    // `Config::load`'s Credential Manager import ever runs.
+    //
+    // `RaiiAclFailure` below forces `Config::restrict_acl` to fail via the
+    // thread-local seam, so these tests can prove "ACL failure aborts the
+    // write and is reported" deterministically, on this test's own thread,
+    // without touching the real `USERNAME` env var (which unrelated tests
+    // on other threads also depend on for their own `save_to` calls).
+
+    #[cfg(windows)]
+    struct RaiiAclFailure;
+
+    #[cfg(windows)]
+    impl RaiiAclFailure {
+        fn new() -> Self {
+            FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.set(true));
+            Self
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for RaiiAclFailure {
+        fn drop(&mut self) {
+            FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.set(false));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn save_to_aborts_and_reports_when_acl_restriction_fails() {
+        let path = scratch_path("acl-failure-save");
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-fake-must-not-land-unprotected".to_string();
+
+        let guard = RaiiAclFailure::new();
+        let result = config.save_to(&path);
+        drop(guard);
+
+        assert!(
+            result.is_err(),
+            "an ACL restriction failure must be reported, not swallowed"
+        );
+        assert!(
+            !path.exists(),
+            "the config file must never be left on disk holding a key that \
+             could not be ACL-restricted"
+        );
+        let mut tmp_name = path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        assert!(
+            !PathBuf::from(tmp_name).exists(),
+            "the unprotected temp file must not be left behind either"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn save_to_restricts_the_acl_on_a_normal_successful_save() {
+        // End-state regression net: a successful save_to must still leave
+        // the file ACL-restricted (this already held before the fix; this
+        // guards against a future change silently dropping the call).
+        let path = scratch_path("acl-success-save");
+        let config = Config::default();
+
+        config.save_to(&path).expect("save_to should succeed");
+
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .expect("icacls should run");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !listing.contains("(I)"),
+            "inheritance must be disabled after restrict_acl: {listing}"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn migrate_from_aborts_and_reports_when_acl_restriction_fails() {
+        let root = scratch_dir("acl-failure-migrate");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(
+            &old_path,
+            "[providers.openai]\napi_key = \"sk-fake-for-migrate-test\"\n",
+        )
+        .unwrap();
+
+        let guard = RaiiAclFailure::new();
+        let result = Config::migrate_from(&old_path, &new_path);
+        drop(guard);
+
+        assert!(
+            result.is_err(),
+            "migrate_from must report an ACL restriction failure, not \
+             silently succeed"
+        );
+        assert!(
+            !new_path.exists(),
+            "the migrated file must never land on disk unprotected if the \
+             ACL step failed"
+        );
+
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn migrate_from_restricts_the_acl_of_the_migrated_file() {
+        let root = scratch_dir("acl-success-migrate");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(
+            &old_path,
+            "[providers.openai]\napi_key = \"sk-fake-for-migrate-test\"\n",
+        )
+        .unwrap();
+
+        Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
+
+        let output = std::process::Command::new("icacls")
+            .arg(&new_path)
+            .output()
+            .expect("icacls should run");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !listing.contains("(I)"),
+            "the migrated file must have inheritance disabled: {listing}"
+        );
+
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn load_from_file_repair_write_back_leaves_the_original_untouched_when_acl_restriction_fails() {
+        // The scenario #257 names directly: a live, not-yet-imported key
+        // sits in a config file that also needs a schema repair (the old
+        // refusal-triggering prompt sentence gets rewritten, which is the
+        // one `backfill()` step that actually reports `repaired = true`),
+        // so `load_from_file` tries to write the repaired config back to
+        // disk *before* `Config::load`'s Credential Manager import step
+        // ever runs on it.
+        let path = scratch_path("acl-failure-repair");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "[providers.openai]\napi_key = \"sk-fake-not-yet-imported\"\n\n[ui]\nprompt = \"Look at the image. This is your scratchpad \u{2014} reason it out before committing to a verdict. Then answer.\"\n";
+        fs::write(&path, original).unwrap();
+
+        let guard = RaiiAclFailure::new();
+        let result = Config::load_from_file(&path);
+        drop(guard);
+
+        // load_from_file's own contract (its doc comment) is best-effort on
+        // the write-back: a failed repair write must not fail the load.
+        let cfg = result.expect(
+            "load_from_file must still succeed even when the repair \
+             write-back's ACL step fails",
+        );
+        assert_eq!(cfg.providers.openai.api_key, "sk-fake-not-yet-imported");
+        assert!(
+            !cfg.ui.prompt.contains("This is your scratchpad"),
+            "the refusal-trigger repair should still have run in memory, \
+             proving a write-back was attempted: {}",
+            cfg.ui.prompt
+        );
+
+        // But the on-disk file must be exactly what it was before: the
+        // aborted write must not have replaced it with a partial or
+        // unprotected copy.
+        let on_disk_after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on_disk_after, original,
+            "a failed repair write-back must leave the original file \
+             untouched, not overwrite it with an unprotected copy"
+        );
+        let mut tmp_name = path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        assert!(
+            !PathBuf::from(tmp_name).exists(),
+            "no leftover temp file from the aborted repair write"
+        );
+
+        cleanup(&path);
     }
 
     /// #157: `{:?}` on `Config`/`ProviderConfig` must never leak the raw
