@@ -1261,11 +1261,15 @@ impl App {
     /// it" -- the task brief's own wording. Otherwise: edits are applied
     /// deterministically (`actions::review_email::apply_edits`) once, here,
     /// before the preview ever shows, so "Do it" later never re-derives
-    /// anything. Only a [`actions::review_email::CapturedTarget`] (i.e. a
-    /// `ComposeBody`-sourced review) gets a real preview with "Do it";
-    /// `Selection`/`Screen` sources show the proposal as a read-only
-    /// informational card instead, since there is nothing "Do it" could
-    /// write back to (rule 7: never offer a button that cannot work).
+    /// anything. A `ComposeBody`-sourced review always gets a real preview
+    /// with "Do it"; a `Selection`-sourced one does too, but only when the
+    /// UIA path actually captured a
+    /// [`actions::review_email::ReplaceTarget`] (#219) -- a `ValuePattern`-
+    /// only control, a discontiguous multi-range selection, or a
+    /// clipboard-fallback capture never does. `Screen`, and any
+    /// `Selection` without a captured target, show the proposal as a
+    /// read-only informational card instead, since there is nothing "Do it"
+    /// could write back to (rule 7: never offer a button that cannot work).
     fn on_review_result(
         &mut self,
         result: std::result::Result<actions::review_email::ReviewOutcome, String>,
@@ -1289,9 +1293,14 @@ impl App {
             return;
         }
 
-        if !actions::review_email::source_has_target(outcome.source) {
-            // Selection- or Screen-sourced: informational only, no target
-            // to write back through (see this method's doc comment).
+        if !actions::review_email::source_has_target(outcome.source) || outcome.target.is_none() {
+            // Screen-sourced, or a Selection/ComposeBody that (per
+            // `source_has_target`'s doc comment) still ended up with no
+            // captured target: informational only, no target to write back
+            // through (see this method's doc comment). #219: unlike before,
+            // `source_has_target(outcome.source)` alone is no longer
+            // enough to guarantee `outcome.target.is_some()`, so both are
+            // checked.
             let edits = actions::review_email::edits_from_value(&outcome.proposal);
             let detail = if edits.is_empty() {
                 "No specific edits proposed.".to_string()
@@ -1310,7 +1319,7 @@ impl App {
         let target = outcome
             .target
             .clone()
-            .expect("source_has_target(outcome.source) is true, so ComposeBody always set target");
+            .expect("just checked outcome.target.is_some() above");
 
         let edits = actions::review_email::edits_from_value(&outcome.proposal);
         let applied = actions::review_email::apply_edits(&outcome.original_text, &edits);
@@ -2415,7 +2424,7 @@ fn review_worker(
     let captured = actions::review_email::capture_input(foreground_hwnd);
     let source = captured.source();
     let original_text = captured.text().unwrap_or_default().to_string();
-    let target = captured.target().cloned();
+    let target = captured.target();
 
     let req = match captured.text() {
         Some(text) => review_request_from_text(&action.prompt, text),

@@ -31,6 +31,20 @@
 //! `do_replace`'s undo closure), refuse if it has changed again, else
 //! restore.
 //!
+//! `ReplaceSelection`'s stale-target protection is the SAME `is_stale`
+//! check as `ReplaceAll`'s (mode-agnostic, run before either mode's
+//! planning step): since `(start, end)` only ever index into
+//! `expected_current_text`, a byte-identical `expected_current_text` at Do
+//! time guarantees those offsets still identify the exact same substring
+//! they did at Look time -- there is no separate "did the SELECTION move"
+//! check to make on top of that (#219), because this executor never reads
+//! the live selection at Do time at all; it only ever writes the previewed
+//! substitution back into the previewed text. The one thing `is_stale`
+//! alone would not catch is a captured selection collapsing to zero width
+//! (`start == end`) by the time this runs -- [`plan_new_value`] refuses
+//! that explicitly ([`WriteRefusal::CollapsedSelection`]) rather than
+//! silently turning a replace into an insertion nobody previewed.
+//!
 //! # Write paths
 //!
 //! UIA has no direct "replace" operation. Both modes end at
@@ -164,6 +178,15 @@ fn is_mid_surrogate_pair(units: &[u16], index: usize) -> bool {
 pub enum WriteRefusal {
     /// `ReplaceSelection` with no `(start, end)` captured.
     NoSelectionCaptured,
+    /// `ReplaceSelection` with `start == end`. A caller that builds a
+    /// `ReplaceSelection` proposal always does so from a genuinely
+    /// non-empty captured selection (#219: `inputs::selection`'s
+    /// `plan_from_probe` already discards any selection whose text is
+    /// empty), so a collapsed range reaching here means the selection
+    /// moved or was deselected since the preview was shown -- refuse
+    /// rather than silently turning "replace this selection" into a plain
+    /// insertion the user never previewed.
+    CollapsedSelection,
     InvalidSelection(SpliceError),
 }
 
@@ -176,6 +199,10 @@ impl std::fmt::Display for WriteRefusal {
                     "mode is \"replace_selection\" but no selection was captured"
                 )
             }
+            WriteRefusal::CollapsedSelection => write!(
+                f,
+                "the selection is now empty; it may have moved or been deselected since the preview was shown"
+            ),
             WriteRefusal::InvalidSelection(e) => write!(f, "invalid selection: {e}"),
         }
     }
@@ -198,6 +225,9 @@ pub fn plan_new_value(
         ReplaceMode::ReplaceAll => Ok(new_text.to_string()),
         ReplaceMode::ReplaceSelection => {
             let (start, end) = selection.ok_or(WriteRefusal::NoSelectionCaptured)?;
+            if start == end {
+                return Err(WriteRefusal::CollapsedSelection);
+            }
             splice_utf16(expected_current_text, start, end, new_text)
                 .map_err(WriteRefusal::InvalidSelection)
         }
@@ -689,6 +719,23 @@ mod tests {
     }
 
     #[test]
+    fn replace_selection_with_a_collapsed_range_is_refused() {
+        // #219: a genuinely captured selection is never zero-width by
+        // construction; reaching plan_new_value with start == end means it
+        // moved or collapsed since the preview -- refuse, never silently
+        // insert.
+        let err = plan_new_value(
+            ReplaceMode::ReplaceSelection,
+            "Hello world",
+            "Rust",
+            Some((6, 6)),
+        )
+        .expect_err("a collapsed selection must be refused");
+        assert_eq!(err, WriteRefusal::CollapsedSelection);
+        assert!(!err.to_string().contains('\u{2014}'), "no em dashes: {err}");
+    }
+
+    #[test]
     fn replace_selection_splices_the_new_text_in() {
         let value = plan_new_value(
             ReplaceMode::ReplaceSelection,
@@ -1019,6 +1066,72 @@ mod tests {
 
             undo.undo().expect("undo must succeed");
             assert_eq!(current_edit_text(frame), "Hello world");
+
+            unsafe {
+                let _ = DestroyWindow(frame);
+            }
+        }
+
+        /// #219: the observable that would differ if `ReplaceSelection`
+        /// were wired to nothing -- a real EDIT control, a real captured
+        /// target, splicing "world" -> "Rust" at UTF-16 offsets 6..11 of
+        /// "Hello world" leaves "Hello Rust", and undo restores exactly
+        /// "Hello world".
+        #[test]
+        fn replace_selection_writes_and_undo_restores_a_real_edit_control() {
+            let _uia = crate::inputs::lock_uia_test();
+            let (frame, _edit) = build_test_window(w!("Hello world"));
+
+            let target = edit_target(frame);
+            let access: Arc<dyn TextElementAccess> =
+                Arc::new(crate::executors::target::com::UiaTextElementAccess);
+            let executor = ReplaceTextExecutor::with_access(access);
+
+            let proposal = replace_selection_proposal(&target, "Rust", "Hello world", 6, 11);
+            let undo = executor
+                .execute(confirmed(proposal))
+                .expect("execute must succeed against a real EDIT control");
+
+            assert_eq!(current_edit_text(frame), "Hello Rust");
+
+            undo.undo().expect("undo must succeed");
+            assert_eq!(current_edit_text(frame), "Hello world");
+
+            unsafe {
+                let _ = DestroyWindow(frame);
+            }
+        }
+
+        /// #219: `ReplaceSelection`'s "own equivalent" of the `ReplaceAll`
+        /// stale-target test above -- the SAME mode-agnostic `is_stale`
+        /// check (see the module doc comment) must also refuse a
+        /// `ReplaceSelection` write when the field's real text changed
+        /// between Look and Do.
+        #[test]
+        fn stale_target_is_refused_for_replace_selection_when_text_changed_between_look_and_do() {
+            let _uia = crate::inputs::lock_uia_test();
+            let (frame, edit) = build_test_window(w!("Hello world"));
+
+            let target = edit_target(frame);
+
+            unsafe {
+                let _ = SetWindowTextW(edit, w!("Someone typed this"));
+            }
+
+            let access: Arc<dyn TextElementAccess> =
+                Arc::new(crate::executors::target::com::UiaTextElementAccess);
+            let executor = ReplaceTextExecutor::with_access(access);
+            let proposal = replace_selection_proposal(&target, "Rust", "Hello world", 6, 11);
+
+            let err = executor.execute(confirmed(proposal)).err().expect(
+                "a stale target must be refused for replace_selection against a real EDIT control",
+            );
+            assert!(err.to_string().contains("changed"));
+            assert_eq!(
+                current_edit_text(frame),
+                "Someone typed this",
+                "a refused write must not touch the control"
+            );
 
             unsafe {
                 let _ = DestroyWindow(frame);
