@@ -1932,6 +1932,15 @@ impl App {
     /// Push `self.config` into everything that caches a piece of it.
     fn apply_config(&mut self) {
         self.chain = Arc::new(self.config.build_chain());
+        // #283: keep the process-wide mode mirror AND the tray's Mode
+        // radio-check in sync with a Reload or a Settings save, the same
+        // way `set_mode` already does for a tray-driven mode change.
+        // Without this, `provider::common::offline_guard` (the only thing
+        // enforcing Offline's non-loopback refusal for a by-name-local
+        // provider like Ollama) keeps reading whatever mode was current at
+        // the last full app restart, silently, until the next one.
+        mode::set_current(self.config.mode);
+        self.tray.set_mode(self.config.mode);
         // #105: keep the process-wide mirror in sync with a Reload or a
         // Settings save, the same way `set_mode` already does for the mode.
         // A hand-edited `[egress_preview]` otherwise needs a full restart.
@@ -4357,6 +4366,35 @@ mod tests {
         assert!(
             never_posted.is_empty(),
             "these WM_APP_* ids are never passed to PostMessageW/SendMessageW anywhere in the crate, so their wnd_proc arms are dead code that reads as a live feature: {never_posted:?}"
+        );
+    }
+
+    // -- apply_config re-syncs the mode mirror (issue #283) ----------------
+
+    /// `App::run`'s startup sequence calls both `mode::set_current` (the
+    /// process-wide atomic `provider::common::offline_guard` reads via
+    /// `mode::is_offline_now()`) and `self.tray.set_mode` (the tray's Mode
+    /// radio-check) right after loading `Config` -- see lines 242 and 304.
+    /// `apply_config` -- the function both `reload()` (tray "Reload") and a
+    /// Settings save call after replacing `self.config` wholesale -- must
+    /// do the same, or a Reload/Settings-save with a changed `Config.mode`
+    /// leaves both mirrors on the OLD mode until the next full restart.
+    /// That is exactly #283: switching to Offline this way leaves
+    /// `offline_guard` reading the stale (non-Offline) mirror, so it skips
+    /// its loopback check entirely and a non-loopback-configured Ollama (or
+    /// any `compat:` provider pointed off-box) keeps sending while the user
+    /// believes Offline is on.
+    #[test]
+    fn apply_config_resyncs_the_mode_mirror() {
+        let app_src = lf(include_str!("app.rs"));
+        let body = apply_config_body(&app_src);
+        assert!(
+            body.contains("mode::set_current("),
+            "apply_config never calls mode::set_current, so a Reload/Settings-save with a changed Config.mode leaves offline_guard's process-wide mirror on the OLD mode (#283):\n{body}"
+        );
+        assert!(
+            body.contains("set_mode("),
+            "apply_config never calls the tray's set_mode, so a Reload/Settings-save with a changed Config.mode leaves the tray's Mode radio-check on the OLD mode (#283):\n{body}"
         );
     }
 
