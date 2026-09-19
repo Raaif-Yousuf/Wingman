@@ -102,9 +102,24 @@ $edits = @(
 )
 foreach ($e in $edits) {
     $path = Join-Path $NewPath $e.File
-    if (-not (Test-Path -LiteralPath $path)) { Write-Warning "skipped  $($e.File) (not found)"; continue }
+    # Under -WhatIf the folder was never actually moved, so read the pattern
+    # from the old location instead. Otherwise a dry run reports four scary
+    # "not found" warnings for files that are perfectly fine, and nobody
+    # trusts the dry run after that.
+    if (-not (Test-Path -LiteralPath $path)) {
+        $preview = Join-Path $OldPath $e.File
+        if ((-not $PSCmdlet.ShouldProcess($path, 'Rewrite path reference')) -and (Test-Path -LiteralPath $preview)) {
+            $path = $preview
+        } else {
+            Write-Warning "skipped  $($e.File) (not found)"
+            continue
+        }
+    }
     $text = Get-Content -LiteralPath $path -Raw
-    if ($text -notlike "*$($e.From)*") { Write-Warning "skipped  $($e.File) (pattern already updated or changed)"; continue }
+    # .Contains, not -like: the CLAUDE.md/AGENTS.md patterns start with the
+    # Markdown bold marker **, and -like would read those asterisks as
+    # wildcards.
+    if (-not $text.Contains($e.From)) { Write-Warning "skipped  $($e.File) (pattern already updated or changed)"; continue }
     if ($PSCmdlet.ShouldProcess($path, 'Rewrite path reference')) {
         [IO.File]::WriteAllText($path, $text.Replace($e.From, $e.To))
         Say "patched  $($e.File)"
