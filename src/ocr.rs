@@ -528,10 +528,9 @@ mod tests {
         use windows::Win32::Foundation::{COLORREF, RECT};
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
-            DeleteObject, DrawTextW, FillRect, SelectObject, SetBkColor, SetTextColor,
-            ANSI_CHARSET, BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, DEFAULT_PITCH,
-            DEFAULT_QUALITY, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
-            OUT_DEFAULT_PRECIS,
+            DeleteObject, FillRect, SelectObject, SetBkColor, SetTextColor, ANSI_CHARSET,
+            BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, DEFAULT_PITCH, DEFAULT_QUALITY,
+            DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, OUT_DEFAULT_PRECIS,
         };
 
         let hdc = CreateCompatibleDC(None);
@@ -558,7 +557,7 @@ mod tests {
         let old_bitmap = SelectObject(hdc, hbitmap.into());
 
         let white = CreateSolidBrush(COLORREF(0x00FF_FFFF));
-        let mut rect = RECT {
+        let rect = RECT {
             left: 0,
             top: 0,
             right: width as i32,
@@ -587,13 +586,13 @@ mod tests {
         SetTextColor(hdc, COLORREF(0x0000_0000));
         SetBkColor(hdc, COLORREF(0x00FF_FFFF));
 
-        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
-        DrawTextW(
-            hdc,
-            &mut text_wide,
-            &mut rect,
-            DT_SINGLELINE | DT_CENTER | DT_VCENTER,
-        );
+        // Routed through the shared guard (issue #221) rather than a raw
+        // `DrawTextW` call: this helper's `text` is always a literal in this
+        // module's own tests today, but nothing enforces that at the call
+        // site, and an empty-string `DrawTextW` call crashes with
+        // `STATUS_ACCESS_VIOLATION` (MEASURED 2026-09-17, palette branch
+        // commit `453fe0b`).
+        crate::ui::text::draw_text_line(hdc, text, rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
         let pixel_count = (width as usize) * (height as usize) * 4;
         let bgra = std::slice::from_raw_parts(bits as *const u8, pixel_count).to_vec();

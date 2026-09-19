@@ -64,6 +64,7 @@
 use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
+use crate::ui::text::draw_text_line;
 use serde_json::Value;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -1462,8 +1463,7 @@ impl CardInner {
             .min(max_headline_h)
             .max(headline_line_h);
 
-        let mut headline_buf = utf16(&self.headline);
-        let mut headline_rect = RECT {
+        let headline_rect = RECT {
             left: rc.left + padding,
             top: rc.top + padding,
             right: rc.left + padding + headline_w,
@@ -1471,10 +1471,10 @@ impl CardInner {
         };
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-        DrawTextW(
+        draw_text_line(
             hdc,
-            &mut headline_buf,
-            &mut headline_rect,
+            &self.headline,
+            headline_rect,
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
 
@@ -1503,8 +1503,7 @@ impl CardInner {
             .max(self.line_height(self.fonts.headline));
 
         let y0 = content_top - self.scroll_offset;
-        let mut headline_buf = utf16(&self.headline);
-        let mut headline_rect = RECT {
+        let headline_rect = RECT {
             left: content_left,
             top: y0,
             right: content_left + headline_w,
@@ -1512,18 +1511,17 @@ impl CardInner {
         };
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-        DrawTextW(
+        draw_text_line(
             hdc,
-            &mut headline_buf,
-            &mut headline_rect,
+            &self.headline,
+            headline_rect,
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
         );
 
         if !self.detail.is_empty() {
             let detail_h = self.measure_wrapped(self.fonts.body, &self.detail, content_w);
             let y1 = y0 + headline_h + gap;
-            let mut detail_buf = utf16(&self.detail);
-            let mut detail_rect = RECT {
+            let detail_rect = RECT {
                 left: content_left,
                 top: y1,
                 right: content_left + content_w,
@@ -1531,10 +1529,10 @@ impl CardInner {
             };
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
-            DrawTextW(
+            draw_text_line(
                 hdc,
-                &mut detail_buf,
-                &mut detail_rect,
+                &self.detail,
+                detail_rect,
                 DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
             );
         }
@@ -1557,11 +1555,10 @@ impl CardInner {
             let bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(palette.bg));
             FillRect(hdc, &band, bg);
             let _ = DeleteObject(HGDIOBJ(bg.0));
-            let mut hint = utf16("more below");
             // Reuse the headline's badge reservation so the hint (which is
             // also right-aligned, in the same bottom-right corner the badge
             // occupies) does not draw underneath it either.
-            let mut hint_rect = RECT {
+            let hint_rect = RECT {
                 left: content_left,
                 top: rc.bottom - padding - band_h + self.scale(2),
                 right: content_left + headline_w,
@@ -1569,10 +1566,10 @@ impl CardInner {
             };
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-            DrawTextW(
+            draw_text_line(
                 hdc,
-                &mut hint,
-                &mut hint_rect,
+                "more below",
+                hint_rect,
                 DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
             );
         }
@@ -1620,8 +1617,7 @@ impl CardInner {
         SelectObject(hdc, old_brush);
         let _ = DeleteObject(HGDIOBJ(brush.0));
 
-        let mut label = utf16(difficulty.label());
-        let mut label_rect = RECT {
+        let label_rect = RECT {
             left,
             top,
             right,
@@ -1629,10 +1625,10 @@ impl CardInner {
         };
         SelectObject(hdc, HGDIOBJ(self.fonts.badge.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_color));
-        DrawTextW(
+        draw_text_line(
             hdc,
-            &mut label,
-            &mut label_rect,
+            difficulty.label(),
+            label_rect,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
     }
@@ -2218,38 +2214,35 @@ impl CardInner {
         let fields = preview.model.fields();
         let metrics = self.compute_preview_layout(fields);
 
-        let mut title_buf = utf16(&preview.title);
-        let mut title_rect = metrics.title_rect;
+        let title_rect = metrics.title_rect;
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-        DrawTextW(
+        draw_text_line(
             hdc,
-            &mut title_buf,
-            &mut title_rect,
+            &preview.title,
+            title_rect,
             DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
 
         for (field, row) in fields.iter().zip(metrics.rows.iter()) {
-            let mut label_buf = utf16(&field.label);
-            let mut label_rect = row.label_rect;
+            let label_rect = row.label_rect;
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-            DrawTextW(
+            draw_text_line(
                 hdc,
-                &mut label_buf,
-                &mut label_rect,
+                &field.label,
+                label_rect,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
 
             if !field.editable {
-                let mut value_buf = utf16(&field.value);
-                let mut value_rect = row.value_rect;
+                let value_rect = row.value_rect;
                 SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
                 SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
-                DrawTextW(
+                draw_text_line(
                     hdc,
-                    &mut value_buf,
-                    &mut value_rect,
+                    &field.value,
+                    value_rect,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
                 );
             }
@@ -3437,5 +3430,90 @@ mod tests {
             "GDI object count grew by more than {slack} after repeated preview create/close/drop \
              (baseline={baseline}, after={after}); investigate a leak before raising this slack"
         );
+    }
+
+    // -- issue #221: DrawTextW must not crash on empty headline/detail/preview
+    // text --------------------------------------------------------------------
+    //
+    // `Answer::headline`/`Answer::detail` are plain, unvalidated `String`s
+    // (`provider::common::answer_schema` has no `minLength`), and a
+    // non-editable preview field's value can be empty too (an omitted or
+    // empty proposal property -- see `PreviewModel::from_schema`'s
+    // `unwrap_or_default()`). MEASURED 2026-09-17 (`src/ui/palette.rs`'s
+    // `draw_text_line_tolerates_an_empty_string`, commit `453fe0b`, and
+    // independently re-confirmed in this worktree by
+    // `crate::ui::text::tests::raw_drawtextw_crashes_on_empty_text`, a
+    // dedicated `#[ignore]`d test run in isolation -- see that module's own
+    // doc comment): an unguarded `DrawTextW` call with a zero-length UTF-16
+    // buffer -- what `utf16("")` produces -- reliably crashes with exit
+    // code `0xC0000005` (`STATUS_ACCESS_VIOLATION`) through this crate's
+    // `windows` 0.62 binding. These tests here do NOT re-run that raw,
+    // unguarded call: doing so as part of this ordinary `cargo test`
+    // invocation would take down this whole test binary
+    // (`STATUS_ACCESS_VIOLATION` is not a catchable panic), losing every
+    // other test in the same run. What these tests prove instead is that
+    // painting an empty headline/detail/preview-field DOES NOT crash now
+    // that every call site routes through
+    // `crate::ui::text::draw_text_line`.
+
+    #[test]
+    fn paint_collapsed_with_empty_headline_does_not_crash() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_answer("", "", 0, None);
+        assert_eq!(card.state(), CardState::Collapsed);
+        let handled = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
+    }
+
+    #[test]
+    fn paint_expanded_with_empty_headline_does_not_crash() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        // `try_expand` only enters Expanded when `detail` is non-empty (see
+        // its own `self.detail.is_empty()` early return), so a genuinely
+        // empty detail can never reach Expanded through the public API --
+        // that DrawTextW call is provably unreachable with empty text
+        // (paint_expanded's own `if !self.detail.is_empty()` guard around
+        // it), unlike the headline's, which is unconditional. This still
+        // exercises the headline's DrawTextW call with an empty string, the
+        // reachable half of the bug.
+        card.show_answer("", "non-empty detail", 0, Some(Difficulty::Level(3)));
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        // Scroll past the fold so the "more below" hint band (also a
+        // DrawTextW call site) paints too.
+        card.inner.scroll_offset = 1;
+        card.inner.scroll_max = 100;
+        let handled = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
+    }
+
+    #[test]
+    fn paint_error_with_empty_headline_and_detail_does_not_crash() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_error("", "");
+        assert_eq!(card.state(), CardState::Collapsed);
+        let handled = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
+    }
+
+    #[test]
+    fn paint_preview_with_empty_title_and_empty_field_value_does_not_crash() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, _) = calendar_schema_and_value();
+        // "location" is a non-editable field (see calendar_schema_and_value's
+        // schema): an empty value here reaches paint_preview's value
+        // DrawTextW call directly, the same shape as a proposal that simply
+        // omitted the property (PreviewModel::from_schema's
+        // unwrap_or_default()).
+        let value = serde_json::json!({
+            "title": "Standup", "start": "09:00", "end": "09:15",
+            "location": "", "notes": "bring laptop"
+        });
+        // An empty title also exercises paint_preview's own title DrawTextW
+        // call.
+        card.inner.show_preview("", &schema, &value, false);
+        assert_eq!(card.state(), CardState::Preview);
+        let handled = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
     }
 }

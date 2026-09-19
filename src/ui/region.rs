@@ -59,9 +59,9 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreatePen, DeleteDC, DeleteObject,
-    DrawTextW, EndPaint, GetStockObject, Rectangle, SelectObject, SetBkMode, SetTextColor,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_NOPREFIX, DT_SINGLELINE, HBITMAP, HDC,
-    HGDIOBJ, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    EndPaint, GetStockObject, Rectangle, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_NOPREFIX, DT_SINGLELINE, HBITMAP, HDC, HGDIOBJ,
+    NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -797,17 +797,22 @@ unsafe fn draw_selection(hdc: HDC, rect: Rect) {
     SelectObject(hdc, old_brush);
     let _ = DeleteObject(HGDIOBJ(pen.0));
 
+    // `size_label` always formats "<width> x <height>" (see its own doc
+    // comment/test), so this can never actually be empty -- still routed
+    // through the shared guard (issue #221) rather than a raw `DrawTextW`
+    // call, so a future change to `size_label` can't silently reintroduce
+    // the empty-buffer crash MEASURED on the palette branch (commit
+    // `453fe0b`).
     let label = size_label(rect);
-    let mut buf = wide_z(&label);
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, COLORREF(0x00FFFFFF));
-    let mut text_rc = RECT {
+    let text_rc = RECT {
         left: rect.left + 4,
         top: (rect.top - 20).max(0),
         right: rect.left + 240,
         bottom: rect.top.max(20),
     };
-    DrawTextW(hdc, &mut buf, &mut text_rc, DT_SINGLELINE | DT_NOPREFIX);
+    crate::ui::text::draw_text_line(hdc, &label, text_rc, DT_SINGLELINE | DT_NOPREFIX);
 }
 
 /// Builds the top-down BGRA DIB section (and the memory DC it is selected
@@ -1518,6 +1523,101 @@ mod tests {
             Err(e) => {
                 println!("Overlay::open failed in this environment: {e:#}");
             }
+        }
+    }
+
+    // -- issue #221: DrawTextW must not crash on empty text -----------------
+    //
+    // `draw_selection`'s own text (`size_label`) can never actually be empty
+    // -- `size_label` always formats "<width> x <height>" (see
+    // `size_label_formats_width_x_height` above) -- so there is no reachable
+    // empty-text call through `draw_selection` itself to reproduce. This
+    // mirrors `src/ui/palette.rs`'s `draw_text_line_tolerates_an_empty_string`
+    // (commit `453fe0b`) and `crate::ui::text`'s own regression test by
+    // exercising the shared guard `draw_selection` now routes through
+    // directly, against a real memory DC, so a future caller of
+    // `crate::ui::text::draw_text_line` from this module is covered too.
+    // Per the module doc comment on `crate::ui::text`: this does NOT
+    // re-trigger the raw, unguarded `DrawTextW` crash (MEASURED 2026-09-17
+    // on the palette branch) -- doing so would crash this whole test binary.
+    // No named kernel object, registry value or file path is created here
+    // (rule 9 is moot: nothing needs a name).
+    #[test]
+    fn draw_text_line_tolerates_an_empty_string_in_a_memory_dc() {
+        use windows::Win32::Graphics::Gdi::{DT_LEFT, DT_VCENTER};
+
+        unsafe {
+            let hdc = CreateCompatibleDC(None);
+            assert!(!hdc.is_invalid(), "CreateCompatibleDC failed");
+
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 8,
+                    biHeight: -8,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let hbitmap = CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .expect("CreateDIBSection failed");
+            let old_bitmap = SelectObject(hdc, hbitmap.into());
+
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 8,
+                bottom: 8,
+            };
+            crate::ui::text::draw_text_line(hdc, "", rect, DT_LEFT | DT_VCENTER);
+            crate::ui::text::draw_text_line(hdc, "8 x 8", rect, DT_LEFT | DT_VCENTER);
+
+            SelectObject(hdc, old_bitmap);
+            let _ = DeleteObject(hbitmap.into());
+            let _ = DeleteDC(hdc);
+        }
+    }
+
+    #[test]
+    fn draw_selection_with_a_zero_size_rect_does_not_crash() {
+        unsafe {
+            let hdc = CreateCompatibleDC(None);
+            assert!(!hdc.is_invalid(), "CreateCompatibleDC failed");
+
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 16,
+                    biHeight: -16,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let hbitmap = CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .expect("CreateDIBSection failed");
+            let old_bitmap = SelectObject(hdc, hbitmap.into());
+
+            draw_selection(
+                hdc,
+                Rect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+            );
+
+            SelectObject(hdc, old_bitmap);
+            let _ = DeleteObject(hbitmap.into());
+            let _ = DeleteDC(hdc);
         }
     }
 }

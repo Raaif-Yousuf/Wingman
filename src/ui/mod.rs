@@ -5,4 +5,5 @@ pub mod palette_model;
 pub(crate) mod preview;
 pub mod region;
 pub mod settings;
+pub(crate) mod text;
 pub mod tray;
