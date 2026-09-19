@@ -1,163 +1,157 @@
-# Handoff: 2026-09-18/19 fan-out, and the salvage after it
+# Handoff: the 2026-09-19 audit round
 
 Written 2026-09-19. Re-check `git log -1` before trusting any sha here.
 Nothing pushed; the owner pushes.
 
-## Read this first: the folder rename is ready to run
+## Read this first
 
-`scripts/rename-repo-folder-to-wingman.ps1`. Its preconditions are met as of
-this commit: **one worktree, clean tree, no stray directories under
-`.claude/worktrees/`**. Run it from a PowerShell window rooted somewhere other
-than the repo, with no Claude Code session open and nothing building.
-`-WhatIf` first.
+**The folder rename is done.** `C:\Users\raaif\copilot-ask` is now
+`C:\Users\raaif\Wingman`, renamed by hand rather than by
+`scripts/rename-repo-folder-to-wingman.ps1`, so the four dependent rewrites
+the script would have done did not happen automatically. All four are now
+handled: the Claude Code project state and its memory directory were copied
+across, there were no worktrees to orphan, both `filing-findings` SKILL.md
+copies had their absolute `CARGO_TARGET_DIR` fixed, and the `Repo:` line in
+CLAUDE.md and AGENTS.md was corrected. The script itself is now only a
+checklist, and it targets lowercase `wingman`; do not run it.
 
-It cannot be run from inside a session: Windows keeps an open handle on a
-process's current directory. It also moves
-`~\.claude\projects\C--Users-raaif-Wingman` (which holds the memory files),
-fixes the absolute `CARGO_TARGET_DIR` in both `filing-findings` SKILL.md
-copies, and updates the `Repo:` line in CLAUDE.md and AGENTS.md. Never run, so
-read it before trusting it.
+**There is a draft spec awaiting your approval.**
+`docs/superpowers/specs/2026-09-19-activation-trust-design.md` covers #236
+and #237, both P1, and its § 7 lists four decisions only you can make. No
+code was written for either issue, per rule 12. Its central finding is worth
+reading even if you reject the rest: sender authentication cannot close
+either hole against a same-user, same-integrity process, and the named-pipe
+approach both issues suggest moves the attacker from one `PostMessageW` to
+one `CreateProcess` without changing what the user loses.
 
-Five unmerged branches still exist (below). Branches do not block the rename;
-only worktrees do, and there are none.
+## What this round was
 
-## What the run delivered
+Twelve read-only auditors, then one adversarial verifier, then six fix
+agents in worktrees. The auditors filed **issues #253 to #297**; the
+verifier re-checked the thirteen most serious and **confirmed all thirteen,
+refuting none**, three of them by copying the function body into a scratch
+program and running it. The tracker is now 166 open, 43 of them P1.
 
-The fan-out was cut short: at about 12:05am the account hit its monthly spend
-limit and ten agents were killed mid-task in one burst. Anything below marked
-"finished at merge time" was salvaged afterwards from a WIP commit.
+Coverage is recorded in [`docs/audit-coverage.md`](docs/audit-coverage.md),
+which is new: the tracker records findings but cannot tell you where nobody
+has looked, and an unaudited 2000-line module looks exactly like a clean one
+from the issue list. Every area of the tree now has a date against it.
 
-| Issue | State |
+The auditor brief is now a skill,
+[`.claude/skills/auditing-a-module`](.claude/skills/auditing-a-module/SKILL.md),
+so the next round shares one brief instead of twelve hand-written ones.
+
+## Landed on master
+
+| Commit | What |
 |---|---|
-| #220 payment value-shape denylist at both fill_form layers | merged |
-| #222 provider-name matching consolidated into config.rs | merged |
-| #203 compile-fail gate for `Confirmed` | merged |
-| #43 `docs/actions.md`, `docs/executors.md` | merged |
-| #219 Selection-sourced "Do it" for Review this email | merged, the agent had finished it |
-| #224 palette uses the shared `draw_text_line` | merged |
-| #216 DirectWrite palette | merged; measurement and fallback observable added at merge time |
-| #106 egress log | merged; read-back surface and config publish wired at merge time |
-| #234 tray command id exhaustiveness | merged; three guards, mutation-checked |
-| #225 stale-preview hijack (P1) | merged; fixed at merge time |
-| #218, #205, #170 | closed without code (stale note, accepted, owner decision) |
-| #105 "Show me what you're sending" | scaffolding merged, deliberately left unwired, see below |
+| `a55ab42` | the repo's own paths pointed at the renamed folder |
+| `ef367de` | the `auditing-a-module` skill, `docs/audit-coverage.md`, the activation-trust spec |
+| `91699a3` | `every_wm_app_id_has_a_wnd_proc_arm` and `every_wm_app_id_is_posted_somewhere`, both mutation-checked |
+| `6ef81f7` | #253, #273, #260 and #281: provider error text redacted, the scrubber widened, the provider test race closed |
+| `7817f0f` | the documentation truth pass, #250 and #286 to #293 |
+| `8898a47` | the folder-rename claim the docs pass left contradicting itself |
 
-Gate on master: fmt, clippy, deny, hooks, Pester, PSScriptAnalyzer all clean;
-**1551 unit tests + 1 trybuild + 7 no-em-dash, 0 failures.**
+### The two findings worth carrying forward
 
-## Three things a future session should know
+**A guard test that cannot fail is worse than no guard.** Two of tonight's
+scanning tests were vacuous when written, in two different ways: one was
+anchored on `\n` while `include_str!` hands back CRLF on this working copy,
+and one filtered line by line for a construct this file's own rustfmt'd
+style always splits across lines (#281). Both reported green while checking
+nothing. Every source-scanning test now asserts its candidate set is
+non-empty first, with a message saying the scanner has broken, and every new
+one is mutation-checked with both outputs recorded in the commit message.
 
-**#105 is sequenced after #225 on purpose, and #225 is now done.** Its
-structural gate (`ui::confirm::SendToken` / `SendAuthorized`, unforgeable in
-the same shape as `Confirmed<P>`) is in place and fails safe: with the toggle
-on and nothing authorized, every request is refused. What remains is `App::ask`
-showing `ui::preview::RequestPreview` through `Card::show_preview` and calling
-`user_confirmed_send` on Send. It was held back because it meant adding a third
-pending kind to a preview state machine that had a live P1. It no longer does.
-The unwired items carry `#[allow(dead_code)]` with that reason at each site.
+**The redaction hole was the shape of the alphabet, not the threshold**
+(#273). The scrubber's token alphabet was base64url and nothing else, so a
+credential in standard base64 or split by a vendor's punctuation was seen as
+several short fragments, each under the 20-character threshold, and every
+one survived intact. Those characters cannot simply join the alphabet,
+because a URL and a filesystem path are long runs over exactly them. A wide
+run is now scrubbed whole only when it also carries upper case, lower case
+and a digit.
 
-**The #225 fix needed a third change nobody had predicted.** Making
-`leave_preview_if_active` report abandonment, on its own, would have swapped
-one wrong-action bug for another: `WM_APP_PREVIEW_DECIDED` is a `PostMessageW`,
-so replacing a live preview posts the old one's abandonment and then arms the
-new one in the same turn, and the stale notification would later clear the
-state of the preview now on screen. Hence the preview generation carried in the
-message's `WPARAM`. If you touch this area, keep the generation.
+## Do these next
 
-**The suite has one known flake, and its cause is not what the issue first
-said.** #252: `executors::fill_form`'s real-window test can pick up a stray
-keystroke, because the typed-input fallback calls `element.SetFocus()` and then
-`SendInput` (`src/executors/target.rs:637`). The owner identified the actual
-cause: a human typing at the keyboard while the suite runs. A cross-test mutex
-would not have helped, and was nearly built before that correction. The
-interesting fix is option 3 on the issue: have `fill_form` verify what actually
-landed in the field. That is a real robustness gap for a user who keeps typing
-during a fill, and the flake would disappear as a side effect.
+Ranked. The first three are the ones a user would notice.
 
-A second flake,
-`pause::tests::set_paused_until_resumed_then_set_running_round_trips`, **was** a
-genuine test-versus-test race on the shared `PAUSE_DEADLINE` atomic, and is
-fixed with a poison-tolerant test lock.
+1. **#271 (P1), the region overlay's click-select-window path is
+   unconditionally broken.** The overlay is opaque and topmost with no
+   hit-test exemption, so `WindowFromPoint` can only ever return the overlay
+   itself. Every such click stages the whole desktop. Advertised behaviour,
+   never worked, no test inspects the staged rect's value.
+2. **#262 (P1), a failed clipboard restore permanently disables the retry.**
+   `restore_now` sets `done = true` whether or not the restore succeeded, so
+   `Drop`'s safety net is disabled at exactly the moment it is needed and
+   the user loses their clipboard. Proven by execution.
+3. **#266 and #267 (both P1), the executors.** `fill_form` writes a field
+   with no staleness check, so it can silently overwrite something changed
+   after the preview was shown and report success; `docs/executors.md`
+   claims it does check. `replace_text` has no payment check at all, so
+   "never touches payment data, no exceptions" currently has zero
+   enforcement on it.
+4. **#279 (P1), the cargo-test hook is bypassable** by any command prefix or
+   nested shell. It is the only thing stopping a fan-out agent from
+   exhausting this machine's RAM, and `time cargo test`, `cargo nextest run`
+   and `bash -c "cargo test"` all walk straight through.
+5. **#283 and #269 (P1, P2), `apply_config` forgets subsystems.** The mode
+   mirror the Offline guard reads is never re-synced on Reload, and neither
+   is the palette chord. The seam audit wrote the whole `Config` field
+   propagation table into #283; only those two rows were wrong, but nothing
+   stops a fourth.
+6. **#257 (P1), the config ACL.** Applied after the write rather than
+   before, swallowed on failure, and never applied at all by the
+   `copilot-ask` migration, which copies a live key into a file with
+   inherited permissions.
+7. **#294 (P1)**, the main Ask path's own prompt says "You are shown a
+   screenshot" on the non-vision path. #247 named this gap and declined to
+   file it because the constant was outside its scope.
 
-## Five unmerged branches
+## The five older unmerged branches
 
-Each holds one WIP commit, clearly labelled, committed only so the work is not
-lost. **None is verified. Four conflict with master; one does not compile.**
-Finish or discard; do not merge blind.
+Triaged in **#285**. The recommendation is **rebase and finish, all five**:
+none is redundant with what landed on master and none is a design that does
+not work. Two things that table did not say before:
 
-| Branch suffix | Issues | Merge state | Where it stopped | New modules |
-|---|---|---|---|---|
-| `a16117ca859523463` | #42, #202 | conflicts | checking the test build compiles | -- |
-| `ac841e1594a42647f` | #109 | conflicts | adding a `WM_DPICHANGED` test | `src/ui/placement.rs` |
-| `a3881048d133bc867` | #111, #103 | conflicts | post-fmt test re-run, then live OCR measurements | `src/redact.rs` |
-| `addbadcfdd437435f` | #21, #101 | conflicts | updating call sites for a new budget argument | `src/usage.rs`, `src/cost.rs` |
-| `ac4408ff852377671` | #229, #212 | 3 compile errors | mid-replacement of `build_background`/`free_background` with an RAII guard | -- |
+- `addbadcfdd437435f` (#21, #101) has an unflagged compile error of its own,
+  not just conflicts: about twelve test call sites are missing the argument
+  the branch itself added.
+- Master's #214 refactor collapsed the four `readiness_gate` call sites that
+  branch patches into one, which makes finishing it **cheaper** than its own
+  original approach, provided whoever does it reads #214 first instead of
+  fighting a blind rebase.
 
-The conflicts are mostly against work that has since landed on master, so a
-rebase is probably cheaper than a merge for all four.
-
-## Highest-value open issues
-
-- **#242**: any action from a user's `actions.toml`, including CONTRIBUTING.md's
-  own tutorial example, appears in the palette and silently does nothing when
-  clicked. The worst one open for a project whose pitch is that actions are the
-  contribution surface.
-- **#236 / #237** (both P1): any local process can post `WM_APP_ACTIVATE` and
-  trigger a billed screenshot plus cloud request with no key press, or squat the
-  fixed single-instance mutex name and make the app exit silently forever,
-  including at autostart. #237 also fires benignly: `app::run()` takes the mutex
-  before the owner window exists, so a slow duplicate launch hits the same silent
-  exit with no adversary. The agent assigned these was killed before writing any
-  code.
-- **#227**: no `catch_unwind` in any worker, and `panic = "abort"` in release, so
-  a worker panic kills the process with no card.
-- **#229**: desktop-sized GDI bitmap leaks on every region-overlay open.
-- **#245**: `units::convert` lets NaN and Infinity reach the card, and the
-  module's own doc comment falsely claims otherwise.
-- **#247**: the calendar and fill_form prompts open with "You are shown a
-  screenshot", contradicting the non-vision OCR preface on every local-model
-  press.
-- **#250**: README still documents the pre-rename `copilot-ask` paths.
-
-## Tooling added this run
-
-- `scripts/rename-repo-folder-to-wingman.ps1` (see the top of this file).
-- `scripts/merge-agent-branches.sh` -- merges agent branches one at a time,
-  aborts rather than resolves a conflicting merge, rolls back a merge that does
-  not build, runs the full suite once at the end. `--dry-run` lists each branch
-  with the files it touches, which is how to plan merge order.
-- `tests/compile_fail.rs` -- a `trybuild` gate for `Confirmed`'s privacy
-  boundary. It does not link against the crate (impossible: bin-only, and
-  `pub(crate)` is invisible from outside anyway); it regenerates a copy of
-  `src/ui/confirm.rs` into a fixture and recreates the intra-crate relationship
-  `src/executors/*.rs` has to it.
-- Three tray-command guards (#234), including a source-scanning test that every
-  `cmd::` id has a `WM_COMMAND` arm in `wnd_proc`.
-- `.claude/skills/filing-findings/SKILL.md` -- the shared-machine cargo rules now
-  scale past five agents: `CARGO_BUILD_JOBS=1` from six up, plus
-  `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`.
-
-## On running a fan-out again
-
-Ten build agents plus five read-only auditors on one 31 GB machine held fine
-(low 4.9 GB free, CPU around 52 percent). **The auditors were the better value
-by a wide margin**: no RAM, no tree writes, and 28 findings including every P1
-found that night, against three merged issues from the ten build agents in the
-same window. Weight the split further toward auditors. Distinct per-agent
-insertion anchors in `config.rs` worked: five agents adding fields to one
-3264-line file produced zero conflicts.
-
-The binding constraint was budget, not the machine. Size the fan-out to
-remaining spend, and when a run dies, commit each worktree's WIP as one clearly
-labelled unverified commit rather than leaving it loose.
+`ac4408ff852377671` (#229) does not touch #271's code path, so those two can
+proceed independently.
 
 ## Manual checks owed
 
-`#166` is the tracker and gained three entries this run: #216's DirectWrite
-appearance, #225's end-to-end preview sequencing, and the #236/#237 checks.
+`#166` is the tracker. Tonight's verifier named four findings that cannot be
+closed without a live desktop, and they should go on it: #271 needs a real
+click on a second window under the overlay; #261 needs a genuinely hung UIA
+provider; #263 needs an injected failing `IsPassword` call; #255 needs a
+real focused control destroyed with `DestroyWindow` to see what
+`WM_KILLFOCUS` Windows actually delivers.
 
-Still owed from before: the one Settings click that points the Copilot key at
-the app (Settings > Bluetooth & devices > Keyboard > Customize Copilot key >
-Custom). No script can do it; `HKCU\...\Shell\BrandedKey` is write-protected by
-the shell even in HKCU. The low-level hook works regardless, so "the key
-responds" does not mean the picker route is live.
+Still owed from before: the one Settings click that points the Copilot key
+at the app. No script can do it.
+
+## On running a fan-out again
+
+- **Read-only auditors remain the best value by a wide margin**, now twice
+  measured. Twelve of them wrote nothing to the tree, produced 45 issues and
+  conflicted with nobody.
+- **Add a verifier pass.** One agent whose only job was to attack the
+  round's P1s turned a pile of `THEORY (unverified)` into something safe to
+  hand to fixers, and would have been worth it even if it had refuted
+  nothing.
+- **An auditor scoped to "the seams between modules" finds what per-module
+  agents structurally cannot.** Both of its findings were about a value
+  crossing a boundary.
+- **The orchestrator needs its own `CARGO_TARGET_DIR` too.** MEASURED
+  2026-09-19: with agents running filtered tests in the main checkout,
+  orchestrator builds failed repeatedly with `LNK1104`, because cargo's file
+  lock serializes compilation but not the linker's output path.
+- Six building agents took this 31 GB machine down to 1.6 GB free. Four is
+  the comfortable number with the orchestrator also building.
