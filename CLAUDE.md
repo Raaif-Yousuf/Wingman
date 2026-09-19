@@ -5,10 +5,11 @@
 > session, and where to look. Depth lives in [`docs/`](docs/README.md).
 
 **Name:** **Wingman** (decided 2026-09-16; the crate, bin, window classes,
-mutex and config directory were renamed 2026-09-16, issue #1. The repo
-folder is still `copilot-ask` until it is physically moved; the package
-identity `RaaifYousuf.CopilotAsk` and icons are issue #10, not yet done).
-GitHub: `Raaif-Yousuf/Wingman`.
+mutex, config directory, package identity and icons were renamed
+2026-09-16, issues #1 and #10, both closed. The repo folder is still
+`copilot-ask` until it is physically moved; the current package identity
+is `RaaifYousuf.Wingman`, per `packaging\Wingman.Common.psm1`'s
+`Get-WingmanIdentity`). GitHub: `Raaif-Yousuf/Wingman`.
 
 **App:** a native Windows 11 tray assistant behind the Copilot key. Today: one
 press screenshots the active monitor, a vision model checks the physics problem
@@ -100,7 +101,7 @@ action framework is the product and actions are the contribution surface.
 | HTTP | `ureq` 3, blocking, on purpose. No tokio, no reqwest, no streaming: every response is a whole structured result |
 | Capture | `xcap` 0.9 (Apache-2.0, permissive but not MIT) + `image` PNG-only |
 | Config | `toml` in `%APPDATA%\Wingman\config.toml`, owner-only ACL, env overrides |
-| Packaging | sparse MSIX, self-signed cert, `install.ps1` self-elevates once; identity `RaaifYousuf.CopilotAsk` |
+| Packaging | sparse MSIX, self-signed cert, `install.ps1` self-elevates once; identity `RaaifYousuf.Wingman` |
 | Local models | Ollama 0.34 on `127.0.0.1:11434`; Intel Arc 140T iGPU needs `OLLAMA_IGPU_ENABLE=1` or Vulkan drops it and runs CPU-only; the only oracle for GPU use is `size_vram > 0` on `/api/ps` |
 | Release profile | `opt-level = "z"`, LTO, `panic = "abort"`, stripped; ~2 MB exe, under 10 MB idle |
 

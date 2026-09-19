@@ -15,8 +15,9 @@ no crash reporting, no update check, no analytics and no background network
 activity of any kind: nothing is sent while idle, and nothing runs on a
 timer (CLAUDE.md rule 5).
 
-Four files under `src/provider/` can open a network connection --
-`openai.rs`, `anthropic.rs`, `gemini.rs` and `ollama.rs` -- one per provider.
+Five files under `src/provider/` can open a network connection --
+`openai.rs`, `anthropic.rs`, `gemini.rs`, `ollama.rs` and `openai_compat.rs`
+-- one per provider.
 A press sends a request to exactly one provider, chosen from
 `providers.order` and filtered by the active **Mode** (see "Modes and the
 Offline guard" below); `Chain` tries the next provider in that filtered list
@@ -36,6 +37,7 @@ Where each provider's request goes:
 | Anthropic | `https://api.anthropic.com/v1/messages` | your `ANTHROPIC_API_KEY` or the stored key |
 | Gemini | `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` | your `GEMINI_API_KEY` or the stored key |
 | Ollama | `{providers.ollama.base_url}/api/chat`, default `http://127.0.0.1:11434/api/chat` | none; local server, no key |
+| OpenAI-compatible (`compat:<name>`) | `{base_url}/chat/completions`, where `base_url` is whatever you configured per endpoint (OpenRouter, Groq, LM Studio, a local server, ...) | your saved `Wingman/compat:<name>` credential, a caller-named header, or none, depending on that endpoint's `auth` setting |
 
 The three cloud requests go to whichever provider you configured with your
 own API key. Ollama's request never leaves your machine: it is a loopback
@@ -146,8 +148,9 @@ in the same change, per issue #58.
 ## How to verify any of this yourself
 
 Wingman is open source under the MIT license. `src/provider/openai.rs`,
-`src/provider/anthropic.rs`, `src/provider/gemini.rs` and
-`src/provider/ollama.rs` are the only files that open a network connection;
+`src/provider/anthropic.rs`, `src/provider/gemini.rs`,
+`src/provider/ollama.rs` and `src/provider/openai_compat.rs` are the only
+files that open a network connection;
 everything above can be checked by reading them and `src/provider/common.rs`
 (the shared, guarded send path and the Offline guard), or by running the app
 under a packet capture during a key press -- see

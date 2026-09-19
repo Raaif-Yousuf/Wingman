@@ -19,7 +19,7 @@ handoff snapshot, or a human-only action: those are four different things.
 | `docs/superpowers/specs/` | design decisions and their rationale, one dated file per topic | written before the code; superseded specs say so at the top and stay in git |
 | [`NEXT_SESSION.md`](../NEXT_SESSION.md) | where the last session stopped and what the next one should do first | fully overwritten each session; no history |
 | [`OWNER_TODO.md`](../OWNER_TODO.md) | actions only a human can take: a Settings click, a repo name, an account | rows deleted when done |
-| `CHANGELOG.md` (planned, Keep a Changelog) | what shipped, per version | append-only |
+| [`CHANGELOG.md`](../CHANGELOG.md) (Keep a Changelog) | what shipped, per version | append-only |
 
 ## Reading order for a new contributor
 
@@ -63,7 +63,6 @@ before they run. Both scripts explain the replacement in their message.
 | [actions.md](actions.md) | The `actions.toml` schema field by field, two worked examples, the proposal schema registry, and why `serde_json` keeps `preserve_order` |
 | [executors.md](executors.md) | The executor contract, the four rules, the `Confirmed<P>` privacy boundary, the stale-target check, and the never-Send/Submit/Buy/Pay rule |
 | [audit-coverage.md](audit-coverage.md) | Which parts of the tree an auditor has actually read, when, and what came out. The issue tracker cannot tell you where nobody has looked |
+| [positioning.md](positioning.md) | Positioning and launch research (Hacker News, GitHub, Windows enthusiast forums, tech press), the one-line pitch, and the launch-day checklist |
 
-Planned, per the expansion plan § 10: `architecture.md`, and at
-the root `PRIVACY.md`, `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`,
-`THIRD_PARTY_NOTICES.md`.
+Planned, per the expansion plan § 10: `architecture.md`.
