@@ -84,8 +84,8 @@ mod tests {
     #[test]
     fn local_app_data_matches_the_localappdata_env_var() {
         let from_api = local_app_data().expect("SHGetKnownFolderPath should succeed");
-        let from_env =
-            std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA should be set in this process's env");
+        let from_env = std::env::var("LOCALAPPDATA")
+            .expect("LOCALAPPDATA should be set in this process's env");
         assert_eq!(from_api, PathBuf::from(from_env));
     }
 

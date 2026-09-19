@@ -449,10 +449,9 @@ pub fn render_human(entry: &EgressEntry) -> String {
             AttachmentKind::Text => "text",
         };
         match (a.width, a.height) {
-            (Some(w), Some(h)) => parts.push(format!(
-                "{kind}: {} ({w}x{h})",
-                human_bytes(a.size_bytes)
-            )),
+            (Some(w), Some(h)) => {
+                parts.push(format!("{kind}: {} ({w}x{h})", human_bytes(a.size_bytes)))
+            }
             _ => parts.push(format!("{kind}: {}", human_bytes(a.size_bytes))),
         }
     }
@@ -645,7 +644,8 @@ mod tests {
     #[test]
     fn model_from_falls_back_to_the_gemini_style_url_path() {
         let body = json!({});
-        let url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent";
+        let url =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent";
         assert_eq!(model_from(url, &body), Some("gemini-3-pro".to_string()));
     }
 

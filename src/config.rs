@@ -3385,6 +3385,7 @@ static EGRESS_PREVIEW_ENABLED: std::sync::atomic::AtomicBool =
 /// itself (a `pub(crate)` item gated that way could not be named from
 /// another module's own `#[cfg(test)]` code in a normal build), but it is
 /// only ever locked from test code.
+#[allow(dead_code)] // Only locked from test code; see the doc comment above.
 pub(crate) static EGRESS_PREVIEW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn set_egress_preview_enabled(on: bool) {

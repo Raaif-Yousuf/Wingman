@@ -653,7 +653,10 @@ mod tests {
         // whatever this test-binary run's shared temp egress log happens to
         // contain at the moment.
         let text = egress_report();
-        assert!(!text.is_empty(), "must never be blank, even with nothing logged");
+        assert!(
+            !text.is_empty(),
+            "must never be blank, even with nothing logged"
+        );
     }
 
     #[test]

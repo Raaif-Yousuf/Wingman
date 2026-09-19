@@ -274,6 +274,15 @@ fn label_for(name: &str) -> String {
 /// This type carries no pixels at all, so that dependency does not apply to
 /// it, only to whatever eventually adds real image rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// #105: part of the "Show me what you're sending" gate. The structural half is
+// done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
+// authorized, `send_preview_guard` refuses every request, which is the
+// fail-safe direction. What remains is `App::ask` showing this preview via
+// `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
+// Deliberately not wired yet: that means adding a third pending kind to the
+// preview state machine, which has a live P1 (#225, two pending slots that can
+// both be Some at once). Sequenced after #225 on purpose.
+#[allow(dead_code)]
 pub struct RequestImagePreview {
     pub size_bytes: usize,
     pub width: Option<u32>,
@@ -292,6 +301,15 @@ pub struct RequestImagePreview {
 /// actually lives) -- [`RequestPreview::from_request`] only ever reads a
 /// [`crate::provider::Request`], which has no field for one.
 #[derive(Debug, Clone, PartialEq)]
+// #105: part of the "Show me what you're sending" gate. The structural half is
+// done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
+// authorized, `send_preview_guard` refuses every request, which is the
+// fail-safe direction. What remains is `App::ask` showing this preview via
+// `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
+// Deliberately not wired yet: that means adding a third pending kind to the
+// preview state machine, which has a live P1 (#225, two pending slots that can
+// both be Some at once). Sequenced after #225 on purpose.
+#[allow(dead_code)]
 pub struct RequestPreview {
     pub images: Vec<RequestImagePreview>,
     pub system_text: String,
@@ -302,6 +320,15 @@ pub struct RequestPreview {
 }
 
 impl RequestPreview {
+    // #105: part of the "Show me what you're sending" gate. The structural half is
+    // done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
+    // authorized, `send_preview_guard` refuses every request, which is the
+    // fail-safe direction. What remains is `App::ask` showing this preview via
+    // `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
+    // Deliberately not wired yet: that means adding a third pending kind to the
+    // preview state machine, which has a live P1 (#225, two pending slots that can
+    // both be Some at once). Sequenced after #225 on purpose.
+    #[allow(dead_code)]
     pub fn from_request(req: &crate::provider::Request) -> Self {
         let images = req
             .images
@@ -331,6 +358,7 @@ impl RequestPreview {
     /// `PreviewModel::from_schema` builds every field non-editable by
     /// construction -- confirming this preview can never "edit" the value
     /// into something the request being sent doesn't actually carry.
+    #[allow(dead_code)] // #105, same as the type above: not wired until #225 lands.
     pub fn to_schema_and_value(&self) -> (Value, Value) {
         let mut properties = Map::new();
         let mut value = Map::new();
@@ -341,7 +369,10 @@ impl RequestPreview {
                 (Some(w), Some(h)) => format!("Image {} ({w} x {h})", i + 1),
                 _ => format!("Image {}", i + 1),
             };
-            properties.insert(key.clone(), serde_json::json!({"type": "string", "label": label}));
+            properties.insert(
+                key.clone(),
+                serde_json::json!({"type": "string", "label": label}),
+            );
             value.insert(key, Value::String(human_bytes(img.size_bytes)));
         }
 
@@ -350,7 +381,10 @@ impl RequestPreview {
                 "system".to_string(),
                 serde_json::json!({"type": "string", "label": "System prompt"}),
             );
-            value.insert("system".to_string(), Value::String(self.system_text.clone()));
+            value.insert(
+                "system".to_string(),
+                Value::String(self.system_text.clone()),
+            );
         }
 
         properties.insert(
@@ -379,6 +413,15 @@ impl RequestPreview {
     }
 }
 
+// #105: part of the "Show me what you're sending" gate. The structural half is
+// done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
+// authorized, `send_preview_guard` refuses every request, which is the
+// fail-safe direction. What remains is `App::ask` showing this preview via
+// `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
+// Deliberately not wired yet: that means adding a third pending kind to the
+// preview state machine, which has a live P1 (#225, two pending slots that can
+// both be Some at once). Sequenced after #225 on purpose.
+#[allow(dead_code)]
 fn human_bytes(n: usize) -> String {
     if n >= 1_000_000 {
         format!("{:.1} MB", n as f64 / 1_000_000.0)
@@ -747,7 +790,11 @@ mod request_preview_tests {
         // usable by the EXISTING `PreviewModel::from_schema` with no
         // adapter code, proving there is one preview rendering path, not
         // two.
-        let req = request_with("Be helpful.", "What is on screen?", vec![tiny_png(340, 200)]);
+        let req = request_with(
+            "Be helpful.",
+            "What is on screen?",
+            vec![tiny_png(340, 200)],
+        );
         let preview = RequestPreview::from_request(&req);
         let (schema, value) = preview.to_schema_and_value();
         let model = PreviewModel::from_schema(&schema, &value);
@@ -755,11 +802,7 @@ mod request_preview_tests {
         let user_field = model.fields().iter().find(|f| f.name == "user").unwrap();
         assert_eq!(user_field.value, "What is on screen?");
 
-        let image_field = model
-            .fields()
-            .iter()
-            .find(|f| f.name == "image_0")
-            .unwrap();
+        let image_field = model.fields().iter().find(|f| f.name == "image_0").unwrap();
         assert!(image_field.label.contains("340 x 200"), "{image_field:?}");
     }
 

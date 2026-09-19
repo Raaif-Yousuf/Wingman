@@ -70,6 +70,15 @@ thread_local! {
 /// runs with the authorization in effect and the flag is always reset
 /// afterward, success or panic-unwind alike (`Drop` guard), so one
 /// confirmed "Send" can never be reused for a second, later request.
+// #105: part of the "Show me what you're sending" gate. The structural half is
+// done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
+// authorized, `send_preview_guard` refuses every request, which is the
+// fail-safe direction. What remains is `App::ask` showing this preview via
+// `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
+// Deliberately not wired yet: that means adding a third pending kind to the
+// preview state machine, which has a live P1 (#225, two pending slots that can
+// both be Some at once). Sequenced after #225 on purpose.
+#[allow(dead_code)]
 pub(crate) fn with_send_authorized<R>(authorized: SendAuthorized, f: impl FnOnce() -> R) -> R {
     let _ = authorized;
     struct ResetOnDrop;
@@ -1832,7 +1841,11 @@ mod tests {
         let clock = FixedClock(0);
         let result = run(&transport, &sleeper, &clock);
 
-        assert_eq!(result.unwrap(), "done", "default behaviour must be unchanged");
+        assert_eq!(
+            result.unwrap(),
+            "done",
+            "default behaviour must be unchanged"
+        );
         assert_eq!(transport.call_count(), 1);
     }
 
@@ -1856,7 +1869,10 @@ mod tests {
 
         crate::config::set_egress_preview_enabled(false);
 
-        assert!(result.is_err(), "authorization must not leak past its scope");
+        assert!(
+            result.is_err(),
+            "authorization must not leak past its scope"
+        );
         assert_eq!(transport.call_count(), 0);
     }
 
