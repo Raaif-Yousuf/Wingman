@@ -32,6 +32,13 @@ arboard = "3.6"
 version = "0.62"
 features = [
   "Win32_Foundation",
+  # Issue #216: the Quick Ask palette's row list and query text, via
+  # ID2D1HwndRenderTarget + IDWriteTextFormat (palette.rs's `d2d` module).
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_DirectWrite",
+  # D2D1_PIXEL_FORMAT's DXGI_FORMAT (issue #216).
+  "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Dwm",
   "Win32_NetworkManagement_IpHelper",
