@@ -1208,12 +1208,30 @@ impl App {
         }
     }
 
+    /// #268: `run_calendar_executor`'s headline, derived from what actually
+    /// happened rather than hardcoded. `CalendarAddExecutor::execute`
+    /// (`src/executors/calendar_add.rs`) appends ", but it could not be
+    /// opened automatically; open ... yourself" to `Undo.summary` exactly
+    /// when `result.opened == false` -- `Undo` exposes only `summary:
+    /// String` (no `opened` field), so that fixed substring is the only
+    /// signal available here without touching `src/executors/`, which
+    /// another agent owns tonight.
+    fn calendar_headline(summary: &str) -> &'static str {
+        if summary.contains("could not be opened automatically") {
+            "Event added, not opened"
+        } else {
+            "Event opened in your calendar app"
+        }
+    }
+
     /// Runs `executor` against `confirmed` and shows the result card:
     /// honest per the connector design doc (`Undo.summary` already names
     /// the generated file and that undo only deletes it, never touching
     /// whatever the calendar app itself created) -- never a second action
     /// taken automatically. This is as far as "Do" goes; Wingman never
-    /// presses Send, Submit, Buy or Pay.
+    /// presses Send, Submit, Buy or Pay. #268: the headline must agree
+    /// with `summary`'s own body text instead of always claiming the
+    /// event was opened (see [`Self::calendar_headline`]).
     fn run_calendar_executor(
         &mut self,
         executor: &dyn executors::Executor,
@@ -1221,8 +1239,8 @@ impl App {
     ) {
         match executor.execute(confirmed) {
             Ok(undo) => {
-                self.card
-                    .show_answer("Event opened in your calendar app", &undo.summary, 0, None);
+                let headline = Self::calendar_headline(&undo.summary);
+                self.card.show_answer(headline, &undo.summary, 0, None);
             }
             Err(e) => {
                 self.card
@@ -1491,11 +1509,51 @@ impl App {
                 .show_preview("Fill this form", &schema, &preview_value, false);
     }
 
+    /// #268: `run_form_fill_executor`'s headline, derived from what
+    /// actually happened rather than hardcoded. `executors::fill_form::
+    /// do_fill` (see its module doc, "Refuse the field, not the whole
+    /// fill") returns `Ok` even when every field ended up `Skipped` or
+    /// `Refused`, and `format_outcomes` (which builds `Undo.summary`)
+    /// always starts that summary with the fixed prefix `"Filled {filled}
+    /// of {total} field..."` -- see `format_outcomes`'s definition and its
+    /// own test `format_outcomes_counts_filled_and_lists_the_rest` in
+    /// `src/executors/fill_form.rs`. `src/executors/` is owned by another
+    /// agent tonight (and mid-change for #266, which will only make the
+    /// zero-filled case more common), so this reads that already-stable
+    /// prefix rather than adding any new field to `Undo` -- `Undo` exposes
+    /// only `summary: String`.
+    ///
+    /// Falls back to the old "Form filled" text if the prefix cannot be
+    /// parsed (should not happen given `format_outcomes`'s own coverage of
+    /// that prefix; a change to it that broke this would also break that
+    /// test first).
+    fn form_fill_headline(summary: &str) -> &'static str {
+        match Self::parse_filled_of_total(summary) {
+            Some((0, _)) => "Nothing filled",
+            Some((filled, total)) if filled < total => "Form partially filled",
+            Some(_) => "Form filled",
+            None => "Form filled",
+        }
+    }
+
+    /// Parses the `"Filled {filled} of {total} field..."` prefix
+    /// `executors::fill_form::format_outcomes` always writes. Returns
+    /// `None` for anything else rather than guessing.
+    fn parse_filled_of_total(summary: &str) -> Option<(usize, usize)> {
+        let rest = summary.strip_prefix("Filled ")?;
+        let (filled_str, rest) = rest.split_once(" of ")?;
+        let total_str = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+        let filled = filled_str.parse().ok()?;
+        let total = total_str.parse().ok()?;
+        Some((filled, total))
+    }
+
     /// Runs the `fill_form` executor and shows the result card (rule 5:
     /// what happened, not what was intended -- `Undo.summary`, built by
     /// `executors::fill_form::format_outcomes`, already lists filled,
-    /// skipped and refused fields by name). On success, stashes the `Undo`
-    /// for "Restore last form" (tray, `restore_last_form`).
+    /// skipped and refused fields by name; #268: the headline above it
+    /// must agree, via [`Self::form_fill_headline`]). On success, stashes
+    /// the `Undo` for "Restore last form" (tray, `restore_last_form`).
     fn run_form_fill_executor(
         &mut self,
         executor: &dyn executors::Executor,
@@ -1503,7 +1561,8 @@ impl App {
     ) {
         match executor.execute(confirmed) {
             Ok(undo) => {
-                self.card.show_answer("Form filled", &undo.summary, 0, None);
+                let headline = Self::form_fill_headline(&undo.summary);
+                self.card.show_answer(headline, &undo.summary, 0, None);
                 self.last_form_undo = Some(undo);
             }
             Err(e) => {
@@ -1932,6 +1991,15 @@ impl App {
     /// Push `self.config` into everything that caches a piece of it.
     fn apply_config(&mut self) {
         self.chain = Arc::new(self.config.build_chain());
+        // #283: keep the process-wide mode mirror AND the tray's Mode
+        // radio-check in sync with a Reload or a Settings save, the same
+        // way `set_mode` already does for a tray-driven mode change.
+        // Without this, `provider::common::offline_guard` (the only thing
+        // enforcing Offline's non-loopback refusal for a by-name-local
+        // provider like Ollama) keeps reading whatever mode was current at
+        // the last full app restart, silently, until the next one.
+        mode::set_current(self.config.mode);
+        self.tray.set_mode(self.config.mode);
         // #105: keep the process-wide mirror in sync with a Reload or a
         // Settings save, the same way `set_mode` already does for the mode.
         // A hand-edited `[egress_preview]` otherwise needs a full restart.
@@ -1944,6 +2012,11 @@ impl App {
             // otherwise a hand-edited `[hotkeys.pause]` in config.toml would
             // only take effect after a full app restart.
             hook.set_pause_chord(self.config.hotkeys.pause);
+            // #269: same reasoning as the pause chord immediately above,
+            // for the Quick Ask palette chord -- previously missing here,
+            // so a hand-edited `[hotkeys.palette]` plus Reload kept the OLD
+            // chord live in the keyboard hook until a full app restart.
+            hook.set_palette_chord(self.config.hotkeys.palette);
         }
         self.refresh_tray_labels();
     }
@@ -3843,6 +3916,87 @@ mod tests {
         }
     }
 
+    // -- form_fill_headline / calendar_headline (issue #268) ---------------
+
+    #[test]
+    fn form_fill_headline_says_nothing_filled_when_every_field_was_skipped_or_refused() {
+        // The exact shape `executors::fill_form::format_outcomes` produces
+        // when every field is skipped or refused -- see its own test
+        // `format_outcomes_counts_filled_and_lists_the_rest`'s style.
+        let summary = "Filled 0 of 3 fields. Skipped \"Password\": password control. \
+                        Refused \"Place order\": invokable or forbidden target. \
+                        Refused \"Total\": payment-shaped label.";
+        assert_eq!(App::form_fill_headline(summary), "Nothing filled");
+    }
+
+    #[test]
+    fn form_fill_headline_says_form_filled_when_every_field_was_filled() {
+        let summary = "Filled 2 of 2 fields.";
+        assert_eq!(App::form_fill_headline(summary), "Form filled");
+    }
+
+    #[test]
+    fn form_fill_headline_says_partially_filled_for_a_mixed_outcome() {
+        let summary = "Filled 1 of 3 fields. Skipped \"Password\": password control.";
+        assert_eq!(App::form_fill_headline(summary), "Form partially filled");
+    }
+
+    #[test]
+    fn form_fill_headline_falls_back_safely_on_an_unparseable_summary() {
+        // Defensive only: `format_outcomes` is the sole producer of this
+        // string and is itself covered by
+        // `format_outcomes_counts_filled_and_lists_the_rest`, so this
+        // should never fire in production. Proves the fallback doesn't
+        // panic rather than asserting a specific string.
+        let _ = App::form_fill_headline("not the expected shape at all");
+    }
+
+    #[test]
+    fn form_fill_headlines_never_use_an_em_dash() {
+        for summary in [
+            "Filled 0 of 3 fields. Skipped \"Password\": password control.",
+            "Filled 2 of 2 fields.",
+            "Filled 1 of 3 fields. Skipped \"Password\": password control.",
+        ] {
+            let headline = App::form_fill_headline(summary);
+            assert!(!headline.contains('\u{2014}'), "{headline}");
+        }
+    }
+
+    #[test]
+    fn calendar_headline_says_opened_when_the_connector_opened_it() {
+        // The exact shape `CalendarAddExecutor::execute` produces when
+        // `result.opened` is `true` (`opened_note` is empty).
+        let summary = "Added \"Standup\" to your calendar via ics. Undo removes this file; \
+                        removing the event from your calendar app is a manual step.";
+        assert_eq!(
+            App::calendar_headline(summary),
+            "Event opened in your calendar app"
+        );
+    }
+
+    #[test]
+    fn calendar_headline_says_not_opened_when_the_connector_could_not_open_it() {
+        // The exact shape when `result.opened` is `false`: `opened_note`
+        // appends "...it could not be opened automatically; open ...
+        // yourself" before the fixed Undo sentence.
+        let summary = "Added \"Standup\" to your calendar via ics, but it could not be opened \
+                        automatically; open C:\\temp\\standup.ics yourself. Undo removes this \
+                        file; removing the event from your calendar app is a manual step.";
+        assert_eq!(App::calendar_headline(summary), "Event added, not opened");
+    }
+
+    #[test]
+    fn calendar_headlines_never_use_an_em_dash() {
+        for summary in [
+            "Added \"Standup\" to your calendar via ics.",
+            "Added \"Standup\" to your calendar via ics, but it could not be opened automatically; open x yourself.",
+        ] {
+            let headline = App::calendar_headline(summary);
+            assert!(!headline.contains('\u{2014}'), "{headline}");
+        }
+    }
+
     // -- should_open_config_after_ensuring_it_exists (issue #174) ---------
 
     #[test]
@@ -4225,6 +4379,40 @@ mod tests {
         src.replace('\r', "")
     }
 
+    /// Slice `App::apply_config`'s body out of the source text, the same
+    /// technique [`wnd_proc_body`] uses for `wnd_proc`. `apply_config` is a
+    /// method (`fn apply_config(&mut self) {`), so unlike a top-level item
+    /// its own closing brace sits at 4 columns of indent, not 0 -- the first
+    /// `\n    }\n` after the signature ends it. Takes already-`lf`-normalised
+    /// source; see [`lf`]'s doc comment for why.
+    fn apply_config_body(app_src: &str) -> &str {
+        const SIG: &str = "fn apply_config(&mut self) {";
+        let start = app_src
+            .find(SIG)
+            .expect("app.rs no longer contains a `fn apply_config(&mut self) {` signature; this scanner is no longer looking at anything");
+        let rest = &app_src[start..];
+        let end = rest
+            .find("\n    }\n")
+            .expect("no 4-space-indented closing brace found after apply_config's signature");
+        &rest[..end]
+    }
+
+    /// Slice `App::run`'s body out of the source text, the same technique
+    /// [`wnd_proc_body`] uses for `wnd_proc`. `run` is a top-level function,
+    /// so like `wnd_proc` its closing brace sits at column 0. Takes
+    /// already-`lf`-normalised source; see [`lf`]'s doc comment for why.
+    fn run_body(app_src: &str) -> &str {
+        const SIG: &str = "pub fn run() -> Result<()> {";
+        let start = app_src
+            .find(SIG)
+            .expect("app.rs no longer contains a `pub fn run() -> Result<()> {` signature; this scanner is no longer looking at anything");
+        let rest = &app_src[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("no column-0 closing brace found after run's signature");
+        &rest[..end]
+    }
+
     /// Every id in `ALL_WM_APP_IDS` must be dispatched somewhere in
     /// `wnd_proc`, or the message posted to the owner window falls through
     /// to `DefWindowProcW` and nothing happens. The sender looks correct,
@@ -4334,6 +4522,137 @@ mod tests {
         assert!(
             never_posted.is_empty(),
             "these WM_APP_* ids are never passed to PostMessageW/SendMessageW anywhere in the crate, so their wnd_proc arms are dead code that reads as a live feature: {never_posted:?}"
+        );
+    }
+
+    // -- apply_config re-syncs the mode mirror (issue #283) ----------------
+
+    /// `App::run`'s startup sequence calls both `mode::set_current` (the
+    /// process-wide atomic `provider::common::offline_guard` reads via
+    /// `mode::is_offline_now()`) and `self.tray.set_mode` (the tray's Mode
+    /// radio-check) right after loading `Config` -- see lines 242 and 304.
+    /// `apply_config` -- the function both `reload()` (tray "Reload") and a
+    /// Settings save call after replacing `self.config` wholesale -- must
+    /// do the same, or a Reload/Settings-save with a changed `Config.mode`
+    /// leaves both mirrors on the OLD mode until the next full restart.
+    /// That is exactly #283: switching to Offline this way leaves
+    /// `offline_guard` reading the stale (non-Offline) mirror, so it skips
+    /// its loopback check entirely and a non-loopback-configured Ollama (or
+    /// any `compat:` provider pointed off-box) keeps sending while the user
+    /// believes Offline is on.
+    #[test]
+    fn apply_config_resyncs_the_mode_mirror() {
+        let app_src = lf(include_str!("app.rs"));
+        let body = apply_config_body(&app_src);
+        assert!(
+            body.contains("mode::set_current("),
+            "apply_config never calls mode::set_current, so a Reload/Settings-save with a changed Config.mode leaves offline_guard's process-wide mirror on the OLD mode (#283):\n{body}"
+        );
+        assert!(
+            body.contains("set_mode("),
+            "apply_config never calls the tray's set_mode, so a Reload/Settings-save with a changed Config.mode leaves the tray's Mode radio-check on the OLD mode (#283):\n{body}"
+        );
+    }
+
+    // -- apply_config re-syncs the palette chord (issue #269) --------------
+
+    /// `App::run`'s startup sequence installs the hook and then calls
+    /// `set_pause_chord` AND `set_palette_chord` on it (lines 330 and 333).
+    /// `apply_config` already re-syncs `set_bindings` and `set_pause_chord`
+    /// (issue #181's fix) but never `set_palette_chord`, so a hand-edited
+    /// `[hotkeys.palette]` plus Reload, or a future Settings save that
+    /// changes the palette chord, keeps the OLD chord live in the keyboard
+    /// hook until the next full app restart -- the exact bug #181 already
+    /// fixed for the pause chord, reintroduced for palette.
+    #[test]
+    fn apply_config_resyncs_the_palette_chord() {
+        let app_src = lf(include_str!("app.rs"));
+        let body = apply_config_body(&app_src);
+        assert!(
+            body.contains("set_palette_chord("),
+            "apply_config never calls hook.set_palette_chord, so a Reload/Settings-save with a changed hotkeys.palette leaves the OLD chord live until a full restart (#269):\n{body}"
+        );
+    }
+
+    // -- every startup config-mirror setter is resynced by apply_config ----
+    //
+    // #283 (mode::set_current / tray.set_mode) and #269
+    // (hook.set_palette_chord) are two instances of one root cause: a
+    // subsystem holds its OWN copy of a `Config` value (a process-wide
+    // atomic, the tray's radio-check, the keyboard hook's packed chord),
+    // `App::run` publishes it there at startup, and `apply_config` -- the
+    // function both `reload()` (tray "Reload") and a Settings save call
+    // after replacing `self.config` wholesale -- forgets to publish it
+    // again. The two tests immediately above catch exactly those two rows;
+    // this generalises the check so a THIRD row cannot ship silently.
+
+    /// A "config mirror setter" is any `set_*(...)` call in `App::run`
+    /// whose own source line also mentions `config.` -- i.e. it is
+    /// threading a value straight out of the freshly loaded `Config` into
+    /// some setter, unlike e.g. `card.set_owner(hwnd)` (no `config.` on
+    /// that line) or `HotkeyHook::install(hwnd, primary, secondary)` (not a
+    /// `set_*` call at all -- a constructor call has no `apply_config`-time
+    /// equivalent to check against, so it is correctly out of scope).
+    /// Matches by NAME only, not by receiver: the hook's local variable is
+    /// `h` in `run` and `hook` in `apply_config`, and the tray is
+    /// `app.tray` versus `self.tray`.
+    fn config_mirror_setter_names(body: &str) -> Vec<&str> {
+        fn setter_name(line: &str) -> Option<&str> {
+            let at = line.find("set_")?;
+            let after = &line[at..];
+            let paren = after.find('(')?;
+            let name = &after[..paren];
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                .then_some(name)
+        }
+
+        let mut names: Vec<&str> = body
+            .lines()
+            .filter(|line| line.contains("config."))
+            .filter_map(setter_name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Mutation-checked 2026-09-19: with `hook.set_palette_chord(...)`
+    /// deleted from `apply_config` (not merely commented out -- a comment
+    /// still contains the call text and would pass this test vacuously,
+    /// which is exactly how the first draft of this check on this machine
+    /// tonight failed to catch its own planted mutation), this test failed
+    /// with `["set_current", "set_mode", "set_palette_chord"]` in the
+    /// message (the same run also had #283's two calls deleted); restored,
+    /// it passes.
+    #[test]
+    fn every_startup_config_mirror_setter_is_resynced_by_apply_config() {
+        let app_src = lf(include_str!("app.rs"));
+        let run_src = run_body(&app_src);
+        let apply_src = apply_config_body(&app_src);
+
+        let candidates = config_mirror_setter_names(run_src);
+
+        // Non-empty-candidate-set check (issue #281 was exactly a guard
+        // that skipped this and passed vacuously once its own scan broke):
+        // today there are 6 (set_current, set_egress_preview_enabled,
+        // set_text_scale, set_mode, set_pause_chord, set_palette_chord);
+        // require a comfortable margin under that so losing one candidate
+        // to a future refactor cannot silently zero out this check.
+        assert!(
+            candidates.len() >= 4,
+            "scanner found only {} config-mirror setter names in App::run; the scan or run's shape has changed and this test is no longer checking anything: {candidates:?}",
+            candidates.len()
+        );
+
+        let unresynced: Vec<&str> = candidates
+            .iter()
+            .filter(|name| !apply_src.contains(&format!("{name}(")))
+            .copied()
+            .collect();
+
+        assert!(
+            unresynced.is_empty(),
+            "these config-mirror setters run at startup (App::run) but apply_config never calls a setter of the same name, so a Reload/Settings-save leaves their mirror on whatever was true at the last full restart: {unresynced:?}"
         );
     }
 
