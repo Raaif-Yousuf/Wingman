@@ -58,7 +58,9 @@ before they run. Both scripts explain the replacement in their message.
 | [providers.md](providers.md) | Per-provider request shapes, auth and key storage, effort/thinking mapping, structured-output mechanism, retry/429 handling, Ollama-specific facts, how to add Ollama or Gemini to `providers.order` by hand |
 | [offline.md](offline.md) | The four modes exactly as `mode.rs` implements them, what the Offline guard blocks and where, what it cannot guarantee, how to verify it with pktmon or Resource Monitor |
 | [reproducible-builds.md](reproducible-builds.md) | What is and is not verified byte-for-byte reproducible (`wingman.exe` is, `wingman.msix` is not yet), the `/Brepro`/`SOURCE_DATE_EPOCH`/toolchain-pin measurement, how to reproduce it, and the CycloneDX SBOM `release.yml` attaches to every release |
+| [actions.md](actions.md) | The `actions.toml` schema field by field, two worked examples, the proposal schema registry, and why `serde_json` keeps `preserve_order` |
+| [executors.md](executors.md) | The executor contract, the four rules, the `Confirmed<P>` privacy boundary, the stale-target check, and the never-Send/Submit/Buy/Pay rule |
 
-Planned, per the expansion plan § 10: `architecture.md`, `actions.md`, and at
+Planned, per the expansion plan § 10: `architecture.md`, and at
 the root `PRIVACY.md`, `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`,
 `THIRD_PARTY_NOTICES.md`.
