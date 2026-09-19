@@ -54,3 +54,36 @@ that had already shipped, not the code being wrong, and was fixed in place
 by a dedicated docs fix agent rather than left as open issues. #285 (triage
 of the five unmerged 2026-09-18 fan-out branches) is a process item, not a
 module finding, and is not attributed to any single area row above.
+
+Round 4 ran wider than its area rows suggest and then turned into a fix
+round: thirteen of its findings were fixed and merged the same night, by six
+agents working in isolated worktrees, and one adversarial verifier re-checked
+the thirteen most serious findings before any of that started, confirming all
+thirteen and refuting none.
+
+## Where round 4 did NOT look
+
+"Audited" above means an auditor read the area with a brief. It does not mean
+every line. These are the gaps the round's own agents named when they ran out
+of budget, recorded here because the issue tracker cannot express "nobody
+read this" and the next round should start from it rather than rediscover it.
+
+| Not read | Reported by |
+|---|---|
+| `src/config.rs` ~2340-2715 and ~2775-2930 (secrets import/hydrate/push test bodies) | config and secrets |
+| `src/app.rs` ~2380-2600 (`calendar_worker`, `review_worker`, `form_fill_worker`, `router_worker` bodies) | app shell |
+| `src/actions/review_email.rs` ~880-1541 (its test module) | actions and executors |
+| `packaging/Wingman.Common.Tests.ps1` (47 KB Pester suite; only the module it tests was read) | build and CI |
+| `.github/ISSUE_TEMPLATE/*.yml` (only `config.yml` was read) | build and CI |
+| `scripts/rename-repo-folder-to-wingman.ps1`, `scripts/merge-agent-branches.sh` (skimmed for injection only) | build and CI |
+| The `#[cfg(test)]` modules of roughly 60 `src/*.rs` files, individually | build and CI |
+| `src/provider/ollama_admin.rs` ~500-600 (`pull`, `stream_pull_progress`) not build-verified | providers |
+
+The last row on that list is the one worth acting on: **no exhaustive
+per-test audit of the ~1600 `#[test]` functions was done.** The build-and-CI
+agent attempted a scripted sweep, it timed out, and the agent fell back to a
+seven-file sample. That sample found nothing gross, but two genuinely vacuous
+tests were found by other means the same night (#281, and the guard the
+app-shell fixer mutation-checked), so the base rate is not zero. A round 5
+scoped only at test quality, with a working scanner, is a reasonable use of
+one agent.
