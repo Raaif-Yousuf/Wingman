@@ -1944,6 +1944,11 @@ impl App {
             // otherwise a hand-edited `[hotkeys.pause]` in config.toml would
             // only take effect after a full app restart.
             hook.set_pause_chord(self.config.hotkeys.pause);
+            // #269: same reasoning as the pause chord immediately above,
+            // for the Quick Ask palette chord -- previously missing here,
+            // so a hand-edited `[hotkeys.palette]` plus Reload kept the OLD
+            // chord live in the keyboard hook until a full app restart.
+            hook.set_palette_chord(self.config.hotkeys.palette);
         }
         self.refresh_tray_labels();
     }
@@ -4225,6 +4230,24 @@ mod tests {
         src.replace('\r', "")
     }
 
+    /// Slice `App::apply_config`'s body out of the source text, the same
+    /// technique [`wnd_proc_body`] uses for `wnd_proc`. `apply_config` is a
+    /// method (`fn apply_config(&mut self) {`), so unlike a top-level item
+    /// its own closing brace sits at 4 columns of indent, not 0 -- the first
+    /// `\n    }\n` after the signature ends it. Takes already-`lf`-normalised
+    /// source; see [`lf`]'s doc comment for why.
+    fn apply_config_body(app_src: &str) -> &str {
+        const SIG: &str = "fn apply_config(&mut self) {";
+        let start = app_src
+            .find(SIG)
+            .expect("app.rs no longer contains a `fn apply_config(&mut self) {` signature; this scanner is no longer looking at anything");
+        let rest = &app_src[start..];
+        let end = rest
+            .find("\n    }\n")
+            .expect("no 4-space-indented closing brace found after apply_config's signature");
+        &rest[..end]
+    }
+
     /// Every id in `ALL_WM_APP_IDS` must be dispatched somewhere in
     /// `wnd_proc`, or the message posted to the owner window falls through
     /// to `DefWindowProcW` and nothing happens. The sender looks correct,
@@ -4334,6 +4357,26 @@ mod tests {
         assert!(
             never_posted.is_empty(),
             "these WM_APP_* ids are never passed to PostMessageW/SendMessageW anywhere in the crate, so their wnd_proc arms are dead code that reads as a live feature: {never_posted:?}"
+        );
+    }
+
+    // -- apply_config re-syncs the palette chord (issue #269) --------------
+
+    /// `App::run`'s startup sequence installs the hook and then calls
+    /// `set_pause_chord` AND `set_palette_chord` on it (lines 330 and 333).
+    /// `apply_config` already re-syncs `set_bindings` and `set_pause_chord`
+    /// (issue #181's fix) but never `set_palette_chord`, so a hand-edited
+    /// `[hotkeys.palette]` plus Reload, or a future Settings save that
+    /// changes the palette chord, keeps the OLD chord live in the keyboard
+    /// hook until the next full app restart -- the exact bug #181 already
+    /// fixed for the pause chord, reintroduced for palette.
+    #[test]
+    fn apply_config_resyncs_the_palette_chord() {
+        let app_src = lf(include_str!("app.rs"));
+        let body = apply_config_body(&app_src);
+        assert!(
+            body.contains("set_palette_chord("),
+            "apply_config never calls hook.set_palette_chord, so a Reload/Settings-save with a changed hotkeys.palette leaves the OLD chord live until a full restart (#269):\n{body}"
         );
     }
 
