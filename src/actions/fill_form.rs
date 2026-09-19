@@ -561,14 +561,21 @@ pub fn parse_model_response(text: &str) -> Result<Vec<ModelFieldResponse>> {
 /// Merges the model's response for `unmapped` fields into [`MappedField`]s,
 /// re-reading a `"profile"`-sourced value from `profile` itself (never
 /// trusting a value the model might have echoed -- see this file's module
-/// doc comment) and applying the payment-label denylist to a
-/// `"model"`-sourced field's label as a second line of defense
-/// (`executors::fill_form` re-checks this again at Do-time regardless;
+/// doc comment) and applying the payment denylist to a `"model"`-sourced
+/// field's LABEL and VALUE as a second line of defense
+/// (`executors::fill_form` re-checks both again at Do-time regardless;
 /// filtering here too just keeps a doomed-to-be-refused row out of the
-/// preview). A `control_id` the response never mentions, an unrecognized
-/// `profile_field` name, an empty profile value, an empty `"model"` value,
-/// or any `source` other than `"profile"`/`"model"` all mean the same
-/// thing: nothing is proposed for that field.
+/// preview). The value check exists because a `"model"`-sourced value is
+/// literal text the model invented from the screenshot, with no structural
+/// guarantee against being payment-shaped (unlike a `"profile"`-sourced
+/// value, which `Profile::save_to`/`load_from` already refuse to store in
+/// that shape): #220 -- a Luhn-valid card number or a mod-97-valid IBAN
+/// behind an ordinary-looking label ("Reference number", "Confirmation
+/// code") is refused here even though its label alone would pass. A
+/// `control_id` the response never mentions, an unrecognized `profile_field`
+/// name, an empty profile value, an empty `"model"` value, or any `source`
+/// other than `"profile"`/`"model"` all mean the same thing: nothing is
+/// proposed for that field.
 pub fn merge_model_response(
     unmapped: &[UnmappedField],
     responses: &[ModelFieldResponse],
@@ -605,6 +612,9 @@ pub fn merge_model_response(
                     continue;
                 }
                 if crate::payment_denylist::is_payment_shaped_label(&field.label) {
+                    continue;
+                }
+                if crate::payment_denylist::is_payment_shaped_value(trimmed) {
                     continue;
                 }
                 out.push(MappedField {
@@ -1429,6 +1439,120 @@ mod tests {
             sensitive: false,
         }];
         assert!(merge_model_response(&unmapped, &responses, &profile).is_empty());
+    }
+
+    // -- #220: a Luhn-valid/IBAN-shaped model value behind an ORDINARY label
+    // must be refused too, not just a payment-shaped label -----------------
+
+    #[test]
+    fn merge_model_response_skips_a_luhn_valid_card_number_behind_an_ordinary_label() {
+        let profile = sample_profile();
+        let unmapped = vec![UnmappedField {
+            candidate_index: 0,
+            label: "Reference number".to_string(),
+            current: String::new(),
+        }];
+        let responses = vec![ModelFieldResponse {
+            control_id: "f0".to_string(),
+            source: "model".to_string(),
+            profile_field: String::new(),
+            // A well-known Luhn-valid test card number (not a real account).
+            value: "4111111111111111".to_string(),
+            sensitive: false,
+        }];
+        assert!(
+            merge_model_response(&unmapped, &responses, &profile).is_empty(),
+            "a Luhn-valid card number must be refused even behind an ordinary label"
+        );
+    }
+
+    #[test]
+    fn merge_model_response_skips_a_mod97_valid_iban_behind_an_ordinary_label() {
+        let profile = sample_profile();
+        let unmapped = vec![UnmappedField {
+            candidate_index: 0,
+            label: "Confirmation code".to_string(),
+            current: String::new(),
+        }];
+        let responses = vec![ModelFieldResponse {
+            control_id: "f0".to_string(),
+            source: "model".to_string(),
+            profile_field: String::new(),
+            // The well-known mod-97-valid IBAN worked example (ISO 13616).
+            value: "GB29 NWBK 6016 1331 9268 19".to_string(),
+            sensitive: false,
+        }];
+        assert!(
+            merge_model_response(&unmapped, &responses, &profile).is_empty(),
+            "a mod-97-valid IBAN must be refused even behind an ordinary label"
+        );
+    }
+
+    #[test]
+    fn merge_model_response_allows_a_non_luhn_digit_run_behind_an_ordinary_label() {
+        let profile = sample_profile();
+        let unmapped = vec![UnmappedField {
+            candidate_index: 0,
+            label: "Order number".to_string(),
+            current: String::new(),
+        }];
+        let responses = vec![ModelFieldResponse {
+            control_id: "f0".to_string(),
+            source: "model".to_string(),
+            profile_field: String::new(),
+            // 16 digits, deliberately not Luhn-valid (verified by hand, same
+            // as profile::denylist's own non-Luhn fixture): an order number
+            // must still be allowed through.
+            value: "1234567890123456".to_string(),
+            sensitive: false,
+        }];
+        let merged = merge_model_response(&unmapped, &responses, &profile);
+        assert_eq!(merged.len(), 1, "a non-Luhn digit run is not a card number");
+        assert_eq!(merged[0].value, "1234567890123456");
+    }
+
+    #[test]
+    fn merge_model_response_allows_an_ordinary_phone_number_behind_an_ordinary_label() {
+        let profile = sample_profile();
+        let unmapped = vec![UnmappedField {
+            candidate_index: 0,
+            label: "Phone".to_string(),
+            current: String::new(),
+        }];
+        let responses = vec![ModelFieldResponse {
+            control_id: "f0".to_string(),
+            source: "model".to_string(),
+            profile_field: String::new(),
+            value: "+1 555-123-4567".to_string(),
+            sensitive: false,
+        }];
+        let merged = merge_model_response(&unmapped, &responses, &profile);
+        assert_eq!(
+            merged.len(),
+            1,
+            "an ordinary phone number must not be refused"
+        );
+        assert_eq!(merged[0].value, "+1 555-123-4567");
+    }
+
+    #[test]
+    fn merge_model_response_allows_a_zip_plus_four_behind_an_ordinary_label() {
+        let profile = sample_profile();
+        let unmapped = vec![UnmappedField {
+            candidate_index: 0,
+            label: "Postcode".to_string(),
+            current: String::new(),
+        }];
+        let responses = vec![ModelFieldResponse {
+            control_id: "f0".to_string(),
+            source: "model".to_string(),
+            profile_field: String::new(),
+            value: "94103-1234".to_string(),
+            sensitive: false,
+        }];
+        let merged = merge_model_response(&unmapped, &responses, &profile);
+        assert_eq!(merged.len(), 1, "a ZIP+4 must not be refused");
+        assert_eq!(merged[0].value, "94103-1234");
     }
 
     #[test]

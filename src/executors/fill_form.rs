@@ -48,8 +48,20 @@
 //!    term table in [`crate::payment_denylist`] (#215, closed: this used to
 //!    be its own independently-worded table; `profile::denylist` now reads
 //!    from the same table for its own CVV/bank-label checks).
+//! 6. **Payment-shaped VALUE** ([`crate::payment_denylist::is_payment_shaped_value`])
+//!    -> [`RefuseReason::PaymentValue`]. A Luhn-valid card number or a
+//!    mod-97-valid IBAN, independently of the field's label (#220). This is
+//!    the one check in the whole chain that does not assume a
+//!    trustworthy-by-construction source: it is the single point every
+//!    field's value reaches regardless of where it came from (a local
+//!    profile mapping, a model's literal guess, or a user's own edit of a
+//!    sensitive field's proposed value in the confirm-time preview -- see
+//!    `actions::fill_form::rebuild_after_confirm`, which never itself runs
+//!    any payment check on what the user typed), so it is the one place a
+//!    payment-shaped value can be caught regardless of how it slipped past
+//!    every check upstream of "Do it".
 //!
-//! Whatever survives all five checks is [`FieldOutcome::Filled`]: the prior
+//! Whatever survives all six checks is [`FieldOutcome::Filled`]: the prior
 //! value is recorded and the new value is written.
 //!
 //! # Restore
@@ -137,6 +149,10 @@ pub enum RefuseReason {
     /// The label reads as a payment field (card number, CVV/CVC, expiry,
     /// IBAN, account/routing number).
     PaymentLabel,
+    /// The value itself is shaped like a real payment credential (a
+    /// Luhn-valid card number or a mod-97-valid IBAN), independently of
+    /// what the field is labeled (#220).
+    PaymentValue,
     /// Re-resolution and every check above passed, but the write itself
     /// failed (no `ValuePattern`, no editable fallback, or a live Win32
     /// error). Carries the underlying write error's message.
@@ -151,6 +167,9 @@ impl std::fmt::Display for RefuseReason {
                 write!(f, "it is a button or a final-action control")
             }
             RefuseReason::PaymentLabel => write!(f, "its label reads as a payment field"),
+            RefuseReason::PaymentValue => {
+                write!(f, "its value reads as a payment card number or IBAN")
+            }
             RefuseReason::WriteFailed(msg) => write!(f, "the write failed: {msg}"),
         }
     }
@@ -195,7 +214,7 @@ pub fn is_payment_label(label: &str) -> bool {
 /// freshly re-resolved live state. `None` means "proceed to write"; `Some`
 /// is the exact outcome to record instead. Checked in the order the module
 /// doc comment names: password, then sensitive/unapproved, then
-/// invokable-or-forbidden, then payment label.
+/// invokable-or-forbidden, then payment label, then payment-shaped value.
 pub fn evaluate_resolved_field(
     field: &FieldFill,
     resolved: &target::ResolvedElement,
@@ -215,6 +234,13 @@ pub fn evaluate_resolved_field(
     }
     if is_payment_label(&field.label) {
         return Some(FieldOutcome::Refused(RefuseReason::PaymentLabel));
+    }
+    // #220: the label can look completely ordinary while the value itself
+    // is a real card number or IBAN by structure (Luhn / mod-97). This is
+    // the one check in the chain that guards every value regardless of
+    // source -- see this module's doc comment, point 6.
+    if crate::payment_denylist::is_payment_shaped_value(&field.value) {
+        return Some(FieldOutcome::Refused(RefuseReason::PaymentValue));
     }
     None
 }
@@ -740,6 +766,16 @@ mod tests {
         }
     }
 
+    fn field_with_value(label: &str, value: &str, sensitive: bool, approved: bool) -> FieldFill {
+        FieldFill {
+            target: target_for("f"),
+            label: label.to_string(),
+            value: value.to_string(),
+            sensitive,
+            approved,
+        }
+    }
+
     #[test]
     fn password_control_is_skipped() {
         let outcome = evaluate_resolved_field(
@@ -818,6 +854,69 @@ mod tests {
         let outcome = evaluate_resolved_field(
             &ordinary_field("Full name", false, false),
             &resolved("Edit", false, "Full name"),
+        );
+        assert_eq!(outcome, None);
+    }
+
+    // -- #220: a Luhn-valid/IBAN-shaped VALUE behind an ORDINARY label must
+    // be refused too, independently of the label check above, since this is
+    // the one choke point every value reaches regardless of source (local
+    // mapping, model literal, or a user's own edit in the preview) --------
+
+    #[test]
+    fn payment_shaped_value_behind_an_ordinary_label_is_refused() {
+        let outcome = evaluate_resolved_field(
+            &field_with_value("Reference number", "4111 1111 1111 1111", false, false),
+            &resolved("Edit", false, "Reference number"),
+        );
+        assert_eq!(
+            outcome,
+            Some(FieldOutcome::Refused(RefuseReason::PaymentValue))
+        );
+    }
+
+    #[test]
+    fn iban_shaped_value_behind_an_ordinary_label_is_refused() {
+        let outcome = evaluate_resolved_field(
+            &field_with_value(
+                "Confirmation code",
+                "GB29 NWBK 6016 1331 9268 19",
+                false,
+                false,
+            ),
+            &resolved("Edit", false, "Confirmation code"),
+        );
+        assert_eq!(
+            outcome,
+            Some(FieldOutcome::Refused(RefuseReason::PaymentValue))
+        );
+    }
+
+    #[test]
+    fn non_luhn_digit_run_behind_an_ordinary_label_proceeds() {
+        let outcome = evaluate_resolved_field(
+            // 16 digits, deliberately not Luhn-valid: an order number must
+            // still be allowed through.
+            &field_with_value("Order number", "1234567890123456", false, false),
+            &resolved("Edit", false, "Order number"),
+        );
+        assert_eq!(outcome, None);
+    }
+
+    #[test]
+    fn ordinary_phone_number_value_proceeds() {
+        let outcome = evaluate_resolved_field(
+            &field_with_value("Phone", "+1 555-123-4567", false, false),
+            &resolved("Edit", false, "Phone"),
+        );
+        assert_eq!(outcome, None);
+    }
+
+    #[test]
+    fn zip_plus_four_value_proceeds() {
+        let outcome = evaluate_resolved_field(
+            &field_with_value("Postcode", "94103-1234", false, false),
+            &resolved("Edit", false, "Postcode"),
         );
         assert_eq!(outcome, None);
     }
@@ -990,6 +1089,28 @@ mod tests {
             .expect("execute must succeed");
         assert_eq!(*access.fields[&target_for("card")].text.borrow(), "");
         assert!(undo.summary.contains("Card number"));
+    }
+
+    #[test]
+    fn payment_shaped_value_is_refused_even_with_an_ordinary_label() {
+        let access = access(vec![(
+            "ref",
+            field("ref", "Edit", false, "Reference number", ""),
+        )]);
+        let executor = FillFormExecutor::with_access(access.clone());
+        let form = form_json(vec![field_json(
+            "ref",
+            "Reference number",
+            "4111 1111 1111 1111",
+            false,
+            false,
+        )]);
+
+        let undo = executor
+            .execute(confirmed(form))
+            .expect("execute must succeed");
+        assert_eq!(*access.fields[&target_for("ref")].text.borrow(), "");
+        assert!(undo.summary.contains("Reference number"));
     }
 
     #[test]
