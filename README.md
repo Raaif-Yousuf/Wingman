@@ -19,13 +19,6 @@ it and it [shows the working](docs/screenshots/card-expanded.png) it used to get
 there. That run went to a local Ollama model, so the screenshot never left the
 machine.
 
-> **Phase 0, in progress.** The crate, exe and config folder are being
-> renamed from `copilot-ask` to `wingman` (tracked in issue #1). The commands
-> and paths in this README are the ones that work in this checkout today,
-> which still say `copilot-ask`; once the rename lands they become `wingman`
-> and this file gets updated in the same commit. Everywhere else, the product
-> is called Wingman.
-
 ## Why not Copilot or Recall?
 
 Sourced from [`docs/positioning.md`](docs/positioning.md); every claim below
@@ -107,7 +100,7 @@ see "What works today" above. Track what remains in
 .\install.ps1
 ```
 
-Builds it, puts the `.exe` in `%LOCALAPPDATA%\Programs\copilot-ask`, registers
+Builds it, puts the `.exe` in `%LOCALAPPDATA%\Programs\Wingman`, registers
 it with Windows, and switches on start-with-Windows. Re-run it to upgrade in
 place. One UAC prompt the first time, to trust the certificate it signs with;
 none after that.
@@ -117,7 +110,7 @@ Registering is what puts the app in **Start ▸ All apps**, in
 below. Windows lists only packaged, signed apps in that picker, which is the
 whole reason the install does more than copy a file.
 
-`-SkipBuild` uses the existing `target\release\copilot-ask.exe` instead of
+`-SkipBuild` uses the existing `target\release\wingman.exe` instead of
 running cargo; `-NoAutostart` installs without the login entry.
 
 Nothing in install, upgrade or uninstall reads, writes or deletes your
@@ -127,7 +120,7 @@ Nothing in install, upgrade or uninstall reads, writes or deletes your
 
 ```powershell
 cargo build --release
-# target\release\copilot-ask.exe
+# target\release\wingman.exe
 ```
 
 The `.exe` is standalone and runs from anywhere with no runtime dependency.
@@ -136,7 +129,7 @@ if you tick it yourself in Settings.
 
 ## First run
 
-Launch it. A tray icon appears and `%APPDATA%\copilot-ask\config.toml` is
+Launch it. A tray icon appears and `%APPDATA%\Wingman\config.toml` is
 created. Left-click the tray icon to open **Settings**, and paste your key
 into **OpenAI API key** or **Anthropic API key**, both in the Providers group
 at the top. Everything else lives there too: model, effort, capture size,
@@ -206,10 +199,9 @@ Once installed, Wingman can also be made the Copilot key's target the
 official way:
 
 **Settings ▸ Bluetooth & devices ▸ Keyboard ▸ Customize Copilot key on
-keyboard ▸ Custom ▸ copilot-ask**
+keyboard ▸ Custom ▸ Wingman**
 
-(That entry still says `copilot-ask` in the picker until the Phase 0 rename
-lands; it is the same app.) You have to click that yourself. Windows protects
+You have to click that yourself. Windows protects
 the setting so no app can make itself the target, which is the right call,
 and means an installer cannot do it for you however much it would like to.
 
@@ -289,12 +281,12 @@ it.
 
 Stops it, unregisters the package, clears the autostart entry, hands the
 Copilot key back to Search if it was pointed here, deletes
-`%LOCALAPPDATA%\Programs\copilot-ask`, and removes the signing certificate
+`%LOCALAPPDATA%\Programs\Wingman`, and removes the signing certificate
 from both stores. One UAC prompt, for that last part; `-KeepCertificate`
 skips it, which is what you want if you are about to reinstall.
 
 Since it is a registered app you can also use **Settings ▸ Apps ▸ Installed
-apps ▸ copilot-ask ▸ Uninstall**. That removes the package but leaves the
+apps ▸ Wingman ▸ Uninstall**. That removes the package but leaves the
 autostart entry, the certificate and the installed folder behind, so the
 script is the tidier route.
 
@@ -302,7 +294,7 @@ Either way your config is left alone, deliberately: it holds your API keys
 and your prompt, and throwing those away is your call:
 
 ```powershell
-Remove-Item "$env:APPDATA\copilot-ask" -Recurse -Force
+Remove-Item "$env:APPDATA\Wingman" -Recurse -Force
 ```
 
 Rotate any API key that was in it; deleting the file does not invalidate it.
