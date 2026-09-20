@@ -12,6 +12,13 @@ draft, a filled form, an answer. One press, one action, one card. There is no
 chat window, no conversation, no follow-up question: if you want a back and
 forth, ChatGPT and Ollama's own app already do that well.
 
+![Wingman's card in the corner of the screen, answering a physics problem](docs/screenshots/card-on-screen.png)
+
+One press on the problem above, and the card in the corner says 5.94 m/s. Click
+it and it [shows the working](docs/screenshots/card-expanded.png) it used to get
+there. That run went to a local Ollama model, so the screenshot never left the
+machine.
+
 > **Phase 0, in progress.** The crate, exe and config folder are being
 > renamed from `copilot-ask` to `wingman` (tracked in issue #1). The commands
 > and paths in this README are the ones that work in this checkout today,
