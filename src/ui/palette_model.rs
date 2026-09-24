@@ -514,8 +514,18 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
 /// strings.
 pub fn footer_line(mode_label: &str, provider_model: Option<&str>) -> String {
     match provider_model {
-        Some(pm) => format!("mode: {mode_label} - {pm}"),
-        None => format!("mode: {mode_label}"),
+        Some(pm) => {
+            let friendly_name = match pm {
+                "openai:gpt-5" => "GPT-5",
+                "openai:gpt-4o" => "GPT-4o",
+                "anthropic:claude-3-5-sonnet" => "Claude 3.5 Sonnet",
+                "google:gemini-2.5-pro" => "Gemini 2.5 Pro",
+                _ => pm,
+            };
+
+            format!("{mode_label} · {friendly_name}")
+        }
+        None => mode_label.to_string(),
     }
 }
 
@@ -1032,13 +1042,13 @@ mod tests {
     fn footer_line_with_a_provider() {
         assert_eq!(
             footer_line("Auto", Some("openai:gpt-5")),
-            "mode: Auto - openai:gpt-5"
+            "Auto · GPT-5"
         );
     }
 
     #[test]
     fn footer_line_with_no_provider() {
-        assert_eq!(footer_line("Offline", None), "mode: Offline");
+        assert_eq!(footer_line("Offline", None), "Offline");
     }
 
     #[test]
