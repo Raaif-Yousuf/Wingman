@@ -60,7 +60,8 @@ use std::time::Duration;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, FW_NORMAL, HFONT, HGDIOBJ, LOGFONTW,
+    CreateFontIndirectW, DeleteObject, EnumFontFamiliesExW, GetDC, ReleaseDC, FW_NORMAL, HFONT,
+    HGDIOBJ, LOGFONTW, TEXTMETRICW,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -210,6 +211,13 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
+        // #346: without an explicit initial focus, keyboard focus landed
+        // wherever it happened to fall (reported as the Max edge box) --
+        // pin it to the first field instead, so Tab order starts from the
+        // top of the window every time it opens.
+        if let Some(first) = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER) {
+            let _ = SetFocus(Some(first));
+        }
     }
 
     run_message_loop(hwnd, inner_ref.prompt_edit);
@@ -819,6 +827,54 @@ fn checkbox_checked(hwnd: HWND, id: i32) -> bool {
 // Font
 // ---------------------------------------------------------------------------
 
+unsafe extern "system" fn record_font_found(
+    _logfont: *const LOGFONTW,
+    _metric: *const TEXTMETRICW,
+    _font_type: u32,
+    lparam: LPARAM,
+) -> i32 {
+    unsafe {
+        *(lparam.0 as *mut bool) = true;
+    }
+    0 // stop after the first match -- existence is all this needs
+}
+
+/// #346: true if a font face with exactly this name is installed. Used by
+/// [`build_font`]'s rare fallback path (both `SystemParametersInfoForDpi`
+/// and `SystemParametersInfoW` failing) to check "Segoe UI Variable Text"
+/// is actually present before naming it, rather than trusting
+/// `CreateFontIndirectW` to silently substitute something reasonable if it
+/// isn't -- GDI's substitute for a missing face need not resemble either
+/// Segoe face.
+fn font_face_exists(name: &str) -> bool {
+    unsafe {
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return false;
+        }
+        let mut lf = LOGFONTW {
+            // DEFAULT_CHARSET: match the face regardless of charset.
+            lfCharSet: windows::Win32::Graphics::Gdi::FONT_CHARSET(1),
+            ..Default::default()
+        };
+        for (i, u) in name.encode_utf16().enumerate() {
+            if i < lf.lfFaceName.len() {
+                lf.lfFaceName[i] = u;
+            }
+        }
+        let mut found = false;
+        EnumFontFamiliesExW(
+            hdc,
+            &lf,
+            Some(record_font_found),
+            LPARAM(std::ptr::addr_of_mut!(found) as isize),
+            0,
+        );
+        ReleaseDC(None, hdc);
+        found
+    }
+}
+
 /// A single dialog font derived from the shell's message font, same source
 /// `card.rs` uses for its own fonts, just without the headline/detail split
 /// this window has no need for.
@@ -851,7 +907,16 @@ fn build_font(dpi: u32) -> HFONT {
                 lfHeight: -12,
                 ..Default::default()
             };
-            for (i, u) in "Segoe UI".encode_utf16().enumerate() {
+            // #346: prefer the newer variable-weight face when it's actually
+            // installed (Windows 11), falling back to plain "Segoe UI"
+            // (present since Windows 7) rather than trusting GDI's own
+            // silent substitute, which need not be either.
+            let face = if font_face_exists("Segoe UI Variable Text") {
+                "Segoe UI Variable Text"
+            } else {
+                "Segoe UI"
+            };
+            for (i, u) in face.encode_utf16().enumerate() {
                 if i < lf.lfFaceName.len() {
                     lf.lfFaceName[i] = u;
                 }
@@ -1755,12 +1820,18 @@ fn build_ui(
 
     // Tab order / grouping: give the first control of each visual group
     // WS_GROUP so arrow-key navigation and Tab-between-groups behave.
+    // #346: this used to list only 5 controls, missing the first focusable
+    // control of the "General" group (ID_AUTOSTART) and, once #403 added the
+    // Forms group, its first control (ID_REQUIRE_TICK_FOR) too -- so
+    // arrow-key/group navigation didn't match the visible group boxes.
     for id in [
         ID_ACTIVE_PROVIDER,
         ID_MAX_EDGE,
         ID_CARD_SECONDS,
+        ID_REQUIRE_TICK_FOR,
         ID_PROMPT_EDIT,
         ID_SAVE,
+        ID_AUTOSTART,
     ] {
         if let Some(h) = get_dlg_item(hwnd, id) {
             add_style(h, WS_GROUP.0);
@@ -2243,6 +2314,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- font_face_exists (#346) -------------------------------------------
+
+    #[test]
+    fn font_face_exists_finds_a_font_present_on_every_windows_install() {
+        // Arial ships with every supported Windows version; if this is ever
+        // false, the check itself is broken, not the machine.
+        assert!(font_face_exists("Arial"));
+    }
+
+    #[test]
+    fn font_face_exists_is_false_for_a_made_up_name() {
+        assert!(!font_face_exists(
+            "Definitely Not A Real Font XYZ123 Wingman Test"
+        ));
     }
 
     // -- ollama_status_line (#14, #15) ------------------------------------
