@@ -50,6 +50,13 @@ Hooks (`.claude/settings.json`, scripts in `scripts/hooks/`): a recursive
 force-delete aimed inside the repo and any mutating `git stash` are refused
 before they run. Both scripts explain the replacement in their message.
 
+## Orchestrator scripts (`scripts/`)
+
+| Script | What it does |
+|---|---|
+| `merge-agent-branches.sh` | Merges a fan-out's leftover branches one at a time, least-contended first; aborts and reports any conflict instead of resolving it |
+| `pr-overlap.sh` | Lists open pull requests with author, CI state, mergeable state and changed files, finds every pair that touches the same file, and suggests a merge order (fewest overlaps first). Needs `gh` and `jq` |
+
 ## Index
 
 | Doc | What is in it |
