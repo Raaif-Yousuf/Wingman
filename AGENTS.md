@@ -154,4 +154,4 @@ revisited without a concrete reason to doubt it.
 | User-facing install and usage | [README.md](README.md) |
 | Docs index and who owns which fact | [docs/README.md](docs/README.md) |
 
-*Last updated: 2026-09-24 (moved here from CLAUDE.md: Claude Code v2.1.277+ reads AGENTS.md directly; personal details trimmed).*
+*Last updated: 2026-09-24 (moved here from CLAUDE.md: Claude Code v2.1.277+ reads AGENTS.md directly, MEASURED 2026-09-24: a session with no CLAUDE.md in the repo loaded this file as project instructions; personal details trimmed).*
