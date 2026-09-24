@@ -63,10 +63,11 @@ use std::sync::{Once, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreatePen, DeleteDC, DeleteObject,
-    EndPaint, GetStockObject, Rectangle, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_NOPREFIX, DT_SINGLELINE, HBITMAP, HDC, HGDIOBJ,
-    NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreatePen, CreateSolidBrush,
+    DeleteDC, DeleteObject, EndPaint, GetStockObject, Rectangle, RoundRect, SelectObject,
+    SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CENTER,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HGDIOBJ, NULL_BRUSH, NULL_PEN,
+    PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -299,6 +300,38 @@ pub fn to_buffer_rect(rect: Rect, desktop: Rect) -> RectPx {
 /// The "N x M" pixel-size label the overlay draws next to a live selection.
 pub fn size_label(rect: Rect) -> String {
     format!("{} x {}", rect.width(), rect.height())
+}
+
+/// #360: the one-line instructions shown before the user starts dragging,
+/// hidden once a drag begins (see [`OverlayInner::visible_hint`]).
+pub const HINT_TEXT: &str =
+    "Drag to select. Click a window to pick it. Enter to copy, Esc to cancel.";
+
+/// Margin from the top of the overlay to the hint pill, in physical pixels.
+/// This module makes no separate DPI-to-pixel conversion (see the module
+/// doc comment's "Coordinate spaces"): `width`/`height` here are already
+/// the overlay's real device-pixel size on whichever monitor(s) it covers,
+/// so centering against them, rather than any fixed screen-resolution
+/// assumption, is what makes this placement DPI-aware.
+const HINT_TOP_MARGIN_PX: i32 = 24;
+const HINT_HEIGHT_PX: i32 = 34;
+const HINT_MAX_WIDTH_PX: i32 = 640;
+const HINT_SIDE_PADDING_PX: i32 = 40;
+
+/// The centered pill [`draw_hint`] paints the instruction text into, for an
+/// overlay `width` wide. Pure geometry, no GDI, so it is unit-tested
+/// directly; clamped to stay within `width` (and never negative-sized) on a
+/// narrow monitor.
+pub fn hint_rect(width: i32) -> Rect {
+    let available = (width - HINT_SIDE_PADDING_PX).max(0);
+    let box_width = HINT_MAX_WIDTH_PX.min(available);
+    let left = (width - box_width) / 2;
+    Rect {
+        left,
+        top: HINT_TOP_MARGIN_PX,
+        right: left + box_width,
+        bottom: HINT_TOP_MARGIN_PX + HINT_HEIGHT_PX,
+    }
 }
 
 /// Darkens `rgba`'s RGB channels in place by `factor` (0.0 = black, 1.0 =
@@ -883,6 +916,11 @@ impl OverlayInner {
             if let Some(rect) = self.visible_rect() {
                 draw_selection(hdc, rect);
             }
+            // #360: hidden once dragging starts -- the size label next to
+            // the live selection already tells the user what they're doing.
+            if !self.dragging {
+                draw_hint(hdc, self.width);
+            }
 
             let _ = EndPaint(self.hwnd, &ps);
         }
@@ -963,6 +1001,39 @@ unsafe fn draw_selection(hdc: HDC, rect: Rect) {
         bottom: rect.top.max(20),
     };
     crate::ui::text::draw_text_line(hdc, &label, text_rc, DT_SINGLELINE | DT_NOPREFIX);
+}
+
+/// #360: draws [`HINT_TEXT`] centered in a dark backing pill (readable
+/// against both a light and a dark wallpaper) near the top of the overlay,
+/// at the position [`hint_rect`] computes for `width`.
+unsafe fn draw_hint(hdc: HDC, width: i32) {
+    let rect = hint_rect(width);
+    if rect.width() <= 0 || rect.height() <= 0 {
+        return;
+    }
+
+    let brush = CreateSolidBrush(COLORREF(0x00303030)); // dark grey, BGR-packed
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 16, 16);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, COLORREF(0x00FFFFFF));
+    let text_rc = RECT {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    };
+    crate::ui::text::draw_text_line(
+        hdc,
+        HINT_TEXT,
+        text_rc,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
 }
 
 /// Builds the top-down BGRA DIB section (and the memory DC it is selected
@@ -1540,6 +1611,44 @@ mod tests {
         assert_eq!(size_label(r), "1024 x 768");
     }
 
+    // -- hint_rect (#360) -----------------------------------------------------
+
+    #[test]
+    fn hint_rect_is_centered_horizontally() {
+        let r = hint_rect(2000);
+        let left_margin = r.left;
+        let right_margin = 2000 - r.right;
+        assert_eq!(left_margin, right_margin);
+        assert_eq!(r.width(), HINT_MAX_WIDTH_PX);
+    }
+
+    #[test]
+    fn hint_rect_sits_near_the_top() {
+        let r = hint_rect(1920);
+        assert_eq!(r.top, HINT_TOP_MARGIN_PX);
+        assert_eq!(r.height(), HINT_HEIGHT_PX);
+    }
+
+    #[test]
+    fn hint_rect_shrinks_to_fit_a_narrow_overlay() {
+        let r = hint_rect(300);
+        assert!(r.width() <= 300);
+        assert!(r.left >= 0);
+        assert!(r.right <= 300);
+    }
+
+    #[test]
+    fn hint_rect_never_goes_negative_on_a_tiny_overlay() {
+        let r = hint_rect(10);
+        assert!(r.width() >= 0);
+        assert!(r.height() > 0);
+    }
+
+    #[test]
+    fn hint_text_has_no_em_dash() {
+        assert!(!HINT_TEXT.contains('\u{2014}'));
+    }
+
     #[test]
     fn dim_rgba_scales_rgb_and_leaves_alpha_untouched() {
         let mut buf = vec![200u8, 100, 50, 255];
@@ -2081,6 +2190,40 @@ mod tests {
                     bottom: 0,
                 },
             );
+
+            SelectObject(hdc, old_bitmap);
+            let _ = DeleteObject(hbitmap.into());
+            let _ = DeleteDC(hdc);
+        }
+    }
+
+    #[test]
+    fn draw_hint_against_a_real_memory_dc_does_not_crash() {
+        unsafe {
+            let hdc = CreateCompatibleDC(None);
+            assert!(!hdc.is_invalid(), "CreateCompatibleDC failed");
+
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 800,
+                    biHeight: -600,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let hbitmap = CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .expect("CreateDIBSection failed");
+            let old_bitmap = SelectObject(hdc, hbitmap.into());
+
+            draw_hint(hdc, 800);
+            // A width too narrow for any pill: exercises the zero-size
+            // early-return path without crashing.
+            draw_hint(hdc, 0);
 
             SelectObject(hdc, old_bitmap);
             let _ = DeleteObject(hbitmap.into());
