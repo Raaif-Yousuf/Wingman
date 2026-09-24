@@ -129,10 +129,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, LoadCursorW, PostMessageW, RegisterClassExW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_COMMAND,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE,
+    WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASSEXW, WS_CHILD,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 const WC_EDIT: &str = "EDIT";
@@ -879,6 +879,13 @@ impl PaletteInner {
         self.reposition_centered();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOW);
+            // #395: this window is already WS_EX_TOPMOST, so this call only
+            // needs to (re)assert topmost z-order after ShowWindow, never
+            // move or resize what reposition_centered() just computed above
+            // -- SWP_NOMOVE | SWP_NOSIZE is load-bearing here. The previous
+            // 0,0,0,0 call with SWP_NOZORDER (which cancels the HWND_TOPMOST
+            // it passed) both moved the window to the origin and collapsed
+            // it to 0x0 right after positioning it (issue #395).
             let _ = SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
@@ -886,7 +893,7 @@ impl PaletteInner {
                 0,
                 0,
                 0,
-                SWP_NOACTIVATE | SWP_NOZORDER,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
             );
             let _ = SetForegroundWindow(self.hwnd);
             let _ = SetFocus(Some(self.edit_hwnd));
@@ -1483,7 +1490,8 @@ mod tests {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_RETURN};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        DispatchMessageW, GetMessageW, GetWindowRect, PeekMessageW, TranslateMessage, MSG,
+        PM_REMOVE,
     };
 
     fn instance() -> HINSTANCE {
@@ -1534,6 +1542,51 @@ mod tests {
         assert!(p.is_visible());
         p.hide();
         assert!(!p.is_visible());
+    }
+
+    /// #395: `show()` must leave the window at the size and position
+    /// `reposition_centered()` just computed for it -- not collapsed to
+    /// 0x0 at the origin. Replays `reposition_centered`'s own math (monitor
+    /// rect, `scale`, `window_height`) against the REAL `GetWindowRect`
+    /// after a real `show()`, so a regression that moves/collapses the
+    /// window after positioning it (the exact #395 bug: an unqualified
+    /// `SetWindowPos(...,0,0,0,0,...)` after `reposition_centered()`) fails
+    /// this test even though `is_visible()` still reports `true`.
+    #[test]
+    fn show_leaves_the_window_at_reposition_centereds_computed_rect() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+
+        let mut rect = RECT::default();
+        unsafe {
+            GetWindowRect(p.hwnd(), &mut rect).expect("GetWindowRect must succeed");
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        assert!(
+            w > 0 && h > 0,
+            "palette window must have nonzero size after show(), got {w}x{h} at ({}, {})",
+            rect.left,
+            rect.top
+        );
+
+        let monitor =
+            crate::capture::active_monitor_rect().expect("active monitor rect must be readable");
+        let dpi = unsafe { GetDpiForWindow(p.hwnd()) }.max(1);
+        let expected_w = scale(WINDOW_WIDTH, dpi);
+        let expected_h = window_height(dpi);
+        let mon_w = monitor.right - monitor.left;
+        let mon_h = monitor.bottom - monitor.top;
+        let expected_x = monitor.left + (mon_w - expected_w).max(0) / 2;
+        let expected_y = monitor.top + (mon_h - expected_h).max(0) / 3;
+
+        assert_eq!(
+            (rect.left, rect.top, w, h),
+            (expected_x, expected_y, expected_w, expected_h),
+            "show() must leave the window exactly where reposition_centered() put it"
+        );
     }
 
     #[test]
