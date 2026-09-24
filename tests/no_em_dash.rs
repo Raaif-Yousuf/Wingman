@@ -124,6 +124,20 @@ fn scan(path: &Path, src: &str) -> Vec<Violation> {
                         // Fall through to the generic skip below rather than
                         // having scanned all the way to EOF for nothing.
                     }
+                    // `\` immediately followed by a real newline is Rust's
+                    // string-continuation escape (a long message split
+                    // across source lines, trimming the following line's
+                    // leading whitespace from the string's value) -- common
+                    // in this codebase's longer error/assert messages. The
+                    // blind 2-char skip below would consume that `\n`
+                    // without the top-of-loop check ever seeing it as `c`,
+                    // undercounting `line` by one per occurrence and
+                    // eventually pointing a real violation at the wrong
+                    // source line (found while adding #412's migration,
+                    // which shifted enough lines to expose it).
+                    if chars.get(i + 1) == Some(&'\n') {
+                        line += 1;
+                    }
                     i += 2; // skip the escaped character, whatever it is
                     continue;
                 }
@@ -471,4 +485,33 @@ fn f() {
     // this single malformed literal is inherently ambiguous) -- the test
     // asserts only that `scan` returns rather than looping or panicking.
     let _ = scan(Path::new("fixture.rs"), src);
+}
+
+/// A `\` immediately followed by a real newline (Rust's string-continuation
+/// escape, used throughout this codebase's longer error/assert messages to
+/// split one string across source lines) must not eat that newline
+/// uncounted. Found while working #412: `src/config.rs` already had several
+/// such continuations before `Config::repair_refusal_trigger`'s
+/// `\u{2014}`-containing `TRIGGER` constant, so adding lines ahead of it
+/// shifted `TRIGGER` far enough that the undercount landed the reported
+/// violation on the wrong source line entirely (the function's own `fn`
+/// line), which no longer contained the text `is_deliberately_exempt`
+/// matches against -- silently breaking the exemption for text that was
+/// never touched.
+#[test]
+fn scan_counts_a_line_continuation_escape_as_a_real_newline() {
+    let src = "\
+fn f() {
+    let msg = \"first part of a long message \\
+               continued here \\u{2014} on line 3\";
+}
+";
+    let violations = scan(Path::new("fixture.rs"), src);
+    let lines: Vec<usize> = violations.iter().map(|v| v.line).collect();
+    assert_eq!(
+        lines,
+        vec![3],
+        "the em dash after a line-continuation escape must be reported on \
+         its own real source line, not undercounted by the continuation: {violations:?}"
+    );
 }

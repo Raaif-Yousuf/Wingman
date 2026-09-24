@@ -12,6 +12,78 @@ use crate::provider::{
 };
 use crate::secrets::{target_name, CredManagerStore, SecretStore};
 
+/// A previous shipped value of `provider::DEFAULT_PROMPT`, identified only by
+/// its normalized hash (see [`hash_prompt_for_migration`]), plus the commit
+/// that introduced it -- for `repair_stale_default_prompt`'s issue #412
+/// migration. Never store the prompt text itself here: the whole point is
+/// that the *hash* is what stays small as this list grows over releases.
+///
+/// No hashing crate is a dependency of this project (Cargo.toml has none),
+/// and issue #412 asked not to add one just for this, so this uses a plain
+/// inline FNV-1a 64-bit hash instead of a cryptographic one. That is fine
+/// here: the only threat model is "did this config ever hold this exact
+/// shipped string", not an adversary trying to forge a collision.
+const OLD_DEFAULT_PROMPT_HASHES: &[(u64, &str)] = &[
+    // e35e16e ("copilot-ask: Copilot-key screenshot to LLM verdict in the
+    // tray") through 98274d8 ("GUI settings, difficulty rating, provider
+    // switch, autostart"): the original prompt, before #299's
+    // reasoning_extraction fix replaced "This is your scratchpad -- reason
+    // it out before committing to a verdict." (repair_refusal_trigger
+    // already handles a prompt that only has that sentence changed by hand;
+    // this entry is for a config that still has the entire original default
+    // untouched).
+    (0xe7eb1d1ed8ce7d74, "e35e16e/98274d8"),
+    // The e35e16e/98274d8 default as it sits on disk after an *earlier*
+    // launch already ran `repair_refusal_trigger` on it (#299) -- that
+    // repair rewrites the trigger sentence in place, leaving the rest of
+    // the e35e16e/98274d8 text untouched, so a config that was live before
+    // #412 shipped can have this exact text, not the pristine original
+    // above. Verified equal to `repair_refusal_trigger` applied to the
+    // e35e16e/98274d8 text by
+    // `repairing_the_refusal_trigger_first_still_lets_the_result_migrate`,
+    // so this entry cannot silently drift from what that function actually
+    // produces.
+    (
+        0x11909e68d46b4cee,
+        "e35e16e/98274d8, post repair_refusal_trigger",
+    ),
+    // 0797844 ("Verify the Claude path live; fix two bugs it exposed"):
+    // fixed the scratchpad sentence in DEFAULT_PROMPT itself, but still
+    // lacked the non-vision-fallback parenthetical and the em-dash
+    // instruction that c7c8e68 later added.
+    (0x937c2b9f2fc523a9, "0797844"),
+];
+
+/// FNV-1a, 64-bit. Deterministic across builds and platforms (unlike
+/// `std::collections::hash_map::DefaultHasher`, whose algorithm Rust does
+/// not guarantee to stay the same between versions) -- required here since
+/// the hashes in [`OLD_DEFAULT_PROMPT_HASHES`] are hardcoded constants that
+/// must keep meaning the same thing release after release.
+const fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        i += 1;
+    }
+    hash
+}
+
+/// Normalizes a prompt before hashing it for the #412 migration: CRLF
+/// becomes LF, and trailing whitespace (per line, and at the very end) is
+/// stripped. A config saved by an editor that touched line endings or added
+/// trailing spaces must still match a known old default.
+fn normalize_prompt_for_migration(prompt: &str) -> String {
+    let unified = prompt.replace("\r\n", "\n");
+    let lines: Vec<&str> = unified.lines().map(|line| line.trim_end()).collect();
+    lines.join("\n").trim_end().to_string()
+}
+
+fn hash_prompt_for_migration(prompt: &str) -> u64 {
+    fnv1a64(normalize_prompt_for_migration(prompt).as_bytes())
+}
+
 /// Sentinel `hydrate_secrets` writes into a `ProviderConfig::api_key` field
 /// when the store has a credential for that provider but [`SecretStore::get`]
 /// returned `Err` (#175: a transient `CredReadW` failure, or a blob this
@@ -910,11 +982,20 @@ impl Config {
             self.ui.text_scale = Ui::default().text_scale;
             changed = true;
         }
-        // `|` (not `||`), deliberately: `repair_refusal_trigger` must always
-        // run and its mutation must always apply, even when an earlier
-        // branch already set `changed` -- short-circuiting here would skip
-        // the call entirely (#299).
-        changed | self.repair_refusal_trigger()
+        // `|` (not `||`), deliberately: these repairs must always run and
+        // their mutation must always apply, even when an earlier branch
+        // already set `changed` -- short-circuiting here would skip the
+        // call entirely (#299).
+        //
+        // `repair_stale_default_prompt` runs first, deliberately: an old
+        // shipped default can itself contain the sentence
+        // `repair_refusal_trigger` rewrites (the oldest one does), and that
+        // rewrite would leave `ui.prompt` no longer byte-for-byte equal to
+        // the historical text its hash was computed from, so the whole-
+        // prompt match would silently miss. Once `ui.prompt` has been
+        // migrated to the current `DEFAULT_PROMPT`, `repair_refusal_trigger`
+        // is a no-op against it (the current default carries no trigger).
+        changed | self.repair_stale_default_prompt() | self.repair_refusal_trigger()
     }
 
     /// Rewrites one sentence of a stored prompt that makes Claude refuse.
@@ -938,6 +1019,49 @@ impl Config {
 
         if self.ui.prompt.contains(TRIGGER) {
             self.ui.prompt = self.ui.prompt.replace(TRIGGER, REPLACEMENT);
+            return true;
+        }
+        false
+    }
+
+    /// Replaces a stored `ui.prompt` with the current
+    /// [`crate::provider::DEFAULT_PROMPT`] if it exactly matches one of the
+    /// *previous* built-in defaults (issue #412).
+    ///
+    /// `Config::default()` writes `DEFAULT_PROMPT` into `ui.prompt` on first
+    /// run (see `Ui::default` below), so a config written by an older build
+    /// carries that build's default verbatim on disk. Fixing
+    /// `provider::DEFAULT_PROMPT` in source therefore never reaches an
+    /// existing install: the stored copy just sits there, untouched by any
+    /// future release. This does not change `config.toml`'s shape (still a
+    /// plain `ui.prompt` string) -- it just recognizes "this is a stale
+    /// factory default, not something the user wrote" and swaps it for the
+    /// current one, the same way `repair_refusal_trigger` recognizes one
+    /// known-bad sentence.
+    ///
+    /// A prompt is compared by a normalized hash rather than byte-for-byte,
+    /// so a config saved with CRLF line endings (or picked up trailing
+    /// whitespace some editor added) still matches. A prompt the user
+    /// actually customized will not hash to any of these values (matching
+    /// one exactly, character for character once normalized, is exactly as
+    /// likely as the user having retyped an old shipped default verbatim --
+    /// effectively impossible), so a real edit is never touched.
+    ///
+    /// Add a new entry here whenever `DEFAULT_PROMPT`'s text changes: hash
+    /// the *previous* value (see `tools` note below) and cite the commit it
+    /// came from, so the list only ever grows.
+    fn repair_stale_default_prompt(&mut self) -> bool {
+        if hash_prompt_for_migration(&self.ui.prompt) == hash_prompt_for_migration(DEFAULT_PROMPT) {
+            // Already current; nothing to do (also short-circuits before
+            // touching a config the user has not opened yet).
+            return false;
+        }
+        let stored_hash = hash_prompt_for_migration(&self.ui.prompt);
+        if OLD_DEFAULT_PROMPT_HASHES
+            .iter()
+            .any(|(hash, _commit)| *hash == stored_hash)
+        {
+            self.ui.prompt = DEFAULT_PROMPT.to_string();
             return true;
         }
         false
@@ -2233,6 +2357,151 @@ text_scale = 0.0
     #[test]
     fn the_shipped_default_contains_no_refusal_trigger() {
         assert!(!Config::default().ui.prompt.contains("scratchpad"));
+    }
+
+    // -- #412: a stale built-in prompt default must migrate forward --------
+
+    /// The very first shipped `DEFAULT_PROMPT` (commits e35e16e/98274d8),
+    /// verbatim, before #299's reasoning_extraction fix. Kept only in this
+    /// test as the input that must migrate; `OLD_DEFAULT_PROMPT_HASHES`
+    /// stores just its hash, never this text.
+    const OLDEST_DEFAULT_PROMPT: &str = "You are shown a screenshot of the user's screen. They are working through a physics or statistics problem and want a second opinion before committing an answer. Usually the problem statement is on screen (often an online assignment) while the user has done the working on paper, so their derivation is generally NOT visible to you. Sometimes a value they are about to submit is already typed into an input field, and sometimes their working is on screen too.
+
+Work the problem out yourself from what is visible, then:
+- If a candidate answer is visible (typed into a field, or written in on-screen working), compare it against your own result. Say plainly whether it matches. If it does not, give the correct value and name the specific mistake you can infer (e.g. \"that is cos 30, not sin 30\" or \"you used the population variance formula, not the sample one\").
+- If only the problem is visible, just give your answer.
+- If something essential is unreadable or missing from the screenshot, say exactly what you need instead of guessing at it.
+
+Carry units through and give the final value to a sensible number of significant figures.
+
+Respond with exactly two fields, and write them in this order:
+- detail: FIRST. At most 700 characters, plain text. Work the problem through here step by step so the user can check it against their own. This is your scratchpad \u{2014} reason it out before committing to a verdict.
+- headline: SECOND, and it must be the conclusion of the working you just wrote. At most 90 characters, plain text. Lead with the final value, or with the correction if a visible answer is wrong. Never state a verdict in the headline that your own detail contradicts; if the working changed your mind, the headline follows the working.
+
+Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline.";
+
+    #[test]
+    fn a_config_holding_the_oldest_default_prompt_migrates_to_the_current_default() {
+        let doc = format!(
+            "[ui]\nprompt = {}\n",
+            toml::Value::String(OLDEST_DEFAULT_PROMPT.to_string())
+        );
+        let cfg = Config::parse_or_default(&doc);
+        assert_eq!(
+            cfg.ui.prompt, DEFAULT_PROMPT,
+            "a config still holding the oldest shipped default must be migrated to the current one"
+        );
+    }
+
+    #[test]
+    fn migrating_the_oldest_default_prompt_writes_the_repair_back_to_disk() {
+        let path = scratch_path("prompt-migration-writeback");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let doc = format!(
+            "[ui]\nprompt = {}\n",
+            toml::Value::String(OLDEST_DEFAULT_PROMPT.to_string())
+        );
+        std::fs::write(&path, &doc).unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.ui.prompt, DEFAULT_PROMPT);
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let reparsed: Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            reparsed.ui.prompt, DEFAULT_PROMPT,
+            "the prompt migration must be written back to disk, not just kept in memory"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn old_default_hash_list_matches_what_repair_refusal_trigger_actually_produces() {
+        // A config that ran `repair_refusal_trigger` (#299) on an earlier
+        // launch, before #412 shipped, has the oldest default with only
+        // that one sentence rewritten -- not the pristine original, and not
+        // hand-computed text either. Derive the exact bytes from the real
+        // function, not by retyping the transformation, so
+        // `OLD_DEFAULT_PROMPT_HASHES` cannot silently drift from what
+        // `repair_refusal_trigger` actually does.
+        let mut cfg = Config::default();
+        cfg.ui.prompt = OLDEST_DEFAULT_PROMPT.to_string();
+        let changed = cfg.repair_refusal_trigger();
+        assert!(
+            changed,
+            "the oldest default must contain the trigger sentence"
+        );
+        assert_ne!(
+            cfg.ui.prompt, OLDEST_DEFAULT_PROMPT,
+            "repair_refusal_trigger must have actually rewritten the sentence"
+        );
+
+        let hash = hash_prompt_for_migration(&cfg.ui.prompt);
+        assert!(
+            OLD_DEFAULT_PROMPT_HASHES.iter().any(|(h, _)| *h == hash),
+            "OLD_DEFAULT_PROMPT_HASHES must contain the hash of the oldest default \
+             as repair_refusal_trigger actually leaves it (0x{hash:016x}), so a config \
+             repaired by an earlier launch still migrates to the current default"
+        );
+    }
+
+    #[test]
+    fn a_config_already_repaired_by_refusal_trigger_on_an_earlier_launch_still_migrates() {
+        // Simulates exactly that earlier-launch history: the stored prompt
+        // is the oldest default with `repair_refusal_trigger`'s rewrite
+        // already applied, as it would be sitting on disk from before #412.
+        let mut pre_existing = Config::default();
+        pre_existing.ui.prompt = OLDEST_DEFAULT_PROMPT.to_string();
+        pre_existing.repair_refusal_trigger();
+        let already_repaired_prompt = pre_existing.ui.prompt;
+        assert_ne!(already_repaired_prompt, DEFAULT_PROMPT);
+
+        let doc = format!(
+            "[ui]\nprompt = {}\n",
+            toml::Value::String(already_repaired_prompt)
+        );
+        let cfg = Config::parse_or_default(&doc);
+        assert_eq!(
+            cfg.ui.prompt, DEFAULT_PROMPT,
+            "a config already repaired for the refusal trigger on an earlier launch \
+             must still migrate to the current default"
+        );
+    }
+
+    #[test]
+    fn a_crlf_variant_of_an_old_default_prompt_still_migrates() {
+        let crlf_prompt = OLDEST_DEFAULT_PROMPT.replace('\n', "\r\n");
+        let doc = format!("[ui]\nprompt = {}\n", toml::Value::String(crlf_prompt));
+        let cfg = Config::parse_or_default(&doc);
+        assert_eq!(
+            cfg.ui.prompt, DEFAULT_PROMPT,
+            "a CRLF copy of an old shipped default must still be recognized and migrated"
+        );
+    }
+
+    #[test]
+    fn a_customized_prompt_is_never_migrated() {
+        let toml = "[ui]\nprompt = \"Just check my algebra please.\"\n";
+        let cfg = Config::parse_or_default(toml);
+        assert_eq!(
+            cfg.ui.prompt, "Just check my algebra please.",
+            "a prompt the user actually wrote must never be replaced"
+        );
+    }
+
+    #[test]
+    fn the_current_default_prompt_is_a_migration_no_op() {
+        let doc = format!(
+            "[ui]\nprompt = {}\n",
+            toml::Value::String(DEFAULT_PROMPT.to_string())
+        );
+        let (_, repaired) = Config::parse_reporting_repair(&doc);
+        assert!(
+            !repaired,
+            "loading the current shipped default must not be reported as a repair"
+        );
     }
 
     // -- #197: show_difficulty default flipped to false ---------------------
