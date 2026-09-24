@@ -929,20 +929,50 @@ pub const MAX_DETAIL_CHARS: usize = 700;
 /// [`MAX_DETAIL_CHARS`] and the two are not expected to converge.
 pub const MAX_HEADLINE_CHARS: usize = 90;
 
-/// Second line of defense for CLAUDE.md rule 11 (#296): every model-facing
-/// prompt now asks the model not to use an em dash, but a prompt "cannot
-/// enforce the model" (rule 11's own wording), so this runs on every
-/// model-sourced string before it reaches a card or preview. Pure and
-/// independently unit-tested, on purpose: providers only ever hand back raw
-/// text, and nothing downstream of this function should need to know an em
-/// dash was ever possible.
+/// Second line of defense for AGENTS.md Hard Rule 11 (#296): every
+/// model-facing prompt now asks the model not to use an em dash, but a
+/// prompt "cannot enforce the model" (rule 11's own wording), so this runs
+/// on every model-sourced string before it reaches a card or preview. Pure
+/// and independently unit-tested, on purpose: providers only ever hand back
+/// raw text, and nothing downstream of this function should need to know an
+/// em dash was ever possible.
 ///
 /// Replaces a literal U+2014 with ", " (keeps the sentence readable without
-/// re-flowing punctuation) and then clamps to `max_chars` **characters**,
-/// never splitting a multi-byte codepoint (see [`truncate_chars`]).
+/// re-flowing punctuation), then clamps to `max_chars` **characters**, never
+/// splitting a multi-byte codepoint. A truncation is never silent: it ends
+/// with a single "…" (U+2026) *inside* the limit, so a cut mid-number or
+/// mid-word never reads as a complete answer (#406 review: a headline cut at
+/// 90 chars could otherwise change what value it states). The cut point
+/// prefers the last whitespace within the final ~15 characters of the kept
+/// text, so words are not chopped in half when a natural break is nearby;
+/// with no such break, it falls back to a hard cut at the character limit.
 pub fn sanitize_model_text(s: &str, max_chars: usize) -> String {
     let replaced = s.replace('\u{2014}', ", ");
-    truncate_chars(&replaced, max_chars).0
+    if replaced.chars().count() <= max_chars {
+        return replaced;
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    // One character of the budget is reserved for the ellipsis itself.
+    let keep = max_chars - 1;
+    let chars: Vec<char> = replaced.chars().take(keep).collect();
+
+    const BREAK_WINDOW: usize = 15;
+    let window_start = keep.saturating_sub(BREAK_WINDOW);
+    let cut_at = chars[window_start..]
+        .iter()
+        .rposition(|c| c.is_whitespace())
+        .map(|rel| window_start + rel)
+        .unwrap_or(keep);
+
+    let mut out: String = chars[..cut_at].iter().collect();
+    while out.ends_with(char::is_whitespace) {
+        out.pop();
+    }
+    out.push('\u{2026}');
+    out
 }
 
 /// Parses a `Completion::text` produced from a [`physics_request`] (i.e.
@@ -1749,6 +1779,32 @@ mod tests {
         assert!(!answer.headline.contains('\u{2014}'), "{}", answer.headline);
         assert_eq!(answer.detail, "the answer is 5, not 4");
         assert_eq!(answer.headline, "5, correction");
+    }
+
+    #[test]
+    fn sanitize_model_text_truncation_ends_with_an_ellipsis_within_the_limit() {
+        let long = "a".repeat(200);
+        let out = sanitize_model_text(&long, 90);
+        assert!(out.ends_with('\u{2026}'), "{out}");
+        assert!(out.chars().count() <= 90, "{}", out.chars().count());
+    }
+
+    #[test]
+    fn sanitize_model_text_prefers_cutting_at_the_last_whitespace_near_the_limit() {
+        // "0123456789 " (11 chars) repeated, with a space just inside the
+        // final ~15 characters of the 20-char budget -- the cut should land
+        // on that space rather than mid-digit.
+        let s = "0123456789 0123456789";
+        let out = sanitize_model_text(s, 20);
+        assert_eq!(out, "0123456789…");
+        assert!(out.chars().count() <= 20);
+    }
+
+    #[test]
+    fn sanitize_model_text_leaves_a_short_string_untouched() {
+        let out = sanitize_model_text("short", 90);
+        assert_eq!(out, "short");
+        assert!(!out.contains('\u{2026}'));
     }
 
     #[test]
