@@ -86,6 +86,26 @@ correctly under the new code, alongside the new field's default. This is
 issue #135's regression net: a settings or hotkey reset across an upgrade
 should fail a fixture test, not get discovered by a user.
 
+## Downloading a test build from a pull request
+
+CI builds `Wingman.exe` for every push to a pull request (the `ci` job's
+"Upload exe artifact" step in `.github/workflows/ci.yml`), so a reviewer can
+try a change without building it themselves:
+
+1. Open the pull request and go to its "Checks" tab, or open the run
+   directly from the commit's status check.
+2. Click the `CI` workflow run for the commit you want to try.
+3. Scroll to "Artifacts" at the bottom of the run summary page and download
+   `wingman-windows-exe` (a zip containing `Wingman.exe`).
+4. Unzip it and run `Wingman.exe` directly. It is unsigned and not
+   installed, so Windows SmartScreen may warn on first run; this is a
+   release-profile build of the exact commit under review, not a packaged
+   installer.
+
+You need to be signed in to GitHub to download workflow artifacts, and the
+artifact is retained for GitHub's default retention window before it
+expires.
+
 ## Commit sign-off (DCO)
 
 Every commit needs a Developer Certificate of Origin sign-off, certifying
