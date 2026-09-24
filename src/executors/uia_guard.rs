@@ -1,6 +1,6 @@
 //! The shared UIA-targeting deny-list (#31, for #32/#33). No executor may
 //! target a UI element whose name or automation id reads as a final-action
-//! button: CLAUDE.md's app description is explicit that "Wingman never
+//! button: AGENTS.md's app description is explicit that "Wingman never
 //! presses Send, Submit, Buy or Pay", and the expansion plan's "rules every
 //! executor obeys" adds Place order and Checkout. Neither `replace_text`
 //! (#32) nor `fill_form` (#33) exists yet -- this is a pure function with no

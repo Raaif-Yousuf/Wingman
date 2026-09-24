@@ -15,7 +15,7 @@ use super::Executor;
 
 /// Resolves an executor by name, or fails with the exact text an
 /// `actions.toml` naming an unknown executor surfaces on an error card
-/// (CLAUDE.md rule 7: a load error, not a panic; rule 11: no em dash).
+/// (AGENTS.md rule 7: a load error, not a panic; rule 11: no em dash).
 // Unused outside its own test and `actions::resolve_executor` (also
 // `#[allow(dead_code)]`) until the confirm-card issue calls a resolved
 // executor for real -- see `executors::mod`'s `Effect` doc comment.

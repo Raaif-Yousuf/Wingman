@@ -1,4 +1,4 @@
-//! The profile's hard payment-data denylist (issue #36, CLAUDE.md's "never
+//! The profile's hard payment-data denylist (issue #36, AGENTS.md's "never
 //! stores payment data" and the expansion plan's confirm rule 4: "the
 //! profile has no card, bank or password fields").
 //!
@@ -9,7 +9,7 @@
 //! to the user or written to a log (this module's own error strings never
 //! contain the value either, only the field name and the kind of match).
 //!
-//! No em dashes in the messages (CLAUDE.md rule 11): they are user-facing,
+//! No em dashes in the messages (AGENTS.md rule 11): they are user-facing,
 //! since a save that fails this check surfaces the message on a card.
 //!
 //! Deliberately dependency-free (no `regex`): every check below is a plain

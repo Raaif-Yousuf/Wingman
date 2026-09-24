@@ -587,7 +587,7 @@ before the first public push:
 | GitHub | Discussions on; roadmap as a pinned issue; labels below; `good first issue` on every catalogue action that needs no new executor |
 
 Already in place as of 2026-09-16, ported from the sibling CLAIR repo:
-`CLAUDE.md`, `docs/README.md`, four skills, the `cold-diff-reviewer` agent, two
+`AGENTS.md`, `docs/README.md`, four skills, the `cold-diff-reviewer` agent, two
 guard hooks, `NEXT_SESSION.md`, `OWNER_TODO.md`.
 
 Labels: `area:actions`, `area:executors`, `area:connectors`, `area:providers`,

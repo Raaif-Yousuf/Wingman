@@ -24,7 +24,7 @@ Outcome { summary, undo: Option<Box<dyn FnOnce()>> }`), and the overnight
 task brief pins a different shape (`Executor::execute(&self, Confirmed<P>)
 -> Result<Undo>`). Neither pins where `Confirmed`'s privacy boundary
 physically lives, whether `Executor` is object-safe, or what `P` is at the
-registry boundary. This is architectural per CLAUDE.md rule 12: it adds a
+registry boundary. This is architectural per AGENTS.md rule 12: it adds a
 new module (`executors/`) and a new privacy-load-bearing module
 (`ui::confirm`) whose whole job is that one specific type cannot be
 constructed anywhere else in the crate.
@@ -226,7 +226,7 @@ no state to undo for an action that only shows a card).
 Copies the confirmed proposal's `"text"` string field to the clipboard,
 recording whatever was on the clipboard beforehand so `undo()` restores it.
 Generic over a small injectable trait so tests never touch the real
-clipboard (CLAUDE.md rule 9 in spirit -- this isn't a named kernel object,
+clipboard (AGENTS.md rule 9 in spirit -- this isn't a named kernel object,
 but "touches a real shared OS resource from a test" is the same failure
 shape):
 

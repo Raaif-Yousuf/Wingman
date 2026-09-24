@@ -25,7 +25,7 @@
 
 .PARAMETER PfxPath
   Path to a PKCS#12 certificate file to sign the exe and the package with. If
-  omitted, both are left unsigned -- CLAUDE.md rule 4 (sparse package) still
+  omitted, both are left unsigned -- AGENTS.md rule 4 (sparse package) still
   applies to the manifest either way; signing only affects whether the
   artifact can be *deployed* with Add-AppxPackage, not whether it builds.
 

@@ -40,7 +40,7 @@ because it is easy.
 | 1 | **Wired to nothing** | Code that compiles, tests green, and does nothing at runtime. Eighteen recorded instances in the sibling repo, none caught by a test. See the `wired-to-nothing` skill for the checks. |
 | 2 | **Confirm-boundary holes** | Anything that lets an executor act without a `Confirmed<P>`, or lets a proposal change between the card and the act. The product promise is Look, Propose, Confirm, Do. |
 | 3 | **Leaks and lifetime bugs** | GDI/USER handles, COM interfaces, `HGLOBAL`, DIB sections, thread handles. A tray app that leaks runs for weeks. |
-| 4 | **Idle work** | Any timer, poll, spin or wake while the app is doing nothing. CLAUDE.md rule 5; the owner audits this machine to the tenth of a watt. |
+| 4 | **Idle work** | Any timer, poll, spin or wake while the app is doing nothing. AGENTS.md rule 5; the owner audits this machine to the tenth of a watt. |
 | 5 | **Unsound error paths** | A failure that ends in something other than a card, a swallowed `HRESULT`, a `?` that converts a recoverable error into an exit, an `unwrap` on the main thread. |
 | 6 | **Secret exposure** | A key reachable through `Debug`, a log line, a panic message, an error string, a serialized struct, a diagnostics dump. |
 | 7 | **Wrong results** | Arithmetic, unit conversion, time zones, encoding, surrogate pairs, off-by-one in slicing a `&str` by byte index. |
@@ -78,7 +78,7 @@ Check these by name; each has bitten this repo or its sibling at least once.
 - Slicing a `&str` or `OsString` by a byte index that may land inside a
   UTF-8 sequence or split a UTF-16 surrogate pair. Tray tooltips, card text
   and truncation helpers are the usual sites.
-- Em dashes in user-facing strings (CLAUDE.md rule 11). `tests/no_em_dash.rs`
+- Em dashes in user-facing strings (AGENTS.md rule 11). `tests/no_em_dash.rs`
   gates this; a new user-facing surface not covered by it is a finding.
 
 **Config, secrets, providers**
@@ -86,10 +86,10 @@ Check these by name; each has bitten this repo or its sibling at least once.
 - An env override that reads differently from the file value.
 - A provider error body echoed into a card verbatim.
 - `serde_json` `preserve_order` assumptions: schema property order is
-  load-bearing (CLAUDE.md rule 3). A schema built in the wrong order is a
+  load-bearing (AGENTS.md rule 3). A schema built in the wrong order is a
   correctness bug, not style.
 - Ollama: `localhost` instead of `127.0.0.1`, `think` left unset, `keep_alive`
-  nested inside `options` (CLAUDE.md rule 6).
+  nested inside `options` (AGENTS.md rule 6).
 
 **Prompts and schemas**
 - A prompt that describes an input the model is not actually given (the
@@ -123,5 +123,5 @@ would a user or a maintainer do differently because this exists?* If the
 answer is "nothing", it is a batch-into-one-issue item or nothing at all.
 
 Mark every unobserved claim `THEORY (unverified):` and add `needs-repro`
-(CLAUDE.md rule 10). An auditor who dresses a reading as an observation
+(AGENTS.md rule 10). An auditor who dresses a reading as an observation
 costs more than one who files nothing.

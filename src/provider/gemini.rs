@@ -4,7 +4,7 @@
 //! Sources, fetched 2026-09-17:
 //! - Endpoint shape, `x-goog-api-key` header (never `?key=` in the URL --
 //!   the URL ends up in ureq error strings and any future request log, and
-//!   CLAUDE.md rule 1 treats a secret leaking into either the same as a
+//!   AGENTS.md rule 1 treats a secret leaking into either the same as a
 //!   leak into the repo): <https://ai.google.dev/gemini-api/docs/generate-content/text-generation>
 //! - `inline_data`/`mime_type` Part shape, `candidates[].content.parts[].text`,
 //!   `candidates[].finishReason`, `promptFeedback.blockReason`,
@@ -15,7 +15,7 @@
 //!   schema carried over a protobuf `Struct`, which does not preserve key
 //!   order on its own): <https://blog.google/innovation-and-ai/technology/developers-tools/gemini-api-structured-outputs/>
 //!   ("the API now preserves the same order as the ordering of keys in the
-//!   schema"). This is what CLAUDE.md rule 3 needs -- see
+//!   schema"). This is what AGENTS.md rule 3 needs -- see
 //!   `response_json_schema_preserves_property_order` below for the actual
 //!   proof (a serialized-string check, matching #156's note in
 //!   `anthropic.rs`/`openai.rs`: `assert_eq!` on two `Value`s does not
@@ -75,7 +75,7 @@ impl Gemini {
     /// `{ENDPOINT_BASE}/{model}:generateContent`. Deliberately carries no
     /// query string: the API key goes in the `x-goog-api-key` header (see
     /// [`Gemini::complete`]), never in the URL, where it would leak into a
-    /// ureq transport-error string or any future request log (CLAUDE.md
+    /// ureq transport-error string or any future request log (AGENTS.md
     /// rule 1).
     fn endpoint_url(&self) -> String {
         format!("{ENDPOINT_BASE}/{}:generateContent", self.model)
@@ -280,7 +280,7 @@ impl Provider for Gemini {
 
         // The key goes in a header, never the URL (see `endpoint_url`'s
         // doc and `endpoint_url_never_contains_the_api_key` below) --
-        // CLAUDE.md rule 1: a key in the URL leaks into ureq's own
+        // AGENTS.md rule 1: a key in the URL leaks into ureq's own
         // transport-error strings and any future request log.
         let body_text = common::post_json(
             &url,

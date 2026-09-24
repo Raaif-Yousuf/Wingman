@@ -122,7 +122,7 @@ impl OpenAiCompat {
     ///   own Responses API (`input_image`) and Ollama's plain base64.
     /// - The schema, system text and image bytes all come from `req`: this
     ///   provider never builds the physics-check schema itself (#12).
-    /// - `serde_json` keeps `preserve_order` (CLAUDE.md rule 3), so a
+    /// - `serde_json` keeps `preserve_order` (AGENTS.md rule 3), so a
     ///   schema handed to `response_format.json_schema.schema` here keeps
     ///   the property order the caller built it with.
     fn build_body(&self, req: &Request) -> Value {
@@ -520,7 +520,7 @@ mod tests {
         assert!(system.contains("JSON Schema"));
     }
 
-    /// CLAUDE.md rule 3: `detail` must stay before `headline` in the schema
+    /// AGENTS.md rule 3: `detail` must stay before `headline` in the schema
     /// handed to `response_format.json_schema.schema`, unchanged from what
     /// `physics_request` built.
     #[test]
@@ -688,7 +688,7 @@ mod tests {
     /// doing that against a REAL `OpenAiCompat` would need its `complete()`
     /// to actually run, which means a real HTTP call -- forbidden for an
     /// automated test in this repo (see the ignored live check below
-    /// instead, and CLAUDE.md's "no live API calls").
+    /// instead, and AGENTS.md's "no live API calls").
     #[test]
     fn a_compat_provider_configured_text_only_reports_non_vision_to_the_chain() {
         use crate::provider::Chain;

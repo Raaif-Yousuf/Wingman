@@ -883,7 +883,7 @@ fn should_query_ollama_details(ollama_configured: bool, health: &OllamaHealth) -
 
 /// Combines #15's health check with #14's GPU/CPU indicator into the one
 /// status line Settings shows for Ollama. Computed once, synchronously,
-/// when Settings opens (CLAUDE.md rule 5: discovery happens on demand,
+/// when Settings opens (AGENTS.md rule 5: discovery happens on demand,
 /// never on a timer): the health check is Win32-only (no network at all)
 /// and always runs; the two HTTP calls it can make (`/api/ps`, `/api/tags`)
 /// only run when [`should_query_ollama_details`] says so (#188), and are
@@ -1176,7 +1176,7 @@ fn build_ui(
     // -- Ollama status (#14, #15) ----------------------------------------
     // One read-only line: whether anything answers on the configured
     // Ollama port, whether it's the stock tray app's CPU-only server
-    // (CLAUDE.md's "Stock Ollama's tray app steals port 11434" pitfall),
+    // (AGENTS.md's "Stock Ollama's tray app steals port 11434" pitfall),
     // and -- once it's confirmed to be a real server -- whether the
     // configured model is currently loaded on GPU or CPU and how many
     // local models support vision. See `ollama_status_line`.

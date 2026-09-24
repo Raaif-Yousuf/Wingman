@@ -17,7 +17,7 @@
 //!
 //! `list_tags`/`show_capabilities`/`ps` are plain blocking HTTP calls (same
 //! `ureq`, same 127.0.0.1-only rule as `ollama.rs`) and are cheap enough to
-//! call synchronously when a UI surface opens (CLAUDE.md rule 5: discovery
+//! call synchronously when a UI surface opens (AGENTS.md rule 5: discovery
 //! happens on demand, never on a timer). `pull` is the one exception -- a
 //! real download can run for minutes, so it must be called from a worker
 //! thread, never the UI thread; see its own doc comment.
@@ -48,7 +48,7 @@ use super::ollama::is_vision_model;
 // ===========================================================================
 
 /// Whether the listening process looks like the stock Ollama tray app's
-/// spawned server (CPU only -- CLAUDE.md's "Stock Ollama's tray app steals
+/// spawned server (CPU only -- AGENTS.md's "Stock Ollama's tray app steals
 /// port 11434" pitfall) or something else (a manually started server,
 /// possibly with `OLLAMA_IGPU_ENABLE=1` set so the Arc iGPU is actually
 /// used).
@@ -73,7 +73,7 @@ pub enum OllamaHealth {
 }
 
 impl OllamaHealth {
-    /// A single-line, user-facing message (CLAUDE.md rule 11: no em dashes
+    /// A single-line, user-facing message (AGENTS.md rule 11: no em dashes
     /// in user-facing strings).
     pub fn message(&self) -> String {
         match self {
@@ -297,7 +297,7 @@ pub fn port_from_base_url(base_url: &str) -> Option<u16> {
 }
 
 /// Local discovery calls (`/api/tags`, `/api/show`, `/api/ps`) are meant to
-/// run synchronously when a UI surface opens (CLAUDE.md rule 5), so their
+/// run synchronously when a UI surface opens (AGENTS.md rule 5), so their
 /// timeouts stay short: a hung/wedged server should not visibly stall
 /// Settings opening.
 const DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
@@ -478,7 +478,7 @@ impl GpuStatus {
 
 /// Classifies `model`'s current run state from a `/api/ps` listing.
 /// `size_vram > 0` is the ONLY oracle for GPU use on this hardware
-/// (CLAUDE.md rule 6 / the Arc iGPU pitfall: `ollama ps`'s own PROCESSOR
+/// (AGENTS.md rule 6 / the Arc iGPU pitfall: `ollama ps`'s own PROCESSOR
 /// column has been MEASURED mislabelling a real GPU run as CPU) -- this
 /// reads the field directly rather than going through the CLI.
 pub fn gpu_status_for(entries: &[PsEntry], model: &str) -> GpuStatus {
@@ -561,7 +561,7 @@ pub fn parse_pull_line(line: &str) -> Option<PullProgress> {
 /// moment a line carries `"error"` -- Ollama reports a pull failure inline
 /// in the stream (e.g. an unknown model name), not as an HTTP error status.
 ///
-/// This is a download-progress stream, not model output -- CLAUDE.md's "no
+/// This is a download-progress stream, not model output -- AGENTS.md's "no
 /// chat, no streaming" rule is about conversational completions, and
 /// nothing here surfaces text the model wrote.
 #[allow(dead_code)]
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn no_health_message_contains_an_em_dash() {
-        // CLAUDE.md rule 11: no em dashes in user-facing strings.
+        // AGENTS.md rule 11: no em dashes in user-facing strings.
         let messages = [
             OllamaHealth::NotListening.message(),
             OllamaHealth::Listening {
@@ -948,7 +948,7 @@ mod tests {
 
     #[test]
     fn gpu_status_for_reports_gpu_when_size_vram_is_positive() {
-        // Synthetic: size_vram > 0 is the ONLY oracle (CLAUDE.md rule 6) --
+        // Synthetic: size_vram > 0 is the ONLY oracle (AGENTS.md rule 6) --
         // not a real captured response, since capturing a "loaded on GPU"
         // response would require actually running a completion.
         let entries = vec![PsEntry {

@@ -53,7 +53,7 @@ def _to_forward(path: pathlib.Path) -> str:
 
 
 class MsysPathTranslationTests(unittest.TestCase):
-    """CLAUDE.md rule 15: the Bash tool here IS Git Bash, so `/c/...` is the
+    """AGENTS.md rule 14: the Bash tool here IS Git Bash, so `/c/...` is the
     idiomatic way an agent writes an absolute path, not an edge case."""
 
     def test_msys_style_path_is_blocked(self):

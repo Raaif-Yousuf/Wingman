@@ -2,7 +2,7 @@
 
 Status: **draft, owner approval owed.** Written 2026-09-19 against commit
 `a55ab42` to unblock issues **#236** and **#237**, both P1. No code was written
-for either; CLAUDE.md rule 12 says an architectural change gets a spec first,
+for either; AGENTS.md rule 12 says an architectural change gets a spec first,
 and both issues propose changing how the app decides that a request to act is
 legitimate. That is architecture.
 
@@ -30,7 +30,7 @@ same-user process.
 `ERROR_ALREADY_EXISTS`, treats it as a duplicate launch, calls `poke_existing`,
 finds no owner window, returns from the `let Ok(hwnd) = ... else { return; }`
 and exits with no tray icon, no card and no log line. Every launch after that,
-including autostart at every login, does the same. CLAUDE.md rule 7 says every
+including autostart at every login, does the same. AGENTS.md rule 7 says every
 failure ends in a card; this one ends in nothing.
 
 ## 2. The finding that should stop someone building the wrong fix
@@ -104,7 +104,7 @@ is now exactly the adversarial case, so:
   name must not be able to prevent the app from running, and the thing the lock
   guards against (two tray icons, two hooks, two billed calls per press) is
   defined by a live instance, which by construction is not there.
-- Surface it. A card on that path (CLAUDE.md rule 7) plus a diagnostics entry
+- Surface it. A card on that path (AGENTS.md rule 7) plus a diagnostics entry
   naming the condition: the name is held by a process that is not Wingman.
 
 Tradeoff, stated plainly so the owner can reject it: if a genuine instance is
@@ -161,7 +161,7 @@ the sender" is a category error rather than an unfinished feature.
 
 ## 6. What "done" looks like
 
-Each is one observable, per CLAUDE.md rule 8.
+Each is one observable, per AGENTS.md rule 8.
 
 1. A unit test asserts the owner window handle exists before
    `single_instance::acquire` is called in `app::run` (source-scanning in the

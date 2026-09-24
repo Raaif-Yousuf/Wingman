@@ -920,7 +920,7 @@ const OFFLINE_TINT_FACTOR: f32 = 0.35;
 /// by `factor`. Pure and allocation-free so the transform itself is
 /// unit-tested without touching GDI -- [`derive_icon_with_transform`] is
 /// the only place that reads or writes real pixel memory, and is Win32-only
-/// (checked by hand per CLAUDE.md rule 8; the manual check itself is named
+/// (checked by hand per AGENTS.md rule 8; the manual check itself is named
 /// on issue #20's closing comment and issue #166).
 fn grey_pixel([b, g, r, a]: [u8; 4], factor: f32) -> [u8; 4] {
     let luma = 0.114 * b as f32 + 0.587 * g as f32 + 0.299 * r as f32;

@@ -37,7 +37,7 @@
 //!    target by name/automation id
 //!    ([`super::uia_guard::is_forbidden_target`]) ->
 //!    [`RefuseReason::InvokableOrForbiddenTarget`]. Never touches a button,
-//!    regardless of its label (CLAUDE.md: "Wingman never presses Send,
+//!    regardless of its label (AGENTS.md: "Wingman never presses Send,
 //!    Submit, Buy or Pay").
 //! 5. **Payment-looking label** ([`is_payment_label`]) ->
 //!    [`RefuseReason::PaymentLabel`]. Card number, CVV/CVC, expiry, IBAN,
@@ -314,7 +314,7 @@ pub fn decide_restore_action(
 }
 
 /// Renders a completed fill's per-field outcomes into the `Undo::summary`
-/// the result card shows (CLAUDE.md rule 5: "say what happened, not what
+/// the result card shows (AGENTS.md rule 5: "say what happened, not what
 /// was intended"). No em dash (rule 11).
 pub fn format_outcomes(results: &[FieldResult]) -> String {
     let filled = results

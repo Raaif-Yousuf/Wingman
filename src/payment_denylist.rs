@@ -4,7 +4,7 @@
 //! `profile::denylist::contains_cvv_label`/`contains_bank_label` (a profile
 //! field's name or value, checked on every save and load) each maintained
 //! their own separately-worded term list for the same underlying concept
-//! (CLAUDE.md rule: never store or fill payment data). Filed as #215 the
+//! (AGENTS.md rule: never store or fill payment data). Filed as #215 the
 //! night both landed in parallel with no shared vocabulary; this module is
 //! the reconciliation: one canonical table per payment concept (card
 //! number, expiry, IBAN, CVV, bank/routing), both call sites read from it,

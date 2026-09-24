@@ -10,7 +10,7 @@
 //! staged rectangle into the overlay's result. See [`select_region`] for the
 //! public entry point.
 //!
-//! Two layers, same split as `ui::card` and for the same reason (CLAUDE.md
+//! Two layers, same split as `ui::card` and for the same reason (AGENTS.md
 //! rule 8):
 //!
 //! - **Pure geometry** (top of this file): [`Rect`] and every function that
@@ -229,7 +229,7 @@ pub fn resolve_window_selection(
 /// taken once, before the overlay's own window is created, has no such
 /// problem -- the overlay cannot be in a list captured before it exists --
 /// and it turns "which window is under this click" into the pure, testable
-/// [`window_at_point`] below, per CLAUDE.md rule 8 (pure logic is unit
+/// [`window_at_point`] below, per AGENTS.md rule 8 (pure logic is unit
 /// tested; Win32 is checked by hand). The alternative (hide the overlay,
 /// `WindowFromPoint`, restore) was rejected: it races a repaint (a visible
 /// flicker) and stays untestable without a live desktop, where this shape
@@ -606,7 +606,7 @@ impl Overlay {
             let ret = unsafe { GetMessageW(&mut msg, Some(self.inner.hwnd), 0, 0) };
             if ret.0 <= 0 {
                 // WM_QUIT or an error -- treat as a cancel rather than
-                // hanging forever (CLAUDE.md rule 7: every path ends in a
+                // hanging forever (AGENTS.md rule 7: every path ends in a
                 // card, never a silent hang).
                 return OverlayOutcome::Cancelled;
             }
@@ -1051,7 +1051,7 @@ mod win32 {
     /// Captures every visible, non-minimized top-level window's bounds, in
     /// Z-order (topmost first -- `EnumWindows` already enumerates that way),
     /// at the instant this is called. Real Win32, not unit-tested directly
-    /// (CLAUDE.md rule 8) -- [`super::window_at_point`] is the pure decision
+    /// (AGENTS.md rule 8) -- [`super::window_at_point`] is the pure decision
     /// this feeds, and IS unit-tested.
     ///
     /// **#271's fix**: [`super::Overlay::create`] calls this BEFORE

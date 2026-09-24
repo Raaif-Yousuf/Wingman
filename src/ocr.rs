@@ -4,7 +4,7 @@
 //! RGBA8 pixels (the shape `capture::RawShot` already holds) rather than
 //! depending on `capture` or `provider`, so the orchestrator can move it
 //! under `inputs/` at merge without untangling a dependency on either.
-//! Must not call the network (see CLAUDE.md's `inputs/ocr.rs` row).
+//! Must not call the network (see AGENTS.md's `inputs/ocr.rs` row).
 //!
 //! **MEASURED 2026-09-17** (this module's `ocr_live_recognizes_gdi_rendered_text`
 //! test, run manually per its own doc comment): a plain `cargo test` binary
@@ -12,7 +12,7 @@
 //! `GetCurrentPackageFullName` returns `APPMODEL_ERROR_NO_PACKAGE`), and
 //! `OcrEngine::RecognizeAsync` over a synthetic GDI-rendered image still
 //! succeeds from that binary: cold call 36 ms, warm call 22 ms, recognizer
-//! language `en-US`, `OcrEngine::MaxImageDimension()` 10000. See CLAUDE.md's
+//! language `en-US`, `OcrEngine::MaxImageDimension()` 10000. See AGENTS.md's
 //! "Windows OCR under a sparse package" pitfall, updated in place with this
 //! result, for what remains THEORY (unverified) -- whether an exe launched
 //! via the `Run` key while the sparse package is installed elsewhere on the
@@ -69,7 +69,7 @@ pub struct OcrOutput {
 /// `GetCurrentPackageFullName` returns something other than
 /// `APPMODEL_ERROR_NO_PACKAGE`. Windows OCR is documented as requiring
 /// package identity for some WinRT surfaces; see this module's doc comment
-/// and CLAUDE.md's pitfall for what was actually measured. Cheap and
+/// and AGENTS.md's pitfall for what was actually measured. Cheap and
 /// side-effect-free -- safe to call from any thread, no apartment needed.
 pub fn has_package_identity() -> bool {
     let mut len: u32 = 0;
@@ -613,14 +613,14 @@ mod tests {
     /// The measurement issue #30 exists to make: does `Windows.Media.Ocr`
     /// work from a process with no package identity, and how fast.
     ///
-    /// Run manually (CLAUDE.md build rules -- never bare `cargo test`):
+    /// Run manually (AGENTS.md build rules -- never bare `cargo test`):
     /// ```text
     /// export CARGO_TARGET_DIR=C:/Users/raaif/Wingman/target/wt/<worktree> RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2
     /// cargo test ocr_live -- --ignored --nocapture
     /// ```
     /// Prints `MEASURED 2026-09-17:` lines with the cold/warm latency and
     /// recognizer language actually observed; the module doc comment above
-    /// and CLAUDE.md's "Windows OCR under a sparse package" pitfall were
+    /// and AGENTS.md's "Windows OCR under a sparse package" pitfall were
     /// updated from one such run's output.
     #[test]
     #[ignore = "live WinRT OCR call against a rendered image; run manually, see this test's doc comment"]

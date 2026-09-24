@@ -3,7 +3,7 @@
 //! fallback synthetic Ctrl+C with byte-exact clipboard restore" / "must not:
 //! leave the clipboard changed").
 //!
-//! Two layers, same split as `inputs::uia` and for the same reason (CLAUDE.md
+//! Two layers, same split as `inputs::uia` and for the same reason (AGENTS.md
 //! rule 8: pure logic is unit-tested, Win32 is checked by hand and the check
 //! is named):
 //!
@@ -66,11 +66,11 @@
 //! 4. **Wait, event-driven, bounded.** [`win32::wait_for_clipboard_update`]
 //!    registers `AddClipboardFormatListener` on a message-only window and
 //!    blocks on `MsgWaitForMultipleObjects` up to the caller's budget,
-//!    rather than a sleep-polling loop (CLAUDE.md rule 5).
+//!    rather than a sleep-polling loop (AGENTS.md rule 5).
 //! 5. **Read `CF_UNICODETEXT`**, then **always restore** via
 //!    [`ClipboardGuard`]'s explicit `restore_now` on the success path, and
 //!    its `Drop` impl as the safety net for every other path (timeout,
-//!    error, an early `?`) -- CLAUDE.md rule 7's "every failure ends in a
+//!    error, an early `?`) -- AGENTS.md rule 7's "every failure ends in a
 //!    card", never a modified clipboard.
 //!
 //! ## What is and is not preserved
@@ -157,7 +157,7 @@ pub const DEFAULT_MAX_CHARS: usize = 20_000;
 /// sequence-number change) after injecting Ctrl+C before giving up and
 /// restoring the clipboard anyway. Generous enough for a slow app to finish
 /// its own copy handler; still short enough that a card is never stuck
-/// waiting on it (CLAUDE.md rule 7).
+/// waiting on it (AGENTS.md rule 7).
 #[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub const DEFAULT_CLIPBOARD_WAIT_BUDGET: Duration = Duration::from_millis(1500);
 
@@ -529,7 +529,7 @@ pub fn restore_and_verify(
 }
 
 /// RAII guard: captures the clipboard on construction, and guarantees a
-/// restore attempt no matter how the caller's scope ends (CLAUDE.md rule 7 /
+/// restore attempt no matter how the caller's scope ends (AGENTS.md rule 7 /
 /// the task brief: "Never leave the user's clipboard modified on any path").
 /// [`ClipboardGuard::restore_now`] is the primary, verified path; `Drop` is
 /// the safety net for every path that does not reach it (an early `?`, a
@@ -946,7 +946,7 @@ mod win32 {
     /// transiently fail if another process holds the clipboard open (a very
     /// short window in practice); this retries a bounded number of times
     /// with a short sleep between attempts. This is NOT the idle-polling
-    /// CLAUDE.md rule 5 forbids -- it only runs during an actively
+    /// AGENTS.md rule 5 forbids -- it only runs during an actively
     /// in-progress, user-triggered clipboard operation, never while idle,
     /// and gives up (returning the last error) after a bounded number of
     /// tries rather than looping forever.
@@ -1131,7 +1131,7 @@ mod win32 {
         OK.get().copied().unwrap_or(false)
     }
 
-    /// Blocks (event-driven, no sleep-polling loop -- CLAUDE.md rule 5)
+    /// Blocks (event-driven, no sleep-polling loop -- AGENTS.md rule 5)
     /// until either the clipboard's sequence number differs from
     /// `sequence_before` or `budget` elapses, whichever comes first. Returns
     /// whether a change was observed. A message-only listener window plus

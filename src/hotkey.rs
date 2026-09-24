@@ -239,7 +239,7 @@ fn unpack_chord(packed: u64) -> Chord {
 
 /// Outcome of checking a keydown's chord against the configured
 /// pause-toggle chord (issue #181), independent of Win32/atomics so it is
-/// unit-tested directly (CLAUDE.md rule 8). Fires the same whether the app
+/// unit-tested directly (AGENTS.md rule 8). Fires the same whether the app
 /// is currently paused or running -- `app.rs`'s `WM_APP_PAUSE_TOGGLE`
 /// handler decides pause-vs-resume from its own `PauseState`, not from
 /// anything computed here.

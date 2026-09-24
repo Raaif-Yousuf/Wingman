@@ -167,7 +167,7 @@ pub fn control_type_str(kind: ControlKind) -> &'static str {
 /// candidate. `inputs::uia::snapshot_foreground` already never emits a
 /// button (or anything else outside its six known control kinds) as a
 /// `FieldSnapshot` at all -- see that module's `build_snapshot` -- so
-/// "never touches a button" (CLAUDE.md, Wingman never presses Send/Submit)
+/// "never touches a button" (AGENTS.md, Wingman never presses Send/Submit)
 /// holds by construction upstream of this function; this narrows further,
 /// to the three kinds `executors::target::is_editable_control_type` (and
 /// therefore `TextElementAccess::write`/`write_with_fallback`) actually
@@ -1968,7 +1968,7 @@ mod tests {
     //
     // #40's task brief: "profile in a temp dir, local mapping fills all
     // three with zero model calls (assert no provider called), button
-    // untouched." `#[ignore]`d (CLAUDE.md: no live app launch in this
+    // untouched." `#[ignore]`d (AGENTS.md: no live app launch in this
     // task) -- run by hand with
     // `cargo test fill_form_live -- --ignored --nocapture`.
     mod win32 {

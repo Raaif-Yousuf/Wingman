@@ -10,7 +10,7 @@
 //! [`protect`] and [`unprotect`] always pass `CRYPTPROTECT_UI_FORBIDDEN`.
 //! Without it, a corrupted key store or an unusual account configuration
 //! can make DPAPI pop a credential prompt -- exactly the dialog box
-//! CLAUDE.md rule 7 promises this app never shows. Forbidding it turns that
+//! AGENTS.md rule 7 promises this app never shows. Forbidding it turns that
 //! case into an ordinary `Err` a caller can turn into a card instead.
 //!
 //! # Envelope format

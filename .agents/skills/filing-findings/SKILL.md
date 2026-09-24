@@ -17,7 +17,7 @@ gh issue list --state all --search "<two or three distinctive words>" --limit 20
 Search by the symptom and by the function name. If it exists, add a comment
 with your new evidence instead of a new issue.
 
-## 2. Classify honestly (CLAUDE.md rule 10)
+## 2. Classify honestly (AGENTS.md rule 10)
 
 | You have | Labels | Title starts with |
 |---|---|---|
