@@ -8,20 +8,28 @@ future path and how to contribute to the app as it exists today.
 
 ## Where the project actually is
 
-Read this before writing code: today's app is one hotkey, one screenshot,
-one cloud model call, one read-only card (`README.md` has the details). The
-**actions framework described below in "Add an action in 20 minutes" does
-not exist in the code yet.** It is the target shape from the [expansion
-plan](docs/superpowers/specs/2026-09-16-expansion-plan-design.md) §6, written
-here so the format is settled before anyone builds the framework or the
-first catalogue action against it. If you want to contribute to the actions
-framework itself (`actions/`, the proposal schema registry, the intent
-router, the palette), that is Phase 2 work; open an issue or comment on an
-existing one before starting, per the spec-first rule below.
+Read this before writing code: the actions framework (`src/actions/`,
+`actions.toml`) is real and built, not a target shape. Five built-in
+actions run end to end today (check my work, add event from screen, review
+this email, fill this form, copy text from screen), each going through the
+real Look, Propose, Confirm, Do loop (`README.md` has the details). What is
+still missing is narrower: a *new*, hand-written `actions.toml` entry
+parses and shows in the palette, but does not yet dispatch on confirm
+(issue #242); only the five built-in action ids run today.
+
+The walkthrough below, "Add an action in 20 minutes", writes and reviews a
+real `actions.toml` entry and its prompt/schema against the shipped
+framework; the one step it cannot yet run end to end is the confirm step,
+which is blocked on #242. If you want to help unblock arbitrary action
+dispatch itself (`src/actions/`, the intent router, the palette), open an
+issue or comment on an existing one before starting, per the spec-first
+rule below.
 
 Contributions that work against the app as it exists today (the hotkey
-path, capture, the settings window, the card, the tray, provider code) are
-welcome right now and do not need any of the actions-framework scaffolding.
+path, capture, the settings window, the card, the tray, provider code, or a
+new catalogue action) are welcome right now. See the
+[good first issue list](https://github.com/Raaif-Yousuf/Wingman/labels/good%20first%20issue)
+for a place to start.
 
 ## Prerequisites
 
@@ -30,9 +38,8 @@ welcome right now and do not need any of the actions-framework scaffolding.
   another OS, though `cargo check` may get partway on one.
 - An OpenAI or Anthropic API key to exercise the running app end to end.
   Not required to build or run the unit tests.
-- Optional: [Ollama](https://ollama.com) running locally, only relevant once
-  local-model support (Phase 1 of the plan) exists; nothing in the current
-  codebase talks to it yet.
+- Optional: [Ollama](https://ollama.com) running locally on `127.0.0.1:11434`
+  to exercise the built local-model provider (`src/provider/ollama.rs`).
 
 ## Before you write code: spec-first for anything architectural
 
@@ -121,13 +128,15 @@ your configured `git config user.name` / `user.email`. Pull requests without
 it will be asked to amend (`git commit --amend -s` for the last commit, or
 `git rebase --exec 'git commit --amend --no-edit -s' -i <base>` for several).
 
-## Add an action in 20 minutes (target format, Phase 2)
+## Add an action in 20 minutes
 
 This walks through adding **Translate selection**, the catalogue action the
 expansion plan names as the worked example (§6), because it needs no new
 executor: it reads the current text selection and hands back translated text
-on a read-only card. Every step below describes the framework as designed;
-none of it can be run yet.
+on a read-only card. Every step below runs against the shipped framework,
+except that a hand-written action id will not yet dispatch on confirm
+(issue #242); the entry, its prompt and its schema can be written, loaded
+and reviewed today.
 
 See [`docs/actions.md`](docs/actions.md) for the full `actions.toml` schema
 (checked against the code, with worked examples) and

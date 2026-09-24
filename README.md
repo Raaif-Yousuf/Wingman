@@ -33,6 +33,17 @@ about Wingman is checked against the code in this repo, not aspirational.
 | **Not a chatbot** | One press, one action, one card, done. No conversation view, no follow-up question | Copilot is a chat pane first, everything else second |
 | **Bring your own model** | OpenAI, Anthropic, Gemini, a local Ollama model, or any OpenAI-compatible endpoint (OpenRouter, Groq, LM Studio, llama.cpp, vLLM, ...) today. No account or subscription required for the app itself | Recall and Click to Do require a 40+ TOPS NPU; the strongest models sit behind Copilot Pro |
 
+### What Wingman will never be
+
+- Never a chat window or a conversation history: one press, one action, one
+  card.
+- Never a follow-up question: the palette filters actions and takes a
+  one-line question at most, never a thread.
+- Never something you have to type into to get value: pick an action and
+  confirm.
+- Never the final button: it fills, drafts and proposes, never presses
+  Send, Submit, Buy or Pay.
+
 ## What works today
 
 Five built-in actions, built and running, all reachable from the tray menu:
