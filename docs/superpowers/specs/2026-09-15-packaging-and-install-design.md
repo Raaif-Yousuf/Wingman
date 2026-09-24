@@ -21,12 +21,23 @@ path registered against it.
 
 ## Install layout
 
+Current, post-rename (issues #1 and #10, both closed; identity from
+`packaging\Wingman.Common.psm1`'s `Get-WingmanIdentity`):
+
 | What | Where |
 |---|---|
-| executable | `%LOCALAPPDATA%\Programs\copilot-ask\copilot-ask.exe` |
+| executable | `%LOCALAPPDATA%\Programs\Wingman\wingman.exe` |
 | config | `%APPDATA%\Wingman\config.toml` (renamed from `%APPDATA%\copilot-ask\config.toml`, issue #1; the old file is left in place and copied forward once, on first run) |
-| signing certificate | `%LOCALAPPDATA%\Programs\copilot-ask\copilot-ask.cer` |
-| sparse package | installed by identity; no payload on disk |
+| signing certificate | `%LOCALAPPDATA%\Programs\Wingman\wingman.cer` |
+| sparse package | installed by identity (`RaaifYousuf.Wingman`); no payload on disk |
+
+As originally written (below, and the "Confirmed on 2026-09-15" measurement
+and the manifest example further down), this document used the pre-rename
+`%LOCALAPPDATA%\Programs\copilot-ask\copilot-ask.exe` / `RaaifYousuf.CopilotAsk`
+identity, since the rename (issue #1) and the identity/icon work (issue #10)
+had not yet landed when it was written. Both are done now; `uninstall.ps1`
+still cleans up that pre-rename `copilot-ask` install (the `Legacy` identity
+in `Get-WingmanIdentity`) wherever it is still found on a machine.
 
 `%LOCALAPPDATA%\Programs` matches where other per-user apps on this machine
 install, needs no admin, and is stable across rebuilds.
@@ -65,14 +76,22 @@ providers. Querying the same catalog the Settings picker reads —
 Package=RaaifYousuf.CopilotAsk_pa8sd8xv631fa`. It is the *only* entry;
 Microsoft Copilot itself is special-cased by the shell rather than registered
 through this extension. The full-MSIX fallback was therefore never needed.
+(This measurement predates the 2026-09-16 rename, issues #1 and #10, both
+closed; the mechanism it confirms -- sparse packages are enumerated as
+Copilot key providers -- still holds, but a fresh query today would return
+`DisplayName='Wingman' Id='Wingman' Package=RaaifYousuf.Wingman_...` instead
+of the `copilot-ask`/`CopilotAsk` values shown here.)
 
 ## Manifest
 
 Identity publisher must match the signing certificate subject exactly, or
-deployment fails with `0x800B0109`.
+deployment fails with `0x800B0109`. Shown here with the current,
+post-rename identity (`packaging\AppxManifest.xml.in`); the pre-rename
+manifest used `Name="RaaifYousuf.CopilotAsk"` and `DisplayName="copilot-ask"`
+in the same two places.
 
 ```xml
-<Identity Name="RaaifYousuf.CopilotAsk" Publisher="CN=Raaif Yousuf" Version="0.1.0.0" />
+<Identity Name="RaaifYousuf.Wingman" Publisher="CN=Raaif Yousuf" Version="0.1.0.0" />
 ```
 
 Three things the manifest carries beyond the basics:
@@ -86,7 +105,7 @@ Three things the manifest carries beyond the basics:
 ```xml
 <uap3:Extension Category="windows.appExtension">
   <uap3:AppExtension Name="com.microsoft.windows.copilotkeyprovider"
-                     Id="CopilotAsk" DisplayName="copilot-ask"
+                     Id="Wingman" DisplayName="Wingman"
                      Description="Check what's on screen with a vision model"
                      PublicFolder="Public" />
 </uap3:Extension>

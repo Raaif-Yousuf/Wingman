@@ -27,8 +27,41 @@ preview. Say yes or adjust.
 ## 4. The Copilot key picker click (carried over from 2026-09-15)
 
 Settings ▸ Bluetooth & devices ▸ Keyboard ▸ Customize Copilot key on keyboard
-▸ Custom ▸ copilot-ask. Shell-protected; no script can do it. Needs re-doing
-once after the rename to Wingman. If already done, delete this row.
+▸ Custom ▸ Wingman. Shell-protected; no script can do it. Needs re-doing
+once after the rename. If already done, delete this row.
+
+## 7. Approve or reject the activation trust spec (added 2026-09-19)
+
+`docs/superpowers/specs/2026-09-19-activation-trust-design.md` covers issues
+#236 and #237, both P1, and no code was written for either because rule 12
+says an architectural change gets an approved spec first. Its § 7 asks four
+questions, one of which has a real downside you should weigh rather than
+wave through: whether Wingman should **start anyway, without the lock**, when
+the single-instance name is held but no owner window answers after two
+seconds. That is what stops a squatter blocking every launch forever,
+including at login, and the cost is a second instance if a genuine one is ever
+alive that long with no window.
+
+The spec's other conclusion is worth a minute even if you reject the rest:
+sender authentication cannot close either hole against a process running as
+you, so the named-pipe fix both issues suggest would be a week spent on a
+property the threat model cannot have.
+
+## 8. Four manual desktop checks (added 2026-09-19, tracked on #166)
+
+Tonight's round produced four findings that cannot be closed without a live
+desktop, two of them against fixes that have now landed:
+
+- **#271**: open the region overlay over two overlapping real windows, click
+  without dragging on the front one, and check the size label matches that
+  window rather than the whole desktop. Also click bare desktop background:
+  the fixing agent flagged, as an unverified theory, that Progman/WorkerW may
+  appear in the window snapshot and stage a whole monitor.
+- **#272**: open the overlay, Alt-Tab away, and check it disappears rather
+  than sticking on screen unresponsive to Escape.
+- **#261**: needs a genuinely hung UIA provider to observe `busy` wedging.
+- **#255**: needs a real focused preview control destroyed with
+  `DestroyWindow`, to see what `WM_KILLFOCUS` Windows actually delivers.
 
 ## 5. GitHub repo settings (one-time, in the browser)
 

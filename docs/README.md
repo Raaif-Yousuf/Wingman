@@ -19,7 +19,7 @@ handoff snapshot, or a human-only action: those are four different things.
 | `docs/superpowers/specs/` | design decisions and their rationale, one dated file per topic | written before the code; superseded specs say so at the top and stay in git |
 | [`NEXT_SESSION.md`](../NEXT_SESSION.md) | where the last session stopped and what the next one should do first | fully overwritten each session; no history |
 | [`OWNER_TODO.md`](../OWNER_TODO.md) | actions only a human can take: a Settings click, a repo name, an account | rows deleted when done |
-| `CHANGELOG.md` (planned, Keep a Changelog) | what shipped, per version | append-only |
+| [`CHANGELOG.md`](../CHANGELOG.md) (Keep a Changelog) | what shipped, per version | append-only |
 
 ## Reading order for a new contributor
 
@@ -40,6 +40,8 @@ instructions live there, not duplicated here.
 | `fixing-a-bug` | Fixing any bug or regression, before writing fix code. Also when a fix "should work" but the symptom persists |
 | `wired-to-nothing` | Before reporting any change as done. The Win32-specific list of ways code compiles, passes and does nothing |
 | `working-an-issue` | Before starting or closing any GitHub issue |
+| `filing-findings` | Before filing an issue about something you noticed, and for the shared-machine cargo RAM rules |
+| `auditing-a-module` | Auditing a module or file set for defects worth filing, and when dispatched as a read-only auditor in a fan-out |
 
 Agents (`.claude/agents/`): `cold-diff-reviewer` reviews a diff with no ticket
 or author framing, checking for this repo's recorded bug shapes.
@@ -58,7 +60,9 @@ before they run. Both scripts explain the replacement in their message.
 | [providers.md](providers.md) | Per-provider request shapes, auth and key storage, effort/thinking mapping, structured-output mechanism, retry/429 handling, Ollama-specific facts, how to add Ollama or Gemini to `providers.order` by hand |
 | [offline.md](offline.md) | The four modes exactly as `mode.rs` implements them, what the Offline guard blocks and where, what it cannot guarantee, how to verify it with pktmon or Resource Monitor |
 | [reproducible-builds.md](reproducible-builds.md) | What is and is not verified byte-for-byte reproducible (`wingman.exe` is, `wingman.msix` is not yet), the `/Brepro`/`SOURCE_DATE_EPOCH`/toolchain-pin measurement, how to reproduce it, and the CycloneDX SBOM `release.yml` attaches to every release |
+| [actions.md](actions.md) | The `actions.toml` schema field by field, two worked examples, the proposal schema registry, and why `serde_json` keeps `preserve_order` |
+| [executors.md](executors.md) | The executor contract, the four rules, the `Confirmed<P>` privacy boundary, the stale-target check, and the never-Send/Submit/Buy/Pay rule |
+| [audit-coverage.md](audit-coverage.md) | Which parts of the tree an auditor has actually read, when, and what came out. The issue tracker cannot tell you where nobody has looked |
+| [positioning.md](positioning.md) | Positioning and launch research (Hacker News, GitHub, Windows enthusiast forums, tech press), the one-line pitch, and the launch-day checklist |
 
-Planned, per the expansion plan § 10: `architecture.md`, `actions.md`, and at
-the root `PRIVACY.md`, `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`,
-`THIRD_PARTY_NOTICES.md`.
+Planned, per the expansion plan § 10: `architecture.md`.

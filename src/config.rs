@@ -69,6 +69,13 @@ pub struct Config {
     /// #40 "Fill this form". See [`Forms`]'s own doc comment for the
     /// still-owed owner decision this carries.
     pub forms: Forms,
+    /// #105 "Show me what you're sending". Default off (existing behaviour
+    /// unchanged): there is no Settings UI to flip this yet
+    /// (`ui/settings.rs`, Phase 3), so today the only way to turn it on is
+    /// hand-editing `config.toml`. See [`EgressPreview`]'s own doc comment
+    /// and `provider::common`'s `send_preview_guard` for what turning it on
+    /// actually does today versus what still has to be wired up.
+    pub egress_preview: EgressPreview,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -515,6 +522,18 @@ impl Default for Palette {
     }
 }
 
+// #257: a per-thread test seam that makes `Config::restrict_acl` report
+// failure deterministically, so tests can prove the "abort the write rather
+// than leave a live key in an unprotected file" contract without mutating
+// process-wide state (`USERNAME`) that unrelated tests running on other
+// threads also depend on. `cargo test` runs each test function on its own
+// OS thread, so a `thread_local` is exactly as isolated as the test itself
+// and cannot leak into a concurrently-running test.
+#[cfg(test)]
+thread_local! {
+    static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Config {
     /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {
@@ -554,7 +573,29 @@ impl Config {
         if let Some(parent) = new_path.parent() {
             fs::create_dir_all(parent).context("failed to create the new config directory")?;
         }
-        fs::copy(old_path, new_path).context("failed to copy the old config forward")?;
+
+        // #257: copy to a temp file and restrict its ACL before it is ever
+        // visible under `new_path`, the same abort-on-failure discipline as
+        // `save_to`. Before this fix, `migrate_from` never restricted the
+        // ACL at all, so a live `api_key` carried forward by the rename
+        // migration landed in a file with whatever permissions it inherited.
+        let mut tmp_name = new_path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_name);
+        fs::copy(old_path, &tmp_path).context("failed to copy the old config forward")?;
+
+        #[cfg(windows)]
+        if let Err(e) = Self::restrict_acl(&tmp_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e).context(
+                "failed to restrict permissions on the migrated config file; the \
+                 migration was aborted rather than leave an API key in an \
+                 unprotected file",
+            );
+        }
+
+        fs::rename(&tmp_path, new_path)
+            .context("failed to move the migrated config file into place")?;
         Ok(true)
     }
 
@@ -942,30 +983,62 @@ impl Config {
         tmp_name.push(".tmp");
         let tmp_path = PathBuf::from(tmp_name);
         fs::write(&tmp_path, &toml_str).context("failed to write config temp file")?;
-        fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
 
+        // #257: restrict the ACL on the TEMP file, before it is ever visible
+        // under the real name, and never rename an unrestricted file into
+        // place. The old order (rename, then restrict) left a window where
+        // the finally-named file existed, held a live key, and had whatever
+        // ACL the rename happened to produce; it also swallowed a failure
+        // there and let the write stand regardless. Now a failure aborts
+        // the write entirely instead.
         #[cfg(windows)]
-        Self::restrict_acl(path);
+        if let Err(e) = Self::restrict_acl(&tmp_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e).context(
+                "failed to restrict the config file's permissions to the current \
+                 user; the write was aborted rather than leave an API key in an \
+                 unprotected file",
+            );
+        }
+
+        fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
 
         Ok(())
     }
 
-    /// Restricts the config file's ACL to the current user only, via
-    /// `icacls`. Best-effort: any failure (missing binary, non-NTFS volume,
-    /// etc.) is ignored rather than propagated, since the config file is
-    /// still perfectly usable without it.
+    /// Restricts a file's ACL to the current user only, via `icacls`.
+    /// Returns an error rather than swallowing one (#257): a caller that
+    /// cannot show a card itself (this module never does, per rule 7) must
+    /// propagate this so whichever caller CAN show one does.
     #[cfg(windows)]
-    fn restrict_acl(path: &Path) {
-        let username = match std::env::var("USERNAME") {
-            Ok(u) if !u.is_empty() => u,
-            _ => return,
-        };
-        let _ = std::process::Command::new("icacls")
+    fn restrict_acl(path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.get()) {
+            anyhow::bail!("ACL restriction forced to fail for a test");
+        }
+
+        let username = std::env::var("USERNAME")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .context(
+                "the USERNAME environment variable is not set; cannot restrict \
+                 the config file to the current user",
+            )?;
+        let output = std::process::Command::new("icacls")
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
             .arg(format!("{username}:F"))
-            .output();
+            .output()
+            .context("failed to run icacls to restrict the config file's permissions")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "icacls exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
     }
 
     /// Builds the provider fallback chain per `providers.order`, ignoring
@@ -1009,31 +1082,71 @@ pub(crate) struct ProviderDescriptor {
 
 impl Providers {
     /// Constructs the `Provider` for one `providers.order` name against
-    /// `self`'s per-provider config, or `None` for an unrecognized name.
-    /// The one name-to-provider mapping [`Providers::build_chain`] and
-    /// [`Providers::build_chain_for_mode`] (#19) both build from, so the
-    /// two can never drift apart from each other (see the
-    /// `wired-to-nothing` skill's "hard-coded list" row).
+    /// `self`'s per-provider config, using that provider's configured
+    /// "active" model. Thin wrapper over
+    /// [`Providers::provider_for_named_model`] with `model: None` -- see
+    /// that function's doc for why it, not this one, is now the single
+    /// name-to-provider match arm list in the crate (issue #222).
     fn provider_for(&self, name: &str) -> Option<Box<dyn Provider>> {
+        self.provider_for_named_model(name, None)
+    }
+
+    /// Constructs the `Provider` for one `providers.order` name against
+    /// `self`'s per-provider config, or `None` for an unrecognized name.
+    /// `model`, when given, is used in place of that provider's configured
+    /// "active" model (every other field -- API key, effort, base URL,
+    /// auth -- still comes from `self`); `None` uses the configured model,
+    /// exactly like the old `provider_for` did before this function existed.
+    ///
+    /// This is the ONE name-to-provider match arm list in the whole crate
+    /// (issue #222). Before this fix, [`Providers::build_chain`] and
+    /// [`Providers::build_chain_for_mode`] (#19) built from this match (via
+    /// the old, model-less `provider_for`), while `app.rs`'s intent router
+    /// (`router_worker`, via `provider_for_router`) kept its own hand-copied
+    /// match with the same five arms (`"openai"`/`"anthropic"`/`"gemini"`/
+    /// `"ollama"`/`"compat:<name>"`) so it could build a provider with the
+    /// router's own cheaper picked model instead of the configured one. A
+    /// provider kind added to this match without a matching arm in that
+    /// hand-copy silently made the router skip it forever, with no error
+    /// card by design (see `App::maybe_start_router`'s doc comment) --
+    /// exactly the `wired-to-nothing` skill's "hard-coded list" row. Now
+    /// `app.rs`'s `provider_for_router` is a one-line call into this
+    /// function with `model: Some(&target.model)`, so there is nowhere else
+    /// for that arm to go missing from; see
+    /// `router_and_chain_paths_agree_on_which_provider_names_resolve` in
+    /// `app.rs`'s test module for the regression guard.
+    pub(crate) fn provider_for_named_model(
+        &self,
+        name: &str,
+        model: Option<&str>,
+    ) -> Option<Box<dyn Provider>> {
         match name {
             "openai" => Some(Box::new(OpenAi::new(
                 unreadable_as_empty(&self.openai.api_key),
-                self.openai.model.clone(),
+                model
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.openai.model.clone()),
                 self.openai.effort.clone(),
             ))),
             "anthropic" => Some(Box::new(Anthropic::new(
                 unreadable_as_empty(&self.anthropic.api_key),
-                self.anthropic.model.clone(),
+                model
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.anthropic.model.clone()),
                 self.anthropic.effort.clone(),
             ))),
             "gemini" => Some(Box::new(Gemini::new(
                 unreadable_as_empty(&self.gemini.api_key),
-                self.gemini.model.clone(),
+                model
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.gemini.model.clone()),
                 self.gemini.effort.clone(),
             ))),
             "ollama" => Some(Box::new(Ollama::new(
                 self.ollama.base_url.clone(),
-                self.ollama.model.clone(),
+                model
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.ollama.model.clone()),
                 self.ollama.effort.clone(),
             ))),
             _ => {
@@ -1045,13 +1158,45 @@ impl Providers {
                 let cfg = self.compat.iter().find(|c| c.name == compat_name)?;
                 Some(Box::new(OpenAiCompat::new(
                     cfg.base_url.clone(),
-                    cfg.model.clone(),
+                    model
+                        .map(str::to_string)
+                        .unwrap_or_else(|| cfg.model.clone()),
                     cfg.auth,
                     cfg.auth_header.clone(),
                     unreadable_as_empty(&cfg.api_key),
                     cfg.structured,
                     cfg.vision,
                 )))
+            }
+        }
+    }
+
+    /// Every model configured for one `providers.order` name, in the
+    /// crate's authored newest/flagship-first order -- the model-LIST
+    /// counterpart to [`Providers::provider_for_named_model`], and (issue
+    /// #222) the second mirror `app.rs`'s router used to keep by hand
+    /// (`router_models_for`, now a one-line call into this function).
+    /// `router::cheapest_router_target` picks its own cheapest entry from
+    /// whichever of these it is handed. Ollama has no list of its own, so
+    /// its one configured model is wrapped in a single-element `Vec` here.
+    /// Empty for an unrecognized name or a `"compat:<name>"` entry with no
+    /// matching `self.compat` config, same "just skip it" behavior as
+    /// [`Providers::provider_for_named_model`].
+    pub(crate) fn models_for(&self, name: &str) -> Vec<String> {
+        match name {
+            "openai" => self.openai.models.clone(),
+            "anthropic" => self.anthropic.models.clone(),
+            "gemini" => self.gemini.models.clone(),
+            "ollama" => vec![self.ollama.model.clone()],
+            _ => {
+                let Some(compat_name) = name.strip_prefix("compat:") else {
+                    return Vec::new();
+                };
+                self.compat
+                    .iter()
+                    .find(|c| c.name == compat_name)
+                    .map(|c| c.models.clone())
+                    .unwrap_or_default()
             }
         }
     }
@@ -2204,6 +2349,205 @@ text_scale = 0.0
         );
     }
 
+    // -- #257: owner-only ACL on config.toml ---------------------------------
+    //
+    // Three confirmed problems: `migrate_from` never called `restrict_acl`
+    // at all; `save_to` applied it only AFTER the rename, leaving a window
+    // where the finally-named file exists, holds a key, and is unrestricted,
+    // and swallowed a failure there so the write still counted as a success;
+    // and `load_from_file`'s repair-write-back could persist a live,
+    // not-yet-imported key through that same unguarded window before
+    // `Config::load`'s Credential Manager import ever runs.
+    //
+    // `RaiiAclFailure` below forces `Config::restrict_acl` to fail via the
+    // thread-local seam, so these tests can prove "ACL failure aborts the
+    // write and is reported" deterministically, on this test's own thread,
+    // without touching the real `USERNAME` env var (which unrelated tests
+    // on other threads also depend on for their own `save_to` calls).
+
+    #[cfg(windows)]
+    struct RaiiAclFailure;
+
+    #[cfg(windows)]
+    impl RaiiAclFailure {
+        fn new() -> Self {
+            FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.set(true));
+            Self
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for RaiiAclFailure {
+        fn drop(&mut self) {
+            FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.set(false));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn save_to_aborts_and_reports_when_acl_restriction_fails() {
+        let path = scratch_path("acl-failure-save");
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-fake-must-not-land-unprotected".to_string();
+
+        let guard = RaiiAclFailure::new();
+        let result = config.save_to(&path);
+        drop(guard);
+
+        assert!(
+            result.is_err(),
+            "an ACL restriction failure must be reported, not swallowed"
+        );
+        assert!(
+            !path.exists(),
+            "the config file must never be left on disk holding a key that \
+             could not be ACL-restricted"
+        );
+        let mut tmp_name = path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        assert!(
+            !PathBuf::from(tmp_name).exists(),
+            "the unprotected temp file must not be left behind either"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn save_to_restricts_the_acl_on_a_normal_successful_save() {
+        // End-state regression net: a successful save_to must still leave
+        // the file ACL-restricted (this already held before the fix; this
+        // guards against a future change silently dropping the call).
+        let path = scratch_path("acl-success-save");
+        let config = Config::default();
+
+        config.save_to(&path).expect("save_to should succeed");
+
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .expect("icacls should run");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !listing.contains("(I)"),
+            "inheritance must be disabled after restrict_acl: {listing}"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn migrate_from_aborts_and_reports_when_acl_restriction_fails() {
+        let root = scratch_dir("acl-failure-migrate");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(
+            &old_path,
+            "[providers.openai]\napi_key = \"sk-fake-for-migrate-test\"\n",
+        )
+        .unwrap();
+
+        let guard = RaiiAclFailure::new();
+        let result = Config::migrate_from(&old_path, &new_path);
+        drop(guard);
+
+        assert!(
+            result.is_err(),
+            "migrate_from must report an ACL restriction failure, not \
+             silently succeed"
+        );
+        assert!(
+            !new_path.exists(),
+            "the migrated file must never land on disk unprotected if the \
+             ACL step failed"
+        );
+
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn migrate_from_restricts_the_acl_of_the_migrated_file() {
+        let root = scratch_dir("acl-success-migrate");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(
+            &old_path,
+            "[providers.openai]\napi_key = \"sk-fake-for-migrate-test\"\n",
+        )
+        .unwrap();
+
+        Config::migrate_from(&old_path, &new_path).expect("migration should succeed");
+
+        let output = std::process::Command::new("icacls")
+            .arg(&new_path)
+            .output()
+            .expect("icacls should run");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !listing.contains("(I)"),
+            "the migrated file must have inheritance disabled: {listing}"
+        );
+
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn load_from_file_repair_write_back_leaves_the_original_untouched_when_acl_restriction_fails() {
+        // The scenario #257 names directly: a live, not-yet-imported key
+        // sits in a config file that also needs a schema repair (the old
+        // refusal-triggering prompt sentence gets rewritten, which is the
+        // one `backfill()` step that actually reports `repaired = true`),
+        // so `load_from_file` tries to write the repaired config back to
+        // disk *before* `Config::load`'s Credential Manager import step
+        // ever runs on it.
+        let path = scratch_path("acl-failure-repair");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "[providers.openai]\napi_key = \"sk-fake-not-yet-imported\"\n\n[ui]\nprompt = \"Look at the image. This is your scratchpad \u{2014} reason it out before committing to a verdict. Then answer.\"\n";
+        fs::write(&path, original).unwrap();
+
+        let guard = RaiiAclFailure::new();
+        let result = Config::load_from_file(&path);
+        drop(guard);
+
+        // load_from_file's own contract (its doc comment) is best-effort on
+        // the write-back: a failed repair write must not fail the load.
+        let cfg = result.expect(
+            "load_from_file must still succeed even when the repair \
+             write-back's ACL step fails",
+        );
+        assert_eq!(cfg.providers.openai.api_key, "sk-fake-not-yet-imported");
+        assert!(
+            !cfg.ui.prompt.contains("This is your scratchpad"),
+            "the refusal-trigger repair should still have run in memory, \
+             proving a write-back was attempted: {}",
+            cfg.ui.prompt
+        );
+
+        // But the on-disk file must be exactly what it was before: the
+        // aborted write must not have replaced it with a partial or
+        // unprotected copy.
+        let on_disk_after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on_disk_after, original,
+            "a failed repair write-back must leave the original file \
+             untouched, not overwrite it with an unprotected copy"
+        );
+        let mut tmp_name = path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        assert!(
+            !PathBuf::from(tmp_name).exists(),
+            "no leftover temp file from the aborted repair write"
+        );
+
+        cleanup(&path);
+    }
+
     /// #157: `{:?}` on `Config`/`ProviderConfig` must never leak the raw
     /// `api_key`, however deeply nested.
     #[test]
@@ -3260,5 +3604,96 @@ text_scale = 0.0
             assert_eq!(key, "sentinel-value", "{provider} via {var}");
             std::env::remove_var(var);
         }
+    }
+}
+
+/// #105 "Show me what you're sending": a toggle that shows the exact
+/// request about to leave the machine (image dims/size, text, snippets)
+/// with a Send or Cancel before it does. `enabled` alone does not, by
+/// itself, make that preview happen -- see `provider::common`'s
+/// `send_preview_guard`/`with_send_authorized` and `ui::confirm`'s
+/// `SendToken`/`SendAuthorized` for the structural gate this flag feeds,
+/// and that module's doc comment for exactly what still needs wiring
+/// (`App::ask` showing `ui::preview::RequestPreview`) before turning this on
+/// produces the real Send/Cancel UX rather than every request failing
+/// closed with a card naming why.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EgressPreview {
+    pub enabled: bool,
+}
+
+/// Process-wide mirror of `Config::egress_preview.enabled`, read by
+/// `provider::common::send_preview_guard` on every completion request --
+/// the same "decision lives in `mode.rs`/config, enforcement lives in
+/// `provider/common.rs`" division of labor `mode::is_offline_now` already
+/// uses, and for the same reason: `post_json_with` has a `Config`
+/// reference nowhere in its call chain, only a URL/body/headers/tag.
+///
+/// STILL OWED (app.rs is out of this agent's file scope tonight, see the
+/// task's file-scope note): nothing calls [`set_egress_preview_enabled`]
+/// yet. `App::run` needs to call it once at startup right alongside its
+/// existing `mode::set_current(config.mode)` call, and `ui::settings`
+/// needs to call it again whenever the user changes the setting (once a
+/// Settings UI for it exists -- Phase 3, `ui/settings_window.rs`). Until
+/// then this defaults to `false`, so `egress_preview_enabled()` always
+/// returns `false` and every existing request path is completely
+/// unaffected -- verified by
+/// `egress_preview_enabled_defaults_to_false_until_something_sets_it` below.
+static EGRESS_PREVIEW_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Serializes every test in the crate that mutates
+/// [`EGRESS_PREVIEW_ENABLED`] -- it is process-wide, so `cargo test`'s
+/// default parallelism means a test in `provider::common` toggling it can
+/// otherwise interleave with one here or in `ui::confirm`. Not `#[cfg(test)]`
+/// itself (a `pub(crate)` item gated that way could not be named from
+/// another module's own `#[cfg(test)]` code in a normal build), but it is
+/// only ever locked from test code.
+#[allow(dead_code)] // Only locked from test code; see the doc comment above.
+pub(crate) static EGRESS_PREVIEW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn set_egress_preview_enabled(on: bool) {
+    EGRESS_PREVIEW_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn egress_preview_enabled() -> bool {
+    EGRESS_PREVIEW_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod egress_preview_tests {
+    use super::*;
+
+    // A process-wide `static` is shared across every test in the crate
+    // (including `provider::common`'s and `ui::confirm`'s, which also
+    // exercise this flag), so every mutating test locks the SAME shared
+    // `EGRESS_PREVIEW_TEST_LOCK`, not a module-local one, and always
+    // restores the default before releasing it.
+
+    #[test]
+    fn egress_preview_defaults_to_disabled_in_a_fresh_config() {
+        let config = Config::default();
+        assert!(!config.egress_preview.enabled);
+    }
+
+    #[test]
+    fn set_egress_preview_enabled_is_reflected_by_the_getter() {
+        let _guard = EGRESS_PREVIEW_TEST_LOCK.lock().unwrap();
+        set_egress_preview_enabled(true);
+        assert!(egress_preview_enabled());
+        set_egress_preview_enabled(false);
+        assert!(!egress_preview_enabled());
+    }
+
+    #[test]
+    fn egress_preview_enabled_defaults_to_false_until_something_sets_it() {
+        let _guard = EGRESS_PREVIEW_TEST_LOCK.lock().unwrap();
+        // Simulates a fresh process that never called `set_egress_preview_enabled`
+        // at all (today's real state, per this module's doc comment: nothing
+        // calls it yet) by explicitly resetting to the documented default
+        // before asserting it.
+        set_egress_preview_enabled(false);
+        assert!(!egress_preview_enabled());
     }
 }

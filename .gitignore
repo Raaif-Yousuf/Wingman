@@ -8,3 +8,13 @@ config.toml
 .serena/
 .claude/worktrees/
 __pycache__/
+# #203: tests/compile_fail.rs regenerates this from src/ui/confirm.rs on
+# every run (see that file's doc comment for why); never hand-edited or
+# committed.
+tests/compile_fail/generated/
+
+# Personal Claude Code settings (per-machine permissions); the shared
+# .claude/settings.json above stays tracked.
+.claude/settings.local.json
+.env
+.env.*

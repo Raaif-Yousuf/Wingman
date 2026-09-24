@@ -64,6 +64,7 @@
 use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
+use crate::ui::text::draw_text_line;
 use serde_json::Value;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -87,15 +88,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsWindow,
-    KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, CREATESTRUCTW,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HMENU, HWND_TOPMOST, IDC_ARROW,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsChild,
+    IsWindow, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
+    HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -186,6 +187,8 @@ impl Card {
             preview: None,
             last_confirmed: None,
             owner: None,
+            preview_decision_pending: false,
+            preview_generation: 0,
         });
         let raw = Box::into_raw(inner);
 
@@ -333,15 +336,22 @@ impl Card {
     /// was called, so focus returns to the user's previous work the moment
     /// the decision is made either way.
     #[allow(dead_code)] // wiring app.rs's worker to call this is a later issue's job
+    /// Shows the preview and returns its generation (#225). Store it: the
+    /// `WM_APP_PREVIEW_DECIDED` that eventually arrives carries the
+    /// generation it belongs to in its `WPARAM`, and anything older is a
+    /// late abandonment for a preview that is already gone, not a decision
+    /// about this one.
+    #[must_use = "store the generation; on_preview_decided needs it to reject a stale notification"]
     pub fn show_preview(
         &mut self,
         title: &str,
         schema: &serde_json::Value,
         proposal_value: &serde_json::Value,
         main_window_exists: bool,
-    ) {
+    ) -> u32 {
         self.inner
             .show_preview(title, schema, proposal_value, main_window_exists);
+        self.inner.preview_generation
     }
 
     /// Takes the `Confirmed<Value>` produced by the last "Do it" / Enter, if
@@ -892,6 +902,30 @@ struct CardInner {
     /// no owner set still works, it just has nowhere to notify -- the same
     /// degrade `Tray`'s own best-effort Win32 calls use elsewhere.
     owner: Option<HWND>,
+    /// Issue #225: `true` from the moment a preview is shown until a
+    /// decision has been reported for it. "Do it" and Cancel clear it and
+    /// notify the owner themselves; anything else that tears the preview
+    /// down (hiding the card, starting another action, opening Settings,
+    /// pausing, or replacing this preview with a different one) leaves it
+    /// set, and [`CardInner::leave_preview_if_active`] then reports the
+    /// abandonment so the owner can drop whatever it was holding.
+    ///
+    /// Without this, a preview could be destroyed with no
+    /// [`WM_APP_PREVIEW_DECIDED`] ever posted, `App`'s `pending_review` /
+    /// `pending_form_fill` would stay `Some`, and a later "Do it" on a
+    /// different preview could run the abandoned action instead of the one
+    /// the user actually confirmed.
+    preview_decision_pending: bool,
+    /// Issue #225: incremented on every [`CardInner::show_preview`], and
+    /// posted as `WM_APP_PREVIEW_DECIDED`'s `WPARAM` so the owner can tell
+    /// WHICH preview a decision belongs to.
+    ///
+    /// The notification is a `PostMessageW`, so it is delivered after the
+    /// call that triggered it has returned. Replacing a live preview posts
+    /// the old one's abandonment and then arms the new one in the same turn;
+    /// without a generation the owner would process that abandonment later
+    /// and clear the state belonging to the preview now on screen.
+    preview_generation: u32,
 }
 
 impl CardInner {
@@ -1462,8 +1496,7 @@ impl CardInner {
             .min(max_headline_h)
             .max(headline_line_h);
 
-        let mut headline_buf = utf16(&self.headline);
-        let mut headline_rect = RECT {
+        let headline_rect = RECT {
             left: rc.left + padding,
             top: rc.top + padding,
             right: rc.left + padding + headline_w,
@@ -1471,10 +1504,10 @@ impl CardInner {
         };
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-        DrawTextW(
+        draw_text_line(
             hdc,
-            &mut headline_buf,
-            &mut headline_rect,
+            &self.headline,
+            headline_rect,
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
 
@@ -1503,8 +1536,7 @@ impl CardInner {
             .max(self.line_height(self.fonts.headline));
 
         let y0 = content_top - self.scroll_offset;
-        let mut headline_buf = utf16(&self.headline);
-        let mut headline_rect = RECT {
+        let headline_rect = RECT {
             left: content_left,
             top: y0,
             right: content_left + headline_w,
@@ -1512,18 +1544,17 @@ impl CardInner {
         };
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-        DrawTextW(
+        draw_text_line(
             hdc,
-            &mut headline_buf,
-            &mut headline_rect,
+            &self.headline,
+            headline_rect,
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
         );
 
         if !self.detail.is_empty() {
             let detail_h = self.measure_wrapped(self.fonts.body, &self.detail, content_w);
             let y1 = y0 + headline_h + gap;
-            let mut detail_buf = utf16(&self.detail);
-            let mut detail_rect = RECT {
+            let detail_rect = RECT {
                 left: content_left,
                 top: y1,
                 right: content_left + content_w,
@@ -1531,10 +1562,10 @@ impl CardInner {
             };
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
-            DrawTextW(
+            draw_text_line(
                 hdc,
-                &mut detail_buf,
-                &mut detail_rect,
+                &self.detail,
+                detail_rect,
                 DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
             );
         }
@@ -1557,11 +1588,10 @@ impl CardInner {
             let bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(palette.bg));
             FillRect(hdc, &band, bg);
             let _ = DeleteObject(HGDIOBJ(bg.0));
-            let mut hint = utf16("more below");
             // Reuse the headline's badge reservation so the hint (which is
             // also right-aligned, in the same bottom-right corner the badge
             // occupies) does not draw underneath it either.
-            let mut hint_rect = RECT {
+            let hint_rect = RECT {
                 left: content_left,
                 top: rc.bottom - padding - band_h + self.scale(2),
                 right: content_left + headline_w,
@@ -1569,10 +1599,10 @@ impl CardInner {
             };
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-            DrawTextW(
+            draw_text_line(
                 hdc,
-                &mut hint,
-                &mut hint_rect,
+                "more below",
+                hint_rect,
                 DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
             );
         }
@@ -1620,8 +1650,7 @@ impl CardInner {
         SelectObject(hdc, old_brush);
         let _ = DeleteObject(HGDIOBJ(brush.0));
 
-        let mut label = utf16(difficulty.label());
-        let mut label_rect = RECT {
+        let label_rect = RECT {
             left,
             top,
             right,
@@ -1629,10 +1658,10 @@ impl CardInner {
         };
         SelectObject(hdc, HGDIOBJ(self.fonts.badge.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_color));
-        DrawTextW(
+        draw_text_line(
             hdc,
-            &mut label,
-            &mut label_rect,
+            difficulty.label(),
+            label_rect,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
     }
@@ -1773,6 +1802,12 @@ impl CardInner {
             previous_foreground,
             main_window_exists,
         });
+        // #225: from here until a decision is reported, tearing this
+        // preview down is an abandonment and the owner has to be told. Set
+        // AFTER the `leave_preview_if_active` above, so replacing a live
+        // preview reports the OLD one exactly once and then arms the new.
+        self.preview_decision_pending = true;
+        self.preview_generation = self.preview_generation.wrapping_add(1);
 
         self.layout_preview();
         self.create_preview_controls();
@@ -1831,8 +1866,13 @@ impl CardInner {
         // `PreviewUi` before returning -- see `last_confirmed`'s doc
         // comment on why this can't live there.
         self.last_confirmed = Some(confirmed);
+        // #225: claim the decision before `close_preview` reaches
+        // `leave_preview_if_active`, so it does not also report this as an
+        // abandonment (and does not clear the `Confirmed` just stored).
+        let generation = self.preview_generation;
+        self.preview_decision_pending = false;
         self.close_preview();
-        self.notify_owner_of_preview_decision();
+        self.notify_owner_of_preview_decision(generation);
     }
 
     /// "Cancel" / Esc: produces nothing (no `Confirmed` is ever built) and
@@ -1842,8 +1882,12 @@ impl CardInner {
     /// earlier preview.
     fn preview_cancel(&mut self) {
         self.last_confirmed = None;
+        // #225: same as `preview_do_it` -- this path reports its own
+        // decision, so it is not an abandonment.
+        let generation = self.preview_generation;
+        self.preview_decision_pending = false;
         self.close_preview();
-        self.notify_owner_of_preview_decision();
+        self.notify_owner_of_preview_decision(generation);
     }
 
     /// Issue #39: the one way `CardInner` (a plain Win32 window with no
@@ -1853,10 +1897,18 @@ impl CardInner {
     /// doc comment for why that is safe even if this message is dropped
     /// while Settings is open. A no-op if [`Card::set_owner`] was never
     /// called.
-    fn notify_owner_of_preview_decision(&self) {
+    /// #225: `WPARAM` is the generation of the preview this decision is
+    /// about, so a late-delivered abandonment cannot be mistaken for a
+    /// decision on whatever preview is on screen by the time it arrives.
+    fn notify_owner_of_preview_decision(&self, generation: u32) {
         if let Some(owner) = self.owner {
             unsafe {
-                let _ = PostMessageW(Some(owner), WM_APP_PREVIEW_DECIDED, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(
+                    Some(owner),
+                    WM_APP_PREVIEW_DECIDED,
+                    WPARAM(generation as usize),
+                    LPARAM(0),
+                );
             }
         }
     }
@@ -1913,10 +1965,24 @@ impl CardInner {
     /// method (`show_pending`, `show_collapsed`, `show_preview` itself, and
     /// `hide`) so a preview's child controls can never survive a jump to a
     /// different state, regardless of which path got there.
+    /// The single choke point every path out of `CardState::Preview` goes
+    /// through. Issue #225: it is also where an ABANDONED preview is
+    /// reported. "Do it" and Cancel clear `preview_decision_pending` before
+    /// they get here and post their own notification, so they do not double
+    /// post (`preview_do_it_posts_exactly_one_wm_app_preview_decided`
+    /// guards that). Every other way out of Preview leaves the flag set,
+    /// and the owner is told here.
     fn leave_preview_if_active(&mut self) {
         if self.preview.is_some() {
             self.destroy_preview_controls();
             self.preview = None;
+        }
+        if self.preview_decision_pending {
+            self.preview_decision_pending = false;
+            // No `Confirmed` is produced, and any stale one is dropped: an
+            // abandoned preview must never look like a confirmation.
+            self.last_confirmed = None;
+            self.notify_owner_of_preview_decision(self.preview_generation);
         }
     }
 
@@ -2218,38 +2284,35 @@ impl CardInner {
         let fields = preview.model.fields();
         let metrics = self.compute_preview_layout(fields);
 
-        let mut title_buf = utf16(&preview.title);
-        let mut title_rect = metrics.title_rect;
+        let title_rect = metrics.title_rect;
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-        DrawTextW(
+        draw_text_line(
             hdc,
-            &mut title_buf,
-            &mut title_rect,
+            &preview.title,
+            title_rect,
             DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
 
         for (field, row) in fields.iter().zip(metrics.rows.iter()) {
-            let mut label_buf = utf16(&field.label);
-            let mut label_rect = row.label_rect;
+            let label_rect = row.label_rect;
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-            DrawTextW(
+            draw_text_line(
                 hdc,
-                &mut label_buf,
-                &mut label_rect,
+                &field.label,
+                label_rect,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
 
             if !field.editable {
-                let mut value_buf = utf16(&field.value);
-                let mut value_rect = row.value_rect;
+                let value_rect = row.value_rect;
                 SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
                 SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
-                DrawTextW(
+                draw_text_line(
                     hdc,
-                    &mut value_buf,
-                    &mut value_rect,
+                    &field.value,
+                    value_rect,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
                 );
             }
@@ -2348,6 +2411,24 @@ fn preview_key_command(vk: u16) -> Option<i32> {
     }
 }
 
+/// Issue #207: pure decision for a preview child control's `WM_KILLFOCUS`
+/// -- whether the new focus target means "click away" (cancel the preview,
+/// same as Esc) or staying within the card's own window group (do nothing:
+/// Tab moving between two preview fields, or focus landing on the Do
+/// it/Cancel button itself right before its own click fires).
+/// `new_focus_is_card_or_descendant` is
+/// `new_focus_hwnd == card_hwnd || IsChild(card_hwnd, new_focus_hwnd)`,
+/// computed by the caller (both need a live `HWND` comparison/`IsChild`
+/// call, so cannot be done here). `WM_KILLFOCUS`'s own "nothing is gaining
+/// focus" case (`wparam == 0`, e.g. the whole app losing the foreground to
+/// nothing in particular) needs no separate case: a null `HWND` is never
+/// the card's own and `IsChild` is never true for it, so it already
+/// computes `new_focus_is_card_or_descendant == false` the same as any
+/// other outside window.
+fn preview_focus_left_the_card(new_focus_is_card_or_descendant: bool) -> bool {
+    !new_focus_is_card_or_descendant
+}
+
 /// Subclass installed on every preview EDIT/BUTTON child control so Enter
 /// and Esc work regardless of which control currently has keyboard focus.
 ///
@@ -2365,6 +2446,16 @@ fn preview_key_command(vk: u16) -> Option<i32> {
 /// subclass time by [`subclass_preview_control`]) so a mapped key can
 /// `PostMessageW` a `WM_COMMAND` back to it, indistinguishable from a real
 /// button click.
+///
+/// Issue #207: the same `dwrefdata` is what makes click-away cancellation
+/// possible here too. `WM_KILLFOCUS` on the card's own `HWND` (handled in
+/// `CardInner::handle_message`) never fires while a preview is showing,
+/// because Preview's fields are real EDIT/BUTTON children -- focus moves
+/// between THEM, not off the card window itself, until it leaves the whole
+/// group. So this subclass, installed on every one of those children,
+/// checks each `WM_KILLFOCUS`'s own new-focus target (`wparam`) against the
+/// card window group via [`preview_focus_left_the_card`] and posts
+/// `ID_PREVIEW_CANCEL` the same way Enter/Esc already do when it has.
 unsafe extern "system" fn preview_control_subclass(
     hwnd: HWND,
     msg: u32,
@@ -2373,9 +2464,9 @@ unsafe extern "system" fn preview_control_subclass(
     _subclass_id: usize,
     ref_data: usize,
 ) -> LRESULT {
+    let parent = HWND(ref_data as *mut c_void);
     if msg == WM_KEYDOWN {
         if let Some(command_id) = preview_key_command(wparam.0 as u16) {
-            let parent = HWND(ref_data as *mut c_void);
             let _ = PostMessageW(
                 Some(parent),
                 WM_COMMAND,
@@ -2383,6 +2474,19 @@ unsafe extern "system" fn preview_control_subclass(
                 LPARAM(0),
             );
             return LRESULT(0);
+        }
+    }
+    if msg == WM_KILLFOCUS {
+        let new_focus = HWND(wparam.0 as *mut c_void);
+        let new_focus_is_card_or_descendant =
+            new_focus == parent || unsafe { IsChild(parent, new_focus) }.as_bool();
+        if preview_focus_left_the_card(new_focus_is_card_or_descendant) {
+            let _ = PostMessageW(
+                Some(parent),
+                WM_COMMAND,
+                WPARAM(ID_PREVIEW_CANCEL as usize),
+                LPARAM(0),
+            );
         }
     }
     if msg == WM_NCDESTROY {
@@ -2793,6 +2897,25 @@ mod tests {
         }
     }
 
+    // -- preview_focus_left_the_card: pure decision (#207) -------------------
+
+    #[test]
+    fn focus_staying_in_the_card_group_does_not_cancel() {
+        // Tab between two preview fields, or focus landing on the Do
+        // it/Cancel button right before its own click fires: the new focus
+        // target IS the card or a descendant of it.
+        assert!(!preview_focus_left_the_card(true));
+    }
+
+    #[test]
+    fn focus_leaving_the_card_group_cancels() {
+        // The new focus target is neither the card itself nor a descendant
+        // -- covers both "another window" and WM_KILLFOCUS's own
+        // wparam == 0 case (see this function's doc comment: both compute
+        // new_focus_is_card_or_descendant == false at the call site).
+        assert!(preview_focus_left_the_card(false));
+    }
+
     // -- preview state: real Win32 (#26) -------------------------------------
     //
     // Uses `Card::new_for_test`, which registers and creates against a
@@ -3034,6 +3157,121 @@ mod tests {
     }
 
     #[test]
+    fn hide_while_preview_is_open_notifies_the_owner_with_no_confirmation() {
+        // Issue #225: every one of app.rs's "hide the stale card" call
+        // sites (ask, extract_text, copy_region, open_settings,
+        // pause_for, add_event_from_screen, review_this_email,
+        // fill_form_from_screen) calls exactly this public `Card::hide()`
+        // with no check for `CardState::Preview`. Before the fix,
+        // `CardInner::hide` routed to `leave_preview_if_active`, which
+        // destroyed the preview's controls and reset `state` to `Hidden`
+        // -- but never posted `WM_APP_PREVIEW_DECIDED`, so whichever
+        // pending-preview context `App` had stashed for it was never
+        // cleared, and a later, unrelated preview's confirm could pick up
+        // the stale one instead (or run neither, dropping the new one).
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_preview("Add to calendar", &schema, &value, false);
+        assert_eq!(card.state(), CardState::Preview);
+
+        // The bug: hiding the card for an unrelated reason while a
+        // preview is open (Settings opening, Pause, a second action
+        // starting...), instead of the user pressing "Do it" or "Cancel".
+        card.hide();
+
+        assert_eq!(card.state(), CardState::Hidden, "hide() must still hide");
+        assert!(
+            card.take_confirmed().is_none(),
+            "an externally-hidden preview must never look like a Do it"
+        );
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "hide() must post WM_APP_PREVIEW_DECIDED when it destroys an \
+             active preview, so App::on_preview_decided can clear its \
+             pending-preview slot instead of leaving it to hijack a \
+             later, unrelated preview's decision (#225)"
+        );
+        assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn show_preview_interrupting_an_active_preview_notifies_before_replacing_it() {
+        // Same shape as the hide() case above, but for the path where a
+        // NEW preview interrupts an active one directly (on_calendar_result
+        // / on_review_result / on_form_fill_result all call show_preview
+        // without checking for an existing one first).
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_preview("Add to calendar", &schema, &value, false);
+        assert_eq!(card.state(), CardState::Preview);
+
+        let _ = card.show_preview("Fill this form", &schema, &value, false);
+        assert_eq!(
+            card.state(),
+            CardState::Preview,
+            "the second preview must still show"
+        );
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "replacing an active preview with a new one must notify the \
+             owner about the FIRST one before showing the second"
+        );
+        assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn preview_do_it_posts_exactly_one_wm_app_preview_decided() {
+        // Mutation guard for #225's fix: `leave_preview_if_active` now
+        // does the notifying (so an external `hide()` is covered too),
+        // and `preview_do_it`'s own explicit call was removed -- if it
+        // had not been, "Do it" would double-post and this would go red.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        let card_hwnd = card.hwnd();
+        unsafe {
+            SendMessageW(
+                card_hwnd,
+                WM_COMMAND,
+                Some(WPARAM(ID_PREVIEW_DO_IT as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+
+        let mut count = 0;
+        let mut msg = MSG::default();
+        while unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() } {
+            if msg.message == WM_APP_PREVIEW_DECIDED {
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 1,
+            "leave_preview_if_active must not double-post alongside a \
+             separate explicit notify"
+        );
+    }
+
+    #[test]
     fn no_owner_set_means_preview_do_it_never_panics_and_posts_nothing() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
@@ -3139,6 +3377,170 @@ mod tests {
         assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_DO_IT);
     }
 
+    // -- click-away cancels the preview (#207) --------------------------
+
+    #[test]
+    fn preview_control_subclass_posts_cancel_when_focus_leaves_the_card() {
+        // Simulates a real click-away: WM_KILLFOCUS on a preview field whose
+        // new focus target (wparam, per the real WM_KILLFOCUS contract) is
+        // some other, unrelated window -- not the card, not one of its
+        // children.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let start_hwnd = card
+            .inner
+            .preview
+            .as_ref()
+            .unwrap()
+            .edits
+            .iter()
+            .find(|(name, _)| name == "start")
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap();
+        let card_hwnd = card.hwnd();
+
+        let other_hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(wide_z(TEST_CLASS_NAME).as_ptr()),
+                PCWSTR(wide_z("unrelated window").as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                10,
+                10,
+                None,
+                None,
+                Some(instance()),
+                None,
+            )
+        }
+        .expect("CreateWindowExW for the unrelated window");
+
+        unsafe {
+            let _ = preview_control_subclass(
+                start_hwnd,
+                WM_KILLFOCUS,
+                WPARAM(other_hwnd.0 as usize),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "a click-away WM_KILLFOCUS must post a WM_COMMAND to the card window"
+        );
+        assert_eq!(msg.message, WM_COMMAND);
+        assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_CANCEL);
+
+        unsafe {
+            let _ = DestroyWindow(other_hwnd);
+        }
+    }
+
+    #[test]
+    fn preview_control_subclass_posts_cancel_when_nothing_gains_focus() {
+        // WM_KILLFOCUS's wparam is 0 when no window is gaining the focus at
+        // all (e.g. the whole app losing the foreground) -- must cancel the
+        // same as a click into another window, per preview_focus_left_the_card's
+        // doc comment.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let start_hwnd = card
+            .inner
+            .preview
+            .as_ref()
+            .unwrap()
+            .edits
+            .iter()
+            .find(|(name, _)| name == "start")
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap();
+        let card_hwnd = card.hwnd();
+
+        unsafe {
+            let _ = preview_control_subclass(
+                start_hwnd,
+                WM_KILLFOCUS,
+                WPARAM(0),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(found, "wparam == 0 must also be treated as a click-away");
+        assert_eq!(msg.message, WM_COMMAND);
+        assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_CANCEL);
+    }
+
+    #[test]
+    fn preview_control_subclass_does_not_cancel_on_focus_moving_to_another_preview_control() {
+        // Tab moving focus from the "start" EDIT to the Do it button (both
+        // preview children) must not cancel -- the exact scenario
+        // preview_focus_left_the_card's doc comment names.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let preview = card.inner.preview.as_ref().unwrap();
+        let start_hwnd = preview
+            .edits
+            .iter()
+            .find(|(name, _)| name == "start")
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap();
+        let do_it_btn = preview.do_it_btn;
+        let card_hwnd = card.hwnd();
+
+        unsafe {
+            let _ = preview_control_subclass(
+                start_hwnd,
+                WM_KILLFOCUS,
+                WPARAM(do_it_btn.0 as usize),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+
+        // Filtered to the WM_COMMAND range specifically (rather than 0..0,
+        // which every other real-Win32 test in this module uses): an EDIT
+        // control's OWN default WM_KILLFOCUS handling (reached via
+        // DefSubclassProc, since `preview_control_subclass` does not
+        // swallow WM_KILLFOCUS) legitimately posts its own WM_COMMAND
+        // (EN_KILLFOCUS) to its parent regardless of this fix, and an
+        // unfiltered peek would also pick up an unrelated synthesized
+        // WM_PAINT for this never-validated test window. Neither is what
+        // this test checks; only whether ID_PREVIEW_CANCEL specifically was
+        // posted.
+        let mut msg = MSG::default();
+        let found = unsafe {
+            PeekMessageW(&mut msg, Some(card_hwnd), WM_COMMAND, WM_COMMAND, PM_REMOVE).as_bool()
+        };
+        let cancelled = found && (msg.wParam.0 & 0xFFFF) as i32 == ID_PREVIEW_CANCEL;
+        assert!(
+            !cancelled,
+            "focus moving between two preview controls must not cancel the preview"
+        );
+    }
+
     #[test]
     fn preview_closing_restores_the_previous_foreground_window() {
         // The settings window's own smoke test constructs a real HWND the
@@ -3213,5 +3615,90 @@ mod tests {
             "GDI object count grew by more than {slack} after repeated preview create/close/drop \
              (baseline={baseline}, after={after}); investigate a leak before raising this slack"
         );
+    }
+
+    // -- issue #221: DrawTextW must not crash on empty headline/detail/preview
+    // text --------------------------------------------------------------------
+    //
+    // `Answer::headline`/`Answer::detail` are plain, unvalidated `String`s
+    // (`provider::common::answer_schema` has no `minLength`), and a
+    // non-editable preview field's value can be empty too (an omitted or
+    // empty proposal property -- see `PreviewModel::from_schema`'s
+    // `unwrap_or_default()`). MEASURED 2026-09-17 (`src/ui/palette.rs`'s
+    // `draw_text_line_tolerates_an_empty_string`, commit `453fe0b`, and
+    // independently re-confirmed in this worktree by
+    // `crate::ui::text::tests::raw_drawtextw_crashes_on_empty_text`, a
+    // dedicated `#[ignore]`d test run in isolation -- see that module's own
+    // doc comment): an unguarded `DrawTextW` call with a zero-length UTF-16
+    // buffer -- what `utf16("")` produces -- reliably crashes with exit
+    // code `0xC0000005` (`STATUS_ACCESS_VIOLATION`) through this crate's
+    // `windows` 0.62 binding. These tests here do NOT re-run that raw,
+    // unguarded call: doing so as part of this ordinary `cargo test`
+    // invocation would take down this whole test binary
+    // (`STATUS_ACCESS_VIOLATION` is not a catchable panic), losing every
+    // other test in the same run. What these tests prove instead is that
+    // painting an empty headline/detail/preview-field DOES NOT crash now
+    // that every call site routes through
+    // `crate::ui::text::draw_text_line`.
+
+    #[test]
+    fn paint_collapsed_with_empty_headline_does_not_crash() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_answer("", "", 0, None);
+        assert_eq!(card.state(), CardState::Collapsed);
+        let handled = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
+    }
+
+    #[test]
+    fn paint_expanded_with_empty_headline_does_not_crash() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        // `try_expand` only enters Expanded when `detail` is non-empty (see
+        // its own `self.detail.is_empty()` early return), so a genuinely
+        // empty detail can never reach Expanded through the public API --
+        // that DrawTextW call is provably unreachable with empty text
+        // (paint_expanded's own `if !self.detail.is_empty()` guard around
+        // it), unlike the headline's, which is unconditional. This still
+        // exercises the headline's DrawTextW call with an empty string, the
+        // reachable half of the bug.
+        card.show_answer("", "non-empty detail", 0, Some(Difficulty::Level(3)));
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        // Scroll past the fold so the "more below" hint band (also a
+        // DrawTextW call site) paints too.
+        card.inner.scroll_offset = 1;
+        card.inner.scroll_max = 100;
+        let handled = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
+    }
+
+    #[test]
+    fn paint_error_with_empty_headline_and_detail_does_not_crash() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_error("", "");
+        assert_eq!(card.state(), CardState::Collapsed);
+        let handled = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
+    }
+
+    #[test]
+    fn paint_preview_with_empty_title_and_empty_field_value_does_not_crash() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, _) = calendar_schema_and_value();
+        // "location" is a non-editable field (see calendar_schema_and_value's
+        // schema): an empty value here reaches paint_preview's value
+        // DrawTextW call directly, the same shape as a proposal that simply
+        // omitted the property (PreviewModel::from_schema's
+        // unwrap_or_default()).
+        let value = serde_json::json!({
+            "title": "Standup", "start": "09:00", "end": "09:15",
+            "location": "", "notes": "bring laptop"
+        });
+        // An empty title also exercises paint_preview's own title DrawTextW
+        // call.
+        card.inner.show_preview("", &schema, &value, false);
+        assert_eq!(card.state(), CardState::Preview);
+        let handled = card.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
     }
 }

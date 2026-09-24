@@ -59,9 +59,10 @@
 //!    whatever is on the clipboard *right now*, byte-exact, for every
 //!    format this module knows how to restore -- see "What is and is not
 //!    preserved" below.
-//! 3. **Inject Ctrl+C**, `dwExtraInfo` tagged with [`INJECTED_MARKER`] (see
-//!    that constant's doc comment for why nothing in `hotkey.rs` currently
-//!    reads this tag).
+//! 3. **Inject Ctrl+C**, `dwExtraInfo` tagged with
+//!    [`crate::hotkey::INJECTED_MARKER`] (issue #209: `hotkey.rs`'s
+//!    `hook_proc` now reads this tag and ignores anything carrying it,
+//!    rather than treating the injected Ctrl+C as a real keypress).
 //! 4. **Wait, event-driven, bounded.** [`win32::wait_for_clipboard_update`]
 //!    registers `AddClipboardFormatListener` on a message-only window and
 //!    blocks on `MsgWaitForMultipleObjects` up to the caller's budget,
@@ -76,8 +77,12 @@
 //!
 //! Snapshotted and restored byte-exact, via `HGLOBAL` buffers copied
 //! straight off the real clipboard with no reinterpretation:
-//! `CF_UNICODETEXT`, `CF_HDROP`, `CF_DIB`, the registered `"HTML Format"`
-//! and `"Rich Text Format"` formats.
+//! `CF_UNICODETEXT`, `CF_HDROP`, `CF_DIB`, `CF_DIBV5` (#265: a distinct
+//! registered format from `CF_DIB`, carrying a `BITMAPV5HEADER`, that
+//! several common copy sources -- Snipping Tool/Snip & Sketch, some browser
+//! image copies -- put on the clipboard, sometimes with no parallel
+//! `CF_DIB` entry), the registered `"HTML Format"` and `"Rich Text Format"`
+//! formats.
 //!
 //! **`CF_BITMAP` is NOT byte-copied.** It is a GDI bitmap *handle*, not an
 //! `HGLOBAL` buffer -- there is no byte buffer to snapshot without decoding
@@ -102,10 +107,40 @@
 //!
 //! # Not wired yet
 //!
-//! Same status `inputs::uia` had until #27 landed and still has today
-//! (nothing in `app.rs` calls it): every public item below is exercised
-//! only by this file's own tests. Wiring a real key press or palette chip to
-//! [`get_selection_foreground`] is a later issue.
+//! Same status `inputs::uia` had until #27 landed: most public items below
+//! are exercised only by this file's own tests. [`get_selection_foreground`]
+//! and [`get_selection_foreground_with_target`] ARE wired, via
+//! `actions::review_email::capture_input` (#38, #219) -- wiring a real key
+//! press or palette chip directly to this module for some other action is
+//! still a later issue.
+//!
+//! # Selection identity and offsets (#219)
+//!
+//! [`get_selection_foreground`] returns text only -- no element identity, so
+//! nothing can write back through it. [`get_selection_foreground_with_target`]
+//! is the same capture plus, when the UIA `TextPattern` path (not the
+//! clipboard fallback) finds exactly one contiguous selection range, a
+//! [`SelectionTarget`]: the owning element's identity (mirroring
+//! `executors::replace_text::TargetRef`'s fields byte for byte -- that type
+//! is private to the `executors` module tree, so this is a deliberate,
+//! independent twin, the same "duplicated, not shared" call
+//! `actions::review_email::CapturedTarget`'s own doc comment already makes),
+//! the element's whole current text, and the selection's own UTF-16
+//! `(start, end)` code-unit offsets into it, read from the same
+//! `IUIAutomationTextRange` the selection came from
+//! (`DocumentRange().GetText`/`MoveEndpointByRange` to find where the
+//! selection starts, never a byte offset or a char count -- see
+//! `executors::replace_text::splice_utf16`'s own doc comment for why that
+//! distinction matters for a non-BMP character).
+//!
+//! [`Selection::target`] is `None` whenever a wrong offset would otherwise be
+//! possible, never a guess: no caller-supplied `foreground_hwnd`, a
+//! `ValuePattern`-only control with no `TextPattern` at all (already
+//! [`UiaProbe::NoTextPattern`], degrading to the clipboard fallback, which
+//! never carries identity either), or a discontiguous multi-range selection
+//! (e.g. a multi-cell spreadsheet selection), which has no single `(start,
+//! end)` pair to report. A password field is stopped even earlier
+//! ([`UiaProbe::FocusedIsPassword`]) and never reaches any of this.
 
 use std::time::Duration;
 
@@ -145,8 +180,84 @@ pub enum UiaProbe {
     /// The element has neither `TextPattern2` nor `TextPattern`.
     NoTextPattern,
     /// A `TextPattern`/`TextPattern2` was found and `GetSelection` was
-    /// read; the string may be empty (nothing selected).
-    Selection(String),
+    /// read; `text` may be empty (nothing selected). `identity` is `Some`
+    /// only when exactly one contiguous selection range was found and its
+    /// owning element's identity/offsets were all read successfully -- see
+    /// the module doc comment's "Selection identity and offsets" section.
+    Selection {
+        text: String,
+        identity: Option<SelectionIdentity>,
+    },
+}
+
+/// The UIA-derived half of a [`SelectionTarget`]: everything except the
+/// caller-supplied `hwnd` (see [`SelectionTarget`]'s own doc comment for why
+/// `hwnd` is never read from UIA here). Produced only by
+/// [`com::probe_from_element`]'s single-contiguous-range case.
+#[allow(dead_code)] // see the module doc comment's "not wired yet"
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionIdentity {
+    pub runtime_id: Vec<i32>,
+    pub automation_id: String,
+    pub name: String,
+    pub control_type: String,
+    /// The element's whole current text at capture time
+    /// (`TextPattern.DocumentRange().GetText(-1)`), the same "full text"
+    /// role `executors::replace_text::ReplaceTextProposal::expected_current_text`
+    /// plays: the stale-target check's baseline and the base string
+    /// `splice_utf16` splices into.
+    pub full_text: String,
+    /// UTF-16 code-unit offsets `(start, end)` of the selection within
+    /// `full_text` -- never byte offsets, never char counts.
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Identifies the UIA element a captured selection lives in, plus the
+/// selection's own UTF-16 `(start, end)` offsets into its whole current
+/// text -- everything `executors::replace_text`'s `ReplaceSelection` mode
+/// needs to re-resolve the element and splice the edited text back in.
+/// `hwnd` is supplied by the caller (the foreground window handle it
+/// already has, e.g. from `GetForegroundWindow()`), never read from UIA:
+/// `IUIAutomationElement::GetFocusedElement()` reports identity relative to
+/// the desktop, not a window, the same reason
+/// `actions::review_email::com::capture_focused_compose_body` takes its
+/// `hwnd: isize` as a parameter instead of deriving one.
+#[allow(dead_code)] // see the module doc comment's "not wired yet"
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionTarget {
+    pub hwnd: isize,
+    pub runtime_id: Vec<i32>,
+    pub automation_id: String,
+    pub name: String,
+    pub control_type: String,
+    pub full_text: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Combines a UIA-derived [`SelectionIdentity`] with the caller-supplied
+/// foreground window handle into the [`SelectionTarget`] [`Selection`]
+/// exposes. Pure and total: `None` in, `None` out, on either side -- kept
+/// separate from [`resolve`] so this combination has a plain unit test
+/// independent of any live UIA call.
+#[allow(dead_code)] // see the module doc comment's "not wired yet"
+fn combine_target(
+    foreground_hwnd: Option<isize>,
+    identity: Option<SelectionIdentity>,
+) -> Option<SelectionTarget> {
+    let hwnd = foreground_hwnd?;
+    let identity = identity?;
+    Some(SelectionTarget {
+        hwnd,
+        runtime_id: identity.runtime_id,
+        automation_id: identity.automation_id,
+        name: identity.name,
+        control_type: identity.control_type,
+        full_text: identity.full_text,
+        start: identity.start,
+        end: identity.end,
+    })
 }
 
 /// What [`get_selection_foreground`] (or its by-handle test seam) should do
@@ -157,8 +268,15 @@ pub enum UiaProbe {
 #[allow(dead_code)] // see the module doc comment's "not wired yet"
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionPlan {
-    /// Use the UIA text as-is (already bounded).
-    UseUia { text: String, truncated: bool },
+    /// Use the UIA text as-is (already bounded). `identity` carries straight
+    /// through from [`UiaProbe::Selection`] unexamined -- see [`resolve`]'s
+    /// use of [`combine_target`] for where it becomes a real
+    /// [`SelectionTarget`] (or is discarded).
+    UseUia {
+        text: String,
+        truncated: bool,
+        identity: Option<SelectionIdentity>,
+    },
     /// The focused element is a password field: stop entirely, no clipboard
     /// fallback either.
     SkipPasswordField,
@@ -180,12 +298,35 @@ pub fn plan_from_probe(probe: UiaProbe, max_chars: usize) -> SelectionPlan {
     match probe {
         UiaProbe::FocusedIsPassword => SelectionPlan::SkipPasswordField,
         UiaProbe::NoFocusedElement | UiaProbe::NoTextPattern => SelectionPlan::Fallback,
-        UiaProbe::Selection(text) if text.is_empty() => SelectionPlan::Fallback,
-        UiaProbe::Selection(text) => {
+        // Discards `identity` too, even if one was somehow computed for an
+        // empty range: an empty selection falls back to the clipboard path
+        // exactly as before, never to a "Do it" target with a zero-width
+        // range (#219's "must degrade... not a wrong offset").
+        UiaProbe::Selection { text, .. } if text.is_empty() => SelectionPlan::Fallback,
+        UiaProbe::Selection { text, identity } => {
             let (text, truncated) = truncate_bounded(&text, max_chars);
-            SelectionPlan::UseUia { text, truncated }
+            SelectionPlan::UseUia {
+                text,
+                truncated,
+                identity,
+            }
         }
     }
+}
+
+/// #263: resolves a `CurrentIsPassword` read to a plain `bool`, failing
+/// CLOSED (treated as a password field) rather than open when the read
+/// itself errors. This module's own doc comment says the whole point of
+/// checking `IsPassword` first is that "neither the UIA read nor the
+/// clipboard fallback ever touches a password field's contents" -- a COM
+/// error on the read itself (a hung provider, a non-conformant control)
+/// must not silently take the less-safe "not a password" branch. Generic
+/// over the error type so this stays in the pure, no-`windows`-crate-types
+/// section and gets a plain unit test with no COM call involved;
+/// `com::probe_from_element` is the sole caller.
+#[allow(dead_code)] // see the module doc comment's "not wired yet"
+fn resolve_is_password<E>(read: Result<bool, E>) -> bool {
+    read.unwrap_or(true)
 }
 
 /// Truncates `text` to at most `max_chars` Unicode scalar values (never a
@@ -306,21 +447,6 @@ pub fn build_ctrl_c_plan(release: &[u32]) -> Vec<SyntheticKeyEvent> {
     plan
 }
 
-/// `dwExtraInfo` tag applied to every synthetic input event this module
-/// injects (see [`win32::inject_events`]). `THEORY (unverified)`: the task
-/// brief assumes `hotkey.rs`'s low-level hook already filters on
-/// `LLKHF_INJECTED` and that this tag exists so it "ignores" these events --
-/// **it does not**. `hook_proc` (`src/hotkey.rs`) reads `kb.vkCode` and the
-/// live modifier state on every `WM_KEYDOWN`/`WM_SYSKEYDOWN` with no check
-/// of `kb.flags` or `kb.dwExtraInfo` at all, injected or not. In practice
-/// this is harmless today: Ctrl+C is not shaped like either configured
-/// hotkey chord (which both require Shift, per the design spec's examples),
-/// so the hook's `matches()` check never fires for it regardless. The tag is
-/// still applied, as a marker any future filtering logic can key off, and
-/// the gap is filed as a follow-up finding (see this session's report)
-/// rather than fixed here: `hotkey.rs` is out of this task's scope.
-const INJECTED_MARKER: usize = 0x57494E47; // ASCII "WING", arbitrary but recognizable
-
 // ---------------------------------------------------------------------------
 // Clipboard snapshot / restore, injectable
 // ---------------------------------------------------------------------------
@@ -426,14 +552,17 @@ impl<'a, C: RawClipboard> ClipboardGuard<'a, C> {
         }
     }
 
-    /// Restores and verifies now. Idempotent: a second call (including the
-    /// one `Drop` would otherwise make) is a no-op `Ok(())`.
+    /// Restores and verifies now. Idempotent on SUCCESS: a second call after
+    /// a successful restore (including the one `Drop` would otherwise make)
+    /// is a no-op `Ok(())`. On FAILURE, `done` is left `false` so `Drop`
+    /// still gets its documented one more attempt (#262: a failed restore
+    /// must not forfeit the safety net at exactly the moment it is needed).
     pub fn restore_now(&mut self) -> anyhow::Result<()> {
         if self.done {
             return Ok(());
         }
         let result = restore_and_verify(self.clipboard, &self.snapshot);
-        self.done = true;
+        self.done = result.is_ok();
         result
     }
 }
@@ -472,6 +601,13 @@ pub struct Selection {
     pub text: String,
     pub truncated: bool,
     pub source: SelectionSource,
+    /// `Some` only when [`get_selection_foreground_with_target`] was called
+    /// (a `foreground_hwnd` was supplied) AND the UIA path found exactly one
+    /// contiguous selection range with everything readable -- see the
+    /// module doc comment's "Selection identity and offsets" section. Always
+    /// `None` from plain [`get_selection_foreground`], and always `None` for
+    /// [`SelectionSource::ClipboardFallback`]/`Empty`/`SkippedPasswordField`.
+    pub target: Option<SelectionTarget>,
 }
 
 // ---------------------------------------------------------------------------
@@ -481,15 +617,20 @@ pub struct Selection {
 mod com {
     #![allow(dead_code)] // see the module doc comment's "not wired yet"
 
-    use super::UiaProbe;
+    use super::{resolve_is_password, SelectionIdentity, UiaProbe};
     use windows::core::Interface;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
+        COINIT_APARTMENTTHREADED, SAFEARRAY,
+    };
+    use windows::Win32::System::Ole::{
+        SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
+        SafeArrayUnaccessData,
     };
     use windows::Win32::UI::Accessibility::{
         CUIAutomation8, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
+        IUIAutomationTextRange, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
         UIA_TextPattern2Id, UIA_TextPatternId,
     };
 
@@ -550,10 +691,10 @@ mod com {
     fn probe_from_element(element: &IUIAutomationElement) -> anyhow::Result<UiaProbe> {
         // NEVER read anything else from a password field's selection --
         // checked before any pattern lookup, same shape as
-        // `inputs::uia::com::extract`'s `is_password` guard.
-        let is_password = unsafe { element.CurrentIsPassword() }
-            .map(|b| b.as_bool())
-            .unwrap_or(false);
+        // `inputs::uia::com::extract`'s `is_password` guard. #263: a failed
+        // read fails CLOSED via `resolve_is_password`, never open.
+        let is_password =
+            resolve_is_password(unsafe { element.CurrentIsPassword() }.map(|b| b.as_bool()));
         if is_password {
             return Ok(UiaProbe::FocusedIsPassword);
         }
@@ -565,6 +706,12 @@ mod com {
         let ranges = unsafe { pattern.GetSelection() }?;
         let count = unsafe { ranges.Length() }?.max(0) as usize;
         let mut text = String::new();
+        // Only a single, contiguous range has one meaningful (start, end)
+        // pair to report -- a discontiguous multi-range selection (e.g. a
+        // multi-cell Excel selection) degrades to text-only, same as the
+        // module doc comment's "Selection identity and offsets" section
+        // says.
+        let mut only_range: Option<IUIAutomationTextRange> = None;
         for i in 0..count {
             let range = unsafe { ranges.GetElement(i as i32) }?;
             let range_text = unsafe { range.GetText(-1) }?.to_string();
@@ -577,8 +724,141 @@ mod com {
                 text.push('\n');
             }
             text.push_str(&range_text);
+            if count == 1 {
+                only_range = Some(range);
+            }
         }
-        Ok(UiaProbe::Selection(text))
+
+        // `.ok()`: any failure while reading identity/offsets (a provider
+        // quirk, a COM hiccup) degrades to no target, never a wrong one --
+        // the text itself is already captured above and is returned either
+        // way.
+        let identity =
+            only_range.and_then(|range| selection_identity(element, &pattern, &range).ok());
+
+        Ok(UiaProbe::Selection { text, identity })
+    }
+
+    /// Reads the owning element's identity plus the selection's own UTF-16
+    /// `(start, end)` offsets, both from the same `IUIAutomationTextRange`
+    /// [`probe_from_element`] already has in hand. The offset technique:
+    /// clone the document's whole range, move its END to the selection's
+    /// START (`MoveEndpointByRange`), then the UTF-16 length of THAT
+    /// range's text is `start`; `end` is `start` plus the UTF-16 length of
+    /// the selection's own text (already read by the caller as
+    /// `range_text`, but re-read here via `GetText` again rather than
+    /// threaded through, since a second `GetText` call on the same
+    /// unmodified range is cheap and keeps this function's inputs/outputs
+    /// self-contained). Never a byte offset or a char count -- see
+    /// `executors::replace_text::splice_utf16`'s own doc comment for why
+    /// that distinction matters for a non-BMP character.
+    fn selection_identity(
+        element: &IUIAutomationElement,
+        pattern: &IUIAutomationTextPattern,
+        selection_range: &IUIAutomationTextRange,
+    ) -> anyhow::Result<SelectionIdentity> {
+        let document_range = unsafe { pattern.DocumentRange() }?;
+        let before_range = unsafe { document_range.Clone() }?;
+        unsafe {
+            before_range.MoveEndpointByRange(
+                TextPatternRangeEndpoint_End,
+                selection_range,
+                TextPatternRangeEndpoint_Start,
+            )
+        }?;
+        let before_text = unsafe { before_range.GetText(-1) }?.to_string();
+        let start = before_text.encode_utf16().count();
+
+        let selection_text = unsafe { selection_range.GetText(-1) }?.to_string();
+        let end = start + selection_text.encode_utf16().count();
+
+        let full_text = unsafe { document_range.GetText(-1) }?.to_string();
+
+        let name = unsafe { element.CurrentName() }
+            .map(|b| b.to_string())
+            .unwrap_or_default();
+        let automation_id = unsafe { element.CurrentAutomationId() }
+            .map(|b| b.to_string())
+            .unwrap_or_default();
+        let control_type = control_type_to_string(unsafe { element.CurrentControlType() }?);
+        let runtime_id = unsafe { element.GetRuntimeId() }
+            .ok()
+            .and_then(|psa| unsafe { runtime_id_from_safearray(psa) }.ok())
+            .unwrap_or_default();
+
+        Ok(SelectionIdentity {
+            runtime_id,
+            automation_id,
+            name,
+            control_type,
+            full_text,
+            start,
+            end,
+        })
+    }
+
+    /// Same mapping as `actions::review_email::com::control_type_to_string`
+    /// (duplicated, not shared -- see this file's module doc comment on
+    /// `SelectionTarget` for why).
+    fn control_type_to_string(id: windows::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID) -> String {
+        use windows::Win32::UI::Accessibility::{
+            UIA_CheckBoxControlTypeId as CHECKBOX, UIA_ComboBoxControlTypeId as COMBOBOX,
+            UIA_DocumentControlTypeId as DOCUMENT, UIA_EditControlTypeId as EDIT,
+            UIA_ListControlTypeId as LIST, UIA_RadioButtonControlTypeId as RADIOBUTTON,
+            UIA_TextControlTypeId as TEXT,
+        };
+        if id == EDIT {
+            "Edit"
+        } else if id == COMBOBOX {
+            "ComboBox"
+        } else if id == DOCUMENT {
+            "Document"
+        } else if id == CHECKBOX {
+            "CheckBox"
+        } else if id == RADIOBUTTON {
+            "RadioButton"
+        } else if id == LIST {
+            "List"
+        } else if id == TEXT {
+            "Text"
+        } else {
+            "Other"
+        }
+        .to_string()
+    }
+
+    /// Same shape as `executors::target::com::runtime_id_from_safearray`
+    /// (duplicated, not shared -- see this file's module doc comment on
+    /// `SelectionTarget` for why).
+    unsafe fn runtime_id_from_safearray(psa: *mut SAFEARRAY) -> anyhow::Result<Vec<i32>> {
+        if psa.is_null() {
+            return Ok(Vec::new());
+        }
+
+        struct SafeArrayGuard(*mut SAFEARRAY);
+        impl Drop for SafeArrayGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SafeArrayDestroy(self.0);
+                }
+            }
+        }
+        let _guard = SafeArrayGuard(psa);
+
+        let lbound = unsafe { SafeArrayGetLBound(psa, 1) }?;
+        let ubound = unsafe { SafeArrayGetUBound(psa, 1) }?;
+        if ubound < lbound {
+            return Ok(Vec::new());
+        }
+        let count = (ubound - lbound + 1) as usize;
+
+        let mut data_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        unsafe { SafeArrayAccessData(psa, &mut data_ptr) }?;
+        let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const i32, count) };
+        let result = slice.to_vec();
+        unsafe { SafeArrayUnaccessData(psa) }?;
+
+        Ok(result)
     }
 
     /// `TextPattern2` first (the task brief's preference: it is a superset),
@@ -604,7 +884,8 @@ mod com {
 mod win32 {
     #![allow(dead_code)] // see the module doc comment's "not wired yet"
 
-    use super::{RawClipboard, SyntheticKeyEvent, INJECTED_MARKER};
+    use super::{RawClipboard, SyntheticKeyEvent};
+    use crate::hotkey::INJECTED_MARKER;
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
     use windows::core::w;
@@ -617,7 +898,7 @@ mod win32 {
         RemoveClipboardFormatListener, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
-    use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+    use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
         KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
@@ -631,6 +912,12 @@ mod win32 {
     pub(super) const CF_UNICODETEXT_U32: u32 = CF_UNICODETEXT.0 as u32;
     pub(super) const CF_HDROP_U32: u32 = CF_HDROP.0 as u32;
     pub(super) const CF_DIB_U32: u32 = CF_DIB.0 as u32;
+    /// #265: a distinct registered format from `CF_DIB` (carries a
+    /// `BITMAPV5HEADER`, used for images with an embedded ICC profile or a
+    /// real alpha channel). Several common copy sources (Snipping
+    /// Tool/Snip & Sketch, some browser image copies) put this on the
+    /// clipboard, sometimes with no parallel `CF_DIB` entry.
+    pub(super) const CF_DIBV5_U32: u32 = CF_DIBV5.0 as u32;
 
     fn html_format() -> u32 {
         static FMT: OnceLock<u32> = OnceLock::new();
@@ -642,13 +929,14 @@ mod win32 {
         *FMT.get_or_init(|| unsafe { RegisterClipboardFormatW(w!("Rich Text Format")) })
     }
 
-    /// The five formats [`super::snapshot`]/[`super::restore`] round-trip.
+    /// The six formats [`super::snapshot`]/[`super::restore`] round-trip.
     /// See the module doc comment's "what is and is not preserved".
-    pub(super) fn preserved_formats() -> [u32; 5] {
+    pub(super) fn preserved_formats() -> [u32; 6] {
         [
             CF_UNICODETEXT_U32,
             CF_HDROP_U32,
             CF_DIB_U32,
+            CF_DIBV5_U32,
             html_format(),
             rtf_format(),
         ]
@@ -795,10 +1083,10 @@ mod win32 {
     }
 
     /// `SendInput`s the given plan. Never called by this module's own
-    /// automated tests (see [`INJECTED_MARKER`]'s doc comment and the crate
-    /// task brief: it would type into whatever real window has focus when
-    /// the test runs). Covered by [`super::build_ctrl_c_plan`]'s pure tests
-    /// plus the manual check filed to #166.
+    /// automated tests (see [`crate::hotkey::INJECTED_MARKER`]'s doc comment
+    /// and the crate task brief: it would type into whatever real window has
+    /// focus when the test runs). Covered by [`super::build_ctrl_c_plan`]'s
+    /// pure tests plus the manual check filed to #166.
     pub(super) fn inject_events(events: &[SyntheticKeyEvent]) {
         let inputs: Vec<INPUT> = events.iter().map(to_input).collect();
         if inputs.is_empty() {
@@ -940,24 +1228,52 @@ pub fn get_selection_foreground(
     // genuine `FocusedIsPassword` read must still short-circuit everything,
     // which is why that variant is never folded into this `unwrap_or`.
     let probe = com::probe_focused().unwrap_or(UiaProbe::NoFocusedElement);
-    resolve(probe, max_chars, clipboard_wait_budget)
+    resolve(probe, max_chars, clipboard_wait_budget, None)
+}
+
+/// Same as [`get_selection_foreground`], plus a [`Selection::target`] when
+/// the UIA path can support one (#219). `foreground_hwnd` is the caller's
+/// already-known foreground window handle (e.g. `GetForegroundWindow()`),
+/// the same value `actions::review_email::capture_input` already threads
+/// through for the compose-body path -- see [`SelectionTarget`]'s doc
+/// comment for why this module never derives it from UIA itself.
+#[allow(dead_code)] // see the module doc comment's "not wired yet"
+pub fn get_selection_foreground_with_target(
+    foreground_hwnd: isize,
+    max_chars: usize,
+    clipboard_wait_budget: Duration,
+) -> anyhow::Result<Selection> {
+    let probe = com::probe_focused().unwrap_or(UiaProbe::NoFocusedElement);
+    resolve(
+        probe,
+        max_chars,
+        clipboard_wait_budget,
+        Some(foreground_hwnd),
+    )
 }
 
 fn resolve(
     probe: UiaProbe,
     max_chars: usize,
     clipboard_wait_budget: Duration,
+    foreground_hwnd: Option<isize>,
 ) -> anyhow::Result<Selection> {
     match plan_from_probe(probe, max_chars) {
-        SelectionPlan::UseUia { text, truncated } => Ok(Selection {
+        SelectionPlan::UseUia {
+            text,
+            truncated,
+            identity,
+        } => Ok(Selection {
             text,
             truncated,
             source: SelectionSource::Uia,
+            target: combine_target(foreground_hwnd, identity),
         }),
         SelectionPlan::SkipPasswordField => Ok(Selection {
             text: String::new(),
             truncated: false,
             source: SelectionSource::SkippedPasswordField,
+            target: None,
         }),
         SelectionPlan::Fallback => clipboard_fallback(max_chars, clipboard_wait_budget),
     }
@@ -1001,12 +1317,14 @@ fn clipboard_fallback(max_chars: usize, wait_budget: Duration) -> anyhow::Result
                 text,
                 truncated,
                 source: SelectionSource::ClipboardFallback,
+                target: None,
             })
         }
         _ => Ok(Selection {
             text: String::new(),
             truncated: false,
             source: SelectionSource::Empty,
+            target: None,
         }),
     }
 }
@@ -1034,6 +1352,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_is_password_fails_closed_when_the_read_itself_errors() {
+        // #263: a COM error reading IsPassword must be treated as "this is
+        // a password field", never as "this is not".
+        assert!(resolve_is_password::<()>(Err(())));
+    }
+
+    #[test]
+    fn resolve_is_password_reports_a_successful_read_unchanged() {
+        assert!(!resolve_is_password::<()>(Ok(false)));
+        assert!(resolve_is_password::<()>(Ok(true)));
+    }
+
+    #[test]
     fn no_text_pattern_falls_back() {
         assert_eq!(
             plan_from_probe(UiaProbe::NoTextPattern, DEFAULT_MAX_CHARS),
@@ -1044,7 +1375,13 @@ mod tests {
     #[test]
     fn empty_uia_selection_falls_back() {
         assert_eq!(
-            plan_from_probe(UiaProbe::Selection(String::new()), DEFAULT_MAX_CHARS),
+            plan_from_probe(
+                UiaProbe::Selection {
+                    text: String::new(),
+                    identity: None
+                },
+                DEFAULT_MAX_CHARS
+            ),
             SelectionPlan::Fallback
         );
     }
@@ -1052,10 +1389,17 @@ mod tests {
     #[test]
     fn non_empty_uia_selection_is_used_untruncated() {
         assert_eq!(
-            plan_from_probe(UiaProbe::Selection("hello".to_string()), DEFAULT_MAX_CHARS),
+            plan_from_probe(
+                UiaProbe::Selection {
+                    text: "hello".to_string(),
+                    identity: None
+                },
+                DEFAULT_MAX_CHARS
+            ),
             SelectionPlan::UseUia {
                 text: "hello".to_string(),
                 truncated: false,
+                identity: None,
             }
         );
     }
@@ -1064,12 +1408,97 @@ mod tests {
     fn oversized_uia_selection_is_truncated() {
         let long = "x".repeat(10);
         assert_eq!(
-            plan_from_probe(UiaProbe::Selection(long), 4),
+            plan_from_probe(
+                UiaProbe::Selection {
+                    text: long,
+                    identity: None
+                },
+                4
+            ),
             SelectionPlan::UseUia {
                 text: "xxxx".to_string(),
                 truncated: true,
+                identity: None,
             }
         );
+    }
+
+    // -- plan_from_probe: identity carry-through / discard (#219) -----------
+
+    fn sample_identity() -> SelectionIdentity {
+        SelectionIdentity {
+            runtime_id: vec![1, 2, 3],
+            automation_id: "compose-body".to_string(),
+            name: "Message Body".to_string(),
+            control_type: "Edit".to_string(),
+            full_text: "Hello world".to_string(),
+            start: 6,
+            end: 11,
+        }
+    }
+
+    #[test]
+    fn non_empty_uia_selection_carries_its_identity_through_to_use_uia() {
+        let plan = plan_from_probe(
+            UiaProbe::Selection {
+                text: "world".to_string(),
+                identity: Some(sample_identity()),
+            },
+            DEFAULT_MAX_CHARS,
+        );
+        assert_eq!(
+            plan,
+            SelectionPlan::UseUia {
+                text: "world".to_string(),
+                truncated: false,
+                identity: Some(sample_identity()),
+            }
+        );
+    }
+
+    #[test]
+    fn empty_uia_selection_discards_any_identity_and_falls_back() {
+        // Even if identity was somehow computed for a zero-width range, an
+        // empty selection must still fall back -- never surface a "Do it"
+        // target for nothing selected (#219's "must degrade... not a wrong
+        // offset").
+        let plan = plan_from_probe(
+            UiaProbe::Selection {
+                text: String::new(),
+                identity: Some(sample_identity()),
+            },
+            DEFAULT_MAX_CHARS,
+        );
+        assert_eq!(plan, SelectionPlan::Fallback);
+    }
+
+    // -- combine_target (#219) ----------------------------------------------
+
+    #[test]
+    fn combine_target_is_none_with_no_foreground_hwnd() {
+        // Plain `get_selection_foreground` (no hwnd) never attaches a
+        // target, even if identity was captured.
+        assert_eq!(combine_target(None, Some(sample_identity())), None);
+    }
+
+    #[test]
+    fn combine_target_is_none_with_no_identity() {
+        // A ValuePattern-only/no-TextPattern control, or a discontiguous
+        // multi-range selection: hwnd alone is never enough.
+        assert_eq!(combine_target(Some(4242), None), None);
+    }
+
+    #[test]
+    fn combine_target_builds_the_full_target_when_both_are_present() {
+        let target = combine_target(Some(4242), Some(sample_identity())).unwrap();
+        assert_eq!(target.hwnd, 4242);
+        assert_eq!(target.runtime_id, vec![1, 2, 3]);
+        assert_eq!(target.automation_id, "compose-body");
+        assert_eq!(target.name, "Message Body");
+        assert_eq!(target.control_type, "Edit");
+        assert_eq!(target.full_text, "Hello world");
+        assert_eq!(target.start, 6);
+        assert_eq!(target.end, 11);
     }
 
     // -- truncate_bounded ---------------------------------------------------
@@ -1333,6 +1762,26 @@ mod tests {
     }
 
     #[test]
+    fn a_cf_dibv5_only_snapshot_round_trips_through_the_production_format_list() {
+        // #265: CF_DIBV5 (BITMAPV5HEADER images -- Snipping Tool/Snip &
+        // Sketch, some browser image copies, sometimes with no parallel
+        // CF_DIB) must not be silently dropped by a selection-fallback
+        // round trip, the same way CF_DIB already is not.
+        let cf_dibv5 = windows::Win32::System::Ole::CF_DIBV5.0 as u32;
+        let clipboard = FakeClipboard::seeded(&[(cf_dibv5, b"fake-dibv5-bytes")]);
+
+        let snap = snapshot(&clipboard, &win32::preserved_formats());
+        clipboard.set_formats(&[]).unwrap(); // the injected Ctrl+C clearing the clipboard
+        restore(&clipboard, &snap).unwrap();
+
+        assert_eq!(
+            clipboard.get_format(cf_dibv5),
+            Some(b"fake-dibv5-bytes".to_vec()),
+            "a CF_DIBV5 image must survive a selection-fallback clipboard round trip"
+        );
+    }
+
+    #[test]
     fn restore_writes_back_exactly_the_captured_formats() {
         let clipboard = FakeClipboard::seeded(&[(FMT_TEXT, b"original")]);
         let snap = snapshot(&clipboard, &[FMT_TEXT]);
@@ -1444,6 +1893,39 @@ mod tests {
             clipboard.sequence_number(),
             seq_after_first_restore,
             "Drop must not perform a second restore after restore_now already ran"
+        );
+    }
+
+    #[test]
+    fn restore_now_leaves_done_false_on_failure_so_drop_still_retries() {
+        // #262: a failed restore_now must not forfeit Drop's safety net.
+        let clipboard = FakeClipboard::seeded(&[(FMT_TEXT, b"original")]);
+        let mut guard = ClipboardGuard::capture(&clipboard, &[FMT_TEXT]);
+        clipboard
+            .set_formats(&[(FMT_TEXT, b"injected".to_vec())])
+            .unwrap();
+
+        // Make the first restore attempt fail (a silent no-op write, the
+        // same fake behaviour `restore_and_verify_errs_when_the_write_silently_no_ops`
+        // uses).
+        *clipboard.fail_restore_silently.borrow_mut() = true;
+        let err = guard.restore_now().unwrap_err();
+        assert!(err.to_string().contains("sequence number"));
+        assert_eq!(
+            clipboard.get_format(FMT_TEXT).unwrap(),
+            b"injected",
+            "restore_now failed, so the injected copy must still be on the clipboard"
+        );
+
+        // Let a later attempt (Drop's safety net) succeed.
+        *clipboard.fail_restore_silently.borrow_mut() = false;
+        drop(guard);
+
+        assert_eq!(
+            clipboard.get_format(FMT_TEXT).unwrap(),
+            b"original",
+            "Drop must still attempt a restore after a failed restore_now, per the \
+             doc comment's stated safety-net guarantee"
         );
     }
 
@@ -1599,7 +2081,113 @@ mod tests {
             // integration test's convention.
             eprintln!("selection::com::probe_element took {elapsed:?} for an EDIT control");
 
-            assert_eq!(probe, UiaProbe::Selection("selection".to_string()));
+            // #219: a single contiguous real EDIT-control selection must
+            // also carry its owning element's identity and the selection's
+            // own UTF-16 offsets into the control's whole current text --
+            // the observable that would differ if `SelectionTarget`
+            // capturing were wired to nothing.
+            match probe {
+                UiaProbe::Selection { text, identity } => {
+                    assert_eq!(text, "selection");
+                    let identity = identity.expect(
+                        "a single contiguous EDIT-control selection must carry its identity",
+                    );
+                    assert_eq!(identity.control_type, "Edit");
+                    assert_eq!(identity.full_text, "Hello, selection world");
+                    assert_eq!(identity.start, 7);
+                    assert_eq!(identity.end, 16);
+                    assert!(
+                        !identity.runtime_id.is_empty(),
+                        "a real UIA element must report a non-empty runtime id"
+                    );
+                }
+                other => panic!("expected UiaProbe::Selection, got {other:?}"),
+            }
+
+            unsafe {
+                let _ = DestroyWindow(frame);
+            }
+        }
+
+        /// #219: the selection's own UTF-16 offsets must round-trip a
+        /// non-BMP character (a surrogate pair) correctly -- a char-count or
+        /// byte-count offset would both be wrong here. "Hi <emoji> team":
+        /// "Hi " is 3 UTF-16 units, the emoji is 2 (a high + low surrogate),
+        /// then " team" is 5 more (10 units total). Selecting just the
+        /// emoji is `EM_SETSEL(3, 5)`.
+        #[test]
+        fn uia_selection_offsets_round_trip_a_non_bmp_character() {
+            let _lock = lock_uia_test();
+            let hinstance = instance();
+            assert!(ensure_class_registered(hinstance));
+
+            let frame = unsafe {
+                CreateWindowExW(
+                    Default::default(),
+                    CLASS_NAME,
+                    w!("Wingman selection test window (emoji)"),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    0,
+                    0,
+                    320,
+                    120,
+                    None,
+                    None,
+                    Some(hinstance),
+                    None,
+                )
+            }
+            .expect("CreateWindowExW (frame)");
+            unsafe {
+                let _ = ShowWindow(frame, SW_SHOWNOACTIVATE);
+            }
+            pump_pending_messages();
+
+            let text = "Hi \u{1F600} team";
+            assert_eq!(text.encode_utf16().count(), 10);
+
+            let text_w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let edit = unsafe {
+                CreateWindowExW(
+                    Default::default(),
+                    w!("EDIT"),
+                    windows::core::PCWSTR(text_w.as_ptr()),
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                    10,
+                    10,
+                    280,
+                    20,
+                    Some(frame),
+                    None,
+                    Some(hinstance),
+                    None,
+                )
+            }
+            .expect("CreateWindowExW (edit)");
+            pump_pending_messages();
+
+            // Select exactly the emoji (UTF-16 offsets 3..5), never
+            // splitting its surrogate pair.
+            unsafe {
+                SendMessageW(edit, EM_SETSEL, Some(WPARAM(3)), Some(LPARAM(5)));
+            }
+            pump_pending_messages();
+
+            let probe = com::probe_element(edit).expect("com::probe_element");
+            match probe {
+                UiaProbe::Selection {
+                    text: selected_text,
+                    identity,
+                } => {
+                    assert_eq!(selected_text, "\u{1F600}");
+                    let identity = identity
+                        .expect("a single contiguous emoji selection must carry its identity");
+                    assert_eq!(identity.full_text, text);
+                    assert_eq!(identity.start, 3);
+                    assert_eq!(identity.end, 5);
+                }
+                other => panic!("expected UiaProbe::Selection, got {other:?}"),
+            }
 
             unsafe {
                 let _ = DestroyWindow(frame);
@@ -1661,7 +2249,13 @@ mod tests {
             pump_pending_messages();
 
             let probe = com::probe_element(edit).expect("com::probe_element");
-            assert_eq!(probe, UiaProbe::Selection(String::new()));
+            assert_eq!(
+                probe,
+                UiaProbe::Selection {
+                    text: String::new(),
+                    identity: None
+                }
+            );
             assert_eq!(
                 plan_from_probe(probe, DEFAULT_MAX_CHARS),
                 SelectionPlan::Fallback,

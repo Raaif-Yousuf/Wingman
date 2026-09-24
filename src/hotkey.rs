@@ -68,6 +68,34 @@ pub const WM_APP_PALETTE_TOGGLE: u32 = WM_APP + 10;
 pub const HK_PRIMARY: usize = 1;
 pub const HK_SECONDARY: usize = 2;
 
+/// `dwExtraInfo` tag applied to every synthetic input event Wingman itself
+/// injects via `SendInput`, anywhere in the crate -- the ONE constant every
+/// such call site uses: [`ctrl_input`] below,
+/// `inputs::selection::win32::inject_events`'s Ctrl+C fallback, and
+/// `executors::target::inject_unicode_events`'s typed-input fallback
+/// (`fill_form` and every other executor that falls back to typing reach
+/// `SendInput` only through that one function). Issue #209: before this,
+/// `inputs::selection` and `executors::target` each defined their own
+/// private copy of the same value, and nothing in this file ever read
+/// either of them -- `hook_proc` matched a synthetic keydown exactly like a
+/// real one.
+///
+/// `hook_proc` treats any keydown tagged with exactly this value as
+/// Wingman's own synthetic input and lets it pass straight through: never
+/// swallowed, never matched against a hotkey or the pause chord, never fed
+/// to learn mode. Deliberately NOT a blanket check of `LLKHF_INJECTED` (the
+/// low-level hook's own flag for "some process injected this event",
+/// without saying which): some third-party key remapper may legitimately
+/// inject the Copilot key, or any other configured chord, on the user's
+/// behalf -- this crate's own hotkey pitfall notes ("Learn mode exists
+/// because Dell firmware may emit something else") already treat remapped
+/// input as an expected source, not a hostile one. Filtering by this
+/// specific tag instead means only Wingman's OWN synthetic events are ever
+/// ignored; a genuinely `LLKHF_INJECTED` event carrying any other
+/// `dwExtraInfo` value (including a real remapper's own tag, or none) is
+/// still treated exactly like a real keypress.
+pub const INJECTED_MARKER: usize = 0x5749_4E47; // ASCII "WING"
+
 const LEARN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A key combination: a trigger virtual-key plus the modifier keys held with
@@ -450,6 +478,11 @@ fn key_down(vk: i32) -> bool {
 }
 
 /// Build a single Ctrl key-event input (down or up) for [`send_ctrl_tap`].
+/// Tagged with [`INJECTED_MARKER`] (issue #209) like every other synthetic
+/// input this crate injects, so `hook_proc` never treats its own Win-release
+/// workaround as a real keypress -- harmless today only because no
+/// configured chord happens to be shaped like a bare Ctrl tap, exactly the
+/// latent trap #209 was filed about.
 fn ctrl_input(key_up: bool) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
@@ -463,7 +496,7 @@ fn ctrl_input(key_up: bool) -> INPUT {
                     KEYBD_EVENT_FLAGS(0)
                 },
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: INJECTED_MARKER,
             },
         },
     }
@@ -492,6 +525,21 @@ fn send_ctrl_tap() {
 /// it" failure mode.
 fn needs_win_release_workaround(chord: &Chord) -> bool {
     chord.win
+}
+
+/// Issue #209: whether `hook_proc` should treat a keydown as Wingman's own
+/// synthetic input -- checked first, before reading `kb.vkCode` or any live
+/// modifier state, so a matching event never reaches hotkey matching,
+/// pause-toggle matching, or learn mode at all. `true` only for exactly
+/// [`INJECTED_MARKER`]; every other value (including `0`, an untagged real
+/// keypress, and any other process's own tag on a genuinely
+/// `LLKHF_INJECTED` event) is real input as far as this crate is concerned
+/// -- see `INJECTED_MARKER`'s doc comment for why this deliberately does
+/// not check the hook's `LLKHF_INJECTED` flag at all. Pure and
+/// allocation-free, same reasoning as [`needs_win_release_workaround`]: the
+/// hook callback cannot afford anything slower than a comparison.
+fn is_own_synthetic_input(dw_extra_info: usize) -> bool {
+    dw_extra_info == INJECTED_MARKER
 }
 
 /// Reads [`PAUSE_CHORD`] and unpacks it, lock-free. `None` if no pause
@@ -529,6 +577,16 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     }
 
     let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+
+    // Issue #209: Wingman's own synthetic input (the Win-release Ctrl tap,
+    // learn mode's own tap, the selection-reading Ctrl+C fallback, the
+    // typed-input fallback) must never be treated as a real keypress --
+    // checked before anything else, including the paused branch below, so
+    // it can never accidentally toggle Pause or match a hotkey either.
+    if is_own_synthetic_input(kb.dwExtraInfo) {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
     let chord = current_chord(kb.vkCode);
 
     // Pause (issue #20) / pause-toggle chord (issue #181): while paused,
@@ -954,5 +1012,71 @@ mod tests {
             pause_hotkey_outcome(&same_key_no_ctrl, Some(pause_chord)),
             PauseHotkeyOutcome::PassThrough
         );
+    }
+
+    // -- is_own_synthetic_input (issue #209, pure) --------------------------
+
+    #[test]
+    fn own_marker_is_recognized_as_synthetic() {
+        assert!(is_own_synthetic_input(INJECTED_MARKER));
+    }
+
+    #[test]
+    fn untagged_real_input_is_not_synthetic() {
+        // dwExtraInfo == 0 is what an ordinary, un-injected keypress carries.
+        assert!(!is_own_synthetic_input(0));
+    }
+
+    #[test]
+    fn a_different_tag_is_not_treated_as_our_own_synthetic_input() {
+        // Some other process's own dwExtraInfo tag on a genuinely
+        // LLKHF_INJECTED event (a key remapper, say) must NOT be filtered --
+        // see INJECTED_MARKER's doc comment for why this crate deliberately
+        // does not do a blanket LLKHF_INJECTED check: that would also
+        // ignore a legitimate remapper injecting the Copilot key itself.
+        assert!(!is_own_synthetic_input(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn a_hotkey_shaped_like_our_own_synthetic_input_would_still_be_swallowed_by_matches_alone() {
+        // Proves #209's own scenario is real, not hypothetical: if a future
+        // contributor binds a hotkey to bare Ctrl -- exactly the shape
+        // send_ctrl_tap's own workaround injects -- `matches()` alone
+        // (hook_proc's very next check after is_own_synthetic_input) would
+        // happily fire for it. is_own_synthetic_input is what stops that
+        // synthetic tap from ever reaching this comparison at all.
+        let bare_ctrl_hotkey = chord(VK_CONTROL.0 as u32, false, false, false, false);
+        assert!(matches(&bare_ctrl_hotkey, &bare_ctrl_hotkey));
+        assert!(is_own_synthetic_input(INJECTED_MARKER));
+    }
+
+    // -- every SendInput call site tags its INPUT (issue #209) --------------
+
+    #[test]
+    fn every_sendinput_call_site_tags_its_input_with_the_shared_marker() {
+        // An INPUT built without this tag is invisible to
+        // is_own_synthetic_input, so a SendInput call site that forgets it
+        // is exactly the #209 trap again. Text-scanned the same way
+        // app.rs's wm_app_ids_registry_is_exhaustive counts WM_APP_*
+        // declarations: a new file that calls SendInput needs adding here.
+        for (name, src) in [
+            ("hotkey.rs", include_str!("hotkey.rs")),
+            ("inputs/selection.rs", include_str!("inputs/selection.rs")),
+            ("executors/target.rs", include_str!("executors/target.rs")),
+        ] {
+            let calls = src.matches("SendInput(").count();
+            let tagged = src.matches("dwExtraInfo: INJECTED_MARKER").count();
+            assert!(
+                calls > 0,
+                "{name} no longer calls SendInput -- update this test's file list"
+            );
+            assert!(
+                tagged > 0,
+                "{name} calls SendInput {calls} time(s) but no \
+                 \"dwExtraInfo: INJECTED_MARKER\" tag was found in it -- every synthetic \
+                 INPUT this crate builds must be tagged so hook_proc can recognize and \
+                 ignore it"
+            );
+        }
     }
 }

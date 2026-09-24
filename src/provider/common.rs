@@ -19,11 +19,94 @@
 //! trait, extended"). They stay in this file rather than `mod.rs` simply
 //! because that's where the JSON-building imports already are.
 
+use std::cell::Cell;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use serde_json::{json, Value};
+
+use crate::egress;
+use crate::ui::confirm::SendAuthorized;
+
+// ---------------------------------------------------------------------
+// "Show me what you're sending" (#105): a structural send gate.
+//
+// `SEND_AUTHORIZED` is thread-local, not a shared/global flag, because the
+// only real caller (a future `App::ask` once the preview card is wired up,
+// see this section's doc comment below) already crosses from the main
+// thread (which shows the card and gets the user's decision) to a fresh
+// worker thread (which alone calls into this module) per request -- see
+// `app.rs`'s `ask`. [`with_send_authorized`] is meant to wrap exactly that
+// worker closure's call into `Chain::complete`/`complete_parsed*`, so the
+// authorization is scoped to the one request it was granted for and can
+// never leak into an unrelated later request on a reused thread (a fresh
+// `std::thread::spawn` per request already means there is no reuse today,
+// but the explicit reset at the end of `with_send_authorized` keeps that
+// true even if that ever changes).
+//
+// STILL OWED (out of this agent's file scope -- app.rs is contended
+// tonight, see the task's file-scope note): nothing calls
+// `with_send_authorized` yet. Until `App::ask` is wired to show
+// `ui::preview::RequestPreview` via the existing `Card::show_preview`/
+// `PreviewModel` machinery (#26) and calls `ui::confirm::user_confirmed_send`
+// only on "Send", turning `config.egress_preview.enabled` on makes EVERY
+// request fail closed with [`send_preview_guard`]'s error (a card naming
+// why, rule 7) rather than silently sending unreviewed -- which is the
+// correct fail-safe direction for a half-wired safety feature, but is not
+// yet the full "Send/Cancel preview" UX #105 describes.
+// ---------------------------------------------------------------------
+
+thread_local! {
+    static SEND_AUTHORIZED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The only way anything in this crate can make [`send_preview_guard`] pass
+/// while the toggle is on: `authorized` can only have come from
+/// [`crate::ui::confirm::authorize_send`], whose only input is a
+/// `SendToken`, whose only source is
+/// [`crate::ui::confirm::user_confirmed_send`] -- the real preview card's
+/// "Send" handler, once wired (see this module's doc comment above). `f`
+/// runs with the authorization in effect and the flag is always reset
+/// afterward, success or panic-unwind alike (`Drop` guard), so one
+/// confirmed "Send" can never be reused for a second, later request.
+// #105: part of the "Show me what you're sending" gate. The structural half is
+// done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
+// authorized, `send_preview_guard` refuses every request, which is the
+// fail-safe direction. What remains is `App::ask` showing this preview via
+// `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
+// Deliberately not wired yet: that means adding a third pending kind to the
+// preview state machine, which has a live P1 (#225, two pending slots that can
+// both be Some at once). Sequenced after #225 on purpose.
+#[allow(dead_code)]
+pub(crate) fn with_send_authorized<R>(authorized: SendAuthorized, f: impl FnOnce() -> R) -> R {
+    let _ = authorized;
+    struct ResetOnDrop;
+    impl Drop for ResetOnDrop {
+        fn drop(&mut self) {
+            SEND_AUTHORIZED.with(|c| c.set(false));
+        }
+    }
+    SEND_AUTHORIZED.with(|c| c.set(true));
+    let _reset = ResetOnDrop;
+    f()
+}
+
+/// #105: refuses to proceed when `config::egress_preview_enabled()` is on
+/// and this thread has no live [`with_send_authorized`] scope. No em dash
+/// (rule 11) -- this text reaches the result card verbatim.
+fn send_preview_guard() -> Result<()> {
+    if !crate::config::egress_preview_enabled() {
+        return Ok(());
+    }
+    if SEND_AUTHORIZED.with(|c| c.get()) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "\"Show me what you're sending\" is on, and this request was not shown and confirmed. Nothing was sent."
+        ))
+    }
+}
 
 // ---------------------------------------------------------------------
 // Transport / clock / sleep abstractions (#98)
@@ -354,8 +437,43 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// (which gets its own message naming the retry delay, see
 /// `rate_limited_error`).
 fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
-    let truncated: String = body.chars().take(300).collect();
+    let truncated = redact_and_truncate(body);
     anyhow!("{tag}: HTTP {status}: {truncated}")
+}
+
+/// #253: the one place network-derived text becomes user-facing text.
+///
+/// [`egress::build_entry`] already redacts key-shaped tokens out of the
+/// copy it writes to the log, for the reason its own doc comment gives: a
+/// failure message comes straight from the network and a vendor can echo
+/// something key-shaped back. The `Err` built from the same body reaches
+/// the card (rule 7) and whatever the user pastes into a bug report, so it
+/// needs the same defense. Four of the five sites that build one had their
+/// own inline `body.chars().take(300)`, which is how three of them came to
+/// be missed; `no_error_text_in_this_file_interpolates_an_unredacted_body`
+/// now fails if a fifth appears.
+///
+/// Redaction runs before truncation deliberately: truncating first can cut
+/// a token below the 20-character threshold that identifies it, so the tail
+/// of a key would survive as ordinary-looking text.
+fn redact_and_truncate(body: &str) -> String {
+    egress::redact_opaque_tokens(body)
+        .chars()
+        .take(300)
+        .collect()
+}
+
+/// The same defense for a transport or body-read failure's text, which is
+/// network-derived too: it carries the URL, and `openai_compat` points at
+/// whatever base URL the user configured (#16's list includes proxies that
+/// take a key as a query parameter). Gemini's own URL is key-free by
+/// construction, and `gemini.rs`'s `endpoint_url_never_contains_the_api_key`
+/// keeps it that way, but a user-configured endpoint is not ours to promise.
+///
+/// Not truncated: these strings are a sentence, not a vendor's response
+/// body, and cutting them loses the reason the request failed.
+fn redact_detail(e: &impl std::fmt::Display) -> String {
+    egress::redact_opaque_tokens(&e.to_string())
 }
 
 /// #98: names the provider (`tag`) and the retry-after delay so the card
@@ -415,12 +533,17 @@ pub(crate) fn post_json_with(
     timeout: Duration,
     tag: &str,
 ) -> Result<String> {
+    send_preview_guard()?;
     offline_guard(url)?;
 
     let policy = env.policy;
     let mut retries = 0u32;
     let mut backoff_spent = Duration::ZERO;
     let mut retried_429 = false;
+    // #106: computed once -- `body` never changes across retries of the
+    // same logical request, so every logged attempt for this call shares
+    // the same "bytes sent" figure.
+    let bytes_sent = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
 
     // #186: a wall-clock deadline computed once, up front -- never
     // recomputed from a fresh "now" per attempt, or a slow attempt would
@@ -441,8 +564,17 @@ pub(crate) fn post_json_with(
         // timeout (the default policy's is), but a second or third attempt
         // only gets whatever remains.
         let attempt_timeout = timeout.min(wall_clock_remaining());
+        // #106: this attempt is a retry iff an earlier attempt in THIS call
+        // already failed and asked for another try (a transport/5xx retry
+        // bumps `retries`, a 429 retry-after sets `retried_429`) -- read
+        // before either can change again below, so it describes the
+        // attempt about to happen, not the one that just finished.
+        let is_retry = retries > 0 || retried_429;
 
-        match env.transport.post_json(url, headers, body, attempt_timeout) {
+        let attempt = env.transport.post_json(url, headers, body, attempt_timeout);
+        log_attempt(tag, url, body, is_retry, bytes_sent, &attempt);
+
+        match attempt {
             // #187: a status was already received -- the request almost
             // certainly reached the vendor (and, for a billed completion
             // API, was almost certainly already processed). Never retried
@@ -450,7 +582,8 @@ pub(crate) fn post_json_with(
             // that was received so the card is honest about what's known.
             Err(TransportError::BodyReadFailed { status, error }) => {
                 return Err(anyhow!(
-                    "{tag}: HTTP {status} received, then failed reading the response body: {error}"
+                    "{tag}: HTTP {status} received, then failed reading the response body: {}",
+                    redact_detail(&error)
                 ));
             }
             Err(TransportError::NoResponse(transport_err)) => {
@@ -465,7 +598,10 @@ pub(crate) fn post_json_with(
                     retries += 1;
                     continue;
                 }
-                return Err(anyhow!("{tag}: transport error: {transport_err}"));
+                return Err(anyhow!(
+                    "{tag}: transport error: {}",
+                    redact_detail(&transport_err)
+                ));
             }
             Ok(resp) => {
                 if (200..300).contains(&resp.status) {
@@ -504,6 +640,65 @@ pub(crate) fn post_json_with(
             }
         }
     }
+}
+
+/// #106: logs one HTTP attempt (success or failure) to the local egress
+/// log, from exactly the values `post_json_with`'s loop already has on
+/// hand -- see `egress.rs`'s module doc comment for what is and is not
+/// recorded. Never touches `headers` (where a key actually lives): it is
+/// not even a parameter here, so there is structurally no path for one to
+/// reach the log through this function.
+fn log_attempt(
+    tag: &str,
+    url: &str,
+    body: &Value,
+    is_retry: bool,
+    bytes_sent: usize,
+    attempt: &std::result::Result<RawResponse, TransportError>,
+) {
+    let entry = match attempt {
+        Ok(resp) if (200..300).contains(&resp.status) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            resp.body.len(),
+            egress::Outcome::Success,
+            None,
+        ),
+        Ok(resp) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            resp.body.len(),
+            egress::Outcome::Failure,
+            Some(&format!("HTTP {}", resp.status)),
+        ),
+        Err(TransportError::NoResponse(e)) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            0,
+            egress::Outcome::Failure,
+            Some(&format!("transport error: {e}")),
+        ),
+        Err(TransportError::BodyReadFailed { status, error }) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            0,
+            egress::Outcome::Failure,
+            Some(&format!("HTTP {status} then body read failed: {error}")),
+        ),
+    };
+    egress::record(&entry);
 }
 
 /// POSTs `body` as JSON to `url` with `headers`, waits up to `timeout`,
@@ -577,7 +772,8 @@ pub(crate) fn get_text_with_timeout(url: &str, timeout: Duration, tag: &str) -> 
         .timeout_global(Some(timeout))
         .build()
         .call();
-    let mut response = response.map_err(|e| anyhow!("{tag}: transport error: {e}"))?;
+    let mut response =
+        response.map_err(|e| anyhow!("{tag}: transport error: {}", redact_detail(&e)))?;
 
     let status = response.status();
     let body_text = response
@@ -586,7 +782,7 @@ pub(crate) fn get_text_with_timeout(url: &str, timeout: Duration, tag: &str) -> 
         .with_context(|| format!("{tag}: failed to read response body"))?;
 
     if !status.is_success() {
-        let truncated: String = body_text.chars().take(300).collect();
+        let truncated = redact_and_truncate(&body_text);
         return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
     }
 
@@ -614,12 +810,12 @@ pub(crate) fn post_json_read_body<T>(
         .timeout_connect(Some(connect_timeout))
         .build()
         .send_json(body)
-        .map_err(|e| anyhow!("{tag}: transport error: {e}"))?;
+        .map_err(|e| anyhow!("{tag}: transport error: {}", redact_detail(&e)))?;
 
     let status = response.status();
     if !status.is_success() {
         let body_text = response.body_mut().read_to_string().unwrap_or_default();
-        let truncated: String = body_text.chars().take(300).collect();
+        let truncated = redact_and_truncate(&body_text);
         return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
     }
 
@@ -646,33 +842,89 @@ pub(crate) fn post_json_with_connect_timeout(
     total_timeout: Duration,
     tag: &str,
 ) -> Result<String> {
+    send_preview_guard()?;
     offline_guard(url)?;
+
+    // #191: no retry loop here (Ollama is local/loopback and unbilled), so
+    // an attempt logged from this function is never a retry.
+    let bytes_sent = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
 
     let mut builder = ureq::post(url);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
 
-    let mut response = builder
+    let sent = builder
         .config()
         .http_status_as_error(false)
         .timeout_connect(Some(connect_timeout))
         .timeout_global(Some(total_timeout))
         .build()
-        .send_json(body)
-        .map_err(|e| anyhow!("{tag}: transport error: {e}"))?;
+        .send_json(body);
+
+    let mut response = match sent {
+        Ok(r) => r,
+        Err(e) => {
+            egress::record(&egress::build_entry(
+                tag,
+                url,
+                body,
+                false,
+                bytes_sent,
+                0,
+                egress::Outcome::Failure,
+                Some(&format!("transport error: {e}")),
+            ));
+            return Err(anyhow!("{tag}: transport error: {}", redact_detail(&e)));
+        }
+    };
 
     let status = response.status();
-    let body_text = response
-        .body_mut()
-        .read_to_string()
-        .with_context(|| format!("{tag}: failed to read response body"))?;
+    let body_text = match response.body_mut().read_to_string() {
+        Ok(t) => t,
+        Err(e) => {
+            egress::record(&egress::build_entry(
+                tag,
+                url,
+                body,
+                false,
+                bytes_sent,
+                0,
+                egress::Outcome::Failure,
+                Some(&format!("failed to read response body: {e}")),
+            ));
+            return Err(anyhow!(
+                "{tag}: failed to read response body: {}",
+                redact_detail(&e)
+            ));
+        }
+    };
 
     if !status.is_success() {
-        let truncated: String = body_text.chars().take(300).collect();
+        let truncated = redact_and_truncate(&body_text);
+        egress::record(&egress::build_entry(
+            tag,
+            url,
+            body,
+            false,
+            bytes_sent,
+            body_text.len(),
+            egress::Outcome::Failure,
+            Some(&format!("HTTP {status}: {truncated}")),
+        ));
         return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
     }
 
+    egress::record(&egress::build_entry(
+        tag,
+        url,
+        body,
+        false,
+        bytes_sent,
+        body_text.len(),
+        egress::Outcome::Success,
+        None,
+    ));
     Ok(body_text)
 }
 
@@ -841,13 +1093,14 @@ mod tests {
         sleeper: &RecordingSleeper,
         clock: &FixedClock,
     ) -> Result<String> {
-        // The Offline guard reads process-wide mode state that the #19 guard
-        // tests flip to Offline; without this lock a retry test running in
-        // parallel is refused before its scripted transport (MEASURED
-        // 2026-09-17: `http_500_then_200_succeeds` failed once this way).
-        let _mode = crate::mode::MODE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // Deliberately takes no lock: every caller holds `network_guard()`
+        // for the whole test, and `std::sync::Mutex` is not reentrant, so
+        // locking again here would deadlock rather than protect anything.
+        // #260 replaced the mode-only lock that used to live here, which
+        // covered half the race (MEASURED 2026-09-17:
+        // `http_500_then_200_succeeds` failed once through the mode half;
+        // MEASURED 2026-09-19: two wall-clock tests failed through the
+        // egress-preview half, which that lock did not cover).
         let policy = RetryPolicy::default();
         let env = RetryEnv {
             transport,
@@ -869,6 +1122,7 @@ mod tests {
 
     #[test]
     fn transport_error_retries_then_succeeds_without_a_real_sleep() {
+        let _g = network_guard();
         let transport = ScriptedTransport::new(vec![no_response("connection refused"), ok("done")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
@@ -882,6 +1136,7 @@ mod tests {
 
     #[test]
     fn http_500_then_200_succeeds() {
+        let _g = network_guard();
         let transport =
             ScriptedTransport::new(vec![status(500, vec![], "server error"), ok("done")]);
         let sleeper = RecordingSleeper::new();
@@ -896,6 +1151,7 @@ mod tests {
 
     #[test]
     fn http_400_never_retries() {
+        let _g = network_guard();
         let transport = ScriptedTransport::new(vec![status(400, vec![], "bad request")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
@@ -909,6 +1165,7 @@ mod tests {
 
     #[test]
     fn http_404_never_retries() {
+        let _g = network_guard();
         let transport = ScriptedTransport::new(vec![status(404, vec![], "not found")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
@@ -921,6 +1178,7 @@ mod tests {
 
     #[test]
     fn transport_errors_stop_after_max_retries_within_the_backoff_budget() {
+        let _g = network_guard();
         let transport = ScriptedTransport::new(vec![
             no_response("e1"),
             no_response("e2"),
@@ -944,6 +1202,7 @@ mod tests {
 
     #[test]
     fn body_read_failure_after_200_is_not_retried_and_surfaces_immediately() {
+        let _g = network_guard();
         let transport = ScriptedTransport::new(vec![body_read_failed(200, "connection reset")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
@@ -972,6 +1231,7 @@ mod tests {
 
     #[test]
     fn body_read_failure_after_5xx_is_not_retried_either() {
+        let _g = network_guard();
         // The "do not retry a body-read failure" rule doesn't depend on
         // which status came back -- any status at all means the request
         // reached the vendor.
@@ -988,6 +1248,7 @@ mod tests {
 
     #[test]
     fn a_pre_response_transport_error_is_still_retried_normally() {
+        let _g = network_guard();
         // Contrast case: `NoResponse` (never got a status at all) keeps the
         // existing retry-then-succeed behaviour -- #187 only changes the
         // BodyReadFailed path.
@@ -1003,6 +1264,8 @@ mod tests {
 
     #[test]
     fn http_429_with_short_retry_after_retries_once_then_surfaces_a_card() {
+        let _g = network_guard();
+
         let transport = ScriptedTransport::new(vec![
             status(429, vec![("retry-after", "3")], "slow down"),
             status(429, vec![("retry-after", "3")], "slow down"),
@@ -1041,6 +1304,7 @@ mod tests {
 
     #[test]
     fn http_429_that_recovers_on_retry_succeeds() {
+        let _g = network_guard();
         let transport = ScriptedTransport::new(vec![
             status(429, vec![("retry-after", "2")], "slow down"),
             ok("done"),
@@ -1056,6 +1320,7 @@ mod tests {
 
     #[test]
     fn http_429_with_long_retry_after_never_retries() {
+        let _g = network_guard();
         let transport =
             ScriptedTransport::new(vec![status(429, vec![("retry-after", "30")], "slow down")]);
         let sleeper = RecordingSleeper::new();
@@ -1074,6 +1339,7 @@ mod tests {
 
     #[test]
     fn http_429_without_retry_after_header_never_retries() {
+        let _g = network_guard();
         let transport = ScriptedTransport::new(vec![status(429, vec![], "slow down")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
@@ -1087,6 +1353,7 @@ mod tests {
 
     #[test]
     fn http_429_retry_after_is_case_insensitive() {
+        let _g = network_guard();
         let transport = ScriptedTransport::new(vec![
             status(429, vec![("Retry-After", "1")], "slow down"),
             ok("done"),
@@ -1102,6 +1369,7 @@ mod tests {
 
     #[test]
     fn http_429_retry_after_http_date_is_resolved_against_the_injected_clock() {
+        let _g = network_guard();
         let transport = ScriptedTransport::new(vec![
             status(
                 429,
@@ -1121,6 +1389,7 @@ mod tests {
 
     #[test]
     fn http_429_http_date_already_in_the_past_retries_immediately() {
+        let _g = network_guard();
         let transport = ScriptedTransport::new(vec![
             status(
                 429,
@@ -1198,6 +1467,8 @@ mod tests {
 
     #[test]
     fn wall_clock_budget_shrinks_a_later_attempts_timeout_and_stays_bounded() {
+        let _g = network_guard();
+
         let clock = FakeClock::new(0);
         let transport = HangingTransport::new(&clock);
         let sleeper = RecordingSleeper::new();
@@ -1253,6 +1524,8 @@ mod tests {
 
     #[test]
     fn wall_clock_floor_stops_retrying_before_max_retries_is_reached() {
+        let _g = network_guard();
+
         let clock = FakeClock::new(0);
         let transport = HangingTransport::new(&clock);
         let sleeper = RecordingSleeper::new();
@@ -1398,9 +1671,37 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Both process-wide gates `post_json_with` consults, taken together in
+    /// one fixed order, by every test in this module that can reach it.
+    ///
+    /// #260. `post_json_with` starts with `send_preview_guard()` then
+    /// `offline_guard()`, and each reads a different process-wide value:
+    /// `config::EGRESS_PREVIEW_ENABLED` and `mode::CURRENT_MODE`. A test
+    /// that flips either one refuses every *other* test's request before
+    /// its scripted transport is ever invoked, and the failure reads as
+    /// "0 attempts" against whatever that test was actually asserting, so
+    /// it looks like a retry-arithmetic regression rather than a race.
+    /// Locking only one of the two, which is what this module did, leaves
+    /// the other half of the race in place.
+    ///
+    /// The order is egress-preview first, then mode, and it is the only
+    /// order any test may take them in: two tests taking them in opposite
+    /// orders deadlock the suite rather than flake it. `run` deliberately
+    /// does NOT lock, so a test can hold these across setup and assertions
+    /// without the non-reentrant `Mutex` deadlocking against itself.
+    fn network_guard() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let egress = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (egress, mode_guard())
+    }
+
     #[test]
     fn offline_guard_refuses_a_non_loopback_url_before_the_transport_runs() {
-        let _g = mode_guard();
+        let _g = network_guard();
         crate::mode::set_current(crate::mode::Mode::Offline);
 
         let transport = ScriptedTransport::new(vec![ok("should never be reached")]);
@@ -1439,7 +1740,7 @@ mod tests {
 
     #[test]
     fn offline_guard_names_localhost_with_guidance() {
-        let _g = mode_guard();
+        let _g = network_guard();
         crate::mode::set_current(crate::mode::Mode::Offline);
 
         let transport = ScriptedTransport::new(vec![]);
@@ -1472,7 +1773,7 @@ mod tests {
 
     #[test]
     fn offline_guard_allows_a_loopback_url_while_offline() {
-        let _g = mode_guard();
+        let _g = network_guard();
         crate::mode::set_current(crate::mode::Mode::Offline);
 
         let transport = ScriptedTransport::new(vec![ok("done")]);
@@ -1503,7 +1804,7 @@ mod tests {
 
     #[test]
     fn offline_guard_is_inert_outside_offline_mode() {
-        let _g = mode_guard();
+        let _g = network_guard();
         for mode in [
             crate::mode::Mode::Cloud,
             crate::mode::Mode::Local,
@@ -1565,5 +1866,424 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    // -- #105 "Show me what you're sending": the structural send gate ------
+    //
+    // `EGRESS_PREVIEW_TEST_LOCK` is shared with `config.rs`'s and
+    // `ui::confirm`'s own tests -- see that lock's doc comment -- because
+    // `EGRESS_PREVIEW_ENABLED` is one process-wide `AtomicBool` for the
+    // whole test binary.
+
+    #[test]
+    fn post_json_with_never_reaches_the_transport_when_preview_is_on_and_not_authorized() {
+        let _g = network_guard();
+        crate::config::set_egress_preview_enabled(true);
+
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let result = run(&transport, &sleeper, &clock);
+
+        crate::config::set_egress_preview_enabled(false);
+
+        let err = result.expect_err("must be refused before any HTTP attempt");
+        assert!(
+            err.to_string().contains("Show me what you're sending"),
+            "{err}"
+        );
+        assert_eq!(
+            transport.call_count(),
+            0,
+            "the transport must never be reached while unconfirmed"
+        );
+    }
+
+    #[test]
+    fn post_json_with_reaches_the_transport_once_authorized_even_with_preview_on() {
+        let _g = network_guard();
+        crate::config::set_egress_preview_enabled(true);
+
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let authorized =
+            crate::ui::confirm::authorize_send(crate::ui::confirm::user_confirmed_send());
+        let result = with_send_authorized(authorized, || run(&transport, &sleeper, &clock));
+
+        crate::config::set_egress_preview_enabled(false);
+
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(transport.call_count(), 1);
+    }
+
+    #[test]
+    fn post_json_with_is_unaffected_by_the_gate_when_preview_is_off() {
+        let _g = network_guard();
+        crate::config::set_egress_preview_enabled(false);
+
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let result = run(&transport, &sleeper, &clock);
+
+        assert_eq!(
+            result.unwrap(),
+            "done",
+            "default behaviour must be unchanged"
+        );
+        assert_eq!(transport.call_count(), 1);
+    }
+
+    #[test]
+    fn with_send_authorized_resets_the_flag_after_the_closure_returns() {
+        let _g = network_guard();
+        crate::config::set_egress_preview_enabled(true);
+
+        let authorized =
+            crate::ui::confirm::authorize_send(crate::ui::confirm::user_confirmed_send());
+        with_send_authorized(authorized, || {});
+        // Authorization must not outlive the closure it was granted for --
+        // a second, unrelated attempt on the same thread must be refused
+        // again.
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let result = run(&transport, &sleeper, &clock);
+
+        crate::config::set_egress_preview_enabled(false);
+
+        assert!(
+            result.is_err(),
+            "authorization must not leak past its scope"
+        );
+        assert_eq!(transport.call_count(), 0);
+    }
+
+    // -- #106: egress logging from the real HTTP boundary -------------------
+
+    #[test]
+    fn post_json_with_logs_a_successful_attempt_to_the_egress_log() {
+        let _g = network_guard();
+        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        run(&transport, &sleeper, &clock).unwrap();
+
+        let log = crate::egress::read_all();
+        assert!(log.contains("\"provider\":\"anthropic\""), "{log}");
+        assert!(log.contains("\"outcome\":\"success\""), "{log}");
+    }
+
+    #[test]
+    fn post_json_with_logs_the_retry_attempt_as_retried() {
+        let _g = network_guard();
+        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+
+        let transport = ScriptedTransport::new(vec![no_response("connection refused"), ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        run(&transport, &sleeper, &clock).unwrap();
+
+        let log = crate::egress::read_all();
+        // One failed (not retried) attempt, then one successful retried one.
+        assert!(log.contains("\"retried\":false"), "{log}");
+        assert!(log.contains("\"retried\":true"), "{log}");
+        assert!(log.contains("\"outcome\":\"failure\""), "{log}");
+    }
+
+    /// #106's single most important test, at the real HTTP boundary: a fake
+    /// key in the `Authorization` header AND echoed back in a vendor error
+    /// body must appear NOWHERE in the resulting egress log.
+    #[test]
+    fn post_json_with_never_logs_a_fake_key_from_headers_or_a_failing_response_body() {
+        let _g = network_guard();
+        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+
+        let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
+        let body_text = format!("{{\"error\": \"invalid api key {fake_key}\"}}");
+        let auth_header = format!("Bearer {fake_key}");
+        let headers: [(&str, &str); 1] = [("authorization", &auth_header)];
+
+        let transport = ScriptedTransport::new(vec![status(401, vec![], &body_text)]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
+
+        let _ = post_json_with(
+            &env,
+            "https://example.invalid/",
+            &headers,
+            &json!({"model": "claude-opus-5"}),
+            Duration::from_secs(1),
+            "anthropic",
+        );
+
+        let log = crate::egress::read_all();
+        assert!(!log.contains(fake_key), "{log}");
+    }
+
+    // -- #253: the card gets the same redaction the log already has --------
+    //
+    // The test above proves a key-shaped token in a failing response body
+    // never reaches the on-disk egress log. These prove it never reaches
+    // the `Err` either, which is the text rule 7 puts on the card and the
+    // text a user copies into a bug report. The asymmetry was real: one
+    // `truncated` string was built, the copy handed to `egress::build_entry`
+    // was redacted and the copy returned to the caller was not.
+
+    /// The shape `redact_opaque_tokens` exists to catch: a run of 20 or
+    /// more base64/URL-safe characters. Deliberately not a real key.
+    const FAKE_KEY: &str = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
+
+    #[test]
+    fn post_json_with_error_text_redacts_a_key_shaped_token_from_the_response_body() {
+        let _g = network_guard();
+        let body_text = format!("{{\"error\": \"invalid api key {FAKE_KEY}\"}}");
+        let transport = ScriptedTransport::new(vec![status(401, vec![], &body_text)]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+
+        let err = run(&transport, &sleeper, &clock).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(FAKE_KEY),
+            "the error text that reaches the card still carries the token: {msg}"
+        );
+        assert!(
+            msg.contains("[redacted]"),
+            "the token should be replaced, not silently dropped: {msg}"
+        );
+        assert!(
+            msg.contains("401"),
+            "redaction must not cost the status the user needs: {msg}"
+        );
+    }
+
+    /// Redaction must not eat the prose around the token. A card reading
+    /// "anthropic: HTTP 401: [redacted]" with the vendor's explanation
+    /// scrubbed away would trade one bug for another.
+    #[test]
+    fn redacted_error_text_keeps_the_vendors_prose() {
+        let _g = network_guard();
+        let body_text = format!("{{\"error\": \"invalid api key {FAKE_KEY}\"}}");
+        let transport = ScriptedTransport::new(vec![status(401, vec![], &body_text)]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+
+        let msg = run(&transport, &sleeper, &clock).unwrap_err().to_string();
+
+        assert!(msg.contains("invalid api key"), "{msg}");
+        assert!(msg.contains("anthropic"), "{msg}");
+        assert!(!msg.contains('\u{2014}'), "rule 11: no em dash: {msg}");
+    }
+
+    /// An ordinary error body must survive untouched, so the redaction
+    /// cannot be "green because it redacts everything".
+    #[test]
+    fn error_text_without_a_token_is_unchanged() {
+        let _g = network_guard();
+        let transport = ScriptedTransport::new(vec![status(
+            400,
+            vec![],
+            "{\"error\": \"model not found\"}",
+        )]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+
+        let msg = run(&transport, &sleeper, &clock).unwrap_err().to_string();
+
+        assert_eq!(msg, "anthropic: HTTP 400: {\"error\": \"model not found\"}");
+    }
+
+    /// A transport error's text is network-derived too: it carries the URL,
+    /// and `openai_compat` points at whatever base URL the user configured
+    /// (#16's list includes proxies that take a key as a query parameter).
+    /// Gemini's own URL is key-free by construction and tested as such in
+    /// `gemini.rs`, but a user-configured endpoint is not ours to promise.
+    #[test]
+    fn transport_error_text_redacts_a_key_shaped_token_too() {
+        let _g = network_guard();
+        let transport = ScriptedTransport::new(vec![
+            no_response(&format!("failed to connect to host?api-key={FAKE_KEY}")),
+            no_response(&format!("failed to connect to host?api-key={FAKE_KEY}")),
+            no_response(&format!("failed to connect to host?api-key={FAKE_KEY}")),
+        ]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+
+        let msg = run(&transport, &sleeper, &clock).unwrap_err().to_string();
+
+        assert!(!msg.contains(FAKE_KEY), "{msg}");
+        assert!(msg.contains("transport error"), "{msg}");
+    }
+
+    /// `get_text_with_timeout`, `post_json_read_body` and
+    /// `post_json_with_connect_timeout` each build their own error text
+    /// rather than going through `http_error`, which is how three of the
+    /// five sites came to be missed. Nothing type-checks that, so this
+    /// scans the source: every `anyhow!` carrying a truncated body must
+    /// carry a redacted one.
+    #[test]
+    fn no_error_text_in_this_file_interpolates_an_unredacted_body() {
+        let src = include_str!("common.rs").replace('\r', "");
+        let candidates: Vec<&str> = src
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("let truncated"))
+            .collect();
+        let offenders: Vec<&&str> = candidates
+            .iter()
+            .filter(|line| !line.contains("redact_and_truncate"))
+            .collect();
+
+        // #281: without this, a rename of the local would empty the
+        // haystack and the test would pass by checking nothing.
+        assert!(
+            candidates.len() >= 4,
+            "the scanner found only {} `let truncated` bindings; the naming must have changed and this test is no longer checking anything",
+            candidates.len()
+        );
+        assert!(
+            offenders.is_empty(),
+            "these build a truncated body without redacting it; route them through `redact_and_truncate`: {offenders:?}"
+        );
+    }
+
+    /// The text of every `anyhow!(...)` invocation in this file, one entry
+    /// per call, with its newlines flattened.
+    ///
+    /// #281: the first version of the caller below filtered line by line,
+    /// so it only ever flagged a site with `anyhow!(` and the raw
+    /// placeholder on the SAME source line. This file's own dominant style
+    /// puts them on different lines, so the scanner matched nothing and
+    /// passed vacuously: it would not have caught the very regression it is
+    /// named for. The match unit has to be the macro invocation, not the
+    /// line.
+    ///
+    /// Paren-counted rather than brace-matched or span-capped, with a cap
+    /// only as a runaway guard. A `(` or `)` inside a string literal would
+    /// end the span early, which can only produce a false positive, and a
+    /// test that fails loudly on a shape it does not understand is the safe
+    /// direction to be wrong in.
+    fn anyhow_invocations(src: &str) -> Vec<String> {
+        const PAT: &str = "anyhow!(";
+        const CAP: usize = 600;
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(i) = src[from..].find(PAT) {
+            let start = from + i + PAT.len();
+            let mut depth = 1usize;
+            let mut end = start;
+            for (off, c) in src[start..].char_indices().take(CAP) {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = start + off;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                end = start + off;
+            }
+            out.push(
+                src[start..end]
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            from = start;
+        }
+        out
+    }
+
+    /// #260: every test in this module that can reach `post_json_with`
+    /// must hold `network_guard()`, or it races the two process-wide gates
+    /// that function consults and fails as "0 attempts" against whatever
+    /// it was actually asserting.
+    ///
+    /// Nothing types this relationship, and the module drifted into 32
+    /// tests of which 8 locked half the state and 24 locked none, so this
+    /// scans its own source. A new test added without the guard fails here
+    /// rather than intermittently somewhere else.
+    #[test]
+    fn every_test_that_reaches_the_network_path_holds_the_network_guard() {
+        let src = include_str!("common.rs").replace('\r', "");
+        let lines: Vec<&str> = src.lines().collect();
+
+        let mut unguarded: Vec<&str> = Vec::new();
+        let mut checked = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            let Some(name) = line
+                .strip_prefix("    fn ")
+                .and_then(|r| r.strip_suffix("() {"))
+            else {
+                continue;
+            };
+            let end = lines[i..]
+                .iter()
+                .position(|l| *l == "    }")
+                .map_or(lines.len(), |o| i + o);
+            let body = lines[i..end].join("\n");
+            if !body.contains("run(&transport") && !body.contains("post_json_with(") {
+                continue;
+            }
+            checked += 1;
+            if !body.contains("network_guard()") {
+                unguarded.push(name);
+            }
+        }
+
+        assert!(
+            checked > 25,
+            "the scanner found only {checked} tests reaching post_json_with; the test or helper naming must have changed and this guard is no longer checking anything"
+        );
+        assert!(
+            unguarded.is_empty(),
+            "these tests reach post_json_with without holding `network_guard()`, so they race the egress-preview and mode globals: {unguarded:?}"
+        );
+    }
+
+    /// The other half of the same guard, for the transport and body-read
+    /// failure texts: no `anyhow!` in this file may interpolate a raw error
+    /// value. `{}` plus `redact_detail(&e)` is the only sanctioned shape,
+    /// so a new call site cannot quietly reintroduce the gap.
+    #[test]
+    fn no_error_text_in_this_file_interpolates_a_raw_transport_error() {
+        let src = include_str!("common.rs").replace('\r', "");
+        let calls = anyhow_invocations(&src);
+
+        // #281. The module raises errors from a dozen sites; a scanner that
+        // finds almost none of them has stopped working, whatever it
+        // reports.
+        assert!(
+            calls.len() >= 8,
+            "the scanner found only {} `anyhow!` invocations in this file; the extraction in `anyhow_invocations` has broken and this test is no longer checking anything",
+            calls.len()
+        );
+
+        let offenders: Vec<&String> = calls
+            .iter()
+            .filter(|call| {
+                call.contains("{e}") || call.contains("{error}") || call.contains("{transport_err}")
+            })
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "these interpolate a raw error into user-facing text; use `{{}}` with `redact_detail(&e)`: {offenders:?}"
+        );
     }
 }

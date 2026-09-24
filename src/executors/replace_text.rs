@@ -31,6 +31,20 @@
 //! `do_replace`'s undo closure), refuse if it has changed again, else
 //! restore.
 //!
+//! `ReplaceSelection`'s stale-target protection is the SAME `is_stale`
+//! check as `ReplaceAll`'s (mode-agnostic, run before either mode's
+//! planning step): since `(start, end)` only ever index into
+//! `expected_current_text`, a byte-identical `expected_current_text` at Do
+//! time guarantees those offsets still identify the exact same substring
+//! they did at Look time -- there is no separate "did the SELECTION move"
+//! check to make on top of that (#219), because this executor never reads
+//! the live selection at Do time at all; it only ever writes the previewed
+//! substitution back into the previewed text. The one thing `is_stale`
+//! alone would not catch is a captured selection collapsing to zero width
+//! (`start == end`) by the time this runs -- [`plan_new_value`] refuses
+//! that explicitly ([`WriteRefusal::CollapsedSelection`]) rather than
+//! silently turning a replace into an insertion nobody previewed.
+//!
 //! # Write paths
 //!
 //! UIA has no direct "replace" operation. Both modes end at
@@ -57,6 +71,20 @@
 //! [`TargetRef`] identity in the common case, but it is cheap and the task
 //! brief asks for it explicitly as a second line of defense against a
 //! corrupted or mismatched target.
+//!
+//! Never writes to a target whose name reads as payment-shaped, and never
+//! writes a value that IS payment-shaped by structure (a Luhn-valid card
+//! number, a mod-97-valid IBAN), regardless of the target's name (#267):
+//! [`crate::payment_denylist::is_payment_shaped_label`] against
+//! [`super::target::ResolvedElement::name`] (this executor's closest analog
+//! to `fill_form`'s per-field label) and
+//! [`crate::payment_denylist::is_payment_shaped_value`] against the full
+//! planned text [`plan_new_value`] is about to write -- the same one
+//! canonical table `executors::fill_form::evaluate_resolved_field` reads,
+//! never a second copy of the rules. `replace_text` is a plainly resolvable,
+//! generically-targetable executor (`executors::registry::resolve`), not a
+//! `fill_form`-only implementation detail, so CLAUDE.md's "never touches
+//! payment data, no exceptions" applies to it exactly the same way.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
@@ -164,6 +192,15 @@ fn is_mid_surrogate_pair(units: &[u16], index: usize) -> bool {
 pub enum WriteRefusal {
     /// `ReplaceSelection` with no `(start, end)` captured.
     NoSelectionCaptured,
+    /// `ReplaceSelection` with `start == end`. A caller that builds a
+    /// `ReplaceSelection` proposal always does so from a genuinely
+    /// non-empty captured selection (#219: `inputs::selection`'s
+    /// `plan_from_probe` already discards any selection whose text is
+    /// empty), so a collapsed range reaching here means the selection
+    /// moved or was deselected since the preview was shown -- refuse
+    /// rather than silently turning "replace this selection" into a plain
+    /// insertion the user never previewed.
+    CollapsedSelection,
     InvalidSelection(SpliceError),
 }
 
@@ -176,6 +213,10 @@ impl std::fmt::Display for WriteRefusal {
                     "mode is \"replace_selection\" but no selection was captured"
                 )
             }
+            WriteRefusal::CollapsedSelection => write!(
+                f,
+                "the selection is now empty; it may have moved or been deselected since the preview was shown"
+            ),
             WriteRefusal::InvalidSelection(e) => write!(f, "invalid selection: {e}"),
         }
     }
@@ -198,6 +239,9 @@ pub fn plan_new_value(
         ReplaceMode::ReplaceAll => Ok(new_text.to_string()),
         ReplaceMode::ReplaceSelection => {
             let (start, end) = selection.ok_or(WriteRefusal::NoSelectionCaptured)?;
+            if start == end {
+                return Err(WriteRefusal::CollapsedSelection);
+            }
             splice_utf16(expected_current_text, start, end, new_text)
                 .map_err(WriteRefusal::InvalidSelection)
         }
@@ -326,8 +370,21 @@ impl Executor for ReplaceTextExecutor {
 }
 
 /// The refusal chain, in order: re-resolve -> refuse a password field ->
-/// refuse a forbidden (final-action-looking) target -> refuse a stale
-/// target -> plan the write -> write -> record an honest [`Undo`].
+/// refuse a forbidden (final-action-looking) target -> refuse a
+/// payment-shaped target name -> refuse a stale target -> plan the write ->
+/// refuse a payment-shaped planned value -> write -> record an honest
+/// [`Undo`].
+///
+/// The two payment checks (#267) reuse the one canonical
+/// `crate::payment_denylist` table `executors::fill_form::evaluate_resolved_field`
+/// already calls, rather than a second copy of the rules: `resolved.name`
+/// is this executor's closest analog to `fill_form`'s per-field `label`
+/// (this executor has no separate label of its own), and the planned FULL
+/// text about to be written (`new_full_text`, after `plan_new_value` has
+/// already spliced a `ReplaceSelection` into it) is the analog of
+/// `fill_form`'s `field.value` -- checking the spliced result, not just the
+/// raw `new_text` fragment, catches a payment-shaped value assembled across
+/// the splice, not only one written whole via `ReplaceAll`.
 fn do_replace(access: &Arc<dyn TextElementAccess>, proposal: &ReplaceTextProposal) -> Result<Undo> {
     let resolved = access
         .resolve(&proposal.target)
@@ -347,6 +404,15 @@ fn do_replace(access: &Arc<dyn TextElementAccess>, proposal: &ReplaceTextProposa
         }
     );
     anyhow::ensure!(
+        !crate::payment_denylist::is_payment_shaped_label(&resolved.name),
+        "replace_text: refusing to write to \"{}\"; its name reads as a payment field",
+        if resolved.name.is_empty() {
+            resolved.automation_id.as_str()
+        } else {
+            resolved.name.as_str()
+        }
+    );
+    anyhow::ensure!(
         !is_stale(&proposal.expected_current_text, &resolved.current_text),
         "replace_text: the text has changed since the preview was shown; refusing to overwrite it"
     );
@@ -358,6 +424,11 @@ fn do_replace(access: &Arc<dyn TextElementAccess>, proposal: &ReplaceTextProposa
         proposal.selection,
     )
     .map_err(|e| anyhow!("replace_text: {e}"))?;
+
+    anyhow::ensure!(
+        !crate::payment_denylist::is_payment_shaped_value(&new_full_text),
+        "replace_text: refusing to write a value that reads as a payment card number or IBAN"
+    );
 
     access
         .write(&proposal.target, &new_full_text)
@@ -689,6 +760,23 @@ mod tests {
     }
 
     #[test]
+    fn replace_selection_with_a_collapsed_range_is_refused() {
+        // #219: a genuinely captured selection is never zero-width by
+        // construction; reaching plan_new_value with start == end means it
+        // moved or collapsed since the preview -- refuse, never silently
+        // insert.
+        let err = plan_new_value(
+            ReplaceMode::ReplaceSelection,
+            "Hello world",
+            "Rust",
+            Some((6, 6)),
+        )
+        .expect_err("a collapsed selection must be refused");
+        assert_eq!(err, WriteRefusal::CollapsedSelection);
+        assert!(!err.to_string().contains('\u{2014}'), "no em dashes: {err}");
+    }
+
+    #[test]
     fn replace_selection_splices_the_new_text_in() {
         let value = plan_new_value(
             ReplaceMode::ReplaceSelection,
@@ -808,6 +896,65 @@ mod tests {
             .expect("a forbidden target must be refused");
 
         assert!(err.to_string().contains("Send"));
+        assert_eq!(*access.write_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn payment_looking_target_name_is_refused_and_never_written() {
+        let access = fake_access_named("1234", false, "Card number");
+        let executor = ReplaceTextExecutor::with_access(access.clone());
+        let proposal = replace_all_proposal(&sample_target(), "5678", "1234");
+
+        let err = executor
+            .execute(confirmed(proposal))
+            .err()
+            .expect("a payment-looking target name must be refused");
+
+        assert!(err.to_string().contains("payment"));
+        assert!(!err.to_string().contains('\u{2014}'), "no em dashes: {err}");
+        assert_eq!(*access.write_calls.borrow(), 0);
+        assert_eq!(*access.element.text.borrow(), "1234");
+    }
+
+    #[test]
+    fn payment_shaped_value_behind_an_ordinary_name_is_refused_and_never_written() {
+        let access = fake_access_named("old value", false, "Reference number");
+        let executor = ReplaceTextExecutor::with_access(access.clone());
+        let proposal = replace_all_proposal(&sample_target(), "4111 1111 1111 1111", "old value");
+
+        let err = executor
+            .execute(confirmed(proposal))
+            .err()
+            .expect("a payment-shaped value must be refused even behind an ordinary name");
+
+        assert!(err.to_string().contains("payment"));
+        assert_eq!(*access.write_calls.borrow(), 0);
+        assert_eq!(*access.element.text.borrow(), "old value");
+    }
+
+    #[test]
+    fn payment_shaped_value_inserted_via_replace_selection_is_refused() {
+        let access = fake_access("Card: 0000000000000000");
+        let executor = ReplaceTextExecutor::with_access(access.clone());
+        // "Card: " is 6 UTF-16 code units; the 16 zeros that follow are the
+        // selection. Splicing "4111111111111111" (a Luhn-valid Visa test
+        // number) into that range produces a payment-shaped FINAL text even
+        // though neither the base text nor the inserted fragment alone would
+        // trip a naive check on `new_text` in isolation.
+        let proposal = replace_selection_proposal(
+            &sample_target(),
+            "4111111111111111",
+            "Card: 0000000000000000",
+            6,
+            22,
+        );
+
+        let err = executor
+            .execute(confirmed(proposal))
+            .err()
+            .expect("a payment-shaped spliced result must be refused");
+
+        assert!(err.to_string().contains("payment"));
         assert_eq!(*access.write_calls.borrow(), 0);
     }
 
@@ -1019,6 +1166,72 @@ mod tests {
 
             undo.undo().expect("undo must succeed");
             assert_eq!(current_edit_text(frame), "Hello world");
+
+            unsafe {
+                let _ = DestroyWindow(frame);
+            }
+        }
+
+        /// #219: the observable that would differ if `ReplaceSelection`
+        /// were wired to nothing -- a real EDIT control, a real captured
+        /// target, splicing "world" -> "Rust" at UTF-16 offsets 6..11 of
+        /// "Hello world" leaves "Hello Rust", and undo restores exactly
+        /// "Hello world".
+        #[test]
+        fn replace_selection_writes_and_undo_restores_a_real_edit_control() {
+            let _uia = crate::inputs::lock_uia_test();
+            let (frame, _edit) = build_test_window(w!("Hello world"));
+
+            let target = edit_target(frame);
+            let access: Arc<dyn TextElementAccess> =
+                Arc::new(crate::executors::target::com::UiaTextElementAccess);
+            let executor = ReplaceTextExecutor::with_access(access);
+
+            let proposal = replace_selection_proposal(&target, "Rust", "Hello world", 6, 11);
+            let undo = executor
+                .execute(confirmed(proposal))
+                .expect("execute must succeed against a real EDIT control");
+
+            assert_eq!(current_edit_text(frame), "Hello Rust");
+
+            undo.undo().expect("undo must succeed");
+            assert_eq!(current_edit_text(frame), "Hello world");
+
+            unsafe {
+                let _ = DestroyWindow(frame);
+            }
+        }
+
+        /// #219: `ReplaceSelection`'s "own equivalent" of the `ReplaceAll`
+        /// stale-target test above -- the SAME mode-agnostic `is_stale`
+        /// check (see the module doc comment) must also refuse a
+        /// `ReplaceSelection` write when the field's real text changed
+        /// between Look and Do.
+        #[test]
+        fn stale_target_is_refused_for_replace_selection_when_text_changed_between_look_and_do() {
+            let _uia = crate::inputs::lock_uia_test();
+            let (frame, edit) = build_test_window(w!("Hello world"));
+
+            let target = edit_target(frame);
+
+            unsafe {
+                let _ = SetWindowTextW(edit, w!("Someone typed this"));
+            }
+
+            let access: Arc<dyn TextElementAccess> =
+                Arc::new(crate::executors::target::com::UiaTextElementAccess);
+            let executor = ReplaceTextExecutor::with_access(access);
+            let proposal = replace_selection_proposal(&target, "Rust", "Hello world", 6, 11);
+
+            let err = executor.execute(confirmed(proposal)).err().expect(
+                "a stale target must be refused for replace_selection against a real EDIT control",
+            );
+            assert!(err.to_string().contains("changed"));
+            assert_eq!(
+                current_edit_text(frame),
+                "Someone typed this",
+                "a refused write must not touch the control"
+            );
 
             unsafe {
                 let _ = DestroyWindow(frame);

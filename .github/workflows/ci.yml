@@ -1,8 +1,22 @@
 name: CI
 
-# Manual only (owner decision 2026-09-17): run from the Actions tab.
+# Runs on every push to master and every pull request (owner decision
+# 2026-09-24: the repo is public, so standard GitHub-hosted runners are
+# free). It was manual-only from 2026-09-17 while the repo was private.
+# workflow_dispatch stays so a run can still be started by hand from the
+# Actions tab. release.yml stays manual on purpose: a release is a decision.
 on:
+  push:
+    branches: [master]
+  pull_request:
   workflow_dispatch:
+
+# Least privilege: nothing here writes to the repo. Pull requests from forks
+# get a read-only token regardless; this makes same-repo runs match them.
+permissions:
+  contents: read
+  # gitleaks-action lists a pull request's commits through the API.
+  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,7 +34,7 @@ env:
 
 jobs:
   ci:
-    name: fmt, clippy, test, deny, gitleaks, release build
+    name: fmt, clippy, test, release build
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -54,6 +68,31 @@ jobs:
         env:
           WINGMAN_FULL_SUITE: '1'
 
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wingman-windows-exe
+          path: target/release/*.exe
+          if-no-files-found: error
+
+  supply-chain:
+    # cargo-deny-action is a Docker container action, and GitHub runs those
+    # only on Linux runners ("Container action is only supported on Linux",
+    # MEASURED 2026-09-24 on the first GitHub run of this workflow). Neither
+    # step needs Windows: deny.toml's [graph] targets pin the dependency graph
+    # to x86_64-pc-windows-msvc wherever it is evaluated, and gitleaks scans
+    # git history, not a build.
+    name: cargo deny, gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -65,16 +104,6 @@ jobs:
         uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: cargo build --release
-        run: cargo build --release
-
-      - name: Upload exe artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: wingman-windows-exe
-          path: target/release/*.exe
-          if-no-files-found: error
 
   hooks:
     name: Python hook tests

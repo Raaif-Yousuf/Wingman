@@ -28,28 +28,43 @@ about Wingman is checked against the code in this repo, not aspirational.
 |---|---|---|
 | **Footprint** | A tray icon, about 2 MB, 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
 | **Verifiable** | Offline mode refuses any non-loopback network call in code, enforced before a socket ever opens (see [`docs/offline.md`](docs/offline.md)). Open source under MIT: read the code yourself | Copilot Vision sends the screen to Microsoft's servers. Windows Recall shipped plaintext screenshots and had to be pulled twice before relaunching opt-in |
-| **Extensible** (planned) | An action will be a small, readable definition: a prompt, an input list and an executor. The framework is the product, actions are the contribution surface | Closed |
+| **Extensible** | An action is a small, readable definition: a prompt, an input list and an executor. Five built-in actions ship today (check my work, add event from screen, review this email, fill this form, copy text from screen); a hand-written `actions.toml` entry parses and shows in the palette but does not yet dispatch on confirm (issue #242). The framework is the product, actions are the contribution surface | Closed |
 | **Never the final button** | Fills, drafts and proposes. Never presses Send, Submit, Buy or Pay: a permanent rule, not a version-1 limit to be relaxed later | Copilot Actions and other "agent" products sell autonomy |
 | **Not a chatbot** | One press, one action, one card, done. No conversation view, no follow-up question | Copilot is a chat pane first, everything else second |
-| **Bring your own model** | OpenAI, Anthropic, Gemini or a local Ollama model today; any OpenAI-compatible endpoint is planned. No account or subscription required for the app itself | Recall and Click to Do require a 40+ TOPS NPU; the strongest models sit behind Copilot Pro |
+| **Bring your own model** | OpenAI, Anthropic, Gemini, a local Ollama model, or any OpenAI-compatible endpoint (OpenRouter, Groq, LM Studio, llama.cpp, vLLM, ...) today. No account or subscription required for the app itself | Recall and Click to Do require a 40+ TOPS NPU; the strongest models sit behind Copilot Pro |
 
 ## What works today
 
-One action, built and running: **Check my work**. Press the key, Wingman
-screenshots your active monitor, sends it to a vision model with a prompt
-tuned for checking a hand-worked physics or statistics problem, and shows the
-verdict as a small GDI card in the corner. Click the card for the full
-working; click anywhere else and it goes away.
+Five built-in actions, built and running, all reachable from the tray menu:
 
-That is the whole app today: one hotkey, one screenshot, one model call, one
-read-only card. No confirm-and-execute loop, no other actions yet. What has
-landed around that one action:
+- **Check my work**: press the key, Wingman screenshots your active
+  monitor, sends it to a vision model with a prompt tuned for checking a
+  hand-worked physics or statistics problem, and shows the verdict as a
+  small GDI card in the corner. Click the card for the full working; click
+  anywhere else and it goes away. Read-only: it skips Confirm and Do.
+- **Add event from screen**: screenshots, proposes a calendar entry, and on
+  confirm writes a real `.ics` file via the ics connector.
+- **Review this email**: screenshots, proposes edited text, and on confirm
+  replaces the selected text via the `replace_text` executor.
+- **Fill this form**: screenshots, proposes field values, and on confirm
+  fills the form via the `fill_form` executor (with **Restore last form**
+  to undo). Goes through the same Look, Propose, Confirm, Do loop as the
+  others: `App::on_preview_decided` reads the card's confirmed proposal and
+  calls `confirm::confirm(...)` before the executor runs.
+- **Copy text from screen**: OCRs the active monitor and copies the text to
+  the clipboard.
 
-- **Four providers**: OpenAI, Anthropic and Gemini (cloud, your key) plus
-  Ollama (local, your own machine). See
-  [`docs/providers.md`](docs/providers.md) for request shapes and how to add
-  Ollama or Gemini to the fallback order today (Settings only exposes
-  OpenAI/Anthropic so far).
+The confirm-and-execute loop, the executors (calendar add, form fill, text
+replace, image-to-clipboard) and the actions framework itself
+(`actions.toml`, five built-in actions loadable today) are built and wired,
+not planned. What has landed alongside those actions:
+
+- **Four providers plus any OpenAI-compatible endpoint**: OpenAI, Anthropic
+  and Gemini (cloud, your key), Ollama (local, your own machine), and any
+  OpenAI-compatible server (OpenRouter, Groq, LM Studio, llama.cpp, vLLM,
+  ...). See [`docs/providers.md`](docs/providers.md) for request shapes and
+  how to add Ollama, Gemini or a compat endpoint to the fallback order today
+  (Settings only exposes OpenAI/Anthropic so far).
 - **Modes**: Cloud, Local, Auto (default) or Offline, from the tray's
   **Mode** submenu. Offline refuses any non-loopback network call in code;
   see [`docs/offline.md`](docs/offline.md).
@@ -65,9 +80,8 @@ landed around that one action:
 ## Where it's going
 
 The [expansion plan](docs/superpowers/specs/2026-09-16-expansion-plan-design.md)
-is the detailed roadmap; the short version is that every future action
-follows the same four-step loop, and none of steps 2 through 4 exist in code
-yet:
+is the detailed roadmap; the short version is that every action follows the
+same four-step loop:
 
 ```
    LOOK          PROPOSE              CONFIRM            DO
@@ -77,21 +91,21 @@ yet:
  context        form values, ...)                       possible)
 ```
 
-Read-only actions (like today's Check my work) skip Confirm and Do and just
-show the card. Anything that would write to your screen or a connected
-service always waits for your Enter or click first, and Wingman never
-presses these four buttons for you:
+Read-only actions (like Check my work) skip Confirm and Do and just show the
+card. Anything that would write to your screen or a connected service always
+waits for your Enter or click first, and Wingman never presses these four
+buttons for you:
 
 **Send. Submit. Buy. Pay.**
 
 It fills, drafts and proposes; you finish. That rule is permanent, not a
 version-1 limitation to be relaxed later.
 
-Planned and not yet built: the actions-as-data framework, the
-confirm-and-execute loop, executors (form fill, calendar add, text replace),
-connectors, and awareness. Local models (Ollama) and the Cloud/Local/Auto/
-Offline mode switch mentioned in earlier drafts of this README are now built;
-see "What works today" above. Track what remains in
+Planned and not yet built: dispatch for an arbitrary hand-written
+`actions.toml` entry beyond the five built-in ids (issue #242), more
+connectors beyond ics, and awareness. The actions-as-data framework, the
+confirm-and-execute loop, the built executors and the ics connector are
+built; see "What works today" above. Track what remains in
 [GitHub Issues](https://github.com/Raaif-Yousuf/Wingman/issues).
 
 ## Install
@@ -283,7 +297,9 @@ Stops it, unregisters the package, clears the autostart entry, hands the
 Copilot key back to Search if it was pointed here, deletes
 `%LOCALAPPDATA%\Programs\Wingman`, and removes the signing certificate
 from both stores. One UAC prompt, for that last part; `-KeepCertificate`
-skips it, which is what you want if you are about to reinstall.
+skips it, which is what you want if you are about to reinstall. It also
+cleans up a pre-rename `copilot-ask` install left over from before the
+2026-09-16 rename, if one is still on the machine.
 
 Since it is a registered app you can also use **Settings ▸ Apps ▸ Installed
 apps ▸ Wingman ▸ Uninstall**. That removes the package but leaves the

@@ -1,15 +1,76 @@
 //! Win32 window for the Quick Ask palette (#25): a pre-created, hidden,
 //! topmost, DPI-aware popup with a child `EDIT` control for the query and a
-//! GDI-painted row list below it. Every decision (fuzzy scoring, grouping,
-//! key handling, dispatch) lives in [`crate::ui::palette_model`], which this
-//! module only renders and forwards Win32 messages into -- see that
-//! module's doc comment and
+//! DirectWrite/Direct2D-painted row list below it. Every decision (fuzzy
+//! scoring, grouping, key handling, dispatch) lives in
+//! [`crate::ui::palette_model`], which this module only renders and forwards
+//! Win32 messages into -- see that module's doc comment and
 //! `docs/superpowers/specs/2026-09-17-palette-design.md`.
 //!
-//! Rendering is plain GDI (`DrawTextW`), not DirectWrite -- see the design
-//! spec's "Rendering" section: issue #25's body mentions DirectWrite, but
-//! this keeps the pre-created window's first paint on the sub-100ms path
-//! with no new dependency. A DirectWrite pass is filed as a follow-up.
+//! # Rendering (issue #216)
+//!
+//! The row list, router summary line, and footer render through
+//! `ID2D1HwndRenderTarget` + `IDWriteTextFormat` (see [`PaletteRenderer`]
+//! below), not plain GDI `DrawTextW` -- #25's original body named
+//! DirectWrite as the expected renderer; the first cut used GDI to keep the
+//! pre-created window's first paint on the sub-100ms path with no new
+//! dependency (see the design spec's now-superseded "Rendering" section),
+//! and #216 is this follow-up.
+//!
+//! `ID2D1RenderTarget::DrawText` with a cached `IDWriteTextFormat` is used
+//! instead of building a per-row `IDWriteTextLayout` + `DrawTextLayout`:
+//! `DrawTextLayout`'s `origin` parameter is a `windows_numerics::Vector2`,
+//! a type the `windows` crate does not re-export, so naming it would need a
+//! new direct Cargo dependency (`windows-numerics`) beyond this task's
+//! `Cargo.toml` scope (the `windows` crate's own feature list only, since
+//! `Cargo.toml` is contended across the overnight run). `DrawText` still
+//! goes through the same DirectWrite text renderer and `IDWriteTextFormat`
+//! (font, single-line, vertical-centering); it just skips materializing an
+//! intermediate layout object this module never otherwise needs (no
+//! hit-testing, no multi-format runs).
+//!
+//! The D2D factory, DirectWrite factory and the `IDWriteTextFormat` are
+//! created once, in [`Palette::create`], right after the `HWND` exists --
+//! never per paint (that is what would blow the sub-100ms show-latency
+//! budget: see the MEASURED block below). The `ID2D1HwndRenderTarget` is
+//! created lazily on first use from the same call (so it always exists
+//! before the first real paint) and is resized in place
+//! (`ID2D1HwndRenderTarget::Resize`) on every window-size or DPI change
+//! rather than recreated. If Direct2D/DirectWrite factory creation fails
+//! at window-creation time (e.g. no Direct2D support at all -- rare, but
+//! rule 7 says every failure ends in a card, never a silent blank palette),
+//! or `EndDraw` ever returns `D2DERR_RECREATE_TARGET` (device loss: the
+//! GPU driver reset or the adapter went away), [`PaletteInner::on_paint`]
+//! falls back to the exact GDI `DrawTextW` path this module used before
+//! #216 rather than paint nothing -- device loss additionally drops the
+//! render target so the next paint recreates it from scratch.
+//!
+//! MEASURED 2026-09-19, this machine, `dev` profile, machine otherwise idle,
+//! `cargo test ui::palette::tests::measure_show_latency -- --ignored
+//! --nocapture`, 20 shows of a real palette window: **avg 12.94 ms, max
+//! 44.11 ms**, the max being the first-show outlier (44.11 ms; every
+//! subsequent sample is 9.2 to 12.9 ms). The GDI baseline this replaced was
+//! avg 11.84 ms / max 34.53 ms (MEASURED 2026-09-17, same harness), so
+//! DirectWrite costs roughly 1 ms on average here and stays far inside
+//! #25's under-100 ms Done-when. Not re-measured in release; the debug
+//! number already clears the budget by a factor of seven, and `opt-level =
+//! "z"` plus LTO only moves it down.
+//!
+//! The fallback above is the reason
+//! [`tests::show_leaves_a_live_direct2d_renderer_not_a_silent_gdi_fallback`]
+//! exists: a DirectWrite path that never initializes at all paints
+//! identically, passes every other test, and keeps this latency number in
+//! budget, because GDI was fast too. That test asserts the renderer, its
+//! render target and its text format are really there after a real show.
+//!
+//! Per-monitor-v2 DPI: `WM_DPICHANGED` updates `self.dpi`, re-lays-out the
+//! query edit control, resizes the window to the system's suggested rect
+//! (the standard per-monitor-v2 contract), and calls
+//! `ID2D1RenderTarget::SetDpi` on the render target -- the target's DPI is
+//! never read once and reused; see `handle_message`'s `WM_DPICHANGED` arm.
+//! Content itself is laid out in logical (96-DPI) DIPs, exactly the row/
+//! padding/font constants already used for the window's own logical size
+//! math -- `SetDpi` plus `Resize`'d target then does the DPI scaling to
+//! physical pixels, so no D2D draw call scales anything itself.
 //!
 //! # Window lifecycle
 //!
@@ -37,11 +98,28 @@ use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+};
+use windows::Win32::Graphics::DirectWrite::{
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject,
-    InvalidateRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow, DEFAULT_GUI_FONT, DT_LEFT,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject, InvalidateRect,
+    SelectObject, SetBkMode, SetTextColor, UpdateWindow, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
@@ -52,9 +130,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_COMMAND,
-    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
-    WM_PAINT, WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_TABSTOP, WS_VISIBLE,
+    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 const WC_EDIT: &str = "EDIT";
@@ -158,6 +236,7 @@ impl Palette {
             owner: None,
             dpi: 96,
             font: unsafe { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) },
+            d2d: None,
             catalogue: Vec::new(),
             model_configured: true,
             footer_text: String::new(),
@@ -203,6 +282,24 @@ impl Palette {
         let inner_ref = unsafe { &mut *raw };
         inner_ref.hwnd = hwnd;
         inner_ref.dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+
+        // #216: created once, here, right after the HWND exists -- never
+        // per paint (see the module doc comment's "Rendering" section for
+        // why that matters for the show-latency budget). `ensure_target`
+        // sizes the render target to the window's actual size at THIS
+        // moment (the un-DPI-corrected, logical-96 size the window was just
+        // created with above; `reposition_centered` resizes it again, to
+        // the real per-monitor size, on the first real `Show`).
+        let mut d2d = PaletteRenderer::new();
+        if let Some(renderer) = &mut d2d {
+            renderer.ensure_target(
+                hwnd,
+                inner_ref.dpi,
+                WINDOW_WIDTH.max(1) as u32,
+                window_height(96).max(1) as u32,
+            );
+        }
+        inner_ref.d2d = d2d;
 
         let edit_hwnd = create_query_edit(hwnd, instance, inner_ref.font, inner_ref.dpi);
         inner_ref.edit_hwnd = edit_hwnd;
@@ -511,6 +608,210 @@ unsafe extern "system" fn palette_edit_subclass(
 }
 
 // ---------------------------------------------------------------------------
+// D2D/DirectWrite rendering (#216) -- see the module doc comment's
+// "Rendering" section for the design and the GDI-fallback/device-loss story.
+// ---------------------------------------------------------------------------
+
+/// Font family and size for the palette's DirectWrite text. Logical (DIP)
+/// size, not scaled by DPI here -- `ID2D1RenderTarget::SetDpi` plus a
+/// correctly `Resize`'d target does that scaling; see the module doc
+/// comment. Roughly matches `DEFAULT_GUI_FONT`'s visual size at 96 DPI.
+const D2D_FONT_FAMILY: &str = "Segoe UI";
+const D2D_FONT_SIZE_DIP: f32 = 14.0;
+/// `CreateTextFormat`'s locale -- matches `ocr.rs`'s recognizer language
+/// choice elsewhere in this crate rather than leaving it to the current
+/// thread's locale, which is not guaranteed to be English on every machine
+/// this runs on.
+const D2D_LOCALE: &str = "en-US";
+
+/// Owns the Direct2D/DirectWrite resources for one palette window: the two
+/// factories (created once, in [`Palette::create`], and never per paint --
+/// see the module doc comment) and the `ID2D1HwndRenderTarget`/
+/// `IDWriteTextFormat`, both created lazily (on first use, or again after a
+/// device-loss drop) rather than up front, since the very first creation
+/// needs a real `HWND` and a real pixel size to size the target to.
+struct PaletteRenderer {
+    factory: ID2D1Factory,
+    dwrite_factory: IDWriteFactory,
+    target: Option<ID2D1HwndRenderTarget>,
+    text_format: Option<IDWriteTextFormat>,
+}
+
+impl PaletteRenderer {
+    /// `None` on any failure to create either factory -- rare (no Direct2D
+    /// support at all), but rule 7 says every failure ends in a card, never
+    /// a panic: the caller falls back to the GDI path for the lifetime of
+    /// this window rather than unwrap either factory.
+    fn new() -> Option<Self> {
+        let factory: ID2D1Factory =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }.ok()?;
+        let dwrite_factory: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.ok()?;
+        Some(Self {
+            factory,
+            dwrite_factory,
+            target: None,
+            text_format: None,
+        })
+    }
+
+    /// Creates the render target and text format if they do not already
+    /// exist (first call, or a call after [`PaletteRenderer::drop_target`]
+    /// dropped a lost device) -- a no-op otherwise. Returns whether both now
+    /// exist, which is what [`PaletteInner::try_paint_d2d`] uses to decide
+    /// whether to paint via D2D at all this time.
+    fn ensure_target(&mut self, hwnd: HWND, dpi: u32, width: u32, height: u32) -> bool {
+        if self.target.is_none() {
+            let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: dpi as f32,
+                dpiY: dpi as f32,
+                usage: Default::default(),
+                minLevel: Default::default(),
+            };
+            let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+                hwnd,
+                pixelSize: D2D_SIZE_U {
+                    width: width.max(1),
+                    height: height.max(1),
+                },
+                presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+            };
+            self.target = unsafe {
+                self.factory
+                    .CreateHwndRenderTarget(&rt_props as *const _, &hwnd_props as *const _)
+            }
+            .ok();
+        }
+        if self.target.is_some() && self.text_format.is_none() {
+            self.text_format = self.build_text_format();
+        }
+        self.target.is_some() && self.text_format.is_some()
+    }
+
+    fn build_text_format(&self) -> Option<IDWriteTextFormat> {
+        let family = wide_z(D2D_FONT_FAMILY);
+        let locale = wide_z(D2D_LOCALE);
+        let format = unsafe {
+            self.dwrite_factory.CreateTextFormat(
+                PCWSTR(family.as_ptr()),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                D2D_FONT_SIZE_DIP,
+                PCWSTR(locale.as_ptr()),
+            )
+        }
+        .ok()?;
+        unsafe {
+            // DT_LEFT | DT_VCENTER | DT_SINGLELINE's DirectWrite equivalent:
+            // leading (left) horizontal alignment, centered vertically
+            // within the layout box, no wrapping (every row is one line).
+            let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+        Some(format)
+    }
+
+    /// Resizes the render target's pixel buffer to match a real window-size
+    /// change (a fresh `Show`, or `WM_DPICHANGED`'s suggested rect) -- called
+    /// instead of recreating the target, per the module doc comment. Device
+    /// loss can surface here too (`Resize` can return
+    /// `D2DERR_RECREATE_TARGET` the same as `EndDraw`), handled the same
+    /// way: drop the target so the next paint recreates it from scratch.
+    fn resize(&mut self, width: u32, height: u32) {
+        let Some(target) = &self.target else {
+            return;
+        };
+        let size = D2D_SIZE_U {
+            width: width.max(1),
+            height: height.max(1),
+        };
+        if unsafe { target.Resize(&size as *const _) }.is_err() {
+            self.target = None;
+        }
+    }
+
+    /// `WM_DPICHANGED` calls this so the render target's own DPI always
+    /// tracks the window's current monitor rather than the DPI it was
+    /// created with (see the module doc comment's "Per-monitor-v2 DPI"
+    /// paragraph).
+    fn set_dpi(&self, dpi: u32) {
+        if let Some(target) = &self.target {
+            unsafe {
+                target.SetDpi(dpi as f32, dpi as f32);
+            }
+        }
+    }
+
+    /// Drops a lost device's render target after `EndDraw` reports
+    /// `D2DERR_RECREATE_TARGET` -- the next paint's `ensure_target` call
+    /// recreates it (and the text format, which belongs to the old
+    /// `IDWriteFactory`'s target-independent state but is cheap enough to
+    /// just rebuild alongside it rather than special-case keeping it).
+    fn drop_target(&mut self) {
+        self.target = None;
+        self.text_format = None;
+    }
+}
+
+/// Converts this crate's existing `COLORREF` palette (0x00bbggrr, the GDI
+/// convention every color constant in this module already uses) to D2D's
+/// `D2D1_COLOR_F` -- one conversion point so the GDI-era constants stay the
+/// single source of truth for this module's colors rather than forking into
+/// a second, D2D-only set that could drift from them.
+fn colorref_to_d2d(c: COLORREF) -> D2D1_COLOR_F {
+    let v = c.0;
+    D2D1_COLOR_F {
+        r: (v & 0xFF) as f32 / 255.0,
+        g: ((v >> 8) & 0xFF) as f32 / 255.0,
+        b: ((v >> 16) & 0xFF) as f32 / 255.0,
+        a: 1.0,
+    }
+}
+
+/// D2D/DirectWrite equivalent of `draw_text_line` (imported from
+/// `crate::ui::text` for the GDI fallback path below): draws one line of
+/// `text` in `rect` (logical/DIP coordinates -- see the module doc comment)
+/// with `color`, or does nothing at all when `text` is empty. Unlike the GDI
+/// version, the empty-string check here is a plain optimization (skip a
+/// wasted brush + draw call), not a crash guard -- `IDWriteFactory`/
+/// `ID2D1RenderTarget` do not share `DrawTextW`'s zero-length-buffer bug.
+fn draw_text_line_d2d(
+    target: &ID2D1HwndRenderTarget,
+    format: &IDWriteTextFormat,
+    text: &str,
+    rect: D2D_RECT_F,
+    color: COLORREF,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let buf = utf16(text);
+    let Ok(brush) =
+        (unsafe { target.CreateSolidColorBrush(&colorref_to_d2d(color) as *const _, None) })
+    else {
+        return;
+    };
+    unsafe {
+        target.DrawText(
+            &buf,
+            format,
+            &rect as *const _,
+            &brush,
+            D2D1_DRAW_TEXT_OPTIONS_NONE,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Palette state + Win32 message handling
 // ---------------------------------------------------------------------------
 
@@ -521,6 +822,11 @@ struct PaletteInner {
     owner: Option<HWND>,
     dpi: u32,
     font: HFONT,
+    /// Direct2D/DirectWrite resources (#216). `None` only when
+    /// [`PaletteRenderer::new`] itself failed (no Direct2D support at all);
+    /// [`PaletteInner::try_paint_d2d`] falls back to the GDI path for the
+    /// lifetime of this window in that case.
+    d2d: Option<PaletteRenderer>,
     /// The full catalogue as of the last [`PaletteInner::show`]; re-filtered
     /// on every `EN_CHANGE` without re-gathering anything (rule 5: no work
     /// while hidden, and no re-gathering while typing either).
@@ -643,7 +949,7 @@ impl PaletteInner {
         }
     }
 
-    fn reposition_centered(&self) {
+    fn reposition_centered(&mut self) {
         let Ok(monitor) = crate::capture::active_monitor_rect() else {
             return;
         };
@@ -663,8 +969,26 @@ impl PaletteInner {
                 h,
                 windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
             );
-            let pad = scale(PADDING, self.dpi);
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+        }
+        self.layout_edit_control(w);
+        // #216: the render target's pixel buffer must match the window's
+        // real physical size -- resized here (never recreated) alongside
+        // every window resize, mirroring the window/edit-control resize
+        // right above rather than waiting for a separate WM_SIZE.
+        if let Some(renderer) = &mut self.d2d {
+            renderer.resize(w.max(1) as u32, h.max(1) as u32);
+        }
+    }
+
+    /// Positions the query `EDIT` control within a window of logical width
+    /// `w` (physical pixels, already DPI-scaled by the caller) -- factored
+    /// out of [`PaletteInner::reposition_centered`] so `WM_DPICHANGED`'s
+    /// handler can re-run the same layout after a DPI change without
+    /// re-centering the window on the active monitor too.
+    fn layout_edit_control(&self, w: i32) {
+        let pad = scale(PADDING, self.dpi);
+        unsafe {
+            let _ = SetWindowPos(
                 self.edit_hwnd,
                 None,
                 pad,
@@ -750,10 +1074,159 @@ impl PaletteInner {
         }
     }
 
-    fn on_paint(&self) {
+    /// #216: tries the D2D/DirectWrite path first
+    /// ([`PaletteInner::try_paint_d2d`]); falls back to the original GDI
+    /// path ([`PaletteInner::paint_gdi`]) whenever D2D is unavailable for
+    /// this window (factory creation failed at window-creation time) or a
+    /// paint attempt hits device loss -- see the module doc comment. Either
+    /// way, `BeginPaint`/`EndPaint` still bracket the call: D2D renders
+    /// straight to the `HWND` and never touches the returned `HDC`, but
+    /// Win32 still needs `BeginPaint`/`EndPaint` to validate the update
+    /// region or `WM_PAINT` never stops firing.
+    fn on_paint(&mut self) {
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
+            if !self.try_paint_d2d() {
+                self.paint_gdi(hdc);
+            }
+            let _ = EndPaint(self.hwnd, &ps);
+        }
+    }
+
+    /// Attempts the D2D/DirectWrite paint; returns whether it happened at
+    /// all (not whether every individual `DrawText` call succeeded -- a
+    /// single row failing to get a brush just leaves that row blank, per
+    /// [`draw_text_line_d2d`], rather than failing the whole paint).
+    /// `false` means the caller must fall back to GDI this time: either
+    /// this window has no usable D2D at all, or `EndDraw` reported
+    /// `D2DERR_RECREATE_TARGET` (device loss), in which case the target is
+    /// dropped so the NEXT paint's `ensure_target` call rebuilds it fresh.
+    fn try_paint_d2d(&mut self) -> bool {
+        let Some(renderer) = &mut self.d2d else {
+            return false;
+        };
+        let w = scale(WINDOW_WIDTH, self.dpi).max(1) as u32;
+        let h = window_height(self.dpi).max(1) as u32;
+        if !renderer.ensure_target(self.hwnd, self.dpi, w, h) {
+            return false;
+        }
+        // Cloned out (a cheap COM AddRef, not a real copy) so the
+        // `EndDraw` device-loss branch below can still mutate
+        // `renderer`/`self.d2d` without fighting the borrow checker over a
+        // live `&self.d2d` reference.
+        let target = renderer
+            .target
+            .clone()
+            .expect("ensure_target just confirmed Some");
+        let format = renderer
+            .text_format
+            .clone()
+            .expect("ensure_target just confirmed Some");
+
+        let pad = PADDING as f32;
+        let row_h = ROW_HEIGHT as f32;
+        let content_w = WINDOW_WIDTH as f32;
+        let content_h = window_height(96) as f32; // logical/DIP total height -- see the module doc comment
+        let mut y = pad + EDIT_HEIGHT as f32 + pad;
+
+        unsafe {
+            target.BeginDraw();
+            target.Clear(Some(&colorref_to_d2d(COLORREF(0x0026_2626)) as *const _));
+        }
+
+        // #24: the router summary band is always reserved (see
+        // ROUTER_SUMMARY_HEIGHT's doc comment) so the window never
+        // resizes; only its text is conditional.
+        if let Some(summary) = &self.router_summary {
+            let band_rect = D2D_RECT_F {
+                left: pad,
+                top: y,
+                right: content_w - pad,
+                bottom: y + ROUTER_SUMMARY_HEIGHT as f32,
+            };
+            draw_text_line_d2d(&target, &format, summary, band_rect, COLORREF(0x0080_B080));
+        }
+        y += ROUTER_SUMMARY_HEIGHT as f32;
+
+        // #217: only the rows inside [offset, offset + MAX_VISIBLE_ROWS) are
+        // painted; `i` stays the row's real index into `state.rows` (what
+        // `state.selected` compares against for the highlight), while
+        // `visible_pos` (i - offset) is what actually places it vertically.
+        for (i, row) in self
+            .state
+            .rows
+            .iter()
+            .enumerate()
+            .skip(self.state.offset)
+            .take(crate::ui::palette_model::MAX_VISIBLE_ROWS)
+        {
+            let visible_pos = (i - self.state.offset) as f32;
+            let row_rect = D2D_RECT_F {
+                left: pad,
+                top: y + row_h * visible_pos,
+                right: content_w - pad,
+                bottom: y + row_h * (visible_pos + 1.0),
+            };
+            match row {
+                crate::ui::palette_model::Row::Header(name) => {
+                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(0x0090_9090));
+                }
+                crate::ui::palette_model::Row::Hint(text) => {
+                    draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(0x0080_8080));
+                }
+                crate::ui::palette_model::Row::Action { name, .. } => {
+                    if i == self.state.selected {
+                        if let Ok(hl) = unsafe {
+                            target.CreateSolidColorBrush(
+                                &colorref_to_d2d(COLORREF(0x0045_3A2E)) as *const _,
+                                None,
+                            )
+                        } {
+                            unsafe {
+                                target.FillRectangle(&row_rect as *const _, &hl);
+                            }
+                        }
+                    }
+                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(0x00E6_E6E6));
+                }
+            }
+        }
+
+        let footer_rect = D2D_RECT_F {
+            left: pad,
+            top: content_h - FOOTER_HEIGHT as f32,
+            right: content_w - pad,
+            bottom: content_h,
+        };
+        draw_text_line_d2d(
+            &target,
+            &format,
+            &self.footer_text,
+            footer_rect,
+            COLORREF(0x0080_8080),
+        );
+
+        if let Err(e) = unsafe { target.EndDraw(None, None) } {
+            if e.code() == D2DERR_RECREATE_TARGET {
+                renderer.drop_target();
+                self.invalidate();
+            }
+            // Rule 7: any other `EndDraw` failure is swallowed here, not
+            // panicked on -- worst case this one paint is incomplete and
+            // the next `Invalidate`/`Show` tries again.
+        }
+        true
+    }
+
+    /// The original GDI `DrawTextW` path (module doc comment's "Rendering"
+    /// section): used only as the fallback when D2D is unavailable for this
+    /// window or just hit device loss. Kept byte-for-byte equivalent to
+    /// what this module painted before #216 so the fallback is exactly as
+    /// tested as the path it replaces, not a second, thinner
+    /// implementation.
+    fn paint_gdi(&self, hdc: windows::Win32::Graphics::Gdi::HDC) {
+        unsafe {
             let mut rc = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rc);
 
@@ -859,7 +1332,6 @@ impl PaletteInner {
             );
 
             SelectObject(hdc, old_font);
-            let _ = EndPaint(self.hwnd, &ps);
         }
     }
 
@@ -938,6 +1410,39 @@ impl PaletteInner {
                 }
                 Some(LRESULT(0))
             }
+            // #216: the render target's DPI must follow WM_DPICHANGED, not
+            // be read once at window creation -- see the module doc
+            // comment's "Per-monitor-v2 DPI" paragraph. `wParam`'s low word
+            // is the new DPI (identical on x and y, winuser.h); `lParam`
+            // points at Windows' suggested new window rect, the standard
+            // per-monitor-v2 contract this handler honors so the window's
+            // physical size and the render target's DPI change together
+            // (leaving one stale relative to the other would stretch or
+            // shrink the DIP-laid-out content -- see the doc comment).
+            WM_DPICHANGED => {
+                self.dpi = ((wparam.0 & 0xFFFF) as u32).max(1);
+                let suggested = unsafe { &*(lparam.0 as *const RECT) };
+                let w = (suggested.right - suggested.left).max(1);
+                let h = (suggested.bottom - suggested.top).max(1);
+                unsafe {
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        None,
+                        suggested.left,
+                        suggested.top,
+                        w,
+                        h,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                self.layout_edit_control(w);
+                if let Some(renderer) = &mut self.d2d {
+                    renderer.set_dpi(self.dpi);
+                    renderer.resize(w as u32, h as u32);
+                }
+                self.invalidate();
+                Some(LRESULT(0))
+            }
             WM_DESTROY | WM_NCDESTROY => Some(LRESULT(0)),
             _ => None,
         }
@@ -953,45 +1458,23 @@ fn wide_z(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// UTF-16, *not* null-terminated -- for `DrawTextW`, which takes an
+/// UTF-16, *not* null-terminated -- for [`draw_text_line_d2d`]'s
+/// `ID2D1RenderTarget::DrawText`, which (like `DrawTextW`) takes an
 /// explicit slice length rather than scanning for a terminator.
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-/// Draws one line of `text` in `rect` with `DrawTextW`, or does nothing at
-/// all when `text` is empty.
-///
-/// MEASURED 2026-09-17 (`app.rs`'s `render_gdi_lines_rgba_tolerates_a_blank_line`
-/// and the live test that first hit this): calling `DrawTextW` with a
-/// zero-length `&mut [u16]` buffer -- exactly what `utf16("")` produces --
-/// reliably crashes with `STATUS_ACCESS_VIOLATION` through this crate's
-/// `windows` binding. THEORY (unverified): the binding reads the buffer's
-/// length as "scan for a null terminator" rather than "nothing to draw"
-/// when it is zero, walking off the end of the `Vec`'s dangling-but-valid
-/// empty-allocation pointer.
-///
-/// Every row's text here ultimately comes from data this process does not
-/// fully control -- `router_summary` from a live model's JSON response
-/// (#24, `RouterResult::summary` has no `minLength`), `Row::Action`'s
-/// `name`/`Row::Header`'s group name from a hand-editable `actions.toml`
-/// (#23's `Action::name`/`Action::group` are plain, unvalidated `String`s)
-/// -- so this guard belongs at the one place every row's text funnels
-/// through for painting, not at each individual source.
-fn draw_text_line(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
-    text: &str,
-    mut rect: RECT,
-    format: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
-) {
-    if text.is_empty() {
-        return;
-    }
-    let mut buf = utf16(text);
-    unsafe {
-        DrawTextW(hdc, &mut buf, &mut rect, format);
-    }
-}
+// #224: `draw_text_line` used to live here as a private copy, structurally
+// identical to `crate::ui::text::draw_text_line` (issue #221) -- see that
+// module's doc comment for the MEASURED empty-string crash and the guard's
+// reasoning, which applies unchanged to every row's text painted below
+// (`router_summary` from a live model's JSON response, `Row::Action`'s
+// `name`/`Row::Header`'s group name from a hand-editable `actions.toml`,
+// none of it validated non-empty at the source). Now imported instead of
+// duplicated; the regression coverage for the empty-string guard itself
+// lives in `ui::text`'s own tests.
+use crate::ui::text::draw_text_line;
 
 #[cfg(test)]
 mod tests {
@@ -1329,10 +1812,13 @@ mod tests {
         assert_eq!(scale(96, 192), 192);
     }
 
-    /// Regression check for `draw_text_line`'s doc comment: an empty string
-    /// must not reach `DrawTextW` at all. Before this guard existed, this
-    /// exact call crashed with `STATUS_ACCESS_VIOLATION` (see the doc
-    /// comment for the reproduction).
+    /// #224 smoke test: `palette.rs` now imports `crate::ui::text::draw_text_line`
+    /// rather than carrying its own copy -- this proves the import actually
+    /// resolves and behaves the same way at THIS call site (an empty string
+    /// must not reach the real `DrawTextW` at all, or this crashes with
+    /// `STATUS_ACCESS_VIOLATION`). The guard's own regression coverage
+    /// (empty vs. non-empty) lives in `ui::text`'s tests; this is not a
+    /// second copy of that, just confirmation the wiring here is live.
     #[test]
     fn draw_text_line_tolerates_an_empty_string() {
         unsafe {
@@ -1347,6 +1833,44 @@ mod tests {
             draw_text_line(hdc, "", rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
         }
+    }
+
+    // -- the DirectWrite path is really taken (#216) -------------------------
+
+    /// #216's "wired to nothing" observable, and the reason it needs its own
+    /// test: [`PaletteInner::try_paint_d2d`] returns `false` and falls back to
+    /// [`PaletteInner::paint_gdi`] whenever the Direct2D renderer is missing or
+    /// a device is lost. That fallback is the right behaviour, but it means a
+    /// DirectWrite path that never initializes at all looks exactly like a
+    /// working one: the palette still paints, every other test still passes,
+    /// and the show-latency number stays in budget because GDI was fast too.
+    ///
+    /// So assert the renderer is actually there after a real show, not just
+    /// that painting happened. If this fails while the palette still renders,
+    /// #216 has silently regressed to GDI.
+    #[test]
+    fn show_leaves_a_live_direct2d_renderer_not_a_silent_gdi_fallback() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).expect("palette window creation must succeed");
+        p.show(
+            free_actions(),
+            true,
+            "mode: Auto - openai:gpt-5".to_string(),
+        );
+
+        let renderer = p
+            .inner
+            .d2d
+            .as_ref()
+            .expect("PaletteRenderer::new returned None: Direct2D/DirectWrite factories                      were never created, so every paint silently falls back to GDI");
+        assert!(
+            renderer.target.is_some(),
+            "no ID2D1HwndRenderTarget after a real show: try_paint_d2d returns false              every time and the palette is still a GDI surface"
+        );
+        assert!(
+            renderer.text_format.is_some(),
+            "no IDWriteTextFormat after a real show: rows would draw with no text"
+        );
     }
 
     // -- show latency (#25's Done-when: under 100 ms) -----------------------

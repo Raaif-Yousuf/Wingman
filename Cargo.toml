@@ -32,6 +32,13 @@ arboard = "3.6"
 version = "0.62"
 features = [
   "Win32_Foundation",
+  # Issue #216: the Quick Ask palette's row list and query text, via
+  # ID2D1HwndRenderTarget + IDWriteTextFormat (palette.rs's `d2d` module).
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_DirectWrite",
+  # D2D1_PIXEL_FORMAT's DXGI_FORMAT (issue #216).
+  "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Dwm",
   "Win32_NetworkManagement_IpHelper",
@@ -82,6 +89,15 @@ features = [
 version = "0.3"
 default-features = false
 features = ["std"]
+
+[dev-dependencies]
+# #203: drives tests/compile_fail.rs, which proves `ui::confirm::Confirmed`'s
+# field-privacy boundary actually fails to compile if it is ever widened,
+# instead of only being documented in a `compile_fail` doc comment that
+# `cargo test` never runs (wingman has no [lib] target, see Cargo.toml's
+# [[bin]] section and tests/no_em_dash.rs's own doc comment for the same
+# fact). MIT OR Apache-2.0, re-verified at adoption 2026-09-18.
+trybuild = "1"
 
 [profile.release]
 opt-level = "z"

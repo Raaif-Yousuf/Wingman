@@ -1,9 +1,11 @@
 //! Region and window capture (#29): a full-virtual-desktop, topmost overlay
 //! window that shows a frozen screenshot dimmed, a crosshair cursor, and a
 //! live selection rectangle with a pixel-size label. Drag selects a region;
-//! click-without-drag on a window selects that window's bounds (top-level
-//! ancestor, DWM extended frame bounds). Esc or right-click cancels; Enter
-//! confirms the current rectangle -- a drag or a click only STAGES a
+//! click-without-drag on a window selects that window's bounds (DWM
+//! extended frame bounds, resolved from a window snapshot taken before the
+//! overlay itself existed -- see [`SnapshotEntry`], #271). Esc, right-click,
+//! or losing activation (Alt-Tab, Win+Tab, a Snap layout -- #272) cancels;
+//! Enter confirms the current rectangle -- a drag or a click only STAGES a
 //! rectangle (drawn, not yet returned); Enter is the one thing that turns a
 //! staged rectangle into the overlay's result. See [`select_region`] for the
 //! public entry point.
@@ -13,16 +15,19 @@
 //!
 //! - **Pure geometry** (top of this file): [`Rect`] and every function that
 //!   normalizes a drag, clamps to the desktop, enforces a minimum size,
-//!   resolves which rect a click-on-a-window should offer, and converts a
-//!   virtual-desktop-space rect into the buffer-local
-//!   [`crate::capture::RectPx`] `capture::crop_rgba` needs. None of this
-//!   touches a `windows` type, so it runs against plain Rust values with no
-//!   real window, monitor or DPI call involved.
+//!   resolves which rect a click-on-a-window should offer (including
+//!   [`window_at_point`], the pure lookup against a [`SnapshotEntry`]
+//!   snapshot), and converts a virtual-desktop-space rect into the
+//!   buffer-local [`crate::capture::RectPx`] `capture::crop_rgba` needs.
+//!   None of this touches a `windows` type, so it runs against plain Rust
+//!   values with no real window, monitor or DPI call involved.
 //! - **Win32** ([`Overlay`], [`win32`]): the real window (its own class,
 //!   `WM_LBUTTONDOWN`/`WM_MOUSEMOVE`/`WM_LBUTTONUP`/`WM_KEYDOWN`/
-//!   `WM_RBUTTONDOWN`/`WM_PAINT` handling) and `WindowFromPoint` ->
-//!   `GetAncestor(GA_ROOT)` -> `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_
-//!   BOUNDS)` (falling back to `GetWindowRect`) for the window-selection
+//!   `WM_RBUTTONDOWN`/`WM_ACTIVATE`/`WM_PAINT` handling) and
+//!   `win32::capture_window_snapshot` (`EnumWindows` ->
+//!   `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`, falling back to
+//!   `GetWindowRect`, for every visible top-level window, captured ONCE
+//!   before the overlay's own window is created) for the window-selection
 //!   click path.
 //!
 //! # Coordinate spaces
@@ -59,18 +64,18 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreatePen, DeleteDC, DeleteObject,
-    DrawTextW, EndPaint, GetStockObject, Rectangle, SelectObject, SetBkMode, SetTextColor,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_NOPREFIX, DT_SINGLELINE, HBITMAP, HDC,
-    HGDIOBJ, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    EndPaint, GetStockObject, Rectangle, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_NOPREFIX, DT_SINGLELINE, HBITMAP, HDC, HGDIOBJ,
+    NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     GetWindowLongPtrW, LoadCursorW, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST,
-    IDC_CROSS, MSG, SWP_NOACTIVATE, SW_SHOW, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    IDC_CROSS, MSG, SWP_NOACTIVATE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::{self, RawShot, RectPx};
@@ -190,12 +195,11 @@ pub fn enforce_min_size(rect: Rect, min: i32, bounds: Rect) -> Rect {
 
 /// Resolves the rect to stage for a click-not-drag release at `point`:
 /// prefers `dwm_rect` (the DWM extended frame bounds of the top-level window
-/// under the cursor, see [`win32::window_rect_at_point`]), falls back to
-/// `fallback_rect` (`GetWindowRect`) when DWM has nothing usable, and
-/// finally falls back to a single point-sized rect (grown to
-/// [`MIN_REGION_SIZE_PX`] below) when neither is available -- e.g. the
-/// point is over the desktop background itself, where `WindowFromPoint`
-/// returns the shell's desktop window and neither rect means anything.
+/// under the cursor, see [`window_at_point`]), falls back to `fallback_rect`
+/// (`GetWindowRect`) when DWM has nothing usable, and finally falls back to
+/// a single point-sized rect (grown to [`MIN_REGION_SIZE_PX`] below) when
+/// neither is available -- e.g. the point is over the desktop background
+/// itself, where neither rect means anything.
 pub fn resolve_window_selection(
     dwm_rect: Option<Rect>,
     fallback_rect: Option<Rect>,
@@ -212,6 +216,70 @@ pub fn resolve_window_selection(
             bottom: point.1,
         });
     enforce_min_size(clamp_to_desktop(chosen, bounds), MIN_REGION_SIZE_PX, bounds)
+}
+
+/// One top-level window captured by [`win32::capture_window_snapshot`], in
+/// the Z-order `EnumWindows` already hands back (topmost first).
+///
+/// **#271:** querying `WindowFromPoint` live, once the overlay is already
+/// showing, can only ever return the overlay's OWN `HWND` -- it is itself a
+/// real, opaque, `HWND_TOPMOST`, full-virtual-desktop `WS_POPUP` with no
+/// `WS_EX_TRANSPARENT` hit-test exemption, so it occupies literally every
+/// point a click could land on (see the module doc comment). A snapshot
+/// taken once, before the overlay's own window is created, has no such
+/// problem -- the overlay cannot be in a list captured before it exists --
+/// and it turns "which window is under this click" into the pure, testable
+/// [`window_at_point`] below, per CLAUDE.md rule 8 (pure logic is unit
+/// tested; Win32 is checked by hand). The alternative (hide the overlay,
+/// `WindowFromPoint`, restore) was rejected: it races a repaint (a visible
+/// flicker) and stays untestable without a live desktop, where this shape
+/// keeps only the actual `EnumWindows`/`GetWindowRect`/
+/// `DwmGetWindowAttribute` calls in Win32 territory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotEntry {
+    /// The rect this entry is hit-tested against (virtual-desktop space):
+    /// the DWM extended frame bounds when available, else `GetWindowRect`
+    /// -- the same preference order [`resolve_window_selection`] applies to
+    /// the rect it eventually stages.
+    hit_rect: Rect,
+    dwm_rect: Option<Rect>,
+    fallback_rect: Option<Rect>,
+}
+
+#[cfg(test)]
+impl SnapshotEntry {
+    /// Test-only constructor (rule 9: no production seam skipped, just a
+    /// plain value builder) -- production code only ever builds these from
+    /// [`win32::capture_window_snapshot`]'s real Win32 calls.
+    fn for_test(rect: Rect) -> Self {
+        SnapshotEntry {
+            hit_rect: rect,
+            dwm_rect: Some(rect),
+            fallback_rect: Some(rect),
+        }
+    }
+}
+
+/// Finds the topmost entry in `snapshot` (ordered topmost-first, exactly as
+/// [`win32::capture_window_snapshot`] produces it) whose `hit_rect` contains
+/// `point` (virtual-desktop space), and returns the `(dwm_rect,
+/// fallback_rect)` pair [`resolve_window_selection`] wants. `None` when
+/// nothing in the snapshot covers `point`.
+pub fn window_at_point(
+    snapshot: &[SnapshotEntry],
+    point: (i32, i32),
+) -> Option<(Option<Rect>, Option<Rect>)> {
+    snapshot
+        .iter()
+        .find(|entry| rect_contains(entry.hit_rect, point))
+        .map(|entry| (entry.dwm_rect, entry.fallback_rect))
+}
+
+/// Half-open containment (`[left, right)` x `[top, bottom)`), matching
+/// `Rect::width`/`Rect::height`'s own treatment of `right`/`bottom` as
+/// exclusive edges.
+fn rect_contains(rect: Rect, point: (i32, i32)) -> bool {
+    point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom
 }
 
 /// Converts a virtual-desktop-space `rect` (space 1, see the module doc
@@ -432,6 +500,11 @@ impl Overlay {
             anyhow::bail!("Wingman: failed to register the region overlay window class");
         }
 
+        // #271: captured BEFORE `CreateWindowExW` below, so the overlay's
+        // own (about-to-exist) window cannot be in it -- see
+        // `win32::capture_window_snapshot`'s doc comment.
+        let window_snapshot = win32::capture_window_snapshot();
+
         let mut dimmed = original.rgba.clone();
         dim_rgba(&mut dimmed, BACKGROUND_DIM_FACTOR);
         let (background_bitmap, background_dc) =
@@ -450,6 +523,8 @@ impl Overlay {
             current_point: (0, 0),
             current_rect: None,
             outcome: None,
+            was_activated: false,
+            window_snapshot,
         });
         let raw = Box::into_raw(inner);
 
@@ -577,6 +652,23 @@ impl Overlay {
     pub(crate) fn outcome(&self) -> Option<OverlayOutcome> {
         self.inner.outcome
     }
+
+    /// Test-only seam: the staged (not-yet-confirmed) rect, overlay-local
+    /// space -- lets #271's regression test inspect what a click-not-drag
+    /// resolved to without needing Enter/an `OverlayOutcome`.
+    #[cfg(test)]
+    pub(crate) fn current_rect(&self) -> Option<Rect> {
+        self.inner.current_rect
+    }
+
+    /// Test-only seam: replaces the real, `EnumWindows`-captured snapshot
+    /// with a synthetic one, so #271's regression test can assert the
+    /// click-not-drag path resolves to a KNOWN rect instead of whatever
+    /// real windows happen to be on the machine running the test.
+    #[cfg(test)]
+    pub(crate) fn set_window_snapshot(&mut self, snapshot: Vec<SnapshotEntry>) {
+        self.inner.window_snapshot = snapshot;
+    }
 }
 
 impl Drop for Overlay {
@@ -593,6 +685,22 @@ impl Drop for Overlay {
         self.inner.background_bitmap = HBITMAP(std::ptr::null_mut());
         self.inner.background_dc = HDC(std::ptr::null_mut());
     }
+}
+
+/// Whether a `WM_ACTIVATE` should cancel the overlay (#272).
+///
+/// Pure, so it can be stated exhaustively without a window. The posted
+/// message tests that originally covered this were inherently racy: the
+/// overlay is a real top-level window, so while the suite runs, other Win32
+/// tests creating and destroying their own windows deliver genuine
+/// `WA_INACTIVE` messages to it, and any test asserting "the overlay was NOT
+/// cancelled" fails whenever that happens. They passed alone and failed in
+/// the full suite (MEASURED 2026-09-19). That the handler is reached at all
+/// is covered separately by `wm_activate_is_dispatched_to_on_activate`.
+///
+/// `state` is `LOWORD(wParam)`.
+fn activation_cancels(state: u32, was_activated: bool) -> bool {
+    state == WA_INACTIVE && was_activated
 }
 
 struct OverlayInner {
@@ -619,6 +727,16 @@ struct OverlayInner {
     /// drag or resolving a window click; Enter turns this into `outcome`.
     current_rect: Option<Rect>,
     outcome: Option<OverlayOutcome>,
+    /// #272: whether this overlay has ever been activated. Losing an
+    /// activation the window never had is not a reason to cancel; see
+    /// [`activation_cancels`].
+    was_activated: bool,
+    /// #271: the window list [`win32::capture_window_snapshot`] captured
+    /// once, before this overlay's own window was created. Consulted by
+    /// [`Self::on_lbuttonup`]'s click-not-drag path instead of a live
+    /// `WindowFromPoint` call (which, once the overlay is showing, could
+    /// only ever find the overlay itself).
+    window_snapshot: Vec<SnapshotEntry>,
 }
 
 impl OverlayInner {
@@ -687,7 +805,8 @@ impl OverlayInner {
             )
         } else {
             let screen_pt = (self.desktop.left + end.0, self.desktop.top + end.1);
-            let (dwm_rect, fallback_rect) = win32::window_rect_at_point(screen_pt);
+            let (dwm_rect, fallback_rect) =
+                window_at_point(&self.window_snapshot, screen_pt).unwrap_or((None, None));
             resolve_window_selection(
                 dwm_rect.map(|r| self.to_local(r)),
                 fallback_rect.map(|r| self.to_local(r)),
@@ -712,6 +831,33 @@ impl OverlayInner {
 
     fn on_rbuttondown(&mut self) {
         self.outcome = Some(OverlayOutcome::Cancelled);
+    }
+
+    /// #272: the overlay is a top-level `WS_POPUP` with no child control
+    /// (unlike `ui::palette`'s query edit, which forwards its own
+    /// `WM_KILLFOCUS` to the parent), so losing activation -- Alt-Tab,
+    /// Win+Tab, a Snap layout, Win+L -- arrives at THIS window as
+    /// `WM_ACTIVATE(WA_INACTIVE)`, not `WM_KILLFOCUS`. Cancel the same way
+    /// a right-click already does, so a topmost, full-desktop overlay never
+    /// gets stranded on screen, unresponsive to Escape, once focus moves
+    /// elsewhere.
+    ///
+    /// Only once the overlay has actually been activated, which in
+    /// production it always has by the time it can lose one, because
+    /// `Overlay::open` foregrounds itself. A window that never took the
+    /// foreground has no activation to lose, and treating a stray
+    /// deactivation as a cancel is wrong: MEASURED 2026-09-19, without this
+    /// two `ui::region` tests that pass alone fail in the full suite,
+    /// because other Win32 tests create and destroy real windows and the
+    /// foreground moves under them.
+    fn on_activate(&mut self, wparam: WPARAM) {
+        let state = (wparam.0 as u32) & 0xFFFF; // LOWORD: activation state
+        if activation_cancels(state, self.was_activated) {
+            self.outcome = Some(OverlayOutcome::Cancelled);
+        }
+        if state != WA_INACTIVE {
+            self.was_activated = true;
+        }
     }
 
     fn visible_rect(&self) -> Option<Rect> {
@@ -775,6 +921,10 @@ impl OverlayInner {
                 self.on_keydown(wparam.0 as u32);
                 Some(LRESULT(0))
             }
+            WM_ACTIVATE => {
+                self.on_activate(wparam);
+                Some(LRESULT(0))
+            }
             WM_DESTROY | WM_NCDESTROY => Some(LRESULT(0)),
             _ => None,
         }
@@ -797,17 +947,22 @@ unsafe fn draw_selection(hdc: HDC, rect: Rect) {
     SelectObject(hdc, old_brush);
     let _ = DeleteObject(HGDIOBJ(pen.0));
 
+    // `size_label` always formats "<width> x <height>" (see its own doc
+    // comment/test), so this can never actually be empty -- still routed
+    // through the shared guard (issue #221) rather than a raw `DrawTextW`
+    // call, so a future change to `size_label` can't silently reintroduce
+    // the empty-buffer crash MEASURED on the palette branch (commit
+    // `453fe0b`).
     let label = size_label(rect);
-    let mut buf = wide_z(&label);
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, COLORREF(0x00FFFFFF));
-    let mut text_rc = RECT {
+    let text_rc = RECT {
         left: rect.left + 4,
         top: (rect.top - 20).max(0),
         right: rect.left + 240,
         bottom: rect.top.max(20),
     };
-    DrawTextW(hdc, &mut buf, &mut text_rc, DT_SINGLELINE | DT_NOPREFIX);
+    crate::ui::text::draw_text_line(hdc, &label, text_rc, DT_SINGLELINE | DT_NOPREFIX);
 }
 
 /// Builds the top-down BGRA DIB section (and the memory DC it is selected
@@ -881,44 +1036,76 @@ fn wide_z(s: &str) -> Vec<u16> {
 }
 
 // ---------------------------------------------------------------------------
-// Win32: window-at-point resolution for the click-select-window path
+// Win32: window snapshot for the click-select-window path (#271)
 // ---------------------------------------------------------------------------
 
 mod win32 {
-    use super::Rect;
-    use windows::Win32::Foundation::{POINT, RECT};
+    use super::{Rect, SnapshotEntry};
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetAncestor, GetWindowRect, WindowFromPoint, GA_ROOT,
+        EnumWindows, GetWindowRect, IsIconic, IsWindowVisible,
     };
 
-    /// Resolves the rects to offer [`super::resolve_window_selection`] for
-    /// a click at `screen_pt` (virtual-desktop physical pixels, space 1):
-    /// the DWM extended frame bounds of the top-level ancestor of whatever
-    /// window is under the point, plus a `GetWindowRect` fallback. Real
-    /// Win32, not unit-tested directly (CLAUDE.md rule 8) --
-    /// `resolve_window_selection` is the pure decision this feeds, and IS
-    /// unit-tested. **Manual check** (filed to #166): click on a real
-    /// window (not the desktop background) with the overlay open and
-    /// confirm the staged rectangle matches that window's actual bounds,
-    /// including on a monitor at non-100% DPI scaling.
-    pub(super) fn window_rect_at_point(screen_pt: (i32, i32)) -> (Option<Rect>, Option<Rect>) {
-        let pt = POINT {
-            x: screen_pt.0,
-            y: screen_pt.1,
-        };
-        let hwnd = unsafe { WindowFromPoint(pt) };
-        if hwnd.0.is_null() {
-            return (None, None);
+    /// Captures every visible, non-minimized top-level window's bounds, in
+    /// Z-order (topmost first -- `EnumWindows` already enumerates that way),
+    /// at the instant this is called. Real Win32, not unit-tested directly
+    /// (CLAUDE.md rule 8) -- [`super::window_at_point`] is the pure decision
+    /// this feeds, and IS unit-tested.
+    ///
+    /// **#271's fix**: [`super::Overlay::create`] calls this BEFORE
+    /// `CreateWindowExW` runs for the overlay itself, so the overlay's own
+    /// `HWND` cannot be in the snapshot -- there is no live-`WindowFromPoint`
+    /// race with the overlay's own opaque, topmost, full-desktop window to
+    /// guard against, because the snapshot is deterministic and taken
+    /// before that window exists.
+    ///
+    /// **Manual check** (filed to #166): open the overlay over two
+    /// overlapping real windows (e.g. Notepad in front of File Explorer)
+    /// and confirm a click-without-drag on the visible (topmost) one stages
+    /// ITS bounds -- watch the "W x H" label before pressing Enter -- not
+    /// the full desktop rect and not the window it is covering. Also check
+    /// a click on bare desktop background: `THEORY (unverified)`: the
+    /// shell's own desktop window (`Progman`/`WorkerW`) may appear in this
+    /// snapshot with a real, full-monitor `GetWindowRect`, which would
+    /// stage that whole rect rather than falling back to a point-sized one
+    /// -- this was equally possible in the pre-#271 code once corrected for
+    /// the overlay-always-wins bug, so it is not a regression this fix
+    /// introduces, but it has not been observed on a live desktop.
+    pub(super) fn capture_window_snapshot() -> Vec<SnapshotEntry> {
+        let mut entries: Vec<SnapshotEntry> = Vec::new();
+        unsafe {
+            let _ = EnumWindows(
+                Some(enum_proc),
+                LPARAM(&mut entries as *mut Vec<SnapshotEntry> as isize),
+            );
         }
-        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-        let root = if root.0.is_null() { hwnd } else { root };
+        entries
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let entries = unsafe { &mut *(lparam.0 as *mut Vec<SnapshotEntry>) };
+        let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+        let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+        if !visible || minimized {
+            return BOOL(1); // continue enumerating
+        }
+
+        let fallback_rect = {
+            let mut rc = RECT::default();
+            if unsafe { GetWindowRect(hwnd, &mut rc) }.is_ok() {
+                Some(Rect::from(rc))
+            } else {
+                None
+            }
+        };
 
         let dwm_rect = {
             let mut rc = RECT::default();
             let ok = unsafe {
                 DwmGetWindowAttribute(
-                    root,
+                    hwnd,
                     DWMWA_EXTENDED_FRAME_BOUNDS,
                     &mut rc as *mut _ as *mut core::ffi::c_void,
                     std::mem::size_of::<RECT>() as u32,
@@ -931,16 +1118,15 @@ mod win32 {
             }
         };
 
-        let fallback_rect = {
-            let mut rc = RECT::default();
-            if unsafe { GetWindowRect(root, &mut rc) }.is_ok() {
-                Some(Rect::from(rc))
-            } else {
-                None
-            }
-        };
+        if let Some(hit_rect) = dwm_rect.filter(|r| !r.is_empty()).or(fallback_rect) {
+            entries.push(SnapshotEntry {
+                hit_rect,
+                dwm_rect,
+                fallback_rect,
+            });
+        }
 
-        (dwm_rect, fallback_rect)
+        BOOL(1) // continue enumerating
     }
 }
 
@@ -1178,6 +1364,85 @@ mod tests {
         let cy = (chosen.top + chosen.bottom) / 2;
         assert!((cx - 500).abs() <= 1);
         assert!((cy - 500).abs() <= 1);
+    }
+
+    // -- window_at_point: #271's pure snapshot lookup -----------------------
+
+    #[test]
+    fn window_at_point_returns_none_for_an_empty_snapshot() {
+        assert_eq!(window_at_point(&[], (10, 10)), None);
+    }
+
+    #[test]
+    fn window_at_point_returns_none_when_point_is_outside_every_entry() {
+        let snapshot = vec![SnapshotEntry::for_test(Rect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        })];
+        assert_eq!(window_at_point(&snapshot, (200, 200)), None);
+    }
+
+    #[test]
+    fn window_at_point_finds_the_single_covering_entry() {
+        let rect = Rect {
+            left: 10,
+            top: 10,
+            right: 110,
+            bottom: 210,
+        };
+        let snapshot = vec![SnapshotEntry::for_test(rect)];
+        assert_eq!(
+            window_at_point(&snapshot, (50, 50)),
+            Some((Some(rect), Some(rect)))
+        );
+    }
+
+    #[test]
+    fn window_at_point_prefers_the_topmost_of_two_overlapping_entries() {
+        // Both entries cover (50, 50); `topmost` is listed FIRST, matching
+        // the order `win32::capture_window_snapshot` produces (EnumWindows
+        // already enumerates Z-order top-to-bottom). This is the exact
+        // shape #271 needs: a click over two overlapping real windows must
+        // resolve to the visible (topmost) one, never whichever happens to
+        // be underneath.
+        let topmost = Rect {
+            left: 0,
+            top: 0,
+            right: 60,
+            bottom: 60,
+        };
+        let behind = Rect {
+            left: 0,
+            top: 0,
+            right: 2000,
+            bottom: 2000,
+        };
+        let snapshot = vec![
+            SnapshotEntry::for_test(topmost),
+            SnapshotEntry::for_test(behind),
+        ];
+        let (dwm, fallback) = window_at_point(&snapshot, (50, 50)).expect("a covering entry");
+        assert_eq!(dwm, Some(topmost));
+        assert_eq!(fallback, Some(topmost));
+    }
+
+    #[test]
+    fn window_at_point_containment_is_half_open_on_the_right_and_bottom_edges() {
+        let rect = Rect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        let snapshot = vec![SnapshotEntry::for_test(rect)];
+        // Left/top edges are inside.
+        assert!(window_at_point(&snapshot, (0, 0)).is_some());
+        // Right/bottom edges are exclusive, matching `Rect::width`/`height`
+        // already treating them that way.
+        assert_eq!(window_at_point(&snapshot, (100, 50)), None);
+        assert_eq!(window_at_point(&snapshot, (50, 100)), None);
     }
 
     // -- to_buffer_rect: the crate's one "mixed DPI" conversion -------------
@@ -1455,18 +1720,225 @@ mod tests {
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_LBUTTONDOWN, WPARAM(0), make_lparam(10, 10));
             // Released 1px away: below DRAG_THRESHOLD_PX, so this is a
-            // click, not a drag -- the window-selection path runs (real
-            // WindowFromPoint/DwmGetWindowAttribute, whatever that resolves
-            // to on the machine running this test), staging SOME rect but
-            // never confirming without Enter.
+            // click, not a drag -- the window-selection path runs (against
+            // the real `EnumWindows`-captured snapshot, whatever that
+            // resolves to on the machine running this test), staging SOME
+            // rect but never confirming without Enter.
             let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), make_lparam(11, 10));
+        }
+        pump_until(hwnd, 20, || overlay.outcome().is_some());
+
+        // Asserts only that the click did not CONFIRM. It cannot assert
+        // `outcome() == None`: since #272 the overlay cancels on losing
+        // activation, and other Win32 tests in this suite move the
+        // foreground while this one runs, so a genuine WA_INACTIVE can
+        // arrive at any moment. `Cancelled` is therefore an acceptable
+        // outcome here; `Confirmed` never is, and that is the claim.
+        assert!(
+            !matches!(overlay.outcome(), Some(OverlayOutcome::Selected(_))),
+            "a click alone must stage a rectangle, not confirm one"
+        );
+    }
+
+    // -- #271: click-without-drag must resolve to the window UNDER the ----
+    // -- click, never the overlay's own full-desktop bounds ---------------
+
+    #[test]
+    fn overlay_click_without_drag_stages_the_snapshot_window_not_the_whole_overlay() {
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+        let instance = test_instance();
+        let desktop = Rect {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 300,
+        };
+        let mut overlay =
+            Overlay::open_for_test(instance, desktop).expect("Overlay::open_for_test");
+        let hwnd = overlay.hwnd();
+
+        // A synthetic "real window" entirely inside the overlay's local
+        // bounds, in DESKTOP space (here identical to local space since
+        // `desktop` starts at (0, 0)). Before #271's fix, the click path
+        // called `WindowFromPoint` live while the overlay itself covers
+        // every point on screen, so it could only ever resolve to the
+        // overlay's own bounds (0,0)-(400,300) -- never this rect.
+        let window_rect = Rect {
+            left: 20,
+            top: 20,
+            right: 120,
+            bottom: 90,
+        };
+        overlay.set_window_snapshot(vec![SnapshotEntry::for_test(window_rect)]);
+
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_LBUTTONDOWN, WPARAM(0), make_lparam(50, 50));
+            // 1px away: a click, not a drag.
+            let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), make_lparam(51, 50));
+        }
+        pump_until(hwnd, 20, || overlay.current_rect().is_some());
+
+        assert_eq!(
+            overlay.current_rect(),
+            Some(window_rect),
+            "a click over a window in the snapshot must stage THAT window's \
+             bounds, not the overlay's own full-desktop rect"
+        );
+    }
+
+    #[test]
+    fn overlay_click_without_drag_with_nothing_in_the_snapshot_stages_a_point_sized_rect() {
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+        let instance = test_instance();
+        let desktop = Rect {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 300,
+        };
+        let mut overlay =
+            Overlay::open_for_test(instance, desktop).expect("Overlay::open_for_test");
+        let hwnd = overlay.hwnd();
+
+        // Nothing in the snapshot covers (200, 150) -- the empty-desktop
+        // case; must fall back to a small, point-sized rect (grown to
+        // MIN_REGION_SIZE_PX by `resolve_window_selection`), never the
+        // overlay's own full-desktop bounds.
+        overlay.set_window_snapshot(vec![]);
+
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_LBUTTONDOWN, WPARAM(0), make_lparam(200, 150));
+            let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), make_lparam(201, 150));
+        }
+        pump_until(hwnd, 20, || overlay.current_rect().is_some());
+
+        let rect = overlay.current_rect().expect("a click must stage a rect");
+        assert!(rect.width() <= MIN_REGION_SIZE_PX * 2);
+        assert!(rect.height() <= MIN_REGION_SIZE_PX * 2);
+        assert_ne!(
+            rect,
+            Rect {
+                left: 0,
+                top: 0,
+                right: 400,
+                bottom: 300
+            },
+            "must never fall back to the overlay's own full-desktop bounds"
+        );
+    }
+
+    // -- #272: losing activation (Alt-Tab etc.) must cancel, the same way -
+    // -- a right-click already does ----------------------------------------
+
+    #[test]
+    fn overlay_losing_activation_cancels() {
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+        let instance = test_instance();
+        let desktop = Rect {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 300,
+        };
+        let overlay = Overlay::open_for_test(instance, desktop).expect("Overlay::open_for_test");
+        let hwnd = overlay.hwnd();
+
+        unsafe {
+            // WM_ACTIVATE, LOWORD(wParam) = WA_INACTIVE (0): the window is
+            // being deactivated, e.g. by Alt-Tab away.
+            let _ = PostMessageW(Some(hwnd), WM_ACTIVATE, WPARAM(0), LPARAM(0));
         }
         pump_until(hwnd, 20, || overlay.outcome().is_some());
 
         assert_eq!(
             overlay.outcome(),
-            None,
-            "a click alone must stage a rectangle, not confirm one"
+            Some(OverlayOutcome::Cancelled),
+            "losing activation must cancel the overlay, the same as a right-click"
+        );
+    }
+
+    #[test]
+    fn overlay_gaining_activation_does_not_cancel() {
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+        let instance = test_instance();
+        let desktop = Rect {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 300,
+        };
+        let overlay = Overlay::open_for_test(instance, desktop).expect("Overlay::open_for_test");
+        let hwnd = overlay.hwnd();
+
+        unsafe {
+            // WM_ACTIVATE, LOWORD(wParam) = WA_ACTIVE (1): being (re)
+            // activated must NOT be mistaken for losing focus.
+            let _ = PostMessageW(Some(hwnd), WM_ACTIVATE, WPARAM(1), LPARAM(0));
+        }
+        pump_until(hwnd, 20, || overlay.outcome().is_some());
+
+        // Deliberately asserts nothing about `outcome()` here: see
+        // `activation_cancels`. While the suite runs, other Win32 tests
+        // move the foreground, so a genuine WA_INACTIVE can arrive at this
+        // window at any moment and any "was NOT cancelled" assertion is a
+        // race. The decision itself is covered exhaustively below.
+        let _ = overlay.outcome();
+    }
+
+    #[test]
+    fn activation_cancels_only_after_the_overlay_has_been_activated() {
+        use windows::Win32::UI::WindowsAndMessaging::{WA_ACTIVE, WA_CLICKACTIVE};
+
+        assert!(
+            activation_cancels(WA_INACTIVE, true),
+            "losing an activation the overlay had must cancel it (#272)"
+        );
+        assert!(
+            !activation_cancels(WA_INACTIVE, false),
+            "a deactivation the overlay never earned must not cancel it"
+        );
+        for state in [WA_ACTIVE, WA_CLICKACTIVE] {
+            for was_activated in [false, true] {
+                assert!(
+                    !activation_cancels(state, was_activated),
+                    "gaining activation must never cancel: state {state}, was_activated {was_activated}"
+                );
+            }
+        }
+    }
+
+    /// The other half `activation_cancels` cannot cover: that `wnd_proc`
+    /// actually routes `WM_ACTIVATE` to `on_activate`. Without this, the
+    /// pure test above passes while the message is never handled, which is
+    /// the wired-to-nothing shape this repo keeps hitting.
+    #[test]
+    fn wm_activate_is_dispatched_to_on_activate() {
+        let src = include_str!("region.rs").replace('\r', "");
+        // The inner handler, not the `pub(crate)` wrapper above it: rfind
+        // lands on the last of the two, which is `OverlayInner`'s own. Its
+        // body ends at the first column-4 closing brace, since it is a
+        // method rather than a free function.
+        let at = src.rfind("fn handle_message").expect(
+            "region.rs no longer has a `fn handle_message`; this guard is checking nothing",
+        );
+        let handler = &src[at..];
+        let body = &handler[..handler.find("\n    }\n").unwrap_or(handler.len())];
+        assert!(
+            body.len() > 500,
+            "the extracted handle_message body is only {} bytes; this guard is no longer checking anything",
+            body.len()
+        );
+        assert!(
+            body.contains("WM_ACTIVATE =>"),
+            "handle_message has no WM_ACTIVATE arm, so losing focus is silently ignored"
+        );
+        assert!(
+            body.contains("self.on_activate("),
+            "handle_message's WM_ACTIVATE arm no longer calls on_activate"
         );
     }
 
@@ -1518,6 +1990,101 @@ mod tests {
             Err(e) => {
                 println!("Overlay::open failed in this environment: {e:#}");
             }
+        }
+    }
+
+    // -- issue #221: DrawTextW must not crash on empty text -----------------
+    //
+    // `draw_selection`'s own text (`size_label`) can never actually be empty
+    // -- `size_label` always formats "<width> x <height>" (see
+    // `size_label_formats_width_x_height` above) -- so there is no reachable
+    // empty-text call through `draw_selection` itself to reproduce. This
+    // mirrors `src/ui/palette.rs`'s `draw_text_line_tolerates_an_empty_string`
+    // (commit `453fe0b`) and `crate::ui::text`'s own regression test by
+    // exercising the shared guard `draw_selection` now routes through
+    // directly, against a real memory DC, so a future caller of
+    // `crate::ui::text::draw_text_line` from this module is covered too.
+    // Per the module doc comment on `crate::ui::text`: this does NOT
+    // re-trigger the raw, unguarded `DrawTextW` crash (MEASURED 2026-09-17
+    // on the palette branch) -- doing so would crash this whole test binary.
+    // No named kernel object, registry value or file path is created here
+    // (rule 9 is moot: nothing needs a name).
+    #[test]
+    fn draw_text_line_tolerates_an_empty_string_in_a_memory_dc() {
+        use windows::Win32::Graphics::Gdi::{DT_LEFT, DT_VCENTER};
+
+        unsafe {
+            let hdc = CreateCompatibleDC(None);
+            assert!(!hdc.is_invalid(), "CreateCompatibleDC failed");
+
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 8,
+                    biHeight: -8,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let hbitmap = CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .expect("CreateDIBSection failed");
+            let old_bitmap = SelectObject(hdc, hbitmap.into());
+
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 8,
+                bottom: 8,
+            };
+            crate::ui::text::draw_text_line(hdc, "", rect, DT_LEFT | DT_VCENTER);
+            crate::ui::text::draw_text_line(hdc, "8 x 8", rect, DT_LEFT | DT_VCENTER);
+
+            SelectObject(hdc, old_bitmap);
+            let _ = DeleteObject(hbitmap.into());
+            let _ = DeleteDC(hdc);
+        }
+    }
+
+    #[test]
+    fn draw_selection_with_a_zero_size_rect_does_not_crash() {
+        unsafe {
+            let hdc = CreateCompatibleDC(None);
+            assert!(!hdc.is_invalid(), "CreateCompatibleDC failed");
+
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 16,
+                    biHeight: -16,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let hbitmap = CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .expect("CreateDIBSection failed");
+            let old_bitmap = SelectObject(hdc, hbitmap.into());
+
+            draw_selection(
+                hdc,
+                Rect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+            );
+
+            SelectObject(hdc, old_bitmap);
+            let _ = DeleteObject(hbitmap.into());
+            let _ = DeleteDC(hdc);
         }
     }
 }

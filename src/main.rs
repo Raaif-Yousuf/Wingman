@@ -14,6 +14,7 @@ mod connectors;
 mod diagnostics;
 mod dismiss;
 mod dpapi;
+mod egress;
 mod executors;
 mod hotkey;
 mod hotkey_conflicts;

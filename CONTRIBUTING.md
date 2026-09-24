@@ -109,6 +109,11 @@ executor: it reads the current text selection and hands back translated text
 on a read-only card. Every step below describes the framework as designed;
 none of it can be run yet.
 
+See [`docs/actions.md`](docs/actions.md) for the full `actions.toml` schema
+(checked against the code, with worked examples) and
+[`docs/executors.md`](docs/executors.md) for the executor contract this
+walkthrough's step 3 summarizes.
+
 ### 1. Add the action to `actions.toml`
 
 ```toml
@@ -139,10 +144,11 @@ Only needed when no existing schema fits (`text_answer`, `verdict`,
 cases). Add it to the proposal schema registry in `actions/` with its
 `serde` struct, in **property-declaration order**, because that order is
 sent as the JSON schema and the model answers in that order (CLAUDE.md rule
-3: this is why `serde_json` keeps `preserve_order`). Put any field the model
-should commit to last (like a verdict) after the fields that justify it
-(like the reasoning), the same way the existing `verdict` schema puts
-`headline` after `detail`.
+3: this is why `serde_json` keeps `preserve_order`, explained in full in
+[`docs/actions.md`](docs/actions.md)). Put any field the model should commit
+to last (like a verdict) after the fields that justify it (like the
+reasoning), the same way the existing `verdict` schema puts `headline` after
+`detail`.
 
 ### 3. If the action needs a new executor
 
@@ -158,9 +164,12 @@ that:
   intended), with an undo closure where the platform allows one,
 - never presses Send, Submit, Buy or Pay, and never touches payment data.
 
-These five rules (plan §6, "The rules every executor obeys") are non-
-negotiable for anything merged as an executor; a pull request that adds an
-executor is reviewed against them explicitly.
+These rules (plan §6, "The rules every executor obeys") are non-negotiable
+for anything merged as an executor; a pull request that adds an executor is
+reviewed against them explicitly. See [`docs/executors.md`](docs/executors.md)
+for the full contract, the `Confirmed<P>` type-system enforcement behind
+the first rule, and the stale-target check every UIA-writing executor
+applies.
 
 ### 4. If the action needs a new connector
 

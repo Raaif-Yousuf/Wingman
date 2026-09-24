@@ -448,11 +448,29 @@ mod tests {
     // -- the shared atomic, exercised through its real accessors -------------
     //
     // These three tests are the only ones in the crate that touch
-    // PAUSE_DEADLINE; each restores Running before returning so it can never
-    // leak into another test run in the same process.
+    // PAUSE_DEADLINE, and they must not run at the same time as each other.
+    //
+    // Restoring Running before returning (which they each do) is not enough:
+    // that only stops state leaking to a LATER test, and cargo runs unit tests
+    // multi-threaded in one process. Observed 2026-09-19 as a real intermittent
+    // failure of `set_paused_until_resumed_then_set_running_round_trips` in the
+    // full suite, passing on re-run and in isolation: one test's `set_running`
+    // landed between another's `set_paused` and its `assert!(is_paused_now())`.
+    //
+    // Same fix, and the same reason, as `config::EGRESS_PREVIEW_TEST_LOCK`.
+    // The lock is poison-tolerant: a panicking test must not turn one failure
+    // into three.
+    static PAUSE_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_pause_state() -> std::sync::MutexGuard<'static, ()> {
+        PAUSE_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn set_paused_until_resumed_then_set_running_round_trips() {
+        let _guard = lock_pause_state();
         set_paused(None);
         assert!(is_paused_now());
         set_running();
@@ -461,6 +479,7 @@ mod tests {
 
     #[test]
     fn set_paused_with_future_deadline_reports_paused() {
+        let _guard = lock_pause_state();
         set_paused(Some(SystemTime::now() + Duration::from_secs(120)));
         assert!(is_paused_now());
         set_running();
@@ -469,6 +488,7 @@ mod tests {
 
     #[test]
     fn set_paused_with_past_deadline_reports_not_paused() {
+        let _guard = lock_pause_state();
         set_paused(Some(SystemTime::now() - Duration::from_secs(5)));
         assert!(!is_paused_now());
         set_running();

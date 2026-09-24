@@ -388,6 +388,15 @@ rebinds; provider fallback works with a deliberately bad OpenAI key.
 
 ## Out of scope
 
-Conversation history, follow-up questions, OCR preprocessing, auto-start
-(documented as a manual Startup-folder shortcut), packaging and installer, a
-settings GUI (the TOML is the settings UI), streaming responses.
+Conversation history, follow-up questions, OCR preprocessing, streaming
+responses.
+
+(As of this writing, auto-start was planned as a manual Startup-folder
+shortcut, a settings GUI was considered out of scope in favor of editing the
+TOML directly, and packaging/installer did not exist yet. All three later
+shipped: `src/autostart.rs` writes a real `HKCU\...\Run` entry -- see the
+Modules table above -- `src/ui/settings.rs` is a real modal settings window
+-- see "Settings modal re-entrancy" below -- and packaging/install is its
+own spec, [`2026-09-15-packaging-and-install-design.md`](2026-09-15-packaging-and-install-design.md).
+This section is left as originally written for the historical record; do
+not read it as describing what is out of scope today.)
