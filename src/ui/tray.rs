@@ -121,6 +121,11 @@ pub mod cmd {
     pub const MODE_AUTO: u32 = 1017;
     pub const MODE_OFFLINE: u32 = 1018;
 
+    /// Issue #317: the disabled, greyed version line at the top of the
+    /// menu. Never enabled, so it never sends `WM_COMMAND`; the id only
+    /// needs to be unique among menu items.
+    pub const VERSION_LABEL: u32 = 1029;
+
     /// Issue #124: builds a plain-text diagnostics report and copies it to
     /// the clipboard. See `App::copy_diagnostics` in `app.rs`.
     pub const COPY_DIAGNOSTICS: u32 = 1019;
@@ -480,6 +485,11 @@ impl Tray {
     }
 
     fn build_menu(&self, hmenu: HMENU) -> Result<()> {
+        // #317: a disabled, greyed first line showing the running version --
+        // no `WM_COMMAND` arm needed since it's never enabled and thus never
+        // clickable (see `append_item_state`'s doc comment on #185).
+        append_item_state(hmenu, cmd::VERSION_LABEL, &version_label(), false)?;
+        append_separator(hmenu)?;
         append_item(hmenu, cmd::ASK_NOW, "Ask now")?;
         // #25: honors Pause the same way "Calculate selection" does just
         // below -- opening the palette to run an action defeats the point
@@ -576,6 +586,14 @@ impl Drop for Tray {
             let _ = unsafe { DestroyIcon(icon) };
         }
     }
+}
+
+/// Issue #317: the disabled first line of the tray menu, e.g. "Wingman
+/// 0.1.0". Pure so it can be unit-tested without a real menu; `build.rs`
+/// does not currently embed a git hash (only `diagnostics.rs`'s
+/// `CARGO_PKG_VERSION` exists), so there is nothing to append yet.
+fn version_label() -> String {
+    format!("Wingman {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn key_label(base: &str, binding: &str) -> String {
@@ -1079,6 +1097,15 @@ fn derive_icon_with_transform(
 mod tests {
     use super::*;
 
+    // -- Version label (#317) ------------------------------------------------
+
+    #[test]
+    fn version_label_shows_the_crate_version() {
+        let label = version_label();
+        assert_eq!(label, format!("Wingman {}", env!("CARGO_PKG_VERSION")));
+        assert!(!label.contains('\u{2014}'), "no em dashes in menu text");
+    }
+
     // -- TaskbarCreated recovery (#145) -------------------------------------
 
     #[test]
@@ -1569,6 +1596,7 @@ mod tests {
         ("REVIEW_EMAIL", cmd::REVIEW_EMAIL),
         ("FILL_FORM", cmd::FILL_FORM),
         ("RESTORE_LAST_FORM", cmd::RESTORE_LAST_FORM),
+        ("VERSION_LABEL", cmd::VERSION_LABEL),
     ];
 
     /// Issue #234, half of it: every id in [`ALL_FIXED_CMD_IDS`] must be a
