@@ -199,6 +199,11 @@ const PADDING: i32 = 8;
 /// blank when [`PaletteInner::router_summary`] is `None`.
 const ROUTER_SUMMARY_HEIGHT: i32 = 18;
 
+/// #359: shown in the router summary band from the moment
+/// `App::maybe_start_router` actually starts a background request until the
+/// result (or a failure) replaces or clears it. No em dash (rule 11).
+const ROUTER_LOOKING_TEXT: &str = "Looking at your screen...";
+
 fn scale(v: i32, dpi: u32) -> i32 {
     v * dpi as i32 / 96
 }
@@ -433,6 +438,16 @@ impl Palette {
     ) {
         self.inner
             .apply_router_suggestion(generation, result, threshold);
+    }
+
+    /// #359: see [`PaletteInner::set_router_pending`].
+    pub fn set_router_pending(&mut self, generation: u64) {
+        self.inner.set_router_pending(generation);
+    }
+
+    /// #359: see [`PaletteInner::clear_router_pending`].
+    pub fn clear_router_pending(&mut self, generation: u64) {
+        self.inner.clear_router_pending(generation);
     }
 
     /// The palette's own window proc dispatches internally; this is the
@@ -1019,7 +1034,13 @@ impl PaletteInner {
         if !self.visible {
             return;
         }
+        // #359: whatever happens from here, the "Looking at your screen..."
+        // placeholder this session's request started with must not survive
+        // the result -- either it becomes the real summary below, or this
+        // clears it back to None.
         let Some(intent_id) = result.intent.as_deref() else {
+            self.router_summary = None;
+            self.invalidate();
             return;
         };
         if !crate::router::should_apply(
@@ -1028,10 +1049,53 @@ impl PaletteInner {
             threshold,
             self.interacted,
         ) {
+            self.router_summary = None;
+            self.invalidate();
             return;
         }
         if crate::ui::palette_model::preselect_action(&mut self.state, intent_id) {
             self.router_summary = Some(result.summary.clone());
+        } else {
+            self.router_summary = None;
+        }
+        self.invalidate();
+    }
+
+    /// #359: called right when [`App::maybe_start_router`] actually starts a
+    /// background request (after the Paused/no-provider/capture-failure
+    /// checks all pass), so the reserved summary band shows something is
+    /// happening instead of sitting blank until the result arrives. Cleared
+    /// the same way a real summary is: by
+    /// [`PaletteInner::apply_router_suggestion`] on arrival,
+    /// [`PaletteInner::clear_router_pending`] on failure, or any of the
+    /// existing "user already interacted" paths above (`show`, `hide`,
+    /// `on_palette_key_command`'s Up/Down/PageUp/PageDown arm, `EN_CHANGE`).
+    /// No timer involved (rule 5): this only ever changes on those events.
+    fn set_router_pending(&mut self, generation: u64) {
+        if crate::router::is_stale(generation, self.router_generation) {
+            return;
+        }
+        if !self.visible {
+            return;
+        }
+        self.router_summary = Some(ROUTER_LOOKING_TEXT.to_string());
+        self.invalidate();
+    }
+
+    /// #359: the router's background request failed (or no provider ended up
+    /// ready by the time the worker thread ran) -- clears whatever
+    /// [`PaletteInner::set_router_pending`] showed rather than leaving it
+    /// stuck. A no-op if the user already interacted or hid the palette,
+    /// both of which already cleared it.
+    fn clear_router_pending(&mut self, generation: u64) {
+        if crate::router::is_stale(generation, self.router_generation) {
+            return;
+        }
+        if !self.visible {
+            return;
+        }
+        if self.router_summary.is_some() {
+            self.router_summary = None;
             self.invalidate();
         }
     }
@@ -2218,5 +2282,100 @@ mod tests {
             avg < 100.0,
             "#25's Done-when is under 100 ms; measured avg {avg:.2} ms"
         );
+    }
+
+    // -- #359: "Looking at your screen..." while the router works ----------
+
+    fn router_result(intent: Option<&str>, confidence: f64) -> crate::router::RouterResult {
+        crate::router::RouterResult {
+            summary: "Check my work".to_string(),
+            intent: intent.map(|s| s.to_string()),
+            confidence,
+        }
+    }
+
+    #[test]
+    fn set_router_pending_shows_the_looking_text() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        assert_eq!(p.inner.router_summary, None);
+        p.set_router_pending(generation);
+        assert_eq!(p.inner.router_summary.as_deref(), Some(ROUTER_LOOKING_TEXT));
+    }
+
+    #[test]
+    fn set_router_pending_is_a_noop_for_a_stale_generation() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let stale_generation = p.router_generation().wrapping_sub(1);
+        p.set_router_pending(stale_generation);
+        assert_eq!(p.inner.router_summary, None);
+    }
+
+    #[test]
+    fn apply_router_suggestion_replaces_pending_text_with_the_real_summary() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        // #414: show()'s own SetWindowTextW clear fires a real, synchronous
+        // EN_CHANGE in this real-window test harness, which marks
+        // `interacted` true before this test's simulated router result ever
+        // arrives -- a separate, pre-existing bug unrelated to #359. Reset
+        // it here so this test exercises apply_router_suggestion's own
+        // decision chain in isolation.
+        p.inner.interacted = false;
+        let generation = p.router_generation();
+        p.set_router_pending(generation);
+        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.9), 0.5);
+        assert_eq!(
+            p.inner.router_summary.as_deref(),
+            Some("Check my work"),
+            "a successful, above-threshold result must replace the placeholder"
+        );
+    }
+
+    #[test]
+    fn apply_router_suggestion_below_threshold_clears_the_pending_text() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.set_router_pending(generation);
+        // Confidence below the threshold: should_apply is false, so the
+        // placeholder must be cleared rather than left stuck.
+        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.1), 0.5);
+        assert_eq!(p.inner.router_summary, None);
+    }
+
+    #[test]
+    fn apply_router_suggestion_with_no_intent_clears_the_pending_text() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.set_router_pending(generation);
+        p.apply_router_suggestion(generation, &router_result(None, 0.9), 0.5);
+        assert_eq!(p.inner.router_summary, None);
+    }
+
+    #[test]
+    fn clear_router_pending_clears_the_looking_text_on_failure() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.set_router_pending(generation);
+        p.clear_router_pending(generation);
+        assert_eq!(p.inner.router_summary, None);
+    }
+
+    #[test]
+    fn clear_router_pending_is_a_noop_for_a_stale_generation() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.set_router_pending(generation);
+        // A new showing bumps the generation; the old request's eventual
+        // failure must not clear the NEW showing's (currently empty) band.
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        p.clear_router_pending(generation);
+        assert_eq!(p.inner.router_summary, None);
     }
 }
