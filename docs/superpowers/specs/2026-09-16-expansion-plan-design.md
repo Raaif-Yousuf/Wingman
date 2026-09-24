@@ -421,7 +421,7 @@ Small, centred, Win32 + DirectWrite, pre-created so it shows in under 50 ms.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ 🔍 Ask anything, or pick an action…                           │
+│ 🔍 Filter actions, or type a one-line question…                │
 ├──────────────────────────────────────────────────────────────┤
 │ ★ Review this email        to Dana, "Q3 numbers"    ↵         │
 │ ○ Fill this form           uia → confirm                      │
@@ -436,7 +436,10 @@ Small, centred, Win32 + DirectWrite, pre-created so it shows in under 50 ms.
 ```
 
 The starred row is the router's suggestion. The chips are what will be
-attached; each is a toggle; nothing is attached that is not shown.
+attached; each is a toggle; nothing is attached that is not shown. Typing
+filters the action list by name; a line ending in `?` is routed as a
+one-line question to a single action that returns one card (for example
+#63, #92, #116), never a thread. There is no chat.
 
 ### Inputs
 
