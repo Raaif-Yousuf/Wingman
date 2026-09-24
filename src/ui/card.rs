@@ -77,8 +77,8 @@ use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint,
     ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject, GetTextMetricsW,
     IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect, SelectClipRgn,
-    SelectObject, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT, DT_CENTER,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
     DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND,
     PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
@@ -94,10 +94,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
     HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_CTLCOLOREDIT,
+    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW,
+    WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -189,6 +190,7 @@ impl Card {
             owner: None,
             preview_decision_pending: false,
             preview_generation: 0,
+            edit_bg_brush: HBRUSH(std::ptr::null_mut()),
         });
         let raw = Box::into_raw(inner);
 
@@ -510,6 +512,16 @@ impl Theme {
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+/// Issue #350: the `(text, background)` colors a preview EDIT field is
+/// painted with, so it follows the card's theme instead of the stock EDIT
+/// control's fixed white-on-black. Pure so the theme -> color mapping is
+/// unit-testable without a real window; the WM_CTLCOLOREDIT handler is the
+/// only caller and does the GDI calls (SetTextColor/SetBkColor/brush) this
+/// function has no business doing.
+fn edit_field_colors(palette: &Palette) -> (u32, u32) {
+    (palette.headline, palette.bg)
 }
 
 // ---------------------------------------------------------------------------
@@ -926,6 +938,14 @@ struct CardInner {
     /// without a generation the owner would process that abandonment later
     /// and clear the state belonging to the preview now on screen.
     preview_generation: u32,
+    /// Issue #350: the brush WM_CTLCOLOREDIT returns for preview EDIT
+    /// fields, matching `self.theme`. Created lazily on first use and cached
+    /// rather than created per-paint (WM_CTLCOLOREDIT fires on every
+    /// keystroke and repaint), and deleted once in WM_NCDESTROY -- the theme
+    /// never changes for the lifetime of a card window (no WM_SETTINGCHANGE
+    /// handler exists), so one brush for the window's whole life is correct,
+    /// not just an optimisation.
+    edit_bg_brush: HBRUSH,
 }
 
 impl CardInner {
@@ -1668,9 +1688,32 @@ impl CardInner {
 
     // -- message handling --------------------------------------------------
 
-    fn handle_message(&mut self, msg: u32, wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+    fn handle_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         match msg {
             WM_ERASEBKGND => Some(LRESULT(1)),
+            // Issue #350: without this, preview EDIT fields keep the stock
+            // white background and black text regardless of theme -- the
+            // one control on the card where the user reads carefully before
+            // confirming stays bright in dark mode. Only WM_CTLCOLOREDIT is
+            // handled: every preview field the card creates is an editable
+            // EDIT control (`create_preview_edit`, no ES_READONLY, no
+            // STATIC), so WM_CTLCOLORSTATIC never fires for them and adding
+            // a handler for it would be dead code.
+            WM_CTLCOLOREDIT => {
+                let hdc = HDC(wparam.0 as *mut _);
+                let palette = self.theme.palette();
+                let (text, bg) = edit_field_colors(&palette);
+                unsafe {
+                    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text));
+                    SetBkColor(hdc, windows::Win32::Foundation::COLORREF(bg));
+                    if self.edit_bg_brush.0.is_null() {
+                        self.edit_bg_brush =
+                            CreateSolidBrush(windows::Win32::Foundation::COLORREF(bg));
+                    }
+                }
+                let _ = HWND(lparam.0 as *mut _); // the EDIT control; unused (every preview EDIT shares one theme)
+                Some(LRESULT(self.edit_bg_brush.0 as isize))
+            }
             WM_PAINT => {
                 self.on_paint();
                 Some(LRESULT(0))
@@ -1746,6 +1789,12 @@ impl CardInner {
             WM_NCDESTROY => {
                 self.fonts.delete();
                 self.fonts = Fonts::null();
+                if !self.edit_bg_brush.0.is_null() {
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(self.edit_bg_brush.0));
+                    }
+                    self.edit_bg_brush = HBRUSH(std::ptr::null_mut());
+                }
                 self.hwnd = HWND(std::ptr::null_mut());
                 None
             }
@@ -2718,6 +2767,31 @@ mod tests {
     }
 
     #[test]
+    fn edit_field_colors_follow_the_card_theme() {
+        // Issue #350: preview EDIT fields kept the stock white-on-black
+        // regardless of theme. The colors WM_CTLCOLOREDIT hands back must
+        // come from the same Palette the rest of the card paints with, not
+        // a hardcoded pair -- otherwise dark mode gets a bright rectangle in
+        // the one place the user reads carefully before confirming.
+        let dark = Theme::Dark.palette();
+        let (dark_text, dark_bg) = edit_field_colors(&dark);
+        assert_eq!(dark_bg, dark.bg);
+        assert_eq!(dark_text, dark.headline);
+
+        let light = Theme::Light.palette();
+        let (light_text, light_bg) = edit_field_colors(&light);
+        assert_eq!(light_bg, light.bg);
+        assert_eq!(light_text, light.headline);
+
+        // The two themes must not collapse onto the same colors -- that
+        // would be the "wired to nothing" failure mode: a function that
+        // compiles and returns *a* color pair but ignores the theme it was
+        // given.
+        assert_ne!(dark_bg, light_bg);
+        assert_ne!(dark_text, light_text);
+    }
+
+    #[test]
     fn set_text_scale_clamps_and_rebuilds() {
         let mut card = Card::new(instance()).expect("Card::new");
         assert!((card.inner.text_scale - 1.0).abs() < f32::EPSILON);
@@ -2985,6 +3059,161 @@ mod tests {
             .map(|(_, hwnd)| *hwnd)
             .unwrap();
         assert_eq!(window_text(start_hwnd), "09:00");
+    }
+
+    /// The wired-to-nothing check for issue #350 that does not depend on a
+    /// desktop or compositor being attached to the process: sends the exact
+    /// message a real preview EDIT control sends its parent
+    /// (WM_CTLCOLOREDIT, wParam = the field's own HDC, lParam = its HWND)
+    /// straight to `CardInner::handle_message`, the same path the real
+    /// window proc uses, and checks the two GDI side effects a stock,
+    /// unhandled WM_CTLCOLOREDIT would never produce: the HDC's text/
+    /// background colors actually changed to the theme's, and a non-null
+    /// brush came back (the stock default would leave `DefWindowProcW` to
+    /// return `COLOR_WINDOW`, not our cached brush).
+    #[test]
+    fn wm_ctlcoloredit_paints_the_dark_palette_not_stock_white() {
+        use windows::Win32::Graphics::Gdi::{GetBkColor, GetTextColor};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.inner.theme = Theme::Dark;
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let edit_hwnd = card
+            .inner
+            .preview
+            .as_ref()
+            .expect("preview state is active")
+            .edits[0]
+            .1;
+
+        let hdc = unsafe { GetDC(Some(edit_hwnd)) };
+        let result = card.inner.handle_message(
+            WM_CTLCOLOREDIT,
+            WPARAM(hdc.0 as usize),
+            LPARAM(edit_hwnd.0 as isize),
+        );
+        let brush = result.expect("WM_CTLCOLOREDIT must be handled, not fall through to Def*");
+        assert_ne!(brush.0, 0, "must return a real brush, not NULL");
+
+        let dark = Theme::Dark.palette();
+        let text_after = unsafe { GetTextColor(hdc) };
+        let bg_after = unsafe { GetBkColor(hdc) };
+        assert_eq!(text_after.0, dark.headline);
+        assert_eq!(bg_after.0, dark.bg);
+        // The bug this closes: stock EDIT white background, unconditionally.
+        assert_ne!(bg_after.0, rgb(255, 255, 255));
+
+        unsafe {
+            ReleaseDC(Some(edit_hwnd), hdc);
+        }
+    }
+
+    /// Manual observable for issue #350 (wired-to-nothing check): shows a
+    /// real preview card, forced into `Theme::Dark`, pumps a few WM_PAINTs
+    /// so the EDIT fields actually receive WM_CTLCOLOREDIT and repaint, then
+    /// captures the window's own pixels with GetDIBits and writes a PNG.
+    /// Captured in-process (not via a second process's screen-scrape)
+    /// because this box's Bash and PowerShell tools run on window stations
+    /// that cannot see each other's windows -- MEASURED 2026-09-24:
+    /// `FindWindowW(NULL, "Wingman")` from a PowerShell tool call found
+    /// nothing while the card window from a backgrounded `cargo test` was
+    /// on screen and the test itself was still running. Not run by
+    /// `cargo test`: `#[ignore]`d, same pattern as
+    /// `ocr::ocr_live_recognizes_gdi_rendered_text`. Run with
+    /// `cargo test dark_preview_manual_screenshot -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dark_preview_manual_screenshot() {
+        use image::ImageEncoder;
+        use windows::Win32::Graphics::Gdi::{
+            GetDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, GetWindowRect, PeekMessageW, TranslateMessage, PM_REMOVE,
+        };
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        // Force dark regardless of the machine's actual theme, so this
+        // check does not depend on the dev box's Settings.
+        card.inner.theme = Theme::Dark;
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let hwnd = card.hwnd();
+
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{
+                RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
+            };
+
+            // Pump enough messages for WM_PAINT (and the WM_CTLCOLOREDIT
+            // each preview EDIT sends as it repaints) to actually run, then
+            // force an immediate synchronous repaint before capture.
+            for _ in 0..15 {
+                let mut msg = std::mem::zeroed();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            let _ = RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
+
+            let mut rect = RECT::default();
+            GetWindowRect(hwnd, &mut rect).expect("GetWindowRect");
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+
+            let hdc = GetDC(Some(hwnd));
+            let mem_dc = CreateCompatibleDC(Some(hdc));
+            let bmp = CreateCompatibleBitmap(hdc, w, h);
+            let old = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+            let _ = BitBlt(mem_dc, 0, 0, w, h, Some(hdc), 0, 0, SRCCOPY);
+            SelectObject(mem_dc, old);
+
+            let mut bmi = BITMAPINFO::default();
+            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h; // top-down DIB
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB.0;
+
+            let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+            GetDIBits(
+                mem_dc,
+                bmp,
+                0,
+                h as u32,
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(Some(hwnd), hdc);
+
+            // GetDIBits hands back BGRA; the PNG encoder wants RGBA.
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+
+            let path = std::env::temp_dir().join("wingman_dark_preview_350.png");
+            let file = std::fs::File::create(&path).expect("create png file");
+            let mut writer = std::io::BufWriter::new(file);
+            image::codecs::png::PngEncoder::new(&mut writer)
+                .write_image(&buf, w as u32, h as u32, image::ExtendedColorType::Rgba8)
+                .expect("encode png");
+            println!("saved dark preview screenshot to {}", path.display());
+        }
     }
 
     #[test]
