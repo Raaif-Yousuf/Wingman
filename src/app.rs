@@ -335,7 +335,10 @@ pub fn run() -> Result<()> {
         }
         Err(e) => app.card.show_error(
             "Hotkeys unavailable",
-            &format!("{e:#}\n\nUse Ask now from the tray menu instead."),
+            &format!(
+                "{}\n\nUse Ask now from the tray menu instead.",
+                human_error_detail(&format!("{e:#}"))
+            ),
         ),
     }
 
@@ -596,8 +599,10 @@ impl App {
         let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
             Ok(r) => r,
             Err(e) => {
-                self.card
-                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't capture the screen",
+                    &human_error_detail(&format!("{e:#}")),
+                );
                 return None;
             }
         };
@@ -658,7 +663,7 @@ impl App {
                     want_difficulty,
                 )
             })()
-            .map_err(|e| format!("{e:#}"));
+            .map_err(|e| human_error_detail(&format!("{e:#}")));
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -695,8 +700,10 @@ impl App {
         let resolved = match actions::load_actions() {
             Ok(r) => r,
             Err(e) => {
-                self.card
-                    .show_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't load actions.toml",
+                    &human_error_detail(&format!("{e:#}")),
+                );
                 return;
             }
         };
@@ -782,7 +789,8 @@ impl App {
 
         std::thread::spawn(move || {
             let result: std::result::Result<router::RouterResult, String> =
-                router_worker(&providers, mode, &raw, &candidates).map_err(|e| format!("{e:#}"));
+                router_worker(&providers, mode, &raw, &candidates)
+                    .map_err(|e| human_error_detail(&format!("{e:#}")));
             let payload = Box::into_raw(Box::new((generation, result)));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -901,8 +909,10 @@ impl App {
         let raw = match actions::extract_text::capture_screen() {
             Ok(r) => r,
             Err(e) => {
-                self.card
-                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't capture the screen",
+                    &human_error_detail(&format!("{e:#}")),
+                );
                 return;
             }
         };
@@ -914,7 +924,8 @@ impl App {
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> =
-                actions::extract_text::recognize_and_copy(&raw).map_err(|e| format!("{e:#}"));
+                actions::extract_text::recognize_and_copy(&raw)
+                    .map_err(|e| human_error_detail(&format!("{e:#}")));
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -952,8 +963,10 @@ impl App {
             Ok(Some(raw)) => raw,
             Ok(None) => return, // cancelled: no card, nothing changed
             Err(e) => {
-                self.card
-                    .show_error("Couldn't open the region selector", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't open the region selector",
+                    &human_error_detail(&format!("{e:#}")),
+                );
                 return;
             }
         };
@@ -983,9 +996,10 @@ impl App {
                 self.card
                     .show_answer(&format!("Copied {width}x{height} region"), "", 3, None)
             }
-            Err(e) => self
-                .card
-                .show_error("Couldn't copy the region", &format!("{e:#}")),
+            Err(e) => self.card.show_error(
+                "Couldn't copy the region",
+                &human_error_detail(&format!("{e:#}")),
+            ),
         }
     }
 
@@ -1005,8 +1019,10 @@ impl App {
             self.begin_model_action(|app| match local_today_and_utc_offset() {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    app.card
-                        .show_error("Couldn't read the local date", &format!("{e:#}"));
+                    app.card.show_error(
+                        "Couldn't read the local date",
+                        &human_error_detail(&format!("{e:#}")),
+                    );
                     None
                 }
             })
@@ -1030,7 +1046,7 @@ impl App {
                     offset_minutes,
                 )
             })()
-            .map_err(|e| format!("{e:#}"));
+            .map_err(|e| human_error_detail(&format!("{e:#}")));
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1081,8 +1097,10 @@ impl App {
         let resolved = match actions::load_actions() {
             Ok(r) => r,
             Err(e) => {
-                self.card
-                    .show_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't load actions.toml",
+                    &human_error_detail(&format!("{e:#}")),
+                );
                 self.set_watch(true);
                 return;
             }
@@ -1117,15 +1135,19 @@ impl App {
                 ) {
                     Ok(confirmed) => self.run_calendar_executor(executor.as_ref(), confirmed),
                     Err(e) => {
-                        self.card
-                            .show_error("Couldn't add the event", &format!("{e:#}"));
+                        self.card.show_error(
+                            "Couldn't add the event",
+                            &human_error_detail(&format!("{e:#}")),
+                        );
                         self.set_watch(true);
                     }
                 }
             }
             Err(e) => {
-                self.card
-                    .show_error("Couldn't add the event", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't add the event",
+                    &human_error_detail(&format!("{e:#}")),
+                );
                 self.set_watch(true);
             }
         }
@@ -1197,8 +1219,10 @@ impl App {
             match executors::registry::resolve("fill_form") {
                 Ok(executor) => self.run_form_fill_executor(executor.as_ref(), final_confirmed),
                 Err(e) => {
-                    self.card
-                        .show_error("Couldn't fill the form", &format!("{e:#}"));
+                    self.card.show_error(
+                        "Couldn't fill the form",
+                        &human_error_detail(&format!("{e:#}")),
+                    );
                     self.set_watch(true);
                 }
             }
@@ -1211,8 +1235,10 @@ impl App {
         match executors::registry::resolve("calendar_add") {
             Ok(executor) => self.run_calendar_executor(executor.as_ref(), confirmed),
             Err(e) => {
-                self.card
-                    .show_error("Couldn't add the event", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't add the event",
+                    &human_error_detail(&format!("{e:#}")),
+                );
                 self.set_watch(true);
             }
         }
@@ -1253,8 +1279,10 @@ impl App {
                 self.card.show_answer(headline, &undo.summary, 0, None);
             }
             Err(e) => {
-                self.card
-                    .show_error("Couldn't add the event", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't add the event",
+                    &human_error_detail(&format!("{e:#}")),
+                );
             }
         }
         self.set_watch(true);
@@ -1287,7 +1315,7 @@ impl App {
                     let shot = capture::encode(&raw)?;
                     review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
                 })()
-                .map_err(|e| format!("{e:#}"));
+                .map_err(|e| human_error_detail(&format!("{e:#}")));
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1398,14 +1426,18 @@ impl App {
                             .show_answer("Email updated", &undo.summary, 0, None);
                     }
                     Err(e) => {
-                        self.card
-                            .show_error("Couldn't update the email", &format!("{e:#}"));
+                        self.card.show_error(
+                            "Couldn't update the email",
+                            &human_error_detail(&format!("{e:#}")),
+                        );
                     }
                 }
             }
             Err(e) => {
-                self.card
-                    .show_error("Couldn't update the email", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't update the email",
+                    &human_error_detail(&format!("{e:#}")),
+                );
             }
         }
         self.set_watch(true);
@@ -1449,7 +1481,7 @@ impl App {
                     require_tick_for,
                 )
             })()
-            .map_err(|e| format!("{e:#}"));
+            .map_err(|e| human_error_detail(&format!("{e:#}")));
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1576,8 +1608,10 @@ impl App {
                 self.last_form_undo = Some(undo);
             }
             Err(e) => {
-                self.card
-                    .show_error("Couldn't fill the form", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't fill the form",
+                    &human_error_detail(&format!("{e:#}")),
+                );
             }
         }
         self.set_watch(true);
@@ -1611,8 +1645,10 @@ impl App {
                 );
             }
             Err(e) => {
-                self.card
-                    .show_error("Couldn't fully restore the form", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't fully restore the form",
+                    &human_error_detail(&format!("{e:#}")),
+                );
             }
         }
         self.set_watch(true);
@@ -1674,7 +1710,9 @@ impl App {
         };
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
             Ok(()) => self.card.show_answer("Copied", "", 3, None),
-            Err(e) => self.card.show_error("Couldn't copy", &format!("{e}")),
+            Err(e) => self
+                .card
+                .show_error("Couldn't copy", &human_error_detail(&format!("{e}"))),
         }
     }
 
@@ -1691,9 +1729,10 @@ impl App {
                 6,
                 None,
             ),
-            Err(e) => self
-                .card
-                .show_error("Couldn't copy diagnostics", &format!("{e}")),
+            Err(e) => self.card.show_error(
+                "Couldn't copy diagnostics",
+                &human_error_detail(&format!("{e}")),
+            ),
         }
     }
 
@@ -1716,9 +1755,10 @@ impl App {
                 6,
                 None,
             ),
-            Err(e) => self
-                .card
-                .show_error("Couldn't copy the egress log", &format!("{e}")),
+            Err(e) => self.card.show_error(
+                "Couldn't copy the egress log",
+                &human_error_detail(&format!("{e}")),
+            ),
         }
     }
 
@@ -1836,7 +1876,10 @@ impl App {
                 .show_answer(&format!("Bound to {name}"), "", 4, None),
             Err(e) => self.card.show_error(
                 &format!("Bound to {name}: not saved"),
-                &format!("It will work until you quit.\n\n{e:#}"),
+                &format!(
+                    "It will work until you quit.\n\n{}",
+                    human_error_detail(&format!("{e:#}"))
+                ),
             ),
         }
     }
@@ -1856,9 +1899,10 @@ impl App {
                     self.card.show_error(&headline, &detail);
                 }
             }
-            Err(e) => self
-                .card
-                .show_error("Couldn't reload settings", &format!("{e:#}")),
+            Err(e) => self.card.show_error(
+                "Couldn't reload settings",
+                &human_error_detail(&format!("{e:#}")),
+            ),
         }
     }
 
@@ -1948,12 +1992,16 @@ impl App {
             // the single card slot's final content (`final_settings_card`'s
             // `SaveError` case, unchanged by #213).
             let had_pending = !pending.is_empty();
-            self.card
-                .show_error("Couldn't save settings", &format!("{e:#}"));
+            self.card.show_error(
+                "Couldn't save settings",
+                &human_error_detail(&format!("{e:#}")),
+            );
             self.deliver_deferred(pending);
             if had_pending {
-                self.card
-                    .show_error("Couldn't save settings", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't save settings",
+                    &human_error_detail(&format!("{e:#}")),
+                );
             }
             self.show_tray_restore_error(tray_restore_error);
             return;
@@ -2065,8 +2113,10 @@ impl App {
             // dropped the error and still tried to open a file that might
             // not exist.
             if let Err(e) = &save_result {
-                self.card
-                    .show_error("Couldn't save settings", &format!("{e:#}"));
+                self.card.show_error(
+                    "Couldn't save settings",
+                    &human_error_detail(&format!("{e:#}")),
+                );
             }
             return;
         }
@@ -2120,9 +2170,8 @@ impl App {
             Err(e) => self.card.show_error(
                 &format!("Using {model}: not saved"),
                 &format!(
-                    "It will revert when you quit.
-
-{e:#}"
+                    "It will revert when you quit.\n\n{}",
+                    human_error_detail(&format!("{e:#}"))
                 ),
             ),
         }
@@ -2151,9 +2200,8 @@ impl App {
             Err(e) => self.card.show_error(
                 &format!("Using {name}: not saved"),
                 &format!(
-                    "It will revert when you quit.
-
-{e:#}"
+                    "It will revert when you quit.\n\n{}",
+                    human_error_detail(&format!("{e:#}"))
                 ),
             ),
         }
@@ -2180,9 +2228,8 @@ impl App {
             Err(e) => self.card.show_error(
                 &format!("Using {}: not saved", mode.label()),
                 &format!(
-                    "It will revert when you quit.
-
-{e:#}"
+                    "It will revert when you quit.\n\n{}",
+                    human_error_detail(&format!("{e:#}"))
                 ),
             ),
         }
@@ -2247,7 +2294,7 @@ impl App {
                 Err(e) => {
                     self.card.show_error(
                         "Couldn't compute tomorrow's pause deadline",
-                        &format!("{e:#}"),
+                        &human_error_detail(&format!("{e:#}")),
                     );
                     return;
                 }
@@ -2361,7 +2408,7 @@ impl App {
                 self.refresh_tray_labels();
                 None
             }
-            Err(e) => Some(format!("{e:#}")),
+            Err(e) => Some(human_error_detail(&format!("{e:#}"))),
         }
     }
 
@@ -3064,6 +3111,120 @@ fn first_line(text: &str, max: usize) -> String {
     let mut out: String = line.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+// -- #349: human-readable, redacted error text for the card ----------------
+//
+// Most `show_error` calls used to pass anyhow's alternate `Display` output
+// straight through: the whole context chain, which for a Win32-backed path
+// can read
+// "TzSpecificLocalTimeToSystemTime failed" -- a crash-log line, not
+// something a user can act on. Every place in this file that turns an
+// error into card-visible text now routes through `human_error_detail`
+// (or, when it needs to splice the sentence into a larger message,
+// `humanize_error_chain` directly) instead of interpolating `{e:#}`/`{e}`
+// itself; `show_error_detail_never_bypasses_the_humanizer` below is the
+// mechanical guard that nothing new regresses this.
+
+/// Known technical fragments from anyhow context chains (see `app.rs`'s own
+/// `.context("... failed")` call sites, e.g. `local_today_and_utc_offset`),
+/// mapped to a specific human sentence. Matched by substring against the
+/// already-redacted chain, so it survives whatever context wraps it.
+const KNOWN_TECHNICAL_DETAILS: &[(&str, &str)] = &[
+    (
+        "TzSpecificLocalTimeToSystemTime",
+        "Couldn't read your clock settings.",
+    ),
+    ("FileTimeToSystemTime", "Couldn't read your clock settings."),
+    ("SystemTimeToFileTime", "Couldn't read your clock settings."),
+];
+
+/// True if `text` contains what looks like a Win32/API-style identifier
+/// immediately (optionally via a `(...)` argument list) followed by the
+/// word "failed" -- the exact shape every `.context("XxxYyy(...) failed")`
+/// call in this codebase produces (`SetWindowsHookExW(WH_MOUSE_LL) failed`,
+/// `TzSpecificLocalTimeToSystemTime failed`, `GetMonitorInfoW failed`).
+/// Deliberately narrow: an ordinary English sentence ending "...the save
+/// failed" or "write failed" has at most one capitalized, non-technical
+/// word before "failed" and is left alone. This is #349's detector, and
+/// `show_error_call_sites_never_show_a_failed_suffixed_api_identifier`
+/// below is its own "Done when" regression test.
+fn contains_api_failed_identifier(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        if word.trim_end_matches(|c: char| ".,;:!".contains(c)) != "failed" || i == 0 {
+            continue;
+        }
+        let prev = words[i - 1].trim_end_matches(|c: char| ")(:,.".contains(c));
+        let ident = prev.split('(').next().unwrap_or(prev);
+        if is_api_shaped_identifier(ident) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_api_shaped_identifier(ident: &str) -> bool {
+    if ident.len() < 4 {
+        return false;
+    }
+    if !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    let starts_upper = ident.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+    let upper_count = ident.chars().filter(|c| c.is_ascii_uppercase()).count();
+    // Win32/API names are PascalCase with several internal capitals
+    // ("TzSpecificLocalTimeToSystemTime", "SetWindowsHookExW"); an ordinary
+    // English word before "failed" is lowercase, or has at most the one
+    // leading capital a sentence-initial word would.
+    starts_upper && upper_count >= 2
+}
+
+/// Redacts key-shaped tokens (#253, via the same `egress::redact_opaque_tokens`
+/// the egress log already uses) from a raw anyhow context chain -- already
+/// rendered with anyhow's alternate `Display`, here or forwarded across a
+/// thread boundary as a plain `String` -- and returns just the human
+/// sentence(s), with no
+/// trailing next-step, so a caller that already has its own can append it.
+/// A chain containing a Win32/API `"Xxx failed"`-shaped identifier is
+/// replaced outright (by a known mapping, or a generic sentence); anything
+/// else already reads as prose and is kept, still redacted. Pure and
+/// unit-tested directly (`humanize_error_chain_*` tests below) rather than
+/// only indirectly through whichever call site happens to exercise it.
+fn humanize_error_chain(raw_chain: &str) -> String {
+    // Detection runs against the RAW chain, before redaction: an API
+    // identifier like "TzSpecificLocalTimeToSystemTime" is itself long
+    // enough and mixed-case enough to trip `redact_opaque_tokens`'
+    // key-shaped-token heuristic, which would otherwise erase the very
+    // text `KNOWN_TECHNICAL_DETAILS` and `contains_api_failed_identifier`
+    // need to see. That is harmless here: on every branch below the raw
+    // text itself is discarded in favour of a hand-written human sentence,
+    // never echoed back, so redacting it first would only have hidden it
+    // from our own matching, not protected the user.
+    for (needle, sentence) in KNOWN_TECHNICAL_DETAILS {
+        if raw_chain.contains(needle) {
+            return (*sentence).to_string();
+        }
+    }
+    if contains_api_failed_identifier(raw_chain) {
+        return "Something went wrong.".to_string();
+    }
+    // Only reached for a chain that never looked API-shaped, i.e. is
+    // presumed to already be human prose (an io::Error message, a plain
+    // `anyhow!("...")`) -- still redacted before display, per #253.
+    crate::egress::redact_opaque_tokens(raw_chain)
+        .trim()
+        .to_string()
+}
+
+/// The common card-detail shape (#349): `humanize_error_chain`'s sentence
+/// plus a next step, for the many call sites that pass
+/// `human_error_detail`'s output straight to `show_error`'s `detail`.
+fn human_error_detail(raw_chain: &str) -> String {
+    format!(
+        "{} Try again, and if it keeps happening, use Copy diagnostics for details.",
+        humanize_error_chain(raw_chain)
+    )
 }
 
 thread_local! {
@@ -4840,6 +5001,129 @@ mod tests {
     #[test]
     fn first_line_leaves_short_text_alone() {
         assert_eq!(first_line("fine", 88), "fine");
+    }
+
+    // -- #349: human-readable, redacted error text for the card -------------
+
+    use super::{
+        contains_api_failed_identifier, human_error_detail, humanize_error_chain,
+        is_api_shaped_identifier,
+    };
+
+    #[test]
+    fn contains_api_failed_identifier_catches_the_timezone_chain() {
+        assert!(contains_api_failed_identifier(
+            "TzSpecificLocalTimeToSystemTime failed"
+        ));
+        assert!(contains_api_failed_identifier(
+            "FileTimeToSystemTime failed"
+        ));
+        assert!(contains_api_failed_identifier(
+            "SystemTimeToFileTime failed"
+        ));
+    }
+
+    #[test]
+    fn contains_api_failed_identifier_catches_a_parenthesized_call_site() {
+        // The `.context("SetWindowsHookExW(WH_MOUSE_LL) failed")` shape used
+        // throughout hotkey.rs/dismiss.rs.
+        assert!(contains_api_failed_identifier(
+            "context: SetWindowsHookExW(WH_MOUSE_LL) failed"
+        ));
+        assert!(contains_api_failed_identifier("GetMonitorInfoW failed"));
+        assert!(contains_api_failed_identifier(
+            "SHGetKnownFolderPath failed"
+        ));
+        assert!(contains_api_failed_identifier("CryptProtectData failed"));
+    }
+
+    #[test]
+    fn contains_api_failed_identifier_leaves_ordinary_prose_alone() {
+        assert!(!contains_api_failed_identifier("the save failed"));
+        assert!(!contains_api_failed_identifier("write failed"));
+        assert!(!contains_api_failed_identifier(
+            "request failed: connection reset"
+        ));
+        assert!(!contains_api_failed_identifier(
+            "No such file or directory (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn is_api_shaped_identifier_requires_two_capitals_and_a_leading_one() {
+        assert!(is_api_shaped_identifier("GetMonitorInfoW"));
+        assert!(!is_api_shaped_identifier("Save")); // one leading capital only
+        assert!(!is_api_shaped_identifier("save"));
+        assert!(!is_api_shaped_identifier("abc")); // too short
+    }
+
+    #[test]
+    fn humanize_error_chain_maps_the_known_timezone_fragments() {
+        for chain in [
+            "couldn't read the local date: TzSpecificLocalTimeToSystemTime failed",
+            "couldn't read the local date: FileTimeToSystemTime failed",
+            "couldn't read the local date: SystemTimeToFileTime failed",
+        ] {
+            let human = humanize_error_chain(chain);
+            assert_eq!(human, "Couldn't read your clock settings.");
+            assert!(!contains_api_failed_identifier(&human));
+        }
+    }
+
+    #[test]
+    fn humanize_error_chain_falls_back_to_a_generic_sentence_for_an_unmapped_api_failure() {
+        let human = humanize_error_chain("SetWindowsHookExW(WH_MOUSE_LL) failed");
+        assert_eq!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn humanize_error_chain_keeps_prose_that_is_already_human() {
+        let human = humanize_error_chain("No such file or directory (os error 2)");
+        assert_eq!(human, "No such file or directory (os error 2)");
+    }
+
+    #[test]
+    fn humanize_error_chain_redacts_a_key_shaped_token_issue_253() {
+        let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
+        let human = humanize_error_chain(&format!("HTTP 401: invalid api key {fake_key}"));
+        assert!(!human.contains(fake_key), "{human}");
+    }
+
+    #[test]
+    fn human_error_detail_appends_a_next_step() {
+        let detail = human_error_detail("TzSpecificLocalTimeToSystemTime failed");
+        assert_eq!(
+            detail,
+            "Couldn't read your clock settings. Try again, and if it keeps happening, use Copy diagnostics for details."
+        );
+    }
+
+    /// #349's "Done when": no card's visible text may contain a Win32/API
+    /// function name. Rather than exercising every `show_error` call site
+    /// live (most need a real worker thread, a real window, or real I/O),
+    /// this scans `app.rs`'s own source for the shape every unguarded call
+    /// site used to have -- anyhow's alternate `Display` (or its plain
+    /// `Display`) interpolated straight into a format string -- and fails
+    /// if one is found that is not immediately wrapped by
+    /// `human_error_detail`. This is the mechanical
+    /// guard that a new `show_error` call site cannot reintroduce the bug
+    /// this issue closes.
+    #[test]
+    fn show_error_call_sites_never_show_a_failed_suffixed_api_identifier() {
+        let src = include_str!("app.rs");
+        for needle in ["format!(\"{e:#}\")", "format!(\"{e}\")"] {
+            let mut start = 0;
+            while let Some(idx) = src[start..].find(needle) {
+                let abs = start + idx;
+                let before = &src[..abs];
+                assert!(
+                    before.ends_with("human_error_detail(&"),
+                    "found a raw {needle} at byte {abs} not wrapped by human_error_detail -- \
+                     it could show an API function name on a card"
+                );
+                start = abs + needle.len();
+            }
+        }
     }
 
     // -- router/chain provider-name agreement (issue #222) -------------------
