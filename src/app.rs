@@ -774,6 +774,12 @@ impl App {
         let generation = self.palette.router_generation();
         let target = self.hwnd_isize();
 
+        // #359: a request is actually starting now (every earlier bail-out
+        // above -- Paused, no ready provider, capture failure -- must never
+        // reach this line), so show the placeholder instead of leaving the
+        // reserved summary band blank until the result arrives.
+        self.palette.set_router_pending(generation);
+
         std::thread::spawn(move || {
             let result: std::result::Result<router::RouterResult, String> =
                 router_worker(&providers, mode, &raw, &candidates).map_err(|e| format!("{e:#}"));
@@ -802,10 +808,15 @@ impl App {
         generation: u64,
         result: std::result::Result<router::RouterResult, String>,
     ) {
-        if let Ok(result) = result {
-            let threshold = self.config.palette.router_threshold;
-            self.palette
-                .apply_router_suggestion(generation, &result, threshold);
+        match result {
+            Ok(result) => {
+                let threshold = self.config.palette.router_threshold;
+                self.palette
+                    .apply_router_suggestion(generation, &result, threshold);
+            }
+            // #359: the request that started the "Looking at your screen..."
+            // placeholder failed -- clear it rather than leaving it stuck.
+            Err(_) => self.palette.clear_router_pending(generation),
         }
     }
 

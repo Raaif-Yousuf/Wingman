@@ -403,6 +403,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
     match id {
         ID_SAVE => {
+            let raw = read_raw_form(inner);
+            // #344: an invalid numeric field must not be silently kept at
+            // its old value -- reject the Save, keep the window open, focus
+            // the bad field and say what is wrong inline (rule 7: never a
+            // dialog box). `config.toml` is never touched in this branch.
+            if let Some(invalid) = find_invalid_numeric_field(&raw) {
+                if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                    set_text(msg, invalid.message());
+                }
+                focus_and_select_field(inner.hwnd, invalid.control_id());
+                return;
+            }
+            if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                set_text(msg, "");
+            }
+
             // Autostart is registry state rather than a Config field, so it is
             // applied here instead of riding along in the returned Config.
             // Only written when it actually changed, to avoid rewriting the
@@ -411,7 +427,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             if want != crate::autostart::is_enabled() {
                 let _ = crate::autostart::set_enabled(want);
             }
-            inner.result = Some(read_form(inner));
+            inner.result = Some(build_config(&inner.original, &raw));
             unsafe {
                 let _ = DestroyWindow(inner.hwnd);
             }
@@ -444,6 +460,32 @@ fn toggle_password(hwnd: HWND, checkbox_id: i32, edit_id: i32) {
         unsafe {
             SendMessageW(edit, EM_SETPASSWORDCHAR, Some(WPARAM(ch as usize)), None);
             let _ = InvalidateRect(Some(edit), None, true);
+        }
+    }
+}
+
+/// #344: sets keyboard focus on the named control and selects its whole
+/// contents, so the user can just start typing over the bad value. Handles
+/// `ID_MAX_EDGE` (a `CBS_DROPDOWN` combo, selected via its edit portion) and
+/// any plain `WC_EDIT` control (e.g. `ID_CARD_SECONDS`).
+fn focus_and_select_field(hwnd: HWND, id: i32) {
+    let Some(ctrl) = get_dlg_item(hwnd, id) else {
+        return;
+    };
+    unsafe {
+        let _ = SetFocus(Some(ctrl));
+        if id == ID_MAX_EDGE {
+            // MAKELPARAM(0, -1): start at 0, end at -1 (select to the end
+            // of the text), packed as loword | (hiword << 16).
+            let lparam = (0xFFFFu32 << 16) as i32;
+            SendMessageW(
+                ctrl,
+                CB_SETEDITSEL,
+                Some(WPARAM(0)),
+                Some(LPARAM(lparam as isize)),
+            );
+        } else {
+            SendMessageW(ctrl, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1isize)));
         }
     }
 }
@@ -488,8 +530,12 @@ const ID_CANCEL: i32 = 119;
 /// indicator (see [`ollama_status_line`]). Not a form field -- never read
 /// back in `read_form`/`build_config`.
 const ID_OLLAMA_STATUS: i32 = 120;
+/// #344: the inline "that field is wrong" message shown above Save/Cancel
+/// after a Save attempt with an invalid numeric field. Not a form field --
+/// never read back in `read_form`/`build_config`.
+const ID_VALIDATION_MESSAGE: i32 = 121;
 /// #403: the fill-form tick-requirement combo (`config.forms.require_tick_for`).
-const ID_REQUIRE_TICK_FOR: i32 = 121;
+const ID_REQUIRE_TICK_FOR: i32 = 122;
 
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
@@ -521,6 +567,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_AUTOSTART", ID_AUTOSTART),
     ("ID_CANCEL", ID_CANCEL),
     ("ID_OLLAMA_STATUS", ID_OLLAMA_STATUS),
+    ("ID_VALIDATION_MESSAGE", ID_VALIDATION_MESSAGE),
     ("ID_REQUIRE_TICK_FOR", ID_REQUIRE_TICK_FOR),
 ];
 
@@ -568,8 +615,15 @@ const BS_AUTOCHECKBOX: i32 = 0x0003;
 const BS_PUSHBUTTON: i32 = 0x0000;
 const BS_DEFPUSHBUTTON: i32 = 0x0001;
 const TBS_HORZ: i32 = 0x0000;
+/// #344: selects text in a plain edit control, used to highlight an invalid
+/// numeric field after a failed Save.
+const EM_SETSEL: u32 = 0x00B1;
+/// #344: the combo-box equivalent of `EM_SETSEL`, for the editable text
+/// portion of a `CBS_DROPDOWN` combo (`ID_MAX_EDGE`).
+const CB_SETEDITSEL: u32 = 0x0142;
 
 use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
 // ---------------------------------------------------------------------------
@@ -605,7 +659,13 @@ fn fitted_height_dp(hwnd: HWND, dpi: u32) -> i32 {
 }
 
 const WIN_W_DP: i32 = 620;
-const WIN_H_DP: i32 = 820;
+/// #403 review: raised from 820 by the Forms group's full height (68dp: see
+/// `CONTENT_TOP_DP`'s comment) so the default window still has room for the
+/// Prompt group at something close to its natural size instead of always
+/// falling back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout`
+/// itself never overlaps regardless of this constant, but a taller default
+/// is nicer than always squeezing.
+const WIN_H_DP: i32 = 888;
 /// Below this the prompt box stops being usable; scroll rather than shrink
 /// further (not yet built -- see `prompt_footer_layout`'s doc comment).
 ///
@@ -1656,6 +1716,20 @@ fn build_ui(
 
     // -- Save / Cancel ------------------------------------------------
     let buttons_y = footer.buttons_y;
+    // #344: inline "that field is wrong" message, blank until a Save
+    // attempt fails validation. Sits to the left of the Save/Cancel row so
+    // it never overlaps either the Prompt group or the buttons.
+    ctx.create(
+        WC_STATIC,
+        "",
+        0,
+        0,
+        content_x + MARGIN,
+        buttons_y + (BTN_H - ROW_H) / 2,
+        content_w - 2 * MARGIN - 2 * BTN_W - 12 - 12,
+        ROW_H,
+        ID_VALIDATION_MESSAGE,
+    );
     ctx.create(
         WC_BUTTON,
         "Cancel",
@@ -1765,9 +1839,12 @@ struct RawForm {
     require_tick_for: String,
 }
 
-fn read_form(inner: &SettingsInner) -> Config {
+/// Reads every control into a [`RawForm`], without yet folding it into a
+/// [`Config`]. Split out from [`read_form`] so Save can validate the raw
+/// values (#344) before committing to `build_config`'s fallback behavior.
+fn read_raw_form(inner: &SettingsInner) -> RawForm {
     let hwnd = inner.hwnd;
-    let raw = RawForm {
+    RawForm {
         provider_choice: unsafe {
             SendMessageW(
                 get_dlg_item(hwnd, ID_ACTIVE_PROVIDER).unwrap_or(HWND(std::ptr::null_mut())),
@@ -1800,7 +1877,17 @@ fn read_form(inner: &SettingsInner) -> Config {
             .map(get_text)
             .unwrap_or_default(),
         require_tick_for: combo_selected_text(hwnd, ID_REQUIRE_TICK_FOR),
-    };
+    }
+}
+
+/// Reads every control and folds it into a [`Config`] via [`build_config`].
+/// Exercised directly by UI smoke tests that need the full round trip; the
+/// Save path (`handle_command`) instead calls [`read_raw_form`] and
+/// [`find_invalid_numeric_field`] first, so it can reject before this ever
+/// commits to `build_config`'s fallback behavior.
+#[cfg(test)]
+fn read_form(inner: &SettingsInner) -> Config {
+    let raw = read_raw_form(inner);
     build_config(&inner.original, &raw)
 }
 
@@ -1914,6 +2001,62 @@ fn label_to_require_tick_for(label: &str) -> Option<RequireTickFor> {
         "Never" => Some(RequireTickFor::None),
         _ => None,
     }
+}
+
+/// #344: a numeric Settings field whose text does not parse to a value
+/// `build_config` would actually accept, found by [`find_invalid_numeric_field`].
+/// Distinct from "blank", which `build_config` already treats as "leave the
+/// original value alone" -- this only fires for text a user actually typed
+/// that isn't a valid whole number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidField {
+    MaxEdge,
+    CardSeconds,
+}
+
+impl InvalidField {
+    /// The control to focus so the user can fix it immediately.
+    fn control_id(self) -> i32 {
+        match self {
+            InvalidField::MaxEdge => ID_MAX_EDGE,
+            InvalidField::CardSeconds => ID_CARD_SECONDS,
+        }
+    }
+
+    /// The inline message shown next to Save (rule 7: never a dialog box).
+    /// No em dash (rule 11).
+    fn message(self) -> &'static str {
+        match self {
+            InvalidField::MaxEdge => "Max edge must be a whole number greater than 0.",
+            InvalidField::CardSeconds => "Auto-dismiss must be a whole number of seconds.",
+        }
+    }
+}
+
+/// Checks the two free-typed numeric fields for text that would silently be
+/// discarded by [`build_config`]'s fallback (#344: the bug was that garbage
+/// input like "2ooo" saved as if nothing had been typed, with no sign
+/// anything was wrong). A blank field is not an error here -- it is the
+/// established "leave this alone" convention `build_config` already
+/// implements and several tests already rely on. Only text that is present
+/// but does not parse to a value `build_config` would actually use counts as
+/// invalid. Returns the first invalid field found (max edge before card
+/// seconds), since only one inline message is shown at a time.
+fn find_invalid_numeric_field(raw: &RawForm) -> Option<InvalidField> {
+    let max_edge = raw.max_edge_text.trim();
+    if !max_edge.is_empty() {
+        match max_edge.parse::<u32>() {
+            Ok(v) if v > 0 => {}
+            _ => return Some(InvalidField::MaxEdge),
+        }
+    }
+
+    let card_seconds = raw.card_seconds_text.trim();
+    if !card_seconds.is_empty() && card_seconds.parse::<u32>().is_err() {
+        return Some(InvalidField::CardSeconds);
+    }
+
+    None
 }
 
 /// Clamps to the range `Card::set_text_scale` (see `ui/card.rs`) accepts;
@@ -2239,6 +2382,80 @@ mod tests {
         assert_eq!(parse_max_edge_or("0", 1568), 1568);
         assert_eq!(parse_max_edge_or("2048", 1568), 2048);
         assert_eq!(parse_max_edge_or("bogus", 1568), 1568);
+    }
+
+    // -- find_invalid_numeric_field (#344) ---------------------------------
+
+    fn raw_with_numbers(max_edge_text: &str, card_seconds_text: &str) -> RawForm {
+        let mut raw = raw_from(&Config::default());
+        raw.max_edge_text = max_edge_text.to_string();
+        raw.card_seconds_text = card_seconds_text.to_string();
+        raw
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_accepts_valid_values() {
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("2048", "30")),
+            None
+        );
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_treats_blank_fields_as_fine() {
+        // Blank is "leave the original value alone" (build_config's existing
+        // fallback contract), not an error.
+        assert_eq!(find_invalid_numeric_field(&raw_with_numbers("", "")), None);
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_catches_letters_in_card_seconds() {
+        // #344's exact repro: typing "2ooo" into Auto-dismiss.
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("2048", "2ooo")),
+            Some(InvalidField::CardSeconds)
+        );
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_catches_letters_in_max_edge() {
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("wide", "30")),
+            Some(InvalidField::MaxEdge)
+        );
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_catches_a_typed_zero_max_edge() {
+        // Zero max edge is silently rejected by `build_config`'s fallback;
+        // Save must not pretend that succeeded.
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("0", "30")),
+            Some(InvalidField::MaxEdge)
+        );
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_catches_a_negative_card_seconds() {
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("2048", "-5")),
+            Some(InvalidField::CardSeconds)
+        );
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_reports_max_edge_before_card_seconds() {
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("bogus", "also bogus")),
+            Some(InvalidField::MaxEdge)
+        );
+    }
+
+    #[test]
+    fn invalid_field_messages_have_no_em_dash() {
+        for field in [InvalidField::MaxEdge, InvalidField::CardSeconds] {
+            assert!(!field.message().contains('\u{2014}'));
+        }
     }
 
     // -- clamp_text_scale --------------------------------------------------
@@ -2721,13 +2938,20 @@ mod tests {
     // window and 144dpi's (150%) shrunk one.
 
     /// The y where the Prompt group starts on a real Settings window: the
-    /// bottom of the last fixed group (Card) plus `GROUP_GAP`. Hand-computed
-    /// from the constants that drive `build_ui`'s Providers/Ollama/General/
-    /// Capture/Card sections with `Config::default()` (5 + 0 + 4 + 1 + 2
-    /// rows respectively); kept here as a literal, not derived, so a change
-    /// to those sections has to update this test deliberately rather than
-    /// silently keep passing against a moving target.
-    const CONTENT_TOP_DP: i32 = 640;
+    /// bottom of the last fixed group (Forms, #403) plus `GROUP_GAP`.
+    /// Hand-computed from the constants that drive `build_ui`'s
+    /// Providers/Ollama/General/Capture/Card sections with `Config::default()`
+    /// (5 + 0 + 4 + 1 + 2 rows respectively, giving 640 -- see git blame for
+    /// that derivation), plus the #403 Forms group added after Card and
+    /// before Prompt: one row, so its own height is
+    /// `GROUP_LABEL_TOP + (ROW_H + ROW_GAP) + 4` (the same `label + rows +
+    /// bottom padding` shape every other group in `build_ui` uses) `=
+    /// 20 + 30 + 4 = 54`, plus the `GROUP_GAP` (14) that already separated
+    /// Card from whatever came next `= 640 + 54 + 14 = 708`. Kept here as a
+    /// literal, not derived, so a change to those sections has to update this
+    /// test deliberately rather than silently keep passing against a moving
+    /// target.
+    const CONTENT_TOP_DP: i32 = 708;
 
     fn footer_does_not_overlap(win_h_dp: i32) -> bool {
         let footer = prompt_footer_layout(CONTENT_TOP_DP, win_h_dp);
@@ -2762,13 +2986,16 @@ mod tests {
     fn footer_sits_flush_with_the_window_bottom_when_there_is_room() {
         // Unchanged from the pre-#340 behaviour when the window is tall
         // enough: Save/Cancel hug the bottom edge rather than floating
-        // higher than necessary. `WIN_H_DP` (820) itself is not tall enough
-        // for `CONTENT_TOP_DP` (640) plus the Prompt group's minimum
-        // (issue #340's underlying finding: the original 820dp design
-        // height never actually had room for its own content -- see
-        // `MIN_WIN_H_DP`'s comment), so this uses a window tall enough to
-        // exercise the "plenty of room" branch specifically.
-        let roomy_win_h_dp = 900;
+        // higher than necessary. Even `WIN_H_DP` (888, raised by #403's
+        // Forms group) is not tall enough for `CONTENT_TOP_DP` (708) plus
+        // the Prompt group's minimum (issue #340's underlying finding: the
+        // original design height never actually had room for its own
+        // content -- see `MIN_WIN_H_DP`'s comment), so this uses a window
+        // tall enough to exercise the "plenty of room" branch specifically.
+        // Needs `win_h_dp - buttons_h >= CONTENT_TOP_DP + min_prompt_group_h`
+        // (708 + 138 = 846, so > 906) to actually land in the flush branch
+        // rather than the minimum-height one; 950 gives headroom.
+        let roomy_win_h_dp = 950;
         let footer = prompt_footer_layout(CONTENT_TOP_DP, roomy_win_h_dp);
         let buttons_h = BTN_H + MARGIN * 2;
         assert_eq!(footer.buttons_y, roomy_win_h_dp - buttons_h + MARGIN);

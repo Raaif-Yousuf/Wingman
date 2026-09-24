@@ -52,6 +52,10 @@ pub const COPY_REGION_ACTION_ID: &str = "copy-region";
 /// #132's exact hint text. No em dash (rule 11).
 pub const NO_MODEL_HINT: &str = "Add a model in Settings to unlock more actions.";
 
+/// #358's exact hint text, shown in place of a blank list when a non-empty
+/// query matches no action at all. No em dash (rule 11).
+pub const NO_MATCHES_HINT: &str = "No matching actions. Press Esc to clear.";
+
 // ---------------------------------------------------------------------------
 // Fuzzy scoring
 // ---------------------------------------------------------------------------
@@ -112,7 +116,14 @@ pub fn build_rows(actions: &[PaletteAction], query: &str, model_configured: bool
     if query.trim().is_empty() {
         grouped_rows(actions, model_configured)
     } else {
-        flat_ranked_rows(actions, query)
+        let rows = flat_ranked_rows(actions, query);
+        if rows.is_empty() {
+            // #358: a non-empty query that matches nothing must not just
+            // leave the list blank -- that reads as broken, not empty.
+            vec![Row::Hint(NO_MATCHES_HINT.to_string())]
+        } else {
+            rows
+        }
     }
 }
 
@@ -668,6 +679,23 @@ mod tests {
             })
             .collect();
         assert_eq!(ids[0], "b", "prefix match must rank first: {rows:?}");
+    }
+
+    #[test]
+    fn typing_a_query_that_matches_nothing_shows_the_no_matches_hint() {
+        let actions = vec![
+            action("a", "Check my work", Some("Study"), true),
+            action("b", "Add to calendar", Some("Work"), true),
+        ];
+        let rows = build_rows(&actions, "zzz", true);
+        assert_eq!(rows, vec![Row::Hint(NO_MATCHES_HINT.to_string())]);
+    }
+
+    #[test]
+    fn typing_a_query_that_matches_something_shows_no_hint() {
+        let actions = vec![action("a", "Check my work", Some("Study"), true)];
+        let rows = build_rows(&actions, "check", true);
+        assert!(!rows.iter().any(|r| matches!(r, Row::Hint(_))));
     }
 
     // -- build_rows: no-model ordering (#132) ----------------------------

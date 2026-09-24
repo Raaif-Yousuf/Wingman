@@ -101,6 +101,9 @@ impl<C: ImageClipboardAccess + 'static> Executor for ImageClipboardExecutor<C> {
         "image_clipboard"
     }
 
+    /// `ReadOnly` is intentional, not an oversight: see `executors::Effect`'s
+    /// doc comment ("Decided (issue #402)") for why a clipboard-writing
+    /// executor still counts as read-only for the confirm fast path.
     fn effect(&self) -> Effect {
         Effect::ReadOnly
     }
@@ -129,7 +132,9 @@ impl<C: ImageClipboardAccess + 'static> Executor for ImageClipboardExecutor<C> {
 
         // Best-effort: a clipboard that was empty, or held no CF_DIB entry,
         // restores to nothing rather than failing the whole action -- same
-        // shape as `executors::clipboard`'s text case.
+        // shape as `executors::clipboard`'s text case, including the same
+        // residual gap (issue #410): "empty" and "had something this
+        // executor cannot capture" are indistinguishable here.
         let previous = self.clipboard.get_dib();
 
         self.clipboard.set_dib(&dib)?;
@@ -393,6 +398,19 @@ mod tests {
     fn image_clipboard_executor_is_read_only() {
         assert_eq!(ImageClipboardExecutor::new().effect(), Effect::ReadOnly);
         assert_eq!(ImageClipboardExecutor::new().name(), "image_clipboard");
+    }
+
+    /// Issue #402: a clipboard-overwriting executor still auto-confirming
+    /// is a deliberate decision (see `executors::Effect`'s doc comment), not
+    /// a gap. Regression guard for that decision, same shape as
+    /// `executors::clipboard`'s sibling test.
+    #[test]
+    fn image_clipboard_executor_auto_confirms_by_design_per_issue_402() {
+        let executor = ImageClipboardExecutor::with_clipboard(FakeImageClipboard::default());
+        let proposal = Proposal::new(proposal_for(&[0, 0, 0, 0], 1, 1));
+        crate::ui::confirm::auto_confirm_read_only(&executor, proposal).expect(
+            "image_clipboard executor must auto-confirm: issue #402 decided this is intended",
+        );
     }
 
     #[test]
