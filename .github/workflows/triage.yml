@@ -1,0 +1,50 @@
+name: Triage
+
+# Welcomes first-time contributors and labels new issues/PRs by area (issue
+# #372). Runs on pull_request_target (not pull_request) so a labeler PR from
+# a fork still gets a repo-scoped token to add labels; per GitHub's own
+# guidance this must never check out or execute the PR's code, and this
+# workflow does not: actions/labeler only reads the diff's changed file list
+# through the API, and actions/first-interaction only posts a comment.
+on:
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  welcome:
+    name: Welcome first-time contributors
+    runs-on: ubuntu-latest
+    steps:
+      - name: actions/first-interaction
+        uses: actions/first-interaction@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          issue-message: >
+            Thanks for opening your first issue in Wingman. A maintainer will
+            take a look soon. See AGENTS.md for the project's ground rules if
+            you plan to send a pull request for it.
+          pr-message: >
+            Thanks for your first pull request to Wingman. See AGENTS.md for
+            the project's ground rules and CONTRIBUTING.md for how CI and
+            test builds work.
+
+  label:
+    name: Label by area
+    # actions/labeler labels a PR from its changed files; an issue has none,
+    # so this job only runs for pull requests (issues still get the welcome
+    # comment above from the same trigger).
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: actions/labeler
+        uses: actions/labeler@v5
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          sync-labels: false

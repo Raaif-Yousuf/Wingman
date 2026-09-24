@@ -1,0 +1,62 @@
+# Path-based area labels for actions/labeler (see .github/workflows/triage.yml).
+# Kept close to src/'s own module layout; update both together.
+
+area:actions:
+- src/actions/**
+- src/actions_example.rs
+- src/router.rs
+
+area:executors:
+- src/executors/**
+
+area:connectors:
+- src/connectors/**
+
+area:providers:
+- src/provider/**
+- src/egress.rs
+
+area:ui:
+- src/ui/**
+
+area:inputs:
+- src/inputs/**
+- src/capture.rs
+- src/ocr.rs
+- src/hotkey.rs
+- src/hotkey_conflicts.rs
+
+area:awareness:
+- src/profile/**
+
+area:packaging:
+- packaging/**
+- install.ps1
+- uninstall.ps1
+- '*.wapproj'
+- AppxManifest.xml.in
+
+area:docs:
+- docs/**
+- '**/*.md'
+
+area:ci:
+- .github/**
+- scripts/hooks/**
+- scripts/verify-all.sh
+
+area:core:
+- src/app.rs
+- src/config.rs
+- src/config_example.rs
+- src/mode.rs
+- src/secrets.rs
+- src/dpapi.rs
+- src/single_instance.rs
+- src/autostart.rs
+- src/known_folder.rs
+- src/pause.rs
+- src/dismiss.rs
+- src/diagnostics.rs
+- src/payment_denylist.rs
+- src/main.rs
