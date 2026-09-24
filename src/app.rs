@@ -193,6 +193,25 @@ struct App {
     /// a second "Restore" click after a successful restore reports "nothing
     /// to restore" rather than attempting a stale undo twice.
     last_form_undo: Option<executors::Undo>,
+    /// Review of #349/#426: the full (redacted) chain behind the most
+    /// recent error card, so "use Copy diagnostics for details" points at
+    /// something real instead of nothing -- `human_error_detail` on its own
+    /// discards the raw chain entirely. In memory only, never written to
+    /// disk (Hard Rule 5 and privacy): overwritten by the next error,
+    /// cleared on nothing else, and never itself the source of a card's
+    /// display text (`track_error` returns the human sentence separately).
+    last_error: Option<LastError>,
+}
+
+/// See `App::last_error`'s doc comment.
+struct LastError {
+    /// Whatever headline the card that reported this error also used, e.g.
+    /// "Couldn't add the event" -- not a separate taxonomy to keep in sync.
+    action: String,
+    occurred_at: SystemTime,
+    /// Already redacted (#253, `egress::redact_opaque_tokens`) -- this is
+    /// the only place the *original*, non-humanized chain survives at all.
+    chain: String,
 }
 
 pub fn run() -> Result<()> {
@@ -296,6 +315,7 @@ pub fn run() -> Result<()> {
         pending_preview: None,
         pending_preview_generation: 0,
         last_form_undo: None,
+        last_error: None,
     });
     app.refresh_tray_labels();
     // Issue #19: reflect the loaded mode in the tray submenu/icon from the
@@ -333,13 +353,13 @@ pub fn run() -> Result<()> {
             h.set_palette_chord(app.config.hotkeys.palette);
             app.hook = Some(h);
         }
-        Err(e) => app.card.show_error(
-            "Hotkeys unavailable",
-            &format!(
-                "{}\n\nUse Ask now from the tray menu instead.",
-                human_error_detail(&format!("{e:#}"))
-            ),
-        ),
+        Err(e) => {
+            let detail = app.track_error("Hotkeys unavailable", &format!("{e:#}"));
+            app.card.show_error(
+                "Hotkeys unavailable",
+                &format!("{detail}\n\nUse Ask now from the tray menu instead."),
+            );
+        }
     }
 
     // Non-fatal: without it the card still auto-dismisses on its timer.
@@ -599,10 +619,8 @@ impl App {
         let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
             Ok(r) => r,
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't capture the screen",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
+                self.card.show_error("Couldn't capture the screen", &detail);
                 return None;
             }
         };
@@ -663,7 +681,12 @@ impl App {
                     want_difficulty,
                 )
             })()
-            .map_err(|e| human_error_detail(&format!("{e:#}")));
+            .map_err(|e| {
+                pack_error(
+                    &human_error_detail(&format!("{e:#}")),
+                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                )
+            });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -700,10 +723,8 @@ impl App {
         let resolved = match actions::load_actions() {
             Ok(r) => r,
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't load actions.toml",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.card.show_error("Couldn't load actions.toml", &detail);
                 return;
             }
         };
@@ -789,8 +810,12 @@ impl App {
 
         std::thread::spawn(move || {
             let result: std::result::Result<router::RouterResult, String> =
-                router_worker(&providers, mode, &raw, &candidates)
-                    .map_err(|e| human_error_detail(&format!("{e:#}")));
+                router_worker(&providers, mode, &raw, &candidates).map_err(|e| {
+                    pack_error(
+                        &human_error_detail(&format!("{e:#}")),
+                        &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                    )
+                });
             let payload = Box::into_raw(Box::new((generation, result)));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -909,10 +934,8 @@ impl App {
         let raw = match actions::extract_text::capture_screen() {
             Ok(r) => r,
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't capture the screen",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
+                self.card.show_error("Couldn't capture the screen", &detail);
                 return;
             }
         };
@@ -924,8 +947,12 @@ impl App {
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> =
-                actions::extract_text::recognize_and_copy(&raw)
-                    .map_err(|e| human_error_detail(&format!("{e:#}")));
+                actions::extract_text::recognize_and_copy(&raw).map_err(|e| {
+                    pack_error(
+                        &human_error_detail(&format!("{e:#}")),
+                        &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                    )
+                });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -963,10 +990,10 @@ impl App {
             Ok(Some(raw)) => raw,
             Ok(None) => return, // cancelled: no card, nothing changed
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't open the region selector",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail =
+                    self.track_error("Couldn't open the region selector", &format!("{e:#}"));
+                self.card
+                    .show_error("Couldn't open the region selector", &detail);
                 return;
             }
         };
@@ -996,10 +1023,10 @@ impl App {
                 self.card
                     .show_answer(&format!("Copied {width}x{height} region"), "", 3, None)
             }
-            Err(e) => self.card.show_error(
-                "Couldn't copy the region",
-                &human_error_detail(&format!("{e:#}")),
-            ),
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy the region", &format!("{e:#}"));
+                self.card.show_error("Couldn't copy the region", &detail);
+            }
         }
     }
 
@@ -1019,10 +1046,8 @@ impl App {
             self.begin_model_action(|app| match local_today_and_utc_offset() {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    app.card.show_error(
-                        "Couldn't read the local date",
-                        &human_error_detail(&format!("{e:#}")),
-                    );
+                    let detail = app.track_error("Couldn't read the local date", &format!("{e:#}"));
+                    app.card.show_error("Couldn't read the local date", &detail);
                     None
                 }
             })
@@ -1046,7 +1071,12 @@ impl App {
                     offset_minutes,
                 )
             })()
-            .map_err(|e| human_error_detail(&format!("{e:#}")));
+            .map_err(|e| {
+                pack_error(
+                    &human_error_detail(&format!("{e:#}")),
+                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                )
+            });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1075,9 +1105,11 @@ impl App {
 
         let proposal = match result {
             Ok(p) => p,
-            Err(e) => {
-                let headline = first_line(&e, 88);
-                self.card.show_error(&headline, &e);
+            Err(packed) => {
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
+                self.card.show_error(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1097,10 +1129,8 @@ impl App {
         let resolved = match actions::load_actions() {
             Ok(r) => r,
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't load actions.toml",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.card.show_error("Couldn't load actions.toml", &detail);
                 self.set_watch(true);
                 return;
             }
@@ -1135,19 +1165,15 @@ impl App {
                 ) {
                     Ok(confirmed) => self.run_calendar_executor(executor.as_ref(), confirmed),
                     Err(e) => {
-                        self.card.show_error(
-                            "Couldn't add the event",
-                            &human_error_detail(&format!("{e:#}")),
-                        );
+                        let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
+                        self.card.show_error("Couldn't add the event", &detail);
                         self.set_watch(true);
                     }
                 }
             }
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't add the event",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
+                self.card.show_error("Couldn't add the event", &detail);
                 self.set_watch(true);
             }
         }
@@ -1219,10 +1245,8 @@ impl App {
             match executors::registry::resolve("fill_form") {
                 Ok(executor) => self.run_form_fill_executor(executor.as_ref(), final_confirmed),
                 Err(e) => {
-                    self.card.show_error(
-                        "Couldn't fill the form",
-                        &human_error_detail(&format!("{e:#}")),
-                    );
+                    let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
+                    self.card.show_error("Couldn't fill the form", &detail);
                     self.set_watch(true);
                 }
             }
@@ -1235,10 +1259,8 @@ impl App {
         match executors::registry::resolve("calendar_add") {
             Ok(executor) => self.run_calendar_executor(executor.as_ref(), confirmed),
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't add the event",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
+                self.card.show_error("Couldn't add the event", &detail);
                 self.set_watch(true);
             }
         }
@@ -1279,10 +1301,8 @@ impl App {
                 self.card.show_answer(headline, &undo.summary, 0, None);
             }
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't add the event",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
+                self.card.show_error("Couldn't add the event", &detail);
             }
         }
         self.set_watch(true);
@@ -1315,7 +1335,12 @@ impl App {
                     let shot = capture::encode(&raw)?;
                     review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
                 })()
-                .map_err(|e| human_error_detail(&format!("{e:#}")));
+                .map_err(|e| {
+                    pack_error(
+                        &human_error_detail(&format!("{e:#}")),
+                        &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                    )
+                });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1350,9 +1375,11 @@ impl App {
 
         let outcome = match result {
             Ok(o) => o,
-            Err(e) => {
-                let headline = first_line(&e, 88);
-                self.card.show_error(&headline, &e);
+            Err(packed) => {
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
+                self.card.show_error(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1426,18 +1453,15 @@ impl App {
                             .show_answer("Email updated", &undo.summary, 0, None);
                     }
                     Err(e) => {
-                        self.card.show_error(
-                            "Couldn't update the email",
-                            &human_error_detail(&format!("{e:#}")),
-                        );
+                        let detail =
+                            self.track_error("Couldn't update the email", &format!("{e:#}"));
+                        self.card.show_error("Couldn't update the email", &detail);
                     }
                 }
             }
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't update the email",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
+                self.card.show_error("Couldn't update the email", &detail);
             }
         }
         self.set_watch(true);
@@ -1481,7 +1505,12 @@ impl App {
                     require_tick_for,
                 )
             })()
-            .map_err(|e| human_error_detail(&format!("{e:#}")));
+            .map_err(|e| {
+                pack_error(
+                    &human_error_detail(&format!("{e:#}")),
+                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                )
+            });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1512,9 +1541,11 @@ impl App {
 
         let value = match result {
             Ok(v) => v,
-            Err(e) => {
-                let headline = first_line(&e, 88);
-                self.card.show_error(&headline, &e);
+            Err(packed) => {
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
+                self.card.show_error(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1608,10 +1639,8 @@ impl App {
                 self.last_form_undo = Some(undo);
             }
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't fill the form",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
+                self.card.show_error("Couldn't fill the form", &detail);
             }
         }
         self.set_watch(true);
@@ -1645,10 +1674,9 @@ impl App {
                 );
             }
             Err(e) => {
-                self.card.show_error(
-                    "Couldn't fully restore the form",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't fully restore the form", &format!("{e:#}"));
+                self.card
+                    .show_error("Couldn't fully restore the form", &detail);
             }
         }
         self.set_watch(true);
@@ -1684,11 +1712,17 @@ impl App {
         self.busy = false;
         let answer = match result {
             Ok(answer) => answer,
-            Err(e) => {
-                let headline = first_line(&e, 88);
+            Err(packed) => {
+                // Review of #349/#426: the worker packed the human, redacted
+                // detail together with the full, redacted chain so it
+                // survives the thread boundary -- see `pack_error`'s doc
+                // comment for why a tuple isn't used instead.
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
                 Answer {
                     headline,
-                    detail: e,
+                    detail: human.to_string(),
                     // An error has no difficulty to report.
                     difficulty: None,
                 }
@@ -1710,9 +1744,10 @@ impl App {
         };
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
             Ok(()) => self.card.show_answer("Copied", "", 3, None),
-            Err(e) => self
-                .card
-                .show_error("Couldn't copy", &human_error_detail(&format!("{e}"))),
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy", &format!("{e}"));
+                self.card.show_error("Couldn't copy", &detail);
+            }
         }
     }
 
@@ -1720,8 +1755,44 @@ impl App {
     /// (`diagnostics::render_report`) and puts it on the clipboard -- no
     /// file writes, no network. See `diagnostics.rs`'s module doc for the
     /// redaction guarantee.
+    /// Review of #349/#426: records `raw_chain` (redacted, #253) as
+    /// [`App::last_error`] and returns [`human_error_detail`]'s display
+    /// text for it -- a drop-in replacement for calling
+    /// `human_error_detail` directly at every call site that shows an
+    /// error card, so "use Copy diagnostics for details" (the sentence
+    /// every card detail ends with) is never a pointer at nothing: the very
+    /// next "Copy diagnostics" click includes this chain, in memory only,
+    /// never written to disk (Hard Rule 5) and gone the moment the process
+    /// exits or another error overwrites it.
+    fn record_last_error(&mut self, action: &str, raw_chain: &str) {
+        self.last_error = Some(LastError {
+            action: action.to_string(),
+            occurred_at: SystemTime::now(),
+            chain: crate::egress::redact_opaque_tokens(raw_chain),
+        });
+    }
+
+    fn track_error(&mut self, action: &str, raw_chain: &str) -> String {
+        self.record_last_error(action, raw_chain);
+        human_error_detail(raw_chain)
+    }
+
     fn copy_diagnostics(&mut self) {
-        let report = crate::diagnostics::render_report(&crate::diagnostics::collect(&self.config));
+        let last_error = self
+            .last_error
+            .as_ref()
+            .map(|e| crate::diagnostics::LastError {
+                action: e.action.clone(),
+                seconds_ago: SystemTime::now()
+                    .duration_since(e.occurred_at)
+                    .unwrap_or_default()
+                    .as_secs(),
+                chain: e.chain.clone(),
+            });
+        let report = crate::diagnostics::render_report(&crate::diagnostics::collect(
+            &self.config,
+            last_error,
+        ));
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
             Ok(()) => self.card.show_answer(
                 "Diagnostics copied",
@@ -1729,10 +1800,10 @@ impl App {
                 6,
                 None,
             ),
-            Err(e) => self.card.show_error(
-                "Couldn't copy diagnostics",
-                &human_error_detail(&format!("{e}")),
-            ),
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy diagnostics", &format!("{e}"));
+                self.card.show_error("Couldn't copy diagnostics", &detail);
+            }
         }
     }
 
@@ -1755,10 +1826,11 @@ impl App {
                 6,
                 None,
             ),
-            Err(e) => self.card.show_error(
-                "Couldn't copy the egress log",
-                &human_error_detail(&format!("{e}")),
-            ),
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy the egress log", &format!("{e}"));
+                self.card
+                    .show_error("Couldn't copy the egress log", &detail);
+            }
         }
     }
 
@@ -1799,7 +1871,16 @@ impl App {
                     "Nothing selected. Select an expression or a \"<number> <unit> in <unit>\" query first."
                         .to_string(),
                 ),
-                crate::calc::SelectionCalcOutcome::Error(e) => Err(e.to_string()),
+                // `CalcError`'s `Display` is always plain arithmetic-parse
+                // prose today (never Win32/API-derived -- see
+                // `calc::run_on_selection`'s own doc comment), but every
+                // path into `show_error` goes through the same humanizer
+                // regardless (review of #349/#426): no exemption for "this
+                // one is safe today" is how #349 happened in the first
+                // place.
+                crate::calc::SelectionCalcOutcome::Error(e) => {
+                    Err(human_error_detail(&e.to_string()))
+                }
             };
             let payload = Box::into_raw(Box::new(result));
             unsafe {
@@ -1874,13 +1955,14 @@ impl App {
             Ok(()) => self
                 .card
                 .show_answer(&format!("Bound to {name}"), "", 4, None),
-            Err(e) => self.card.show_error(
-                &format!("Bound to {name}: not saved"),
-                &format!(
-                    "It will work until you quit.\n\n{}",
-                    human_error_detail(&format!("{e:#}"))
-                ),
-            ),
+            Err(e) => {
+                let headline = format!("Bound to {name}: not saved");
+                let human = self.track_error(&headline, &format!("{e:#}"));
+                self.card.show_error(
+                    &headline,
+                    &format!("It will work until you quit.\n\n{human}"),
+                );
+            }
         }
     }
 
@@ -1899,10 +1981,10 @@ impl App {
                     self.card.show_error(&headline, &detail);
                 }
             }
-            Err(e) => self.card.show_error(
-                "Couldn't reload settings",
-                &human_error_detail(&format!("{e:#}")),
-            ),
+            Err(e) => {
+                let detail = self.track_error("Couldn't reload settings", &format!("{e:#}"));
+                self.card.show_error("Couldn't reload settings", &detail);
+            }
         }
     }
 
@@ -1992,16 +2074,11 @@ impl App {
             // the single card slot's final content (`final_settings_card`'s
             // `SaveError` case, unchanged by #213).
             let had_pending = !pending.is_empty();
-            self.card.show_error(
-                "Couldn't save settings",
-                &human_error_detail(&format!("{e:#}")),
-            );
+            let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
+            self.card.show_error("Couldn't save settings", &detail);
             self.deliver_deferred(pending);
             if had_pending {
-                self.card.show_error(
-                    "Couldn't save settings",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                self.card.show_error("Couldn't save settings", &detail);
             }
             self.show_tray_restore_error(tray_restore_error);
             return;
@@ -2113,10 +2190,8 @@ impl App {
             // dropped the error and still tried to open a file that might
             // not exist.
             if let Err(e) = &save_result {
-                self.card.show_error(
-                    "Couldn't save settings",
-                    &human_error_detail(&format!("{e:#}")),
-                );
+                let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
+                self.card.show_error("Couldn't save settings", &detail);
             }
             return;
         }
@@ -2167,13 +2242,14 @@ impl App {
 
         match saved {
             Ok(()) => self.card.show_answer(&model, "", 3, None),
-            Err(e) => self.card.show_error(
-                &format!("Using {model}: not saved"),
-                &format!(
-                    "It will revert when you quit.\n\n{}",
-                    human_error_detail(&format!("{e:#}"))
-                ),
-            ),
+            Err(e) => {
+                let headline = format!("Using {model}: not saved");
+                let human = self.track_error(&headline, &format!("{e:#}"));
+                self.card.show_error(
+                    &headline,
+                    &format!("It will revert when you quit.\n\n{human}"),
+                );
+            }
         }
         self.set_watch(true);
     }
@@ -2197,13 +2273,14 @@ impl App {
         let name = if openai { "ChatGPT" } else { "Claude" };
         match saved {
             Ok(()) => self.card.show_answer(name, "", 3, None),
-            Err(e) => self.card.show_error(
-                &format!("Using {name}: not saved"),
-                &format!(
-                    "It will revert when you quit.\n\n{}",
-                    human_error_detail(&format!("{e:#}"))
-                ),
-            ),
+            Err(e) => {
+                let headline = format!("Using {name}: not saved");
+                let human = self.track_error(&headline, &format!("{e:#}"));
+                self.card.show_error(
+                    &headline,
+                    &format!("It will revert when you quit.\n\n{human}"),
+                );
+            }
         }
         self.set_watch(true);
     }
@@ -2225,13 +2302,14 @@ impl App {
         let saved = self.config.save();
         match saved {
             Ok(()) => self.card.show_answer(mode.label(), "", 3, None),
-            Err(e) => self.card.show_error(
-                &format!("Using {}: not saved", mode.label()),
-                &format!(
-                    "It will revert when you quit.\n\n{}",
-                    human_error_detail(&format!("{e:#}"))
-                ),
-            ),
+            Err(e) => {
+                let headline = format!("Using {}: not saved", mode.label());
+                let human = self.track_error(&headline, &format!("{e:#}"));
+                self.card.show_error(
+                    &headline,
+                    &format!("It will revert when you quit.\n\n{human}"),
+                );
+            }
         }
         self.set_watch(true);
     }
@@ -2292,10 +2370,12 @@ impl App {
             PauseChoice::UntilTomorrow => match deadline_until_tomorrow() {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    self.card.show_error(
+                    let detail = self.track_error(
                         "Couldn't compute tomorrow's pause deadline",
-                        &human_error_detail(&format!("{e:#}")),
+                        &format!("{e:#}"),
                     );
+                    self.card
+                        .show_error("Couldn't compute tomorrow's pause deadline", &detail);
                     return;
                 }
             },
@@ -2408,7 +2488,7 @@ impl App {
                 self.refresh_tray_labels();
                 None
             }
-            Err(e) => Some(human_error_detail(&format!("{e:#}"))),
+            Err(e) => Some(self.track_error("Couldn't restore the tray icon", &format!("{e:#}"))),
         }
     }
 
@@ -3180,6 +3260,141 @@ fn is_api_shaped_identifier(ident: &str) -> bool {
     starts_upper && upper_count >= 2
 }
 
+// -- review of #349/#426: a wider, self-tested source scanner --------------
+//
+// The original scanner only matched two exact `format!` literals: the
+// alternate-Display specifier on the bound name `e`, and plain Display on
+// the same name. It missed the Debug specifier, the `err`/`error` bound
+// names just as many `Err(err) => ...`/`.map_err(|error| ...)` arms use,
+// a bare call to the error's own `ToString` (no `format!` at all), and any
+// whitespace variant inside the macro call. No `regex` dependency: this
+// crate has none today and these shapes are simple enough to hand-scan.
+
+// Test-only: exercised solely by `show_error_call_sites_never_show_a_failed_suffixed_api_identifier`
+// and the `find_error_interpolations_*`/`interpolation_is_guarded_*` self-tests
+// below, never by production code, hence `#[cfg(test)]` on every item in
+// this section (otherwise a release build's dead-code lint flags all of it).
+#[cfg(test)]
+const ERROR_BINDING_NAMES: [&str; 3] = ["e", "err", "error"];
+#[cfg(test)]
+const ERROR_FORMAT_SPECS: [&str; 3] = ["", ":#", ":?"];
+
+#[cfg(test)]
+fn skip_ws(s: &str, mut i: usize) -> usize {
+    let bytes = s.as_bytes();
+    while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Byte offsets (into `src`, which the caller must have already normalized
+/// to `\n` line endings -- see
+/// `show_error_call_sites_never_show_a_failed_suffixed_api_identifier`
+/// below) of every `format!` call whose one placeholder is exactly one of
+/// `e`, `err` or `error`, with the alternate-Display, plain-Display or
+/// Debug specifier (arbitrary whitespace around the macro's parens and
+/// string tolerated), and every direct `.to_string()` call on one of those
+/// same three bound names. Each of these is a way to turn an error into a
+/// `String` by interpolating its Display/Debug output directly -- #349's
+/// whole bug.
+#[cfg(test)]
+fn find_error_interpolations(src: &str) -> Vec<usize> {
+    let bytes = src.as_bytes();
+    let mut hits = Vec::new();
+
+    // format!( "{name[:spec]}" )
+    let mut i = 0;
+    while let Some(rel) = src[i..].find("format!") {
+        let start = i + rel;
+        let mut j = skip_ws(src, start + "format!".len());
+        if bytes.get(j) != Some(&b'(') {
+            i = start + 1;
+            continue;
+        }
+        j = skip_ws(src, j + 1);
+        if bytes.get(j) != Some(&b'"') {
+            i = start + 1;
+            continue;
+        }
+        let str_start = j + 1;
+        let Some(close_rel) = src[str_start..].find('"') else {
+            break;
+        };
+        let inner = &src[str_start..str_start + close_rel];
+        let after_quote = str_start + close_rel + 1;
+        let matched = ERROR_BINDING_NAMES.iter().any(|name| {
+            ERROR_FORMAT_SPECS
+                .iter()
+                .any(|spec| inner == format!("{{{name}{spec}}}"))
+        });
+        if matched && bytes.get(skip_ws(src, after_quote)) == Some(&b')') {
+            hits.push(start);
+        }
+        i = str_start + 1;
+    }
+
+    // name.to_string()
+    for name in ERROR_BINDING_NAMES {
+        let needle = format!("{name}.to_string()");
+        let mut i = 0;
+        while let Some(rel) = src[i..].find(needle.as_str()) {
+            let pos = i + rel;
+            let prev_is_ident =
+                pos > 0 && (bytes[pos - 1].is_ascii_alphanumeric() || bytes[pos - 1] == b'_');
+            if !prev_is_ident {
+                hits.push(pos);
+            }
+            i = pos + needle.len();
+        }
+    }
+
+    hits.sort_unstable();
+    hits
+}
+
+/// True if the statement containing byte offset `pos` in `src` mentions
+/// `human_error_detail(` or `track_error(` before that offset -- both
+/// redact (#253) before ever building card-visible text, and `track_error`
+/// additionally records the chain for "Copy diagnostics" (review of
+/// #349/#426). "Statement" is approximated as the text since the nearest
+/// preceding `;`, `{` or `}` OUTSIDE a string literal. That last part is
+/// not optional: a naive brace search trips on the literal `{`/`}`
+/// characters inside `format!`'s own `"{e:#}"` placeholder, which -- in a
+/// statement with two `format!` calls, e.g. `pack_error`'s -- would find
+/// the first call's closing `}` and cut `human_error_detail(` out of the
+/// text being searched for the second call's guard check (caught by
+/// `interpolation_is_guarded_sees_past_an_earlier_format_placeholder`
+/// below, which is exactly this shape).
+#[cfg(test)]
+fn interpolation_is_guarded(src: &str, pos: usize) -> bool {
+    let before = &src[..pos];
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut stmt_start = 0;
+    for (i, c) in before.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match c {
+                '\\' => escape_next = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            ';' | '{' | '}' => stmt_start = i + c.len_utf8(),
+            _ => {}
+        }
+    }
+    let stmt = &before[stmt_start..];
+    stmt.contains("human_error_detail(") || stmt.contains("track_error(")
+}
+
 /// Redacts key-shaped tokens (#253, via the same `egress::redact_opaque_tokens`
 /// the egress log already uses) from a raw anyhow context chain -- already
 /// rendered with anyhow's alternate `Display`, here or forwarded across a
@@ -3225,6 +3440,36 @@ fn human_error_detail(raw_chain: &str) -> String {
         "{} Try again, and if it keeps happening, use Copy diagnostics for details.",
         humanize_error_chain(raw_chain)
     )
+}
+
+/// Separator `pack_error`/`unpack_error` use. A control character no real
+/// error message or human sentence will ever contain, so a plain
+/// `split_once` is exact.
+const ERROR_PACK_SEP: char = '\u{1}';
+
+/// Review of #349/#426: a worker thread builds a `Result<T, String>` that
+/// crosses into the main thread's message loop as a boxed, type-erased
+/// pointer (`WM_APP_CALENDAR_RESULT` and friends) -- changing that `String`
+/// to a tuple would mean re-deriving every `unsafe { Box::from_raw::<...>() }`
+/// cast at each of those call sites exactly right, which is a correctness
+/// risk this fix does not need to take. Packing both the human, redacted
+/// detail and the full, redacted chain into one `String` (split back apart
+/// by [`unpack_error`] in the `on_*_result` handler that already runs on
+/// the main thread, with access to `self`) gets the same result -- the
+/// full chain survives to [`App::track_error`] -- without touching any of
+/// that unsafe plumbing.
+fn pack_error(human: &str, chain: &str) -> String {
+    format!("{human}{ERROR_PACK_SEP}{chain}")
+}
+
+/// The other half of [`pack_error`]. Defensive against a string that was
+/// never packed (falls back to using the same text for both halves) so a
+/// caller can never panic on this, even if some future path started
+/// building the `Result<T, String>` a different way.
+fn unpack_error(packed: &str) -> (&str, &str) {
+    packed
+        .split_once(ERROR_PACK_SEP)
+        .unwrap_or((packed, packed))
 }
 
 thread_local! {
@@ -5006,8 +5251,8 @@ mod tests {
     // -- #349: human-readable, redacted error text for the card -------------
 
     use super::{
-        contains_api_failed_identifier, human_error_detail, humanize_error_chain,
-        is_api_shaped_identifier,
+        contains_api_failed_identifier, find_error_interpolations, human_error_detail,
+        humanize_error_chain, interpolation_is_guarded, is_api_shaped_identifier,
     };
 
     #[test]
@@ -5089,6 +5334,95 @@ mod tests {
         assert!(!human.contains(fake_key), "{human}");
     }
 
+    // -- review of #349/#426, item 2: actionable provider errors must stay
+    // specific, never collapse to the generic "Something went wrong." --
+    //
+    // `contains_api_failed_identifier` only replaces text that looks
+    // Win32/API-shaped ("XxxYyy(...) failed"); every provider error text
+    // below mirrors the exact `format!`/`anyhow!` template
+    // `src/provider/common.rs` actually uses (`http_error`,
+    // `rate_limited_error`, the `NoResponse` transport-error arm), run
+    // through the same `egress::redact_opaque_tokens` those call sites
+    // already apply (#253) before it ever reaches `app.rs`, so these are
+    // the real strings a card would show, not synthetic ones.
+
+    #[test]
+    fn humanize_error_chain_keeps_a_401_bad_key_specific() {
+        // Real Anthropic 401 body shape (anthropic.rs/common.rs's
+        // `http_error`: `"{tag}: HTTP {status}: {truncated}"`).
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        let chain = format!(
+            "anthropic: HTTP 401: {}",
+            crate::egress::redact_opaque_tokens(body)
+        );
+        assert!(!contains_api_failed_identifier(&chain));
+        let human = humanize_error_chain(&chain);
+        assert!(human.contains("HTTP 401"), "{human}");
+        assert!(human.contains("invalid x-api-key"), "{human}");
+        assert_ne!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn humanize_error_chain_keeps_a_429_rate_limit_specific() {
+        // Real shape from `rate_limited_error`: `"{tag}: too many requests.
+        // Retry after {} seconds."`.
+        let chain = "openai: too many requests. Retry after 20 seconds.".to_string();
+        assert!(!contains_api_failed_identifier(&chain));
+        let human = humanize_error_chain(&chain);
+        assert!(human.contains("too many requests"), "{human}");
+        assert!(human.contains("Retry after 20 seconds"), "{human}");
+        assert_ne!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn humanize_error_chain_keeps_a_model_not_found_specific() {
+        // Real OpenAI 404 body shape, same `http_error` template as the 401
+        // case above.
+        let body = r#"{"error":{"message":"The model `gpt-9` does not exist","type":"invalid_request_error","code":"model_not_found"}}"#;
+        let chain = format!(
+            "openai: HTTP 404: {}",
+            crate::egress::redact_opaque_tokens(body)
+        );
+        assert!(!contains_api_failed_identifier(&chain));
+        let human = humanize_error_chain(&chain);
+        assert!(human.contains("HTTP 404"), "{human}");
+        assert!(human.contains("does not exist"), "{human}");
+        assert_ne!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn humanize_error_chain_keeps_ollama_not_running_specific() {
+        // Real shape from the `TransportError::NoResponse` arm:
+        // `"{tag}: transport error: {}"`, `redact_detail`-ed -- what a real
+        // `ureq` connection-refused error (Ollama's tray app not running,
+        // #253's own "stock Ollama tray steals the port" pitfall aside)
+        // looks like.
+        let transport_err = "connect error: Connection refused (os error 10061)";
+        let chain = format!(
+            "ollama: transport error: {}",
+            crate::egress::redact_opaque_tokens(transport_err)
+        );
+        assert!(!contains_api_failed_identifier(&chain));
+        let human = humanize_error_chain(&chain);
+        assert!(human.contains("Connection refused"), "{human}");
+        assert_ne!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn humanize_error_chain_keeps_a_network_timeout_specific() {
+        // Same `"{tag}: transport error: {}"` template, a timeout instead
+        // of a refused connection.
+        let transport_err = "operation timed out after 30s";
+        let chain = format!(
+            "openai: transport error: {}",
+            crate::egress::redact_opaque_tokens(transport_err)
+        );
+        assert!(!contains_api_failed_identifier(&chain));
+        let human = humanize_error_chain(&chain);
+        assert!(human.contains("timed out"), "{human}");
+        assert_ne!(human, "Something went wrong.");
+    }
+
     #[test]
     fn human_error_detail_appends_a_next_step() {
         let detail = human_error_detail("TzSpecificLocalTimeToSystemTime failed");
@@ -5101,28 +5435,151 @@ mod tests {
     /// #349's "Done when": no card's visible text may contain a Win32/API
     /// function name. Rather than exercising every `show_error` call site
     /// live (most need a real worker thread, a real window, or real I/O),
-    /// this scans `app.rs`'s own source for the shape every unguarded call
-    /// site used to have -- anyhow's alternate `Display` (or its plain
-    /// `Display`) interpolated straight into a format string -- and fails
-    /// if one is found that is not immediately wrapped by
-    /// `human_error_detail`. This is the mechanical
-    /// guard that a new `show_error` call site cannot reintroduce the bug
-    /// this issue closes.
+    /// this scans `app.rs`'s own source (normalized to `\n` line endings,
+    /// so a CRLF checkout never changes what this test sees) for every
+    /// shape `find_error_interpolations` recognizes -- interpolating a
+    /// bound error value's Display/Debug output, or calling its
+    /// `.to_string()`, directly -- and fails if one is found whose
+    /// enclosing statement does not mention `human_error_detail` or
+    /// `track_error`. This is the mechanical guard that a new `show_error`
+    /// call site cannot reintroduce the bug this issue closes. See
+    /// `find_error_interpolations_*` below for proof the scanner itself
+    /// has teeth (review of #349/#426: the original version of this test
+    /// only matched two exact literals).
     #[test]
     fn show_error_call_sites_never_show_a_failed_suffixed_api_identifier() {
-        let src = include_str!("app.rs");
-        for needle in ["format!(\"{e:#}\")", "format!(\"{e}\")"] {
-            let mut start = 0;
-            while let Some(idx) = src[start..].find(needle) {
-                let abs = start + idx;
-                let before = &src[..abs];
-                assert!(
-                    before.ends_with("human_error_detail(&"),
-                    "found a raw {needle} at byte {abs} not wrapped by human_error_detail -- \
-                     it could show an API function name on a card"
-                );
-                start = abs + needle.len();
-            }
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        for pos in find_error_interpolations(&src) {
+            let window_start = pos.saturating_sub(80);
+            let window_end = (pos + 40).min(src.len());
+            assert!(
+                interpolation_is_guarded(&src, pos),
+                "found a raw error interpolation at byte {pos} not wrapped by \
+                 human_error_detail/track_error -- it could show an API function \
+                 name on a card:\n{}",
+                &src[window_start..window_end]
+            );
+        }
+    }
+
+    // -- the scanner's own regression tests (review of #349/#426) -----------
+    //
+    // A source-scanning test is only as good as its patterns: the version
+    // above only matched two exact `format!` literals (the alternate- and
+    // plain-Display specifiers on the bound name `e`), so it could never
+    // have caught the Debug specifier, an `err`/`error` bound name, a bare
+    // `.to_string()`, or a whitespace variant -- and, being green either
+    // way, gave no signal that it was blind to them.
+    // These tests plant exactly those shapes as Rust *string* data (never
+    // compiled, so they can safely look like the bug without being it) and
+    // prove the scanner actually flags each one, plus that a properly
+    // guarded call is correctly left alone.
+
+    #[test]
+    fn find_error_interpolations_catches_a_planted_bad_line() {
+        let planted = "fn f(e: anyhow::Error) -> String { format!(\"{e:#}\") }";
+        let hits = find_error_interpolations(planted);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(!interpolation_is_guarded(planted, hits[0]));
+    }
+
+    #[test]
+    fn find_error_interpolations_recognizes_debug_other_bindings_and_to_string() {
+        for planted in [
+            "format!(\"{e:?}\")",
+            "format!(\"{err}\")",
+            "format!(\"{err:#}\")",
+            "format!(\"{error:?}\")",
+        ] {
+            let hits = find_error_interpolations(planted);
+            assert_eq!(hits.len(), 1, "did not catch: {planted}");
+        }
+        // Built from parts, not as a literal string constant spelling out
+        // the bound name immediately followed by a call to its own
+        // `ToString`: that would itself be exactly the bare pattern this
+        // scanner looks for, and this file's own source is one of the
+        // things `show_error_call_sites_never_show_a_failed_suffixed_api_identifier`
+        // scans.
+        for name in ["e", "err", "error"] {
+            let planted = format!("{name}{}to_string()", '.');
+            let hits = find_error_interpolations(&planted);
+            assert_eq!(hits.len(), 1, "did not catch: {planted}");
+        }
+    }
+
+    #[test]
+    fn find_error_interpolations_tolerates_whitespace_variants() {
+        for planted in [
+            "format! (\"{e:#}\")",
+            "format!( \"{e:#}\" )",
+            "format!(\"{e:#}\" )",
+        ] {
+            let hits = find_error_interpolations(planted);
+            assert_eq!(hits.len(), 1, "did not catch: {planted:?}");
+        }
+    }
+
+    #[test]
+    fn find_error_interpolations_normalizes_crlf() {
+        let planted = "fn f() {\r\n    format!(\"{e:#}\")\r\n}".replace("\r\n", "\n");
+        let hits = find_error_interpolations(&planted);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn find_error_interpolations_ignores_a_longer_identifier_ending_in_e() {
+        // A longer identifier merely ending in the letter e (like "value")
+        // must not be mistaken for the bare-`e` binding name.
+        let hits = find_error_interpolations("let s = value.to_string();");
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    #[test]
+    fn find_error_interpolations_ignores_an_unrelated_format_call() {
+        let hits = find_error_interpolations("format!(\"{name}\")");
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    #[test]
+    fn interpolation_is_guarded_accepts_human_error_detail_and_track_error() {
+        for guarded in [
+            "self.card.show_error(\"x\", &human_error_detail(&format!(\"{e:#}\")));",
+            "let d = self.track_error(\"x\", &format!(\"{e:#}\"));",
+        ] {
+            let hits = find_error_interpolations(guarded);
+            assert_eq!(hits.len(), 1, "{guarded}");
+            assert!(interpolation_is_guarded(guarded, hits[0]), "{guarded}");
+        }
+    }
+
+    #[test]
+    fn interpolation_is_guarded_rejects_a_bare_call() {
+        let bare = "self.card.show_error(\"x\", &format!(\"{e:#}\"));";
+        let hits = find_error_interpolations(bare);
+        assert_eq!(hits.len(), 1);
+        assert!(!interpolation_is_guarded(bare, hits[0]));
+    }
+
+    /// Regression test for exactly the bug this scanner shipped with once:
+    /// `pack_error`'s real call site wraps two separate error-formatting
+    /// expressions -- one inside `human_error_detail`, one inside
+    /// `egress::redact_opaque_tokens` -- in a single statement. A naive
+    /// "nearest preceding brace" boundary search finds the first
+    /// expression's own literal closing brace (part of its Display
+    /// placeholder text, not a real block boundary) and cuts
+    /// `human_error_detail(` out of what it searches for the second
+    /// expression -- wrongly reporting it unguarded.
+    #[test]
+    fn interpolation_is_guarded_sees_past_an_earlier_format_placeholder() {
+        let guarded = "pack_error(&human_error_detail(&format!(\"{e:#}\")), \
+                        &egress::redact_opaque_tokens(&format!(\"{e:#}\")));";
+        let hits = find_error_interpolations(guarded);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        for pos in hits {
+            assert!(
+                interpolation_is_guarded(guarded, pos),
+                "byte {pos} in: {guarded}"
+            );
         }
     }
 

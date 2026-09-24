@@ -54,6 +54,23 @@ impl KeyStatus {
     }
 }
 
+/// Review of #349/#426: the full (already redacted, #253) chain behind the
+/// most recent error card, plus enough context to identify it. `App` keeps
+/// this in memory only (Hard Rule 5, and privacy: never written to disk)
+/// and hands a fresh one to [`collect`] on every "Copy diagnostics" click,
+/// so the card's "use Copy diagnostics for details" pointer is only ever
+/// shown when it is actually true.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastError {
+    /// The same headline the error card itself showed.
+    pub action: String,
+    /// How long ago the error happened, computed by the caller (`App`, from
+    /// its own stored `SystemTime`) so this module stays free of a real
+    /// clock read in its pure half.
+    pub seconds_ago: u64,
+    pub chain: String,
+}
+
 /// One entry in the report's provider table, in `providers.order`.
 /// `key` is `None` for Ollama, which has no API key at all (a local server
 /// has nothing to authenticate with -- see `config.rs`'s `OllamaConfig`
@@ -93,6 +110,8 @@ pub struct DiagnosticsInput {
     /// listening on the configured Ollama port -- Win32-only, no HTTP (see
     /// that module's doc comment).
     pub ollama_health: String,
+    /// `None` when nothing has failed yet this session. See [`LastError`].
+    pub last_error: Option<LastError>,
 }
 
 /// Reduces `config.providers` to the report's provider table, in
@@ -202,6 +221,15 @@ pub fn render_report(input: &DiagnosticsInput) -> String {
         }
     }
 
+    out.push_str("\nLast error:");
+    match &input.last_error {
+        None => out.push_str(" none\n"),
+        Some(e) => {
+            out.push_str(&format!(" {} ({} seconds ago)\n", e.action, e.seconds_ago));
+            out.push_str(&format!("{}\n", e.chain));
+        }
+    }
+
     out.push_str("\nProviders (in order):\n");
     if input.providers.is_empty() {
         out.push_str("(none configured)\n");
@@ -243,7 +271,10 @@ pub fn egress_report() -> String {
 // ===========================================================================
 
 /// Builds the real report input from the running process and `config`.
-pub fn collect(config: &Config) -> DiagnosticsInput {
+/// `last_error` is `App`'s own in-memory record (see [`LastError`]), passed
+/// in rather than read from anywhere here -- this module has no error state
+/// of its own and never will (Hard Rule 5: nothing here polls or persists).
+pub fn collect(config: &Config, last_error: Option<LastError>) -> DiagnosticsInput {
     let ollama_port =
         ollama_admin::port_from_base_url(&config.providers.ollama.base_url).unwrap_or(11434);
     let ollama_health = ollama_admin::query_ollama_health(ollama_port).message();
@@ -263,6 +294,7 @@ pub fn collect(config: &Config) -> DiagnosticsInput {
         primary_hotkey: chord_to_string(&config.hotkeys.primary),
         secondary_hotkey: chord_to_string(&config.hotkeys.secondary),
         ollama_health,
+        last_error,
     }
 }
 
@@ -398,6 +430,7 @@ mod tests {
             primary_hotkey: "Win+Shift+F23".to_string(),
             secondary_hotkey: "Ctrl+Shift+/".to_string(),
             ollama_health: "Ollama is not running.".to_string(),
+            last_error: None,
         }
     }
 
@@ -587,6 +620,33 @@ mod tests {
         let text = render_report(&input);
         assert!(text.contains("Package identity: present"), "{text}");
         assert!(text.contains("DPI awareness: not per monitor"), "{text}");
+    }
+
+    // -- Last error (review of #349/#426) --------------------------------
+
+    #[test]
+    fn render_report_says_none_when_nothing_has_failed() {
+        let text = render_report(&sample_input());
+        assert!(text.contains("Last error: none"), "{text}");
+    }
+
+    #[test]
+    fn render_report_includes_the_last_error_action_age_and_full_chain() {
+        let mut input = sample_input();
+        input.last_error = Some(LastError {
+            action: "Couldn't add the event".to_string(),
+            seconds_ago: 42,
+            chain: "TzSpecificLocalTimeToSystemTime failed: os error 87".to_string(),
+        });
+        let text = render_report(&input);
+        assert!(
+            text.contains("Last error: Couldn't add the event (42 seconds ago)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("TzSpecificLocalTimeToSystemTime failed: os error 87"),
+            "{text}: the full chain must be present so Copy diagnostics is not an empty promise"
+        );
     }
 
     #[test]
