@@ -35,7 +35,7 @@ pub const NO_EVENT_TITLE: &str = "NO_EVENT";
 /// action-model design doc's "Origin tracking") -- the date/offset context
 /// is always appended fresh at ask-time, by `app.rs`, never something a
 /// static prompt string could carry.
-pub const BASE_PROMPT: &str = "You are shown a screenshot of the user's screen. Find the ONE calendar event described or shown on screen (an email, a chat message, an invite, a flyer, a webpage, and so on) and extract it: its title, start time, end time if one is shown, location and any short notes worth keeping. If the screen shows more than one event, pick the one that is the clear focus of the screen (e.g. an open invite or the top message), not a list entry glimpsed in the background.";
+pub const BASE_PROMPT: &str = "You are shown a screenshot of the user's screen. Find the ONE calendar event described or shown on screen (an email, a chat message, an invite, a flyer, a webpage, and so on) and extract it: its title, start time, end time if one is shown, location and any short notes worth keeping. If the screen shows more than one event, pick the one that is the clear focus of the screen (e.g. an open invite or the top message), not a list entry glimpsed in the background. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
 
 /// The built-in "Add event from screen" action (#39): group Work, input
 /// Screen, proposal `calendar_event` (#26), executor `calendar_add` (#34),

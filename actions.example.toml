@@ -9,7 +9,7 @@ proposal = "verdict"
 executor = "none"
 confirm = false
 prompt = """
-You are shown a screenshot of the user's screen. They are working through a physics or statistics problem and want a second opinion before committing an answer. Usually the problem statement is on screen (often an online assignment) while the user has done the working on paper, so their derivation is generally NOT visible to you. Sometimes a value they are about to submit is already typed into an input field, and sometimes their working is on screen too.
+You are shown a screenshot of the user's screen (or, if no image could be captured, its recognized text and fields instead). They are working through a physics or statistics problem and want a second opinion before committing an answer. Usually the problem statement is on screen (often an online assignment) while the user has done the working on paper, so their derivation is generally NOT visible to you. Sometimes a value they are about to submit is already typed into an input field, and sometimes their working is on screen too.
 
 Work the problem out yourself from what is visible, then:
 - If a candidate answer is visible (typed into a field, or written in on-screen working), compare it against your own result. Say plainly whether it matches. If it does not, give the correct value and name the specific mistake you can infer (e.g. "that is cos 30, not sin 30" or "you used the population variance formula, not the sample one").
@@ -22,7 +22,7 @@ Respond with exactly two fields, and write them in this order:
 - detail: FIRST. At most 700 characters, plain text. Show the worked solution step by step, so the user can check it against their own. Write this out in full before you write the headline, so that the headline states the conclusion this working actually reaches.
 - headline: SECOND, and it must be the conclusion of the working you just wrote. At most 90 characters, plain text. Lead with the final value, or with the correction if a visible answer is wrong. Never state a verdict in the headline that your own detail contradicts; if the working changed your mind, the headline follows the working.
 
-Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline."""
+Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline. Never use an em dash; write a full stop, a colon, or the word "and" or "but" instead."""
 rate_difficulty = false
 enabled = true
 
@@ -52,7 +52,7 @@ inputs = ["screen"]
 proposal = "calendar_event"
 executor = "calendar_add"
 confirm = true
-prompt = "You are shown a screenshot of the user's screen. Find the ONE calendar event described or shown on screen (an email, a chat message, an invite, a flyer, a webpage, and so on) and extract it: its title, start time, end time if one is shown, location and any short notes worth keeping. If the screen shows more than one event, pick the one that is the clear focus of the screen (e.g. an open invite or the top message), not a list entry glimpsed in the background."
+prompt = """You are shown a screenshot of the user's screen. Find the ONE calendar event described or shown on screen (an email, a chat message, an invite, a flyer, a webpage, and so on) and extract it: its title, start time, end time if one is shown, location and any short notes worth keeping. If the screen shows more than one event, pick the one that is the clear focus of the screen (e.g. an open invite or the top message), not a list entry glimpsed in the background. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead)."""
 rate_difficulty = false
 enabled = true
 
@@ -71,7 +71,7 @@ inputs = [
 proposal = "text_review"
 executor = "replace_text"
 confirm = true
-prompt = """You are shown the text of an email the user is writing (or, if no compose box could be read directly, a screenshot of one). Proofread it: fix spelling and grammar mistakes, and flag anything that reads as unintentionally harsh or unclear in tone. For each individual problem, propose one edit: the EXACT original text to find ("before"), what it should become ("after"), and a short reason. Keep each edit as small and specific as possible -- one edit per individual mistake (e.g. one misspelled word), never one edit spanning an entire sentence or paragraph just because it contains more than one mistake. Only propose an edit for a real problem -- never rewrite text that is already fine just to have something to say, and never propose an edit whose "after" is identical to its "before": if there is nothing to change, do not propose that edit at all. If nothing needs fixing, set "verdict" to "good_to_go" and leave "edits" empty. Otherwise set "verdict" to "needs_edits". Separately, note the overall tone in one short sentence ("tone_note"), and set "missing_attachment" to true only when the text itself mentions an attachment (e.g. "see attached", "I've attached") since you cannot see whether a real attachment is present -- this is a heuristic on the wording alone, not a real attachment check. Never suggest sending, submitting or otherwise finishing the email; only propose edits to its text."""
+prompt = """You are shown the text of an email the user is writing (or, if no compose box could be read directly, a screenshot of one). Proofread it: fix spelling and grammar mistakes, and flag anything that reads as unintentionally harsh or unclear in tone. For each individual problem, propose one edit: the EXACT original text to find ("before"), what it should become ("after"), and a short reason. Keep each edit as small and specific as possible -- one edit per individual mistake (e.g. one misspelled word), never one edit spanning an entire sentence or paragraph just because it contains more than one mistake. Only propose an edit for a real problem -- never rewrite text that is already fine just to have something to say, and never propose an edit whose "after" is identical to its "before": if there is nothing to change, do not propose that edit at all. If nothing needs fixing, set "verdict" to "good_to_go" and leave "edits" empty. Otherwise set "verdict" to "needs_edits". Separately, note the overall tone in one short sentence ("tone_note"), and set "missing_attachment" to true only when the text itself mentions an attachment (e.g. "see attached", "I've attached") since you cannot see whether a real attachment is present -- this is a heuristic on the wording alone, not a real attachment check. Never suggest sending, submitting or otherwise finishing the email; only propose edits to its text. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead)."""
 rate_difficulty = false
 enabled = true
 
@@ -89,7 +89,7 @@ inputs = [
 proposal = "form_fill"
 executor = "fill_form"
 confirm = true
-prompt = 'You are shown a screenshot of a form and a short list of its fields Wingman could not confidently map to a profile field by label alone. For each one, decide whether a profile field (named below) is the right source, or whether you can read/infer a short, literal value directly from what is visible on screen. Never invent personal data that is not visible and not in the profile. Never fill a payment field (card number, CVV, expiry, IBAN, account or routing number) by any means; leave it as "skip". If you are unsure, choose "skip" rather than guessing.'
+prompt = 'You are shown a screenshot of a form and a short list of its fields Wingman could not confidently map to a profile field by label alone. For each one, decide whether a profile field (named below) is the right source, or whether you can read/infer a short, literal value directly from what is visible on screen. Never invent personal data that is not visible and not in the profile. Never fill a payment field (card number, CVV, expiry, IBAN, account or routing number) by any means; leave it as "skip". If you are unsure, choose "skip" rather than guessing. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
 rate_difficulty = false
 enabled = true
 

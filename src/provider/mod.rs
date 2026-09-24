@@ -23,7 +23,7 @@ pub use openai_compat::OpenAiCompat;
 /// The system prompt. The user solves physics and statistics problems on paper,
 /// then screenshots the on-screen assignment to check their result before
 /// entering it. The screenshot shows the problem — not, usually, their working.
-pub const DEFAULT_PROMPT: &str = "You are shown a screenshot of the user's screen. They are working through a physics or statistics problem and want a second opinion before committing an answer. Usually the problem statement is on screen (often an online assignment) while the user has done the working on paper, so their derivation is generally NOT visible to you. Sometimes a value they are about to submit is already typed into an input field, and sometimes their working is on screen too.
+pub const DEFAULT_PROMPT: &str = "You are shown a screenshot of the user's screen (or, if no image could be captured, its recognized text and fields instead). They are working through a physics or statistics problem and want a second opinion before committing an answer. Usually the problem statement is on screen (often an online assignment) while the user has done the working on paper, so their derivation is generally NOT visible to you. Sometimes a value they are about to submit is already typed into an input field, and sometimes their working is on screen too.
 
 Work the problem out yourself from what is visible, then:
 - If a candidate answer is visible (typed into a field, or written in on-screen working), compare it against your own result. Say plainly whether it matches. If it does not, give the correct value and name the specific mistake you can infer (e.g. \"that is cos 30, not sin 30\" or \"you used the population variance formula, not the sample one\").
@@ -36,7 +36,7 @@ Respond with exactly two fields, and write them in this order:
 - detail: FIRST. At most 700 characters, plain text. Show the worked solution step by step, so the user can check it against their own. Write this out in full before you write the headline, so that the headline states the conclusion this working actually reaches.
 - headline: SECOND, and it must be the conclusion of the working you just wrote. At most 90 characters, plain text. Lead with the final value, or with the correction if a visible answer is wrong. Never state a verdict in the headline that your own detail contradicts; if the working changed your mind, the headline follows the working.
 
-Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline.";
+Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline. Never use an em dash; write a full stop, a colon, or the word \"and\" or \"but\" instead.";
 
 /// Appended programmatically to the system prompt when the difficulty toggle
 /// is on — never folded into `DEFAULT_PROMPT` itself, because the user edits
@@ -916,16 +916,78 @@ struct RawAnswer {
     difficulty: Option<String>,
 }
 
+/// #301: `Answer::detail`'s documented cap. This is a card-layout
+/// constraint (the collapsed card has room for a worked solution, not an
+/// essay), separate from [`MAX_HEADLINE_CHARS`]'s notification constraint --
+/// they are asked of the model in [`DEFAULT_PROMPT`] but not guaranteed, so
+/// [`sanitize_model_text`] enforces both here regardless of what the model
+/// actually returns.
+pub const MAX_DETAIL_CHARS: usize = 700;
+
+/// #301: `Answer::headline`'s documented cap. The headline is the only text
+/// a collapsed notification shows, so this is deliberately much smaller than
+/// [`MAX_DETAIL_CHARS`] and the two are not expected to converge.
+pub const MAX_HEADLINE_CHARS: usize = 90;
+
+/// Second line of defense for AGENTS.md Hard Rule 11 (#296): every
+/// model-facing prompt now asks the model not to use an em dash, but a
+/// prompt "cannot enforce the model" (rule 11's own wording), so this runs
+/// on every model-sourced string before it reaches a card or preview. Pure
+/// and independently unit-tested, on purpose: providers only ever hand back
+/// raw text, and nothing downstream of this function should need to know an
+/// em dash was ever possible.
+///
+/// Replaces a literal U+2014 with ", " (keeps the sentence readable without
+/// re-flowing punctuation), then clamps to `max_chars` **characters**, never
+/// splitting a multi-byte codepoint. A truncation is never silent: it ends
+/// with a single "…" (U+2026) *inside* the limit, so a cut mid-number or
+/// mid-word never reads as a complete answer (#406 review: a headline cut at
+/// 90 chars could otherwise change what value it states). The cut point
+/// prefers the last whitespace within the final ~15 characters of the kept
+/// text, so words are not chopped in half when a natural break is nearby;
+/// with no such break, it falls back to a hard cut at the character limit.
+pub fn sanitize_model_text(s: &str, max_chars: usize) -> String {
+    let replaced = s.replace('\u{2014}', ", ");
+    if replaced.chars().count() <= max_chars {
+        return replaced;
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    // One character of the budget is reserved for the ellipsis itself.
+    let keep = max_chars - 1;
+    let chars: Vec<char> = replaced.chars().take(keep).collect();
+
+    const BREAK_WINDOW: usize = 15;
+    let window_start = keep.saturating_sub(BREAK_WINDOW);
+    let cut_at = chars[window_start..]
+        .iter()
+        .rposition(|c| c.is_whitespace())
+        .map(|rel| window_start + rel)
+        .unwrap_or(keep);
+
+    let mut out: String = chars[..cut_at].iter().collect();
+    while out.ends_with(char::is_whitespace) {
+        out.pop();
+    }
+    out.push('\u{2026}');
+    out
+}
+
 /// Parses a `Completion::text` produced from a [`physics_request`] (i.e.
 /// matching `common::answer_schema`) into an `Answer`. This is the one place
 /// the physics-check schema is interpreted -- providers only ever hand back
-/// raw text.
+/// raw text. `detail`/`headline` are run through [`sanitize_model_text`]
+/// (#296, #301): the prompt asks the model to stay under the documented
+/// length and never use an em dash, but neither is guaranteed, so this is
+/// where that gets enforced regardless of what a live model actually sends.
 pub fn parse_answer(text: &str) -> Result<Answer> {
     let raw: RawAnswer =
         serde_json::from_str(text).context("provider: completion text is not a valid Answer")?;
     Ok(Answer {
-        detail: raw.detail,
-        headline: raw.headline,
+        detail: sanitize_model_text(&raw.detail, MAX_DETAIL_CHARS),
+        headline: sanitize_model_text(&raw.headline, MAX_HEADLINE_CHARS),
         // A missing or unparseable difficulty must yield `None`, never an
         // error -- the answer itself is what matters.
         difficulty: raw.difficulty.as_deref().and_then(Difficulty::parse),
@@ -1676,6 +1738,82 @@ mod tests {
     fn parse_answer_missing_difficulty_key_is_none() {
         let answer = parse_answer(r#"{"detail":"d","headline":"h"}"#).unwrap();
         assert_eq!(answer.difficulty, None);
+    }
+
+    // -- #301: unenforced length limits ------------------------------------
+
+    #[test]
+    fn parse_answer_clamps_an_overlong_detail_to_the_documented_limit() {
+        let long_detail = "a".repeat(2000);
+        let json = serde_json::json!({"detail": long_detail, "headline": "h"}).to_string();
+        let answer = parse_answer(&json).unwrap();
+        assert_eq!(answer.detail.chars().count(), MAX_DETAIL_CHARS);
+    }
+
+    #[test]
+    fn parse_answer_clamps_an_overlong_headline_to_the_documented_limit() {
+        let long_headline = "a".repeat(300);
+        let json = serde_json::json!({"detail": "d", "headline": long_headline}).to_string();
+        let answer = parse_answer(&json).unwrap();
+        assert_eq!(answer.headline.chars().count(), MAX_HEADLINE_CHARS);
+    }
+
+    #[test]
+    fn parse_answer_leaves_a_short_detail_and_headline_untouched() {
+        let answer = parse_answer(r#"{"detail":"short","headline":"also short"}"#).unwrap();
+        assert_eq!(answer.detail, "short");
+        assert_eq!(answer.headline, "also short");
+    }
+
+    // -- #296: em dash reaches the parsed Answer unless sanitized ----------
+
+    #[test]
+    fn parse_answer_replaces_an_em_dash_in_detail_and_headline() {
+        let json = serde_json::json!({
+            "detail": "the answer is 5\u{2014}not 4",
+            "headline": "5\u{2014}correction",
+        })
+        .to_string();
+        let answer = parse_answer(&json).unwrap();
+        assert!(!answer.detail.contains('\u{2014}'), "{}", answer.detail);
+        assert!(!answer.headline.contains('\u{2014}'), "{}", answer.headline);
+        assert_eq!(answer.detail, "the answer is 5, not 4");
+        assert_eq!(answer.headline, "5, correction");
+    }
+
+    #[test]
+    fn sanitize_model_text_truncation_ends_with_an_ellipsis_within_the_limit() {
+        let long = "a".repeat(200);
+        let out = sanitize_model_text(&long, 90);
+        assert!(out.ends_with('\u{2026}'), "{out}");
+        assert!(out.chars().count() <= 90, "{}", out.chars().count());
+    }
+
+    #[test]
+    fn sanitize_model_text_prefers_cutting_at_the_last_whitespace_near_the_limit() {
+        // "0123456789 " (11 chars) repeated, with a space just inside the
+        // final ~15 characters of the 20-char budget -- the cut should land
+        // on that space rather than mid-digit.
+        let s = "0123456789 0123456789";
+        let out = sanitize_model_text(s, 20);
+        assert_eq!(out, "0123456789…");
+        assert!(out.chars().count() <= 20);
+    }
+
+    #[test]
+    fn sanitize_model_text_leaves_a_short_string_untouched() {
+        let out = sanitize_model_text("short", 90);
+        assert_eq!(out, "short");
+        assert!(!out.contains('\u{2026}'));
+    }
+
+    #[test]
+    fn sanitize_model_text_clamps_on_a_char_boundary_not_a_byte_boundary() {
+        // Each of these is a multi-byte codepoint; a byte-based truncation
+        // at an odd length would split one and either panic or corrupt it.
+        let multibyte = "\u{00e9}".repeat(10); // "é" * 10
+        let out = sanitize_model_text(&multibyte, 3);
+        assert_eq!(out.chars().count(), 3);
     }
 
     #[test]
