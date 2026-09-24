@@ -12,3 +12,9 @@ __pycache__/
 # every run (see that file's doc comment for why); never hand-edited or
 # committed.
 tests/compile_fail/generated/
+
+# Personal Claude Code settings (per-machine permissions); the shared
+# .claude/settings.json above stays tracked.
+.claude/settings.local.json
+.env
+.env.*

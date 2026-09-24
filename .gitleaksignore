@@ -1,0 +1,7 @@
+# Findings gitleaks reports that are known false positives. One fingerprint
+# per line (commit:file:rule:line); each needs a comment saying why.
+#
+# src/diagnostics.rs: "sk-TESTSECRET1234567890ABCDEF" is a deliberately
+# realistic-looking FAKE key in the test proving Copy diagnostics never leaks
+# any substring of a configured key (#124). Reviewed 2026-09-24.
+5d68281169c069f1e2198d4de259f7c449ca6885:src/diagnostics.rs:generic-api-key:596
