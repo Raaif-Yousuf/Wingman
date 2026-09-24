@@ -299,6 +299,7 @@ impl Palette {
             router_summary: None,
             hover: None,
             tracking_leave: false,
+            suppress_en_change: false,
         });
         let raw = Box::into_raw(inner);
 
@@ -944,6 +945,16 @@ struct PaletteInner {
     /// avoids the extra syscall on every single mouse-move while still
     /// tracking is armed.
     tracking_leave: bool,
+    /// #414: armed around `show`'s own programmatic
+    /// `SetWindowTextW(edit_hwnd, "")` clear, which -- MEASURED 2026-09-24 in
+    /// a real-window test -- fires a real, synchronous `EN_CHANGE` for this
+    /// edit control, not just user typing or `EM_REPLACESEL` as the old
+    /// comment here assumed. While armed, `handle_message`'s `EN_CHANGE` arm
+    /// treats the notification as the programmatic clear it is: it skips
+    /// marking `interacted`/clearing `router_summary` (both already just set
+    /// by `show`) and skips the redundant `rebuild_state` (`show` already
+    /// calls it with the real, empty query right after).
+    suppress_en_change: bool,
 }
 
 impl PaletteInner {
@@ -965,9 +976,16 @@ impl PaletteInner {
         self.router_summary = None;
         self.hover = None;
         self.tracking_leave = false;
+        // #414: SetWindowTextW below fires a real, synchronous EN_CHANGE for
+        // this edit control -- see `suppress_en_change`'s doc comment. Armed
+        // only around this one call, so a genuine keystroke that lands
+        // between `show` calls (impossible: this is all synchronous) or any
+        // later real typing still sets `interacted` normally.
+        self.suppress_en_change = true;
         unsafe {
             let _ = SetWindowTextW(self.edit_hwnd, PCWSTR(wide_z("").as_ptr()));
         }
+        self.suppress_en_change = false;
         self.rebuild_state("");
         self.reposition_centered();
         unsafe {
@@ -1498,10 +1516,16 @@ impl PaletteInner {
                 let notify = (wp >> 16) & 0xFFFF;
                 let ctrl_id = (wp & 0xFFFF) as i32;
                 if notify == EN_CHANGE && ctrl_id == QUERY_EDIT_ID && lparam.0 != 0 {
-                    // #24: real user typing (never the programmatic clear in
-                    // `show`, which uses SetWindowTextW and never fires
-                    // EN_CHANGE) -- the router's suggestion must not steal
-                    // the selection back from here on for this showing.
+                    if self.suppress_en_change {
+                        // #414: this is `show`'s own programmatic clear, not
+                        // real user typing -- `show` already reset
+                        // `interacted`/`router_summary` and will call
+                        // `rebuild_state` itself right after.
+                        return Some(LRESULT(0));
+                    }
+                    // #24: real user typing -- the router's suggestion must
+                    // not steal the selection back from here on for this
+                    // showing.
                     self.interacted = true;
                     self.router_summary = None;
                     let query = self.current_query();
@@ -2038,6 +2062,28 @@ mod tests {
         );
     }
 
+    /// #414: the fix for `show`'s programmatic clear must not also swallow
+    /// genuine user typing -- a real `EN_CHANGE` from `set_query_for_test`
+    /// (which drives the query through the real edit control, not by poking
+    /// `PaletteState` directly) must still mark `interacted`.
+    #[test]
+    fn real_typing_after_show_still_marks_interacted() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        assert!(
+            !p.inner.interacted,
+            "show() itself must not mark interacted"
+        );
+        p.set_query_for_test("copy");
+        pump_pending(p.hwnd());
+        assert!(
+            p.inner.interacted,
+            "a real EN_CHANGE from user typing must mark interacted"
+        );
+    }
+
     fn many_ungrouped_actions(n: usize) -> Vec<PaletteAction> {
         (0..n)
             .map(|i| PaletteAction {
@@ -2313,17 +2359,31 @@ mod tests {
         assert_eq!(p.inner.router_summary, None);
     }
 
+    /// #414: `show()`'s own programmatic `SetWindowTextW(edit_hwnd, "")`
+    /// clear must never look like real user input -- if it does, `interacted`
+    /// is `true` immediately after every `show()`, and
+    /// `crate::router::should_apply` (which refuses once `interacted`) means
+    /// the router's preselect (#24) can never apply in the real app. This
+    /// calls only `show()` then `apply_router_suggestion`, with no manual
+    /// `interacted` reset, unlike the tests below.
+    #[test]
+    fn show_does_not_mark_interacted_so_a_router_suggestion_still_applies() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.9), 0.5);
+        assert_eq!(
+            p.inner.router_summary.as_deref(),
+            Some("Check my work"),
+            "show()'s own programmatic text clear must not mark interacted, \
+             or a genuine above-threshold router suggestion can never apply"
+        );
+    }
+
     #[test]
     fn apply_router_suggestion_replaces_pending_text_with_the_real_summary() {
         let mut p = Palette::new_for_test(instance()).unwrap();
         p.show(free_actions(), true, "mode: Auto".to_string());
-        // #414: show()'s own SetWindowTextW clear fires a real, synchronous
-        // EN_CHANGE in this real-window test harness, which marks
-        // `interacted` true before this test's simulated router result ever
-        // arrives -- a separate, pre-existing bug unrelated to #359. Reset
-        // it here so this test exercises apply_router_suggestion's own
-        // decision chain in isolation.
-        p.inner.interacted = false;
         let generation = p.router_generation();
         p.set_router_pending(generation);
         p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.9), 0.5);
