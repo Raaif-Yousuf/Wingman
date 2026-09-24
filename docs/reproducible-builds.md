@@ -110,7 +110,7 @@ in the job via `cargo install cargo-cyclonedx --locked`; the tool itself is
 Apache-2.0, permissive per CLAUDE.md rule 2 -- checked at
 <https://crates.io/crates/cargo-cyclonedx> before adding it here) and
 uploads it as a release asset alongside `wingman.exe`, `wingman.msix` and
-`SHA256SUMS`. It describes `Cargo.lock`'s resolved dependency graph for
+`SHA256SUMS.txt`. It describes `Cargo.lock`'s resolved dependency graph for
 this build (name, version, license where crates.io metadata has it,
 PURLs); it is not itself a reproducibility check; it is what
 `THIRD_PARTY_NOTICES.md` already keeps by hand, in a machine-readable

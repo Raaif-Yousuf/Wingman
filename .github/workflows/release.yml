@@ -133,7 +133,11 @@ jobs:
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$h  $($_.Name)"
           }
-          Set-Content -Path dist\SHA256SUMS -Value $hashes -Encoding ascii
+          # sha256sum -c / Get-FileHash comparisons expect LF line endings
+          # (the standard sha256sum format), not pwsh's default CRLF, so the
+          # newline is built by hand rather than left to Set-Content.
+          $content = ($hashes -join "`n") + "`n"
+          [IO.File]::WriteAllText("$PWD\dist\SHA256SUMS.txt", $content, [Text.Encoding]::ASCII)
 
       - name: Create or update the GitHub release
         env:
@@ -150,15 +154,16 @@ jobs:
             'certificate that eventually signs it; build from source and run install.ps1 for a ' +
             'locally-signed, installable copy in the meantime.'
           }
-          $sums = Get-Content dist\SHA256SUMS -Raw
-          $notes = "$signedNote`n`n``````text`n$sums``````"
+          $sums = Get-Content dist\SHA256SUMS.txt -Raw
+          $verifyHint = 'Verify a download: (Get-FileHash .\wingman.exe -Algorithm SHA256).Hash.ToLower() should match its line in SHA256SUMS.txt.'
+          $notes = "$signedNote`n`n$verifyHint`n`n``````text`n$sums``````"
           $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           Set-Content -Path $notesPath -Value $notes -Encoding utf8
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS --clobber
+            gh release upload $tag dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS.txt --clobber
             gh release edit $tag --notes-file $notesPath
           } else {
-            gh release create $tag dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS `
+            gh release create $tag dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS.txt `
               --title $tag --notes-file $notesPath --target $env:GITHUB_SHA
           }

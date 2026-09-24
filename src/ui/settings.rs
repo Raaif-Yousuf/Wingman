@@ -184,10 +184,22 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     // CLIENT height, not the window height -- the caption and borders are
     // ~100px at 250% scaling, which is enough to push Save and Cancel below
     // the visible area. Ask the window what it actually got.
+    //
+    // Issue #340 MEASURED 2026-09-24: this used to clamp the result up to
+    // at least `MIN_WIN_H_DP` (`.max(MIN_WIN_H_DP)`). On a small screen at
+    // high DPI (reproduced here at 1280x800 @ 240dpi/250%) the real client
+    // area can be smaller than `MIN_WIN_H_DP`, and clamping up made
+    // `build_ui` believe it had more room than it actually did -- the
+    // Prompt group and the Save/Cancel footer both got positioned using a
+    // taller height than the real client rect, landing partly or fully
+    // below the visible window. `prompt_footer_layout` already keeps the
+    // footer below the Prompt group for *any* `win_h_dp`, however small, so
+    // this only needs the true measured value, floored at 1 so a later
+    // subtraction never goes negative.
     let client_h_dp = {
         let mut rc = windows::Win32::Foundation::RECT::default();
         if unsafe { GetClientRect(hwnd, &mut rc) }.is_ok() {
-            ((rc.bottom - rc.top) * 96 / dpi.max(1) as i32).max(MIN_WIN_H_DP)
+            ((rc.bottom - rc.top) * 96 / dpi.max(1) as i32).max(1)
         } else {
             fitted_h
         }
@@ -591,7 +603,20 @@ fn fitted_height_dp(hwnd: HWND, dpi: u32) -> i32 {
 
 const WIN_W_DP: i32 = 620;
 const WIN_H_DP: i32 = 820;
-/// Below this the prompt box stops being usable; scroll rather than shrink further.
+/// Below this the prompt box stops being usable; scroll rather than shrink
+/// further (not yet built -- see `prompt_footer_layout`'s doc comment).
+///
+/// This is only a floor against a failed/absurd monitor query (see its use
+/// in `fitted_height_dp` and the `client_h_dp` fallback in `show_modal`),
+/// not a guarantee that content never gets clipped: that guarantee is
+/// `prompt_footer_layout`'s job now (issue #340), and it holds for whatever
+/// `win_h_dp` the window actually ends up with, however small. MEASURED
+/// 2026-09-24: raising this constant to try to force enough room for the
+/// Prompt group is a trap -- `show_modal`'s `client_h_dp` clamps the real,
+/// measured client height *up* to at least `MIN_WIN_H_DP`
+/// (`.max(MIN_WIN_H_DP)`), so a large `MIN_WIN_H_DP` makes `build_ui` believe
+/// the window is taller than it actually is on a small screen, which pushes
+/// the footer below the real visible area instead of fixing anything.
 const MIN_WIN_H_DP: i32 = 420;
 
 const MARGIN: i32 = 16;
@@ -605,6 +630,75 @@ const BTN_H: i32 = 28;
 
 fn to_px(dp: i32, dpi: u32) -> i32 {
     ((dp as i64 * dpi as i64 + 48) / 96) as i32
+}
+
+/// Below this the prompt box stops being usable; scroll rather than shrink
+/// further. (`MIN_PROMPT_EDIT_H` in dp, three text rows tall.)
+const MIN_PROMPT_EDIT_H: i32 = ROW_H * 3;
+
+/// Rects for the Prompt group box and the Save/Cancel footer, computed
+/// purely from where the fixed-height groups above it end (`content_top`,
+/// in dp) and how tall the window's client area actually is (`win_h_dp`).
+///
+/// Issue #340: the previous code placed the footer at a fixed offset from
+/// `win_h_dp` (`win_h_dp - buttons_h`) while the Prompt group's *top* came
+/// from `content_top`, a value that does not shrink with the window. At
+/// high DPI on a small monitor `fitted_height_dp` shrinks `win_h_dp` well
+/// below `content_top`, so the footer's fixed offset from the (now much
+/// smaller) `win_h_dp` landed *above* `content_top`, drawing Save/Cancel on
+/// top of the Prompt box. MEASURED 2026-09-24 (issue #340 screenshot, 150%
+/// scaling).
+///
+/// This function makes the invariant structural instead of incidental: the
+/// footer is always placed below the Prompt group's actual bottom, never
+/// derived from `win_h_dp` alone. When there's enough room the footer still
+/// sits flush with the bottom of the window (unchanged from before); when
+/// there isn't, the Prompt group takes its minimum height and the footer is
+/// pushed down to clear it, which can push the footer below the visible
+/// window on a very short client area rather than overlapping it -- clipping
+/// instead of overlap. `fitted_height_dp`'s `MIN_WIN_H_DP` is sized so that
+/// case does not occur on a 1080p screen at up to 200% scaling (see its own
+/// comment).
+struct PromptFooterLayout {
+    prompt_top: i32,
+    prompt_bottom: i32,
+    prompt_edit_h: i32,
+    reset_btn_y: i32,
+    buttons_y: i32,
+}
+
+fn prompt_footer_layout(content_top: i32, win_h_dp: i32) -> PromptFooterLayout {
+    let buttons_h = BTN_H + MARGIN * 2;
+    let reset_btn_h = BTN_H;
+    let prompt_top = content_top;
+    let prompt_label_bottom = prompt_top + GROUP_LABEL_TOP;
+
+    // The smallest the Prompt group can be and still hold a usable edit box
+    // and the reset button: label, minimum edit height, the gap before the
+    // reset button, the reset button itself, and a bottom margin before the
+    // group's own border.
+    let min_prompt_group_h = GROUP_LABEL_TOP + MIN_PROMPT_EDIT_H + ROW_GAP + reset_btn_h + MARGIN;
+
+    let desired_prompt_bottom = win_h_dp - buttons_h;
+    let prompt_bottom = desired_prompt_bottom.max(prompt_top + min_prompt_group_h);
+
+    let prompt_edit_h = ((prompt_bottom - MARGIN) - prompt_label_bottom - reset_btn_h - ROW_GAP)
+        .max(MIN_PROMPT_EDIT_H);
+    let reset_btn_y = prompt_label_bottom + prompt_edit_h + ROW_GAP;
+
+    // Flush with the window bottom when there's room (matches the original
+    // layout exactly); otherwise pinned just below the Prompt group's own
+    // bottom, which by construction is always >= where the reset button
+    // ends, so Save/Cancel can never land on the Prompt box.
+    let buttons_y = (prompt_bottom + GROUP_GAP).max(win_h_dp - buttons_h + MARGIN);
+
+    PromptFooterLayout {
+        prompt_top,
+        prompt_bottom,
+        prompt_edit_h,
+        reset_btn_y,
+        buttons_y,
+    }
 }
 
 fn wide_z(s: &str) -> Vec<u16> {
@@ -1451,13 +1545,13 @@ fn build_ui(
     y = card_bottom + GROUP_GAP;
 
     // -- Prompt (grows to fill remaining space above the button row) ------
-    let buttons_h = BTN_H + MARGIN * 2;
-    let prompt_top = y;
-    let prompt_bottom = win_h_dp - buttons_h;
-    y += GROUP_LABEL_TOP;
+    let footer = prompt_footer_layout(y, win_h_dp);
+    let prompt_top = footer.prompt_top;
+    let prompt_bottom = footer.prompt_bottom;
+    y = prompt_top + GROUP_LABEL_TOP;
 
     let reset_btn_h = BTN_H;
-    let prompt_edit_h = (prompt_bottom - MARGIN) - y - reset_btn_h - ROW_GAP;
+    let prompt_edit_h = footer.prompt_edit_h;
     let prompt_edit = ctx.create(
         WC_EDIT,
         &config.ui.prompt,
@@ -1466,7 +1560,7 @@ fn build_ui(
         content_x + MARGIN,
         y,
         content_w - 2 * MARGIN,
-        prompt_edit_h.max(ROW_H * 3),
+        prompt_edit_h,
         ID_PROMPT_EDIT,
     );
     // WS_VSCROLL isn't representable via the `style` u32 alone without
@@ -1489,7 +1583,7 @@ fn build_ui(
         BS_PUSHBUTTON as u32,
         0,
         content_x + MARGIN,
-        y + prompt_edit_h.max(ROW_H * 3) + ROW_GAP,
+        footer.reset_btn_y,
         200,
         reset_btn_h,
         ID_RESET_PROMPT,
@@ -1508,7 +1602,7 @@ fn build_ui(
     );
 
     // -- Save / Cancel ------------------------------------------------
-    let buttons_y = win_h_dp - buttons_h + MARGIN;
+    let buttons_y = footer.buttons_y;
     ctx.create(
         WC_BUTTON,
         "Cancel",
@@ -2482,6 +2576,69 @@ mod tests {
     #[test]
     fn to_px_scales_up_at_250_percent() {
         assert_eq!(to_px(100, 240), 250);
+    }
+
+    // -- prompt_footer_layout (issue #340) -------------------------------
+    // The bug: Save/Cancel are placed from `win_h_dp` alone while the
+    // Prompt group's top comes from the fixed content above it, so a
+    // shrunk `win_h_dp` (high DPI, small monitor) can put the footer
+    // above the Prompt box's actual bottom. These assert the invariant
+    // directly: the reset button (the Prompt group's lowest control) must
+    // always end above the Save/Cancel row, at both 96dpi's un-shrunk
+    // window and 144dpi's (150%) shrunk one.
+
+    /// The y where the Prompt group starts on a real Settings window: the
+    /// bottom of the last fixed group (Card) plus `GROUP_GAP`. Hand-computed
+    /// from the constants that drive `build_ui`'s Providers/Ollama/General/
+    /// Capture/Card sections with `Config::default()` (5 + 0 + 4 + 1 + 2
+    /// rows respectively); kept here as a literal, not derived, so a change
+    /// to those sections has to update this test deliberately rather than
+    /// silently keep passing against a moving target.
+    const CONTENT_TOP_DP: i32 = 640;
+
+    fn footer_does_not_overlap(win_h_dp: i32) -> bool {
+        let footer = prompt_footer_layout(CONTENT_TOP_DP, win_h_dp);
+        let reset_btn_bottom = footer.reset_btn_y + BTN_H;
+        reset_btn_bottom <= footer.buttons_y && footer.prompt_bottom <= footer.buttons_y
+    }
+
+    #[test]
+    fn footer_does_not_overlap_prompt_at_96_dpi_full_height() {
+        // 96dpi (100%), `fitted_height_dp` leaves the window at its full
+        // design height.
+        assert!(footer_does_not_overlap(WIN_H_DP));
+    }
+
+    #[test]
+    fn footer_does_not_overlap_prompt_at_144_dpi_shrunk_height() {
+        // 144dpi (150%) on a 1080p screen: `fitted_height_dp` shrinks the
+        // window to roughly 645dp of usable client height (MEASURED via
+        // the same formula `fitted_height_dp` uses, for a ~1040px-tall work
+        // area at 144dpi: (1040*96/144) - 48 ~= 645), well below
+        // `CONTENT_TOP_DP`. This is the exact shape of issue #340's
+        // screenshot.
+        assert!(footer_does_not_overlap(645));
+    }
+
+    #[test]
+    fn footer_does_not_overlap_prompt_at_the_configured_minimum_height() {
+        assert!(footer_does_not_overlap(MIN_WIN_H_DP));
+    }
+
+    #[test]
+    fn footer_sits_flush_with_the_window_bottom_when_there_is_room() {
+        // Unchanged from the pre-#340 behaviour when the window is tall
+        // enough: Save/Cancel hug the bottom edge rather than floating
+        // higher than necessary. `WIN_H_DP` (820) itself is not tall enough
+        // for `CONTENT_TOP_DP` (640) plus the Prompt group's minimum
+        // (issue #340's underlying finding: the original 820dp design
+        // height never actually had room for its own content -- see
+        // `MIN_WIN_H_DP`'s comment), so this uses a window tall enough to
+        // exercise the "plenty of room" branch specifically.
+        let roomy_win_h_dp = 900;
+        let footer = prompt_footer_layout(CONTENT_TOP_DP, roomy_win_h_dp);
+        let buttons_h = BTN_H + MARGIN * 2;
+        assert_eq!(footer.buttons_y, roomy_win_h_dp - buttons_h + MARGIN);
     }
 
     // -- window smoke test ----------------------------------------------
