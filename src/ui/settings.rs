@@ -82,7 +82,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_VSCROLL,
 };
 
-use crate::config::{Config, OllamaConfig};
+use crate::config::{Config, OllamaConfig, RequireTickFor};
 use crate::hotkey::chord_to_string;
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::DEFAULT_PROMPT;
@@ -534,6 +534,8 @@ const ID_OLLAMA_STATUS: i32 = 120;
 /// after a Save attempt with an invalid numeric field. Not a form field --
 /// never read back in `read_form`/`build_config`.
 const ID_VALIDATION_MESSAGE: i32 = 121;
+/// #403: the fill-form tick-requirement combo (`config.forms.require_tick_for`).
+const ID_REQUIRE_TICK_FOR: i32 = 122;
 
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
@@ -566,6 +568,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_CANCEL", ID_CANCEL),
     ("ID_OLLAMA_STATUS", ID_OLLAMA_STATUS),
     ("ID_VALIDATION_MESSAGE", ID_VALIDATION_MESSAGE),
+    ("ID_REQUIRE_TICK_FOR", ID_REQUIRE_TICK_FOR),
 ];
 
 // ---------------------------------------------------------------------------
@@ -656,7 +659,13 @@ fn fitted_height_dp(hwnd: HWND, dpi: u32) -> i32 {
 }
 
 const WIN_W_DP: i32 = 620;
-const WIN_H_DP: i32 = 820;
+/// #403 review: raised from 820 by the Forms group's full height (68dp: see
+/// `CONTENT_TOP_DP`'s comment) so the default window still has room for the
+/// Prompt group at something close to its natural size instead of always
+/// falling back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout`
+/// itself never overlaps regardless of this constant, but a taller default
+/// is nicer than always squeezing.
+const WIN_H_DP: i32 = 888;
 /// Below this the prompt box stops being usable; scroll rather than shrink
 /// further (not yet built -- see `prompt_footer_layout`'s doc comment).
 ///
@@ -1598,6 +1607,56 @@ fn build_ui(
     );
     y = card_bottom + GROUP_GAP;
 
+    // -- Forms (#403) -------------------------------------------------
+    let forms_top = y;
+    y += GROUP_LABEL_TOP;
+    let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
+
+    ctx.create(
+        WC_STATIC,
+        "Require a tick to fill:",
+        0,
+        0,
+        r.x,
+        r.y,
+        150,
+        ROW_H,
+        0,
+    );
+    let require_tick_for = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + 150,
+        r.y,
+        r.w - 150,
+        ROW_H * 4,
+        ID_REQUIRE_TICK_FOR,
+    );
+    for label in REQUIRE_TICK_FOR_LABELS {
+        combo_add(require_tick_for, label);
+    }
+    combo_select(
+        require_tick_for,
+        require_tick_for_label(config.forms.require_tick_for),
+    );
+    r.advance();
+
+    let forms_bottom = r.y + 4;
+    ctx.create(
+        WC_BUTTON,
+        "Fill forms",
+        BS_GROUPBOX as u32,
+        0,
+        content_x,
+        forms_top,
+        content_w,
+        forms_bottom - forms_top,
+        0,
+    );
+    y = forms_bottom + GROUP_GAP;
+
     // -- Prompt (grows to fill remaining space above the button row) ------
     let footer = prompt_footer_layout(y, win_h_dp);
     let prompt_top = footer.prompt_top;
@@ -1722,6 +1781,7 @@ fn build_ui(
         ID_CARD_SECONDS,
         ID_SHOW_DIFFICULTY,
         ID_TEXT_SCALE_TRACK,
+        ID_REQUIRE_TICK_FOR,
         ID_PROMPT_EDIT,
         ID_RESET_PROMPT,
         ID_SAVE,
@@ -1776,6 +1836,7 @@ struct RawForm {
     show_difficulty: bool,
     text_scale_raw: f32,
     prompt: String,
+    require_tick_for: String,
 }
 
 /// Reads every control into a [`RawForm`], without yet folding it into a
@@ -1815,6 +1876,7 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
         prompt: get_dlg_item(hwnd, ID_PROMPT_EDIT)
             .map(get_text)
             .unwrap_or_default(),
+        require_tick_for: combo_selected_text(hwnd, ID_REQUIRE_TICK_FOR),
     }
 }
 
@@ -1910,6 +1972,34 @@ fn parse_max_edge_or(text: &str, fallback: u32) -> u32 {
     match text.trim().parse::<u32>() {
         Ok(v) if v > 0 => v,
         _ => fallback,
+    }
+}
+
+/// #403: the three [`RequireTickFor`] labels shown in the Settings combo, in
+/// display order. Plain words, not the config's internal `all`/`sensitive`/
+/// `none` tokens (rule 11's sibling concern, #341: Settings speaks in
+/// internals).
+const REQUIRE_TICK_FOR_LABELS: [&str; 3] = ["All fields", "Only sensitive fields", "Never"];
+
+/// The label shown for a given [`RequireTickFor`] value. Inverse of
+/// [`label_to_require_tick_for`].
+fn require_tick_for_label(value: RequireTickFor) -> &'static str {
+    match value {
+        RequireTickFor::All => REQUIRE_TICK_FOR_LABELS[0],
+        RequireTickFor::Sensitive => REQUIRE_TICK_FOR_LABELS[1],
+        RequireTickFor::None => REQUIRE_TICK_FOR_LABELS[2],
+    }
+}
+
+/// Parses a combo selection back into a [`RequireTickFor`]. `None` for a
+/// blank or unrecognized selection, so callers can fall back to the
+/// original config value rather than silently picking a default.
+fn label_to_require_tick_for(label: &str) -> Option<RequireTickFor> {
+    match label {
+        "All fields" => Some(RequireTickFor::All),
+        "Only sensitive fields" => Some(RequireTickFor::Sensitive),
+        "Never" => Some(RequireTickFor::None),
+        _ => None,
     }
 }
 
@@ -2090,6 +2180,9 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     } else {
         raw.prompt.clone()
     };
+
+    cfg.forms.require_tick_for =
+        label_to_require_tick_for(&raw.require_tick_for).unwrap_or(original.forms.require_tick_for);
 
     cfg
 }
@@ -2658,6 +2751,7 @@ mod tests {
             show_difficulty: original.ui.show_difficulty,
             text_scale_raw: original.ui.text_scale,
             prompt: original.ui.prompt.clone(),
+            require_tick_for: require_tick_for_label(original.forms.require_tick_for).to_string(),
         }
     }
 
@@ -2681,6 +2775,51 @@ mod tests {
             cfg.providers.anthropic.models,
             original.providers.anthropic.models
         );
+    }
+
+    // -- require_tick_for (#403) ------------------------------------------
+
+    #[test]
+    fn require_tick_for_label_round_trips_for_all_variants() {
+        for value in [
+            RequireTickFor::All,
+            RequireTickFor::Sensitive,
+            RequireTickFor::None,
+        ] {
+            let label = require_tick_for_label(value);
+            assert_eq!(label_to_require_tick_for(label), Some(value));
+        }
+    }
+
+    #[test]
+    fn label_to_require_tick_for_rejects_unknown_text() {
+        assert_eq!(label_to_require_tick_for(""), None);
+        assert_eq!(label_to_require_tick_for("garbage"), None);
+    }
+
+    #[test]
+    fn build_config_round_trips_require_tick_for_through_all_three_variants() {
+        for value in [
+            RequireTickFor::All,
+            RequireTickFor::Sensitive,
+            RequireTickFor::None,
+        ] {
+            let mut original = Config::default();
+            original.forms.require_tick_for = value;
+            let raw = raw_from(&original);
+            let cfg = build_config(&original, &raw);
+            assert_eq!(cfg.forms.require_tick_for, value);
+        }
+    }
+
+    #[test]
+    fn build_config_falls_back_to_original_require_tick_for_on_blank_selection() {
+        let mut original = Config::default();
+        original.forms.require_tick_for = RequireTickFor::All;
+        let mut raw = raw_from(&original);
+        raw.require_tick_for = String::new();
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.forms.require_tick_for, RequireTickFor::All);
     }
 
     #[test]
@@ -2799,13 +2938,20 @@ mod tests {
     // window and 144dpi's (150%) shrunk one.
 
     /// The y where the Prompt group starts on a real Settings window: the
-    /// bottom of the last fixed group (Card) plus `GROUP_GAP`. Hand-computed
-    /// from the constants that drive `build_ui`'s Providers/Ollama/General/
-    /// Capture/Card sections with `Config::default()` (5 + 0 + 4 + 1 + 2
-    /// rows respectively); kept here as a literal, not derived, so a change
-    /// to those sections has to update this test deliberately rather than
-    /// silently keep passing against a moving target.
-    const CONTENT_TOP_DP: i32 = 640;
+    /// bottom of the last fixed group (Forms, #403) plus `GROUP_GAP`.
+    /// Hand-computed from the constants that drive `build_ui`'s
+    /// Providers/Ollama/General/Capture/Card sections with `Config::default()`
+    /// (5 + 0 + 4 + 1 + 2 rows respectively, giving 640 -- see git blame for
+    /// that derivation), plus the #403 Forms group added after Card and
+    /// before Prompt: one row, so its own height is
+    /// `GROUP_LABEL_TOP + (ROW_H + ROW_GAP) + 4` (the same `label + rows +
+    /// bottom padding` shape every other group in `build_ui` uses) `=
+    /// 20 + 30 + 4 = 54`, plus the `GROUP_GAP` (14) that already separated
+    /// Card from whatever came next `= 640 + 54 + 14 = 708`. Kept here as a
+    /// literal, not derived, so a change to those sections has to update this
+    /// test deliberately rather than silently keep passing against a moving
+    /// target.
+    const CONTENT_TOP_DP: i32 = 708;
 
     fn footer_does_not_overlap(win_h_dp: i32) -> bool {
         let footer = prompt_footer_layout(CONTENT_TOP_DP, win_h_dp);
@@ -2840,13 +2986,16 @@ mod tests {
     fn footer_sits_flush_with_the_window_bottom_when_there_is_room() {
         // Unchanged from the pre-#340 behaviour when the window is tall
         // enough: Save/Cancel hug the bottom edge rather than floating
-        // higher than necessary. `WIN_H_DP` (820) itself is not tall enough
-        // for `CONTENT_TOP_DP` (640) plus the Prompt group's minimum
-        // (issue #340's underlying finding: the original 820dp design
-        // height never actually had room for its own content -- see
-        // `MIN_WIN_H_DP`'s comment), so this uses a window tall enough to
-        // exercise the "plenty of room" branch specifically.
-        let roomy_win_h_dp = 900;
+        // higher than necessary. Even `WIN_H_DP` (888, raised by #403's
+        // Forms group) is not tall enough for `CONTENT_TOP_DP` (708) plus
+        // the Prompt group's minimum (issue #340's underlying finding: the
+        // original design height never actually had room for its own
+        // content -- see `MIN_WIN_H_DP`'s comment), so this uses a window
+        // tall enough to exercise the "plenty of room" branch specifically.
+        // Needs `win_h_dp - buttons_h >= CONTENT_TOP_DP + min_prompt_group_h`
+        // (708 + 138 = 846, so > 906) to actually land in the flush branch
+        // rather than the minimum-height one; 950 gives headroom.
+        let roomy_win_h_dp = 950;
         let footer = prompt_footer_layout(CONTENT_TOP_DP, roomy_win_h_dp);
         let buttons_h = BTN_H + MARGIN * 2;
         assert_eq!(footer.buttons_y, roomy_win_h_dp - buttons_h + MARGIN);
