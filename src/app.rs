@@ -776,8 +776,7 @@ impl App {
 
         std::thread::spawn(move || {
             let result: std::result::Result<router::RouterResult, String> =
-                router_worker(&providers, mode, &raw, &candidates)
-                    .map_err(|e| format!("{e:#}"));
+                router_worker(&providers, mode, &raw, &candidates).map_err(|e| format!("{e:#}"));
             let payload = Box::into_raw(Box::new((generation, result)));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
