@@ -1214,7 +1214,11 @@ fn build_ui(
     for e in EFFORT_LABELS {
         combo_add(openai_effort, e);
     }
-    combo_select(openai_effort, effort_label(&config.providers.openai.effort));
+    combo_select_with_custom(
+        openai_effort,
+        &EFFORT_LABELS,
+        &effort_display(&config.providers.openai.effort),
+    );
     r.advance();
 
     // Anthropic
@@ -1296,9 +1300,10 @@ fn build_ui(
     for e in EFFORT_LABELS {
         combo_add(anthropic_effort, e);
     }
-    combo_select(
+    combo_select_with_custom(
         anthropic_effort,
-        effort_label(&config.providers.anthropic.effort),
+        &EFFORT_LABELS,
+        &effort_display(&config.providers.anthropic.effort),
     );
     r.advance();
 
@@ -1472,7 +1477,11 @@ fn build_ui(
     for v in MAX_EDGE_LABELS {
         combo_add(max_edge, v);
     }
-    combo_select(max_edge, max_edge_label(config.capture.max_edge));
+    combo_select_with_custom(
+        max_edge,
+        &MAX_EDGE_LABELS,
+        &max_edge_display(config.capture.max_edge),
+    );
 
     ctx.create(
         WC_STATIC,
@@ -1499,7 +1508,11 @@ fn build_ui(
     for v in MONITOR_LABELS {
         combo_add(monitor, v);
     }
-    combo_select(monitor, monitor_label(&config.capture.monitor));
+    combo_select_with_custom(
+        monitor,
+        &MONITOR_LABELS,
+        &monitor_display(&config.capture.monitor),
+    );
     r.advance();
 
     // #341: a one-line hint, since "screenshot detail" alone doesn't say
@@ -2003,6 +2016,24 @@ fn parse_max_edge_or(text: &str, fallback: u32) -> u32 {
     }
 }
 
+/// Review of #341 (data loss): a value outside a combo's fixed preset list
+/// (a hand-edited `config.toml`, e.g. `max_edge = 999`) used to display as
+/// the nearest/default preset -- so opening Settings and pressing Save with
+/// nothing touched silently replaced the real value with that preset's.
+/// Every preset combo below instead shows an honest `"Custom (<value>)"`
+/// entry for an off-preset value and selects it, so an untouched Save writes
+/// back the exact original value; the wrapping quotes are omitted from the
+/// label itself, matching `parse_custom_label`'s expectation.
+fn custom_label(raw: &str) -> String {
+    format!("Custom ({raw})")
+}
+
+/// The inverse of [`custom_label`]: the raw text inside `"Custom (...)"`, or
+/// `None` if `label` isn't one.
+fn parse_custom_label(label: &str) -> Option<&str> {
+    label.strip_prefix("Custom (")?.strip_suffix(')')
+}
+
 /// #341: the config's own `low`/`medium`/`high` effort tokens, and the plain
 /// words shown in their place in Settings ("Thinking:"). Index-paired with
 /// [`EFFORT_LABELS`].
@@ -2010,24 +2041,25 @@ const EFFORT_VALUES: [&str; 3] = ["low", "medium", "high"];
 /// #341: display labels for [`EFFORT_VALUES`], in the same order.
 const EFFORT_LABELS: [&str; 3] = ["Fast", "Balanced", "Thorough"];
 
-/// The label shown for a given effort value. An unrecognized value (a
-/// hand-edited `config.toml`) shows as "Balanced" rather than nothing
-/// selected -- the middle, least-surprising option.
-fn effort_label(value: &str) -> &'static str {
+/// The label shown for a given effort value: one of [`EFFORT_LABELS`] for an
+/// exact preset match, or `"Custom (<value>)"` (never silently rounded to a
+/// preset -- see the review-fix doc comment above [`custom_label`]).
+fn effort_display(value: &str) -> String {
     match EFFORT_VALUES.iter().position(|&v| v == value) {
-        Some(i) => EFFORT_LABELS[i],
-        None => EFFORT_LABELS[1],
+        Some(i) => EFFORT_LABELS[i].to_string(),
+        None => custom_label(value),
     }
 }
 
-/// Parses a combo selection back into one of [`EFFORT_VALUES`]. `None` for a
-/// blank or unrecognized selection, so callers can fall back to the original
-/// config value rather than silently picking a default.
-fn label_to_effort(label: &str) -> Option<&'static str> {
-    EFFORT_LABELS
-        .iter()
-        .position(|&l| l == label)
-        .map(|i| EFFORT_VALUES[i])
+/// Parses a combo selection back into an effort value: one of
+/// [`EFFORT_VALUES`] for a preset label, the wrapped text for a
+/// `"Custom (...)"` label, or `None` for a blank/unrecognized selection so
+/// callers can fall back to the original config value.
+fn label_to_effort(label: &str) -> Option<String> {
+    if let Some(i) = EFFORT_LABELS.iter().position(|&l| l == label) {
+        return Some(EFFORT_VALUES[i].to_string());
+    }
+    parse_custom_label(label).map(|s| s.to_string())
 }
 
 /// #341: the four `capture.max_edge` presets, and the plain words shown in
@@ -2037,35 +2069,26 @@ const MAX_EDGE_VALUES: [u32; 4] = [1024, 1280, 1568, 2048];
 /// #341: display labels for [`MAX_EDGE_VALUES`], in the same order.
 const MAX_EDGE_LABELS: [&str; 4] = ["Low", "Medium", "High", "Maximum"];
 
-/// The label for a given `max_edge` value. A value that doesn't match any
-/// preset (a hand-edited `config.toml`) shows the numerically closest
-/// preset's label rather than nothing selected.
-fn max_edge_label(value: u32) -> &'static str {
+/// The label for a given `max_edge` value: one of [`MAX_EDGE_LABELS`] for an
+/// exact preset match, or `"Custom (<value>)"` (never silently rounded to
+/// the nearest preset -- see the review-fix doc comment above
+/// [`custom_label`]).
+fn max_edge_display(value: u32) -> String {
     match MAX_EDGE_VALUES.iter().position(|&v| v == value) {
-        Some(i) => MAX_EDGE_LABELS[i],
-        None => {
-            let mut best = 0;
-            let mut best_diff = u32::MAX;
-            for (i, &v) in MAX_EDGE_VALUES.iter().enumerate() {
-                let diff = value.abs_diff(v);
-                if diff < best_diff {
-                    best_diff = diff;
-                    best = i;
-                }
-            }
-            MAX_EDGE_LABELS[best]
-        }
+        Some(i) => MAX_EDGE_LABELS[i].to_string(),
+        None => custom_label(&value.to_string()),
     }
 }
 
-/// Parses a combo selection back into one of [`MAX_EDGE_VALUES`]. `None` for
-/// a blank or unrecognized selection, so callers can fall back to the
-/// original config value rather than silently picking a default.
+/// Parses a combo selection back into a `max_edge` value: one of
+/// [`MAX_EDGE_VALUES`] for a preset label, the parsed number for a
+/// `"Custom (...)"` label, or `None` for a blank/unrecognized/unparsable
+/// selection so callers can fall back to the original config value.
 fn label_to_max_edge(label: &str) -> Option<u32> {
-    MAX_EDGE_LABELS
-        .iter()
-        .position(|&l| l == label)
-        .map(|i| MAX_EDGE_VALUES[i])
+    if let Some(i) = MAX_EDGE_LABELS.iter().position(|&l| l == label) {
+        return Some(MAX_EDGE_VALUES[i]);
+    }
+    parse_custom_label(label)?.parse().ok()
 }
 
 /// #341: the config's own `active`/`primary` monitor tokens, and the plain
@@ -2075,24 +2098,37 @@ const MONITOR_VALUES: [&str; 2] = ["active", "primary"];
 /// #341: display labels for [`MONITOR_VALUES`], in the same order.
 const MONITOR_LABELS: [&str; 2] = ["The one I'm using", "The main display"];
 
-/// The label shown for a given monitor value. An unrecognized value (a
-/// hand-edited `config.toml`) defaults to "The one I'm using", matching
-/// `Config`'s own default.
-fn monitor_label(value: &str) -> &'static str {
+/// The label shown for a given monitor value: one of [`MONITOR_LABELS`] for
+/// an exact preset match, or `"Custom (<value>)"` (never silently defaulted
+/// -- see the review-fix doc comment above [`custom_label`]).
+fn monitor_display(value: &str) -> String {
     match MONITOR_VALUES.iter().position(|&v| v == value) {
-        Some(i) => MONITOR_LABELS[i],
-        None => MONITOR_LABELS[0],
+        Some(i) => MONITOR_LABELS[i].to_string(),
+        None => custom_label(value),
     }
 }
 
-/// Parses a combo selection back into one of [`MONITOR_VALUES`]. `None` for
-/// a blank or unrecognized selection, so callers can fall back to the
-/// original config value rather than silently picking a default.
-fn label_to_monitor(label: &str) -> Option<&'static str> {
-    MONITOR_LABELS
-        .iter()
-        .position(|&l| l == label)
-        .map(|i| MONITOR_VALUES[i])
+/// Parses a combo selection back into a monitor value: one of
+/// [`MONITOR_VALUES`] for a preset label, the wrapped text for a
+/// `"Custom (...)"` label, or `None` for a blank/unrecognized selection so
+/// callers can fall back to the original config value.
+fn label_to_monitor(label: &str) -> Option<String> {
+    if let Some(i) = MONITOR_LABELS.iter().position(|&l| l == label) {
+        return Some(MONITOR_VALUES[i].to_string());
+    }
+    parse_custom_label(label).map(|s| s.to_string())
+}
+
+/// Adds `display` to `combo` as an extra entry and selects it, but only if
+/// it isn't already one of the combo's fixed preset labels (already added by
+/// the caller) -- used by the three "custom value" combos above so an
+/// off-preset value gets its own honest entry instead of colliding with or
+/// hiding behind a preset.
+fn combo_select_with_custom(combo: HWND, presets: &[&str], display: &str) {
+    if !presets.contains(&display) {
+        combo_add(combo, display);
+    }
+    combo_select(combo, display);
 }
 
 /// #403: the three [`RequireTickFor`] labels shown in the Settings combo, in
@@ -2275,7 +2311,7 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
         cfg.providers.openai.model = raw.openai_model.clone();
     }
     if let Some(v) = label_to_effort(raw.openai_effort.trim()) {
-        cfg.providers.openai.effort = v.to_string();
+        cfg.providers.openai.effort = v;
     }
 
     cfg.providers.anthropic.api_key =
@@ -2284,12 +2320,12 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
         cfg.providers.anthropic.model = raw.anthropic_model.clone();
     }
     if let Some(v) = label_to_effort(raw.anthropic_effort.trim()) {
-        cfg.providers.anthropic.effort = v.to_string();
+        cfg.providers.anthropic.effort = v;
     }
 
     cfg.capture.max_edge = parse_max_edge_or(&raw.max_edge_text, original.capture.max_edge);
     if let Some(v) = label_to_monitor(raw.monitor.trim()) {
-        cfg.capture.monitor = v.to_string();
+        cfg.capture.monitor = v;
     }
 
     cfg.ui.card_seconds = parse_u32_or(&raw.card_seconds_text, original.ui.card_seconds);
@@ -2861,12 +2897,12 @@ mod tests {
             provider_choice: 0,
             openai_key: original.providers.openai.api_key.clone(),
             openai_model: original.providers.openai.model.clone(),
-            openai_effort: effort_label(&original.providers.openai.effort).to_string(),
+            openai_effort: effort_display(&original.providers.openai.effort),
             anthropic_key: original.providers.anthropic.api_key.clone(),
             anthropic_model: original.providers.anthropic.model.clone(),
-            anthropic_effort: effort_label(&original.providers.anthropic.effort).to_string(),
+            anthropic_effort: effort_display(&original.providers.anthropic.effort),
             max_edge_text: original.capture.max_edge.to_string(),
-            monitor: monitor_label(&original.capture.monitor).to_string(),
+            monitor: monitor_display(&original.capture.monitor),
             card_seconds_text: original.ui.card_seconds.to_string(),
             show_difficulty: original.ui.show_difficulty,
             text_scale_raw: original.ui.text_scale,
@@ -2900,16 +2936,38 @@ mod tests {
     // -- plain-word label mappings (#341) ----------------------------------
 
     #[test]
-    fn effort_label_round_trips_for_all_variants() {
-        for value in EFFORT_VALUES {
-            let label = effort_label(value);
-            assert_eq!(label_to_effort(label), Some(value));
-        }
+    fn custom_label_round_trips_through_parse_custom_label() {
+        assert_eq!(parse_custom_label(&custom_label("999")), Some("999"));
+        assert_eq!(
+            parse_custom_label(&custom_label("extreme")),
+            Some("extreme")
+        );
     }
 
     #[test]
-    fn effort_label_defaults_an_unrecognized_value_to_balanced() {
-        assert_eq!(effort_label("bogus"), "Balanced");
+    fn parse_custom_label_rejects_a_plain_preset_label() {
+        assert_eq!(parse_custom_label("Fast"), None);
+        assert_eq!(parse_custom_label(""), None);
+    }
+
+    #[test]
+    fn effort_display_round_trips_for_all_presets() {
+        for value in EFFORT_VALUES {
+            let label = effort_display(value);
+            assert_eq!(label_to_effort(&label), Some(value.to_string()));
+        }
+    }
+
+    // Review of #341: an off-preset value (a hand-edited config.toml) must
+    // never be silently rounded to a preset -- an untouched Save has to
+    // write back the exact original value.
+    #[test]
+    fn effort_display_of_an_unrecognized_value_is_an_honest_custom_label() {
+        assert_eq!(effort_display("extreme"), "Custom (extreme)");
+        assert_eq!(
+            label_to_effort("Custom (extreme)"),
+            Some("extreme".to_string())
+        );
     }
 
     #[test]
@@ -2919,37 +2977,43 @@ mod tests {
     }
 
     #[test]
-    fn max_edge_label_round_trips_for_all_presets() {
+    fn max_edge_display_round_trips_for_all_presets() {
         for value in MAX_EDGE_VALUES {
-            let label = max_edge_label(value);
-            assert_eq!(label_to_max_edge(label), Some(value));
+            let label = max_edge_display(value);
+            assert_eq!(label_to_max_edge(&label), Some(value));
         }
     }
 
     #[test]
-    fn max_edge_label_picks_the_closest_preset_for_an_unrecognized_value() {
-        assert_eq!(max_edge_label(1500), "High"); // closest to 1568
-        assert_eq!(max_edge_label(1), "Low"); // closest to 1024
-        assert_eq!(max_edge_label(9999), "Maximum"); // closest to 2048
+    fn max_edge_display_of_an_unrecognized_value_is_an_honest_custom_label() {
+        assert_eq!(max_edge_display(999), "Custom (999)");
+        assert_eq!(label_to_max_edge("Custom (999)"), Some(999));
+        assert_eq!(max_edge_display(3000), "Custom (3000)");
+        assert_eq!(label_to_max_edge("Custom (3000)"), Some(3000));
     }
 
     #[test]
     fn label_to_max_edge_rejects_unknown_text() {
         assert_eq!(label_to_max_edge(""), None);
         assert_eq!(label_to_max_edge("2048"), None); // the raw number is not a label
+        assert_eq!(label_to_max_edge("Custom (not a number)"), None);
     }
 
     #[test]
-    fn monitor_label_round_trips_for_all_variants() {
+    fn monitor_display_round_trips_for_all_presets() {
         for value in MONITOR_VALUES {
-            let label = monitor_label(value);
-            assert_eq!(label_to_monitor(label), Some(value));
+            let label = monitor_display(value);
+            assert_eq!(label_to_monitor(&label), Some(value.to_string()));
         }
     }
 
     #[test]
-    fn monitor_label_defaults_an_unrecognized_value_to_active() {
-        assert_eq!(monitor_label("bogus"), "The one I'm using");
+    fn monitor_display_of_an_unrecognized_value_is_an_honest_custom_label() {
+        assert_eq!(monitor_display("laptop-lid"), "Custom (laptop-lid)");
+        assert_eq!(
+            label_to_monitor("Custom (laptop-lid)"),
+            Some("laptop-lid".to_string())
+        );
     }
 
     #[test]
@@ -2970,6 +3034,48 @@ mod tests {
         let cfg = build_config(&original, &raw);
         assert_eq!(cfg.providers.openai.effort, "high");
         assert_eq!(cfg.providers.anthropic.effort, "low");
+        assert_eq!(cfg.capture.max_edge, 2048);
+        assert_eq!(cfg.capture.monitor, "primary");
+    }
+
+    // Review of #341 (data loss): with an off-preset value in all three
+    // fields, an untouched Save (raw built straight from `raw_from`, as
+    // `read_raw_form` would from the combo's own selected "Custom (...)"
+    // entry) must reproduce the exact original values, not the nearest or
+    // default preset.
+    #[test]
+    fn build_config_round_trips_exact_off_preset_values_untouched() {
+        let mut original = Config::default();
+        original.providers.openai.effort = "extreme".to_string();
+        original.providers.anthropic.effort = "barely".to_string();
+        original.capture.max_edge = 999;
+        original.capture.monitor = "laptop-lid".to_string();
+
+        let raw = raw_from(&original);
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.openai.effort, "extreme");
+        assert_eq!(cfg.providers.anthropic.effort, "barely");
+        assert_eq!(cfg.capture.max_edge, 999);
+        assert_eq!(cfg.capture.monitor, "laptop-lid");
+    }
+
+    // Review of #341: picking an actual preset instead must still change
+    // the off-preset value to that exact preset (this is not a "never
+    // change a custom value" rule -- choosing a preset is a real edit).
+    #[test]
+    fn build_config_applies_a_chosen_preset_over_an_off_preset_original() {
+        let mut original = Config::default();
+        original.providers.openai.effort = "extreme".to_string();
+        original.capture.max_edge = 999;
+        original.capture.monitor = "laptop-lid".to_string();
+
+        let mut raw = raw_from(&original);
+        raw.openai_effort = "Thorough".to_string();
+        raw.max_edge_text = MAX_EDGE_VALUES[3].to_string(); // "Maximum" preset
+        raw.monitor = "The main display".to_string();
+
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.openai.effort, "high");
         assert_eq!(cfg.capture.max_edge, 2048);
         assert_eq!(cfg.capture.monitor, "primary");
     }
