@@ -580,7 +580,7 @@ before the first public push:
 | `docs/architecture.md`, `docs/providers.md`, `docs/offline.md`, `docs/actions.md`, `docs/executors.md`, `docs/connectors.md` | kept current with the code |
 | `deny.toml` | allow: MIT, Apache-2.0, BSD-2/3, ISC, Zlib, Unicode-3.0, Unlicense; advisories on |
 | `.github/workflows/ci.yml` | on every push and PR: fmt, clippy, test, deny, gitleaks, release build, exe artifact |
-| `.github/workflows/release.yml` | on tag `v*`: build, sign if the cert secret exists, attach `.exe`, `.msix`, `SHA256SUMS` |
+| `.github/workflows/release.yml` | on tag `v*`: build, sign if the cert secret exists, attach `.exe`, `.msix`, `SHA256SUMS.txt` |
 | `.github/ISSUE_TEMPLATE/` | bug, feature, **new action**, new provider, new connector |
 | `.github/PULL_REQUEST_TEMPLATE.md` | spec link, tests red-then-green, docs, deny green, the observable checked |
 | `CODEOWNERS` | the owner, for now |
