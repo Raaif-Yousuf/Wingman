@@ -113,9 +113,7 @@ for b in $BRANCHES; do
     if ! cargo fmt --all -- --check >/dev/null 2>&1; then
         note "  merged; fmt drift (fixing)"
         cargo fmt --all
-        git commit -aqm "cargo fmt after merging $b
-
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+        git commit -aqm "cargo fmt after merging $b"
     fi
     if ! cargo clippy --all-targets -- -D warnings >/tmp/clippy.$$.log 2>&1; then
         note "  merged but CLIPPY FAILS (left in place; fix before the final gate):"

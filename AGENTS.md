@@ -80,8 +80,9 @@ action framework is the product and actions are the contribution surface.
     authoritative for what is built.
 13. **Issues live in GitHub Issues** once the public repo exists; until then
     the roadmap is the expansion plan's § 13. Never recreate a markdown
-    backlog. `NEXT_SESSION.md` is a handoff snapshot, `OWNER_TODO.md` is the
-    human-only queue; neither is a backlog.
+    backlog. `OWNER_TODO.md` is the human-only queue, not a backlog. A
+    session handoff note (`NEXT_SESSION.md`) is personal and gitignored:
+    each contributor keeps their own.
 14. **Shell discipline.** The Bash tool here is Git Bash; PowerShell is a
     separate tool with its own syntax. Never mix them in one command. Prefer
     `rtk` wrappers where the hook rewrites them. A compound command's exit code
@@ -145,7 +146,7 @@ revisited without a concrete reason to doubt it.
 
 | Topic | Doc |
 |---|---|
-| **Where the last session stopped** | [NEXT_SESSION.md](NEXT_SESSION.md) |
+| **Where the last session stopped** | your own `NEXT_SESSION.md`, if you keep one (gitignored) |
 | **Things only the owner can do** (the picker click, the repo name) | [OWNER_TODO.md](OWNER_TODO.md) |
 | The running app: threading, modules, request shapes, card, hotkeys | [2026-09-14 design spec](docs/superpowers/specs/2026-09-14-copilot-ask-design.md) |
 | Install, sparse package, signing, Copilot-key registration | [2026-09-15 packaging spec](docs/superpowers/specs/2026-09-15-packaging-and-install-design.md) |
