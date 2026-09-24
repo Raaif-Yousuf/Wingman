@@ -197,7 +197,7 @@ struct App {
 
 pub fn run() -> Result<()> {
     // Before any window exists, so the card's metrics are right on a mixed-DPI
-    // setup (the XPS panel next to an external monitor).
+    // setup (a laptop panel next to an external monitor).
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }

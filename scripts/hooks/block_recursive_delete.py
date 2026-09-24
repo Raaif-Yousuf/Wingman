@@ -199,10 +199,10 @@ _MSYS_ABS = re.compile(r"^/([A-Za-z])(/.*)?$")
 def _translate_msys_path(target: str) -> str:
     """`pathlib.Path.resolve()` on Windows does not understand either MSYS
     spelling: it treats the leading `/` as the root of the CURRENT drive and
-    the drive letter becomes a literal directory name, so `/c/Users/raaif/x`
-    resolves to `C:\\c\\Users\\raaif\\x`, never under `REPO_ROOT`
-    (MEASURED 2026-09-16: `pathlib.Path('/c/Users/raaif/copilot-ask/target').resolve()`
-    == `WindowsPath('C:/c/Users/raaif/copilot-ask/target')`). Translate both
+    the drive letter becomes a literal directory name, so `/c/Users/me/x`
+    resolves to `C:\\c\\Users\\me\\x`, never under `REPO_ROOT`
+    (MEASURED 2026-09-16: `pathlib.Path('/c/Users/me/repo/target').resolve()`
+    == `WindowsPath('C:/c/Users/me/repo/target')`). Translate both
     MSYS spellings to a drive-rooted Windows path first. POSIX-only, since on
     a real POSIX filesystem `/c/...` is an ordinary absolute path and must be
     left alone."""

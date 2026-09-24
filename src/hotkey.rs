@@ -88,7 +88,7 @@ pub const HK_SECONDARY: usize = 2;
 /// without saying which): some third-party key remapper may legitimately
 /// inject the Copilot key, or any other configured chord, on the user's
 /// behalf -- this crate's own hotkey pitfall notes ("Learn mode exists
-/// because Dell firmware may emit something else") already treat remapped
+/// because some laptop firmware may emit something else") already treat remapped
 /// input as an expected source, not a hostile one. Filtering by this
 /// specific tag instead means only Wingman's OWN synthetic events are ever
 /// ignored; a genuinely `LLKHF_INJECTED` event carrying any other

@@ -67,7 +67,7 @@ Unbounded parallel builds have frozen this machine by exhausting RAM.
   most of what it holds):
 
   ```
-  export CARGO_TARGET_DIR=C:/Users/raaif/Wingman/target/wt/$(basename "$PWD")
+  export CARGO_TARGET_DIR="$(git rev-parse --path-format=absolute --git-common-dir)/../target/wt/$(basename "$PWD")"
   export RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=1
   export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
   ```

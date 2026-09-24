@@ -121,11 +121,11 @@ pub fn query_ollama_health(port: u16) -> OllamaHealth {
 /// tray-spawned server. No Win32 calls -- unit-tested directly with
 /// synthetic inputs.
 ///
-/// MEASURED 2026-09-17 on this machine: the real Ollama listener on
+/// MEASURED 2026-09-17 on the dev machine: the real Ollama listener on
 /// 127.0.0.1:11434 had image path
-/// `C:\Users\raaif\AppData\Local\Programs\Ollama\ollama.exe` (command line
+/// `C:\Users\me\AppData\Local\Programs\Ollama\ollama.exe` (command line
 /// `...\ollama.exe serve`) and parent image path
-/// `C:\Users\raaif\AppData\Local\Programs\Ollama\ollama app.exe` -- both
+/// `C:\Users\me\AppData\Local\Programs\Ollama\ollama app.exe` -- both
 /// signals agreed. The parent-process signal is trusted first and the
 /// install-directory check is only a fallback for when the parent can't be
 /// resolved: a manually started `ollama.exe serve` lives under the exact
@@ -611,7 +611,7 @@ mod tests {
     fn classify_trusts_stock_tray_parent_regardless_of_directory() {
         let kind = classify(
             r"C:\Somewhere\Else\ollama.exe",
-            Some(r"C:\Users\raaif\AppData\Local\Programs\Ollama\ollama app.exe"),
+            Some(r"C:\Users\me\AppData\Local\Programs\Ollama\ollama app.exe"),
         );
         assert_eq!(kind, ListenerKind::StockTrayServer);
     }
@@ -629,7 +629,7 @@ mod tests {
         // the user launched `ollama serve` from) must NOT be classified as
         // the stock tray server.
         let kind = classify(
-            r"C:\Users\raaif\AppData\Local\Programs\Ollama\ollama.exe",
+            r"C:\Users\me\AppData\Local\Programs\Ollama\ollama.exe",
             Some(r"C:\Windows\System32\cmd.exe"),
         );
         assert_eq!(kind, ListenerKind::Other);
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn classify_falls_back_to_directory_when_parent_is_unresolvable() {
         let kind = classify(
-            r"C:\Users\raaif\AppData\Local\Programs\Ollama\ollama.exe",
+            r"C:\Users\me\AppData\Local\Programs\Ollama\ollama.exe",
             None,
         );
         assert_eq!(kind, ListenerKind::StockTrayServer);

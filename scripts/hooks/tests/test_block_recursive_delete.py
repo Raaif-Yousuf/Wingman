@@ -32,7 +32,7 @@ OUTSIDE_TARGET = pathlib.Path(m.REPO_ROOT.drive + "/") / "not-this-repo-at-all"
 
 
 def _to_msys(path: pathlib.Path) -> str:
-    """`C:/Users/raaif/...` -> `/c/Users/raaif/...`, the way Git Bash spells it."""
+    """`C:/Users/me/...` -> `/c/Users/me/...`, the way Git Bash spells it."""
     posix = path.as_posix()
     drive, rest = posix.split(":", 1)
     return f"/{drive.lower()}{rest}"

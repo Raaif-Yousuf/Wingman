@@ -351,7 +351,7 @@ known-fragile spot — if Start still flickers, the fallback is to also swallow 
 
 **Learn mode.** A tray menu item arms it. The next keydown is captured as a
 `Chord` rather than matched, posted as `WM_APP_LEARNED`, swallowed, and written to
-the config. This is what makes the app work even if Dell's firmware emits
+the config. This is what makes the app work even if a laptop's firmware emits
 something other than the documented combo. Learn mode times out after 10 s. A bare
 modifier keydown (Shift, Ctrl, Alt or Win alone) is ignored while learning, so the
 chord captures the real trigger key rather than the modifier that preceded it.

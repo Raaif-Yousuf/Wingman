@@ -107,7 +107,7 @@ what is known as of 2026-09-16:
 | tool | what it covers | why Wingman is still worth building |
 |---|---|---|
 | **Microsoft Copilot on Windows** (Copilot Vision, Copilot Actions, the Copilot key's default target) | The closest thing: sees the screen, can act in apps, ships with Windows | Proprietary, Microsoft's models only, requires a Microsoft account, no local or offline path, no provider choice, no control over what is captured or sent. Wingman is the open, bring-your-own-model, local-capable version of the same key |
-| **Click to Do** (Copilot+ PCs) | Select on-screen text or images and get actions | Requires a 40+ TOPS NPU; the Core Ultra 7 255H is not a Copilot+ PC, so it is unavailable on the dev machine and most laptops in use today |
+| **Click to Do** (Copilot+ PCs) | Select on-screen text or images and get actions | Requires a 40+ TOPS NPU; Core Ultra 200H chips are not Copilot+ class, so it is unavailable on the dev machine and most laptops in use today |
 | **Windows Recall** | The awareness timeline | Same NPU gate; proprietary; no app-level control |
 | **PowerToys Advanced Paste** (MIT) | Clipboard transforms with cloud or local models | Clipboard only, no screen, no actions on the UI. Wingman reuses its patterns and covers the case as one action |
 | **UI-TARS Desktop** (Apache-2.0) | Open-source computer-use agent that operates the GUI from a vision model | Electron, needs a large VLM, autonomous clicking with no confirm step, no tray, no hotkey-first quick actions. A different product: an agent, not an assistant at a key |
@@ -261,7 +261,7 @@ Model discovery: Ollama `/api/tags` with a vision badge from `/api/show`
 `capabilities`; OpenAI-compatible `/v1/models`. Pulling a model streams
 `/api/pull` progress into the settings window.
 
-Local hardware on the dev machine: Core Ultra 7 255H, Intel Arc 140T, 31 GB.
+Reference dev hardware: an Intel Core Ultra 200H laptop (Arc iGPU, 32 GB RAM).
 Vision-capable in Ollama today: `gemma3:4b`, `gemma3:12b`, `gemma4:12b`,
 `qwen3.5:2b/4b/9b`. Text-only: `qwen3:14b`, `deepseek-r1:14b`, `llama3.1:8b`.
 Defaults: router `qwen3.5:4b` (fast), actions `gemma4:12b`.

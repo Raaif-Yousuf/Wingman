@@ -40,7 +40,7 @@ because it is easy.
 | 1 | **Wired to nothing** | Code that compiles, tests green, and does nothing at runtime. Eighteen recorded instances in the sibling repo, none caught by a test. See the `wired-to-nothing` skill for the checks. |
 | 2 | **Confirm-boundary holes** | Anything that lets an executor act without a `Confirmed<P>`, or lets a proposal change between the card and the act. The product promise is Look, Propose, Confirm, Do. |
 | 3 | **Leaks and lifetime bugs** | GDI/USER handles, COM interfaces, `HGLOBAL`, DIB sections, thread handles. A tray app that leaks runs for weeks. |
-| 4 | **Idle work** | Any timer, poll, spin or wake while the app is doing nothing. AGENTS.md rule 5; the owner audits this machine to the tenth of a watt. |
+| 4 | **Idle work** | Any timer, poll, spin or wake while the app is doing nothing. AGENTS.md rule 5; idle battery drain is measured to the tenth of a watt. |
 | 5 | **Unsound error paths** | A failure that ends in something other than a card, a swallowed `HRESULT`, a `?` that converts a recoverable error into an exit, an `unwrap` on the main thread. |
 | 6 | **Secret exposure** | A key reachable through `Debug`, a log line, a panic message, an error string, a serialized struct, a diagnostics dump. |
 | 7 | **Wrong results** | Arithmetic, unit conversion, time zones, encoding, surrogate pairs, off-by-one in slicing a `&str` by byte index. |
