@@ -205,10 +205,16 @@ impl Profile {
     }
 
     /// Restricts the profile file's ACL to the current user only, via
-    /// `icacls`. Best-effort, same as `Config::restrict_acl`: any failure
-    /// (missing binary, non-NTFS volume) is ignored, since DPAPI's own
-    /// user-scoped encryption is the real protection here -- this is
-    /// defense in depth, not the only barrier.
+    /// `icacls`. Deliberately best-effort, unlike `Config::restrict_acl`
+    /// (#257), which returns a `Result` and aborts the write on failure:
+    /// the profile file's contents are DPAPI-encrypted under the current
+    /// user's own key (see `save_to` above), so another account cannot
+    /// decrypt it regardless of what the ACL says. This call is defense in
+    /// depth on top of that, not the only barrier, so a failure here
+    /// (missing `icacls`, non-NTFS volume) is ignored rather than failing
+    /// the save. `Config`'s file has no such second layer -- a plaintext
+    /// API key with the wrong ACL is genuinely exposed -- which is exactly
+    /// why that path cannot afford to be best-effort and this one can.
     #[cfg(windows)]
     fn restrict_acl(path: &Path) {
         let username = match std::env::var("USERNAME") {
