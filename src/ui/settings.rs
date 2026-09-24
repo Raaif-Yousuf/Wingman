@@ -465,28 +465,20 @@ fn toggle_password(hwnd: HWND, checkbox_id: i32, edit_id: i32) {
 }
 
 /// #344: sets keyboard focus on the named control and selects its whole
-/// contents, so the user can just start typing over the bad value. Handles
-/// `ID_MAX_EDGE` (a `CBS_DROPDOWN` combo, selected via its edit portion) and
-/// any plain `WC_EDIT` control (e.g. `ID_CARD_SECONDS`).
+/// contents, so the user can just start typing over the bad value. For any
+/// plain `WC_EDIT` control (e.g. `ID_CARD_SECONDS`). `ID_MAX_EDGE` became a
+/// `CBS_DROPDOWNLIST` combo in #341 (no free-typed text, so it can no longer
+/// actually reach this function with an invalid value from the real UI, only
+/// from a direct unit-test call) -- `EM_SETSEL` on a `CBS_DROPDOWNLIST`
+/// combo with no editable text portion is simply a no-op, so no special case
+/// is needed here any more.
 fn focus_and_select_field(hwnd: HWND, id: i32) {
     let Some(ctrl) = get_dlg_item(hwnd, id) else {
         return;
     };
     unsafe {
         let _ = SetFocus(Some(ctrl));
-        if id == ID_MAX_EDGE {
-            // MAKELPARAM(0, -1): start at 0, end at -1 (select to the end
-            // of the text), packed as loword | (hiword << 16).
-            let lparam = (0xFFFFu32 << 16) as i32;
-            SendMessageW(
-                ctrl,
-                CB_SETEDITSEL,
-                Some(WPARAM(0)),
-                Some(LPARAM(lparam as isize)),
-            );
-        } else {
-            SendMessageW(ctrl, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1isize)));
-        }
+        SendMessageW(ctrl, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1isize)));
     }
 }
 
@@ -595,7 +587,6 @@ const TBM_SETRANGE: u32 = 0x0406;
 const TBM_SETPOS: u32 = 0x0405;
 const TBM_SETPAGESIZE: u32 = 0x0415;
 const TBM_SETLINESIZE: u32 = 0x0417;
-const CBS_DROPDOWN: i32 = 0x0002;
 const CBS_DROPDOWNLIST: i32 = 0x0003;
 const CBS_HASSTRINGS: i32 = 0x0200;
 const ES_PASSWORD: i32 = 0x0020;
@@ -618,9 +609,6 @@ const TBS_HORZ: i32 = 0x0000;
 /// #344: selects text in a plain edit control, used to highlight an invalid
 /// numeric field after a failed Save.
 const EM_SETSEL: u32 = 0x00B1;
-/// #344: the combo-box equivalent of `EM_SETSEL`, for the editable text
-/// portion of a `CBS_DROPDOWN` combo (`ID_MAX_EDGE`).
-const CB_SETEDITSEL: u32 = 0x0142;
 
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
@@ -660,12 +648,14 @@ fn fitted_height_dp(hwnd: HWND, dpi: u32) -> i32 {
 
 const WIN_W_DP: i32 = 620;
 /// #403 review: raised from 820 by the Forms group's full height (68dp: see
-/// `CONTENT_TOP_DP`'s comment) so the default window still has room for the
-/// Prompt group at something close to its natural size instead of always
-/// falling back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout`
-/// itself never overlaps regardless of this constant, but a taller default
-/// is nicer than always squeezing.
-const WIN_H_DP: i32 = 888;
+/// `CONTENT_TOP_DP`'s comment). #341 raised it again by 30dp (one more
+/// `ROW_H + ROW_GAP` row: the Capture group's new "higher reads small text
+/// better" hint line) so the default window still has room for the Prompt
+/// group at something close to its natural size instead of always falling
+/// back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout` itself
+/// never overlaps regardless of this constant, but a taller default is nicer
+/// than always squeezing.
+const WIN_H_DP: i32 = 918;
 /// Below this the prompt box stops being usable; scroll rather than shrink
 /// further (not yet built -- see `prompt_footer_layout`'s doc comment).
 ///
@@ -1201,12 +1191,12 @@ fn build_ui(
 
     ctx.create(
         WC_STATIC,
-        "Effort:",
+        "Thinking:",
         0,
         0,
         r.x + half + 12,
         r.y,
-        50,
+        60,
         ROW_H,
         0,
     );
@@ -1215,16 +1205,16 @@ fn build_ui(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 50,
+        r.x + half + 12 + 60,
         r.y,
-        half - 50,
+        half - 60,
         ROW_H * 4,
         ID_OPENAI_EFFORT,
     );
-    for e in ["low", "medium", "high"] {
+    for e in EFFORT_LABELS {
         combo_add(openai_effort, e);
     }
-    combo_select(openai_effort, &config.providers.openai.effort);
+    combo_select(openai_effort, effort_label(&config.providers.openai.effort));
     r.advance();
 
     // Anthropic
@@ -1283,12 +1273,12 @@ fn build_ui(
 
     ctx.create(
         WC_STATIC,
-        "Effort:",
+        "Thinking:",
         0,
         0,
         r.x + half + 12,
         r.y,
-        50,
+        60,
         ROW_H,
         0,
     );
@@ -1297,16 +1287,19 @@ fn build_ui(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 50,
+        r.x + half + 12 + 60,
         r.y,
-        half - 50,
+        half - 60,
         ROW_H * 4,
         ID_ANTHROPIC_EFFORT,
     );
-    for e in ["low", "medium", "high"] {
+    for e in EFFORT_LABELS {
         combo_add(anthropic_effort, e);
     }
-    combo_select(anthropic_effort, &config.providers.anthropic.effort);
+    combo_select(
+        anthropic_effort,
+        effort_label(&config.providers.anthropic.effort),
+    );
     r.advance();
 
     let providers_bottom = r.y + ROW_H + 8;
@@ -1380,7 +1373,7 @@ fn build_ui(
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
     ctx.create(
         WC_STATIC,
-        &format!("Primary:   {}", chord_to_string(&config.hotkeys.primary)),
+        &format!("Copilot key: {}", chord_to_string(&config.hotkeys.primary)),
         0,
         0,
         r.x,
@@ -1392,7 +1385,10 @@ fn build_ui(
     r.advance();
     ctx.create(
         WC_STATIC,
-        &format!("Secondary: {}", chord_to_string(&config.hotkeys.secondary)),
+        &format!(
+            "Other shortcut: {}",
+            chord_to_string(&config.hotkeys.secondary)
+        ),
         0,
         0,
         r.x,
@@ -1451,26 +1447,36 @@ fn build_ui(
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
     let half = (r.w - 12) / 2;
 
-    ctx.create(WC_STATIC, "Max edge:", 0, 0, r.x, r.y, 70, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "Screenshot detail:",
+        0,
+        0,
+        r.x,
+        r.y,
+        110,
+        ROW_H,
+        0,
+    );
     let max_edge = ctx.create(
         WC_COMBOBOX,
         "",
-        (CBS_DROPDOWN | CBS_HASSTRINGS) as u32,
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 70,
+        r.x + 110,
         r.y,
-        half - 70,
+        half - 110,
         ROW_H * 6,
         ID_MAX_EDGE,
     );
-    for v in ["1024", "1280", "1568", "2048"] {
+    for v in MAX_EDGE_LABELS {
         combo_add(max_edge, v);
     }
-    set_text(max_edge, &config.capture.max_edge.to_string());
+    combo_select(max_edge, max_edge_label(config.capture.max_edge));
 
     ctx.create(
         WC_STATIC,
-        "Monitor:",
+        "Screen:",
         0,
         0,
         r.x + half + 12,
@@ -1490,10 +1496,25 @@ fn build_ui(
         ROW_H * 4,
         ID_MONITOR,
     );
-    for v in ["active", "primary"] {
+    for v in MONITOR_LABELS {
         combo_add(monitor, v);
     }
-    combo_select(monitor, &config.capture.monitor);
+    combo_select(monitor, monitor_label(&config.capture.monitor));
+    r.advance();
+
+    // #341: a one-line hint, since "screenshot detail" alone doesn't say
+    // what changes or why it costs more.
+    ctx.create(
+        WC_STATIC,
+        "Higher reads small text better, costs more.",
+        0,
+        0,
+        r.x,
+        r.y,
+        r.w,
+        ROW_H,
+        0,
+    );
     r.advance();
     let capture_bottom = r.y + 4;
     ctx.create(
@@ -1516,12 +1537,12 @@ fn build_ui(
 
     ctx.create(
         WC_STATIC,
-        "Auto-dismiss (sec, 0=never):",
+        "Hide the card after this many seconds (0 = never):",
         0,
         0,
         r.x,
         r.y,
-        190,
+        260,
         ROW_H,
         0,
     );
@@ -1530,9 +1551,9 @@ fn build_ui(
         &config.ui.card_seconds.to_string(),
         (ES_NUMBER | ES_AUTOHSCROLL) as u32,
         WS_EX_BORDER,
-        r.x + 190,
+        r.x + 260,
         r.y,
-        70,
+        50,
         ROW_H,
         ID_CARD_SECONDS,
     );
@@ -1541,9 +1562,9 @@ fn build_ui(
         "Show difficulty rating",
         BS_AUTOCHECKBOX as u32,
         0,
-        r.x + 190 + 70 + 20,
+        r.x + 260 + 50 + 12,
         r.y,
-        r.w - (190 + 70 + 20),
+        r.w - (260 + 50 + 12),
         ROW_H,
         ID_SHOW_DIFFICULTY,
     );
@@ -1864,7 +1885,14 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
             .unwrap_or_default(),
         anthropic_model: combo_selected_text(hwnd, ID_ANTHROPIC_MODEL),
         anthropic_effort: combo_selected_text(hwnd, ID_ANTHROPIC_EFFORT),
-        max_edge_text: combo_selected_text(hwnd, ID_MAX_EDGE),
+        // #341: the combo now shows "Low"/"Medium"/.../"Maximum" rather than
+        // the raw number, so convert back to the numeric text `build_config`
+        // and `find_invalid_numeric_field` (#344) already expect. An
+        // unrecognized selection (should not happen with `CBS_DROPDOWNLIST`)
+        // becomes blank, which both of those already treat as "leave alone".
+        max_edge_text: label_to_max_edge(&combo_selected_text(hwnd, ID_MAX_EDGE))
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
         monitor: combo_selected_text(hwnd, ID_MONITOR),
         card_seconds_text: get_dlg_item(hwnd, ID_CARD_SECONDS)
             .map(get_text)
@@ -1973,6 +2001,98 @@ fn parse_max_edge_or(text: &str, fallback: u32) -> u32 {
         Ok(v) if v > 0 => v,
         _ => fallback,
     }
+}
+
+/// #341: the config's own `low`/`medium`/`high` effort tokens, and the plain
+/// words shown in their place in Settings ("Thinking:"). Index-paired with
+/// [`EFFORT_LABELS`].
+const EFFORT_VALUES: [&str; 3] = ["low", "medium", "high"];
+/// #341: display labels for [`EFFORT_VALUES`], in the same order.
+const EFFORT_LABELS: [&str; 3] = ["Fast", "Balanced", "Thorough"];
+
+/// The label shown for a given effort value. An unrecognized value (a
+/// hand-edited `config.toml`) shows as "Balanced" rather than nothing
+/// selected -- the middle, least-surprising option.
+fn effort_label(value: &str) -> &'static str {
+    match EFFORT_VALUES.iter().position(|&v| v == value) {
+        Some(i) => EFFORT_LABELS[i],
+        None => EFFORT_LABELS[1],
+    }
+}
+
+/// Parses a combo selection back into one of [`EFFORT_VALUES`]. `None` for a
+/// blank or unrecognized selection, so callers can fall back to the original
+/// config value rather than silently picking a default.
+fn label_to_effort(label: &str) -> Option<&'static str> {
+    EFFORT_LABELS
+        .iter()
+        .position(|&l| l == label)
+        .map(|i| EFFORT_VALUES[i])
+}
+
+/// #341: the four `capture.max_edge` presets, and the plain words shown in
+/// their place in Settings ("Screenshot detail:"). Index-paired with
+/// [`MAX_EDGE_LABELS`].
+const MAX_EDGE_VALUES: [u32; 4] = [1024, 1280, 1568, 2048];
+/// #341: display labels for [`MAX_EDGE_VALUES`], in the same order.
+const MAX_EDGE_LABELS: [&str; 4] = ["Low", "Medium", "High", "Maximum"];
+
+/// The label for a given `max_edge` value. A value that doesn't match any
+/// preset (a hand-edited `config.toml`) shows the numerically closest
+/// preset's label rather than nothing selected.
+fn max_edge_label(value: u32) -> &'static str {
+    match MAX_EDGE_VALUES.iter().position(|&v| v == value) {
+        Some(i) => MAX_EDGE_LABELS[i],
+        None => {
+            let mut best = 0;
+            let mut best_diff = u32::MAX;
+            for (i, &v) in MAX_EDGE_VALUES.iter().enumerate() {
+                let diff = value.abs_diff(v);
+                if diff < best_diff {
+                    best_diff = diff;
+                    best = i;
+                }
+            }
+            MAX_EDGE_LABELS[best]
+        }
+    }
+}
+
+/// Parses a combo selection back into one of [`MAX_EDGE_VALUES`]. `None` for
+/// a blank or unrecognized selection, so callers can fall back to the
+/// original config value rather than silently picking a default.
+fn label_to_max_edge(label: &str) -> Option<u32> {
+    MAX_EDGE_LABELS
+        .iter()
+        .position(|&l| l == label)
+        .map(|i| MAX_EDGE_VALUES[i])
+}
+
+/// #341: the config's own `active`/`primary` monitor tokens, and the plain
+/// words shown in their place in Settings ("Screen:"). Index-paired with
+/// [`MONITOR_LABELS`].
+const MONITOR_VALUES: [&str; 2] = ["active", "primary"];
+/// #341: display labels for [`MONITOR_VALUES`], in the same order.
+const MONITOR_LABELS: [&str; 2] = ["The one I'm using", "The main display"];
+
+/// The label shown for a given monitor value. An unrecognized value (a
+/// hand-edited `config.toml`) defaults to "The one I'm using", matching
+/// `Config`'s own default.
+fn monitor_label(value: &str) -> &'static str {
+    match MONITOR_VALUES.iter().position(|&v| v == value) {
+        Some(i) => MONITOR_LABELS[i],
+        None => MONITOR_LABELS[0],
+    }
+}
+
+/// Parses a combo selection back into one of [`MONITOR_VALUES`]. `None` for
+/// a blank or unrecognized selection, so callers can fall back to the
+/// original config value rather than silently picking a default.
+fn label_to_monitor(label: &str) -> Option<&'static str> {
+    MONITOR_LABELS
+        .iter()
+        .position(|&l| l == label)
+        .map(|i| MONITOR_VALUES[i])
 }
 
 /// #403: the three [`RequireTickFor`] labels shown in the Settings combo, in
@@ -2154,8 +2274,8 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     if !raw.openai_model.trim().is_empty() {
         cfg.providers.openai.model = raw.openai_model.clone();
     }
-    if !raw.openai_effort.trim().is_empty() {
-        cfg.providers.openai.effort = raw.openai_effort.clone();
+    if let Some(v) = label_to_effort(raw.openai_effort.trim()) {
+        cfg.providers.openai.effort = v.to_string();
     }
 
     cfg.providers.anthropic.api_key =
@@ -2163,13 +2283,13 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     if !raw.anthropic_model.trim().is_empty() {
         cfg.providers.anthropic.model = raw.anthropic_model.clone();
     }
-    if !raw.anthropic_effort.trim().is_empty() {
-        cfg.providers.anthropic.effort = raw.anthropic_effort.clone();
+    if let Some(v) = label_to_effort(raw.anthropic_effort.trim()) {
+        cfg.providers.anthropic.effort = v.to_string();
     }
 
     cfg.capture.max_edge = parse_max_edge_or(&raw.max_edge_text, original.capture.max_edge);
-    if !raw.monitor.trim().is_empty() {
-        cfg.capture.monitor = raw.monitor.clone();
+    if let Some(v) = label_to_monitor(raw.monitor.trim()) {
+        cfg.capture.monitor = v.to_string();
     }
 
     cfg.ui.card_seconds = parse_u32_or(&raw.card_seconds_text, original.ui.card_seconds);
@@ -2741,12 +2861,12 @@ mod tests {
             provider_choice: 0,
             openai_key: original.providers.openai.api_key.clone(),
             openai_model: original.providers.openai.model.clone(),
-            openai_effort: original.providers.openai.effort.clone(),
+            openai_effort: effort_label(&original.providers.openai.effort).to_string(),
             anthropic_key: original.providers.anthropic.api_key.clone(),
             anthropic_model: original.providers.anthropic.model.clone(),
-            anthropic_effort: original.providers.anthropic.effort.clone(),
+            anthropic_effort: effort_label(&original.providers.anthropic.effort).to_string(),
             max_edge_text: original.capture.max_edge.to_string(),
-            monitor: original.capture.monitor.clone(),
+            monitor: monitor_label(&original.capture.monitor).to_string(),
             card_seconds_text: original.ui.card_seconds.to_string(),
             show_difficulty: original.ui.show_difficulty,
             text_scale_raw: original.ui.text_scale,
@@ -2775,6 +2895,83 @@ mod tests {
             cfg.providers.anthropic.models,
             original.providers.anthropic.models
         );
+    }
+
+    // -- plain-word label mappings (#341) ----------------------------------
+
+    #[test]
+    fn effort_label_round_trips_for_all_variants() {
+        for value in EFFORT_VALUES {
+            let label = effort_label(value);
+            assert_eq!(label_to_effort(label), Some(value));
+        }
+    }
+
+    #[test]
+    fn effort_label_defaults_an_unrecognized_value_to_balanced() {
+        assert_eq!(effort_label("bogus"), "Balanced");
+    }
+
+    #[test]
+    fn label_to_effort_rejects_unknown_text() {
+        assert_eq!(label_to_effort(""), None);
+        assert_eq!(label_to_effort("low"), None); // the internal token itself is not a label
+    }
+
+    #[test]
+    fn max_edge_label_round_trips_for_all_presets() {
+        for value in MAX_EDGE_VALUES {
+            let label = max_edge_label(value);
+            assert_eq!(label_to_max_edge(label), Some(value));
+        }
+    }
+
+    #[test]
+    fn max_edge_label_picks_the_closest_preset_for_an_unrecognized_value() {
+        assert_eq!(max_edge_label(1500), "High"); // closest to 1568
+        assert_eq!(max_edge_label(1), "Low"); // closest to 1024
+        assert_eq!(max_edge_label(9999), "Maximum"); // closest to 2048
+    }
+
+    #[test]
+    fn label_to_max_edge_rejects_unknown_text() {
+        assert_eq!(label_to_max_edge(""), None);
+        assert_eq!(label_to_max_edge("2048"), None); // the raw number is not a label
+    }
+
+    #[test]
+    fn monitor_label_round_trips_for_all_variants() {
+        for value in MONITOR_VALUES {
+            let label = monitor_label(value);
+            assert_eq!(label_to_monitor(label), Some(value));
+        }
+    }
+
+    #[test]
+    fn monitor_label_defaults_an_unrecognized_value_to_active() {
+        assert_eq!(monitor_label("bogus"), "The one I'm using");
+    }
+
+    #[test]
+    fn label_to_monitor_rejects_unknown_text() {
+        assert_eq!(label_to_monitor(""), None);
+        assert_eq!(label_to_monitor("active"), None); // the internal token itself is not a label
+    }
+
+    #[test]
+    fn build_config_round_trips_effort_max_edge_and_monitor_labels() {
+        let mut original = Config::default();
+        original.providers.openai.effort = "high".to_string();
+        original.providers.anthropic.effort = "low".to_string();
+        original.capture.max_edge = 2048;
+        original.capture.monitor = "primary".to_string();
+
+        let raw = raw_from(&original);
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.openai.effort, "high");
+        assert_eq!(cfg.providers.anthropic.effort, "low");
+        assert_eq!(cfg.capture.max_edge, 2048);
+        assert_eq!(cfg.capture.monitor, "primary");
     }
 
     // -- require_tick_for (#403) ------------------------------------------
@@ -2947,11 +3144,15 @@ mod tests {
     /// `GROUP_LABEL_TOP + (ROW_H + ROW_GAP) + 4` (the same `label + rows +
     /// bottom padding` shape every other group in `build_ui` uses) `=
     /// 20 + 30 + 4 = 54`, plus the `GROUP_GAP` (14) that already separated
-    /// Card from whatever came next `= 640 + 54 + 14 = 708`. Kept here as a
-    /// literal, not derived, so a change to those sections has to update this
-    /// test deliberately rather than silently keep passing against a moving
+    /// Card from whatever came next `= 640 + 54 + 14 = 708`. #341 then added
+    /// one more row to the *Capture* group itself (the "higher reads small
+    /// text better, costs more" hint under Screenshot detail/Screen), which
+    /// shifts every group below it, including Forms, down by one
+    /// `ROW_H + ROW_GAP = 30`: `708 + 30 = 738`. Kept here as a literal, not
+    /// derived, so a change to those sections has to update this test
+    /// deliberately rather than silently keep passing against a moving
     /// target.
-    const CONTENT_TOP_DP: i32 = 708;
+    const CONTENT_TOP_DP: i32 = 738;
 
     fn footer_does_not_overlap(win_h_dp: i32) -> bool {
         let footer = prompt_footer_layout(CONTENT_TOP_DP, win_h_dp);
@@ -2986,14 +3187,15 @@ mod tests {
     fn footer_sits_flush_with_the_window_bottom_when_there_is_room() {
         // Unchanged from the pre-#340 behaviour when the window is tall
         // enough: Save/Cancel hug the bottom edge rather than floating
-        // higher than necessary. Even `WIN_H_DP` (888, raised by #403's
-        // Forms group) is not tall enough for `CONTENT_TOP_DP` (708) plus
-        // the Prompt group's minimum (issue #340's underlying finding: the
-        // original design height never actually had room for its own
-        // content -- see `MIN_WIN_H_DP`'s comment), so this uses a window
-        // tall enough to exercise the "plenty of room" branch specifically.
-        // Needs `win_h_dp - buttons_h >= CONTENT_TOP_DP + min_prompt_group_h`
-        // (708 + 138 = 846, so > 906) to actually land in the flush branch
+        // higher than necessary. Even `WIN_H_DP` (918, raised by #403's
+        // Forms group and #341's Capture hint line) is not tall enough for
+        // `CONTENT_TOP_DP` (738) plus the Prompt group's minimum (issue
+        // #340's underlying finding: the original design height never
+        // actually had room for its own content -- see `MIN_WIN_H_DP`'s
+        // comment), so this uses a window tall enough to exercise the
+        // "plenty of room" branch specifically. Needs
+        // `win_h_dp - buttons_h >= CONTENT_TOP_DP + min_prompt_group_h`
+        // (738 + 138 = 876, so > 936) to actually land in the flush branch
         // rather than the minimum-height one; 950 gives headroom.
         let roomy_win_h_dp = 950;
         let footer = prompt_footer_layout(CONTENT_TOP_DP, roomy_win_h_dp);
