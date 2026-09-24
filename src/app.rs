@@ -4344,6 +4344,9 @@ mod tests {
         // dynamic model-submenu ranges (dispatched by MenuChoice::OpenAiModel /
         // AnthropicModel, not by exact id) and MODEL_RANGE is that width.
         const DYNAMIC: &[&str] = &["MODEL_RANGE", "OPENAI_MODEL_BASE", "ANTHROPIC_MODEL_BASE"];
+        // Display-only items: added disabled (greyed), so no click can ever
+        // produce their WM_COMMAND and they need no wnd_proc arm (#317).
+        const DISPLAY_ONLY: &[&str] = &["VERSION_LABEL"];
 
         let tray_src = include_str!("ui/tray.rs");
         let app_src = include_str!("app.rs");
@@ -4359,7 +4362,11 @@ mod tests {
                     && name.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
                 .then_some(name)
             })
-            .filter(|name| !DYNAMIC.contains(name) && !name.starts_with("WM_APP_"))
+            .filter(|name| {
+                !DYNAMIC.contains(name)
+                    && !DISPLAY_ONLY.contains(name)
+                    && !name.starts_with("WM_APP_")
+            })
             .collect();
 
         assert!(
