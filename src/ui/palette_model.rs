@@ -1,7 +1,7 @@
 //! Pure model for the Quick Ask palette (#25): fuzzy scoring, grouped vs.
 //! flat ranking (#199, #132), the key-handling state machine, and the
 //! action-id dispatch table. No `windows` crate dependency anywhere in this
-//! file (CLAUDE.md rule 8) -- see `ui::palette` for the real window that
+//! file (AGENTS.md rule 8) -- see `ui::palette` for the real window that
 //! wraps this, and
 //! `docs/superpowers/specs/2026-09-17-palette-design.md` for the rules this
 //! file implements and why.
@@ -387,7 +387,7 @@ pub enum PaletteOutcome {
     Hide,
 }
 
-/// The whole key-handling state machine in one pure function (CLAUDE.md
+/// The whole key-handling state machine in one pure function (AGENTS.md
 /// rule 8): given the current state and a recognized key, what happens.
 pub fn handle_key(state: &mut PaletteState, key: PaletteKey) -> PaletteOutcome {
     match key {
@@ -448,7 +448,7 @@ pub enum DispatchTarget {
 /// `dispatch_covers_every_built_in_action` below, so a built-in added to
 /// `actions::builtin_actions()` (or a new tray-only utility) without a
 /// matching arm here fails a test instead of silently being unrunnable from
-/// the palette (the "wired to nothing" shape CLAUDE.md rule 8 calls out).
+/// the palette (the "wired to nothing" shape AGENTS.md rule 8 calls out).
 pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
     match action_id {
         crate::actions::DEFAULT_ACTION_ID => Some(DispatchTarget::CheckMyWork),
@@ -1043,7 +1043,7 @@ mod tests {
 
     #[test]
     fn footer_line_has_no_em_dash() {
-        // CLAUDE.md rule 11.
+        // AGENTS.md rule 11.
         let a = footer_line("Auto", Some("ollama:gemma3"));
         let b = footer_line("Auto", None);
         assert!(!a.contains('\u{2014}'));

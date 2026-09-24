@@ -2,7 +2,7 @@
 //! `on_learned` when learn mode (`hotkey.rs`) captures a new chord for
 //! `hotkeys.primary`/`hotkeys.secondary`.
 //!
-//! Two layers, the module's usual split (CLAUDE.md rule 8):
+//! Two layers, the module's usual split (AGENTS.md rule 8):
 //!
 //! - **Pure** (this file, top-level): a fixed table of known system and
 //!   common-app global shortcuts ([`known_bindings`]), a lookup
@@ -14,7 +14,7 @@
 //!   detection mechanism precisely because the probe's coverage is so
 //!   narrow.
 //!
-//! # The flow (no dialogs, CLAUDE.md rule 7's "every failure ends in a
+//! # The flow (no dialogs, AGENTS.md rule 7's "every failure ends in a
 //! card", never a blocking prompt)
 //!
 //! The **first** time learn mode captures a chord that [`check`] finds in
@@ -215,7 +215,7 @@ pub mod win32 {
     //! A best-effort `RegisterHotKey` probe: register a chord against a
     //! scratch id on a window the caller owns, then immediately unregister
     //! it, with no lasting side effect either way. Exercised by hand, named
-    //! per CLAUDE.md rule 8 -- see [`probe_available`]'s doc comment for the
+    //! per AGENTS.md rule 8 -- see [`probe_available`]'s doc comment for the
     //! manual check.
     //!
     //! # What this can and cannot detect
@@ -262,7 +262,7 @@ pub mod win32 {
     /// return `false` for it. Filed as a manual step under issue #166 rather
     /// than exercised automatically: it needs two real processes racing for
     /// the same hotkey, which a `cargo test` binary cannot set up safely
-    /// (CLAUDE.md rule 9 -- it also must never collide with a hotkey the
+    /// (AGENTS.md rule 9 -- it also must never collide with a hotkey the
     /// developer's own machine actually uses).
     // Not called anywhere yet: this probe is a narrow supplementary signal
     // (see this module's doc comment), and #112's Done-when is satisfied by

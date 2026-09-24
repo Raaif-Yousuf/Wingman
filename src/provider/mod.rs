@@ -234,7 +234,7 @@ pub struct Caps {
 /// the constants in `capture.rs` (Anthropic's standard/high-res tiers,
 /// OpenAI's tile budget) or a documented/conservative default -- see each
 /// provider file's `capabilities()` doc comment for the source and its
-/// MEASURED/THEORY status (CLAUDE.md rule 10).
+/// MEASURED/THEORY status (AGENTS.md rule 10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageLimits {
     pub max_long_edge: u32,
@@ -263,7 +263,7 @@ pub enum StopReason {
 }
 
 /// A single-turn request. There is no multi-turn: Wingman is "no chat"
-/// (CLAUDE.md, owner decision 2026-09-16) — every `Request` is the whole
+/// (AGENTS.md, owner decision 2026-09-16) — every `Request` is the whole
 /// conversation, always exactly one user turn, and a `Provider` never sees
 /// history.
 #[derive(Debug, Clone)]
@@ -337,7 +337,7 @@ pub const MAX_NON_VISION_CHARS: usize = 12_000;
 /// Prefaced onto `system` by [`non_vision_request`], explaining the input
 /// shape to a model that is not shown the screenshot. Describes the INPUT
 /// format only -- it never asks the model to explain itself or its own
-/// reasoning, which is CLAUDE.md rule 10's reasoning-extraction trap
+/// reasoning, which is AGENTS.md rule 10's reasoning-extraction trap
 /// (Anthropic's classifier refuses a prompt that reads that way,
 /// `stop_reason: "refusal"`, MEASURED 2026-09-15); that trap is about
 /// wording that asks FOR reasoning, not about describing what data the
@@ -787,7 +787,7 @@ fn attempt_provider<T>(
 
 /// Issue #99's repair-request system prompt. Worded to ask only for
 /// corrected JSON, never for the model's reasoning or "how" it got the
-/// answer -- CLAUDE.md rule 10's `reasoning_extraction` trap (Anthropic's
+/// answer -- AGENTS.md rule 10's `reasoning_extraction` trap (Anthropic's
 /// classifier refuses a prompt that reads as extracting internal reasoning,
 /// `stop_reason: "refusal"`, MEASURED 2026-09-15) applies just as much to a
 /// repair prompt as to the original one that rule 3's `detail`-before-
@@ -1514,7 +1514,7 @@ mod tests {
         assert!(repair.user.contains("parse error text"));
     }
 
-    /// CLAUDE.md rule 10's trap: a repair prompt that reads as asking for
+    /// AGENTS.md rule 10's trap: a repair prompt that reads as asking for
     /// the model's internal reasoning gets refused (MEASURED 2026-09-15).
     /// The repair wording must never ask "why" or for a scratchpad -- only
     /// for corrected JSON.
@@ -1983,7 +1983,7 @@ mod tests {
 
     #[test]
     fn non_vision_request_preface_never_asks_for_reasoning() {
-        // CLAUDE.md rule 10's trap: wording that reads as asking the model
+        // AGENTS.md rule 10's trap: wording that reads as asking the model
         // to explain its own reasoning gets refused (MEASURED 2026-09-15).
         // This describes the INPUT format only.
         let base = base_req_with_image();

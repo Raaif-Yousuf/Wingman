@@ -4,12 +4,11 @@
 > shortest enforceable form, the stack, the pitfalls that have already cost a
 > session, and where to look. Depth lives in [`docs/`](docs/README.md).
 
-**Name:** **Wingman** (decided 2026-09-16; the crate, bin, window classes,
-mutex, config directory, package identity and icons were renamed
-2026-09-16, issues #1 and #10, both closed. The repo folder was renamed by
-hand on 2026-09-19 and is now `C:\Users\raaif\Wingman`; the current package
-identity is `RaaifYousuf.Wingman`, per `packaging\Wingman.Common.psm1`'s
-`Get-WingmanIdentity`). GitHub: `Raaif-Yousuf/Wingman`.
+**Name:** **Wingman** (renamed from `copilot-ask` on 2026-09-16: crate, bin,
+window classes, mutex, config directory, package identity and icons, issues
+#1 and #10). Package identity `RaaifYousuf.Wingman`, per
+`packaging\Wingman.Common.psm1`'s `Get-WingmanIdentity`. GitHub:
+`Raaif-Yousuf/Wingman`.
 
 **App:** a native Windows 11 tray assistant behind the Copilot key. Today: one
 press screenshots the active monitor, a vision model checks the physics problem
@@ -22,7 +21,7 @@ Cloud or local (Ollama), a purely offline mode, one switch that turns it off.
 follow-ups (owner decision 2026-09-16). Meant to be a community project: the
 action framework is the product and actions are the contribution surface.
 
-**Repo:** `C:\Users\raaif\Wingman` | single Rust crate, ~8k LOC, Win32 via
+**Repo:** single Rust crate, ~8k LOC, Win32 via
 `windows` 0.62, no async runtime | open source, MIT.
 
 ---
@@ -34,9 +33,8 @@ action framework is the product and actions are the contribution surface.
    in `%APPDATA%` and is gitignored. Never read
    `%APPDATA%\Wingman\config.toml` or the pre-rename
    `%APPDATA%\copilot-ask\config.toml` (still present; the rename migration
-   copies it forward and leaves it in place): the owner asked for the keys to
-   stay unread, and no task so far has needed them. Keys were rotated
-   2026-09-15; do not re-raise that.
+   copies it forward and leaves it in place): they hold real keys, and no task
+   needs them.
 2. **Permissive licenses only.** Dependencies: MIT, Apache-2.0, BSD, ISC, Zlib,
    Unlicense. Code copied from another project: MIT only, attributed in
    `THIRD_PARTY_NOTICES.md`. Re-verify a license at adoption; two projects on
@@ -49,8 +47,8 @@ action framework is the product and actions are the contribution surface.
    exe into a per-version `WindowsApps` path, breaking the `HKCU\…\Run`
    autostart on every upgrade and virtualizing the `%APPDATA%` writes.
 5. **Nothing runs while idle.** No polling timers in the tray, never
-   `NtSetTimerResolution`/`timeBeginPeriod`, every watcher is event-driven. The
-   owner audits this machine's battery drain to the tenth of a watt.
+   `NtSetTimerResolution`/`timeBeginPeriod`, every watcher is event-driven. Idle
+   battery drain is treated as a bug, measured to the tenth of a watt.
 6. **Ollama is `127.0.0.1:11434`, never `localhost`** (IPv6-first resolution
    stalls ~2 s per connection on Windows, MEASURED in the sibling CLAIR repo).
    `think` is always set explicitly (unset on a thinking model was MEASURED 28x
@@ -84,9 +82,7 @@ action framework is the product and actions are the contribution surface.
     the roadmap is the expansion plan's § 13. Never recreate a markdown
     backlog. `NEXT_SESSION.md` is a handoff snapshot, `OWNER_TODO.md` is the
     human-only queue; neither is a backlog.
-14. **Subagents run on Sonnet 5** (`model: "sonnet"` on every Agent call).
-    Owner rule 2026-09-16.
-15. **Shell discipline.** The Bash tool here is Git Bash; PowerShell is a
+14. **Shell discipline.** The Bash tool here is Git Bash; PowerShell is a
     separate tool with its own syntax. Never mix them in one command. Prefer
     `rtk` wrappers where the hook rewrites them. A compound command's exit code
     is the last command's, so check the one that matters.
@@ -102,7 +98,7 @@ action framework is the product and actions are the contribution surface.
 | Capture | `xcap` 0.9 (Apache-2.0, permissive but not MIT) + `image` PNG-only |
 | Config | `toml` in `%APPDATA%\Wingman\config.toml`, owner-only ACL, env overrides |
 | Packaging | sparse MSIX, self-signed cert, `install.ps1` self-elevates once; identity `RaaifYousuf.Wingman` |
-| Local models | Ollama 0.34 on `127.0.0.1:11434`; Intel Arc 140T iGPU needs `OLLAMA_IGPU_ENABLE=1` or Vulkan drops it and runs CPU-only; the only oracle for GPU use is `size_vram > 0` on `/api/ps` |
+| Local models | Ollama 0.34 on `127.0.0.1:11434`; Intel Arc iGPUs need `OLLAMA_IGPU_ENABLE=1` or Vulkan drops it and runs CPU-only; the only oracle for GPU use is `size_vram > 0` on `/api/ps` |
 | Release profile | `opt-level = "z"`, LTO, `panic = "abort"`, stripped; ~2 MB exe, under 10 MB idle |
 
 ---
@@ -112,7 +108,7 @@ action framework is the product and actions are the contribution surface.
 **The Copilot key is `Win+Shift+F23`, and swallowing it leaves Win logically
 down.** `hotkey.rs` taps `VK_CONTROL` to cancel the pending Start menu. Known
 fragile; if Start flickers, the fallback is swallowing the following `LWin`
-keyup. Learn mode exists because Dell firmware may emit something else.
+keyup. Learn mode exists because some laptop firmware may emit something else.
 
 **A bare launch must not ask.** The Copilot-key picker and the Start Menu both
 activate the exe with no arguments; the login autostart is the same bare launch.
@@ -136,7 +132,7 @@ by `ocr::has_package_identity()`), and `OcrEngine::RecognizeAsync` over a
 synthetic GDI-rendered image still succeeded from it: cold call 36 ms, warm
 call 22 ms, recognizer language `en-US`, `MaxImageDimension` 10000. WinRT
 OCR does **not** require package identity for a direct-path-launched
-process on this machine -- the earlier THEORY below is disproven.
+process on the Windows 11 dev machine -- the earlier THEORY below is disproven.
 `THEORY (unverified)`: whether an exe launched from the `Run` key while the
 sparse package is installed elsewhere on the machine differs from this
 measurement; no mechanism is known by which installing an unrelated package
@@ -158,4 +154,4 @@ revisited without a concrete reason to doubt it.
 | User-facing install and usage | [README.md](README.md) |
 | Docs index and who owns which fact | [docs/README.md](docs/README.md) |
 
-*Last updated: 2026-09-16 (card created; conventions ported from the sibling CLAIR repo and cut to what applies here).*
+*Last updated: 2026-09-24 (moved here from CLAUDE.md: Claude Code v2.1.277+ reads AGENTS.md directly, MEASURED 2026-09-24: a session with no CLAUDE.md in the repo loaded this file as project instructions; personal details trimmed).*

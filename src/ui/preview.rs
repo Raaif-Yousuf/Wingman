@@ -61,7 +61,7 @@ impl PreviewModel {
     /// Field order follows `schema["properties"]`'s own iteration order,
     /// which is load-bearing here the same way it is everywhere else this
     /// crate builds a schema (`serde_json` keeps `preserve_order`
-    /// crate-wide, CLAUDE.md rule 3): the card renders fields top-to-bottom
+    /// crate-wide, AGENTS.md rule 3): the card renders fields top-to-bottom
     /// in exactly the order the schema declares them, so a schema author
     /// controls the form's reading order by construction, not by a second
     /// ordering list that could drift from it.

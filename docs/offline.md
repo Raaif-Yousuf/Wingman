@@ -106,7 +106,7 @@ all, not just before data is sent. It recognizes:
   classify as refused -- this under-recognizes rather than over-recognizes,
   since this codebase never produces an unusual spelling itself.
 - `localhost` specifically is its own class, refused but with a message
-  pointing at `127.0.0.1` instead (CLAUDE.md rule 6: `localhost`'s
+  pointing at `127.0.0.1` instead (AGENTS.md rule 6: `localhost`'s
   IPv6-first resolution stalls on Windows, so a config that names it is
   almost always meant to mean the literal loopback address).
 - Anything else -- a real hostname, an unparseable string, an empty URL --

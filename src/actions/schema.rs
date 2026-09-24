@@ -2,7 +2,7 @@
 //! `Action::proposal` string, e.g. `"verdict"`) to the JSON Schema the
 //! model's completion must satisfy.
 //!
-//! `serde_json` keeps `preserve_order` (CLAUDE.md rule 3) crate-wide, so
+//! `serde_json` keeps `preserve_order` (AGENTS.md rule 3) crate-wide, so
 //! every schema built here carries its property order into the wire
 //! request unchanged -- a verdict-shaped proposal always puts the field the
 //! model should commit to (`headline`, `difficulty`) after the field that

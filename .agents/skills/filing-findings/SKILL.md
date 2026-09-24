@@ -17,7 +17,7 @@ gh issue list --state all --search "<two or three distinctive words>" --limit 20
 Search by the symptom and by the function name. If it exists, add a comment
 with your new evidence instead of a new issue.
 
-## 2. Classify honestly (CLAUDE.md rule 10)
+## 2. Classify honestly (AGENTS.md rule 10)
 
 | You have | Labels | Title starts with |
 |---|---|---|
@@ -67,7 +67,7 @@ Unbounded parallel builds have frozen this machine by exhausting RAM.
   most of what it holds):
 
   ```
-  export CARGO_TARGET_DIR=C:/Users/raaif/Wingman/target/wt/$(basename "$PWD")
+  export CARGO_TARGET_DIR="$(git rev-parse --path-format=absolute --git-common-dir)/../target/wt/$(basename "$PWD")"
   export RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=1
   export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
   ```

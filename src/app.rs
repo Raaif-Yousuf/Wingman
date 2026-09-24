@@ -50,7 +50,7 @@ use crate::provider::{
     review_request_from_text, Answer, Chain, Provider, Shot,
 };
 use crate::router;
-use crate::ui::card::{Card, WM_APP_PREVIEW_DECIDED};
+use crate::ui::card::{Card, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED};
 use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
 use crate::ui::palette_model::{self, DispatchTarget};
@@ -197,7 +197,7 @@ struct App {
 
 pub fn run() -> Result<()> {
     // Before any window exists, so the card's metrics are right on a mixed-DPI
-    // setup (the XPS panel next to an external monitor).
+    // setup (a laptop panel next to an external monitor).
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -351,7 +351,7 @@ pub fn run() -> Result<()> {
 
 /// Card text for issue #175: one or more stored provider keys exist in
 /// Credential Manager but could not be read back on this load. Pure so the
-/// wording is unit-tested without a real `Card`/HWND (CLAUDE.md rule 8);
+/// wording is unit-tested without a real `Card`/HWND (AGENTS.md rule 8);
 /// never includes any key material, only provider names, which are public
 /// config labels, never secrets. No em dash (rule 11).
 fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
@@ -483,12 +483,12 @@ impl App {
                 ),
             ),
             Mode::Cloud => (
-                "No API key: open Edit settings".to_string(),
-                format!("Add a key under [providers.openai] or [providers.anthropic] in:\n{config_path}"),
+                "No AI model set up yet".to_string(),
+                "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
             ),
             Mode::Auto => (
-                "No provider ready: open Edit settings".to_string(),
-                format!("Add a cloud API key, or configure Ollama, in:\n{config_path}"),
+                "No AI model set up yet".to_string(),
+                "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
             ),
         })
     }
@@ -556,7 +556,10 @@ impl App {
         if let Some((headline, detail)) =
             Self::readiness_gate(self.config.mode, &self.config.providers, &path)
         {
-            self.card.show_error(&headline, &detail);
+            // Issue #347: readiness-gate cards are always "go fix something
+            // in Settings" cards (a missing API key or Ollama config), so a
+            // click opens Settings directly instead of just expanding.
+            self.card.show_settings_needed(&headline, &detail);
             return None;
         }
 
@@ -2026,7 +2029,7 @@ impl App {
     /// actually succeeded -- otherwise `ShellExecuteW` opens a path that
     /// still does not exist, or exists with stale defaults, with nothing on
     /// screen to say so. Pure so this one-branch decision is unit-tested
-    /// directly (CLAUDE.md rule 8) rather than only through a live
+    /// directly (AGENTS.md rule 8) rather than only through a live
     /// Credential-Manager failure, which `edit_settings` itself cannot be
     /// unit-tested against (it owns a real `Card`/`HWND`).
     fn should_open_config_after_ensuring_it_exists(
@@ -2769,7 +2772,7 @@ fn local_today_and_utc_offset() -> Result<(CivilDate, i32)> {
 /// next to the OCR/network cost already paid on this path.
 ///
 /// An OCR failure (no language pack installed, the engine unavailable, a
-/// timeout) fails this whole function -- CLAUDE.md rule 7 wants that
+/// timeout) fails this whole function -- AGENTS.md rule 7 wants that
 /// surfaced as a clear, named skip reason for every provider that needed it
 /// (see `Chain::complete_parsed_with_fallback`'s doc comment), not silently
 /// degraded. A UIA failure (no foreground window, a hung app UIA can't
@@ -2839,7 +2842,7 @@ fn resolve_prompt_and_difficulty<'a>(
 
 /// Issue #181: which action a pause-toggle-chord press should take. Pure
 /// (just a bool in, an enum out) so the toggle direction is unit-tested
-/// directly (CLAUDE.md rule 8) without a real `App` -- `App::toggle_pause`
+/// directly (AGENTS.md rule 8) without a real `App` -- `App::toggle_pause`
 /// is the thin Win32-touching wrapper (checked by hand: press the
 /// configured chord while running, confirm the tray greys and the card
 /// shows "Paused"; press it again, confirm it un-greys, per issue #166).
@@ -3214,6 +3217,11 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_DISMISS
         | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
+        // #347: like WM_APP_TRAY's own OPEN_SETTINGS command, this just
+        // calls open_settings() with no payload to leak, and the card that
+        // posts it is hidden the moment it does so, so there is nothing
+        // left to defer either.
+        | WM_APP_CARD_OPEN_SETTINGS
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
@@ -3444,6 +3452,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_preview_decided(wparam.0 as u32);
             LRESULT(0)
         }
+        WM_APP_CARD_OPEN_SETTINGS => {
+            // Issue #347: a click on a "settings needed" card. No payload.
+            app.open_settings();
+            LRESULT(0)
+        }
         WM_APP_DISMISS => {
             let (x, y) = unpack_point(lparam.0 as u32);
             app.on_global_click(x, y);
@@ -3558,7 +3571,7 @@ mod tests {
     use crate::mode::Mode;
     use crate::provider::Provider;
     use crate::router;
-    use crate::ui::card::WM_APP_PREVIEW_DECIDED;
+    use crate::ui::card::{WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED};
     use crate::ui::palette::WM_APP_PALETTE_RUN;
     use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
@@ -3646,7 +3659,7 @@ mod tests {
 
     #[test]
     fn unreadable_secrets_card_has_no_em_dash() {
-        // CLAUDE.md rule 11: no em dashes in user-facing strings.
+        // AGENTS.md rule 11: no em dashes in user-facing strings.
         let (headline, detail) = unreadable_secrets_card(&["openai".to_string()]);
         assert!(!headline.contains('\u{2014}'));
         assert!(!detail.contains('\u{2014}'));
@@ -3824,7 +3837,10 @@ mod tests {
         let (headline, _) =
             App::readiness_gate(Mode::Cloud, &ollama_only_providers(), "config.toml")
                 .expect("must block: cloud mode has nothing cloud configured");
-        assert_eq!(headline, "No API key: open Edit settings");
+        // Issue #347: "Edit settings" is not a real menu item (the tray has
+        // "Settings..." and "Open config.toml"). The card must name a real
+        // action, and clicking it must actually open Settings.
+        assert_eq!(headline, "No AI model set up yet");
     }
 
     #[test]
@@ -3882,7 +3898,8 @@ mod tests {
         let (headline, _) =
             App::readiness_gate(Mode::Auto, &nothing_configured_providers(), "config.toml")
                 .expect("must block: nothing is configured at all");
-        assert_eq!(headline, "No provider ready: open Edit settings");
+        // Issue #347: same fix as Cloud mode's headline above.
+        assert_eq!(headline, "No AI model set up yet");
     }
 
     #[test]
@@ -3903,7 +3920,7 @@ mod tests {
 
     #[test]
     fn readiness_gate_cards_have_no_em_dash() {
-        // CLAUDE.md rule 11.
+        // AGENTS.md rule 11.
         for (mode, providers) in [
             (Mode::Cloud, nothing_configured_providers()),
             (Mode::Local, nothing_configured_providers()),
@@ -4223,6 +4240,7 @@ mod tests {
         ("WM_APP_REVIEW_RESULT", WM_APP_REVIEW_RESULT),
         ("WM_APP_FORM_FILL_RESULT", WM_APP_FORM_FILL_RESULT),
         ("WM_APP_ROUTER_RESULT", WM_APP_ROUTER_RESULT),
+        ("WM_APP_CARD_OPEN_SETTINGS", WM_APP_CARD_OPEN_SETTINGS),
     ];
 
     #[test]
@@ -4726,6 +4744,11 @@ mod tests {
             WM_APP_ROUTER_RESULT,
             SettingsReentrancy::Ignore,
         ),
+        (
+            "WM_APP_CARD_OPEN_SETTINGS",
+            WM_APP_CARD_OPEN_SETTINGS,
+            SettingsReentrancy::Ignore,
+        ),
     ];
 
     #[test]
@@ -4999,7 +5022,7 @@ mod tests {
     /// larger draft downscaled afterward), through the REAL intent router
     /// (`router::build_request`/`router::parse_router_result`, the same
     /// functions `App::router_worker` calls) against local Ollama
-    /// `gemma3:4b`. Run manually (CLAUDE.md build rules -- never bare
+    /// `gemma3:4b`. Run manually (AGENTS.md build rules -- never bare
     /// `cargo test`):
     /// ```text
     /// CARGO_TARGET_DIR=... RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2 \

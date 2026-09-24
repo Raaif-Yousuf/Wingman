@@ -13,7 +13,7 @@ hotkey (the Copilot key, `Ctrl+Shift+/`, or **Ask now** in the tray menu),
 and only while it is not Paused (see "Pause" below). There is no telemetry,
 no crash reporting, no update check, no analytics and no background network
 activity of any kind: nothing is sent while idle, and nothing runs on a
-timer (CLAUDE.md rule 5).
+timer (AGENTS.md rule 5).
 
 Five files under `src/provider/` can open a network connection --
 `openai.rs`, `anthropic.rs`, `gemini.rs`, `ollama.rs` and `openai_compat.rs`
@@ -68,7 +68,7 @@ send in `src/provider/common.rs` (`post_json_with`,
 socket or resolving any DNS. While Offline is active, the guard refuses any
 URL whose host is not a literal loopback address (`127.0.0.0/8` or `[::1]`);
 `localhost` is refused too, with a message pointing at `127.0.0.1`, since
-CLAUDE.md rule 6 already establishes Wingman never uses that name itself. A
+AGENTS.md rule 6 already establishes Wingman never uses that name itself. A
 test in `provider/common.rs` fails the build if any file under
 `src/provider/` calls the HTTP library directly outside this guarded path,
 so the enforcement is structural, not a convention someone could forget in

@@ -17,7 +17,7 @@ action-level option; the config-level toggle is untouched).
 
 This adds a new module (`actions/`) and changes what decides the system
 prompt and JSON schema sent for the one action Wingman runs today, which is
-architectural per CLAUDE.md rule 12 and CONTRIBUTING.md's "spec-first"
+architectural per AGENTS.md rule 12 and CONTRIBUTING.md's "spec-first"
 section. It is short because the shape is already pinned by the expansion
 plan §6 and CONTRIBUTING.md's worked example; this fills in the concrete
 Rust types, the TOML shape, and the merge/precedence rules those two

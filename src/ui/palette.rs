@@ -122,18 +122,27 @@ use windows::Win32::Graphics::Gdi::{
     DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
     GetWindowTextLengthW, GetWindowTextW, LoadCursorW, PostMessageW, RegisterClassExW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_COMMAND,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE,
+    WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    WS_VISIBLE,
 };
+
+/// `WM_MOUSELEAVE`'s stable, documented value (winuser.h) -- not re-exported
+/// by the `windows` crate under `Win32::UI::WindowsAndMessaging` (unlike
+/// `WM_MOUSEMOVE`), so spelled out here the same way this file already
+/// spells out `EN_CHANGE`.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 const WC_EDIT: &str = "EDIT";
 const ES_AUTOHSCROLL: u32 = 0x0080;
@@ -201,6 +210,44 @@ fn window_height(dpi: u32) -> i32 {
         + scale(FOOTER_HEIGHT, dpi)
 }
 
+/// #357: pure hit-test -- given a client-area `y` in physical pixels (as
+/// `WM_MOUSEMOVE`/`WM_LBUTTONUP` deliver it), the current viewport `offset`
+/// and the real row count, returns the real row index (into
+/// `PaletteState::rows`, the same space `PaletteState::selected` lives in)
+/// under that `y`, or `None` when `y` is above the list (still over the
+/// query box/padding/router-summary band), below the last real row, or below
+/// the whole painted viewport. Mirrors `on_paint`'s row-geometry math
+/// exactly (same constants, same order of additions) so a click always lands
+/// on the row it visually looks like it landed on -- see that function's `y`
+/// math, which this must never drift from.
+fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
+    let pad = scale(PADDING, dpi);
+    let list_top = pad + scale(EDIT_HEIGHT, dpi) + pad + scale(ROUTER_SUMMARY_HEIGHT, dpi);
+    let row_h = scale(ROW_HEIGHT, dpi);
+    if row_h <= 0 || y < list_top {
+        return None;
+    }
+    let visible_pos = ((y - list_top) / row_h) as usize;
+    if visible_pos >= crate::ui::palette_model::MAX_VISIBLE_ROWS {
+        return None;
+    }
+    let idx = offset + visible_pos;
+    if idx < row_count {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+/// Extracts the signed `y` client coordinate from a mouse message's
+/// `lParam` (`GET_Y_LPARAM`, winuser.h) -- not re-exported by the `windows`
+/// crate for these messages, so spelled out here the same way this file
+/// already spells out `EN_CHANGE`.
+fn mouse_y(lparam: LPARAM) -> i32 {
+    let raw = lparam.0 as i32 as u32;
+    ((raw >> 16) & 0xFFFF) as u16 as i16 as i32
+}
+
 /// One owned Quick Ask palette window. Thin handle around a heap-allocated
 /// [`PaletteInner`] -- same indirection reasoning as [`crate::ui::card::Card`]:
 /// the window's `WNDPROC` stashes a raw pointer in `GWLP_USERDATA` at
@@ -245,6 +292,8 @@ impl Palette {
             router_generation: 0,
             interacted: false,
             router_summary: None,
+            hover: None,
+            tracking_leave: false,
         });
         let raw = Box::into_raw(inner);
 
@@ -414,6 +463,18 @@ impl Palette {
     #[cfg(test)]
     pub(crate) fn selected_action_id(&self) -> Option<String> {
         self.inner.state.selected_action_id().map(|s| s.to_string())
+    }
+
+    /// #357: like [`Palette::selected_action_id`] but for an arbitrary real
+    /// row index rather than `state.selected` -- lets a test read off the
+    /// action id a hovered/clicked row names without duplicating
+    /// `Row::Action`'s field-matching itself.
+    #[cfg(test)]
+    pub(crate) fn selected_action_id_at(&self, idx: usize) -> Option<String> {
+        match self.inner.state.rows.get(idx) {
+            Some(crate::ui::palette_model::Row::Action { id, .. }) => Some(id.clone()),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -853,6 +914,21 @@ struct PaletteInner {
     /// `on_paint`). `None` most of the time -- no router result yet, the
     /// result didn't clear the threshold, or the user already interacted.
     router_summary: Option<String>,
+    /// #357: the row currently under the mouse cursor (real index into
+    /// `state.rows`, same space as `state.selected`), or `None` when the
+    /// mouse isn't over the list, isn't over an `Action` row, or hasn't
+    /// moved into the window since it was last shown. Separate from
+    /// `state.selected` on purpose: moving the mouse off the list must not
+    /// forget the keyboard/last-click selection Enter would still run, only
+    /// clear the hover highlight (see `WM_MOUSELEAVE` below).
+    hover: Option<usize>,
+    /// #357: whether `TrackMouseEvent(TME_LEAVE)` is currently armed for
+    /// this window. `TrackMouseEvent` disarms itself the moment it fires
+    /// (`WM_MOUSELEAVE`) or the mouse leaves, so it must be re-armed on
+    /// every `WM_MOUSEMOVE` that finds it not already tracking -- this flag
+    /// avoids the extra syscall on every single mouse-move while still
+    /// tracking is armed.
+    tracking_leave: bool,
 }
 
 impl PaletteInner {
@@ -872,6 +948,8 @@ impl PaletteInner {
         self.router_generation = self.router_generation.wrapping_add(1);
         self.interacted = false;
         self.router_summary = None;
+        self.hover = None;
+        self.tracking_leave = false;
         unsafe {
             let _ = SetWindowTextW(self.edit_hwnd, PCWSTR(wide_z("").as_ptr()));
         }
@@ -879,6 +957,13 @@ impl PaletteInner {
         self.reposition_centered();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOW);
+            // #395: this window is already WS_EX_TOPMOST, so this call only
+            // needs to (re)assert topmost z-order after ShowWindow, never
+            // move or resize what reposition_centered() just computed above
+            // -- SWP_NOMOVE | SWP_NOSIZE is load-bearing here. The previous
+            // 0,0,0,0 call with SWP_NOZORDER (which cancels the HWND_TOPMOST
+            // it passed) both moved the window to the origin and collapsed
+            // it to 0x0 right after positioning it (issue #395).
             let _ = SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
@@ -886,7 +971,7 @@ impl PaletteInner {
                 0,
                 0,
                 0,
-                SWP_NOACTIVATE | SWP_NOZORDER,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
             );
             let _ = SetForegroundWindow(self.hwnd);
             let _ = SetFocus(Some(self.edit_hwnd));
@@ -913,6 +998,8 @@ impl PaletteInner {
         // safe to do even when nothing was in flight.
         self.router_generation = self.router_generation.wrapping_add(1);
         self.router_summary = None;
+        self.hover = None;
+        self.tracking_leave = false;
     }
 
     /// #24: see [`Palette::apply_router_suggestion`]'s doc comment for the
@@ -1176,7 +1263,7 @@ impl PaletteInner {
                     draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(0x0080_8080));
                 }
                 crate::ui::palette_model::Row::Action { name, .. } => {
-                    if i == self.state.selected {
+                    if i == self.state.selected || self.hover == Some(i) {
                         if let Ok(hl) = unsafe {
                             target.CreateSolidColorBrush(
                                 &colorref_to_d2d(COLORREF(0x0045_3A2E)) as *const _,
@@ -1301,7 +1388,7 @@ impl PaletteInner {
                         );
                     }
                     crate::ui::palette_model::Row::Action { name, .. } => {
-                        if i == self.state.selected {
+                        if i == self.state.selected || self.hover == Some(i) {
                             let hl = CreateSolidBrush(COLORREF(0x0045_3A2E));
                             FillRect(hdc, &row_rect, hl);
                             let _ = DeleteObject(hl.into());
@@ -1410,6 +1497,71 @@ impl PaletteInner {
                 }
                 Some(LRESULT(0))
             }
+            // #357: hover highlight. `row_at` is purely geometric (any row
+            // slot), so this also checks the row is really an `Action` --
+            // headers/hints/blank space below the last row must never
+            // highlight. Re-arms `TrackMouseEvent` on every move that finds
+            // tracking not already armed, since `TrackMouseEvent` disarms
+            // itself the moment `WM_MOUSELEAVE` fires -- a one-shot device,
+            // not a subscription (no polling timer either way, rule 5: this
+            // only runs in response to a real mouse message).
+            WM_MOUSEMOVE => {
+                if !self.tracking_leave {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: self.hwnd,
+                        dwHoverTime: 0,
+                    };
+                    if unsafe { TrackMouseEvent(&mut tme) }.is_ok() {
+                        self.tracking_leave = true;
+                    }
+                }
+                let y = mouse_y(lparam);
+                let hit =
+                    row_at(y, self.dpi, self.state.offset, self.state.rows.len()).filter(|&i| {
+                        matches!(
+                            self.state.rows.get(i),
+                            Some(crate::ui::palette_model::Row::Action { .. })
+                        )
+                    });
+                if self.hover != hit {
+                    self.hover = hit;
+                    self.invalidate();
+                }
+                Some(LRESULT(0))
+            }
+            WM_MOUSELEAVE => {
+                self.tracking_leave = false;
+                if self.hover.is_some() {
+                    self.hover = None;
+                    self.invalidate();
+                }
+                Some(LRESULT(0))
+            }
+            // #357: click runs the row exactly as Enter would -- reuses
+            // `on_palette_key_command`'s `PaletteKey::Enter` arm (dispatch +
+            // hide) after moving `selected` to the clicked row, rather than
+            // duplicating that dispatch/hide logic here. Only `Action` rows
+            // are clickable (a header/hint hit is a no-op, per the issue's
+            // Done-when); `WM_LBUTTONDOWN` is swallowed so the popup window
+            // (no `WS_TABSTOP`) doesn't do anything Win32-default with it
+            // and the click is a single visible action, on release, like an
+            // ordinary button.
+            WM_LBUTTONDOWN => Some(LRESULT(0)),
+            WM_LBUTTONUP => {
+                let y = mouse_y(lparam);
+                if let Some(idx) = row_at(y, self.dpi, self.state.offset, self.state.rows.len()) {
+                    if matches!(
+                        self.state.rows.get(idx),
+                        Some(crate::ui::palette_model::Row::Action { .. })
+                    ) {
+                        self.state.selected = idx;
+                        self.on_palette_key_command(crate::ui::palette_model::PaletteKey::Enter);
+                    }
+                }
+                Some(LRESULT(0))
+            }
             // #216: the render target's DPI must follow WM_DPICHANGED, not
             // be read once at window creation -- see the module doc
             // comment's "Per-monitor-v2 DPI" paragraph. `wParam`'s low word
@@ -1483,7 +1635,8 @@ mod tests {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_RETURN};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        DispatchMessageW, GetMessageW, GetWindowRect, PeekMessageW, TranslateMessage, MSG,
+        PM_REMOVE,
     };
 
     fn instance() -> HINSTANCE {
@@ -1519,6 +1672,63 @@ mod tests {
         }
     }
 
+    // #357: pure hit-test tests, written before `row_at` exists (RED first).
+    // `dpi` is 96 throughout (logical == physical) so the expected pixel
+    // values are the raw layout constants.
+    mod row_at_tests {
+        use super::super::row_at;
+
+        const DPI: u32 = 96;
+        // list_top = PADDING + EDIT_HEIGHT + PADDING + ROUTER_SUMMARY_HEIGHT
+        //          = 8 + 30 + 8 + 18 = 64
+        const LIST_TOP: i32 = 64;
+        const ROW_H: i32 = 26;
+
+        #[test]
+        fn y_in_the_header_padding_above_the_list_is_none() {
+            assert_eq!(row_at(0, DPI, 0, 10), None);
+            assert_eq!(row_at(LIST_TOP - 1, DPI, 0, 10), None);
+        }
+
+        #[test]
+        fn y_at_the_top_of_the_first_row_is_row_zero() {
+            assert_eq!(row_at(LIST_TOP, DPI, 0, 10), Some(0));
+        }
+
+        #[test]
+        fn y_between_rows_lands_on_the_row_it_falls_in() {
+            // Middle of row 2 (index 2): list_top + 2*ROW_H + ROW_H/2.
+            let y = LIST_TOP + 2 * ROW_H + ROW_H / 2;
+            assert_eq!(row_at(y, DPI, 0, 10), Some(2));
+            // Exactly on the boundary between row 2 and row 3 -> row 3.
+            let boundary = LIST_TOP + 3 * ROW_H;
+            assert_eq!(row_at(boundary, DPI, 0, 10), Some(3));
+        }
+
+        #[test]
+        fn y_below_the_last_real_row_is_none() {
+            // Only 2 rows exist; the geometric slot for row 2 is still inside
+            // the painted viewport but there is no such row.
+            let y = LIST_TOP + 2 * ROW_H + 1;
+            assert_eq!(row_at(y, DPI, 0, 2), None);
+        }
+
+        #[test]
+        fn y_below_the_whole_viewport_is_none() {
+            let y = LIST_TOP + ROW_H * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32 + 5;
+            assert_eq!(row_at(y, DPI, 0, 100), None);
+        }
+
+        #[test]
+        fn scrolled_offset_shifts_the_returned_index() {
+            // With offset 5, the row painted at visible position 0 is real
+            // index 5.
+            assert_eq!(row_at(LIST_TOP, DPI, 5, 20), Some(5));
+            let y = LIST_TOP + 2 * ROW_H + 1;
+            assert_eq!(row_at(y, DPI, 5, 20), Some(7));
+        }
+    }
+
     #[test]
     fn window_and_edit_control_are_created() {
         let p = Palette::new_for_test(instance()).expect("palette window creation must succeed");
@@ -1534,6 +1744,51 @@ mod tests {
         assert!(p.is_visible());
         p.hide();
         assert!(!p.is_visible());
+    }
+
+    /// #395: `show()` must leave the window at the size and position
+    /// `reposition_centered()` just computed for it -- not collapsed to
+    /// 0x0 at the origin. Replays `reposition_centered`'s own math (monitor
+    /// rect, `scale`, `window_height`) against the REAL `GetWindowRect`
+    /// after a real `show()`, so a regression that moves/collapses the
+    /// window after positioning it (the exact #395 bug: an unqualified
+    /// `SetWindowPos(...,0,0,0,0,...)` after `reposition_centered()`) fails
+    /// this test even though `is_visible()` still reports `true`.
+    #[test]
+    fn show_leaves_the_window_at_reposition_centereds_computed_rect() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+
+        let mut rect = RECT::default();
+        unsafe {
+            GetWindowRect(p.hwnd(), &mut rect).expect("GetWindowRect must succeed");
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        assert!(
+            w > 0 && h > 0,
+            "palette window must have nonzero size after show(), got {w}x{h} at ({}, {})",
+            rect.left,
+            rect.top
+        );
+
+        let monitor =
+            crate::capture::active_monitor_rect().expect("active monitor rect must be readable");
+        let dpi = unsafe { GetDpiForWindow(p.hwnd()) }.max(1);
+        let expected_w = scale(WINDOW_WIDTH, dpi);
+        let expected_h = window_height(dpi);
+        let mon_w = monitor.right - monitor.left;
+        let mon_h = monitor.bottom - monitor.top;
+        let expected_x = monitor.left + (mon_w - expected_w).max(0) / 2;
+        let expected_y = monitor.top + (mon_h - expected_h).max(0) / 3;
+
+        assert_eq!(
+            (rect.left, rect.top, w, h),
+            (expected_x, expected_y, expected_w, expected_h),
+            "show() must leave the window exactly where reposition_centered() put it"
+        );
     }
 
     #[test]
@@ -1602,6 +1857,67 @@ mod tests {
         assert_eq!(Some(action_id.as_str()), after_down.as_deref());
 
         // Enter also hides the palette.
+        assert!(!p.is_visible());
+
+        unsafe {
+            let _ = DestroyWindow(owner);
+        }
+    }
+
+    /// #357: real Win32 test mirroring
+    /// `real_win32_down_then_enter_dispatches_the_second_action` but through
+    /// the mouse -- a real `WM_MOUSEMOVE` over the second row (checked
+    /// against `self.inner.hover` for the highlight), then a real
+    /// `WM_LBUTTONUP` at the same point, sent straight to the palette's own
+    /// `HWND` (mouse messages go to the window under the cursor directly, no
+    /// subclass forwarding needed here unlike the query edit control's
+    /// keys).
+    #[test]
+    fn real_win32_mouse_move_then_click_dispatches_the_hovered_row() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        let owner = create_test_owner_window(inst);
+        p.set_owner(owner);
+
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+
+        // list_top (96 DPI) = PADDING + EDIT_HEIGHT + PADDING +
+        // ROUTER_SUMMARY_HEIGHT = 8 + 30 + 8 + 18 = 64; row 1's midpoint is
+        // list_top + ROW_HEIGHT + ROW_HEIGHT/2 = 64 + 26 + 13 = 103.
+        let x: i16 = 50;
+        let y: i16 = 103;
+        let lparam = LPARAM(((y as u16 as u32) << 16 | (x as u16 as u32)) as isize);
+
+        unsafe {
+            SendMessageW(p.hwnd(), WM_MOUSEMOVE, Some(WPARAM(0)), Some(lparam));
+        }
+        assert!(
+            p.inner.hover.is_some(),
+            "hovering an action row must set hover"
+        );
+        // The row the click below must dispatch: the SAME id the mouse-move
+        // just hovered (which is also what Down-then-Enter would have
+        // selected, since the hover moved `state.selected` to the same
+        // geometric row hovering highlighted).
+        let hovered_action_id = p.selected_action_id_at(p.inner.hover.unwrap());
+
+        unsafe {
+            SendMessageW(p.hwnd(), WM_LBUTTONUP, Some(WPARAM(0)), Some(lparam));
+        }
+        pump_pending(p.hwnd());
+
+        let mut msg = MSG::default();
+        let got = unsafe { GetMessageW(&mut msg, Some(owner), 0, 0) };
+        assert!(
+            got.as_bool(),
+            "expected WM_APP_PALETTE_RUN to be queued by the click"
+        );
+        assert_eq!(msg.message, WM_APP_PALETTE_RUN);
+        let action_id = unsafe { *Box::from_raw(msg.lParam.0 as *mut String) };
+        assert_eq!(Some(action_id), hovered_action_id);
+
+        // Click also hides the palette, same as Enter.
         assert!(!p.is_visible());
 
         unsafe {

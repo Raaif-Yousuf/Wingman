@@ -15,7 +15,7 @@ settings Actions page.
 ## Why a design doc (rule 12)
 
 This adds a new UI surface with its own window class, message flow and key
-handling, which is architectural per CLAUDE.md rule 12. Short because the
+handling, which is architectural per AGENTS.md rule 12. Short because the
 shape is already pinned by the expansion plan §7 and issue #25's Done-when;
 this fills in the concrete split between pure and Win32 code, the message
 names, and the dispatch mechanism.

@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use super::common;
 use super::{Caps, Completion, Effort, ImageLimits, Provider, Request, StopReason};
 
-/// Local loopback only -- never `localhost` (CLAUDE.md rule 6: IPv6-first
+/// Local loopback only -- never `localhost` (AGENTS.md rule 6: IPv6-first
 /// resolution on Windows stalls ~2 s per connection, MEASURED in the
 /// sibling CLAIR repo).
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
@@ -26,7 +26,7 @@ const DEFAULT_MAX_TOKENS: u32 = 2500;
 /// is tight once a screenshot's image tokens are added in.
 const DEFAULT_NUM_CTX: u32 = 8192;
 /// `keep_alive` is a top-level request field, not inside `options`
-/// (CLAUDE.md rule 6: nested there it is silently ignored). This default
+/// (AGENTS.md rule 6: nested there it is silently ignored). This default
 /// matches the expansion plan's "default 30 m"; the live-check test
 /// overrides it to unload the model immediately after use.
 const DEFAULT_KEEP_ALIVE: &str = "30m";
@@ -78,7 +78,7 @@ impl Ollama {
 
     /// Maps [`Effort`] to Ollama's `think` field.
     ///
-    /// `think` is always sent explicitly, never omitted (CLAUDE.md rule 6:
+    /// `think` is always sent explicitly, never omitted (AGENTS.md rule 6:
     /// leaving it unset on a thinking model was MEASURED 28x slower). Most
     /// vision models Wingman talks to locally (`gemma3`) have no thinking
     /// mode at all, so `think` is ignored by them either way; it only
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn default_base_url_is_never_localhost() {
-        // CLAUDE.md rule 6: IPv6-first resolution of `localhost` stalls
+        // AGENTS.md rule 6: IPv6-first resolution of `localhost` stalls
         // ~2 s per connection on Windows. Must always be the literal IPv4
         // loopback address.
         assert_eq!(DEFAULT_BASE_URL, "http://127.0.0.1:11434");
@@ -357,7 +357,7 @@ mod tests {
         assert!(body.get("format").is_none());
     }
 
-    /// The MEASURED-28x-slower footgun (CLAUDE.md rule 6): `think` must be
+    /// The MEASURED-28x-slower footgun (AGENTS.md rule 6): `think` must be
     /// present on every request, never omitted -- regardless of effort.
     #[test]
     fn build_body_always_sends_think_explicitly() {
@@ -390,7 +390,7 @@ mod tests {
     }
 
     /// `keep_alive` must be a top-level field, never nested inside
-    /// `options` (CLAUDE.md rule 6: nested there it is silently ignored).
+    /// `options` (AGENTS.md rule 6: nested there it is silently ignored).
     #[test]
     fn keep_alive_is_top_level_not_inside_options() {
         let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");

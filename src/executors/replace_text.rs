@@ -83,7 +83,7 @@
 //! canonical table `executors::fill_form::evaluate_resolved_field` reads,
 //! never a second copy of the rules. `replace_text` is a plainly resolvable,
 //! generically-targetable executor (`executors::registry::resolve`), not a
-//! `fill_form`-only implementation detail, so CLAUDE.md's "never touches
+//! `fill_form`-only implementation detail, so AGENTS.md's "never touches
 //! payment data, no exceptions" applies to it exactly the same way.
 
 use anyhow::{anyhow, Context, Result};

@@ -2,7 +2,7 @@
 //! thread the moment the Quick Ask palette opens, that guesses which
 //! catalogue action the screen in front of the user is probably about.
 //!
-//! Pure module (CLAUDE.md rule 8): no `windows` dependency anywhere in this
+//! Pure module (AGENTS.md rule 8): no `windows` dependency anywhere in this
 //! file. `app.rs` owns every piece of Win32/network wiring this needs --
 //! capturing the downscaled screenshot on the main thread (mirroring
 //! `App::ask`'s own capture-before-spawn ordering), picking and constructing
@@ -95,7 +95,7 @@ pub fn candidates_from_catalogue(catalogue: &[PaletteAction]) -> Vec<RouterCandi
 }
 
 /// The router's JSON-schema, `additionalProperties: false`. Property order
-/// is load-bearing (CLAUDE.md rule 3): `summary` FIRST, so the model
+/// is load-bearing (AGENTS.md rule 3): `summary` FIRST, so the model
 /// describes what it actually sees before it commits to an intent id or a
 /// confidence number -- the same reasoning `provider::common::answer_schema`
 /// already applies to `detail` before `headline`.

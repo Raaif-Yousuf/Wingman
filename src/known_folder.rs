@@ -2,7 +2,7 @@
 //! Windows folders directly via the `windows` crate this project already
 //! depends on, instead of the `dirs` crate (issue #160: `dirs` pulled in
 //! `dirs-sys` -> `option-ext`, MPL-2.0, which was only a TEMPORARY per-crate
-//! exception in `deny.toml`, not on CLAUDE.md rule 2's permissive
+//! exception in `deny.toml`, not on AGENTS.md rule 2's permissive
 //! allowlist).
 //!
 //! Today only [`roaming_app_data`] (`%APPDATA%`, used by `config.rs`) is
@@ -62,7 +62,7 @@ mod tests {
 
     /// Read-only comparison against the `APPDATA` env var Windows itself
     /// sets for every process to the same folder -- never writes anything
-    /// under the resolved path. Per CLAUDE.md rule 1, this test never reads
+    /// under the resolved path. Per AGENTS.md rule 1, this test never reads
     /// `config.toml`'s contents; it only compares directory paths.
     #[test]
     fn roaming_app_data_matches_the_appdata_env_var() {

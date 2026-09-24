@@ -8,7 +8,7 @@
 use super::{Connector, IcsConnector};
 
 /// Resolves a connector by name, or fails with the exact text an unknown
-/// connector setting would surface on an error card (CLAUDE.md rule 7: a
+/// connector setting would surface on an error card (AGENTS.md rule 7: a
 /// load error, not a panic; rule 11: no em dash).
 pub fn resolve(name: &str) -> anyhow::Result<Box<dyn Connector>> {
     match name {
