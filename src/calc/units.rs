@@ -1,6 +1,7 @@
 //! Issue #115: unit conversion, `"<number> <unit> in|to <unit>"`, no model
 //! involved. Length, mass, volume, temperature (affine, not a linear
-//! factor), time, data (decimal KB vs. binary KiB), speed and area.
+//! factor), time, data (decimal KB vs. binary KiB), speed, area, energy
+//! (issue #316) and pressure (issue #316).
 //!
 //! Every non-temperature dimension converts through a fixed base unit (a
 //! plain multiplicative factor); temperature is the one dimension that needs
@@ -21,6 +22,8 @@ pub enum Dimension {
     Data,
     Speed,
     Area,
+    Energy,
+    Pressure,
 }
 
 impl fmt::Display for Dimension {
@@ -34,6 +37,8 @@ impl fmt::Display for Dimension {
             Dimension::Data => "data",
             Dimension::Speed => "speed",
             Dimension::Area => "area",
+            Dimension::Energy => "energy",
+            Dimension::Pressure => "pressure",
         };
         write!(f, "{s}")
     }
@@ -182,6 +187,30 @@ fn units_table() -> &'static [UnitDef] {
             ),
             linear_unit!(&["acre", "acres"], Area, 4046.8564224),
             linear_unit!(&["hectare", "hectares", "ha"], Area, 10_000.0),
+            // -- Energy (base: joule; factors NIST SP 811) -----------------------
+            linear_unit!(&["j", "joule", "joules"], Energy, 1.0),
+            linear_unit!(&["kj", "kilojoule", "kilojoules"], Energy, 1000.0),
+            // Thermochemical calorie, NIST SP 811: 1 cal = 4.184 J.
+            linear_unit!(&["cal", "calorie", "calories"], Energy, 4.184),
+            // Food "Calorie" is a kilocalorie: 1 kcal = 4184 J.
+            linear_unit!(&["kcal", "kilocalorie", "kilocalories"], Energy, 4184.0),
+            linear_unit!(&["wh", "watt hour", "watt hours"], Energy, 3600.0),
+            linear_unit!(
+                &["kwh", "kilowatt hour", "kilowatt hours"],
+                Energy,
+                3_600_000.0
+            ),
+            // British thermal unit (IT), NIST SP 811: 1 BTU = 1055.05585262 J.
+            linear_unit!(&["btu"], Energy, 1055.05585262),
+            // -- Pressure (base: pascal; factors NIST SP 811) --------------------
+            linear_unit!(&["pa", "pascal", "pascals"], Pressure, 1.0),
+            linear_unit!(&["kpa", "kilopascal", "kilopascals"], Pressure, 1000.0),
+            linear_unit!(&["bar", "bars"], Pressure, 100_000.0),
+            // 1 psi = 6894.757293168... Pa (NIST SP 811).
+            linear_unit!(&["psi"], Pressure, 6894.757293168361),
+            linear_unit!(&["atm", "atmosphere", "atmospheres"], Pressure, 101_325.0),
+            // 1 mmHg = 133.322387415 Pa (NIST SP 811, conventional mmHg).
+            linear_unit!(&["mmhg"], Pressure, 133.322387415),
             // -- Temperature (base: kelvin, affine) -----------------------------
             UnitDef {
                 aliases: &["c", "celsius"],
@@ -350,6 +379,20 @@ mod tests {
             (100.0, "kmh", "mph", 62.13711922),
             (1.0, "sqkm", "sqm", 1_000_000.0),
             (1.0, "acre", "sqm", 4046.8564224),
+            // -- Energy (from issue #316) -----------------------------------
+            (1.0, "kcal", "j", 4184.0),
+            (1.0, "kwh", "j", 3_600_000.0),
+            (1.0, "cal", "j", 4.184),
+            (1.0, "j", "cal", 1.0 / 4.184),
+            (1.0, "kj", "j", 1000.0),
+            (1.0, "wh", "j", 3600.0),
+            (1.0, "kwh", "kcal", 3_600_000.0 / 4184.0),
+            (1.0, "btu", "j", 1055.05585262),
+            // -- Pressure (from issue #316) ----------------------------------
+            (1.0, "bar", "pa", 100_000.0),
+            (1.0, "atm", "pa", 101325.0),
+            (1.0, "kpa", "pa", 1000.0),
+            (1.0, "mmhg", "pa", 133.322387415),
         ];
         for (value, from, to, expected) in cases {
             let got = convert(*value, from, to)
@@ -358,6 +401,67 @@ mod tests {
                 close(got, *expected),
                 "{value} {from} -> {to}: expected {expected}, got {got}"
             );
+        }
+    }
+
+    #[test]
+    fn energy_and_pressure_brief_examples() {
+        // 1 kcal is 4184 J.
+        assert!(close(convert(1.0, "kcal", "j").unwrap(), 4184.0));
+        // 1 kWh is 3.6e6 J.
+        assert!(close(convert(1.0, "kwh", "j").unwrap(), 3.6e6));
+        // 1 bar is 14.5038 psi (to 4 decimal places).
+        let bar_to_psi = convert(1.0, "bar", "psi").unwrap();
+        assert_eq!((bar_to_psi * 10_000.0).round() / 10_000.0, 14.5038);
+        // 1 atm is 101325 Pa.
+        assert!(close(convert(1.0, "atm", "pa").unwrap(), 101_325.0));
+        // 5 kg in psi is a clear error, not a number.
+        let err = convert(5.0, "kg", "psi").unwrap_err();
+        assert!(matches!(err, UnitError::IncompatibleDimensions { .. }));
+    }
+
+    #[test]
+    fn kcal_and_kwh_round_trip() {
+        let out = convert(10.0, "kcal", "kwh").unwrap();
+        let back = convert(out, "kwh", "kcal").unwrap();
+        assert!(close(back, 10.0), "kcal<->kwh round trip: got {back}");
+    }
+
+    #[test]
+    fn psi_and_bar_round_trip() {
+        let out = convert(10.0, "psi", "bar").unwrap();
+        let back = convert(out, "bar", "psi").unwrap();
+        assert!(close(back, 10.0), "psi<->bar round trip: got {back}");
+    }
+
+    #[test]
+    fn energy_and_pressure_are_separate_dimensions() {
+        let err = convert(1.0, "psi", "kcal").unwrap_err();
+        assert!(matches!(err, UnitError::IncompatibleDimensions { .. }));
+        let err = convert(1.0, "kcal", "psi").unwrap_err();
+        assert!(matches!(err, UnitError::IncompatibleDimensions { .. }));
+    }
+
+    #[test]
+    fn cal_and_kcal_do_not_collide() {
+        // "kcal" must resolve as one unit, not "k" (kelvin) + "cal".
+        assert!(find_unit("kcal").is_some());
+        assert_eq!(find_unit("kcal").unwrap().dimension, Dimension::Energy);
+        assert_eq!(find_unit("cal").unwrap().dimension, Dimension::Energy);
+        // The two units convert differently: 1 kcal != 1 cal in joules.
+        let kcal_j = convert(1.0, "kcal", "j").unwrap();
+        let cal_j = convert(1.0, "cal", "j").unwrap();
+        assert!((kcal_j - cal_j).abs() > 1.0);
+    }
+
+    #[test]
+    fn bar_does_not_collide_with_other_units() {
+        assert_eq!(find_unit("bar").unwrap().dimension, Dimension::Pressure);
+        // "bar" is not accidentally an alias of any other existing unit.
+        for u in units_table() {
+            if u.dimension != Dimension::Pressure {
+                assert!(!u.aliases.contains(&"bar"));
+            }
         }
     }
 
