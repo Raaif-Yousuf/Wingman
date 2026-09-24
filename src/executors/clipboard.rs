@@ -90,6 +90,9 @@ impl<C: ClipboardAccess + 'static> Executor for ClipboardExecutor<C> {
         "clipboard"
     }
 
+    /// `ReadOnly` is intentional, not an oversight: see `executors::Effect`'s
+    /// doc comment ("Decided (issue #402)") for why a clipboard-writing
+    /// executor still counts as read-only for the confirm fast path.
     fn effect(&self) -> Effect {
         Effect::ReadOnly
     }
@@ -105,7 +108,11 @@ impl<C: ClipboardAccess + 'static> Executor for ClipboardExecutor<C> {
         };
 
         // Best-effort: a clipboard that was empty or held non-text content
-        // restores to nothing rather than failing the whole action.
+        // restores to nothing rather than failing the whole action. These
+        // two cases are indistinguishable here (arboard's
+        // `ContentNotAvailable` covers both), so a prior non-text value is
+        // silently lost on undo rather than merely left alone -- tracked
+        // separately as issue #410, not fixed by this decision.
         let previous = self.clipboard.get_text().ok();
 
         self.clipboard.set_text(&text)?;
@@ -174,6 +181,21 @@ mod tests {
     #[test]
     fn clipboard_executor_is_read_only() {
         assert_eq!(ClipboardExecutor::new().effect(), Effect::ReadOnly);
+    }
+
+    /// Issue #402: a clipboard-overwriting executor still auto-confirming
+    /// is a deliberate decision (see `executors::Effect`'s doc comment), not
+    /// a gap. This test is the regression guard for that decision: if
+    /// `Effect::ReadOnly` on `ClipboardExecutor` ever gets narrowed back to
+    /// requiring a real confirmation, this is the assertion that must be
+    /// updated (and the mod.rs doc comment with it) rather than one that
+    /// silently starts failing.
+    #[test]
+    fn clipboard_executor_auto_confirms_by_design_per_issue_402() {
+        let executor = ClipboardExecutor::with_clipboard(FakeClipboard::default());
+        let proposal = crate::ui::confirm::Proposal::new(serde_json::json!({"text": "x"}));
+        crate::ui::confirm::auto_confirm_read_only(&executor, proposal)
+            .expect("clipboard executor must auto-confirm: issue #402 decided this is intended");
     }
 
     #[test]
