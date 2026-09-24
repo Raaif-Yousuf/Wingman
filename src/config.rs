@@ -893,19 +893,28 @@ impl Config {
     /// customized is never touched.
     fn backfill(&mut self) -> bool {
         let d = Providers::default();
+        let mut changed = false;
         if self.providers.openai.models.is_empty() {
             self.providers.openai.models = d.openai.models;
+            changed = true;
         }
         if self.providers.anthropic.models.is_empty() {
             self.providers.anthropic.models = d.anthropic.models;
+            changed = true;
         }
         if self.providers.gemini.models.is_empty() {
             self.providers.gemini.models = d.gemini.models;
+            changed = true;
         }
         if self.ui.text_scale <= 0.0 {
             self.ui.text_scale = Ui::default().text_scale;
+            changed = true;
         }
-        self.repair_refusal_trigger()
+        // `|` (not `||`), deliberately: `repair_refusal_trigger` must always
+        // run and its mutation must always apply, even when an earlier
+        // branch already set `changed` -- short-circuiting here would skip
+        // the call entirely (#299).
+        changed | self.repair_refusal_trigger()
     }
 
     /// Rewrites one sentence of a stored prompt that makes Claude refuse.
@@ -2141,6 +2150,34 @@ api_key = "sk-x"
         // The user's own values survive the backfill.
         assert_eq!(cfg.providers.openai.api_key, "sk-x");
         assert_eq!(cfg.ui.text_scale, 1.0);
+    }
+
+    #[test]
+    fn backfilling_a_model_list_writes_the_repair_back_to_disk() {
+        // Issue #299: `backfill` mutated `models` in memory but only
+        // `repair_refusal_trigger`'s result reached `load_from_file`'s
+        // write-back gate, so a model-list repair never made it to disk.
+        let path = scratch_path("backfill-writeback");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let old = r#"
+[providers.openai]
+model = "gpt-5.5"
+api_key = "sk-x"
+"#;
+        std::fs::write(&path, old).unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(!loaded.providers.openai.models.is_empty());
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let reparsed: Config = toml::from_str(&on_disk).unwrap();
+        assert!(
+            !reparsed.providers.openai.models.is_empty(),
+            "the backfilled model list must be written back to disk, not just kept in memory: {on_disk}"
+        );
+        cleanup(&path);
     }
 
     #[test]
