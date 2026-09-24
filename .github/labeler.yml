@@ -1,62 +1,84 @@
-# Path-based area labels for actions/labeler (see .github/workflows/triage.yml).
-# Kept close to src/'s own module layout; update both together.
+# Path-based area labels for actions/labeler v5 (see
+# .github/workflows/triage.yml). v5's config shape is
+# <label>:\n- changed-files:\n  - any-glob-to-any-file: [...]
+# (a v4 flat glob list under the label is rejected). Kept close to src/'s own
+# module layout; update both together.
 
 area:actions:
-- src/actions/**
-- src/actions_example.rs
-- src/router.rs
+- changed-files:
+  - any-glob-to-any-file:
+    - src/actions/**
+    - src/actions_example.rs
+    - src/router.rs
+    - src/calc/**
 
 area:executors:
-- src/executors/**
+- changed-files:
+  - any-glob-to-any-file:
+    - src/executors/**
+    - src/profile/**
 
 area:connectors:
-- src/connectors/**
+- changed-files:
+  - any-glob-to-any-file:
+    - src/connectors/**
 
 area:providers:
-- src/provider/**
-- src/egress.rs
+- changed-files:
+  - any-glob-to-any-file:
+    - src/provider/**
+    - src/egress.rs
 
 area:ui:
-- src/ui/**
+- changed-files:
+  - any-glob-to-any-file:
+    - src/ui/**
 
 area:inputs:
-- src/inputs/**
-- src/capture.rs
-- src/ocr.rs
-- src/hotkey.rs
-- src/hotkey_conflicts.rs
-
-area:awareness:
-- src/profile/**
+- changed-files:
+  - any-glob-to-any-file:
+    - src/inputs/**
+    - src/capture.rs
+    - src/ocr.rs
+    - src/hotkey.rs
+    - src/hotkey_conflicts.rs
 
 area:packaging:
-- packaging/**
-- install.ps1
-- uninstall.ps1
-- '*.wapproj'
-- AppxManifest.xml.in
+- changed-files:
+  - any-glob-to-any-file:
+    - packaging/**
+    - install.ps1
+    - uninstall.ps1
+    - '*.wapproj'
+    - AppxManifest.xml.in
 
 area:docs:
-- docs/**
-- '**/*.md'
+- changed-files:
+  - any-glob-to-any-file:
+    - docs/**
+    - '**/*.md'
 
 area:ci:
-- .github/**
-- scripts/hooks/**
-- scripts/verify-all.sh
+- changed-files:
+  - any-glob-to-any-file:
+    - .github/**
+    - scripts/hooks/**
+    - scripts/verify-all.sh
 
 area:core:
-- src/app.rs
-- src/config.rs
-- src/config_example.rs
-- src/mode.rs
-- src/secrets.rs
-- src/dpapi.rs
-- src/single_instance.rs
-- src/autostart.rs
-- src/known_folder.rs
-- src/pause.rs
-- src/dismiss.rs
-- src/diagnostics.rs
-- src/payment_denylist.rs
-- src/main.rs
+- changed-files:
+  - any-glob-to-any-file:
+    - src/app.rs
+    - src/config.rs
+    - src/config_example.rs
+    - src/mode.rs
+    - src/secrets.rs
+    - src/dpapi.rs
+    - src/single_instance.rs
+    - src/autostart.rs
+    - src/known_folder.rs
+    - src/pause.rs
+    - src/dismiss.rs
+    - src/diagnostics.rs
+    - src/payment_denylist.rs
+    - src/main.rs

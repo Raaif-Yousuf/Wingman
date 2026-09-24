@@ -28,11 +28,11 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           issue-message: >
             Thanks for opening your first issue in Wingman. A maintainer will
-            take a look soon. See AGENTS.md for the project's ground rules if
-            you plan to send a pull request for it.
+            take a look soon. If you plan to send a pull request for it, see
+            CONTRIBUTING.md and issue #318 ("Start here") first.
           pr-message: >
-            Thanks for your first pull request to Wingman. See AGENTS.md for
-            the project's ground rules and CONTRIBUTING.md for how CI and
+            Thanks for your first pull request to Wingman. See
+            CONTRIBUTING.md and issue #318 ("Start here") for how CI and
             test builds work.
 
   label:
