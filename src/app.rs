@@ -50,7 +50,7 @@ use crate::provider::{
     review_request_from_text, Answer, Chain, Provider, Shot,
 };
 use crate::router;
-use crate::ui::card::{Card, WM_APP_PREVIEW_DECIDED};
+use crate::ui::card::{Card, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED};
 use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
 use crate::ui::palette_model::{self, DispatchTarget};
@@ -483,12 +483,12 @@ impl App {
                 ),
             ),
             Mode::Cloud => (
-                "No API key: open Edit settings".to_string(),
-                format!("Add a key under [providers.openai] or [providers.anthropic] in:\n{config_path}"),
+                "No AI model set up yet".to_string(),
+                "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
             ),
             Mode::Auto => (
-                "No provider ready: open Edit settings".to_string(),
-                format!("Add a cloud API key, or configure Ollama, in:\n{config_path}"),
+                "No AI model set up yet".to_string(),
+                "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
             ),
         })
     }
@@ -556,7 +556,10 @@ impl App {
         if let Some((headline, detail)) =
             Self::readiness_gate(self.config.mode, &self.config.providers, &path)
         {
-            self.card.show_error(&headline, &detail);
+            // Issue #347: readiness-gate cards are always "go fix something
+            // in Settings" cards (a missing API key or Ollama config), so a
+            // click opens Settings directly instead of just expanding.
+            self.card.show_settings_needed(&headline, &detail);
             return None;
         }
 
@@ -3214,6 +3217,11 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_DISMISS
         | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
+        // #347: like WM_APP_TRAY's own OPEN_SETTINGS command, this just
+        // calls open_settings() with no payload to leak, and the card that
+        // posts it is hidden the moment it does so, so there is nothing
+        // left to defer either.
+        | WM_APP_CARD_OPEN_SETTINGS
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
@@ -3444,6 +3452,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_preview_decided(wparam.0 as u32);
             LRESULT(0)
         }
+        WM_APP_CARD_OPEN_SETTINGS => {
+            // Issue #347: a click on a "settings needed" card. No payload.
+            app.open_settings();
+            LRESULT(0)
+        }
         WM_APP_DISMISS => {
             let (x, y) = unpack_point(lparam.0 as u32);
             app.on_global_click(x, y);
@@ -3558,7 +3571,7 @@ mod tests {
     use crate::mode::Mode;
     use crate::provider::Provider;
     use crate::router;
-    use crate::ui::card::WM_APP_PREVIEW_DECIDED;
+    use crate::ui::card::{WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED};
     use crate::ui::palette::WM_APP_PALETTE_RUN;
     use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
@@ -3824,7 +3837,10 @@ mod tests {
         let (headline, _) =
             App::readiness_gate(Mode::Cloud, &ollama_only_providers(), "config.toml")
                 .expect("must block: cloud mode has nothing cloud configured");
-        assert_eq!(headline, "No API key: open Edit settings");
+        // Issue #347: "Edit settings" is not a real menu item (the tray has
+        // "Settings..." and "Open config.toml"). The card must name a real
+        // action, and clicking it must actually open Settings.
+        assert_eq!(headline, "No AI model set up yet");
     }
 
     #[test]
@@ -3882,7 +3898,8 @@ mod tests {
         let (headline, _) =
             App::readiness_gate(Mode::Auto, &nothing_configured_providers(), "config.toml")
                 .expect("must block: nothing is configured at all");
-        assert_eq!(headline, "No provider ready: open Edit settings");
+        // Issue #347: same fix as Cloud mode's headline above.
+        assert_eq!(headline, "No AI model set up yet");
     }
 
     #[test]
@@ -4223,6 +4240,7 @@ mod tests {
         ("WM_APP_REVIEW_RESULT", WM_APP_REVIEW_RESULT),
         ("WM_APP_FORM_FILL_RESULT", WM_APP_FORM_FILL_RESULT),
         ("WM_APP_ROUTER_RESULT", WM_APP_ROUTER_RESULT),
+        ("WM_APP_CARD_OPEN_SETTINGS", WM_APP_CARD_OPEN_SETTINGS),
     ];
 
     #[test]
@@ -4724,6 +4742,11 @@ mod tests {
         (
             "WM_APP_ROUTER_RESULT",
             WM_APP_ROUTER_RESULT,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_CARD_OPEN_SETTINGS",
+            WM_APP_CARD_OPEN_SETTINGS,
             SettingsReentrancy::Ignore,
         ),
     ];

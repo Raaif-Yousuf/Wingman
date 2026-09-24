@@ -112,6 +112,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// doc comment.
 pub const WM_APP_PREVIEW_DECIDED: u32 = WM_APP + 9;
 
+/// Posted to the card's owner window (see [`Card::set_owner`]) when the user
+/// clicks a card shown via [`Card::show_settings_needed`] -- issue #347.
+/// Carries no payload: `App::on_card_open_settings` just calls
+/// `App::open_settings()`. Adding another `WM_APP_*` constant anywhere in the
+/// crate also means adding it to `app.rs`'s `tests::ALL_WM_APP_IDS` (issue
+/// #163) and its `count_declarations` file list -- see that test's doc
+/// comment.
+pub const WM_APP_CARD_OPEN_SETTINGS: u32 = WM_APP + 15;
+
 use crate::provider::Difficulty;
 use crate::ui::preview::{Field, PreviewModel};
 
@@ -187,6 +196,7 @@ impl Card {
             preview: None,
             last_confirmed: None,
             owner: None,
+            open_settings_on_click: false,
             preview_decision_pending: false,
             preview_generation: 0,
         });
@@ -285,6 +295,18 @@ impl Card {
         // ensures a previous answer's badge can never linger on an error
         // card.
         self.inner.show_collapsed(headline, detail, 0, None);
+    }
+
+    /// Issue #347: like [`Card::show_error`] (persists until dismissed, no
+    /// difficulty badge), except a click on the card while it is still
+    /// Collapsed posts [`WM_APP_CARD_OPEN_SETTINGS`] to the owner window
+    /// (see [`Card::set_owner`]) and hides the card, instead of expanding it
+    /// for more detail. Used for the readiness-gate cards ("No AI model set
+    /// up yet", "Local mode needs Ollama configured") -- the actionable next
+    /// step for those is Settings, not more text to read.
+    pub fn show_settings_needed(&mut self, headline: &str, detail: &str) {
+        self.inner.show_collapsed(headline, detail, 0, None);
+        self.inner.open_settings_on_click = true;
     }
 
     pub fn hide(&mut self) {
@@ -915,6 +937,13 @@ struct CardInner {
     /// `pending_form_fill` would stay `Some`, and a later "Do it" on a
     /// different preview could run the abandoned action instead of the one
     /// the user actually confirmed.
+    /// Issue #347: `true` while the currently-showing Collapsed card is a
+    /// "you need to configure something" prompt whose click should open
+    /// Settings instead of expanding for more detail. Set only by
+    /// [`Card::show_settings_needed`]; cleared by every other path into
+    /// Collapsed (`show_collapsed`, used by both `show_answer` and
+    /// `show_error`) so it can never linger onto an unrelated card.
+    open_settings_on_click: bool,
     preview_decision_pending: bool,
     /// Issue #225: incremented on every [`CardInner::show_preview`], and
     /// posted as `WM_APP_PREVIEW_DECIDED`'s `WPARAM` so the owner can tell
@@ -994,6 +1023,11 @@ impl CardInner {
         self.state = CardState::Collapsed;
         self.scroll_offset = 0;
         self.scroll_max = 0;
+        // Issue #347: every ordinary show_answer/show_error call starts a
+        // plain card, not a "click to open Settings" prompt -- only
+        // `Card::show_settings_needed` sets this, right after this call
+        // returns.
+        self.open_settings_on_click = false;
 
         unsafe {
             if auto_dismiss_secs > 0 {
@@ -1700,7 +1734,26 @@ impl CardInner {
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
-                self.try_expand();
+                // Issue #347: a settings-needed card's click opens Settings
+                // instead of expanding -- checked before try_expand() (whose
+                // own guard would otherwise just expand it, since these
+                // cards are always Collapsed with a non-empty detail).
+                if self.state == CardState::Collapsed && self.open_settings_on_click {
+                    self.open_settings_on_click = false;
+                    if let Some(owner) = self.owner {
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(owner),
+                                WM_APP_CARD_OPEN_SETTINGS,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                    self.hide();
+                } else {
+                    self.try_expand();
+                }
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL => {
@@ -2715,6 +2768,53 @@ mod tests {
         card.hide();
         assert_eq!(card.state(), CardState::Hidden);
         // Dropping must not panic (this exercises DestroyWindow + WM_NCDESTROY).
+    }
+
+    #[test]
+    fn clicking_a_settings_needed_card_opens_settings_instead_of_expanding() {
+        // Issue #347: the old "No API key: open Edit settings" card named a
+        // menu item that no longer exists. The fix is that the card's own
+        // click opens Settings directly, so this proves the click posts
+        // WM_APP_CARD_OPEN_SETTINGS to the owner (same self-notify idiom the
+        // preview tests use) and does not just expand the card.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_settings_needed("No AI model set up yet", "Click here to open Settings.");
+        assert_eq!(card.state(), CardState::Collapsed);
+
+        let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
+
+        assert_eq!(
+            card.state(),
+            CardState::Hidden,
+            "clicking a settings-needed card must hide it, not expand it"
+        );
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "clicking a settings-needed card must post WM_APP_CARD_OPEN_SETTINGS to the owner"
+        );
+        assert_eq!(msg.message, WM_APP_CARD_OPEN_SETTINGS);
+    }
+
+    #[test]
+    fn clicking_an_ordinary_error_card_still_expands() {
+        // Neighbouring case: show_error (not show_settings_needed) must keep
+        // the pre-#347 expand-on-click behaviour.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error("Couldn't capture the screen", "detail text");
+        assert_eq!(card.state(), CardState::Collapsed);
+
+        let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
+        assert_eq!(card.state(), CardState::Expanded);
     }
 
     #[test]
