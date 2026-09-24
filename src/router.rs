@@ -69,7 +69,7 @@ pub const ROUTER_MAX_TOKENS: u32 = 200;
 /// below and change nothing.
 pub const DEFAULT_ROUTER_THRESHOLD: f64 = 0.7;
 
-const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Identify which listed action (if any) the screen suggests, and describe in one short sentence what's on screen. Never explain your reasoning, only report the result.";
+const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Identify which listed action (if any) the screen suggests, and describe in one short sentence what's on screen. Never explain your reasoning, only report the result. Use plain text only: no markdown and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
 
 /// One candidate action offered to the router: its id and a one-line
 /// description (today: [`PaletteAction::name`] -- the catalogue has no
