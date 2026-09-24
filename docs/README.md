@@ -1,6 +1,6 @@
 # Documentation index
 
-> The detailed reference. `CLAUDE.md` at the repo root is the quick-reference
+> The detailed reference. `AGENTS.md` at the repo root is the quick-reference
 > card and points here for depth.
 
 A native Windows 11 tray assistant behind the Copilot key. Rust, Win32, one
@@ -24,7 +24,7 @@ handoff snapshot, or a human-only action: those are four different things.
 ## Reading order for a new contributor
 
 1. [`README.md`](../README.md) at the root: what it does and how to install it.
-2. [`CLAUDE.md`](../CLAUDE.md): the rules and the pitfalls, ten minutes.
+2. [`AGENTS.md`](../AGENTS.md): the rules and the pitfalls, ten minutes.
 3. [`2026-09-14-copilot-ask-design.md`](superpowers/specs/2026-09-14-copilot-ask-design.md): the running app.
 4. [`2026-09-15-packaging-and-install-design.md`](superpowers/specs/2026-09-15-packaging-and-install-design.md): how it gets onto a machine.
 5. [`2026-09-16-expansion-plan-design.md`](superpowers/specs/2026-09-16-expansion-plan-design.md): where it is going.

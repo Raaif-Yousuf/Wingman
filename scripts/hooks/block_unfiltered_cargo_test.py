@@ -131,7 +131,7 @@ Run only the tests you touched instead:
 Build with a capped job count and the shared target dir so builds queue
 behind a file lock instead of running in parallel:
 
-    export CARGO_TARGET_DIR=C:/Users/raaif/copilot-ask/target CARGO_BUILD_JOBS=4
+    export CARGO_TARGET_DIR=<repo>/target CARGO_BUILD_JOBS=4
 
 The orchestrator's full-suite run sets WINGMAN_FULL_SUITE=1 on the command
 to bypass this check; that override is not for individual agents to use."""

@@ -79,7 +79,7 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// NUL-laden UTF-8 reading is kept only as the last resort, if UTF-16LE
 /// itself does not decode cleanly either. Pure and Win32-free on purpose so
 /// the decode logic -- the part issue #175 actually needed fixed -- is
-/// unit-testable without touching the real store (CLAUDE.md rule 8).
+/// unit-testable without touching the real store (AGENTS.md rule 8).
 fn decode_blob(bytes: &[u8]) -> Result<String> {
     let utf8: Option<String> = std::str::from_utf8(bytes).ok().map(|s| s.to_string());
     if let Some(s) = &utf8 {

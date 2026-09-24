@@ -124,7 +124,7 @@ fn now_unix() -> u64 {
 /// number (`\x89PNG\r\n\x1a\n`): base64 is a 6-bits-per-character encoding,
 /// so a byte sequence with a fixed prefix always base64-encodes to a fixed
 /// character prefix too. Every image this crate ever sends is a PNG
-/// (`capture.rs`, "PNG-only", CLAUDE.md's stack table), so this alone is
+/// (`capture.rs`, "PNG-only", AGENTS.md's stack table), so this alone is
 /// enough to recognise an embedded image string generically, without
 /// knowing any vendor's specific JSON shape.
 const PNG_BASE64_PREFIX: &str = "iVBORw0KG";
@@ -470,7 +470,7 @@ pub(crate) fn cap_lines(existing: &str, new_line: &str, max_bytes: usize) -> Str
 /// `%APPDATA%` (roaming), since this file is deliberately not something
 /// that should follow a roaming profile between machines.
 ///
-/// CLAUDE.md rule 9 ("tests never touch production names"): under
+/// AGENTS.md rule 9 ("tests never touch production names"): under
 /// `#[cfg(test)]` this resolves to a process-scoped file in `%TEMP%`
 /// instead, never the real `%LOCALAPPDATA%\Wingman\egress.log` -- so
 /// `provider::common`'s tests, which call the real `post_json_with` (and so
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn no_egress_text_contains_an_em_dash() {
-        // CLAUDE.md rule 11: this text can end up pasted into a bug report.
+        // AGENTS.md rule 11: this text can end up pasted into a bug report.
         let entry = build_entry(
             "anthropic",
             "https://api.anthropic.com/v1/messages",

@@ -107,7 +107,7 @@ bit `.cargo/config.toml` itself, since TOML has no shell to mangle.)
 
 `release.yml` generates a CycloneDX SBOM with `cargo cyclonedx` (installed
 in the job via `cargo install cargo-cyclonedx --locked`; the tool itself is
-Apache-2.0, permissive per CLAUDE.md rule 2 -- checked at
+Apache-2.0, permissive per AGENTS.md rule 2 -- checked at
 <https://crates.io/crates/cargo-cyclonedx> before adding it here) and
 uploads it as a release asset alongside `wingman.exe`, `wingman.msix` and
 `SHA256SUMS.txt`. It describes `Cargo.lock`'s resolved dependency graph for

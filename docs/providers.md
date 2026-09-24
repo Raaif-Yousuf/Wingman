@@ -50,7 +50,7 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   400s or is silently ignored has not been checked live (#167).
 - **Structured output:** `text.format` with `type: "json_schema"`,
   `strict: true`, and the schema verbatim from `Request::schema`. Property
-  order is preserved end to end (`serde_json`'s `preserve_order`, CLAUDE.md
+  order is preserved end to end (`serde_json`'s `preserve_order`, AGENTS.md
   rule 3): `detail` before `headline` before `difficulty`. `difficulty` is
   opt-in (`ui.show_difficulty`, default `false` as of issue #197): when off,
   the property is left out of the schema entirely and nothing is appended to
@@ -99,7 +99,7 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   (`src/provider/gemini.rs`, issue #17).
 - **Auth:** `x-goog-api-key` header. The key is deliberately never put in
   the URL (a `?key=` query string would leak into a ureq transport-error
-  string or any future request log, CLAUDE.md rule 1); see
+  string or any future request log, AGENTS.md rule 1); see
   `endpoint_url_never_contains_the_api_key`.
 - **Models:** `providers.gemini.models`, active model
   `providers.gemini.model`. Ships with `gemini-3.8-flash`,
@@ -139,7 +139,7 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
 - **Auth:** none. `ready()` only checks that `base_url` is non-empty; a
   local server that isn't actually listening fails as a transport error,
   which `Chain` already falls through on.
-- **127.0.0.1, never `localhost`** (CLAUDE.md rule 6): IPv6-first resolution
+- **127.0.0.1, never `localhost`** (AGENTS.md rule 6): IPv6-first resolution
   of `localhost` stalls about 2 seconds per connection on Windows, MEASURED
   in the sibling CLAIR repo. `DEFAULT_BASE_URL` is asserted in tests to
   never contain the string `localhost`. The Offline guard (see
@@ -150,12 +150,12 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   own `/api/tags` is the source of what is actually pulled; Settings shows a
   read-only status line, not an editable list.
 - **Effort/thinking:** `think` (boolean) is **always sent explicitly**,
-  never omitted (CLAUDE.md rule 6: leaving it unset on a thinking model was
+  never omitted (AGENTS.md rule 6: leaving it unset on a thinking model was
   MEASURED 28x slower, 366s vs 13s for the same answer). `Effort::Unset` and
   `Effort::Low` map to `think: false`; `Medium`/`High` map to `true`
   (`Ollama::think`).
 - **`keep_alive` is a top-level request field**, not nested inside
-  `options` -- CLAUDE.md rule 6: nested there it is silently ignored.
+  `options` -- AGENTS.md rule 6: nested there it is silently ignored.
   Defaults to `"30m"`.
 - **`options.num_ctx` is always sent explicitly** (`8192`): the server
   default is 4096, which is tight once a screenshot's image tokens are
@@ -191,7 +191,7 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   (or the equivalent for however Ollama is launched on the target machine),
   not in Wingman's config.
 - **The only oracle for GPU use is `size_vram > 0` on `/api/ps`**
-  (CLAUDE.md rule 6): `ollama_admin::gpu_status_for` reads this field
+  (AGENTS.md rule 6): `ollama_admin::gpu_status_for` reads this field
   directly rather than trusting `ollama ps`'s own PROCESSOR column, which
   has been MEASURED mislabelling a real GPU run as CPU on this hardware.
   Settings' Ollama status line surfaces this as "`<model>` is loaded on

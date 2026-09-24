@@ -197,7 +197,7 @@ struct App {
 
 pub fn run() -> Result<()> {
     // Before any window exists, so the card's metrics are right on a mixed-DPI
-    // setup (the XPS panel next to an external monitor).
+    // setup (a laptop panel next to an external monitor).
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -351,7 +351,7 @@ pub fn run() -> Result<()> {
 
 /// Card text for issue #175: one or more stored provider keys exist in
 /// Credential Manager but could not be read back on this load. Pure so the
-/// wording is unit-tested without a real `Card`/HWND (CLAUDE.md rule 8);
+/// wording is unit-tested without a real `Card`/HWND (AGENTS.md rule 8);
 /// never includes any key material, only provider names, which are public
 /// config labels, never secrets. No em dash (rule 11).
 fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
@@ -2029,7 +2029,7 @@ impl App {
     /// actually succeeded -- otherwise `ShellExecuteW` opens a path that
     /// still does not exist, or exists with stale defaults, with nothing on
     /// screen to say so. Pure so this one-branch decision is unit-tested
-    /// directly (CLAUDE.md rule 8) rather than only through a live
+    /// directly (AGENTS.md rule 8) rather than only through a live
     /// Credential-Manager failure, which `edit_settings` itself cannot be
     /// unit-tested against (it owns a real `Card`/`HWND`).
     fn should_open_config_after_ensuring_it_exists(
@@ -2772,7 +2772,7 @@ fn local_today_and_utc_offset() -> Result<(CivilDate, i32)> {
 /// next to the OCR/network cost already paid on this path.
 ///
 /// An OCR failure (no language pack installed, the engine unavailable, a
-/// timeout) fails this whole function -- CLAUDE.md rule 7 wants that
+/// timeout) fails this whole function -- AGENTS.md rule 7 wants that
 /// surfaced as a clear, named skip reason for every provider that needed it
 /// (see `Chain::complete_parsed_with_fallback`'s doc comment), not silently
 /// degraded. A UIA failure (no foreground window, a hung app UIA can't
@@ -2842,7 +2842,7 @@ fn resolve_prompt_and_difficulty<'a>(
 
 /// Issue #181: which action a pause-toggle-chord press should take. Pure
 /// (just a bool in, an enum out) so the toggle direction is unit-tested
-/// directly (CLAUDE.md rule 8) without a real `App` -- `App::toggle_pause`
+/// directly (AGENTS.md rule 8) without a real `App` -- `App::toggle_pause`
 /// is the thin Win32-touching wrapper (checked by hand: press the
 /// configured chord while running, confirm the tray greys and the card
 /// shows "Paused"; press it again, confirm it un-greys, per issue #166).
@@ -3659,7 +3659,7 @@ mod tests {
 
     #[test]
     fn unreadable_secrets_card_has_no_em_dash() {
-        // CLAUDE.md rule 11: no em dashes in user-facing strings.
+        // AGENTS.md rule 11: no em dashes in user-facing strings.
         let (headline, detail) = unreadable_secrets_card(&["openai".to_string()]);
         assert!(!headline.contains('\u{2014}'));
         assert!(!detail.contains('\u{2014}'));
@@ -3920,7 +3920,7 @@ mod tests {
 
     #[test]
     fn readiness_gate_cards_have_no_em_dash() {
-        // CLAUDE.md rule 11.
+        // AGENTS.md rule 11.
         for (mode, providers) in [
             (Mode::Cloud, nothing_configured_providers()),
             (Mode::Local, nothing_configured_providers()),
@@ -5022,7 +5022,7 @@ mod tests {
     /// larger draft downscaled afterward), through the REAL intent router
     /// (`router::build_request`/`router::parse_router_result`, the same
     /// functions `App::router_worker` calls) against local Ollama
-    /// `gemma3:4b`. Run manually (CLAUDE.md build rules -- never bare
+    /// `gemma3:4b`. Run manually (AGENTS.md build rules -- never bare
     /// `cargo test`):
     /// ```text
     /// CARGO_TARGET_DIR=... RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2 \

@@ -59,7 +59,7 @@ impl TextRecognizer for WindowsOcr {
 /// model, so "is a provider configured" is not a question it needs to
 /// answer (#41's Done-when: works with Offline mode on and Ollama stopped,
 /// and equally with no provider configured at all). Pure so the decision is
-/// unit-tested directly (CLAUDE.md rule 8); the real Paused check
+/// unit-tested directly (AGENTS.md rule 8); the real Paused check
 /// (`pause::is_paused_now()`) is Win32-adjacent state `app.rs` reads and
 /// passes in.
 pub fn gate(paused: bool) -> std::result::Result<(), (&'static str, &'static str)> {

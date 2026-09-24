@@ -246,7 +246,7 @@ pub enum HostClass {
     /// IPv4-mapped `::ffff:127.x.x.x`): allowed while Offline.
     Loopback,
     /// The name `localhost` specifically: refused, but with guidance,
-    /// since CLAUDE.md rule 6 already establishes that Wingman never uses
+    /// since AGENTS.md rule 6 already establishes that Wingman never uses
     /// it deliberately (IPv6-first resolution stalls ~2s on Windows) --
     /// a config that names it is almost always meant to mean 127.0.0.1.
     Localhost,

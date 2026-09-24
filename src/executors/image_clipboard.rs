@@ -213,7 +213,7 @@ mod win32 {
     /// doc comment): `OpenClipboard` can transiently fail while another
     /// process holds the clipboard open, and this only ever runs during an
     /// actively in-progress, user-triggered copy, never while idle
-    /// (CLAUDE.md rule 5).
+    /// (AGENTS.md rule 5).
     struct OpenGuard;
 
     impl OpenGuard {

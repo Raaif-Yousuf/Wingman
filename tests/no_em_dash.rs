@@ -1,4 +1,4 @@
-//! Regression test for issue #162 (CLAUDE.md rule 11): no em dash (U+2014)
+//! Regression test for issue #162 (AGENTS.md rule 11): no em dash (U+2014)
 //! may appear in a string literal anywhere under `src/`. Comments are
 //! exempt (the rule explicitly allows them), and `#[cfg(test)]` modules are
 //! skipped as dev-only text rather than user-facing strings.
@@ -279,7 +279,7 @@ fn scan(path: &Path, src: &str) -> Vec<Violation> {
 
 /// Deliberate, narrow exemptions from the scan above (issue #179): a string
 /// literal that legitimately needs to CONTAIN a real em dash in order to
-/// MATCH one, rather than DISPLAY one to the user, so it is not what CLAUDE.md
+/// MATCH one, rather than DISPLAY one to the user, so it is not what AGENTS.md
 /// rule 11 is actually about even though it is a string literal outside a
 /// comment or `#[cfg(test)]` module.
 ///
@@ -354,7 +354,7 @@ fn no_em_dash_in_user_facing_string_literals() {
     if !violations.is_empty() {
         let mut msg = String::from(
             "found U+2014 (em dash) in a string literal outside comments / #[cfg(test)] \
-             modules (CLAUDE.md rule 11 -- use a full stop, colon, or the word the dash \
+             modules (AGENTS.md rule 11 -- use a full stop, colon, or the word the dash \
              was hiding):\n",
         );
         for v in &violations {

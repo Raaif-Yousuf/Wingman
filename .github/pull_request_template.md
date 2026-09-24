@@ -9,7 +9,7 @@ and say why in its place.
 ## Spec link
 
 <!--
-CLAUDE.md rule 12: anything architectural (a new module, a changed thread
+AGENTS.md rule 12: anything architectural (a new module, a changed thread
 responsibility, a changed stored-file format) needs a design spec in
 docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md, written and approved
 before the implementation. Link it here. If this change is not architectural
@@ -33,7 +33,7 @@ checked" section below.
 ## Docs
 
 - [ ] Any doc this change makes stale is updated in this PR (README.md,
-      docs/*, CLAUDE.md, or none needed)
+      docs/*, AGENTS.md, or none needed)
 
 ## `cargo deny check`
 
@@ -43,7 +43,7 @@ checked" section below.
 ## Observable checked (wired-to-nothing)
 
 <!--
-CLAUDE.md rule 8 / the wired-to-nothing skill: state the one observable that
+AGENTS.md rule 8 / the wired-to-nothing skill: state the one observable that
 would differ if this change were wired to nothing, and say you looked at it.
 A hook installed on a thread with no message loop, a PostMessage to a window
 that was never created, a menu item with no WM_COMMAND arm all compile, pass

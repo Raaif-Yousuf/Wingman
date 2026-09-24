@@ -3,7 +3,7 @@
 //! leaves this process except onto the clipboard the user explicitly asked
 //! for (`App::copy_diagnostics` in `app.rs`).
 //!
-//! Split per CLAUDE.md rule 8: [`render_report`] is pure and unit-tested
+//! Split per AGENTS.md rule 8: [`render_report`] is pure and unit-tested
 //! directly, including the redaction guarantee (never a substring of a real
 //! key, see `render_report_never_leaks_any_part_of_a_configured_key`
 //! below). [`collect`] gathers the real values from Win32 and `Config` and
@@ -135,7 +135,7 @@ fn env_overrides_present() -> Vec<String> {
 /// Renders `input` as a plain-text report, ready for the clipboard and for
 /// pasting into a bug report's "Steps to reproduce" / attachment field. Pure
 /// -- no Win32, no I/O -- so every line is unit-tested directly. No em
-/// dashes (CLAUDE.md rule 11): this text is meant to be pasted verbatim into
+/// dashes (AGENTS.md rule 11): this text is meant to be pasted verbatim into
 /// a public GitHub issue.
 pub fn render_report(input: &DiagnosticsInput) -> String {
     let mut out = String::new();
@@ -235,7 +235,7 @@ pub fn egress_report() -> String {
 }
 
 // ===========================================================================
-// Win32/Config data collection -- checked by hand (CLAUDE.md rule 8), never
+// Win32/Config data collection -- checked by hand (AGENTS.md rule 8), never
 // unit tested against the real process. The manual check: run the app, open
 // the tray menu, click "Copy diagnostics", paste the clipboard and confirm
 // every line above is populated (not "unknown") on this machine -- see
@@ -350,7 +350,7 @@ fn is_per_monitor_dpi_aware() -> bool {
 /// `GetCurrentPackageFullName`: `true` when this process has package
 /// identity (running under the sparse MSIX via its AUMID), `false` for
 /// `APPMODEL_ERROR_NO_PACKAGE` (a direct exe launch, e.g. the `Run` key --
-/// see CLAUDE.md's "Windows OCR under a sparse package" pitfall, which this
+/// see AGENTS.md's "Windows OCR under a sparse package" pitfall, which this
 /// diagnostic exists to help answer). Any other, unexpected error also
 /// reports `false` -- best-effort, same as the rest of this module.
 fn has_package_identity() -> bool {
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn no_report_line_contains_an_em_dash() {
-        // CLAUDE.md rule 11: this text is meant to be pasted into a public
+        // AGENTS.md rule 11: this text is meant to be pasted into a public
         // GitHub issue verbatim.
         let text = render_report(&sample_input());
         assert!(!text.contains('\u{2014}'), "{text}");

@@ -64,7 +64,7 @@ jobs:
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked
 
-      # cargo-cyclonedx is Apache-2.0 (permissive, CLAUDE.md rule 2; checked
+      # cargo-cyclonedx is Apache-2.0 (permissive, AGENTS.md rule 2; checked
       # at https://crates.io/crates/cargo-cyclonedx before adding this step).
       # It is a build-time tool installed into the runner, never added as a
       # dependency of the shipped binary, so it needs no THIRD_PARTY_NOTICES.md

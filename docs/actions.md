@@ -3,7 +3,7 @@
 An action is a `[[actions]]` block in `actions.toml`: a name, what it looks
 at, what JSON shape it asks a model for (or no model at all), and which
 executor is allowed to act on the confirmed result. This is the contribution
-surface CLAUDE.md means by "the action framework is the product and actions
+surface AGENTS.md means by "the action framework is the product and actions
 are the contribution surface": most new capability should be one TOML block
 that reuses an existing proposal schema and executor, not new Rust.
 
@@ -183,7 +183,7 @@ A proposal name with no registered schema returns `None`; the caller
 that as a load error for anything that actually needs a completion, never as
 "send no schema".
 
-## Why `serde_json` keeps `preserve_order` (CLAUDE.md rule 3)
+## Why `serde_json` keeps `preserve_order` (AGENTS.md rule 3)
 
 This is the single most surprising rule in the repo, and it is not
 cosmetic.
@@ -234,7 +234,7 @@ in `actions/schema.rs`'s `#[cfg(test)] mod tests` (comparing against a
 `HashMap`/`BTreeMap` equality check would be) -- removing
 `preserve_order` would not fail compilation, only silently break the
 property that keeps a model from contradicting itself, which is why the rule
-lives in `CLAUDE.md` and in a comment directly on the `serde_json` line in
+lives in `AGENTS.md` and in a comment directly on the `serde_json` line in
 `Cargo.toml` rather than only here.
 
 ## See also

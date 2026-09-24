@@ -3,7 +3,7 @@
 Wingman is MIT-licensed. It links against the Rust crates below, all
 permissively licensed with two flagged (non-blocking) exceptions (see
 **Licensing note**). No source code has been copied from another project
-into this repository yet; when that happens (CLAUDE.md rule 2: MIT-only,
+into this repository yet; when that happens (AGENTS.md rule 2: MIT-only,
 attributed here), the attribution goes in **Copied code**, below.
 
 ## How this list was generated
@@ -45,7 +45,7 @@ transitive chain, plus the `windows-sys` 0.61.2 pulled in only by
 | windows | 0.62.2 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs |
 | xcap | 0.9.8 | **Apache-2.0 only** | https://github.com/nashaofu/xcap |
 
-`xcap` is Apache-2.0 without an MIT alternative (CLAUDE.md flags this: it is
+`xcap` is Apache-2.0 without an MIT alternative (AGENTS.md flags this: it is
 permissive and allowed as a dependency, but code cannot be copied from it
 under the MIT-only copied-code rule; only used as a library, never copied
 from, here).
@@ -233,6 +233,6 @@ that, only attribution, which this file provides.
 ## Copied code
 
 None yet. When a snippet is copied from another MIT-licensed project (per
-CLAUDE.md rule 2, e.g. the planned study of PowerToys' Text Extractor overlay
+AGENTS.md rule 2, e.g. the planned study of PowerToys' Text Extractor overlay
 or Flow Launcher's fuzzy ranking, see the expansion plan §14), it is listed
 here with the source file, the origin project, and its license text.

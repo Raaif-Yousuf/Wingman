@@ -20,7 +20,7 @@
 //! signs) and total input length are bounded (see [`MAX_DEPTH`] /
 //! [`super::MAX_INPUT_LEN`]) so a hostile or accidental `((((((((...` or
 //! `------...` input cannot blow the stack -- this crate's release profile
-//! is `panic = "abort"` (CLAUDE.md's stack table), so a stack overflow here
+//! is `panic = "abort"` (AGENTS.md's stack table), so a stack overflow here
 //! would kill the whole tray app, not just this one calculation.
 
 use std::fmt;
@@ -454,7 +454,7 @@ fn check_finite(value: f64) -> Result<(), ExprError> {
 
 /// Evaluates a bounded-length arithmetic expression to an `f64`. Never
 /// panics on malformed input -- every failure comes back as a named
-/// [`ExprError`] (CLAUDE.md rule 7's "every failure ends in a card" starts
+/// [`ExprError`] (AGENTS.md rule 7's "every failure ends in a card" starts
 /// here: this is the pure layer a card's text is built from).
 pub fn evaluate(input: &str) -> Result<f64, ExprError> {
     if input.trim().is_empty() {
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn display_messages_have_no_em_dash() {
-        // CLAUDE.md rule 11: no em dashes in user-facing strings, and every
+        // AGENTS.md rule 11: no em dashes in user-facing strings, and every
         // ExprError's Display text is exactly that.
         let samples = [
             ExprError::Empty,

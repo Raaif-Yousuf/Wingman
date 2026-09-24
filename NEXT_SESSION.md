@@ -5,9 +5,9 @@ Nothing pushed; the owner pushes.
 
 ## Read this first
 
-**The folder rename is done.** `C:\Users\raaif\copilot-ask` is now
-`C:\Users\raaif\Wingman`, renamed by hand rather than by
-`scripts/rename-repo-folder-to-wingman.ps1`, so the four dependent rewrites
+**The folder rename is done.** The local `copilot-ask` checkout is now
+`Wingman`, renamed by hand rather than by the one-off rename script (since
+deleted), so the four dependent rewrites
 the script would have done did not happen automatically. All four are now
 handled: the Claude Code project state and its memory directory were copied
 across, there were no worktrees to orphan, both `filing-findings` SKILL.md

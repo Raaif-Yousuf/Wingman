@@ -73,7 +73,7 @@ pub const GEMINI_CONSERVATIVE_MAX_PIXELS: u64 = 1536 * 1536;
 /// budget (most local vision encoders in the 2026-09-16 expansion plan's
 /// hardware table -- gemma3/gemma4/qwen3.5 -- are ViT-based at a similar
 /// patch scale), which also keeps local CPU/GPU decode time bounded on this
-/// machine's iGPU (CLAUDE.md's battery-drain concern).
+/// machine's iGPU (AGENTS.md's battery-drain concern).
 pub const OLLAMA_CONSERVATIVE_MAX_LONG_EDGE: u32 = ANTHROPIC_STANDARD_MAX_LONG_EDGE;
 pub const OLLAMA_CONSERVATIVE_MAX_PIXELS: u64 = ANTHROPIC_STANDARD_MAX_PIXELS;
 
@@ -500,7 +500,7 @@ pub struct RectPx {
 }
 
 /// Crops `rect` out of an RGBA8 `width`x`height` buffer, clamping `rect` to
-/// the buffer's own bounds first rather than trusting the caller (CLAUDE.md
+/// the buffer's own bounds first rather than trusting the caller (AGENTS.md
 /// rule 8: a parser/guard should not trust its input even when every
 /// current caller already clamps). Never returns a zero-size image: a
 /// completely out-of-bounds or zero-area `rect` clamps to a single pixel
@@ -1057,7 +1057,7 @@ mod tests {
         (ms_samples[ms_samples.len() / 2], bytes)
     }
 
-    /// Run manually in release, once (CLAUDE.md build rules): from the crate
+    /// Run manually in release, once (AGENTS.md build rules): from the crate
     /// root,
     /// ```text
     /// $env:CARGO_TARGET_DIR = "...\target\wt\<worktree>"; $env:RUSTC_WRAPPER = "sccache"; $env:CARGO_BUILD_JOBS = "2"

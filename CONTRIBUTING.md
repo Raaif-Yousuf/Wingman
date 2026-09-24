@@ -36,7 +36,7 @@ welcome right now and do not need any of the actions-framework scaffolding.
 
 ## Before you write code: spec-first for anything architectural
 
-CLAUDE.md rule 12: a change that adds a module, changes a thread's
+AGENTS.md rule 12: a change that adds a module, changes a thread's
 responsibilities, changes a stored file's format, or otherwise affects
 architecture gets a short design spec in
 `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`, written and settled
@@ -62,11 +62,11 @@ which is the pattern to follow for new pure-logic code.
 `cargo clippy -D warnings` must be clean. Once `deny.toml` exists
 (tracked separately), `cargo deny check` joins this list; until then, keep
 new dependencies permissively licensed by hand (MIT, Apache-2.0, BSD, ISC,
-Zlib, Unlicense: CLAUDE.md rule 2) and add anything new to
+Zlib, Unlicense: AGENTS.md rule 2) and add anything new to
 `THIRD_PARTY_NOTICES.md` in the same pull request.
 
 Win32 code (anything touching a window, a hook, the tray, GDI) is not
-meaningfully unit-testable. CLAUDE.md rule 8 applies: state the one
+meaningfully unit-testable. AGENTS.md rule 8 applies: state the one
 observable that would differ if the change were wired to nothing, and check
 it by hand before calling the change done. The `wired-to-nothing` skill in
 this repo exists for exactly this.
@@ -143,7 +143,7 @@ Only needed when no existing schema fits (`text_answer`, `verdict`,
 `calendar_event`, `form_fill`, `text_review` cover most read-and-propose
 cases). Add it to the proposal schema registry in `actions/` with its
 `serde` struct, in **property-declaration order**, because that order is
-sent as the JSON schema and the model answers in that order (CLAUDE.md rule
+sent as the JSON schema and the model answers in that order (AGENTS.md rule
 3: this is why `serde_json` keeps `preserve_order`, explained in full in
 [`docs/actions.md`](docs/actions.md)). Put any field the model should commit
 to last (like a verdict) after the fields that justify it (like the

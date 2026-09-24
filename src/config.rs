@@ -318,7 +318,7 @@ impl Default for ProviderConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct OllamaConfig {
-    /// `http://127.0.0.1:11434`, never `localhost` (CLAUDE.md rule 6).
+    /// `http://127.0.0.1:11434`, never `localhost` (AGENTS.md rule 6).
     pub base_url: String,
     pub model: String,
     pub effort: String,

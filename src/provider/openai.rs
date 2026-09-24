@@ -167,7 +167,7 @@ impl OpenAi {
 /// config.rs) predates the reasoning-effort parameter -- it is not a
 /// reasoning model, unlike the gpt-5.x/o* lines. By analogy with
 /// Anthropic's `supports_effort` gate (a hard 400 on unsupported models,
-/// MEASURED 2026-09-15, CLAUDE.md rule 10), `gpt-4.1` is carved out here
+/// MEASURED 2026-09-15, AGENTS.md rule 10), `gpt-4.1` is carved out here
 /// too.
 ///
 /// THEORY (unverified): no live OpenAI call has confirmed whether sending
