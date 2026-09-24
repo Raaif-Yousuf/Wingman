@@ -33,6 +33,20 @@ const OLD_DEFAULT_PROMPT_HASHES: &[(u64, &str)] = &[
     // this entry is for a config that still has the entire original default
     // untouched).
     (0xe7eb1d1ed8ce7d74, "e35e16e/98274d8"),
+    // The e35e16e/98274d8 default as it sits on disk after an *earlier*
+    // launch already ran `repair_refusal_trigger` on it (#299) -- that
+    // repair rewrites the trigger sentence in place, leaving the rest of
+    // the e35e16e/98274d8 text untouched, so a config that was live before
+    // #412 shipped can have this exact text, not the pristine original
+    // above. Verified equal to `repair_refusal_trigger` applied to the
+    // e35e16e/98274d8 text by
+    // `repairing_the_refusal_trigger_first_still_lets_the_result_migrate`,
+    // so this entry cannot silently drift from what that function actually
+    // produces.
+    (
+        0x11909e68d46b4cee,
+        "e35e16e/98274d8, post repair_refusal_trigger",
+    ),
     // 0797844 ("Verify the Claude path live; fix two bugs it exposed"):
     // fixed the scratchpad sentence in DEFAULT_PROMPT itself, but still
     // lacked the non-vision-fallback parenthetical and the em-dash
@@ -2401,6 +2415,59 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
             "the prompt migration must be written back to disk, not just kept in memory"
         );
         cleanup(&path);
+    }
+
+    #[test]
+    fn old_default_hash_list_matches_what_repair_refusal_trigger_actually_produces() {
+        // A config that ran `repair_refusal_trigger` (#299) on an earlier
+        // launch, before #412 shipped, has the oldest default with only
+        // that one sentence rewritten -- not the pristine original, and not
+        // hand-computed text either. Derive the exact bytes from the real
+        // function, not by retyping the transformation, so
+        // `OLD_DEFAULT_PROMPT_HASHES` cannot silently drift from what
+        // `repair_refusal_trigger` actually does.
+        let mut cfg = Config::default();
+        cfg.ui.prompt = OLDEST_DEFAULT_PROMPT.to_string();
+        let changed = cfg.repair_refusal_trigger();
+        assert!(
+            changed,
+            "the oldest default must contain the trigger sentence"
+        );
+        assert_ne!(
+            cfg.ui.prompt, OLDEST_DEFAULT_PROMPT,
+            "repair_refusal_trigger must have actually rewritten the sentence"
+        );
+
+        let hash = hash_prompt_for_migration(&cfg.ui.prompt);
+        assert!(
+            OLD_DEFAULT_PROMPT_HASHES.iter().any(|(h, _)| *h == hash),
+            "OLD_DEFAULT_PROMPT_HASHES must contain the hash of the oldest default \
+             as repair_refusal_trigger actually leaves it (0x{hash:016x}), so a config \
+             repaired by an earlier launch still migrates to the current default"
+        );
+    }
+
+    #[test]
+    fn a_config_already_repaired_by_refusal_trigger_on_an_earlier_launch_still_migrates() {
+        // Simulates exactly that earlier-launch history: the stored prompt
+        // is the oldest default with `repair_refusal_trigger`'s rewrite
+        // already applied, as it would be sitting on disk from before #412.
+        let mut pre_existing = Config::default();
+        pre_existing.ui.prompt = OLDEST_DEFAULT_PROMPT.to_string();
+        pre_existing.repair_refusal_trigger();
+        let already_repaired_prompt = pre_existing.ui.prompt;
+        assert_ne!(already_repaired_prompt, DEFAULT_PROMPT);
+
+        let doc = format!(
+            "[ui]\nprompt = {}\n",
+            toml::Value::String(already_repaired_prompt)
+        );
+        let cfg = Config::parse_or_default(&doc);
+        assert_eq!(
+            cfg.ui.prompt, DEFAULT_PROMPT,
+            "a config already repaired for the refusal trigger on an earlier launch \
+             must still migrate to the current default"
+        );
     }
 
     #[test]
