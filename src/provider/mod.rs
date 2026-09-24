@@ -2215,6 +2215,84 @@ mod tests {
         );
     }
 
+    /// Issue #295: `router_worker` (`app.rs`) used to build its request with
+    /// [`crate::router::build_request`] (always `images: vec![image_png]`)
+    /// and hand it to the plain [`Chain::complete_parsed`], which never
+    /// checks `own_caps().vision` at all -- unlike every other screen action
+    /// (`worker`/`calendar_worker`/`review_worker`/`form_fill_worker`), all
+    /// of which go through [`Chain::complete_parsed_with_fallback`]. The
+    /// fix pulls `router_worker`'s request-building and chain call into
+    /// [`crate::router::route`], which uses `complete_parsed_with_fallback`
+    /// the same way every other action does; this test proves it: a
+    /// no-vision provider run through `route` must never see the real
+    /// screenshot. Before the fix (when `route` called plain
+    /// `complete_parsed`), this test failed with the image still present.
+    #[test]
+    fn router_route_against_a_no_vision_provider_must_not_carry_the_screenshot() {
+        fn router_ok_completion() -> anyhow::Result<Completion> {
+            Ok(Completion {
+                text: r#"{"summary":"an email compose window","intent":"none","confidence":0.1}"#
+                    .to_string(),
+                usage: None,
+                stop: StopReason::Complete,
+            })
+        }
+
+        let candidates = vec![crate::router::RouterCandidate {
+            id: "calendar".to_string(),
+            description: "Add event from screen".to_string(),
+        }];
+
+        let provider = VisionAwareProvider::new("ollama", false, router_ok_completion);
+        let seen = provider.seen_handle();
+        let chain = Chain::new(vec![Box::new(provider)]);
+
+        let result = crate::router::route(&chain, vec![1, 2, 3, 4], &candidates, || {
+            Ok(non_vision_inputs_for_test())
+        })
+        .unwrap();
+
+        assert_eq!(result.intent, None);
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].images.is_empty(),
+            "a no-vision provider must never see the router's screenshot"
+        );
+        assert!(requests[0].user.contains("OCR SAW: 17 + 25"));
+    }
+
+    #[test]
+    fn router_route_still_sends_the_real_screenshot_to_a_vision_provider() {
+        fn router_ok_completion() -> anyhow::Result<Completion> {
+            Ok(Completion {
+                text: r#"{"summary":"an email compose window","intent":"none","confidence":0.1}"#
+                    .to_string(),
+                usage: None,
+                stop: StopReason::Complete,
+            })
+        }
+
+        let candidates = vec![crate::router::RouterCandidate {
+            id: "calendar".to_string(),
+            description: "Add event from screen".to_string(),
+        }];
+        let image_png = vec![1, 2, 3, 4];
+
+        let provider = VisionAwareProvider::new("openai", true, router_ok_completion);
+        let seen = provider.seen_handle();
+        let chain = Chain::new(vec![Box::new(provider)]);
+
+        crate::router::route(&chain, image_png.clone(), &candidates, || {
+            panic!("fallback must never run for a vision provider")
+        })
+        .unwrap();
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].images, vec![image_png]);
+    }
+
     #[test]
     fn ocr_fallback_failure_skips_every_provider_that_needed_it_with_a_named_reason() {
         struct PanicsIfCalled;

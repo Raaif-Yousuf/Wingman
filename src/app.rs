@@ -776,11 +776,8 @@ impl App {
 
         std::thread::spawn(move || {
             let result: std::result::Result<router::RouterResult, String> =
-                (|| -> Result<router::RouterResult> {
-                    let shot = capture::encode(&raw)?;
-                    router_worker(&providers, mode, shot.png, &candidates)
-                })()
-                .map_err(|e| format!("{e:#}"));
+                router_worker(&providers, mode, &raw, &candidates)
+                    .map_err(|e| format!("{e:#}"));
             let payload = Box::into_raw(Box::new((generation, result)));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -2662,7 +2659,7 @@ fn form_fill_worker(
 fn router_worker(
     providers: &Providers,
     mode: Mode,
-    image_png: Vec<u8>,
+    raw: &capture::RawShot,
     candidates: &[router::RouterCandidate],
 ) -> Result<router::RouterResult> {
     let ollama_ready = mode == Mode::Auto
@@ -2680,10 +2677,37 @@ fn router_worker(
     let provider = provider_for_router(providers, &target.provider, &target.model)
         .ok_or_else(|| anyhow::anyhow!("router: unrecognized provider \"{}\"", target.provider))?;
 
-    let candidate_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
-    let req = router::build_request(image_png, candidates);
-    Chain::new(vec![provider]).complete_parsed(&req, |c| {
-        router::parse_router_result(&c.text, &candidate_ids)
+    let shot = capture::encode(raw)?;
+    let chain = Chain::new(vec![provider]);
+    router::route(&chain, shot.png, candidates, || {
+        router_non_vision_inputs(raw)
+    })
+}
+
+/// Issue #295: the router's own (deliberately lighter) [`non_vision_inputs`]
+/// -- OCR text of the router's own downscaled capture, and NO UIA snapshot.
+/// Unlike `worker`/`calendar_worker`/`review_worker`/`form_fill_worker`, the
+/// router has no `foreground_hwnd` handy at this call site (it runs off
+/// `App::maybe_start_router`'s own capture, not `App::ask`'s), and its
+/// schema (`router::router_schema`) never asks about editable-field
+/// contents the way `fill_form` does -- so paying for a second COM
+/// apartment thread just to snapshot UIA fields the router would never use
+/// is pure waste. An OCR failure still fails this closure exactly like
+/// `non_vision_inputs` (surfaced as a named skip reason to
+/// `Chain::complete_parsed_with_fallback`'s caller); router failures are
+/// silent by the time they reach the user regardless (see
+/// `App::maybe_start_router`'s doc comment), so this never becomes a card.
+fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::NonVisionInputs> {
+    let ocr_output = crate::ocr::recognize(
+        &raw.rgba,
+        raw.width,
+        raw.height,
+        crate::ocr::DEFAULT_TIMEOUT,
+    )
+    .context("OCR unavailable")?;
+    Ok(crate::provider::NonVisionInputs {
+        ocr_text: crate::ocr::serialize_lines(&ocr_output.lines),
+        uia_fields: String::new(),
     })
 }
 
