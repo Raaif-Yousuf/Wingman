@@ -333,13 +333,15 @@ impl Card {
     /// declared field, with an EDIT control for every field the schema
     /// marks `"editable"`.
     ///
-    /// `main_window_exists` gates the "Edit" button: greyed out
-    /// (`WS_DISABLED`) until a main window exists to open (#26's issue body:
-    /// "Edit opens the main window when it exists"). No caller passes
+    /// `main_window_exists` gates whether the "Edit" button is created at
+    /// all (#352): with no main window to open, a permanently-disabled Edit
+    /// button just squeezed "Do it" and "Cancel" for no reason, so the
+    /// button is omitted entirely until a main window exists (#26's issue
+    /// body: "Edit opens the main window when it exists"). No caller passes
     /// `true` yet -- Wingman has no main window today -- the same "inert
     /// until its caller exists" status `Action::hotkey` has; the button's
-    /// enable/disable wiring is still exercised by
-    /// `preview_edit_button_is_disabled_until_main_window_exists` below.
+    /// create-or-not wiring is still exercised by
+    /// `preview_edit_button_only_exists_once_main_window_exists` below.
     ///
     /// Nothing runs until the user presses "Do it" (Enter) or "Cancel"
     /// (Esc): see [`Card::take_confirmed`].
@@ -1899,7 +1901,7 @@ impl CardInner {
             title: title.to_string(),
             edits: Vec::new(),
             do_it_btn: HWND(std::ptr::null_mut()),
-            edit_btn: HWND(std::ptr::null_mut()),
+            edit_btn: None,
             cancel_btn: HWND(std::ptr::null_mut()),
             previous_foreground,
             main_window_exists,
@@ -2016,14 +2018,14 @@ impl CardInner {
     }
 
     /// "Edit": only reachable when `main_window_exists` was `true` at
-    /// `show_preview` time -- the button is `WS_DISABLED` otherwise, and
-    /// Windows never delivers a click (or this synthetic command) for a
-    /// disabled control. No caller passes `true` yet (Wingman has no main
-    /// window today), so this body is an intentional no-op placeholder for
-    /// the issue that adds one, the same "inert until its caller exists"
-    /// status `Action::hotkey` has -- not a control silently doing nothing
-    /// where a real signal was expected, since that control cannot be
-    /// clicked in production yet.
+    /// `show_preview` time -- the button (and thus `ID_PREVIEW_EDIT`) is not
+    /// even created otherwise (#352), so Windows never delivers a click (or
+    /// this synthetic command) for it. No caller passes `true` yet (Wingman
+    /// has no main window today), so this body is an intentional no-op
+    /// placeholder for the issue that adds one, the same "inert until its
+    /// caller exists" status `Action::hotkey` has -- not a control silently
+    /// doing nothing where a real signal was expected, since that control
+    /// does not exist in production yet.
     fn preview_edit_clicked(&mut self) {}
 
     /// Reads every editable control's `GetWindowTextW` back into the model.
@@ -2098,7 +2100,11 @@ impl CardInner {
                     let _ = DestroyWindow(*hwnd);
                 }
             }
-            for hwnd in [preview.do_it_btn, preview.edit_btn, preview.cancel_btn] {
+            let mut btns = vec![preview.do_it_btn, preview.cancel_btn];
+            if let Some(edit_btn) = preview.edit_btn {
+                btns.push(edit_btn);
+            }
+            for hwnd in btns {
                 if !hwnd.0.is_null() {
                     let _ = DestroyWindow(hwnd);
                 }
@@ -2134,15 +2140,15 @@ impl CardInner {
             Some(p) => p.model.fields().to_vec(),
             None => return,
         };
-        let metrics = self.compute_preview_layout(&fields);
-        let instance = self.instance;
-        let parent = self.hwnd;
-        let font = self.fonts.body;
-        let edit_enabled = self
+        let main_window_exists = self
             .preview
             .as_ref()
             .map(|p| p.main_window_exists)
             .unwrap_or(false);
+        let metrics = self.compute_preview_layout(&fields, main_window_exists);
+        let instance = self.instance;
+        let parent = self.hwnd;
+        let font = self.fonts.body;
 
         let mut edits = Vec::new();
         for (field, row) in fields.iter().zip(metrics.rows.iter()) {
@@ -2167,16 +2173,18 @@ impl CardInner {
             true,
             true,
         );
-        let edit_btn = create_preview_button(
-            parent,
-            instance,
-            font,
-            "Edit",
-            &metrics.buttons.edit,
-            ID_PREVIEW_EDIT,
-            false,
-            edit_enabled,
-        );
+        let edit_btn = metrics.buttons.edit.map(|rect| {
+            create_preview_button(
+                parent,
+                instance,
+                font,
+                "Edit",
+                &rect,
+                ID_PREVIEW_EDIT,
+                false,
+                true,
+            )
+        });
         let cancel_btn = create_preview_button(
             parent,
             instance,
@@ -2187,7 +2195,11 @@ impl CardInner {
             false,
             true,
         );
-        for hwnd in [do_it_btn, edit_btn, cancel_btn] {
+        let mut btns = vec![do_it_btn, cancel_btn];
+        if let Some(edit_btn) = edit_btn {
+            btns.push(edit_btn);
+        }
+        for hwnd in btns {
             if !hwnd.0.is_null() {
                 subclass_preview_control(hwnd, parent);
             }
@@ -2210,7 +2222,12 @@ impl CardInner {
             Some(p) => p.model.fields().to_vec(),
             None => return,
         };
-        let metrics = self.compute_preview_layout(&fields);
+        let main_window_exists = self
+            .preview
+            .as_ref()
+            .map(|p| p.main_window_exists)
+            .unwrap_or(false);
+        let metrics = self.compute_preview_layout(&fields, main_window_exists);
         let font = self.fonts.body;
 
         let Some(preview) = self.preview.as_ref() else {
@@ -2238,11 +2255,14 @@ impl CardInner {
                 }
             }
         }
-        for (hwnd, rect) in [
-            (preview.do_it_btn, &metrics.buttons.do_it),
-            (preview.edit_btn, &metrics.buttons.edit),
-            (preview.cancel_btn, &metrics.buttons.cancel),
-        ] {
+        let mut positioned = vec![
+            (preview.do_it_btn, metrics.buttons.do_it),
+            (preview.cancel_btn, metrics.buttons.cancel),
+        ];
+        if let (Some(edit_btn), Some(edit_rect)) = (preview.edit_btn, metrics.buttons.edit) {
+            positioned.push((edit_btn, edit_rect));
+        }
+        for (hwnd, rect) in positioned {
             if hwnd.0.is_null() {
                 continue;
             }
@@ -2271,7 +2291,12 @@ impl CardInner {
             Some(p) => p.model.fields().to_vec(),
             None => return,
         };
-        let metrics = self.compute_preview_layout(&fields);
+        let main_window_exists = self
+            .preview
+            .as_ref()
+            .map(|p| p.main_window_exists)
+            .unwrap_or(false);
+        let metrics = self.compute_preview_layout(&fields, main_window_exists);
         // Preview does not track the cursor the way Pending/Collapsed do
         // (`work_area_for_cursor`): once a form is up, the user's mouse is
         // likely to move away while they read or type, and having the card
@@ -2283,10 +2308,15 @@ impl CardInner {
 
     /// The preview form's full geometry: the title line, one label/value
     /// row per field (in `fields`' order, which is schema order -- see
-    /// `PreviewModel::from_schema`), and the three buttons. Pure geometry:
+    /// `PreviewModel::from_schema`), and the button row. Pure geometry:
     /// used both to position real child controls and to paint the
     /// non-editable rows' labels/values, so the two can never drift apart.
-    fn compute_preview_layout(&self, fields: &[Field]) -> PreviewLayoutMetrics {
+    ///
+    /// `show_edit` mirrors `main_window_exists` (#352): when `false`, no
+    /// "Edit" rect is produced at all (`buttons.edit` is `None`) and "Do it"
+    /// / "Cancel" are spread across the freed width instead of leaving a
+    /// blank column where "Edit" used to sit.
+    fn compute_preview_layout(&self, fields: &[Field], show_edit: bool) -> PreviewLayoutMetrics {
         let padding = self.scale(PADDING_DP);
         let gap = self.scale(GAP_DP);
         let width = self.scale(PREVIEW_WIDTH_DP);
@@ -2370,17 +2400,30 @@ impl CardInner {
             right: content_right,
             bottom: y + btn_h,
         };
+        // With no "Edit" button, "Cancel" moves from directly left of "Do
+        // it" all the way to the content's left edge, spreading the two
+        // buttons across the width "Edit" used to share instead of leaving
+        // it blank (#352).
+        let cancel_left = if show_edit {
+            do_it.left - btn_gap - btn_w
+        } else {
+            content_left
+        };
         let cancel = RECT {
-            left: do_it.left - btn_gap - btn_w,
+            left: cancel_left,
             top: y,
-            right: do_it.left - btn_gap,
+            right: cancel_left + btn_w,
             bottom: y + btn_h,
         };
-        let edit = RECT {
-            left: content_left,
-            top: y,
-            right: content_left + btn_w,
-            bottom: y + btn_h,
+        let edit = if show_edit {
+            Some(RECT {
+                left: content_left,
+                top: y,
+                right: content_left + btn_w,
+                bottom: y + btn_h,
+            })
+        } else {
+            None
         };
         y += btn_h;
 
@@ -2407,7 +2450,7 @@ impl CardInner {
             return;
         };
         let fields = preview.model.fields();
-        let metrics = self.compute_preview_layout(fields);
+        let metrics = self.compute_preview_layout(fields, preview.main_window_exists);
 
         let title_rect = metrics.title_rect;
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
@@ -2506,7 +2549,9 @@ struct PreviewUi {
     /// fields have no entry here; their value is painted, not typed into.
     edits: Vec<(String, HWND)>,
     do_it_btn: HWND,
-    edit_btn: HWND,
+    /// `None` when `main_window_exists` was `false` at `show_preview` time
+    /// (#352): the button is not created at all, not just disabled.
+    edit_btn: Option<HWND>,
     cancel_btn: HWND,
     /// `GetForegroundWindow()` at the moment `show_preview` was called.
     /// `close_preview` hands the foreground back to this window (if it
@@ -2530,7 +2575,8 @@ struct PreviewRowMetrics {
 
 struct PreviewButtonMetrics {
     do_it: RECT,
-    edit: RECT,
+    /// `None` when the layout was computed with `show_edit: false` (#352).
+    edit: Option<RECT>,
     cancel: RECT,
 }
 
@@ -3195,7 +3241,8 @@ mod tests {
         }
         assert!(!preview.do_it_btn.0.is_null());
         assert!(!preview.cancel_btn.0.is_null());
-        assert!(!preview.edit_btn.0.is_null());
+        // main_window_exists is false here (#352): no Edit button at all.
+        assert!(preview.edit_btn.is_none());
 
         // A real EDIT control's initial text round-trips through the
         // window, not just the pure model.
@@ -3364,26 +3411,30 @@ mod tests {
     }
 
     #[test]
-    fn preview_edit_button_is_disabled_until_main_window_exists() {
+    fn preview_edit_button_only_exists_once_main_window_exists() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
 
         card.inner
             .show_preview("Add to calendar", &schema, &value, false);
-        let edit_btn = card.inner.preview.as_ref().unwrap().edit_btn;
-        assert_ne!(
-            gwl_style(edit_btn) & (WS_DISABLED.0 as isize),
-            0,
-            "Edit must be disabled while no main window exists"
+        assert!(
+            card.inner.preview.as_ref().unwrap().edit_btn.is_none(),
+            "Edit must not be created while no main window exists (#352)"
         );
 
         card.inner
             .show_preview("Add to calendar", &schema, &value, true);
-        let edit_btn = card.inner.preview.as_ref().unwrap().edit_btn;
+        let edit_btn = card
+            .inner
+            .preview
+            .as_ref()
+            .unwrap()
+            .edit_btn
+            .expect("Edit must be created once main_window_exists is true");
         assert_eq!(
             gwl_style(edit_btn) & (WS_DISABLED.0 as isize),
             0,
-            "Edit must be enabled once main_window_exists is true"
+            "Edit must be enabled, not WS_DISABLED, once created"
         );
     }
 
@@ -3466,6 +3517,30 @@ mod tests {
                  not be silently ellipsized (measured {label_w}px)"
             );
         }
+    }
+
+    #[test]
+    fn preview_without_edit_spreads_do_it_and_cancel_across_the_freed_width() {
+        // #352's Done-when: only Do it and Cancel show, laid out across the
+        // width Edit used to share -- not squeezed into the same corner as
+        // before with a blank gap where Edit was.
+        let card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let fields = vec![];
+        let metrics = card.inner.compute_preview_layout(&fields, false);
+        assert!(metrics.buttons.edit.is_none());
+        // Cancel now sits at the content's left edge, not directly beside
+        // Do it, so the freed width is genuinely used rather than left
+        // blank on the far side.
+        let padding = card.inner.scale(PADDING_DP);
+        assert_eq!(metrics.buttons.cancel.left, padding);
+        assert!(metrics.buttons.cancel.right < metrics.buttons.do_it.left);
+
+        let with_edit = card.inner.compute_preview_layout(&fields, true);
+        assert!(with_edit.buttons.edit.is_some());
+        // With Edit present, Cancel sits directly beside Do it (small gap),
+        // not spread out to the content's left edge like the no-edit case.
+        assert!(with_edit.buttons.cancel.left > padding);
+        assert!(with_edit.buttons.cancel.right < with_edit.buttons.do_it.left);
     }
 
     #[test]
