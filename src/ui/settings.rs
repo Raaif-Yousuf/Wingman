@@ -82,7 +82,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_VSCROLL,
 };
 
-use crate::config::{Config, OllamaConfig};
+use crate::config::{Config, OllamaConfig, RequireTickFor};
 use crate::hotkey::chord_to_string;
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::DEFAULT_PROMPT;
@@ -488,6 +488,8 @@ const ID_CANCEL: i32 = 119;
 /// indicator (see [`ollama_status_line`]). Not a form field -- never read
 /// back in `read_form`/`build_config`.
 const ID_OLLAMA_STATUS: i32 = 120;
+/// #403: the fill-form tick-requirement combo (`config.forms.require_tick_for`).
+const ID_REQUIRE_TICK_FOR: i32 = 121;
 
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
@@ -519,6 +521,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_AUTOSTART", ID_AUTOSTART),
     ("ID_CANCEL", ID_CANCEL),
     ("ID_OLLAMA_STATUS", ID_OLLAMA_STATUS),
+    ("ID_REQUIRE_TICK_FOR", ID_REQUIRE_TICK_FOR),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +1547,56 @@ fn build_ui(
     );
     y = card_bottom + GROUP_GAP;
 
+    // -- Forms (#403) -------------------------------------------------
+    let forms_top = y;
+    y += GROUP_LABEL_TOP;
+    let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
+
+    ctx.create(
+        WC_STATIC,
+        "Require a tick to fill:",
+        0,
+        0,
+        r.x,
+        r.y,
+        150,
+        ROW_H,
+        0,
+    );
+    let require_tick_for = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + 150,
+        r.y,
+        r.w - 150,
+        ROW_H * 4,
+        ID_REQUIRE_TICK_FOR,
+    );
+    for label in REQUIRE_TICK_FOR_LABELS {
+        combo_add(require_tick_for, label);
+    }
+    combo_select(
+        require_tick_for,
+        require_tick_for_label(config.forms.require_tick_for),
+    );
+    r.advance();
+
+    let forms_bottom = r.y + 4;
+    ctx.create(
+        WC_BUTTON,
+        "Fill forms",
+        BS_GROUPBOX as u32,
+        0,
+        content_x,
+        forms_top,
+        content_w,
+        forms_bottom - forms_top,
+        0,
+    );
+    y = forms_bottom + GROUP_GAP;
+
     // -- Prompt (grows to fill remaining space above the button row) ------
     let footer = prompt_footer_layout(y, win_h_dp);
     let prompt_top = footer.prompt_top;
@@ -1654,6 +1707,7 @@ fn build_ui(
         ID_CARD_SECONDS,
         ID_SHOW_DIFFICULTY,
         ID_TEXT_SCALE_TRACK,
+        ID_REQUIRE_TICK_FOR,
         ID_PROMPT_EDIT,
         ID_RESET_PROMPT,
         ID_SAVE,
@@ -1708,6 +1762,7 @@ struct RawForm {
     show_difficulty: bool,
     text_scale_raw: f32,
     prompt: String,
+    require_tick_for: String,
 }
 
 fn read_form(inner: &SettingsInner) -> Config {
@@ -1744,6 +1799,7 @@ fn read_form(inner: &SettingsInner) -> Config {
         prompt: get_dlg_item(hwnd, ID_PROMPT_EDIT)
             .map(get_text)
             .unwrap_or_default(),
+        require_tick_for: combo_selected_text(hwnd, ID_REQUIRE_TICK_FOR),
     };
     build_config(&inner.original, &raw)
 }
@@ -1829,6 +1885,34 @@ fn parse_max_edge_or(text: &str, fallback: u32) -> u32 {
     match text.trim().parse::<u32>() {
         Ok(v) if v > 0 => v,
         _ => fallback,
+    }
+}
+
+/// #403: the three [`RequireTickFor`] labels shown in the Settings combo, in
+/// display order. Plain words, not the config's internal `all`/`sensitive`/
+/// `none` tokens (rule 11's sibling concern, #341: Settings speaks in
+/// internals).
+const REQUIRE_TICK_FOR_LABELS: [&str; 3] = ["All fields", "Only sensitive fields", "Never"];
+
+/// The label shown for a given [`RequireTickFor`] value. Inverse of
+/// [`label_to_require_tick_for`].
+fn require_tick_for_label(value: RequireTickFor) -> &'static str {
+    match value {
+        RequireTickFor::All => REQUIRE_TICK_FOR_LABELS[0],
+        RequireTickFor::Sensitive => REQUIRE_TICK_FOR_LABELS[1],
+        RequireTickFor::None => REQUIRE_TICK_FOR_LABELS[2],
+    }
+}
+
+/// Parses a combo selection back into a [`RequireTickFor`]. `None` for a
+/// blank or unrecognized selection, so callers can fall back to the
+/// original config value rather than silently picking a default.
+fn label_to_require_tick_for(label: &str) -> Option<RequireTickFor> {
+    match label {
+        "All fields" => Some(RequireTickFor::All),
+        "Only sensitive fields" => Some(RequireTickFor::Sensitive),
+        "Never" => Some(RequireTickFor::None),
+        _ => None,
     }
 }
 
@@ -1953,6 +2037,9 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     } else {
         raw.prompt.clone()
     };
+
+    cfg.forms.require_tick_for =
+        label_to_require_tick_for(&raw.require_tick_for).unwrap_or(original.forms.require_tick_for);
 
     cfg
 }
@@ -2447,6 +2534,7 @@ mod tests {
             show_difficulty: original.ui.show_difficulty,
             text_scale_raw: original.ui.text_scale,
             prompt: original.ui.prompt.clone(),
+            require_tick_for: require_tick_for_label(original.forms.require_tick_for).to_string(),
         }
     }
 
@@ -2470,6 +2558,51 @@ mod tests {
             cfg.providers.anthropic.models,
             original.providers.anthropic.models
         );
+    }
+
+    // -- require_tick_for (#403) ------------------------------------------
+
+    #[test]
+    fn require_tick_for_label_round_trips_for_all_variants() {
+        for value in [
+            RequireTickFor::All,
+            RequireTickFor::Sensitive,
+            RequireTickFor::None,
+        ] {
+            let label = require_tick_for_label(value);
+            assert_eq!(label_to_require_tick_for(label), Some(value));
+        }
+    }
+
+    #[test]
+    fn label_to_require_tick_for_rejects_unknown_text() {
+        assert_eq!(label_to_require_tick_for(""), None);
+        assert_eq!(label_to_require_tick_for("garbage"), None);
+    }
+
+    #[test]
+    fn build_config_round_trips_require_tick_for_through_all_three_variants() {
+        for value in [
+            RequireTickFor::All,
+            RequireTickFor::Sensitive,
+            RequireTickFor::None,
+        ] {
+            let mut original = Config::default();
+            original.forms.require_tick_for = value;
+            let raw = raw_from(&original);
+            let cfg = build_config(&original, &raw);
+            assert_eq!(cfg.forms.require_tick_for, value);
+        }
+    }
+
+    #[test]
+    fn build_config_falls_back_to_original_require_tick_for_on_blank_selection() {
+        let mut original = Config::default();
+        original.forms.require_tick_for = RequireTickFor::All;
+        let mut raw = raw_from(&original);
+        raw.require_tick_for = String::new();
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.forms.require_tick_for, RequireTickFor::All);
     }
 
     #[test]
