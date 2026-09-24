@@ -61,22 +61,24 @@ use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreatePen, CreateSolidBrush,
-    DeleteDC, DeleteObject, EndPaint, GetStockObject, Rectangle, RoundRect, SelectObject,
-    SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CENTER,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HGDIOBJ, NULL_BRUSH, NULL_PEN,
-    PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreatePen,
+    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, GetMonitorInfoW, GetStockObject,
+    MonitorFromPoint, Rectangle, RoundRect, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    NULL_BRUSH, NULL_PEN, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    GetWindowLongPtrW, LoadCursorW, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST,
-    IDC_CROSS, MSG, SWP_NOACTIVATE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_RBUTTONDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
+    GetMessageW, GetWindowLongPtrW, LoadCursorW, RegisterClassExW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, HWND_TOPMOST, IDC_CROSS, MSG, SWP_NOACTIVATE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::{self, RawShot, RectPx};
@@ -307,30 +309,124 @@ pub fn size_label(rect: Rect) -> String {
 pub const HINT_TEXT: &str =
     "Drag to select. Click a window to pick it. Enter to copy, Esc to cancel.";
 
-/// Margin from the top of the overlay to the hint pill, in physical pixels.
-/// This module makes no separate DPI-to-pixel conversion (see the module
-/// doc comment's "Coordinate spaces"): `width`/`height` here are already
-/// the overlay's real device-pixel size on whichever monitor(s) it covers,
-/// so centering against them, rather than any fixed screen-resolution
-/// assumption, is what makes this placement DPI-aware.
-const HINT_TOP_MARGIN_PX: i32 = 24;
-const HINT_HEIGHT_PX: i32 = 34;
-const HINT_MAX_WIDTH_PX: i32 = 640;
-const HINT_SIDE_PADDING_PX: i32 = 40;
+/// Design-pixel (96 DPI) layout constants for the hint pill. [`hint_rect`]
+/// scales these to the monitor's real DPI via [`scale_for_dpi`] -- the
+/// overlay itself spans the whole virtual desktop (possibly several
+/// monitors at different DPIs), so a raw pixel constant would be centered
+/// on the wrong monitor and sized for the wrong DPI. Named `_DP` (design
+/// pixel), matching `card.rs`'s convention for the same reason.
+const HINT_TOP_MARGIN_DP: i32 = 24;
+const HINT_HEIGHT_DP: i32 = 34;
+const HINT_MAX_WIDTH_DP: i32 = 640;
+const HINT_SIDE_PADDING_DP: i32 = 40;
+/// The hint's font size, design pixels at 96 DPI (negative `lfHeight`
+/// convention, matched by [`hint_font`]).
+const HINT_FONT_HEIGHT_DP: i32 = 18;
 
-/// The centered pill [`draw_hint`] paints the instruction text into, for an
-/// overlay `width` wide. Pure geometry, no GDI, so it is unit-tested
-/// directly; clamped to stay within `width` (and never negative-sized) on a
-/// narrow monitor.
-pub fn hint_rect(width: i32) -> Rect {
-    let available = (width - HINT_SIDE_PADDING_PX).max(0);
-    let box_width = HINT_MAX_WIDTH_PX.min(available);
-    let left = (width - box_width) / 2;
+/// Converts a 96-DPI design pixel to a physical pixel at `dpi`, rounding to
+/// the nearest pixel -- same `(dp * dpi + 48) / 96` rounding `card.rs`'s
+/// `Fonts`/`Card::dp` uses for the same conversion.
+fn scale_for_dpi(dp: i32, dpi: u32) -> i32 {
+    (dp * dpi as i32 + 48) / 96
+}
+
+/// The centered pill [`draw_hint`] paints the instruction text into, given
+/// `monitor` (the monitor under the cursor when the overlay opened,
+/// converted to overlay-local coordinates -- see [`monitor_to_local`], and
+/// possibly with a negative `left` for a monitor left of the virtual
+/// desktop's origin) and that monitor's `dpi`. Pure geometry, no GDI, so
+/// it's unit-tested directly; clamped to stay within `monitor`'s width (and
+/// never negative-sized) on a narrow monitor.
+pub fn hint_rect(monitor: Rect, dpi: u32) -> Rect {
+    let side_padding = scale_for_dpi(HINT_SIDE_PADDING_DP, dpi);
+    let max_width = scale_for_dpi(HINT_MAX_WIDTH_DP, dpi);
+    let top_margin = scale_for_dpi(HINT_TOP_MARGIN_DP, dpi);
+    let height = scale_for_dpi(HINT_HEIGHT_DP, dpi);
+
+    let available = (monitor.width() - side_padding).max(0);
+    let box_width = max_width.min(available);
+    let left = monitor.left + (monitor.width() - box_width) / 2;
+    let top = monitor.top + top_margin;
     Rect {
         left,
-        top: HINT_TOP_MARGIN_PX,
+        top,
         right: left + box_width,
-        bottom: HINT_TOP_MARGIN_PX + HINT_HEIGHT_PX,
+        bottom: top + height,
+    }
+}
+
+/// Converts a monitor rectangle (as `GetMonitorInfoW` returns it, in
+/// virtual-desktop/screen space -- space 1) to overlay-local coordinates
+/// (space 2), the same origin shift [`OverlayInner::to_local`] applies to a
+/// selection rectangle. A free function (rather than a method) so it is
+/// usable, and unit-testable, before any `OverlayInner` exists.
+fn monitor_to_local(monitor: Rect, desktop: Rect) -> Rect {
+    Rect {
+        left: monitor.left - desktop.left,
+        top: monitor.top - desktop.top,
+        right: monitor.right - desktop.left,
+        bottom: monitor.bottom - desktop.top,
+    }
+}
+
+/// Win32-only: the monitor under the cursor at the moment the overlay
+/// opens, in overlay-local coordinates, plus that monitor's effective DPI.
+/// Falls back to the whole overlay (`desktop`, converted to local
+/// coordinates -- i.e. `{0, 0, width, height}`) at 96 DPI if any step
+/// fails, so the hint still renders, just without per-monitor
+/// placement/scaling. Not unit-tested -- rule 8: Win32 is checked by hand;
+/// the pure logic downstream of this (`monitor_to_local`, `scale_for_dpi`,
+/// `hint_rect`) is.
+fn hint_monitor_and_dpi(desktop: Rect) -> (Rect, u32) {
+    let local_desktop = Rect {
+        left: 0,
+        top: 0,
+        right: desktop.width(),
+        bottom: desktop.height(),
+    };
+    unsafe {
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_err() {
+            return (local_desktop, 96);
+        }
+        let hmonitor: HMONITOR = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(hmonitor, &mut info).as_bool() {
+            return (local_desktop, 96);
+        }
+        let monitor_local = monitor_to_local(Rect::from(info.rcMonitor), desktop);
+
+        let mut dpi_x: u32 = 96;
+        let mut dpi_y: u32 = 96;
+        if GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_err() {
+            dpi_x = 96;
+        }
+        (monitor_local, dpi_x)
+    }
+}
+
+/// Builds the hint's font at `dpi`, scaling [`HINT_FONT_HEIGHT_DP`] the same
+/// way [`hint_rect`] scales its layout constants. Falls back to the stock
+/// GUI font if `CreateFontIndirectW` fails, mirroring `card.rs`'s
+/// `font_or_stock`.
+fn hint_font(dpi: u32) -> HFONT {
+    let mut lf = LOGFONTW {
+        lfHeight: -scale_for_dpi(HINT_FONT_HEIGHT_DP, dpi),
+        ..Default::default()
+    };
+    for (i, u) in "Segoe UI".encode_utf16().enumerate() {
+        if i < lf.lfFaceName.len() {
+            lf.lfFaceName[i] = u;
+        }
+    }
+    let font = unsafe { CreateFontIndirectW(&lf) };
+    if font.0.is_null() {
+        HFONT(unsafe { GetStockObject(windows::Win32::Graphics::Gdi::DEFAULT_GUI_FONT) }.0)
+    } else {
+        font
     }
 }
 
@@ -543,6 +639,8 @@ impl Overlay {
         let (background_bitmap, background_dc) =
             build_background(&dimmed, original.width, original.height);
 
+        let (hint_monitor, hint_dpi) = hint_monitor_and_dpi(desktop);
+
         let inner = Box::new(OverlayInner {
             hwnd: HWND(std::ptr::null_mut()),
             desktop,
@@ -558,6 +656,8 @@ impl Overlay {
             outcome: None,
             was_activated: false,
             window_snapshot,
+            hint_monitor,
+            hint_dpi,
         });
         let raw = Box::into_raw(inner);
 
@@ -770,6 +870,11 @@ struct OverlayInner {
     /// `WindowFromPoint` call (which, once the overlay is showing, could
     /// only ever find the overlay itself).
     window_snapshot: Vec<SnapshotEntry>,
+    /// #360: the monitor under the cursor when the overlay opened,
+    /// overlay-local (space 2), and its effective DPI -- computed once at
+    /// creation via [`hint_monitor_and_dpi`], not re-queried per paint.
+    hint_monitor: Rect,
+    hint_dpi: u32,
 }
 
 impl OverlayInner {
@@ -919,7 +1024,7 @@ impl OverlayInner {
             // #360: hidden once dragging starts -- the size label next to
             // the live selection already tells the user what they're doing.
             if !self.dragging {
-                draw_hint(hdc, self.width);
+                draw_hint(hdc, self.hint_monitor, self.hint_dpi);
             }
 
             let _ = EndPaint(self.hwnd, &ps);
@@ -1006,8 +1111,8 @@ unsafe fn draw_selection(hdc: HDC, rect: Rect) {
 /// #360: draws [`HINT_TEXT`] centered in a dark backing pill (readable
 /// against both a light and a dark wallpaper) near the top of the overlay,
 /// at the position [`hint_rect`] computes for `width`.
-unsafe fn draw_hint(hdc: HDC, width: i32) {
-    let rect = hint_rect(width);
+unsafe fn draw_hint(hdc: HDC, monitor: Rect, dpi: u32) {
+    let rect = hint_rect(monitor, dpi);
     if rect.width() <= 0 || rect.height() <= 0 {
         return;
     }
@@ -1015,11 +1120,22 @@ unsafe fn draw_hint(hdc: HDC, width: i32) {
     let brush = CreateSolidBrush(COLORREF(0x00303030)); // dark grey, BGR-packed
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
     let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-    let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 16, 16);
+    let radius = scale_for_dpi(16, dpi);
+    let _ = RoundRect(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        radius,
+        radius,
+    );
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(HGDIOBJ(brush.0));
 
+    let font = hint_font(dpi);
+    let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, COLORREF(0x00FFFFFF));
     let text_rc = RECT {
@@ -1034,6 +1150,8 @@ unsafe fn draw_hint(hdc: HDC, width: i32) {
         text_rc,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     );
+    SelectObject(hdc, old_font);
+    let _ = DeleteObject(HGDIOBJ(font.0));
 }
 
 /// Builds the top-down BGRA DIB section (and the memory DC it is selected
@@ -1613,40 +1731,105 @@ mod tests {
 
     // -- hint_rect (#360) -----------------------------------------------------
 
-    #[test]
-    fn hint_rect_is_centered_horizontally() {
-        let r = hint_rect(2000);
-        let left_margin = r.left;
-        let right_margin = 2000 - r.right;
-        assert_eq!(left_margin, right_margin);
-        assert_eq!(r.width(), HINT_MAX_WIDTH_PX);
+    fn monitor_rect(left: i32, top: i32, w: i32, h: i32) -> Rect {
+        Rect {
+            left,
+            top,
+            right: left + w,
+            bottom: top + h,
+        }
     }
 
     #[test]
-    fn hint_rect_sits_near_the_top() {
-        let r = hint_rect(1920);
-        assert_eq!(r.top, HINT_TOP_MARGIN_PX);
-        assert_eq!(r.height(), HINT_HEIGHT_PX);
+    fn hint_rect_is_centered_horizontally_at_96_dpi() {
+        let m = monitor_rect(0, 0, 2000, 1200);
+        let r = hint_rect(m, 96);
+        assert_eq!(r.left - m.left, m.right - r.right);
+        assert_eq!(r.width(), HINT_MAX_WIDTH_DP);
     }
 
     #[test]
-    fn hint_rect_shrinks_to_fit_a_narrow_overlay() {
-        let r = hint_rect(300);
+    fn hint_rect_sits_near_the_top_at_96_dpi() {
+        let m = monitor_rect(0, 0, 1920, 1080);
+        let r = hint_rect(m, 96);
+        assert_eq!(r.top, HINT_TOP_MARGIN_DP);
+        assert_eq!(r.height(), HINT_HEIGHT_DP);
+    }
+
+    #[test]
+    fn hint_rect_shrinks_to_fit_a_narrow_monitor() {
+        let m = monitor_rect(0, 0, 300, 800);
+        let r = hint_rect(m, 96);
         assert!(r.width() <= 300);
-        assert!(r.left >= 0);
-        assert!(r.right <= 300);
+        assert!(r.left >= m.left);
+        assert!(r.right <= m.right);
     }
 
     #[test]
-    fn hint_rect_never_goes_negative_on_a_tiny_overlay() {
-        let r = hint_rect(10);
+    fn hint_rect_never_goes_negative_on_a_tiny_monitor() {
+        let m = monitor_rect(0, 0, 10, 10);
+        let r = hint_rect(m, 96);
         assert!(r.width() >= 0);
         assert!(r.height() > 0);
+    }
+
+    /// #360, DPI awareness: at 144 DPI (150%, a common laptop scale) every
+    /// scaled dimension is exactly 1.5x its 96 DPI value -- `scale_for_dpi`
+    /// is `dp * dpi / 96`, and 144/96 = 1.5 exactly, so this is exact
+    /// integer arithmetic, not an approximation.
+    #[test]
+    fn hint_rect_scales_with_monitor_dpi() {
+        let m = monitor_rect(0, 0, 3840, 2160);
+        let r96 = hint_rect(m, 96);
+        let r144 = hint_rect(m, 144);
+        assert_eq!(r144.width(), r96.width() * 3 / 2);
+        assert_eq!(r144.height(), r96.height() * 3 / 2);
+        assert_eq!(r144.top - m.top, (r96.top - m.top) * 3 / 2);
+    }
+
+    /// A secondary monitor at a positive x offset within overlay-local
+    /// coordinates (the overlay spans the whole virtual desktop): the hint
+    /// must center on that monitor's own bounds, not the overlay's.
+    #[test]
+    fn hint_rect_centers_on_an_offset_monitor_not_the_overlay_origin() {
+        let m = monitor_rect(1920, 0, 1280, 1024);
+        let r = hint_rect(m, 96);
+        assert_eq!(r.left - m.left, m.right - r.right);
+        assert!(r.left >= m.left && r.right <= m.right);
     }
 
     #[test]
     fn hint_text_has_no_em_dash() {
         assert!(!HINT_TEXT.contains('\u{2014}'));
+    }
+
+    // -- monitor_to_local (#360) ----------------------------------------------
+
+    /// A realistic two-monitor layout: the primary monitor sits at the
+    /// virtual desktop's origin, and a secondary monitor of the same size
+    /// is placed to its left, at a negative x -- exactly the layout the
+    /// module doc comment's "Coordinate spaces" section describes as
+    /// routine. `monitor_to_local` must shift each monitor's rect by the
+    /// SAME desktop origin regardless of which side of 0 it falls on.
+    #[test]
+    fn monitor_to_local_handles_a_negative_x_left_monitor_in_a_two_monitor_layout() {
+        let desktop = Rect {
+            left: -1920,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let left_monitor = monitor_rect(-1920, 0, 1920, 1080);
+        let right_monitor = monitor_rect(0, 0, 1920, 1080);
+
+        assert_eq!(
+            monitor_to_local(left_monitor, desktop),
+            monitor_rect(0, 0, 1920, 1080)
+        );
+        assert_eq!(
+            monitor_to_local(right_monitor, desktop),
+            monitor_rect(1920, 0, 1920, 1080)
+        );
     }
 
     #[test]
@@ -2220,10 +2403,12 @@ mod tests {
                 .expect("CreateDIBSection failed");
             let old_bitmap = SelectObject(hdc, hbitmap.into());
 
-            draw_hint(hdc, 800);
-            // A width too narrow for any pill: exercises the zero-size
+            draw_hint(hdc, monitor_rect(0, 0, 800, 600), 96);
+            // 144 DPI: exercises the scaled-font/scaled-pill path.
+            draw_hint(hdc, monitor_rect(0, 0, 800, 600), 144);
+            // A monitor too narrow for any pill: exercises the zero-size
             // early-return path without crashing.
-            draw_hint(hdc, 0);
+            draw_hint(hdc, monitor_rect(0, 0, 0, 0), 96);
 
             SelectObject(hdc, old_bitmap);
             let _ = DeleteObject(hbitmap.into());
