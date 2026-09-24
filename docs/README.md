@@ -17,7 +17,7 @@ handoff snapshot, or a human-only action: those are four different things.
 |---|---|---|
 | GitHub Issues (once the public repo exists) | every bug, feature and roadmap item | open to closed; nothing duplicates it in markdown |
 | `docs/superpowers/specs/` | design decisions and their rationale, one dated file per topic | written before the code; superseded specs say so at the top and stay in git |
-| [`NEXT_SESSION.md`](../NEXT_SESSION.md) | where the last session stopped and what the next one should do first | fully overwritten each session; no history |
+| `NEXT_SESSION.md` (gitignored, per contributor) | where your last session stopped and what the next one should do first | local only; never committed |
 | [`OWNER_TODO.md`](../OWNER_TODO.md) | actions only a human can take: a Settings click, a repo name, an account | rows deleted when done |
 | [`CHANGELOG.md`](../CHANGELOG.md) (Keep a Changelog) | what shipped, per version | append-only |
 

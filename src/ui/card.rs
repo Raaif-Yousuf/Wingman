@@ -1950,8 +1950,8 @@ impl CardInner {
             // A required field is blank after editing: refuse silently and
             // leave the card open rather than build a Confirmed from an
             // invalid form. A card is never a dialog box (rule 7); an
-            // inline validation message is left to a follow-up issue (see
-            // NEXT_SESSION.md), not invented here.
+            // inline validation message is left to a follow-up issue, not
+            // invented here.
             return;
         }
         let shown = preview.model.to_value();

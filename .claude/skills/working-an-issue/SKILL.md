@@ -71,9 +71,9 @@ gh issue close <n> --reason completed --comment "$(cat "$SCRATCH/close.md")"
 
 Closing the issue and proving the behaviour are different statements. If the
 proof needs a packaged install, a real Copilot key press, or a live model, put
-the exact manual check and what passing looks like in `NEXT_SESSION.md` under
-"To verify by hand", and say so in the closing comment. That list must drain:
-delete the row when verified, reopen the issue when it fails.
+the exact manual check and what passing looks like in the closing comment,
+and add the `needs-manual-check` label. That label must drain: remove it when
+verified, reopen the issue when it fails.
 
 ## Red flags
 

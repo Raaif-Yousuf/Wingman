@@ -18,3 +18,6 @@ tests/compile_fail/generated/
 .claude/settings.local.json
 .env
 .env.*
+
+# Personal session handoff notes: each contributor keeps their own.
+NEXT_SESSION.md
