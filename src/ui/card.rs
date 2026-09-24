@@ -2372,11 +2372,15 @@ impl CardInner {
                 right: content_left + label_w,
                 bottom: y + row_content_h,
             };
+            // When the label wraps to two lines, the value stays a single
+            // line top-aligned with the label's *first* line rather than
+            // vertically centred in the now-taller row (review nit on
+            // #355): `row_h` here, not `row_content_h`.
             let value_rect = RECT {
                 left: value_x,
                 top: y,
                 right: value_x + value_w,
-                bottom: y + row_content_h,
+                bottom: y + row_h,
             };
             rows.push(PreviewRowMetrics {
                 label_rect,
@@ -3504,7 +3508,7 @@ mod tests {
                 editable: false,
                 required: false,
             }];
-            let metrics = card.inner.compute_preview_layout(&fields);
+            let metrics = card.inner.compute_preview_layout(&fields, false);
             let row = &metrics.rows[0];
             let (label_w, _) = card
                 .inner
