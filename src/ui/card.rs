@@ -2338,18 +2338,44 @@ impl CardInner {
             .scale(PREVIEW_ROW_H_DP)
             .max(self.line_height(self.fonts.body));
         let row_gap = self.scale(PREVIEW_ROW_GAP_DP);
-        let label_w = self.scale(PREVIEW_LABEL_W_DP).min(content_width / 2).max(1);
+        // #355: the label column used to be a fixed 84dp, truncating a long
+        // label (e.g. "Date of birth") to "Date of bi..." exactly when the
+        // user is checking what is about to be written. Size it from the
+        // widest label actually shown instead, clamped between the old
+        // 84dp floor and 45% of the content width so one very long label
+        // cannot squeeze the value column away.
+        let label_min_w = self.scale(PREVIEW_LABEL_W_DP).min(content_width / 2).max(1);
+        let label_max_w = ((content_width as f32) * PREVIEW_LABEL_MAX_FRACTION) as i32;
+        let measured_label_w: Vec<i32> = fields
+            .iter()
+            .map(|f| self.measure_label(self.fonts.body, &f.label).0)
+            .collect();
+        let label_w = label_column_width(&measured_label_w, label_min_w, label_max_w);
         let value_x = content_left + label_w + self.scale(6);
         let value_w = (content_right - value_x).max(1);
 
         let mut rows = Vec::with_capacity(fields.len());
-        for _ in fields {
+        for (field, &measured_w) in fields.iter().zip(measured_label_w.iter()) {
+            // A label that still does not fit the (clamped) column wraps to
+            // a second line rather than ellipsizing, per #355's "Done
+            // when": the whole label must be visible, not just wider.
+            let label_wrapped = measured_w > label_w;
+            let row_content_h = if label_wrapped {
+                self.measure_wrapped(self.fonts.body, &field.label, label_w)
+                    .max(row_h)
+            } else {
+                row_h
+            };
             let label_rect = RECT {
                 left: content_left,
                 top: y,
                 right: content_left + label_w,
-                bottom: y + row_h,
+                bottom: y + row_content_h,
             };
+            // When the label wraps to two lines, the value stays a single
+            // line top-aligned with the label's *first* line rather than
+            // vertically centred in the now-taller row (review nit on
+            // #355): `row_h` here, not `row_content_h`.
             let value_rect = RECT {
                 left: value_x,
                 top: y,
@@ -2359,8 +2385,9 @@ impl CardInner {
             rows.push(PreviewRowMetrics {
                 label_rect,
                 value_rect,
+                label_wrapped,
             });
-            y += row_h + row_gap;
+            y += row_content_h + row_gap;
         }
         y = if fields.is_empty() {
             y + gap
@@ -2443,12 +2470,15 @@ impl CardInner {
             let label_rect = row.label_rect;
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-            draw_text_line(
-                hdc,
-                &field.label,
-                label_rect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-            );
+            // #355: a label that did not fit the clamped column even at its
+            // widest wraps to a second line instead of ellipsizing, so the
+            // whole label stays readable.
+            let label_format = if row.label_wrapped {
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX
+            } else {
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
+            };
+            draw_text_line(hdc, &field.label, label_rect, label_format);
 
             if !field.editable {
                 let value_rect = row.value_rect;
@@ -2477,6 +2507,22 @@ const PREVIEW_LABEL_W_DP: i32 = 84;
 const PREVIEW_BUTTON_H_DP: i32 = 26;
 const PREVIEW_BUTTON_W_DP: i32 = 84;
 const PREVIEW_BUTTON_GAP_DP: i32 = 8;
+/// Upper bound on the label column as a fraction of the content width
+/// (#355): even the widest label never pushes the value column below 55%
+/// of the available space.
+const PREVIEW_LABEL_MAX_FRACTION: f32 = 0.45;
+
+/// Sizes the preview label column from the widest measured label (#355),
+/// clamped between `min_w` (the old fixed 84dp floor) and `max_w` (45% of
+/// the content width). Pure and DPI-agnostic: callers scale `measured`,
+/// `min_w` and `max_w` to pixels first, so this same function is exercised
+/// at every DPI by `label_column_width_is_clamped_at_several_dpis` below --
+/// it never needs to know what DPI produced its inputs.
+fn label_column_width(measured: &[i32], min_w: i32, max_w: i32) -> i32 {
+    let max_w = max_w.max(min_w);
+    let widest = measured.iter().copied().max().unwrap_or(min_w);
+    widest.clamp(min_w, max_w)
+}
 
 const ID_PREVIEW_DO_IT: i32 = 3900;
 const ID_PREVIEW_EDIT: i32 = 3901;
@@ -2524,6 +2570,11 @@ struct PreviewUi {
 struct PreviewRowMetrics {
     label_rect: RECT,
     value_rect: RECT,
+    /// Whether this row's label is too wide for the (clamped) label column
+    /// even after `label_column_width` picked the widest label it could,
+    /// so it must be drawn wrapped (`DT_WORDBREAK`) instead of ellipsized
+    /// on one line (#355).
+    label_wrapped: bool,
 }
 
 struct PreviewButtonMetrics {
@@ -3389,6 +3440,87 @@ mod tests {
             0,
             "Edit must be enabled, not WS_DISABLED, once created"
         );
+    }
+
+    /// #355's pure layout-math test: `label_column_width` at several DPIs.
+    /// Callers scale their inputs first, so this exercises the same
+    /// function real DPIs would see without needing a real window.
+    #[test]
+    fn label_column_width_is_clamped_at_several_dpis() {
+        for dpi in [96u32, 120, 144, 192] {
+            let scale = |dp: i32| (dp * dpi as i32 + 48) / 96;
+            let min_w = scale(PREVIEW_LABEL_W_DP);
+            let content_w = scale(PREVIEW_WIDTH_DP) - 2 * scale(PADDING_DP);
+            let max_w = ((content_w as f32) * PREVIEW_LABEL_MAX_FRACTION) as i32;
+
+            // A short label never grows the column past its natural width.
+            let short = scale(20);
+            assert_eq!(
+                label_column_width(&[short], min_w, max_w),
+                min_w,
+                "dpi {dpi}: a label narrower than the floor must not shrink the column"
+            );
+
+            // A label between the floor and the ceiling sizes the column
+            // to exactly that label.
+            let mid = (min_w + max_w) / 2;
+            assert_eq!(
+                label_column_width(&[mid], min_w, max_w),
+                mid,
+                "dpi {dpi}: a label between floor and ceiling sizes the column to it"
+            );
+
+            // A label wider than the ceiling is clamped, not honored in
+            // full (it wraps instead -- see the row-height test below).
+            let huge = max_w + scale(200);
+            assert_eq!(
+                label_column_width(&[huge], min_w, max_w),
+                max_w,
+                "dpi {dpi}: a label past the 45% ceiling must clamp, not widen the column further"
+            );
+
+            // The widest of several labels wins, still clamped.
+            assert_eq!(
+                label_column_width(&[short, mid, huge], min_w, max_w),
+                max_w,
+                "dpi {dpi}: the widest label among several drives the column"
+            );
+
+            // No fields at all: falls back to the floor, never zero/negative.
+            assert_eq!(label_column_width(&[], min_w, max_w), min_w);
+        }
+    }
+
+    /// #355's Done-when: a "Date of birth" field's whole label is visible
+    /// (measured width fits inside `label_rect`, or it wraps rather than
+    /// being cut) at both 100% and 150% scaling.
+    #[test]
+    fn preview_long_label_is_never_ellipsized_at_100_or_150_percent() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        for dpi in [96u32, 144] {
+            card.inner.dpi = dpi;
+            card.inner.rebuild_fonts();
+
+            let fields = vec![Field {
+                name: "dob".to_string(),
+                label: "Date of birth".to_string(),
+                value: "2000-01-01".to_string(),
+                editable: false,
+                required: false,
+            }];
+            let metrics = card.inner.compute_preview_layout(&fields, false);
+            let row = &metrics.rows[0];
+            let (label_w, _) = card
+                .inner
+                .measure_label(card.inner.fonts.body, "Date of birth");
+            let column_w = row.label_rect.right - row.label_rect.left;
+
+            assert!(
+                column_w >= label_w || row.label_wrapped,
+                "dpi {dpi}: \"Date of birth\" must fit the column ({column_w}px) or wrap, \
+                 not be silently ellipsized (measured {label_w}px)"
+            );
+        }
     }
 
     #[test]
