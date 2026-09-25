@@ -12,6 +12,23 @@ use crate::provider::{
 };
 use crate::secrets::{target_name, CredManagerStore, SecretStore};
 
+/// Overwrites `s`'s bytes with zero before truncating it to empty, mirroring
+/// `dpapi::zeroize` (issue #258). `String::clear()` alone only resets the
+/// length to 0; the byte content stays live in the still-allocated buffer,
+/// so a bare `.clear()` on a field that held a plaintext API key leaves the
+/// key readable in that buffer until an unrelated allocation reuses and
+/// overwrites it.
+fn zeroize_string(s: &mut String) {
+    // SAFETY: `dpapi::zeroize` only ever writes the byte 0x00, which is
+    // valid UTF-8 on its own (each write yields one more NUL code point), so
+    // the string never observes invalid UTF-8 through this pointer -- and it
+    // is cleared immediately after regardless.
+    unsafe {
+        crate::dpapi::zeroize(s.as_bytes_mut());
+    }
+    s.clear();
+}
+
 /// A previous shipped value of `provider::DEFAULT_PROMPT`, identified only by
 /// its normalized hash (see [`hash_prompt_for_migration`]), plus the commit
 /// that introduced it -- for `repair_stale_default_prompt`'s issue #412
@@ -751,7 +768,7 @@ impl Config {
                 continue;
             }
             if store.set(&target_name(provider), key).is_ok() {
-                key.clear();
+                zeroize_string(key);
                 changed = true;
             }
         }
@@ -763,7 +780,7 @@ impl Config {
             }
             let target = target_name(&compat_order_name(&entry.name));
             if store.set(&target, &entry.api_key).is_ok() {
-                entry.api_key.clear();
+                zeroize_string(&mut entry.api_key);
                 changed = true;
             }
         }
@@ -888,13 +905,13 @@ impl Config {
             let env_name = Self::env_var_name(provider)
                 .expect("every provider iterated here has an env var name");
             if env_is_set(env_name) {
-                key.clear();
+                zeroize_string(key);
                 continue;
             }
 
             let target = target_name(provider);
             if key == UNREADABLE_KEY_MARKER {
-                key.clear();
+                zeroize_string(key);
                 continue;
             }
             if key.is_empty() {
@@ -905,7 +922,7 @@ impl Config {
                 store
                     .set(&target, key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
-                key.clear();
+                zeroize_string(key);
             }
         }
 
@@ -915,7 +932,7 @@ impl Config {
         for entry in &mut self.providers.compat {
             let target = target_name(&compat_order_name(&entry.name));
             if entry.api_key == UNREADABLE_KEY_MARKER {
-                entry.api_key.clear();
+                zeroize_string(&mut entry.api_key);
                 continue;
             }
             if entry.api_key.is_empty() {
@@ -926,7 +943,7 @@ impl Config {
                 store
                     .set(&target, &entry.api_key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
-                entry.api_key.clear();
+                zeroize_string(&mut entry.api_key);
             }
         }
         Ok(())
@@ -1450,6 +1467,38 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    // -- zeroize_string (#258) ------------------------------------------------
+
+    #[test]
+    fn zeroize_string_overwrites_the_retained_buffer_before_clearing() {
+        let mut s = String::from("sk-test-synthetic-not-a-real-key");
+        let ptr = s.as_ptr();
+        let len = s.len();
+        zeroize_string(&mut s);
+        // `s.clear()` only resets length to 0, so `s.as_bytes()` would show
+        // nothing either way -- inspect the still-allocated buffer directly
+        // via the raw pointer captured before the clear, exactly the check
+        // AGENTS.md rule 8 asks for (the observable that would differ if
+        // this were wired to nothing).
+        let retained = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert!(
+            retained.iter().all(|&b| b == 0),
+            "buffer still holds plaintext after zeroize_string: {retained:?}"
+        );
+        assert!(s.is_empty());
+        assert!(
+            s.capacity() >= len,
+            "capacity should be retained by clear()"
+        );
+    }
+
+    #[test]
+    fn zeroize_string_handles_empty_string() {
+        let mut s = String::new();
+        zeroize_string(&mut s);
+        assert!(s.is_empty());
     }
 
     // -- forms.require_tick_for (#40) ----------------------------------------
