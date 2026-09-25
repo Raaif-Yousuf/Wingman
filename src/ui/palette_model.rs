@@ -466,11 +466,12 @@ pub enum DispatchTarget {
 /// resolved (see `catalogue`), so there is no id left that has nowhere to
 /// go.
 ///
-/// Every built-in id this function recognizes is exercised by
-/// `dispatch_covers_every_built_in_action` below, so a built-in added to
-/// `actions::builtin_actions()` (or a new tray-only utility) without a
-/// matching arm here fails a test instead of silently being unrunnable from
-/// the palette (the "wired to nothing" shape AGENTS.md rule 8 calls out).
+/// Every named arm above is asserted to produce its own exact,
+/// non-`Generic` `DispatchTarget` by `dispatch_covers_every_built_in_action`
+/// below, so a built-in added to `actions::builtin_actions()` (or a new
+/// tray-only utility) without a matching arm here fails a test instead of
+/// silently falling through to the generic path and losing its dedicated
+/// dispatch (the "wired to nothing" shape AGENTS.md rule 8 calls out).
 pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
     match action_id {
         crate::actions::DEFAULT_ACTION_ID => Some(DispatchTarget::CheckMyWork),
@@ -989,16 +990,46 @@ mod tests {
 
     // -- dispatch table: every built-in, tested (rule 8) ------------------
 
+    /// Every built-in action id (from `actions::builtin_actions()`) and
+    /// both tray-only utility ids must route to their OWN named
+    /// `DispatchTarget` arm, never to `Generic` -- `Generic` is only for an
+    /// id nothing above special-cases (#242). `is_some()` alone stopped
+    /// being a meaningful assertion once `dispatch_target_for`'s `_` arm
+    /// started returning `Some(Generic(..))` for everything: this asserts
+    /// the exact expected value per id instead, so a built-in that
+    /// regresses to the generic path (silently losing its dedicated
+    /// dispatch, e.g. its own preview headline or a fixed-name executor)
+    /// fails this test instead of passing it vacuously.
     #[test]
     fn dispatch_covers_every_built_in_action() {
         for a in crate::actions::builtin_actions() {
             assert!(
-                dispatch_target_for(&a.id).is_some(),
-                "built-in action {:?} has no palette dispatch target -- it would be wired \
-                 to nothing from the palette",
+                !matches!(dispatch_target_for(&a.id), Some(DispatchTarget::Generic(_))),
+                "built-in action {:?} dispatches generically -- it lost its own named \
+                 DispatchTarget arm",
                 a.id
             );
         }
+        assert_eq!(
+            dispatch_target_for(crate::actions::DEFAULT_ACTION_ID),
+            Some(DispatchTarget::CheckMyWork)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::EXTRACT_TEXT_ACTION_ID),
+            Some(DispatchTarget::ExtractText)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::calendar::ACTION_ID),
+            Some(DispatchTarget::AddToCalendar)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::review_email::ACTION_ID),
+            Some(DispatchTarget::ReviewEmail)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::fill_form::ACTION_ID),
+            Some(DispatchTarget::FillForm)
+        );
         assert_eq!(
             dispatch_target_for(CALCULATE_SELECTION_ACTION_ID),
             Some(DispatchTarget::CalculateSelection)

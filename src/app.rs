@@ -1251,7 +1251,17 @@ impl App {
         let mode = self.config.mode;
         let prompt = action.prompt.clone();
         let target = self.hwnd_isize();
-        let id_for_worker = action_id.to_string();
+        // #242 review: the action and the schema it was dispatched with are
+        // carried through the worker and back in the result payload, rather
+        // than `on_generic_action_result` re-loading `actions.toml` and
+        // re-resolving the schema after the model call returns. A second
+        // load reading a file that changed (or vanished) between dispatch
+        // and result -- a real possibility, since nothing locks
+        // `actions.toml` against a concurrent edit -- must never panic the
+        // main thread (rule 7); using exactly what was dispatched makes
+        // that whole class of failure unreachable instead of merely rare.
+        let action_for_result = action.clone();
+        let schema_for_result = schema.clone();
         std::thread::spawn(move || {
             let result: std::result::Result<Value, String> = (|| -> Result<Value> {
                 let shot = capture::encode(&raw)?;
@@ -1275,7 +1285,7 @@ impl App {
                     &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
                 )
             });
-            let payload = Box::into_raw(Box::new((id_for_worker, result)));
+            let payload = Box::into_raw(Box::new((action_for_result, schema_for_result, result)));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
@@ -1292,10 +1302,16 @@ impl App {
     /// card (when the action's `confirm` field is `true`, the default) or,
     /// for a read-only action with `confirm = false`, auto-confirms and
     /// runs the executor immediately -- the same two-path shape
-    /// `on_calendar_result` already implements.
+    /// `on_calendar_result` already implements. `action` and `schema` are
+    /// exactly what `run_generic_action` dispatched with (carried through
+    /// the worker's result payload, see that function's doc comment) --
+    /// this handler never re-loads `actions.toml` or re-resolves a schema,
+    /// so there is nothing here that can fail on a file that changed since
+    /// dispatch, and no `.expect()` on the main thread.
     fn on_generic_action_result(
         &mut self,
-        action_id: String,
+        action: actions::Action,
+        schema: Value,
         result: std::result::Result<Value, String>,
     ) {
         self.busy = false;
@@ -1312,32 +1328,7 @@ impl App {
             }
         };
 
-        let resolved = match actions::load_actions() {
-            Ok(r) => r,
-            Err(e) => {
-                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
-                self.card.show_error("Couldn't load actions.toml", &detail);
-                self.set_watch(true);
-                return;
-            }
-        };
-        let Some(action) = resolved
-            .iter()
-            .find(|r| r.action.id == action_id)
-            .map(|r| r.action.clone())
-        else {
-            let detail = self.track_error(
-                "Couldn't run that action",
-                &format!("no visible action with id \"{action_id}\""),
-            );
-            self.card.show_error("Couldn't run that action", &detail);
-            self.set_watch(true);
-            return;
-        };
-
         if action.confirm {
-            let schema = actions::schema::schema_for(&action.proposal, action.rate_difficulty)
-                .expect("checked in run_generic_action before the worker was ever started");
             self.pending_preview = Some(PendingPreview::Generic(action.clone()));
             self.pending_preview_generation =
                 self.card
@@ -2348,8 +2339,8 @@ impl App {
                 DeferredMessage::ReviewResult(result) => self.on_review_result(result),
                 DeferredMessage::FormFillResult(result) => self.on_form_fill_result(result),
                 DeferredMessage::PreviewDecided(generation) => self.on_preview_decided(generation),
-                DeferredMessage::GenericActionResult(action_id, result) => {
-                    self.on_generic_action_result(action_id, result)
+                DeferredMessage::GenericActionResult(action, schema, result) => {
+                    self.on_generic_action_result(action, schema, result)
                 }
             }
         }
@@ -3807,9 +3798,10 @@ enum DeferredMessage {
     /// deferred notification is still matched against the right preview
     /// when Settings closes and the queue drains.
     PreviewDecided(u32),
-    /// `WM_APP_GENERIC_ACTION_RESULT` (#242). The `String` is the action id
-    /// the result belongs to.
-    GenericActionResult(String, std::result::Result<Value, String>),
+    /// `WM_APP_GENERIC_ACTION_RESULT` (#242). Carries the exact `Action`
+    /// and schema `run_generic_action` dispatched with, not just the id --
+    /// see `on_generic_action_result`'s doc comment for why.
+    GenericActionResult(actions::Action, Value, std::result::Result<Value, String>),
 }
 
 /// Issue #225: which action is waiting on the preview currently on screen.
@@ -4027,12 +4019,17 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
                     // #242: same treatment as WM_APP_CALENDAR_RESULT above.
                     WM_APP_GENERIC_ACTION_RESULT => {
-                        let (action_id, result) = *unsafe {
+                        let (action, schema, result) = *unsafe {
                             Box::from_raw(
-                                lparam.0 as *mut (String, std::result::Result<Value, String>),
+                                lparam.0
+                                    as *mut (
+                                        actions::Action,
+                                        Value,
+                                        std::result::Result<Value, String>,
+                                    ),
                             )
                         };
-                        DeferredMessage::GenericActionResult(action_id, result)
+                        DeferredMessage::GenericActionResult(action, schema, result)
                     }
                     _ => unreachable!(
                         "settings_reentrancy_policy only returns Defer for the six ids above"
@@ -4154,10 +4151,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_APP_GENERIC_ACTION_RESULT => {
-            let (action_id, result) = unsafe {
-                *Box::from_raw(lparam.0 as *mut (String, std::result::Result<Value, String>))
+            let (action, schema, result) = unsafe {
+                *Box::from_raw(
+                    lparam.0 as *mut (actions::Action, Value, std::result::Result<Value, String>),
+                )
             };
-            app.on_generic_action_result(action_id, result);
+            app.on_generic_action_result(action, schema, result);
             LRESULT(0)
         }
         WM_APP_PREVIEW_DECIDED => {
