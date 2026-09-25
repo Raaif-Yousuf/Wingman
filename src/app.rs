@@ -642,7 +642,19 @@ impl App {
         // Disarmed for the whole in-flight window: a click while the spinner
         // is up must not touch the card.
         self.set_watch(false);
-        self.card.show_pending();
+        // Issue #354 follow-up review findings 1 and 2: every model-backed
+        // flow goes through this shared method, so the pending card starts
+        // directly at `AskingModel` here -- once, for all three callers --
+        // instead of each flow (or just `ask()`, before this fix) setting it
+        // separately after the fact. The label is resolved from the SAME
+        // mode-aware chain the worker thread will actually try (finding 4),
+        // known synchronously here with no network call, so this is not a
+        // promise the worker reaches that exact provider (it may fail over)
+        // but an honest "what Wingman is trying right now" cue, same as the
+        // pre-existing reasoning this replaces.
+        let model_name = self.first_provider_model_label().unwrap_or_default();
+        self.card
+            .show_pending(crate::ui::card::PendingStage::AskingModel { model_name });
 
         Some((raw, foreground_hwnd_isize, extra_value))
     }
@@ -669,19 +681,9 @@ impl App {
         let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
 
-        // Issue #354: the pending card moves from "Looking at your
-        // screen..." to "Asking {model}..." here, right as the request is
-        // handed to the worker thread -- the model label is the same
-        // mode-aware "first provider that looks configured" guess
-        // `first_provider_model_label` already gives the palette footer
-        // (issue #192's reasoning), not a promise the worker will actually
-        // reach that provider (it may fail over; the card is a "what
-        // Wingman is trying right now" cue, not a commitment).
-        if let Some(model_name) = self.first_provider_model_label() {
-            self.card
-                .set_pending_stage(crate::ui::card::PendingStage::AskingModel { model_name });
-        }
-
+        // Issue #354 follow-up review: the pending card already started at
+        // `AskingModel` inside `begin_model_action` (findings 1 and 2), so
+        // there is nothing left to set here.
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
                 let shot = capture::encode(&raw)?;
@@ -867,22 +869,42 @@ impl App {
         }
     }
 
-    /// `"<name>:<model>"` for the first entry in `providers.order`, or just
-    /// `"<name>"` when that provider has no distinct model field set to a
-    /// non-empty value. `None` when nothing is configured at all -- the
-    /// palette footer then shows just the mode label (see
+    /// `"<name>:<model>"` for the first entry `self.config.mode` would
+    /// actually try -- `Providers::selected_order_for_mode` applied to the
+    /// current mode, the SAME mode-aware filtering/reordering
+    /// `build_chain_for_mode` (and so the real worker thread) uses -- or
+    /// just `"<name>"` when that provider has no distinct model field set to
+    /// a non-empty value. `None` when nothing survives mode filtering --
+    /// the palette footer then shows just the mode label (see
     /// `palette_model::footer_line`).
+    ///
+    /// Issue #354 follow-up review, finding 4: this used to read
+    /// `providers.order.first()` directly, ignoring `mode` entirely -- so
+    /// e.g. `order = ["openai", "ollama"]` with `mode = Local` named
+    /// "openai" even though Local mode would never try it. `ollama_ready:
+    /// true` here is the same optimistic-upper-bound argument
+    /// `readiness_gate`'s doc comment already explains: this only decides
+    /// whether Auto mode COUNTS Ollama as a candidate (no network probe),
+    /// never a claim it is reachable right now.
     fn first_provider_model_label(&self) -> Option<String> {
-        let name = self.config.providers.order.first()?;
+        Self::provider_model_label_for(self.config.mode, &self.config.providers)
+    }
+
+    /// `first_provider_model_label`'s actual logic, taken out as a plain
+    /// associated function (mirroring `readiness_gate`'s own shape) so a
+    /// test can call it directly with a fixture `Providers` and `Mode`
+    /// instead of constructing a whole `App` (which needs a live `HWND`).
+    fn provider_model_label_for(mode: Mode, providers: &Providers) -> Option<String> {
+        let selected = providers.selected_order_for_mode(mode, true);
+        let name = selected.first()?;
         let model: &str = match name.as_str() {
-            "openai" => &self.config.providers.openai.model,
-            "anthropic" => &self.config.providers.anthropic.model,
-            "gemini" => &self.config.providers.gemini.model,
-            "ollama" => &self.config.providers.ollama.model,
+            "openai" => &providers.openai.model,
+            "anthropic" => &providers.anthropic.model,
+            "gemini" => &providers.gemini.model,
+            "ollama" => &providers.ollama.model,
             n if n.starts_with("compat:") => {
                 let compat_name = &n["compat:".len()..];
-                self.config
-                    .providers
+                providers
                     .compat
                     .iter()
                     .find(|c| c.name == compat_name)
@@ -956,7 +978,10 @@ impl App {
 
         self.busy = true;
         self.set_watch(false);
-        self.card.show_pending();
+        // No model in this flow (see the doc comment above): `Working` is
+        // the honest generic placeholder, not `AskingModel`.
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
 
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
@@ -1869,7 +1894,11 @@ impl App {
 
         self.busy = true;
         self.set_watch(false);
-        self.card.show_pending();
+        // Issue #354 follow-up review, finding 3: this reads the current
+        // text selection, not a screenshot -- `ReadingSelection` says so
+        // truthfully instead of reusing a screenshot-flavored line.
+        self.card
+            .show_pending(crate::ui::card::PendingStage::ReadingSelection);
 
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
@@ -4385,6 +4414,55 @@ mod tests {
             assert!(!headline.contains('\u{2014}'), "{headline}");
             assert!(!detail.contains('\u{2014}'), "{detail}");
         }
+    }
+
+    // -- first_provider_model_label / provider_model_label_for (issue #354
+    //    follow-up review, finding 4) -------------------------------------
+
+    #[test]
+    fn provider_model_label_is_mode_aware_not_just_order_first() {
+        // order = ["openai", "ollama"], but mode = Local: Local mode never
+        // tries "openai" (`select_providers`/`is_local_provider`), so the
+        // label must name "ollama", not "openai". Before the fix this read
+        // `providers.order.first()` directly and asserted "openai" here,
+        // which is the exact wrong-model-name bug finding 4 reports.
+        let mut providers = Providers {
+            order: vec!["openai".to_string(), "ollama".to_string()],
+            ..Providers::default()
+        };
+        providers.openai.api_key = "sk-real".to_string();
+        providers.openai.model = "gpt-5".to_string();
+        providers.ollama.base_url = "http://127.0.0.1:11434".to_string();
+        providers.ollama.model = "llava".to_string();
+
+        let label = App::provider_model_label_for(Mode::Local, &providers)
+            .expect("ollama is configured and selected for Local mode");
+        assert_eq!(label, "ollama:llava");
+    }
+
+    #[test]
+    fn provider_model_label_matches_order_first_when_mode_does_not_filter_it_out() {
+        // Cloud mode DOES select "openai" first here, so this stays "openai"
+        // -- a control case proving the fix did not just always answer
+        // "ollama".
+        let mut providers = Providers {
+            order: vec!["openai".to_string(), "ollama".to_string()],
+            ..Providers::default()
+        };
+        providers.openai.api_key = "sk-real".to_string();
+        providers.openai.model = "gpt-5".to_string();
+
+        let label = App::provider_model_label_for(Mode::Cloud, &providers)
+            .expect("openai is configured for Cloud mode");
+        assert_eq!(label, "openai:gpt-5");
+    }
+
+    #[test]
+    fn provider_model_label_is_none_when_mode_filtering_leaves_nothing() {
+        // Cloud mode with only ollama configured: nothing survives
+        // `selected_order_for_mode`, so the label is None (never a stale
+        // name from an unfiltered `order`).
+        assert!(App::provider_model_label_for(Mode::Cloud, &ollama_only_providers()).is_none());
     }
 
     // -- form_fill_headline / calendar_headline (issue #268) ---------------

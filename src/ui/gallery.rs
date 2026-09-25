@@ -50,7 +50,11 @@ pub enum GalleryState {
     /// Issue #354. Replaces the old single glyph-only `CardPending` state:
     /// the pending card now always carries a status line, so each sub-stage
     /// gets its own gallery entry instead of one generic "pending" shot.
-    CardPendingCapturing,
+    /// Uses `PendingStage::ReadingSelection` (#354 follow-up review, finding
+    /// 3): `calculate_selection` reads the current text selection, not a
+    /// screenshot, and its own honest stage is the simplest non-`AskingModel`
+    /// one to put in the gallery.
+    CardPendingReadingSelection,
     /// Issue #354.
     CardPendingAskingModelShort,
     /// Issue #354: a long model name, to show `pending_status`'s
@@ -77,7 +81,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardAnswerDifficultyHigh,
         CardAnswerDifficultyUltra,
         CardError,
-        CardPendingCapturing,
+        CardPendingReadingSelection,
         CardPendingAskingModelShort,
         CardPendingAskingModelLong,
         CardPendingStillWorking,
@@ -102,7 +106,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardAnswerDifficultyHigh => "card-answer-difficulty-high",
         CardAnswerDifficultyUltra => "card-answer-difficulty-ultra",
         CardError => "card-error",
-        CardPendingCapturing => "card-pending-capturing",
+        CardPendingReadingSelection => "card-pending-reading-selection",
         CardPendingAskingModelShort => "card-pending-asking-model-short",
         CardPendingAskingModelLong => "card-pending-asking-model-long",
         CardPendingStillWorking => "card-pending-still-working",
@@ -354,24 +358,22 @@ mod driver {
                     "The request timed out. Check your connection and try again.",
                 );
             }
-            CardPendingCapturing => {
+            CardPendingReadingSelection => {
                 card.hide();
                 palette.hide();
-                card.show_pending();
+                card.show_pending(crate::ui::card::PendingStage::ReadingSelection);
             }
             CardPendingAskingModelShort => {
                 card.hide();
                 palette.hide();
-                card.show_pending();
-                card.set_pending_stage(crate::ui::card::PendingStage::AskingModel {
+                card.show_pending(crate::ui::card::PendingStage::AskingModel {
                     model_name: "claude-haiku".to_string(),
                 });
             }
             CardPendingAskingModelLong => {
                 card.hide();
                 palette.hide();
-                card.show_pending();
-                card.set_pending_stage(crate::ui::card::PendingStage::AskingModel {
+                card.show_pending(crate::ui::card::PendingStage::AskingModel {
                     // Deliberately over `pending_status`'s truncation
                     // length, to show the ellipsis in the gallery shot.
                     model_name:
@@ -382,7 +384,9 @@ mod driver {
             CardPendingStillWorking => {
                 card.hide();
                 palette.hide();
-                card.show_pending();
+                card.show_pending(crate::ui::card::PendingStage::AskingModel {
+                    model_name: "claude-haiku".to_string(),
+                });
                 card.set_pending_stage(crate::ui::card::PendingStage::StillWorking);
             }
             CardPreviewCalendar => {

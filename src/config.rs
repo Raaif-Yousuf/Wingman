@@ -1401,6 +1401,25 @@ impl Providers {
     /// change between two presses, and rule 5 rules out polling to keep a
     /// cached answer warm).
     pub fn build_chain_for_mode(&self, mode: Mode, ollama_ready: bool) -> Chain {
+        let selected = self.selected_order_for_mode(mode, ollama_ready);
+        let providers: Vec<Box<dyn Provider>> = selected
+            .iter()
+            .filter_map(|name| self.provider_for(name))
+            .collect();
+        Chain::new(providers)
+    }
+
+    /// The `order` entries `build_chain_for_mode` would turn into a
+    /// [`Chain`] for `mode`, filtered and reordered by
+    /// `mode::select_providers` but stopping short of constructing any
+    /// `Box<dyn Provider>` -- issue #354: `App::first_provider_model_label`
+    /// needs the mode-aware FIRST entry's own order-string (so it can look
+    /// up its configured model, including a compat provider's specific
+    /// name, which `Provider::id()` collapses to the generic
+    /// `"openai-compat"` and would otherwise lose), not a `Chain` to run
+    /// requests through. Kept as the one place both callers share so they
+    /// can never disagree about which providers `mode` allows.
+    pub fn selected_order_for_mode(&self, mode: Mode, ollama_ready: bool) -> Vec<String> {
         // #16: a compat endpoint's locality is decided by its configured
         // `base_url` host, never by name (`mode::is_local_provider`'s doc) --
         // this is the one place that host check happens, right before
@@ -1416,13 +1435,7 @@ impl Providers {
             })
             .map(|c| compat_order_name(&c.name))
             .collect();
-        let selected =
-            crate::mode::select_providers(mode, &self.order, ollama_ready, &local_compat_names);
-        let providers: Vec<Box<dyn Provider>> = selected
-            .iter()
-            .filter_map(|name| self.provider_for(name))
-            .collect();
-        Chain::new(providers)
+        crate::mode::select_providers(mode, &self.order, ollama_ready, &local_compat_names)
     }
 }
 

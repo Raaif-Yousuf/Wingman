@@ -12,7 +12,7 @@
 //! impl Card {
 //!     pub fn new(instance: HINSTANCE) -> anyhow::Result<Self>;
 //!     pub fn hwnd(&self) -> HWND;
-//!     pub fn show_pending(&mut self);
+//!     pub fn show_pending(&mut self, stage: PendingStage);
 //!     pub fn set_pending_stage(&mut self, stage: PendingStage); // #354
 //!     pub fn show_answer(&mut self, headline: &str, detail: &str, auto_dismiss_secs: u32, difficulty: Option<Difficulty>);
 //!     pub fn show_error(&mut self, headline: &str, detail: &str);
@@ -206,7 +206,7 @@ impl Card {
             preview_decision_pending: false,
             preview_generation: 0,
             edit_bg_brush: HBRUSH(std::ptr::null_mut()),
-            pending_stage: PendingStage::Capturing,
+            pending_stage: PendingStage::Working,
             animations_enabled: true,
         });
         let raw = Box::into_raw(inner);
@@ -279,15 +279,18 @@ impl Card {
         self.inner.owner = Some(hwnd);
     }
 
-    pub fn show_pending(&mut self) {
-        self.inner.show_pending();
+    /// `stage` is the caller's honest description of what is happening at
+    /// the moment the card appears -- see `CardInner::show_pending`'s doc
+    /// comment for why there is no default/implicit starting stage any
+    /// more.
+    pub fn show_pending(&mut self, stage: PendingStage) {
+        self.inner.show_pending(stage);
     }
 
     /// Issue #354: moves an already-showing Pending card to a new sub-stage
-    /// ("Looking at your screen..." -> "Asking {model}..." -> "Still
-    /// working."), updating both the painted status line and the window's
-    /// accessible text. A no-op if the card is not currently Pending (see
-    /// `CardInner::set_pending_stage`).
+    /// (e.g. "Asking {model}..." -> "Still working."), updating both the
+    /// painted status line and the window's accessible text. A no-op if the
+    /// card is not currently Pending (see `CardInner::set_pending_stage`).
     pub fn set_pending_stage(&mut self, stage: PendingStage) {
         self.inner.set_pending_stage(stage);
     }
@@ -1033,8 +1036,9 @@ struct CardInner {
     /// not just an optimisation.
     edit_bg_brush: HBRUSH,
     /// Issue #354: which sub-stage the Pending state is in. Meaningless
-    /// outside `CardState::Pending`; reset to `Capturing` by every
-    /// `show_pending` call, alongside every other pending-only field.
+    /// outside `CardState::Pending`; set to whatever stage the caller passed
+    /// `show_pending` by every `show_pending` call, alongside every other
+    /// pending-only field.
     pending_stage: PendingStage,
     /// Issue #354: whether Windows' "Animation effects" setting was on the
     /// last time `show_pending` queried it (`client_area_animation_enabled`,
@@ -1071,7 +1075,16 @@ impl CardInner {
 
     // -- show/hide -----------------------------------------------------
 
-    fn show_pending(&mut self) {
+    /// `stage` is the caller's own honest description of what is happening
+    /// right as the card appears (issue #354 follow-up review, finding 1):
+    /// there is no longer a generic "Capturing" placeholder shown here and
+    /// then immediately overwritten -- see `PendingStage`'s doc comment for
+    /// why that variant was removed rather than kept and fixed. Every
+    /// caller passes the stage that is actually true at THIS call, e.g.
+    /// `App::begin_model_action` already knows the mode-aware model label
+    /// before capture even runs, so the three model-backed flows start
+    /// directly at `AskingModel`.
+    fn show_pending(&mut self, stage: PendingStage) {
         self.leave_preview_if_active();
         self.reset_activation_and_timers();
         // `headline`/`detail` stay unused by Pending (issue #354's status
@@ -1084,7 +1097,6 @@ impl CardInner {
         self.anim_frame = 0;
         self.scroll_offset = 0;
         self.scroll_max = 0;
-        self.pending_stage = PendingStage::Capturing;
         // Issue #354: queried once per Pending session, not on every frame
         // -- see the field's doc comment.
         self.animations_enabled = client_area_animation_enabled();
@@ -1101,26 +1113,42 @@ impl CardInner {
             );
         }
 
-        self.set_window_text_for_pending_stage();
+        // Applied BEFORE layout: `layout_pending` sizes the card off the
+        // current status text, so `pending_stage` must already be `stage`
+        // (not the previous Pending session's leftover value) by the time
+        // it runs -- shares the "still working" timer arm-or-kill and
+        // repaint logic with `set_pending_stage`, so starting straight at
+        // `AskingModel` arms the same countdown a later transition into it
+        // would.
+        self.apply_pending_stage(stage);
         self.layout_pending();
         self.reveal();
     }
 
     /// Issue #354: moves the Pending card to a new sub-stage -- called by
-    /// `App` once capture hands off to the worker thread (`AskingModel`,
-    /// with the model label already resolved on the main thread) or by this
-    /// module's own `TIMER_STILL_WORKING` handler (`StillWorking`). A no-op
-    /// outside `CardState::Pending`: a stale call arriving after the card
-    /// has already moved on (answer, error, hidden) must never resurrect a
-    /// pending-only field or re-arm a pending-only timer.
+    /// this module's own `TIMER_STILL_WORKING` handler (`StillWorking`) once
+    /// the card is already showing. A no-op outside `CardState::Pending`: a
+    /// stale call arriving after the card has already moved on (answer,
+    /// error, hidden) must never resurrect a pending-only field or re-arm a
+    /// pending-only timer.
     fn set_pending_stage(&mut self, stage: PendingStage) {
         if self.state != CardState::Pending {
             return;
         }
+        self.apply_pending_stage(stage);
+    }
+
+    /// Shared by `show_pending` (the card's very first stage) and
+    /// `set_pending_stage` (a later transition): stores `stage`, arms or
+    /// kills the "still working" countdown to match, and repaints the
+    /// status line. No `CardState::Pending` guard here -- both callers
+    /// already enforce it themselves, one implicitly (it just set the state
+    /// to `Pending`), one explicitly.
+    fn apply_pending_stage(&mut self, stage: PendingStage) {
         self.pending_stage = stage;
         // Only `AskingModel` starts the "still working" countdown; killing
-        // any previous one first means a caller that calls this twice in a
-        // row (e.g. the router retrying a provider) never stacks timers.
+        // any previous one first means a caller that applies this twice in
+        // a row (e.g. the router retrying a provider) never stacks timers.
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_STILL_WORKING);
         }
@@ -3061,7 +3089,7 @@ mod tests {
         assert!(!card.hwnd().0.is_null());
         assert_eq!(card.state(), CardState::Hidden);
 
-        card.show_pending();
+        card.show_pending(PendingStage::Working);
         assert_eq!(card.state(), CardState::Pending);
 
         card.show_answer(
