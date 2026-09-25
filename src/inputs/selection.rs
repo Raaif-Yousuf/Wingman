@@ -621,17 +621,16 @@ mod com {
     use windows::core::Interface;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED, SAFEARRAY,
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, SAFEARRAY,
     };
     use windows::Win32::System::Ole::{
         SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
         SafeArrayUnaccessData,
     };
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation8, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
-        IUIAutomationTextRange, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
-        UIA_TextPattern2Id, UIA_TextPatternId,
+        IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern, IUIAutomationTextRange,
+        TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start, UIA_TextPattern2Id,
+        UIA_TextPatternId,
     };
 
     /// Same RAII pairing as `inputs::uia::com::ComApartment`, duplicated
@@ -662,8 +661,11 @@ mod com {
     pub(super) fn probe_focused() -> anyhow::Result<UiaProbe> {
         let _apartment = ComApartment::enter()?;
         let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
-        let element = unsafe { automation.GetFocusedElement() }?;
+            unsafe { crate::inputs::uia_automation::create_automation() }?;
+        let element = crate::inputs::uia_automation::describe_timeout(
+            unsafe { automation.GetFocusedElement() },
+            "GetFocusedElement",
+        )?;
         if is_null(&element) {
             return Ok(UiaProbe::NoFocusedElement);
         }
@@ -678,8 +680,11 @@ mod com {
     pub(super) fn probe_element(hwnd: HWND) -> anyhow::Result<UiaProbe> {
         let _apartment = ComApartment::enter()?;
         let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
-        let element = unsafe { automation.ElementFromHandle(hwnd) }?;
+            unsafe { crate::inputs::uia_automation::create_automation() }?;
+        let element = crate::inputs::uia_automation::describe_timeout(
+            unsafe { automation.ElementFromHandle(hwnd) },
+            "ElementFromHandle",
+        )?;
         if is_null(&element) {
             return Ok(UiaProbe::NoFocusedElement);
         }

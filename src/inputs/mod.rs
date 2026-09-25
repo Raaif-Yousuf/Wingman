@@ -8,6 +8,7 @@
 
 pub mod selection;
 pub mod uia;
+pub(crate) mod uia_automation;
 
 /// Serializes every test in this module tree that drives real UIA over COM.
 /// MEASURED 2026-09-17 (#208): UIA integration tests in `uia` and

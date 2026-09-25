@@ -254,19 +254,18 @@ pub mod com {
     use windows::core::{Interface, BSTR};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED, SAFEARRAY,
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, SAFEARRAY,
     };
     use windows::Win32::System::Ole::{
         SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
         SafeArrayUnaccessData,
     };
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation8, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
-        TreeScope_Descendants, UIA_AutomationIdPropertyId, UIA_ButtonControlTypeId,
-        UIA_ControlTypePropertyId, UIA_HyperlinkControlTypeId, UIA_IsPasswordPropertyId,
-        UIA_MenuItemControlTypeId, UIA_NamePropertyId, UIA_SplitButtonControlTypeId,
-        UIA_ValuePatternId, UIA_ValueValuePropertyId,
+        IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern, TreeScope_Descendants,
+        UIA_AutomationIdPropertyId, UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
+        UIA_HyperlinkControlTypeId, UIA_IsPasswordPropertyId, UIA_MenuItemControlTypeId,
+        UIA_NamePropertyId, UIA_SplitButtonControlTypeId, UIA_ValuePatternId,
+        UIA_ValueValuePropertyId,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
@@ -341,10 +340,15 @@ pub mod com {
             cache_request.AddProperty(UIA_ValueValuePropertyId)?;
         }
 
-        let root = unsafe { automation.ElementFromHandle(hwnd) }?;
+        let root = crate::inputs::uia_automation::describe_timeout(
+            unsafe { automation.ElementFromHandle(hwnd) },
+            "ElementFromHandle",
+        )?;
         let condition = unsafe { automation.CreateTrueCondition() }?;
-        let found =
-            unsafe { root.FindAllBuildCache(TreeScope_Descendants, &condition, &cache_request) }?;
+        let found = crate::inputs::uia_automation::describe_timeout(
+            unsafe { root.FindAllBuildCache(TreeScope_Descendants, &condition, &cache_request) },
+            "FindAllBuildCache",
+        )?;
         let total = unsafe { found.Length() }?.max(0) as usize;
 
         let mut candidates = Vec::with_capacity(total);
@@ -583,7 +587,7 @@ pub mod com {
         fn resolve(&self, target: &TargetRef) -> Result<ResolvedElement> {
             let _apartment = ComApartment::enter()?;
             let automation: IUIAutomation =
-                unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
+                unsafe { crate::inputs::uia_automation::create_automation() }?;
             let hwnd = HWND(target.hwnd as *mut core::ffi::c_void);
 
             let matched = find_and_match(&automation, hwnd, target)?;
@@ -599,7 +603,7 @@ pub mod com {
         fn write(&self, target: &TargetRef, new_text: &str) -> Result<()> {
             let _apartment = ComApartment::enter()?;
             let automation: IUIAutomation =
-                unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
+                unsafe { crate::inputs::uia_automation::create_automation() }?;
             let hwnd = HWND(target.hwnd as *mut core::ffi::c_void);
 
             let matched = find_and_match(&automation, hwnd, target)?;
@@ -615,7 +619,7 @@ pub mod com {
         fn write_with_fallback(&self, target: &TargetRef, new_text: &str) -> Result<()> {
             let _apartment = ComApartment::enter()?;
             let automation: IUIAutomation =
-                unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
+                unsafe { crate::inputs::uia_automation::create_automation() }?;
             let hwnd = HWND(target.hwnd as *mut core::ffi::c_void);
 
             let matched = find_and_match(&automation, hwnd, target)?;
@@ -655,7 +659,7 @@ pub mod com {
     pub fn list_all_for_test(hwnd: HWND) -> Result<Vec<TargetRef>> {
         let _apartment = ComApartment::enter()?;
         let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
+            unsafe { crate::inputs::uia_automation::create_automation() }?;
         let (candidates, _elements, _extra) = walk(&automation, hwnd)?;
         Ok(candidates)
     }

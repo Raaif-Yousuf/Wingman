@@ -3217,6 +3217,10 @@ const KNOWN_TECHNICAL_DETAILS: &[(&str, &str)] = &[
     ),
     ("FileTimeToSystemTime", "Couldn't read your clock settings."),
     ("SystemTimeToFileTime", "Couldn't read your clock settings."),
+    (
+        crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT,
+        "The other app stopped responding.",
+    ),
 ];
 
 /// True if `text` contains what looks like a Win32/API-style identifier
@@ -5320,6 +5324,20 @@ mod tests {
             assert_eq!(human, "Couldn't read your clock settings.");
             assert!(!contains_api_failed_identifier(&human));
         }
+    }
+
+    /// #261/#264: a UIA call bounded by
+    /// `inputs::uia_automation::create_automation`'s timeouts, once it
+    /// actually trips, must show a readable card, not a raw HRESULT.
+    #[test]
+    fn humanize_error_chain_maps_a_uia_timeout() {
+        let chain = format!(
+            "couldn't read the focused element: {} (GetFocusedElement)",
+            crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT
+        );
+        let human = humanize_error_chain(&chain);
+        assert_eq!(human, "The other app stopped responding.");
+        assert!(!contains_api_failed_identifier(&human));
     }
 
     #[test]

@@ -664,16 +664,14 @@ mod com {
     use anyhow::Result;
     use windows::core::Interface;
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED, SAFEARRAY,
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, SAFEARRAY,
     };
     use windows::Win32::System::Ole::{
         SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
         SafeArrayUnaccessData,
     };
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation8, IUIAutomation, IUIAutomationValuePattern, UIA_TextPatternId,
-        UIA_ValuePatternId,
+        IUIAutomation, IUIAutomationValuePattern, UIA_TextPatternId, UIA_ValuePatternId,
     };
 
     struct ComApartment;
@@ -780,9 +778,12 @@ mod com {
     ) -> Result<Option<(CapturedTarget, String)>> {
         let _apartment = ComApartment::enter()?;
         let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
+            unsafe { crate::inputs::uia_automation::create_automation() }?;
 
-        let element = unsafe { automation.GetFocusedElement() }?;
+        let element = crate::inputs::uia_automation::describe_timeout(
+            unsafe { automation.GetFocusedElement() },
+            "GetFocusedElement",
+        )?;
         if is_null(&element) {
             return Ok(None);
         }
