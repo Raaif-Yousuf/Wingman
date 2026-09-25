@@ -46,8 +46,8 @@ use crate::hotkey::{
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
 use crate::provider::{
-    calendar_request, parse_answer, physics_request, review_request_from_screen,
-    review_request_from_text, Answer, Chain, Provider, Shot,
+    calendar_request, generic_action_request, parse_answer, physics_request,
+    review_request_from_screen, review_request_from_text, Answer, Chain, Provider, Shot,
 };
 use crate::router;
 use crate::ui::card::{Card, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED};
@@ -113,6 +113,15 @@ pub const WM_APP_FORM_FILL_RESULT: u32 = WM_APP + 13;
 /// `+13` are already `WM_APP_PREVIEW_DECIDED`/`WM_APP_PALETTE_TOGGLE`/
 /// `WM_APP_PALETTE_RUN`/`WM_APP_REVIEW_RESULT`/`WM_APP_FORM_FILL_RESULT`.
 pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
+
+/// #242: posted by `App::run_generic_action`'s worker thread when the
+/// provider chain finishes for a non-built-in `actions.toml` action:
+/// `lparam` is `Box::into_raw(Box::new((String, Result<Value, String>)))`,
+/// the generic-dispatch analogue of [`WM_APP_CALENDAR_RESULT`] -- the
+/// `String` is the action id, carried along because (unlike the calendar
+/// flow) there is no single fixed action this result can belong to.
+/// `WM_APP + 16`: `+15` is already `crate::ui::card::WM_APP_CARD_OPEN_SETTINGS`.
+pub const WM_APP_GENERIC_ACTION_RESULT: u32 = WM_APP + 16;
 
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
@@ -900,6 +909,13 @@ impl App {
             Some(DispatchTarget::FillForm) => self.fill_form_from_screen(),
             Some(DispatchTarget::CalculateSelection) => self.calculate_selection(),
             Some(DispatchTarget::CopyRegion) => self.copy_region(),
+            // #242: any other action id -- a user-authored `actions.toml`
+            // entry -- runs through the generic Look/Propose/Confirm/Do
+            // path instead of silently doing nothing.
+            Some(DispatchTarget::Generic(action_id)) => self.run_generic_action(&action_id),
+            // `dispatch_target_for` never returns `None` (#242); kept only
+            // because the match is over an `Option`, not because this arm
+            // is expected to run.
             None => {}
         }
     }
@@ -1179,6 +1195,187 @@ impl App {
         }
     }
 
+    /// #242: the generic-dispatch entry point for any palette action id
+    /// `palette_model::dispatch_target_for` does not special-case -- a
+    /// user-authored `actions.toml` entry. Looks the action up by id (an
+    /// error card if it was disabled or removed since the palette was
+    /// shown, never a panic), resolves its `proposal` schema, and runs the
+    /// same capture-then-model-call shape `ask`/`add_event_from_screen`
+    /// already use. An action whose `proposal` names a schema
+    /// `actions::schema::schema_for` does not know (e.g. a
+    /// deliberately-model-free proposal like `extract_text`'s `"ocr_text"`)
+    /// is reported as a load error today rather than run with no schema:
+    /// the generic path only covers "reuse an existing proposal schema and
+    /// executor", the case `docs/actions.md` documents as the intended
+    /// shape for a new `actions.toml` action.
+    fn run_generic_action(&mut self, action_id: &str) {
+        let resolved = match actions::load_actions() {
+            Ok(r) => r,
+            Err(e) => {
+                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.card.show_error("Couldn't load actions.toml", &detail);
+                return;
+            }
+        };
+        let Some(action) = resolved
+            .iter()
+            .find(|r| r.action.id == action_id)
+            .map(|r| r.action.clone())
+        else {
+            let detail = self.track_error(
+                "Couldn't run that action",
+                &format!("no visible action with id \"{action_id}\""),
+            );
+            self.card.show_error("Couldn't run that action", &detail);
+            return;
+        };
+        let Some(schema) = actions::schema::schema_for(&action.proposal, action.rate_difficulty)
+        else {
+            let detail = self.track_error(
+                &format!("Couldn't run \"{}\"", action.name),
+                &format!(
+                    "\"{}\" is not a proposal schema Wingman can run generically yet",
+                    action.proposal
+                ),
+            );
+            self.card
+                .show_error(&format!("Couldn't run \"{}\"", action.name), &detail);
+            return;
+        };
+
+        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
+            return;
+        };
+
+        let providers = self.config.providers.clone();
+        let mode = self.config.mode;
+        let prompt = action.prompt.clone();
+        let target = self.hwnd_isize();
+        let id_for_worker = action_id.to_string();
+        std::thread::spawn(move || {
+            let result: std::result::Result<Value, String> = (|| -> Result<Value> {
+                let shot = capture::encode(&raw)?;
+                let ollama_ready = mode == Mode::Auto
+                    && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+                    && mode::probe_ollama_ready(
+                        &providers.ollama.base_url,
+                        &providers.ollama.model,
+                    );
+                let chain = providers.build_chain_for_mode(mode, ollama_ready);
+                let req = generic_action_request(&shot, &prompt, schema);
+                chain.complete_parsed_with_fallback(
+                    &req,
+                    || non_vision_inputs(&raw, foreground_hwnd_isize),
+                    |c| actions::parse_generic_proposal(&c.text),
+                )
+            })()
+            .map_err(|e| {
+                pack_error(
+                    &human_error_detail(&format!("{e:#}")),
+                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                )
+            });
+            let payload = Box::into_raw(Box::new((id_for_worker, result)));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_GENERIC_ACTION_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                );
+            }
+        });
+    }
+
+    /// Handles [`App::run_generic_action`]'s worker result (#242): an error
+    /// shows an error card (rule 7); a success either shows the preview
+    /// card (when the action's `confirm` field is `true`, the default) or,
+    /// for a read-only action with `confirm = false`, auto-confirms and
+    /// runs the executor immediately -- the same two-path shape
+    /// `on_calendar_result` already implements.
+    fn on_generic_action_result(
+        &mut self,
+        action_id: String,
+        result: std::result::Result<Value, String>,
+    ) {
+        self.busy = false;
+
+        let proposal = match result {
+            Ok(p) => p,
+            Err(packed) => {
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
+                self.card.show_error(&headline, human);
+                self.set_watch(true);
+                return;
+            }
+        };
+
+        let resolved = match actions::load_actions() {
+            Ok(r) => r,
+            Err(e) => {
+                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.card.show_error("Couldn't load actions.toml", &detail);
+                self.set_watch(true);
+                return;
+            }
+        };
+        let Some(action) = resolved
+            .iter()
+            .find(|r| r.action.id == action_id)
+            .map(|r| r.action.clone())
+        else {
+            let detail = self.track_error(
+                "Couldn't run that action",
+                &format!("no visible action with id \"{action_id}\""),
+            );
+            self.card.show_error("Couldn't run that action", &detail);
+            self.set_watch(true);
+            return;
+        };
+
+        if action.confirm {
+            let schema = actions::schema::schema_for(&action.proposal, action.rate_difficulty)
+                .expect("checked in run_generic_action before the worker was ever started");
+            self.pending_preview = Some(PendingPreview::Generic(action.clone()));
+            self.pending_preview_generation =
+                self.card
+                    .show_preview(&action.name, &schema, &proposal, false);
+            return;
+        }
+
+        // `action.confirm == false`: only reachable for a read-only
+        // executor -- `auto_confirm_read_only` refuses anything else, same
+        // as `on_calendar_result`'s own `confirm == false` branch.
+        match actions::resolve_executor(&action) {
+            Ok(executor) => match confirm::auto_confirm_read_only(
+                executor.as_ref(),
+                confirm::Proposal::new(proposal),
+            ) {
+                Ok(confirmed) => self.run_confirmed_generic_action(&action, confirmed),
+                Err(e) => {
+                    let detail = self.track_error(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &format!("{e:#}"),
+                    );
+                    self.card
+                        .show_error(&format!("Couldn't run \"{}\"", action.name), &detail);
+                    self.set_watch(true);
+                }
+            },
+            Err(e) => {
+                let detail = self.track_error(
+                    &format!("Couldn't run \"{}\"", action.name),
+                    &format!("{e:#}"),
+                );
+                self.card
+                    .show_error(&format!("Couldn't run \"{}\"", action.name), &detail);
+                self.set_watch(true);
+            }
+        }
+    }
+
     /// The card's preview closed with a decision
     /// (`ui::card::WM_APP_PREVIEW_DECIDED`). `Card::take_confirmed()` is
     /// `None` for Cancel/Esc -- nothing runs, per Look/Propose/Confirm/Do:
@@ -1231,8 +1428,50 @@ impl App {
             Some(PendingPreview::FormFill(original)) => {
                 self.run_confirmed_form_fill(&original, confirmed);
             }
+            Some(PendingPreview::Generic(action)) => {
+                self.run_confirmed_generic_action(&action, confirmed);
+            }
             None => self.run_confirmed_calendar_add(confirmed),
         }
+    }
+
+    /// #242's half of [`App::on_preview_decided`]: resolves `action`'s own
+    /// `executor` field generically (no fixed executor name, unlike
+    /// `run_confirmed_calendar_add`/`run_confirmed_form_fill`) and runs it
+    /// against the card's confirmed value. The result is shown with the
+    /// action's own name as the headline: there is no per-action headline
+    /// logic to derive from the summary the way `calendar_headline`/
+    /// `form_fill_headline` do, because a generic action's executor and
+    /// wording are not known ahead of time.
+    fn run_confirmed_generic_action(
+        &mut self,
+        action: &actions::Action,
+        confirmed: confirm::Confirmed<Value>,
+    ) {
+        match actions::resolve_executor(action) {
+            Ok(executor) => match executor.execute(confirmed) {
+                Ok(undo) => {
+                    self.card.show_answer(&action.name, &undo.summary, 0, None);
+                }
+                Err(e) => {
+                    let detail = self.track_error(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &format!("{e:#}"),
+                    );
+                    self.card
+                        .show_error(&format!("Couldn't run \"{}\"", action.name), &detail);
+                }
+            },
+            Err(e) => {
+                let detail = self.track_error(
+                    &format!("Couldn't run \"{}\"", action.name),
+                    &format!("{e:#}"),
+                );
+                self.card
+                    .show_error(&format!("Couldn't run \"{}\"", action.name), &detail);
+            }
+        }
+        self.set_watch(true);
     }
 
     /// #40's half of [`App::on_preview_decided`], split out so that handler
@@ -2109,6 +2348,9 @@ impl App {
                 DeferredMessage::ReviewResult(result) => self.on_review_result(result),
                 DeferredMessage::FormFillResult(result) => self.on_form_fill_result(result),
                 DeferredMessage::PreviewDecided(generation) => self.on_preview_decided(generation),
+                DeferredMessage::GenericActionResult(action_id, result) => {
+                    self.on_generic_action_result(action_id, result)
+                }
             }
         }
     }
@@ -3565,6 +3807,9 @@ enum DeferredMessage {
     /// deferred notification is still matched against the right preview
     /// when Settings closes and the queue drains.
     PreviewDecided(u32),
+    /// `WM_APP_GENERIC_ACTION_RESULT` (#242). The `String` is the action id
+    /// the result belongs to.
+    GenericActionResult(String, std::result::Result<Value, String>),
 }
 
 /// Issue #225: which action is waiting on the preview currently on screen.
@@ -3578,6 +3823,12 @@ enum PendingPreview {
     /// the card confirmed is only the preview's flat translation, so this is
     /// what `actions::fill_form::rebuild_after_confirm` rebuilds against.
     FormFill(Value),
+    /// #242: a non-built-in `actions.toml` action awaiting its preview
+    /// decision. Carries the resolved `Action` itself (not just its id) so
+    /// `run_confirmed_generic_action` does not need a second
+    /// `actions::load_actions()` call between the model's proposal and the
+    /// user's confirm click.
+    Generic(actions::Action),
 }
 
 /// What `wnd_proc` should do with a message addressed to the owner window
@@ -3646,11 +3897,16 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // WM_APP_FORM_FILL_RESULT joins the same group for the same reason
         // -- its boxed `Result<Value, String>` payload is taken (not freed)
         // in the Defer arm below.
+        // #242: WM_APP_GENERIC_ACTION_RESULT joins the same group -- a
+        // finished non-built-in action run must not silently lose its card
+        // just because Settings happened to be open, same as
+        // WM_APP_CALENDAR_RESULT/WM_APP_FORM_FILL_RESULT.
         WM_APP_RESULT
         | WM_APP_CALENDAR_RESULT
         | WM_APP_REVIEW_RESULT
         | WM_APP_PREVIEW_DECIDED
-        | WM_APP_FORM_FILL_RESULT => SettingsReentrancy::Defer,
+        | WM_APP_FORM_FILL_RESULT
+        | WM_APP_GENERIC_ACTION_RESULT => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
@@ -3769,8 +4025,17 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
                     }),
                     WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
+                    // #242: same treatment as WM_APP_CALENDAR_RESULT above.
+                    WM_APP_GENERIC_ACTION_RESULT => {
+                        let (action_id, result) = *unsafe {
+                            Box::from_raw(
+                                lparam.0 as *mut (String, std::result::Result<Value, String>),
+                            )
+                        };
+                        DeferredMessage::GenericActionResult(action_id, result)
+                    }
                     _ => unreachable!(
-                        "settings_reentrancy_policy only returns Defer for the five ids above"
+                        "settings_reentrancy_policy only returns Defer for the six ids above"
                     ),
                 };
                 PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
@@ -3888,6 +4153,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_form_fill_result(result);
             LRESULT(0)
         }
+        WM_APP_GENERIC_ACTION_RESULT => {
+            let (action_id, result) = unsafe {
+                *Box::from_raw(lparam.0 as *mut (String, std::result::Result<Value, String>))
+            };
+            app.on_generic_action_result(action_id, result);
+            LRESULT(0)
+        }
         WM_APP_PREVIEW_DECIDED => {
             app.on_preview_decided(wparam.0 as u32);
             LRESULT(0)
@@ -3998,8 +4270,8 @@ mod tests {
     use super::{provider_for_router, router_models_for};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
-        WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT, WM_APP_RESULT,
-        WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
+        WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
+        WM_APP_GENERIC_ACTION_RESULT, WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
@@ -4681,6 +4953,7 @@ mod tests {
         ("WM_APP_FORM_FILL_RESULT", WM_APP_FORM_FILL_RESULT),
         ("WM_APP_ROUTER_RESULT", WM_APP_ROUTER_RESULT),
         ("WM_APP_CARD_OPEN_SETTINGS", WM_APP_CARD_OPEN_SETTINGS),
+        ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
     ];
 
     #[test]
@@ -5195,6 +5468,11 @@ mod tests {
             "WM_APP_CARD_OPEN_SETTINGS",
             WM_APP_CARD_OPEN_SETTINGS,
             SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_GENERIC_ACTION_RESULT",
+            WM_APP_GENERIC_ACTION_RESULT,
+            SettingsReentrancy::Defer,
         ),
     ];
 

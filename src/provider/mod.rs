@@ -694,6 +694,27 @@ pub fn calendar_request(shot: &Shot, prompt: &str) -> Request {
     }
 }
 
+/// #242: the generic-dispatch analogue of `physics_request`/
+/// `calendar_request`, for any `actions.toml` action whose `proposal` names
+/// a schema already registered in `actions::schema::schema_for` -- the
+/// generic path `App::run_generic_action` uses for a non-built-in action id
+/// (see `docs/actions.md`: "most new capability should be one TOML block
+/// that reuses an existing proposal schema and executor, not new Rust").
+/// `schema` must already be resolved by the caller (`schema_for(&action.
+/// proposal, ...)`); this function does not re-look it up, so a proposal
+/// name with no registered schema is the caller's load error to report, not
+/// a silent `None` here.
+pub fn generic_action_request(shot: &Shot, prompt: &str, schema: Value) -> Request {
+    Request {
+        system: prompt.to_string(),
+        user: "Look at the screen and respond.".to_string(),
+        images: vec![shot.png.clone()],
+        schema: Some(schema),
+        effort: Effort::Unset,
+        max_tokens: 0,
+    }
+}
+
 /// Builds the `text_review` `Request` (#38) for a `ComposeBody`- or
 /// `Selection`-sourced review: `captured_text` becomes the whole user turn,
 /// with no image at all. Every provider (vision-capable or not) handles a
