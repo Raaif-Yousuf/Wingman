@@ -151,6 +151,62 @@ fn env_overrides_present() -> Vec<String> {
         .collect()
 }
 
+/// Issue #270: replaces every occurrence of `profile` (the user's
+/// `%USERPROFILE%` directory, e.g. `C:\Users\test`) at the start of a path
+/// component in `text` with the placeholder `%USERPROFILE%`, case
+/// insensitively. Pure and given `profile` as a parameter (rather than
+/// reading the environment itself) so it is unit-testable without touching
+/// the real account name -- the real value is resolved once, by
+/// [`crate::known_folder::user_profile`], in [`collect`] below.
+///
+/// A match only counts if the character right after `profile` in `text` is
+/// a path separator or the end of the string, so `C:\Users\raa` can never
+/// partially match inside `C:\Users\test\...` (a different, longer, real
+/// account name that happens to start with the same letters). An empty
+/// `profile` (the known-folder lookup failed) leaves `text` untouched
+/// rather than matching everything.
+pub fn redact_user_profile(text: &str, profile: &str) -> String {
+    let profile = profile.trim_end_matches(['\\', '/']);
+    if profile.is_empty() {
+        return text.to_string();
+    }
+
+    let needle_lower = profile.to_ascii_lowercase();
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+
+    loop {
+        let rest_lower = rest.to_ascii_lowercase();
+        let Some(idx) = rest_lower.find(&needle_lower) else {
+            result.push_str(rest);
+            break;
+        };
+        let end = idx + needle_lower.len();
+        let next = rest[end..].chars().next();
+        let is_boundary = matches!(next, None | Some('\\') | Some('/'));
+
+        if is_boundary {
+            result.push_str(&rest[..idx]);
+            result.push_str("%USERPROFILE%");
+            rest = &rest[end..];
+        } else {
+            // A longer name shares this prefix (e.g. needle "raa" inside
+            // "test") -- not a real match. Copy through the false match
+            // plus the disqualifying character so the next search cannot
+            // find the same spot again, and keep scanning the remainder.
+            let take = end + next.map(|c| c.len_utf8()).unwrap_or(0);
+            result.push_str(&rest[..take]);
+            rest = &rest[take..];
+        }
+
+        if rest.is_empty() {
+            break;
+        }
+    }
+
+    result
+}
+
 /// Renders `input` as a plain-text report, ready for the clipboard and for
 /// pasting into a bug report's "Steps to reproduce" / attachment field. Pure
 /// -- no Win32, no I/O -- so every line is unit-tested directly. No em
@@ -279,6 +335,21 @@ pub fn collect(config: &Config, last_error: Option<LastError>) -> DiagnosticsInp
         ollama_admin::port_from_base_url(&config.providers.ollama.base_url).unwrap_or(11434);
     let ollama_health = ollama_admin::query_ollama_health(ollama_port).message();
 
+    // Issue #270: redact the account name out of the two fields it can
+    // leak from before it ever reaches `DiagnosticsInput`. Best-effort, same
+    // as the rest of this module -- if `user_profile()` fails, `.ok()`
+    // yields `None`, `.unwrap_or_default()` is `""`, and
+    // `redact_user_profile` leaves both fields untouched rather than
+    // erroring the whole report out.
+    let profile = crate::known_folder::user_profile()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let config_path = Config::path()
+        .ok()
+        .map(|p| redact_user_profile(&p.display().to_string(), &profile));
+    let ollama_health = redact_user_profile(&ollama_health, &profile);
+
     DiagnosticsInput {
         wingman_version: env!("CARGO_PKG_VERSION").to_string(),
         windows_build: windows_build_number(),
@@ -289,7 +360,7 @@ pub fn collect(config: &Config, last_error: Option<LastError>) -> DiagnosticsInp
         paused: crate::pause::is_paused_now(),
         providers: provider_rows(config),
         env_overrides: env_overrides_present(),
-        config_path: Config::path().ok().map(|p| p.display().to_string()),
+        config_path,
         autostart_enabled: crate::autostart::is_enabled(),
         primary_hotkey: chord_to_string(&config.hotkeys.primary),
         secondary_hotkey: chord_to_string(&config.hotkeys.secondary),
@@ -701,6 +772,99 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- redact_user_profile (#270) ---------------------------------------
+
+    #[test]
+    fn redact_user_profile_replaces_the_profile_prefix() {
+        let text = redact_user_profile(
+            r"C:\Users\test\AppData\Roaming\Wingman\config.toml",
+            r"C:\Users\test",
+        );
+        assert_eq!(text, r"%USERPROFILE%\AppData\Roaming\Wingman\config.toml");
+    }
+
+    #[test]
+    fn redact_user_profile_leaves_a_path_not_under_the_profile_untouched() {
+        let text = redact_user_profile(r"C:\Windows\System32\cmd.exe", r"C:\Users\test");
+        assert_eq!(text, r"C:\Windows\System32\cmd.exe");
+    }
+
+    #[test]
+    fn redact_user_profile_matches_case_insensitively() {
+        let text = redact_user_profile(
+            r"c:\USERS\Test\appdata\roaming\Wingman\config.toml",
+            r"C:\Users\test",
+        );
+        assert_eq!(text, r"%USERPROFILE%\appdata\roaming\Wingman\config.toml");
+    }
+
+    #[test]
+    fn redact_user_profile_tolerates_a_trailing_slash_on_the_profile_param() {
+        let text = redact_user_profile(
+            r"C:\Users\test\AppData\Roaming\Wingman\config.toml",
+            r"C:\Users\test\",
+        );
+        assert_eq!(text, r"%USERPROFILE%\AppData\Roaming\Wingman\config.toml");
+    }
+
+    #[test]
+    fn redact_user_profile_does_not_partially_match_a_prefix_username() {
+        // "te" is a prefix of "test" -- a naive substring replace on
+        // C:\Users\te would corrupt C:\Users\test\... into
+        // %USERPROFILE%st\... . Must be left untouched instead.
+        let text = redact_user_profile(
+            r"C:\Users\test\AppData\Roaming\Wingman\config.toml",
+            r"C:\Users\te",
+        );
+        assert_eq!(text, r"C:\Users\test\AppData\Roaming\Wingman\config.toml");
+    }
+
+    #[test]
+    fn redact_user_profile_matches_the_profile_path_exactly_with_no_suffix() {
+        let text = redact_user_profile(r"C:\Users\test", r"C:\Users\test");
+        assert_eq!(text, "%USERPROFILE%");
+    }
+
+    #[test]
+    fn redact_user_profile_replaces_every_occurrence() {
+        let text = redact_user_profile(
+            r"Ollama is running: C:\Users\test\AppData\Local\Programs\Ollama\ollama.exe. Config: C:\Users\test\AppData\Roaming\Wingman\config.toml",
+            r"C:\Users\test",
+        );
+        assert_eq!(
+            text,
+            r"Ollama is running: %USERPROFILE%\AppData\Local\Programs\Ollama\ollama.exe. Config: %USERPROFILE%\AppData\Roaming\Wingman\config.toml"
+        );
+    }
+
+    #[test]
+    fn redact_user_profile_with_an_empty_profile_leaves_text_untouched() {
+        // `known_folder::user_profile()` failing (best-effort, same as the
+        // rest of this module) must degrade to "no redaction", not panic.
+        let text = redact_user_profile(r"C:\Users\test\AppData\Roaming", "");
+        assert_eq!(text, r"C:\Users\test\AppData\Roaming");
+    }
+
+    #[test]
+    fn render_report_redacts_the_account_name_from_config_path_and_ollama_health() {
+        // #270's "Done when": no literal Windows account name survives into
+        // the rendered report, for either field it can leak from.
+        let mut input = sample_input();
+        input.config_path = Some(r"C:\Users\test\AppData\Roaming\Wingman\config.toml".to_string());
+        input.ollama_health =
+            "Ollama is running: C:\\Users\\test\\AppData\\Local\\Programs\\Ollama\\ollama.exe."
+                .to_string();
+        // render_report itself doesn't redact -- collect() does, via
+        // redact_user_profile applied at the DiagnosticsInput boundary. This
+        // test exercises that boundary directly.
+        let profile = r"C:\Users\test";
+        input.config_path = input.config_path.map(|p| redact_user_profile(&p, profile));
+        input.ollama_health = redact_user_profile(&input.ollama_health, profile);
+        let text = render_report(&input);
+        assert!(!text.contains("test"), "{text}");
+        assert!(text.contains("%USERPROFILE%"), "{text}");
     }
 
     // -- egress_report (#106) ------------------------------------------------
