@@ -411,19 +411,18 @@ mod com {
     use windows::core::Interface;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED, SAFEARRAY,
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, SAFEARRAY,
     };
     use windows::Win32::System::Ole::{
         SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
         SafeArrayUnaccessData,
     };
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation8, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
-        TreeScope_Descendants, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId,
-        UIA_ControlTypePropertyId, UIA_HelpTextPropertyId, UIA_IsEnabledPropertyId,
-        UIA_IsKeyboardFocusablePropertyId, UIA_IsPasswordPropertyId, UIA_LabeledByPropertyId,
-        UIA_NamePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
+        IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern, TreeScope_Descendants,
+        UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
+        UIA_HelpTextPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
+        UIA_IsPasswordPropertyId, UIA_LabeledByPropertyId, UIA_NamePropertyId, UIA_ValuePatternId,
+        UIA_ValueValuePropertyId,
     };
 
     /// RAII pairing of `CoInitializeEx(APARTMENTTHREADED)` with
@@ -475,7 +474,7 @@ mod com {
         let _apartment = ComApartment::enter()?;
 
         let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
+            unsafe { crate::inputs::uia_automation::create_automation() }?;
 
         let cache_request = unsafe { automation.CreateCacheRequest() }?;
         unsafe {
@@ -499,7 +498,10 @@ mod com {
             cache_request.AddProperty(UIA_ValueValuePropertyId)?;
         }
 
-        let root = unsafe { automation.ElementFromHandle(hwnd) }?;
+        let root = crate::inputs::uia_automation::describe_timeout(
+            unsafe { automation.ElementFromHandle(hwnd) },
+            "ElementFromHandle",
+        )?;
         // A True condition over Descendants, not an OR of the six editable
         // control types: label resolution's "nearest preceding Text
         // element" fallback needs the Text (label) elements in the walk
@@ -512,8 +514,10 @@ mod com {
         // `build_snapshot`), over data this one call already brought back
         // cached, not via a second interop round trip per element.
         let condition = unsafe { automation.CreateTrueCondition() }?;
-        let found =
-            unsafe { root.FindAllBuildCache(TreeScope_Descendants, &condition, &cache_request) }?;
+        let found = crate::inputs::uia_automation::describe_timeout(
+            unsafe { root.FindAllBuildCache(TreeScope_Descendants, &condition, &cache_request) },
+            "FindAllBuildCache",
+        )?;
 
         let total = unsafe { found.Length() }?.max(0) as usize;
         let (keep, mut truncated) = super::bounded_count(total, max_elements);

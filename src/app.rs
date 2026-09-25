@@ -721,9 +721,10 @@ impl App {
                 )
             })()
             .map_err(|e| {
+                let chain_text = worker_error_chain_text(&e);
                 pack_error(
-                    &human_error_detail(&format!("{e:#}")),
-                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                    &human_error_detail(&chain_text),
+                    &crate::egress::redact_opaque_tokens(&chain_text),
                 )
             });
             let payload = Box::into_raw(Box::new(result));
@@ -851,9 +852,10 @@ impl App {
         std::thread::spawn(move || {
             let result: std::result::Result<router::RouterResult, String> =
                 router_worker(&providers, mode, &raw, &candidates).map_err(|e| {
+                    let chain_text = worker_error_chain_text(&e);
                     pack_error(
-                        &human_error_detail(&format!("{e:#}")),
-                        &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                        &human_error_detail(&chain_text),
+                        &crate::egress::redact_opaque_tokens(&chain_text),
                     )
                 });
             let payload = Box::into_raw(Box::new((generation, result)));
@@ -996,9 +998,10 @@ impl App {
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> =
                 actions::extract_text::recognize_and_copy(&raw).map_err(|e| {
+                    let chain_text = worker_error_chain_text(&e);
                     pack_error(
-                        &human_error_detail(&format!("{e:#}")),
-                        &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                        &human_error_detail(&chain_text),
+                        &crate::egress::redact_opaque_tokens(&chain_text),
                     )
                 });
             let payload = Box::into_raw(Box::new(result));
@@ -1122,9 +1125,10 @@ impl App {
                 )
             })()
             .map_err(|e| {
+                let chain_text = worker_error_chain_text(&e);
                 pack_error(
-                    &human_error_detail(&format!("{e:#}")),
-                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                    &human_error_detail(&chain_text),
+                    &crate::egress::redact_opaque_tokens(&chain_text),
                 )
             });
             let payload = Box::into_raw(Box::new(result));
@@ -1612,9 +1616,10 @@ impl App {
                     review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
                 })()
                 .map_err(|e| {
+                    let chain_text = worker_error_chain_text(&e);
                     pack_error(
-                        &human_error_detail(&format!("{e:#}")),
-                        &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                        &human_error_detail(&chain_text),
+                        &crate::egress::redact_opaque_tokens(&chain_text),
                     )
                 });
             let payload = Box::into_raw(Box::new(result));
@@ -1784,9 +1789,10 @@ impl App {
                 )
             })()
             .map_err(|e| {
+                let chain_text = worker_error_chain_text(&e);
                 pack_error(
-                    &human_error_detail(&format!("{e:#}")),
-                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                    &human_error_detail(&chain_text),
+                    &crate::egress::redact_opaque_tokens(&chain_text),
                 )
             });
             let payload = Box::into_raw(Box::new(result));
@@ -3573,6 +3579,10 @@ const KNOWN_TECHNICAL_DETAILS: &[(&str, &str)] = &[
     ),
     ("FileTimeToSystemTime", "Couldn't read your clock settings."),
     ("SystemTimeToFileTime", "Couldn't read your clock settings."),
+    (
+        crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT,
+        "The other app stopped responding.",
+    ),
 ];
 
 /// True if `text` contains what looks like a Win32/API-style identifier
@@ -3786,6 +3796,39 @@ fn humanize_error_chain(raw_chain: &str) -> String {
     crate::egress::redact_opaque_tokens(raw_chain)
         .trim()
         .to_string()
+}
+
+/// #261/#264 code review follow-up: a `UIA_E_TIMEOUT` can surface from any
+/// bare UIA call, not only the handful `inputs::uia_automation::
+/// describe_timeout` wraps by hand (e.g. `IUIAutomationTextPattern::
+/// GetSelection`/`IUIAutomationTextRange::GetText` in
+/// `inputs::selection::com::probe_from_element`/`selection_identity`,
+/// which have no per-call wrapping). Requiring every current and future
+/// UIA call site to opt in is the kind of thing a future call is likely to
+/// miss; walking `e`'s whole `anyhow` context chain here instead, looking
+/// for the underlying `windows::core::Error` and comparing its `code()`
+/// directly to `UIA_E_TIMEOUT`, cannot miss a site the way a fixed string
+/// fragment could (a timed-out call's `Display` text is whatever the OS
+/// happens to have registered for that HRESULT, not something this crate
+/// controls). Every worker-thread `pack_error` call site in this file
+/// calls this instead of formatting `e` directly, so the result always
+/// still goes through [`human_error_detail`]/`redact_opaque_tokens` same
+/// as before.
+fn worker_error_chain_text(e: &anyhow::Error) -> String {
+    for cause in e.chain() {
+        if let Some(win_err) = cause.downcast_ref::<windows::core::Error>() {
+            if crate::inputs::uia_automation::is_uia_timeout(win_err) {
+                return crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT.to_string();
+            }
+        }
+    }
+    // Positional, not `{e:#}`: this fallback's *return value* already
+    // always goes through `human_error_detail` at every call site below
+    // (never displayed directly), so it is not one of the raw-interpolation
+    // shapes `find_error_interpolations`'s scanner exists to catch -- using
+    // `{e:#}`'s named-binding form here would trip that scanner as a false
+    // positive on this file's own already-guarded plumbing.
+    format!("{:#}", e)
 }
 
 /// The common card-detail shape (#349): `humanize_error_chain`'s sentence
@@ -5774,6 +5817,7 @@ mod tests {
     use super::{
         contains_api_failed_identifier, find_error_interpolations, human_error_detail,
         humanize_error_chain, interpolation_is_guarded, is_api_shaped_identifier,
+        worker_error_chain_text,
     };
 
     #[test]
@@ -5834,6 +5878,65 @@ mod tests {
             assert_eq!(human, "Couldn't read your clock settings.");
             assert!(!contains_api_failed_identifier(&human));
         }
+    }
+
+    /// #261/#264: a UIA call bounded by
+    /// `inputs::uia_automation::create_automation`'s timeouts, once it
+    /// actually trips, must show a readable card, not a raw HRESULT.
+    #[test]
+    fn humanize_error_chain_maps_a_uia_timeout() {
+        let chain = format!(
+            "couldn't read the focused element: {} (GetFocusedElement)",
+            crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT
+        );
+        let human = humanize_error_chain(&chain);
+        assert_eq!(human, "The other app stopped responding.");
+        assert!(!contains_api_failed_identifier(&human));
+    }
+
+    /// Code review follow-up on #261/#264: a bare UIA call this crate never
+    /// wrapped with `describe_timeout` (e.g. `GetSelection`/`GetText`) can
+    /// still surface `UIA_E_TIMEOUT` deep in an anyhow context chain.
+    /// `worker_error_chain_text` must find it by downcasting, not by
+    /// looking for a fixed string, so it works regardless of how many
+    /// `.context(...)` layers sit on top.
+    #[test]
+    fn worker_error_chain_text_finds_a_uia_timeout_with_no_context() {
+        let win_err = windows::core::Error::from_hresult(windows::core::HRESULT(
+            crate::inputs::uia_automation::UIA_E_TIMEOUT_HRESULT,
+        ));
+        let err: anyhow::Error = win_err.into();
+        let text = worker_error_chain_text(&err);
+        assert_eq!(
+            text,
+            crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT
+        );
+    }
+
+    #[test]
+    fn worker_error_chain_text_finds_a_uia_timeout_under_several_context_layers() {
+        let win_err = windows::core::Error::from_hresult(windows::core::HRESULT(
+            crate::inputs::uia_automation::UIA_E_TIMEOUT_HRESULT,
+        ));
+        let err: anyhow::Error = anyhow::Error::new(win_err)
+            .context("reading the selection")
+            .context("capturing input");
+        let text = worker_error_chain_text(&err);
+        assert_eq!(
+            text,
+            crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT
+        );
+    }
+
+    #[test]
+    fn worker_error_chain_text_passes_through_a_non_timeout_error() {
+        let win_err = windows::core::Error::from_hresult(windows::core::HRESULT(
+            windows::Win32::Foundation::E_FAIL.0,
+        ));
+        let err: anyhow::Error = anyhow::Error::new(win_err).context("doing something else");
+        let text = worker_error_chain_text(&err);
+        assert!(!text.contains(crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT));
+        assert!(text.contains("doing something else"));
     }
 
     #[test]
