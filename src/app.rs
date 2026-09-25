@@ -668,6 +668,20 @@ impl App {
         let prompt = self.config.ui.prompt.clone();
         let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
+
+        // Issue #354: the pending card moves from "Looking at your
+        // screen..." to "Asking {model}..." here, right as the request is
+        // handed to the worker thread -- the model label is the same
+        // mode-aware "first provider that looks configured" guess
+        // `first_provider_model_label` already gives the palette footer
+        // (issue #192's reasoning), not a promise the worker will actually
+        // reach that provider (it may fail over; the card is a "what
+        // Wingman is trying right now" cue, not a commitment).
+        if let Some(model_name) = self.first_provider_model_label() {
+            self.card
+                .set_pending_stage(crate::ui::card::PendingStage::AskingModel { model_name });
+        }
+
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
                 let shot = capture::encode(&raw)?;

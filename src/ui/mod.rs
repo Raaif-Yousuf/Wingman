@@ -3,6 +3,7 @@ pub(crate) mod confirm;
 pub mod gallery;
 pub mod palette;
 pub mod palette_model;
+pub(crate) mod pending_status;
 pub(crate) mod preview;
 pub mod region;
 pub mod settings;
