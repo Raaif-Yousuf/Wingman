@@ -377,7 +377,7 @@ pub fn run() -> Result<()> {
         }
         Err(e) => {
             let detail = app.track_error("Hotkeys unavailable", &format!("{e:#}"));
-            app.card.show_error(
+            app.card.show_error_with_details(
                 "Hotkeys unavailable",
                 &format!("{detail}\n\nUse Ask now from the tray menu instead."),
             );
@@ -642,7 +642,8 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
-                self.card.show_error("Couldn't capture the screen", &detail);
+                self.card
+                    .show_error_with_details("Couldn't capture the screen", &detail);
                 return None;
             }
         };
@@ -746,7 +747,8 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
-                self.card.show_error("Couldn't load actions.toml", &detail);
+                self.card
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
                 return;
             }
         };
@@ -945,7 +947,8 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
-                self.card.show_error("Couldn't capture the screen", &detail);
+                self.card
+                    .show_error_with_details("Couldn't capture the screen", &detail);
                 return;
             }
         };
@@ -1003,7 +1006,7 @@ impl App {
                 let detail =
                     self.track_error("Couldn't open the region selector", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't open the region selector", &detail);
+                    .show_error_with_details("Couldn't open the region selector", &detail);
                 return;
             }
         };
@@ -1035,7 +1038,8 @@ impl App {
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't copy the region", &format!("{e:#}"));
-                self.card.show_error("Couldn't copy the region", &detail);
+                self.card
+                    .show_error_with_details("Couldn't copy the region", &detail);
             }
         }
     }
@@ -1057,7 +1061,8 @@ impl App {
                 Ok(v) => Some(v),
                 Err(e) => {
                     let detail = app.track_error("Couldn't read the local date", &format!("{e:#}"));
-                    app.card.show_error("Couldn't read the local date", &detail);
+                    app.card
+                        .show_error_with_details("Couldn't read the local date", &detail);
                     None
                 }
             })
@@ -1119,7 +1124,7 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_last_error(&headline, chain);
-                self.card.show_error(&headline, human);
+                self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1140,7 +1145,8 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
-                self.card.show_error("Couldn't load actions.toml", &detail);
+                self.card
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
                 self.set_watch(true);
                 return;
             }
@@ -1176,14 +1182,16 @@ impl App {
                     Ok(confirmed) => self.run_calendar_executor(executor.as_ref(), confirmed),
                     Err(e) => {
                         let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
-                        self.card.show_error("Couldn't add the event", &detail);
+                        self.card
+                            .show_error_with_details("Couldn't add the event", &detail);
                         self.set_watch(true);
                     }
                 }
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
-                self.card.show_error("Couldn't add the event", &detail);
+                self.card
+                    .show_error_with_details("Couldn't add the event", &detail);
                 self.set_watch(true);
             }
         }
@@ -1207,7 +1215,8 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
-                self.card.show_error("Couldn't load actions.toml", &detail);
+                self.card
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
                 return;
             }
         };
@@ -1220,7 +1229,8 @@ impl App {
                 "Couldn't run that action",
                 &format!("no visible action with id \"{action_id}\""),
             );
-            self.card.show_error("Couldn't run that action", &detail);
+            self.card
+                .show_error_with_details("Couldn't run that action", &detail);
             return;
         };
         let Some(schema) = actions::schema::schema_for(&action.proposal, action.rate_difficulty)
@@ -1233,7 +1243,7 @@ impl App {
                 ),
             );
             self.card
-                .show_error(&format!("Couldn't run \"{}\"", action.name), &detail);
+                .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
             return;
         };
 
@@ -1316,7 +1326,7 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_last_error(&headline, chain);
-                self.card.show_error(&headline, human);
+                self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1344,8 +1354,10 @@ impl App {
                         &format!("Couldn't run \"{}\"", action.name),
                         &format!("{e:#}"),
                     );
-                    self.card
-                        .show_error(&format!("Couldn't run \"{}\"", action.name), &detail);
+                    self.card.show_error_with_details(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &detail,
+                    );
                     self.set_watch(true);
                 }
             },
@@ -1355,7 +1367,7 @@ impl App {
                     &format!("{e:#}"),
                 );
                 self.card
-                    .show_error(&format!("Couldn't run \"{}\"", action.name), &detail);
+                    .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
                 self.set_watch(true);
             }
         }
@@ -1443,8 +1455,10 @@ impl App {
                         &format!("Couldn't run \"{}\"", action.name),
                         &format!("{e:#}"),
                     );
-                    self.card
-                        .show_error(&format!("Couldn't run \"{}\"", action.name), &detail);
+                    self.card.show_error_with_details(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &detail,
+                    );
                 }
             },
             Err(e) => {
@@ -1453,7 +1467,7 @@ impl App {
                     &format!("{e:#}"),
                 );
                 self.card
-                    .show_error(&format!("Couldn't run \"{}\"", action.name), &detail);
+                    .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
             }
         }
         self.set_watch(true);
@@ -1470,7 +1484,8 @@ impl App {
                 Ok(executor) => self.run_form_fill_executor(executor.as_ref(), final_confirmed),
                 Err(e) => {
                     let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
-                    self.card.show_error("Couldn't fill the form", &detail);
+                    self.card
+                        .show_error_with_details("Couldn't fill the form", &detail);
                     self.set_watch(true);
                 }
             }
@@ -1484,7 +1499,8 @@ impl App {
             Ok(executor) => self.run_calendar_executor(executor.as_ref(), confirmed),
             Err(e) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
-                self.card.show_error("Couldn't add the event", &detail);
+                self.card
+                    .show_error_with_details("Couldn't add the event", &detail);
                 self.set_watch(true);
             }
         }
@@ -1526,7 +1542,8 @@ impl App {
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
-                self.card.show_error("Couldn't add the event", &detail);
+                self.card
+                    .show_error_with_details("Couldn't add the event", &detail);
             }
         }
         self.set_watch(true);
@@ -1603,7 +1620,7 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_last_error(&headline, chain);
-                self.card.show_error(&headline, human);
+                self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1679,13 +1696,15 @@ impl App {
                     Err(e) => {
                         let detail =
                             self.track_error("Couldn't update the email", &format!("{e:#}"));
-                        self.card.show_error("Couldn't update the email", &detail);
+                        self.card
+                            .show_error_with_details("Couldn't update the email", &detail);
                     }
                 }
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
-                self.card.show_error("Couldn't update the email", &detail);
+                self.card
+                    .show_error_with_details("Couldn't update the email", &detail);
             }
         }
         self.set_watch(true);
@@ -1769,7 +1788,7 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_last_error(&headline, chain);
-                self.card.show_error(&headline, human);
+                self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1864,7 +1883,8 @@ impl App {
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
-                self.card.show_error("Couldn't fill the form", &detail);
+                self.card
+                    .show_error_with_details("Couldn't fill the form", &detail);
             }
         }
         self.set_watch(true);
@@ -1900,7 +1920,7 @@ impl App {
             Err(e) => {
                 let detail = self.track_error("Couldn't fully restore the form", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't fully restore the form", &detail);
+                    .show_error_with_details("Couldn't fully restore the form", &detail);
             }
         }
         self.set_watch(true);
@@ -1910,7 +1930,8 @@ impl App {
         let is_err = result.is_err();
         let answer = self.record_last(result);
         if is_err {
-            self.card.show_error(&answer.headline, &answer.detail);
+            self.card
+                .show_error_with_details(&answer.headline, &answer.detail);
         } else {
             self.card.show_answer(
                 &answer.headline,
@@ -1970,7 +1991,7 @@ impl App {
             Ok(()) => self.card.show_answer("Copied", "", 3, None),
             Err(e) => {
                 let detail = self.track_error("Couldn't copy", &format!("{e}"));
-                self.card.show_error("Couldn't copy", &detail);
+                self.card.show_error_with_details("Couldn't copy", &detail);
             }
         }
     }
@@ -2026,7 +2047,8 @@ impl App {
             ),
             Err(e) => {
                 let detail = self.track_error("Couldn't copy diagnostics", &format!("{e}"));
-                self.card.show_error("Couldn't copy diagnostics", &detail);
+                self.card
+                    .show_error_with_details("Couldn't copy diagnostics", &detail);
             }
         }
     }
@@ -2060,7 +2082,8 @@ impl App {
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't copy details", &format!("{e}"));
-                self.card.show_error("Couldn't copy details", &detail);
+                self.card
+                    .show_error_with_details("Couldn't copy details", &detail);
             }
         }
     }
@@ -2087,7 +2110,7 @@ impl App {
             Err(e) => {
                 let detail = self.track_error("Couldn't copy the egress log", &format!("{e}"));
                 self.card
-                    .show_error("Couldn't copy the egress log", &detail);
+                    .show_error_with_details("Couldn't copy the egress log", &detail);
             }
         }
     }
@@ -2216,7 +2239,7 @@ impl App {
             Err(e) => {
                 let headline = format!("Bound to {name}: not saved");
                 let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error(
+                self.card.show_error_with_details(
                     &headline,
                     &format!("It will work until you quit.\n\n{human}"),
                 );
@@ -2241,7 +2264,8 @@ impl App {
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't reload settings", &format!("{e:#}"));
-                self.card.show_error("Couldn't reload settings", &detail);
+                self.card
+                    .show_error_with_details("Couldn't reload settings", &detail);
             }
         }
     }
@@ -2333,10 +2357,12 @@ impl App {
             // `SaveError` case, unchanged by #213).
             let had_pending = !pending.is_empty();
             let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
-            self.card.show_error("Couldn't save settings", &detail);
+            self.card
+                .show_error_with_details("Couldn't save settings", &detail);
             self.deliver_deferred(pending);
             if had_pending {
-                self.card.show_error("Couldn't save settings", &detail);
+                self.card
+                    .show_error_with_details("Couldn't save settings", &detail);
             }
             self.show_tray_restore_error(tray_restore_error);
             return;
@@ -2452,7 +2478,8 @@ impl App {
             // not exist.
             if let Err(e) = &save_result {
                 let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
-                self.card.show_error("Couldn't save settings", &detail);
+                self.card
+                    .show_error_with_details("Couldn't save settings", &detail);
             }
             return;
         }
@@ -2506,7 +2533,7 @@ impl App {
             Err(e) => {
                 let headline = format!("Using {model}: not saved");
                 let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error(
+                self.card.show_error_with_details(
                     &headline,
                     &format!("It will revert when you quit.\n\n{human}"),
                 );
@@ -2537,7 +2564,7 @@ impl App {
             Err(e) => {
                 let headline = format!("Using {name}: not saved");
                 let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error(
+                self.card.show_error_with_details(
                     &headline,
                     &format!("It will revert when you quit.\n\n{human}"),
                 );
@@ -2566,7 +2593,7 @@ impl App {
             Err(e) => {
                 let headline = format!("Using {}: not saved", mode.label());
                 let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error(
+                self.card.show_error_with_details(
                     &headline,
                     &format!("It will revert when you quit.\n\n{human}"),
                 );
@@ -2635,8 +2662,10 @@ impl App {
                         "Couldn't compute tomorrow's pause deadline",
                         &format!("{e:#}"),
                     );
-                    self.card
-                        .show_error("Couldn't compute tomorrow's pause deadline", &detail);
+                    self.card.show_error_with_details(
+                        "Couldn't compute tomorrow's pause deadline",
+                        &detail,
+                    );
                     return;
                 }
             },

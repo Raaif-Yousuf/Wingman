@@ -15,6 +15,7 @@
 //!     pub fn show_pending(&mut self);
 //!     pub fn show_answer(&mut self, headline: &str, detail: &str, auto_dismiss_secs: u32, difficulty: Option<Difficulty>);
 //!     pub fn show_error(&mut self, headline: &str, detail: &str);
+//!     pub fn show_error_with_details(&mut self, headline: &str, detail: &str);
 //!     pub fn hide(&mut self);
 //!     pub fn set_text_scale(&mut self, scale: f32);
 //!     pub fn state(&self) -> CardState;
@@ -312,10 +313,35 @@ impl Card {
         // and passing None explicitly (rather than leaving a stale value)
         // ensures a previous answer's badge can never linger on an error
         // card.
+        //
+        // Cold review of #425 (PR #451): deliberately does NOT set
+        // `copy_details_available`. `Card` has no way to know whether the
+        // headline/detail it was just given is the same failure
+        // `App::last_error` holds -- most `show_error` call sites in
+        // `app.rs` never call `track_error`/`record_last_error` at all
+        // (a static "Hotkeys unavailable" message, `show_tray_restore_error`,
+        // "Couldn't locate config.toml", the startup unreadable-secrets
+        // card...), so offering "Copy details" here would silently copy
+        // whatever unrelated error happened to run last. Only
+        // [`Card::show_error_with_details`] -- reserved for callers that
+        // just recorded the matching chain -- grows the footer.
         self.inner.show_collapsed(headline, detail, 0, None);
-        // Issue #425: only an error card offers "Copy details" once
-        // Expanded -- set AFTER show_collapsed, which unconditionally
-        // clears this for every other caller (show_answer included).
+    }
+
+    /// Like [`Card::show_error`], except the card also offers "Copy
+    /// details" once Expanded (#425). Callers MUST have just recorded the
+    /// exact chain behind `headline`/`detail` as `App::last_error`
+    /// (`App::track_error`/`record_last_error`) -- this method does not and
+    /// cannot verify that itself, since `Card` never holds the raw chain or
+    /// a reference back to `App` (see [`WM_APP_CARD_COPY_DETAILS`]'s doc
+    /// comment). Using this for an untracked error would let "Copy details"
+    /// silently copy a stale, unrelated chain (PR #451's cold review).
+    pub fn show_error_with_details(&mut self, headline: &str, detail: &str) {
+        self.inner.show_collapsed(headline, detail, 0, None);
+        // Set AFTER show_collapsed, which unconditionally clears this for
+        // every other caller (show_answer and plain show_error included) --
+        // so a later untracked error, or a later answer, can never inherit
+        // a footer left over from an earlier tracked one.
         self.inner.copy_details_available = true;
     }
 
@@ -3078,12 +3104,61 @@ mod tests {
     fn expanded_error_card_reserves_a_copy_details_footer() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
-        card.show_error("Couldn't add the event", "detail text");
+        card.show_error_with_details("Couldn't add the event", "detail text");
         card.inner.try_expand();
         assert_eq!(card.state(), CardState::Expanded);
         assert!(
             card.inner.copy_details_rect.is_some(),
-            "an expanded error card must reserve a \"Copy details\" footer"
+            "an expanded, tracked error card must reserve a \"Copy details\" footer"
+        );
+    }
+
+    #[test]
+    fn plain_show_error_never_gets_a_copy_details_footer() {
+        // Cold review of #425/PR #451: `show_error` alone (untracked -- no
+        // `App::track_error`/`record_last_error` call behind it) must never
+        // offer "Copy details", because `App::last_error` may hold a chain
+        // from an unrelated, earlier failure. Only `show_error_with_details`
+        // -- reserved for callers that just recorded the matching chain --
+        // grows the footer.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error("Hotkeys unavailable", "The keyboard hook is not installed.");
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.copy_details_rect.is_none(),
+            "an untracked error card must not show \"Copy details\""
+        );
+    }
+
+    #[test]
+    fn untracked_error_card_after_a_tracked_one_has_no_copy_details_footer() {
+        // The exact regression PR #451's cold review caught: a tracked
+        // error card's footer must not linger (or, worse, keep pointing at
+        // the OLDER chain) once a later, untracked error card replaces it.
+        // `show_collapsed` (both `show_answer` and plain `show_error` route
+        // through it) unconditionally clears `copy_details_available`, so
+        // only the call that most recently used `show_error_with_details`
+        // can have left it set -- and a later plain `show_error` call
+        // always clears it again.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+
+        card.show_error_with_details("Couldn't add the event", "tracked detail");
+        card.inner.try_expand();
+        assert!(
+            card.inner.copy_details_rect.is_some(),
+            "the tracked error must show the footer"
+        );
+
+        card.show_error("Couldn't restore the tray icon", "untracked detail");
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.copy_details_rect.is_none(),
+            "an untracked error card must never inherit the previous card's \"Copy details\" \
+             footer, which would copy a stale, unrelated chain"
         );
     }
 
@@ -3108,7 +3183,7 @@ mod tests {
 
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
-        card.show_error("Couldn't add the event", "detail text");
+        card.show_error_with_details("Couldn't add the event", "detail text");
         card.inner.try_expand();
         let rect = card
             .inner
@@ -3142,7 +3217,7 @@ mod tests {
 
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
-        card.show_error("Couldn't add the event", "detail text");
+        card.show_error_with_details("Couldn't add the event", "detail text");
         card.inner.try_expand();
 
         let handled = card.handle_message(WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(0));
@@ -3184,7 +3259,7 @@ mod tests {
         // footer's own rect does.
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
-        card.show_error("Couldn't add the event", "detail text");
+        card.show_error_with_details("Couldn't add the event", "detail text");
         card.inner.try_expand();
         let rect = card.inner.copy_details_rect.expect("footer must exist");
         // Just above the footer -- still inside the card, but not on it.
