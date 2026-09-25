@@ -79,7 +79,7 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// NUL-laden UTF-8 reading is kept only as the last resort, if UTF-16LE
 /// itself does not decode cleanly either. Pure and Win32-free on purpose so
 /// the decode logic -- the part issue #175 actually needed fixed -- is
-/// unit-testable without touching the real store (CLAUDE.md rule 8).
+/// unit-testable without touching the real store (AGENTS.md rule 8).
 fn decode_blob(bytes: &[u8]) -> Result<String> {
     let utf8: Option<String> = std::str::from_utf8(bytes).ok().map(|s| s.to_string());
     if let Some(s) = &utf8 {
@@ -124,7 +124,7 @@ impl SecretStore for CredManagerStore {
             Ok(()) => {
                 // SAFETY: CredReadW just reported success, so `cred` is a
                 // valid, non-null pointer that CredFree must release.
-                let bytes = unsafe {
+                let mut bytes = unsafe {
                     let c = &*cred;
                     let bytes =
                         std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize)
@@ -136,9 +136,15 @@ impl SecretStore for CredManagerStore {
                 // credential that could not be read, never "no credential".
                 // Confusing the two is exactly what let a later save delete
                 // it -- never fold this back into `Ok(None)`.
-                decode_blob(&bytes)
+                let result = decode_blob(&bytes)
                     .map(Some)
-                    .with_context(|| format!("CredReadW returned an unreadable blob for {target}"))
+                    .with_context(|| format!("CredReadW returned an unreadable blob for {target}"));
+                // #258: `bytes` is our own plaintext copy of the credential
+                // blob (CredFree only releases Win32's copy above); an
+                // ordinary `Vec` drop does not zero it, so wipe it in place
+                // before it goes out of scope, mirroring dpapi.rs.
+                crate::dpapi::zeroize(&mut bytes);
+                result
             }
             Err(e) if e.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0) => Ok(None),
             Err(e) => bail!("CredReadW failed for {target}: {}", e.code()),
@@ -156,8 +162,13 @@ impl SecretStore for CredManagerStore {
             Persist: CRED_PERSIST_LOCAL_MACHINE,
             ..Default::default()
         };
-        unsafe { CredWriteW(&cred, 0) }
-            .map_err(|e| anyhow::anyhow!("CredWriteW failed for {target}: {}", e.code()))
+        let result = unsafe { CredWriteW(&cred, 0) }
+            .map_err(|e| anyhow::anyhow!("CredWriteW failed for {target}: {}", e.code()));
+        // #258: zeroize the local plaintext copy before it drops, success or
+        // failure, mirroring dpapi.rs's "Zeroizing" discipline -- an ordinary
+        // `Vec` drop does not zero its backing memory.
+        crate::dpapi::zeroize(&mut blob);
+        result
     }
 
     fn delete(&self, target: &str) -> Result<()> {
@@ -303,6 +314,33 @@ mod tests {
         assert_eq!(
             store.get("Wingman/anthropic").unwrap().as_deref(),
             Some("sk-ant-fine")
+        );
+    }
+
+    // -- zeroize wiring (#258) -----------------------------------------------
+    //
+    // `CredManagerStore::set`/`get` call real `CredWriteW`/`CredReadW`, which
+    // this test suite never touches (rule 9). What is unit-testable is the
+    // exact zeroize step each now performs on its local plaintext buffer:
+    // build the buffer the same way `set`/`get` do, and confirm
+    // `dpapi::zeroize` wipes it in place. The wiring itself (that `set` and
+    // `get` actually call this on their real buffers) is verified by code
+    // reading, not by this test -- see the PR's wired-to-nothing note.
+
+    #[test]
+    fn zeroize_wipes_a_blob_built_the_way_set_builds_one() {
+        let secret = "sk-test-synthetic-not-a-real-key";
+        let mut blob = secret.as_bytes().to_vec();
+        let ptr = blob.as_ptr();
+        let len = blob.len();
+        crate::dpapi::zeroize(&mut blob);
+        // Inspect the retained allocation directly via the raw pointer
+        // captured before zeroizing, not `blob` itself (which is still the
+        // same Vec, now zeroed but not freed).
+        let retained = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert!(
+            retained.iter().all(|&b| b == 0),
+            "blob still holds plaintext after zeroize: {retained:?}"
         );
     }
 

@@ -3,7 +3,7 @@
 //! leaves this process except onto the clipboard the user explicitly asked
 //! for (`App::copy_diagnostics` in `app.rs`).
 //!
-//! Split per CLAUDE.md rule 8: [`render_report`] is pure and unit-tested
+//! Split per AGENTS.md rule 8: [`render_report`] is pure and unit-tested
 //! directly, including the redaction guarantee (never a substring of a real
 //! key, see `render_report_never_leaks_any_part_of_a_configured_key`
 //! below). [`collect`] gathers the real values from Win32 and `Config` and
@@ -54,6 +54,23 @@ impl KeyStatus {
     }
 }
 
+/// Review of #349/#426: the full (already redacted, #253) chain behind the
+/// most recent error card, plus enough context to identify it. `App` keeps
+/// this in memory only (Hard Rule 5, and privacy: never written to disk)
+/// and hands a fresh one to [`collect`] on every "Copy diagnostics" click,
+/// so the card's "use Copy diagnostics for details" pointer is only ever
+/// shown when it is actually true.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastError {
+    /// The same headline the error card itself showed.
+    pub action: String,
+    /// How long ago the error happened, computed by the caller (`App`, from
+    /// its own stored `SystemTime`) so this module stays free of a real
+    /// clock read in its pure half.
+    pub seconds_ago: u64,
+    pub chain: String,
+}
+
 /// One entry in the report's provider table, in `providers.order`.
 /// `key` is `None` for Ollama, which has no API key at all (a local server
 /// has nothing to authenticate with -- see `config.rs`'s `OllamaConfig`
@@ -93,6 +110,8 @@ pub struct DiagnosticsInput {
     /// listening on the configured Ollama port -- Win32-only, no HTTP (see
     /// that module's doc comment).
     pub ollama_health: String,
+    /// `None` when nothing has failed yet this session. See [`LastError`].
+    pub last_error: Option<LastError>,
 }
 
 /// Reduces `config.providers` to the report's provider table, in
@@ -132,10 +151,66 @@ fn env_overrides_present() -> Vec<String> {
         .collect()
 }
 
+/// Issue #270: replaces every occurrence of `profile` (the user's
+/// `%USERPROFILE%` directory, e.g. `C:\Users\test`) at the start of a path
+/// component in `text` with the placeholder `%USERPROFILE%`, case
+/// insensitively. Pure and given `profile` as a parameter (rather than
+/// reading the environment itself) so it is unit-testable without touching
+/// the real account name -- the real value is resolved once, by
+/// [`crate::known_folder::user_profile`], in [`collect`] below.
+///
+/// A match only counts if the character right after `profile` in `text` is
+/// a path separator or the end of the string, so `C:\Users\raa` can never
+/// partially match inside `C:\Users\test\...` (a different, longer, real
+/// account name that happens to start with the same letters). An empty
+/// `profile` (the known-folder lookup failed) leaves `text` untouched
+/// rather than matching everything.
+pub fn redact_user_profile(text: &str, profile: &str) -> String {
+    let profile = profile.trim_end_matches(['\\', '/']);
+    if profile.is_empty() {
+        return text.to_string();
+    }
+
+    let needle_lower = profile.to_ascii_lowercase();
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+
+    loop {
+        let rest_lower = rest.to_ascii_lowercase();
+        let Some(idx) = rest_lower.find(&needle_lower) else {
+            result.push_str(rest);
+            break;
+        };
+        let end = idx + needle_lower.len();
+        let next = rest[end..].chars().next();
+        let is_boundary = matches!(next, None | Some('\\') | Some('/'));
+
+        if is_boundary {
+            result.push_str(&rest[..idx]);
+            result.push_str("%USERPROFILE%");
+            rest = &rest[end..];
+        } else {
+            // A longer name shares this prefix (e.g. needle "raa" inside
+            // "test") -- not a real match. Copy through the false match
+            // plus the disqualifying character so the next search cannot
+            // find the same spot again, and keep scanning the remainder.
+            let take = end + next.map(|c| c.len_utf8()).unwrap_or(0);
+            result.push_str(&rest[..take]);
+            rest = &rest[take..];
+        }
+
+        if rest.is_empty() {
+            break;
+        }
+    }
+
+    result
+}
+
 /// Renders `input` as a plain-text report, ready for the clipboard and for
 /// pasting into a bug report's "Steps to reproduce" / attachment field. Pure
 /// -- no Win32, no I/O -- so every line is unit-tested directly. No em
-/// dashes (CLAUDE.md rule 11): this text is meant to be pasted verbatim into
+/// dashes (AGENTS.md rule 11): this text is meant to be pasted verbatim into
 /// a public GitHub issue.
 pub fn render_report(input: &DiagnosticsInput) -> String {
     let mut out = String::new();
@@ -202,6 +277,15 @@ pub fn render_report(input: &DiagnosticsInput) -> String {
         }
     }
 
+    out.push_str("\nLast error:");
+    match &input.last_error {
+        None => out.push_str(" none\n"),
+        Some(e) => {
+            out.push_str(&format!(" {} ({} seconds ago)\n", e.action, e.seconds_ago));
+            out.push_str(&format!("{}\n", e.chain));
+        }
+    }
+
     out.push_str("\nProviders (in order):\n");
     if input.providers.is_empty() {
         out.push_str("(none configured)\n");
@@ -235,7 +319,7 @@ pub fn egress_report() -> String {
 }
 
 // ===========================================================================
-// Win32/Config data collection -- checked by hand (CLAUDE.md rule 8), never
+// Win32/Config data collection -- checked by hand (AGENTS.md rule 8), never
 // unit tested against the real process. The manual check: run the app, open
 // the tray menu, click "Copy diagnostics", paste the clipboard and confirm
 // every line above is populated (not "unknown") on this machine -- see
@@ -243,10 +327,28 @@ pub fn egress_report() -> String {
 // ===========================================================================
 
 /// Builds the real report input from the running process and `config`.
-pub fn collect(config: &Config) -> DiagnosticsInput {
+/// `last_error` is `App`'s own in-memory record (see [`LastError`]), passed
+/// in rather than read from anywhere here -- this module has no error state
+/// of its own and never will (Hard Rule 5: nothing here polls or persists).
+pub fn collect(config: &Config, last_error: Option<LastError>) -> DiagnosticsInput {
     let ollama_port =
         ollama_admin::port_from_base_url(&config.providers.ollama.base_url).unwrap_or(11434);
     let ollama_health = ollama_admin::query_ollama_health(ollama_port).message();
+
+    // Issue #270: redact the account name out of the two fields it can
+    // leak from before it ever reaches `DiagnosticsInput`. Best-effort, same
+    // as the rest of this module -- if `user_profile()` fails, `.ok()`
+    // yields `None`, `.unwrap_or_default()` is `""`, and
+    // `redact_user_profile` leaves both fields untouched rather than
+    // erroring the whole report out.
+    let profile = crate::known_folder::user_profile()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let config_path = Config::path()
+        .ok()
+        .map(|p| redact_user_profile(&p.display().to_string(), &profile));
+    let ollama_health = redact_user_profile(&ollama_health, &profile);
 
     DiagnosticsInput {
         wingman_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -258,11 +360,12 @@ pub fn collect(config: &Config) -> DiagnosticsInput {
         paused: crate::pause::is_paused_now(),
         providers: provider_rows(config),
         env_overrides: env_overrides_present(),
-        config_path: Config::path().ok().map(|p| p.display().to_string()),
+        config_path,
         autostart_enabled: crate::autostart::is_enabled(),
         primary_hotkey: chord_to_string(&config.hotkeys.primary),
         secondary_hotkey: chord_to_string(&config.hotkeys.secondary),
         ollama_health,
+        last_error,
     }
 }
 
@@ -350,7 +453,7 @@ fn is_per_monitor_dpi_aware() -> bool {
 /// `GetCurrentPackageFullName`: `true` when this process has package
 /// identity (running under the sparse MSIX via its AUMID), `false` for
 /// `APPMODEL_ERROR_NO_PACKAGE` (a direct exe launch, e.g. the `Run` key --
-/// see CLAUDE.md's "Windows OCR under a sparse package" pitfall, which this
+/// see AGENTS.md's "Windows OCR under a sparse package" pitfall, which this
 /// diagnostic exists to help answer). Any other, unexpected error also
 /// reports `false` -- best-effort, same as the rest of this module.
 fn has_package_identity() -> bool {
@@ -398,6 +501,7 @@ mod tests {
             primary_hotkey: "Win+Shift+F23".to_string(),
             secondary_hotkey: "Ctrl+Shift+/".to_string(),
             ollama_health: "Ollama is not running.".to_string(),
+            last_error: None,
         }
     }
 
@@ -589,6 +693,33 @@ mod tests {
         assert!(text.contains("DPI awareness: not per monitor"), "{text}");
     }
 
+    // -- Last error (review of #349/#426) --------------------------------
+
+    #[test]
+    fn render_report_says_none_when_nothing_has_failed() {
+        let text = render_report(&sample_input());
+        assert!(text.contains("Last error: none"), "{text}");
+    }
+
+    #[test]
+    fn render_report_includes_the_last_error_action_age_and_full_chain() {
+        let mut input = sample_input();
+        input.last_error = Some(LastError {
+            action: "Couldn't add the event".to_string(),
+            seconds_ago: 42,
+            chain: "TzSpecificLocalTimeToSystemTime failed: os error 87".to_string(),
+        });
+        let text = render_report(&input);
+        assert!(
+            text.contains("Last error: Couldn't add the event (42 seconds ago)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("TzSpecificLocalTimeToSystemTime failed: os error 87"),
+            "{text}: the full chain must be present so Copy diagnostics is not an empty promise"
+        );
+    }
+
     #[test]
     fn render_report_contains_hotkeys_and_ollama_health() {
         let text = render_report(&sample_input());
@@ -599,7 +730,7 @@ mod tests {
 
     #[test]
     fn no_report_line_contains_an_em_dash() {
-        // CLAUDE.md rule 11: this text is meant to be pasted into a public
+        // AGENTS.md rule 11: this text is meant to be pasted into a public
         // GitHub issue verbatim.
         let text = render_report(&sample_input());
         assert!(!text.contains('\u{2014}'), "{text}");
@@ -641,6 +772,99 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- redact_user_profile (#270) ---------------------------------------
+
+    #[test]
+    fn redact_user_profile_replaces_the_profile_prefix() {
+        let text = redact_user_profile(
+            r"C:\Users\test\AppData\Roaming\Wingman\config.toml",
+            r"C:\Users\test",
+        );
+        assert_eq!(text, r"%USERPROFILE%\AppData\Roaming\Wingman\config.toml");
+    }
+
+    #[test]
+    fn redact_user_profile_leaves_a_path_not_under_the_profile_untouched() {
+        let text = redact_user_profile(r"C:\Windows\System32\cmd.exe", r"C:\Users\test");
+        assert_eq!(text, r"C:\Windows\System32\cmd.exe");
+    }
+
+    #[test]
+    fn redact_user_profile_matches_case_insensitively() {
+        let text = redact_user_profile(
+            r"c:\USERS\Test\appdata\roaming\Wingman\config.toml",
+            r"C:\Users\test",
+        );
+        assert_eq!(text, r"%USERPROFILE%\appdata\roaming\Wingman\config.toml");
+    }
+
+    #[test]
+    fn redact_user_profile_tolerates_a_trailing_slash_on_the_profile_param() {
+        let text = redact_user_profile(
+            r"C:\Users\test\AppData\Roaming\Wingman\config.toml",
+            r"C:\Users\test\",
+        );
+        assert_eq!(text, r"%USERPROFILE%\AppData\Roaming\Wingman\config.toml");
+    }
+
+    #[test]
+    fn redact_user_profile_does_not_partially_match_a_prefix_username() {
+        // "te" is a prefix of "test" -- a naive substring replace on
+        // C:\Users\te would corrupt C:\Users\test\... into
+        // %USERPROFILE%st\... . Must be left untouched instead.
+        let text = redact_user_profile(
+            r"C:\Users\test\AppData\Roaming\Wingman\config.toml",
+            r"C:\Users\te",
+        );
+        assert_eq!(text, r"C:\Users\test\AppData\Roaming\Wingman\config.toml");
+    }
+
+    #[test]
+    fn redact_user_profile_matches_the_profile_path_exactly_with_no_suffix() {
+        let text = redact_user_profile(r"C:\Users\test", r"C:\Users\test");
+        assert_eq!(text, "%USERPROFILE%");
+    }
+
+    #[test]
+    fn redact_user_profile_replaces_every_occurrence() {
+        let text = redact_user_profile(
+            r"Ollama is running: C:\Users\test\AppData\Local\Programs\Ollama\ollama.exe. Config: C:\Users\test\AppData\Roaming\Wingman\config.toml",
+            r"C:\Users\test",
+        );
+        assert_eq!(
+            text,
+            r"Ollama is running: %USERPROFILE%\AppData\Local\Programs\Ollama\ollama.exe. Config: %USERPROFILE%\AppData\Roaming\Wingman\config.toml"
+        );
+    }
+
+    #[test]
+    fn redact_user_profile_with_an_empty_profile_leaves_text_untouched() {
+        // `known_folder::user_profile()` failing (best-effort, same as the
+        // rest of this module) must degrade to "no redaction", not panic.
+        let text = redact_user_profile(r"C:\Users\test\AppData\Roaming", "");
+        assert_eq!(text, r"C:\Users\test\AppData\Roaming");
+    }
+
+    #[test]
+    fn render_report_redacts_the_account_name_from_config_path_and_ollama_health() {
+        // #270's "Done when": no literal Windows account name survives into
+        // the rendered report, for either field it can leak from.
+        let mut input = sample_input();
+        input.config_path = Some(r"C:\Users\test\AppData\Roaming\Wingman\config.toml".to_string());
+        input.ollama_health =
+            "Ollama is running: C:\\Users\\test\\AppData\\Local\\Programs\\Ollama\\ollama.exe."
+                .to_string();
+        // render_report itself doesn't redact -- collect() does, via
+        // redact_user_profile applied at the DiagnosticsInput boundary. This
+        // test exercises that boundary directly.
+        let profile = r"C:\Users\test";
+        input.config_path = input.config_path.map(|p| redact_user_profile(&p, profile));
+        input.ollama_health = redact_user_profile(&input.ollama_health, profile);
+        let text = render_report(&input);
+        assert!(!text.contains("test"), "{text}");
+        assert!(text.contains("%USERPROFILE%"), "{text}");
     }
 
     // -- egress_report (#106) ------------------------------------------------

@@ -13,7 +13,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CivilDate {
     pub year: i32,
     pub month: u8,
@@ -253,6 +253,27 @@ mod tests {
                 year: 2026,
                 month: 2,
                 day: 1
+            }
+        );
+    }
+
+    #[test]
+    fn add_days_crosses_the_9999_10000_year_boundary_with_pure_civil_arithmetic() {
+        // #276: this arithmetic itself is correct and unguarded on purpose
+        // (civil_time has no concept of a "valid ICS year"); the guard
+        // belongs to ics.rs's formatter. This just pins the input this
+        // module hands that formatter at the boundary.
+        let dec_31_9999 = CivilDate {
+            year: 9999,
+            month: 12,
+            day: 31,
+        };
+        assert_eq!(
+            add_days(&dec_31_9999, 1),
+            CivilDate {
+                year: 10000,
+                month: 1,
+                day: 1,
             }
         );
     }

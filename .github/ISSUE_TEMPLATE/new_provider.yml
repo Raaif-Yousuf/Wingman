@@ -52,7 +52,7 @@ body:
         How this provider's chat/vision request and response differ from
         OpenAI's or Anthropic's (both already supported). Note anything that
         needs `serde_json`'s `preserve_order` to keep property order intact,
-        per CLAUDE.md rule 3, if this provider is also given a JSON schema.
+        per AGENTS.md rule 3, if this provider is also given a JSON schema.
     validations:
       required: true
 
@@ -61,7 +61,7 @@ body:
     attributes:
       label: License of any SDK or reference code
       description: >-
-        CLAUDE.md rule 2: dependencies and copied code must be MIT,
+        AGENTS.md rule 2: dependencies and copied code must be MIT,
         Apache-2.0, BSD, ISC, Zlib or Unlicense. Name the license of any
         crate this would add or any code you'd want to adapt from an
         existing SDK, verified as of today, not from memory of an older

@@ -25,6 +25,11 @@ use super::{Effect, Executor, Undo};
 pub trait ClipboardAccess: Send + Sync {
     fn get_text(&self) -> Result<String>;
     fn set_text(&self, text: &str) -> Result<()>;
+    /// True if the OS clipboard holds data in any format, regardless of
+    /// whether `get_text` can read it back as text. The only use: telling
+    /// "the clipboard was empty" apart from "the clipboard held something
+    /// this executor cannot preserve" before overwriting it (#410).
+    fn has_any_content(&self) -> bool;
 }
 
 /// The real clipboard, via the crate's existing `arboard` dependency
@@ -47,6 +52,10 @@ impl ClipboardAccess for ArboardClipboard {
         arboard::Clipboard::new()
             .and_then(|mut c| c.set_text(text))
             .context("could not write the clipboard")
+    }
+
+    fn has_any_content(&self) -> bool {
+        super::format_probe::any_clipboard_format_present()
     }
 }
 
@@ -90,6 +99,9 @@ impl<C: ClipboardAccess + 'static> Executor for ClipboardExecutor<C> {
         "clipboard"
     }
 
+    /// `ReadOnly` is intentional, not an oversight: see `executors::Effect`'s
+    /// doc comment ("Decided (issue #402)") for why a clipboard-writing
+    /// executor still counts as read-only for the confirm fast path.
     fn effect(&self) -> Effect {
         Effect::ReadOnly
     }
@@ -104,22 +116,35 @@ impl<C: ClipboardAccess + 'static> Executor for ClipboardExecutor<C> {
             bail!("clipboard executor: proposal has no \"text\" field to copy");
         };
 
-        // Best-effort: a clipboard that was empty or held non-text content
-        // restores to nothing rather than failing the whole action.
+        // `get_text` returning nothing is ambiguous on its own (arboard's
+        // `ContentNotAvailable` covers both "empty" and "present but not
+        // text"); the format probe (#410) resolves it before we overwrite
+        // anything, so an unrestorable prior value is reported, not
+        // silently dropped.
         let previous = self.clipboard.get_text().ok();
+        let lost_unrestorable_content = previous.is_none() && self.clipboard.has_any_content();
 
         self.clipboard.set_text(&text)?;
 
+        let summary = if lost_unrestorable_content {
+            format!(
+                "copied \"{text}\" to the clipboard. Its previous contents were in a format that could not be preserved and cannot be restored."
+            )
+        } else {
+            format!("copied \"{text}\" to the clipboard")
+        };
+
         let clipboard = Arc::clone(&self.clipboard);
-        Ok(Undo::recording(
-            format!("copied \"{text}\" to the clipboard"),
-            move || {
-                if let Some(previous) = previous {
-                    clipboard.set_text(&previous)?;
-                }
-                Ok(())
-            },
-        ))
+        Ok(Undo::recording(summary, move || {
+            if let Some(previous) = previous {
+                clipboard.set_text(&previous)?;
+            } else if lost_unrestorable_content {
+                bail!(
+                    "cannot undo the clipboard write: its previous contents were not text and could not be preserved"
+                );
+            }
+            Ok(())
+        }))
     }
 }
 
@@ -133,12 +158,23 @@ mod tests {
     #[derive(Default)]
     struct FakeClipboard {
         text: RefCell<Option<String>>,
+        /// Simulates a clipboard holding non-text content (e.g. an image):
+        /// `get_text` still fails, but `has_any_content` must say `true`.
+        holding_unrestorable_content: bool,
     }
 
     impl FakeClipboard {
         fn seeded(initial: &str) -> Self {
             Self {
                 text: RefCell::new(Some(initial.to_string())),
+                holding_unrestorable_content: false,
+            }
+        }
+
+        fn holding_unrestorable_content() -> Self {
+            Self {
+                text: RefCell::new(None),
+                holding_unrestorable_content: true,
             }
         }
     }
@@ -162,6 +198,10 @@ mod tests {
             *self.text.borrow_mut() = Some(text.to_string());
             Ok(())
         }
+
+        fn has_any_content(&self) -> bool {
+            self.text.borrow().is_some() || self.holding_unrestorable_content
+        }
     }
 
     fn confirmed_with(
@@ -174,6 +214,21 @@ mod tests {
     #[test]
     fn clipboard_executor_is_read_only() {
         assert_eq!(ClipboardExecutor::new().effect(), Effect::ReadOnly);
+    }
+
+    /// Issue #402: a clipboard-overwriting executor still auto-confirming
+    /// is a deliberate decision (see `executors::Effect`'s doc comment), not
+    /// a gap. This test is the regression guard for that decision: if
+    /// `Effect::ReadOnly` on `ClipboardExecutor` ever gets narrowed back to
+    /// requiring a real confirmation, this is the assertion that must be
+    /// updated (and the mod.rs doc comment with it) rather than one that
+    /// silently starts failing.
+    #[test]
+    fn clipboard_executor_auto_confirms_by_design_per_issue_402() {
+        let executor = ClipboardExecutor::with_clipboard(FakeClipboard::default());
+        let proposal = crate::ui::confirm::Proposal::new(serde_json::json!({"text": "x"}));
+        crate::ui::confirm::auto_confirm_read_only(&executor, proposal)
+            .expect("clipboard executor must auto-confirm: issue #402 decided this is intended");
     }
 
     #[test]
@@ -224,8 +279,42 @@ mod tests {
         let confirmed = confirmed_with(serde_json::json!({"text": "new text"}), &executor);
 
         let undo = executor.execute(confirmed).unwrap();
+        assert_eq!(
+            undo.summary, "copied \"new text\" to the clipboard",
+            "a genuinely empty prior clipboard is not data loss and gets no warning"
+        );
         undo.undo()
             .expect("undo must not fail just because there was nothing to restore");
         assert_eq!(executor.clipboard.get_text().unwrap(), "new text");
+    }
+
+    /// Issue #410: `get_text` returning nothing is ambiguous (empty vs.
+    /// "held something we cannot read as text"). The format probe resolves
+    /// that before the overwrite, and the honest outcome is: the summary
+    /// says content could not be preserved (a card line, not silent), and
+    /// undo refuses to pretend it restored something it never had.
+    #[test]
+    fn execute_reports_and_undo_refuses_when_prior_content_could_not_be_preserved() {
+        let executor =
+            ClipboardExecutor::with_clipboard(FakeClipboard::holding_unrestorable_content());
+        let confirmed = confirmed_with(serde_json::json!({"text": "new text"}), &executor);
+
+        let undo = executor.execute(confirmed).unwrap();
+        assert!(
+            undo.summary.contains("could not be preserved"),
+            "summary must say so honestly: {}",
+            undo.summary
+        );
+        assert!(
+            !undo.summary.contains('\u{2014}'),
+            "no em dashes: {}",
+            undo.summary
+        );
+
+        let err = undo
+            .undo()
+            .expect_err("undo must not silently claim success when it cannot restore lost content");
+        assert!(err.to_string().contains("cannot"));
+        assert!(!err.to_string().contains('\u{2014}'), "no em dashes: {err}");
     }
 }

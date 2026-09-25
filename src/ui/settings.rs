@@ -60,7 +60,8 @@ use std::time::Duration;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, FW_NORMAL, HFONT, HGDIOBJ, LOGFONTW,
+    CreateFontIndirectW, DeleteObject, EnumFontFamiliesExW, GetDC, ReleaseDC, FW_NORMAL, HFONT,
+    HGDIOBJ, LOGFONTW, TEXTMETRICW,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -82,7 +83,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_VSCROLL,
 };
 
-use crate::config::{Config, OllamaConfig};
+use crate::config::{Config, OllamaConfig, RequireTickFor};
 use crate::hotkey::chord_to_string;
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::DEFAULT_PROMPT;
@@ -184,10 +185,22 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     // CLIENT height, not the window height -- the caption and borders are
     // ~100px at 250% scaling, which is enough to push Save and Cancel below
     // the visible area. Ask the window what it actually got.
+    //
+    // Issue #340 MEASURED 2026-09-24: this used to clamp the result up to
+    // at least `MIN_WIN_H_DP` (`.max(MIN_WIN_H_DP)`). On a small screen at
+    // high DPI (reproduced here at 1280x800 @ 240dpi/250%) the real client
+    // area can be smaller than `MIN_WIN_H_DP`, and clamping up made
+    // `build_ui` believe it had more room than it actually did -- the
+    // Prompt group and the Save/Cancel footer both got positioned using a
+    // taller height than the real client rect, landing partly or fully
+    // below the visible window. `prompt_footer_layout` already keeps the
+    // footer below the Prompt group for *any* `win_h_dp`, however small, so
+    // this only needs the true measured value, floored at 1 so a later
+    // subtraction never goes negative.
     let client_h_dp = {
         let mut rc = windows::Win32::Foundation::RECT::default();
         if unsafe { GetClientRect(hwnd, &mut rc) }.is_ok() {
-            ((rc.bottom - rc.top) * 96 / dpi.max(1) as i32).max(MIN_WIN_H_DP)
+            ((rc.bottom - rc.top) * 96 / dpi.max(1) as i32).max(1)
         } else {
             fitted_h
         }
@@ -198,6 +211,13 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
+        // #346: without an explicit initial focus, keyboard focus landed
+        // wherever it happened to fall (reported as the Max edge box) --
+        // pin it to the first field instead, so Tab order starts from the
+        // top of the window every time it opens.
+        if let Some(first) = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER) {
+            let _ = SetFocus(Some(first));
+        }
     }
 
     run_message_loop(hwnd, inner_ref.prompt_edit);
@@ -391,6 +411,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
     match id {
         ID_SAVE => {
+            let raw = read_raw_form(inner);
+            // #344: an invalid numeric field must not be silently kept at
+            // its old value -- reject the Save, keep the window open, focus
+            // the bad field and say what is wrong inline (rule 7: never a
+            // dialog box). `config.toml` is never touched in this branch.
+            if let Some(invalid) = find_invalid_numeric_field(&raw) {
+                if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                    set_text(msg, invalid.message());
+                }
+                focus_and_select_field(inner.hwnd, invalid.control_id());
+                return;
+            }
+            if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                set_text(msg, "");
+            }
+
             // Autostart is registry state rather than a Config field, so it is
             // applied here instead of riding along in the returned Config.
             // Only written when it actually changed, to avoid rewriting the
@@ -399,7 +435,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             if want != crate::autostart::is_enabled() {
                 let _ = crate::autostart::set_enabled(want);
             }
-            inner.result = Some(read_form(inner));
+            inner.result = Some(build_config(&inner.original, &raw));
             unsafe {
                 let _ = DestroyWindow(inner.hwnd);
             }
@@ -433,6 +469,24 @@ fn toggle_password(hwnd: HWND, checkbox_id: i32, edit_id: i32) {
             SendMessageW(edit, EM_SETPASSWORDCHAR, Some(WPARAM(ch as usize)), None);
             let _ = InvalidateRect(Some(edit), None, true);
         }
+    }
+}
+
+/// #344: sets keyboard focus on the named control and selects its whole
+/// contents, so the user can just start typing over the bad value. For any
+/// plain `WC_EDIT` control (e.g. `ID_CARD_SECONDS`). `ID_MAX_EDGE` became a
+/// `CBS_DROPDOWNLIST` combo in #341 (no free-typed text, so it can no longer
+/// actually reach this function with an invalid value from the real UI, only
+/// from a direct unit-test call) -- `EM_SETSEL` on a `CBS_DROPDOWNLIST`
+/// combo with no editable text portion is simply a no-op, so no special case
+/// is needed here any more.
+fn focus_and_select_field(hwnd: HWND, id: i32) {
+    let Some(ctrl) = get_dlg_item(hwnd, id) else {
+        return;
+    };
+    unsafe {
+        let _ = SetFocus(Some(ctrl));
+        SendMessageW(ctrl, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1isize)));
     }
 }
 
@@ -476,6 +530,12 @@ const ID_CANCEL: i32 = 119;
 /// indicator (see [`ollama_status_line`]). Not a form field -- never read
 /// back in `read_form`/`build_config`.
 const ID_OLLAMA_STATUS: i32 = 120;
+/// #344: the inline "that field is wrong" message shown above Save/Cancel
+/// after a Save attempt with an invalid numeric field. Not a form field --
+/// never read back in `read_form`/`build_config`.
+const ID_VALIDATION_MESSAGE: i32 = 121;
+/// #403: the fill-form tick-requirement combo (`config.forms.require_tick_for`).
+const ID_REQUIRE_TICK_FOR: i32 = 122;
 
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
@@ -507,6 +567,8 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_AUTOSTART", ID_AUTOSTART),
     ("ID_CANCEL", ID_CANCEL),
     ("ID_OLLAMA_STATUS", ID_OLLAMA_STATUS),
+    ("ID_VALIDATION_MESSAGE", ID_VALIDATION_MESSAGE),
+    ("ID_REQUIRE_TICK_FOR", ID_REQUIRE_TICK_FOR),
 ];
 
 // ---------------------------------------------------------------------------
@@ -533,7 +595,6 @@ const TBM_SETRANGE: u32 = 0x0406;
 const TBM_SETPOS: u32 = 0x0405;
 const TBM_SETPAGESIZE: u32 = 0x0415;
 const TBM_SETLINESIZE: u32 = 0x0417;
-const CBS_DROPDOWN: i32 = 0x0002;
 const CBS_DROPDOWNLIST: i32 = 0x0003;
 const CBS_HASSTRINGS: i32 = 0x0200;
 const ES_PASSWORD: i32 = 0x0020;
@@ -553,8 +614,12 @@ const BS_AUTOCHECKBOX: i32 = 0x0003;
 const BS_PUSHBUTTON: i32 = 0x0000;
 const BS_DEFPUSHBUTTON: i32 = 0x0001;
 const TBS_HORZ: i32 = 0x0000;
+/// #344: selects text in a plain edit control, used to highlight an invalid
+/// numeric field after a failed Save.
+const EM_SETSEL: u32 = 0x00B1;
 
 use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
 // ---------------------------------------------------------------------------
@@ -590,8 +655,29 @@ fn fitted_height_dp(hwnd: HWND, dpi: u32) -> i32 {
 }
 
 const WIN_W_DP: i32 = 620;
-const WIN_H_DP: i32 = 820;
-/// Below this the prompt box stops being usable; scroll rather than shrink further.
+/// #403 review: raised from 820 by the Forms group's full height (68dp: see
+/// `CONTENT_TOP_DP`'s comment). #341 raised it again by 30dp (one more
+/// `ROW_H + ROW_GAP` row: the Capture group's new "higher reads small text
+/// better" hint line) so the default window still has room for the Prompt
+/// group at something close to its natural size instead of always falling
+/// back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout` itself
+/// never overlaps regardless of this constant, but a taller default is nicer
+/// than always squeezing.
+const WIN_H_DP: i32 = 918;
+/// Below this the prompt box stops being usable; scroll rather than shrink
+/// further (not yet built -- see `prompt_footer_layout`'s doc comment).
+///
+/// This is only a floor against a failed/absurd monitor query (see its use
+/// in `fitted_height_dp` and the `client_h_dp` fallback in `show_modal`),
+/// not a guarantee that content never gets clipped: that guarantee is
+/// `prompt_footer_layout`'s job now (issue #340), and it holds for whatever
+/// `win_h_dp` the window actually ends up with, however small. MEASURED
+/// 2026-09-24: raising this constant to try to force enough room for the
+/// Prompt group is a trap -- `show_modal`'s `client_h_dp` clamps the real,
+/// measured client height *up* to at least `MIN_WIN_H_DP`
+/// (`.max(MIN_WIN_H_DP)`), so a large `MIN_WIN_H_DP` makes `build_ui` believe
+/// the window is taller than it actually is on a small screen, which pushes
+/// the footer below the real visible area instead of fixing anything.
 const MIN_WIN_H_DP: i32 = 420;
 
 const MARGIN: i32 = 16;
@@ -605,6 +691,75 @@ const BTN_H: i32 = 28;
 
 fn to_px(dp: i32, dpi: u32) -> i32 {
     ((dp as i64 * dpi as i64 + 48) / 96) as i32
+}
+
+/// Below this the prompt box stops being usable; scroll rather than shrink
+/// further. (`MIN_PROMPT_EDIT_H` in dp, three text rows tall.)
+const MIN_PROMPT_EDIT_H: i32 = ROW_H * 3;
+
+/// Rects for the Prompt group box and the Save/Cancel footer, computed
+/// purely from where the fixed-height groups above it end (`content_top`,
+/// in dp) and how tall the window's client area actually is (`win_h_dp`).
+///
+/// Issue #340: the previous code placed the footer at a fixed offset from
+/// `win_h_dp` (`win_h_dp - buttons_h`) while the Prompt group's *top* came
+/// from `content_top`, a value that does not shrink with the window. At
+/// high DPI on a small monitor `fitted_height_dp` shrinks `win_h_dp` well
+/// below `content_top`, so the footer's fixed offset from the (now much
+/// smaller) `win_h_dp` landed *above* `content_top`, drawing Save/Cancel on
+/// top of the Prompt box. MEASURED 2026-09-24 (issue #340 screenshot, 150%
+/// scaling).
+///
+/// This function makes the invariant structural instead of incidental: the
+/// footer is always placed below the Prompt group's actual bottom, never
+/// derived from `win_h_dp` alone. When there's enough room the footer still
+/// sits flush with the bottom of the window (unchanged from before); when
+/// there isn't, the Prompt group takes its minimum height and the footer is
+/// pushed down to clear it, which can push the footer below the visible
+/// window on a very short client area rather than overlapping it -- clipping
+/// instead of overlap. `fitted_height_dp`'s `MIN_WIN_H_DP` is sized so that
+/// case does not occur on a 1080p screen at up to 200% scaling (see its own
+/// comment).
+struct PromptFooterLayout {
+    prompt_top: i32,
+    prompt_bottom: i32,
+    prompt_edit_h: i32,
+    reset_btn_y: i32,
+    buttons_y: i32,
+}
+
+fn prompt_footer_layout(content_top: i32, win_h_dp: i32) -> PromptFooterLayout {
+    let buttons_h = BTN_H + MARGIN * 2;
+    let reset_btn_h = BTN_H;
+    let prompt_top = content_top;
+    let prompt_label_bottom = prompt_top + GROUP_LABEL_TOP;
+
+    // The smallest the Prompt group can be and still hold a usable edit box
+    // and the reset button: label, minimum edit height, the gap before the
+    // reset button, the reset button itself, and a bottom margin before the
+    // group's own border.
+    let min_prompt_group_h = GROUP_LABEL_TOP + MIN_PROMPT_EDIT_H + ROW_GAP + reset_btn_h + MARGIN;
+
+    let desired_prompt_bottom = win_h_dp - buttons_h;
+    let prompt_bottom = desired_prompt_bottom.max(prompt_top + min_prompt_group_h);
+
+    let prompt_edit_h = ((prompt_bottom - MARGIN) - prompt_label_bottom - reset_btn_h - ROW_GAP)
+        .max(MIN_PROMPT_EDIT_H);
+    let reset_btn_y = prompt_label_bottom + prompt_edit_h + ROW_GAP;
+
+    // Flush with the window bottom when there's room (matches the original
+    // layout exactly); otherwise pinned just below the Prompt group's own
+    // bottom, which by construction is always >= where the reset button
+    // ends, so Save/Cancel can never land on the Prompt box.
+    let buttons_y = (prompt_bottom + GROUP_GAP).max(win_h_dp - buttons_h + MARGIN);
+
+    PromptFooterLayout {
+        prompt_top,
+        prompt_bottom,
+        prompt_edit_h,
+        reset_btn_y,
+        buttons_y,
+    }
 }
 
 fn wide_z(s: &str) -> Vec<u16> {
@@ -662,6 +817,54 @@ fn checkbox_checked(hwnd: HWND, id: i32) -> bool {
 // Font
 // ---------------------------------------------------------------------------
 
+unsafe extern "system" fn record_font_found(
+    _logfont: *const LOGFONTW,
+    _metric: *const TEXTMETRICW,
+    _font_type: u32,
+    lparam: LPARAM,
+) -> i32 {
+    unsafe {
+        *(lparam.0 as *mut bool) = true;
+    }
+    0 // stop after the first match -- existence is all this needs
+}
+
+/// #346: true if a font face with exactly this name is installed. Used by
+/// [`build_font`]'s rare fallback path (both `SystemParametersInfoForDpi`
+/// and `SystemParametersInfoW` failing) to check "Segoe UI Variable Text"
+/// is actually present before naming it, rather than trusting
+/// `CreateFontIndirectW` to silently substitute something reasonable if it
+/// isn't -- GDI's substitute for a missing face need not resemble either
+/// Segoe face.
+fn font_face_exists(name: &str) -> bool {
+    unsafe {
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return false;
+        }
+        let mut lf = LOGFONTW {
+            // DEFAULT_CHARSET: match the face regardless of charset.
+            lfCharSet: windows::Win32::Graphics::Gdi::FONT_CHARSET(1),
+            ..Default::default()
+        };
+        for (i, u) in name.encode_utf16().enumerate() {
+            if i < lf.lfFaceName.len() {
+                lf.lfFaceName[i] = u;
+            }
+        }
+        let mut found = false;
+        EnumFontFamiliesExW(
+            hdc,
+            &lf,
+            Some(record_font_found),
+            LPARAM(std::ptr::addr_of_mut!(found) as isize),
+            0,
+        );
+        ReleaseDC(None, hdc);
+        found
+    }
+}
+
 /// A single dialog font derived from the shell's message font, same source
 /// `card.rs` uses for its own fonts, just without the headline/detail split
 /// this window has no need for.
@@ -694,7 +897,16 @@ fn build_font(dpi: u32) -> HFONT {
                 lfHeight: -12,
                 ..Default::default()
             };
-            for (i, u) in "Segoe UI".encode_utf16().enumerate() {
+            // #346: prefer the newer variable-weight face when it's actually
+            // installed (Windows 11), falling back to plain "Segoe UI"
+            // (present since Windows 7) rather than trusting GDI's own
+            // silent substitute, which need not be either.
+            let face = if font_face_exists("Segoe UI Variable Text") {
+                "Segoe UI Variable Text"
+            } else {
+                "Segoe UI"
+            };
+            for (i, u) in face.encode_utf16().enumerate() {
                 if i < lf.lfFaceName.len() {
                     lf.lfFaceName[i] = u;
                 }
@@ -883,7 +1095,7 @@ fn should_query_ollama_details(ollama_configured: bool, health: &OllamaHealth) -
 
 /// Combines #15's health check with #14's GPU/CPU indicator into the one
 /// status line Settings shows for Ollama. Computed once, synchronously,
-/// when Settings opens (CLAUDE.md rule 5: discovery happens on demand,
+/// when Settings opens (AGENTS.md rule 5: discovery happens on demand,
 /// never on a timer): the health check is Win32-only (no network at all)
 /// and always runs; the two HTTP calls it can make (`/api/ps`, `/api/tags`)
 /// only run when [`should_query_ollama_details`] says so (#188), and are
@@ -1044,12 +1256,12 @@ fn build_ui(
 
     ctx.create(
         WC_STATIC,
-        "Effort:",
+        "Thinking:",
         0,
         0,
         r.x + half + 12,
         r.y,
-        50,
+        60,
         ROW_H,
         0,
     );
@@ -1058,16 +1270,20 @@ fn build_ui(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 50,
+        r.x + half + 12 + 60,
         r.y,
-        half - 50,
+        half - 60,
         ROW_H * 4,
         ID_OPENAI_EFFORT,
     );
-    for e in ["low", "medium", "high"] {
+    for e in EFFORT_LABELS {
         combo_add(openai_effort, e);
     }
-    combo_select(openai_effort, &config.providers.openai.effort);
+    combo_select_with_custom(
+        openai_effort,
+        &EFFORT_LABELS,
+        &effort_display(&config.providers.openai.effort),
+    );
     r.advance();
 
     // Anthropic
@@ -1126,12 +1342,12 @@ fn build_ui(
 
     ctx.create(
         WC_STATIC,
-        "Effort:",
+        "Thinking:",
         0,
         0,
         r.x + half + 12,
         r.y,
-        50,
+        60,
         ROW_H,
         0,
     );
@@ -1140,16 +1356,20 @@ fn build_ui(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 50,
+        r.x + half + 12 + 60,
         r.y,
-        half - 50,
+        half - 60,
         ROW_H * 4,
         ID_ANTHROPIC_EFFORT,
     );
-    for e in ["low", "medium", "high"] {
+    for e in EFFORT_LABELS {
         combo_add(anthropic_effort, e);
     }
-    combo_select(anthropic_effort, &config.providers.anthropic.effort);
+    combo_select_with_custom(
+        anthropic_effort,
+        &EFFORT_LABELS,
+        &effort_display(&config.providers.anthropic.effort),
+    );
     r.advance();
 
     let providers_bottom = r.y + ROW_H + 8;
@@ -1176,7 +1396,7 @@ fn build_ui(
     // -- Ollama status (#14, #15) ----------------------------------------
     // One read-only line: whether anything answers on the configured
     // Ollama port, whether it's the stock tray app's CPU-only server
-    // (CLAUDE.md's "Stock Ollama's tray app steals port 11434" pitfall),
+    // (AGENTS.md's "Stock Ollama's tray app steals port 11434" pitfall),
     // and -- once it's confirmed to be a real server -- whether the
     // configured model is currently loaded on GPU or CPU and how many
     // local models support vision. See `ollama_status_line`.
@@ -1223,7 +1443,7 @@ fn build_ui(
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
     ctx.create(
         WC_STATIC,
-        &format!("Primary:   {}", chord_to_string(&config.hotkeys.primary)),
+        &format!("Copilot key: {}", chord_to_string(&config.hotkeys.primary)),
         0,
         0,
         r.x,
@@ -1235,7 +1455,10 @@ fn build_ui(
     r.advance();
     ctx.create(
         WC_STATIC,
-        &format!("Secondary: {}", chord_to_string(&config.hotkeys.secondary)),
+        &format!(
+            "Other shortcut: {}",
+            chord_to_string(&config.hotkeys.secondary)
+        ),
         0,
         0,
         r.x,
@@ -1294,26 +1517,40 @@ fn build_ui(
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
     let half = (r.w - 12) / 2;
 
-    ctx.create(WC_STATIC, "Max edge:", 0, 0, r.x, r.y, 70, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "Screenshot detail:",
+        0,
+        0,
+        r.x,
+        r.y,
+        110,
+        ROW_H,
+        0,
+    );
     let max_edge = ctx.create(
         WC_COMBOBOX,
         "",
-        (CBS_DROPDOWN | CBS_HASSTRINGS) as u32,
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 70,
+        r.x + 110,
         r.y,
-        half - 70,
+        half - 110,
         ROW_H * 6,
         ID_MAX_EDGE,
     );
-    for v in ["1024", "1280", "1568", "2048"] {
+    for v in MAX_EDGE_LABELS {
         combo_add(max_edge, v);
     }
-    set_text(max_edge, &config.capture.max_edge.to_string());
+    combo_select_with_custom(
+        max_edge,
+        &MAX_EDGE_LABELS,
+        &max_edge_display(config.capture.max_edge),
+    );
 
     ctx.create(
         WC_STATIC,
-        "Monitor:",
+        "Screen:",
         0,
         0,
         r.x + half + 12,
@@ -1333,10 +1570,29 @@ fn build_ui(
         ROW_H * 4,
         ID_MONITOR,
     );
-    for v in ["active", "primary"] {
+    for v in MONITOR_LABELS {
         combo_add(monitor, v);
     }
-    combo_select(monitor, &config.capture.monitor);
+    combo_select_with_custom(
+        monitor,
+        &MONITOR_LABELS,
+        &monitor_display(&config.capture.monitor),
+    );
+    r.advance();
+
+    // #341: a one-line hint, since "screenshot detail" alone doesn't say
+    // what changes or why it costs more.
+    ctx.create(
+        WC_STATIC,
+        "Higher reads small text better, costs more.",
+        0,
+        0,
+        r.x,
+        r.y,
+        r.w,
+        ROW_H,
+        0,
+    );
     r.advance();
     let capture_bottom = r.y + 4;
     ctx.create(
@@ -1359,12 +1615,12 @@ fn build_ui(
 
     ctx.create(
         WC_STATIC,
-        "Auto-dismiss (sec, 0=never):",
+        "Hide the card after this many seconds (0 = never):",
         0,
         0,
         r.x,
         r.y,
-        190,
+        260,
         ROW_H,
         0,
     );
@@ -1373,9 +1629,9 @@ fn build_ui(
         &config.ui.card_seconds.to_string(),
         (ES_NUMBER | ES_AUTOHSCROLL) as u32,
         WS_EX_BORDER,
-        r.x + 190,
+        r.x + 260,
         r.y,
-        70,
+        50,
         ROW_H,
         ID_CARD_SECONDS,
     );
@@ -1384,9 +1640,9 @@ fn build_ui(
         "Show difficulty rating",
         BS_AUTOCHECKBOX as u32,
         0,
-        r.x + 190 + 70 + 20,
+        r.x + 260 + 50 + 12,
         r.y,
-        r.w - (190 + 70 + 20),
+        r.w - (260 + 50 + 12),
         ROW_H,
         ID_SHOW_DIFFICULTY,
     );
@@ -1450,14 +1706,64 @@ fn build_ui(
     );
     y = card_bottom + GROUP_GAP;
 
-    // -- Prompt (grows to fill remaining space above the button row) ------
-    let buttons_h = BTN_H + MARGIN * 2;
-    let prompt_top = y;
-    let prompt_bottom = win_h_dp - buttons_h;
+    // -- Forms (#403) -------------------------------------------------
+    let forms_top = y;
     y += GROUP_LABEL_TOP;
+    let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
+
+    ctx.create(
+        WC_STATIC,
+        "Require a tick to fill:",
+        0,
+        0,
+        r.x,
+        r.y,
+        150,
+        ROW_H,
+        0,
+    );
+    let require_tick_for = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + 150,
+        r.y,
+        r.w - 150,
+        ROW_H * 4,
+        ID_REQUIRE_TICK_FOR,
+    );
+    for label in REQUIRE_TICK_FOR_LABELS {
+        combo_add(require_tick_for, label);
+    }
+    combo_select(
+        require_tick_for,
+        require_tick_for_label(config.forms.require_tick_for),
+    );
+    r.advance();
+
+    let forms_bottom = r.y + 4;
+    ctx.create(
+        WC_BUTTON,
+        "Fill forms",
+        BS_GROUPBOX as u32,
+        0,
+        content_x,
+        forms_top,
+        content_w,
+        forms_bottom - forms_top,
+        0,
+    );
+    y = forms_bottom + GROUP_GAP;
+
+    // -- Prompt (grows to fill remaining space above the button row) ------
+    let footer = prompt_footer_layout(y, win_h_dp);
+    let prompt_top = footer.prompt_top;
+    let prompt_bottom = footer.prompt_bottom;
+    y = prompt_top + GROUP_LABEL_TOP;
 
     let reset_btn_h = BTN_H;
-    let prompt_edit_h = (prompt_bottom - MARGIN) - y - reset_btn_h - ROW_GAP;
+    let prompt_edit_h = footer.prompt_edit_h;
     let prompt_edit = ctx.create(
         WC_EDIT,
         &config.ui.prompt,
@@ -1466,7 +1772,7 @@ fn build_ui(
         content_x + MARGIN,
         y,
         content_w - 2 * MARGIN,
-        prompt_edit_h.max(ROW_H * 3),
+        prompt_edit_h,
         ID_PROMPT_EDIT,
     );
     // WS_VSCROLL isn't representable via the `style` u32 alone without
@@ -1489,7 +1795,7 @@ fn build_ui(
         BS_PUSHBUTTON as u32,
         0,
         content_x + MARGIN,
-        y + prompt_edit_h.max(ROW_H * 3) + ROW_GAP,
+        footer.reset_btn_y,
         200,
         reset_btn_h,
         ID_RESET_PROMPT,
@@ -1508,7 +1814,21 @@ fn build_ui(
     );
 
     // -- Save / Cancel ------------------------------------------------
-    let buttons_y = win_h_dp - buttons_h + MARGIN;
+    let buttons_y = footer.buttons_y;
+    // #344: inline "that field is wrong" message, blank until a Save
+    // attempt fails validation. Sits to the left of the Save/Cancel row so
+    // it never overlaps either the Prompt group or the buttons.
+    ctx.create(
+        WC_STATIC,
+        "",
+        0,
+        0,
+        content_x + MARGIN,
+        buttons_y + (BTN_H - ROW_H) / 2,
+        content_w - 2 * MARGIN - 2 * BTN_W - 12 - 12,
+        ROW_H,
+        ID_VALIDATION_MESSAGE,
+    );
     ctx.create(
         WC_BUTTON,
         "Cancel",
@@ -1534,12 +1854,18 @@ fn build_ui(
 
     // Tab order / grouping: give the first control of each visual group
     // WS_GROUP so arrow-key navigation and Tab-between-groups behave.
+    // #346: this used to list only 5 controls, missing the first focusable
+    // control of the "General" group (ID_AUTOSTART) and, once #403 added the
+    // Forms group, its first control (ID_REQUIRE_TICK_FOR) too -- so
+    // arrow-key/group navigation didn't match the visible group boxes.
     for id in [
         ID_ACTIVE_PROVIDER,
         ID_MAX_EDGE,
         ID_CARD_SECONDS,
+        ID_REQUIRE_TICK_FOR,
         ID_PROMPT_EDIT,
         ID_SAVE,
+        ID_AUTOSTART,
     ] {
         if let Some(h) = get_dlg_item(hwnd, id) {
             add_style(h, WS_GROUP.0);
@@ -1560,6 +1886,7 @@ fn build_ui(
         ID_CARD_SECONDS,
         ID_SHOW_DIFFICULTY,
         ID_TEXT_SCALE_TRACK,
+        ID_REQUIRE_TICK_FOR,
         ID_PROMPT_EDIT,
         ID_RESET_PROMPT,
         ID_SAVE,
@@ -1614,11 +1941,15 @@ struct RawForm {
     show_difficulty: bool,
     text_scale_raw: f32,
     prompt: String,
+    require_tick_for: String,
 }
 
-fn read_form(inner: &SettingsInner) -> Config {
+/// Reads every control into a [`RawForm`], without yet folding it into a
+/// [`Config`]. Split out from [`read_form`] so Save can validate the raw
+/// values (#344) before committing to `build_config`'s fallback behavior.
+fn read_raw_form(inner: &SettingsInner) -> RawForm {
     let hwnd = inner.hwnd;
-    let raw = RawForm {
+    RawForm {
         provider_choice: unsafe {
             SendMessageW(
                 get_dlg_item(hwnd, ID_ACTIVE_PROVIDER).unwrap_or(HWND(std::ptr::null_mut())),
@@ -1638,7 +1969,14 @@ fn read_form(inner: &SettingsInner) -> Config {
             .unwrap_or_default(),
         anthropic_model: combo_selected_text(hwnd, ID_ANTHROPIC_MODEL),
         anthropic_effort: combo_selected_text(hwnd, ID_ANTHROPIC_EFFORT),
-        max_edge_text: combo_selected_text(hwnd, ID_MAX_EDGE),
+        // #341: the combo now shows "Low"/"Medium"/.../"Maximum" rather than
+        // the raw number, so convert back to the numeric text `build_config`
+        // and `find_invalid_numeric_field` (#344) already expect. An
+        // unrecognized selection (should not happen with `CBS_DROPDOWNLIST`)
+        // becomes blank, which both of those already treat as "leave alone".
+        max_edge_text: label_to_max_edge(&combo_selected_text(hwnd, ID_MAX_EDGE))
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
         monitor: combo_selected_text(hwnd, ID_MONITOR),
         card_seconds_text: get_dlg_item(hwnd, ID_CARD_SECONDS)
             .map(get_text)
@@ -1650,7 +1988,18 @@ fn read_form(inner: &SettingsInner) -> Config {
         prompt: get_dlg_item(hwnd, ID_PROMPT_EDIT)
             .map(get_text)
             .unwrap_or_default(),
-    };
+        require_tick_for: combo_selected_text(hwnd, ID_REQUIRE_TICK_FOR),
+    }
+}
+
+/// Reads every control and folds it into a [`Config`] via [`build_config`].
+/// Exercised directly by UI smoke tests that need the full round trip; the
+/// Save path (`handle_command`) instead calls [`read_raw_form`] and
+/// [`find_invalid_numeric_field`] first, so it can reject before this ever
+/// commits to `build_config`'s fallback behavior.
+#[cfg(test)]
+fn read_form(inner: &SettingsInner) -> Config {
+    let raw = read_raw_form(inner);
     build_config(&inner.original, &raw)
 }
 
@@ -1736,6 +2085,205 @@ fn parse_max_edge_or(text: &str, fallback: u32) -> u32 {
         Ok(v) if v > 0 => v,
         _ => fallback,
     }
+}
+
+/// Review of #341 (data loss): a value outside a combo's fixed preset list
+/// (a hand-edited `config.toml`, e.g. `max_edge = 999`) used to display as
+/// the nearest/default preset -- so opening Settings and pressing Save with
+/// nothing touched silently replaced the real value with that preset's.
+/// Every preset combo below instead shows an honest `"Custom (<value>)"`
+/// entry for an off-preset value and selects it, so an untouched Save writes
+/// back the exact original value; the wrapping quotes are omitted from the
+/// label itself, matching `parse_custom_label`'s expectation.
+fn custom_label(raw: &str) -> String {
+    format!("Custom ({raw})")
+}
+
+/// The inverse of [`custom_label`]: the raw text inside `"Custom (...)"`, or
+/// `None` if `label` isn't one.
+fn parse_custom_label(label: &str) -> Option<&str> {
+    label.strip_prefix("Custom (")?.strip_suffix(')')
+}
+
+/// #341: the config's own `low`/`medium`/`high` effort tokens, and the plain
+/// words shown in their place in Settings ("Thinking:"). Index-paired with
+/// [`EFFORT_LABELS`].
+const EFFORT_VALUES: [&str; 3] = ["low", "medium", "high"];
+/// #341: display labels for [`EFFORT_VALUES`], in the same order.
+const EFFORT_LABELS: [&str; 3] = ["Fast", "Balanced", "Thorough"];
+
+/// The label shown for a given effort value: one of [`EFFORT_LABELS`] for an
+/// exact preset match, or `"Custom (<value>)"` (never silently rounded to a
+/// preset -- see the review-fix doc comment above [`custom_label`]).
+fn effort_display(value: &str) -> String {
+    match EFFORT_VALUES.iter().position(|&v| v == value) {
+        Some(i) => EFFORT_LABELS[i].to_string(),
+        None => custom_label(value),
+    }
+}
+
+/// Parses a combo selection back into an effort value: one of
+/// [`EFFORT_VALUES`] for a preset label, the wrapped text for a
+/// `"Custom (...)"` label, or `None` for a blank/unrecognized selection so
+/// callers can fall back to the original config value.
+fn label_to_effort(label: &str) -> Option<String> {
+    if let Some(i) = EFFORT_LABELS.iter().position(|&l| l == label) {
+        return Some(EFFORT_VALUES[i].to_string());
+    }
+    parse_custom_label(label).map(|s| s.to_string())
+}
+
+/// #341: the four `capture.max_edge` presets, and the plain words shown in
+/// their place in Settings ("Screenshot detail:"). Index-paired with
+/// [`MAX_EDGE_LABELS`].
+const MAX_EDGE_VALUES: [u32; 4] = [1024, 1280, 1568, 2048];
+/// #341: display labels for [`MAX_EDGE_VALUES`], in the same order.
+const MAX_EDGE_LABELS: [&str; 4] = ["Low", "Medium", "High", "Maximum"];
+
+/// The label for a given `max_edge` value: one of [`MAX_EDGE_LABELS`] for an
+/// exact preset match, or `"Custom (<value>)"` (never silently rounded to
+/// the nearest preset -- see the review-fix doc comment above
+/// [`custom_label`]).
+fn max_edge_display(value: u32) -> String {
+    match MAX_EDGE_VALUES.iter().position(|&v| v == value) {
+        Some(i) => MAX_EDGE_LABELS[i].to_string(),
+        None => custom_label(&value.to_string()),
+    }
+}
+
+/// Parses a combo selection back into a `max_edge` value: one of
+/// [`MAX_EDGE_VALUES`] for a preset label, the parsed number for a
+/// `"Custom (...)"` label, or `None` for a blank/unrecognized/unparsable
+/// selection so callers can fall back to the original config value.
+fn label_to_max_edge(label: &str) -> Option<u32> {
+    if let Some(i) = MAX_EDGE_LABELS.iter().position(|&l| l == label) {
+        return Some(MAX_EDGE_VALUES[i]);
+    }
+    parse_custom_label(label)?.parse().ok()
+}
+
+/// #341: the config's own `active`/`primary` monitor tokens, and the plain
+/// words shown in their place in Settings ("Screen:"). Index-paired with
+/// [`MONITOR_LABELS`].
+const MONITOR_VALUES: [&str; 2] = ["active", "primary"];
+/// #341: display labels for [`MONITOR_VALUES`], in the same order.
+const MONITOR_LABELS: [&str; 2] = ["The one I'm using", "The main display"];
+
+/// The label shown for a given monitor value: one of [`MONITOR_LABELS`] for
+/// an exact preset match, or `"Custom (<value>)"` (never silently defaulted
+/// -- see the review-fix doc comment above [`custom_label`]).
+fn monitor_display(value: &str) -> String {
+    match MONITOR_VALUES.iter().position(|&v| v == value) {
+        Some(i) => MONITOR_LABELS[i].to_string(),
+        None => custom_label(value),
+    }
+}
+
+/// Parses a combo selection back into a monitor value: one of
+/// [`MONITOR_VALUES`] for a preset label, the wrapped text for a
+/// `"Custom (...)"` label, or `None` for a blank/unrecognized selection so
+/// callers can fall back to the original config value.
+fn label_to_monitor(label: &str) -> Option<String> {
+    if let Some(i) = MONITOR_LABELS.iter().position(|&l| l == label) {
+        return Some(MONITOR_VALUES[i].to_string());
+    }
+    parse_custom_label(label).map(|s| s.to_string())
+}
+
+/// Adds `display` to `combo` as an extra entry and selects it, but only if
+/// it isn't already one of the combo's fixed preset labels (already added by
+/// the caller) -- used by the three "custom value" combos above so an
+/// off-preset value gets its own honest entry instead of colliding with or
+/// hiding behind a preset.
+fn combo_select_with_custom(combo: HWND, presets: &[&str], display: &str) {
+    if !presets.contains(&display) {
+        combo_add(combo, display);
+    }
+    combo_select(combo, display);
+}
+
+/// #403: the three [`RequireTickFor`] labels shown in the Settings combo, in
+/// display order. Plain words, not the config's internal `all`/`sensitive`/
+/// `none` tokens (rule 11's sibling concern, #341: Settings speaks in
+/// internals).
+const REQUIRE_TICK_FOR_LABELS: [&str; 3] = ["All fields", "Only sensitive fields", "Never"];
+
+/// The label shown for a given [`RequireTickFor`] value. Inverse of
+/// [`label_to_require_tick_for`].
+fn require_tick_for_label(value: RequireTickFor) -> &'static str {
+    match value {
+        RequireTickFor::All => REQUIRE_TICK_FOR_LABELS[0],
+        RequireTickFor::Sensitive => REQUIRE_TICK_FOR_LABELS[1],
+        RequireTickFor::None => REQUIRE_TICK_FOR_LABELS[2],
+    }
+}
+
+/// Parses a combo selection back into a [`RequireTickFor`]. `None` for a
+/// blank or unrecognized selection, so callers can fall back to the
+/// original config value rather than silently picking a default.
+fn label_to_require_tick_for(label: &str) -> Option<RequireTickFor> {
+    match label {
+        "All fields" => Some(RequireTickFor::All),
+        "Only sensitive fields" => Some(RequireTickFor::Sensitive),
+        "Never" => Some(RequireTickFor::None),
+        _ => None,
+    }
+}
+
+/// #344: a numeric Settings field whose text does not parse to a value
+/// `build_config` would actually accept, found by [`find_invalid_numeric_field`].
+/// Distinct from "blank", which `build_config` already treats as "leave the
+/// original value alone" -- this only fires for text a user actually typed
+/// that isn't a valid whole number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidField {
+    MaxEdge,
+    CardSeconds,
+}
+
+impl InvalidField {
+    /// The control to focus so the user can fix it immediately.
+    fn control_id(self) -> i32 {
+        match self {
+            InvalidField::MaxEdge => ID_MAX_EDGE,
+            InvalidField::CardSeconds => ID_CARD_SECONDS,
+        }
+    }
+
+    /// The inline message shown next to Save (rule 7: never a dialog box).
+    /// No em dash (rule 11).
+    fn message(self) -> &'static str {
+        match self {
+            InvalidField::MaxEdge => "Max edge must be a whole number greater than 0.",
+            InvalidField::CardSeconds => "Auto-dismiss must be a whole number of seconds.",
+        }
+    }
+}
+
+/// Checks the two free-typed numeric fields for text that would silently be
+/// discarded by [`build_config`]'s fallback (#344: the bug was that garbage
+/// input like "2ooo" saved as if nothing had been typed, with no sign
+/// anything was wrong). A blank field is not an error here -- it is the
+/// established "leave this alone" convention `build_config` already
+/// implements and several tests already rely on. Only text that is present
+/// but does not parse to a value `build_config` would actually use counts as
+/// invalid. Returns the first invalid field found (max edge before card
+/// seconds), since only one inline message is shown at a time.
+fn find_invalid_numeric_field(raw: &RawForm) -> Option<InvalidField> {
+    let max_edge = raw.max_edge_text.trim();
+    if !max_edge.is_empty() {
+        match max_edge.parse::<u32>() {
+            Ok(v) if v > 0 => {}
+            _ => return Some(InvalidField::MaxEdge),
+        }
+    }
+
+    let card_seconds = raw.card_seconds_text.trim();
+    if !card_seconds.is_empty() && card_seconds.parse::<u32>().is_err() {
+        return Some(InvalidField::CardSeconds);
+    }
+
+    None
 }
 
 /// Clamps to the range `Card::set_text_scale` (see `ui/card.rs`) accepts;
@@ -1833,8 +2381,8 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     if !raw.openai_model.trim().is_empty() {
         cfg.providers.openai.model = raw.openai_model.clone();
     }
-    if !raw.openai_effort.trim().is_empty() {
-        cfg.providers.openai.effort = raw.openai_effort.clone();
+    if let Some(v) = label_to_effort(raw.openai_effort.trim()) {
+        cfg.providers.openai.effort = v;
     }
 
     cfg.providers.anthropic.api_key =
@@ -1842,13 +2390,13 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     if !raw.anthropic_model.trim().is_empty() {
         cfg.providers.anthropic.model = raw.anthropic_model.clone();
     }
-    if !raw.anthropic_effort.trim().is_empty() {
-        cfg.providers.anthropic.effort = raw.anthropic_effort.clone();
+    if let Some(v) = label_to_effort(raw.anthropic_effort.trim()) {
+        cfg.providers.anthropic.effort = v;
     }
 
     cfg.capture.max_edge = parse_max_edge_or(&raw.max_edge_text, original.capture.max_edge);
-    if !raw.monitor.trim().is_empty() {
-        cfg.capture.monitor = raw.monitor.clone();
+    if let Some(v) = label_to_monitor(raw.monitor.trim()) {
+        cfg.capture.monitor = v;
     }
 
     cfg.ui.card_seconds = parse_u32_or(&raw.card_seconds_text, original.ui.card_seconds);
@@ -1859,6 +2407,9 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     } else {
         raw.prompt.clone()
     };
+
+    cfg.forms.require_tick_for =
+        label_to_require_tick_for(&raw.require_tick_for).unwrap_or(original.forms.require_tick_for);
 
     cfg
 }
@@ -1919,6 +2470,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- font_face_exists (#346) -------------------------------------------
+
+    #[test]
+    fn font_face_exists_finds_a_font_present_on_every_windows_install() {
+        // Arial ships with every supported Windows version; if this is ever
+        // false, the check itself is broken, not the machine.
+        assert!(font_face_exists("Arial"));
+    }
+
+    #[test]
+    fn font_face_exists_is_false_for_a_made_up_name() {
+        assert!(!font_face_exists(
+            "Definitely Not A Real Font XYZ123 Wingman Test"
+        ));
     }
 
     // -- ollama_status_line (#14, #15) ------------------------------------
@@ -2058,6 +2625,80 @@ mod tests {
         assert_eq!(parse_max_edge_or("0", 1568), 1568);
         assert_eq!(parse_max_edge_or("2048", 1568), 2048);
         assert_eq!(parse_max_edge_or("bogus", 1568), 1568);
+    }
+
+    // -- find_invalid_numeric_field (#344) ---------------------------------
+
+    fn raw_with_numbers(max_edge_text: &str, card_seconds_text: &str) -> RawForm {
+        let mut raw = raw_from(&Config::default());
+        raw.max_edge_text = max_edge_text.to_string();
+        raw.card_seconds_text = card_seconds_text.to_string();
+        raw
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_accepts_valid_values() {
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("2048", "30")),
+            None
+        );
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_treats_blank_fields_as_fine() {
+        // Blank is "leave the original value alone" (build_config's existing
+        // fallback contract), not an error.
+        assert_eq!(find_invalid_numeric_field(&raw_with_numbers("", "")), None);
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_catches_letters_in_card_seconds() {
+        // #344's exact repro: typing "2ooo" into Auto-dismiss.
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("2048", "2ooo")),
+            Some(InvalidField::CardSeconds)
+        );
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_catches_letters_in_max_edge() {
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("wide", "30")),
+            Some(InvalidField::MaxEdge)
+        );
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_catches_a_typed_zero_max_edge() {
+        // Zero max edge is silently rejected by `build_config`'s fallback;
+        // Save must not pretend that succeeded.
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("0", "30")),
+            Some(InvalidField::MaxEdge)
+        );
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_catches_a_negative_card_seconds() {
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("2048", "-5")),
+            Some(InvalidField::CardSeconds)
+        );
+    }
+
+    #[test]
+    fn find_invalid_numeric_field_reports_max_edge_before_card_seconds() {
+        assert_eq!(
+            find_invalid_numeric_field(&raw_with_numbers("bogus", "also bogus")),
+            Some(InvalidField::MaxEdge)
+        );
+    }
+
+    #[test]
+    fn invalid_field_messages_have_no_em_dash() {
+        for field in [InvalidField::MaxEdge, InvalidField::CardSeconds] {
+            assert!(!field.message().contains('\u{2014}'));
+        }
     }
 
     // -- clamp_text_scale --------------------------------------------------
@@ -2343,16 +2984,17 @@ mod tests {
             provider_choice: 0,
             openai_key: original.providers.openai.api_key.clone(),
             openai_model: original.providers.openai.model.clone(),
-            openai_effort: original.providers.openai.effort.clone(),
+            openai_effort: effort_display(&original.providers.openai.effort),
             anthropic_key: original.providers.anthropic.api_key.clone(),
             anthropic_model: original.providers.anthropic.model.clone(),
-            anthropic_effort: original.providers.anthropic.effort.clone(),
+            anthropic_effort: effort_display(&original.providers.anthropic.effort),
             max_edge_text: original.capture.max_edge.to_string(),
-            monitor: original.capture.monitor.clone(),
+            monitor: monitor_display(&original.capture.monitor),
             card_seconds_text: original.ui.card_seconds.to_string(),
             show_difficulty: original.ui.show_difficulty,
             text_scale_raw: original.ui.text_scale,
             prompt: original.ui.prompt.clone(),
+            require_tick_for: require_tick_for_label(original.forms.require_tick_for).to_string(),
         }
     }
 
@@ -2376,6 +3018,198 @@ mod tests {
             cfg.providers.anthropic.models,
             original.providers.anthropic.models
         );
+    }
+
+    // -- plain-word label mappings (#341) ----------------------------------
+
+    #[test]
+    fn custom_label_round_trips_through_parse_custom_label() {
+        assert_eq!(parse_custom_label(&custom_label("999")), Some("999"));
+        assert_eq!(
+            parse_custom_label(&custom_label("extreme")),
+            Some("extreme")
+        );
+    }
+
+    #[test]
+    fn parse_custom_label_rejects_a_plain_preset_label() {
+        assert_eq!(parse_custom_label("Fast"), None);
+        assert_eq!(parse_custom_label(""), None);
+    }
+
+    #[test]
+    fn effort_display_round_trips_for_all_presets() {
+        for value in EFFORT_VALUES {
+            let label = effort_display(value);
+            assert_eq!(label_to_effort(&label), Some(value.to_string()));
+        }
+    }
+
+    // Review of #341: an off-preset value (a hand-edited config.toml) must
+    // never be silently rounded to a preset -- an untouched Save has to
+    // write back the exact original value.
+    #[test]
+    fn effort_display_of_an_unrecognized_value_is_an_honest_custom_label() {
+        assert_eq!(effort_display("extreme"), "Custom (extreme)");
+        assert_eq!(
+            label_to_effort("Custom (extreme)"),
+            Some("extreme".to_string())
+        );
+    }
+
+    #[test]
+    fn label_to_effort_rejects_unknown_text() {
+        assert_eq!(label_to_effort(""), None);
+        assert_eq!(label_to_effort("low"), None); // the internal token itself is not a label
+    }
+
+    #[test]
+    fn max_edge_display_round_trips_for_all_presets() {
+        for value in MAX_EDGE_VALUES {
+            let label = max_edge_display(value);
+            assert_eq!(label_to_max_edge(&label), Some(value));
+        }
+    }
+
+    #[test]
+    fn max_edge_display_of_an_unrecognized_value_is_an_honest_custom_label() {
+        assert_eq!(max_edge_display(999), "Custom (999)");
+        assert_eq!(label_to_max_edge("Custom (999)"), Some(999));
+        assert_eq!(max_edge_display(3000), "Custom (3000)");
+        assert_eq!(label_to_max_edge("Custom (3000)"), Some(3000));
+    }
+
+    #[test]
+    fn label_to_max_edge_rejects_unknown_text() {
+        assert_eq!(label_to_max_edge(""), None);
+        assert_eq!(label_to_max_edge("2048"), None); // the raw number is not a label
+        assert_eq!(label_to_max_edge("Custom (not a number)"), None);
+    }
+
+    #[test]
+    fn monitor_display_round_trips_for_all_presets() {
+        for value in MONITOR_VALUES {
+            let label = monitor_display(value);
+            assert_eq!(label_to_monitor(&label), Some(value.to_string()));
+        }
+    }
+
+    #[test]
+    fn monitor_display_of_an_unrecognized_value_is_an_honest_custom_label() {
+        assert_eq!(monitor_display("laptop-lid"), "Custom (laptop-lid)");
+        assert_eq!(
+            label_to_monitor("Custom (laptop-lid)"),
+            Some("laptop-lid".to_string())
+        );
+    }
+
+    #[test]
+    fn label_to_monitor_rejects_unknown_text() {
+        assert_eq!(label_to_monitor(""), None);
+        assert_eq!(label_to_monitor("active"), None); // the internal token itself is not a label
+    }
+
+    #[test]
+    fn build_config_round_trips_effort_max_edge_and_monitor_labels() {
+        let mut original = Config::default();
+        original.providers.openai.effort = "high".to_string();
+        original.providers.anthropic.effort = "low".to_string();
+        original.capture.max_edge = 2048;
+        original.capture.monitor = "primary".to_string();
+
+        let raw = raw_from(&original);
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.openai.effort, "high");
+        assert_eq!(cfg.providers.anthropic.effort, "low");
+        assert_eq!(cfg.capture.max_edge, 2048);
+        assert_eq!(cfg.capture.monitor, "primary");
+    }
+
+    // Review of #341 (data loss): with an off-preset value in all three
+    // fields, an untouched Save (raw built straight from `raw_from`, as
+    // `read_raw_form` would from the combo's own selected "Custom (...)"
+    // entry) must reproduce the exact original values, not the nearest or
+    // default preset.
+    #[test]
+    fn build_config_round_trips_exact_off_preset_values_untouched() {
+        let mut original = Config::default();
+        original.providers.openai.effort = "extreme".to_string();
+        original.providers.anthropic.effort = "barely".to_string();
+        original.capture.max_edge = 999;
+        original.capture.monitor = "laptop-lid".to_string();
+
+        let raw = raw_from(&original);
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.openai.effort, "extreme");
+        assert_eq!(cfg.providers.anthropic.effort, "barely");
+        assert_eq!(cfg.capture.max_edge, 999);
+        assert_eq!(cfg.capture.monitor, "laptop-lid");
+    }
+
+    // Review of #341: picking an actual preset instead must still change
+    // the off-preset value to that exact preset (this is not a "never
+    // change a custom value" rule -- choosing a preset is a real edit).
+    #[test]
+    fn build_config_applies_a_chosen_preset_over_an_off_preset_original() {
+        let mut original = Config::default();
+        original.providers.openai.effort = "extreme".to_string();
+        original.capture.max_edge = 999;
+        original.capture.monitor = "laptop-lid".to_string();
+
+        let mut raw = raw_from(&original);
+        raw.openai_effort = "Thorough".to_string();
+        raw.max_edge_text = MAX_EDGE_VALUES[3].to_string(); // "Maximum" preset
+        raw.monitor = "The main display".to_string();
+
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.openai.effort, "high");
+        assert_eq!(cfg.capture.max_edge, 2048);
+        assert_eq!(cfg.capture.monitor, "primary");
+    }
+
+    // -- require_tick_for (#403) ------------------------------------------
+
+    #[test]
+    fn require_tick_for_label_round_trips_for_all_variants() {
+        for value in [
+            RequireTickFor::All,
+            RequireTickFor::Sensitive,
+            RequireTickFor::None,
+        ] {
+            let label = require_tick_for_label(value);
+            assert_eq!(label_to_require_tick_for(label), Some(value));
+        }
+    }
+
+    #[test]
+    fn label_to_require_tick_for_rejects_unknown_text() {
+        assert_eq!(label_to_require_tick_for(""), None);
+        assert_eq!(label_to_require_tick_for("garbage"), None);
+    }
+
+    #[test]
+    fn build_config_round_trips_require_tick_for_through_all_three_variants() {
+        for value in [
+            RequireTickFor::All,
+            RequireTickFor::Sensitive,
+            RequireTickFor::None,
+        ] {
+            let mut original = Config::default();
+            original.forms.require_tick_for = value;
+            let raw = raw_from(&original);
+            let cfg = build_config(&original, &raw);
+            assert_eq!(cfg.forms.require_tick_for, value);
+        }
+    }
+
+    #[test]
+    fn build_config_falls_back_to_original_require_tick_for_on_blank_selection() {
+        let mut original = Config::default();
+        original.forms.require_tick_for = RequireTickFor::All;
+        let mut raw = raw_from(&original);
+        raw.require_tick_for = String::new();
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.forms.require_tick_for, RequireTickFor::All);
     }
 
     #[test]
@@ -2482,6 +3316,84 @@ mod tests {
     #[test]
     fn to_px_scales_up_at_250_percent() {
         assert_eq!(to_px(100, 240), 250);
+    }
+
+    // -- prompt_footer_layout (issue #340) -------------------------------
+    // The bug: Save/Cancel are placed from `win_h_dp` alone while the
+    // Prompt group's top comes from the fixed content above it, so a
+    // shrunk `win_h_dp` (high DPI, small monitor) can put the footer
+    // above the Prompt box's actual bottom. These assert the invariant
+    // directly: the reset button (the Prompt group's lowest control) must
+    // always end above the Save/Cancel row, at both 96dpi's un-shrunk
+    // window and 144dpi's (150%) shrunk one.
+
+    /// The y where the Prompt group starts on a real Settings window: the
+    /// bottom of the last fixed group (Forms, #403) plus `GROUP_GAP`.
+    /// Hand-computed from the constants that drive `build_ui`'s
+    /// Providers/Ollama/General/Capture/Card sections with `Config::default()`
+    /// (5 + 0 + 4 + 1 + 2 rows respectively, giving 640 -- see git blame for
+    /// that derivation), plus the #403 Forms group added after Card and
+    /// before Prompt: one row, so its own height is
+    /// `GROUP_LABEL_TOP + (ROW_H + ROW_GAP) + 4` (the same `label + rows +
+    /// bottom padding` shape every other group in `build_ui` uses) `=
+    /// 20 + 30 + 4 = 54`, plus the `GROUP_GAP` (14) that already separated
+    /// Card from whatever came next `= 640 + 54 + 14 = 708`. #341 then added
+    /// one more row to the *Capture* group itself (the "higher reads small
+    /// text better, costs more" hint under Screenshot detail/Screen), which
+    /// shifts every group below it, including Forms, down by one
+    /// `ROW_H + ROW_GAP = 30`: `708 + 30 = 738`. Kept here as a literal, not
+    /// derived, so a change to those sections has to update this test
+    /// deliberately rather than silently keep passing against a moving
+    /// target.
+    const CONTENT_TOP_DP: i32 = 738;
+
+    fn footer_does_not_overlap(win_h_dp: i32) -> bool {
+        let footer = prompt_footer_layout(CONTENT_TOP_DP, win_h_dp);
+        let reset_btn_bottom = footer.reset_btn_y + BTN_H;
+        reset_btn_bottom <= footer.buttons_y && footer.prompt_bottom <= footer.buttons_y
+    }
+
+    #[test]
+    fn footer_does_not_overlap_prompt_at_96_dpi_full_height() {
+        // 96dpi (100%), `fitted_height_dp` leaves the window at its full
+        // design height.
+        assert!(footer_does_not_overlap(WIN_H_DP));
+    }
+
+    #[test]
+    fn footer_does_not_overlap_prompt_at_144_dpi_shrunk_height() {
+        // 144dpi (150%) on a 1080p screen: `fitted_height_dp` shrinks the
+        // window to roughly 645dp of usable client height (MEASURED via
+        // the same formula `fitted_height_dp` uses, for a ~1040px-tall work
+        // area at 144dpi: (1040*96/144) - 48 ~= 645), well below
+        // `CONTENT_TOP_DP`. This is the exact shape of issue #340's
+        // screenshot.
+        assert!(footer_does_not_overlap(645));
+    }
+
+    #[test]
+    fn footer_does_not_overlap_prompt_at_the_configured_minimum_height() {
+        assert!(footer_does_not_overlap(MIN_WIN_H_DP));
+    }
+
+    #[test]
+    fn footer_sits_flush_with_the_window_bottom_when_there_is_room() {
+        // Unchanged from the pre-#340 behaviour when the window is tall
+        // enough: Save/Cancel hug the bottom edge rather than floating
+        // higher than necessary. Even `WIN_H_DP` (918, raised by #403's
+        // Forms group and #341's Capture hint line) is not tall enough for
+        // `CONTENT_TOP_DP` (738) plus the Prompt group's minimum (issue
+        // #340's underlying finding: the original design height never
+        // actually had room for its own content -- see `MIN_WIN_H_DP`'s
+        // comment), so this uses a window tall enough to exercise the
+        // "plenty of room" branch specifically. Needs
+        // `win_h_dp - buttons_h >= CONTENT_TOP_DP + min_prompt_group_h`
+        // (738 + 138 = 876, so > 936) to actually land in the flush branch
+        // rather than the minimum-height one; 950 gives headroom.
+        let roomy_win_h_dp = 950;
+        let footer = prompt_footer_layout(CONTENT_TOP_DP, roomy_win_h_dp);
+        let buttons_h = BTN_H + MARGIN * 2;
+        assert_eq!(footer.buttons_y, roomy_win_h_dp - buttons_h + MARGIN);
     }
 
     // -- window smoke test ----------------------------------------------

@@ -1,0 +1,84 @@
+# Path-based area labels for actions/labeler v5 (see
+# .github/workflows/triage.yml). v5's config shape is
+# <label>:\n- changed-files:\n  - any-glob-to-any-file: [...]
+# (a v4 flat glob list under the label is rejected). Kept close to src/'s own
+# module layout; update both together.
+
+area:actions:
+- changed-files:
+  - any-glob-to-any-file:
+    - src/actions/**
+    - src/actions_example.rs
+    - src/router.rs
+    - src/calc/**
+
+area:executors:
+- changed-files:
+  - any-glob-to-any-file:
+    - src/executors/**
+    - src/profile/**
+
+area:connectors:
+- changed-files:
+  - any-glob-to-any-file:
+    - src/connectors/**
+
+area:providers:
+- changed-files:
+  - any-glob-to-any-file:
+    - src/provider/**
+    - src/egress.rs
+
+area:ui:
+- changed-files:
+  - any-glob-to-any-file:
+    - src/ui/**
+
+area:inputs:
+- changed-files:
+  - any-glob-to-any-file:
+    - src/inputs/**
+    - src/capture.rs
+    - src/ocr.rs
+    - src/hotkey.rs
+    - src/hotkey_conflicts.rs
+
+area:packaging:
+- changed-files:
+  - any-glob-to-any-file:
+    - packaging/**
+    - install.ps1
+    - uninstall.ps1
+    - '*.wapproj'
+    - AppxManifest.xml.in
+
+area:docs:
+- changed-files:
+  - any-glob-to-any-file:
+    - docs/**
+    - '**/*.md'
+
+area:ci:
+- changed-files:
+  - any-glob-to-any-file:
+    - .github/**
+    - scripts/hooks/**
+    - scripts/verify-all.sh
+
+area:core:
+- changed-files:
+  - any-glob-to-any-file:
+    - src/app.rs
+    - src/config.rs
+    - src/config_example.rs
+    - src/mode.rs
+    - src/secrets.rs
+    - src/dpapi.rs
+    - src/single_instance.rs
+    - src/autostart.rs
+    - src/known_folder.rs
+    - src/pause.rs
+    - src/dismiss.rs
+    - src/diagnostics.rs
+    - src/payment_denylist.rs
+    - src/main.rs

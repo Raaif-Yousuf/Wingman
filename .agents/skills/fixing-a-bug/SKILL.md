@@ -38,7 +38,8 @@ State the symptom as an assertion a user would recognise:
 
 **If you cannot write a failing test from the symptom, that IS the finding.**
 Win32 behaviour often cannot be reached from `cargo test`. Say so, name the
-manual reproduction, and add it to `NEXT_SESSION.md`. Then narrow first and
+manual reproduction in a comment on the issue, and add the
+`needs-manual-check` label. Then narrow first and
 come back. Do not skip to fixing because the test was awkward.
 
 ## 2. Watch it fail, and READ the failure

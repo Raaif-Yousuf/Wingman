@@ -16,7 +16,7 @@
 //! `app.rs`'s wiring call. [`run_on_selection`] adds the one Win32-touching
 //! step (reading the current selection via `inputs::selection`) behind an
 //! injectable trait, so the offline-evaluation logic above stays testable
-//! with no selection/clipboard/UIA involved at all (CLAUDE.md rule 8/9).
+//! with no selection/clipboard/UIA involved at all (AGENTS.md rule 8/9).
 
 pub mod expr;
 pub mod units;
@@ -151,7 +151,7 @@ fn format_significant(x: f64, sig: usize) -> String {
 /// Seam between [`run_on_selection`] and the real selected text, so the
 /// pipeline (trim/empty-check/evaluate/format) is exercised with an
 /// injectable string instead of the real UIA/clipboard round trip
-/// (`inputs::selection::get_selection_foreground`) -- CLAUDE.md rule 8/9:
+/// (`inputs::selection::get_selection_foreground`) -- AGENTS.md rule 8/9:
 /// Win32 stays out of this module's own tests.
 pub trait SelectionSource {
     /// Returns the selected text, or `Ok(None)` for "nothing selected"
@@ -200,7 +200,7 @@ pub enum SelectionCalcOutcome {
 /// Pure logic ([`evaluate`], [`format_significant`]) is exercised directly
 /// by this module's other tests; this function's own tests use a fake
 /// [`SelectionSource`], so no real UIA/clipboard round trip runs in
-/// automated tests (CLAUDE.md rule 9).
+/// automated tests (AGENTS.md rule 9).
 pub fn run_on_selection(source: &impl SelectionSource) -> SelectionCalcOutcome {
     let text = match source.selected_text() {
         Ok(Some(text)) if !text.trim().is_empty() => text,
@@ -226,6 +226,24 @@ mod tests {
         let result = evaluate("3.5 mi in km").unwrap();
         assert!(matches!(result, CalcResult::Conversion { .. }));
         assert_eq!(result.headline(), "3.5 mi = 5.633 km");
+    }
+
+    #[test]
+    fn in_as_source_unit_routes_to_units_end_to_end() {
+        // Issue #274: "5 in to cm" must resolve "in" as inches, not fail to
+        // parse as a conversion query at all.
+        let result = evaluate("5 in to cm").unwrap();
+        assert!(matches!(result, CalcResult::Conversion { .. }));
+        assert_eq!(result.headline(), "5 in = 12.7 cm");
+    }
+
+    #[test]
+    fn ton_end_to_end_is_the_us_short_ton() {
+        // Issue #275: a bare "ton" is the US short ton (907.18474 kg), not
+        // the metric tonne.
+        let result = evaluate("1 ton to kg").unwrap();
+        assert!(matches!(result, CalcResult::Conversion { .. }));
+        assert_eq!(result.headline(), "1 ton = 907.2 kg");
     }
 
     #[test]

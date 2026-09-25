@@ -1,6 +1,7 @@
 //! Issue #115: unit conversion, `"<number> <unit> in|to <unit>"`, no model
 //! involved. Length, mass, volume, temperature (affine, not a linear
-//! factor), time, data (decimal KB vs. binary KiB), speed and area.
+//! factor), time, data (decimal KB vs. binary KiB), speed, area, energy
+//! (issue #316) and pressure (issue #316).
 //!
 //! Every non-temperature dimension converts through a fixed base unit (a
 //! plain multiplicative factor); temperature is the one dimension that needs
@@ -21,6 +22,8 @@ pub enum Dimension {
     Data,
     Speed,
     Area,
+    Energy,
+    Pressure,
 }
 
 impl fmt::Display for Dimension {
@@ -34,6 +37,8 @@ impl fmt::Display for Dimension {
             Dimension::Data => "data",
             Dimension::Speed => "speed",
             Dimension::Area => "area",
+            Dimension::Energy => "energy",
+            Dimension::Pressure => "pressure",
         };
         write!(f, "{s}")
     }
@@ -107,8 +112,14 @@ fn units_table() -> &'static [UnitDef] {
             linear_unit!(&["kg", "kilogram", "kilograms"], Mass, 1.0),
             linear_unit!(&["lb", "lbs", "pound", "pounds"], Mass, 0.45359237),
             linear_unit!(&["oz", "ounce", "ounces"], Mass, 0.028349523125),
+            // US short ton: 2000 lb = 907.18474 kg. Kept separate from the
+            // metric tonne below so a bare "ton"/"tons" is unambiguous
+            // (issue #275) -- every other Length/Mass/Volume/Speed entry in
+            // this table is US-customary, so a bare "ton" should mean the
+            // US ton, not silently resolve to the metric definition.
+            linear_unit!(&["ton", "tons", "short ton", "short tons"], Mass, 907.18474),
             linear_unit!(
-                &["ton", "tonne", "tonnes", "metric ton", "metric tons"],
+                &["tonne", "tonnes", "metric ton", "metric tons", "t"],
                 Mass,
                 1000.0
             ),
@@ -182,6 +193,30 @@ fn units_table() -> &'static [UnitDef] {
             ),
             linear_unit!(&["acre", "acres"], Area, 4046.8564224),
             linear_unit!(&["hectare", "hectares", "ha"], Area, 10_000.0),
+            // -- Energy (base: joule; factors NIST SP 811) -----------------------
+            linear_unit!(&["j", "joule", "joules"], Energy, 1.0),
+            linear_unit!(&["kj", "kilojoule", "kilojoules"], Energy, 1000.0),
+            // Thermochemical calorie, NIST SP 811: 1 cal = 4.184 J.
+            linear_unit!(&["cal", "calorie", "calories"], Energy, 4.184),
+            // Food "Calorie" is a kilocalorie: 1 kcal = 4184 J.
+            linear_unit!(&["kcal", "kilocalorie", "kilocalories"], Energy, 4184.0),
+            linear_unit!(&["wh", "watt hour", "watt hours"], Energy, 3600.0),
+            linear_unit!(
+                &["kwh", "kilowatt hour", "kilowatt hours"],
+                Energy,
+                3_600_000.0
+            ),
+            // British thermal unit (IT), NIST SP 811: 1 BTU = 1055.05585262 J.
+            linear_unit!(&["btu"], Energy, 1055.05585262),
+            // -- Pressure (base: pascal; factors NIST SP 811) --------------------
+            linear_unit!(&["pa", "pascal", "pascals"], Pressure, 1.0),
+            linear_unit!(&["kpa", "kilopascal", "kilopascals"], Pressure, 1000.0),
+            linear_unit!(&["bar", "bars"], Pressure, 100_000.0),
+            // 1 psi = 6894.757293168... Pa (NIST SP 811).
+            linear_unit!(&["psi"], Pressure, 6894.757293168361),
+            linear_unit!(&["atm", "atmosphere", "atmospheres"], Pressure, 101_325.0),
+            // 1 mmHg = 133.322387415 Pa (NIST SP 811, conventional mmHg).
+            linear_unit!(&["mmhg"], Pressure, 133.322387415),
             // -- Temperature (base: kelvin, affine) -----------------------------
             UnitDef {
                 aliases: &["c", "celsius"],
@@ -230,6 +265,11 @@ pub enum UnitError {
         to_unit: String,
         to_dim: Dimension,
     },
+    /// The input value, or the converted result, is NaN or infinite
+    /// (issue #245): `f64::from_str` accepts "nan"/"inf"/"infinity"
+    /// literals and silently rounds an overflowing decimal to infinity, so
+    /// this is caught explicitly rather than letting it reach a card.
+    NotANumber,
 }
 
 impl fmt::Display for UnitError {
@@ -245,6 +285,7 @@ impl fmt::Display for UnitError {
                 f,
                 "Can't convert {from_unit} ({from_dim}) to {to_unit} ({to_dim})."
             ),
+            UnitError::NotANumber => write!(f, "That isn't a finite number I can convert."),
         }
     }
 }
@@ -252,6 +293,9 @@ impl fmt::Display for UnitError {
 /// Converts `value` from `from` to `to`. Both are matched case-insensitively
 /// against [`units_table`]'s aliases.
 pub fn convert(value: f64, from: &str, to: &str) -> Result<f64, UnitError> {
+    if !value.is_finite() {
+        return Err(UnitError::NotANumber);
+    }
     let from_def = find_unit(from).ok_or_else(|| UnitError::UnknownUnit(from.to_string()))?;
     let to_def = find_unit(to).ok_or_else(|| UnitError::UnknownUnit(to.to_string()))?;
     if from_def.dimension != to_def.dimension {
@@ -263,7 +307,11 @@ pub fn convert(value: f64, from: &str, to: &str) -> Result<f64, UnitError> {
         });
     }
     let base = (from_def.to_base)(value);
-    Ok((to_def.from_base)(base))
+    let result = (to_def.from_base)(base);
+    if !result.is_finite() {
+        return Err(UnitError::NotANumber);
+    }
+    Ok(result)
 }
 
 /// One `"<number> <unit> in|to <unit>"` query, already split apart -- pure
@@ -291,19 +339,38 @@ pub fn parse_conversion_query(input: &str) -> Option<ParsedConversion> {
     if tokens.len() < 3 {
         return None;
     }
-    let sep_idx = tokens
-        .iter()
-        .position(|t| t.eq_ignore_ascii_case("in") || t.eq_ignore_ascii_case("to"))?;
-    if sep_idx == 0 || sep_idx == tokens.len() - 1 {
-        return None;
-    }
     let value = parse_leading_number(tokens[0])?;
-    let from = tokens[1..sep_idx].join(" ");
-    let to = tokens[sep_idx + 1..].join(" ");
-    if from.is_empty() || to.is_empty() {
-        return None;
+
+    // Issue #274: "in" is both the separator word and a valid unit alias
+    // (inches), so the FIRST "in"/"to" token isn't always the real
+    // separator -- e.g. "5 in to cm" has "in" as the source unit and "to"
+    // as the separator. Walk every candidate separator position in order;
+    // prefer the first split whose "from" side resolves to a known unit,
+    // and fall back to the first non-empty split (the old behaviour) if
+    // none does, so an unrecognized unit is still reported by `convert`,
+    // not silently swallowed here.
+    let mut fallback: Option<(String, String)> = None;
+    for (i, t) in tokens.iter().enumerate().skip(1) {
+        if !(t.eq_ignore_ascii_case("in") || t.eq_ignore_ascii_case("to")) {
+            continue;
+        }
+        let sep_idx = i;
+        if sep_idx == tokens.len() - 1 {
+            continue;
+        }
+        let from = tokens[1..sep_idx].join(" ");
+        let to = tokens[sep_idx + 1..].join(" ");
+        if from.is_empty() || to.is_empty() {
+            continue;
+        }
+        if fallback.is_none() {
+            fallback = Some((from.clone(), to.clone()));
+        }
+        if find_unit(&from).is_some() {
+            return Some(ParsedConversion { value, from, to });
+        }
     }
-    Some(ParsedConversion { value, from, to })
+    fallback.map(|(from, to)| ParsedConversion { value, from, to })
 }
 
 /// Parses one whitespace-free numeric token: decimals, thousands separators
@@ -315,7 +382,15 @@ pub fn parse_conversion_query(input: &str) -> Option<ParsedConversion> {
 /// digit-scanning).
 fn parse_leading_number(token: &str) -> Option<f64> {
     let cleaned: String = token.chars().filter(|&c| c != ',').collect();
-    cleaned.parse::<f64>().ok()
+    let value = cleaned.parse::<f64>().ok()?;
+    // Issue #245: `f64::from_str` accepts "nan"/"inf"/"infinity" literals
+    // and silently rounds an overflowing decimal (e.g. "1e400") to
+    // infinity rather than erroring; reject both so a non-finite value
+    // never reaches `ParsedConversion`.
+    if !value.is_finite() {
+        return None;
+    }
+    Some(value)
 }
 
 #[cfg(test)]
@@ -350,6 +425,20 @@ mod tests {
             (100.0, "kmh", "mph", 62.13711922),
             (1.0, "sqkm", "sqm", 1_000_000.0),
             (1.0, "acre", "sqm", 4046.8564224),
+            // -- Energy (from issue #316) -----------------------------------
+            (1.0, "kcal", "j", 4184.0),
+            (1.0, "kwh", "j", 3_600_000.0),
+            (1.0, "cal", "j", 4.184),
+            (1.0, "j", "cal", 1.0 / 4.184),
+            (1.0, "kj", "j", 1000.0),
+            (1.0, "wh", "j", 3600.0),
+            (1.0, "kwh", "kcal", 3_600_000.0 / 4184.0),
+            (1.0, "btu", "j", 1055.05585262),
+            // -- Pressure (from issue #316) ----------------------------------
+            (1.0, "bar", "pa", 100_000.0),
+            (1.0, "atm", "pa", 101325.0),
+            (1.0, "kpa", "pa", 1000.0),
+            (1.0, "mmhg", "pa", 133.322387415),
         ];
         for (value, from, to, expected) in cases {
             let got = convert(*value, from, to)
@@ -358,6 +447,67 @@ mod tests {
                 close(got, *expected),
                 "{value} {from} -> {to}: expected {expected}, got {got}"
             );
+        }
+    }
+
+    #[test]
+    fn energy_and_pressure_brief_examples() {
+        // 1 kcal is 4184 J.
+        assert!(close(convert(1.0, "kcal", "j").unwrap(), 4184.0));
+        // 1 kWh is 3.6e6 J.
+        assert!(close(convert(1.0, "kwh", "j").unwrap(), 3.6e6));
+        // 1 bar is 14.5038 psi (to 4 decimal places).
+        let bar_to_psi = convert(1.0, "bar", "psi").unwrap();
+        assert_eq!((bar_to_psi * 10_000.0).round() / 10_000.0, 14.5038);
+        // 1 atm is 101325 Pa.
+        assert!(close(convert(1.0, "atm", "pa").unwrap(), 101_325.0));
+        // 5 kg in psi is a clear error, not a number.
+        let err = convert(5.0, "kg", "psi").unwrap_err();
+        assert!(matches!(err, UnitError::IncompatibleDimensions { .. }));
+    }
+
+    #[test]
+    fn kcal_and_kwh_round_trip() {
+        let out = convert(10.0, "kcal", "kwh").unwrap();
+        let back = convert(out, "kwh", "kcal").unwrap();
+        assert!(close(back, 10.0), "kcal<->kwh round trip: got {back}");
+    }
+
+    #[test]
+    fn psi_and_bar_round_trip() {
+        let out = convert(10.0, "psi", "bar").unwrap();
+        let back = convert(out, "bar", "psi").unwrap();
+        assert!(close(back, 10.0), "psi<->bar round trip: got {back}");
+    }
+
+    #[test]
+    fn energy_and_pressure_are_separate_dimensions() {
+        let err = convert(1.0, "psi", "kcal").unwrap_err();
+        assert!(matches!(err, UnitError::IncompatibleDimensions { .. }));
+        let err = convert(1.0, "kcal", "psi").unwrap_err();
+        assert!(matches!(err, UnitError::IncompatibleDimensions { .. }));
+    }
+
+    #[test]
+    fn cal_and_kcal_do_not_collide() {
+        // "kcal" must resolve as one unit, not "k" (kelvin) + "cal".
+        assert!(find_unit("kcal").is_some());
+        assert_eq!(find_unit("kcal").unwrap().dimension, Dimension::Energy);
+        assert_eq!(find_unit("cal").unwrap().dimension, Dimension::Energy);
+        // The two units convert differently: 1 kcal != 1 cal in joules.
+        let kcal_j = convert(1.0, "kcal", "j").unwrap();
+        let cal_j = convert(1.0, "cal", "j").unwrap();
+        assert!((kcal_j - cal_j).abs() > 1.0);
+    }
+
+    #[test]
+    fn bar_does_not_collide_with_other_units() {
+        assert_eq!(find_unit("bar").unwrap().dimension, Dimension::Pressure);
+        // "bar" is not accidentally an alias of any other existing unit.
+        for u in units_table() {
+            if u.dimension != Dimension::Pressure {
+                assert!(!u.aliases.contains(&"bar"));
+            }
         }
     }
 
@@ -446,5 +596,142 @@ mod tests {
     #[test]
     fn non_numeric_leading_token_is_not_a_query() {
         assert_eq!(parse_conversion_query("bananas mi in km"), None);
+    }
+
+    // -- issue #274: "in" (inches) as the source unit -------------------------
+
+    #[test]
+    fn in_as_source_unit_before_to_separator() {
+        // "5 in to cm": the FIRST "in" is the source unit (inches), not the
+        // separator; "to" is the real separator.
+        let parsed = parse_conversion_query("5 in to cm").unwrap();
+        assert_eq!(parsed.value, 5.0);
+        assert_eq!(parsed.from, "in");
+        assert_eq!(parsed.to, "cm");
+    }
+
+    #[test]
+    fn in_as_source_unit_before_in_separator() {
+        // "5 in in cm": first "in" is the unit, second "in" is the separator.
+        let parsed = parse_conversion_query("5 in in cm").unwrap();
+        assert_eq!(parsed.value, 5.0);
+        assert_eq!(parsed.from, "in");
+        assert_eq!(parsed.to, "cm");
+    }
+
+    #[test]
+    fn in_as_target_unit_still_works() {
+        // "5 m in in": "in" (separator) then "in" (target unit, inches).
+        let parsed = parse_conversion_query("5 m in in").unwrap();
+        assert_eq!(parsed.value, 5.0);
+        assert_eq!(parsed.from, "m");
+        assert_eq!(parsed.to, "in");
+    }
+
+    #[test]
+    fn spelled_out_inches_still_works() {
+        let parsed = parse_conversion_query("5 inches in cm").unwrap();
+        assert_eq!(parsed.from, "inches");
+        assert_eq!(parsed.to, "cm");
+        let parsed = parse_conversion_query("5 inches to cm").unwrap();
+        assert_eq!(parsed.from, "inches");
+        assert_eq!(parsed.to, "cm");
+    }
+
+    #[test]
+    fn word_containing_in_is_not_mistaken_for_the_separator() {
+        // "inside" is not "in"; this should still find the real "in"/"to"
+        // separator and not treat "inside" as one.
+        assert_eq!(parse_conversion_query("5 inside cm"), None);
+    }
+
+    #[test]
+    fn in_to_cm_end_to_end_conversion() {
+        let parsed = parse_conversion_query("5 in to cm").unwrap();
+        let out = convert(parsed.value, &parsed.from, &parsed.to).unwrap();
+        assert!(close(out, 12.7), "5 in to cm: got {out}");
+    }
+
+    // -- issue #275: "ton"/"tons" must be the US short ton, unambiguous -------
+
+    #[test]
+    fn ton_is_the_us_short_ton_not_the_metric_tonne() {
+        // 1 short ton = 907.18474 kg, NOT 1000 kg.
+        let got = convert(1.0, "ton", "kg").unwrap();
+        assert!(close(got, 907.18474), "1 ton -> kg: got {got}");
+    }
+
+    #[test]
+    fn tons_plural_is_a_recognized_alias() {
+        let singular = convert(1.0, "ton", "kg").unwrap();
+        let plural = convert(1.0, "tons", "kg").unwrap();
+        assert!(close(singular, plural));
+    }
+
+    #[test]
+    fn tonne_stays_the_metric_tonne() {
+        let got = convert(1.0, "tonne", "kg").unwrap();
+        assert!(close(got, 1000.0), "1 tonne -> kg: got {got}");
+        let got = convert(1.0, "tonnes", "kg").unwrap();
+        assert!(close(got, 1000.0));
+        let got = convert(1.0, "metric ton", "kg").unwrap();
+        assert!(close(got, 1000.0));
+        let got = convert(1.0, "metric tons", "kg").unwrap();
+        assert!(close(got, 1000.0));
+    }
+
+    #[test]
+    fn ton_and_tonne_are_unambiguously_different() {
+        let ton_kg = convert(1.0, "ton", "kg").unwrap();
+        let tonne_kg = convert(1.0, "tonne", "kg").unwrap();
+        assert!((ton_kg - tonne_kg).abs() > 1.0);
+    }
+
+    // -- issue #245: reject NaN/Infinity literals and non-finite results ------
+
+    #[test]
+    fn nan_literal_is_not_a_conversion_query() {
+        assert_eq!(parse_conversion_query("nan m in km"), None);
+    }
+
+    #[test]
+    fn infinity_literal_is_not_a_conversion_query() {
+        assert_eq!(parse_conversion_query("inf m in km"), None);
+        assert_eq!(parse_conversion_query("infinity m in km"), None);
+    }
+
+    #[test]
+    fn overflowing_literal_is_not_a_conversion_query() {
+        // 1e400 overflows f64::from_str to +inf rather than erroring.
+        assert_eq!(parse_conversion_query("1e400 m in km"), None);
+    }
+
+    #[test]
+    fn convert_rejects_nan_input() {
+        let err = convert(f64::NAN, "m", "km").unwrap_err();
+        assert!(matches!(err, UnitError::NotANumber));
+    }
+
+    #[test]
+    fn convert_rejects_infinite_input() {
+        let err = convert(f64::INFINITY, "m", "km").unwrap_err();
+        assert!(matches!(err, UnitError::NotANumber));
+        let err = convert(f64::NEG_INFINITY, "m", "km").unwrap_err();
+        assert!(matches!(err, UnitError::NotANumber));
+    }
+
+    #[test]
+    fn convert_still_accepts_finite_values() {
+        assert!(convert(5.0, "m", "km").is_ok());
+        assert!(convert(0.0, "m", "km").is_ok());
+        assert!(convert(-5.0, "m", "km").is_ok());
+    }
+
+    #[test]
+    fn not_a_number_error_ends_in_a_card_worthy_message() {
+        let err = convert(f64::NAN, "m", "km").unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.is_empty());
+        assert!(!msg.contains('\u{2014}'), "no em dashes in card text");
     }
 }

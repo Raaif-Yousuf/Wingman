@@ -57,5 +57,5 @@ Record it per Hard Rule 10: `MEASURED <date>:` with the observation, or
 
 Say which observable you checked and what it showed. If you could not check one
 (no live key, no Ollama running, cannot press the Copilot key from a script)
-**say that plainly** and put the manual check in `NEXT_SESSION.md` with what
-passing looks like. "Tests pass" is not evidence that a feature is reachable.
+**say that plainly**, comment the manual check on the issue with what
+passing looks like, and add the `needs-manual-check` label. "Tests pass" is not evidence that a feature is reachable.

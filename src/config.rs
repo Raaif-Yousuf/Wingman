@@ -12,6 +12,96 @@ use crate::provider::{
 };
 use crate::secrets::{target_name, CredManagerStore, SecretStore};
 
+/// Overwrites `s`'s bytes with zero before truncating it to empty, mirroring
+/// `dpapi::zeroize` (issue #258). `String::clear()` alone only resets the
+/// length to 0; the byte content stays live in the still-allocated buffer,
+/// so a bare `.clear()` on a field that held a plaintext API key leaves the
+/// key readable in that buffer until an unrelated allocation reuses and
+/// overwrites it.
+fn zeroize_string(s: &mut String) {
+    // SAFETY: mid-loop, `dpapi::zeroize` can leave `s` transiently invalid
+    // UTF-8 (zeroing a multi-byte char's lead byte orphans its continuation
+    // bytes), but no `String` method observes the buffer between these raw
+    // writes and the `clear()` right below, and the final all-zero state
+    // (every byte 0x00, i.e. all NUL) is itself valid UTF-8.
+    unsafe {
+        crate::dpapi::zeroize(s.as_bytes_mut());
+    }
+    s.clear();
+}
+
+/// A previous shipped value of `provider::DEFAULT_PROMPT`, identified only by
+/// its normalized hash (see [`hash_prompt_for_migration`]), plus the commit
+/// that introduced it -- for `repair_stale_default_prompt`'s issue #412
+/// migration. Never store the prompt text itself here: the whole point is
+/// that the *hash* is what stays small as this list grows over releases.
+///
+/// No hashing crate is a dependency of this project (Cargo.toml has none),
+/// and issue #412 asked not to add one just for this, so this uses a plain
+/// inline FNV-1a 64-bit hash instead of a cryptographic one. That is fine
+/// here: the only threat model is "did this config ever hold this exact
+/// shipped string", not an adversary trying to forge a collision.
+const OLD_DEFAULT_PROMPT_HASHES: &[(u64, &str)] = &[
+    // e35e16e ("copilot-ask: Copilot-key screenshot to LLM verdict in the
+    // tray") through 98274d8 ("GUI settings, difficulty rating, provider
+    // switch, autostart"): the original prompt, before #299's
+    // reasoning_extraction fix replaced "This is your scratchpad -- reason
+    // it out before committing to a verdict." (repair_refusal_trigger
+    // already handles a prompt that only has that sentence changed by hand;
+    // this entry is for a config that still has the entire original default
+    // untouched).
+    (0xe7eb1d1ed8ce7d74, "e35e16e/98274d8"),
+    // The e35e16e/98274d8 default as it sits on disk after an *earlier*
+    // launch already ran `repair_refusal_trigger` on it (#299) -- that
+    // repair rewrites the trigger sentence in place, leaving the rest of
+    // the e35e16e/98274d8 text untouched, so a config that was live before
+    // #412 shipped can have this exact text, not the pristine original
+    // above. Verified equal to `repair_refusal_trigger` applied to the
+    // e35e16e/98274d8 text by
+    // `repairing_the_refusal_trigger_first_still_lets_the_result_migrate`,
+    // so this entry cannot silently drift from what that function actually
+    // produces.
+    (
+        0x11909e68d46b4cee,
+        "e35e16e/98274d8, post repair_refusal_trigger",
+    ),
+    // 0797844 ("Verify the Claude path live; fix two bugs it exposed"):
+    // fixed the scratchpad sentence in DEFAULT_PROMPT itself, but still
+    // lacked the non-vision-fallback parenthetical and the em-dash
+    // instruction that c7c8e68 later added.
+    (0x937c2b9f2fc523a9, "0797844"),
+];
+
+/// FNV-1a, 64-bit. Deterministic across builds and platforms (unlike
+/// `std::collections::hash_map::DefaultHasher`, whose algorithm Rust does
+/// not guarantee to stay the same between versions) -- required here since
+/// the hashes in [`OLD_DEFAULT_PROMPT_HASHES`] are hardcoded constants that
+/// must keep meaning the same thing release after release.
+const fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        i += 1;
+    }
+    hash
+}
+
+/// Normalizes a prompt before hashing it for the #412 migration: CRLF
+/// becomes LF, and trailing whitespace (per line, and at the very end) is
+/// stripped. A config saved by an editor that touched line endings or added
+/// trailing spaces must still match a known old default.
+fn normalize_prompt_for_migration(prompt: &str) -> String {
+    let unified = prompt.replace("\r\n", "\n");
+    let lines: Vec<&str> = unified.lines().map(|line| line.trim_end()).collect();
+    lines.join("\n").trim_end().to_string()
+}
+
+fn hash_prompt_for_migration(prompt: &str) -> u64 {
+    fnv1a64(normalize_prompt_for_migration(prompt).as_bytes())
+}
+
 /// Sentinel `hydrate_secrets` writes into a `ProviderConfig::api_key` field
 /// when the store has a credential for that provider but [`SecretStore::get`]
 /// returned `Err` (#175: a transient `CredReadW` failure, or a blob this
@@ -318,7 +408,7 @@ impl Default for ProviderConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct OllamaConfig {
-    /// `http://127.0.0.1:11434`, never `localhost` (CLAUDE.md rule 6).
+    /// `http://127.0.0.1:11434`, never `localhost` (AGENTS.md rule 6).
     pub base_url: String,
     pub model: String,
     pub effort: String,
@@ -534,6 +624,15 @@ thread_local! {
     static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Test-only seam onto [`FORCE_ACL_FAILURE_FOR_TEST`] for modules other than
+/// this one (#277: `egress.rs` reuses `restrict_acl` and needs to prove its
+/// own "ACL failure must not lose the log entry" contract the same way this
+/// module already proves "ACL failure aborts the write").
+#[cfg(all(test, windows))]
+pub(crate) fn force_acl_failure_for_test(active: bool) {
+    FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.set(active));
+}
+
 impl Config {
     /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {
@@ -679,7 +778,7 @@ impl Config {
                 continue;
             }
             if store.set(&target_name(provider), key).is_ok() {
-                key.clear();
+                zeroize_string(key);
                 changed = true;
             }
         }
@@ -691,7 +790,7 @@ impl Config {
             }
             let target = target_name(&compat_order_name(&entry.name));
             if store.set(&target, &entry.api_key).is_ok() {
-                entry.api_key.clear();
+                zeroize_string(&mut entry.api_key);
                 changed = true;
             }
         }
@@ -816,13 +915,13 @@ impl Config {
             let env_name = Self::env_var_name(provider)
                 .expect("every provider iterated here has an env var name");
             if env_is_set(env_name) {
-                key.clear();
+                zeroize_string(key);
                 continue;
             }
 
             let target = target_name(provider);
             if key == UNREADABLE_KEY_MARKER {
-                key.clear();
+                zeroize_string(key);
                 continue;
             }
             if key.is_empty() {
@@ -833,7 +932,7 @@ impl Config {
                 store
                     .set(&target, key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
-                key.clear();
+                zeroize_string(key);
             }
         }
 
@@ -843,7 +942,7 @@ impl Config {
         for entry in &mut self.providers.compat {
             let target = target_name(&compat_order_name(&entry.name));
             if entry.api_key == UNREADABLE_KEY_MARKER {
-                entry.api_key.clear();
+                zeroize_string(&mut entry.api_key);
                 continue;
             }
             if entry.api_key.is_empty() {
@@ -854,7 +953,7 @@ impl Config {
                 store
                     .set(&target, &entry.api_key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
-                entry.api_key.clear();
+                zeroize_string(&mut entry.api_key);
             }
         }
         Ok(())
@@ -893,19 +992,37 @@ impl Config {
     /// customized is never touched.
     fn backfill(&mut self) -> bool {
         let d = Providers::default();
+        let mut changed = false;
         if self.providers.openai.models.is_empty() {
             self.providers.openai.models = d.openai.models;
+            changed = true;
         }
         if self.providers.anthropic.models.is_empty() {
             self.providers.anthropic.models = d.anthropic.models;
+            changed = true;
         }
         if self.providers.gemini.models.is_empty() {
             self.providers.gemini.models = d.gemini.models;
+            changed = true;
         }
         if self.ui.text_scale <= 0.0 {
             self.ui.text_scale = Ui::default().text_scale;
+            changed = true;
         }
-        self.repair_refusal_trigger()
+        // `|` (not `||`), deliberately: these repairs must always run and
+        // their mutation must always apply, even when an earlier branch
+        // already set `changed` -- short-circuiting here would skip the
+        // call entirely (#299).
+        //
+        // `repair_stale_default_prompt` runs first, deliberately: an old
+        // shipped default can itself contain the sentence
+        // `repair_refusal_trigger` rewrites (the oldest one does), and that
+        // rewrite would leave `ui.prompt` no longer byte-for-byte equal to
+        // the historical text its hash was computed from, so the whole-
+        // prompt match would silently miss. Once `ui.prompt` has been
+        // migrated to the current `DEFAULT_PROMPT`, `repair_refusal_trigger`
+        // is a no-op against it (the current default carries no trigger).
+        changed | self.repair_stale_default_prompt() | self.repair_refusal_trigger()
     }
 
     /// Rewrites one sentence of a stored prompt that makes Claude refuse.
@@ -929,6 +1046,49 @@ impl Config {
 
         if self.ui.prompt.contains(TRIGGER) {
             self.ui.prompt = self.ui.prompt.replace(TRIGGER, REPLACEMENT);
+            return true;
+        }
+        false
+    }
+
+    /// Replaces a stored `ui.prompt` with the current
+    /// [`crate::provider::DEFAULT_PROMPT`] if it exactly matches one of the
+    /// *previous* built-in defaults (issue #412).
+    ///
+    /// `Config::default()` writes `DEFAULT_PROMPT` into `ui.prompt` on first
+    /// run (see `Ui::default` below), so a config written by an older build
+    /// carries that build's default verbatim on disk. Fixing
+    /// `provider::DEFAULT_PROMPT` in source therefore never reaches an
+    /// existing install: the stored copy just sits there, untouched by any
+    /// future release. This does not change `config.toml`'s shape (still a
+    /// plain `ui.prompt` string) -- it just recognizes "this is a stale
+    /// factory default, not something the user wrote" and swaps it for the
+    /// current one, the same way `repair_refusal_trigger` recognizes one
+    /// known-bad sentence.
+    ///
+    /// A prompt is compared by a normalized hash rather than byte-for-byte,
+    /// so a config saved with CRLF line endings (or picked up trailing
+    /// whitespace some editor added) still matches. A prompt the user
+    /// actually customized will not hash to any of these values (matching
+    /// one exactly, character for character once normalized, is exactly as
+    /// likely as the user having retyped an old shipped default verbatim --
+    /// effectively impossible), so a real edit is never touched.
+    ///
+    /// Add a new entry here whenever `DEFAULT_PROMPT`'s text changes: hash
+    /// the *previous* value (see `tools` note below) and cite the commit it
+    /// came from, so the list only ever grows.
+    fn repair_stale_default_prompt(&mut self) -> bool {
+        if hash_prompt_for_migration(&self.ui.prompt) == hash_prompt_for_migration(DEFAULT_PROMPT) {
+            // Already current; nothing to do (also short-circuits before
+            // touching a config the user has not opened yet).
+            return false;
+        }
+        let stored_hash = hash_prompt_for_migration(&self.ui.prompt);
+        if OLD_DEFAULT_PROMPT_HASHES
+            .iter()
+            .any(|(hash, _commit)| *hash == stored_hash)
+        {
+            self.ui.prompt = DEFAULT_PROMPT.to_string();
             return true;
         }
         false
@@ -1011,7 +1171,7 @@ impl Config {
     /// cannot show a card itself (this module never does, per rule 7) must
     /// propagate this so whichever caller CAN show one does.
     #[cfg(windows)]
-    fn restrict_acl(path: &Path) -> Result<()> {
+    pub(crate) fn restrict_acl(path: &Path) -> Result<()> {
         #[cfg(test)]
         if FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.get()) {
             anyhow::bail!("ACL restriction forced to fail for a test");
@@ -1024,11 +1184,19 @@ impl Config {
                 "the USERNAME environment variable is not set; cannot restrict \
                  the config file to the current user",
             )?;
+        // CREATE_NO_WINDOW (0x0800_0000): Wingman is a windows-subsystem GUI
+        // app with no console of its own, so spawning `icacls` without this
+        // flag allocates and briefly flashes a new console window on every
+        // call -- every `save()`/`save_to()`, i.e. potentially on every
+        // settings change, not just once at startup.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let output = std::process::Command::new("icacls")
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
             .arg(format!("{username}:F"))
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .context("failed to run icacls to restrict the config file's permissions")?;
         if !output.status.success() {
@@ -1080,7 +1248,42 @@ pub(crate) struct ProviderDescriptor {
     pub api_key: Option<String>,
 }
 
+/// The four provider kinds every `providers.order` name outside
+/// `"compat:<name>"` can mean, and nothing else. Issue #244:
+/// [`Providers::provider_for_named_model`], [`Providers::models_for`] and
+/// [`Providers::describe`] each used to match `order_name` against the same
+/// four string literals independently -- three hand-mirrored copies of the
+/// same list, alongside `app.rs`'s `first_provider_model_label` as a fourth
+/// (issue #243, now a thin call into `describe`). All three remaining
+/// matches now match `Self::known_provider_for(name)` instead: an
+/// unhandled `KnownProvider` variant is a compiler error (a `match` over an
+/// enum must be exhaustive), not a silently omitted string literal, so a
+/// fifth provider kind added only to this enum and not handled in one of
+/// the three consumers below fails to compile rather than compiling clean
+/// and quietly disagreeing at runtime (see the `wired-to-nothing` skill's
+/// "hand-maintained list" row).
+enum KnownProvider {
+    Openai,
+    Anthropic,
+    Gemini,
+    Ollama,
+}
+
 impl Providers {
+    /// The one place a `providers.order` name is recognized as one of the
+    /// four built-in provider kinds ([`KnownProvider`]). `None` for a
+    /// `"compat:<name>"` entry (resolved separately, by name, against
+    /// `self.compat`) or any other unrecognized name.
+    fn known_provider_for(name: &str) -> Option<KnownProvider> {
+        match name {
+            "openai" => Some(KnownProvider::Openai),
+            "anthropic" => Some(KnownProvider::Anthropic),
+            "gemini" => Some(KnownProvider::Gemini),
+            "ollama" => Some(KnownProvider::Ollama),
+            _ => None,
+        }
+    }
+
     /// Constructs the `Provider` for one `providers.order` name against
     /// `self`'s per-provider config, using that provider's configured
     /// "active" model. Thin wrapper over
@@ -1120,36 +1323,36 @@ impl Providers {
         name: &str,
         model: Option<&str>,
     ) -> Option<Box<dyn Provider>> {
-        match name {
-            "openai" => Some(Box::new(OpenAi::new(
+        match Self::known_provider_for(name) {
+            Some(KnownProvider::Openai) => Some(Box::new(OpenAi::new(
                 unreadable_as_empty(&self.openai.api_key),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.openai.model.clone()),
                 self.openai.effort.clone(),
             ))),
-            "anthropic" => Some(Box::new(Anthropic::new(
+            Some(KnownProvider::Anthropic) => Some(Box::new(Anthropic::new(
                 unreadable_as_empty(&self.anthropic.api_key),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.anthropic.model.clone()),
                 self.anthropic.effort.clone(),
             ))),
-            "gemini" => Some(Box::new(Gemini::new(
+            Some(KnownProvider::Gemini) => Some(Box::new(Gemini::new(
                 unreadable_as_empty(&self.gemini.api_key),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.gemini.model.clone()),
                 self.gemini.effort.clone(),
             ))),
-            "ollama" => Some(Box::new(Ollama::new(
+            Some(KnownProvider::Ollama) => Some(Box::new(Ollama::new(
                 self.ollama.base_url.clone(),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.ollama.model.clone()),
                 self.ollama.effort.clone(),
             ))),
-            _ => {
+            None => {
                 // #16: `"compat:<name>"` order entries resolve against
                 // `self.compat` by `name`, not by position -- an entry
                 // reordered or removed in `providers.order` simply
@@ -1183,12 +1386,12 @@ impl Providers {
     /// matching `self.compat` config, same "just skip it" behavior as
     /// [`Providers::provider_for_named_model`].
     pub(crate) fn models_for(&self, name: &str) -> Vec<String> {
-        match name {
-            "openai" => self.openai.models.clone(),
-            "anthropic" => self.anthropic.models.clone(),
-            "gemini" => self.gemini.models.clone(),
-            "ollama" => vec![self.ollama.model.clone()],
-            _ => {
+        match Self::known_provider_for(name) {
+            Some(KnownProvider::Openai) => self.openai.models.clone(),
+            Some(KnownProvider::Anthropic) => self.anthropic.models.clone(),
+            Some(KnownProvider::Gemini) => self.gemini.models.clone(),
+            Some(KnownProvider::Ollama) => vec![self.ollama.model.clone()],
+            None => {
                 let Some(compat_name) = name.strip_prefix("compat:") else {
                     return Vec::new();
                 };
@@ -1209,17 +1412,23 @@ impl Providers {
     /// `diagnostics::provider_rows` reads instead of keeping its own copy of
     /// [`Providers::provider_for`]'s match (issue #201) -- which also means
     /// a `"compat:<name>"` entry, previously invisible to diagnostics
-    /// entirely, now shows up there too.
+    /// entirely, now shows up there too. `app.rs`'s
+    /// `first_provider_model_label` (issue #243) reads this too, rather
+    /// than keeping a fourth copy of the match.
     pub(crate) fn describe(&self, order_name: &str) -> Option<ProviderDescriptor> {
-        let (model, api_key) = match order_name {
-            "openai" => (self.openai.model.clone(), Some(self.openai.api_key.clone())),
-            "anthropic" => (
+        let (model, api_key) = match Self::known_provider_for(order_name) {
+            Some(KnownProvider::Openai) => {
+                (self.openai.model.clone(), Some(self.openai.api_key.clone()))
+            }
+            Some(KnownProvider::Anthropic) => (
                 self.anthropic.model.clone(),
                 Some(self.anthropic.api_key.clone()),
             ),
-            "gemini" => (self.gemini.model.clone(), Some(self.gemini.api_key.clone())),
-            "ollama" => (self.ollama.model.clone(), None),
-            _ => {
+            Some(KnownProvider::Gemini) => {
+                (self.gemini.model.clone(), Some(self.gemini.api_key.clone()))
+            }
+            Some(KnownProvider::Ollama) => (self.ollama.model.clone(), None),
+            None => {
                 let compat_name = order_name.strip_prefix("compat:")?;
                 let cfg = self.compat.iter().find(|c| c.name == compat_name)?;
                 (cfg.model.clone(), Some(cfg.api_key.clone()))
@@ -1268,6 +1477,25 @@ impl Providers {
     /// change between two presses, and rule 5 rules out polling to keep a
     /// cached answer warm).
     pub fn build_chain_for_mode(&self, mode: Mode, ollama_ready: bool) -> Chain {
+        let selected = self.selected_order_for_mode(mode, ollama_ready);
+        let providers: Vec<Box<dyn Provider>> = selected
+            .iter()
+            .filter_map(|name| self.provider_for(name))
+            .collect();
+        Chain::new(providers)
+    }
+
+    /// The `order` entries `build_chain_for_mode` would turn into a
+    /// [`Chain`] for `mode`, filtered and reordered by
+    /// `mode::select_providers` but stopping short of constructing any
+    /// `Box<dyn Provider>` -- issue #354: `App::first_provider_model_label`
+    /// needs the mode-aware FIRST entry's own order-string (so it can look
+    /// up its configured model, including a compat provider's specific
+    /// name, which `Provider::id()` collapses to the generic
+    /// `"openai-compat"` and would otherwise lose), not a `Chain` to run
+    /// requests through. Kept as the one place both callers share so they
+    /// can never disagree about which providers `mode` allows.
+    pub fn selected_order_for_mode(&self, mode: Mode, ollama_ready: bool) -> Vec<String> {
         // #16: a compat endpoint's locality is decided by its configured
         // `base_url` host, never by name (`mode::is_local_provider`'s doc) --
         // this is the one place that host check happens, right before
@@ -1283,13 +1511,7 @@ impl Providers {
             })
             .map(|c| compat_order_name(&c.name))
             .collect();
-        let selected =
-            crate::mode::select_providers(mode, &self.order, ollama_ready, &local_compat_names);
-        let providers: Vec<Box<dyn Provider>> = selected
-            .iter()
-            .filter_map(|name| self.provider_for(name))
-            .collect();
-        Chain::new(providers)
+        crate::mode::select_providers(mode, &self.order, ollama_ready, &local_compat_names)
     }
 }
 
@@ -1317,6 +1539,38 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    // -- zeroize_string (#258) ------------------------------------------------
+
+    #[test]
+    fn zeroize_string_overwrites_the_retained_buffer_before_clearing() {
+        let mut s = String::from("sk-test-synthetic-not-a-real-key");
+        let ptr = s.as_ptr();
+        let len = s.len();
+        zeroize_string(&mut s);
+        // `s.clear()` only resets length to 0, so `s.as_bytes()` would show
+        // nothing either way -- inspect the still-allocated buffer directly
+        // via the raw pointer captured before the clear, exactly the check
+        // AGENTS.md rule 8 asks for (the observable that would differ if
+        // this were wired to nothing).
+        let retained = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert!(
+            retained.iter().all(|&b| b == 0),
+            "buffer still holds plaintext after zeroize_string: {retained:?}"
+        );
+        assert!(s.is_empty());
+        assert!(
+            s.capacity() >= len,
+            "capacity should be retained by clear()"
+        );
+    }
+
+    #[test]
+    fn zeroize_string_handles_empty_string() {
+        let mut s = String::new();
+        zeroize_string(&mut s);
+        assert!(s.is_empty());
     }
 
     // -- forms.require_tick_for (#40) ----------------------------------------
@@ -2144,6 +2398,34 @@ api_key = "sk-x"
     }
 
     #[test]
+    fn backfilling_a_model_list_writes_the_repair_back_to_disk() {
+        // Issue #299: `backfill` mutated `models` in memory but only
+        // `repair_refusal_trigger`'s result reached `load_from_file`'s
+        // write-back gate, so a model-list repair never made it to disk.
+        let path = scratch_path("backfill-writeback");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let old = r#"
+[providers.openai]
+model = "gpt-5.5"
+api_key = "sk-x"
+"#;
+        std::fs::write(&path, old).unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(!loaded.providers.openai.models.is_empty());
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let reparsed: Config = toml::from_str(&on_disk).unwrap();
+        assert!(
+            !reparsed.providers.openai.models.is_empty(),
+            "the backfilled model list must be written back to disk, not just kept in memory: {on_disk}"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
     fn a_customized_model_list_is_never_overwritten() {
         let custom = r#"
 [providers.openai]
@@ -2196,6 +2478,151 @@ text_scale = 0.0
     #[test]
     fn the_shipped_default_contains_no_refusal_trigger() {
         assert!(!Config::default().ui.prompt.contains("scratchpad"));
+    }
+
+    // -- #412: a stale built-in prompt default must migrate forward --------
+
+    /// The very first shipped `DEFAULT_PROMPT` (commits e35e16e/98274d8),
+    /// verbatim, before #299's reasoning_extraction fix. Kept only in this
+    /// test as the input that must migrate; `OLD_DEFAULT_PROMPT_HASHES`
+    /// stores just its hash, never this text.
+    const OLDEST_DEFAULT_PROMPT: &str = "You are shown a screenshot of the user's screen. They are working through a physics or statistics problem and want a second opinion before committing an answer. Usually the problem statement is on screen (often an online assignment) while the user has done the working on paper, so their derivation is generally NOT visible to you. Sometimes a value they are about to submit is already typed into an input field, and sometimes their working is on screen too.
+
+Work the problem out yourself from what is visible, then:
+- If a candidate answer is visible (typed into a field, or written in on-screen working), compare it against your own result. Say plainly whether it matches. If it does not, give the correct value and name the specific mistake you can infer (e.g. \"that is cos 30, not sin 30\" or \"you used the population variance formula, not the sample one\").
+- If only the problem is visible, just give your answer.
+- If something essential is unreadable or missing from the screenshot, say exactly what you need instead of guessing at it.
+
+Carry units through and give the final value to a sensible number of significant figures.
+
+Respond with exactly two fields, and write them in this order:
+- detail: FIRST. At most 700 characters, plain text. Work the problem through here step by step so the user can check it against their own. This is your scratchpad \u{2014} reason it out before committing to a verdict.
+- headline: SECOND, and it must be the conclusion of the working you just wrote. At most 90 characters, plain text. Lead with the final value, or with the correction if a visible answer is wrong. Never state a verdict in the headline that your own detail contradicts; if the working changed your mind, the headline follows the working.
+
+Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline.";
+
+    #[test]
+    fn a_config_holding_the_oldest_default_prompt_migrates_to_the_current_default() {
+        let doc = format!(
+            "[ui]\nprompt = {}\n",
+            toml::Value::String(OLDEST_DEFAULT_PROMPT.to_string())
+        );
+        let cfg = Config::parse_or_default(&doc);
+        assert_eq!(
+            cfg.ui.prompt, DEFAULT_PROMPT,
+            "a config still holding the oldest shipped default must be migrated to the current one"
+        );
+    }
+
+    #[test]
+    fn migrating_the_oldest_default_prompt_writes_the_repair_back_to_disk() {
+        let path = scratch_path("prompt-migration-writeback");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let doc = format!(
+            "[ui]\nprompt = {}\n",
+            toml::Value::String(OLDEST_DEFAULT_PROMPT.to_string())
+        );
+        std::fs::write(&path, &doc).unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.ui.prompt, DEFAULT_PROMPT);
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let reparsed: Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            reparsed.ui.prompt, DEFAULT_PROMPT,
+            "the prompt migration must be written back to disk, not just kept in memory"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn old_default_hash_list_matches_what_repair_refusal_trigger_actually_produces() {
+        // A config that ran `repair_refusal_trigger` (#299) on an earlier
+        // launch, before #412 shipped, has the oldest default with only
+        // that one sentence rewritten -- not the pristine original, and not
+        // hand-computed text either. Derive the exact bytes from the real
+        // function, not by retyping the transformation, so
+        // `OLD_DEFAULT_PROMPT_HASHES` cannot silently drift from what
+        // `repair_refusal_trigger` actually does.
+        let mut cfg = Config::default();
+        cfg.ui.prompt = OLDEST_DEFAULT_PROMPT.to_string();
+        let changed = cfg.repair_refusal_trigger();
+        assert!(
+            changed,
+            "the oldest default must contain the trigger sentence"
+        );
+        assert_ne!(
+            cfg.ui.prompt, OLDEST_DEFAULT_PROMPT,
+            "repair_refusal_trigger must have actually rewritten the sentence"
+        );
+
+        let hash = hash_prompt_for_migration(&cfg.ui.prompt);
+        assert!(
+            OLD_DEFAULT_PROMPT_HASHES.iter().any(|(h, _)| *h == hash),
+            "OLD_DEFAULT_PROMPT_HASHES must contain the hash of the oldest default \
+             as repair_refusal_trigger actually leaves it (0x{hash:016x}), so a config \
+             repaired by an earlier launch still migrates to the current default"
+        );
+    }
+
+    #[test]
+    fn a_config_already_repaired_by_refusal_trigger_on_an_earlier_launch_still_migrates() {
+        // Simulates exactly that earlier-launch history: the stored prompt
+        // is the oldest default with `repair_refusal_trigger`'s rewrite
+        // already applied, as it would be sitting on disk from before #412.
+        let mut pre_existing = Config::default();
+        pre_existing.ui.prompt = OLDEST_DEFAULT_PROMPT.to_string();
+        pre_existing.repair_refusal_trigger();
+        let already_repaired_prompt = pre_existing.ui.prompt;
+        assert_ne!(already_repaired_prompt, DEFAULT_PROMPT);
+
+        let doc = format!(
+            "[ui]\nprompt = {}\n",
+            toml::Value::String(already_repaired_prompt)
+        );
+        let cfg = Config::parse_or_default(&doc);
+        assert_eq!(
+            cfg.ui.prompt, DEFAULT_PROMPT,
+            "a config already repaired for the refusal trigger on an earlier launch \
+             must still migrate to the current default"
+        );
+    }
+
+    #[test]
+    fn a_crlf_variant_of_an_old_default_prompt_still_migrates() {
+        let crlf_prompt = OLDEST_DEFAULT_PROMPT.replace('\n', "\r\n");
+        let doc = format!("[ui]\nprompt = {}\n", toml::Value::String(crlf_prompt));
+        let cfg = Config::parse_or_default(&doc);
+        assert_eq!(
+            cfg.ui.prompt, DEFAULT_PROMPT,
+            "a CRLF copy of an old shipped default must still be recognized and migrated"
+        );
+    }
+
+    #[test]
+    fn a_customized_prompt_is_never_migrated() {
+        let toml = "[ui]\nprompt = \"Just check my algebra please.\"\n";
+        let cfg = Config::parse_or_default(toml);
+        assert_eq!(
+            cfg.ui.prompt, "Just check my algebra please.",
+            "a prompt the user actually wrote must never be replaced"
+        );
+    }
+
+    #[test]
+    fn the_current_default_prompt_is_a_migration_no_op() {
+        let doc = format!(
+            "[ui]\nprompt = {}\n",
+            toml::Value::String(DEFAULT_PROMPT.to_string())
+        );
+        let (_, repaired) = Config::parse_reporting_repair(&doc);
+        assert!(
+            !repaired,
+            "loading the current shipped default must not be reported as a repair"
+        );
     }
 
     // -- #197: show_difficulty default flipped to false ---------------------
@@ -3580,6 +4007,43 @@ text_scale = 0.0
         let describe_count = config.providers.describe_all().len();
         assert_eq!(chain_count, describe_count);
         assert_eq!(chain_count, 5, "bogus must be dropped by both");
+    }
+
+    #[test]
+    fn provider_for_named_model_models_for_and_describe_agree_on_which_names_resolve() {
+        // Issue #244: describe still kept its own third hand-mirrored match
+        // over "openai"/"anthropic"/"gemini"/"ollama"/"compat:<name>",
+        // alongside provider_for_named_model and models_for (both already
+        // consolidated by #222). A provider kind added to one of these three
+        // without a matching arm in the other two would compile fine and
+        // silently disagree here about whether a name "resolves" at all.
+        let mut providers = Providers::default();
+        providers.compat.push(CompatConfig {
+            name: "custom".to_string(),
+            models: vec!["compat-cheap".to_string(), "compat-flagship".to_string()],
+            ..Default::default()
+        });
+        let fixture = [
+            "openai",
+            "anthropic",
+            "gemini",
+            "ollama",
+            "compat:custom",
+            "not-a-real-provider",
+        ];
+        for name in fixture {
+            let ctor_recognizes = providers.provider_for_named_model(name, None).is_some();
+            let models_recognizes = !providers.models_for(name).is_empty();
+            let describe_recognizes = providers.describe(name).is_some();
+            assert_eq!(
+                ctor_recognizes, models_recognizes,
+                "provider_for_named_model and models_for disagree on {name:?}"
+            );
+            assert_eq!(
+                ctor_recognizes, describe_recognizes,
+                "provider_for_named_model and describe disagree on {name:?}"
+            );
+        }
     }
 
     // -- ENV_OVERRIDE_VARS agrees with apply_env_overrides (issue #201) ----

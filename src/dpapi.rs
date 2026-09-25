@@ -10,7 +10,7 @@
 //! [`protect`] and [`unprotect`] always pass `CRYPTPROTECT_UI_FORBIDDEN`.
 //! Without it, a corrupted key store or an unusual account configuration
 //! can make DPAPI pop a credential prompt -- exactly the dialog box
-//! CLAUDE.md rule 7 promises this app never shows. Forbidding it turns that
+//! AGENTS.md rule 7 promises this app never shows. Forbidding it turns that
 //! case into an ordinary `Err` a caller can turn into a card instead.
 //!
 //! # Envelope format
@@ -82,7 +82,7 @@ pub const PROFILE_ENTROPY: &[u8] = b"Wingman/profile/v1";
 /// proving the writes are dead -- because nothing reads the buffer again
 /// before it is freed -- and eliding them, which is exactly the bug a plain
 /// assignment risks right before the buffer is freed or dropped.
-fn zeroize(buf: &mut [u8]) {
+pub(crate) fn zeroize(buf: &mut [u8]) {
     for byte in buf.iter_mut() {
         // SAFETY: `byte` is a valid `&mut u8` yielded by `iter_mut`.
         unsafe { std::ptr::write_volatile(byte, 0) };

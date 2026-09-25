@@ -44,6 +44,11 @@ pub trait ImageClipboardAccess: Send + Sync {
     /// replace, not a merge, the same tradeoff `inputs::selection`'s module
     /// doc documents for its own multi-format snapshot/restore).
     fn set_dib(&self, dib: &[u8]) -> Result<()>;
+    /// True if the OS clipboard holds data in any format, regardless of
+    /// whether `get_dib` found a `CF_DIB` entry. The only use: telling "the
+    /// clipboard was empty" apart from "the clipboard held something this
+    /// executor cannot preserve" before overwriting it (#410).
+    fn has_any_content(&self) -> bool;
 }
 
 /// The real clipboard, via raw Win32 calls (`arboard`, already a crate
@@ -58,6 +63,10 @@ impl ImageClipboardAccess for Win32ImageClipboard {
 
     fn set_dib(&self, dib: &[u8]) -> Result<()> {
         win32::set_dib(dib)
+    }
+
+    fn has_any_content(&self) -> bool {
+        super::format_probe::any_clipboard_format_present()
     }
 }
 
@@ -101,6 +110,9 @@ impl<C: ImageClipboardAccess + 'static> Executor for ImageClipboardExecutor<C> {
         "image_clipboard"
     }
 
+    /// `ReadOnly` is intentional, not an oversight: see `executors::Effect`'s
+    /// doc comment ("Decided (issue #402)") for why a clipboard-writing
+    /// executor still counts as read-only for the confirm fast path.
     fn effect(&self) -> Effect {
         Effect::ReadOnly
     }
@@ -127,23 +139,35 @@ impl<C: ImageClipboardAccess + 'static> Executor for ImageClipboardExecutor<C> {
 
         let dib = encode_dib(&rgba, width, height);
 
-        // Best-effort: a clipboard that was empty, or held no CF_DIB entry,
-        // restores to nothing rather than failing the whole action -- same
-        // shape as `executors::clipboard`'s text case.
+        // `get_dib` returning `None` is ambiguous on its own (empty
+        // clipboard vs. present but not `CF_DIB`); the format probe (#410)
+        // resolves it before we overwrite anything, so an unrestorable
+        // prior value is reported, not silently dropped -- same shape as
+        // `executors::clipboard`'s text case.
         let previous = self.clipboard.get_dib();
+        let lost_unrestorable_content = previous.is_none() && self.clipboard.has_any_content();
 
         self.clipboard.set_dib(&dib)?;
 
+        let summary = if lost_unrestorable_content {
+            format!(
+                "copied a {width}x{height} region image to the clipboard. Its previous contents were in a format that could not be preserved and cannot be restored."
+            )
+        } else {
+            format!("copied a {width}x{height} region image to the clipboard")
+        };
+
         let clipboard = Arc::clone(&self.clipboard);
-        Ok(Undo::recording(
-            format!("copied a {width}x{height} region image to the clipboard"),
-            move || {
-                if let Some(previous) = previous {
-                    clipboard.set_dib(&previous)?;
-                }
-                Ok(())
-            },
-        ))
+        Ok(Undo::recording(summary, move || {
+            if let Some(previous) = previous {
+                clipboard.set_dib(&previous)?;
+            } else if lost_unrestorable_content {
+                bail!(
+                    "cannot undo the clipboard write: its previous contents were not a CF_DIB image and could not be preserved"
+                );
+            }
+            Ok(())
+        }))
     }
 }
 
@@ -213,7 +237,7 @@ mod win32 {
     /// doc comment): `OpenClipboard` can transiently fail while another
     /// process holds the clipboard open, and this only ever runs during an
     /// actively in-progress, user-triggered copy, never while idle
-    /// (CLAUDE.md rule 5).
+    /// (AGENTS.md rule 5).
     struct OpenGuard;
 
     impl OpenGuard {
@@ -303,12 +327,24 @@ mod tests {
     #[derive(Default)]
     struct FakeImageClipboard {
         dib: RefCell<Option<Vec<u8>>>,
+        /// Simulates the clipboard holding a non-`CF_DIB` format (e.g.
+        /// plain text): `get_dib` still finds nothing, but `has_any_content`
+        /// must say `true`.
+        holding_unrestorable_content: bool,
     }
 
     impl FakeImageClipboard {
         fn seeded(initial: &[u8]) -> Self {
             Self {
                 dib: RefCell::new(Some(initial.to_vec())),
+                holding_unrestorable_content: false,
+            }
+        }
+
+        fn holding_unrestorable_content() -> Self {
+            Self {
+                dib: RefCell::new(None),
+                holding_unrestorable_content: true,
             }
         }
     }
@@ -326,6 +362,10 @@ mod tests {
         fn set_dib(&self, dib: &[u8]) -> Result<()> {
             *self.dib.borrow_mut() = Some(dib.to_vec());
             Ok(())
+        }
+
+        fn has_any_content(&self) -> bool {
+            self.dib.borrow().is_some() || self.holding_unrestorable_content
         }
     }
 
@@ -395,6 +435,19 @@ mod tests {
         assert_eq!(ImageClipboardExecutor::new().name(), "image_clipboard");
     }
 
+    /// Issue #402: a clipboard-overwriting executor still auto-confirming
+    /// is a deliberate decision (see `executors::Effect`'s doc comment), not
+    /// a gap. Regression guard for that decision, same shape as
+    /// `executors::clipboard`'s sibling test.
+    #[test]
+    fn image_clipboard_executor_auto_confirms_by_design_per_issue_402() {
+        let executor = ImageClipboardExecutor::with_clipboard(FakeImageClipboard::default());
+        let proposal = Proposal::new(proposal_for(&[0, 0, 0, 0], 1, 1));
+        crate::ui::confirm::auto_confirm_read_only(&executor, proposal).expect(
+            "image_clipboard executor must auto-confirm: issue #402 decided this is intended",
+        );
+    }
+
     #[test]
     fn execute_writes_a_cf_dib_payload_matching_encode_dib() {
         let executor = ImageClipboardExecutor::with_clipboard(FakeImageClipboard::default());
@@ -460,8 +513,44 @@ mod tests {
         let confirmed = confirmed_with(proposal_for(&rgba, 1, 1), &executor);
 
         let undo = executor.execute(confirmed).unwrap();
+        assert_eq!(
+            undo.summary, "copied a 1x1 region image to the clipboard",
+            "a genuinely empty prior clipboard is not data loss and gets no warning"
+        );
         undo.undo()
             .expect("undo must not fail just because there was nothing to restore");
         assert!(executor.clipboard.get_dib().is_some());
+    }
+
+    /// Issue #410: `get_dib` returning `None` is ambiguous (empty vs. "held
+    /// something we cannot read as CF_DIB"). The format probe resolves that
+    /// before the overwrite, and the honest outcome is: the summary says
+    /// content could not be preserved (a card line, not silent), and undo
+    /// refuses to pretend it restored something it never had.
+    #[test]
+    fn execute_reports_and_undo_refuses_when_prior_content_could_not_be_preserved() {
+        let executor = ImageClipboardExecutor::with_clipboard(
+            FakeImageClipboard::holding_unrestorable_content(),
+        );
+        let rgba = vec![1u8, 2, 3, 255];
+        let confirmed = confirmed_with(proposal_for(&rgba, 1, 1), &executor);
+
+        let undo = executor.execute(confirmed).unwrap();
+        assert!(
+            undo.summary.contains("could not be preserved"),
+            "summary must say so honestly: {}",
+            undo.summary
+        );
+        assert!(
+            !undo.summary.contains('\u{2014}'),
+            "no em dashes: {}",
+            undo.summary
+        );
+
+        let err = undo
+            .undo()
+            .expect_err("undo must not silently claim success when it cannot restore lost content");
+        assert!(err.to_string().contains("cannot"));
+        assert!(!err.to_string().contains('\u{2014}'), "no em dashes: {err}");
     }
 }

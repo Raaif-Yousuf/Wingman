@@ -1,6 +1,6 @@
 # cargo-deny configuration. Run with `cargo deny check`.
 #
-# Allowlist per issue #9 and CLAUDE.md rule 2 (permissive licenses only):
+# Allowlist per issue #9 and AGENTS.md rule 2 (permissive licenses only):
 # MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, Unicode-3.0, Unlicense.
 #
 # Two crates on the actual x86_64-pc-windows-msvc dependency graph sit
@@ -13,7 +13,7 @@
 #
 # BSL-1.0 and CDLA-Permissive-2.0 are uncontroversially permissive, so they
 # get narrow per-crate exceptions below rather than widening the allowlist
-# CLAUDE.md rule 2 states, so anyone reading this file still sees exactly
+# AGENTS.md rule 2 states, so anyone reading this file still sees exactly
 # which crates needed a judgment call and why.
 #
 # A third exception used to live here for option-ext 0.2.0 (MPL-2.0, weak

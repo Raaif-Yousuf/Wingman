@@ -122,18 +122,27 @@ use windows::Win32::Graphics::Gdi::{
     DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
     GetWindowTextLengthW, GetWindowTextW, LoadCursorW, PostMessageW, RegisterClassExW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_COMMAND,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE,
+    WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    WS_VISIBLE,
 };
+
+/// `WM_MOUSELEAVE`'s stable, documented value (winuser.h) -- not re-exported
+/// by the `windows` crate under `Win32::UI::WindowsAndMessaging` (unlike
+/// `WM_MOUSEMOVE`), so spelled out here the same way this file already
+/// spells out `EN_CHANGE`.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 const WC_EDIT: &str = "EDIT";
 const ES_AUTOHSCROLL: u32 = 0x0080;
@@ -190,6 +199,11 @@ const PADDING: i32 = 8;
 /// blank when [`PaletteInner::router_summary`] is `None`.
 const ROUTER_SUMMARY_HEIGHT: i32 = 18;
 
+/// #359: shown in the router summary band from the moment
+/// `App::maybe_start_router` actually starts a background request until the
+/// result (or a failure) replaces or clears it. No em dash (rule 11).
+const ROUTER_LOOKING_TEXT: &str = "Looking at your screen...";
+
 fn scale(v: i32, dpi: u32) -> i32 {
     v * dpi as i32 / 96
 }
@@ -199,6 +213,44 @@ fn window_height(dpi: u32) -> i32 {
         + scale(ROUTER_SUMMARY_HEIGHT, dpi)
         + scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32
         + scale(FOOTER_HEIGHT, dpi)
+}
+
+/// #357: pure hit-test -- given a client-area `y` in physical pixels (as
+/// `WM_MOUSEMOVE`/`WM_LBUTTONUP` deliver it), the current viewport `offset`
+/// and the real row count, returns the real row index (into
+/// `PaletteState::rows`, the same space `PaletteState::selected` lives in)
+/// under that `y`, or `None` when `y` is above the list (still over the
+/// query box/padding/router-summary band), below the last real row, or below
+/// the whole painted viewport. Mirrors `on_paint`'s row-geometry math
+/// exactly (same constants, same order of additions) so a click always lands
+/// on the row it visually looks like it landed on -- see that function's `y`
+/// math, which this must never drift from.
+fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
+    let pad = scale(PADDING, dpi);
+    let list_top = pad + scale(EDIT_HEIGHT, dpi) + pad + scale(ROUTER_SUMMARY_HEIGHT, dpi);
+    let row_h = scale(ROW_HEIGHT, dpi);
+    if row_h <= 0 || y < list_top {
+        return None;
+    }
+    let visible_pos = ((y - list_top) / row_h) as usize;
+    if visible_pos >= crate::ui::palette_model::MAX_VISIBLE_ROWS {
+        return None;
+    }
+    let idx = offset + visible_pos;
+    if idx < row_count {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+/// Extracts the signed `y` client coordinate from a mouse message's
+/// `lParam` (`GET_Y_LPARAM`, winuser.h) -- not re-exported by the `windows`
+/// crate for these messages, so spelled out here the same way this file
+/// already spells out `EN_CHANGE`.
+fn mouse_y(lparam: LPARAM) -> i32 {
+    let raw = lparam.0 as i32 as u32;
+    ((raw >> 16) & 0xFFFF) as u16 as i16 as i32
 }
 
 /// One owned Quick Ask palette window. Thin handle around a heap-allocated
@@ -221,7 +273,7 @@ impl Palette {
     /// Same as [`Palette::new`], but registers (once) and uses a class name
     /// distinct from the production one (rule 9: tests never touch
     /// production names).
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn new_for_test(instance: HINSTANCE) -> anyhow::Result<Self> {
         if !ensure_test_class_registered(instance) {
             anyhow::bail!("Wingman: failed to register the test palette window class");
@@ -245,6 +297,9 @@ impl Palette {
             router_generation: 0,
             interacted: false,
             router_summary: None,
+            hover: None,
+            tracking_leave: false,
+            suppress_en_change: false,
         });
         let raw = Box::into_raw(inner);
 
@@ -386,6 +441,16 @@ impl Palette {
             .apply_router_suggestion(generation, result, threshold);
     }
 
+    /// #359: see [`PaletteInner::set_router_pending`].
+    pub fn set_router_pending(&mut self, generation: u64) {
+        self.inner.set_router_pending(generation);
+    }
+
+    /// #359: see [`PaletteInner::clear_router_pending`].
+    pub fn clear_router_pending(&mut self, generation: u64) {
+        self.inner.clear_router_pending(generation);
+    }
+
     /// The palette's own window proc dispatches internally; this is the
     /// seam tests use to feed synthetic messages directly. Unused by this
     /// module's own tests today (they drive the palette through real posted
@@ -416,7 +481,19 @@ impl Palette {
         self.inner.state.selected_action_id().map(|s| s.to_string())
     }
 
+    /// #357: like [`Palette::selected_action_id`] but for an arbitrary real
+    /// row index rather than `state.selected` -- lets a test read off the
+    /// action id a hovered/clicked row names without duplicating
+    /// `Row::Action`'s field-matching itself.
     #[cfg(test)]
+    pub(crate) fn selected_action_id_at(&self, idx: usize) -> Option<String> {
+        match self.inner.state.rows.get(idx) {
+            Some(crate::ui::palette_model::Row::Action { id, .. }) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn set_query_for_test(&mut self, query: &str) {
         self.inner.set_query(query);
     }
@@ -443,14 +520,14 @@ impl Drop for Palette {
 
 const CLASS_NAME: &str = "Wingman.Palette.Window.9c4e2b17";
 /// Rule 9: tests never touch production names.
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 const TEST_CLASS_NAME: &str = "Wingman.Palette.Window.9c4e2b17.Test";
 
 static CLASS_INIT: Once = Once::new();
 static CLASS_OK: OnceLock<bool> = OnceLock::new();
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 static TEST_CLASS_INIT: Once = Once::new();
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 static TEST_CLASS_OK: OnceLock<bool> = OnceLock::new();
 
 fn ensure_class_registered(instance: HINSTANCE) -> bool {
@@ -461,7 +538,7 @@ fn ensure_class_registered(instance: HINSTANCE) -> bool {
     CLASS_OK.get().copied().unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn ensure_test_class_registered(instance: HINSTANCE) -> bool {
     TEST_CLASS_INIT.call_once(|| {
         let ok = unsafe { register_class(instance, TEST_CLASS_NAME) };
@@ -853,6 +930,31 @@ struct PaletteInner {
     /// `on_paint`). `None` most of the time -- no router result yet, the
     /// result didn't clear the threshold, or the user already interacted.
     router_summary: Option<String>,
+    /// #357: the row currently under the mouse cursor (real index into
+    /// `state.rows`, same space as `state.selected`), or `None` when the
+    /// mouse isn't over the list, isn't over an `Action` row, or hasn't
+    /// moved into the window since it was last shown. Separate from
+    /// `state.selected` on purpose: moving the mouse off the list must not
+    /// forget the keyboard/last-click selection Enter would still run, only
+    /// clear the hover highlight (see `WM_MOUSELEAVE` below).
+    hover: Option<usize>,
+    /// #357: whether `TrackMouseEvent(TME_LEAVE)` is currently armed for
+    /// this window. `TrackMouseEvent` disarms itself the moment it fires
+    /// (`WM_MOUSELEAVE`) or the mouse leaves, so it must be re-armed on
+    /// every `WM_MOUSEMOVE` that finds it not already tracking -- this flag
+    /// avoids the extra syscall on every single mouse-move while still
+    /// tracking is armed.
+    tracking_leave: bool,
+    /// #414: armed around `show`'s own programmatic
+    /// `SetWindowTextW(edit_hwnd, "")` clear, which -- MEASURED 2026-09-24 in
+    /// a real-window test -- fires a real, synchronous `EN_CHANGE` for this
+    /// edit control, not just user typing or `EM_REPLACESEL` as the old
+    /// comment here assumed. While armed, `handle_message`'s `EN_CHANGE` arm
+    /// treats the notification as the programmatic clear it is: it skips
+    /// marking `interacted`/clearing `router_summary` (both already just set
+    /// by `show`) and skips the redundant `rebuild_state` (`show` already
+    /// calls it with the real, empty query right after).
+    suppress_en_change: bool,
 }
 
 impl PaletteInner {
@@ -872,13 +974,29 @@ impl PaletteInner {
         self.router_generation = self.router_generation.wrapping_add(1);
         self.interacted = false;
         self.router_summary = None;
+        self.hover = None;
+        self.tracking_leave = false;
+        // #414: SetWindowTextW below fires a real, synchronous EN_CHANGE for
+        // this edit control -- see `suppress_en_change`'s doc comment. Armed
+        // only around this one call, so a genuine keystroke that lands
+        // between `show` calls (impossible: this is all synchronous) or any
+        // later real typing still sets `interacted` normally.
+        self.suppress_en_change = true;
         unsafe {
             let _ = SetWindowTextW(self.edit_hwnd, PCWSTR(wide_z("").as_ptr()));
         }
+        self.suppress_en_change = false;
         self.rebuild_state("");
         self.reposition_centered();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOW);
+            // #395: this window is already WS_EX_TOPMOST, so this call only
+            // needs to (re)assert topmost z-order after ShowWindow, never
+            // move or resize what reposition_centered() just computed above
+            // -- SWP_NOMOVE | SWP_NOSIZE is load-bearing here. The previous
+            // 0,0,0,0 call with SWP_NOZORDER (which cancels the HWND_TOPMOST
+            // it passed) both moved the window to the origin and collapsed
+            // it to 0x0 right after positioning it (issue #395).
             let _ = SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
@@ -886,7 +1004,7 @@ impl PaletteInner {
                 0,
                 0,
                 0,
-                SWP_NOACTIVATE | SWP_NOZORDER,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
             );
             let _ = SetForegroundWindow(self.hwnd);
             let _ = SetFocus(Some(self.edit_hwnd));
@@ -913,6 +1031,8 @@ impl PaletteInner {
         // safe to do even when nothing was in flight.
         self.router_generation = self.router_generation.wrapping_add(1);
         self.router_summary = None;
+        self.hover = None;
+        self.tracking_leave = false;
     }
 
     /// #24: see [`Palette::apply_router_suggestion`]'s doc comment for the
@@ -932,7 +1052,13 @@ impl PaletteInner {
         if !self.visible {
             return;
         }
+        // #359: whatever happens from here, the "Looking at your screen..."
+        // placeholder this session's request started with must not survive
+        // the result -- either it becomes the real summary below, or this
+        // clears it back to None.
         let Some(intent_id) = result.intent.as_deref() else {
+            self.router_summary = None;
+            self.invalidate();
             return;
         };
         if !crate::router::should_apply(
@@ -941,10 +1067,53 @@ impl PaletteInner {
             threshold,
             self.interacted,
         ) {
+            self.router_summary = None;
+            self.invalidate();
             return;
         }
         if crate::ui::palette_model::preselect_action(&mut self.state, intent_id) {
             self.router_summary = Some(result.summary.clone());
+        } else {
+            self.router_summary = None;
+        }
+        self.invalidate();
+    }
+
+    /// #359: called right when [`App::maybe_start_router`] actually starts a
+    /// background request (after the Paused/no-provider/capture-failure
+    /// checks all pass), so the reserved summary band shows something is
+    /// happening instead of sitting blank until the result arrives. Cleared
+    /// the same way a real summary is: by
+    /// [`PaletteInner::apply_router_suggestion`] on arrival,
+    /// [`PaletteInner::clear_router_pending`] on failure, or any of the
+    /// existing "user already interacted" paths above (`show`, `hide`,
+    /// `on_palette_key_command`'s Up/Down/PageUp/PageDown arm, `EN_CHANGE`).
+    /// No timer involved (rule 5): this only ever changes on those events.
+    fn set_router_pending(&mut self, generation: u64) {
+        if crate::router::is_stale(generation, self.router_generation) {
+            return;
+        }
+        if !self.visible {
+            return;
+        }
+        self.router_summary = Some(ROUTER_LOOKING_TEXT.to_string());
+        self.invalidate();
+    }
+
+    /// #359: the router's background request failed (or no provider ended up
+    /// ready by the time the worker thread ran) -- clears whatever
+    /// [`PaletteInner::set_router_pending`] showed rather than leaving it
+    /// stuck. A no-op if the user already interacted or hid the palette,
+    /// both of which already cleared it.
+    fn clear_router_pending(&mut self, generation: u64) {
+        if crate::router::is_stale(generation, self.router_generation) {
+            return;
+        }
+        if !self.visible {
+            return;
+        }
+        if self.router_summary.is_some() {
+            self.router_summary = None;
             self.invalidate();
         }
     }
@@ -1016,7 +1185,7 @@ impl PaletteInner {
     /// production always drives the query through a real `EN_CHANGE`
     /// notification (`handle_message`'s `WM_COMMAND` arm), not by setting
     /// the edit control's text programmatically.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fn set_query(&mut self, query: &str) {
         unsafe {
             let _ = SetWindowTextW(self.edit_hwnd, PCWSTR(wide_z(query).as_ptr()));
@@ -1176,7 +1345,7 @@ impl PaletteInner {
                     draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(0x0080_8080));
                 }
                 crate::ui::palette_model::Row::Action { name, .. } => {
-                    if i == self.state.selected {
+                    if i == self.state.selected || self.hover == Some(i) {
                         if let Ok(hl) = unsafe {
                             target.CreateSolidColorBrush(
                                 &colorref_to_d2d(COLORREF(0x0045_3A2E)) as *const _,
@@ -1301,7 +1470,7 @@ impl PaletteInner {
                         );
                     }
                     crate::ui::palette_model::Row::Action { name, .. } => {
-                        if i == self.state.selected {
+                        if i == self.state.selected || self.hover == Some(i) {
                             let hl = CreateSolidBrush(COLORREF(0x0045_3A2E));
                             FillRect(hdc, &row_rect, hl);
                             let _ = DeleteObject(hl.into());
@@ -1347,10 +1516,16 @@ impl PaletteInner {
                 let notify = (wp >> 16) & 0xFFFF;
                 let ctrl_id = (wp & 0xFFFF) as i32;
                 if notify == EN_CHANGE && ctrl_id == QUERY_EDIT_ID && lparam.0 != 0 {
-                    // #24: real user typing (never the programmatic clear in
-                    // `show`, which uses SetWindowTextW and never fires
-                    // EN_CHANGE) -- the router's suggestion must not steal
-                    // the selection back from here on for this showing.
+                    if self.suppress_en_change {
+                        // #414: this is `show`'s own programmatic clear, not
+                        // real user typing -- `show` already reset
+                        // `interacted`/`router_summary` and will call
+                        // `rebuild_state` itself right after.
+                        return Some(LRESULT(0));
+                    }
+                    // #24: real user typing -- the router's suggestion must
+                    // not steal the selection back from here on for this
+                    // showing.
                     self.interacted = true;
                     self.router_summary = None;
                     let query = self.current_query();
@@ -1407,6 +1582,71 @@ impl PaletteInner {
                         crate::ui::palette_model::MAX_VISIBLE_ROWS,
                     );
                     self.invalidate();
+                }
+                Some(LRESULT(0))
+            }
+            // #357: hover highlight. `row_at` is purely geometric (any row
+            // slot), so this also checks the row is really an `Action` --
+            // headers/hints/blank space below the last row must never
+            // highlight. Re-arms `TrackMouseEvent` on every move that finds
+            // tracking not already armed, since `TrackMouseEvent` disarms
+            // itself the moment `WM_MOUSELEAVE` fires -- a one-shot device,
+            // not a subscription (no polling timer either way, rule 5: this
+            // only runs in response to a real mouse message).
+            WM_MOUSEMOVE => {
+                if !self.tracking_leave {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: self.hwnd,
+                        dwHoverTime: 0,
+                    };
+                    if unsafe { TrackMouseEvent(&mut tme) }.is_ok() {
+                        self.tracking_leave = true;
+                    }
+                }
+                let y = mouse_y(lparam);
+                let hit =
+                    row_at(y, self.dpi, self.state.offset, self.state.rows.len()).filter(|&i| {
+                        matches!(
+                            self.state.rows.get(i),
+                            Some(crate::ui::palette_model::Row::Action { .. })
+                        )
+                    });
+                if self.hover != hit {
+                    self.hover = hit;
+                    self.invalidate();
+                }
+                Some(LRESULT(0))
+            }
+            WM_MOUSELEAVE => {
+                self.tracking_leave = false;
+                if self.hover.is_some() {
+                    self.hover = None;
+                    self.invalidate();
+                }
+                Some(LRESULT(0))
+            }
+            // #357: click runs the row exactly as Enter would -- reuses
+            // `on_palette_key_command`'s `PaletteKey::Enter` arm (dispatch +
+            // hide) after moving `selected` to the clicked row, rather than
+            // duplicating that dispatch/hide logic here. Only `Action` rows
+            // are clickable (a header/hint hit is a no-op, per the issue's
+            // Done-when); `WM_LBUTTONDOWN` is swallowed so the popup window
+            // (no `WS_TABSTOP`) doesn't do anything Win32-default with it
+            // and the click is a single visible action, on release, like an
+            // ordinary button.
+            WM_LBUTTONDOWN => Some(LRESULT(0)),
+            WM_LBUTTONUP => {
+                let y = mouse_y(lparam);
+                if let Some(idx) = row_at(y, self.dpi, self.state.offset, self.state.rows.len()) {
+                    if matches!(
+                        self.state.rows.get(idx),
+                        Some(crate::ui::palette_model::Row::Action { .. })
+                    ) {
+                        self.state.selected = idx;
+                        self.on_palette_key_command(crate::ui::palette_model::PaletteKey::Enter);
+                    }
                 }
                 Some(LRESULT(0))
             }
@@ -1483,7 +1723,8 @@ mod tests {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_RETURN};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        DispatchMessageW, GetMessageW, GetWindowRect, PeekMessageW, TranslateMessage, MSG,
+        PM_REMOVE,
     };
 
     fn instance() -> HINSTANCE {
@@ -1519,6 +1760,63 @@ mod tests {
         }
     }
 
+    // #357: pure hit-test tests, written before `row_at` exists (RED first).
+    // `dpi` is 96 throughout (logical == physical) so the expected pixel
+    // values are the raw layout constants.
+    mod row_at_tests {
+        use super::super::row_at;
+
+        const DPI: u32 = 96;
+        // list_top = PADDING + EDIT_HEIGHT + PADDING + ROUTER_SUMMARY_HEIGHT
+        //          = 8 + 30 + 8 + 18 = 64
+        const LIST_TOP: i32 = 64;
+        const ROW_H: i32 = 26;
+
+        #[test]
+        fn y_in_the_header_padding_above_the_list_is_none() {
+            assert_eq!(row_at(0, DPI, 0, 10), None);
+            assert_eq!(row_at(LIST_TOP - 1, DPI, 0, 10), None);
+        }
+
+        #[test]
+        fn y_at_the_top_of_the_first_row_is_row_zero() {
+            assert_eq!(row_at(LIST_TOP, DPI, 0, 10), Some(0));
+        }
+
+        #[test]
+        fn y_between_rows_lands_on_the_row_it_falls_in() {
+            // Middle of row 2 (index 2): list_top + 2*ROW_H + ROW_H/2.
+            let y = LIST_TOP + 2 * ROW_H + ROW_H / 2;
+            assert_eq!(row_at(y, DPI, 0, 10), Some(2));
+            // Exactly on the boundary between row 2 and row 3 -> row 3.
+            let boundary = LIST_TOP + 3 * ROW_H;
+            assert_eq!(row_at(boundary, DPI, 0, 10), Some(3));
+        }
+
+        #[test]
+        fn y_below_the_last_real_row_is_none() {
+            // Only 2 rows exist; the geometric slot for row 2 is still inside
+            // the painted viewport but there is no such row.
+            let y = LIST_TOP + 2 * ROW_H + 1;
+            assert_eq!(row_at(y, DPI, 0, 2), None);
+        }
+
+        #[test]
+        fn y_below_the_whole_viewport_is_none() {
+            let y = LIST_TOP + ROW_H * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32 + 5;
+            assert_eq!(row_at(y, DPI, 0, 100), None);
+        }
+
+        #[test]
+        fn scrolled_offset_shifts_the_returned_index() {
+            // With offset 5, the row painted at visible position 0 is real
+            // index 5.
+            assert_eq!(row_at(LIST_TOP, DPI, 5, 20), Some(5));
+            let y = LIST_TOP + 2 * ROW_H + 1;
+            assert_eq!(row_at(y, DPI, 5, 20), Some(7));
+        }
+    }
+
     #[test]
     fn window_and_edit_control_are_created() {
         let p = Palette::new_for_test(instance()).expect("palette window creation must succeed");
@@ -1534,6 +1832,51 @@ mod tests {
         assert!(p.is_visible());
         p.hide();
         assert!(!p.is_visible());
+    }
+
+    /// #395: `show()` must leave the window at the size and position
+    /// `reposition_centered()` just computed for it -- not collapsed to
+    /// 0x0 at the origin. Replays `reposition_centered`'s own math (monitor
+    /// rect, `scale`, `window_height`) against the REAL `GetWindowRect`
+    /// after a real `show()`, so a regression that moves/collapses the
+    /// window after positioning it (the exact #395 bug: an unqualified
+    /// `SetWindowPos(...,0,0,0,0,...)` after `reposition_centered()`) fails
+    /// this test even though `is_visible()` still reports `true`.
+    #[test]
+    fn show_leaves_the_window_at_reposition_centereds_computed_rect() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+
+        let mut rect = RECT::default();
+        unsafe {
+            GetWindowRect(p.hwnd(), &mut rect).expect("GetWindowRect must succeed");
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        assert!(
+            w > 0 && h > 0,
+            "palette window must have nonzero size after show(), got {w}x{h} at ({}, {})",
+            rect.left,
+            rect.top
+        );
+
+        let monitor =
+            crate::capture::active_monitor_rect().expect("active monitor rect must be readable");
+        let dpi = unsafe { GetDpiForWindow(p.hwnd()) }.max(1);
+        let expected_w = scale(WINDOW_WIDTH, dpi);
+        let expected_h = window_height(dpi);
+        let mon_w = monitor.right - monitor.left;
+        let mon_h = monitor.bottom - monitor.top;
+        let expected_x = monitor.left + (mon_w - expected_w).max(0) / 2;
+        let expected_y = monitor.top + (mon_h - expected_h).max(0) / 3;
+
+        assert_eq!(
+            (rect.left, rect.top, w, h),
+            (expected_x, expected_y, expected_w, expected_h),
+            "show() must leave the window exactly where reposition_centered() put it"
+        );
     }
 
     #[test]
@@ -1609,6 +1952,67 @@ mod tests {
         }
     }
 
+    /// #357: real Win32 test mirroring
+    /// `real_win32_down_then_enter_dispatches_the_second_action` but through
+    /// the mouse -- a real `WM_MOUSEMOVE` over the second row (checked
+    /// against `self.inner.hover` for the highlight), then a real
+    /// `WM_LBUTTONUP` at the same point, sent straight to the palette's own
+    /// `HWND` (mouse messages go to the window under the cursor directly, no
+    /// subclass forwarding needed here unlike the query edit control's
+    /// keys).
+    #[test]
+    fn real_win32_mouse_move_then_click_dispatches_the_hovered_row() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        let owner = create_test_owner_window(inst);
+        p.set_owner(owner);
+
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+
+        // list_top (96 DPI) = PADDING + EDIT_HEIGHT + PADDING +
+        // ROUTER_SUMMARY_HEIGHT = 8 + 30 + 8 + 18 = 64; row 1's midpoint is
+        // list_top + ROW_HEIGHT + ROW_HEIGHT/2 = 64 + 26 + 13 = 103.
+        let x: i16 = 50;
+        let y: i16 = 103;
+        let lparam = LPARAM(((y as u16 as u32) << 16 | (x as u16 as u32)) as isize);
+
+        unsafe {
+            SendMessageW(p.hwnd(), WM_MOUSEMOVE, Some(WPARAM(0)), Some(lparam));
+        }
+        assert!(
+            p.inner.hover.is_some(),
+            "hovering an action row must set hover"
+        );
+        // The row the click below must dispatch: the SAME id the mouse-move
+        // just hovered (which is also what Down-then-Enter would have
+        // selected, since the hover moved `state.selected` to the same
+        // geometric row hovering highlighted).
+        let hovered_action_id = p.selected_action_id_at(p.inner.hover.unwrap());
+
+        unsafe {
+            SendMessageW(p.hwnd(), WM_LBUTTONUP, Some(WPARAM(0)), Some(lparam));
+        }
+        pump_pending(p.hwnd());
+
+        let mut msg = MSG::default();
+        let got = unsafe { GetMessageW(&mut msg, Some(owner), 0, 0) };
+        assert!(
+            got.as_bool(),
+            "expected WM_APP_PALETTE_RUN to be queued by the click"
+        );
+        assert_eq!(msg.message, WM_APP_PALETTE_RUN);
+        let action_id = unsafe { *Box::from_raw(msg.lParam.0 as *mut String) };
+        assert_eq!(Some(action_id), hovered_action_id);
+
+        // Click also hides the palette, same as Enter.
+        assert!(!p.is_visible());
+
+        unsafe {
+            let _ = DestroyWindow(owner);
+        }
+    }
+
     #[test]
     fn escape_hides_without_posting_a_run_message() {
         let inst = instance();
@@ -1655,6 +2059,28 @@ mod tests {
         assert_eq!(
             p.selected_action_id().as_deref(),
             Some("extract-text-to-clipboard")
+        );
+    }
+
+    /// #414: the fix for `show`'s programmatic clear must not also swallow
+    /// genuine user typing -- a real `EN_CHANGE` from `set_query_for_test`
+    /// (which drives the query through the real edit control, not by poking
+    /// `PaletteState` directly) must still mark `interacted`.
+    #[test]
+    fn real_typing_after_show_still_marks_interacted() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        assert!(
+            !p.inner.interacted,
+            "show() itself must not mark interacted"
+        );
+        p.set_query_for_test("copy");
+        pump_pending(p.hwnd());
+        assert!(
+            p.inner.interacted,
+            "a real EN_CHANGE from user typing must mark interacted"
         );
     }
 
@@ -1902,5 +2328,114 @@ mod tests {
             avg < 100.0,
             "#25's Done-when is under 100 ms; measured avg {avg:.2} ms"
         );
+    }
+
+    // -- #359: "Looking at your screen..." while the router works ----------
+
+    fn router_result(intent: Option<&str>, confidence: f64) -> crate::router::RouterResult {
+        crate::router::RouterResult {
+            summary: "Check my work".to_string(),
+            intent: intent.map(|s| s.to_string()),
+            confidence,
+        }
+    }
+
+    #[test]
+    fn set_router_pending_shows_the_looking_text() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        assert_eq!(p.inner.router_summary, None);
+        p.set_router_pending(generation);
+        assert_eq!(p.inner.router_summary.as_deref(), Some(ROUTER_LOOKING_TEXT));
+    }
+
+    #[test]
+    fn set_router_pending_is_a_noop_for_a_stale_generation() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let stale_generation = p.router_generation().wrapping_sub(1);
+        p.set_router_pending(stale_generation);
+        assert_eq!(p.inner.router_summary, None);
+    }
+
+    /// #414: `show()`'s own programmatic `SetWindowTextW(edit_hwnd, "")`
+    /// clear must never look like real user input -- if it does, `interacted`
+    /// is `true` immediately after every `show()`, and
+    /// `crate::router::should_apply` (which refuses once `interacted`) means
+    /// the router's preselect (#24) can never apply in the real app. This
+    /// calls only `show()` then `apply_router_suggestion`, with no manual
+    /// `interacted` reset, unlike the tests below.
+    #[test]
+    fn show_does_not_mark_interacted_so_a_router_suggestion_still_applies() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.9), 0.5);
+        assert_eq!(
+            p.inner.router_summary.as_deref(),
+            Some("Check my work"),
+            "show()'s own programmatic text clear must not mark interacted, \
+             or a genuine above-threshold router suggestion can never apply"
+        );
+    }
+
+    #[test]
+    fn apply_router_suggestion_replaces_pending_text_with_the_real_summary() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.set_router_pending(generation);
+        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.9), 0.5);
+        assert_eq!(
+            p.inner.router_summary.as_deref(),
+            Some("Check my work"),
+            "a successful, above-threshold result must replace the placeholder"
+        );
+    }
+
+    #[test]
+    fn apply_router_suggestion_below_threshold_clears_the_pending_text() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.set_router_pending(generation);
+        // Confidence below the threshold: should_apply is false, so the
+        // placeholder must be cleared rather than left stuck.
+        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.1), 0.5);
+        assert_eq!(p.inner.router_summary, None);
+    }
+
+    #[test]
+    fn apply_router_suggestion_with_no_intent_clears_the_pending_text() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.set_router_pending(generation);
+        p.apply_router_suggestion(generation, &router_result(None, 0.9), 0.5);
+        assert_eq!(p.inner.router_summary, None);
+    }
+
+    #[test]
+    fn clear_router_pending_clears_the_looking_text_on_failure() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.set_router_pending(generation);
+        p.clear_router_pending(generation);
+        assert_eq!(p.inner.router_summary, None);
+    }
+
+    #[test]
+    fn clear_router_pending_is_a_noop_for_a_stale_generation() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let generation = p.router_generation();
+        p.set_router_pending(generation);
+        // A new showing bumps the generation; the old request's eventual
+        // failure must not clear the NEW showing's (currently empty) band.
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        p.clear_router_pending(generation);
+        assert_eq!(p.inner.router_summary, None);
     }
 }

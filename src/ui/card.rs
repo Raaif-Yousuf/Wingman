@@ -12,9 +12,11 @@
 //! impl Card {
 //!     pub fn new(instance: HINSTANCE) -> anyhow::Result<Self>;
 //!     pub fn hwnd(&self) -> HWND;
-//!     pub fn show_pending(&mut self);
+//!     pub fn show_pending(&mut self, stage: PendingStage);
+//!     pub fn set_pending_stage(&mut self, stage: PendingStage); // #354
 //!     pub fn show_answer(&mut self, headline: &str, detail: &str, auto_dismiss_secs: u32, difficulty: Option<Difficulty>);
 //!     pub fn show_error(&mut self, headline: &str, detail: &str);
+//!     pub fn show_error_with_details(&mut self, headline: &str, detail: &str);
 //!     pub fn hide(&mut self);
 //!     pub fn set_text_scale(&mut self, scale: f32);
 //!     pub fn state(&self) -> CardState;
@@ -77,8 +79,8 @@ use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint,
     ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject, GetTextMetricsW,
     IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect, SelectClipRgn,
-    SelectObject, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT, DT_CENTER,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
     DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND,
     PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
@@ -92,12 +94,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
-    HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETCLIENTAREAANIMATION,
+    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
+    WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -112,7 +115,30 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// doc comment.
 pub const WM_APP_PREVIEW_DECIDED: u32 = WM_APP + 9;
 
+/// Posted to the card's owner window (see [`Card::set_owner`]) when the user
+/// clicks a card shown via [`Card::show_settings_needed`] -- issue #347.
+/// Carries no payload: `App::on_card_open_settings` just calls
+/// `App::open_settings()`. Adding another `WM_APP_*` constant anywhere in the
+/// crate also means adding it to `app.rs`'s `tests::ALL_WM_APP_IDS` (issue
+/// #163) and its `count_declarations` file list -- see that test's doc
+/// comment.
+pub const WM_APP_CARD_OPEN_SETTINGS: u32 = WM_APP + 15;
+
+/// Posted to the card's owner window (see [`Card::set_owner`]) when the user
+/// clicks or activates (Enter) the "Copy details" affordance on an expanded
+/// error card -- issue #425. Carries no payload: the full raw error chain
+/// does not live on `Card` at all (only the already-humanized `detail` does),
+/// so `App::copy_error_details` reads it from `App::last_error` (set by
+/// `App::record_last_error`, the same store #426's Copy diagnostics already
+/// reads) rather than anything this message would carry. Adding another
+/// `WM_APP_*` constant anywhere in the crate also means adding it to
+/// `app.rs`'s `tests::ALL_WM_APP_IDS` (issue #163) and its
+/// `count_declarations` file list -- see that test's doc comment.
+pub const WM_APP_CARD_COPY_DETAILS: u32 = WM_APP + 17;
+
 use crate::provider::Difficulty;
+pub use crate::ui::pending_status::PendingStage;
+use crate::ui::pending_status::{pending_glyph_should_spin, pending_status_text};
 use crate::ui::preview::{Field, PreviewModel};
 
 // ---------------------------------------------------------------------------
@@ -126,8 +152,10 @@ pub enum CardState {
     Collapsed,
     Expanded,
     /// The confirmation state (#26): a proposal rendered as a compact form
-    /// (title + one row per schema field), with "Do it" / "Edit" / "Cancel"
-    /// buttons. See [`Card::show_preview`].
+    /// (title + one row per schema field), with "Do it" / "Edit" buttons.
+    /// No Cancel button (#392): nothing has run yet, so there is nothing to
+    /// undo -- Esc or a click elsewhere dismiss it instead. See
+    /// [`Card::show_preview`].
     Preview,
 }
 
@@ -156,7 +184,7 @@ impl Card {
     /// production names). Used only by the preview state's real-Win32 test
     /// in this module, which needs an actual `HWND` with real child
     /// controls, not the production `Card`'s class.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn new_for_test(instance: HINSTANCE) -> anyhow::Result<Self> {
         if !ensure_test_class_registered(instance) {
             anyhow::bail!("Wingman: failed to register the test card window class");
@@ -187,8 +215,14 @@ impl Card {
             preview: None,
             last_confirmed: None,
             owner: None,
+            open_settings_on_click: false,
+            copy_details_available: false,
+            copy_details_rect: None,
             preview_decision_pending: false,
             preview_generation: 0,
+            edit_bg_brush: HBRUSH(std::ptr::null_mut()),
+            pending_stage: PendingStage::Working,
+            animations_enabled: true,
         });
         let raw = Box::into_raw(inner);
 
@@ -260,8 +294,20 @@ impl Card {
         self.inner.owner = Some(hwnd);
     }
 
-    pub fn show_pending(&mut self) {
-        self.inner.show_pending();
+    /// `stage` is the caller's honest description of what is happening at
+    /// the moment the card appears -- see `CardInner::show_pending`'s doc
+    /// comment for why there is no default/implicit starting stage any
+    /// more.
+    pub fn show_pending(&mut self, stage: PendingStage) {
+        self.inner.show_pending(stage);
+    }
+
+    /// Issue #354: moves an already-showing Pending card to a new sub-stage
+    /// (e.g. "Asking {model}..." -> "Still working."), updating both the
+    /// painted status line and the window's accessible text. A no-op if the
+    /// card is not currently Pending (see `CardInner::set_pending_stage`).
+    pub fn set_pending_stage(&mut self, stage: PendingStage) {
+        self.inner.set_pending_stage(stage);
     }
 
     pub fn show_answer(
@@ -284,7 +330,48 @@ impl Card {
         // and passing None explicitly (rather than leaving a stale value)
         // ensures a previous answer's badge can never linger on an error
         // card.
+        //
+        // Cold review of #425 (PR #451): deliberately does NOT set
+        // `copy_details_available`. `Card` has no way to know whether the
+        // headline/detail it was just given is the same failure
+        // `App::last_error` holds -- most `show_error` call sites in
+        // `app.rs` never call `track_error`/`record_last_error` at all
+        // (a static "Hotkeys unavailable" message, `show_tray_restore_error`,
+        // "Couldn't locate config.toml", the startup unreadable-secrets
+        // card...), so offering "Copy details" here would silently copy
+        // whatever unrelated error happened to run last. Only
+        // [`Card::show_error_with_details`] -- reserved for callers that
+        // just recorded the matching chain -- grows the footer.
         self.inner.show_collapsed(headline, detail, 0, None);
+    }
+
+    /// Like [`Card::show_error`], except the card also offers "Copy
+    /// details" once Expanded (#425). Callers MUST have just recorded the
+    /// exact chain behind `headline`/`detail` as `App::last_error`
+    /// (`App::track_error`/`record_last_error`) -- this method does not and
+    /// cannot verify that itself, since `Card` never holds the raw chain or
+    /// a reference back to `App` (see [`WM_APP_CARD_COPY_DETAILS`]'s doc
+    /// comment). Using this for an untracked error would let "Copy details"
+    /// silently copy a stale, unrelated chain (PR #451's cold review).
+    pub fn show_error_with_details(&mut self, headline: &str, detail: &str) {
+        self.inner.show_collapsed(headline, detail, 0, None);
+        // Set AFTER show_collapsed, which unconditionally clears this for
+        // every other caller (show_answer and plain show_error included) --
+        // so a later untracked error, or a later answer, can never inherit
+        // a footer left over from an earlier tracked one.
+        self.inner.copy_details_available = true;
+    }
+
+    /// Issue #347: like [`Card::show_error`] (persists until dismissed, no
+    /// difficulty badge), except a click on the card while it is still
+    /// Collapsed posts [`WM_APP_CARD_OPEN_SETTINGS`] to the owner window
+    /// (see [`Card::set_owner`]) and hides the card, instead of expanding it
+    /// for more detail. Used for the readiness-gate cards ("No AI model set
+    /// up yet", "Local mode needs Ollama configured") -- the actionable next
+    /// step for those is Settings, not more text to read.
+    pub fn show_settings_needed(&mut self, headline: &str, detail: &str) {
+        self.inner.show_collapsed(headline, detail, 0, None);
+        self.inner.open_settings_on_click = true;
     }
 
     pub fn hide(&mut self) {
@@ -309,13 +396,15 @@ impl Card {
     /// declared field, with an EDIT control for every field the schema
     /// marks `"editable"`.
     ///
-    /// `main_window_exists` gates the "Edit" button: greyed out
-    /// (`WS_DISABLED`) until a main window exists to open (#26's issue body:
-    /// "Edit opens the main window when it exists"). No caller passes
+    /// `main_window_exists` gates whether the "Edit" button is created at
+    /// all (#352): with no main window to open, a permanently-disabled Edit
+    /// button just squeezed "Do it" and "Cancel" for no reason, so the
+    /// button is omitted entirely until a main window exists (#26's issue
+    /// body: "Edit opens the main window when it exists"). No caller passes
     /// `true` yet -- Wingman has no main window today -- the same "inert
     /// until its caller exists" status `Action::hotkey` has; the button's
-    /// enable/disable wiring is still exercised by
-    /// `preview_edit_button_is_disabled_until_main_window_exists` below.
+    /// create-or-not wiring is still exercised by
+    /// `preview_edit_button_only_exists_once_main_window_exists` below.
     ///
     /// Nothing runs until the user presses "Do it" (Enter) or "Cancel"
     /// (Esc): see [`Card::take_confirmed`].
@@ -395,14 +484,14 @@ const CLASS_NAME: &str = "Wingman.Card.Window.7f3c1a9e";
 /// real child controls, so it gets its own window class rather than sharing
 /// the production one, the same way `single_instance`'s test uses its own
 /// mutex/class names (commit `011f11a`).
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 const TEST_CLASS_NAME: &str = "Wingman.Card.Window.7f3c1a9e.Test";
 
 static CLASS_INIT: Once = Once::new();
 static CLASS_OK: OnceLock<bool> = OnceLock::new();
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 static TEST_CLASS_INIT: Once = Once::new();
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 static TEST_CLASS_OK: OnceLock<bool> = OnceLock::new();
 
 fn ensure_class_registered(instance: HINSTANCE) -> bool {
@@ -413,7 +502,7 @@ fn ensure_class_registered(instance: HINSTANCE) -> bool {
     CLASS_OK.get().copied().unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn ensure_test_class_registered(instance: HINSTANCE) -> bool {
     TEST_CLASS_INIT.call_once(|| {
         let ok = unsafe { register_class(instance, TEST_CLASS_NAME) };
@@ -510,6 +599,16 @@ impl Theme {
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+/// Issue #350: the `(text, background)` colors a preview EDIT field is
+/// painted with, so it follows the card's theme instead of the stock EDIT
+/// control's fixed white-on-black. Pure so the theme -> color mapping is
+/// unit-testable without a real window; the WM_CTLCOLOREDIT handler is the
+/// only caller and does the GDI calls (SetTextColor/SetBkColor/brush) this
+/// function has no business doing.
+fn edit_field_colors(palette: &Palette) -> (u32, u32) {
+    (palette.headline, palette.bg)
 }
 
 // ---------------------------------------------------------------------------
@@ -806,9 +905,16 @@ const CARD_WIDTH_DP: i32 = 280;
 /// that push wrapping earlier, so a full 90-character headline is never
 /// silently `DT_END_ELLIPSIS`'d.
 const HEADLINE_MAX_LINES: i32 = 3;
-/// Side length of the small square pending card (there is no text in it
-/// any more -- just the spinner -- so it does not need to be wide).
-const PENDING_SIZE_DP: i32 = 60;
+/// Side length of the spinner/glyph square inside the pending card (issue
+/// #354: smaller than the old spinner-only card's full size, since the
+/// pending card now also carries a status line below the glyph).
+const PENDING_SIZE_DP: i32 = 40;
+/// Full width of the pending card, once it carries status text -- matches
+/// the Collapsed/Expanded card width so the pending card no longer looks
+/// like a different surface from the states that immediately replace it.
+const PENDING_WIDTH_DP: i32 = CARD_WIDTH_DP;
+/// Vertical gap between the glyph and the status line beneath it.
+const PENDING_TEXT_GAP_DP: i32 = 8;
 const GAP_DP: i32 = 6;
 const WHEEL_SCROLL_DP: i32 = 48;
 
@@ -833,10 +939,42 @@ const BADGE_TEXT_GAP_DP: i32 = 6;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_DISMISS: usize = 2;
+/// Issue #354: fires once, `STILL_WORKING_DELAY_MS` after the card enters
+/// `PendingStage::AskingModel`, and moves the status line to "Still
+/// working." Armed only for as long as the card is actually Pending and in
+/// that sub-stage -- see `CardInner::set_pending_stage` and
+/// `CardInner::kill_timers` (AGENTS.md rule 5: nothing runs while idle).
+const TIMER_STILL_WORKING: usize = 3;
 /// A rotation needs ~16-33ms/frame to read as smooth; the old text-dot
 /// animation could get away with much slower ticks, but a spinner cannot.
 const ANIM_INTERVAL_MS: u32 = 20;
 const PENDING_SAFETY_TIMEOUT_SECS: u32 = 30;
+/// How long "Asking {model}..." stays up before the line changes to "Still
+/// working." -- issue #354's "after a few seconds".
+const STILL_WORKING_DELAY_MS: u32 = 4000;
+
+/// Issue #354: the one-line Win32 read behind the reduce-motion decision.
+/// Kept trivial on purpose (nothing here to get wrong) -- the actual
+/// decision of whether to animate is the pure, unit-tested
+/// `pending_status::pending_glyph_should_spin`. Falls back to `true`
+/// (animate) on any Win32 failure, matching this module's existing degrade
+/// pattern of "keep the pre-existing behaviour" rather than inventing a new
+/// failure mode.
+fn client_area_animation_enabled() -> bool {
+    // SPI_GETCLIENTAREAANIMATION writes a Win32 BOOL (a plain 4-byte int, 0
+    // or nonzero) through pvParam -- a raw i32 avoids depending on exactly
+    // which module this `windows` crate version exports its BOOL type from.
+    let mut enabled: i32 = 1;
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut enabled as *mut _ as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    enabled != 0
+}
 
 // -- Spinner (pending state) -------------------------------------------
 
@@ -915,6 +1053,26 @@ struct CardInner {
     /// `pending_form_fill` would stay `Some`, and a later "Do it" on a
     /// different preview could run the abandoned action instead of the one
     /// the user actually confirmed.
+    /// Issue #347: `true` while the currently-showing Collapsed card is a
+    /// "you need to configure something" prompt whose click should open
+    /// Settings instead of expanding for more detail. Set only by
+    /// [`Card::show_settings_needed`]; cleared by every other path into
+    /// Collapsed (`show_collapsed`, used by both `show_answer` and
+    /// `show_error`) so it can never linger onto an unrelated card.
+    open_settings_on_click: bool,
+    /// Issue #425: `true` while the currently-showing card is an error card
+    /// (set only by [`Card::show_error`]), i.e. one that has a "Copy
+    /// details" affordance to offer once Expanded. Cleared by every other
+    /// path into Collapsed (`show_collapsed`, used by both `show_answer` and
+    /// `show_error`) so an answer card can never inherit it.
+    copy_details_available: bool,
+    /// The "Copy details" affordance's hit-test rect while Expanded, in the
+    /// same client-window coordinates `WM_LBUTTONDOWN`'s `lparam` arrives
+    /// in -- a pinned footer row, so unlike the headline/detail text it is
+    /// NOT affected by `scroll_offset`, and hit-testing it needs no scroll
+    /// math. `None` whenever there is nothing to show (not an error card,
+    /// or not Expanded yet); recomputed by every `layout_expanded` call.
+    copy_details_rect: Option<RECT>,
     preview_decision_pending: bool,
     /// Issue #225: incremented on every [`CardInner::show_preview`], and
     /// posted as `WM_APP_PREVIEW_DECIDED`'s `WPARAM` so the owner can tell
@@ -926,6 +1084,27 @@ struct CardInner {
     /// without a generation the owner would process that abandonment later
     /// and clear the state belonging to the preview now on screen.
     preview_generation: u32,
+    /// Issue #350: the brush WM_CTLCOLOREDIT returns for preview EDIT
+    /// fields, matching `self.theme`. Created lazily on first use and cached
+    /// rather than created per-paint (WM_CTLCOLOREDIT fires on every
+    /// keystroke and repaint), and deleted once in WM_NCDESTROY -- the theme
+    /// never changes for the lifetime of a card window (no WM_SETTINGCHANGE
+    /// handler exists), so one brush for the window's whole life is correct,
+    /// not just an optimisation.
+    edit_bg_brush: HBRUSH,
+    /// Issue #354: which sub-stage the Pending state is in. Meaningless
+    /// outside `CardState::Pending`; set to whatever stage the caller passed
+    /// `show_pending` by every `show_pending` call, alongside every other
+    /// pending-only field.
+    pending_stage: PendingStage,
+    /// Issue #354: whether Windows' "Animation effects" setting was on the
+    /// last time `show_pending` queried it (`client_area_animation_enabled`,
+    /// checked once per Pending session, not re-polled -- there is no
+    /// `WM_SETTINGCHANGE` handler in this module, matching `theme`'s own
+    /// once-per-window-life treatment noted on `edit_bg_brush` above). With
+    /// it `false`, `paint_pending` draws a static glyph and `show_pending`
+    /// never arms `TIMER_ANIM`.
+    animations_enabled: bool,
 }
 
 impl CardInner {
@@ -953,10 +1132,21 @@ impl CardInner {
 
     // -- show/hide -----------------------------------------------------
 
-    fn show_pending(&mut self) {
+    /// `stage` is the caller's own honest description of what is happening
+    /// right as the card appears (issue #354 follow-up review, finding 1):
+    /// there is no longer a generic "Capturing" placeholder shown here and
+    /// then immediately overwritten -- see `PendingStage`'s doc comment for
+    /// why that variant was removed rather than kept and fixed. Every
+    /// caller passes the stage that is actually true at THIS call, e.g.
+    /// `App::begin_model_action` already knows the mode-aware model label
+    /// before capture even runs, so the three model-backed flows start
+    /// directly at `AskingModel`.
+    fn show_pending(&mut self, stage: PendingStage) {
         self.leave_preview_if_active();
         self.reset_activation_and_timers();
-        // No text in the pending state any more -- it shows a spinner.
+        // `headline`/`detail` stay unused by Pending (issue #354's status
+        // line is driven by `pending_stage`/`pending_status_text`, painted
+        // separately in `paint_pending`, never stored back into `headline`).
         self.headline.clear();
         self.detail.clear();
         self.difficulty = None; // pending never shows a badge; keep state tidy
@@ -964,9 +1154,14 @@ impl CardInner {
         self.anim_frame = 0;
         self.scroll_offset = 0;
         self.scroll_max = 0;
+        // Issue #354: queried once per Pending session, not on every frame
+        // -- see the field's doc comment.
+        self.animations_enabled = client_area_animation_enabled();
 
         unsafe {
-            let _ = SetTimer(Some(self.hwnd), TIMER_ANIM, ANIM_INTERVAL_MS, None);
+            if pending_glyph_should_spin(self.animations_enabled) {
+                let _ = SetTimer(Some(self.hwnd), TIMER_ANIM, ANIM_INTERVAL_MS, None);
+            }
             let _ = SetTimer(
                 Some(self.hwnd),
                 TIMER_DISMISS,
@@ -975,8 +1170,71 @@ impl CardInner {
             );
         }
 
+        // Applied BEFORE layout: `layout_pending` sizes the card off the
+        // current status text, so `pending_stage` must already be `stage`
+        // (not the previous Pending session's leftover value) by the time
+        // it runs -- shares the "still working" timer arm-or-kill and
+        // repaint logic with `set_pending_stage`, so starting straight at
+        // `AskingModel` arms the same countdown a later transition into it
+        // would.
+        self.apply_pending_stage(stage);
         self.layout_pending();
         self.reveal();
+    }
+
+    /// Issue #354: moves the Pending card to a new sub-stage -- called by
+    /// this module's own `TIMER_STILL_WORKING` handler (`StillWorking`) once
+    /// the card is already showing. A no-op outside `CardState::Pending`: a
+    /// stale call arriving after the card has already moved on (answer,
+    /// error, hidden) must never resurrect a pending-only field or re-arm a
+    /// pending-only timer.
+    fn set_pending_stage(&mut self, stage: PendingStage) {
+        if self.state != CardState::Pending {
+            return;
+        }
+        self.apply_pending_stage(stage);
+    }
+
+    /// Shared by `show_pending` (the card's very first stage) and
+    /// `set_pending_stage` (a later transition): stores `stage`, arms or
+    /// kills the "still working" countdown to match, and repaints the
+    /// status line. No `CardState::Pending` guard here -- both callers
+    /// already enforce it themselves, one implicitly (it just set the state
+    /// to `Pending`), one explicitly.
+    fn apply_pending_stage(&mut self, stage: PendingStage) {
+        self.pending_stage = stage;
+        // Only `AskingModel` starts the "still working" countdown; killing
+        // any previous one first means a caller that applies this twice in
+        // a row (e.g. the router retrying a provider) never stacks timers.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_STILL_WORKING);
+        }
+        if matches!(self.pending_stage, PendingStage::AskingModel { .. }) {
+            unsafe {
+                let _ = SetTimer(
+                    Some(self.hwnd),
+                    TIMER_STILL_WORKING,
+                    STILL_WORKING_DELAY_MS,
+                    None,
+                );
+            }
+        }
+        self.set_window_text_for_pending_stage();
+        self.invalidate();
+    }
+
+    /// `SetWindowTextW` with the current pending status line, so basic
+    /// assistive tech reading the window's own accessible name sees the
+    /// same text a sighted user reads off the card (issue #354; full UIA
+    /// provider wiring is #119, out of scope here).
+    fn set_window_text_for_pending_stage(&self) {
+        let text = wide_z(&pending_status_text(&self.pending_stage));
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                self.hwnd,
+                PCWSTR(text.as_ptr()),
+            );
+        }
     }
 
     fn show_collapsed(
@@ -994,6 +1252,16 @@ impl CardInner {
         self.state = CardState::Collapsed;
         self.scroll_offset = 0;
         self.scroll_max = 0;
+        // Issue #347: every ordinary show_answer/show_error call starts a
+        // plain card, not a "click to open Settings" prompt -- only
+        // `Card::show_settings_needed` sets this, right after this call
+        // returns.
+        self.open_settings_on_click = false;
+        // Issue #425: same reasoning -- only `Card::show_error` sets this,
+        // right after this call returns, so an answer card never inherits a
+        // "Copy details" affordance for an error it isn't.
+        self.copy_details_available = false;
+        self.copy_details_rect = None;
 
         unsafe {
             if auto_dismiss_secs > 0 {
@@ -1045,6 +1313,12 @@ impl CardInner {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
             let _ = KillTimer(Some(self.hwnd), TIMER_DISMISS);
+            // Issue #354: killed on every exit from Pending (this is called
+            // from `reset_activation_and_timers`, which every `show_*`
+            // entry point runs first, and from `hide()`), so the "Asking
+            // ..." -> "Still working." countdown never outlives the card
+            // state it belongs to.
+            let _ = KillTimer(Some(self.hwnd), TIMER_STILL_WORKING);
         }
     }
 
@@ -1112,6 +1386,36 @@ impl CardInner {
         }
     }
 
+    /// Issue #425: `true` when `(x, y)` (client-window coordinates, the same
+    /// space `WM_LBUTTONDOWN`'s `lparam` arrives in) lands inside the
+    /// pinned "Copy details" footer -- `false` whenever there is no footer
+    /// at all (not an error card, or not Expanded, so `copy_details_rect`
+    /// is `None`).
+    fn point_hits_copy_details(&self, x: i32, y: i32) -> bool {
+        let Some(r) = self.copy_details_rect else {
+            return false;
+        };
+        (r.left..r.right).contains(&x) && (r.top..r.bottom).contains(&y)
+    }
+
+    /// Issue #425: the click or Enter activation of "Copy details" on an
+    /// expanded error card. `Card`/`CardInner` never holds the full raw
+    /// error chain (only the already-humanized `detail` does -- see
+    /// `WM_APP_CARD_COPY_DETAILS`'s doc comment), so this only notifies the
+    /// owner; `App::copy_error_details` does the actual clipboard write from
+    /// `App::last_error`. Deliberately does NOT hide the card first (unlike
+    /// `show_settings_needed`'s click handling): the owner's handler
+    /// replaces the card's content with its own confirmation
+    /// (`show_answer("Details copied", ...)`) or error, so there is nothing
+    /// for this to tear down itself.
+    fn copy_details_activated(&mut self) {
+        if let Some(owner) = self.owner {
+            unsafe {
+                let _ = PostMessageW(Some(owner), WM_APP_CARD_COPY_DETAILS, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
     // -- layout ------------------------------------------------------------
 
     fn work_area_for_cursor(&self) -> RECT {
@@ -1148,9 +1452,14 @@ impl CardInner {
     }
 
     fn layout_pending(&mut self) {
-        let size = self.scale(PENDING_SIZE_DP);
+        let padding = self.scale(PADDING_DP);
+        let width = self.scale(PENDING_WIDTH_DP);
+        let glyph_size = self.scale(PENDING_SIZE_DP);
+        let gap = self.scale(PENDING_TEXT_GAP_DP);
+        let text_line_h = self.line_height(self.fonts.body).max(1);
+        let height = padding * 2 + glyph_size + gap + text_line_h;
         let work = self.work_area_for_cursor();
-        self.place_bottom_right(work, size, size);
+        self.place_bottom_right(work, width, height);
     }
 
     fn layout_collapsed(&mut self) {
@@ -1189,17 +1498,43 @@ impl CardInner {
         };
         let content_h = headline_h + if detail_h > 0 { gap + detail_h } else { 0 };
 
+        // Issue #425: "Copy details" is a pinned footer row below the
+        // scrollable headline/detail area, not part of it -- so it stays
+        // reachable regardless of scroll position and its hit-test rect
+        // needs no scroll_offset math (see `copy_details_rect`'s doc
+        // comment). Only an error card (`copy_details_available`) reserves
+        // the space at all.
+        let footer_h = if self.copy_details_available {
+            self.line_height(self.fonts.body).max(1)
+        } else {
+            0
+        };
+        let footer_gap = if footer_h > 0 { gap } else { 0 };
+
         let work = self.work_area_for_self();
         let work_h = (work.bottom - work.top).max(1);
         let max_window_h = ((work_h as f32) * 0.6) as i32;
-        let min_window_h = padding * 2 + self.line_height(self.fonts.headline);
+        let min_window_h =
+            padding * 2 + self.line_height(self.fonts.headline) + footer_gap + footer_h;
 
-        let desired_window_h = padding * 2 + content_h;
+        let desired_window_h = padding * 2 + content_h + footer_gap + footer_h;
         let window_h = desired_window_h.min(max_window_h).max(min_window_h);
-        let viewport_h = (window_h - padding * 2).max(1);
+        let viewport_h = (window_h - padding * 2 - footer_gap - footer_h).max(1);
 
         self.scroll_max = (content_h - viewport_h).max(0);
         self.scroll_offset = self.scroll_offset.clamp(0, self.scroll_max);
+
+        self.copy_details_rect = if footer_h > 0 {
+            let top = window_h - padding - footer_h;
+            Some(RECT {
+                left: padding,
+                top,
+                right: padding + content_width,
+                bottom: top + footer_h,
+            })
+        } else {
+            None
+        };
 
         self.place_bottom_right(work, width, window_h);
     }
@@ -1413,27 +1748,71 @@ impl CardInner {
         }
     }
 
-    /// Draws the indeterminate spinner: a dim full ring, then a brighter arc
-    /// segment swept on top of it, its position driven by `anim_frame`.
-    /// Replaces the old "Thinking..." text entirely.
+    /// Issue #354: the glyph (spinner, or a static ring with animations
+    /// off) sits in a fixed-size square at the top of the card, with the
+    /// status line (`pending_status_text`) drawn below it -- replacing the
+    /// old glyph-only, text-only pending card.
     unsafe fn paint_pending(&self, hdc: HDC, rc: RECT, padding: i32, palette: &Palette) {
         let w = rc.right - rc.left;
-        let h = rc.bottom - rc.top;
+        let glyph_size = self.scale(PENDING_SIZE_DP);
         let cx = rc.left + w / 2;
-        let cy = rc.top + h / 2;
-        let diameter = (w.min(h) - padding * 2).max(4);
-        let radius = (diameter / 2).max(1);
+        let cy = rc.top + padding + glyph_size / 2;
+        let radius = (glyph_size / 2 - self.scale(SPINNER_STROKE_DP)).max(1);
         let left = cx - radius;
         let top = cy - radius;
         let right = cx + radius;
         let bottom = cy + radius;
         let stroke = self.scale(SPINNER_STROKE_DP).max(2);
 
-        // Arc() never fills, but Ellipse() does -- select NULL_BRUSH so the
-        // dim ring is an outline, not a filled disc.
+        self.paint_pending_glyph(
+            hdc, left, top, right, bottom, cx, cy, radius, stroke, palette,
+        );
+
+        // Status line, centered under the glyph.
+        let gap = self.scale(PENDING_TEXT_GAP_DP);
+        let text_top = rc.top + padding + glyph_size + gap;
+        let text_rect = RECT {
+            left: rc.left + padding,
+            top: text_top,
+            right: rc.right - padding,
+            bottom: rc.bottom - padding,
+        };
+        SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
+        let text = pending_status_text(&self.pending_stage);
+        draw_text_line(
+            hdc,
+            &text,
+            text_rect,
+            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+    }
+
+    /// Draws either the spinning arc-over-ring (animations on) or a single
+    /// static ring (animations off, issue #354: no motion when Windows'
+    /// "Animation effects" setting is off). `anim_frame` is only consulted
+    /// in the spinning branch, so a static glyph never depends on the timer
+    /// that `show_pending` deliberately does not arm in that case.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn paint_pending_glyph(
+        &self,
+        hdc: HDC,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        cx: i32,
+        cy: i32,
+        radius: i32,
+        stroke: i32,
+        palette: &Palette,
+    ) {
+        // Arc()/Ellipse(outline) never fill -- select NULL_BRUSH so both the
+        // dim ring and the static glyph render as outlines, not filled
+        // discs.
         let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
 
-        // Dim full ring underneath.
+        // Dim full ring underneath (also the whole glyph when static).
         let ring_pen = CreatePen(
             PS_SOLID,
             stroke,
@@ -1446,38 +1825,62 @@ impl CardInner {
         }
         let _ = DeleteObject(HGDIOBJ(ring_pen.0));
 
-        // Bright sweeping arc on top. Prefer a geometric pen with round end
-        // caps for a clean look; fall back to a plain cosmetic pen if that
-        // ever fails (e.g. exotic display driver).
-        let brush = LOGBRUSH {
-            lbStyle: BS_SOLID,
-            lbColor: windows::Win32::Foundation::COLORREF(palette.headline),
-            lbHatch: 0,
-        };
-        let mut arc_pen = ExtCreatePen(
-            PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
-            stroke as u32,
-            &brush,
-            None,
-        );
-        if arc_pen.0.is_null() {
-            arc_pen = CreatePen(
+        if pending_glyph_should_spin(self.animations_enabled) {
+            // Bright sweeping arc on top. Prefer a geometric pen with round
+            // end caps for a clean look; fall back to a plain cosmetic pen
+            // if that ever fails (e.g. exotic display driver).
+            let brush = LOGBRUSH {
+                lbStyle: BS_SOLID,
+                lbColor: windows::Win32::Foundation::COLORREF(palette.headline),
+                lbHatch: 0,
+            };
+            let mut arc_pen = ExtCreatePen(
+                PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
+                stroke as u32,
+                &brush,
+                None,
+            );
+            if arc_pen.0.is_null() {
+                arc_pen = CreatePen(
+                    PS_SOLID,
+                    stroke,
+                    windows::Win32::Foundation::COLORREF(palette.headline),
+                );
+            }
+            if !arc_pen.0.is_null() {
+                let start_deg = (self.anim_frame as f32 * SPINNER_DEGREES_PER_FRAME) % 360.0;
+                let end_deg = start_deg + SPINNER_SWEEP_DEG;
+                let (x1, y1) = ray_point(cx, cy, start_deg, radius);
+                let (x2, y2) = ray_point(cx, cy, end_deg, radius);
+
+                let old_pen = SelectObject(hdc, HGDIOBJ(arc_pen.0));
+                let _ = Arc(hdc, left, top, right, bottom, x1, y1, x2, y2);
+                SelectObject(hdc, old_pen);
+            }
+            let _ = DeleteObject(HGDIOBJ(arc_pen.0));
+        } else {
+            // Static glyph: a brighter, slightly smaller inner ring on top
+            // of the dim outer one, so the state still reads as "in
+            // progress" without any per-frame motion.
+            let inner_radius = (radius * 3 / 5).max(1);
+            let inner_pen = CreatePen(
                 PS_SOLID,
                 stroke,
                 windows::Win32::Foundation::COLORREF(palette.headline),
             );
+            if !inner_pen.0.is_null() {
+                let old_pen = SelectObject(hdc, HGDIOBJ(inner_pen.0));
+                let _ = Ellipse(
+                    hdc,
+                    cx - inner_radius,
+                    cy - inner_radius,
+                    cx + inner_radius,
+                    cy + inner_radius,
+                );
+                SelectObject(hdc, old_pen);
+            }
+            let _ = DeleteObject(HGDIOBJ(inner_pen.0));
         }
-        if !arc_pen.0.is_null() {
-            let start_deg = (self.anim_frame as f32 * SPINNER_DEGREES_PER_FRAME) % 360.0;
-            let end_deg = start_deg + SPINNER_SWEEP_DEG;
-            let (x1, y1) = ray_point(cx, cy, start_deg, radius);
-            let (x2, y2) = ray_point(cx, cy, end_deg, radius);
-
-            let old_pen = SelectObject(hdc, HGDIOBJ(arc_pen.0));
-            let _ = Arc(hdc, left, top, right, bottom, x1, y1, x2, y2);
-            SelectObject(hdc, old_pen);
-        }
-        let _ = DeleteObject(HGDIOBJ(arc_pen.0));
 
         SelectObject(hdc, old_brush);
     }
@@ -1518,7 +1921,17 @@ impl CardInner {
         let content_w = (rc.right - rc.left - padding * 2).max(1);
         let content_left = rc.left + padding;
         let content_top = rc.top + padding;
-        let content_bottom = rc.bottom - padding;
+        // Issue #425: the scrollable headline/detail area stops above the
+        // pinned "Copy details" footer, not at the window's own bottom
+        // padding, the same reservation `layout_expanded`'s `viewport_h`
+        // makes -- otherwise a long detail could scroll text underneath (or
+        // the clip region could cut into) the footer row.
+        let footer_reserve = self
+            .copy_details_rect
+            .map(|r| (rc.bottom - r.top) + gap - padding)
+            .unwrap_or(0)
+            .max(0);
+        let content_bottom = rc.bottom - padding - footer_reserve;
 
         // Clip to the padded content area so scrolled text never bleeds into
         // the border/padding.
@@ -1581,7 +1994,7 @@ impl CardInner {
                 left: rc.left + 1,
                 top: content_bottom - line_h,
                 right: rc.right - 1,
-                bottom: rc.bottom - 1,
+                bottom: content_bottom,
             };
             // Paint the card colour back over the clipped line so the hint sits
             // on a clean strip rather than on top of half a word.
@@ -1590,12 +2003,15 @@ impl CardInner {
             let _ = DeleteObject(HGDIOBJ(bg.0));
             // Reuse the headline's badge reservation so the hint (which is
             // also right-aligned, in the same bottom-right corner the badge
-            // occupies) does not draw underneath it either.
+            // occupies) does not draw underneath it either. Anchored off
+            // `content_bottom` (the scroll area's own bottom edge, #425),
+            // not the window's, so it never lands on top of the "Copy
+            // details" footer when both are present.
             let hint_rect = RECT {
                 left: content_left,
-                top: rc.bottom - padding - band_h + self.scale(2),
+                top: content_bottom - band_h + self.scale(2),
                 right: content_left + headline_w,
-                bottom: rc.bottom - padding,
+                bottom: content_bottom,
             };
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
@@ -1608,6 +2024,23 @@ impl CardInner {
         }
 
         self.paint_difficulty_badge(hdc, rc);
+
+        // Issue #425: the pinned "Copy details" footer, painted outside the
+        // clip region the scrollable content above used (it is set with
+        // `IntersectClipRect`, which only ever narrows -- painting here,
+        // after that clip has already applied to everything above, still
+        // draws within it unless the clip is reset, so reset it first).
+        if let Some(footer_rect) = self.copy_details_rect {
+            let _ = SelectClipRgn(hdc, None);
+            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
+            draw_text_line(
+                hdc,
+                "Copy details",
+                footer_rect,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
     }
 
     /// Draws the difficulty badge in the card's bottom-right corner, if any
@@ -1668,9 +2101,32 @@ impl CardInner {
 
     // -- message handling --------------------------------------------------
 
-    fn handle_message(&mut self, msg: u32, wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+    fn handle_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         match msg {
             WM_ERASEBKGND => Some(LRESULT(1)),
+            // Issue #350: without this, preview EDIT fields keep the stock
+            // white background and black text regardless of theme -- the
+            // one control on the card where the user reads carefully before
+            // confirming stays bright in dark mode. Only WM_CTLCOLOREDIT is
+            // handled: every preview field the card creates is an editable
+            // EDIT control (`create_preview_edit`, no ES_READONLY, no
+            // STATIC), so WM_CTLCOLORSTATIC never fires for them and adding
+            // a handler for it would be dead code.
+            WM_CTLCOLOREDIT => {
+                let hdc = HDC(wparam.0 as *mut _);
+                let palette = self.theme.palette();
+                let (text, bg) = edit_field_colors(&palette);
+                unsafe {
+                    SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text));
+                    SetBkColor(hdc, windows::Win32::Foundation::COLORREF(bg));
+                    if self.edit_bg_brush.0.is_null() {
+                        self.edit_bg_brush =
+                            CreateSolidBrush(windows::Win32::Foundation::COLORREF(bg));
+                    }
+                }
+                let _ = HWND(lparam.0 as *mut _); // the EDIT control; unused (every preview EDIT shares one theme)
+                Some(LRESULT(self.edit_bg_brush.0 as isize))
+            }
             WM_PAINT => {
                 self.on_paint();
                 Some(LRESULT(0))
@@ -1695,12 +2151,49 @@ impl CardInner {
                     TIMER_DISMISS if self.state != CardState::Preview => {
                         self.hide();
                     }
+                    // Issue #354: only acts while still genuinely Pending --
+                    // `set_pending_stage`'s own guard would also catch a
+                    // stale message, but checking here too means a message
+                    // already queued from a state `kill_timers` could not
+                    // reach in time never even calls into it.
+                    TIMER_STILL_WORKING if self.state == CardState::Pending => {
+                        self.set_pending_stage(PendingStage::StillWorking);
+                    }
                     _ => {}
                 }
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
-                self.try_expand();
+                // Issue #347: a settings-needed card's click opens Settings
+                // instead of expanding -- checked before try_expand() (whose
+                // own guard would otherwise just expand it, since these
+                // cards are always Collapsed with a non-empty detail).
+                if self.state == CardState::Collapsed && self.open_settings_on_click {
+                    self.open_settings_on_click = false;
+                    if let Some(owner) = self.owner {
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(owner),
+                                WM_APP_CARD_OPEN_SETTINGS,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                    self.hide();
+                } else if self.state == CardState::Expanded {
+                    // Issue #425: checked before try_expand() -- whose own
+                    // guard would no-op here anyway (Expanded, not
+                    // Collapsed), but the point is that a click on the
+                    // "Copy details" footer must activate it instead of
+                    // falling through to nothing.
+                    let (x, y) = crate::dismiss::unpack_point(lparam.0 as u32);
+                    if self.point_hits_copy_details(x, y) {
+                        self.copy_details_activated();
+                    }
+                } else {
+                    self.try_expand();
+                }
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL => {
@@ -1718,6 +2211,14 @@ impl CardInner {
             WM_KEYDOWN => {
                 if self.state == CardState::Expanded && wparam.0 as u16 == VK_ESCAPE.0 {
                     self.close_expanded();
+                } else if self.state == CardState::Expanded
+                    && wparam.0 as u16 == VK_RETURN.0
+                    && self.copy_details_rect.is_some()
+                {
+                    // Issue #425: "keyboard reachable too, not just mouse" --
+                    // Enter activates "Copy details" while it is showing, the
+                    // same way it already activates "Do it" in Preview.
+                    self.copy_details_activated();
                 } else if self.state == CardState::Preview {
                     if let Some(command_id) = preview_key_command(wparam.0 as u16) {
                         self.run_preview_command(command_id);
@@ -1746,6 +2247,12 @@ impl CardInner {
             WM_NCDESTROY => {
                 self.fonts.delete();
                 self.fonts = Fonts::null();
+                if !self.edit_bg_brush.0.is_null() {
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(self.edit_bg_brush.0));
+                    }
+                    self.edit_bg_brush = HBRUSH(std::ptr::null_mut());
+                }
                 self.hwnd = HWND(std::ptr::null_mut());
                 None
             }
@@ -1797,8 +2304,7 @@ impl CardInner {
             title: title.to_string(),
             edits: Vec::new(),
             do_it_btn: HWND(std::ptr::null_mut()),
-            edit_btn: HWND(std::ptr::null_mut()),
-            cancel_btn: HWND(std::ptr::null_mut()),
+            edit_btn: None,
             previous_foreground,
             main_window_exists,
         });
@@ -1848,8 +2354,8 @@ impl CardInner {
             // A required field is blank after editing: refuse silently and
             // leave the card open rather than build a Confirmed from an
             // invalid form. A card is never a dialog box (rule 7); an
-            // inline validation message is left to a follow-up issue (see
-            // NEXT_SESSION.md), not invented here.
+            // inline validation message is left to a follow-up issue, not
+            // invented here.
             return;
         }
         let shown = preview.model.to_value();
@@ -1914,14 +2420,14 @@ impl CardInner {
     }
 
     /// "Edit": only reachable when `main_window_exists` was `true` at
-    /// `show_preview` time -- the button is `WS_DISABLED` otherwise, and
-    /// Windows never delivers a click (or this synthetic command) for a
-    /// disabled control. No caller passes `true` yet (Wingman has no main
-    /// window today), so this body is an intentional no-op placeholder for
-    /// the issue that adds one, the same "inert until its caller exists"
-    /// status `Action::hotkey` has -- not a control silently doing nothing
-    /// where a real signal was expected, since that control cannot be
-    /// clicked in production yet.
+    /// `show_preview` time -- the button (and thus `ID_PREVIEW_EDIT`) is not
+    /// even created otherwise (#352), so Windows never delivers a click (or
+    /// this synthetic command) for it. No caller passes `true` yet (Wingman
+    /// has no main window today), so this body is an intentional no-op
+    /// placeholder for the issue that adds one, the same "inert until its
+    /// caller exists" status `Action::hotkey` has -- not a control silently
+    /// doing nothing where a real signal was expected, since that control
+    /// does not exist in production yet.
     fn preview_edit_clicked(&mut self) {}
 
     /// Reads every editable control's `GetWindowTextW` back into the model.
@@ -1996,7 +2502,11 @@ impl CardInner {
                     let _ = DestroyWindow(*hwnd);
                 }
             }
-            for hwnd in [preview.do_it_btn, preview.edit_btn, preview.cancel_btn] {
+            let mut btns = vec![preview.do_it_btn];
+            if let Some(edit_btn) = preview.edit_btn {
+                btns.push(edit_btn);
+            }
+            for hwnd in btns {
                 if !hwnd.0.is_null() {
                     let _ = DestroyWindow(hwnd);
                 }
@@ -2032,15 +2542,15 @@ impl CardInner {
             Some(p) => p.model.fields().to_vec(),
             None => return,
         };
-        let metrics = self.compute_preview_layout(&fields);
-        let instance = self.instance;
-        let parent = self.hwnd;
-        let font = self.fonts.body;
-        let edit_enabled = self
+        let main_window_exists = self
             .preview
             .as_ref()
             .map(|p| p.main_window_exists)
             .unwrap_or(false);
+        let metrics = self.compute_preview_layout(&fields, main_window_exists);
+        let instance = self.instance;
+        let parent = self.hwnd;
+        let font = self.fonts.body;
 
         let mut edits = Vec::new();
         for (field, row) in fields.iter().zip(metrics.rows.iter()) {
@@ -2065,27 +2575,23 @@ impl CardInner {
             true,
             true,
         );
-        let edit_btn = create_preview_button(
-            parent,
-            instance,
-            font,
-            "Edit",
-            &metrics.buttons.edit,
-            ID_PREVIEW_EDIT,
-            false,
-            edit_enabled,
-        );
-        let cancel_btn = create_preview_button(
-            parent,
-            instance,
-            font,
-            "Cancel",
-            &metrics.buttons.cancel,
-            ID_PREVIEW_CANCEL,
-            false,
-            true,
-        );
-        for hwnd in [do_it_btn, edit_btn, cancel_btn] {
+        let edit_btn = metrics.buttons.edit.map(|rect| {
+            create_preview_button(
+                parent,
+                instance,
+                font,
+                "Edit",
+                &rect,
+                ID_PREVIEW_EDIT,
+                false,
+                true,
+            )
+        });
+        let mut btns = vec![do_it_btn];
+        if let Some(edit_btn) = edit_btn {
+            btns.push(edit_btn);
+        }
+        for hwnd in btns {
             if !hwnd.0.is_null() {
                 subclass_preview_control(hwnd, parent);
             }
@@ -2095,7 +2601,6 @@ impl CardInner {
             preview.edits = edits;
             preview.do_it_btn = do_it_btn;
             preview.edit_btn = edit_btn;
-            preview.cancel_btn = cancel_btn;
         }
     }
 
@@ -2108,7 +2613,12 @@ impl CardInner {
             Some(p) => p.model.fields().to_vec(),
             None => return,
         };
-        let metrics = self.compute_preview_layout(&fields);
+        let main_window_exists = self
+            .preview
+            .as_ref()
+            .map(|p| p.main_window_exists)
+            .unwrap_or(false);
+        let metrics = self.compute_preview_layout(&fields, main_window_exists);
         let font = self.fonts.body;
 
         let Some(preview) = self.preview.as_ref() else {
@@ -2136,11 +2646,11 @@ impl CardInner {
                 }
             }
         }
-        for (hwnd, rect) in [
-            (preview.do_it_btn, &metrics.buttons.do_it),
-            (preview.edit_btn, &metrics.buttons.edit),
-            (preview.cancel_btn, &metrics.buttons.cancel),
-        ] {
+        let mut positioned = vec![(preview.do_it_btn, metrics.buttons.do_it)];
+        if let (Some(edit_btn), Some(edit_rect)) = (preview.edit_btn, metrics.buttons.edit) {
+            positioned.push((edit_btn, edit_rect));
+        }
+        for (hwnd, rect) in positioned {
             if hwnd.0.is_null() {
                 continue;
             }
@@ -2169,7 +2679,12 @@ impl CardInner {
             Some(p) => p.model.fields().to_vec(),
             None => return,
         };
-        let metrics = self.compute_preview_layout(&fields);
+        let main_window_exists = self
+            .preview
+            .as_ref()
+            .map(|p| p.main_window_exists)
+            .unwrap_or(false);
+        let metrics = self.compute_preview_layout(&fields, main_window_exists);
         // Preview does not track the cursor the way Pending/Collapsed do
         // (`work_area_for_cursor`): once a form is up, the user's mouse is
         // likely to move away while they read or type, and having the card
@@ -2181,10 +2696,15 @@ impl CardInner {
 
     /// The preview form's full geometry: the title line, one label/value
     /// row per field (in `fields`' order, which is schema order -- see
-    /// `PreviewModel::from_schema`), and the three buttons. Pure geometry:
+    /// `PreviewModel::from_schema`), and the button row. Pure geometry:
     /// used both to position real child controls and to paint the
     /// non-editable rows' labels/values, so the two can never drift apart.
-    fn compute_preview_layout(&self, fields: &[Field]) -> PreviewLayoutMetrics {
+    ///
+    /// `show_edit` mirrors `main_window_exists` (#352): when `false`, no
+    /// "Edit" rect is produced at all (`buttons.edit` is `None`) and "Do it"
+    /// / "Cancel" are spread across the freed width instead of leaving a
+    /// blank column where "Edit" used to sit.
+    fn compute_preview_layout(&self, fields: &[Field], show_edit: bool) -> PreviewLayoutMetrics {
         let padding = self.scale(PADDING_DP);
         let gap = self.scale(GAP_DP);
         let width = self.scale(PREVIEW_WIDTH_DP);
@@ -2206,18 +2726,44 @@ impl CardInner {
             .scale(PREVIEW_ROW_H_DP)
             .max(self.line_height(self.fonts.body));
         let row_gap = self.scale(PREVIEW_ROW_GAP_DP);
-        let label_w = self.scale(PREVIEW_LABEL_W_DP).min(content_width / 2).max(1);
+        // #355: the label column used to be a fixed 84dp, truncating a long
+        // label (e.g. "Date of birth") to "Date of bi..." exactly when the
+        // user is checking what is about to be written. Size it from the
+        // widest label actually shown instead, clamped between the old
+        // 84dp floor and 45% of the content width so one very long label
+        // cannot squeeze the value column away.
+        let label_min_w = self.scale(PREVIEW_LABEL_W_DP).min(content_width / 2).max(1);
+        let label_max_w = ((content_width as f32) * PREVIEW_LABEL_MAX_FRACTION) as i32;
+        let measured_label_w: Vec<i32> = fields
+            .iter()
+            .map(|f| self.measure_label(self.fonts.body, &f.label).0)
+            .collect();
+        let label_w = label_column_width(&measured_label_w, label_min_w, label_max_w);
         let value_x = content_left + label_w + self.scale(6);
         let value_w = (content_right - value_x).max(1);
 
         let mut rows = Vec::with_capacity(fields.len());
-        for _ in fields {
+        for (field, &measured_w) in fields.iter().zip(measured_label_w.iter()) {
+            // A label that still does not fit the (clamped) column wraps to
+            // a second line rather than ellipsizing, per #355's "Done
+            // when": the whole label must be visible, not just wider.
+            let label_wrapped = measured_w > label_w;
+            let row_content_h = if label_wrapped {
+                self.measure_wrapped(self.fonts.body, &field.label, label_w)
+                    .max(row_h)
+            } else {
+                row_h
+            };
             let label_rect = RECT {
                 left: content_left,
                 top: y,
                 right: content_left + label_w,
-                bottom: y + row_h,
+                bottom: y + row_content_h,
             };
+            // When the label wraps to two lines, the value stays a single
+            // line top-aligned with the label's *first* line rather than
+            // vertically centred in the now-taller row (review nit on
+            // #355): `row_h` here, not `row_content_h`.
             let value_rect = RECT {
                 left: value_x,
                 top: y,
@@ -2227,8 +2773,9 @@ impl CardInner {
             rows.push(PreviewRowMetrics {
                 label_rect,
                 value_rect,
+                label_wrapped,
             });
-            y += row_h + row_gap;
+            y += row_content_h + row_gap;
         }
         y = if fields.is_empty() {
             y + gap
@@ -2238,24 +2785,26 @@ impl CardInner {
 
         let btn_h = self.scale(PREVIEW_BUTTON_H_DP);
         let btn_w = self.scale(PREVIEW_BUTTON_W_DP);
-        let btn_gap = self.scale(PREVIEW_BUTTON_GAP_DP);
         let do_it = RECT {
             left: content_right - btn_w,
             top: y,
             right: content_right,
             bottom: y + btn_h,
         };
-        let cancel = RECT {
-            left: do_it.left - btn_gap - btn_w,
-            top: y,
-            right: do_it.left - btn_gap,
-            bottom: y + btn_h,
-        };
-        let edit = RECT {
-            left: content_left,
-            top: y,
-            right: content_left + btn_w,
-            bottom: y + btn_h,
+        // #392: Cancel is gone (nothing has run yet, so there is nothing to
+        // undo). "Edit", when present, keeps its spot at the content's left
+        // edge; "Do it" stays right-aligned. With no "Edit" either, the left
+        // side is simply empty rather than filled by a button that no
+        // longer exists.
+        let edit = if show_edit {
+            Some(RECT {
+                left: content_left,
+                top: y,
+                right: content_left + btn_w,
+                bottom: y + btn_h,
+            })
+        } else {
+            None
         };
         y += btn_h;
 
@@ -2266,11 +2815,7 @@ impl CardInner {
             window_h,
             title_rect,
             rows,
-            buttons: PreviewButtonMetrics {
-                do_it,
-                edit,
-                cancel,
-            },
+            buttons: PreviewButtonMetrics { do_it, edit },
         }
     }
 
@@ -2282,7 +2827,7 @@ impl CardInner {
             return;
         };
         let fields = preview.model.fields();
-        let metrics = self.compute_preview_layout(fields);
+        let metrics = self.compute_preview_layout(fields, preview.main_window_exists);
 
         let title_rect = metrics.title_rect;
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
@@ -2298,12 +2843,15 @@ impl CardInner {
             let label_rect = row.label_rect;
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-            draw_text_line(
-                hdc,
-                &field.label,
-                label_rect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-            );
+            // #355: a label that did not fit the clamped column even at its
+            // widest wraps to a second line instead of ellipsizing, so the
+            // whole label stays readable.
+            let label_format = if row.label_wrapped {
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX
+            } else {
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
+            };
+            draw_text_line(hdc, &field.label, label_rect, label_format);
 
             if !field.editable {
                 let value_rect = row.value_rect;
@@ -2331,7 +2879,22 @@ const PREVIEW_ROW_GAP_DP: i32 = 6;
 const PREVIEW_LABEL_W_DP: i32 = 84;
 const PREVIEW_BUTTON_H_DP: i32 = 26;
 const PREVIEW_BUTTON_W_DP: i32 = 84;
-const PREVIEW_BUTTON_GAP_DP: i32 = 8;
+/// Upper bound on the label column as a fraction of the content width
+/// (#355): even the widest label never pushes the value column below 55%
+/// of the available space.
+const PREVIEW_LABEL_MAX_FRACTION: f32 = 0.45;
+
+/// Sizes the preview label column from the widest measured label (#355),
+/// clamped between `min_w` (the old fixed 84dp floor) and `max_w` (45% of
+/// the content width). Pure and DPI-agnostic: callers scale `measured`,
+/// `min_w` and `max_w` to pixels first, so this same function is exercised
+/// at every DPI by `label_column_width_is_clamped_at_several_dpis` below --
+/// it never needs to know what DPI produced its inputs.
+fn label_column_width(measured: &[i32], min_w: i32, max_w: i32) -> i32 {
+    let max_w = max_w.max(min_w);
+    let widest = measured.iter().copied().max().unwrap_or(min_w);
+    widest.clamp(min_w, max_w)
+}
 
 const ID_PREVIEW_DO_IT: i32 = 3900;
 const ID_PREVIEW_EDIT: i32 = 3901;
@@ -2362,8 +2925,9 @@ struct PreviewUi {
     /// fields have no entry here; their value is painted, not typed into.
     edits: Vec<(String, HWND)>,
     do_it_btn: HWND,
-    edit_btn: HWND,
-    cancel_btn: HWND,
+    /// `None` when `main_window_exists` was `false` at `show_preview` time
+    /// (#352): the button is not created at all, not just disabled.
+    edit_btn: Option<HWND>,
     /// `GetForegroundWindow()` at the moment `show_preview` was called.
     /// `close_preview` hands the foreground back to this window (if it
     /// still exists) so the preview's interruption is temporary -- see
@@ -2377,12 +2941,17 @@ struct PreviewUi {
 struct PreviewRowMetrics {
     label_rect: RECT,
     value_rect: RECT,
+    /// Whether this row's label is too wide for the (clamped) label column
+    /// even after `label_column_width` picked the widest label it could,
+    /// so it must be drawn wrapped (`DT_WORDBREAK`) instead of ellipsized
+    /// on one line (#355).
+    label_wrapped: bool,
 }
 
 struct PreviewButtonMetrics {
     do_it: RECT,
-    edit: RECT,
-    cancel: RECT,
+    /// `None` when the layout was computed with `show_edit: false` (#352).
+    edit: Option<RECT>,
 }
 
 struct PreviewLayoutMetrics {
@@ -2415,7 +2984,7 @@ fn preview_key_command(vk: u16) -> Option<i32> {
 /// -- whether the new focus target means "click away" (cancel the preview,
 /// same as Esc) or staying within the card's own window group (do nothing:
 /// Tab moving between two preview fields, or focus landing on the Do
-/// it/Cancel button itself right before its own click fires).
+/// it/Edit button itself right before its own click fires).
 /// `new_focus_is_card_or_descendant` is
 /// `new_focus_hwnd == card_hwnd || IsChild(card_hwnd, new_focus_hwnd)`,
 /// computed by the caller (both need a live `HWND` comparison/`IsChild`
@@ -2686,7 +3255,7 @@ mod tests {
         assert!(!card.hwnd().0.is_null());
         assert_eq!(card.state(), CardState::Hidden);
 
-        card.show_pending();
+        card.show_pending(PendingStage::Working);
         assert_eq!(card.state(), CardState::Pending);
 
         card.show_answer(
@@ -2715,6 +3284,271 @@ mod tests {
         card.hide();
         assert_eq!(card.state(), CardState::Hidden);
         // Dropping must not panic (this exercises DestroyWindow + WM_NCDESTROY).
+    }
+
+    #[test]
+    fn clicking_a_settings_needed_card_opens_settings_instead_of_expanding() {
+        // Issue #347: the old "No API key: open Edit settings" card named a
+        // menu item that no longer exists. The fix is that the card's own
+        // click opens Settings directly, so this proves the click posts
+        // WM_APP_CARD_OPEN_SETTINGS to the owner (same self-notify idiom the
+        // preview tests use) and does not just expand the card.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_settings_needed("No AI model set up yet", "Click here to open Settings.");
+        assert_eq!(card.state(), CardState::Collapsed);
+
+        let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
+
+        assert_eq!(
+            card.state(),
+            CardState::Hidden,
+            "clicking a settings-needed card must hide it, not expand it"
+        );
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "clicking a settings-needed card must post WM_APP_CARD_OPEN_SETTINGS to the owner"
+        );
+        assert_eq!(msg.message, WM_APP_CARD_OPEN_SETTINGS);
+    }
+
+    #[test]
+    fn clicking_an_ordinary_error_card_still_expands() {
+        // Neighbouring case: show_error (not show_settings_needed) must keep
+        // the pre-#347 expand-on-click behaviour.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error("Couldn't capture the screen", "detail text");
+        assert_eq!(card.state(), CardState::Collapsed);
+
+        let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
+        assert!(handled.is_some());
+        assert_eq!(card.state(), CardState::Expanded);
+    }
+
+    // -- "Copy details" affordance on an expanded error card (#425) --------
+
+    #[test]
+    fn expanded_error_card_reserves_a_copy_details_footer() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.copy_details_rect.is_some(),
+            "an expanded, tracked error card must reserve a \"Copy details\" footer"
+        );
+    }
+
+    #[test]
+    fn plain_show_error_never_gets_a_copy_details_footer() {
+        // Cold review of #425/PR #451: `show_error` alone (untracked -- no
+        // `App::track_error`/`record_last_error` call behind it) must never
+        // offer "Copy details", because `App::last_error` may hold a chain
+        // from an unrelated, earlier failure. Only `show_error_with_details`
+        // -- reserved for callers that just recorded the matching chain --
+        // grows the footer.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error("Hotkeys unavailable", "The keyboard hook is not installed.");
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.copy_details_rect.is_none(),
+            "an untracked error card must not show \"Copy details\""
+        );
+    }
+
+    #[test]
+    fn untracked_error_card_after_a_tracked_one_has_no_copy_details_footer() {
+        // The exact regression PR #451's cold review caught: a tracked
+        // error card's footer must not linger (or, worse, keep pointing at
+        // the OLDER chain) once a later, untracked error card replaces it.
+        // `show_collapsed` (both `show_answer` and plain `show_error` route
+        // through it) unconditionally clears `copy_details_available`, so
+        // only the call that most recently used `show_error_with_details`
+        // can have left it set -- and a later plain `show_error` call
+        // always clears it again.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+
+        card.show_error_with_details("Couldn't add the event", "tracked detail");
+        card.inner.try_expand();
+        assert!(
+            card.inner.copy_details_rect.is_some(),
+            "the tracked error must show the footer"
+        );
+
+        card.show_error("Couldn't restore the tray icon", "untracked detail");
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.copy_details_rect.is_none(),
+            "an untracked error card must never inherit the previous card's \"Copy details\" \
+             footer, which would copy a stale, unrelated chain"
+        );
+    }
+
+    #[test]
+    fn expanded_answer_card_has_no_copy_details_footer() {
+        // Neighbour: show_answer (not show_error) must never grow the
+        // affordance -- there is no raw error chain behind an answer.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.copy_details_rect.is_none(),
+            "an answer card must not show \"Copy details\""
+        );
+    }
+
+    #[test]
+    fn clicking_copy_details_posts_wm_app_card_copy_details() {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        let rect = card
+            .inner
+            .copy_details_rect
+            .expect("error card must have a Copy details footer once expanded");
+        let x = (rect.left + rect.right) / 2;
+        let y = (rect.top + rect.bottom) / 2;
+        let lparam = LPARAM(crate::dismiss::pack_point(x, y) as isize);
+
+        let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), lparam);
+        assert!(handled.is_some());
+        // Unlike the settings-needed click, activating "Copy details" does
+        // not hide the card itself -- the owner's handler replaces its
+        // content with its own confirmation/error.
+        assert_eq!(card.state(), CardState::Expanded);
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "clicking \"Copy details\" must post WM_APP_CARD_COPY_DETAILS to the owner"
+        );
+        assert_eq!(msg.message, WM_APP_CARD_COPY_DETAILS);
+    }
+
+    #[test]
+    fn pressing_enter_on_an_expanded_error_card_also_posts_copy_details() {
+        // "Keyboard reachable too, not just mouse" (#425).
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+
+        let handled = card.handle_message(WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(0));
+        assert!(handled.is_some());
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "Enter on an expanded error card must post WM_APP_CARD_COPY_DETAILS"
+        );
+        assert_eq!(msg.message, WM_APP_CARD_COPY_DETAILS);
+    }
+
+    /// `true` if `wanted` is queued for `hwnd`. Unlike
+    /// `PeekMessageW(&mut msg, Some(hwnd), 0, 0, PM_REMOVE)` (the
+    /// unfiltered range the positive-assertion tests above use, where the
+    /// first message found IS the one under test), this passes `wanted` as
+    /// both `wMsgFilterMin` and `wMsgFilterMax` so it only ever looks at --
+    /// and only ever removes -- that exact message. A real window can have
+    /// unrelated messages pending even with no interactive desktop pump
+    /// running (WM_WINDOWPOSCHANGED, WM_ACTIVATE, a paint); WM_PAINT in
+    /// particular is regenerated by Windows for as long as its update
+    /// region stays non-empty, which an unfiltered drain loop would never
+    /// clear (`BeginPaint`/`DispatchMessageW` would; a bare `PeekMessageW`
+    /// does neither) -- so this must never widen to "drain everything and
+    /// see what turns up".
+    fn queue_contains(hwnd: HWND, wanted: u32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+        let mut msg = MSG::default();
+        unsafe { PeekMessageW(&mut msg, Some(hwnd), wanted, wanted, PM_REMOVE) }.as_bool()
+    }
+
+    #[test]
+    fn clicking_outside_the_footer_on_an_expanded_error_card_does_not_copy() {
+        // Neighbour: a click elsewhere in the expanded card (e.g. on the
+        // headline/detail text) must not trigger the affordance -- only the
+        // footer's own rect does.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        let rect = card.inner.copy_details_rect.expect("footer must exist");
+        // Just above the footer -- still inside the card, but not on it.
+        let lparam = LPARAM(crate::dismiss::pack_point(rect.left, rect.top - 4) as isize);
+
+        let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), lparam);
+        assert!(handled.is_some());
+
+        assert!(
+            !queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS),
+            "a click above the footer must not post WM_APP_CARD_COPY_DETAILS"
+        );
+    }
+
+    #[test]
+    fn pressing_enter_on_an_expanded_answer_card_does_nothing() {
+        // Neighbour: no footer, so Enter must not post anything either.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        card.inner.try_expand();
+
+        let handled = card.handle_message(WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(0));
+        assert!(handled.is_some());
+
+        assert!(
+            !queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS),
+            "an answer card has no Copy details to activate"
+        );
+    }
+
+    #[test]
+    fn edit_field_colors_follow_the_card_theme() {
+        // Issue #350: preview EDIT fields kept the stock white-on-black
+        // regardless of theme. The colors WM_CTLCOLOREDIT hands back must
+        // come from the same Palette the rest of the card paints with, not
+        // a hardcoded pair -- otherwise dark mode gets a bright rectangle in
+        // the one place the user reads carefully before confirming.
+        let dark = Theme::Dark.palette();
+        let (dark_text, dark_bg) = edit_field_colors(&dark);
+        assert_eq!(dark_bg, dark.bg);
+        assert_eq!(dark_text, dark.headline);
+
+        let light = Theme::Light.palette();
+        let (light_text, light_bg) = edit_field_colors(&light);
+        assert_eq!(light_bg, light.bg);
+        assert_eq!(light_text, light.headline);
+
+        // The two themes must not collapse onto the same colors -- that
+        // would be the "wired to nothing" failure mode: a function that
+        // compiles and returns *a* color pair but ignores the theme it was
+        // given.
+        assert_ne!(dark_bg, light_bg);
+        assert_ne!(dark_text, light_text);
     }
 
     #[test]
@@ -2902,7 +3736,7 @@ mod tests {
     #[test]
     fn focus_staying_in_the_card_group_does_not_cancel() {
         // Tab between two preview fields, or focus landing on the Do
-        // it/Cancel button right before its own click fires: the new focus
+        // it/Edit button right before its own click fires: the new focus
         // target IS the card or a descendant of it.
         assert!(!preview_focus_left_the_card(true));
     }
@@ -2973,8 +3807,8 @@ mod tests {
             assert!(!hwnd.0.is_null());
         }
         assert!(!preview.do_it_btn.0.is_null());
-        assert!(!preview.cancel_btn.0.is_null());
-        assert!(!preview.edit_btn.0.is_null());
+        // main_window_exists is false here (#352): no Edit button at all.
+        assert!(preview.edit_btn.is_none());
 
         // A real EDIT control's initial text round-trips through the
         // window, not just the pure model.
@@ -2987,28 +3821,337 @@ mod tests {
         assert_eq!(window_text(start_hwnd), "09:00");
     }
 
+    /// Walks the card's own top-level BUTTON children via `GetWindow`
+    /// (`GW_CHILD` then `GW_HWNDNEXT`), reading each one's text with
+    /// `window_text`. Independent of `PreviewUi`'s field names, so it keeps
+    /// checking the real, on-screen button set even as the struct backing
+    /// it is refactored (issue #392: the whole point is that no `HWND`
+    /// with `BUTTON` class and "Cancel" text is ever created, not just that
+    /// no field happens to be named `cancel_btn`).
+    fn preview_button_texts(card_hwnd: HWND) -> Vec<String> {
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindow, GW_CHILD, GW_HWNDNEXT};
+        let mut out = Vec::new();
+        unsafe {
+            let mut child = GetWindow(card_hwnd, GW_CHILD).unwrap_or(HWND(std::ptr::null_mut()));
+            while !child.0.is_null() {
+                let text = window_text(child);
+                if !text.is_empty() {
+                    out.push(text);
+                }
+                child = GetWindow(child, GW_HWNDNEXT).unwrap_or(HWND(std::ptr::null_mut()));
+            }
+        }
+        out
+    }
+
     #[test]
-    fn preview_edit_button_is_disabled_until_main_window_exists() {
+    fn preview_button_set_has_no_cancel_button() {
+        // #392: nothing has run yet when a preview is shown, so there is
+        // nothing to undo -- the Cancel button must not exist at all, only
+        // "Do it". Esc and click-away still resolve to `preview_cancel`
+        // (covered by `preview_key_command_maps_escape_to_cancel` and the
+        // `preview_control_subclass_*` click-away tests below), just with
+        // no visible button behind them.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        let texts = preview_button_texts(card.hwnd());
+        assert!(
+            texts.iter().any(|t| t == "Do it"),
+            "expected a \"Do it\" button among {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "Cancel"),
+            "no Cancel button on a preview where nothing has run yet, found {texts:?}"
+        );
+    }
+
+    /// The wired-to-nothing check for issue #350 that does not depend on a
+    /// desktop or compositor being attached to the process: sends the exact
+    /// message a real preview EDIT control sends its parent
+    /// (WM_CTLCOLOREDIT, wParam = the field's own HDC, lParam = its HWND)
+    /// straight to `CardInner::handle_message`, the same path the real
+    /// window proc uses, and checks the two GDI side effects a stock,
+    /// unhandled WM_CTLCOLOREDIT would never produce: the HDC's text/
+    /// background colors actually changed to the theme's, and a non-null
+    /// brush came back (the stock default would leave `DefWindowProcW` to
+    /// return `COLOR_WINDOW`, not our cached brush).
+    #[test]
+    fn wm_ctlcoloredit_paints_the_dark_palette_not_stock_white() {
+        use windows::Win32::Graphics::Gdi::{GetBkColor, GetTextColor};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.inner.theme = Theme::Dark;
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let edit_hwnd = card
+            .inner
+            .preview
+            .as_ref()
+            .expect("preview state is active")
+            .edits[0]
+            .1;
+
+        let hdc = unsafe { GetDC(Some(edit_hwnd)) };
+        let result = card.inner.handle_message(
+            WM_CTLCOLOREDIT,
+            WPARAM(hdc.0 as usize),
+            LPARAM(edit_hwnd.0 as isize),
+        );
+        let brush = result.expect("WM_CTLCOLOREDIT must be handled, not fall through to Def*");
+        assert_ne!(brush.0, 0, "must return a real brush, not NULL");
+
+        let dark = Theme::Dark.palette();
+        let text_after = unsafe { GetTextColor(hdc) };
+        let bg_after = unsafe { GetBkColor(hdc) };
+        assert_eq!(text_after.0, dark.headline);
+        assert_eq!(bg_after.0, dark.bg);
+        // The bug this closes: stock EDIT white background, unconditionally.
+        assert_ne!(bg_after.0, rgb(255, 255, 255));
+
+        unsafe {
+            ReleaseDC(Some(edit_hwnd), hdc);
+        }
+    }
+
+    /// Manual observable for issue #350 (wired-to-nothing check): shows a
+    /// real preview card, forced into `Theme::Dark`, pumps a few WM_PAINTs
+    /// so the EDIT fields actually receive WM_CTLCOLOREDIT and repaint, then
+    /// captures the window's own pixels with GetDIBits and writes a PNG.
+    /// Captured in-process (not via a second process's screen-scrape)
+    /// because this box's Bash and PowerShell tools run on window stations
+    /// that cannot see each other's windows -- MEASURED 2026-09-24:
+    /// `FindWindowW(NULL, "Wingman")` from a PowerShell tool call found
+    /// nothing while the card window from a backgrounded `cargo test` was
+    /// on screen and the test itself was still running. Not run by
+    /// `cargo test`: `#[ignore]`d, same pattern as
+    /// `ocr::ocr_live_recognizes_gdi_rendered_text`. Run with
+    /// `cargo test dark_preview_manual_screenshot -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dark_preview_manual_screenshot() {
+        use image::ImageEncoder;
+        use windows::Win32::Graphics::Gdi::{
+            GetDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, GetWindowRect, PeekMessageW, TranslateMessage, PM_REMOVE,
+        };
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        // Force dark regardless of the machine's actual theme, so this
+        // check does not depend on the dev box's Settings.
+        card.inner.theme = Theme::Dark;
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let hwnd = card.hwnd();
+
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{
+                RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
+            };
+
+            // Pump enough messages for WM_PAINT (and the WM_CTLCOLOREDIT
+            // each preview EDIT sends as it repaints) to actually run, then
+            // force an immediate synchronous repaint before capture.
+            for _ in 0..15 {
+                let mut msg = std::mem::zeroed();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            let _ = RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
+
+            let mut rect = RECT::default();
+            GetWindowRect(hwnd, &mut rect).expect("GetWindowRect");
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+
+            let hdc = GetDC(Some(hwnd));
+            let mem_dc = CreateCompatibleDC(Some(hdc));
+            let bmp = CreateCompatibleBitmap(hdc, w, h);
+            let old = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+            let _ = BitBlt(mem_dc, 0, 0, w, h, Some(hdc), 0, 0, SRCCOPY);
+            SelectObject(mem_dc, old);
+
+            let mut bmi = BITMAPINFO::default();
+            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h; // top-down DIB
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB.0;
+
+            let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+            GetDIBits(
+                mem_dc,
+                bmp,
+                0,
+                h as u32,
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(Some(hwnd), hdc);
+
+            // GetDIBits hands back BGRA; the PNG encoder wants RGBA.
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+
+            let path = std::env::temp_dir().join("wingman_dark_preview_350.png");
+            let file = std::fs::File::create(&path).expect("create png file");
+            let mut writer = std::io::BufWriter::new(file);
+            image::codecs::png::PngEncoder::new(&mut writer)
+                .write_image(&buf, w as u32, h as u32, image::ExtendedColorType::Rgba8)
+                .expect("encode png");
+            println!("saved dark preview screenshot to {}", path.display());
+        }
+    }
+
+    #[test]
+    fn preview_edit_button_only_exists_once_main_window_exists() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
 
         card.inner
             .show_preview("Add to calendar", &schema, &value, false);
-        let edit_btn = card.inner.preview.as_ref().unwrap().edit_btn;
-        assert_ne!(
-            gwl_style(edit_btn) & (WS_DISABLED.0 as isize),
-            0,
-            "Edit must be disabled while no main window exists"
+        assert!(
+            card.inner.preview.as_ref().unwrap().edit_btn.is_none(),
+            "Edit must not be created while no main window exists (#352)"
         );
 
         card.inner
             .show_preview("Add to calendar", &schema, &value, true);
-        let edit_btn = card.inner.preview.as_ref().unwrap().edit_btn;
+        let edit_btn = card
+            .inner
+            .preview
+            .as_ref()
+            .unwrap()
+            .edit_btn
+            .expect("Edit must be created once main_window_exists is true");
         assert_eq!(
             gwl_style(edit_btn) & (WS_DISABLED.0 as isize),
             0,
-            "Edit must be enabled once main_window_exists is true"
+            "Edit must be enabled, not WS_DISABLED, once created"
         );
+    }
+
+    /// #355's pure layout-math test: `label_column_width` at several DPIs.
+    /// Callers scale their inputs first, so this exercises the same
+    /// function real DPIs would see without needing a real window.
+    #[test]
+    fn label_column_width_is_clamped_at_several_dpis() {
+        for dpi in [96u32, 120, 144, 192] {
+            let scale = |dp: i32| (dp * dpi as i32 + 48) / 96;
+            let min_w = scale(PREVIEW_LABEL_W_DP);
+            let content_w = scale(PREVIEW_WIDTH_DP) - 2 * scale(PADDING_DP);
+            let max_w = ((content_w as f32) * PREVIEW_LABEL_MAX_FRACTION) as i32;
+
+            // A short label never grows the column past its natural width.
+            let short = scale(20);
+            assert_eq!(
+                label_column_width(&[short], min_w, max_w),
+                min_w,
+                "dpi {dpi}: a label narrower than the floor must not shrink the column"
+            );
+
+            // A label between the floor and the ceiling sizes the column
+            // to exactly that label.
+            let mid = (min_w + max_w) / 2;
+            assert_eq!(
+                label_column_width(&[mid], min_w, max_w),
+                mid,
+                "dpi {dpi}: a label between floor and ceiling sizes the column to it"
+            );
+
+            // A label wider than the ceiling is clamped, not honored in
+            // full (it wraps instead -- see the row-height test below).
+            let huge = max_w + scale(200);
+            assert_eq!(
+                label_column_width(&[huge], min_w, max_w),
+                max_w,
+                "dpi {dpi}: a label past the 45% ceiling must clamp, not widen the column further"
+            );
+
+            // The widest of several labels wins, still clamped.
+            assert_eq!(
+                label_column_width(&[short, mid, huge], min_w, max_w),
+                max_w,
+                "dpi {dpi}: the widest label among several drives the column"
+            );
+
+            // No fields at all: falls back to the floor, never zero/negative.
+            assert_eq!(label_column_width(&[], min_w, max_w), min_w);
+        }
+    }
+
+    /// #355's Done-when: a "Date of birth" field's whole label is visible
+    /// (measured width fits inside `label_rect`, or it wraps rather than
+    /// being cut) at both 100% and 150% scaling.
+    #[test]
+    fn preview_long_label_is_never_ellipsized_at_100_or_150_percent() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        for dpi in [96u32, 144] {
+            card.inner.dpi = dpi;
+            card.inner.rebuild_fonts();
+
+            let fields = vec![Field {
+                name: "dob".to_string(),
+                label: "Date of birth".to_string(),
+                value: "2000-01-01".to_string(),
+                editable: false,
+                required: false,
+            }];
+            let metrics = card.inner.compute_preview_layout(&fields, false);
+            let row = &metrics.rows[0];
+            let (label_w, _) = card
+                .inner
+                .measure_label(card.inner.fonts.body, "Date of birth");
+            let column_w = row.label_rect.right - row.label_rect.left;
+
+            assert!(
+                column_w >= label_w || row.label_wrapped,
+                "dpi {dpi}: \"Date of birth\" must fit the column ({column_w}px) or wrap, \
+                 not be silently ellipsized (measured {label_w}px)"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_without_edit_keeps_do_it_right_aligned_with_no_cancel_slot() {
+        // #392 supersedes #352's Cancel-placement Done-when: Cancel no
+        // longer exists at all, so there is no layout slot for it any more
+        // -- only "Do it" (always right-aligned against the content edge)
+        // and, when `show_edit` is true, "Edit" at the content's left edge.
+        let card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let fields = vec![];
+        let content_right = card.inner.scale(PREVIEW_WIDTH_DP) - card.inner.scale(PADDING_DP);
+
+        let metrics = card.inner.compute_preview_layout(&fields, false);
+        assert!(metrics.buttons.edit.is_none());
+        assert_eq!(metrics.buttons.do_it.right, content_right);
+
+        let with_edit = card.inner.compute_preview_layout(&fields, true);
+        assert!(with_edit.buttons.edit.is_some());
+        assert_eq!(with_edit.buttons.do_it.right, content_right);
+        let edit_rect = with_edit.buttons.edit.unwrap();
+        assert_eq!(edit_rect.left, card.inner.scale(PADDING_DP));
+        assert!(edit_rect.right < with_edit.buttons.do_it.left);
     }
 
     #[test]

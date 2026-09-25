@@ -1,6 +1,6 @@
 # Documentation index
 
-> The detailed reference. `CLAUDE.md` at the repo root is the quick-reference
+> The detailed reference. `AGENTS.md` at the repo root is the quick-reference
 > card and points here for depth.
 
 A native Windows 11 tray assistant behind the Copilot key. Rust, Win32, one
@@ -17,14 +17,14 @@ handoff snapshot, or a human-only action: those are four different things.
 |---|---|---|
 | GitHub Issues (once the public repo exists) | every bug, feature and roadmap item | open to closed; nothing duplicates it in markdown |
 | `docs/superpowers/specs/` | design decisions and their rationale, one dated file per topic | written before the code; superseded specs say so at the top and stay in git |
-| [`NEXT_SESSION.md`](../NEXT_SESSION.md) | where the last session stopped and what the next one should do first | fully overwritten each session; no history |
+| `NEXT_SESSION.md` (gitignored, per contributor) | where your last session stopped and what the next one should do first | local only; never committed |
 | [`OWNER_TODO.md`](../OWNER_TODO.md) | actions only a human can take: a Settings click, a repo name, an account | rows deleted when done |
 | [`CHANGELOG.md`](../CHANGELOG.md) (Keep a Changelog) | what shipped, per version | append-only |
 
 ## Reading order for a new contributor
 
 1. [`README.md`](../README.md) at the root: what it does and how to install it.
-2. [`CLAUDE.md`](../CLAUDE.md): the rules and the pitfalls, ten minutes.
+2. [`AGENTS.md`](../AGENTS.md): the rules and the pitfalls, ten minutes.
 3. [`2026-09-14-copilot-ask-design.md`](superpowers/specs/2026-09-14-copilot-ask-design.md): the running app.
 4. [`2026-09-15-packaging-and-install-design.md`](superpowers/specs/2026-09-15-packaging-and-install-design.md): how it gets onto a machine.
 5. [`2026-09-16-expansion-plan-design.md`](superpowers/specs/2026-09-16-expansion-plan-design.md): where it is going.
@@ -49,6 +49,13 @@ or author framing, checking for this repo's recorded bug shapes.
 Hooks (`.claude/settings.json`, scripts in `scripts/hooks/`): a recursive
 force-delete aimed inside the repo and any mutating `git stash` are refused
 before they run. Both scripts explain the replacement in their message.
+
+## Orchestrator scripts (`scripts/`)
+
+| Script | What it does |
+|---|---|
+| `merge-agent-branches.sh` | Merges a fan-out's leftover branches one at a time, least-contended first; aborts and reports any conflict instead of resolving it |
+| `pr-overlap.sh` | Lists open pull requests with author, CI state, mergeable state and changed files, finds every pair that touches the same file, and suggests a merge order (fewest overlaps first). Needs `gh` and `jq` |
 
 ## Index
 

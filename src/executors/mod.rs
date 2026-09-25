@@ -11,6 +11,7 @@
 mod calendar_add;
 mod clipboard;
 mod fill_form;
+mod format_probe;
 mod image_clipboard;
 mod none;
 pub mod registry;
@@ -26,6 +27,30 @@ use crate::ui::confirm::Confirmed;
 /// [`crate::ui::confirm::auto_confirm_read_only`] without a real user
 /// confirmation (expansion plan §6: "Read-only actions show a result card
 /// straight away").
+///
+/// **Decided (issue #402):** `ClipboardExecutor` and `ImageClipboardExecutor`
+/// stay `ReadOnly` even though both overwrite the real OS clipboard. This
+/// was raised as a possible bug (a `ReadOnly` label letting a clobbering
+/// write skip confirmation), but it matches what the 2026-09-16 expansion
+/// plan already specifies: the actions table's `confirm` column is "false
+/// only for read-only actions", and its own example -- "Extract text
+/// (offline)  screen -> clipboard  local" -- is exactly this shape, an
+/// action whose entire purpose is landing a computed result on the
+/// clipboard with no extra click. Per AGENTS.md's Look-Propose-Confirm-Do
+/// loop, the result card the read-only fast path still shows *is* the
+/// propose/confirm step for this class of action: the user pressed the key
+/// to get something copied, and requiring a second confirmation on top of
+/// the card would be the same tap twice that the fast path exists to avoid.
+/// A distinct `Effect::Clipboard` variant was considered and rejected: nothing
+/// in either spec calls for a third policy bucket, and inventing one here
+/// would be undocumented architecture, which AGENTS.md rule 12 reserves for
+/// a spec update, not a bugfix.
+///
+/// This does not excuse silently destroying whatever was on the clipboard
+/// before: see `executors::clipboard`'s and `executors::image_clipboard`'s
+/// own doc comments for the residual gap (arboard's `ContentNotAvailable`
+/// cannot tell "clipboard was empty" from "clipboard held something this
+/// executor cannot preserve") and issue #410 tracking it separately.
 ///
 /// Nothing in `app.rs` calls an executor yet (the confirm card's "Do it"
 /// button does not exist -- see the 2026-09-17 executor design doc's "Out

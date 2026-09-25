@@ -7,7 +7,7 @@ toggle nobody can verify is not a promise. Where a promise depends on
 something not built yet, that is stated plainly, not implied to already
 work.
 
-Rule 10 (CLAUDE.md) applies here too: every enforcement claim below is
+Rule 10 (AGENTS.md) applies here too: every enforcement claim below is
 either checked against the code as it exists today, or marked as a promise
 for a planned feature.
 
@@ -35,7 +35,7 @@ has pressed the key.
 **Today, enforced:** the keyboard hook (`WH_KEYBOARD_LL`) and tray icon are
 the only things resident, both purely event-driven; there is no polling
 timer anywhere in the crate, no `NtSetTimerResolution`/`timeBeginPeriod`
-call (CLAUDE.md rule 5). A network request only ever originates from
+call (AGENTS.md rule 5). A network request only ever originates from
 `App::ask`, itself only reachable from a hotkey press, **Ask now** in the
 tray menu, or the Auto-mode Ollama reachability probe (which itself is only
 attempted when Ollama is actually configured -- see
@@ -96,7 +96,7 @@ and no paid tier for the app itself.
 every dependency to a permissive-license allowlist (MIT, Apache-2.0, BSD,
 ISC, Zlib, Unlicense, Unicode-3.0) and CI runs `cargo deny check` on every
 push. Code copied from elsewhere must itself be MIT and is attributed in
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) (CLAUDE.md rule 2). There
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) (AGENTS.md rule 2). There
 is no payment code, no license-check code, and no feature gate anywhere in
 the crate -- there is nothing to gate. **This is a policy commitment about
 the project's future, not something a compiler can enforce**: nothing stops
@@ -140,7 +140,7 @@ before and after running `install.ps1` yourself.
 
 Folded into the first promise above; listed separately here only because
 it is also the project's most load-bearing single sentence. It is a
-permanent design constraint (CLAUDE.md, the app's own top-level
+permanent design constraint (AGENTS.md, the app's own top-level
 description), not a feature flag: an executor that pressed Send, Submit,
 Buy or Pay would be rejected in review regardless of how it is written,
 per the `filing-findings` skill's "Enhancements must fit the product" rule.

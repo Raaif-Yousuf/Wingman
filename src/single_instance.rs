@@ -147,7 +147,7 @@ pub fn activation_from_args<I: IntoIterator<Item = String>>(args: I) -> Activati
 /// Deliberately not [`Activation`]: on this path "no flag" means "start
 /// normally and do nothing more" rather than "ask", because every bare
 /// first launch -- the Copilot key, the Start Menu entry, autostart at
-/// login -- must not ask unasked (CLAUDE.md: "a bare launch must not ask").
+/// login -- must not ask unasked (AGENTS.md: "a bare launch must not ask").
 /// Only an explicit `--settings`, as `install.ps1` passes after a fresh
 /// install, opens Settings.
 #[derive(Debug, PartialEq, Eq)]
@@ -254,7 +254,7 @@ mod tests {
     fn a_bare_first_launch_does_nothing() {
         // The Copilot key, the Start Menu entry and autostart at login all
         // activate the exe with no arguments, and none of them may open
-        // Settings unasked (CLAUDE.md: "a bare launch must not ask").
+        // Settings unasked (AGENTS.md: "a bare launch must not ask").
         assert!(matches!(
             first_launch_action(args(&["wingman.exe"])),
             FirstLaunchAction::None

@@ -205,21 +205,38 @@ impl Profile {
     }
 
     /// Restricts the profile file's ACL to the current user only, via
-    /// `icacls`. Best-effort, same as `Config::restrict_acl`: any failure
-    /// (missing binary, non-NTFS volume) is ignored, since DPAPI's own
-    /// user-scoped encryption is the real protection here -- this is
-    /// defense in depth, not the only barrier.
+    /// `icacls`. Deliberately best-effort, unlike `Config::restrict_acl`
+    /// (#257), which returns a `Result` and aborts the write on failure:
+    /// the profile file's contents are DPAPI-encrypted under the current
+    /// user's own key (see `save_to` above), so another account cannot
+    /// decrypt it regardless of what the ACL says. This call is defense in
+    /// depth on top of that, not the only barrier, so a failure here
+    /// (missing `icacls`, non-NTFS volume) is ignored rather than failing
+    /// the save. `Config`'s file has no such second layer -- a plaintext
+    /// API key with the wrong ACL is genuinely exposed -- which is exactly
+    /// why that path cannot afford to be best-effort and this one can.
     #[cfg(windows)]
     fn restrict_acl(path: &Path) {
         let username = match std::env::var("USERNAME") {
             Ok(u) if !u.is_empty() => u,
             _ => return,
         };
+        // CREATE_NO_WINDOW (0x0800_0000): Wingman is a windows-subsystem GUI
+        // app with no console of its own, so spawning `icacls` without this
+        // flag allocates and briefly flashes a new console window on every
+        // profile save (#447; `config.rs`'s `restrict_acl` had the same gap,
+        // fixed in #446 -- not yet on `master`, so not shared as a helper
+        // here; see this function's own doc comment for why the two
+        // `restrict_acl`s already differ in error handling and can't simply
+        // be merged into one without also reconciling that).
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let _ = std::process::Command::new("icacls")
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
             .arg(format!("{username}:F"))
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
     }
 
@@ -358,6 +375,37 @@ mod tests {
         let loaded = Profile::load_from(&path).expect("load_from should succeed");
         assert!(!loaded.emails[0].sensitive);
         assert!(loaded.emails[1].sensitive);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // -- #447: CREATE_NO_WINDOW must not break the icacls call -------------
+    //
+    // The console-flash fix itself (spawning `icacls` with `CREATE_NO_WINDOW`
+    // so no console window briefly appears) has no automated observable:
+    // whether a window flashes is a Win32 UI effect, not something a
+    // `cargo test` process can see. That check is by-hand only (see this
+    // module's `#447` follow-up note). What CAN be proven here is the
+    // regression this kind of change risks: a wrong flag value or a
+    // malformed `Command` silently breaking the ACL restriction itself.
+    // This mirrors `config.rs`'s own `save_to_restricts_the_acl_on_a_normal_
+    // successful_save`.
+    #[test]
+    #[cfg(windows)]
+    fn save_to_still_restricts_the_acl_after_the_create_no_window_change() {
+        let path = scratch_path("acl-after-no-window-flag");
+        let profile = sample_profile();
+        profile.save_to(&path).expect("save_to should succeed");
+
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .expect("icacls should run");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !listing.contains("(I)"),
+            "inheritance must still be disabled after adding CREATE_NO_WINDOW: {listing}"
+        );
 
         let _ = fs::remove_file(&path);
     }

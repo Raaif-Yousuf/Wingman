@@ -2,7 +2,7 @@
 //! thread the moment the Quick Ask palette opens, that guesses which
 //! catalogue action the screen in front of the user is probably about.
 //!
-//! Pure module (CLAUDE.md rule 8): no `windows` dependency anywhere in this
+//! Pure module (AGENTS.md rule 8): no `windows` dependency anywhere in this
 //! file. `app.rs` owns every piece of Win32/network wiring this needs --
 //! capturing the downscaled screenshot on the main thread (mirroring
 //! `App::ask`'s own capture-before-spawn ordering), picking and constructing
@@ -24,7 +24,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::provider::{Effort, Request};
+use crate::provider::{Chain, Effort, NonVisionInputs, Request};
 use crate::ui::palette_model::PaletteAction;
 
 /// Long edge (pixels) the router's screenshot is downscaled to before
@@ -69,7 +69,7 @@ pub const ROUTER_MAX_TOKENS: u32 = 200;
 /// below and change nothing.
 pub const DEFAULT_ROUTER_THRESHOLD: f64 = 0.7;
 
-const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Identify which listed action (if any) the screen suggests, and describe in one short sentence what's on screen. Never explain your reasoning, only report the result.";
+const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Identify which listed action (if any) the screen suggests, and describe in one short sentence what's on screen. Never explain your reasoning, only report the result. Use plain text only: no markdown and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
 
 /// One candidate action offered to the router: its id and a one-line
 /// description (today: [`PaletteAction::name`] -- the catalogue has no
@@ -95,7 +95,7 @@ pub fn candidates_from_catalogue(catalogue: &[PaletteAction]) -> Vec<RouterCandi
 }
 
 /// The router's JSON-schema, `additionalProperties: false`. Property order
-/// is load-bearing (CLAUDE.md rule 3): `summary` FIRST, so the model
+/// is load-bearing (AGENTS.md rule 3): `summary` FIRST, so the model
 /// describes what it actually sees before it commits to an intent id or a
 /// confidence number -- the same reasoning `provider::common::answer_schema`
 /// already applies to `detail` before `headline`.
@@ -145,6 +145,32 @@ pub fn build_request(image_png: Vec<u8>, candidates: &[RouterCandidate]) -> Requ
         effort: Effort::Low,
         max_tokens: ROUTER_MAX_TOKENS,
     }
+}
+
+/// Issue #295: runs the router's request through `chain`, the same
+/// vision-aware way every other screen action does. Before this function
+/// existed, `app.rs`'s `router_worker` built its own `Request` via
+/// [`build_request`] and called the chain's plain `complete_parsed`, which
+/// never checks a provider's `own_caps().vision` -- so a no-vision provider
+/// (a text-only Ollama model, a compat endpoint without vision) still
+/// received the real screenshot, unlike `worker`/`calendar_worker`/
+/// `review_worker`/`form_fill_worker`, all of which already went through
+/// [`crate::provider::Chain::complete_parsed_with_fallback`] (#18/#206).
+/// `fallback` is `router_worker`'s OCR-only substitute (no UIA snapshot --
+/// see `app.rs`'s `router_non_vision_inputs` doc comment for why); it is
+/// only ever invoked when the chain's one provider actually needs it, per
+/// `complete_parsed_with_fallback`'s own laziness guarantee.
+pub fn route(
+    chain: &Chain,
+    image_png: Vec<u8>,
+    candidates: &[RouterCandidate],
+    fallback: impl FnMut() -> anyhow::Result<NonVisionInputs>,
+) -> anyhow::Result<RouterResult> {
+    let candidate_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+    let req = build_request(image_png, candidates);
+    chain.complete_parsed_with_fallback(&req, fallback, |c| {
+        parse_router_result(&c.text, &candidate_ids)
+    })
 }
 
 /// The wire shape of the router's completion, before `intent` is validated

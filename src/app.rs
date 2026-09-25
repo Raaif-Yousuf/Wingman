@@ -46,11 +46,13 @@ use crate::hotkey::{
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
 use crate::provider::{
-    calendar_request, parse_answer, physics_request, review_request_from_screen,
-    review_request_from_text, Answer, Chain, Provider, Shot,
+    calendar_request, generic_action_request, parse_answer, physics_request,
+    review_request_from_screen, review_request_from_text, Answer, Chain, Provider, Shot,
 };
 use crate::router;
-use crate::ui::card::{Card, WM_APP_PREVIEW_DECIDED};
+use crate::ui::card::{
+    Card, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+};
 use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
 use crate::ui::palette_model::{self, DispatchTarget};
@@ -113,6 +115,15 @@ pub const WM_APP_FORM_FILL_RESULT: u32 = WM_APP + 13;
 /// `+13` are already `WM_APP_PREVIEW_DECIDED`/`WM_APP_PALETTE_TOGGLE`/
 /// `WM_APP_PALETTE_RUN`/`WM_APP_REVIEW_RESULT`/`WM_APP_FORM_FILL_RESULT`.
 pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
+
+/// #242: posted by `App::run_generic_action`'s worker thread when the
+/// provider chain finishes for a non-built-in `actions.toml` action:
+/// `lparam` is `Box::into_raw(Box::new((String, Result<Value, String>)))`,
+/// the generic-dispatch analogue of [`WM_APP_CALENDAR_RESULT`] -- the
+/// `String` is the action id, carried along because (unlike the calendar
+/// flow) there is no single fixed action this result can belong to.
+/// `WM_APP + 16`: `+15` is already `crate::ui::card::WM_APP_CARD_OPEN_SETTINGS`.
+pub const WM_APP_GENERIC_ACTION_RESULT: u32 = WM_APP + 16;
 
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
@@ -193,11 +204,41 @@ struct App {
     /// a second "Restore" click after a successful restore reports "nothing
     /// to restore" rather than attempting a stale undo twice.
     last_form_undo: Option<executors::Undo>,
+    /// Review of #349/#426: the full (redacted) chain behind the most
+    /// recent error card, so "use Copy diagnostics for details" points at
+    /// something real instead of nothing -- `human_error_detail` on its own
+    /// discards the raw chain entirely. In memory only, never written to
+    /// disk (Hard Rule 5 and privacy): overwritten by the next error,
+    /// cleared on nothing else, and never itself the source of a card's
+    /// display text (`track_error` returns the human sentence separately).
+    last_error: Option<LastError>,
+}
+
+/// See `App::last_error`'s doc comment.
+struct LastError {
+    /// Whatever headline the card that reported this error also used, e.g.
+    /// "Couldn't add the event" -- not a separate taxonomy to keep in sync.
+    action: String,
+    occurred_at: SystemTime,
+    /// Already redacted (#253, `egress::redact_opaque_tokens`) -- this is
+    /// the only place the *original*, non-humanized chain survives at all.
+    chain: String,
+}
+
+/// Issue #425: the exact text "Copy details" puts on the clipboard.
+/// `last_error.chain` is already redacted (#253) at `record_last_error`
+/// time -- this is a plain accessor, not a second redaction pass -- but it
+/// is factored out (rather than inlined in `copy_error_details`) so the
+/// "the redacted chain, and only the redacted chain, is what reaches the
+/// clipboard" guarantee is unit-tested directly, without touching the real
+/// OS clipboard.
+fn error_details_clipboard_text(last_error: &LastError) -> &str {
+    &last_error.chain
 }
 
 pub fn run() -> Result<()> {
     // Before any window exists, so the card's metrics are right on a mixed-DPI
-    // setup (the XPS panel next to an external monitor).
+    // setup (a laptop panel next to an external monitor).
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -296,6 +337,7 @@ pub fn run() -> Result<()> {
         pending_preview: None,
         pending_preview_generation: 0,
         last_form_undo: None,
+        last_error: None,
     });
     app.refresh_tray_labels();
     // Issue #19: reflect the loaded mode in the tray submenu/icon from the
@@ -333,10 +375,13 @@ pub fn run() -> Result<()> {
             h.set_palette_chord(app.config.hotkeys.palette);
             app.hook = Some(h);
         }
-        Err(e) => app.card.show_error(
-            "Hotkeys unavailable",
-            &format!("{e:#}\n\nUse Ask now from the tray menu instead."),
-        ),
+        Err(e) => {
+            let detail = app.track_error("Hotkeys unavailable", &format!("{e:#}"));
+            app.card.show_error_with_details(
+                "Hotkeys unavailable",
+                &format!("{detail}\n\nUse Ask now from the tray menu instead."),
+            );
+        }
     }
 
     // Non-fatal: without it the card still auto-dismisses on its timer.
@@ -351,7 +396,7 @@ pub fn run() -> Result<()> {
 
 /// Card text for issue #175: one or more stored provider keys exist in
 /// Credential Manager but could not be read back on this load. Pure so the
-/// wording is unit-tested without a real `Card`/HWND (CLAUDE.md rule 8);
+/// wording is unit-tested without a real `Card`/HWND (AGENTS.md rule 8);
 /// never includes any key material, only provider names, which are public
 /// config labels, never secrets. No em dash (rule 11).
 fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
@@ -483,12 +528,12 @@ impl App {
                 ),
             ),
             Mode::Cloud => (
-                "No API key: open Edit settings".to_string(),
-                format!("Add a key under [providers.openai] or [providers.anthropic] in:\n{config_path}"),
+                "No AI model set up yet".to_string(),
+                "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
             ),
             Mode::Auto => (
-                "No provider ready: open Edit settings".to_string(),
-                format!("Add a cloud API key, or configure Ollama, in:\n{config_path}"),
+                "No AI model set up yet".to_string(),
+                "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
             ),
         })
     }
@@ -556,7 +601,10 @@ impl App {
         if let Some((headline, detail)) =
             Self::readiness_gate(self.config.mode, &self.config.providers, &path)
         {
-            self.card.show_error(&headline, &detail);
+            // Issue #347: readiness-gate cards are always "go fix something
+            // in Settings" cards (a missing API key or Ollama config), so a
+            // click opens Settings directly instead of just expanding.
+            self.card.show_settings_needed(&headline, &detail);
             return None;
         }
 
@@ -593,8 +641,9 @@ impl App {
         let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
             Ok(r) => r,
             Err(e) => {
+                let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't capture the screen", &detail);
                 return None;
             }
         };
@@ -616,7 +665,19 @@ impl App {
         // Disarmed for the whole in-flight window: a click while the spinner
         // is up must not touch the card.
         self.set_watch(false);
-        self.card.show_pending();
+        // Issue #354 follow-up review findings 1 and 2: every model-backed
+        // flow goes through this shared method, so the pending card starts
+        // directly at `AskingModel` here -- once, for all three callers --
+        // instead of each flow (or just `ask()`, before this fix) setting it
+        // separately after the fact. The label is resolved from the SAME
+        // mode-aware chain the worker thread will actually try (finding 4),
+        // known synchronously here with no network call, so this is not a
+        // promise the worker reaches that exact provider (it may fail over)
+        // but an honest "what Wingman is trying right now" cue, same as the
+        // pre-existing reasoning this replaces.
+        let model_name = self.first_provider_model_label().unwrap_or_default();
+        self.card
+            .show_pending(crate::ui::card::PendingStage::AskingModel { model_name });
 
         Some((raw, foreground_hwnd_isize, extra_value))
     }
@@ -642,6 +703,10 @@ impl App {
         let prompt = self.config.ui.prompt.clone();
         let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
+
+        // Issue #354 follow-up review: the pending card already started at
+        // `AskingModel` inside `begin_model_action` (findings 1 and 2), so
+        // there is nothing left to set here.
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
                 let shot = capture::encode(&raw)?;
@@ -655,7 +720,12 @@ impl App {
                     want_difficulty,
                 )
             })()
-            .map_err(|e| format!("{e:#}"));
+            .map_err(|e| {
+                pack_error(
+                    &human_error_detail(&format!("{e:#}")),
+                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                )
+            });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -692,8 +762,9 @@ impl App {
         let resolved = match actions::load_actions() {
             Ok(r) => r,
             Err(e) => {
+                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't load actions.toml", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
                 return;
             }
         };
@@ -771,13 +842,20 @@ impl App {
         let generation = self.palette.router_generation();
         let target = self.hwnd_isize();
 
+        // #359: a request is actually starting now (every earlier bail-out
+        // above -- Paused, no ready provider, capture failure -- must never
+        // reach this line), so show the placeholder instead of leaving the
+        // reserved summary band blank until the result arrives.
+        self.palette.set_router_pending(generation);
+
         std::thread::spawn(move || {
             let result: std::result::Result<router::RouterResult, String> =
-                (|| -> Result<router::RouterResult> {
-                    let shot = capture::encode(&raw)?;
-                    router_worker(&providers, mode, shot.png, &candidates)
-                })()
-                .map_err(|e| format!("{e:#}"));
+                router_worker(&providers, mode, &raw, &candidates).map_err(|e| {
+                    pack_error(
+                        &human_error_detail(&format!("{e:#}")),
+                        &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                    )
+                });
             let payload = Box::into_raw(Box::new((generation, result)));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -803,42 +881,44 @@ impl App {
         generation: u64,
         result: std::result::Result<router::RouterResult, String>,
     ) {
-        if let Ok(result) = result {
-            let threshold = self.config.palette.router_threshold;
-            self.palette
-                .apply_router_suggestion(generation, &result, threshold);
+        match result {
+            Ok(result) => {
+                let threshold = self.config.palette.router_threshold;
+                self.palette
+                    .apply_router_suggestion(generation, &result, threshold);
+            }
+            // #359: the request that started the "Looking at your screen..."
+            // placeholder failed -- clear it rather than leaving it stuck.
+            Err(_) => self.palette.clear_router_pending(generation),
         }
     }
 
-    /// `"<name>:<model>"` for the first entry in `providers.order`, or just
-    /// `"<name>"` when that provider has no distinct model field set to a
-    /// non-empty value. `None` when nothing is configured at all -- the
-    /// palette footer then shows just the mode label (see
+    /// `"<name>:<model>"` for the first entry `self.config.mode` would
+    /// actually try -- `Providers::selected_order_for_mode` applied to the
+    /// current mode, the SAME mode-aware filtering/reordering
+    /// `build_chain_for_mode` (and so the real worker thread) uses -- or
+    /// just `"<name>"` when that provider has no distinct model field set to
+    /// a non-empty value. `None` when nothing survives mode filtering --
+    /// the palette footer then shows just the mode label (see
     /// `palette_model::footer_line`).
+    ///
+    /// Issue #354 follow-up review, finding 4: this used to read
+    /// `providers.order.first()` directly, ignoring `mode` entirely -- so
+    /// e.g. `order = ["openai", "ollama"]` with `mode = Local` named
+    /// "openai" even though Local mode would never try it. `ollama_ready:
+    /// true` here is the same optimistic-upper-bound argument
+    /// `readiness_gate`'s doc comment already explains: this only decides
+    /// whether Auto mode COUNTS Ollama as a candidate (no network probe),
+    /// never a claim it is reachable right now.
     fn first_provider_model_label(&self) -> Option<String> {
-        let name = self.config.providers.order.first()?;
-        let model: &str = match name.as_str() {
-            "openai" => &self.config.providers.openai.model,
-            "anthropic" => &self.config.providers.anthropic.model,
-            "gemini" => &self.config.providers.gemini.model,
-            "ollama" => &self.config.providers.ollama.model,
-            n if n.starts_with("compat:") => {
-                let compat_name = &n["compat:".len()..];
-                self.config
-                    .providers
-                    .compat
-                    .iter()
-                    .find(|c| c.name == compat_name)
-                    .map(|c| c.model.as_str())
-                    .unwrap_or("")
-            }
-            _ => "",
-        };
-        if model.is_empty() {
-            Some(name.clone())
-        } else {
-            Some(format!("{name}:{model}"))
-        }
+        Self::provider_model_label_for(self.config.mode, &self.config.providers)
+    }
+
+    /// Thin associated-fn alias over the free `first_provider_model_label`
+    /// (issue #243's split, so it is testable without a live `HWND`), kept
+    /// so the #354 mode-filtering tests read as `App::...`.
+    fn provider_model_label_for(mode: Mode, providers: &Providers) -> Option<String> {
+        first_provider_model_label(mode, providers)
     }
 
     /// #25: Enter in the palette routes here through the SAME dispatch table
@@ -857,6 +937,13 @@ impl App {
             Some(DispatchTarget::FillForm) => self.fill_form_from_screen(),
             Some(DispatchTarget::CalculateSelection) => self.calculate_selection(),
             Some(DispatchTarget::CopyRegion) => self.copy_region(),
+            // #242: any other action id -- a user-authored `actions.toml`
+            // entry -- runs through the generic Look/Propose/Confirm/Do
+            // path instead of silently doing nothing.
+            Some(DispatchTarget::Generic(action_id)) => self.run_generic_action(&action_id),
+            // `dispatch_target_for` never returns `None` (#242); kept only
+            // because the match is over an `Option`, not because this arm
+            // is expected to run.
             None => {}
         }
     }
@@ -891,20 +978,29 @@ impl App {
         let raw = match actions::extract_text::capture_screen() {
             Ok(r) => r,
             Err(e) => {
+                let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't capture the screen", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't capture the screen", &detail);
                 return;
             }
         };
 
         self.busy = true;
         self.set_watch(false);
-        self.card.show_pending();
+        // No model in this flow (see the doc comment above): `Working` is
+        // the honest generic placeholder, not `AskingModel`.
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
 
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> =
-                actions::extract_text::recognize_and_copy(&raw).map_err(|e| format!("{e:#}"));
+                actions::extract_text::recognize_and_copy(&raw).map_err(|e| {
+                    pack_error(
+                        &human_error_detail(&format!("{e:#}")),
+                        &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                    )
+                });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -942,8 +1038,10 @@ impl App {
             Ok(Some(raw)) => raw,
             Ok(None) => return, // cancelled: no card, nothing changed
             Err(e) => {
+                let detail =
+                    self.track_error("Couldn't open the region selector", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't open the region selector", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't open the region selector", &detail);
                 return;
             }
         };
@@ -973,9 +1071,11 @@ impl App {
                 self.card
                     .show_answer(&format!("Copied {width}x{height} region"), "", 3, None)
             }
-            Err(e) => self
-                .card
-                .show_error("Couldn't copy the region", &format!("{e:#}")),
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy the region", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't copy the region", &detail);
+            }
         }
     }
 
@@ -995,8 +1095,9 @@ impl App {
             self.begin_model_action(|app| match local_today_and_utc_offset() {
                 Ok(v) => Some(v),
                 Err(e) => {
+                    let detail = app.track_error("Couldn't read the local date", &format!("{e:#}"));
                     app.card
-                        .show_error("Couldn't read the local date", &format!("{e:#}"));
+                        .show_error_with_details("Couldn't read the local date", &detail);
                     None
                 }
             })
@@ -1020,7 +1121,12 @@ impl App {
                     offset_minutes,
                 )
             })()
-            .map_err(|e| format!("{e:#}"));
+            .map_err(|e| {
+                pack_error(
+                    &human_error_detail(&format!("{e:#}")),
+                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                )
+            });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1049,9 +1155,11 @@ impl App {
 
         let proposal = match result {
             Ok(p) => p,
-            Err(e) => {
-                let headline = first_line(&e, 88);
-                self.card.show_error(&headline, &e);
+            Err(packed) => {
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
+                self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1071,8 +1179,9 @@ impl App {
         let resolved = match actions::load_actions() {
             Ok(r) => r,
             Err(e) => {
+                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't load actions.toml", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
                 self.set_watch(true);
                 return;
             }
@@ -1107,15 +1216,193 @@ impl App {
                 ) {
                     Ok(confirmed) => self.run_calendar_executor(executor.as_ref(), confirmed),
                     Err(e) => {
+                        let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
                         self.card
-                            .show_error("Couldn't add the event", &format!("{e:#}"));
+                            .show_error_with_details("Couldn't add the event", &detail);
                         self.set_watch(true);
                     }
                 }
             }
             Err(e) => {
+                let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't add the event", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't add the event", &detail);
+                self.set_watch(true);
+            }
+        }
+    }
+
+    /// #242: the generic-dispatch entry point for any palette action id
+    /// `palette_model::dispatch_target_for` does not special-case -- a
+    /// user-authored `actions.toml` entry. Looks the action up by id (an
+    /// error card if it was disabled or removed since the palette was
+    /// shown, never a panic), resolves its `proposal` schema, and runs the
+    /// same capture-then-model-call shape `ask`/`add_event_from_screen`
+    /// already use. An action whose `proposal` names a schema
+    /// `actions::schema::schema_for` does not know (e.g. a
+    /// deliberately-model-free proposal like `extract_text`'s `"ocr_text"`)
+    /// is reported as a load error today rather than run with no schema:
+    /// the generic path only covers "reuse an existing proposal schema and
+    /// executor", the case `docs/actions.md` documents as the intended
+    /// shape for a new `actions.toml` action.
+    fn run_generic_action(&mut self, action_id: &str) {
+        let resolved = match actions::load_actions() {
+            Ok(r) => r,
+            Err(e) => {
+                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
+                return;
+            }
+        };
+        let Some(action) = resolved
+            .iter()
+            .find(|r| r.action.id == action_id)
+            .map(|r| r.action.clone())
+        else {
+            let detail = self.track_error(
+                "Couldn't run that action",
+                &format!("no visible action with id \"{action_id}\""),
+            );
+            self.card
+                .show_error_with_details("Couldn't run that action", &detail);
+            return;
+        };
+        let Some(schema) = actions::schema::schema_for(&action.proposal, action.rate_difficulty)
+        else {
+            let detail = self.track_error(
+                &format!("Couldn't run \"{}\"", action.name),
+                &format!(
+                    "\"{}\" is not a proposal schema Wingman can run generically yet",
+                    action.proposal
+                ),
+            );
+            self.card
+                .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
+            return;
+        };
+
+        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
+            return;
+        };
+
+        let providers = self.config.providers.clone();
+        let mode = self.config.mode;
+        let prompt = action.prompt.clone();
+        let target = self.hwnd_isize();
+        // #242 review: the action and the schema it was dispatched with are
+        // carried through the worker and back in the result payload, rather
+        // than `on_generic_action_result` re-loading `actions.toml` and
+        // re-resolving the schema after the model call returns. A second
+        // load reading a file that changed (or vanished) between dispatch
+        // and result -- a real possibility, since nothing locks
+        // `actions.toml` against a concurrent edit -- must never panic the
+        // main thread (rule 7); using exactly what was dispatched makes
+        // that whole class of failure unreachable instead of merely rare.
+        let action_for_result = action.clone();
+        let schema_for_result = schema.clone();
+        std::thread::spawn(move || {
+            let result: std::result::Result<Value, String> = (|| -> Result<Value> {
+                let shot = capture::encode(&raw)?;
+                let ollama_ready = mode == Mode::Auto
+                    && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+                    && mode::probe_ollama_ready(
+                        &providers.ollama.base_url,
+                        &providers.ollama.model,
+                    );
+                let chain = providers.build_chain_for_mode(mode, ollama_ready);
+                let req = generic_action_request(&shot, &prompt, schema);
+                chain.complete_parsed_with_fallback(
+                    &req,
+                    || non_vision_inputs(&raw, foreground_hwnd_isize),
+                    |c| actions::parse_generic_proposal(&c.text),
+                )
+            })()
+            .map_err(|e| {
+                pack_error(
+                    &human_error_detail(&format!("{e:#}")),
+                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                )
+            });
+            let payload = Box::into_raw(Box::new((action_for_result, schema_for_result, result)));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_GENERIC_ACTION_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                );
+            }
+        });
+    }
+
+    /// Handles [`App::run_generic_action`]'s worker result (#242): an error
+    /// shows an error card (rule 7); a success either shows the preview
+    /// card (when the action's `confirm` field is `true`, the default) or,
+    /// for a read-only action with `confirm = false`, auto-confirms and
+    /// runs the executor immediately -- the same two-path shape
+    /// `on_calendar_result` already implements. `action` and `schema` are
+    /// exactly what `run_generic_action` dispatched with (carried through
+    /// the worker's result payload, see that function's doc comment) --
+    /// this handler never re-loads `actions.toml` or re-resolves a schema,
+    /// so there is nothing here that can fail on a file that changed since
+    /// dispatch, and no `.expect()` on the main thread.
+    fn on_generic_action_result(
+        &mut self,
+        action: actions::Action,
+        schema: Value,
+        result: std::result::Result<Value, String>,
+    ) {
+        self.busy = false;
+
+        let proposal = match result {
+            Ok(p) => p,
+            Err(packed) => {
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
+                self.card.show_error_with_details(&headline, human);
+                self.set_watch(true);
+                return;
+            }
+        };
+
+        if action.confirm {
+            self.pending_preview = Some(PendingPreview::Generic(action.clone()));
+            self.pending_preview_generation =
+                self.card
+                    .show_preview(&action.name, &schema, &proposal, false);
+            return;
+        }
+
+        // `action.confirm == false`: only reachable for a read-only
+        // executor -- `auto_confirm_read_only` refuses anything else, same
+        // as `on_calendar_result`'s own `confirm == false` branch.
+        match actions::resolve_executor(&action) {
+            Ok(executor) => match confirm::auto_confirm_read_only(
+                executor.as_ref(),
+                confirm::Proposal::new(proposal),
+            ) {
+                Ok(confirmed) => self.run_confirmed_generic_action(&action, confirmed),
+                Err(e) => {
+                    let detail = self.track_error(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &format!("{e:#}"),
+                    );
+                    self.card.show_error_with_details(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &detail,
+                    );
+                    self.set_watch(true);
+                }
+            },
+            Err(e) => {
+                let detail = self.track_error(
+                    &format!("Couldn't run \"{}\"", action.name),
+                    &format!("{e:#}"),
+                );
+                self.card
+                    .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
                 self.set_watch(true);
             }
         }
@@ -1173,8 +1460,52 @@ impl App {
             Some(PendingPreview::FormFill(original)) => {
                 self.run_confirmed_form_fill(&original, confirmed);
             }
+            Some(PendingPreview::Generic(action)) => {
+                self.run_confirmed_generic_action(&action, confirmed);
+            }
             None => self.run_confirmed_calendar_add(confirmed),
         }
+    }
+
+    /// #242's half of [`App::on_preview_decided`]: resolves `action`'s own
+    /// `executor` field generically (no fixed executor name, unlike
+    /// `run_confirmed_calendar_add`/`run_confirmed_form_fill`) and runs it
+    /// against the card's confirmed value. The result is shown with the
+    /// action's own name as the headline: there is no per-action headline
+    /// logic to derive from the summary the way `calendar_headline`/
+    /// `form_fill_headline` do, because a generic action's executor and
+    /// wording are not known ahead of time.
+    fn run_confirmed_generic_action(
+        &mut self,
+        action: &actions::Action,
+        confirmed: confirm::Confirmed<Value>,
+    ) {
+        match actions::resolve_executor(action) {
+            Ok(executor) => match executor.execute(confirmed) {
+                Ok(undo) => {
+                    self.card.show_answer(&action.name, &undo.summary, 0, None);
+                }
+                Err(e) => {
+                    let detail = self.track_error(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &format!("{e:#}"),
+                    );
+                    self.card.show_error_with_details(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &detail,
+                    );
+                }
+            },
+            Err(e) => {
+                let detail = self.track_error(
+                    &format!("Couldn't run \"{}\"", action.name),
+                    &format!("{e:#}"),
+                );
+                self.card
+                    .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
+            }
+        }
+        self.set_watch(true);
     }
 
     /// #40's half of [`App::on_preview_decided`], split out so that handler
@@ -1187,8 +1518,9 @@ impl App {
             match executors::registry::resolve("fill_form") {
                 Ok(executor) => self.run_form_fill_executor(executor.as_ref(), final_confirmed),
                 Err(e) => {
+                    let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
                     self.card
-                        .show_error("Couldn't fill the form", &format!("{e:#}"));
+                        .show_error_with_details("Couldn't fill the form", &detail);
                     self.set_watch(true);
                 }
             }
@@ -1201,8 +1533,9 @@ impl App {
         match executors::registry::resolve("calendar_add") {
             Ok(executor) => self.run_calendar_executor(executor.as_ref(), confirmed),
             Err(e) => {
+                let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't add the event", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't add the event", &detail);
                 self.set_watch(true);
             }
         }
@@ -1243,8 +1576,9 @@ impl App {
                 self.card.show_answer(headline, &undo.summary, 0, None);
             }
             Err(e) => {
+                let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't add the event", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't add the event", &detail);
             }
         }
         self.set_watch(true);
@@ -1277,7 +1611,12 @@ impl App {
                     let shot = capture::encode(&raw)?;
                     review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
                 })()
-                .map_err(|e| format!("{e:#}"));
+                .map_err(|e| {
+                    pack_error(
+                        &human_error_detail(&format!("{e:#}")),
+                        &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                    )
+                });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1312,9 +1651,11 @@ impl App {
 
         let outcome = match result {
             Ok(o) => o,
-            Err(e) => {
-                let headline = first_line(&e, 88);
-                self.card.show_error(&headline, &e);
+            Err(packed) => {
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
+                self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1388,14 +1729,17 @@ impl App {
                             .show_answer("Email updated", &undo.summary, 0, None);
                     }
                     Err(e) => {
+                        let detail =
+                            self.track_error("Couldn't update the email", &format!("{e:#}"));
                         self.card
-                            .show_error("Couldn't update the email", &format!("{e:#}"));
+                            .show_error_with_details("Couldn't update the email", &detail);
                     }
                 }
             }
             Err(e) => {
+                let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't update the email", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't update the email", &detail);
             }
         }
         self.set_watch(true);
@@ -1439,7 +1783,12 @@ impl App {
                     require_tick_for,
                 )
             })()
-            .map_err(|e| format!("{e:#}"));
+            .map_err(|e| {
+                pack_error(
+                    &human_error_detail(&format!("{e:#}")),
+                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                )
+            });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1470,9 +1819,11 @@ impl App {
 
         let value = match result {
             Ok(v) => v,
-            Err(e) => {
-                let headline = first_line(&e, 88);
-                self.card.show_error(&headline, &e);
+            Err(packed) => {
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
+                self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1566,8 +1917,9 @@ impl App {
                 self.last_form_undo = Some(undo);
             }
             Err(e) => {
+                let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't fill the form", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't fill the form", &detail);
             }
         }
         self.set_watch(true);
@@ -1601,8 +1953,9 @@ impl App {
                 );
             }
             Err(e) => {
+                let detail = self.track_error("Couldn't fully restore the form", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't fully restore the form", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't fully restore the form", &detail);
             }
         }
         self.set_watch(true);
@@ -1612,7 +1965,8 @@ impl App {
         let is_err = result.is_err();
         let answer = self.record_last(result);
         if is_err {
-            self.card.show_error(&answer.headline, &answer.detail);
+            self.card
+                .show_error_with_details(&answer.headline, &answer.detail);
         } else {
             self.card.show_answer(
                 &answer.headline,
@@ -1638,11 +1992,17 @@ impl App {
         self.busy = false;
         let answer = match result {
             Ok(answer) => answer,
-            Err(e) => {
-                let headline = first_line(&e, 88);
+            Err(packed) => {
+                // Review of #349/#426: the worker packed the human, redacted
+                // detail together with the full, redacted chain so it
+                // survives the thread boundary -- see `pack_error`'s doc
+                // comment for why a tuple isn't used instead.
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
                 Answer {
                     headline,
-                    detail: e,
+                    detail: human.to_string(),
                     // An error has no difficulty to report.
                     difficulty: None,
                 }
@@ -1664,7 +2024,10 @@ impl App {
         };
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
             Ok(()) => self.card.show_answer("Copied", "", 3, None),
-            Err(e) => self.card.show_error("Couldn't copy", &format!("{e}")),
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy", &format!("{e}"));
+                self.card.show_error_with_details("Couldn't copy", &detail);
+            }
         }
     }
 
@@ -1672,8 +2035,44 @@ impl App {
     /// (`diagnostics::render_report`) and puts it on the clipboard -- no
     /// file writes, no network. See `diagnostics.rs`'s module doc for the
     /// redaction guarantee.
+    /// Review of #349/#426: records `raw_chain` (redacted, #253) as
+    /// [`App::last_error`] and returns [`human_error_detail`]'s display
+    /// text for it -- a drop-in replacement for calling
+    /// `human_error_detail` directly at every call site that shows an
+    /// error card, so "use Copy diagnostics for details" (the sentence
+    /// every card detail ends with) is never a pointer at nothing: the very
+    /// next "Copy diagnostics" click includes this chain, in memory only,
+    /// never written to disk (Hard Rule 5) and gone the moment the process
+    /// exits or another error overwrites it.
+    fn record_last_error(&mut self, action: &str, raw_chain: &str) {
+        self.last_error = Some(LastError {
+            action: action.to_string(),
+            occurred_at: SystemTime::now(),
+            chain: crate::egress::redact_opaque_tokens(raw_chain),
+        });
+    }
+
+    fn track_error(&mut self, action: &str, raw_chain: &str) -> String {
+        self.record_last_error(action, raw_chain);
+        human_error_detail(raw_chain)
+    }
+
     fn copy_diagnostics(&mut self) {
-        let report = crate::diagnostics::render_report(&crate::diagnostics::collect(&self.config));
+        let last_error = self
+            .last_error
+            .as_ref()
+            .map(|e| crate::diagnostics::LastError {
+                action: e.action.clone(),
+                seconds_ago: SystemTime::now()
+                    .duration_since(e.occurred_at)
+                    .unwrap_or_default()
+                    .as_secs(),
+                chain: e.chain.clone(),
+            });
+        let report = crate::diagnostics::render_report(&crate::diagnostics::collect(
+            &self.config,
+            last_error,
+        ));
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
             Ok(()) => self.card.show_answer(
                 "Diagnostics copied",
@@ -1681,9 +2080,46 @@ impl App {
                 6,
                 None,
             ),
-            Err(e) => self
-                .card
-                .show_error("Couldn't copy diagnostics", &format!("{e}")),
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy diagnostics", &format!("{e}"));
+                self.card
+                    .show_error_with_details("Couldn't copy diagnostics", &detail);
+            }
+        }
+    }
+
+    /// Issue #425: "Copy details" on an expanded error card. Reuses
+    /// [`App::last_error`] -- the same store #426's `copy_diagnostics`
+    /// above reads -- rather than a second copy of the error, so the two
+    /// "copy the raw chain" affordances can never disagree about what the
+    /// most recent error's chain even was. `WM_APP_CARD_COPY_DETAILS`
+    /// carries no payload (see that constant's doc comment): `Card` never
+    /// holds the full raw chain itself, only the already-humanized
+    /// `detail` text, so there is nothing to read off the message.
+    fn copy_error_details(&mut self) {
+        let Some(last_error) = self.last_error.as_ref() else {
+            // No error recorded yet (e.g. a stale click/Enter reaching here
+            // after `last_error` was somehow never set) -- nothing to copy,
+            // say so plainly rather than copying nothing silently.
+            self.card.show_answer(
+                "Nothing to copy",
+                "No error details are available.",
+                4,
+                None,
+            );
+            return;
+        };
+        let text = error_details_clipboard_text(last_error).to_string();
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            Ok(()) => {
+                self.card
+                    .show_answer("Details copied", "Paste them into a bug report.", 6, None)
+            }
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy details", &format!("{e}"));
+                self.card
+                    .show_error_with_details("Couldn't copy details", &detail);
+            }
         }
     }
 
@@ -1706,9 +2142,11 @@ impl App {
                 6,
                 None,
             ),
-            Err(e) => self
-                .card
-                .show_error("Couldn't copy the egress log", &format!("{e}")),
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy the egress log", &format!("{e}"));
+                self.card
+                    .show_error_with_details("Couldn't copy the egress log", &detail);
+            }
         }
     }
 
@@ -1733,7 +2171,11 @@ impl App {
 
         self.busy = true;
         self.set_watch(false);
-        self.card.show_pending();
+        // Issue #354 follow-up review, finding 3: this reads the current
+        // text selection, not a screenshot -- `ReadingSelection` says so
+        // truthfully instead of reusing a screenshot-flavored line.
+        self.card
+            .show_pending(crate::ui::card::PendingStage::ReadingSelection);
 
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
@@ -1749,7 +2191,16 @@ impl App {
                     "Nothing selected. Select an expression or a \"<number> <unit> in <unit>\" query first."
                         .to_string(),
                 ),
-                crate::calc::SelectionCalcOutcome::Error(e) => Err(e.to_string()),
+                // `CalcError`'s `Display` is always plain arithmetic-parse
+                // prose today (never Win32/API-derived -- see
+                // `calc::run_on_selection`'s own doc comment), but every
+                // path into `show_error` goes through the same humanizer
+                // regardless (review of #349/#426): no exemption for "this
+                // one is safe today" is how #349 happened in the first
+                // place.
+                crate::calc::SelectionCalcOutcome::Error(e) => {
+                    Err(human_error_detail(&e.to_string()))
+                }
             };
             let payload = Box::into_raw(Box::new(result));
             unsafe {
@@ -1824,10 +2275,14 @@ impl App {
             Ok(()) => self
                 .card
                 .show_answer(&format!("Bound to {name}"), "", 4, None),
-            Err(e) => self.card.show_error(
-                &format!("Bound to {name}: not saved"),
-                &format!("It will work until you quit.\n\n{e:#}"),
-            ),
+            Err(e) => {
+                let headline = format!("Bound to {name}: not saved");
+                let human = self.track_error(&headline, &format!("{e:#}"));
+                self.card.show_error_with_details(
+                    &headline,
+                    &format!("It will work until you quit.\n\n{human}"),
+                );
+            }
         }
     }
 
@@ -1846,9 +2301,11 @@ impl App {
                     self.card.show_error(&headline, &detail);
                 }
             }
-            Err(e) => self
-                .card
-                .show_error("Couldn't reload settings", &format!("{e:#}")),
+            Err(e) => {
+                let detail = self.track_error("Couldn't reload settings", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't reload settings", &detail);
+            }
         }
     }
 
@@ -1938,12 +2395,13 @@ impl App {
             // the single card slot's final content (`final_settings_card`'s
             // `SaveError` case, unchanged by #213).
             let had_pending = !pending.is_empty();
+            let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
             self.card
-                .show_error("Couldn't save settings", &format!("{e:#}"));
+                .show_error_with_details("Couldn't save settings", &detail);
             self.deliver_deferred(pending);
             if had_pending {
                 self.card
-                    .show_error("Couldn't save settings", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't save settings", &detail);
             }
             self.show_tray_restore_error(tray_restore_error);
             return;
@@ -1974,6 +2432,9 @@ impl App {
                 DeferredMessage::ReviewResult(result) => self.on_review_result(result),
                 DeferredMessage::FormFillResult(result) => self.on_form_fill_result(result),
                 DeferredMessage::PreviewDecided(generation) => self.on_preview_decided(generation),
+                DeferredMessage::GenericActionResult(action, schema, result) => {
+                    self.on_generic_action_result(action, schema, result)
+                }
             }
         }
     }
@@ -2026,7 +2487,7 @@ impl App {
     /// actually succeeded -- otherwise `ShellExecuteW` opens a path that
     /// still does not exist, or exists with stale defaults, with nothing on
     /// screen to say so. Pure so this one-branch decision is unit-tested
-    /// directly (CLAUDE.md rule 8) rather than only through a live
+    /// directly (AGENTS.md rule 8) rather than only through a live
     /// Credential-Manager failure, which `edit_settings` itself cannot be
     /// unit-tested against (it owns a real `Card`/`HWND`).
     fn should_open_config_after_ensuring_it_exists(
@@ -2055,8 +2516,9 @@ impl App {
             // dropped the error and still tried to open a file that might
             // not exist.
             if let Err(e) = &save_result {
+                let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't save settings", &format!("{e:#}"));
+                    .show_error_with_details("Couldn't save settings", &detail);
             }
             return;
         }
@@ -2107,14 +2569,14 @@ impl App {
 
         match saved {
             Ok(()) => self.card.show_answer(&model, "", 3, None),
-            Err(e) => self.card.show_error(
-                &format!("Using {model}: not saved"),
-                &format!(
-                    "It will revert when you quit.
-
-{e:#}"
-                ),
-            ),
+            Err(e) => {
+                let headline = format!("Using {model}: not saved");
+                let human = self.track_error(&headline, &format!("{e:#}"));
+                self.card.show_error_with_details(
+                    &headline,
+                    &format!("It will revert when you quit.\n\n{human}"),
+                );
+            }
         }
         self.set_watch(true);
     }
@@ -2138,14 +2600,14 @@ impl App {
         let name = if openai { "ChatGPT" } else { "Claude" };
         match saved {
             Ok(()) => self.card.show_answer(name, "", 3, None),
-            Err(e) => self.card.show_error(
-                &format!("Using {name}: not saved"),
-                &format!(
-                    "It will revert when you quit.
-
-{e:#}"
-                ),
-            ),
+            Err(e) => {
+                let headline = format!("Using {name}: not saved");
+                let human = self.track_error(&headline, &format!("{e:#}"));
+                self.card.show_error_with_details(
+                    &headline,
+                    &format!("It will revert when you quit.\n\n{human}"),
+                );
+            }
         }
         self.set_watch(true);
     }
@@ -2167,14 +2629,14 @@ impl App {
         let saved = self.config.save();
         match saved {
             Ok(()) => self.card.show_answer(mode.label(), "", 3, None),
-            Err(e) => self.card.show_error(
-                &format!("Using {}: not saved", mode.label()),
-                &format!(
-                    "It will revert when you quit.
-
-{e:#}"
-                ),
-            ),
+            Err(e) => {
+                let headline = format!("Using {}: not saved", mode.label());
+                let human = self.track_error(&headline, &format!("{e:#}"));
+                self.card.show_error_with_details(
+                    &headline,
+                    &format!("It will revert when you quit.\n\n{human}"),
+                );
+            }
         }
         self.set_watch(true);
     }
@@ -2235,9 +2697,13 @@ impl App {
             PauseChoice::UntilTomorrow => match deadline_until_tomorrow() {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    self.card.show_error(
+                    let detail = self.track_error(
                         "Couldn't compute tomorrow's pause deadline",
                         &format!("{e:#}"),
+                    );
+                    self.card.show_error_with_details(
+                        "Couldn't compute tomorrow's pause deadline",
+                        &detail,
                     );
                     return;
                 }
@@ -2351,7 +2817,7 @@ impl App {
                 self.refresh_tray_labels();
                 None
             }
-            Err(e) => Some(format!("{e:#}")),
+            Err(e) => Some(self.track_error("Couldn't restore the tray icon", &format!("{e:#}"))),
         }
     }
 
@@ -2659,7 +3125,7 @@ fn form_fill_worker(
 fn router_worker(
     providers: &Providers,
     mode: Mode,
-    image_png: Vec<u8>,
+    raw: &capture::RawShot,
     candidates: &[router::RouterCandidate],
 ) -> Result<router::RouterResult> {
     let ollama_ready = mode == Mode::Auto
@@ -2677,10 +3143,37 @@ fn router_worker(
     let provider = provider_for_router(providers, &target.provider, &target.model)
         .ok_or_else(|| anyhow::anyhow!("router: unrecognized provider \"{}\"", target.provider))?;
 
-    let candidate_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
-    let req = router::build_request(image_png, candidates);
-    Chain::new(vec![provider]).complete_parsed(&req, |c| {
-        router::parse_router_result(&c.text, &candidate_ids)
+    let shot = capture::encode(raw)?;
+    let chain = Chain::new(vec![provider]);
+    router::route(&chain, shot.png, candidates, || {
+        router_non_vision_inputs(raw)
+    })
+}
+
+/// Issue #295: the router's own (deliberately lighter) [`non_vision_inputs`]
+/// -- OCR text of the router's own downscaled capture, and NO UIA snapshot.
+/// Unlike `worker`/`calendar_worker`/`review_worker`/`form_fill_worker`, the
+/// router has no `foreground_hwnd` handy at this call site (it runs off
+/// `App::maybe_start_router`'s own capture, not `App::ask`'s), and its
+/// schema (`router::router_schema`) never asks about editable-field
+/// contents the way `fill_form` does -- so paying for a second COM
+/// apartment thread just to snapshot UIA fields the router would never use
+/// is pure waste. An OCR failure still fails this closure exactly like
+/// `non_vision_inputs` (surfaced as a named skip reason to
+/// `Chain::complete_parsed_with_fallback`'s caller); router failures are
+/// silent by the time they reach the user regardless (see
+/// `App::maybe_start_router`'s doc comment), so this never becomes a card.
+fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::NonVisionInputs> {
+    let ocr_output = crate::ocr::recognize(
+        &raw.rgba,
+        raw.width,
+        raw.height,
+        crate::ocr::DEFAULT_TIMEOUT,
+    )
+    .context("OCR unavailable")?;
+    Ok(crate::provider::NonVisionInputs {
+        ocr_text: crate::ocr::serialize_lines(&ocr_output.lines),
+        uia_fields: String::new(),
     })
 }
 
@@ -2706,6 +3199,33 @@ fn provider_for_router(
     model: &str,
 ) -> Option<Box<dyn Provider>> {
     providers.provider_for_named_model(name, Some(model))
+}
+
+/// #243: `App::first_provider_model_label`'s implementation, pulled out to a
+/// free function over `&Providers` (same split as `router_models_for`/
+/// `provider_for_router` above) so it is testable without constructing a
+/// whole `App`. Used to keep its own hand-mirrored match over
+/// "openai"/"anthropic"/"gemini"/"ollama"/"compat:<name>" -- the same five
+/// arms issue #222 already consolidated for the router and #201 for
+/// diagnostics. Now a thin call into `Providers::describe`, the single
+/// source of truth those two already read, so a provider kind missing an
+/// arm here is no longer possible: there is no arm here to miss.
+///
+/// #354 follow-up: reads the first entry `mode` would actually try
+/// (`Providers::selected_order_for_mode`, shared with `build_chain_for_mode`)
+/// rather than `providers.order.first()` unfiltered.
+fn first_provider_model_label(mode: Mode, providers: &Providers) -> Option<String> {
+    let selected = providers.selected_order_for_mode(mode, true);
+    let name = selected.first()?;
+    let model = providers
+        .describe(name)
+        .map(|d| d.model)
+        .unwrap_or_default();
+    if model.is_empty() {
+        Some(name.clone())
+    } else {
+        Some(format!("{name}:{model}"))
+    }
 }
 
 /// #39: today's local date and current local UTC offset, for the "Add
@@ -2769,7 +3289,7 @@ fn local_today_and_utc_offset() -> Result<(CivilDate, i32)> {
 /// next to the OCR/network cost already paid on this path.
 ///
 /// An OCR failure (no language pack installed, the engine unavailable, a
-/// timeout) fails this whole function -- CLAUDE.md rule 7 wants that
+/// timeout) fails this whole function -- AGENTS.md rule 7 wants that
 /// surfaced as a clear, named skip reason for every provider that needed it
 /// (see `Chain::complete_parsed_with_fallback`'s doc comment), not silently
 /// degraded. A UIA failure (no foreground window, a hung app UIA can't
@@ -2839,7 +3359,7 @@ fn resolve_prompt_and_difficulty<'a>(
 
 /// Issue #181: which action a pause-toggle-chord press should take. Pure
 /// (just a bool in, an enum out) so the toggle direction is unit-tested
-/// directly (CLAUDE.md rule 8) without a real `App` -- `App::toggle_pause`
+/// directly (AGENTS.md rule 8) without a real `App` -- `App::toggle_pause`
 /// is the thin Win32-touching wrapper (checked by hand: press the
 /// configured chord while running, confirm the tray greys and the card
 /// shows "Paused"; press it again, confirm it un-greys, per issue #166).
@@ -3029,6 +3549,285 @@ fn first_line(text: &str, max: usize) -> String {
     out
 }
 
+// -- #349: human-readable, redacted error text for the card ----------------
+//
+// Most `show_error` calls used to pass anyhow's alternate `Display` output
+// straight through: the whole context chain, which for a Win32-backed path
+// can read
+// "TzSpecificLocalTimeToSystemTime failed" -- a crash-log line, not
+// something a user can act on. Every place in this file that turns an
+// error into card-visible text now routes through `human_error_detail`
+// (or, when it needs to splice the sentence into a larger message,
+// `humanize_error_chain` directly) instead of interpolating `{e:#}`/`{e}`
+// itself; `show_error_detail_never_bypasses_the_humanizer` below is the
+// mechanical guard that nothing new regresses this.
+
+/// Known technical fragments from anyhow context chains (see `app.rs`'s own
+/// `.context("... failed")` call sites, e.g. `local_today_and_utc_offset`),
+/// mapped to a specific human sentence. Matched by substring against the
+/// already-redacted chain, so it survives whatever context wraps it.
+const KNOWN_TECHNICAL_DETAILS: &[(&str, &str)] = &[
+    (
+        "TzSpecificLocalTimeToSystemTime",
+        "Couldn't read your clock settings.",
+    ),
+    ("FileTimeToSystemTime", "Couldn't read your clock settings."),
+    ("SystemTimeToFileTime", "Couldn't read your clock settings."),
+];
+
+/// True if `text` contains what looks like a Win32/API-style identifier
+/// immediately (optionally via a `(...)` argument list) followed by the
+/// word "failed" -- the exact shape every `.context("XxxYyy(...) failed")`
+/// call in this codebase produces (`SetWindowsHookExW(WH_MOUSE_LL) failed`,
+/// `TzSpecificLocalTimeToSystemTime failed`, `GetMonitorInfoW failed`).
+/// Deliberately narrow: an ordinary English sentence ending "...the save
+/// failed" or "write failed" has at most one capitalized, non-technical
+/// word before "failed" and is left alone. This is #349's detector, and
+/// `show_error_call_sites_never_show_a_failed_suffixed_api_identifier`
+/// below is its own "Done when" regression test.
+fn contains_api_failed_identifier(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        if word.trim_end_matches(|c: char| ".,;:!".contains(c)) != "failed" || i == 0 {
+            continue;
+        }
+        let prev = words[i - 1].trim_end_matches(|c: char| ")(:,.".contains(c));
+        let ident = prev.split('(').next().unwrap_or(prev);
+        if is_api_shaped_identifier(ident) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_api_shaped_identifier(ident: &str) -> bool {
+    if ident.len() < 4 {
+        return false;
+    }
+    if !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    let starts_upper = ident.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+    let upper_count = ident.chars().filter(|c| c.is_ascii_uppercase()).count();
+    // Win32/API names are PascalCase with several internal capitals
+    // ("TzSpecificLocalTimeToSystemTime", "SetWindowsHookExW"); an ordinary
+    // English word before "failed" is lowercase, or has at most the one
+    // leading capital a sentence-initial word would.
+    starts_upper && upper_count >= 2
+}
+
+// -- review of #349/#426: a wider, self-tested source scanner --------------
+//
+// The original scanner only matched two exact `format!` literals: the
+// alternate-Display specifier on the bound name `e`, and plain Display on
+// the same name. It missed the Debug specifier, the `err`/`error` bound
+// names just as many `Err(err) => ...`/`.map_err(|error| ...)` arms use,
+// a bare call to the error's own `ToString` (no `format!` at all), and any
+// whitespace variant inside the macro call. No `regex` dependency: this
+// crate has none today and these shapes are simple enough to hand-scan.
+
+// Test-only: exercised solely by `show_error_call_sites_never_show_a_failed_suffixed_api_identifier`
+// and the `find_error_interpolations_*`/`interpolation_is_guarded_*` self-tests
+// below, never by production code, hence `#[cfg(test)]` on every item in
+// this section (otherwise a release build's dead-code lint flags all of it).
+#[cfg(test)]
+const ERROR_BINDING_NAMES: [&str; 3] = ["e", "err", "error"];
+#[cfg(test)]
+const ERROR_FORMAT_SPECS: [&str; 3] = ["", ":#", ":?"];
+
+#[cfg(test)]
+fn skip_ws(s: &str, mut i: usize) -> usize {
+    let bytes = s.as_bytes();
+    while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Byte offsets (into `src`, which the caller must have already normalized
+/// to `\n` line endings -- see
+/// `show_error_call_sites_never_show_a_failed_suffixed_api_identifier`
+/// below) of every `format!` call whose one placeholder is exactly one of
+/// `e`, `err` or `error`, with the alternate-Display, plain-Display or
+/// Debug specifier (arbitrary whitespace around the macro's parens and
+/// string tolerated), and every direct `.to_string()` call on one of those
+/// same three bound names. Each of these is a way to turn an error into a
+/// `String` by interpolating its Display/Debug output directly -- #349's
+/// whole bug.
+#[cfg(test)]
+fn find_error_interpolations(src: &str) -> Vec<usize> {
+    let bytes = src.as_bytes();
+    let mut hits = Vec::new();
+
+    // format!( "{name[:spec]}" )
+    let mut i = 0;
+    while let Some(rel) = src[i..].find("format!") {
+        let start = i + rel;
+        let mut j = skip_ws(src, start + "format!".len());
+        if bytes.get(j) != Some(&b'(') {
+            i = start + 1;
+            continue;
+        }
+        j = skip_ws(src, j + 1);
+        if bytes.get(j) != Some(&b'"') {
+            i = start + 1;
+            continue;
+        }
+        let str_start = j + 1;
+        let Some(close_rel) = src[str_start..].find('"') else {
+            break;
+        };
+        let inner = &src[str_start..str_start + close_rel];
+        let after_quote = str_start + close_rel + 1;
+        let matched = ERROR_BINDING_NAMES.iter().any(|name| {
+            ERROR_FORMAT_SPECS
+                .iter()
+                .any(|spec| inner == format!("{{{name}{spec}}}"))
+        });
+        if matched && bytes.get(skip_ws(src, after_quote)) == Some(&b')') {
+            hits.push(start);
+        }
+        i = str_start + 1;
+    }
+
+    // name.to_string()
+    for name in ERROR_BINDING_NAMES {
+        let needle = format!("{name}.to_string()");
+        let mut i = 0;
+        while let Some(rel) = src[i..].find(needle.as_str()) {
+            let pos = i + rel;
+            let prev_is_ident =
+                pos > 0 && (bytes[pos - 1].is_ascii_alphanumeric() || bytes[pos - 1] == b'_');
+            if !prev_is_ident {
+                hits.push(pos);
+            }
+            i = pos + needle.len();
+        }
+    }
+
+    hits.sort_unstable();
+    hits
+}
+
+/// True if the statement containing byte offset `pos` in `src` mentions
+/// `human_error_detail(` or `track_error(` before that offset -- both
+/// redact (#253) before ever building card-visible text, and `track_error`
+/// additionally records the chain for "Copy diagnostics" (review of
+/// #349/#426). "Statement" is approximated as the text since the nearest
+/// preceding `;`, `{` or `}` OUTSIDE a string literal. That last part is
+/// not optional: a naive brace search trips on the literal `{`/`}`
+/// characters inside `format!`'s own `"{e:#}"` placeholder, which -- in a
+/// statement with two `format!` calls, e.g. `pack_error`'s -- would find
+/// the first call's closing `}` and cut `human_error_detail(` out of the
+/// text being searched for the second call's guard check (caught by
+/// `interpolation_is_guarded_sees_past_an_earlier_format_placeholder`
+/// below, which is exactly this shape).
+#[cfg(test)]
+fn interpolation_is_guarded(src: &str, pos: usize) -> bool {
+    let before = &src[..pos];
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut stmt_start = 0;
+    for (i, c) in before.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match c {
+                '\\' => escape_next = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            ';' | '{' | '}' => stmt_start = i + c.len_utf8(),
+            _ => {}
+        }
+    }
+    let stmt = &before[stmt_start..];
+    stmt.contains("human_error_detail(") || stmt.contains("track_error(")
+}
+
+/// Redacts key-shaped tokens (#253, via the same `egress::redact_opaque_tokens`
+/// the egress log already uses) from a raw anyhow context chain -- already
+/// rendered with anyhow's alternate `Display`, here or forwarded across a
+/// thread boundary as a plain `String` -- and returns just the human
+/// sentence(s), with no
+/// trailing next-step, so a caller that already has its own can append it.
+/// A chain containing a Win32/API `"Xxx failed"`-shaped identifier is
+/// replaced outright (by a known mapping, or a generic sentence); anything
+/// else already reads as prose and is kept, still redacted. Pure and
+/// unit-tested directly (`humanize_error_chain_*` tests below) rather than
+/// only indirectly through whichever call site happens to exercise it.
+fn humanize_error_chain(raw_chain: &str) -> String {
+    // Detection runs against the RAW chain, before redaction: an API
+    // identifier like "TzSpecificLocalTimeToSystemTime" is itself long
+    // enough and mixed-case enough to trip `redact_opaque_tokens`'
+    // key-shaped-token heuristic, which would otherwise erase the very
+    // text `KNOWN_TECHNICAL_DETAILS` and `contains_api_failed_identifier`
+    // need to see. That is harmless here: on every branch below the raw
+    // text itself is discarded in favour of a hand-written human sentence,
+    // never echoed back, so redacting it first would only have hidden it
+    // from our own matching, not protected the user.
+    for (needle, sentence) in KNOWN_TECHNICAL_DETAILS {
+        if raw_chain.contains(needle) {
+            return (*sentence).to_string();
+        }
+    }
+    if contains_api_failed_identifier(raw_chain) {
+        return "Something went wrong.".to_string();
+    }
+    // Only reached for a chain that never looked API-shaped, i.e. is
+    // presumed to already be human prose (an io::Error message, a plain
+    // `anyhow!("...")`) -- still redacted before display, per #253.
+    crate::egress::redact_opaque_tokens(raw_chain)
+        .trim()
+        .to_string()
+}
+
+/// The common card-detail shape (#349): `humanize_error_chain`'s sentence
+/// plus a next step, for the many call sites that pass
+/// `human_error_detail`'s output straight to `show_error`'s `detail`.
+fn human_error_detail(raw_chain: &str) -> String {
+    format!(
+        "{} Try again, and if it keeps happening, use Copy diagnostics for details.",
+        humanize_error_chain(raw_chain)
+    )
+}
+
+/// Separator `pack_error`/`unpack_error` use. A control character no real
+/// error message or human sentence will ever contain, so a plain
+/// `split_once` is exact.
+const ERROR_PACK_SEP: char = '\u{1}';
+
+/// Review of #349/#426: a worker thread builds a `Result<T, String>` that
+/// crosses into the main thread's message loop as a boxed, type-erased
+/// pointer (`WM_APP_CALENDAR_RESULT` and friends) -- changing that `String`
+/// to a tuple would mean re-deriving every `unsafe { Box::from_raw::<...>() }`
+/// cast at each of those call sites exactly right, which is a correctness
+/// risk this fix does not need to take. Packing both the human, redacted
+/// detail and the full, redacted chain into one `String` (split back apart
+/// by [`unpack_error`] in the `on_*_result` handler that already runs on
+/// the main thread, with access to `self`) gets the same result -- the
+/// full chain survives to [`App::track_error`] -- without touching any of
+/// that unsafe plumbing.
+fn pack_error(human: &str, chain: &str) -> String {
+    format!("{human}{ERROR_PACK_SEP}{chain}")
+}
+
+/// The other half of [`pack_error`]. Defensive against a string that was
+/// never packed (falls back to using the same text for both halves) so a
+/// caller can never panic on this, even if some future path started
+/// building the `Result<T, String>` a different way.
+fn unpack_error(packed: &str) -> (&str, &str) {
+    packed
+        .split_once(ERROR_PACK_SEP)
+        .unwrap_or((packed, packed))
+}
+
 thread_local! {
     static OWNER_HWND: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 
@@ -3122,6 +3921,10 @@ enum DeferredMessage {
     /// deferred notification is still matched against the right preview
     /// when Settings closes and the queue drains.
     PreviewDecided(u32),
+    /// `WM_APP_GENERIC_ACTION_RESULT` (#242). Carries the exact `Action`
+    /// and schema `run_generic_action` dispatched with, not just the id --
+    /// see `on_generic_action_result`'s doc comment for why.
+    GenericActionResult(actions::Action, Value, std::result::Result<Value, String>),
 }
 
 /// Issue #225: which action is waiting on the preview currently on screen.
@@ -3135,6 +3938,12 @@ enum PendingPreview {
     /// the card confirmed is only the preview's flat translation, so this is
     /// what `actions::fill_form::rebuild_after_confirm` rebuilds against.
     FormFill(Value),
+    /// #242: a non-built-in `actions.toml` action awaiting its preview
+    /// decision. Carries the resolved `Action` itself (not just its id) so
+    /// `run_confirmed_generic_action` does not need a second
+    /// `actions::load_actions()` call between the model's proposal and the
+    /// user's confirm click.
+    Generic(actions::Action),
 }
 
 /// What `wnd_proc` should do with a message addressed to the owner window
@@ -3203,17 +4012,33 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // WM_APP_FORM_FILL_RESULT joins the same group for the same reason
         // -- its boxed `Result<Value, String>` payload is taken (not freed)
         // in the Defer arm below.
+        // #242: WM_APP_GENERIC_ACTION_RESULT joins the same group -- a
+        // finished non-built-in action run must not silently lose its card
+        // just because Settings happened to be open, same as
+        // WM_APP_CALENDAR_RESULT/WM_APP_FORM_FILL_RESULT.
         WM_APP_RESULT
         | WM_APP_CALENDAR_RESULT
         | WM_APP_REVIEW_RESULT
         | WM_APP_PREVIEW_DECIDED
-        | WM_APP_FORM_FILL_RESULT => SettingsReentrancy::Defer,
+        | WM_APP_FORM_FILL_RESULT
+        | WM_APP_GENERIC_ACTION_RESULT => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
         | WM_APP_DISMISS
         | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
+        // #347: like WM_APP_TRAY's own OPEN_SETTINGS command, this just
+        // calls open_settings() with no payload to leak, and the card that
+        // posts it is hidden the moment it does so, so there is nothing
+        // left to defer either.
+        | WM_APP_CARD_OPEN_SETTINGS
+        // #425: same treatment -- no payload to leak, and an error card
+        // cannot be showing at all while Settings is modal-open (every path
+        // that opens Settings hides the card first, the same invariant
+        // #347's WM_APP_CARD_OPEN_SETTINGS above already relies on), so
+        // there is nothing left for a deferred copy to act on either.
+        | WM_APP_CARD_COPY_DETAILS
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
@@ -3321,8 +4146,22 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
                     }),
                     WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
+                    // #242: same treatment as WM_APP_CALENDAR_RESULT above.
+                    WM_APP_GENERIC_ACTION_RESULT => {
+                        let (action, schema, result) = *unsafe {
+                            Box::from_raw(
+                                lparam.0
+                                    as *mut (
+                                        actions::Action,
+                                        Value,
+                                        std::result::Result<Value, String>,
+                                    ),
+                            )
+                        };
+                        DeferredMessage::GenericActionResult(action, schema, result)
+                    }
                     _ => unreachable!(
-                        "settings_reentrancy_policy only returns Defer for the five ids above"
+                        "settings_reentrancy_policy only returns Defer for the six ids above"
                     ),
                 };
                 PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
@@ -3440,8 +4279,28 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_form_fill_result(result);
             LRESULT(0)
         }
+        WM_APP_GENERIC_ACTION_RESULT => {
+            let (action, schema, result) = unsafe {
+                *Box::from_raw(
+                    lparam.0 as *mut (actions::Action, Value, std::result::Result<Value, String>),
+                )
+            };
+            app.on_generic_action_result(action, schema, result);
+            LRESULT(0)
+        }
         WM_APP_PREVIEW_DECIDED => {
             app.on_preview_decided(wparam.0 as u32);
+            LRESULT(0)
+        }
+        WM_APP_CARD_OPEN_SETTINGS => {
+            // Issue #347: a click on a "settings needed" card. No payload.
+            app.open_settings();
+            LRESULT(0)
+        }
+        WM_APP_CARD_COPY_DETAILS => {
+            // Issue #425: a click/Enter on an expanded error card's "Copy
+            // details" affordance. No payload.
+            app.copy_error_details();
             LRESULT(0)
         }
         WM_APP_DISMISS => {
@@ -3542,11 +4401,11 @@ mod tests {
     use super::unreadable_secrets_card;
     use super::App;
     use super::{final_settings_card, SettingsFinalCard};
-    use super::{provider_for_router, router_models_for};
+    use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
-        WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT, WM_APP_RESULT,
-        WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
+        WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
+        WM_APP_GENERIC_ACTION_RESULT, WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
@@ -3558,7 +4417,9 @@ mod tests {
     use crate::mode::Mode;
     use crate::provider::Provider;
     use crate::router;
-    use crate::ui::card::WM_APP_PREVIEW_DECIDED;
+    use crate::ui::card::{
+        WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+    };
     use crate::ui::palette::WM_APP_PALETTE_RUN;
     use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
@@ -3646,7 +4507,7 @@ mod tests {
 
     #[test]
     fn unreadable_secrets_card_has_no_em_dash() {
-        // CLAUDE.md rule 11: no em dashes in user-facing strings.
+        // AGENTS.md rule 11: no em dashes in user-facing strings.
         let (headline, detail) = unreadable_secrets_card(&["openai".to_string()]);
         assert!(!headline.contains('\u{2014}'));
         assert!(!detail.contains('\u{2014}'));
@@ -3824,7 +4685,10 @@ mod tests {
         let (headline, _) =
             App::readiness_gate(Mode::Cloud, &ollama_only_providers(), "config.toml")
                 .expect("must block: cloud mode has nothing cloud configured");
-        assert_eq!(headline, "No API key: open Edit settings");
+        // Issue #347: "Edit settings" is not a real menu item (the tray has
+        // "Settings..." and "Open config.toml"). The card must name a real
+        // action, and clicking it must actually open Settings.
+        assert_eq!(headline, "No AI model set up yet");
     }
 
     #[test]
@@ -3882,7 +4746,8 @@ mod tests {
         let (headline, _) =
             App::readiness_gate(Mode::Auto, &nothing_configured_providers(), "config.toml")
                 .expect("must block: nothing is configured at all");
-        assert_eq!(headline, "No provider ready: open Edit settings");
+        // Issue #347: same fix as Cloud mode's headline above.
+        assert_eq!(headline, "No AI model set up yet");
     }
 
     #[test]
@@ -3903,7 +4768,7 @@ mod tests {
 
     #[test]
     fn readiness_gate_cards_have_no_em_dash() {
-        // CLAUDE.md rule 11.
+        // AGENTS.md rule 11.
         for (mode, providers) in [
             (Mode::Cloud, nothing_configured_providers()),
             (Mode::Local, nothing_configured_providers()),
@@ -3914,6 +4779,55 @@ mod tests {
             assert!(!headline.contains('\u{2014}'), "{headline}");
             assert!(!detail.contains('\u{2014}'), "{detail}");
         }
+    }
+
+    // -- first_provider_model_label / provider_model_label_for (issue #354
+    //    follow-up review, finding 4) -------------------------------------
+
+    #[test]
+    fn provider_model_label_is_mode_aware_not_just_order_first() {
+        // order = ["openai", "ollama"], but mode = Local: Local mode never
+        // tries "openai" (`select_providers`/`is_local_provider`), so the
+        // label must name "ollama", not "openai". Before the fix this read
+        // `providers.order.first()` directly and asserted "openai" here,
+        // which is the exact wrong-model-name bug finding 4 reports.
+        let mut providers = Providers {
+            order: vec!["openai".to_string(), "ollama".to_string()],
+            ..Providers::default()
+        };
+        providers.openai.api_key = "sk-real".to_string();
+        providers.openai.model = "gpt-5".to_string();
+        providers.ollama.base_url = "http://127.0.0.1:11434".to_string();
+        providers.ollama.model = "llava".to_string();
+
+        let label = App::provider_model_label_for(Mode::Local, &providers)
+            .expect("ollama is configured and selected for Local mode");
+        assert_eq!(label, "ollama:llava");
+    }
+
+    #[test]
+    fn provider_model_label_matches_order_first_when_mode_does_not_filter_it_out() {
+        // Cloud mode DOES select "openai" first here, so this stays "openai"
+        // -- a control case proving the fix did not just always answer
+        // "ollama".
+        let mut providers = Providers {
+            order: vec!["openai".to_string(), "ollama".to_string()],
+            ..Providers::default()
+        };
+        providers.openai.api_key = "sk-real".to_string();
+        providers.openai.model = "gpt-5".to_string();
+
+        let label = App::provider_model_label_for(Mode::Cloud, &providers)
+            .expect("openai is configured for Cloud mode");
+        assert_eq!(label, "openai:gpt-5");
+    }
+
+    #[test]
+    fn provider_model_label_is_none_when_mode_filtering_leaves_nothing() {
+        // Cloud mode with only ollama configured: nothing survives
+        // `selected_order_for_mode`, so the label is None (never a stale
+        // name from an unfiltered `order`).
+        assert!(App::provider_model_label_for(Mode::Cloud, &ollama_only_providers()).is_none());
     }
 
     // -- form_fill_headline / calendar_headline (issue #268) ---------------
@@ -4223,6 +5137,9 @@ mod tests {
         ("WM_APP_REVIEW_RESULT", WM_APP_REVIEW_RESULT),
         ("WM_APP_FORM_FILL_RESULT", WM_APP_FORM_FILL_RESULT),
         ("WM_APP_ROUTER_RESULT", WM_APP_ROUTER_RESULT),
+        ("WM_APP_CARD_OPEN_SETTINGS", WM_APP_CARD_OPEN_SETTINGS),
+        ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
+        ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
     ];
 
     #[test]
@@ -4292,6 +5209,9 @@ mod tests {
         // dynamic model-submenu ranges (dispatched by MenuChoice::OpenAiModel /
         // AnthropicModel, not by exact id) and MODEL_RANGE is that width.
         const DYNAMIC: &[&str] = &["MODEL_RANGE", "OPENAI_MODEL_BASE", "ANTHROPIC_MODEL_BASE"];
+        // Display-only items: added disabled (greyed), so no click can ever
+        // produce their WM_COMMAND and they need no wnd_proc arm (#317).
+        const DISPLAY_ONLY: &[&str] = &["VERSION_LABEL"];
 
         let tray_src = include_str!("ui/tray.rs");
         let app_src = include_str!("app.rs");
@@ -4307,7 +5227,11 @@ mod tests {
                     && name.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
                 .then_some(name)
             })
-            .filter(|name| !DYNAMIC.contains(name) && !name.starts_with("WM_APP_"))
+            .filter(|name| {
+                !DYNAMIC.contains(name)
+                    && !DISPLAY_ONLY.contains(name)
+                    && !name.starts_with("WM_APP_")
+            })
             .collect();
 
         assert!(
@@ -4726,6 +5650,21 @@ mod tests {
             WM_APP_ROUTER_RESULT,
             SettingsReentrancy::Ignore,
         ),
+        (
+            "WM_APP_CARD_OPEN_SETTINGS",
+            WM_APP_CARD_OPEN_SETTINGS,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_GENERIC_ACTION_RESULT",
+            WM_APP_GENERIC_ACTION_RESULT,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_CARD_COPY_DETAILS",
+            WM_APP_CARD_COPY_DETAILS,
+            SettingsReentrancy::Ignore,
+        ),
     ];
 
     #[test]
@@ -4783,6 +5722,386 @@ mod tests {
     #[test]
     fn first_line_leaves_short_text_alone() {
         assert_eq!(first_line("fine", 88), "fine");
+    }
+
+    // -- #425: "Copy details" clipboard text ---------------------------------
+
+    use super::{error_details_clipboard_text, LastError};
+    use std::time::SystemTime;
+
+    #[test]
+    fn error_details_clipboard_text_is_the_redacted_chain_and_never_the_raw_token() {
+        // The same fake-key shape `redact_opaque_tokens`'s own tests use
+        // (egress.rs's `redact_opaque_tokens_scrubs_a_long_key_shaped_token`)
+        // -- proves the property this function exists for: whatever
+        // `record_last_error` stored (already redacted, #253) is exactly
+        // what reaches the clipboard, and the raw token never does.
+        let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
+        let raw_chain = format!("HTTP 401: invalid api key {fake_key} supplied");
+        let last_error = LastError {
+            action: "Couldn't add the event".to_string(),
+            occurred_at: SystemTime::now(),
+            // Exactly what `App::record_last_error` does to `raw_chain`.
+            chain: crate::egress::redact_opaque_tokens(&raw_chain),
+        };
+
+        let text = error_details_clipboard_text(&last_error);
+
+        assert!(
+            !text.contains(fake_key),
+            "the raw token must never reach the clipboard text: {text}"
+        );
+        assert!(text.contains("[redacted]"), "{text}");
+        assert!(text.contains("HTTP 401"), "{text}");
+        assert_eq!(text, last_error.chain, "must be the SAME chain, not a copy");
+    }
+
+    #[test]
+    fn error_details_clipboard_text_leaves_ordinary_prose_alone() {
+        // Neighbour: a chain with nothing token-shaped in it round-trips
+        // unchanged, same as `redact_opaque_tokens` itself does.
+        let raw_chain = "HTTP 429: too many requests, retry in 30s";
+        let last_error = LastError {
+            action: "Couldn't ask".to_string(),
+            occurred_at: SystemTime::now(),
+            chain: crate::egress::redact_opaque_tokens(raw_chain),
+        };
+        assert_eq!(error_details_clipboard_text(&last_error), raw_chain);
+    }
+
+    // -- #349: human-readable, redacted error text for the card -------------
+
+    use super::{
+        contains_api_failed_identifier, find_error_interpolations, human_error_detail,
+        humanize_error_chain, interpolation_is_guarded, is_api_shaped_identifier,
+    };
+
+    #[test]
+    fn contains_api_failed_identifier_catches_the_timezone_chain() {
+        assert!(contains_api_failed_identifier(
+            "TzSpecificLocalTimeToSystemTime failed"
+        ));
+        assert!(contains_api_failed_identifier(
+            "FileTimeToSystemTime failed"
+        ));
+        assert!(contains_api_failed_identifier(
+            "SystemTimeToFileTime failed"
+        ));
+    }
+
+    #[test]
+    fn contains_api_failed_identifier_catches_a_parenthesized_call_site() {
+        // The `.context("SetWindowsHookExW(WH_MOUSE_LL) failed")` shape used
+        // throughout hotkey.rs/dismiss.rs.
+        assert!(contains_api_failed_identifier(
+            "context: SetWindowsHookExW(WH_MOUSE_LL) failed"
+        ));
+        assert!(contains_api_failed_identifier("GetMonitorInfoW failed"));
+        assert!(contains_api_failed_identifier(
+            "SHGetKnownFolderPath failed"
+        ));
+        assert!(contains_api_failed_identifier("CryptProtectData failed"));
+    }
+
+    #[test]
+    fn contains_api_failed_identifier_leaves_ordinary_prose_alone() {
+        assert!(!contains_api_failed_identifier("the save failed"));
+        assert!(!contains_api_failed_identifier("write failed"));
+        assert!(!contains_api_failed_identifier(
+            "request failed: connection reset"
+        ));
+        assert!(!contains_api_failed_identifier(
+            "No such file or directory (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn is_api_shaped_identifier_requires_two_capitals_and_a_leading_one() {
+        assert!(is_api_shaped_identifier("GetMonitorInfoW"));
+        assert!(!is_api_shaped_identifier("Save")); // one leading capital only
+        assert!(!is_api_shaped_identifier("save"));
+        assert!(!is_api_shaped_identifier("abc")); // too short
+    }
+
+    #[test]
+    fn humanize_error_chain_maps_the_known_timezone_fragments() {
+        for chain in [
+            "couldn't read the local date: TzSpecificLocalTimeToSystemTime failed",
+            "couldn't read the local date: FileTimeToSystemTime failed",
+            "couldn't read the local date: SystemTimeToFileTime failed",
+        ] {
+            let human = humanize_error_chain(chain);
+            assert_eq!(human, "Couldn't read your clock settings.");
+            assert!(!contains_api_failed_identifier(&human));
+        }
+    }
+
+    #[test]
+    fn humanize_error_chain_falls_back_to_a_generic_sentence_for_an_unmapped_api_failure() {
+        let human = humanize_error_chain("SetWindowsHookExW(WH_MOUSE_LL) failed");
+        assert_eq!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn humanize_error_chain_keeps_prose_that_is_already_human() {
+        let human = humanize_error_chain("No such file or directory (os error 2)");
+        assert_eq!(human, "No such file or directory (os error 2)");
+    }
+
+    #[test]
+    fn humanize_error_chain_redacts_a_key_shaped_token_issue_253() {
+        let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
+        let human = humanize_error_chain(&format!("HTTP 401: invalid api key {fake_key}"));
+        assert!(!human.contains(fake_key), "{human}");
+    }
+
+    // -- review of #349/#426, item 2: actionable provider errors must stay
+    // specific, never collapse to the generic "Something went wrong." --
+    //
+    // `contains_api_failed_identifier` only replaces text that looks
+    // Win32/API-shaped ("XxxYyy(...) failed"); every provider error text
+    // below mirrors the exact `format!`/`anyhow!` template
+    // `src/provider/common.rs` actually uses (`http_error`,
+    // `rate_limited_error`, the `NoResponse` transport-error arm), run
+    // through the same `egress::redact_opaque_tokens` those call sites
+    // already apply (#253) before it ever reaches `app.rs`, so these are
+    // the real strings a card would show, not synthetic ones.
+
+    #[test]
+    fn humanize_error_chain_keeps_a_401_bad_key_specific() {
+        // Real Anthropic 401 body shape (anthropic.rs/common.rs's
+        // `http_error`: `"{tag}: HTTP {status}: {truncated}"`).
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        let chain = format!(
+            "anthropic: HTTP 401: {}",
+            crate::egress::redact_opaque_tokens(body)
+        );
+        assert!(!contains_api_failed_identifier(&chain));
+        let human = humanize_error_chain(&chain);
+        assert!(human.contains("HTTP 401"), "{human}");
+        assert!(human.contains("invalid x-api-key"), "{human}");
+        assert_ne!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn humanize_error_chain_keeps_a_429_rate_limit_specific() {
+        // Real shape from `rate_limited_error`: `"{tag}: too many requests.
+        // Retry after {} seconds."`.
+        let chain = "openai: too many requests. Retry after 20 seconds.".to_string();
+        assert!(!contains_api_failed_identifier(&chain));
+        let human = humanize_error_chain(&chain);
+        assert!(human.contains("too many requests"), "{human}");
+        assert!(human.contains("Retry after 20 seconds"), "{human}");
+        assert_ne!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn humanize_error_chain_keeps_a_model_not_found_specific() {
+        // Real OpenAI 404 body shape, same `http_error` template as the 401
+        // case above.
+        let body = r#"{"error":{"message":"The model `gpt-9` does not exist","type":"invalid_request_error","code":"model_not_found"}}"#;
+        let chain = format!(
+            "openai: HTTP 404: {}",
+            crate::egress::redact_opaque_tokens(body)
+        );
+        assert!(!contains_api_failed_identifier(&chain));
+        let human = humanize_error_chain(&chain);
+        assert!(human.contains("HTTP 404"), "{human}");
+        assert!(human.contains("does not exist"), "{human}");
+        assert_ne!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn humanize_error_chain_keeps_ollama_not_running_specific() {
+        // Real shape from the `TransportError::NoResponse` arm:
+        // `"{tag}: transport error: {}"`, `redact_detail`-ed -- what a real
+        // `ureq` connection-refused error (Ollama's tray app not running,
+        // #253's own "stock Ollama tray steals the port" pitfall aside)
+        // looks like.
+        let transport_err = "connect error: Connection refused (os error 10061)";
+        let chain = format!(
+            "ollama: transport error: {}",
+            crate::egress::redact_opaque_tokens(transport_err)
+        );
+        assert!(!contains_api_failed_identifier(&chain));
+        let human = humanize_error_chain(&chain);
+        assert!(human.contains("Connection refused"), "{human}");
+        assert_ne!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn humanize_error_chain_keeps_a_network_timeout_specific() {
+        // Same `"{tag}: transport error: {}"` template, a timeout instead
+        // of a refused connection.
+        let transport_err = "operation timed out after 30s";
+        let chain = format!(
+            "openai: transport error: {}",
+            crate::egress::redact_opaque_tokens(transport_err)
+        );
+        assert!(!contains_api_failed_identifier(&chain));
+        let human = humanize_error_chain(&chain);
+        assert!(human.contains("timed out"), "{human}");
+        assert_ne!(human, "Something went wrong.");
+    }
+
+    #[test]
+    fn human_error_detail_appends_a_next_step() {
+        let detail = human_error_detail("TzSpecificLocalTimeToSystemTime failed");
+        assert_eq!(
+            detail,
+            "Couldn't read your clock settings. Try again, and if it keeps happening, use Copy diagnostics for details."
+        );
+    }
+
+    /// #349's "Done when": no card's visible text may contain a Win32/API
+    /// function name. Rather than exercising every `show_error` call site
+    /// live (most need a real worker thread, a real window, or real I/O),
+    /// this scans `app.rs`'s own source (normalized to `\n` line endings,
+    /// so a CRLF checkout never changes what this test sees) for every
+    /// shape `find_error_interpolations` recognizes -- interpolating a
+    /// bound error value's Display/Debug output, or calling its
+    /// `.to_string()`, directly -- and fails if one is found whose
+    /// enclosing statement does not mention `human_error_detail` or
+    /// `track_error`. This is the mechanical guard that a new `show_error`
+    /// call site cannot reintroduce the bug this issue closes. See
+    /// `find_error_interpolations_*` below for proof the scanner itself
+    /// has teeth (review of #349/#426: the original version of this test
+    /// only matched two exact literals).
+    #[test]
+    fn show_error_call_sites_never_show_a_failed_suffixed_api_identifier() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        for pos in find_error_interpolations(&src) {
+            let window_start = pos.saturating_sub(80);
+            let window_end = (pos + 40).min(src.len());
+            assert!(
+                interpolation_is_guarded(&src, pos),
+                "found a raw error interpolation at byte {pos} not wrapped by \
+                 human_error_detail/track_error -- it could show an API function \
+                 name on a card:\n{}",
+                &src[window_start..window_end]
+            );
+        }
+    }
+
+    // -- the scanner's own regression tests (review of #349/#426) -----------
+    //
+    // A source-scanning test is only as good as its patterns: the version
+    // above only matched two exact `format!` literals (the alternate- and
+    // plain-Display specifiers on the bound name `e`), so it could never
+    // have caught the Debug specifier, an `err`/`error` bound name, a bare
+    // `.to_string()`, or a whitespace variant -- and, being green either
+    // way, gave no signal that it was blind to them.
+    // These tests plant exactly those shapes as Rust *string* data (never
+    // compiled, so they can safely look like the bug without being it) and
+    // prove the scanner actually flags each one, plus that a properly
+    // guarded call is correctly left alone.
+
+    #[test]
+    fn find_error_interpolations_catches_a_planted_bad_line() {
+        let planted = "fn f(e: anyhow::Error) -> String { format!(\"{e:#}\") }";
+        let hits = find_error_interpolations(planted);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(!interpolation_is_guarded(planted, hits[0]));
+    }
+
+    #[test]
+    fn find_error_interpolations_recognizes_debug_other_bindings_and_to_string() {
+        for planted in [
+            "format!(\"{e:?}\")",
+            "format!(\"{err}\")",
+            "format!(\"{err:#}\")",
+            "format!(\"{error:?}\")",
+        ] {
+            let hits = find_error_interpolations(planted);
+            assert_eq!(hits.len(), 1, "did not catch: {planted}");
+        }
+        // Built from parts, not as a literal string constant spelling out
+        // the bound name immediately followed by a call to its own
+        // `ToString`: that would itself be exactly the bare pattern this
+        // scanner looks for, and this file's own source is one of the
+        // things `show_error_call_sites_never_show_a_failed_suffixed_api_identifier`
+        // scans.
+        for name in ["e", "err", "error"] {
+            let planted = format!("{name}{}to_string()", '.');
+            let hits = find_error_interpolations(&planted);
+            assert_eq!(hits.len(), 1, "did not catch: {planted}");
+        }
+    }
+
+    #[test]
+    fn find_error_interpolations_tolerates_whitespace_variants() {
+        for planted in [
+            "format! (\"{e:#}\")",
+            "format!( \"{e:#}\" )",
+            "format!(\"{e:#}\" )",
+        ] {
+            let hits = find_error_interpolations(planted);
+            assert_eq!(hits.len(), 1, "did not catch: {planted:?}");
+        }
+    }
+
+    #[test]
+    fn find_error_interpolations_normalizes_crlf() {
+        let planted = "fn f() {\r\n    format!(\"{e:#}\")\r\n}".replace("\r\n", "\n");
+        let hits = find_error_interpolations(&planted);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn find_error_interpolations_ignores_a_longer_identifier_ending_in_e() {
+        // A longer identifier merely ending in the letter e (like "value")
+        // must not be mistaken for the bare-`e` binding name.
+        let hits = find_error_interpolations("let s = value.to_string();");
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    #[test]
+    fn find_error_interpolations_ignores_an_unrelated_format_call() {
+        let hits = find_error_interpolations("format!(\"{name}\")");
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    #[test]
+    fn interpolation_is_guarded_accepts_human_error_detail_and_track_error() {
+        for guarded in [
+            "self.card.show_error(\"x\", &human_error_detail(&format!(\"{e:#}\")));",
+            "let d = self.track_error(\"x\", &format!(\"{e:#}\"));",
+        ] {
+            let hits = find_error_interpolations(guarded);
+            assert_eq!(hits.len(), 1, "{guarded}");
+            assert!(interpolation_is_guarded(guarded, hits[0]), "{guarded}");
+        }
+    }
+
+    #[test]
+    fn interpolation_is_guarded_rejects_a_bare_call() {
+        let bare = "self.card.show_error(\"x\", &format!(\"{e:#}\"));";
+        let hits = find_error_interpolations(bare);
+        assert_eq!(hits.len(), 1);
+        assert!(!interpolation_is_guarded(bare, hits[0]));
+    }
+
+    /// Regression test for exactly the bug this scanner shipped with once:
+    /// `pack_error`'s real call site wraps two separate error-formatting
+    /// expressions -- one inside `human_error_detail`, one inside
+    /// `egress::redact_opaque_tokens` -- in a single statement. A naive
+    /// "nearest preceding brace" boundary search finds the first
+    /// expression's own literal closing brace (part of its Display
+    /// placeholder text, not a real block boundary) and cuts
+    /// `human_error_detail(` out of what it searches for the second
+    /// expression -- wrongly reporting it unguarded.
+    #[test]
+    fn interpolation_is_guarded_sees_past_an_earlier_format_placeholder() {
+        let guarded = "pack_error(&human_error_detail(&format!(\"{e:#}\")), \
+                        &egress::redact_opaque_tokens(&format!(\"{e:#}\")));";
+        let hits = find_error_interpolations(guarded);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        for pos in hits {
+            assert!(
+                interpolation_is_guarded(guarded, pos),
+                "byte {pos} in: {guarded}"
+            );
+        }
     }
 
     // -- router/chain provider-name agreement (issue #222) -------------------
@@ -4860,6 +6179,44 @@ mod tests {
                 router_models,
                 providers.models_for(&name),
                 "router and config model lists disagree for provider name {name:?}"
+            );
+        }
+    }
+
+    // -- palette footer label agrees with describe (issue #243) --------------
+
+    #[test]
+    fn first_provider_model_label_matches_describe_for_the_first_order_entry() {
+        // #243: first_provider_model_label used to keep its own fourth
+        // hand-mirrored match over the same five provider-name arms
+        // (alongside provider_for_named_model/models_for/describe in
+        // config.rs, #222 and #244). A recognized name whose describe()
+        // model this label disagreed with would silently show the bare
+        // name in the palette footer forever, with nothing to say why.
+        let mut providers = Providers::default();
+        providers.openai.model = "gpt-5.5-pro".to_string();
+        providers.compat.push(crate::config::CompatConfig {
+            name: "custom".to_string(),
+            model: "compat-flagship".to_string(),
+            ..Default::default()
+        });
+        for name in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "ollama",
+            "compat:custom",
+            "not-a-real-provider",
+        ] {
+            providers.order = vec![name.to_string()];
+            let label = first_provider_model_label(Mode::Auto, &providers);
+            let expected = match providers.describe(name) {
+                Some(d) if !d.model.is_empty() => Some(format!("{name}:{}", d.model)),
+                _ => Some(name.to_string()),
+            };
+            assert_eq!(
+                label, expected,
+                "label disagrees with describe for {name:?}"
             );
         }
     }
@@ -4999,7 +6356,7 @@ mod tests {
     /// larger draft downscaled afterward), through the REAL intent router
     /// (`router::build_request`/`router::parse_router_result`, the same
     /// functions `App::router_worker` calls) against local Ollama
-    /// `gemma3:4b`. Run manually (CLAUDE.md build rules -- never bare
+    /// `gemma3:4b`. Run manually (AGENTS.md build rules -- never bare
     /// `cargo test`):
     /// ```text
     /// CARGO_TARGET_DIR=... RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2 \

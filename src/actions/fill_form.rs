@@ -116,7 +116,7 @@ pub const ACTION_ID: &str = "fill-this-form";
 /// The action's base prompt. Unlike `calendar`'s `BASE_PROMPT` (one prompt,
 /// sent with every ask), this file only ever sends a prompt to the model
 /// for the unmapped-fields request (stage 2) -- see [`build_model_prompt`].
-pub const BASE_PROMPT: &str = "You are shown a screenshot of a form and a short list of its fields Wingman could not confidently map to a profile field by label alone. For each one, decide whether a profile field (named below) is the right source, or whether you can read/infer a short, literal value directly from what is visible on screen. Never invent personal data that is not visible and not in the profile. Never fill a payment field (card number, CVV, expiry, IBAN, account or routing number) by any means; leave it as \"skip\". If you are unsure, choose \"skip\" rather than guessing.";
+pub const BASE_PROMPT: &str = "You are shown a form (or, if no image could be captured, its recognized text and fields instead) and a short list of its fields Wingman could not confidently map to a profile field by label alone. For each one, decide whether a profile field (named below) is the right source, or whether you can read/infer a short, literal value directly from what is visible on screen. Never invent personal data that is not visible and not in the profile. Never fill a payment field (card number, CVV, expiry, IBAN, account or routing number) by any means; leave it as \"skip\". If you are unsure, choose \"skip\" rather than guessing. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
 
 /// The built-in "Fill this form" action (#40): group Work, inputs the UIA
 /// snapshot plus the screen, proposal `form_fill`, executor `fill_form`
@@ -167,7 +167,7 @@ pub fn control_type_str(kind: ControlKind) -> &'static str {
 /// candidate. `inputs::uia::snapshot_foreground` already never emits a
 /// button (or anything else outside its six known control kinds) as a
 /// `FieldSnapshot` at all -- see that module's `build_snapshot` -- so
-/// "never touches a button" (CLAUDE.md, Wingman never presses Send/Submit)
+/// "never touches a button" (AGENTS.md, Wingman never presses Send/Submit)
 /// holds by construction upstream of this function; this narrows further,
 /// to the three kinds `executors::target::is_editable_control_type` (and
 /// therefore `TextElementAccess::write`/`write_with_fallback`) actually
@@ -939,6 +939,38 @@ pub fn load_or_import_profile() -> Result<Profile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- BASE_PROMPT / non-vision composition (#247) ---------------------
+
+    #[test]
+    fn base_prompt_does_not_contradict_the_non_vision_preface() {
+        // provider::non_vision_request prefixes NON_VISION_PREFACE (which
+        // says "Instead of a screenshot, you are given the on-screen text
+        // recognized by OCR...") onto BASE_PROMPT. BASE_PROMPT must not
+        // then turn around and claim a screenshot is shown -- that is a
+        // literal contradiction inside one system prompt (#247).
+        let base = crate::provider::Request {
+            system: BASE_PROMPT.to_string(),
+            user: String::new(),
+            images: Vec::new(),
+            schema: None,
+            effort: crate::provider::Effort::Unset,
+            max_tokens: 0,
+        };
+        let composed =
+            crate::provider::non_vision_request(&base, "some ocr text", "some fields").system;
+        let after_instead = composed
+            .split("Instead of a screenshot")
+            .nth(1)
+            .expect("preface names the non-vision path");
+        assert!(
+            !after_instead
+                .to_lowercase()
+                .contains("you are shown a screenshot"),
+            "BASE_PROMPT still asserts a screenshot is shown after the non-vision \
+             preface says otherwise: {composed}"
+        );
+    }
 
     // -- builtin_action -------------------------------------------------
 
@@ -1968,7 +2000,7 @@ mod tests {
     //
     // #40's task brief: "profile in a temp dir, local mapping fills all
     // three with zero model calls (assert no provider called), button
-    // untouched." `#[ignore]`d (CLAUDE.md: no live app launch in this
+    // untouched." `#[ignore]`d (AGENTS.md: no live app launch in this
     // task) -- run by hand with
     // `cargo test fill_form_live -- --ignored --nocapture`.
     mod win32 {

@@ -6,7 +6,7 @@
 //! no Win32 here; see #50 for the profile settings page and #40 for the
 //! action itself.
 //!
-//! Pure by design (CLAUDE.md rule 8: pure logic is unit-tested) so it can
+//! Pure by design (AGENTS.md rule 8: pure logic is unit-tested) so it can
 //! be exercised without a UIA tree or a live form.
 
 /// One profile field a form label can be matched to. Deliberately flatter

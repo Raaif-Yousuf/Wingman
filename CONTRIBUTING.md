@@ -8,20 +8,26 @@ future path and how to contribute to the app as it exists today.
 
 ## Where the project actually is
 
-Read this before writing code: today's app is one hotkey, one screenshot,
-one cloud model call, one read-only card (`README.md` has the details). The
-**actions framework described below in "Add an action in 20 minutes" does
-not exist in the code yet.** It is the target shape from the [expansion
-plan](docs/superpowers/specs/2026-09-16-expansion-plan-design.md) §6, written
-here so the format is settled before anyone builds the framework or the
-first catalogue action against it. If you want to contribute to the actions
-framework itself (`actions/`, the proposal schema registry, the intent
-router, the palette), that is Phase 2 work; open an issue or comment on an
-existing one before starting, per the spec-first rule below.
+Read this before writing code: the actions framework (`src/actions/`,
+`actions.toml`) is real and built, not a target shape. Five built-in
+actions run end to end today (check my work, add event from screen, review
+this email, fill this form, copy text from screen), each going through the
+real Look, Propose, Confirm, Do loop (`README.md` has the details). A
+*new*, hand-written `actions.toml` entry runs end to end too (#242): it
+parses, shows in the palette, and dispatches on Enter through the same
+generic Look, Propose, Confirm, Do plumbing the built-ins use, resolving
+its own `proposal` schema and `executor` fields at dispatch time -- see
+`App::run_generic_action` (`src/app.rs`) and
+`palette_model::DispatchTarget::Generic`.
+
+The walkthrough below, "Add an action in 20 minutes", writes, loads and runs
+a real `actions.toml` entry against the shipped framework end to end.
 
 Contributions that work against the app as it exists today (the hotkey
-path, capture, the settings window, the card, the tray, provider code) are
-welcome right now and do not need any of the actions-framework scaffolding.
+path, capture, the settings window, the card, the tray, provider code, or a
+new catalogue action) are welcome right now. See the
+[good first issue list](https://github.com/Raaif-Yousuf/Wingman/labels/good%20first%20issue)
+for a place to start.
 
 ## Prerequisites
 
@@ -30,13 +36,12 @@ welcome right now and do not need any of the actions-framework scaffolding.
   another OS, though `cargo check` may get partway on one.
 - An OpenAI or Anthropic API key to exercise the running app end to end.
   Not required to build or run the unit tests.
-- Optional: [Ollama](https://ollama.com) running locally, only relevant once
-  local-model support (Phase 1 of the plan) exists; nothing in the current
-  codebase talks to it yet.
+- Optional: [Ollama](https://ollama.com) running locally on `127.0.0.1:11434`
+  to exercise the built local-model provider (`src/provider/ollama.rs`).
 
 ## Before you write code: spec-first for anything architectural
 
-CLAUDE.md rule 12: a change that adds a module, changes a thread's
+AGENTS.md rule 12: a change that adds a module, changes a thread's
 responsibilities, changes a stored file's format, or otherwise affects
 architecture gets a short design spec in
 `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`, written and settled
@@ -62,14 +67,29 @@ which is the pattern to follow for new pure-logic code.
 `cargo clippy -D warnings` must be clean. Once `deny.toml` exists
 (tracked separately), `cargo deny check` joins this list; until then, keep
 new dependencies permissively licensed by hand (MIT, Apache-2.0, BSD, ISC,
-Zlib, Unlicense: CLAUDE.md rule 2) and add anything new to
+Zlib, Unlicense: AGENTS.md rule 2) and add anything new to
 `THIRD_PARTY_NOTICES.md` in the same pull request.
 
 Win32 code (anything touching a window, a hook, the tray, GDI) is not
-meaningfully unit-testable. CLAUDE.md rule 8 applies: state the one
+meaningfully unit-testable. AGENTS.md rule 8 applies: state the one
 observable that would differ if the change were wired to nothing, and check
 it by hand before calling the change done. The `wired-to-nothing` skill in
 this repo exists for exactly this.
+
+If your change touches the card or the palette, run the UI gallery (a debug
+build only, issue #363) and attach the screenshots to your pull request:
+
+```powershell
+cargo build
+.\target\debug\wingman.exe --ui-gallery --screenshot out\
+```
+
+This writes one PNG per card/palette state (answers at each difficulty
+badge, error, pending, previews, the palette's default/router/no-matches/
+no-model states) from fixture data, with no network request and no model
+call. Run it with no `--screenshot` argument to step through the same
+states interactively with Right/Left. Attach the before and after PNGs so a
+reviewer can see the visual change without reproducing it locally.
 
 ## Config compatibility
 
@@ -86,6 +106,26 @@ correctly under the new code, alongside the new field's default. This is
 issue #135's regression net: a settings or hotkey reset across an upgrade
 should fail a fixture test, not get discovered by a user.
 
+## Downloading a test build from a pull request
+
+CI builds `Wingman.exe` for every push to a pull request (the `ci` job's
+"Upload exe artifact" step in `.github/workflows/ci.yml`), so a reviewer can
+try a change without building it themselves:
+
+1. Open the pull request and go to its "Checks" tab, or open the run
+   directly from the commit's status check.
+2. Click the `CI` workflow run for the commit you want to try.
+3. Scroll to "Artifacts" at the bottom of the run summary page and download
+   `wingman-windows-exe` (a zip containing `Wingman.exe`).
+4. Unzip it and run `Wingman.exe` directly. It is unsigned and not
+   installed, so Windows SmartScreen may warn on first run; this is a
+   release-profile build of the exact commit under review, not a packaged
+   installer.
+
+You need to be signed in to GitHub to download workflow artifacts, and the
+artifact is retained for GitHub's default retention window before it
+expires.
+
 ## Commit sign-off (DCO)
 
 Every commit needs a Developer Certificate of Origin sign-off, certifying
@@ -101,13 +141,15 @@ your configured `git config user.name` / `user.email`. Pull requests without
 it will be asked to amend (`git commit --amend -s` for the last commit, or
 `git rebase --exec 'git commit --amend --no-edit -s' -i <base>` for several).
 
-## Add an action in 20 minutes (target format, Phase 2)
+## Add an action in 20 minutes
 
 This walks through adding **Translate selection**, the catalogue action the
 expansion plan names as the worked example (§6), because it needs no new
 executor: it reads the current text selection and hands back translated text
-on a read-only card. Every step below describes the framework as designed;
-none of it can be run yet.
+copied to the clipboard. Every step below runs against the shipped
+framework end to end (#242): add the block below to `actions.toml`, press
+the hotkey, pick "Translate selection" from the palette, and it runs for
+real.
 
 See [`docs/actions.md`](docs/actions.md) for the full `actions.toml` schema
 (checked against the code, with worked examples) and
@@ -121,21 +163,22 @@ walkthrough's step 3 summarizes.
 id       = "translate-selection"
 name     = "Translate selection"
 inputs   = ["selection", "screen"]      # falls back to a screen region if nothing is selected
-proposal = "text_answer"                # built-in schema: { headline, detail }
-executor = "none"                       # read-only: no executor, no confirm step
+proposal = "text_answer"                # built-in schema: { text }
+executor = "clipboard"                  # read-only: copies `text` to the clipboard
 confirm  = false
 prompt   = """
 Translate the selected text to the user's preferred language (see the
-`preferred_language` setting; default English). Return the translation as
-`detail` and a one-line "Translated from <language>" as `headline`.
+`preferred_language` setting; default English). Return only the translation,
+as `text`.
 """
 prefer   = { mode = "auto" }
 ```
 
 That is the entire contribution for a read-only action that reuses an
-existing proposal schema and needs no executor: one TOML block. It is
-reviewable in minutes because it cannot do anything beyond what `text_answer`
-and "no executor" already allow.
+existing proposal schema and executor: one TOML block. It is reviewable in
+minutes because it cannot do anything beyond what `text_answer` and
+`clipboard` already allow (`clipboard` is read-only by design -- issue #402
+-- so `confirm = false` is honored, not silently ignored).
 
 ### 2. If the action needs a new proposal shape
 
@@ -143,7 +186,7 @@ Only needed when no existing schema fits (`text_answer`, `verdict`,
 `calendar_event`, `form_fill`, `text_review` cover most read-and-propose
 cases). Add it to the proposal schema registry in `actions/` with its
 `serde` struct, in **property-declaration order**, because that order is
-sent as the JSON schema and the model answers in that order (CLAUDE.md rule
+sent as the JSON schema and the model answers in that order (AGENTS.md rule
 3: this is why `serde_json` keeps `preserve_order`, explained in full in
 [`docs/actions.md`](docs/actions.md)). Put any field the model should commit
 to last (like a verdict) after the fields that justify it (like the

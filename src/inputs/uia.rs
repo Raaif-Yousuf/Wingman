@@ -24,7 +24,7 @@
 //!   into a [`RawElement`]. Exercised by the real-window integration test
 //!   at the bottom of `mod tests`.
 //!
-//! # Threading (CLAUDE.md rule 8, the task brief)
+//! # Threading (AGENTS.md rule 8, the task brief)
 //!
 //! [`snapshot_hwnd`] and [`snapshot_foreground`] initialize COM
 //! apartment-threaded (`COINIT_APARTMENTTHREADED`) and uninitialize it
@@ -1007,7 +1007,7 @@ mod tests {
     // -- real Win32 window: label resolution and password redaction, for
     // real, via snapshot_hwnd -----------------------------------------------
     //
-    // A test-only window class (CLAUDE.md rule 9): two labelled EDIT
+    // A test-only window class (AGENTS.md rule 9): two labelled EDIT
     // controls (one plain, one ES_PASSWORD), each preceded by its own
     // STATIC label, built and torn down by this test alone. Z-order is
     // pinned explicitly (see `stack_in_creation_order`) rather than relied
