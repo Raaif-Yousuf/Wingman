@@ -538,15 +538,45 @@ static EGRESS_LOG_ACL_RESTRICTED: AclRestrictOnce = AclRestrictOnce::new();
 /// down -- the entry the caller is about to write still matters more than a
 /// missed ACL attempt, and the next process launch gets another attempt.
 fn restrict_log_acl_once_with(flag: &AclRestrictOnce, path: &std::path::Path) {
+    restrict_log_acl_once_using(flag, path, |p| {
+        #[cfg(windows)]
+        {
+            crate::config::Config::restrict_acl(p)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = p;
+            Ok(())
+        }
+    });
+}
+
+/// The real body of [`restrict_log_acl_once_with`], taking the restrict call
+/// itself as a parameter. This is what lets a test observe "the restrict
+/// action ran exactly once" (the actual "once per process" contract) via a
+/// counting closure, instead of asserting on real `icacls` ACL output --
+/// MEASURED 2026-09-25 on a GitHub Actions Windows runner: a freshly created
+/// file under the runner's own `%TEMP%` already carries explicit,
+/// non-inherited ACEs (SYSTEM, Administrators, `runneradmin`: `(F)`, no
+/// `(I)` flag at all) before `restrict_acl` ever runs, so a test asserting
+/// `(I)` IS present on an unrestricted file is asserting something about the
+/// host's temp-directory inheritance, not about this code, and is not
+/// portable across machines. Asserting `(I)` is ABSENT after a real
+/// `restrict_acl` call (the positive direction; see
+/// `restrict_log_acl_once_with_restricts_a_freshly_written_file` and
+/// `try_record_restricts_the_real_log_path_acl` below) has no such
+/// assumption and stays real-`icacls` based.
+fn restrict_log_acl_once_using(
+    flag: &AclRestrictOnce,
+    path: &std::path::Path,
+    restrict: impl FnOnce(&std::path::Path) -> Result<()>,
+) {
     if !flag.take_first_attempt() {
         return;
     }
-    #[cfg(windows)]
-    if let Err(e) = crate::config::Config::restrict_acl(path) {
+    if let Err(e) = restrict(path) {
         eprintln!("wingman: failed to restrict egress.log permissions: {e:#}");
     }
-    #[cfg(not(windows))]
-    let _ = path;
 }
 
 fn try_record(entry: &EgressEntry) -> Result<()> {
@@ -1106,41 +1136,46 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn restrict_log_acl_once_with_only_shells_out_on_the_first_call() {
-        // Second call against the same flag must not touch the file at all:
-        // starting from a file with default (inherited) permissions, one
-        // call restricts it; deleting and recreating it with default
-        // permissions again and calling a SECOND time against the SAME flag
-        // must leave it unrestricted, because the flag has already been
-        // spent. This is the "never icacls on every write" guarantee.
+        // Second call against the same flag must not invoke the restrict
+        // call at all -- this is the "never icacls on every write"
+        // guarantee. Observed through `restrict_log_acl_once_using`'s
+        // injected closure, counting how many times it actually runs,
+        // rather than through real `icacls` ACL output: MEASURED
+        // 2026-09-25, a GitHub Actions Windows runner's own `%TEMP%` gives a
+        // freshly created file explicit, non-inherited ACEs before any
+        // `restrict_acl` call ever runs, so an assertion that expects the
+        // `(I)` inheritance flag to still be PRESENT on an unrestricted file
+        // is really asserting something about the host, not this code, and
+        // is not portable across machines. Counting calls has no such
+        // assumption.
         let path = std::env::temp_dir().join(format!(
             "wingman-test-egress-acl-once-{}-{}.log",
             std::process::id(),
             line!()
         ));
-        fs::write(&path, "{}\n").expect("scratch file should write");
         let flag = AclRestrictOnce::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
 
-        restrict_log_acl_once_with(&flag, &path);
-        // Recreate the file with fresh, unrestricted (inherited) permissions.
-        let _ = fs::remove_file(&path);
-        fs::write(&path, "{}\n").expect("scratch file should rewrite");
+        restrict_log_acl_once_using(&flag, &path, |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        restrict_log_acl_once_using(&flag, &path, |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        restrict_log_acl_once_using(&flag, &path, |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
 
-        restrict_log_acl_once_with(&flag, &path);
-
-        let output = std::process::Command::new("icacls")
-            .arg(&path)
-            .output()
-            .expect("icacls should run");
-        let listing = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            listing.contains("(I)"),
-            "a second call against an already-spent flag must not \
-             re-restrict the recreated file: {listing}"
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the restrict call must run exactly once per flag, however many \
+             times restrict_log_acl_once_using is called"
         );
-
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
