@@ -310,13 +310,16 @@ mod tests {
             effort: crate::provider::Effort::Unset,
             max_tokens: 0,
         };
-        let composed = crate::provider::non_vision_request(&base, "some ocr text", "some fields").system;
+        let composed =
+            crate::provider::non_vision_request(&base, "some ocr text", "some fields").system;
         let after_instead = composed
             .split("Instead of a screenshot")
             .nth(1)
             .expect("preface names the non-vision path");
         assert!(
-            !after_instead.to_lowercase().contains("you are shown a screenshot"),
+            !after_instead
+                .to_lowercase()
+                .contains("you are shown a screenshot"),
             "BASE_PROMPT still asserts a screenshot is shown after the non-vision \
              preface says otherwise: {composed}"
         );

@@ -473,8 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn form_fill_source_declares_a_closed_enum_of_the_three_tokens(
-    ) {
+    fn form_fill_source_declares_a_closed_enum_of_the_three_tokens() {
         // #246: merge_model_response's `match resp.source.as_str()` treats
         // exactly "profile", "model" or "skip" as meaningful and silently
         // skips anything else. The schema must close the set the same way
