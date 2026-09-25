@@ -305,6 +305,46 @@ pub fn resolve_executor(action: &Action) -> anyhow::Result<Box<dyn crate::execut
     crate::executors::registry::resolve(&action.executor)
 }
 
+/// #242: parses a generic action's completion text into a `serde_json::
+/// Value`, the shape `App::run_generic_action`'s worker needs for any
+/// non-built-in action -- unlike `calendar::parse_calendar_proposal`, this
+/// has no fixed field list to check (a generic action's proposal shape is
+/// whatever its own registered schema says), so the only requirement is
+/// "valid JSON, and a JSON object" -- the same minimum every proposal
+/// schema in `actions::schema` already guarantees via `"type": "object"`.
+pub fn parse_generic_proposal(text: &str) -> anyhow::Result<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| anyhow::anyhow!("provider: completion text is not valid JSON: {e}"))?;
+    if !value.is_object() {
+        anyhow::bail!("provider: completion is not a JSON object");
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod generic_proposal_tests {
+    use super::parse_generic_proposal;
+
+    #[test]
+    fn parse_generic_proposal_parses_a_json_object() {
+        let value = parse_generic_proposal(r#"{"headline":"ok","detail":"fine"}"#)
+            .expect("a JSON object must parse");
+        assert_eq!(value["headline"], "ok");
+    }
+
+    #[test]
+    fn parse_generic_proposal_rejects_invalid_json() {
+        let err = parse_generic_proposal("not json").unwrap_err();
+        assert!(err.to_string().contains("JSON"));
+    }
+
+    #[test]
+    fn parse_generic_proposal_rejects_a_non_object() {
+        let err = parse_generic_proposal("[1,2,3]").unwrap_err();
+        assert!(err.to_string().contains("object"));
+    }
+}
+
 /// Finds the default action (today, the only one the hotkey ever runs) in
 /// an already-merged, already-visibility-filtered list. `None` means the
 /// default action was disabled, disabled via its group, or removed by a
@@ -481,7 +521,7 @@ id       = "translate-selection"
 name     = "Translate selection"
 inputs   = ["selection", "screen"]
 proposal = "text_answer"
-executor = "none"
+executor = "clipboard"
 confirm  = false
 prompt   = "Translate the selected text."
 
@@ -501,6 +541,83 @@ mode = "auto"
             !a.rate_difficulty,
             "rate_difficulty defaults to false when absent"
         );
+    }
+
+    /// #242's own "Done when": a non-built-in `actions.toml` action -- here
+    /// CONTRIBUTING.md's own worked example, loaded from a scratch file
+    /// exactly the way a real user's override would be -- is no longer a
+    /// dead end. This exercises every non-Win32, non-network piece of the
+    /// pipeline `App::run_generic_action`/`on_generic_action_result` use:
+    /// the palette still lists it, `dispatch_target_for` routes it
+    /// (instead of `None`), its proposal schema resolves, and its executor
+    /// resolves and actually runs against a synthetic confirmed value
+    /// shaped like that schema.
+    #[test]
+    fn contributing_md_translate_selection_example_dispatches_and_runs_end_to_end() {
+        let path = scratch_path("translate-selection-e2e");
+        write(
+            &path,
+            r#"
+[[actions]]
+id       = "translate-selection"
+name     = "Translate selection"
+inputs   = ["selection", "screen"]
+proposal = "text_answer"
+executor = "clipboard"
+confirm  = false
+prompt   = "Translate the selected text."
+
+[actions.prefer]
+mode = "auto"
+"#,
+        );
+        let resolved = load_actions_from(&path).unwrap();
+        let action = resolved
+            .iter()
+            .find(|r| r.action.id == "translate-selection")
+            .map(|r| r.action.clone())
+            .expect("the new action must be present after merge");
+
+        // The palette still shows it, and Enter on it no longer dispatches
+        // to nothing (the bug this issue reports).
+        let catalogue = crate::ui::palette_model::catalogue(&resolved);
+        assert!(
+            catalogue.iter().any(|row| row.id == "translate-selection"),
+            "a non-built-in action must still appear in the palette"
+        );
+        assert_eq!(
+            crate::ui::palette_model::dispatch_target_for("translate-selection"),
+            Some(crate::ui::palette_model::DispatchTarget::Generic(
+                "translate-selection".to_string()
+            )),
+            "a non-built-in action id must dispatch generically, not to nothing"
+        );
+
+        // Its proposal schema resolves (the model-call half of the generic
+        // path App::run_generic_action builds a request from).
+        let schema = schema::schema_for(&action.proposal, action.rate_difficulty)
+            .expect("\"text_answer\" must be a registered proposal schema (#242)");
+        assert_eq!(schema["required"], serde_json::json!(["text"]));
+
+        // Its executor resolves and actually runs a synthetic confirmed
+        // value shaped like that schema, exactly what
+        // App::run_confirmed_generic_action does after a real model call
+        // and (for confirm = false) auto-confirm.
+        let executor = resolve_executor(&action).expect("\"clipboard\" must resolve");
+        assert_eq!(executor.effect(), crate::executors::Effect::ReadOnly);
+        let proposal = crate::ui::confirm::Proposal::new(serde_json::json!({"text": "bonjour"}));
+        let confirmed = crate::ui::confirm::auto_confirm_read_only(executor.as_ref(), proposal)
+            .expect("a read-only executor with confirm = false must auto-confirm");
+        let undo = executor
+            .execute(confirmed)
+            .expect("the clipboard executor must run against a text_answer-shaped value");
+        assert!(
+            undo.summary.contains("bonjour"),
+            "the executor must actually have acted on the model's value: {}",
+            undo.summary
+        );
+
+        cleanup(&path);
     }
 
     #[test]

@@ -49,8 +49,32 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "calendar_event" => Some(calendar_event_schema()),
         "text_review" => Some(text_review_schema()),
         "form_fill" => Some(form_fill_schema()),
+        // #242: CONTRIBUTING.md's "Add an action in 20 minutes" worked
+        // example (`translate-selection`) is `proposal = "text_answer"`,
+        // `executor = "clipboard"` (this module's own doc comment above
+        // said this arm lands "the same day its first action lands" -- the
+        // generic dispatch path is that day). One property, matching
+        // exactly what `executors::clipboard::ClipboardExecutor::execute`
+        // reads (`value.get("text")`), so the same shape works for any
+        // `actions.toml` action that just wants a short model-produced
+        // string copied to the clipboard or shown on a card.
+        "text_answer" => Some(text_answer_schema()),
         _ => None,
     }
+}
+
+/// The `text_answer` proposal schema (#242): a single `text` field. See
+/// `schema_for`'s `"text_answer"` arm for why this exists and what it must
+/// match.
+fn text_answer_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "editable": true}
+        },
+        "required": ["text"],
+        "additionalProperties": false
+    })
 }
 
 /// The `calendar_event` proposal schema (#26): title, start, end, location,
@@ -233,7 +257,11 @@ mod tests {
 
     #[test]
     fn unknown_proposal_kind_is_none_not_a_panic() {
-        assert_eq!(schema_for("text_answer", false), None);
+        // #242 registered "text_answer" (CONTRIBUTING.md's own worked
+        // example proposal kind), so this test's fixture moved to a name
+        // that stays genuinely unregistered rather than re-asserting the
+        // gap #242 closed.
+        assert_eq!(schema_for("ocr_text", false), None);
         assert_eq!(schema_for("totally_made_up", true), None);
     }
 
@@ -382,6 +410,24 @@ mod tests {
     #[test]
     fn form_fill_is_registered() {
         assert!(schema_for("form_fill", false).is_some());
+    }
+
+    #[test]
+    fn text_answer_is_registered() {
+        assert!(schema_for("text_answer", false).is_some());
+    }
+
+    #[test]
+    fn text_answer_schema_matches_what_the_clipboard_executor_reads() {
+        let schema = schema_for("text_answer", false).expect("text_answer is registered");
+        assert_eq!(schema["required"], json!(["text"]));
+        assert_eq!(schema["properties"]["text"]["type"], "string");
+    }
+
+    #[test]
+    fn text_answer_rejects_additional_properties() {
+        let schema = schema_for("text_answer", false).expect("text_answer is registered");
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]

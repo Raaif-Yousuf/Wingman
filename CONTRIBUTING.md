@@ -12,18 +12,16 @@ Read this before writing code: the actions framework (`src/actions/`,
 `actions.toml`) is real and built, not a target shape. Five built-in
 actions run end to end today (check my work, add event from screen, review
 this email, fill this form, copy text from screen), each going through the
-real Look, Propose, Confirm, Do loop (`README.md` has the details). What is
-still missing is narrower: a *new*, hand-written `actions.toml` entry
-parses and shows in the palette, but does not yet dispatch on confirm
-(issue #242); only the five built-in action ids run today.
+real Look, Propose, Confirm, Do loop (`README.md` has the details). A
+*new*, hand-written `actions.toml` entry runs end to end too (#242): it
+parses, shows in the palette, and dispatches on Enter through the same
+generic Look, Propose, Confirm, Do plumbing the built-ins use, resolving
+its own `proposal` schema and `executor` fields at dispatch time -- see
+`App::run_generic_action` (`src/app.rs`) and
+`palette_model::DispatchTarget::Generic`.
 
-The walkthrough below, "Add an action in 20 minutes", writes and reviews a
-real `actions.toml` entry and its prompt/schema against the shipped
-framework; the one step it cannot yet run end to end is the confirm step,
-which is blocked on #242. If you want to help unblock arbitrary action
-dispatch itself (`src/actions/`, the intent router, the palette), open an
-issue or comment on an existing one before starting, per the spec-first
-rule below.
+The walkthrough below, "Add an action in 20 minutes", writes, loads and runs
+a real `actions.toml` entry against the shipped framework end to end.
 
 Contributions that work against the app as it exists today (the hotkey
 path, capture, the settings window, the card, the tray, provider code, or a
@@ -148,10 +146,10 @@ it will be asked to amend (`git commit --amend -s` for the last commit, or
 This walks through adding **Translate selection**, the catalogue action the
 expansion plan names as the worked example (§6), because it needs no new
 executor: it reads the current text selection and hands back translated text
-on a read-only card. Every step below runs against the shipped framework,
-except that a hand-written action id will not yet dispatch on confirm
-(issue #242); the entry, its prompt and its schema can be written, loaded
-and reviewed today.
+copied to the clipboard. Every step below runs against the shipped
+framework end to end (#242): add the block below to `actions.toml`, press
+the hotkey, pick "Translate selection" from the palette, and it runs for
+real.
 
 See [`docs/actions.md`](docs/actions.md) for the full `actions.toml` schema
 (checked against the code, with worked examples) and
@@ -165,21 +163,22 @@ walkthrough's step 3 summarizes.
 id       = "translate-selection"
 name     = "Translate selection"
 inputs   = ["selection", "screen"]      # falls back to a screen region if nothing is selected
-proposal = "text_answer"                # built-in schema: { headline, detail }
-executor = "none"                       # read-only: no executor, no confirm step
+proposal = "text_answer"                # built-in schema: { text }
+executor = "clipboard"                  # read-only: copies `text` to the clipboard
 confirm  = false
 prompt   = """
 Translate the selected text to the user's preferred language (see the
-`preferred_language` setting; default English). Return the translation as
-`detail` and a one-line "Translated from <language>" as `headline`.
+`preferred_language` setting; default English). Return only the translation,
+as `text`.
 """
 prefer   = { mode = "auto" }
 ```
 
 That is the entire contribution for a read-only action that reuses an
-existing proposal schema and needs no executor: one TOML block. It is
-reviewable in minutes because it cannot do anything beyond what `text_answer`
-and "no executor" already allow.
+existing proposal schema and executor: one TOML block. It is reviewable in
+minutes because it cannot do anything beyond what `text_answer` and
+`clipboard` already allow (`clipboard` is read-only by design -- issue #402
+-- so `confirm = false` is honored, not silently ignored).
 
 ### 2. If the action needs a new proposal shape
 
