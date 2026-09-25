@@ -273,7 +273,7 @@ impl Palette {
     /// Same as [`Palette::new`], but registers (once) and uses a class name
     /// distinct from the production one (rule 9: tests never touch
     /// production names).
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn new_for_test(instance: HINSTANCE) -> anyhow::Result<Self> {
         if !ensure_test_class_registered(instance) {
             anyhow::bail!("Wingman: failed to register the test palette window class");
@@ -493,7 +493,7 @@ impl Palette {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn set_query_for_test(&mut self, query: &str) {
         self.inner.set_query(query);
     }
@@ -520,14 +520,14 @@ impl Drop for Palette {
 
 const CLASS_NAME: &str = "Wingman.Palette.Window.9c4e2b17";
 /// Rule 9: tests never touch production names.
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 const TEST_CLASS_NAME: &str = "Wingman.Palette.Window.9c4e2b17.Test";
 
 static CLASS_INIT: Once = Once::new();
 static CLASS_OK: OnceLock<bool> = OnceLock::new();
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 static TEST_CLASS_INIT: Once = Once::new();
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 static TEST_CLASS_OK: OnceLock<bool> = OnceLock::new();
 
 fn ensure_class_registered(instance: HINSTANCE) -> bool {
@@ -538,7 +538,7 @@ fn ensure_class_registered(instance: HINSTANCE) -> bool {
     CLASS_OK.get().copied().unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn ensure_test_class_registered(instance: HINSTANCE) -> bool {
     TEST_CLASS_INIT.call_once(|| {
         let ok = unsafe { register_class(instance, TEST_CLASS_NAME) };
@@ -1185,7 +1185,7 @@ impl PaletteInner {
     /// production always drives the query through a real `EN_CHANGE`
     /// notification (`handle_message`'s `WM_COMMAND` arm), not by setting
     /// the edit control's text programmatically.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fn set_query(&mut self, query: &str) {
         unsafe {
             let _ = SetWindowTextW(self.edit_hwnd, PCWSTR(wide_z(query).as_ptr()));

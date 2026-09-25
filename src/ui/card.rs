@@ -166,7 +166,7 @@ impl Card {
     /// production names). Used only by the preview state's real-Win32 test
     /// in this module, which needs an actual `HWND` with real child
     /// controls, not the production `Card`'s class.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn new_for_test(instance: HINSTANCE) -> anyhow::Result<Self> {
         if !ensure_test_class_registered(instance) {
             anyhow::bail!("Wingman: failed to register the test card window class");
@@ -421,14 +421,14 @@ const CLASS_NAME: &str = "Wingman.Card.Window.7f3c1a9e";
 /// real child controls, so it gets its own window class rather than sharing
 /// the production one, the same way `single_instance`'s test uses its own
 /// mutex/class names (commit `011f11a`).
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 const TEST_CLASS_NAME: &str = "Wingman.Card.Window.7f3c1a9e.Test";
 
 static CLASS_INIT: Once = Once::new();
 static CLASS_OK: OnceLock<bool> = OnceLock::new();
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 static TEST_CLASS_INIT: Once = Once::new();
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 static TEST_CLASS_OK: OnceLock<bool> = OnceLock::new();
 
 fn ensure_class_registered(instance: HINSTANCE) -> bool {
@@ -439,7 +439,7 @@ fn ensure_class_registered(instance: HINSTANCE) -> bool {
     CLASS_OK.get().copied().unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn ensure_test_class_registered(instance: HINSTANCE) -> bool {
     TEST_CLASS_INIT.call_once(|| {
         let ok = unsafe { register_class(instance, TEST_CLASS_NAME) };

@@ -78,6 +78,21 @@ observable that would differ if the change were wired to nothing, and check
 it by hand before calling the change done. The `wired-to-nothing` skill in
 this repo exists for exactly this.
 
+If your change touches the card or the palette, run the UI gallery (a debug
+build only, issue #363) and attach the screenshots to your pull request:
+
+```powershell
+cargo build
+.\target\debug\wingman.exe --ui-gallery --screenshot out\
+```
+
+This writes one PNG per card/palette state (answers at each difficulty
+badge, error, pending, previews, the palette's default/router/no-matches/
+no-model states) from fixture data, with no network request and no model
+call. Run it with no `--screenshot` argument to step through the same
+states interactively with Right/Left. Attach the before and after PNGs so a
+reviewer can see the visual change without reproducing it locally.
+
 ## Config compatibility
 
 `config.toml`'s shape only ever grows: `#[serde(default)]` on every struct
