@@ -50,7 +50,9 @@ use crate::provider::{
     review_request_from_screen, review_request_from_text, Answer, Chain, Provider, Shot,
 };
 use crate::router;
-use crate::ui::card::{Card, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED};
+use crate::ui::card::{
+    Card, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+};
 use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
 use crate::ui::palette_model::{self, DispatchTarget};
@@ -221,6 +223,17 @@ struct LastError {
     /// Already redacted (#253, `egress::redact_opaque_tokens`) -- this is
     /// the only place the *original*, non-humanized chain survives at all.
     chain: String,
+}
+
+/// Issue #425: the exact text "Copy details" puts on the clipboard.
+/// `last_error.chain` is already redacted (#253) at `record_last_error`
+/// time -- this is a plain accessor, not a second redaction pass -- but it
+/// is factored out (rather than inlined in `copy_error_details`) so the
+/// "the redacted chain, and only the redacted chain, is what reaches the
+/// clipboard" guarantee is unit-tested directly, without touching the real
+/// OS clipboard.
+fn error_details_clipboard_text(last_error: &LastError) -> &str {
+    &last_error.chain
 }
 
 pub fn run() -> Result<()> {
@@ -2014,6 +2027,40 @@ impl App {
             Err(e) => {
                 let detail = self.track_error("Couldn't copy diagnostics", &format!("{e}"));
                 self.card.show_error("Couldn't copy diagnostics", &detail);
+            }
+        }
+    }
+
+    /// Issue #425: "Copy details" on an expanded error card. Reuses
+    /// [`App::last_error`] -- the same store #426's `copy_diagnostics`
+    /// above reads -- rather than a second copy of the error, so the two
+    /// "copy the raw chain" affordances can never disagree about what the
+    /// most recent error's chain even was. `WM_APP_CARD_COPY_DETAILS`
+    /// carries no payload (see that constant's doc comment): `Card` never
+    /// holds the full raw chain itself, only the already-humanized
+    /// `detail` text, so there is nothing to read off the message.
+    fn copy_error_details(&mut self) {
+        let Some(last_error) = self.last_error.as_ref() else {
+            // No error recorded yet (e.g. a stale click/Enter reaching here
+            // after `last_error` was somehow never set) -- nothing to copy,
+            // say so plainly rather than copying nothing silently.
+            self.card.show_answer(
+                "Nothing to copy",
+                "No error details are available.",
+                4,
+                None,
+            );
+            return;
+        };
+        let text = error_details_clipboard_text(last_error).to_string();
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            Ok(()) => {
+                self.card
+                    .show_answer("Details copied", "Paste them into a bug report.", 6, None)
+            }
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy details", &format!("{e}"));
+                self.card.show_error("Couldn't copy details", &detail);
             }
         }
     }
@@ -3913,6 +3960,12 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // posts it is hidden the moment it does so, so there is nothing
         // left to defer either.
         | WM_APP_CARD_OPEN_SETTINGS
+        // #425: same treatment -- no payload to leak, and an error card
+        // cannot be showing at all while Settings is modal-open (every path
+        // that opens Settings hides the card first, the same invariant
+        // #347's WM_APP_CARD_OPEN_SETTINGS above already relies on), so
+        // there is nothing left for a deferred copy to act on either.
+        | WM_APP_CARD_COPY_DETAILS
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
@@ -4171,6 +4224,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.open_settings();
             LRESULT(0)
         }
+        WM_APP_CARD_COPY_DETAILS => {
+            // Issue #425: a click/Enter on an expanded error card's "Copy
+            // details" affordance. No payload.
+            app.copy_error_details();
+            LRESULT(0)
+        }
         WM_APP_DISMISS => {
             let (x, y) = unpack_point(lparam.0 as u32);
             app.on_global_click(x, y);
@@ -4285,7 +4344,9 @@ mod tests {
     use crate::mode::Mode;
     use crate::provider::Provider;
     use crate::router;
-    use crate::ui::card::{WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED};
+    use crate::ui::card::{
+        WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+    };
     use crate::ui::palette::WM_APP_PALETTE_RUN;
     use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
@@ -4956,6 +5017,7 @@ mod tests {
         ("WM_APP_ROUTER_RESULT", WM_APP_ROUTER_RESULT),
         ("WM_APP_CARD_OPEN_SETTINGS", WM_APP_CARD_OPEN_SETTINGS),
         ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
+        ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
     ];
 
     #[test]
@@ -5476,6 +5538,11 @@ mod tests {
             WM_APP_GENERIC_ACTION_RESULT,
             SettingsReentrancy::Defer,
         ),
+        (
+            "WM_APP_CARD_COPY_DETAILS",
+            WM_APP_CARD_COPY_DETAILS,
+            SettingsReentrancy::Ignore,
+        ),
     ];
 
     #[test]
@@ -5533,6 +5600,51 @@ mod tests {
     #[test]
     fn first_line_leaves_short_text_alone() {
         assert_eq!(first_line("fine", 88), "fine");
+    }
+
+    // -- #425: "Copy details" clipboard text ---------------------------------
+
+    use super::{error_details_clipboard_text, LastError};
+    use std::time::SystemTime;
+
+    #[test]
+    fn error_details_clipboard_text_is_the_redacted_chain_and_never_the_raw_token() {
+        // The same fake-key shape `redact_opaque_tokens`'s own tests use
+        // (egress.rs's `redact_opaque_tokens_scrubs_a_long_key_shaped_token`)
+        // -- proves the property this function exists for: whatever
+        // `record_last_error` stored (already redacted, #253) is exactly
+        // what reaches the clipboard, and the raw token never does.
+        let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
+        let raw_chain = format!("HTTP 401: invalid api key {fake_key} supplied");
+        let last_error = LastError {
+            action: "Couldn't add the event".to_string(),
+            occurred_at: SystemTime::now(),
+            // Exactly what `App::record_last_error` does to `raw_chain`.
+            chain: crate::egress::redact_opaque_tokens(&raw_chain),
+        };
+
+        let text = error_details_clipboard_text(&last_error);
+
+        assert!(
+            !text.contains(fake_key),
+            "the raw token must never reach the clipboard text: {text}"
+        );
+        assert!(text.contains("[redacted]"), "{text}");
+        assert!(text.contains("HTTP 401"), "{text}");
+        assert_eq!(text, last_error.chain, "must be the SAME chain, not a copy");
+    }
+
+    #[test]
+    fn error_details_clipboard_text_leaves_ordinary_prose_alone() {
+        // Neighbour: a chain with nothing token-shaped in it round-trips
+        // unchanged, same as `redact_opaque_tokens` itself does.
+        let raw_chain = "HTTP 429: too many requests, retry in 30s";
+        let last_error = LastError {
+            action: "Couldn't ask".to_string(),
+            occurred_at: SystemTime::now(),
+            chain: crate::egress::redact_opaque_tokens(raw_chain),
+        };
+        assert_eq!(error_details_clipboard_text(&last_error), raw_chain);
     }
 
     // -- #349: human-readable, redacted error text for the card -------------
