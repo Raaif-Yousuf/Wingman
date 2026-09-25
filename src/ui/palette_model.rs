@@ -531,14 +531,92 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
 // Footer
 // ---------------------------------------------------------------------------
 
-/// `"mode: Auto - openai:gpt-5"`, or just `"mode: Auto"` when
-/// `provider_model` is `None` (nothing configured / ready). No em dash
-/// (rule 11) -- a hyphen, matching the rest of this crate's footer-style
-/// strings.
+/// Display name for a `"<provider>:<model>"` label: `gpt-5.5` -> `GPT-5.5`,
+/// `claude-opus-4-8` -> `Claude Opus 4.8`, `gemini-3.8-flash` -> `Gemini 3.8
+/// Flash`. Anything unrecognised (Ollama tags, compat models) falls back to
+/// the model id without the provider prefix, or the raw string.
+fn friendly_model_name(provider_model: &str) -> String {
+    let model = provider_model
+        .split_once(':')
+        .map(|(_, model)| model)
+        .unwrap_or(provider_model);
+
+    if model.is_empty() {
+        return provider_model.to_string();
+    }
+
+    if let Some(rest) = model.strip_prefix("gpt-") {
+        return format!("GPT-{rest}");
+    }
+
+    if let Some(rest) = model.strip_prefix("claude-") {
+        let parts: Vec<&str> = rest.split('-').collect();
+
+        let (words, version) = if parts.len() >= 3
+            && parts[parts.len() - 1].chars().all(|c| c.is_ascii_digit())
+            && parts[parts.len() - 2].chars().all(|c| c.is_ascii_digit())
+        {
+            (
+                &parts[..parts.len() - 2],
+                Some(format!(
+                    "{}.{}",
+                    parts[parts.len() - 2],
+                    parts[parts.len() - 1]
+                )),
+            )
+        } else if parts.len() >= 2 && parts[parts.len() - 1].chars().all(|c| c.is_ascii_digit()) {
+            (
+                &parts[..parts.len() - 1],
+                Some(parts[parts.len() - 1].to_string()),
+            )
+        } else {
+            (&parts[..], None)
+        };
+
+        let name = words
+            .iter()
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        return match version {
+            Some(version) => format!("Claude {name} {version}"),
+            None => format!("Claude {name}"),
+        };
+    }
+
+    if let Some(rest) = model.strip_prefix("gemini-") {
+        return rest
+            .split('-')
+            .fold("Gemini".to_string(), |mut result, word| {
+                result.push(' ');
+                let mut chars = word.chars();
+                if let Some(first) = chars.next() {
+                    result.push_str(&first.to_uppercase().collect::<String>());
+                    result.push_str(chars.as_str());
+                }
+                result
+            });
+    }
+
+    model.to_string()
+}
+
+/// `"Auto · GPT-5.5"`, or just `"Offline"` when `provider_model` is `None`
+/// (nothing configured / ready). No em dash (rule 11).
 pub fn footer_line(mode_label: &str, provider_model: Option<&str>) -> String {
     match provider_model {
-        Some(pm) => format!("mode: {mode_label} - {pm}"),
-        None => format!("mode: {mode_label}"),
+        Some(pm) => {
+            let friendly_name = friendly_model_name(pm);
+            format!("{mode_label} · {friendly_name}")
+        }
+        None => mode_label.to_string(),
     }
 }
 
@@ -1114,16 +1192,46 @@ mod tests {
     // -- footer_line ---------------------------------------------------------
 
     #[test]
-    fn footer_line_with_a_provider() {
+    fn footer_line_formats_gpt_models() {
         assert_eq!(
-            footer_line("Auto", Some("openai:gpt-5")),
-            "mode: Auto - openai:gpt-5"
+            footer_line("Auto", Some("openai:gpt-5.5")),
+            "Auto · GPT-5.5"
+        );
+        assert_eq!(footer_line("Auto", Some("openai:gpt-4o")), "Auto · GPT-4o");
+    }
+
+    #[test]
+    fn footer_line_formats_claude_models() {
+        assert_eq!(
+            footer_line("Auto", Some("anthropic:claude-sonnet-5")),
+            "Auto · Claude Sonnet 5"
+        );
+        assert_eq!(
+            footer_line("Auto", Some("anthropic:claude-opus-4-8")),
+            "Auto · Claude Opus 4.8"
         );
     }
 
     #[test]
+    fn footer_line_formats_gemini_models() {
+        assert_eq!(
+            footer_line("Auto", Some("gemini:gemini-3.8-flash")),
+            "Auto · Gemini 3.8 Flash"
+        );
+    }
+
+    #[test]
+    fn footer_line_falls_back_to_raw_model_name() {
+        assert_eq!(
+            footer_line("Auto", Some("ollama:gemma3:12b")),
+            "Auto · gemma3:12b"
+        );
+        assert_eq!(footer_line("Auto", Some("ollama")), "Auto · ollama");
+    }
+
+    #[test]
     fn footer_line_with_no_provider() {
-        assert_eq!(footer_line("Offline", None), "mode: Offline");
+        assert_eq!(footer_line("Offline", None), "Offline");
     }
 
     #[test]
