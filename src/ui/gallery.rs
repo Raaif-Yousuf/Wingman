@@ -47,7 +47,21 @@ pub enum GalleryState {
     CardAnswerDifficultyHigh,
     CardAnswerDifficultyUltra,
     CardError,
-    CardPending,
+    /// Issue #354. Replaces the old single glyph-only `CardPending` state:
+    /// the pending card now always carries a status line, so each sub-stage
+    /// gets its own gallery entry instead of one generic "pending" shot.
+    /// Uses `PendingStage::ReadingSelection` (#354 follow-up review, finding
+    /// 3): `calculate_selection` reads the current text selection, not a
+    /// screenshot, and its own honest stage is the simplest non-`AskingModel`
+    /// one to put in the gallery.
+    CardPendingReadingSelection,
+    /// Issue #354.
+    CardPendingAskingModelShort,
+    /// Issue #354: a long model name, to show `pending_status`'s
+    /// truncation.
+    CardPendingAskingModelLong,
+    /// Issue #354.
+    CardPendingStillWorking,
     CardPreviewCalendar,
     CardPreviewFormLongLabels,
     PaletteDefault,
@@ -67,7 +81,10 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardAnswerDifficultyHigh,
         CardAnswerDifficultyUltra,
         CardError,
-        CardPending,
+        CardPendingReadingSelection,
+        CardPendingAskingModelShort,
+        CardPendingAskingModelLong,
+        CardPendingStillWorking,
         CardPreviewCalendar,
         CardPreviewFormLongLabels,
         PaletteDefault,
@@ -89,7 +106,10 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardAnswerDifficultyHigh => "card-answer-difficulty-high",
         CardAnswerDifficultyUltra => "card-answer-difficulty-ultra",
         CardError => "card-error",
-        CardPending => "card-pending",
+        CardPendingReadingSelection => "card-pending-reading-selection",
+        CardPendingAskingModelShort => "card-pending-asking-model-short",
+        CardPendingAskingModelLong => "card-pending-asking-model-long",
+        CardPendingStillWorking => "card-pending-still-working",
         CardPreviewCalendar => "card-preview-calendar",
         CardPreviewFormLongLabels => "card-preview-form-long-labels",
         PaletteDefault => "palette-default",
@@ -338,10 +358,36 @@ mod driver {
                     "The request timed out. Check your connection and try again.",
                 );
             }
-            CardPending => {
+            CardPendingReadingSelection => {
                 card.hide();
                 palette.hide();
-                card.show_pending();
+                card.show_pending(crate::ui::card::PendingStage::ReadingSelection);
+            }
+            CardPendingAskingModelShort => {
+                card.hide();
+                palette.hide();
+                card.show_pending(crate::ui::card::PendingStage::AskingModel {
+                    model_name: "claude-haiku".to_string(),
+                });
+            }
+            CardPendingAskingModelLong => {
+                card.hide();
+                palette.hide();
+                card.show_pending(crate::ui::card::PendingStage::AskingModel {
+                    // Deliberately over `pending_status`'s truncation
+                    // length, to show the ellipsis in the gallery shot.
+                    model_name:
+                        "compat:some-very-long-self-hosted-provider-name-with-a-huge-model-id"
+                            .to_string(),
+                });
+            }
+            CardPendingStillWorking => {
+                card.hide();
+                palette.hide();
+                card.show_pending(crate::ui::card::PendingStage::AskingModel {
+                    model_name: "claude-haiku".to_string(),
+                });
+                card.set_pending_stage(crate::ui::card::PendingStage::StillWorking);
             }
             CardPreviewCalendar => {
                 card.hide();
@@ -532,9 +578,10 @@ mod tests {
     #[test]
     fn state_list_has_the_expected_count_and_no_duplicates() {
         let states = gallery_states();
-        // 5 card-answer variants (short + 4 difficulty badges) + error +
-        // pending + 2 previews = 9 card states, + 4 palette states = 13.
-        assert_eq!(states.len(), 13);
+        // 5 card-answer variants (short + 4 difficulty badges) + error + 4
+        // pending sub-stages (#354) + 2 previews = 12 card states, + 4
+        // palette states = 16.
+        assert_eq!(states.len(), 16);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(

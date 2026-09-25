@@ -665,7 +665,19 @@ impl App {
         // Disarmed for the whole in-flight window: a click while the spinner
         // is up must not touch the card.
         self.set_watch(false);
-        self.card.show_pending();
+        // Issue #354 follow-up review findings 1 and 2: every model-backed
+        // flow goes through this shared method, so the pending card starts
+        // directly at `AskingModel` here -- once, for all three callers --
+        // instead of each flow (or just `ask()`, before this fix) setting it
+        // separately after the fact. The label is resolved from the SAME
+        // mode-aware chain the worker thread will actually try (finding 4),
+        // known synchronously here with no network call, so this is not a
+        // promise the worker reaches that exact provider (it may fail over)
+        // but an honest "what Wingman is trying right now" cue, same as the
+        // pre-existing reasoning this replaces.
+        let model_name = self.first_provider_model_label().unwrap_or_default();
+        self.card
+            .show_pending(crate::ui::card::PendingStage::AskingModel { model_name });
 
         Some((raw, foreground_hwnd_isize, extra_value))
     }
@@ -691,6 +703,10 @@ impl App {
         let prompt = self.config.ui.prompt.clone();
         let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
+
+        // Issue #354 follow-up review: the pending card already started at
+        // `AskingModel` inside `begin_model_action` (findings 1 and 2), so
+        // there is nothing left to set here.
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
                 let shot = capture::encode(&raw)?;
@@ -877,16 +893,32 @@ impl App {
         }
     }
 
-    /// `"<name>:<model>"` for the first entry in `providers.order`, or just
-    /// `"<name>"` when that provider has no distinct model field set to a
-    /// non-empty value. `None` when nothing is configured at all -- the
-    /// palette footer then shows just the mode label (see
-    /// `palette_model::footer_line`). Thin wrapper over the free function
-    /// below (issue #243), same split as `provider_for_router`/
-    /// `router_models_for` (issue #222) so the label is testable without
-    /// constructing a whole `App`.
+    /// `"<name>:<model>"` for the first entry `self.config.mode` would
+    /// actually try -- `Providers::selected_order_for_mode` applied to the
+    /// current mode, the SAME mode-aware filtering/reordering
+    /// `build_chain_for_mode` (and so the real worker thread) uses -- or
+    /// just `"<name>"` when that provider has no distinct model field set to
+    /// a non-empty value. `None` when nothing survives mode filtering --
+    /// the palette footer then shows just the mode label (see
+    /// `palette_model::footer_line`).
+    ///
+    /// Issue #354 follow-up review, finding 4: this used to read
+    /// `providers.order.first()` directly, ignoring `mode` entirely -- so
+    /// e.g. `order = ["openai", "ollama"]` with `mode = Local` named
+    /// "openai" even though Local mode would never try it. `ollama_ready:
+    /// true` here is the same optimistic-upper-bound argument
+    /// `readiness_gate`'s doc comment already explains: this only decides
+    /// whether Auto mode COUNTS Ollama as a candidate (no network probe),
+    /// never a claim it is reachable right now.
     fn first_provider_model_label(&self) -> Option<String> {
-        first_provider_model_label(&self.config.providers)
+        Self::provider_model_label_for(self.config.mode, &self.config.providers)
+    }
+
+    /// Thin associated-fn alias over the free `first_provider_model_label`
+    /// (issue #243's split, so it is testable without a live `HWND`), kept
+    /// so the #354 mode-filtering tests read as `App::...`.
+    fn provider_model_label_for(mode: Mode, providers: &Providers) -> Option<String> {
+        first_provider_model_label(mode, providers)
     }
 
     /// #25: Enter in the palette routes here through the SAME dispatch table
@@ -955,7 +987,10 @@ impl App {
 
         self.busy = true;
         self.set_watch(false);
-        self.card.show_pending();
+        // No model in this flow (see the doc comment above): `Working` is
+        // the honest generic placeholder, not `AskingModel`.
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
 
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
@@ -2136,7 +2171,11 @@ impl App {
 
         self.busy = true;
         self.set_watch(false);
-        self.card.show_pending();
+        // Issue #354 follow-up review, finding 3: this reads the current
+        // text selection, not a screenshot -- `ReadingSelection` says so
+        // truthfully instead of reusing a screenshot-flavored line.
+        self.card
+            .show_pending(crate::ui::card::PendingStage::ReadingSelection);
 
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
@@ -3171,8 +3210,13 @@ fn provider_for_router(
 /// diagnostics. Now a thin call into `Providers::describe`, the single
 /// source of truth those two already read, so a provider kind missing an
 /// arm here is no longer possible: there is no arm here to miss.
-fn first_provider_model_label(providers: &Providers) -> Option<String> {
-    let name = providers.order.first()?;
+///
+/// #354 follow-up: reads the first entry `mode` would actually try
+/// (`Providers::selected_order_for_mode`, shared with `build_chain_for_mode`)
+/// rather than `providers.order.first()` unfiltered.
+fn first_provider_model_label(mode: Mode, providers: &Providers) -> Option<String> {
+    let selected = providers.selected_order_for_mode(mode, true);
+    let name = selected.first()?;
     let model = providers
         .describe(name)
         .map(|d| d.model)
@@ -4737,6 +4781,55 @@ mod tests {
         }
     }
 
+    // -- first_provider_model_label / provider_model_label_for (issue #354
+    //    follow-up review, finding 4) -------------------------------------
+
+    #[test]
+    fn provider_model_label_is_mode_aware_not_just_order_first() {
+        // order = ["openai", "ollama"], but mode = Local: Local mode never
+        // tries "openai" (`select_providers`/`is_local_provider`), so the
+        // label must name "ollama", not "openai". Before the fix this read
+        // `providers.order.first()` directly and asserted "openai" here,
+        // which is the exact wrong-model-name bug finding 4 reports.
+        let mut providers = Providers {
+            order: vec!["openai".to_string(), "ollama".to_string()],
+            ..Providers::default()
+        };
+        providers.openai.api_key = "sk-real".to_string();
+        providers.openai.model = "gpt-5".to_string();
+        providers.ollama.base_url = "http://127.0.0.1:11434".to_string();
+        providers.ollama.model = "llava".to_string();
+
+        let label = App::provider_model_label_for(Mode::Local, &providers)
+            .expect("ollama is configured and selected for Local mode");
+        assert_eq!(label, "ollama:llava");
+    }
+
+    #[test]
+    fn provider_model_label_matches_order_first_when_mode_does_not_filter_it_out() {
+        // Cloud mode DOES select "openai" first here, so this stays "openai"
+        // -- a control case proving the fix did not just always answer
+        // "ollama".
+        let mut providers = Providers {
+            order: vec!["openai".to_string(), "ollama".to_string()],
+            ..Providers::default()
+        };
+        providers.openai.api_key = "sk-real".to_string();
+        providers.openai.model = "gpt-5".to_string();
+
+        let label = App::provider_model_label_for(Mode::Cloud, &providers)
+            .expect("openai is configured for Cloud mode");
+        assert_eq!(label, "openai:gpt-5");
+    }
+
+    #[test]
+    fn provider_model_label_is_none_when_mode_filtering_leaves_nothing() {
+        // Cloud mode with only ollama configured: nothing survives
+        // `selected_order_for_mode`, so the label is None (never a stale
+        // name from an unfiltered `order`).
+        assert!(App::provider_model_label_for(Mode::Cloud, &ollama_only_providers()).is_none());
+    }
+
     // -- form_fill_headline / calendar_headline (issue #268) ---------------
 
     #[test]
@@ -6116,7 +6209,7 @@ mod tests {
             "not-a-real-provider",
         ] {
             providers.order = vec![name.to_string()];
-            let label = first_provider_model_label(&providers);
+            let label = first_provider_model_label(Mode::Auto, &providers);
             let expected = match providers.describe(name) {
                 Some(d) if !d.model.is_empty() => Some(format!("{name}:{}", d.model)),
                 _ => Some(name.to_string()),

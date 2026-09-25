@@ -12,7 +12,8 @@
 //! impl Card {
 //!     pub fn new(instance: HINSTANCE) -> anyhow::Result<Self>;
 //!     pub fn hwnd(&self) -> HWND;
-//!     pub fn show_pending(&mut self);
+//!     pub fn show_pending(&mut self, stage: PendingStage);
+//!     pub fn set_pending_stage(&mut self, stage: PendingStage); // #354
 //!     pub fn show_answer(&mut self, headline: &str, detail: &str, auto_dismiss_secs: u32, difficulty: Option<Difficulty>);
 //!     pub fn show_error(&mut self, headline: &str, detail: &str);
 //!     pub fn show_error_with_details(&mut self, headline: &str, detail: &str);
@@ -93,13 +94,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
-    HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_CTLCOLOREDIT,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW,
-    WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
-    WS_VISIBLE,
+    HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETCLIENTAREAANIMATION,
+    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
+    WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -136,6 +137,8 @@ pub const WM_APP_CARD_OPEN_SETTINGS: u32 = WM_APP + 15;
 pub const WM_APP_CARD_COPY_DETAILS: u32 = WM_APP + 17;
 
 use crate::provider::Difficulty;
+pub use crate::ui::pending_status::PendingStage;
+use crate::ui::pending_status::{pending_glyph_should_spin, pending_status_text};
 use crate::ui::preview::{Field, PreviewModel};
 
 // ---------------------------------------------------------------------------
@@ -218,6 +221,8 @@ impl Card {
             preview_decision_pending: false,
             preview_generation: 0,
             edit_bg_brush: HBRUSH(std::ptr::null_mut()),
+            pending_stage: PendingStage::Working,
+            animations_enabled: true,
         });
         let raw = Box::into_raw(inner);
 
@@ -289,8 +294,20 @@ impl Card {
         self.inner.owner = Some(hwnd);
     }
 
-    pub fn show_pending(&mut self) {
-        self.inner.show_pending();
+    /// `stage` is the caller's honest description of what is happening at
+    /// the moment the card appears -- see `CardInner::show_pending`'s doc
+    /// comment for why there is no default/implicit starting stage any
+    /// more.
+    pub fn show_pending(&mut self, stage: PendingStage) {
+        self.inner.show_pending(stage);
+    }
+
+    /// Issue #354: moves an already-showing Pending card to a new sub-stage
+    /// (e.g. "Asking {model}..." -> "Still working."), updating both the
+    /// painted status line and the window's accessible text. A no-op if the
+    /// card is not currently Pending (see `CardInner::set_pending_stage`).
+    pub fn set_pending_stage(&mut self, stage: PendingStage) {
+        self.inner.set_pending_stage(stage);
     }
 
     pub fn show_answer(
@@ -888,9 +905,16 @@ const CARD_WIDTH_DP: i32 = 280;
 /// that push wrapping earlier, so a full 90-character headline is never
 /// silently `DT_END_ELLIPSIS`'d.
 const HEADLINE_MAX_LINES: i32 = 3;
-/// Side length of the small square pending card (there is no text in it
-/// any more -- just the spinner -- so it does not need to be wide).
-const PENDING_SIZE_DP: i32 = 60;
+/// Side length of the spinner/glyph square inside the pending card (issue
+/// #354: smaller than the old spinner-only card's full size, since the
+/// pending card now also carries a status line below the glyph).
+const PENDING_SIZE_DP: i32 = 40;
+/// Full width of the pending card, once it carries status text -- matches
+/// the Collapsed/Expanded card width so the pending card no longer looks
+/// like a different surface from the states that immediately replace it.
+const PENDING_WIDTH_DP: i32 = CARD_WIDTH_DP;
+/// Vertical gap between the glyph and the status line beneath it.
+const PENDING_TEXT_GAP_DP: i32 = 8;
 const GAP_DP: i32 = 6;
 const WHEEL_SCROLL_DP: i32 = 48;
 
@@ -915,10 +939,42 @@ const BADGE_TEXT_GAP_DP: i32 = 6;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_DISMISS: usize = 2;
+/// Issue #354: fires once, `STILL_WORKING_DELAY_MS` after the card enters
+/// `PendingStage::AskingModel`, and moves the status line to "Still
+/// working." Armed only for as long as the card is actually Pending and in
+/// that sub-stage -- see `CardInner::set_pending_stage` and
+/// `CardInner::kill_timers` (AGENTS.md rule 5: nothing runs while idle).
+const TIMER_STILL_WORKING: usize = 3;
 /// A rotation needs ~16-33ms/frame to read as smooth; the old text-dot
 /// animation could get away with much slower ticks, but a spinner cannot.
 const ANIM_INTERVAL_MS: u32 = 20;
 const PENDING_SAFETY_TIMEOUT_SECS: u32 = 30;
+/// How long "Asking {model}..." stays up before the line changes to "Still
+/// working." -- issue #354's "after a few seconds".
+const STILL_WORKING_DELAY_MS: u32 = 4000;
+
+/// Issue #354: the one-line Win32 read behind the reduce-motion decision.
+/// Kept trivial on purpose (nothing here to get wrong) -- the actual
+/// decision of whether to animate is the pure, unit-tested
+/// `pending_status::pending_glyph_should_spin`. Falls back to `true`
+/// (animate) on any Win32 failure, matching this module's existing degrade
+/// pattern of "keep the pre-existing behaviour" rather than inventing a new
+/// failure mode.
+fn client_area_animation_enabled() -> bool {
+    // SPI_GETCLIENTAREAANIMATION writes a Win32 BOOL (a plain 4-byte int, 0
+    // or nonzero) through pvParam -- a raw i32 avoids depending on exactly
+    // which module this `windows` crate version exports its BOOL type from.
+    let mut enabled: i32 = 1;
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut enabled as *mut _ as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    enabled != 0
+}
 
 // -- Spinner (pending state) -------------------------------------------
 
@@ -1036,6 +1092,19 @@ struct CardInner {
     /// handler exists), so one brush for the window's whole life is correct,
     /// not just an optimisation.
     edit_bg_brush: HBRUSH,
+    /// Issue #354: which sub-stage the Pending state is in. Meaningless
+    /// outside `CardState::Pending`; set to whatever stage the caller passed
+    /// `show_pending` by every `show_pending` call, alongside every other
+    /// pending-only field.
+    pending_stage: PendingStage,
+    /// Issue #354: whether Windows' "Animation effects" setting was on the
+    /// last time `show_pending` queried it (`client_area_animation_enabled`,
+    /// checked once per Pending session, not re-polled -- there is no
+    /// `WM_SETTINGCHANGE` handler in this module, matching `theme`'s own
+    /// once-per-window-life treatment noted on `edit_bg_brush` above). With
+    /// it `false`, `paint_pending` draws a static glyph and `show_pending`
+    /// never arms `TIMER_ANIM`.
+    animations_enabled: bool,
 }
 
 impl CardInner {
@@ -1063,10 +1132,21 @@ impl CardInner {
 
     // -- show/hide -----------------------------------------------------
 
-    fn show_pending(&mut self) {
+    /// `stage` is the caller's own honest description of what is happening
+    /// right as the card appears (issue #354 follow-up review, finding 1):
+    /// there is no longer a generic "Capturing" placeholder shown here and
+    /// then immediately overwritten -- see `PendingStage`'s doc comment for
+    /// why that variant was removed rather than kept and fixed. Every
+    /// caller passes the stage that is actually true at THIS call, e.g.
+    /// `App::begin_model_action` already knows the mode-aware model label
+    /// before capture even runs, so the three model-backed flows start
+    /// directly at `AskingModel`.
+    fn show_pending(&mut self, stage: PendingStage) {
         self.leave_preview_if_active();
         self.reset_activation_and_timers();
-        // No text in the pending state any more -- it shows a spinner.
+        // `headline`/`detail` stay unused by Pending (issue #354's status
+        // line is driven by `pending_stage`/`pending_status_text`, painted
+        // separately in `paint_pending`, never stored back into `headline`).
         self.headline.clear();
         self.detail.clear();
         self.difficulty = None; // pending never shows a badge; keep state tidy
@@ -1074,9 +1154,14 @@ impl CardInner {
         self.anim_frame = 0;
         self.scroll_offset = 0;
         self.scroll_max = 0;
+        // Issue #354: queried once per Pending session, not on every frame
+        // -- see the field's doc comment.
+        self.animations_enabled = client_area_animation_enabled();
 
         unsafe {
-            let _ = SetTimer(Some(self.hwnd), TIMER_ANIM, ANIM_INTERVAL_MS, None);
+            if pending_glyph_should_spin(self.animations_enabled) {
+                let _ = SetTimer(Some(self.hwnd), TIMER_ANIM, ANIM_INTERVAL_MS, None);
+            }
             let _ = SetTimer(
                 Some(self.hwnd),
                 TIMER_DISMISS,
@@ -1085,8 +1170,71 @@ impl CardInner {
             );
         }
 
+        // Applied BEFORE layout: `layout_pending` sizes the card off the
+        // current status text, so `pending_stage` must already be `stage`
+        // (not the previous Pending session's leftover value) by the time
+        // it runs -- shares the "still working" timer arm-or-kill and
+        // repaint logic with `set_pending_stage`, so starting straight at
+        // `AskingModel` arms the same countdown a later transition into it
+        // would.
+        self.apply_pending_stage(stage);
         self.layout_pending();
         self.reveal();
+    }
+
+    /// Issue #354: moves the Pending card to a new sub-stage -- called by
+    /// this module's own `TIMER_STILL_WORKING` handler (`StillWorking`) once
+    /// the card is already showing. A no-op outside `CardState::Pending`: a
+    /// stale call arriving after the card has already moved on (answer,
+    /// error, hidden) must never resurrect a pending-only field or re-arm a
+    /// pending-only timer.
+    fn set_pending_stage(&mut self, stage: PendingStage) {
+        if self.state != CardState::Pending {
+            return;
+        }
+        self.apply_pending_stage(stage);
+    }
+
+    /// Shared by `show_pending` (the card's very first stage) and
+    /// `set_pending_stage` (a later transition): stores `stage`, arms or
+    /// kills the "still working" countdown to match, and repaints the
+    /// status line. No `CardState::Pending` guard here -- both callers
+    /// already enforce it themselves, one implicitly (it just set the state
+    /// to `Pending`), one explicitly.
+    fn apply_pending_stage(&mut self, stage: PendingStage) {
+        self.pending_stage = stage;
+        // Only `AskingModel` starts the "still working" countdown; killing
+        // any previous one first means a caller that applies this twice in
+        // a row (e.g. the router retrying a provider) never stacks timers.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_STILL_WORKING);
+        }
+        if matches!(self.pending_stage, PendingStage::AskingModel { .. }) {
+            unsafe {
+                let _ = SetTimer(
+                    Some(self.hwnd),
+                    TIMER_STILL_WORKING,
+                    STILL_WORKING_DELAY_MS,
+                    None,
+                );
+            }
+        }
+        self.set_window_text_for_pending_stage();
+        self.invalidate();
+    }
+
+    /// `SetWindowTextW` with the current pending status line, so basic
+    /// assistive tech reading the window's own accessible name sees the
+    /// same text a sighted user reads off the card (issue #354; full UIA
+    /// provider wiring is #119, out of scope here).
+    fn set_window_text_for_pending_stage(&self) {
+        let text = wide_z(&pending_status_text(&self.pending_stage));
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                self.hwnd,
+                PCWSTR(text.as_ptr()),
+            );
+        }
     }
 
     fn show_collapsed(
@@ -1165,6 +1313,12 @@ impl CardInner {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
             let _ = KillTimer(Some(self.hwnd), TIMER_DISMISS);
+            // Issue #354: killed on every exit from Pending (this is called
+            // from `reset_activation_and_timers`, which every `show_*`
+            // entry point runs first, and from `hide()`), so the "Asking
+            // ..." -> "Still working." countdown never outlives the card
+            // state it belongs to.
+            let _ = KillTimer(Some(self.hwnd), TIMER_STILL_WORKING);
         }
     }
 
@@ -1298,9 +1452,14 @@ impl CardInner {
     }
 
     fn layout_pending(&mut self) {
-        let size = self.scale(PENDING_SIZE_DP);
+        let padding = self.scale(PADDING_DP);
+        let width = self.scale(PENDING_WIDTH_DP);
+        let glyph_size = self.scale(PENDING_SIZE_DP);
+        let gap = self.scale(PENDING_TEXT_GAP_DP);
+        let text_line_h = self.line_height(self.fonts.body).max(1);
+        let height = padding * 2 + glyph_size + gap + text_line_h;
         let work = self.work_area_for_cursor();
-        self.place_bottom_right(work, size, size);
+        self.place_bottom_right(work, width, height);
     }
 
     fn layout_collapsed(&mut self) {
@@ -1589,27 +1748,71 @@ impl CardInner {
         }
     }
 
-    /// Draws the indeterminate spinner: a dim full ring, then a brighter arc
-    /// segment swept on top of it, its position driven by `anim_frame`.
-    /// Replaces the old "Thinking..." text entirely.
+    /// Issue #354: the glyph (spinner, or a static ring with animations
+    /// off) sits in a fixed-size square at the top of the card, with the
+    /// status line (`pending_status_text`) drawn below it -- replacing the
+    /// old glyph-only, text-only pending card.
     unsafe fn paint_pending(&self, hdc: HDC, rc: RECT, padding: i32, palette: &Palette) {
         let w = rc.right - rc.left;
-        let h = rc.bottom - rc.top;
+        let glyph_size = self.scale(PENDING_SIZE_DP);
         let cx = rc.left + w / 2;
-        let cy = rc.top + h / 2;
-        let diameter = (w.min(h) - padding * 2).max(4);
-        let radius = (diameter / 2).max(1);
+        let cy = rc.top + padding + glyph_size / 2;
+        let radius = (glyph_size / 2 - self.scale(SPINNER_STROKE_DP)).max(1);
         let left = cx - radius;
         let top = cy - radius;
         let right = cx + radius;
         let bottom = cy + radius;
         let stroke = self.scale(SPINNER_STROKE_DP).max(2);
 
-        // Arc() never fills, but Ellipse() does -- select NULL_BRUSH so the
-        // dim ring is an outline, not a filled disc.
+        self.paint_pending_glyph(
+            hdc, left, top, right, bottom, cx, cy, radius, stroke, palette,
+        );
+
+        // Status line, centered under the glyph.
+        let gap = self.scale(PENDING_TEXT_GAP_DP);
+        let text_top = rc.top + padding + glyph_size + gap;
+        let text_rect = RECT {
+            left: rc.left + padding,
+            top: text_top,
+            right: rc.right - padding,
+            bottom: rc.bottom - padding,
+        };
+        SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
+        let text = pending_status_text(&self.pending_stage);
+        draw_text_line(
+            hdc,
+            &text,
+            text_rect,
+            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+    }
+
+    /// Draws either the spinning arc-over-ring (animations on) or a single
+    /// static ring (animations off, issue #354: no motion when Windows'
+    /// "Animation effects" setting is off). `anim_frame` is only consulted
+    /// in the spinning branch, so a static glyph never depends on the timer
+    /// that `show_pending` deliberately does not arm in that case.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn paint_pending_glyph(
+        &self,
+        hdc: HDC,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        cx: i32,
+        cy: i32,
+        radius: i32,
+        stroke: i32,
+        palette: &Palette,
+    ) {
+        // Arc()/Ellipse(outline) never fill -- select NULL_BRUSH so both the
+        // dim ring and the static glyph render as outlines, not filled
+        // discs.
         let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
 
-        // Dim full ring underneath.
+        // Dim full ring underneath (also the whole glyph when static).
         let ring_pen = CreatePen(
             PS_SOLID,
             stroke,
@@ -1622,38 +1825,62 @@ impl CardInner {
         }
         let _ = DeleteObject(HGDIOBJ(ring_pen.0));
 
-        // Bright sweeping arc on top. Prefer a geometric pen with round end
-        // caps for a clean look; fall back to a plain cosmetic pen if that
-        // ever fails (e.g. exotic display driver).
-        let brush = LOGBRUSH {
-            lbStyle: BS_SOLID,
-            lbColor: windows::Win32::Foundation::COLORREF(palette.headline),
-            lbHatch: 0,
-        };
-        let mut arc_pen = ExtCreatePen(
-            PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
-            stroke as u32,
-            &brush,
-            None,
-        );
-        if arc_pen.0.is_null() {
-            arc_pen = CreatePen(
+        if pending_glyph_should_spin(self.animations_enabled) {
+            // Bright sweeping arc on top. Prefer a geometric pen with round
+            // end caps for a clean look; fall back to a plain cosmetic pen
+            // if that ever fails (e.g. exotic display driver).
+            let brush = LOGBRUSH {
+                lbStyle: BS_SOLID,
+                lbColor: windows::Win32::Foundation::COLORREF(palette.headline),
+                lbHatch: 0,
+            };
+            let mut arc_pen = ExtCreatePen(
+                PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
+                stroke as u32,
+                &brush,
+                None,
+            );
+            if arc_pen.0.is_null() {
+                arc_pen = CreatePen(
+                    PS_SOLID,
+                    stroke,
+                    windows::Win32::Foundation::COLORREF(palette.headline),
+                );
+            }
+            if !arc_pen.0.is_null() {
+                let start_deg = (self.anim_frame as f32 * SPINNER_DEGREES_PER_FRAME) % 360.0;
+                let end_deg = start_deg + SPINNER_SWEEP_DEG;
+                let (x1, y1) = ray_point(cx, cy, start_deg, radius);
+                let (x2, y2) = ray_point(cx, cy, end_deg, radius);
+
+                let old_pen = SelectObject(hdc, HGDIOBJ(arc_pen.0));
+                let _ = Arc(hdc, left, top, right, bottom, x1, y1, x2, y2);
+                SelectObject(hdc, old_pen);
+            }
+            let _ = DeleteObject(HGDIOBJ(arc_pen.0));
+        } else {
+            // Static glyph: a brighter, slightly smaller inner ring on top
+            // of the dim outer one, so the state still reads as "in
+            // progress" without any per-frame motion.
+            let inner_radius = (radius * 3 / 5).max(1);
+            let inner_pen = CreatePen(
                 PS_SOLID,
                 stroke,
                 windows::Win32::Foundation::COLORREF(palette.headline),
             );
+            if !inner_pen.0.is_null() {
+                let old_pen = SelectObject(hdc, HGDIOBJ(inner_pen.0));
+                let _ = Ellipse(
+                    hdc,
+                    cx - inner_radius,
+                    cy - inner_radius,
+                    cx + inner_radius,
+                    cy + inner_radius,
+                );
+                SelectObject(hdc, old_pen);
+            }
+            let _ = DeleteObject(HGDIOBJ(inner_pen.0));
         }
-        if !arc_pen.0.is_null() {
-            let start_deg = (self.anim_frame as f32 * SPINNER_DEGREES_PER_FRAME) % 360.0;
-            let end_deg = start_deg + SPINNER_SWEEP_DEG;
-            let (x1, y1) = ray_point(cx, cy, start_deg, radius);
-            let (x2, y2) = ray_point(cx, cy, end_deg, radius);
-
-            let old_pen = SelectObject(hdc, HGDIOBJ(arc_pen.0));
-            let _ = Arc(hdc, left, top, right, bottom, x1, y1, x2, y2);
-            SelectObject(hdc, old_pen);
-        }
-        let _ = DeleteObject(HGDIOBJ(arc_pen.0));
 
         SelectObject(hdc, old_brush);
     }
@@ -1923,6 +2150,14 @@ impl CardInner {
                     // arm below, a deliberate no-op.
                     TIMER_DISMISS if self.state != CardState::Preview => {
                         self.hide();
+                    }
+                    // Issue #354: only acts while still genuinely Pending --
+                    // `set_pending_stage`'s own guard would also catch a
+                    // stale message, but checking here too means a message
+                    // already queued from a state `kill_timers` could not
+                    // reach in time never even calls into it.
+                    TIMER_STILL_WORKING if self.state == CardState::Pending => {
+                        self.set_pending_stage(PendingStage::StillWorking);
                     }
                     _ => {}
                 }
@@ -3020,7 +3255,7 @@ mod tests {
         assert!(!card.hwnd().0.is_null());
         assert_eq!(card.state(), CardState::Hidden);
 
-        card.show_pending();
+        card.show_pending(PendingStage::Working);
         assert_eq!(card.state(), CardState::Pending);
 
         card.show_answer(
