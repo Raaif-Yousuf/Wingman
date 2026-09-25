@@ -19,10 +19,11 @@ use crate::secrets::{target_name, CredManagerStore, SecretStore};
 /// key readable in that buffer until an unrelated allocation reuses and
 /// overwrites it.
 fn zeroize_string(s: &mut String) {
-    // SAFETY: `dpapi::zeroize` only ever writes the byte 0x00, which is
-    // valid UTF-8 on its own (each write yields one more NUL code point), so
-    // the string never observes invalid UTF-8 through this pointer -- and it
-    // is cleared immediately after regardless.
+    // SAFETY: mid-loop, `dpapi::zeroize` can leave `s` transiently invalid
+    // UTF-8 (zeroing a multi-byte char's lead byte orphans its continuation
+    // bytes), but no `String` method observes the buffer between these raw
+    // writes and the `clear()` right below, and the final all-zero state
+    // (every byte 0x00, i.e. all NUL) is itself valid UTF-8.
     unsafe {
         crate::dpapi::zeroize(s.as_bytes_mut());
     }
