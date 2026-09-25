@@ -159,27 +159,36 @@ mod tests {
         assert!(TRANSACTION_TIMEOUT <= Duration::from_secs(60));
     }
 
+    /// True if `contents` contains a `CoCreateInstance(&CUIAutomation8`
+    /// construction, regardless of how whitespace (including a line break
+    /// between the call and its argument, e.g. `CoCreateInstance(\n    &
+    /// CUIAutomation8`, which a plain per-line `contains` would miss
+    /// entirely) is arranged around it: every whitespace run in `contents`
+    /// is collapsed to nothing before the substring search, so indentation,
+    /// wrapping and CRLF-vs-LF all normalize away identically.
+    fn contains_bare_cuiautomation_construction(contents: &str) -> bool {
+        let compact: String = contents.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.contains("CoCreateInstance(&CUIAutomation8")
+    }
+
     /// #261/#264's "no site can be missed" guard: every
     /// `CoCreateInstance(&CUIAutomation8` construction in `src/` must go
     /// through this file's [`create_automation`], not call
-    /// `CoCreateInstance` directly. Scans `src/` source normalized to `\n`
-    /// line endings (a CRLF checkout must not change what this test sees,
-    /// per the repo's own source-scanning tests) and fails if that literal
-    /// call shape appears in any file other than this one.
+    /// `CoCreateInstance` directly. Whitespace-collapsed per file (see
+    /// [`contains_bare_cuiautomation_construction`]), so neither a CRLF
+    /// checkout nor a construction split across lines hides from this
+    /// scan, and fails if that call shape appears in any file other than
+    /// this one.
     #[test]
     fn every_cuiautomation_construction_goes_through_create_automation() {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let needle = "CoCreateInstance(&CUIAutomation8";
         let mut offenders = Vec::new();
         visit_rs_files(&src_dir, &mut |path, contents| {
             if path.file_name().and_then(|n| n.to_str()) == Some("uia_automation.rs") {
                 return;
             }
-            let normalized = contents.replace("\r\n", "\n");
-            for (i, line) in normalized.lines().enumerate() {
-                if line.contains(needle) {
-                    offenders.push(format!("{}:{}", path.display(), i + 1));
-                }
+            if contains_bare_cuiautomation_construction(contents) {
+                offenders.push(path.display().to_string());
             }
         });
         assert!(
@@ -187,6 +196,21 @@ mod tests {
             "found a CUIAutomation8 construction bypassing \
              inputs::uia_automation::create_automation: {offenders:?}"
         );
+    }
+
+    /// Proof the scanner has teeth against the exact shape a naive
+    /// per-line `contains` check would miss: the call and its argument
+    /// split across two lines, each individually free of the needle.
+    #[test]
+    fn contains_bare_cuiautomation_construction_catches_a_multiline_call() {
+        let planted = "let automation: IUIAutomation = unsafe {\r\n    CoCreateInstance(\r\n        &CUIAutomation8,\r\n        None,\r\n        CLSCTX_INPROC_SERVER,\r\n    )\r\n}?;\r\n";
+        assert!(contains_bare_cuiautomation_construction(planted));
+    }
+
+    #[test]
+    fn contains_bare_cuiautomation_construction_is_false_for_the_helper_itself() {
+        let helper = "crate::inputs::uia_automation::create_automation()";
+        assert!(!contains_bare_cuiautomation_construction(helper));
     }
 
     fn visit_rs_files(dir: &std::path::Path, f: &mut impl FnMut(&std::path::Path, &str)) {
