@@ -15,6 +15,7 @@
 //!     pub fn show_pending(&mut self);
 //!     pub fn show_answer(&mut self, headline: &str, detail: &str, auto_dismiss_secs: u32, difficulty: Option<Difficulty>);
 //!     pub fn show_error(&mut self, headline: &str, detail: &str);
+//!     pub fn show_error_with_details(&mut self, headline: &str, detail: &str);
 //!     pub fn hide(&mut self);
 //!     pub fn set_text_scale(&mut self, scale: f32);
 //!     pub fn state(&self) -> CardState;
@@ -122,6 +123,18 @@ pub const WM_APP_PREVIEW_DECIDED: u32 = WM_APP + 9;
 /// comment.
 pub const WM_APP_CARD_OPEN_SETTINGS: u32 = WM_APP + 15;
 
+/// Posted to the card's owner window (see [`Card::set_owner`]) when the user
+/// clicks or activates (Enter) the "Copy details" affordance on an expanded
+/// error card -- issue #425. Carries no payload: the full raw error chain
+/// does not live on `Card` at all (only the already-humanized `detail` does),
+/// so `App::copy_error_details` reads it from `App::last_error` (set by
+/// `App::record_last_error`, the same store #426's Copy diagnostics already
+/// reads) rather than anything this message would carry. Adding another
+/// `WM_APP_*` constant anywhere in the crate also means adding it to
+/// `app.rs`'s `tests::ALL_WM_APP_IDS` (issue #163) and its
+/// `count_declarations` file list -- see that test's doc comment.
+pub const WM_APP_CARD_COPY_DETAILS: u32 = WM_APP + 17;
+
 use crate::provider::Difficulty;
 use crate::ui::preview::{Field, PreviewModel};
 
@@ -200,6 +213,8 @@ impl Card {
             last_confirmed: None,
             owner: None,
             open_settings_on_click: false,
+            copy_details_available: false,
+            copy_details_rect: None,
             preview_decision_pending: false,
             preview_generation: 0,
             edit_bg_brush: HBRUSH(std::ptr::null_mut()),
@@ -298,7 +313,36 @@ impl Card {
         // and passing None explicitly (rather than leaving a stale value)
         // ensures a previous answer's badge can never linger on an error
         // card.
+        //
+        // Cold review of #425 (PR #451): deliberately does NOT set
+        // `copy_details_available`. `Card` has no way to know whether the
+        // headline/detail it was just given is the same failure
+        // `App::last_error` holds -- most `show_error` call sites in
+        // `app.rs` never call `track_error`/`record_last_error` at all
+        // (a static "Hotkeys unavailable" message, `show_tray_restore_error`,
+        // "Couldn't locate config.toml", the startup unreadable-secrets
+        // card...), so offering "Copy details" here would silently copy
+        // whatever unrelated error happened to run last. Only
+        // [`Card::show_error_with_details`] -- reserved for callers that
+        // just recorded the matching chain -- grows the footer.
         self.inner.show_collapsed(headline, detail, 0, None);
+    }
+
+    /// Like [`Card::show_error`], except the card also offers "Copy
+    /// details" once Expanded (#425). Callers MUST have just recorded the
+    /// exact chain behind `headline`/`detail` as `App::last_error`
+    /// (`App::track_error`/`record_last_error`) -- this method does not and
+    /// cannot verify that itself, since `Card` never holds the raw chain or
+    /// a reference back to `App` (see [`WM_APP_CARD_COPY_DETAILS`]'s doc
+    /// comment). Using this for an untracked error would let "Copy details"
+    /// silently copy a stale, unrelated chain (PR #451's cold review).
+    pub fn show_error_with_details(&mut self, headline: &str, detail: &str) {
+        self.inner.show_collapsed(headline, detail, 0, None);
+        // Set AFTER show_collapsed, which unconditionally clears this for
+        // every other caller (show_answer and plain show_error included) --
+        // so a later untracked error, or a later answer, can never inherit
+        // a footer left over from an earlier tracked one.
+        self.inner.copy_details_available = true;
     }
 
     /// Issue #347: like [`Card::show_error`] (persists until dismissed, no
@@ -960,6 +1004,19 @@ struct CardInner {
     /// Collapsed (`show_collapsed`, used by both `show_answer` and
     /// `show_error`) so it can never linger onto an unrelated card.
     open_settings_on_click: bool,
+    /// Issue #425: `true` while the currently-showing card is an error card
+    /// (set only by [`Card::show_error`]), i.e. one that has a "Copy
+    /// details" affordance to offer once Expanded. Cleared by every other
+    /// path into Collapsed (`show_collapsed`, used by both `show_answer` and
+    /// `show_error`) so an answer card can never inherit it.
+    copy_details_available: bool,
+    /// The "Copy details" affordance's hit-test rect while Expanded, in the
+    /// same client-window coordinates `WM_LBUTTONDOWN`'s `lparam` arrives
+    /// in -- a pinned footer row, so unlike the headline/detail text it is
+    /// NOT affected by `scroll_offset`, and hit-testing it needs no scroll
+    /// math. `None` whenever there is nothing to show (not an error card,
+    /// or not Expanded yet); recomputed by every `layout_expanded` call.
+    copy_details_rect: Option<RECT>,
     preview_decision_pending: bool,
     /// Issue #225: incremented on every [`CardInner::show_preview`], and
     /// posted as `WM_APP_PREVIEW_DECIDED`'s `WPARAM` so the owner can tell
@@ -1052,6 +1109,11 @@ impl CardInner {
         // `Card::show_settings_needed` sets this, right after this call
         // returns.
         self.open_settings_on_click = false;
+        // Issue #425: same reasoning -- only `Card::show_error` sets this,
+        // right after this call returns, so an answer card never inherits a
+        // "Copy details" affordance for an error it isn't.
+        self.copy_details_available = false;
+        self.copy_details_rect = None;
 
         unsafe {
             if auto_dismiss_secs > 0 {
@@ -1170,6 +1232,36 @@ impl CardInner {
         }
     }
 
+    /// Issue #425: `true` when `(x, y)` (client-window coordinates, the same
+    /// space `WM_LBUTTONDOWN`'s `lparam` arrives in) lands inside the
+    /// pinned "Copy details" footer -- `false` whenever there is no footer
+    /// at all (not an error card, or not Expanded, so `copy_details_rect`
+    /// is `None`).
+    fn point_hits_copy_details(&self, x: i32, y: i32) -> bool {
+        let Some(r) = self.copy_details_rect else {
+            return false;
+        };
+        (r.left..r.right).contains(&x) && (r.top..r.bottom).contains(&y)
+    }
+
+    /// Issue #425: the click or Enter activation of "Copy details" on an
+    /// expanded error card. `Card`/`CardInner` never holds the full raw
+    /// error chain (only the already-humanized `detail` does -- see
+    /// `WM_APP_CARD_COPY_DETAILS`'s doc comment), so this only notifies the
+    /// owner; `App::copy_error_details` does the actual clipboard write from
+    /// `App::last_error`. Deliberately does NOT hide the card first (unlike
+    /// `show_settings_needed`'s click handling): the owner's handler
+    /// replaces the card's content with its own confirmation
+    /// (`show_answer("Details copied", ...)`) or error, so there is nothing
+    /// for this to tear down itself.
+    fn copy_details_activated(&mut self) {
+        if let Some(owner) = self.owner {
+            unsafe {
+                let _ = PostMessageW(Some(owner), WM_APP_CARD_COPY_DETAILS, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
     // -- layout ------------------------------------------------------------
 
     fn work_area_for_cursor(&self) -> RECT {
@@ -1247,17 +1339,43 @@ impl CardInner {
         };
         let content_h = headline_h + if detail_h > 0 { gap + detail_h } else { 0 };
 
+        // Issue #425: "Copy details" is a pinned footer row below the
+        // scrollable headline/detail area, not part of it -- so it stays
+        // reachable regardless of scroll position and its hit-test rect
+        // needs no scroll_offset math (see `copy_details_rect`'s doc
+        // comment). Only an error card (`copy_details_available`) reserves
+        // the space at all.
+        let footer_h = if self.copy_details_available {
+            self.line_height(self.fonts.body).max(1)
+        } else {
+            0
+        };
+        let footer_gap = if footer_h > 0 { gap } else { 0 };
+
         let work = self.work_area_for_self();
         let work_h = (work.bottom - work.top).max(1);
         let max_window_h = ((work_h as f32) * 0.6) as i32;
-        let min_window_h = padding * 2 + self.line_height(self.fonts.headline);
+        let min_window_h =
+            padding * 2 + self.line_height(self.fonts.headline) + footer_gap + footer_h;
 
-        let desired_window_h = padding * 2 + content_h;
+        let desired_window_h = padding * 2 + content_h + footer_gap + footer_h;
         let window_h = desired_window_h.min(max_window_h).max(min_window_h);
-        let viewport_h = (window_h - padding * 2).max(1);
+        let viewport_h = (window_h - padding * 2 - footer_gap - footer_h).max(1);
 
         self.scroll_max = (content_h - viewport_h).max(0);
         self.scroll_offset = self.scroll_offset.clamp(0, self.scroll_max);
+
+        self.copy_details_rect = if footer_h > 0 {
+            let top = window_h - padding - footer_h;
+            Some(RECT {
+                left: padding,
+                top,
+                right: padding + content_width,
+                bottom: top + footer_h,
+            })
+        } else {
+            None
+        };
 
         self.place_bottom_right(work, width, window_h);
     }
@@ -1576,7 +1694,17 @@ impl CardInner {
         let content_w = (rc.right - rc.left - padding * 2).max(1);
         let content_left = rc.left + padding;
         let content_top = rc.top + padding;
-        let content_bottom = rc.bottom - padding;
+        // Issue #425: the scrollable headline/detail area stops above the
+        // pinned "Copy details" footer, not at the window's own bottom
+        // padding, the same reservation `layout_expanded`'s `viewport_h`
+        // makes -- otherwise a long detail could scroll text underneath (or
+        // the clip region could cut into) the footer row.
+        let footer_reserve = self
+            .copy_details_rect
+            .map(|r| (rc.bottom - r.top) + gap - padding)
+            .unwrap_or(0)
+            .max(0);
+        let content_bottom = rc.bottom - padding - footer_reserve;
 
         // Clip to the padded content area so scrolled text never bleeds into
         // the border/padding.
@@ -1639,7 +1767,7 @@ impl CardInner {
                 left: rc.left + 1,
                 top: content_bottom - line_h,
                 right: rc.right - 1,
-                bottom: rc.bottom - 1,
+                bottom: content_bottom,
             };
             // Paint the card colour back over the clipped line so the hint sits
             // on a clean strip rather than on top of half a word.
@@ -1648,12 +1776,15 @@ impl CardInner {
             let _ = DeleteObject(HGDIOBJ(bg.0));
             // Reuse the headline's badge reservation so the hint (which is
             // also right-aligned, in the same bottom-right corner the badge
-            // occupies) does not draw underneath it either.
+            // occupies) does not draw underneath it either. Anchored off
+            // `content_bottom` (the scroll area's own bottom edge, #425),
+            // not the window's, so it never lands on top of the "Copy
+            // details" footer when both are present.
             let hint_rect = RECT {
                 left: content_left,
-                top: rc.bottom - padding - band_h + self.scale(2),
+                top: content_bottom - band_h + self.scale(2),
                 right: content_left + headline_w,
-                bottom: rc.bottom - padding,
+                bottom: content_bottom,
             };
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
@@ -1666,6 +1797,23 @@ impl CardInner {
         }
 
         self.paint_difficulty_badge(hdc, rc);
+
+        // Issue #425: the pinned "Copy details" footer, painted outside the
+        // clip region the scrollable content above used (it is set with
+        // `IntersectClipRect`, which only ever narrows -- painting here,
+        // after that clip has already applied to everything above, still
+        // draws within it unless the clip is reset, so reset it first).
+        if let Some(footer_rect) = self.copy_details_rect {
+            let _ = SelectClipRgn(hdc, None);
+            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
+            draw_text_line(
+                hdc,
+                "Copy details",
+                footer_rect,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
     }
 
     /// Draws the difficulty badge in the card's bottom-right corner, if any
@@ -1798,6 +1946,16 @@ impl CardInner {
                         }
                     }
                     self.hide();
+                } else if self.state == CardState::Expanded {
+                    // Issue #425: checked before try_expand() -- whose own
+                    // guard would no-op here anyway (Expanded, not
+                    // Collapsed), but the point is that a click on the
+                    // "Copy details" footer must activate it instead of
+                    // falling through to nothing.
+                    let (x, y) = crate::dismiss::unpack_point(lparam.0 as u32);
+                    if self.point_hits_copy_details(x, y) {
+                        self.copy_details_activated();
+                    }
                 } else {
                     self.try_expand();
                 }
@@ -1818,6 +1976,14 @@ impl CardInner {
             WM_KEYDOWN => {
                 if self.state == CardState::Expanded && wparam.0 as u16 == VK_ESCAPE.0 {
                     self.close_expanded();
+                } else if self.state == CardState::Expanded
+                    && wparam.0 as u16 == VK_RETURN.0
+                    && self.copy_details_rect.is_some()
+                {
+                    // Issue #425: "keyboard reachable too, not just mouse" --
+                    // Enter activates "Copy details" while it is showing, the
+                    // same way it already activates "Do it" in Preview.
+                    self.copy_details_activated();
                 } else if self.state == CardState::Preview {
                     if let Some(command_id) = preview_key_command(wparam.0 as u16) {
                         self.run_preview_command(command_id);
@@ -2930,6 +3096,199 @@ mod tests {
         let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
         assert!(handled.is_some());
         assert_eq!(card.state(), CardState::Expanded);
+    }
+
+    // -- "Copy details" affordance on an expanded error card (#425) --------
+
+    #[test]
+    fn expanded_error_card_reserves_a_copy_details_footer() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.copy_details_rect.is_some(),
+            "an expanded, tracked error card must reserve a \"Copy details\" footer"
+        );
+    }
+
+    #[test]
+    fn plain_show_error_never_gets_a_copy_details_footer() {
+        // Cold review of #425/PR #451: `show_error` alone (untracked -- no
+        // `App::track_error`/`record_last_error` call behind it) must never
+        // offer "Copy details", because `App::last_error` may hold a chain
+        // from an unrelated, earlier failure. Only `show_error_with_details`
+        // -- reserved for callers that just recorded the matching chain --
+        // grows the footer.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error("Hotkeys unavailable", "The keyboard hook is not installed.");
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.copy_details_rect.is_none(),
+            "an untracked error card must not show \"Copy details\""
+        );
+    }
+
+    #[test]
+    fn untracked_error_card_after_a_tracked_one_has_no_copy_details_footer() {
+        // The exact regression PR #451's cold review caught: a tracked
+        // error card's footer must not linger (or, worse, keep pointing at
+        // the OLDER chain) once a later, untracked error card replaces it.
+        // `show_collapsed` (both `show_answer` and plain `show_error` route
+        // through it) unconditionally clears `copy_details_available`, so
+        // only the call that most recently used `show_error_with_details`
+        // can have left it set -- and a later plain `show_error` call
+        // always clears it again.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+
+        card.show_error_with_details("Couldn't add the event", "tracked detail");
+        card.inner.try_expand();
+        assert!(
+            card.inner.copy_details_rect.is_some(),
+            "the tracked error must show the footer"
+        );
+
+        card.show_error("Couldn't restore the tray icon", "untracked detail");
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.copy_details_rect.is_none(),
+            "an untracked error card must never inherit the previous card's \"Copy details\" \
+             footer, which would copy a stale, unrelated chain"
+        );
+    }
+
+    #[test]
+    fn expanded_answer_card_has_no_copy_details_footer() {
+        // Neighbour: show_answer (not show_error) must never grow the
+        // affordance -- there is no raw error chain behind an answer.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.copy_details_rect.is_none(),
+            "an answer card must not show \"Copy details\""
+        );
+    }
+
+    #[test]
+    fn clicking_copy_details_posts_wm_app_card_copy_details() {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        let rect = card
+            .inner
+            .copy_details_rect
+            .expect("error card must have a Copy details footer once expanded");
+        let x = (rect.left + rect.right) / 2;
+        let y = (rect.top + rect.bottom) / 2;
+        let lparam = LPARAM(crate::dismiss::pack_point(x, y) as isize);
+
+        let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), lparam);
+        assert!(handled.is_some());
+        // Unlike the settings-needed click, activating "Copy details" does
+        // not hide the card itself -- the owner's handler replaces its
+        // content with its own confirmation/error.
+        assert_eq!(card.state(), CardState::Expanded);
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "clicking \"Copy details\" must post WM_APP_CARD_COPY_DETAILS to the owner"
+        );
+        assert_eq!(msg.message, WM_APP_CARD_COPY_DETAILS);
+    }
+
+    #[test]
+    fn pressing_enter_on_an_expanded_error_card_also_posts_copy_details() {
+        // "Keyboard reachable too, not just mouse" (#425).
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+
+        let handled = card.handle_message(WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(0));
+        assert!(handled.is_some());
+
+        let card_hwnd = card.hwnd();
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(
+            found,
+            "Enter on an expanded error card must post WM_APP_CARD_COPY_DETAILS"
+        );
+        assert_eq!(msg.message, WM_APP_CARD_COPY_DETAILS);
+    }
+
+    /// `true` if `wanted` is queued for `hwnd`. Unlike
+    /// `PeekMessageW(&mut msg, Some(hwnd), 0, 0, PM_REMOVE)` (the
+    /// unfiltered range the positive-assertion tests above use, where the
+    /// first message found IS the one under test), this passes `wanted` as
+    /// both `wMsgFilterMin` and `wMsgFilterMax` so it only ever looks at --
+    /// and only ever removes -- that exact message. A real window can have
+    /// unrelated messages pending even with no interactive desktop pump
+    /// running (WM_WINDOWPOSCHANGED, WM_ACTIVATE, a paint); WM_PAINT in
+    /// particular is regenerated by Windows for as long as its update
+    /// region stays non-empty, which an unfiltered drain loop would never
+    /// clear (`BeginPaint`/`DispatchMessageW` would; a bare `PeekMessageW`
+    /// does neither) -- so this must never widen to "drain everything and
+    /// see what turns up".
+    fn queue_contains(hwnd: HWND, wanted: u32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+        let mut msg = MSG::default();
+        unsafe { PeekMessageW(&mut msg, Some(hwnd), wanted, wanted, PM_REMOVE) }.as_bool()
+    }
+
+    #[test]
+    fn clicking_outside_the_footer_on_an_expanded_error_card_does_not_copy() {
+        // Neighbour: a click elsewhere in the expanded card (e.g. on the
+        // headline/detail text) must not trigger the affordance -- only the
+        // footer's own rect does.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        let rect = card.inner.copy_details_rect.expect("footer must exist");
+        // Just above the footer -- still inside the card, but not on it.
+        let lparam = LPARAM(crate::dismiss::pack_point(rect.left, rect.top - 4) as isize);
+
+        let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), lparam);
+        assert!(handled.is_some());
+
+        assert!(
+            !queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS),
+            "a click above the footer must not post WM_APP_CARD_COPY_DETAILS"
+        );
+    }
+
+    #[test]
+    fn pressing_enter_on_an_expanded_answer_card_does_nothing() {
+        // Neighbour: no footer, so Enter must not post anything either.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        card.inner.try_expand();
+
+        let handled = card.handle_message(WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(0));
+        assert!(handled.is_some());
+
+        assert!(
+            !queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS),
+            "an answer card has no Copy details to activate"
+        );
     }
 
     #[test]
