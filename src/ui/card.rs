@@ -136,8 +136,10 @@ pub enum CardState {
     Collapsed,
     Expanded,
     /// The confirmation state (#26): a proposal rendered as a compact form
-    /// (title + one row per schema field), with "Do it" / "Edit" / "Cancel"
-    /// buttons. See [`Card::show_preview`].
+    /// (title + one row per schema field), with "Do it" / "Edit" buttons.
+    /// No Cancel button (#392): nothing has run yet, so there is nothing to
+    /// undo -- Esc or a click elsewhere dismiss it instead. See
+    /// [`Card::show_preview`].
     Preview,
 }
 
@@ -1902,7 +1904,6 @@ impl CardInner {
             edits: Vec::new(),
             do_it_btn: HWND(std::ptr::null_mut()),
             edit_btn: None,
-            cancel_btn: HWND(std::ptr::null_mut()),
             previous_foreground,
             main_window_exists,
         });
@@ -2100,7 +2101,7 @@ impl CardInner {
                     let _ = DestroyWindow(*hwnd);
                 }
             }
-            let mut btns = vec![preview.do_it_btn, preview.cancel_btn];
+            let mut btns = vec![preview.do_it_btn];
             if let Some(edit_btn) = preview.edit_btn {
                 btns.push(edit_btn);
             }
@@ -2185,17 +2186,7 @@ impl CardInner {
                 true,
             )
         });
-        let cancel_btn = create_preview_button(
-            parent,
-            instance,
-            font,
-            "Cancel",
-            &metrics.buttons.cancel,
-            ID_PREVIEW_CANCEL,
-            false,
-            true,
-        );
-        let mut btns = vec![do_it_btn, cancel_btn];
+        let mut btns = vec![do_it_btn];
         if let Some(edit_btn) = edit_btn {
             btns.push(edit_btn);
         }
@@ -2209,7 +2200,6 @@ impl CardInner {
             preview.edits = edits;
             preview.do_it_btn = do_it_btn;
             preview.edit_btn = edit_btn;
-            preview.cancel_btn = cancel_btn;
         }
     }
 
@@ -2255,10 +2245,7 @@ impl CardInner {
                 }
             }
         }
-        let mut positioned = vec![
-            (preview.do_it_btn, metrics.buttons.do_it),
-            (preview.cancel_btn, metrics.buttons.cancel),
-        ];
+        let mut positioned = vec![(preview.do_it_btn, metrics.buttons.do_it)];
         if let (Some(edit_btn), Some(edit_rect)) = (preview.edit_btn, metrics.buttons.edit) {
             positioned.push((edit_btn, edit_rect));
         }
@@ -2397,28 +2384,17 @@ impl CardInner {
 
         let btn_h = self.scale(PREVIEW_BUTTON_H_DP);
         let btn_w = self.scale(PREVIEW_BUTTON_W_DP);
-        let btn_gap = self.scale(PREVIEW_BUTTON_GAP_DP);
         let do_it = RECT {
             left: content_right - btn_w,
             top: y,
             right: content_right,
             bottom: y + btn_h,
         };
-        // With no "Edit" button, "Cancel" moves from directly left of "Do
-        // it" all the way to the content's left edge, spreading the two
-        // buttons across the width "Edit" used to share instead of leaving
-        // it blank (#352).
-        let cancel_left = if show_edit {
-            do_it.left - btn_gap - btn_w
-        } else {
-            content_left
-        };
-        let cancel = RECT {
-            left: cancel_left,
-            top: y,
-            right: cancel_left + btn_w,
-            bottom: y + btn_h,
-        };
+        // #392: Cancel is gone (nothing has run yet, so there is nothing to
+        // undo). "Edit", when present, keeps its spot at the content's left
+        // edge; "Do it" stays right-aligned. With no "Edit" either, the left
+        // side is simply empty rather than filled by a button that no
+        // longer exists.
         let edit = if show_edit {
             Some(RECT {
                 left: content_left,
@@ -2438,11 +2414,7 @@ impl CardInner {
             window_h,
             title_rect,
             rows,
-            buttons: PreviewButtonMetrics {
-                do_it,
-                edit,
-                cancel,
-            },
+            buttons: PreviewButtonMetrics { do_it, edit },
         }
     }
 
@@ -2506,7 +2478,6 @@ const PREVIEW_ROW_GAP_DP: i32 = 6;
 const PREVIEW_LABEL_W_DP: i32 = 84;
 const PREVIEW_BUTTON_H_DP: i32 = 26;
 const PREVIEW_BUTTON_W_DP: i32 = 84;
-const PREVIEW_BUTTON_GAP_DP: i32 = 8;
 /// Upper bound on the label column as a fraction of the content width
 /// (#355): even the widest label never pushes the value column below 55%
 /// of the available space.
@@ -2556,7 +2527,6 @@ struct PreviewUi {
     /// `None` when `main_window_exists` was `false` at `show_preview` time
     /// (#352): the button is not created at all, not just disabled.
     edit_btn: Option<HWND>,
-    cancel_btn: HWND,
     /// `GetForegroundWindow()` at the moment `show_preview` was called.
     /// `close_preview` hands the foreground back to this window (if it
     /// still exists) so the preview's interruption is temporary -- see
@@ -2581,7 +2551,6 @@ struct PreviewButtonMetrics {
     do_it: RECT,
     /// `None` when the layout was computed with `show_edit: false` (#352).
     edit: Option<RECT>,
-    cancel: RECT,
 }
 
 struct PreviewLayoutMetrics {
@@ -2614,7 +2583,7 @@ fn preview_key_command(vk: u16) -> Option<i32> {
 /// -- whether the new focus target means "click away" (cancel the preview,
 /// same as Esc) or staying within the card's own window group (do nothing:
 /// Tab moving between two preview fields, or focus landing on the Do
-/// it/Cancel button itself right before its own click fires).
+/// it/Edit button itself right before its own click fires).
 /// `new_focus_is_card_or_descendant` is
 /// `new_focus_hwnd == card_hwnd || IsChild(card_hwnd, new_focus_hwnd)`,
 /// computed by the caller (both need a live `HWND` comparison/`IsChild`
@@ -3173,7 +3142,7 @@ mod tests {
     #[test]
     fn focus_staying_in_the_card_group_does_not_cancel() {
         // Tab between two preview fields, or focus landing on the Do
-        // it/Cancel button right before its own click fires: the new focus
+        // it/Edit button right before its own click fires: the new focus
         // target IS the card or a descendant of it.
         assert!(!preview_focus_left_the_card(true));
     }
@@ -3244,7 +3213,6 @@ mod tests {
             assert!(!hwnd.0.is_null());
         }
         assert!(!preview.do_it_btn.0.is_null());
-        assert!(!preview.cancel_btn.0.is_null());
         // main_window_exists is false here (#352): no Edit button at all.
         assert!(preview.edit_btn.is_none());
 
@@ -3257,6 +3225,53 @@ mod tests {
             .map(|(_, hwnd)| *hwnd)
             .unwrap();
         assert_eq!(window_text(start_hwnd), "09:00");
+    }
+
+    /// Walks the card's own top-level BUTTON children via `GetWindow`
+    /// (`GW_CHILD` then `GW_HWNDNEXT`), reading each one's text with
+    /// `window_text`. Independent of `PreviewUi`'s field names, so it keeps
+    /// checking the real, on-screen button set even as the struct backing
+    /// it is refactored (issue #392: the whole point is that no `HWND`
+    /// with `BUTTON` class and "Cancel" text is ever created, not just that
+    /// no field happens to be named `cancel_btn`).
+    fn preview_button_texts(card_hwnd: HWND) -> Vec<String> {
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindow, GW_CHILD, GW_HWNDNEXT};
+        let mut out = Vec::new();
+        unsafe {
+            let mut child = GetWindow(card_hwnd, GW_CHILD).unwrap_or(HWND(std::ptr::null_mut()));
+            while !child.0.is_null() {
+                let text = window_text(child);
+                if !text.is_empty() {
+                    out.push(text);
+                }
+                child = GetWindow(child, GW_HWNDNEXT).unwrap_or(HWND(std::ptr::null_mut()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn preview_button_set_has_no_cancel_button() {
+        // #392: nothing has run yet when a preview is shown, so there is
+        // nothing to undo -- the Cancel button must not exist at all, only
+        // "Do it". Esc and click-away still resolve to `preview_cancel`
+        // (covered by `preview_key_command_maps_escape_to_cancel` and the
+        // `preview_control_subclass_*` click-away tests below), just with
+        // no visible button behind them.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+
+        let texts = preview_button_texts(card.hwnd());
+        assert!(
+            texts.iter().any(|t| t == "Do it"),
+            "expected a \"Do it\" button among {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "Cancel"),
+            "no Cancel button on a preview where nothing has run yet, found {texts:?}"
+        );
     }
 
     /// The wired-to-nothing check for issue #350 that does not depend on a
@@ -3524,27 +3539,25 @@ mod tests {
     }
 
     #[test]
-    fn preview_without_edit_spreads_do_it_and_cancel_across_the_freed_width() {
-        // #352's Done-when: only Do it and Cancel show, laid out across the
-        // width Edit used to share -- not squeezed into the same corner as
-        // before with a blank gap where Edit was.
+    fn preview_without_edit_keeps_do_it_right_aligned_with_no_cancel_slot() {
+        // #392 supersedes #352's Cancel-placement Done-when: Cancel no
+        // longer exists at all, so there is no layout slot for it any more
+        // -- only "Do it" (always right-aligned against the content edge)
+        // and, when `show_edit` is true, "Edit" at the content's left edge.
         let card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let fields = vec![];
+        let content_right = card.inner.scale(PREVIEW_WIDTH_DP) - card.inner.scale(PADDING_DP);
+
         let metrics = card.inner.compute_preview_layout(&fields, false);
         assert!(metrics.buttons.edit.is_none());
-        // Cancel now sits at the content's left edge, not directly beside
-        // Do it, so the freed width is genuinely used rather than left
-        // blank on the far side.
-        let padding = card.inner.scale(PADDING_DP);
-        assert_eq!(metrics.buttons.cancel.left, padding);
-        assert!(metrics.buttons.cancel.right < metrics.buttons.do_it.left);
+        assert_eq!(metrics.buttons.do_it.right, content_right);
 
         let with_edit = card.inner.compute_preview_layout(&fields, true);
         assert!(with_edit.buttons.edit.is_some());
-        // With Edit present, Cancel sits directly beside Do it (small gap),
-        // not spread out to the content's left edge like the no-edit case.
-        assert!(with_edit.buttons.cancel.left > padding);
-        assert!(with_edit.buttons.cancel.right < with_edit.buttons.do_it.left);
+        assert_eq!(with_edit.buttons.do_it.right, content_right);
+        let edit_rect = with_edit.buttons.edit.unwrap();
+        assert_eq!(edit_rect.left, card.inner.scale(PADDING_DP));
+        assert!(edit_rect.right < with_edit.buttons.do_it.left);
     }
 
     #[test]
