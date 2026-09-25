@@ -857,31 +857,12 @@ impl App {
     /// `"<name>"` when that provider has no distinct model field set to a
     /// non-empty value. `None` when nothing is configured at all -- the
     /// palette footer then shows just the mode label (see
-    /// `palette_model::footer_line`).
+    /// `palette_model::footer_line`). Thin wrapper over the free function
+    /// below (issue #243), same split as `provider_for_router`/
+    /// `router_models_for` (issue #222) so the label is testable without
+    /// constructing a whole `App`.
     fn first_provider_model_label(&self) -> Option<String> {
-        let name = self.config.providers.order.first()?;
-        let model: &str = match name.as_str() {
-            "openai" => &self.config.providers.openai.model,
-            "anthropic" => &self.config.providers.anthropic.model,
-            "gemini" => &self.config.providers.gemini.model,
-            "ollama" => &self.config.providers.ollama.model,
-            n if n.starts_with("compat:") => {
-                let compat_name = &n["compat:".len()..];
-                self.config
-                    .providers
-                    .compat
-                    .iter()
-                    .find(|c| c.name == compat_name)
-                    .map(|c| c.model.as_str())
-                    .unwrap_or("")
-            }
-            _ => "",
-        };
-        if model.is_empty() {
-            Some(name.clone())
-        } else {
-            Some(format!("{name}:{model}"))
-        }
+        first_provider_model_label(&self.config.providers)
     }
 
     /// #25: Enter in the palette routes here through the SAME dispatch table
@@ -2872,6 +2853,28 @@ fn provider_for_router(
     providers.provider_for_named_model(name, Some(model))
 }
 
+/// #243: `App::first_provider_model_label`'s implementation, pulled out to a
+/// free function over `&Providers` (same split as `router_models_for`/
+/// `provider_for_router` above) so it is testable without constructing a
+/// whole `App`. Used to keep its own hand-mirrored match over
+/// "openai"/"anthropic"/"gemini"/"ollama"/"compat:<name>" -- the same five
+/// arms issue #222 already consolidated for the router and #201 for
+/// diagnostics. Now a thin call into `Providers::describe`, the single
+/// source of truth those two already read, so a provider kind missing an
+/// arm here is no longer possible: there is no arm here to miss.
+fn first_provider_model_label(providers: &Providers) -> Option<String> {
+    let name = providers.order.first()?;
+    let model = providers
+        .describe(name)
+        .map(|d| d.model)
+        .unwrap_or_default();
+    if model.is_empty() {
+        Some(name.clone())
+    } else {
+        Some(format!("{name}:{model}"))
+    }
+}
+
 /// #39: today's local date and current local UTC offset, for the "Add
 /// event from screen" prompt -- DST-correct the same way
 /// `deadline_until_tomorrow` already is for Pause, via the identical
@@ -3995,7 +3998,7 @@ mod tests {
     use super::unreadable_secrets_card;
     use super::App;
     use super::{final_settings_card, SettingsFinalCard};
-    use super::{provider_for_router, router_models_for};
+    use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT, WM_APP_RESULT,
@@ -5665,6 +5668,44 @@ mod tests {
                 router_models,
                 providers.models_for(&name),
                 "router and config model lists disagree for provider name {name:?}"
+            );
+        }
+    }
+
+    // -- palette footer label agrees with describe (issue #243) --------------
+
+    #[test]
+    fn first_provider_model_label_matches_describe_for_the_first_order_entry() {
+        // #243: first_provider_model_label used to keep its own fourth
+        // hand-mirrored match over the same five provider-name arms
+        // (alongside provider_for_named_model/models_for/describe in
+        // config.rs, #222 and #244). A recognized name whose describe()
+        // model this label disagreed with would silently show the bare
+        // name in the palette footer forever, with nothing to say why.
+        let mut providers = Providers::default();
+        providers.openai.model = "gpt-5.5-pro".to_string();
+        providers.compat.push(crate::config::CompatConfig {
+            name: "custom".to_string(),
+            model: "compat-flagship".to_string(),
+            ..Default::default()
+        });
+        for name in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "ollama",
+            "compat:custom",
+            "not-a-real-provider",
+        ] {
+            providers.order = vec![name.to_string()];
+            let label = first_provider_model_label(&providers);
+            let expected = match providers.describe(name) {
+                Some(d) if !d.model.is_empty() => Some(format!("{name}:{}", d.model)),
+                _ => Some(name.to_string()),
+            };
+            assert_eq!(
+                label, expected,
+                "label disagrees with describe for {name:?}"
             );
         }
     }
