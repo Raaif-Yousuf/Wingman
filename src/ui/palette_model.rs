@@ -438,8 +438,13 @@ pub fn handle_key(state: &mut PaletteState, key: PaletteKey) -> PaletteOutcome {
 
 /// Closed set of everywhere Enter can route to. `ui::palette`'s Win32 layer
 /// matches this to call the exact `App` method the tray already calls for
-/// that id -- never a second, palette-only code path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// that id -- never a second, palette-only code path. `Generic` (#242) is
+/// the one open-ended arm: any action id that is not one of the six fixed
+/// built-ins or two tray-only utilities still routes somewhere runnable,
+/// through `App::run_generic_action`'s own generic Look/Propose/Confirm/Do
+/// plumbing (schema + executor resolved from the action's own record at
+/// dispatch time, not baked into this enum).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchTarget {
     CheckMyWork,
     ExtractText,
@@ -448,18 +453,25 @@ pub enum DispatchTarget {
     FillForm,
     CalculateSelection,
     CopyRegion,
+    /// Any other action id (#242): a user-authored `actions.toml` entry,
+    /// carried by value so `App::dispatch_palette_action` can look the
+    /// action back up by id without a second table.
+    Generic(String),
 }
 
 /// The one lookup from a palette row's action id to what running it means.
-/// `None` for an id the palette itself never produces (defensive, not
-/// expected in practice -- see `ui::palette`'s `WM_APP_PALETTE_RUN` handler
-/// for why this degrades to a no-op rather than a panic, rule 7).
+/// Every built-in id and the two tray-only utilities route to their own
+/// named arm; everything else (#242) routes to `Generic`, never `None` --
+/// the palette only ever shows ids `actions::load_actions` actually
+/// resolved (see `catalogue`), so there is no id left that has nowhere to
+/// go.
 ///
-/// Every id this function recognizes is exercised by
-/// `dispatch_covers_every_built_in_action` below, so a built-in added to
-/// `actions::builtin_actions()` (or a new tray-only utility) without a
-/// matching arm here fails a test instead of silently being unrunnable from
-/// the palette (the "wired to nothing" shape AGENTS.md rule 8 calls out).
+/// Every named arm above is asserted to produce its own exact,
+/// non-`Generic` `DispatchTarget` by `dispatch_covers_every_built_in_action`
+/// below, so a built-in added to `actions::builtin_actions()` (or a new
+/// tray-only utility) without a matching arm here fails a test instead of
+/// silently falling through to the generic path and losing its dedicated
+/// dispatch (the "wired to nothing" shape AGENTS.md rule 8 calls out).
 pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
     match action_id {
         crate::actions::DEFAULT_ACTION_ID => Some(DispatchTarget::CheckMyWork),
@@ -469,7 +481,7 @@ pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
         crate::actions::fill_form::ACTION_ID => Some(DispatchTarget::FillForm),
         CALCULATE_SELECTION_ACTION_ID => Some(DispatchTarget::CalculateSelection),
         COPY_REGION_ACTION_ID => Some(DispatchTarget::CopyRegion),
-        _ => None,
+        _ => Some(DispatchTarget::Generic(action_id.to_string())),
     }
 }
 
@@ -978,16 +990,46 @@ mod tests {
 
     // -- dispatch table: every built-in, tested (rule 8) ------------------
 
+    /// Every built-in action id (from `actions::builtin_actions()`) and
+    /// both tray-only utility ids must route to their OWN named
+    /// `DispatchTarget` arm, never to `Generic` -- `Generic` is only for an
+    /// id nothing above special-cases (#242). `is_some()` alone stopped
+    /// being a meaningful assertion once `dispatch_target_for`'s `_` arm
+    /// started returning `Some(Generic(..))` for everything: this asserts
+    /// the exact expected value per id instead, so a built-in that
+    /// regresses to the generic path (silently losing its dedicated
+    /// dispatch, e.g. its own preview headline or a fixed-name executor)
+    /// fails this test instead of passing it vacuously.
     #[test]
     fn dispatch_covers_every_built_in_action() {
         for a in crate::actions::builtin_actions() {
             assert!(
-                dispatch_target_for(&a.id).is_some(),
-                "built-in action {:?} has no palette dispatch target -- it would be wired \
-                 to nothing from the palette",
+                !matches!(dispatch_target_for(&a.id), Some(DispatchTarget::Generic(_))),
+                "built-in action {:?} dispatches generically -- it lost its own named \
+                 DispatchTarget arm",
                 a.id
             );
         }
+        assert_eq!(
+            dispatch_target_for(crate::actions::DEFAULT_ACTION_ID),
+            Some(DispatchTarget::CheckMyWork)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::EXTRACT_TEXT_ACTION_ID),
+            Some(DispatchTarget::ExtractText)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::calendar::ACTION_ID),
+            Some(DispatchTarget::AddToCalendar)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::review_email::ACTION_ID),
+            Some(DispatchTarget::ReviewEmail)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::fill_form::ACTION_ID),
+            Some(DispatchTarget::FillForm)
+        );
         assert_eq!(
             dispatch_target_for(CALCULATE_SELECTION_ACTION_ID),
             Some(DispatchTarget::CalculateSelection)
@@ -1014,9 +1056,24 @@ mod tests {
         );
     }
 
+    /// #242: an id `dispatch_target_for` does not special-case is no longer
+    /// a dead end -- it routes to `Generic`, carrying the id along so
+    /// `App::dispatch_palette_action` can look the action back up and run
+    /// it through the generic Look/Propose/Confirm/Do path. This test
+    /// replaces `unknown_action_id_dispatches_to_nothing_not_a_panic`,
+    /// which asserted the bug this issue reports (a user-authored
+    /// `actions.toml` id parsing, displaying and then silently no-opping on
+    /// Enter).
     #[test]
-    fn unknown_action_id_dispatches_to_nothing_not_a_panic() {
-        assert_eq!(dispatch_target_for("not-a-real-action"), None);
+    fn unknown_action_id_dispatches_generically_instead_of_to_nothing() {
+        assert_eq!(
+            dispatch_target_for("translate-selection"),
+            Some(DispatchTarget::Generic("translate-selection".to_string()))
+        );
+        assert_eq!(
+            dispatch_target_for("not-a-real-action"),
+            Some(DispatchTarget::Generic("not-a-real-action".to_string()))
+        );
     }
 
     // -- catalogue ---------------------------------------------------------

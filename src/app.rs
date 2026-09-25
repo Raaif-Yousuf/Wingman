@@ -46,11 +46,13 @@ use crate::hotkey::{
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
 use crate::provider::{
-    calendar_request, parse_answer, physics_request, review_request_from_screen,
-    review_request_from_text, Answer, Chain, Provider, Shot,
+    calendar_request, generic_action_request, parse_answer, physics_request,
+    review_request_from_screen, review_request_from_text, Answer, Chain, Provider, Shot,
 };
 use crate::router;
-use crate::ui::card::{Card, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED};
+use crate::ui::card::{
+    Card, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+};
 use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
 use crate::ui::palette_model::{self, DispatchTarget};
@@ -113,6 +115,15 @@ pub const WM_APP_FORM_FILL_RESULT: u32 = WM_APP + 13;
 /// `+13` are already `WM_APP_PREVIEW_DECIDED`/`WM_APP_PALETTE_TOGGLE`/
 /// `WM_APP_PALETTE_RUN`/`WM_APP_REVIEW_RESULT`/`WM_APP_FORM_FILL_RESULT`.
 pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
+
+/// #242: posted by `App::run_generic_action`'s worker thread when the
+/// provider chain finishes for a non-built-in `actions.toml` action:
+/// `lparam` is `Box::into_raw(Box::new((String, Result<Value, String>)))`,
+/// the generic-dispatch analogue of [`WM_APP_CALENDAR_RESULT`] -- the
+/// `String` is the action id, carried along because (unlike the calendar
+/// flow) there is no single fixed action this result can belong to.
+/// `WM_APP + 16`: `+15` is already `crate::ui::card::WM_APP_CARD_OPEN_SETTINGS`.
+pub const WM_APP_GENERIC_ACTION_RESULT: u32 = WM_APP + 16;
 
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
@@ -212,6 +223,17 @@ struct LastError {
     /// Already redacted (#253, `egress::redact_opaque_tokens`) -- this is
     /// the only place the *original*, non-humanized chain survives at all.
     chain: String,
+}
+
+/// Issue #425: the exact text "Copy details" puts on the clipboard.
+/// `last_error.chain` is already redacted (#253) at `record_last_error`
+/// time -- this is a plain accessor, not a second redaction pass -- but it
+/// is factored out (rather than inlined in `copy_error_details`) so the
+/// "the redacted chain, and only the redacted chain, is what reaches the
+/// clipboard" guarantee is unit-tested directly, without touching the real
+/// OS clipboard.
+fn error_details_clipboard_text(last_error: &LastError) -> &str {
+    &last_error.chain
 }
 
 pub fn run() -> Result<()> {
@@ -355,7 +377,7 @@ pub fn run() -> Result<()> {
         }
         Err(e) => {
             let detail = app.track_error("Hotkeys unavailable", &format!("{e:#}"));
-            app.card.show_error(
+            app.card.show_error_with_details(
                 "Hotkeys unavailable",
                 &format!("{detail}\n\nUse Ask now from the tray menu instead."),
             );
@@ -620,7 +642,8 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
-                self.card.show_error("Couldn't capture the screen", &detail);
+                self.card
+                    .show_error_with_details("Couldn't capture the screen", &detail);
                 return None;
             }
         };
@@ -740,7 +763,8 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
-                self.card.show_error("Couldn't load actions.toml", &detail);
+                self.card
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
                 return;
             }
         };
@@ -890,34 +914,11 @@ impl App {
         Self::provider_model_label_for(self.config.mode, &self.config.providers)
     }
 
-    /// `first_provider_model_label`'s actual logic, taken out as a plain
-    /// associated function (mirroring `readiness_gate`'s own shape) so a
-    /// test can call it directly with a fixture `Providers` and `Mode`
-    /// instead of constructing a whole `App` (which needs a live `HWND`).
+    /// Thin associated-fn alias over the free `first_provider_model_label`
+    /// (issue #243's split, so it is testable without a live `HWND`), kept
+    /// so the #354 mode-filtering tests read as `App::...`.
     fn provider_model_label_for(mode: Mode, providers: &Providers) -> Option<String> {
-        let selected = providers.selected_order_for_mode(mode, true);
-        let name = selected.first()?;
-        let model: &str = match name.as_str() {
-            "openai" => &providers.openai.model,
-            "anthropic" => &providers.anthropic.model,
-            "gemini" => &providers.gemini.model,
-            "ollama" => &providers.ollama.model,
-            n if n.starts_with("compat:") => {
-                let compat_name = &n["compat:".len()..];
-                providers
-                    .compat
-                    .iter()
-                    .find(|c| c.name == compat_name)
-                    .map(|c| c.model.as_str())
-                    .unwrap_or("")
-            }
-            _ => "",
-        };
-        if model.is_empty() {
-            Some(name.clone())
-        } else {
-            Some(format!("{name}:{model}"))
-        }
+        first_provider_model_label(mode, providers)
     }
 
     /// #25: Enter in the palette routes here through the SAME dispatch table
@@ -936,6 +937,13 @@ impl App {
             Some(DispatchTarget::FillForm) => self.fill_form_from_screen(),
             Some(DispatchTarget::CalculateSelection) => self.calculate_selection(),
             Some(DispatchTarget::CopyRegion) => self.copy_region(),
+            // #242: any other action id -- a user-authored `actions.toml`
+            // entry -- runs through the generic Look/Propose/Confirm/Do
+            // path instead of silently doing nothing.
+            Some(DispatchTarget::Generic(action_id)) => self.run_generic_action(&action_id),
+            // `dispatch_target_for` never returns `None` (#242); kept only
+            // because the match is over an `Option`, not because this arm
+            // is expected to run.
             None => {}
         }
     }
@@ -971,7 +979,8 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
-                self.card.show_error("Couldn't capture the screen", &detail);
+                self.card
+                    .show_error_with_details("Couldn't capture the screen", &detail);
                 return;
             }
         };
@@ -1032,7 +1041,7 @@ impl App {
                 let detail =
                     self.track_error("Couldn't open the region selector", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't open the region selector", &detail);
+                    .show_error_with_details("Couldn't open the region selector", &detail);
                 return;
             }
         };
@@ -1064,7 +1073,8 @@ impl App {
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't copy the region", &format!("{e:#}"));
-                self.card.show_error("Couldn't copy the region", &detail);
+                self.card
+                    .show_error_with_details("Couldn't copy the region", &detail);
             }
         }
     }
@@ -1086,7 +1096,8 @@ impl App {
                 Ok(v) => Some(v),
                 Err(e) => {
                     let detail = app.track_error("Couldn't read the local date", &format!("{e:#}"));
-                    app.card.show_error("Couldn't read the local date", &detail);
+                    app.card
+                        .show_error_with_details("Couldn't read the local date", &detail);
                     None
                 }
             })
@@ -1148,7 +1159,7 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_last_error(&headline, chain);
-                self.card.show_error(&headline, human);
+                self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1169,7 +1180,8 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
-                self.card.show_error("Couldn't load actions.toml", &detail);
+                self.card
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
                 self.set_watch(true);
                 return;
             }
@@ -1205,14 +1217,192 @@ impl App {
                     Ok(confirmed) => self.run_calendar_executor(executor.as_ref(), confirmed),
                     Err(e) => {
                         let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
-                        self.card.show_error("Couldn't add the event", &detail);
+                        self.card
+                            .show_error_with_details("Couldn't add the event", &detail);
                         self.set_watch(true);
                     }
                 }
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
-                self.card.show_error("Couldn't add the event", &detail);
+                self.card
+                    .show_error_with_details("Couldn't add the event", &detail);
+                self.set_watch(true);
+            }
+        }
+    }
+
+    /// #242: the generic-dispatch entry point for any palette action id
+    /// `palette_model::dispatch_target_for` does not special-case -- a
+    /// user-authored `actions.toml` entry. Looks the action up by id (an
+    /// error card if it was disabled or removed since the palette was
+    /// shown, never a panic), resolves its `proposal` schema, and runs the
+    /// same capture-then-model-call shape `ask`/`add_event_from_screen`
+    /// already use. An action whose `proposal` names a schema
+    /// `actions::schema::schema_for` does not know (e.g. a
+    /// deliberately-model-free proposal like `extract_text`'s `"ocr_text"`)
+    /// is reported as a load error today rather than run with no schema:
+    /// the generic path only covers "reuse an existing proposal schema and
+    /// executor", the case `docs/actions.md` documents as the intended
+    /// shape for a new `actions.toml` action.
+    fn run_generic_action(&mut self, action_id: &str) {
+        let resolved = match actions::load_actions() {
+            Ok(r) => r,
+            Err(e) => {
+                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
+                return;
+            }
+        };
+        let Some(action) = resolved
+            .iter()
+            .find(|r| r.action.id == action_id)
+            .map(|r| r.action.clone())
+        else {
+            let detail = self.track_error(
+                "Couldn't run that action",
+                &format!("no visible action with id \"{action_id}\""),
+            );
+            self.card
+                .show_error_with_details("Couldn't run that action", &detail);
+            return;
+        };
+        let Some(schema) = actions::schema::schema_for(&action.proposal, action.rate_difficulty)
+        else {
+            let detail = self.track_error(
+                &format!("Couldn't run \"{}\"", action.name),
+                &format!(
+                    "\"{}\" is not a proposal schema Wingman can run generically yet",
+                    action.proposal
+                ),
+            );
+            self.card
+                .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
+            return;
+        };
+
+        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
+            return;
+        };
+
+        let providers = self.config.providers.clone();
+        let mode = self.config.mode;
+        let prompt = action.prompt.clone();
+        let target = self.hwnd_isize();
+        // #242 review: the action and the schema it was dispatched with are
+        // carried through the worker and back in the result payload, rather
+        // than `on_generic_action_result` re-loading `actions.toml` and
+        // re-resolving the schema after the model call returns. A second
+        // load reading a file that changed (or vanished) between dispatch
+        // and result -- a real possibility, since nothing locks
+        // `actions.toml` against a concurrent edit -- must never panic the
+        // main thread (rule 7); using exactly what was dispatched makes
+        // that whole class of failure unreachable instead of merely rare.
+        let action_for_result = action.clone();
+        let schema_for_result = schema.clone();
+        std::thread::spawn(move || {
+            let result: std::result::Result<Value, String> = (|| -> Result<Value> {
+                let shot = capture::encode(&raw)?;
+                let ollama_ready = mode == Mode::Auto
+                    && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+                    && mode::probe_ollama_ready(
+                        &providers.ollama.base_url,
+                        &providers.ollama.model,
+                    );
+                let chain = providers.build_chain_for_mode(mode, ollama_ready);
+                let req = generic_action_request(&shot, &prompt, schema);
+                chain.complete_parsed_with_fallback(
+                    &req,
+                    || non_vision_inputs(&raw, foreground_hwnd_isize),
+                    |c| actions::parse_generic_proposal(&c.text),
+                )
+            })()
+            .map_err(|e| {
+                pack_error(
+                    &human_error_detail(&format!("{e:#}")),
+                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+                )
+            });
+            let payload = Box::into_raw(Box::new((action_for_result, schema_for_result, result)));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_GENERIC_ACTION_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                );
+            }
+        });
+    }
+
+    /// Handles [`App::run_generic_action`]'s worker result (#242): an error
+    /// shows an error card (rule 7); a success either shows the preview
+    /// card (when the action's `confirm` field is `true`, the default) or,
+    /// for a read-only action with `confirm = false`, auto-confirms and
+    /// runs the executor immediately -- the same two-path shape
+    /// `on_calendar_result` already implements. `action` and `schema` are
+    /// exactly what `run_generic_action` dispatched with (carried through
+    /// the worker's result payload, see that function's doc comment) --
+    /// this handler never re-loads `actions.toml` or re-resolves a schema,
+    /// so there is nothing here that can fail on a file that changed since
+    /// dispatch, and no `.expect()` on the main thread.
+    fn on_generic_action_result(
+        &mut self,
+        action: actions::Action,
+        schema: Value,
+        result: std::result::Result<Value, String>,
+    ) {
+        self.busy = false;
+
+        let proposal = match result {
+            Ok(p) => p,
+            Err(packed) => {
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_last_error(&headline, chain);
+                self.card.show_error_with_details(&headline, human);
+                self.set_watch(true);
+                return;
+            }
+        };
+
+        if action.confirm {
+            self.pending_preview = Some(PendingPreview::Generic(action.clone()));
+            self.pending_preview_generation =
+                self.card
+                    .show_preview(&action.name, &schema, &proposal, false);
+            return;
+        }
+
+        // `action.confirm == false`: only reachable for a read-only
+        // executor -- `auto_confirm_read_only` refuses anything else, same
+        // as `on_calendar_result`'s own `confirm == false` branch.
+        match actions::resolve_executor(&action) {
+            Ok(executor) => match confirm::auto_confirm_read_only(
+                executor.as_ref(),
+                confirm::Proposal::new(proposal),
+            ) {
+                Ok(confirmed) => self.run_confirmed_generic_action(&action, confirmed),
+                Err(e) => {
+                    let detail = self.track_error(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &format!("{e:#}"),
+                    );
+                    self.card.show_error_with_details(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &detail,
+                    );
+                    self.set_watch(true);
+                }
+            },
+            Err(e) => {
+                let detail = self.track_error(
+                    &format!("Couldn't run \"{}\"", action.name),
+                    &format!("{e:#}"),
+                );
+                self.card
+                    .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
                 self.set_watch(true);
             }
         }
@@ -1270,8 +1460,52 @@ impl App {
             Some(PendingPreview::FormFill(original)) => {
                 self.run_confirmed_form_fill(&original, confirmed);
             }
+            Some(PendingPreview::Generic(action)) => {
+                self.run_confirmed_generic_action(&action, confirmed);
+            }
             None => self.run_confirmed_calendar_add(confirmed),
         }
+    }
+
+    /// #242's half of [`App::on_preview_decided`]: resolves `action`'s own
+    /// `executor` field generically (no fixed executor name, unlike
+    /// `run_confirmed_calendar_add`/`run_confirmed_form_fill`) and runs it
+    /// against the card's confirmed value. The result is shown with the
+    /// action's own name as the headline: there is no per-action headline
+    /// logic to derive from the summary the way `calendar_headline`/
+    /// `form_fill_headline` do, because a generic action's executor and
+    /// wording are not known ahead of time.
+    fn run_confirmed_generic_action(
+        &mut self,
+        action: &actions::Action,
+        confirmed: confirm::Confirmed<Value>,
+    ) {
+        match actions::resolve_executor(action) {
+            Ok(executor) => match executor.execute(confirmed) {
+                Ok(undo) => {
+                    self.card.show_answer(&action.name, &undo.summary, 0, None);
+                }
+                Err(e) => {
+                    let detail = self.track_error(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &format!("{e:#}"),
+                    );
+                    self.card.show_error_with_details(
+                        &format!("Couldn't run \"{}\"", action.name),
+                        &detail,
+                    );
+                }
+            },
+            Err(e) => {
+                let detail = self.track_error(
+                    &format!("Couldn't run \"{}\"", action.name),
+                    &format!("{e:#}"),
+                );
+                self.card
+                    .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
+            }
+        }
+        self.set_watch(true);
     }
 
     /// #40's half of [`App::on_preview_decided`], split out so that handler
@@ -1285,7 +1519,8 @@ impl App {
                 Ok(executor) => self.run_form_fill_executor(executor.as_ref(), final_confirmed),
                 Err(e) => {
                     let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
-                    self.card.show_error("Couldn't fill the form", &detail);
+                    self.card
+                        .show_error_with_details("Couldn't fill the form", &detail);
                     self.set_watch(true);
                 }
             }
@@ -1299,7 +1534,8 @@ impl App {
             Ok(executor) => self.run_calendar_executor(executor.as_ref(), confirmed),
             Err(e) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
-                self.card.show_error("Couldn't add the event", &detail);
+                self.card
+                    .show_error_with_details("Couldn't add the event", &detail);
                 self.set_watch(true);
             }
         }
@@ -1341,7 +1577,8 @@ impl App {
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
-                self.card.show_error("Couldn't add the event", &detail);
+                self.card
+                    .show_error_with_details("Couldn't add the event", &detail);
             }
         }
         self.set_watch(true);
@@ -1418,7 +1655,7 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_last_error(&headline, chain);
-                self.card.show_error(&headline, human);
+                self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1494,13 +1731,15 @@ impl App {
                     Err(e) => {
                         let detail =
                             self.track_error("Couldn't update the email", &format!("{e:#}"));
-                        self.card.show_error("Couldn't update the email", &detail);
+                        self.card
+                            .show_error_with_details("Couldn't update the email", &detail);
                     }
                 }
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
-                self.card.show_error("Couldn't update the email", &detail);
+                self.card
+                    .show_error_with_details("Couldn't update the email", &detail);
             }
         }
         self.set_watch(true);
@@ -1584,7 +1823,7 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_last_error(&headline, chain);
-                self.card.show_error(&headline, human);
+                self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
             }
@@ -1679,7 +1918,8 @@ impl App {
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
-                self.card.show_error("Couldn't fill the form", &detail);
+                self.card
+                    .show_error_with_details("Couldn't fill the form", &detail);
             }
         }
         self.set_watch(true);
@@ -1715,7 +1955,7 @@ impl App {
             Err(e) => {
                 let detail = self.track_error("Couldn't fully restore the form", &format!("{e:#}"));
                 self.card
-                    .show_error("Couldn't fully restore the form", &detail);
+                    .show_error_with_details("Couldn't fully restore the form", &detail);
             }
         }
         self.set_watch(true);
@@ -1725,7 +1965,8 @@ impl App {
         let is_err = result.is_err();
         let answer = self.record_last(result);
         if is_err {
-            self.card.show_error(&answer.headline, &answer.detail);
+            self.card
+                .show_error_with_details(&answer.headline, &answer.detail);
         } else {
             self.card.show_answer(
                 &answer.headline,
@@ -1785,7 +2026,7 @@ impl App {
             Ok(()) => self.card.show_answer("Copied", "", 3, None),
             Err(e) => {
                 let detail = self.track_error("Couldn't copy", &format!("{e}"));
-                self.card.show_error("Couldn't copy", &detail);
+                self.card.show_error_with_details("Couldn't copy", &detail);
             }
         }
     }
@@ -1841,7 +2082,43 @@ impl App {
             ),
             Err(e) => {
                 let detail = self.track_error("Couldn't copy diagnostics", &format!("{e}"));
-                self.card.show_error("Couldn't copy diagnostics", &detail);
+                self.card
+                    .show_error_with_details("Couldn't copy diagnostics", &detail);
+            }
+        }
+    }
+
+    /// Issue #425: "Copy details" on an expanded error card. Reuses
+    /// [`App::last_error`] -- the same store #426's `copy_diagnostics`
+    /// above reads -- rather than a second copy of the error, so the two
+    /// "copy the raw chain" affordances can never disagree about what the
+    /// most recent error's chain even was. `WM_APP_CARD_COPY_DETAILS`
+    /// carries no payload (see that constant's doc comment): `Card` never
+    /// holds the full raw chain itself, only the already-humanized
+    /// `detail` text, so there is nothing to read off the message.
+    fn copy_error_details(&mut self) {
+        let Some(last_error) = self.last_error.as_ref() else {
+            // No error recorded yet (e.g. a stale click/Enter reaching here
+            // after `last_error` was somehow never set) -- nothing to copy,
+            // say so plainly rather than copying nothing silently.
+            self.card.show_answer(
+                "Nothing to copy",
+                "No error details are available.",
+                4,
+                None,
+            );
+            return;
+        };
+        let text = error_details_clipboard_text(last_error).to_string();
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            Ok(()) => {
+                self.card
+                    .show_answer("Details copied", "Paste them into a bug report.", 6, None)
+            }
+            Err(e) => {
+                let detail = self.track_error("Couldn't copy details", &format!("{e}"));
+                self.card
+                    .show_error_with_details("Couldn't copy details", &detail);
             }
         }
     }
@@ -1868,7 +2145,7 @@ impl App {
             Err(e) => {
                 let detail = self.track_error("Couldn't copy the egress log", &format!("{e}"));
                 self.card
-                    .show_error("Couldn't copy the egress log", &detail);
+                    .show_error_with_details("Couldn't copy the egress log", &detail);
             }
         }
     }
@@ -2001,7 +2278,7 @@ impl App {
             Err(e) => {
                 let headline = format!("Bound to {name}: not saved");
                 let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error(
+                self.card.show_error_with_details(
                     &headline,
                     &format!("It will work until you quit.\n\n{human}"),
                 );
@@ -2026,7 +2303,8 @@ impl App {
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't reload settings", &format!("{e:#}"));
-                self.card.show_error("Couldn't reload settings", &detail);
+                self.card
+                    .show_error_with_details("Couldn't reload settings", &detail);
             }
         }
     }
@@ -2118,10 +2396,12 @@ impl App {
             // `SaveError` case, unchanged by #213).
             let had_pending = !pending.is_empty();
             let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
-            self.card.show_error("Couldn't save settings", &detail);
+            self.card
+                .show_error_with_details("Couldn't save settings", &detail);
             self.deliver_deferred(pending);
             if had_pending {
-                self.card.show_error("Couldn't save settings", &detail);
+                self.card
+                    .show_error_with_details("Couldn't save settings", &detail);
             }
             self.show_tray_restore_error(tray_restore_error);
             return;
@@ -2152,6 +2432,9 @@ impl App {
                 DeferredMessage::ReviewResult(result) => self.on_review_result(result),
                 DeferredMessage::FormFillResult(result) => self.on_form_fill_result(result),
                 DeferredMessage::PreviewDecided(generation) => self.on_preview_decided(generation),
+                DeferredMessage::GenericActionResult(action, schema, result) => {
+                    self.on_generic_action_result(action, schema, result)
+                }
             }
         }
     }
@@ -2234,7 +2517,8 @@ impl App {
             // not exist.
             if let Err(e) = &save_result {
                 let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
-                self.card.show_error("Couldn't save settings", &detail);
+                self.card
+                    .show_error_with_details("Couldn't save settings", &detail);
             }
             return;
         }
@@ -2288,7 +2572,7 @@ impl App {
             Err(e) => {
                 let headline = format!("Using {model}: not saved");
                 let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error(
+                self.card.show_error_with_details(
                     &headline,
                     &format!("It will revert when you quit.\n\n{human}"),
                 );
@@ -2319,7 +2603,7 @@ impl App {
             Err(e) => {
                 let headline = format!("Using {name}: not saved");
                 let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error(
+                self.card.show_error_with_details(
                     &headline,
                     &format!("It will revert when you quit.\n\n{human}"),
                 );
@@ -2348,7 +2632,7 @@ impl App {
             Err(e) => {
                 let headline = format!("Using {}: not saved", mode.label());
                 let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error(
+                self.card.show_error_with_details(
                     &headline,
                     &format!("It will revert when you quit.\n\n{human}"),
                 );
@@ -2417,8 +2701,10 @@ impl App {
                         "Couldn't compute tomorrow's pause deadline",
                         &format!("{e:#}"),
                     );
-                    self.card
-                        .show_error("Couldn't compute tomorrow's pause deadline", &detail);
+                    self.card.show_error_with_details(
+                        "Couldn't compute tomorrow's pause deadline",
+                        &detail,
+                    );
                     return;
                 }
             },
@@ -2913,6 +3199,33 @@ fn provider_for_router(
     model: &str,
 ) -> Option<Box<dyn Provider>> {
     providers.provider_for_named_model(name, Some(model))
+}
+
+/// #243: `App::first_provider_model_label`'s implementation, pulled out to a
+/// free function over `&Providers` (same split as `router_models_for`/
+/// `provider_for_router` above) so it is testable without constructing a
+/// whole `App`. Used to keep its own hand-mirrored match over
+/// "openai"/"anthropic"/"gemini"/"ollama"/"compat:<name>" -- the same five
+/// arms issue #222 already consolidated for the router and #201 for
+/// diagnostics. Now a thin call into `Providers::describe`, the single
+/// source of truth those two already read, so a provider kind missing an
+/// arm here is no longer possible: there is no arm here to miss.
+///
+/// #354 follow-up: reads the first entry `mode` would actually try
+/// (`Providers::selected_order_for_mode`, shared with `build_chain_for_mode`)
+/// rather than `providers.order.first()` unfiltered.
+fn first_provider_model_label(mode: Mode, providers: &Providers) -> Option<String> {
+    let selected = providers.selected_order_for_mode(mode, true);
+    let name = selected.first()?;
+    let model = providers
+        .describe(name)
+        .map(|d| d.model)
+        .unwrap_or_default();
+    if model.is_empty() {
+        Some(name.clone())
+    } else {
+        Some(format!("{name}:{model}"))
+    }
 }
 
 /// #39: today's local date and current local UTC offset, for the "Add
@@ -3608,6 +3921,10 @@ enum DeferredMessage {
     /// deferred notification is still matched against the right preview
     /// when Settings closes and the queue drains.
     PreviewDecided(u32),
+    /// `WM_APP_GENERIC_ACTION_RESULT` (#242). Carries the exact `Action`
+    /// and schema `run_generic_action` dispatched with, not just the id --
+    /// see `on_generic_action_result`'s doc comment for why.
+    GenericActionResult(actions::Action, Value, std::result::Result<Value, String>),
 }
 
 /// Issue #225: which action is waiting on the preview currently on screen.
@@ -3621,6 +3938,12 @@ enum PendingPreview {
     /// the card confirmed is only the preview's flat translation, so this is
     /// what `actions::fill_form::rebuild_after_confirm` rebuilds against.
     FormFill(Value),
+    /// #242: a non-built-in `actions.toml` action awaiting its preview
+    /// decision. Carries the resolved `Action` itself (not just its id) so
+    /// `run_confirmed_generic_action` does not need a second
+    /// `actions::load_actions()` call between the model's proposal and the
+    /// user's confirm click.
+    Generic(actions::Action),
 }
 
 /// What `wnd_proc` should do with a message addressed to the owner window
@@ -3689,11 +4012,16 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // WM_APP_FORM_FILL_RESULT joins the same group for the same reason
         // -- its boxed `Result<Value, String>` payload is taken (not freed)
         // in the Defer arm below.
+        // #242: WM_APP_GENERIC_ACTION_RESULT joins the same group -- a
+        // finished non-built-in action run must not silently lose its card
+        // just because Settings happened to be open, same as
+        // WM_APP_CALENDAR_RESULT/WM_APP_FORM_FILL_RESULT.
         WM_APP_RESULT
         | WM_APP_CALENDAR_RESULT
         | WM_APP_REVIEW_RESULT
         | WM_APP_PREVIEW_DECIDED
-        | WM_APP_FORM_FILL_RESULT => SettingsReentrancy::Defer,
+        | WM_APP_FORM_FILL_RESULT
+        | WM_APP_GENERIC_ACTION_RESULT => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
@@ -3705,6 +4033,12 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // posts it is hidden the moment it does so, so there is nothing
         // left to defer either.
         | WM_APP_CARD_OPEN_SETTINGS
+        // #425: same treatment -- no payload to leak, and an error card
+        // cannot be showing at all while Settings is modal-open (every path
+        // that opens Settings hides the card first, the same invariant
+        // #347's WM_APP_CARD_OPEN_SETTINGS above already relies on), so
+        // there is nothing left for a deferred copy to act on either.
+        | WM_APP_CARD_COPY_DETAILS
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
@@ -3812,8 +4146,22 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
                     }),
                     WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
+                    // #242: same treatment as WM_APP_CALENDAR_RESULT above.
+                    WM_APP_GENERIC_ACTION_RESULT => {
+                        let (action, schema, result) = *unsafe {
+                            Box::from_raw(
+                                lparam.0
+                                    as *mut (
+                                        actions::Action,
+                                        Value,
+                                        std::result::Result<Value, String>,
+                                    ),
+                            )
+                        };
+                        DeferredMessage::GenericActionResult(action, schema, result)
+                    }
                     _ => unreachable!(
-                        "settings_reentrancy_policy only returns Defer for the five ids above"
+                        "settings_reentrancy_policy only returns Defer for the six ids above"
                     ),
                 };
                 PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
@@ -3931,6 +4279,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_form_fill_result(result);
             LRESULT(0)
         }
+        WM_APP_GENERIC_ACTION_RESULT => {
+            let (action, schema, result) = unsafe {
+                *Box::from_raw(
+                    lparam.0 as *mut (actions::Action, Value, std::result::Result<Value, String>),
+                )
+            };
+            app.on_generic_action_result(action, schema, result);
+            LRESULT(0)
+        }
         WM_APP_PREVIEW_DECIDED => {
             app.on_preview_decided(wparam.0 as u32);
             LRESULT(0)
@@ -3938,6 +4295,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_APP_CARD_OPEN_SETTINGS => {
             // Issue #347: a click on a "settings needed" card. No payload.
             app.open_settings();
+            LRESULT(0)
+        }
+        WM_APP_CARD_COPY_DETAILS => {
+            // Issue #425: a click/Enter on an expanded error card's "Copy
+            // details" affordance. No payload.
+            app.copy_error_details();
             LRESULT(0)
         }
         WM_APP_DISMISS => {
@@ -4038,11 +4401,11 @@ mod tests {
     use super::unreadable_secrets_card;
     use super::App;
     use super::{final_settings_card, SettingsFinalCard};
-    use super::{provider_for_router, router_models_for};
+    use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
-        WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT, WM_APP_RESULT,
-        WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
+        WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
+        WM_APP_GENERIC_ACTION_RESULT, WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
@@ -4054,7 +4417,9 @@ mod tests {
     use crate::mode::Mode;
     use crate::provider::Provider;
     use crate::router;
-    use crate::ui::card::{WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED};
+    use crate::ui::card::{
+        WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+    };
     use crate::ui::palette::WM_APP_PALETTE_RUN;
     use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
@@ -4773,6 +5138,8 @@ mod tests {
         ("WM_APP_FORM_FILL_RESULT", WM_APP_FORM_FILL_RESULT),
         ("WM_APP_ROUTER_RESULT", WM_APP_ROUTER_RESULT),
         ("WM_APP_CARD_OPEN_SETTINGS", WM_APP_CARD_OPEN_SETTINGS),
+        ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
+        ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
     ];
 
     #[test]
@@ -5288,6 +5655,16 @@ mod tests {
             WM_APP_CARD_OPEN_SETTINGS,
             SettingsReentrancy::Ignore,
         ),
+        (
+            "WM_APP_GENERIC_ACTION_RESULT",
+            WM_APP_GENERIC_ACTION_RESULT,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_CARD_COPY_DETAILS",
+            WM_APP_CARD_COPY_DETAILS,
+            SettingsReentrancy::Ignore,
+        ),
     ];
 
     #[test]
@@ -5345,6 +5722,51 @@ mod tests {
     #[test]
     fn first_line_leaves_short_text_alone() {
         assert_eq!(first_line("fine", 88), "fine");
+    }
+
+    // -- #425: "Copy details" clipboard text ---------------------------------
+
+    use super::{error_details_clipboard_text, LastError};
+    use std::time::SystemTime;
+
+    #[test]
+    fn error_details_clipboard_text_is_the_redacted_chain_and_never_the_raw_token() {
+        // The same fake-key shape `redact_opaque_tokens`'s own tests use
+        // (egress.rs's `redact_opaque_tokens_scrubs_a_long_key_shaped_token`)
+        // -- proves the property this function exists for: whatever
+        // `record_last_error` stored (already redacted, #253) is exactly
+        // what reaches the clipboard, and the raw token never does.
+        let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
+        let raw_chain = format!("HTTP 401: invalid api key {fake_key} supplied");
+        let last_error = LastError {
+            action: "Couldn't add the event".to_string(),
+            occurred_at: SystemTime::now(),
+            // Exactly what `App::record_last_error` does to `raw_chain`.
+            chain: crate::egress::redact_opaque_tokens(&raw_chain),
+        };
+
+        let text = error_details_clipboard_text(&last_error);
+
+        assert!(
+            !text.contains(fake_key),
+            "the raw token must never reach the clipboard text: {text}"
+        );
+        assert!(text.contains("[redacted]"), "{text}");
+        assert!(text.contains("HTTP 401"), "{text}");
+        assert_eq!(text, last_error.chain, "must be the SAME chain, not a copy");
+    }
+
+    #[test]
+    fn error_details_clipboard_text_leaves_ordinary_prose_alone() {
+        // Neighbour: a chain with nothing token-shaped in it round-trips
+        // unchanged, same as `redact_opaque_tokens` itself does.
+        let raw_chain = "HTTP 429: too many requests, retry in 30s";
+        let last_error = LastError {
+            action: "Couldn't ask".to_string(),
+            occurred_at: SystemTime::now(),
+            chain: crate::egress::redact_opaque_tokens(raw_chain),
+        };
+        assert_eq!(error_details_clipboard_text(&last_error), raw_chain);
     }
 
     // -- #349: human-readable, redacted error text for the card -------------
@@ -5757,6 +6179,44 @@ mod tests {
                 router_models,
                 providers.models_for(&name),
                 "router and config model lists disagree for provider name {name:?}"
+            );
+        }
+    }
+
+    // -- palette footer label agrees with describe (issue #243) --------------
+
+    #[test]
+    fn first_provider_model_label_matches_describe_for_the_first_order_entry() {
+        // #243: first_provider_model_label used to keep its own fourth
+        // hand-mirrored match over the same five provider-name arms
+        // (alongside provider_for_named_model/models_for/describe in
+        // config.rs, #222 and #244). A recognized name whose describe()
+        // model this label disagreed with would silently show the bare
+        // name in the palette footer forever, with nothing to say why.
+        let mut providers = Providers::default();
+        providers.openai.model = "gpt-5.5-pro".to_string();
+        providers.compat.push(crate::config::CompatConfig {
+            name: "custom".to_string(),
+            model: "compat-flagship".to_string(),
+            ..Default::default()
+        });
+        for name in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "ollama",
+            "compat:custom",
+            "not-a-real-provider",
+        ] {
+            providers.order = vec![name.to_string()];
+            let label = first_provider_model_label(Mode::Auto, &providers);
+            let expected = match providers.describe(name) {
+                Some(d) if !d.model.is_empty() => Some(format!("{name}:{}", d.model)),
+                _ => Some(name.to_string()),
+            };
+            assert_eq!(
+                label, expected,
+                "label disagrees with describe for {name:?}"
             );
         }
     }

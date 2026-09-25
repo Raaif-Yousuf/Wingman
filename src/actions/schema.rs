@@ -49,8 +49,32 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "calendar_event" => Some(calendar_event_schema()),
         "text_review" => Some(text_review_schema()),
         "form_fill" => Some(form_fill_schema()),
+        // #242: CONTRIBUTING.md's "Add an action in 20 minutes" worked
+        // example (`translate-selection`) is `proposal = "text_answer"`,
+        // `executor = "clipboard"` (this module's own doc comment above
+        // said this arm lands "the same day its first action lands" -- the
+        // generic dispatch path is that day). One property, matching
+        // exactly what `executors::clipboard::ClipboardExecutor::execute`
+        // reads (`value.get("text")`), so the same shape works for any
+        // `actions.toml` action that just wants a short model-produced
+        // string copied to the clipboard or shown on a card.
+        "text_answer" => Some(text_answer_schema()),
         _ => None,
     }
+}
+
+/// The `text_answer` proposal schema (#242): a single `text` field. See
+/// `schema_for`'s `"text_answer"` arm for why this exists and what it must
+/// match.
+fn text_answer_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "editable": true}
+        },
+        "required": ["text"],
+        "additionalProperties": false
+    })
 }
 
 /// The `calendar_event` proposal schema (#26): title, start, end, location,
@@ -176,7 +200,7 @@ fn form_fill_schema() -> Value {
                     "type": "object",
                     "properties": {
                         "control_id": {"type": "string"},
-                        "source": {"type": "string"},
+                        "source": {"type": "string", "enum": ["profile", "model", "skip"]},
                         "profile_field": {"type": "string"},
                         "value": {"type": "string"},
                         "sensitive": {"type": "boolean"}
@@ -233,7 +257,11 @@ mod tests {
 
     #[test]
     fn unknown_proposal_kind_is_none_not_a_panic() {
-        assert_eq!(schema_for("text_answer", false), None);
+        // #242 registered "text_answer" (CONTRIBUTING.md's own worked
+        // example proposal kind), so this test's fixture moved to a name
+        // that stays genuinely unregistered rather than re-asserting the
+        // gap #242 closed.
+        assert_eq!(schema_for("ocr_text", false), None);
         assert_eq!(schema_for("totally_made_up", true), None);
     }
 
@@ -385,6 +413,24 @@ mod tests {
     }
 
     #[test]
+    fn text_answer_is_registered() {
+        assert!(schema_for("text_answer", false).is_some());
+    }
+
+    #[test]
+    fn text_answer_schema_matches_what_the_clipboard_executor_reads() {
+        let schema = schema_for("text_answer", false).expect("text_answer is registered");
+        assert_eq!(schema["required"], json!(["text"]));
+        assert_eq!(schema["properties"]["text"]["type"], "string");
+    }
+
+    #[test]
+    fn text_answer_rejects_additional_properties() {
+        let schema = schema_for("text_answer", false).expect("text_answer is registered");
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
     fn form_fill_wraps_a_fields_array_matching_the_executor_proposal_shape() {
         // `executors::fill_form::parse_form_fill` reads a top-level
         // "fields" array too -- same wrapper key, even though the item
@@ -423,6 +469,22 @@ mod tests {
                 "value",
                 "sensitive"
             ])
+        );
+    }
+
+    #[test]
+    fn form_fill_source_declares_a_closed_enum_of_the_three_tokens() {
+        // #246: merge_model_response's `match resp.source.as_str()` treats
+        // exactly "profile", "model" or "skip" as meaningful and silently
+        // skips anything else. The schema must close the set the same way
+        // text_review_schema's "verdict" does, so a constrained-decoding
+        // provider cannot sample a near-miss token that gets silently
+        // dropped.
+        let schema = schema_for("form_fill", false).expect("form_fill is registered");
+        let source_prop = &schema["properties"]["fields"]["items"]["properties"]["source"];
+        assert_eq!(
+            *source_prop,
+            serde_json::json!({"type": "string", "enum": ["profile", "model", "skip"]})
         );
     }
 

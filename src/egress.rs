@@ -499,7 +499,98 @@ pub fn record(entry: &EgressEntry) {
     let _ = try_record(entry);
 }
 
+/// Tracks, within one process, whether an attempt has been made yet to
+/// restrict `egress.log`'s ACL (#277). Pure state machine, deliberately
+/// separate from any real filesystem or `icacls` call, so the "once" policy
+/// itself can be unit-tested against a fresh instance instead of process-wide
+/// state -- the same isolation rationale as `config.rs`'s
+/// `FORCE_ACL_FAILURE_FOR_TEST` thread_local, applied to a plain struct
+/// instead since this needs a *value*, not a boolean toggle, that a test can
+/// own independently of the real process-wide static.
+struct AclRestrictOnce(std::sync::atomic::AtomicBool);
+
+impl AclRestrictOnce {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// `true` the first time this is called; `false` on every call after,
+    /// regardless of whether the first attempt's caller went on to succeed
+    /// or fail -- egress.log is appended on every provider request, so
+    /// re-shelling to `icacls` per request is both a per-request cost and a
+    /// console-window flash risk (AGENTS.md). One attempt per process is the
+    /// budget; a failed attempt is not retried within the same run.
+    fn take_first_attempt(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Process-wide: real callers all share one `egress.log`, so one attempt
+/// covers every caller in the process, whether the file was just created or
+/// already existed from an older Wingman version that never restricted it.
+static EGRESS_LOG_ACL_RESTRICTED: AclRestrictOnce = AclRestrictOnce::new();
+
+/// Restricts `path`'s ACL to the current user via [`crate::config`]'s
+/// `restrict_acl`, at most once for the lifetime of `flag`. A failure is
+/// logged to stderr and otherwise swallowed (never propagated, never a
+/// panic): rule 7 says a logging failure must never be why the request
+/// itself fails, and the same posture extends to failing to lock the log
+/// down -- the entry the caller is about to write still matters more than a
+/// missed ACL attempt, and the next process launch gets another attempt.
+fn restrict_log_acl_once_with(flag: &AclRestrictOnce, path: &std::path::Path) {
+    restrict_log_acl_once_using(flag, path, |p| {
+        #[cfg(windows)]
+        {
+            crate::config::Config::restrict_acl(p)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = p;
+            Ok(())
+        }
+    });
+}
+
+/// The real body of [`restrict_log_acl_once_with`], taking the restrict call
+/// itself as a parameter. This is what lets a test observe "the restrict
+/// action ran exactly once" (the actual "once per process" contract) via a
+/// counting closure, instead of asserting on real `icacls` ACL output --
+/// MEASURED 2026-09-25 on a GitHub Actions Windows runner: a freshly created
+/// file under the runner's own `%TEMP%` already carries explicit,
+/// non-inherited ACEs (SYSTEM, Administrators, `runneradmin`: `(F)`, no
+/// `(I)` flag at all) before `restrict_acl` ever runs, so a test asserting
+/// `(I)` IS present on an unrestricted file is asserting something about the
+/// host's temp-directory inheritance, not about this code, and is not
+/// portable across machines. Asserting `(I)` is ABSENT after a real
+/// `restrict_acl` call (the positive direction; see
+/// `restrict_log_acl_once_with_restricts_a_freshly_written_file` and
+/// `try_record_restricts_the_real_log_path_acl` below) has no such
+/// assumption and stays real-`icacls` based.
+fn restrict_log_acl_once_using(
+    flag: &AclRestrictOnce,
+    path: &std::path::Path,
+    restrict: impl FnOnce(&std::path::Path) -> Result<()>,
+) {
+    if !flag.take_first_attempt() {
+        return;
+    }
+    if let Err(e) = restrict(path) {
+        eprintln!("wingman: failed to restrict egress.log permissions: {e:#}");
+    }
+}
+
 fn try_record(entry: &EgressEntry) -> Result<()> {
+    try_record_with(&EGRESS_LOG_ACL_RESTRICTED, entry)
+}
+
+/// The real body of [`try_record`], taking its ACL-once flag as a parameter
+/// rather than reaching for [`EGRESS_LOG_ACL_RESTRICTED`] directly. This is
+/// what lets a test exercise the write-then-restrict wiring against a flag
+/// nobody else can have spent, instead of racing every other test in the
+/// process that can also reach [`record`] (`provider::common`'s tests do,
+/// for real, as a side effect of the HTTP path they exercise) for the one
+/// shared process-wide attempt.
+fn try_record_with(flag: &AclRestrictOnce, entry: &EgressEntry) -> Result<()> {
     let path = log_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -508,6 +599,12 @@ fn try_record(entry: &EgressEntry) -> Result<()> {
     let line = serde_json::to_string(entry)?;
     let capped = cap_lines(&existing, &line, MAX_LOG_BYTES);
     fs::write(&path, capped)?;
+    // #277: restrict the ACL once per process, after the file is known to
+    // exist on disk (icacls needs a real file to target). Covers both a
+    // freshly created file and one left behind by an older Wingman version
+    // that never restricted it -- either way this process restricts it
+    // exactly once, not on every append.
+    restrict_log_acl_once_with(flag, &path);
     Ok(())
 }
 
@@ -978,6 +1075,205 @@ mod tests {
     }
 
     // -- read_all_human with nothing logged ----------------------------------
+
+    // -- #277: egress.log gets an owner-only ACL, same as config.toml -------
+    //
+    // `try_record` used to create/write `egress.log` with plain `fs::write`,
+    // with nothing analogous to `config.rs`'s `restrict_acl` call --
+    // https://github.com/Raaif-Yousuf/Wingman/issues/277. Every append must
+    // not shell out to `icacls` (cost per request, console-flash risk), so
+    // the restriction happens at most once per process: `AclRestrictOnce`
+    // is the pure "have I attempted this yet" decision, tested here against
+    // a fresh instance per test rather than the process-wide static so
+    // these tests cannot see each other's state (mirrors config.rs's
+    // `FORCE_ACL_FAILURE_FOR_TEST` thread_local isolation rationale).
+
+    #[test]
+    fn acl_restrict_once_returns_true_on_the_first_attempt_only() {
+        let flag = AclRestrictOnce::new();
+        assert!(
+            flag.take_first_attempt(),
+            "the first attempt in a process must be allowed to run"
+        );
+        assert!(
+            !flag.take_first_attempt(),
+            "a second attempt in the same process must be suppressed"
+        );
+        assert!(
+            !flag.take_first_attempt(),
+            "a third attempt must still be suppressed"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn restrict_log_acl_once_with_restricts_a_freshly_written_file() {
+        // The wired-to-nothing observable: after the seam runs once against
+        // a real scratch file, `icacls` shows inheritance disabled, exactly
+        // the same check `config.rs`'s own `save_to_restricts_the_acl_on_a_
+        // normal_successful_save` uses for config.toml.
+        let path = std::env::temp_dir().join(format!(
+            "wingman-test-egress-acl-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        fs::write(&path, "{}\n").expect("scratch file should write");
+
+        let flag = AclRestrictOnce::new();
+        restrict_log_acl_once_with(&flag, &path);
+
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .expect("icacls should run");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !listing.contains("(I)"),
+            "inheritance must be disabled after the ACL seam runs: {listing}"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn restrict_log_acl_once_with_only_shells_out_on_the_first_call() {
+        // Second call against the same flag must not invoke the restrict
+        // call at all -- this is the "never icacls on every write"
+        // guarantee. Observed through `restrict_log_acl_once_using`'s
+        // injected closure, counting how many times it actually runs,
+        // rather than through real `icacls` ACL output: MEASURED
+        // 2026-09-25, a GitHub Actions Windows runner's own `%TEMP%` gives a
+        // freshly created file explicit, non-inherited ACEs before any
+        // `restrict_acl` call ever runs, so an assertion that expects the
+        // `(I)` inheritance flag to still be PRESENT on an unrestricted file
+        // is really asserting something about the host, not this code, and
+        // is not portable across machines. Counting calls has no such
+        // assumption.
+        let path = std::env::temp_dir().join(format!(
+            "wingman-test-egress-acl-once-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let flag = AclRestrictOnce::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        restrict_log_acl_once_using(&flag, &path, |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        restrict_log_acl_once_using(&flag, &path, |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        restrict_log_acl_once_using(&flag, &path, |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the restrict call must run exactly once per flag, however many \
+             times restrict_log_acl_once_using is called"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn try_record_still_writes_the_entry_when_acl_restriction_fails() {
+        // Rule 7: an ACL failure must never lose the log entry or crash the
+        // request path. Force `config::restrict_acl` to fail via its
+        // existing #257 test seam and confirm the row still lands.
+        //
+        // `log_path()` under `#[cfg(test)]` is one file per PROCESS (shared
+        // by every test in this binary, including `provider::common`'s
+        // egress-log tests), so this takes the same
+        // `EGRESS_PREVIEW_TEST_LOCK` those tests use to serialize the file
+        // content, and restores it afterwards. The ACL-ONCE flag is a
+        // freshly constructed `AclRestrictOnce` passed straight to
+        // `try_record_with`, never `EGRESS_LOG_ACL_RESTRICTED` -- otherwise
+        // this test's outcome would depend on whether some other test
+        // (including `provider::common`'s, which really does call
+        // `record()`) already spent the process-wide attempt before this
+        // one runs, which is exactly the "leftover state and libtest
+        // ordering" failure mode a fresh flag rules out.
+        let _guard = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let path = log_path().unwrap();
+        let saved = fs::read_to_string(&path).unwrap_or_default();
+
+        let entry = build_entry(
+            "openai",
+            "https://api.openai.com/v1/responses",
+            &json!({"model": "gpt-5.5"}),
+            false,
+            10,
+            20,
+            Outcome::Success,
+            None,
+        );
+
+        crate::config::force_acl_failure_for_test(true);
+        let result = try_record_with(&AclRestrictOnce::new(), &entry);
+        crate::config::force_acl_failure_for_test(false);
+
+        assert!(
+            result.is_ok(),
+            "an ACL restriction failure must not fail the write: {result:?}"
+        );
+        let contents = fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            contents.contains("\"provider\":\"openai\""),
+            "the entry must still be written even when the ACL call fails: {contents}"
+        );
+
+        fs::write(&path, saved).expect("restoring the shared test log should succeed");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn try_record_restricts_the_real_log_path_acl() {
+        // The wiring check itself, separate from the pure `AclRestrictOnce`
+        // logic above: proves `try_record`'s inner `try_record_with`
+        // actually calls the ACL seam against the file `log_path()`
+        // returns, not just that the seam works in isolation.
+        //
+        // Same shared-file content serialization as the test above, but a
+        // freshly constructed `AclRestrictOnce` for the ACL-once gate, for
+        // the same reason: this test must observe ITS OWN call restricting
+        // the file, not ride on some earlier test (in any thread, in any
+        // order) having already spent the process-wide static.
+        let _guard = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let path = log_path().unwrap();
+        let saved = fs::read_to_string(&path).unwrap_or_default();
+
+        let entry = build_entry(
+            "anthropic",
+            "https://api.anthropic.com/v1/messages",
+            &json!({"model": "claude-opus-5"}),
+            false,
+            5,
+            5,
+            Outcome::Success,
+            None,
+        );
+        try_record_with(&AclRestrictOnce::new(), &entry).expect("try_record should succeed");
+
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .expect("icacls should run");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !listing.contains("(I)"),
+            "try_record must leave egress.log ACL-restricted: {listing}"
+        );
+
+        fs::write(&path, saved).expect("restoring the shared test log should succeed");
+    }
 
     #[test]
     fn read_all_human_of_empty_input_says_so() {

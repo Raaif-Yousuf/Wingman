@@ -12,6 +12,24 @@ use crate::provider::{
 };
 use crate::secrets::{target_name, CredManagerStore, SecretStore};
 
+/// Overwrites `s`'s bytes with zero before truncating it to empty, mirroring
+/// `dpapi::zeroize` (issue #258). `String::clear()` alone only resets the
+/// length to 0; the byte content stays live in the still-allocated buffer,
+/// so a bare `.clear()` on a field that held a plaintext API key leaves the
+/// key readable in that buffer until an unrelated allocation reuses and
+/// overwrites it.
+fn zeroize_string(s: &mut String) {
+    // SAFETY: mid-loop, `dpapi::zeroize` can leave `s` transiently invalid
+    // UTF-8 (zeroing a multi-byte char's lead byte orphans its continuation
+    // bytes), but no `String` method observes the buffer between these raw
+    // writes and the `clear()` right below, and the final all-zero state
+    // (every byte 0x00, i.e. all NUL) is itself valid UTF-8.
+    unsafe {
+        crate::dpapi::zeroize(s.as_bytes_mut());
+    }
+    s.clear();
+}
+
 /// A previous shipped value of `provider::DEFAULT_PROMPT`, identified only by
 /// its normalized hash (see [`hash_prompt_for_migration`]), plus the commit
 /// that introduced it -- for `repair_stale_default_prompt`'s issue #412
@@ -606,6 +624,15 @@ thread_local! {
     static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Test-only seam onto [`FORCE_ACL_FAILURE_FOR_TEST`] for modules other than
+/// this one (#277: `egress.rs` reuses `restrict_acl` and needs to prove its
+/// own "ACL failure must not lose the log entry" contract the same way this
+/// module already proves "ACL failure aborts the write").
+#[cfg(all(test, windows))]
+pub(crate) fn force_acl_failure_for_test(active: bool) {
+    FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.set(active));
+}
+
 impl Config {
     /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {
@@ -751,7 +778,7 @@ impl Config {
                 continue;
             }
             if store.set(&target_name(provider), key).is_ok() {
-                key.clear();
+                zeroize_string(key);
                 changed = true;
             }
         }
@@ -763,7 +790,7 @@ impl Config {
             }
             let target = target_name(&compat_order_name(&entry.name));
             if store.set(&target, &entry.api_key).is_ok() {
-                entry.api_key.clear();
+                zeroize_string(&mut entry.api_key);
                 changed = true;
             }
         }
@@ -888,13 +915,13 @@ impl Config {
             let env_name = Self::env_var_name(provider)
                 .expect("every provider iterated here has an env var name");
             if env_is_set(env_name) {
-                key.clear();
+                zeroize_string(key);
                 continue;
             }
 
             let target = target_name(provider);
             if key == UNREADABLE_KEY_MARKER {
-                key.clear();
+                zeroize_string(key);
                 continue;
             }
             if key.is_empty() {
@@ -905,7 +932,7 @@ impl Config {
                 store
                     .set(&target, key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
-                key.clear();
+                zeroize_string(key);
             }
         }
 
@@ -915,7 +942,7 @@ impl Config {
         for entry in &mut self.providers.compat {
             let target = target_name(&compat_order_name(&entry.name));
             if entry.api_key == UNREADABLE_KEY_MARKER {
-                entry.api_key.clear();
+                zeroize_string(&mut entry.api_key);
                 continue;
             }
             if entry.api_key.is_empty() {
@@ -926,7 +953,7 @@ impl Config {
                 store
                     .set(&target, &entry.api_key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
-                entry.api_key.clear();
+                zeroize_string(&mut entry.api_key);
             }
         }
         Ok(())
@@ -1144,7 +1171,7 @@ impl Config {
     /// cannot show a card itself (this module never does, per rule 7) must
     /// propagate this so whichever caller CAN show one does.
     #[cfg(windows)]
-    fn restrict_acl(path: &Path) -> Result<()> {
+    pub(crate) fn restrict_acl(path: &Path) -> Result<()> {
         #[cfg(test)]
         if FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.get()) {
             anyhow::bail!("ACL restriction forced to fail for a test");
@@ -1157,11 +1184,19 @@ impl Config {
                 "the USERNAME environment variable is not set; cannot restrict \
                  the config file to the current user",
             )?;
+        // CREATE_NO_WINDOW (0x0800_0000): Wingman is a windows-subsystem GUI
+        // app with no console of its own, so spawning `icacls` without this
+        // flag allocates and briefly flashes a new console window on every
+        // call -- every `save()`/`save_to()`, i.e. potentially on every
+        // settings change, not just once at startup.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let output = std::process::Command::new("icacls")
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
             .arg(format!("{username}:F"))
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .context("failed to run icacls to restrict the config file's permissions")?;
         if !output.status.success() {
@@ -1213,7 +1248,42 @@ pub(crate) struct ProviderDescriptor {
     pub api_key: Option<String>,
 }
 
+/// The four provider kinds every `providers.order` name outside
+/// `"compat:<name>"` can mean, and nothing else. Issue #244:
+/// [`Providers::provider_for_named_model`], [`Providers::models_for`] and
+/// [`Providers::describe`] each used to match `order_name` against the same
+/// four string literals independently -- three hand-mirrored copies of the
+/// same list, alongside `app.rs`'s `first_provider_model_label` as a fourth
+/// (issue #243, now a thin call into `describe`). All three remaining
+/// matches now match `Self::known_provider_for(name)` instead: an
+/// unhandled `KnownProvider` variant is a compiler error (a `match` over an
+/// enum must be exhaustive), not a silently omitted string literal, so a
+/// fifth provider kind added only to this enum and not handled in one of
+/// the three consumers below fails to compile rather than compiling clean
+/// and quietly disagreeing at runtime (see the `wired-to-nothing` skill's
+/// "hand-maintained list" row).
+enum KnownProvider {
+    Openai,
+    Anthropic,
+    Gemini,
+    Ollama,
+}
+
 impl Providers {
+    /// The one place a `providers.order` name is recognized as one of the
+    /// four built-in provider kinds ([`KnownProvider`]). `None` for a
+    /// `"compat:<name>"` entry (resolved separately, by name, against
+    /// `self.compat`) or any other unrecognized name.
+    fn known_provider_for(name: &str) -> Option<KnownProvider> {
+        match name {
+            "openai" => Some(KnownProvider::Openai),
+            "anthropic" => Some(KnownProvider::Anthropic),
+            "gemini" => Some(KnownProvider::Gemini),
+            "ollama" => Some(KnownProvider::Ollama),
+            _ => None,
+        }
+    }
+
     /// Constructs the `Provider` for one `providers.order` name against
     /// `self`'s per-provider config, using that provider's configured
     /// "active" model. Thin wrapper over
@@ -1253,36 +1323,36 @@ impl Providers {
         name: &str,
         model: Option<&str>,
     ) -> Option<Box<dyn Provider>> {
-        match name {
-            "openai" => Some(Box::new(OpenAi::new(
+        match Self::known_provider_for(name) {
+            Some(KnownProvider::Openai) => Some(Box::new(OpenAi::new(
                 unreadable_as_empty(&self.openai.api_key),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.openai.model.clone()),
                 self.openai.effort.clone(),
             ))),
-            "anthropic" => Some(Box::new(Anthropic::new(
+            Some(KnownProvider::Anthropic) => Some(Box::new(Anthropic::new(
                 unreadable_as_empty(&self.anthropic.api_key),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.anthropic.model.clone()),
                 self.anthropic.effort.clone(),
             ))),
-            "gemini" => Some(Box::new(Gemini::new(
+            Some(KnownProvider::Gemini) => Some(Box::new(Gemini::new(
                 unreadable_as_empty(&self.gemini.api_key),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.gemini.model.clone()),
                 self.gemini.effort.clone(),
             ))),
-            "ollama" => Some(Box::new(Ollama::new(
+            Some(KnownProvider::Ollama) => Some(Box::new(Ollama::new(
                 self.ollama.base_url.clone(),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.ollama.model.clone()),
                 self.ollama.effort.clone(),
             ))),
-            _ => {
+            None => {
                 // #16: `"compat:<name>"` order entries resolve against
                 // `self.compat` by `name`, not by position -- an entry
                 // reordered or removed in `providers.order` simply
@@ -1316,12 +1386,12 @@ impl Providers {
     /// matching `self.compat` config, same "just skip it" behavior as
     /// [`Providers::provider_for_named_model`].
     pub(crate) fn models_for(&self, name: &str) -> Vec<String> {
-        match name {
-            "openai" => self.openai.models.clone(),
-            "anthropic" => self.anthropic.models.clone(),
-            "gemini" => self.gemini.models.clone(),
-            "ollama" => vec![self.ollama.model.clone()],
-            _ => {
+        match Self::known_provider_for(name) {
+            Some(KnownProvider::Openai) => self.openai.models.clone(),
+            Some(KnownProvider::Anthropic) => self.anthropic.models.clone(),
+            Some(KnownProvider::Gemini) => self.gemini.models.clone(),
+            Some(KnownProvider::Ollama) => vec![self.ollama.model.clone()],
+            None => {
                 let Some(compat_name) = name.strip_prefix("compat:") else {
                     return Vec::new();
                 };
@@ -1342,17 +1412,23 @@ impl Providers {
     /// `diagnostics::provider_rows` reads instead of keeping its own copy of
     /// [`Providers::provider_for`]'s match (issue #201) -- which also means
     /// a `"compat:<name>"` entry, previously invisible to diagnostics
-    /// entirely, now shows up there too.
+    /// entirely, now shows up there too. `app.rs`'s
+    /// `first_provider_model_label` (issue #243) reads this too, rather
+    /// than keeping a fourth copy of the match.
     pub(crate) fn describe(&self, order_name: &str) -> Option<ProviderDescriptor> {
-        let (model, api_key) = match order_name {
-            "openai" => (self.openai.model.clone(), Some(self.openai.api_key.clone())),
-            "anthropic" => (
+        let (model, api_key) = match Self::known_provider_for(order_name) {
+            Some(KnownProvider::Openai) => {
+                (self.openai.model.clone(), Some(self.openai.api_key.clone()))
+            }
+            Some(KnownProvider::Anthropic) => (
                 self.anthropic.model.clone(),
                 Some(self.anthropic.api_key.clone()),
             ),
-            "gemini" => (self.gemini.model.clone(), Some(self.gemini.api_key.clone())),
-            "ollama" => (self.ollama.model.clone(), None),
-            _ => {
+            Some(KnownProvider::Gemini) => {
+                (self.gemini.model.clone(), Some(self.gemini.api_key.clone()))
+            }
+            Some(KnownProvider::Ollama) => (self.ollama.model.clone(), None),
+            None => {
                 let compat_name = order_name.strip_prefix("compat:")?;
                 let cfg = self.compat.iter().find(|c| c.name == compat_name)?;
                 (cfg.model.clone(), Some(cfg.api_key.clone()))
@@ -1463,6 +1539,38 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    // -- zeroize_string (#258) ------------------------------------------------
+
+    #[test]
+    fn zeroize_string_overwrites_the_retained_buffer_before_clearing() {
+        let mut s = String::from("sk-test-synthetic-not-a-real-key");
+        let ptr = s.as_ptr();
+        let len = s.len();
+        zeroize_string(&mut s);
+        // `s.clear()` only resets length to 0, so `s.as_bytes()` would show
+        // nothing either way -- inspect the still-allocated buffer directly
+        // via the raw pointer captured before the clear, exactly the check
+        // AGENTS.md rule 8 asks for (the observable that would differ if
+        // this were wired to nothing).
+        let retained = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert!(
+            retained.iter().all(|&b| b == 0),
+            "buffer still holds plaintext after zeroize_string: {retained:?}"
+        );
+        assert!(s.is_empty());
+        assert!(
+            s.capacity() >= len,
+            "capacity should be retained by clear()"
+        );
+    }
+
+    #[test]
+    fn zeroize_string_handles_empty_string() {
+        let mut s = String::new();
+        zeroize_string(&mut s);
+        assert!(s.is_empty());
     }
 
     // -- forms.require_tick_for (#40) ----------------------------------------
@@ -3899,6 +4007,43 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let describe_count = config.providers.describe_all().len();
         assert_eq!(chain_count, describe_count);
         assert_eq!(chain_count, 5, "bogus must be dropped by both");
+    }
+
+    #[test]
+    fn provider_for_named_model_models_for_and_describe_agree_on_which_names_resolve() {
+        // Issue #244: describe still kept its own third hand-mirrored match
+        // over "openai"/"anthropic"/"gemini"/"ollama"/"compat:<name>",
+        // alongside provider_for_named_model and models_for (both already
+        // consolidated by #222). A provider kind added to one of these three
+        // without a matching arm in the other two would compile fine and
+        // silently disagree here about whether a name "resolves" at all.
+        let mut providers = Providers::default();
+        providers.compat.push(CompatConfig {
+            name: "custom".to_string(),
+            models: vec!["compat-cheap".to_string(), "compat-flagship".to_string()],
+            ..Default::default()
+        });
+        let fixture = [
+            "openai",
+            "anthropic",
+            "gemini",
+            "ollama",
+            "compat:custom",
+            "not-a-real-provider",
+        ];
+        for name in fixture {
+            let ctor_recognizes = providers.provider_for_named_model(name, None).is_some();
+            let models_recognizes = !providers.models_for(name).is_empty();
+            let describe_recognizes = providers.describe(name).is_some();
+            assert_eq!(
+                ctor_recognizes, models_recognizes,
+                "provider_for_named_model and models_for disagree on {name:?}"
+            );
+            assert_eq!(
+                ctor_recognizes, describe_recognizes,
+                "provider_for_named_model and describe disagree on {name:?}"
+            );
+        }
     }
 
     // -- ENV_OVERRIDE_VARS agrees with apply_env_overrides (issue #201) ----

@@ -229,7 +229,7 @@ impl<O: Opener> Connector for IcsConnector<O> {
         // `TZID` with no `VTIMEZONE`) -- see `resolve_local_times` and
         // `format_event_time_property`'s doc comments.
         let resolved_event = resolve_local_times(event, self.local_time_converter.as_ref());
-        let content = render_ics(&resolved_event, &uid, &dtstamp);
+        let content = render_ics(&resolved_event, &uid, &dtstamp)?;
 
         std::fs::create_dir_all(&self.temp_dir)
             .with_context(|| format!("could not create {}", self.temp_dir.display()))?;
@@ -273,18 +273,33 @@ fn sanitize_filename(uid: &str) -> String {
     uid.replace('@', "_")
 }
 
-fn format_date(d: &CivilDate) -> String {
-    format!("{:04}{:02}{:02}", d.year, d.month, d.day)
+/// #276: RFC 5545 `DATE`/`DATE-TIME` values require exactly a 4-digit year
+/// (§3.3.4/§3.3.5). `{:04}` is a minimum-width specifier, not a truncating
+/// one, so a `CivilDate::year` that civil arithmetic (`add_days`/
+/// `add_seconds`, both unguarded on purpose -- see `civil_time`'s doc
+/// comment) has pushed past 9999 would otherwise silently widen to a 9-digit
+/// year. Refused here as a named error instead of writing malformed content
+/// (rule 7: every failure ends in a card, never a silent malformed write).
+fn format_date(d: &CivilDate) -> Result<String> {
+    if !(0..=9999).contains(&d.year) {
+        return Err(anyhow!(
+            "the event date {:04}-{:02}-{:02} is out of range for an ICS DATE value (year must be 0000-9999)",
+            d.year,
+            d.month,
+            d.day
+        ));
+    }
+    Ok(format!("{:04}{:02}{:02}", d.year, d.month, d.day))
 }
 
-fn format_datetime(dt: &CivilDateTime) -> String {
-    format!(
+fn format_datetime(dt: &CivilDateTime) -> Result<String> {
+    Ok(format!(
         "{}T{:02}{:02}{:02}",
-        format_date(&dt.date),
+        format_date(&dt.date)?,
         dt.hour,
         dt.minute,
         dt.second
-    )
+    ))
 }
 
 /// Formats one of `DTSTART`/`DTEND`/etc. with its value, per the connector
@@ -305,12 +320,12 @@ fn format_datetime(dt: &CivilDateTime) -> String {
 /// is the honest thing to emit when this connector cannot itself resolve
 /// the zone -- unlike the old behaviour, it is never wrong about *which*
 /// zone the time is in, only silent about naming one.
-fn format_event_time_property(name: &str, t: &EventTime) -> String {
-    match t {
-        EventTime::AllDay(d) => format!("{name};VALUE=DATE:{}", format_date(d)),
-        EventTime::Utc(dt) => format!("{name}:{}Z", format_datetime(dt)),
-        EventTime::Local { at, .. } => format!("{name}:{}", format_datetime(at)),
-    }
+fn format_event_time_property(name: &str, t: &EventTime) -> Result<String> {
+    Ok(match t {
+        EventTime::AllDay(d) => format!("{name};VALUE=DATE:{}", format_date(d)?),
+        EventTime::Utc(dt) => format!("{name}:{}Z", format_datetime(dt)?),
+        EventTime::Local { at, .. } => format!("{name}:{}", format_datetime(at)?),
+    })
 }
 
 /// Issue #211: upgrades every `EventTime::Local` in `event`'s `start`/`end`
@@ -423,11 +438,22 @@ fn fold_line(line: &str) -> String {
 /// Pure and independently testable with a fixed `uid`/`dtstamp`: the
 /// connector's `create_calendar_event` is the only caller that generates
 /// fresh (non-deterministic) values for those two fields.
-fn render_ics(event: &CalendarEvent, uid: &str, dtstamp: &CivilDateTime) -> String {
+fn render_ics(event: &CalendarEvent, uid: &str, dtstamp: &CivilDateTime) -> Result<String> {
     let end = event
         .end
         .clone()
         .unwrap_or_else(|| default_end(&event.start));
+    // #249: RFC 5545's DTEND is exclusive for a VALUE=DATE (all-day) event,
+    // so an explicit end that is the same day as start -- or, more broadly,
+    // any day at or before start -- names a zero-or-negative-duration event
+    // that no calendar app can render as the honestly-intended single-day
+    // event. Treat it exactly like a missing end (default_end's own +1-day
+    // rule) rather than writing it literally; a genuine multi-day end
+    // (end > start) still renders unmodified.
+    let end = match (&event.start, &end) {
+        (EventTime::AllDay(s), EventTime::AllDay(e)) if e <= s => default_end(&event.start),
+        _ => end,
+    };
 
     let mut lines = vec![
         "BEGIN:VCALENDAR".to_string(),
@@ -436,9 +462,9 @@ fn render_ics(event: &CalendarEvent, uid: &str, dtstamp: &CivilDateTime) -> Stri
         "CALSCALE:GREGORIAN".to_string(),
         "BEGIN:VEVENT".to_string(),
         format!("UID:{uid}"),
-        format!("DTSTAMP:{}Z", format_datetime(dtstamp)),
-        format_event_time_property("DTSTART", &event.start),
-        format_event_time_property("DTEND", &end),
+        format!("DTSTAMP:{}Z", format_datetime(dtstamp)?),
+        format_event_time_property("DTSTART", &event.start)?,
+        format_event_time_property("DTEND", &end)?,
         format!("SUMMARY:{}", escape_text(&event.title)),
     ];
     if let Some(location) = event.location.as_ref().filter(|s| !s.is_empty()) {
@@ -455,7 +481,7 @@ fn render_ics(event: &CalendarEvent, uid: &str, dtstamp: &CivilDateTime) -> Stri
         out.push_str(&fold_line(line));
         out.push_str("\r\n");
     }
-    out
+    Ok(out)
 }
 
 /// Parses a `calendar_event` proposal's `start`/`end` string into an
@@ -651,7 +677,7 @@ mod tests {
 
     #[test]
     fn golden_ics_for_a_sample_event() {
-        let ics = render_ics(&sample_event(), "1234-0@wingman.local", &fixed_dtstamp());
+        let ics = render_ics(&sample_event(), "1234-0@wingman.local", &fixed_dtstamp()).unwrap();
         let expected = "BEGIN:VCALENDAR\r\n\
 VERSION:2.0\r\n\
 PRODID:-//Wingman//ics connector//EN\r\n\
@@ -682,7 +708,7 @@ END:VCALENDAR\r\n";
             location: None,
             description: None,
         };
-        let ics = render_ics(&event, "9999-1@wingman.local", &fixed_dtstamp());
+        let ics = render_ics(&event, "9999-1@wingman.local", &fixed_dtstamp()).unwrap();
         let expected = "BEGIN:VCALENDAR\r\n\
 VERSION:2.0\r\n\
 PRODID:-//Wingman//ics connector//EN\r\n\
@@ -696,6 +722,90 @@ SUMMARY:Conference\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR\r\n";
         assert_eq!(ics, expected, "all-day missing-end default is +1 day");
+    }
+
+    #[test]
+    fn all_day_event_with_an_explicit_same_day_end_still_gets_the_exclusive_next_day_dtend() {
+        // #249: RFC 5545's DTEND is exclusive for a VALUE=DATE event, so an
+        // explicit end equal to start must render exactly like the
+        // missing-end default (start + 1 day), not literally.
+        let event = CalendarEvent {
+            title: "Conference".to_string(),
+            start: EventTime::AllDay(CivilDate {
+                year: 2026,
+                month: 10,
+                day: 1,
+            }),
+            end: Some(EventTime::AllDay(CivilDate {
+                year: 2026,
+                month: 10,
+                day: 1,
+            })),
+            location: None,
+            description: None,
+        };
+        let ics = render_ics(&event, "9999-1@wingman.local", &fixed_dtstamp()).unwrap();
+        assert!(
+            ics.contains("DTEND;VALUE=DATE:20261002\r\n"),
+            "same-day explicit end must render as start + 1 day: {ics}"
+        );
+    }
+
+    #[test]
+    fn all_day_event_with_an_end_before_start_also_gets_bumped_forward() {
+        // Neighbouring case: an end that is literally before start is at
+        // least as broken as an equal-day end, so it gets the same
+        // missing-end-style treatment rather than being written verbatim.
+        let event = CalendarEvent {
+            title: "Oops".to_string(),
+            start: EventTime::AllDay(CivilDate {
+                year: 2026,
+                month: 10,
+                day: 5,
+            }),
+            end: Some(EventTime::AllDay(CivilDate {
+                year: 2026,
+                month: 10,
+                day: 3,
+            })),
+            location: None,
+            description: None,
+        };
+        let ics = render_ics(&event, "9999-1@wingman.local", &fixed_dtstamp()).unwrap();
+        assert!(
+            ics.contains("DTEND;VALUE=DATE:20261006\r\n"),
+            "an end before start must be treated like a missing end: {ics}"
+        );
+    }
+
+    #[test]
+    fn all_day_event_with_a_genuine_multi_day_end_is_left_untouched() {
+        // Neighbouring case: a real multi-day all-day event must not be
+        // altered by the same-day/before-start guard.
+        let event = CalendarEvent {
+            title: "Retreat".to_string(),
+            start: EventTime::AllDay(CivilDate {
+                year: 2026,
+                month: 10,
+                day: 1,
+            }),
+            end: Some(EventTime::AllDay(CivilDate {
+                year: 2026,
+                month: 10,
+                day: 4,
+            })),
+            location: None,
+            description: None,
+        };
+        let ics = render_ics(&event, "9999-1@wingman.local", &fixed_dtstamp()).unwrap();
+        assert!(
+            ics.contains("DTSTART;VALUE=DATE:20261001\r\n"),
+            "unaffected start: {ics}"
+        );
+        assert!(
+            ics.contains("DTEND;VALUE=DATE:20261004\r\n"),
+            "a genuine multi-day end must render literally, unmodified: {ics}"
+        );
     }
 
     #[test]
@@ -716,7 +826,7 @@ END:VCALENDAR\r\n";
             location: None,
             description: None,
         };
-        let ics = render_ics(&event, "u@wingman.local", &fixed_dtstamp());
+        let ics = render_ics(&event, "u@wingman.local", &fixed_dtstamp()).unwrap();
         assert!(ics.contains("DTSTART:20260920T140000Z\r\n"));
         assert!(ics.contains("DTEND:20260920T150000Z\r\n"));
     }
@@ -751,7 +861,7 @@ END:VCALENDAR\r\n";
         // the byte-exact floating-time rendering that must produce (#211:
         // never a `TZID` parameter with no accompanying `VTIMEZONE`).
         let event = sample_local_event();
-        let ics = render_ics(&event, "u@wingman.local", &fixed_dtstamp());
+        let ics = render_ics(&event, "u@wingman.local", &fixed_dtstamp()).unwrap();
         assert!(ics.contains("DTSTART:20260920T090000\r\n"));
         assert!(ics.contains("DTEND:20260920T100000\r\n"));
         assert!(
@@ -978,6 +1088,80 @@ END:VCALENDAR\r\n";
         assert_eq!(rejoined, line);
     }
 
+    // -- out-of-range years (#276) ------------------------------------------
+
+    #[test]
+    fn all_day_event_starting_on_year_9999_12_31_with_no_end_errors_instead_of_writing_a_9_digit_year(
+    ) {
+        // #276: default_end's +1-day rule on the very last representable
+        // 4-digit-year date rolls the year over to 10000. format_date must
+        // refuse this instead of emitting a malformed 9-digit DTEND.
+        let event = CalendarEvent {
+            title: "Boundary".to_string(),
+            start: EventTime::AllDay(CivilDate {
+                year: 9999,
+                month: 12,
+                day: 31,
+            }),
+            end: None,
+            location: None,
+            description: None,
+        };
+        let err = render_ics(&event, "u@wingman.local", &fixed_dtstamp())
+            .expect_err("a year past 9999 must be a named error, not malformed output");
+        assert!(!err.to_string().contains('\u{2014}'), "no em dashes: {err}");
+    }
+
+    #[test]
+    fn all_day_event_with_an_explicit_end_past_year_9999_also_errors() {
+        let event = CalendarEvent {
+            title: "Boundary".to_string(),
+            start: EventTime::AllDay(CivilDate {
+                year: 9999,
+                month: 12,
+                day: 30,
+            }),
+            end: Some(EventTime::AllDay(CivilDate {
+                year: 10000,
+                month: 1,
+                day: 1,
+            })),
+            location: None,
+            description: None,
+        };
+        assert!(render_ics(&event, "u@wingman.local", &fixed_dtstamp()).is_err());
+    }
+
+    #[test]
+    fn a_normal_timed_event_still_renders_successfully_far_from_the_year_boundary() {
+        // Neighbouring case: the new fallible signature must not regress an
+        // ordinary in-range event.
+        let ics = render_ics(&sample_event(), "1234-0@wingman.local", &fixed_dtstamp());
+        assert!(ics.is_ok());
+    }
+
+    #[test]
+    fn format_date_rejects_a_year_below_zero_and_at_or_above_10000() {
+        assert!(format_date(&CivilDate {
+            year: 9999,
+            month: 12,
+            day: 31
+        })
+        .is_ok());
+        assert!(format_date(&CivilDate {
+            year: 10000,
+            month: 1,
+            day: 1
+        })
+        .is_err());
+        assert!(format_date(&CivilDate {
+            year: -1,
+            month: 1,
+            day: 1
+        })
+        .is_err());
+    }
+
     // -- escaping ----------------------------------------------------------
 
     #[test]
@@ -1012,7 +1196,7 @@ END:VCALENDAR\r\n";
             location: None,
             description: Some("line one\nline two".to_string()),
         };
-        let ics = render_ics(&event, "u@wingman.local", &fixed_dtstamp());
+        let ics = render_ics(&event, "u@wingman.local", &fixed_dtstamp()).unwrap();
         assert!(ics.contains("SUMMARY:Team\\, sync\\; notes\\\\here\r\n"));
         assert!(ics.contains("DESCRIPTION:line one\\nline two\r\n"));
     }
