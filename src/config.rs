@@ -1213,7 +1213,42 @@ pub(crate) struct ProviderDescriptor {
     pub api_key: Option<String>,
 }
 
+/// The four provider kinds every `providers.order` name outside
+/// `"compat:<name>"` can mean, and nothing else. Issue #244:
+/// [`Providers::provider_for_named_model`], [`Providers::models_for`] and
+/// [`Providers::describe`] each used to match `order_name` against the same
+/// four string literals independently -- three hand-mirrored copies of the
+/// same list, alongside `app.rs`'s `first_provider_model_label` as a fourth
+/// (issue #243, now a thin call into `describe`). All three remaining
+/// matches now match `Self::known_provider_for(name)` instead: an
+/// unhandled `KnownProvider` variant is a compiler error (a `match` over an
+/// enum must be exhaustive), not a silently omitted string literal, so a
+/// fifth provider kind added only to this enum and not handled in one of
+/// the three consumers below fails to compile rather than compiling clean
+/// and quietly disagreeing at runtime (see the `wired-to-nothing` skill's
+/// "hand-maintained list" row).
+enum KnownProvider {
+    Openai,
+    Anthropic,
+    Gemini,
+    Ollama,
+}
+
 impl Providers {
+    /// The one place a `providers.order` name is recognized as one of the
+    /// four built-in provider kinds ([`KnownProvider`]). `None` for a
+    /// `"compat:<name>"` entry (resolved separately, by name, against
+    /// `self.compat`) or any other unrecognized name.
+    fn known_provider_for(name: &str) -> Option<KnownProvider> {
+        match name {
+            "openai" => Some(KnownProvider::Openai),
+            "anthropic" => Some(KnownProvider::Anthropic),
+            "gemini" => Some(KnownProvider::Gemini),
+            "ollama" => Some(KnownProvider::Ollama),
+            _ => None,
+        }
+    }
+
     /// Constructs the `Provider` for one `providers.order` name against
     /// `self`'s per-provider config, using that provider's configured
     /// "active" model. Thin wrapper over
@@ -1253,36 +1288,36 @@ impl Providers {
         name: &str,
         model: Option<&str>,
     ) -> Option<Box<dyn Provider>> {
-        match name {
-            "openai" => Some(Box::new(OpenAi::new(
+        match Self::known_provider_for(name) {
+            Some(KnownProvider::Openai) => Some(Box::new(OpenAi::new(
                 unreadable_as_empty(&self.openai.api_key),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.openai.model.clone()),
                 self.openai.effort.clone(),
             ))),
-            "anthropic" => Some(Box::new(Anthropic::new(
+            Some(KnownProvider::Anthropic) => Some(Box::new(Anthropic::new(
                 unreadable_as_empty(&self.anthropic.api_key),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.anthropic.model.clone()),
                 self.anthropic.effort.clone(),
             ))),
-            "gemini" => Some(Box::new(Gemini::new(
+            Some(KnownProvider::Gemini) => Some(Box::new(Gemini::new(
                 unreadable_as_empty(&self.gemini.api_key),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.gemini.model.clone()),
                 self.gemini.effort.clone(),
             ))),
-            "ollama" => Some(Box::new(Ollama::new(
+            Some(KnownProvider::Ollama) => Some(Box::new(Ollama::new(
                 self.ollama.base_url.clone(),
                 model
                     .map(str::to_string)
                     .unwrap_or_else(|| self.ollama.model.clone()),
                 self.ollama.effort.clone(),
             ))),
-            _ => {
+            None => {
                 // #16: `"compat:<name>"` order entries resolve against
                 // `self.compat` by `name`, not by position -- an entry
                 // reordered or removed in `providers.order` simply
@@ -1316,12 +1351,12 @@ impl Providers {
     /// matching `self.compat` config, same "just skip it" behavior as
     /// [`Providers::provider_for_named_model`].
     pub(crate) fn models_for(&self, name: &str) -> Vec<String> {
-        match name {
-            "openai" => self.openai.models.clone(),
-            "anthropic" => self.anthropic.models.clone(),
-            "gemini" => self.gemini.models.clone(),
-            "ollama" => vec![self.ollama.model.clone()],
-            _ => {
+        match Self::known_provider_for(name) {
+            Some(KnownProvider::Openai) => self.openai.models.clone(),
+            Some(KnownProvider::Anthropic) => self.anthropic.models.clone(),
+            Some(KnownProvider::Gemini) => self.gemini.models.clone(),
+            Some(KnownProvider::Ollama) => vec![self.ollama.model.clone()],
+            None => {
                 let Some(compat_name) = name.strip_prefix("compat:") else {
                     return Vec::new();
                 };
@@ -1342,17 +1377,23 @@ impl Providers {
     /// `diagnostics::provider_rows` reads instead of keeping its own copy of
     /// [`Providers::provider_for`]'s match (issue #201) -- which also means
     /// a `"compat:<name>"` entry, previously invisible to diagnostics
-    /// entirely, now shows up there too.
+    /// entirely, now shows up there too. `app.rs`'s
+    /// `first_provider_model_label` (issue #243) reads this too, rather
+    /// than keeping a fourth copy of the match.
     pub(crate) fn describe(&self, order_name: &str) -> Option<ProviderDescriptor> {
-        let (model, api_key) = match order_name {
-            "openai" => (self.openai.model.clone(), Some(self.openai.api_key.clone())),
-            "anthropic" => (
+        let (model, api_key) = match Self::known_provider_for(order_name) {
+            Some(KnownProvider::Openai) => {
+                (self.openai.model.clone(), Some(self.openai.api_key.clone()))
+            }
+            Some(KnownProvider::Anthropic) => (
                 self.anthropic.model.clone(),
                 Some(self.anthropic.api_key.clone()),
             ),
-            "gemini" => (self.gemini.model.clone(), Some(self.gemini.api_key.clone())),
-            "ollama" => (self.ollama.model.clone(), None),
-            _ => {
+            Some(KnownProvider::Gemini) => {
+                (self.gemini.model.clone(), Some(self.gemini.api_key.clone()))
+            }
+            Some(KnownProvider::Ollama) => (self.ollama.model.clone(), None),
+            None => {
                 let compat_name = order_name.strip_prefix("compat:")?;
                 let cfg = self.compat.iter().find(|c| c.name == compat_name)?;
                 (cfg.model.clone(), Some(cfg.api_key.clone()))
@@ -3886,6 +3927,43 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let describe_count = config.providers.describe_all().len();
         assert_eq!(chain_count, describe_count);
         assert_eq!(chain_count, 5, "bogus must be dropped by both");
+    }
+
+    #[test]
+    fn provider_for_named_model_models_for_and_describe_agree_on_which_names_resolve() {
+        // Issue #244: describe still kept its own third hand-mirrored match
+        // over "openai"/"anthropic"/"gemini"/"ollama"/"compat:<name>",
+        // alongside provider_for_named_model and models_for (both already
+        // consolidated by #222). A provider kind added to one of these three
+        // without a matching arm in the other two would compile fine and
+        // silently disagree here about whether a name "resolves" at all.
+        let mut providers = Providers::default();
+        providers.compat.push(CompatConfig {
+            name: "custom".to_string(),
+            models: vec!["compat-cheap".to_string(), "compat-flagship".to_string()],
+            ..Default::default()
+        });
+        let fixture = [
+            "openai",
+            "anthropic",
+            "gemini",
+            "ollama",
+            "compat:custom",
+            "not-a-real-provider",
+        ];
+        for name in fixture {
+            let ctor_recognizes = providers.provider_for_named_model(name, None).is_some();
+            let models_recognizes = !providers.models_for(name).is_empty();
+            let describe_recognizes = providers.describe(name).is_some();
+            assert_eq!(
+                ctor_recognizes, models_recognizes,
+                "provider_for_named_model and models_for disagree on {name:?}"
+            );
+            assert_eq!(
+                ctor_recognizes, describe_recognizes,
+                "provider_for_named_model and describe disagree on {name:?}"
+            );
+        }
     }
 
     // -- ENV_OVERRIDE_VARS agrees with apply_env_overrides (issue #201) ----
