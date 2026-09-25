@@ -229,6 +229,24 @@ mod tests {
     }
 
     #[test]
+    fn in_as_source_unit_routes_to_units_end_to_end() {
+        // Issue #274: "5 in to cm" must resolve "in" as inches, not fail to
+        // parse as a conversion query at all.
+        let result = evaluate("5 in to cm").unwrap();
+        assert!(matches!(result, CalcResult::Conversion { .. }));
+        assert_eq!(result.headline(), "5 in = 12.7 cm");
+    }
+
+    #[test]
+    fn ton_end_to_end_is_the_us_short_ton() {
+        // Issue #275: a bare "ton" is the US short ton (907.18474 kg), not
+        // the metric tonne.
+        let result = evaluate("1 ton to kg").unwrap();
+        assert!(matches!(result, CalcResult::Conversion { .. }));
+        assert_eq!(result.headline(), "1 ton = 907.2 kg");
+    }
+
+    #[test]
     fn arithmetic_routes_to_expr() {
         let result = evaluate("(12*7)/4").unwrap();
         assert!(matches!(result, CalcResult::Expression { .. }));
