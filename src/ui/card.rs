@@ -1828,6 +1828,20 @@ impl CardInner {
             WM_COMMAND => {
                 if self.state == CardState::Preview {
                     let id = (wparam.0 & 0xFFFF) as i32;
+                    // #255: `preview_control_subclass` posts ID_PREVIEW_CANCEL
+                    // when a preview's focused child is destroyed (its own
+                    // WM_KILLFOCUS), tagged in lparam with the generation
+                    // that was live at post time. If a new preview has since
+                    // replaced it by the time this WM_COMMAND is dispatched,
+                    // `self.preview_generation` has moved on and this post is
+                    // stale -- it must not be mistaken for a real Esc/
+                    // click-away on the NEW preview. Real button clicks (and
+                    // the WM_KEYDOWN-forwarded Enter/Esc, which never target
+                    // ID_PREVIEW_CANCEL via lparam-tagging) are unaffected:
+                    // ID_PREVIEW_CANCEL is only ever posted by the subclass.
+                    if id == ID_PREVIEW_CANCEL && lparam.0 as u32 != self.preview_generation {
+                        return Some(LRESULT(0));
+                    }
                     self.run_preview_command(id);
                 }
                 Some(LRESULT(0))
@@ -2649,11 +2663,26 @@ unsafe extern "system" fn preview_control_subclass(
         let new_focus_is_card_or_descendant =
             new_focus == parent || unsafe { IsChild(parent, new_focus) }.as_bool();
         if preview_focus_left_the_card(new_focus_is_card_or_descendant) {
+            // #255: tag the post with the generation that is live RIGHT NOW
+            // (read synchronously off the parent's own GWLP_USERDATA, the
+            // same pointer `wndproc` dereferences for this hwnd). If this
+            // WM_COMMAND is not dispatched until after a replacement preview
+            // is already showing, `CardInner::handle_message`'s WM_COMMAND
+            // arm compares this against the generation live AT DISPATCH TIME
+            // and drops it as stale rather than cancelling the new preview.
+            let generation = {
+                let ptr = GetWindowLongPtrW(parent, GWLP_USERDATA) as *const CardInner;
+                if ptr.is_null() {
+                    0
+                } else {
+                    unsafe { (*ptr).preview_generation }
+                }
+            };
             let _ = PostMessageW(
                 Some(parent),
                 WM_COMMAND,
                 WPARAM(ID_PREVIEW_CANCEL as usize),
-                LPARAM(0),
+                LPARAM(generation as isize),
             );
         }
     }
@@ -4087,6 +4116,161 @@ mod tests {
         assert!(
             !cancelled,
             "focus moving between two preview controls must not cancel the preview"
+        );
+    }
+
+    // -- stale preview-cancel hijack (#255) -------------------------------
+
+    #[test]
+    fn replacing_a_focused_preview_does_not_cancel_the_new_one() {
+        // Reproduces #255: a WM_KILLFOCUS fired while tearing down preview A
+        // (because its focused control is destroyed) posts a WM_COMMAND
+        // ID_PREVIEW_CANCEL that is only DISPATCHED after preview B has
+        // already replaced A. Without a generation check, that stale post
+        // hijacks B: it looks exactly like a real Esc/click-away on B.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+
+        let generation_a = card.show_preview("Preview A", &schema, &value, false);
+        // Simulate the subclass posting ID_PREVIEW_CANCEL for A's teardown
+        // (the actual post happens via PostMessageW and is not yet
+        // dispatched, exactly as #255 describes) by capturing A's
+        // generation now, before replacing it.
+
+        let generation_b = card.show_preview("Preview B", &schema, &value, false);
+        assert_ne!(
+            generation_a, generation_b,
+            "replacing a preview must bump the generation"
+        );
+
+        // Deliver the stale WM_COMMAND the way the message loop eventually
+        // would: tagged with A's generation, per the fix plan in #255's
+        // last comment.
+        let handled = card.handle_message(
+            WM_COMMAND,
+            WPARAM(ID_PREVIEW_CANCEL as usize),
+            LPARAM(generation_a as isize),
+        );
+        assert!(handled.is_some());
+
+        assert_eq!(
+            card.state(),
+            CardState::Preview,
+            "a stale cancel for the replaced preview must not close the new one"
+        );
+        assert_eq!(
+            card.inner.preview_generation, generation_b,
+            "the live preview must still be B"
+        );
+        assert_eq!(
+            card.inner.preview.as_ref().map(|p| p.title.as_str()),
+            Some("Preview B")
+        );
+    }
+
+    #[test]
+    fn stale_preview_cancel_generation_is_ignored() {
+        // Narrower than the hijack test above: directly proves the
+        // dispatch-level guard, independent of show_preview's own bookkeeping.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        let generation = card.show_preview("Preview", &schema, &value, false);
+        let stale_generation = generation.wrapping_sub(1);
+
+        card.handle_message(
+            WM_COMMAND,
+            WPARAM(ID_PREVIEW_CANCEL as usize),
+            LPARAM(stale_generation as isize),
+        );
+
+        assert_eq!(
+            card.state(),
+            CardState::Preview,
+            "preview_cancel must not run for a mismatched generation"
+        );
+        assert!(
+            card.inner.last_confirmed.is_none(),
+            "a dropped stale cancel must not touch last_confirmed"
+        );
+    }
+
+    #[test]
+    fn current_generation_cancel_still_works() {
+        // Neighbour: proves the guard does not break a real Esc/click-away
+        // cancel on the preview that is actually live.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        let generation = card.show_preview("Preview", &schema, &value, false);
+
+        card.handle_message(
+            WM_COMMAND,
+            WPARAM(ID_PREVIEW_CANCEL as usize),
+            LPARAM(generation as isize),
+        );
+
+        assert_eq!(
+            card.state(),
+            CardState::Hidden,
+            "a cancel tagged with the CURRENT generation must still close the preview"
+        );
+    }
+
+    #[test]
+    fn current_generation_do_it_still_works() {
+        // Neighbour: the generation guard is scoped to ID_PREVIEW_CANCEL
+        // only (per the fix plan); Do it must be unaffected even though it
+        // also travels through the same WM_COMMAND dispatch.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        let _generation = card.show_preview("Preview", &schema, &value, false);
+
+        card.handle_message(WM_COMMAND, WPARAM(ID_PREVIEW_DO_IT as usize), LPARAM(0));
+
+        assert_eq!(card.state(), CardState::Hidden);
+        assert!(card.inner.last_confirmed.is_some());
+    }
+
+    #[test]
+    fn preview_control_subclass_tags_posted_cancel_with_the_live_generation() {
+        // Wired-to-nothing check: the subclass must actually encode the
+        // CURRENT generation in the posted WM_COMMAND's lparam, not just
+        // post ID_PREVIEW_CANCEL. Reads it back off the real posted message.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        let generation = card.show_preview("Preview", &schema, &value, false);
+        let start_hwnd = card
+            .inner
+            .preview
+            .as_ref()
+            .unwrap()
+            .edits
+            .iter()
+            .find(|(name, _)| name == "start")
+            .map(|(_, hwnd)| *hwnd)
+            .unwrap();
+        let card_hwnd = card.hwnd();
+
+        unsafe {
+            let _ = preview_control_subclass(
+                start_hwnd,
+                WM_KILLFOCUS,
+                WPARAM(0),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
+        assert!(found, "the subclass must post a WM_COMMAND");
+        assert_eq!(msg.message, WM_COMMAND);
+        assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_CANCEL);
+        assert_eq!(
+            msg.lParam.0 as u32, generation,
+            "the posted WM_COMMAND must carry the live preview generation"
         );
     }
 
