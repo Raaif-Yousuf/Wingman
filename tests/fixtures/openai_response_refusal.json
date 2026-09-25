@@ -1,0 +1,26 @@
+{
+  "id": "resp_refusal1",
+  "object": "response",
+  "created_at": 1757836800,
+  "status": "completed",
+  "model": "gpt-5.5",
+  "output": [
+    {
+      "id": "msg_1",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "refusal",
+          "refusal": "I can't help with that."
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 12,
+    "total_tokens": 1212
+  }
+}

@@ -124,6 +124,20 @@ impl OpenAi {
             }
             if let Some(content) = entry.get("content").and_then(Value::as_array) {
                 for part in content {
+                    // Mirrors `anthropic.rs`'s `stop_reason: "refusal"` and
+                    // `openai_compat.rs`'s `message.refusal` handling: the
+                    // Responses API can carry a `type: "refusal"` content
+                    // part in place of a `text` part (THEORY (unverified
+                    // against a live API): no live OpenAI Responses call
+                    // has confirmed this shape; see #254). A refusal must
+                    // surface as itself, not as "no message text found",
+                    // and must win even if an earlier part in the same
+                    // message carried partial text.
+                    if let Some(refusal) = part.get("refusal").and_then(Value::as_str) {
+                        if !refusal.is_empty() {
+                            return Err(anyhow!("openai: model refused to answer"));
+                        }
+                    }
                     if let Some(t) = part.get("text").and_then(Value::as_str) {
                         text.push_str(t);
                     }
@@ -486,6 +500,34 @@ mod tests {
         let body = r#"{"output": []}"#;
         let err = OpenAi::parse_completion(body).unwrap_err();
         assert!(err.to_string().contains("no message text"));
+    }
+
+    /// #254: the Responses API's `output[].content[]` can carry a
+    /// `type: "refusal"` part with a `refusal` string instead of a `text`
+    /// part. Mirrors `anthropic.rs`'s `parse_completion_rejects_refusal`
+    /// and `openai_compat.rs`'s `parse_completion_rejects_a_refusal`: a
+    /// refusal must surface as "model refused to answer", not the generic
+    /// "no message text found in output[]" a genuinely malformed body
+    /// gets.
+    #[test]
+    fn parse_completion_rejects_a_refusal() {
+        let body = fs::read_to_string("tests/fixtures/openai_response_refusal.json")
+            .expect("fixture file should exist");
+        let err = OpenAi::parse_completion(&body).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refused"), "{msg}");
+        assert!(!msg.contains("no message text"), "{msg}");
+    }
+
+    /// Neighbour: a `content[]` mixing a `text` part with a `refusal` part
+    /// in the same message. The refusal must still be reported rather than
+    /// silently dropped in favour of the partial text.
+    #[test]
+    fn parse_completion_rejects_a_refusal_mixed_with_text() {
+        let body = fs::read_to_string("tests/fixtures/openai_response_refusal_mixed.json")
+            .expect("fixture file should exist");
+        let err = OpenAi::parse_completion(&body).unwrap_err();
+        assert!(err.to_string().contains("refused"));
     }
 
     /// #154: mirrors Anthropic's `empty_effort_is_never_sent` -- an empty
