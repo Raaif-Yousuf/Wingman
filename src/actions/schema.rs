@@ -200,7 +200,7 @@ fn form_fill_schema() -> Value {
                     "type": "object",
                     "properties": {
                         "control_id": {"type": "string"},
-                        "source": {"type": "string"},
+                        "source": {"type": "string", "enum": ["profile", "model", "skip"]},
                         "profile_field": {"type": "string"},
                         "value": {"type": "string"},
                         "sensitive": {"type": "boolean"}
@@ -469,6 +469,22 @@ mod tests {
                 "value",
                 "sensitive"
             ])
+        );
+    }
+
+    #[test]
+    fn form_fill_source_declares_a_closed_enum_of_the_three_tokens() {
+        // #246: merge_model_response's `match resp.source.as_str()` treats
+        // exactly "profile", "model" or "skip" as meaningful and silently
+        // skips anything else. The schema must close the set the same way
+        // text_review_schema's "verdict" does, so a constrained-decoding
+        // provider cannot sample a near-miss token that gets silently
+        // dropped.
+        let schema = schema_for("form_fill", false).expect("form_fill is registered");
+        let source_prop = &schema["properties"]["fields"]["items"]["properties"]["source"];
+        assert_eq!(
+            *source_prop,
+            serde_json::json!({"type": "string", "enum": ["profile", "model", "skip"]})
         );
     }
 

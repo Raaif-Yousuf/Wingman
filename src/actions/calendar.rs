@@ -35,7 +35,7 @@ pub const NO_EVENT_TITLE: &str = "NO_EVENT";
 /// action-model design doc's "Origin tracking") -- the date/offset context
 /// is always appended fresh at ask-time, by `app.rs`, never something a
 /// static prompt string could carry.
-pub const BASE_PROMPT: &str = "You are shown a screenshot of the user's screen. Find the ONE calendar event described or shown on screen (an email, a chat message, an invite, a flyer, a webpage, and so on) and extract it: its title, start time, end time if one is shown, location and any short notes worth keeping. If the screen shows more than one event, pick the one that is the clear focus of the screen (e.g. an open invite or the top message), not a list entry glimpsed in the background. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
+pub const BASE_PROMPT: &str = "You are shown the user's screen (or, if no image could be captured, its recognized text and fields instead). Find the ONE calendar event described or shown on screen (an email, a chat message, an invite, a flyer, a webpage, and so on) and extract it: its title, start time, end time if one is shown, location and any short notes worth keeping. If the screen shows more than one event, pick the one that is the clear focus of the screen (e.g. an open invite or the top message), not a list entry glimpsed in the background. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
 
 /// The built-in "Add event from screen" action (#39): group Work, input
 /// Screen, proposal `calendar_event` (#26), executor `calendar_add` (#34),
@@ -291,6 +291,38 @@ mod tests {
             "location": "",
             "notes": ""
         })
+    }
+
+    // -- BASE_PROMPT / non-vision composition (#247) ------------------------
+
+    #[test]
+    fn base_prompt_does_not_contradict_the_non_vision_preface() {
+        // provider::non_vision_request prefixes NON_VISION_PREFACE (which
+        // says "Instead of a screenshot, you are given the on-screen text
+        // recognized by OCR...") onto BASE_PROMPT. BASE_PROMPT must not
+        // then turn around and claim a screenshot is shown -- that is a
+        // literal contradiction inside one system prompt (#247).
+        let base = crate::provider::Request {
+            system: BASE_PROMPT.to_string(),
+            user: String::new(),
+            images: Vec::new(),
+            schema: None,
+            effort: crate::provider::Effort::Unset,
+            max_tokens: 0,
+        };
+        let composed =
+            crate::provider::non_vision_request(&base, "some ocr text", "some fields").system;
+        let after_instead = composed
+            .split("Instead of a screenshot")
+            .nth(1)
+            .expect("preface names the non-vision path");
+        assert!(
+            !after_instead
+                .to_lowercase()
+                .contains("you are shown a screenshot"),
+            "BASE_PROMPT still asserts a screenshot is shown after the non-vision \
+             preface says otherwise: {composed}"
+        );
     }
 
     // -- builtin_action ----------------------------------------------------
