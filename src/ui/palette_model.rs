@@ -531,11 +531,10 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
 // Footer
 // ---------------------------------------------------------------------------
 
-/// `"mode: Auto - openai:gpt-5"`, or just `"mode: Auto"` when
-/// `provider_model` is `None` (nothing configured / ready). No em dash
-/// (rule 11) -- a hyphen, matching the rest of this crate's footer-style
-/// strings.
-
+/// Display name for a `"<provider>:<model>"` label: `gpt-5.5` -> `GPT-5.5`,
+/// `claude-opus-4-8` -> `Claude Opus 4.8`, `gemini-3.8-flash` -> `Gemini 3.8
+/// Flash`. Anything unrecognised (Ollama tags, compat models) falls back to
+/// the model id without the provider prefix, or the raw string.
 fn friendly_model_name(provider_model: &str) -> String {
     let model = provider_model
         .split_once(':')
@@ -609,6 +608,8 @@ fn friendly_model_name(provider_model: &str) -> String {
     model.to_string()
 }
 
+/// `"Auto · GPT-5.5"`, or just `"Offline"` when `provider_model` is `None`
+/// (nothing configured / ready). No em dash (rule 11).
 pub fn footer_line(mode_label: &str, provider_model: Option<&str>) -> String {
     match provider_model {
         Some(pm) => {
