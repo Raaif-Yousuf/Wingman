@@ -550,6 +550,17 @@ fn restrict_log_acl_once_with(flag: &AclRestrictOnce, path: &std::path::Path) {
 }
 
 fn try_record(entry: &EgressEntry) -> Result<()> {
+    try_record_with(&EGRESS_LOG_ACL_RESTRICTED, entry)
+}
+
+/// The real body of [`try_record`], taking its ACL-once flag as a parameter
+/// rather than reaching for [`EGRESS_LOG_ACL_RESTRICTED`] directly. This is
+/// what lets a test exercise the write-then-restrict wiring against a flag
+/// nobody else can have spent, instead of racing every other test in the
+/// process that can also reach [`record`] (`provider::common`'s tests do,
+/// for real, as a side effect of the HTTP path they exercise) for the one
+/// shared process-wide attempt.
+fn try_record_with(flag: &AclRestrictOnce, entry: &EgressEntry) -> Result<()> {
     let path = log_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -563,7 +574,7 @@ fn try_record(entry: &EgressEntry) -> Result<()> {
     // freshly created file and one left behind by an older Wingman version
     // that never restricted it -- either way this process restricts it
     // exactly once, not on every append.
-    restrict_log_acl_once_with(&EGRESS_LOG_ACL_RESTRICTED, &path);
+    restrict_log_acl_once_with(flag, &path);
     Ok(())
 }
 
@@ -1142,9 +1153,15 @@ mod tests {
         // `log_path()` under `#[cfg(test)]` is one file per PROCESS (shared
         // by every test in this binary, including `provider::common`'s
         // egress-log tests), so this takes the same
-        // `EGRESS_PREVIEW_TEST_LOCK` those tests use to serialize access,
-        // and restores the file to empty afterwards rather than leaving a
-        // stray line for an unrelated test to trip over.
+        // `EGRESS_PREVIEW_TEST_LOCK` those tests use to serialize the file
+        // content, and restores it afterwards. The ACL-ONCE flag is a
+        // freshly constructed `AclRestrictOnce` passed straight to
+        // `try_record_with`, never `EGRESS_LOG_ACL_RESTRICTED` -- otherwise
+        // this test's outcome would depend on whether some other test
+        // (including `provider::common`'s, which really does call
+        // `record()`) already spent the process-wide attempt before this
+        // one runs, which is exactly the "leftover state and libtest
+        // ordering" failure mode a fresh flag rules out.
         let _guard = crate::config::EGRESS_PREVIEW_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1163,7 +1180,7 @@ mod tests {
         );
 
         crate::config::force_acl_failure_for_test(true);
-        let result = try_record(&entry);
+        let result = try_record_with(&AclRestrictOnce::new(), &entry);
         crate::config::force_acl_failure_for_test(false);
 
         assert!(
@@ -1183,10 +1200,15 @@ mod tests {
     #[cfg(windows)]
     fn try_record_restricts_the_real_log_path_acl() {
         // The wiring check itself, separate from the pure `AclRestrictOnce`
-        // logic above: proves `try_record` actually calls the ACL seam
-        // against the file `log_path()` returns, not just that the seam
-        // works in isolation. Same shared-file serialization as the test
-        // above.
+        // logic above: proves `try_record`'s inner `try_record_with`
+        // actually calls the ACL seam against the file `log_path()`
+        // returns, not just that the seam works in isolation.
+        //
+        // Same shared-file content serialization as the test above, but a
+        // freshly constructed `AclRestrictOnce` for the ACL-once gate, for
+        // the same reason: this test must observe ITS OWN call restricting
+        // the file, not ride on some earlier test (in any thread, in any
+        // order) having already spent the process-wide static.
         let _guard = crate::config::EGRESS_PREVIEW_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1203,7 +1225,7 @@ mod tests {
             Outcome::Success,
             None,
         );
-        try_record(&entry).expect("try_record should succeed");
+        try_record_with(&AclRestrictOnce::new(), &entry).expect("try_record should succeed");
 
         let output = std::process::Command::new("icacls")
             .arg(&path)
