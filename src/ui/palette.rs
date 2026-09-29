@@ -853,6 +853,10 @@ fn colorref_to_d2d(c: COLORREF) -> D2D1_COLOR_F {
     }
 }
 
+fn selected_row_color() -> COLORREF {
+    COLORREF(0x0098_7858)
+}
+
 /// D2D/DirectWrite equivalent of `draw_text_line` (imported from
 /// `crate::ui::text` for the GDI fallback path below): draws one line of
 /// `text` in `rect` (logical/DIP coordinates -- see the module doc comment)
@@ -1348,12 +1352,31 @@ impl PaletteInner {
                     if i == self.state.selected || self.hover == Some(i) {
                         if let Ok(hl) = unsafe {
                             target.CreateSolidColorBrush(
-                                &colorref_to_d2d(COLORREF(0x0045_3A2E)) as *const _,
+                                &colorref_to_d2d(selected_row_color()) as *const _,
                                 None,
                             )
                         } {
                             unsafe {
                                 target.FillRectangle(&row_rect as *const _, &hl);
+                            }
+                        }
+                    }
+                    if i == self.state.selected {
+                        let accent_rect = D2D_RECT_F {
+                            left: row_rect.left,
+                            top: row_rect.top,
+                            right: row_rect.left + 3.0,
+                            bottom: row_rect.bottom,
+                        };
+
+                        if let Ok(accent) = unsafe {
+                            target.CreateSolidColorBrush(
+                                &colorref_to_d2d(COLORREF(0x00FF_B080)) as *const _,
+                                None,
+                            )
+                        } {
+                            unsafe {
+                                target.FillRectangle(&accent_rect as *const _, &accent);
                             }
                         }
                     }
@@ -1471,9 +1494,20 @@ impl PaletteInner {
                     }
                     crate::ui::palette_model::Row::Action { name, .. } => {
                         if i == self.state.selected || self.hover == Some(i) {
-                            let hl = CreateSolidBrush(COLORREF(0x0045_3A2E));
+                            let hl = CreateSolidBrush(selected_row_color());
                             FillRect(hdc, &row_rect, hl);
                             let _ = DeleteObject(hl.into());
+                        }
+                        if i == self.state.selected {
+                            let accent = CreateSolidBrush(COLORREF(0x00FF_B080));
+                            let accent_rect = RECT {
+                                left: row_rect.left,
+                                top: row_rect.top,
+                                right: row_rect.left + scale(3, self.dpi),
+                                bottom: row_rect.bottom,
+                            };
+                            FillRect(hdc, &accent_rect, accent);
+                            let _ = DeleteObject(accent.into());
                         }
                         SetTextColor(hdc, COLORREF(0x00E6_E6E6));
                         draw_text_line(
@@ -1771,6 +1805,43 @@ mod tests {
         //          = 8 + 30 + 8 + 18 = 64
         const LIST_TOP: i32 = 64;
         const ROW_H: i32 = 26;
+
+        #[test]
+        fn selected_row_has_at_least_3_to_1_contrast_with_background() {
+            fn relative_luminance(color: windows::Win32::Foundation::COLORREF) -> f64 {
+                let channels = [
+                    color.0 & 0xFF,
+                    (color.0 >> 8) & 0xFF,
+                    (color.0 >> 16) & 0xFF,
+                ];
+
+                let linear = channels.map(|channel| {
+                    let value = channel as f64 / 255.0;
+                    if value <= 0.03928 {
+                        value / 12.92
+                    } else {
+                        ((value + 0.055) / 1.055).powf(2.4)
+                    }
+                });
+
+                0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+            }
+
+            let background = windows::Win32::Foundation::COLORREF(0x0026_2626);
+            let selected = crate::ui::palette::selected_row_color();
+
+            let background_luminance = relative_luminance(background);
+            let selected_luminance = relative_luminance(selected);
+
+            let lighter = background_luminance.max(selected_luminance);
+            let darker = background_luminance.min(selected_luminance);
+            let contrast = (lighter + 0.05) / (darker + 0.05);
+
+            assert!(
+                contrast >= 3.0,
+                "selected row contrast must be at least 3:1, got {contrast:.2}:1"
+            );
+        }
 
         #[test]
         fn y_in_the_header_padding_above_the_list_is_none() {
