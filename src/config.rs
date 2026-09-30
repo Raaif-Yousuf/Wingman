@@ -4094,15 +4094,13 @@ pub struct EgressPreview {
 /// uses, and for the same reason: `post_json_with` has a `Config`
 /// reference nowhere in its call chain, only a URL/body/headers/tag.
 ///
-/// STILL OWED (app.rs is out of this agent's file scope tonight, see the
-/// task's file-scope note): nothing calls [`set_egress_preview_enabled`]
-/// yet. `App::run` needs to call it once at startup right alongside its
-/// existing `mode::set_current(config.mode)` call, and `ui::settings`
-/// needs to call it again whenever the user changes the setting (once a
-/// Settings UI for it exists -- Phase 3, `ui/settings_window.rs`). Until
-/// then this defaults to `false`, so `egress_preview_enabled()` always
-/// returns `false` and every existing request path is completely
-/// unaffected -- verified by
+/// `App::run` calls [`set_egress_preview_enabled`] once at startup, right
+/// after `mode::set_current(config.mode)`, and `App::apply_config` calls it
+/// again after every Reload or Settings save, so a hand-edited
+/// `[egress_preview]` takes effect without a restart. STILL OWED: there is
+/// no Settings checkbox for it yet, so hand-editing `config.toml` is the
+/// only way to turn it on. Until something sets it this defaults to
+/// `false` -- verified by
 /// `egress_preview_enabled_defaults_to_false_until_something_sets_it` below.
 static EGRESS_PREVIEW_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
