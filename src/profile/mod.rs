@@ -25,8 +25,9 @@
 //! non-sensitive field without a per-field tick in the preview -- that
 //! product decision is still owed (expansion plan §15 item 2,
 //! `OWNER_TODO.md` item 3) and this module does not make it. It only makes
-//! sure the data model can express either answer: a future `fill_form`
-//! proposal builder can read `field.sensitive` and require a tick when
+//! sure the data model can express either answer: `actions::fill_form`
+//! reads `field.sensitive` (through its `effective_sensitive`, which also
+//! applies `config.forms.require_tick_for`) and requires a tick when
 //! true, whichever way the owner ultimately decides the untouched cases
 //! should default.
 //!
