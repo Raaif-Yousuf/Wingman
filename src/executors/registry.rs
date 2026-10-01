@@ -16,10 +16,11 @@ use super::Executor;
 /// Resolves an executor by name, or fails with the exact text an
 /// `actions.toml` naming an unknown executor surfaces on an error card
 /// (AGENTS.md rule 7: a load error, not a panic; rule 11: no em dash).
-// Unused outside its own test and `actions::resolve_executor` (also
-// `#[allow(dead_code)]`) until the confirm-card issue calls a resolved
-// executor for real -- see `executors::mod`'s `Effect` doc comment.
-#[allow(dead_code)]
+// Called directly from `app.rs`'s `copy_region`, `run_confirmed_form_fill`,
+// `run_confirmed_calendar_add` and `run_review_executor`, from
+// `actions::resolve_executor` (itself called from `app.rs`'s
+// `on_calendar_result`, `on_generic_action_result` and
+// `run_confirmed_generic_action`), and from `actions::extract_text`.
 pub fn resolve(name: &str) -> anyhow::Result<Box<dyn Executor>> {
     match name {
         "none" => Ok(Box::new(NoneExecutor)),

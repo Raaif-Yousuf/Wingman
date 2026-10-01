@@ -2,10 +2,14 @@
 //! target a UI element whose name or automation id reads as a final-action
 //! button: AGENTS.md's app description is explicit that "Wingman never
 //! presses Send, Submit, Buy or Pay", and the expansion plan's "rules every
-//! executor obeys" adds Place order and Checkout. Neither `replace_text`
-//! (#32) nor `fill_form` (#33) exists yet -- this is a pure function with no
-//! UIA dependency, so the *signature* future executors are written against
-//! is pinned now, before there is any UIA code to retrofit it into.
+//! executor obeys" adds Place order and Checkout. Both `replace_text` (#32)
+//! and `fill_form` (#33) now exist and call [`is_forbidden_target`] from
+//! their real, non-test write paths: `executors::replace_text::do_replace`
+//! (itself called from `ReplaceTextExecutor::execute`) and
+//! `executors::fill_form::evaluate_resolved_field` (called from
+//! `FillFormExecutor::execute`'s `do_fill`), plus `actions::fill_form`'s
+//! `is_fillable_candidate` filters a proposal's candidate fields the same
+//! way before they are ever shown on a preview card.
 //!
 //! **Scope: invokable elements only.** As with the English terms above,
 //! every term in [`SINGLE_WORD_DENY`]/[`PHRASE_DENY`] (including the
@@ -53,10 +57,6 @@
 /// "paga") and Dutch ("verzenden", "kopen", "betalen", "afrekenen"). See the
 /// module doc comment's "#204 (closed)" paragraph for scope and the
 /// accepted cross-language false-positive trade-off.
-// Unused outside its own tests until #32/#33 exist to call it -- this
-// module ships the signature and the pure logic ahead of any real UIA call
-// (see the module doc comment).
-#[allow(dead_code)]
 const SINGLE_WORD_DENY: &[&str] = &[
     "send",
     "submit",
@@ -92,7 +92,6 @@ const SINGLE_WORD_DENY: &[&str] = &[
 /// token nor the "checkout" substring), plus two localized phrases --
 /// German "jetzt kaufen" ("buy now") and Portuguese "finalizar compra"
 /// ("complete purchase" / checkout).
-#[allow(dead_code)]
 const PHRASE_DENY: &[&str] = &[
     "place order",
     "checkout",
@@ -105,12 +104,10 @@ const PHRASE_DENY: &[&str] = &[
 /// any executor to target. Checked against both: either can carry the label
 /// a real app puts on a button (see the expansion plan's `inputs/uia.rs`
 /// row: UIA elements expose both Name and AutomationId).
-#[allow(dead_code)]
 pub fn is_forbidden_target(element_name: &str, automation_id: &str) -> bool {
     candidate_denied(element_name) || candidate_denied(automation_id)
 }
 
-#[allow(dead_code)]
 fn candidate_denied(candidate: &str) -> bool {
     let normalized = normalize(candidate);
 
@@ -129,7 +126,6 @@ fn candidate_denied(candidate: &str) -> bool {
 /// [`candidate_denied`]'s phrase check and [`tokenize`]'s per-token check
 /// (#204: deny terms are matched accent-insensitively, e.g. an accented
 /// respelling of "payer" still matches "payer").
-#[allow(dead_code)]
 fn normalize(s: &str) -> String {
     s.chars()
         .flat_map(|c| c.to_lowercase())
@@ -146,7 +142,6 @@ fn normalize(s: &str) -> String {
 /// Anything not in the table (including `ß`, which does not fold to a
 /// single character -- a true fold is "ss", a whole-string transform this
 /// per-`char` function cannot express) passes through unchanged.
-#[allow(dead_code)]
 fn strip_diacritics(c: char) -> char {
     match c {
         'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
@@ -168,7 +163,6 @@ fn strip_diacritics(c: char) -> char {
 /// (#204) happens per input character, before the uppercase-transition
 /// check, so an accented letter's OWN case still counts for the camelCase
 /// boundary the same way its unaccented equivalent would.
-#[allow(dead_code)]
 fn tokenize(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
