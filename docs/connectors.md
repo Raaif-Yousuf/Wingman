@@ -160,13 +160,6 @@ file behind and is not propagated as an error: the write, which is the part
 this connector fully controls, already succeeded (see `create_calendar_event`'s
 own doc comment).
 
-`ics.rs` also best-effort cleans up its own old output: every call to
-`create_calendar_event` sweeps `.ics` files it previously wrote in the same
-temp directory that are older than a short retention window, before writing
-the new one. See `cleanup_stale_ics_files` and `MAX_ICS_FILE_AGE` in that
-file for the exact rule; cleanup failures are always ignored; they never
-fail the calendar-add action (issue #238).
-
 ## How to add a connector
 
 1. **Decide the capability.** If it is calendar writes, implement
