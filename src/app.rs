@@ -2222,8 +2222,14 @@ impl App {
 
     fn start_learning(&mut self, which: usize) {
         let Some(hook) = &self.hook else {
-            self.card
-                .show_error("Hotkeys unavailable", "The keyboard hook is not installed.");
+            // Issue #356: same wording as the sibling install failure at
+            // app start (above, around line 379), so re-binding a key hits
+            // the same dead end with the same way out, instead of leaving
+            // the user stuck with no next step.
+            self.card.show_error(
+                "Hotkeys unavailable",
+                "The keyboard hook is not installed. Use Ask now from the tray menu instead.",
+            );
             return;
         };
         hook.start_learning(which);
