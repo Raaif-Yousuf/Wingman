@@ -177,6 +177,12 @@ pub struct SendToken(());
 /// never passes through this module on the send path, only proof that a
 /// decision happened. Field-private for the same reason `Confirmed`'s is:
 /// nothing outside this module can construct one directly.
+///
+/// This is now an automated gate, not just a doc comment (#256, the same
+/// pattern #203 established for `Confirmed<P>`): `tests/compile_fail.rs`
+/// (via `tests/compile_fail/send_authorized_is_private.rs`) `include!`s
+/// this file into a throwaway crate with a sibling `attacker` module and
+/// proves that module still cannot construct `SendAuthorized(())` directly.
 #[allow(dead_code)]
 pub struct SendAuthorized(());
 
