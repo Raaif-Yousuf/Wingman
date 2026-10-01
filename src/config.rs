@@ -1722,7 +1722,7 @@ win = true
         let path = scratch_path("missing");
         assert!(!path.exists());
 
-        let config = Config::load_from(&path).expect("load should succeed");
+        let config = Config::load_from_with(&path, &|_| None).expect("load should succeed");
         assert_eq!(config.providers.order, vec!["openai", "anthropic"]);
         assert_eq!(config.hotkeys.primary.vk, 0x86);
         assert_eq!(config.capture.max_edge, 1568);
@@ -2449,7 +2449,7 @@ api_key = "sk-x"
 "#;
         std::fs::write(&path, old).unwrap();
 
-        let loaded = Config::load_from(&path).unwrap();
+        let loaded = Config::load_from_with(&path, &|_| None).unwrap();
         assert!(!loaded.providers.openai.models.is_empty());
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -2562,7 +2562,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         );
         std::fs::write(&path, &doc).unwrap();
 
-        let loaded = Config::load_from(&path).unwrap();
+        let loaded = Config::load_from_with(&path, &|_| None).unwrap();
         assert_eq!(loaded.ui.prompt, DEFAULT_PROMPT);
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -3724,7 +3724,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let contents = include_str!("../tests/fixtures/config/pre_rename_copilot_ask.toml");
         let path = write_fixture("golden-pre-rename", contents);
 
-        let cfg = Config::load_from(&path).expect("load should succeed");
+        let cfg = Config::load_from_with(&path, &|_| None).expect("load should succeed");
 
         assert_eq!(
             cfg.hotkeys.primary,
@@ -3787,7 +3787,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let contents = include_str!("../tests/fixtures/config/before_gemini_ollama.toml");
         let path = write_fixture("golden-before-gemini-ollama", contents);
 
-        let cfg = Config::load_from(&path).expect("load should succeed");
+        let cfg = Config::load_from_with(&path, &|_| None).expect("load should succeed");
 
         assert_eq!(
             cfg.hotkeys.primary,
@@ -3845,7 +3845,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let contents = include_str!("../tests/fixtures/config/before_modes.toml");
         let path = write_fixture("golden-before-modes", contents);
 
-        let cfg = Config::load_from(&path).expect("load should succeed");
+        let cfg = Config::load_from_with(&path, &|_| None).expect("load should succeed");
 
         assert_eq!(
             cfg.hotkeys.primary,
@@ -3912,7 +3912,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let contents = include_str!("../tests/fixtures/config/unknown_future_keys.toml");
         let path = write_fixture("golden-unknown-keys", contents);
 
-        let cfg = Config::load_from(&path).expect("load should succeed despite unknown keys");
+        let cfg = Config::load_from_with(&path, &|_| None).expect("load should succeed despite unknown keys");
 
         assert_eq!(
             cfg.hotkeys.primary,
@@ -4115,11 +4115,12 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
     /// Issue #282: `apply_env_overrides` must still actually read the real
     /// process environment in production, not just delegate to a lookup
     /// that is wired to nothing (AGENTS.md rule 8's "state the one
-    /// observable that would differ"). Every other test in this file now
-    /// goes through `apply_overrides_from`/`load_from_with`'s injected
-    /// lookup instead of the real environment, so this is the only test
-    /// left that touches OPENAI_API_KEY for real -- and being the only one,
-    /// it has no sibling to race, so it needs no lock.
+    /// observable that would differ"). Every other test in this file loads
+    /// through `apply_overrides_from`/`load_from_with`'s injected lookup
+    /// instead of the real environment, so none of them can see the
+    /// OPENAI_API_KEY this test sets for a moment, and it needs no lock.
+    /// Keep it that way: a new test that calls plain `load_from` and
+    /// asserts on a key would race this one.
     #[test]
     fn apply_env_overrides_reads_the_real_process_environment() {
         std::env::set_var("OPENAI_API_KEY", "real-env-wiring-check");
