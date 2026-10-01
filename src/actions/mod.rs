@@ -190,12 +190,13 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 ///   `confirm: false` matches the real behaviour: the `"clipboard"`
 ///   executor is `Effect::ReadOnly`, so `actions::extract_text::run_pipeline`
 ///   auto-confirms it, exactly like `"check-my-work"`'s `"none"` executor.
-///   This entry is catalogue metadata for the palette (#25, not yet built)
-///   -- nothing on the real execution path (`ui/tray.rs`'s
-///   `cmd::EXTRACT_TEXT` -> `App::extract_text` ->
-///   `actions::extract_text::{capture_screen, recognize_and_copy}`) reads
-///   this `Action` value back today, the same inert-until-its-caller-exists
-///   status `Action::hotkey` already has.
+///   The Quick Ask palette (#25) reads this entry to list the action, and
+///   picking it dispatches through `DispatchTarget::ExtractText`
+///   (`ui/palette_model.rs`) to `App::extract_text`, the same function the
+///   tray's `cmd::EXTRACT_TEXT` calls. The execution path itself
+///   (`App::extract_text` ->
+///   `actions::extract_text::{capture_screen, recognize_and_copy}`) still
+///   does not read this `Action` value's `proposal`/`executor` fields back.
 /// - `"add-to-calendar"` (#39, `calendar::builtin_action`): the first action
 ///   that runs the full Look/Propose/Confirm/Do loop end to end.
 /// - `"review-this-email"` (#38, `review_email::builtin_action`): the
