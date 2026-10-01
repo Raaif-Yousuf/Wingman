@@ -1228,7 +1228,19 @@ impl CardInner {
     /// same text a sighted user reads off the card (issue #354; full UIA
     /// provider wiring is #119, out of scope here).
     fn set_window_text_for_pending_stage(&self) {
-        let text = wide_z(&pending_status_text(&self.pending_stage));
+        self.set_window_text(&pending_status_text(&self.pending_stage));
+    }
+
+    /// `SetWindowTextW` with `text`. Generalizes
+    /// `set_window_text_for_pending_stage` (issue #354) to every other
+    /// state the card can show (issue #356): the window's own accessible
+    /// name should always match whatever a sighted user currently reads off
+    /// the card, not stay the static "Wingman" set once at `Card::create`.
+    /// No "Wingman:" prefix, same as the Pending precedent -- the app's own
+    /// identity is a separate concern assistive tech already gets from the
+    /// window/process, not something the window's own name needs to repeat.
+    fn set_window_text(&self, text: &str) {
+        let text = wide_z(text);
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
                 self.hwnd,
@@ -1252,6 +1264,11 @@ impl CardInner {
         self.state = CardState::Collapsed;
         self.scroll_offset = 0;
         self.scroll_max = 0;
+        // Issue #356: the window's accessible name follows the card, same
+        // reasoning as `set_window_text_for_pending_stage` (#354) -- covers
+        // show_answer, show_error, show_error_with_details and
+        // show_settings_needed, every one of which funnels through here.
+        self.set_window_text(headline);
         // Issue #347: every ordinary show_answer/show_error call starts a
         // plain card, not a "click to open Settings" prompt -- only
         // `Card::show_settings_needed` sets this, right after this call
@@ -1283,6 +1300,11 @@ impl CardInner {
         self.kill_timers();
         self.set_noactivate(true);
         self.state = CardState::Hidden;
+        // Issue #356: no headline is showing any more, so the accessible
+        // name reverts to the plain app name set at `Card::create`, rather
+        // than leaking the last-shown headline into a window nothing is
+        // displaying.
+        self.set_window_text("Wingman");
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
@@ -2289,6 +2311,11 @@ impl CardInner {
         self.state = CardState::Preview;
         self.scroll_offset = 0;
         self.scroll_max = 0;
+        // Issue #356: same reasoning as `show_collapsed` -- the window's
+        // accessible name follows whatever the card is showing, here the
+        // preview's own title (e.g. "Add to calendar") standing in for a
+        // headline.
+        self.set_window_text(title);
 
         // Preview needs real keyboard focus (typing into an editable field,
         // Enter, Esc), unlike Pending/Collapsed -- see the "Focus" note on
