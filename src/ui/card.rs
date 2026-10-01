@@ -597,7 +597,7 @@ impl Theme {
     }
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> u32 {
+const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
@@ -653,19 +653,61 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
-/// Picks a legible label colour (near-black ink or near-white) for text sat
-/// on top of `fill`, using perceived luminance (ITU-R BT.601 weights) so a
-/// light fill (amber) gets dark ink and a dark fill (green/red/purple) gets
-/// white, per spec ("a yellow fill with white text is not [fine]").
-fn badge_text_color(fill: u32) -> u32 {
-    let r = (fill & 0xFF) as f32;
-    let g = ((fill >> 8) & 0xFF) as f32;
-    let b = ((fill >> 16) & 0xFF) as f32;
-    let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-    if luminance > 140.0 {
-        rgb(0x20, 0x20, 0x20)
+/// One sRGB channel (0..=255), gamma-expanded to linear light per the WCAG 2
+/// relative luminance formula (https://www.w3.org/TR/WCAG21/#dfn-relative-luminance).
+fn srgb_channel_to_linear(channel: u8) -> f64 {
+    let c = channel as f64 / 255.0;
+    if c <= 0.03928 {
+        c / 12.92
     } else {
-        rgb(0xff, 0xff, 0xff)
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// WCAG 2 relative luminance of a packed `0x00BBGGRR` colour (the same
+/// layout [`rgb`] builds): linearize each channel, then combine with the
+/// standard luma weights.
+fn relative_luminance(color: u32) -> f64 {
+    let r = (color & 0xFF) as u8;
+    let g = ((color >> 8) & 0xFF) as u8;
+    let b = ((color >> 16) & 0xFF) as u8;
+    0.2126 * srgb_channel_to_linear(r)
+        + 0.7152 * srgb_channel_to_linear(g)
+        + 0.0722 * srgb_channel_to_linear(b)
+}
+
+/// WCAG 2 contrast ratio between two relative luminances
+/// (https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio): the lighter one over
+/// the darker, each padded by 0.05 so black-on-black still gives a defined
+/// 1:1 rather than dividing by zero.
+fn contrast_ratio(l1: f64, l2: f64) -> f64 {
+    let (lighter, darker) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+/// The near-black ink used for badges whose fill reads as light, and the
+/// white used for badges whose fill reads as dark. Kept as the exact colours
+/// `badge_text_color` returns (not pure `#000000`/`#ffffff`) so the contrast
+/// math below matches what is actually painted.
+const BADGE_INK_DARK: u32 = rgb(0x20, 0x20, 0x20);
+const BADGE_INK_LIGHT: u32 = rgb(0xff, 0xff, 0xff);
+
+/// Picks whichever of near-black or white text gives the higher WCAG 2
+/// contrast ratio (https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio) against
+/// `fill`, rather than thresholding a flat BT.601 luma as before. That flat
+/// threshold (luma > 140) could pick the wrong ink: the issue that prompted
+/// this rewrite measured white text on the red gradient stop at well under
+/// WCAG AA's 4.5:1 for small text, a case the old threshold did not catch.
+/// `badge_text_color_contrasts_with_its_fill` below checks every fill colour
+/// the badge actually uses (every 1..=10 gradient rank plus Ultra).
+fn badge_text_color(fill: u32) -> u32 {
+    let fill_luminance = relative_luminance(fill);
+    let dark_contrast = contrast_ratio(fill_luminance, relative_luminance(BADGE_INK_DARK));
+    let light_contrast = contrast_ratio(fill_luminance, relative_luminance(BADGE_INK_LIGHT));
+    if dark_contrast >= light_contrast {
+        BADGE_INK_DARK
+    } else {
+        BADGE_INK_LIGHT
     }
 }
 
@@ -3691,22 +3733,62 @@ mod tests {
 
     #[test]
     fn badge_text_color_contrasts_with_its_fill() {
-        // A light (amber) fill must get dark ink, not white-on-yellow.
-        let amber = difficulty_color(Difficulty::Level(5));
-        assert_eq!(badge_text_color(amber), rgb(0x20, 0x20, 0x20));
+        // Every fill colour the badge actually paints (issue #356): ranks
+        // 1..=10 plus Ultra, via `difficulty_color` -- the only caller of
+        // `badge_text_color` (`paint_difficulty_badge`).
+        let difficulties: Vec<Difficulty> = (1..=10u8)
+            .map(Difficulty::Level)
+            .chain(std::iter::once(Difficulty::Ultra))
+            .collect();
 
-        // Darker fills (green, red, purple) must get white ink.
-        for d in [
-            Difficulty::Level(1),
-            Difficulty::Level(10),
-            Difficulty::Ultra,
-        ] {
+        for d in difficulties {
             let fill = difficulty_color(d);
-            assert_eq!(
-                badge_text_color(fill),
-                rgb(0xff, 0xff, 0xff),
-                "{d:?} fill {fill:#08x} should contrast with white text"
+            let text = badge_text_color(fill);
+            assert!(
+                text == BADGE_INK_DARK || text == BADGE_INK_LIGHT,
+                "{d:?} fill {fill:#08x}: badge_text_color returned neither badge ink"
             );
+
+            let fill_luminance = relative_luminance(fill);
+            let dark_ratio = contrast_ratio(fill_luminance, relative_luminance(BADGE_INK_DARK));
+            let light_ratio = contrast_ratio(fill_luminance, relative_luminance(BADGE_INK_LIGHT));
+            let chosen_ratio = if text == BADGE_INK_DARK {
+                dark_ratio
+            } else {
+                light_ratio
+            };
+            let best_ratio = dark_ratio.max(light_ratio);
+
+            // The actual bug this rewrite fixes: `badge_text_color` must
+            // always pick whichever ink gives the higher ratio. The old flat
+            // BT.601-luma threshold did not: it picked white for the
+            // Level(1) green stop, whose real WCAG black-ink ratio (about
+            // 4.83:1) is higher than its white-ink ratio (about 3.37:1).
+            assert!(
+                (chosen_ratio - best_ratio).abs() < 1e-9,
+                "{d:?} fill {fill:#08x}: chose a {chosen_ratio:.3}:1 ink when {best_ratio:.3}:1 was achievable"
+            );
+
+            // Level(9)'s fill (#dc4523) is the one gradient stop that
+            // cannot reach WCAG AA's 4.5:1 for small text with EITHER ink
+            // (best achievable is white at about 4.27:1, computed by this
+            // same formula, not eyeballed) -- noted rather than silently
+            // waived: every other fill must clear 4.5:1 with the ink
+            // actually chosen.
+            if d == Difficulty::Level(9) {
+                assert!(
+                    best_ratio < 4.5,
+                    "Level(9) was the one fill expected to fall short of AA with both inks; if the \
+                     gradient changed and it now clears 4.5:1, this note (and the `else` branch \
+                     below) should cover it instead"
+                );
+            } else {
+                assert!(
+                    chosen_ratio >= 4.5,
+                    "{d:?} fill {fill:#08x}: chosen ink only reaches {chosen_ratio:.3}:1, below \
+                     WCAG AA's 4.5:1 for small text"
+                );
+            }
         }
     }
 
