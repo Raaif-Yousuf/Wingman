@@ -292,15 +292,12 @@ pub fn visible(merged: Vec<Resolved>, disabled_groups: &[String]) -> Vec<Resolve
         .collect()
 }
 
-/// Resolves an action's `executor` field (today validated as present but
-/// never resolved to anything, per the action-model design doc's "What
-/// stays out of scope") to a real [`crate::executors::Executor`]. The one
-/// call site connecting the two: see
+/// Resolves an action's `executor` field to a real
+/// [`crate::executors::Executor`], per
 /// `docs/superpowers/specs/2026-09-17-executor-design.md` ("Registry",
-/// "Minimal wiring into `actions/`"). Nothing calls this outside its own
-/// test yet -- wiring `app.rs`'s worker to run the resolved executor after
-/// a real confirm click is the confirm-card issue's job, not #31's.
-#[allow(dead_code)]
+/// "Minimal wiring into `actions/`"). Called from `app.rs`'s
+/// `on_calendar_result`, `on_generic_action_result` and
+/// `run_confirmed_generic_action` after a real confirm click.
 pub fn resolve_executor(action: &Action) -> anyhow::Result<Box<dyn crate::executors::Executor>> {
     crate::executors::registry::resolve(&action.executor)
 }
