@@ -129,7 +129,12 @@ pub fn is_offline_now() -> bool {
 /// `cargo test` runs tests in parallel by default, and this atomic is
 /// process-wide, so two such tests running concurrently without a shared
 /// lock could observe each other's writes. Mirrors `config.rs`'s
-/// `ENV_LOCK` for the same reason (process-wide env vars).
+/// `EGRESS_PREVIEW_TEST_LOCK` for the same reason (a process-wide static
+/// mutated from more than one test). `config.rs` used to also keep an
+/// `ENV_LOCK` for this reason, guarding the real `OPENAI_API_KEY`/
+/// `ANTHROPIC_API_KEY`/`GEMINI_API_KEY` environment variables; issue #282
+/// removed it by having every test but one go through an injected lookup
+/// instead of the real environment, leaving nothing left there to race.
 #[cfg(test)]
 pub(crate) static MODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
