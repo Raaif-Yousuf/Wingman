@@ -1236,16 +1236,39 @@ fn unreadable_as_empty(key: &str) -> String {
 }
 
 /// [`Providers::describe`]'s result: display-safe fields for one
-/// `providers.order` entry. `api_key` is never redacted here -- it is the
-/// raw (possibly empty, possibly [`UNREADABLE_KEY_MARKER`]) field, and
-/// `None` only for a provider with no key concept at all (Ollama). The
-/// caller (`diagnostics::provider_rows`) is responsible for turning it into
-/// a [`crate::diagnostics::KeyStatus`] before anything is displayed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `providers.order` entry. `api_key` is never redacted on the field itself
+/// -- it is the raw (possibly empty, possibly [`UNREADABLE_KEY_MARKER`])
+/// value, and `None` only for a provider with no key concept at all
+/// (Ollama). The caller (`diagnostics::provider_rows`) is responsible for
+/// turning it into a [`crate::diagnostics::KeyStatus`] before anything is
+/// displayed. `Debug` is hand-rolled below to redact `api_key`, mirroring
+/// [`ProviderConfig`]/[`CompatConfig`] (#157, #240), so the raw value is
+/// still never printed.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ProviderDescriptor {
     pub name: String,
     pub model: String,
     pub api_key: Option<String>,
+}
+
+/// Redacts `api_key` so a future `eprintln!("{descriptor:?}")`, panic hook
+/// or diagnostics dump can never print a live key by accident (#240, same
+/// motivation as [`ProviderConfig`]'s impl above). Distinguishes "no key
+/// concept at all" (`None`, Ollama) from "empty" from "set" without ever
+/// printing the value itself.
+impl std::fmt::Debug for ProviderDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let api_key_display: &str = match self.api_key.as_deref() {
+            None => "<none>",
+            Some("") => "<unset>",
+            Some(_) => "<redacted>",
+        };
+        f.debug_struct("ProviderDescriptor")
+            .field("name", &self.name)
+            .field("model", &self.model)
+            .field("api_key", &api_key_display)
+            .finish()
+    }
 }
 
 /// The four provider kinds every `providers.order` name outside
@@ -3939,6 +3962,36 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
     fn describe_unrecognized_name_is_none() {
         let config = Config::default();
         assert!(config.providers.describe("bogus").is_none());
+    }
+
+    /// #240: `ProviderDescriptor` holds the same kind of raw `api_key` as
+    /// `ProviderConfig`/`CompatConfig`, so its `Debug` impl must redact it
+    /// the same way (modelled on `debug_format_never_contains_the_api_key`
+    /// above).
+    #[test]
+    fn provider_descriptor_debug_never_contains_the_api_key() {
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-real-secret-openai".to_string();
+        let d = config
+            .providers
+            .describe("openai")
+            .expect("openai resolves");
+
+        let debug_output = format!("{d:?}");
+        assert!(
+            !debug_output.contains("sk-real-secret-openai"),
+            "{debug_output}"
+        );
+        assert!(debug_output.contains("redacted"), "{debug_output}");
+
+        // `None` (no key concept, e.g. Ollama) must not be confused with a
+        // real, redacted key.
+        let ollama = config
+            .providers
+            .describe("ollama")
+            .expect("ollama resolves");
+        let ollama_debug = format!("{ollama:?}");
+        assert!(!ollama_debug.contains("redacted"), "{ollama_debug}");
     }
 
     #[test]
