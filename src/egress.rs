@@ -310,12 +310,43 @@ pub fn model_from(url: &str, body: &Value) -> Option<String> {
 /// #253 made this matter twice over: it is now the same function that
 /// scrubs the error text `provider::common` returns to the caller, which
 /// rule 7 puts on the card and which a user pastes into a bug report.
+///
+/// #302 item 6. A newline is still a hard boundary: a credential wrapped
+/// across a line break used to come out as two runs, the long first half
+/// redacted and a short tail (under [`MIN_TOKEN_CHARS`] on its own) left to
+/// survive in full. The run is now allowed to bridge a single `\n` when the
+/// part before it is already long enough to be redacted on length alone,
+/// since that is a guarantee, not a guess, that the whole thing was always
+/// going to be scrubbed -- bridging only ever widens a redaction that was
+/// already happening, never creates one in text that would otherwise be
+/// left alone.
 pub fn redact_opaque_tokens(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut run = String::new();
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         if is_wide_token_char(c) {
             run.push(c);
+        } else if c == '\n'
+            && run.chars().count() >= MIN_TOKEN_CHARS
+            && chars.peek().is_some_and(|&next| is_wide_token_char(next))
+        {
+            // #302 item 6: a newline is still a hard boundary for `run`, so
+            // a credential wrapped across a line break used to come out as
+            // two runs -- the long first half got redacted, but a short
+            // tail (under MIN_TOKEN_CHARS on its own) survived in full.
+            //
+            // This is safe to bridge rather than flush: the run so far is
+            // already MIN_TOKEN_CHARS or longer, which on its own guarantees
+            // `flush_run` will redact it whole (the narrow fallback below
+            // has no character-class requirement, only this length floor),
+            // so absorbing the newline can only ever extend a redaction
+            // that was already going to happen, never create a new one in
+            // text that would otherwise be left alone. Dropping the newline
+            // here (instead of pushing it into `run`, which is not itself a
+            // token character) lets the run keep accumulating across the
+            // line break exactly as if it had not been there.
+            continue;
         } else {
             flush_run(&mut run, &mut out);
             out.push(c);
@@ -957,6 +988,37 @@ mod tests {
         let twenty = nineteen.clone() + "z"; // 20
         assert_eq!(twenty.chars().count(), 20);
         assert!(!redact_opaque_tokens(&twenty).contains(&twenty));
+    }
+
+    // -- #302 item 6: a key split across a newline --------------------------
+
+    /// The shape the issue describes: a `sk-`-style 40+ character key
+    /// wrapped onto a second line by whatever put it in the error text,
+    /// leaving a short tail (well under `MIN_TOKEN_CHARS`) on its own on the
+    /// second line. Before the fix this tail survived in full because the
+    /// newline split it from the long first run that triggered redaction.
+    #[test]
+    fn redact_opaque_tokens_scrubs_a_key_split_across_a_newline() {
+        let first = "sk-proj-ABCdefGHIjkl1234567890MNOPqr"; // 36 chars
+        let tail = "stUVWXYZ"; // 8 chars: short on its own
+        let message = format!("request failed: key {first}\n{tail} was rejected");
+
+        let redacted = redact_opaque_tokens(&message);
+        assert!(!redacted.contains(first), "{redacted}");
+        assert!(!redacted.contains(tail), "no tail may survive: {redacted}");
+        assert!(redacted.contains("[redacted]"), "{redacted}");
+        assert!(redacted.contains("request failed"), "{redacted}");
+        assert!(redacted.contains("was rejected"), "{redacted}");
+    }
+
+    /// The other half of the fix's safety case: ordinary prose that happens
+    /// to wrap onto a new line must come through untouched. Nothing in this
+    /// sentence is a 20+ character unbroken run of token characters, so the
+    /// bridging rule never engages.
+    #[test]
+    fn redact_opaque_tokens_leaves_a_normal_multiline_sentence_intact() {
+        let message = "The request failed because the connection\nwas reset by the remote host while streaming the response body.";
+        assert_eq!(redact_opaque_tokens(message), message);
     }
 
     #[test]
