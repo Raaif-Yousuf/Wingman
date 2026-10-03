@@ -636,7 +636,7 @@ impl Overlay {
 
         let mut dimmed = original.rgba.clone();
         dim_rgba(&mut dimmed, BACKGROUND_DIM_FACTOR);
-        let (background_bitmap, background_dc) =
+        let (background_bitmap, background_dc, background_old_bitmap) =
             build_background(&dimmed, original.width, original.height);
 
         let (hint_monitor, hint_dpi) = hint_monitor_and_dpi(desktop);
@@ -649,6 +649,7 @@ impl Overlay {
             original,
             background_bitmap,
             background_dc,
+            background_old_bitmap,
             dragging: false,
             drag_start: (0, 0),
             current_point: (0, 0),
@@ -685,7 +686,11 @@ impl Overlay {
             Err(e) => {
                 unsafe {
                     let inner = Box::from_raw(raw);
-                    free_background(inner.background_bitmap, inner.background_dc);
+                    free_background(
+                        inner.background_bitmap,
+                        inner.background_dc,
+                        inner.background_old_bitmap,
+                    );
                 }
                 return Err(anyhow::anyhow!(
                     "Wingman: CreateWindowExW (region overlay) failed: {e}"
@@ -811,12 +816,17 @@ impl Drop for Overlay {
                 let _ = DestroyWindow(self.inner.hwnd);
             }
         }
-        free_background(self.inner.background_bitmap, self.inner.background_dc);
+        free_background(
+            self.inner.background_bitmap,
+            self.inner.background_dc,
+            self.inner.background_old_bitmap,
+        );
         // Guard against a double-free if Drop somehow runs twice (it never
         // should, but HBITMAP/HDC's null check inside free_background makes
         // a repeat call harmless either way).
         self.inner.background_bitmap = HBITMAP(std::ptr::null_mut());
         self.inner.background_dc = HDC(std::ptr::null_mut());
+        self.inner.background_old_bitmap = HGDIOBJ(std::ptr::null_mut());
     }
 }
 
@@ -851,6 +861,12 @@ struct OverlayInner {
     /// `background_dc`; painted with `BitBlt` on every `WM_PAINT`.
     background_bitmap: HBITMAP,
     background_dc: HDC,
+    /// `background_dc`'s own default bitmap, as `SelectObject` returned it
+    /// when `background_bitmap` was selected in (see `build_background`).
+    /// `free_background` reselects this before deleting `background_bitmap`
+    /// and the DC (issue #229): a bitmap still selected into a DC cannot be
+    /// deleted.
+    background_old_bitmap: HGDIOBJ,
     dragging: bool,
     /// Overlay-local (space 2).
     drag_start: (i32, i32),
@@ -1163,11 +1179,24 @@ unsafe fn draw_hint(hdc: HDC, monitor: Rect, dpi: u32) {
 /// handles on any GDI failure; `on_paint` already checks for a null
 /// `background_dc` before using it, so this degrades to "no background
 /// drawn, selection rectangle still works" rather than a panic.
-fn build_background(rgba: &[u8], width: u32, height: u32) -> (HBITMAP, HDC) {
+///
+/// The third element is the DC's own default bitmap, as `SelectObject`
+/// returned it when the DIB section was selected in. `free_background`
+/// needs this back to reselect it before `DeleteObject`/`DeleteDC`: a
+/// bitmap still selected into a DC cannot be deleted (`DeleteObject`'s own
+/// documented contract), so without saving this, `free_background` has
+/// nothing to reselect and the DIB section leaks for the life of the
+/// process (issue #229). Same save-and-restore pattern as `draw_selection`
+/// and `draw_hint` in this file, and `text.rs`'s `with_memory_dc`.
+fn build_background(rgba: &[u8], width: u32, height: u32) -> (HBITMAP, HDC, HGDIOBJ) {
     unsafe {
         let mem_dc = CreateCompatibleDC(None);
         if mem_dc.0.is_null() {
-            return (HBITMAP(std::ptr::null_mut()), HDC(std::ptr::null_mut()));
+            return (
+                HBITMAP(std::ptr::null_mut()),
+                HDC(std::ptr::null_mut()),
+                HGDIOBJ(std::ptr::null_mut()),
+            );
         }
 
         let bmi = BITMAPINFO {
@@ -1189,7 +1218,11 @@ fn build_background(rgba: &[u8], width: u32, height: u32) -> (HBITMAP, HDC) {
             Ok(h) => h,
             Err(_) => {
                 let _ = DeleteDC(mem_dc);
-                return (HBITMAP(std::ptr::null_mut()), HDC(std::ptr::null_mut()));
+                return (
+                    HBITMAP(std::ptr::null_mut()),
+                    HDC(std::ptr::null_mut()),
+                    HGDIOBJ(std::ptr::null_mut()),
+                );
             }
         };
 
@@ -1204,13 +1237,20 @@ fn build_background(rgba: &[u8], width: u32, height: u32) -> (HBITMAP, HDC) {
             }
         }
 
-        SelectObject(mem_dc, HGDIOBJ(bmp.0));
-        (bmp, mem_dc)
+        let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+        (bmp, mem_dc, old_bitmap)
     }
 }
 
-fn free_background(bitmap: HBITMAP, dc: HDC) {
+fn free_background(bitmap: HBITMAP, dc: HDC, old_bitmap: HGDIOBJ) {
     unsafe {
+        if !dc.0.is_null() && !old_bitmap.0.is_null() {
+            // Reselect the DC's own original bitmap first: `DeleteObject`
+            // fails (per its documented contract) on a bitmap still
+            // selected into a DC, which left this DIB section permanently
+            // leaked before this reselect existed (issue #229).
+            SelectObject(dc, old_bitmap);
+        }
         if !bitmap.0.is_null() {
             let _ = DeleteObject(HGDIOBJ(bitmap.0));
         }
