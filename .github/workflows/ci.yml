@@ -89,16 +89,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Cross-compiling ring (a build script that runs the ARM64 C compiler)
-      # needs the Visual Studio ARM64 build tools. THEORY (unverified): the
-      # windows-latest image ships this component; this step is idempotent
-      # and installs it if it is missing. Owner: confirm on the first run.
       - name: Ensure the pinned toolchain (rust-toolchain.toml) is installed
         run: rustup show
 
       - name: Add the ARM64 target
         run: rustup target add aarch64-pc-windows-msvc
 
+      # Cross-compiling ring (a build script that runs the ARM64 C compiler)
+      # needs the Visual Studio ARM64 build tools. THEORY (unverified): the
+      # windows-latest image ships this component; this step is idempotent
+      # and installs it if it is missing. Owner: confirm on the first run.
       - name: Ensure the VS ARM64 build tools
         shell: pwsh
         run: |
