@@ -4103,10 +4103,21 @@ mod tests {
             font_height_of(save)
         );
         // The window may have been clamped to this machine's work area, so
-        // only the width is compared to the suggestion.
+        // only the width is compared to the suggestion, and Windows also caps
+        // any window at the max track size (about the screen width).
+        // MEASURED 2026-10-02: the CI runner's ~1024px screen capped the
+        // doubled 1240px suggestion at 1044.
         let mut wr2 = windows::Win32::Foundation::RECT::default();
         unsafe { GetWindowRect(hwnd, &mut wr2) }.expect("GetWindowRect");
-        assert_eq!(wr2.right - wr2.left, suggested.right - suggested.left);
+        let max_track_w = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                windows::Win32::UI::WindowsAndMessaging::SM_CXMAXTRACK,
+            )
+        };
+        assert_eq!(
+            wr2.right - wr2.left,
+            (suggested.right - suggested.left).min(max_track_w)
+        );
         assert_eq!(unsafe { &*raw }.dpi, 192);
         assert_eq!(direct_child_count(hwnd), unsafe { &*raw }.children.len());
         assert_eq!(direct_child_count(hwnd), child_count);
