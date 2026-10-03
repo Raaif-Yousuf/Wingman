@@ -64,7 +64,7 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ, LOGFONTW, TEXTMETRICW,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
@@ -78,9 +78,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG,
     NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
-    WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WNDCLASSEXW, WS_CAPTION,
-    WS_CHILD, WS_DISABLED, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW, WNDCLASSEXW,
+    WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{Config, OllamaConfig, RequireTickFor};
@@ -650,7 +650,9 @@ const TBS_HORZ: i32 = 0x0000;
 /// numeric field after a failed Save.
 const EM_SETSEL: u32 = 0x00B1;
 
-use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::Graphics::Gdi::{
+    InvalidateRect, RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
@@ -678,12 +680,43 @@ fn fitted_height_dp(hwnd: HWND, dpi: u32) -> i32 {
             work_px = mi.rcWork.bottom - mi.rcWork.top;
         }
     }
+    fitted_height_for_work_px(work_px, dpi)
+}
+
+/// Pure core of [`fitted_height_dp`]: the window height in dp for a monitor
+/// work area `work_px` tall at `dpi`. A non-positive height (failed query)
+/// gives the full design height.
+fn fitted_height_for_work_px(work_px: i32, dpi: u32) -> i32 {
     if work_px <= 0 {
         return WIN_H_DP;
     }
     // Leave room for the title bar and a little breathing space.
     let avail_dp = (work_px * 96 / dpi.max(1) as i32) - 48;
     WIN_H_DP.min(avail_dp).max(MIN_WIN_H_DP)
+}
+
+/// `WM_DPICHANGED`'s suggested `(x, y, w, h)` clamped to the target
+/// monitor's work area the way `show_modal` does at open (#340): the height
+/// never exceeds `fitted_height_for_work_px`, and the window is slid up if
+/// its bottom would fall below the work area, so Save and Cancel stay on
+/// screen. `work` is the target monitor's `rcWork`.
+fn clamp_suggested_to_work(
+    pos: (i32, i32, i32, i32),
+    work: &windows::Win32::Foundation::RECT,
+    dpi: u32,
+) -> (i32, i32, i32, i32) {
+    let (x, mut y, w, mut h) = pos;
+    let work_h = work.bottom - work.top;
+    if work_h <= 0 {
+        return pos;
+    }
+    h = h
+        .min(to_px(fitted_height_for_work_px(work_h, dpi), dpi))
+        .max(1);
+    if y + h > work.bottom {
+        y = (work.bottom - h).max(work.top);
+    }
+    (x, y, w, h)
 }
 
 const WIN_W_DP: i32 = 620;
@@ -874,7 +907,17 @@ fn child_rect_px(
 unsafe fn on_dpi_changed(inner: &mut SettingsInner, wparam: WPARAM, lparam: LPARAM) {
     inner.dpi = dpi_from_wparam(wparam.0);
     if lparam.0 != 0 {
-        let (x, y, w, h) = suggested_pos(&*(lparam.0 as *const windows::Win32::Foundation::RECT));
+        let rect = &*(lparam.0 as *const windows::Win32::Foundation::RECT);
+        let mut pos = suggested_pos(rect);
+        let mon = MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            pos = clamp_suggested_to_work(pos, &mi.rcWork, inner.dpi);
+        }
+        let (x, y, w, h) = pos;
         let _ = SetWindowPos(inner.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
     apply_dpi(inner);
@@ -894,6 +937,9 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     let new = prompt_footer_layout(inner.content_top_dp, client_h_dp);
 
     let new_font = build_font(dpi);
+    // No repaint between the individual moves: one redraw at the end, so a
+    // drag across monitors does not flicker.
+    SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
     for c in &inner.children {
         let (x, y, w, h) = child_rect_px(c, &old, &new, dpi);
         let _ = SetWindowPos(c.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -911,7 +957,13 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     inner.font = new_font;
     // `win_h_dp` stays the baseline the recorded design rects were built
     // for, so every later change diffs against the same reference.
-    let _ = InvalidateRect(Some(inner.hwnd), None, true);
+    SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(1)), None);
+    let _ = RedrawWindow(
+        Some(inner.hwnd),
+        None,
+        None,
+        RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+    );
 }
 
 fn wide_z(s: &str) -> Vec<u16> {
@@ -2670,6 +2722,17 @@ fn put_on_clipboard(owner: HWND, text: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Test-only window class (rule 9): same `wndproc`, never the production
+    /// class name.
+    const TEST_CLASS_NAME: &str = "Wingman.Settings.Test.Window.7f3a91c2";
+
+    fn ensure_test_class(instance: HINSTANCE) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            assert!(unsafe { register_class_named(instance, TEST_CLASS_NAME) });
+        });
+    }
+
     // -- control ids -----------------------------------------------------
 
     #[test]
@@ -3621,14 +3684,14 @@ mod tests {
         let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         let instance = HINSTANCE(h.0);
 
-        assert!(ensure_class_registered(instance));
+        ensure_test_class(instance);
         ensure_common_controls();
 
         let config = Config::default();
         let inner = Box::new(SettingsInner::new(config.clone()));
         let raw = Box::into_raw(inner);
 
-        let class_name = wide_z(CLASS_NAME);
+        let class_name = wide_z(TEST_CLASS_NAME);
         let title = wide_z("Wingman settings (test)");
         let hwnd = unsafe {
             CreateWindowExW(
@@ -3735,14 +3798,14 @@ mod tests {
 
         let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         let instance = HINSTANCE(h.0);
-        assert!(ensure_class_registered(instance));
+        ensure_test_class(instance);
         ensure_common_controls();
 
         let mut config = Config::default();
         config.providers.openai.api_key = "sk-live-secret-should-not-appear-1234".to_string();
 
         let title = wide_z("Wingman settings (mask test)");
-        let class_name = wide_z(CLASS_NAME);
+        let class_name = wide_z(TEST_CLASS_NAME);
         let hwnd = unsafe {
             CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
@@ -3792,14 +3855,14 @@ mod tests {
 
         let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         let instance = HINSTANCE(h.0);
-        assert!(ensure_class_registered(instance));
+        ensure_test_class(instance);
         ensure_common_controls();
 
         let mut config = Config::default();
         config.providers.openai.api_key = crate::config::UNREADABLE_KEY_MARKER.to_string();
 
         let title = wide_z("Wingman settings (unreadable-marker test)");
-        let class_name = wide_z(CLASS_NAME);
+        let class_name = wide_z(TEST_CLASS_NAME);
         let hwnd = unsafe {
             CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
@@ -3922,8 +3985,6 @@ mod tests {
         assert_eq!(child_rect_px(&reset, &old, &new, 96).1, new.reset_btn_y);
     }
 
-    const TEST_CLASS_NAME: &str = "Wingman.Settings.Test.DpiChanged.7f3a91c2";
-
     fn font_height_of(hwnd: HWND) -> i32 {
         use windows::Win32::Graphics::Gdi::GetObjectW;
         use windows::Win32::UI::WindowsAndMessaging::WM_GETFONT;
@@ -3957,7 +4018,7 @@ mod tests {
 
         let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         let instance = HINSTANCE(h.0);
-        assert!(unsafe { register_class_named(instance, TEST_CLASS_NAME) });
+        ensure_test_class(instance);
         ensure_common_controls();
 
         let raw = Box::into_raw(Box::new(SettingsInner::new(Config::default())));
@@ -3981,22 +4042,34 @@ mod tests {
         }
         .expect("CreateWindowExW");
 
-        let inner = unsafe { &mut *raw };
-        inner.hwnd = hwnd;
-        inner.font = build_font(96);
+        // Cleanup runs even if an assertion below fails.
+        struct Guard(HWND, *mut SettingsInner);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                    drop(Box::from_raw(self.1));
+                }
+            }
+        }
+        let _guard = Guard(hwnd, raw);
+
+        // Short-lived access only: the wndproc mutates the same struct
+        // during SendMessageW, so no `&mut` is held across a send.
         let client_h_dp = client_size(hwnd).1;
-        let built = build_ui_recorded(
-            hwnd,
-            instance,
-            96,
-            inner.font,
-            &Config::default(),
-            client_h_dp,
-        );
-        inner.prompt_edit = built.prompt_edit;
-        inner.children = built.children;
-        inner.content_top_dp = built.content_top_dp;
-        inner.win_h_dp = built.win_h_dp;
+        let font = build_font(96);
+        let built = build_ui_recorded(hwnd, instance, 96, font, &Config::default(), client_h_dp);
+        {
+            let inner = unsafe { &mut *raw };
+            inner.hwnd = hwnd;
+            inner.font = font;
+            inner.prompt_edit = built.prompt_edit;
+            inner.children = built.children;
+            inner.content_top_dp = built.content_top_dp;
+            inner.win_h_dp = built.win_h_dp;
+        }
+        let child_count = unsafe { &*raw }.children.len();
+        assert_eq!(direct_child_count(hwnd), child_count);
 
         let save = get_dlg_item(hwnd, ID_SAVE).expect("Save button");
         assert_eq!(client_size(save), (BTN_W, BTN_H));
@@ -4029,10 +4102,20 @@ mod tests {
             "font must grow with the dpi: {font_96} -> {}",
             font_height_of(save)
         );
+        // The window may have been clamped to this machine's work area, so
+        // only the width is compared to the suggestion.
         let mut wr2 = windows::Win32::Foundation::RECT::default();
         unsafe { GetWindowRect(hwnd, &mut wr2) }.expect("GetWindowRect");
         assert_eq!(wr2.right - wr2.left, suggested.right - suggested.left);
-        assert_eq!(inner.dpi, 192);
+        assert_eq!(unsafe { &*raw }.dpi, 192);
+        assert_eq!(direct_child_count(hwnd), unsafe { &*raw }.children.len());
+        assert_eq!(direct_child_count(hwnd), child_count);
+
+        // Save's top edge sits where the footer layout for the new client
+        // height puts it, in dp at the new dpi.
+        let client_dp = (client_size(hwnd).1 * 96 / 192).max(1);
+        let footer = prompt_footer_layout(unsafe { &*raw }.content_top_dp, client_dp);
+        assert_eq!(top_in_parent_px(hwnd, save), to_px(footer.buttons_y, 192));
 
         // And back to 100%.
         let back = wr;
@@ -4046,11 +4129,78 @@ mod tests {
         }
         assert_eq!(client_size(save), (BTN_W, BTN_H));
         assert_eq!(font_height_of(save), font_96);
+    }
 
-        unsafe {
-            let _ = DestroyWindow(hwnd);
-            drop(Box::from_raw(raw));
+    fn direct_child_count(hwnd: HWND) -> usize {
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindow, GW_CHILD, GW_HWNDNEXT};
+        let mut n = 0;
+        let mut cur = unsafe { GetWindow(hwnd, GW_CHILD) }.ok();
+        while let Some(c) = cur {
+            n += 1;
+            cur = unsafe { GetWindow(c, GW_HWNDNEXT) }.ok();
         }
+        n
+    }
+
+    fn top_in_parent_px(parent: HWND, child: HWND) -> i32 {
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut r = windows::Win32::Foundation::RECT::default();
+        unsafe { GetWindowRect(child, &mut r) }.expect("GetWindowRect");
+        let mut pt = windows::Win32::Foundation::POINT {
+            x: r.left,
+            y: r.top,
+        };
+        assert!(unsafe { ScreenToClient(parent, &mut pt) }.as_bool());
+        pt.y
+    }
+
+    // -- clamp_suggested_to_work (review of #233) -------------------------
+
+    fn work(top: i32, bottom: i32) -> windows::Win32::Foundation::RECT {
+        windows::Win32::Foundation::RECT {
+            left: 0,
+            top,
+            right: 1920,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn clamp_leaves_a_suggestion_that_fits_untouched() {
+        // 100% 1440p-ish work area is tall: nothing to clamp.
+        let pos = (100, 100, 620, 900);
+        assert_eq!(clamp_suggested_to_work(pos, &work(0, 1400), 96), pos);
+    }
+
+    #[test]
+    fn clamp_shrinks_a_tall_suggestion_to_a_200_percent_1080p_work_area() {
+        // 1040px work area at 200%: 1040*96/192 - 48 = 472dp -> 944px.
+        let (x, y, w, h) = clamp_suggested_to_work((50, 0, 1240, 1836), &work(0, 1040), 192);
+        assert_eq!((x, w), (50, 1240));
+        assert_eq!(h, to_px(472, 192));
+        assert!(y + h <= 1040, "bottom {} is below the work area", y + h);
+    }
+
+    #[test]
+    fn clamp_slides_the_window_up_when_its_bottom_would_leave_the_work_area() {
+        let (_, y, _, h) = clamp_suggested_to_work((0, 900, 620, 600), &work(0, 1040), 96);
+        assert_eq!(h, 600);
+        assert_eq!(y, 1040 - 600);
+    }
+
+    #[test]
+    fn clamp_never_moves_above_the_work_area_top() {
+        let (_, y, _, _) = clamp_suggested_to_work((0, -500, 620, 600), &work(0, 1040), 96);
+        assert!(y >= -500);
+        let (_, y2, _, h2) = clamp_suggested_to_work((0, 30, 620, 5000), &work(20, 1060), 96);
+        assert!(y2 >= 20 && y2 + h2 <= 1060);
+    }
+
+    #[test]
+    fn clamp_ignores_an_empty_work_area() {
+        let pos = (1, 2, 3, 4);
+        assert_eq!(clamp_suggested_to_work(pos, &work(0, 0), 96), pos);
     }
 
     #[test]
