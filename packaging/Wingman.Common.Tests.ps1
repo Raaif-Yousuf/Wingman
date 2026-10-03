@@ -962,7 +962,8 @@ Describe 'Get-ElevatedPowerShellArgumentList (issue #278)' {
         "C:\Users\O'Brien\Wingman\wingman.cer",
         "C:\x'; Write-Host pwned; '\wingman.cer",
         'C:\x"; Write-Host pwned; "\wingman.cer',
-        'C:\x`$(Write-Host pwned)\wingman.cer'
+        'C:\x`$(Write-Host pwned)\wingman.cer',
+        "C:\Users\Zo$([char]0xEB)\Wingman\wingman.cer"
     )
     BeforeAll {
         function script:Get-DecodedScript($ArgList) {
@@ -1025,13 +1026,93 @@ Describe 'Confirm-CertTrusted elevated command (issue #278)' {
 }
 
 Describe 'No elevated -Command string is built by interpolation (issue #278)' {
-    It '<_> never passes -Command to a child powershell' -ForEach @(
-        'Wingman.Common.psm1', '..\install.ps1', '..\uninstall.ps1'
-    ) {
-        $text = Get-Content -Raw (Join-Path $PSScriptRoot $_)
-        $text = $text -replace "`r`n", "`n"
+    # Every script in packaging\ (not the tests themselves, which name the
+    # pattern on purpose) plus the two top-level installers.
+    $script:guardFiles = @(
+        Get-ChildItem -Path $PSScriptRoot -Recurse -Include *.ps1, *.psm1 |
+            Where-Object { $_.Name -notlike '*.Tests.ps1' } |
+            ForEach-Object { $_.FullName }
+        (Join-Path $PSScriptRoot '..\install.ps1')
+        (Join-Path $PSScriptRoot '..\uninstall.ps1')
+    )
+    BeforeAll {
+        # -Command or its -c abbreviation, quoted either way or bare, on a
+        # non-comment line, case-insensitive.
+        $script:badPattern = '(?im)^[^#\n]*(?<![\w-])-(command|c)(?![\w-])'
+    }
+
+    It '<_> never passes -Command to a child powershell' -ForEach $script:guardFiles {
+        $text = (Get-Content -Raw $_) -replace "`r`n", "`n"
         # Guard against a vacuous pass: the file must have been read.
         $text.Length | Should -BeGreaterThan 500
-        $text | Should -Not -Match "(?m)^[^#\n]*'-Command'"
+        $text | Should -Not -Match $script:badPattern
+    }
+
+    It 'covers <_>' -ForEach @('Build-Msix.ps1', 'Wingman.Common.psm1', 'install.ps1', 'uninstall.ps1') {
+        # The discovery-time list is only visible to -ForEach, so cover it by
+        # asserting the names it was built from exist where the list looks.
+        $name = $_
+        $found = @(Get-ChildItem -Path $PSScriptRoot, (Join-Path $PSScriptRoot '..') -Filter $name -File)
+        $found.Count | Should -BeGreaterThan 0
+    }
+
+    It 'the pattern catches every spelling of the bad idiom' -ForEach @(
+        "Start-Process x -ArgumentList '-Command', `$x",
+        'Start-Process x -ArgumentList "-Command", $x',
+        "Start-Process x -ArgumentList '-c', `$x",
+        'powershell.exe -NoProfile -command "& { $x }"',
+        'powershell.exe -COMMAND $x'
+    ) {
+        $_ | Should -Match $script:badPattern
+    }
+
+    It 'the pattern leaves unrelated parameters and comments alone' -ForEach @(
+        'Import-Certificate -CertStoreLocation $x',
+        'Remove-Item $x -Confirm:$false',
+        '# powershell.exe -Command is banned'
+    ) {
+        $_ | Should -Not -Match $script:badPattern
+    }
+}
+
+Describe 'uninstall.ps1 elevated thumbprint removal (issue #278)' {
+    # Round-trips the REAL script text and -Data keys out of uninstall.ps1
+    # through the helper into a real non-elevated powershell.exe, with the
+    # cert store replaced by stubs, so a variable-name/-Data-key mismatch fails.
+    BeforeAll {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PSScriptRoot '..\uninstall.ps1'), [ref]$null, [ref]$null)
+        $call = $ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.GetCommandName() -eq 'Get-ElevatedPowerShellArgumentList' }, $true) | Select-Object -First 1
+        $call | Should -Not -BeNullOrEmpty
+        $els = $call.CommandElements
+        $script:realScript = $null; $script:dataKeys = @()
+        for ($i = 0; $i -lt $els.Count; $i++) {
+            if ($els[$i] -is [System.Management.Automation.Language.CommandParameterAst]) {
+                if ($els[$i].ParameterName -eq 'Script') { $script:realScript = $els[$i + 1].Value }
+                if ($els[$i].ParameterName -eq 'Data') {
+                    $script:dataKeys = @($els[$i + 1].KeyValuePairs | ForEach-Object { $_.Item1.Value })
+                }
+            }
+        }
+    }
+
+    It 'extracted the script and a data key from uninstall.ps1' {
+        $script:realScript | Should -Not -BeNullOrEmpty
+        $script:dataKeys | Should -Not -BeNullOrEmpty
+    }
+
+    It 'removes only the certificate whose thumbprint was passed as data' {
+        $stubs = @'
+function Get-ChildItem { [pscustomobject]@{ Thumbprint = 'AAAA' }; [pscustomobject]@{ Thumbprint = 'BBBB' } }
+function Remove-Item { process { Write-Output "REMOVED:$($_.Thumbprint)" } }
+
+'@
+        $data = [ordered]@{}
+        foreach ($k in $script:dataKeys) { $data[$k] = 'BBBB' }
+        $a = Get-ElevatedPowerShellArgumentList -Script ($stubs + $script:realScript) -Data $data
+        $out = & powershell.exe -NoProfile -NonInteractive @a
+        ($out -join "`n") | Should -BeExactly 'REMOVED:BBBB'
     }
 }
