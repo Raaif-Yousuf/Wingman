@@ -340,6 +340,12 @@ What leaves the machine, when, and how to wipe local state is in
 [`PRIVACY.md`](PRIVACY.md). To report a security issue, see
 [`SECURITY.md`](SECURITY.md).
 
+## How Wingman is built
+
+Wingman is built by me with Claude Code as a coding assistant. I decide what
+gets built, review every change, and read every message before it's posted.
+If something reads wrong, that's on me, and I'd like to hear about it.
+
 ## Contributing
 
 Wingman is meant to grow by community-contributed actions: a prompt, an
