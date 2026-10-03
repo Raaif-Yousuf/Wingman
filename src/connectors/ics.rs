@@ -93,51 +93,129 @@ impl Opener for ShellOpener {
 /// otherwise -- see that function's doc comment for why a floating time,
 /// not a bare `TZID` with no `VTIMEZONE`, is the fallback.
 pub trait LocalTimeConverter: Send + Sync {
-    /// `None` when the conversion cannot be performed (an invalid or
-    /// ambiguous wall-clock time during a DST transition, or the
-    /// underlying Win32 call failing for any other reason).
+    /// `None` when the conversion cannot be performed or cannot be trusted:
+    /// an invalid (spring-forward gap) or ambiguous (fall-back overlap)
+    /// wall-clock time, or a failing Win32 call. The Win32 API itself
+    /// reports success for the gap and overlap cases (MEASURED 2026-10-02,
+    /// see `checked_local_to_utc`), so the production converter detects
+    /// them itself and returns `None` so the caller falls back to a
+    /// floating local time instead of a possibly one-hour-wrong UTC time.
     fn to_utc(&self, at: &CivilDateTime) -> Option<CivilDateTime>;
 }
 
-/// Production [`LocalTimeConverter`]: `TzSpecificLocalTimeToSystemTime`
-/// against the machine's own currently active zone. Win32, so checked by
-/// hand per rule 8, not unit-tested directly -- the pure decision this
-/// feeds (`resolve_local_times`, below) is what is actually tested, with a
-/// scripted fake converter.
+/// The two Win32 zone calls the converter needs, behind a seam so the
+/// DST-gap and DST-overlap detection ([`checked_local_to_utc`]) is pure and
+/// testable with fake zone rules instead of the machine's own time zone.
+pub(crate) trait ZoneApi {
+    /// `TzSpecificLocalTimeToSystemTime`: never reports a DST gap or overlap
+    /// (see [`checked_local_to_utc`]'s MEASURED note).
+    fn local_to_utc(&self, local: &CivilDateTime) -> Option<CivilDateTime>;
+    /// `SystemTimeToTzSpecificLocalTime`: unambiguous for any UTC instant.
+    fn utc_to_local(&self, utc: &CivilDateTime) -> Option<CivilDateTime>;
+}
+
+/// Pure detection (issue #248). Converts `at` with `zone.local_to_utc`, then
+/// returns `None` unless the result is the one unique UTC instant for `at`.
+///
+/// MEASURED 2026-10-02 (`dst_live_win32_behaviour_for_gap_and_overlap`, a
+/// hand-built US Eastern `TIME_ZONE_INFORMATION`, never the machine's zone):
+/// `TzSpecificLocalTimeToSystemTime` succeeds for both bad cases, applying
+/// the daylight bias. Gap 2026-03-08 02:30 -> 06:30Z (it converts back to
+/// 01:30, not 02:30). Overlap 2026-11-01 01:30 -> 05:30Z (the first, EDT,
+/// occurrence; it converts back to 01:30 so a round trip alone cannot see
+/// it). Hence two checks:
+///
+/// 1. Gap: `utc_to_local(utc)` must equal `at`, else `at` never existed.
+/// 2. Overlap: no other UTC instant within a DST step of `utc` (30, 60 or
+///    120 minutes either side) may also map back to `at`, else `at` is
+///    ambiguous.
+pub(crate) fn checked_local_to_utc(
+    zone: &dyn ZoneApi,
+    at: &CivilDateTime,
+) -> Option<CivilDateTime> {
+    let utc = zone.local_to_utc(at)?;
+    if zone.utc_to_local(&utc)? != *at {
+        return None;
+    }
+    let utc_secs = civil_time::civil_datetime_to_unix(&utc);
+    for step in [1_800_i64, 3_600, 7_200] {
+        for signed in [step, -step] {
+            let other = civil_time::unix_to_civil_datetime(utc_secs + signed);
+            if zone.utc_to_local(&other).as_ref() == Some(at) {
+                return None;
+            }
+        }
+    }
+    Some(utc)
+}
+
+/// Production [`ZoneApi`] over Win32. `None` zone is the machine's own
+/// currently active zone; `Some` is an explicit zone (used by the live test
+/// so it never depends on, or changes, the machine's zone).
+pub(crate) struct Win32Zone(pub(crate) Option<windows::Win32::System::Time::TIME_ZONE_INFORMATION>);
+
+fn to_systemtime(at: &CivilDateTime) -> windows::Win32::Foundation::SYSTEMTIME {
+    windows::Win32::Foundation::SYSTEMTIME {
+        wYear: at.date.year as u16,
+        wMonth: at.date.month as u16,
+        wDay: at.date.day as u16,
+        wHour: at.hour as u16,
+        wMinute: at.minute as u16,
+        wSecond: at.second as u16,
+        wMilliseconds: 0,
+        wDayOfWeek: 0,
+    }
+}
+
+fn from_systemtime(t: &windows::Win32::Foundation::SYSTEMTIME) -> CivilDateTime {
+    CivilDateTime {
+        date: CivilDate {
+            year: t.wYear as i32,
+            month: t.wMonth as u8,
+            day: t.wDay as u8,
+        },
+        hour: t.wHour as u8,
+        minute: t.wMinute as u8,
+        second: t.wSecond as u8,
+    }
+}
+
+impl ZoneApi for Win32Zone {
+    fn local_to_utc(&self, local: &CivilDateTime) -> Option<CivilDateTime> {
+        use windows::Win32::Foundation::SYSTEMTIME;
+        use windows::Win32::System::Time::TzSpecificLocalTimeToSystemTime;
+
+        let local = to_systemtime(local);
+        let mut utc = SYSTEMTIME::default();
+        let tz = self.0.as_ref().map(|t| t as *const _);
+        // SAFETY: all pointers are to stack-local or `self`-owned values
+        // valid for the call; `None` asks for the machine's active zone.
+        unsafe { TzSpecificLocalTimeToSystemTime(tz, &local, &mut utc) }.ok()?;
+        Some(from_systemtime(&utc))
+    }
+
+    fn utc_to_local(&self, utc: &CivilDateTime) -> Option<CivilDateTime> {
+        use windows::Win32::Foundation::SYSTEMTIME;
+        use windows::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
+
+        let utc = to_systemtime(utc);
+        let mut local = SYSTEMTIME::default();
+        let tz = self.0.as_ref().map(|t| t as *const _);
+        // SAFETY: as in `local_to_utc`.
+        unsafe { SystemTimeToTzSpecificLocalTime(tz, &utc, &mut local) }.ok()?;
+        Some(from_systemtime(&local))
+    }
+}
+
+/// Production [`LocalTimeConverter`]: [`checked_local_to_utc`] over
+/// [`Win32Zone`] for the machine's own currently active zone. Win32, so the
+/// real call is checked by an `#[ignore]`d live test with an explicit zone;
+/// the detection is unit-tested with fake zone rules.
 pub struct Win32LocalTimeConverter;
 
 impl LocalTimeConverter for Win32LocalTimeConverter {
     fn to_utc(&self, at: &CivilDateTime) -> Option<CivilDateTime> {
-        use windows::Win32::Foundation::SYSTEMTIME;
-        use windows::Win32::System::Time::TzSpecificLocalTimeToSystemTime;
-
-        let local = SYSTEMTIME {
-            wYear: at.date.year as u16,
-            wMonth: at.date.month as u16,
-            wDay: at.date.day as u16,
-            wHour: at.hour as u16,
-            wMinute: at.minute as u16,
-            wSecond: at.second as u16,
-            wMilliseconds: 0,
-            wDayOfWeek: 0,
-        };
-        let mut utc = SYSTEMTIME::default();
-        // SAFETY: both SYSTEMTIME values are stack-local and valid for the
-        // duration of this call; `None` for the zone parameter asks for
-        // the machine's own currently active time zone, the same call
-        // `app.rs`'s `deadline_until_tomorrow` already makes for Pause.
-        unsafe { TzSpecificLocalTimeToSystemTime(None, &local, &mut utc) }.ok()?;
-
-        Some(CivilDateTime {
-            date: CivilDate {
-                year: utc.wYear as i32,
-                month: utc.wMonth as u8,
-                day: utc.wDay as u8,
-            },
-            hour: utc.wHour as u8,
-            minute: utc.wMinute as u8,
-            second: utc.wSecond as u8,
-        })
+        checked_local_to_utc(&Win32Zone(None), at)
     }
 }
 
@@ -407,11 +485,24 @@ fn format_event_time_property(name: &str, t: &EventTime) -> Result<String> {
 /// Pure given `converter` (a fake in every test below; the real
 /// `Win32LocalTimeConverter` only in production), so this is what is
 /// actually unit-tested, not the Win32 call itself.
+///
+/// All-or-nothing (#248 review): if any `Local` value fails to convert, every
+/// `Local` value is left floating. A floating start with a UTC end would read
+/// as a different duration depending on the calendar app's own zone, and the
+/// gap/overlap detection makes a one-sided failure reachable.
 fn resolve_local_times(event: &CalendarEvent, converter: &dyn LocalTimeConverter) -> CalendarEvent {
+    let start = resolve_one_time(&event.start, converter);
+    let end = event.end.as_ref().map(|t| resolve_one_time(t, converter));
+    let failed = |t: &EventTime, r: &EventTime| matches!(t, EventTime::Local { .. }) && t == r;
+    let any_failed = failed(&event.start, &start)
+        || matches!((&event.end, &end), (Some(t), Some(r)) if failed(t, r));
+    if any_failed {
+        return event.clone();
+    }
     CalendarEvent {
         title: event.title.clone(),
-        start: resolve_one_time(&event.start, converter),
-        end: event.end.as_ref().map(|t| resolve_one_time(t, converter)),
+        start,
+        end,
         location: event.location.clone(),
         description: event.description.clone(),
     }
@@ -1012,8 +1103,20 @@ END:VCALENDAR\r\n";
         assert_eq!(resolved.end, utc_event.end);
     }
 
-    #[test]
-    fn resolve_local_times_upgrades_both_start_and_end_independently() {
+    /// Fails only for one wall-clock hour, succeeds (noon UTC) otherwise.
+    struct FailAtHour(u8);
+
+    impl LocalTimeConverter for FailAtHour {
+        fn to_utc(&self, at: &CivilDateTime) -> Option<CivilDateTime> {
+            if at.hour == self.0 {
+                None
+            } else {
+                Some(utc_noon())
+            }
+        }
+    }
+
+    fn local_event_ending_at_ten() -> CalendarEvent {
         let mut event = sample_local_event();
         event.end = Some(EventTime::Local {
             at: CivilDateTime {
@@ -1028,12 +1131,36 @@ END:VCALENDAR\r\n";
             },
             tzid: "America/New_York".to_string(),
         });
+        event
+    }
+
+    #[test]
+    fn resolve_local_times_upgrades_both_start_and_end_when_both_convert() {
+        let event = local_event_ending_at_ten();
         let converter = FakeConverter {
             result: Some(utc_noon()),
         };
         let resolved = resolve_local_times(&event, &converter);
         assert_eq!(resolved.start, EventTime::Utc(utc_noon()));
         assert_eq!(resolved.end, Some(EventTime::Utc(utc_noon())));
+    }
+
+    #[test]
+    fn resolve_local_times_keeps_both_floating_when_only_the_start_fails() {
+        // Mixed floating start + UTC end would read as a different duration
+        // depending on the calendar app's own zone (#248 review).
+        let event = local_event_ending_at_ten();
+        let resolved = resolve_local_times(&event, &FailAtHour(9));
+        assert_eq!(resolved.start, event.start);
+        assert_eq!(resolved.end, event.end);
+    }
+
+    #[test]
+    fn resolve_local_times_keeps_both_floating_when_only_the_end_fails() {
+        let event = local_event_ending_at_ten();
+        let resolved = resolve_local_times(&event, &FailAtHour(10));
+        assert_eq!(resolved.start, event.start);
+        assert_eq!(resolved.end, event.end);
     }
 
     #[test]
@@ -1569,5 +1696,145 @@ END:VCALENDAR\r\n";
         assert!(result.path.exists(), "the newly written file must exist");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- DST gap / overlap detection (#248) --------------------------------
+
+    /// Fake US-Eastern rules for 2026: DST from 2026-03-08 07:00 UTC
+    /// (2:00 EST) to 2026-11-01 06:00 UTC (2:00 EDT). Mimics what Win32
+    /// does for `local_to_utc`: an invalid or ambiguous local time is
+    /// treated as daylight time (bias -4h), no failure.
+    struct FakeEastern;
+
+    fn secs(y: i32, mo: u8, d: u8, h: u8, mi: u8) -> i64 {
+        civil_time::civil_datetime_to_unix(&CivilDateTime {
+            date: CivilDate {
+                year: y,
+                month: mo,
+                day: d,
+            },
+            hour: h,
+            minute: mi,
+            second: 0,
+        })
+    }
+
+    fn dst_start() -> i64 {
+        secs(2026, 3, 8, 7, 0)
+    }
+    fn dst_end() -> i64 {
+        secs(2026, 11, 1, 6, 0)
+    }
+
+    impl ZoneApi for FakeEastern {
+        fn local_to_utc(&self, local: &CivilDateTime) -> Option<CivilDateTime> {
+            let l = civil_time::civil_datetime_to_unix(local);
+            // Local wall clock: DST starts at 02:00 (the gap is 02:00-03:00,
+            // treated as DST) and ends at 02:00 (01:00-02:00 repeats, the
+            // overlap, treated as DST).
+            let in_standard_before = l < secs(2026, 3, 8, 2, 0);
+            let in_standard_after = l >= secs(2026, 11, 1, 2, 0);
+            let offset = if in_standard_before || in_standard_after {
+                -5
+            } else {
+                -4
+            };
+            Some(civil_time::unix_to_civil_datetime(l - offset * 3600))
+        }
+        fn utc_to_local(&self, utc: &CivilDateTime) -> Option<CivilDateTime> {
+            let u = civil_time::civil_datetime_to_unix(utc);
+            let offset = if u >= dst_start() && u < dst_end() {
+                -4
+            } else {
+                -5
+            };
+            Some(civil_time::unix_to_civil_datetime(u + offset * 3600))
+        }
+    }
+
+    fn at(y: i32, mo: u8, d: u8, h: u8, mi: u8) -> CivilDateTime {
+        civil_time::unix_to_civil_datetime(secs(y, mo, d, h, mi))
+    }
+
+    #[test]
+    fn dst_gap_local_time_is_rejected() {
+        // 2026-03-08 02:30 does not exist in US Eastern.
+        assert_eq!(
+            checked_local_to_utc(&FakeEastern, &at(2026, 3, 8, 2, 30)),
+            None
+        );
+    }
+
+    #[test]
+    fn dst_overlap_local_time_is_rejected() {
+        // 2026-11-01 01:30 happens twice in US Eastern.
+        assert_eq!(
+            checked_local_to_utc(&FakeEastern, &at(2026, 11, 1, 1, 30)),
+            None
+        );
+    }
+
+    #[test]
+    fn ordinary_local_times_still_convert() {
+        // Summer (EDT, -4), winter (EST, -5).
+        assert_eq!(
+            checked_local_to_utc(&FakeEastern, &at(2026, 7, 4, 12, 0)),
+            Some(at(2026, 7, 4, 16, 0))
+        );
+        assert_eq!(
+            checked_local_to_utc(&FakeEastern, &at(2026, 1, 15, 12, 0)),
+            Some(at(2026, 1, 15, 17, 0))
+        );
+    }
+
+    #[test]
+    fn times_just_outside_the_transition_windows_still_convert() {
+        // 01:59 and 03:00 on spring-forward day; 00:59 and 02:00 on fall-back day.
+        assert!(checked_local_to_utc(&FakeEastern, &at(2026, 3, 8, 1, 59)).is_some());
+        assert!(checked_local_to_utc(&FakeEastern, &at(2026, 3, 8, 3, 0)).is_some());
+        assert!(checked_local_to_utc(&FakeEastern, &at(2026, 11, 1, 0, 59)).is_some());
+        assert!(checked_local_to_utc(&FakeEastern, &at(2026, 11, 1, 2, 0)).is_some());
+    }
+
+    /// MEASURED 2026-10-02 live check, run manually:
+    /// `cargo test dst_live -- --ignored --nocapture`. Uses a hand-built
+    /// US Eastern TIME_ZONE_INFORMATION, never the machine's zone.
+    #[test]
+    #[ignore]
+    fn dst_live_win32_behaviour_for_gap_and_overlap() {
+        use windows::Win32::Foundation::SYSTEMTIME;
+        use windows::Win32::System::Time::TIME_ZONE_INFORMATION;
+
+        let rule = |month: u16, hour: u16| SYSTEMTIME {
+            wYear: 0,
+            wMonth: month,
+            wDayOfWeek: 0,
+            wDay: if month == 3 { 2 } else { 1 },
+            wHour: hour,
+            wMinute: 0,
+            wSecond: 0,
+            wMilliseconds: 0,
+        };
+        let tzi = TIME_ZONE_INFORMATION {
+            Bias: 300,
+            StandardBias: 0,
+            DaylightBias: -60,
+            StandardDate: rule(11, 2),
+            DaylightDate: rule(3, 2),
+            ..Default::default()
+        };
+        let zone = Win32Zone(Some(tzi));
+        for (label, t) in [
+            ("gap 2026-03-08 02:30", at(2026, 3, 8, 2, 30)),
+            ("overlap 2026-11-01 01:30", at(2026, 11, 1, 1, 30)),
+            ("normal 2026-07-04 12:00", at(2026, 7, 4, 12, 0)),
+        ] {
+            let utc = zone.local_to_utc(&t);
+            let back = utc.and_then(|u| zone.utc_to_local(&u));
+            println!("{label}: local_to_utc={utc:?} round_trip={back:?}");
+            let checked = checked_local_to_utc(&zone, &t);
+            println!("{label}: checked={checked:?}");
+            assert_eq!(checked.is_some(), label.starts_with("normal"), "{label}");
+        }
     }
 }
