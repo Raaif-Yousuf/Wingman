@@ -108,7 +108,7 @@ pub trait LocalTimeConverter: Send + Sync {
 /// testable with fake zone rules instead of the machine's own time zone.
 pub(crate) trait ZoneApi {
     /// `TzSpecificLocalTimeToSystemTime`: never reports a DST gap or overlap
-    /// (see [`Win32LocalTimeConverter`]'s MEASURED note).
+    /// (see [`checked_local_to_utc`]'s MEASURED note).
     fn local_to_utc(&self, local: &CivilDateTime) -> Option<CivilDateTime>;
     /// `SystemTimeToTzSpecificLocalTime`: unambiguous for any UTC instant.
     fn utc_to_local(&self, utc: &CivilDateTime) -> Option<CivilDateTime>;
@@ -485,11 +485,24 @@ fn format_event_time_property(name: &str, t: &EventTime) -> Result<String> {
 /// Pure given `converter` (a fake in every test below; the real
 /// `Win32LocalTimeConverter` only in production), so this is what is
 /// actually unit-tested, not the Win32 call itself.
+///
+/// All-or-nothing (#248 review): if any `Local` value fails to convert, every
+/// `Local` value is left floating. A floating start with a UTC end would read
+/// as a different duration depending on the calendar app's own zone, and the
+/// gap/overlap detection makes a one-sided failure reachable.
 fn resolve_local_times(event: &CalendarEvent, converter: &dyn LocalTimeConverter) -> CalendarEvent {
+    let start = resolve_one_time(&event.start, converter);
+    let end = event.end.as_ref().map(|t| resolve_one_time(t, converter));
+    let failed = |t: &EventTime, r: &EventTime| matches!(t, EventTime::Local { .. }) && t == r;
+    let any_failed = failed(&event.start, &start)
+        || matches!((&event.end, &end), (Some(t), Some(r)) if failed(t, r));
+    if any_failed {
+        return event.clone();
+    }
     CalendarEvent {
         title: event.title.clone(),
-        start: resolve_one_time(&event.start, converter),
-        end: event.end.as_ref().map(|t| resolve_one_time(t, converter)),
+        start,
+        end,
         location: event.location.clone(),
         description: event.description.clone(),
     }
@@ -1090,8 +1103,20 @@ END:VCALENDAR\r\n";
         assert_eq!(resolved.end, utc_event.end);
     }
 
-    #[test]
-    fn resolve_local_times_upgrades_both_start_and_end_independently() {
+    /// Fails only for one wall-clock hour, succeeds (noon UTC) otherwise.
+    struct FailAtHour(u8);
+
+    impl LocalTimeConverter for FailAtHour {
+        fn to_utc(&self, at: &CivilDateTime) -> Option<CivilDateTime> {
+            if at.hour == self.0 {
+                None
+            } else {
+                Some(utc_noon())
+            }
+        }
+    }
+
+    fn local_event_ending_at_ten() -> CalendarEvent {
         let mut event = sample_local_event();
         event.end = Some(EventTime::Local {
             at: CivilDateTime {
@@ -1106,12 +1131,36 @@ END:VCALENDAR\r\n";
             },
             tzid: "America/New_York".to_string(),
         });
+        event
+    }
+
+    #[test]
+    fn resolve_local_times_upgrades_both_start_and_end_when_both_convert() {
+        let event = local_event_ending_at_ten();
         let converter = FakeConverter {
             result: Some(utc_noon()),
         };
         let resolved = resolve_local_times(&event, &converter);
         assert_eq!(resolved.start, EventTime::Utc(utc_noon()));
         assert_eq!(resolved.end, Some(EventTime::Utc(utc_noon())));
+    }
+
+    #[test]
+    fn resolve_local_times_keeps_both_floating_when_only_the_start_fails() {
+        // Mixed floating start + UTC end would read as a different duration
+        // depending on the calendar app's own zone (#248 review).
+        let event = local_event_ending_at_ten();
+        let resolved = resolve_local_times(&event, &FailAtHour(9));
+        assert_eq!(resolved.start, event.start);
+        assert_eq!(resolved.end, event.end);
+    }
+
+    #[test]
+    fn resolve_local_times_keeps_both_floating_when_only_the_end_fails() {
+        let event = local_event_ending_at_ten();
+        let resolved = resolve_local_times(&event, &FailAtHour(10));
+        assert_eq!(resolved.start, event.start);
+        assert_eq!(resolved.end, event.end);
     }
 
     #[test]
