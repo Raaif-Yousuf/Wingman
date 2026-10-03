@@ -273,8 +273,20 @@ function Invoke-WingmanSignTool {
     if ($LASTEXITCODE -ne 0) { throw "signing '$TargetPath' failed" }
 }
 
+# Maps a Rust target triple (or the host line of rustc -vV) to the MSIX
+# ProcessorArchitecture it must be packaged as (issue #367). Pure.
+function Get-WingmanTargetArchitecture {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Triple)
+    switch ($Triple) {
+        'x86_64-pc-windows-msvc'  { 'x64'; break }
+        'aarch64-pc-windows-msvc' { 'arm64'; break }
+        default { throw "Unsupported target triple '$Triple': Wingman packages x64 and arm64 only." }
+    }
+}
+
 # Stages layout\Assets and layout\Public under $StageDir, renders the logos,
-# writes the PublicFolder placeholder, substitutes @VERSION@/@PUBLISHER@ into
+# writes the PublicFolder placeholder, substitutes @VERSION@/@PUBLISHER@/@ARCH@ into
 # AppxManifest.xml.in, packs it and (if a certificate is given) signs the
 # result -- the sequence install.ps1 and Build-Msix.ps1 both need, byte for
 # byte, so a GitHub release and a local install build the same package the
@@ -307,7 +319,10 @@ function Publish-WingmanPackage {
         [Parameter(Mandatory)]$Identity,
         [Parameter(Mandatory)][string]$Version,
         [string]$ExePath,
-        $Cert
+        $Cert,
+        # ProcessorArchitecture of the package identity (issue #367). x64 stays
+        # the default so install.ps1 and every existing caller are unchanged.
+        [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64'
     )
 
     $layoutDir = Join-Path $StageDir 'layout'
@@ -327,7 +342,7 @@ function Publish-WingmanPackage {
 
     $publisher = if ($Cert) { $Cert.Subject } else { $Identity.Current.CertSubject }
     $manifest = Get-Content (Join-Path $Repo 'packaging\AppxManifest.xml.in') -Raw
-    $manifest = $manifest.Replace('@VERSION@', $Version).Replace('@PUBLISHER@', $publisher)
+    $manifest = $manifest.Replace('@VERSION@', $Version).Replace('@PUBLISHER@', $publisher).Replace('@ARCH@', $Architecture)
     Set-Content -Path (Join-Path $layoutDir 'AppxManifest.xml') -Value $manifest -Encoding utf8
 
     # Sign the embedded exe, if there is one, before packing -- same order
@@ -661,6 +676,7 @@ Export-ModuleMember -Function @(
     'Invoke-MakeAppxPack',
     'Invoke-WingmanSignTool',
     'Publish-WingmanPackage',
+    'Get-WingmanTargetArchitecture',
     'Get-TopLevelPhaseMarkers',
     'Test-InstallPhaseOrder',
     'Confirm-CertTrusted'

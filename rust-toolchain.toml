@@ -7,4 +7,4 @@
 # update noting the change, not as a drive-by.
 [toolchain]
 channel = "1.98.1"
-targets = ["x86_64-pc-windows-msvc"]
+targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]

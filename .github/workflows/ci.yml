@@ -78,6 +78,40 @@ jobs:
           path: target/release/*.exe
           if-no-files-found: error
 
+  arm64:
+    # Compile-only guard so the ARM64 target (Snapdragon Copilot+ PCs, issue
+    # #367) cannot rot. Cross-compiled on the x64 runner: cargo check never
+    # links or runs anything, so no ARM64 hardware is needed. The exe is
+    # built and packaged by release.yml.
+    name: cargo check aarch64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Cross-compiling ring (a build script that runs the ARM64 C compiler)
+      # needs the Visual Studio ARM64 build tools. THEORY (unverified): the
+      # windows-latest image ships this component; this step is idempotent
+      # and installs it if it is missing. Owner: confirm on the first run.
+      - name: Ensure the VS ARM64 build tools
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $path = & $vswhere -latest -products * -property installationPath
+          $has = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if ($has) { Write-Host "ARM64 tools present."; exit 0 }
+          $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          Start-Process -FilePath $setup -Wait -ArgumentList @(
+            'modify', '--installPath', "`"$path`"",
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
+            '--quiet', '--norestart', '--nocache')
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check --target aarch64-pc-windows-msvc
+        run: cargo check --locked --target aarch64-pc-windows-msvc
+
   supply-chain:
     # cargo-deny-action is a Docker container action, and GitHub runs those
     # only on Linux runners ("Container action is only supported on Linux",

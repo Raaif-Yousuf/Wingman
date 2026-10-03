@@ -61,6 +61,33 @@ jobs:
           RUSTFLAGS: -C link-arg=/Brepro --remap-path-prefix=${{ github.workspace }}=C:\wingman-src
         run: cargo build --release --locked
 
+      # Cross-compiling ring (a build script that runs the ARM64 C compiler)
+      # needs the Visual Studio ARM64 build tools. THEORY (unverified): the
+      # windows-latest image ships this component; this step is idempotent
+      # and installs it if it is missing. Owner: confirm on the first run.
+      - name: Ensure the VS ARM64 build tools
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $path = & $vswhere -latest -products * -property installationPath
+          $has = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if ($has) { Write-Host "ARM64 tools present."; exit 0 }
+          $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          Start-Process -FilePath $setup -Wait -ArgumentList @(
+            'modify', '--installPath', "`"$path`"",
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
+            '--quiet', '--norestart', '--nocache')
+
+      # ARM64 build (issue #367), same reproducibility flags as above. Built
+      # on the x64 runner with --target, so the exe lands in
+      # target\aarch64-pc-windows-msvc\release. It is not run here.
+      - name: cargo build --release (aarch64-pc-windows-msvc)
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
+          CARGO_INCREMENTAL: 0
+          RUSTFLAGS: -C link-arg=/Brepro --remap-path-prefix=${{ github.workspace }}=C:\wingman-src
+        run: cargo build --release --locked --target aarch64-pc-windows-msvc
+
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked
 
@@ -121,6 +148,27 @@ jobs:
           "exe_path=$($exeLine -replace '^built-exe=', '')"   >> $env:GITHUB_OUTPUT
           "msix_path=$($msixLine -replace '^built-msix=', '')" >> $env:GITHUB_OUTPUT
 
+      - name: Build the ARM64 sparse MSIX (packaging\Build-Msix.ps1 -Architecture arm64)
+        id: msix_arm64
+        env:
+          WINGMAN_MSIX_PFX_PASSWORD: ${{ secrets.WINGMAN_MSIX_PFX_PASSWORD }}
+        shell: pwsh
+        run: |
+          # The certificate was imported into CurrentUser\My by the x64 step,
+          # but Build-Msix.ps1 imports it itself, so pass the same inputs.
+          $buildArgs = @{ Architecture = 'arm64' }
+          if ('${{ steps.cert.outputs.has_cert }}' -eq 'true') {
+            $buildArgs['PfxPath'] = '${{ steps.cert.outputs.pfx_path }}'
+            $buildArgs['PfxPassword'] = ConvertTo-SecureString -String $env:WINGMAN_MSIX_PFX_PASSWORD -AsPlainText -Force
+          }
+          $out = & .\packaging\Build-Msix.ps1 @buildArgs
+          $out | Write-Host
+          $exeLine  = $out | Where-Object { $_ -like 'built-exe=*' }
+          $msixLine = $out | Where-Object { $_ -like 'built-msix=*' }
+          if (-not $exeLine -or -not $msixLine) { throw "Build-Msix.ps1 -Architecture arm64 did not report its output paths." }
+          "exe_path=$($exeLine -replace '^built-exe=', '')"   >> $env:GITHUB_OUTPUT
+          "msix_path=$($msixLine -replace '^built-msix=', '')" >> $env:GITHUB_OUTPUT
+
       - name: Stage release assets and compute SHA256SUMS
         id: assets
         shell: pwsh
@@ -128,6 +176,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item '${{ steps.msix.outputs.exe_path }}' dist\wingman.exe -Force
           Copy-Item '${{ steps.msix.outputs.msix_path }}' dist\wingman.msix -Force
+          Copy-Item '${{ steps.msix_arm64.outputs.exe_path }}' dist\wingman-arm64.exe -Force
+          Copy-Item '${{ steps.msix_arm64.outputs.msix_path }}' dist\wingman-arm64.msix -Force
           Copy-Item '${{ steps.sbom.outputs.sbom_path }}' dist\wingman.cdx.json -Force
           $hashes = Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
@@ -149,7 +199,7 @@ jobs:
             'Signed with the certificate in the WINGMAN_MSIX_PFX_BASE64 repository secret.'
           } else {
             'UNSIGNED: no WINGMAN_MSIX_PFX_BASE64 secret is configured for this repository, ' +
-            'so wingman.exe and wingman.msix are not signed. wingman.exe still runs standalone. ' +
+            'so wingman.exe, wingman.msix and the -arm64 pair are not signed. wingman.exe still runs standalone. ' +
             'wingman.msix cannot be installed with Add-AppxPackage unless you trust the ' +
             'certificate that eventually signs it; build from source and run install.ps1 for a ' +
             'locally-signed, installable copy in the meantime.'
@@ -161,9 +211,9 @@ jobs:
           Set-Content -Path $notesPath -Value $notes -Encoding utf8
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS.txt --clobber
+            gh release upload $tag dist\wingman.exe dist\wingman.msix dist\wingman-arm64.exe dist\wingman-arm64.msix dist\wingman.cdx.json dist\SHA256SUMS.txt --clobber
             gh release edit $tag --notes-file $notesPath
           } else {
-            gh release create $tag dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS.txt `
+            gh release create $tag dist\wingman.exe dist\wingman.msix dist\wingman-arm64.exe dist\wingman-arm64.msix dist\wingman.cdx.json dist\SHA256SUMS.txt `
               --title $tag --notes-file $notesPath --target $env:GITHUB_SHA
           }

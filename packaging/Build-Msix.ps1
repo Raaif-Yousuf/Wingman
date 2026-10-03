@@ -23,6 +23,13 @@
   Path to the already-built release executable. Defaults to
   target\release\wingman.exe (what `cargo build --release` produces).
 
+.PARAMETER Architecture
+  x64 (default) or arm64 (issue #367). Sets the package ProcessorArchitecture.
+  For arm64 the default -ExePath becomes
+  target\aarch64-pc-windows-msvc\release\wingman.exe (cargo build --release
+  --target aarch64-pc-windows-msvc) and the output goes under target\msix-arm64
+  so both architectures can be built side by side.
+
 .PARAMETER PfxPath
   Path to a PKCS#12 certificate file to sign the exe and the package with. If
   omitted, both are left unsigned -- AGENTS.md rule 4 (sparse package) still
@@ -40,7 +47,8 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ExePath = (Join-Path $PSScriptRoot '..\target\release\wingman.exe'),
+    [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64',
+    [string]$ExePath = (Join-Path $PSScriptRoot ($(if ($Architecture -eq 'arm64') { '..\target\aarch64-pc-windows-msvc\release\wingman.exe' } else { '..\target\release\wingman.exe' }))),
     [string]$PfxPath,
     [securestring]$PfxPassword
 )
@@ -52,7 +60,7 @@ Import-Module (Join-Path $PSScriptRoot 'Wingman.Common.psm1') -Force
 
 $Repo     = Split-Path $PSScriptRoot -Parent
 $Identity = Get-WingmanIdentity
-$StageDir = Join-Path $Repo 'target\msix'
+$StageDir = Join-Path $Repo $(if ($Architecture -eq 'arm64') { 'target\msix-arm64' } else { 'target\msix' })
 
 function Write-ConsoleLine {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
@@ -104,7 +112,8 @@ Note "version $version, publisher $publisher"
 Step "Staging and packing the package"
 if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
 $published = Publish-WingmanPackage -Sdk $sdk -Repo $Repo -StageDir $StageDir `
-    -Identity $Identity -Version $version -ExePath $ExePath -Cert $cert
+    -Identity $Identity -Version $version -ExePath $ExePath -Cert $cert `
+    -Architecture $Architecture
 $layoutExe = $published.LayoutExePath
 $msix = $published.MsixPath
 

@@ -7,7 +7,7 @@
   across upgrades, and so nothing virtualizes the %APPDATA%\Wingman writes
   that hold config.toml. See docs/superpowers/specs/2026-09-15-packaging-and-install-design.md.
 
-  @VERSION@ and @PUBLISHER@ are substituted by install.ps1. Publisher must
+  @VERSION@, @PUBLISHER@ and @ARCH@ (x64 or arm64) are substituted by install.ps1. Publisher must
   match the signing certificate subject exactly or deployment fails 0x800B0109,
   and Version is derived from Cargo.toml so the two cannot drift.
 
@@ -25,7 +25,7 @@
   <Identity Name="RaaifYousuf.Wingman"
             Publisher="@PUBLISHER@"
             Version="@VERSION@"
-            ProcessorArchitecture="x64" />
+            ProcessorArchitecture="@ARCH@" />
 
   <Properties>
     <DisplayName>Wingman</DisplayName>

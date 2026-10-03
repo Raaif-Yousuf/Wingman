@@ -176,6 +176,14 @@ $version = ConvertTo-MsixVersion -CargoVersion (Get-CargoVersionString -CargoTom
 Note "version $version"
 Note "sdk     $(Split-Path $sdk.MakeAppx -Parent)"
 
+# The package ProcessorArchitecture must match the exe cargo builds, which is
+# the rustc host (issue #367: an ARM64 rustc builds an ARM64 exe). A bare
+# build with no --target never cross-compiles.
+$hostLine = & rustc -vV | Where-Object { $_ -like 'host: *' }
+if (-not $hostLine) { throw "Could not read the rustc host triple from rustc -vV." }
+$arch = Get-WingmanTargetArchitecture -Triple ($hostLine -replace '^host:\s*', '').Trim()
+Note "arch    $arch"
+
 $built = Join-Path $Repo "target\release\$($Identity.Current.ExeName)"
 if (-not $SkipBuild) {
     Step "Building (cargo build --release)"
@@ -206,7 +214,7 @@ Invoke-WingmanSignTool -SignToolPath $sdk.SignTool -Thumbprint $cert.Thumbprint 
 # point, so the package is always signed.
 Step "Building the package"
 $published = Publish-WingmanPackage -Sdk $sdk -Repo $Repo -StageDir $StageDir `
-    -Identity $Identity -Version $version -Cert $cert
+    -Identity $Identity -Version $version -Cert $cert -Architecture $arch
 $msix = $published.MsixPath
 
 # =============================================================================

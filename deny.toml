@@ -28,6 +28,7 @@
 [graph]
 targets = [
   { triple = "x86_64-pc-windows-msvc" },
+  { triple = "aarch64-pc-windows-msvc" },
 ]
 
 [advisories]
