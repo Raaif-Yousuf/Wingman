@@ -735,8 +735,17 @@ impl Config {
     /// `pub` as the documented store-free entry point for exactly that use.
     #[allow(dead_code)]
     pub fn load_from(path: &Path) -> Result<Config> {
+        Self::load_from_with(path, &|name| std::env::var(name).ok())
+    }
+
+    /// [`Config::load_from`]'s implementation, with the env lookup injected
+    /// (issue #282) so a test that needs to control what the three cloud
+    /// providers' env vars resolve to (including "none of them are set")
+    /// can do so without reading or writing the real process environment.
+    /// Production's only caller, `load_from`, passes `std::env::var`.
+    fn load_from_with(path: &Path, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Config> {
         let mut config = Self::load_from_file(path)?;
-        config.apply_env_overrides();
+        config.apply_overrides_from(lookup);
         Ok(config)
     }
 
@@ -1094,16 +1103,33 @@ impl Config {
         false
     }
 
-    /// `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, when set, override the
-    /// corresponding value loaded from the file.
+    /// `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`, when set,
+    /// override the corresponding value loaded from the file. Thin
+    /// production wrapper over [`Config::apply_overrides_from`] (issue
+    /// #282): this is the only place in the crate that reads these three
+    /// vars from the real process environment, so this is also the only
+    /// function `apply_env_overrides_reads_the_real_process_environment`
+    /// below needs to exercise against it.
     pub fn apply_env_overrides(&mut self) {
-        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        self.apply_overrides_from(&|name| std::env::var(name).ok());
+    }
+
+    /// Pure core of [`Config::apply_env_overrides`]: `lookup` is injected
+    /// (issue #282) so a test can exercise the override logic without ever
+    /// reading or writing the real process environment -- the env vars this
+    /// touches (`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`GEMINI_API_KEY`) are
+    /// process-wide, so a test that read them for real would race every
+    /// other test doing the same thing. Production's only caller,
+    /// `apply_env_overrides`, passes `std::env::var`; a test passes a
+    /// closure over a fixed map (or `|_| None`) instead.
+    fn apply_overrides_from(&mut self, lookup: &dyn Fn(&str) -> Option<String>) {
+        if let Some(key) = lookup("OPENAI_API_KEY") {
             self.providers.openai.api_key = key;
         }
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if let Some(key) = lookup("ANTHROPIC_API_KEY") {
             self.providers.anthropic.api_key = key;
         }
-        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+        if let Some(key) = lookup("GEMINI_API_KEY") {
             self.providers.gemini.api_key = key;
         }
     }
@@ -1541,10 +1567,17 @@ impl Providers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // Serializes tests that mutate process-wide environment variables.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Issue #282: every test below that needs OPENAI_API_KEY/
+    // ANTHROPIC_API_KEY/GEMINI_API_KEY to resolve a particular way goes
+    // through `Config::apply_overrides_from`/`Config::load_from_with` with
+    // an injected lookup closure instead of touching the real process
+    // environment, so there is no process-wide state here left to
+    // serialize a lock against (the lock this comment used to name,
+    // `ENV_LOCK`, is gone for exactly that reason). The one exception,
+    // `apply_env_overrides_reads_the_real_process_environment` below, is
+    // the single test that still reads the real environment at all, so it
+    // has nothing left to race.
 
     fn scratch_path(tag: &str) -> PathBuf {
         let unique = format!(
@@ -1712,7 +1745,7 @@ win = true
         let path = scratch_path("missing");
         assert!(!path.exists());
 
-        let config = Config::load_from(&path).expect("load should succeed");
+        let config = Config::load_from_with(&path, &|_| None).expect("load should succeed");
         assert_eq!(config.providers.order, vec!["openai", "anthropic"]);
         assert_eq!(config.hotkeys.primary.vk, 0x86);
         assert_eq!(config.capture.max_edge, 1568);
@@ -1726,11 +1759,19 @@ win = true
 
     #[test]
     fn malformed_file_falls_back_to_defaults() {
+        // Issue #282: this is a full-struct equality against
+        // `Config::default()`, which includes every provider's `api_key`
+        // (empty by default). `load_from_with` with a lookup that always
+        // returns `None` keeps this test from depending on whichever of
+        // OPENAI_API_KEY/ANTHROPIC_API_KEY/GEMINI_API_KEY happen to be set
+        // in the real environment, whether from another test or a
+        // developer's own shell.
         let path = scratch_path("malformed");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "this is not { valid toml at all [[[").unwrap();
 
-        let config = Config::load_from(&path).expect("load should still succeed");
+        let config =
+            Config::load_from_with(&path, &|_| None).expect("load should still succeed");
         assert_eq!(config, Config::default());
 
         cleanup(&path);
@@ -1753,10 +1794,8 @@ win = true
 
     #[test]
     fn env_vars_take_precedence_over_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("OPENAI_API_KEY", "env-openai-key");
-        std::env::set_var("ANTHROPIC_API_KEY", "env-anthropic-key");
-
+        // Issue #282: an injected lookup in place of real set_var/remove_var
+        // calls, so this never touches the real process environment.
         let toml_str = r#"
             [providers.openai]
             api_key = "file-openai-key"
@@ -1765,26 +1804,26 @@ win = true
         "#;
         let mut config = Config::parse_or_default(toml_str);
         assert_eq!(config.providers.openai.api_key, "file-openai-key");
-        config.apply_env_overrides();
+        config.apply_overrides_from(&|name| match name {
+            "OPENAI_API_KEY" => Some("env-openai-key".to_string()),
+            "ANTHROPIC_API_KEY" => Some("env-anthropic-key".to_string()),
+            _ => None,
+        });
         assert_eq!(config.providers.openai.api_key, "env-openai-key");
         assert_eq!(config.providers.anthropic.api_key, "env-anthropic-key");
-
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
     #[test]
     fn no_env_vars_leaves_file_values_untouched() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("ANTHROPIC_API_KEY");
-
+        // Issue #282: a lookup that always reports nothing set, rather than
+        // relying on the real OPENAI_API_KEY/ANTHROPIC_API_KEY being absent
+        // from the real environment.
         let toml_str = r#"
             [providers.openai]
             api_key = "file-openai-key"
         "#;
         let mut config = Config::parse_or_default(toml_str);
-        config.apply_env_overrides();
+        config.apply_overrides_from(&|_| None);
         assert_eq!(config.providers.openai.api_key, "file-openai-key");
     }
 
@@ -2372,20 +2411,17 @@ models = ["gemini-2.5-pro"]
 
     #[test]
     fn gemini_env_var_overrides_the_file_value() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("GEMINI_API_KEY");
-        std::env::set_var("GEMINI_API_KEY", "env-gemini-key");
-
+        // Issue #282: injected lookup instead of real set_var/remove_var.
         let toml_str = r#"
             [providers.gemini]
             api_key = "file-gemini-key"
         "#;
         let mut config = Config::parse_or_default(toml_str);
         assert_eq!(config.providers.gemini.api_key, "file-gemini-key");
-        config.apply_env_overrides();
+        config.apply_overrides_from(&|name| {
+            (name == "GEMINI_API_KEY").then_some("env-gemini-key".to_string())
+        });
         assert_eq!(config.providers.gemini.api_key, "env-gemini-key");
-
-        std::env::remove_var("GEMINI_API_KEY");
     }
 
     #[test]
@@ -2436,7 +2472,7 @@ api_key = "sk-x"
 "#;
         std::fs::write(&path, old).unwrap();
 
-        let loaded = Config::load_from(&path).unwrap();
+        let loaded = Config::load_from_with(&path, &|_| None).unwrap();
         assert!(!loaded.providers.openai.models.is_empty());
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -2549,7 +2585,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         );
         std::fs::write(&path, &doc).unwrap();
 
-        let loaded = Config::load_from(&path).unwrap();
+        let loaded = Config::load_from_with(&path, &|_| None).unwrap();
         assert_eq!(loaded.ui.prompt, DEFAULT_PROMPT);
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -3076,6 +3112,12 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
     fn import_and_blank_against_a_temp_config_file_never_writes_the_key_to_disk() {
         // The scenario issue #2 names directly: an upgrade finds an old
         // config.toml with a live key on disk.
+        //
+        // Issue #282: both `load_from` calls below assert directly on
+        // `providers.openai.api_key`, so they go through `load_from_with`
+        // with a lookup that always returns `None` -- otherwise a real
+        // OPENAI_API_KEY (another test's, or a developer's own shell) would
+        // silently overwrite "sk-legacy-in-file"/"" with that value instead.
         let path = scratch_path("secrets-import");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
@@ -3084,7 +3126,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         )
         .unwrap();
 
-        let mut config = Config::load_from(&path).expect("load should succeed");
+        let mut config = Config::load_from_with(&path, &|_| None).expect("load should succeed");
         assert_eq!(config.providers.openai.api_key, "sk-legacy-in-file");
 
         let store = InMemoryStore::default();
@@ -3103,7 +3145,8 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
 
         // The next load's blank-field hydrate step gets the key back from
         // the store, exactly like `Config::load()` does after `import`.
-        let mut reloaded = Config::load_from(&path).expect("reload should succeed");
+        let mut reloaded =
+            Config::load_from_with(&path, &|_| None).expect("reload should succeed");
         assert_eq!(reloaded.providers.openai.api_key, "");
         reloaded.hydrate_secrets(&store);
         assert_eq!(reloaded.providers.openai.api_key, "sk-legacy-in-file");
@@ -3408,10 +3451,8 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
     fn env_override_wins_over_a_hydrated_store_value() {
         // Mirrors `Config::load()`'s exact ordering: hydrate, then
         // apply_env_overrides. "Env vars still override" (#2) means env
-        // must win even when the store has a key.
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("OPENAI_API_KEY", "env-wins");
-
+        // must win even when the store has a key. Issue #282: an injected
+        // lookup in place of a real OPENAI_API_KEY set_var/remove_var.
         let mut config = Config::default();
         let store = InMemoryStore::default();
         store.set(&target_name("openai"), "store-value").unwrap();
@@ -3419,13 +3460,13 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         config.hydrate_secrets(&store);
         assert_eq!(config.providers.openai.api_key, "store-value");
 
-        config.apply_env_overrides();
+        config.apply_overrides_from(&|name| {
+            (name == "OPENAI_API_KEY").then_some("env-wins".to_string())
+        });
         assert_eq!(
             config.providers.openai.api_key, "env-wins",
             "env must win over a hydrated store value"
         );
-
-        std::env::remove_var("OPENAI_API_KEY");
     }
 
     #[test]
@@ -3706,7 +3747,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let contents = include_str!("../tests/fixtures/config/pre_rename_copilot_ask.toml");
         let path = write_fixture("golden-pre-rename", contents);
 
-        let cfg = Config::load_from(&path).expect("load should succeed");
+        let cfg = Config::load_from_with(&path, &|_| None).expect("load should succeed");
 
         assert_eq!(
             cfg.hotkeys.primary,
@@ -3769,7 +3810,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let contents = include_str!("../tests/fixtures/config/before_gemini_ollama.toml");
         let path = write_fixture("golden-before-gemini-ollama", contents);
 
-        let cfg = Config::load_from(&path).expect("load should succeed");
+        let cfg = Config::load_from_with(&path, &|_| None).expect("load should succeed");
 
         assert_eq!(
             cfg.hotkeys.primary,
@@ -3827,7 +3868,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let contents = include_str!("../tests/fixtures/config/before_modes.toml");
         let path = write_fixture("golden-before-modes", contents);
 
-        let cfg = Config::load_from(&path).expect("load should succeed");
+        let cfg = Config::load_from_with(&path, &|_| None).expect("load should succeed");
 
         assert_eq!(
             cfg.hotkeys.primary,
@@ -3894,7 +3935,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let contents = include_str!("../tests/fixtures/config/unknown_future_keys.toml");
         let path = write_fixture("golden-unknown-keys", contents);
 
-        let cfg = Config::load_from(&path).expect("load should succeed despite unknown keys");
+        let cfg = Config::load_from_with(&path, &|_| None).expect("load should succeed despite unknown keys");
 
         assert_eq!(
             cfg.hotkeys.primary,
@@ -4105,13 +4146,15 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
     fn env_override_vars_agree_with_apply_env_overrides() {
         // The single source of truth `Config::env_var_name` and
         // `diagnostics::env_overrides_present` both read must actually match
-        // what `apply_env_overrides` does -- proves the list was not just
-        // renamed but is the real thing the override logic uses.
-        let _guard = ENV_LOCK.lock().unwrap();
+        // what the override logic does -- proves the list was not just
+        // renamed but is the real thing `apply_overrides_from` (and so,
+        // through it, `apply_env_overrides`) uses. Issue #282: an injected
+        // lookup rather than a real set_var/remove_var per entry.
         for (provider, var) in ENV_OVERRIDE_VARS {
-            std::env::set_var(var, "sentinel-value");
             let mut config = Config::default();
-            config.apply_env_overrides();
+            config.apply_overrides_from(&|name| {
+                (name == *var).then_some("sentinel-value".to_string())
+            });
             let key = match *provider {
                 "openai" => &config.providers.openai.api_key,
                 "anthropic" => &config.providers.anthropic.api_key,
@@ -4119,8 +4162,25 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
                 other => panic!("unexpected provider {other} in ENV_OVERRIDE_VARS"),
             };
             assert_eq!(key, "sentinel-value", "{provider} via {var}");
-            std::env::remove_var(var);
         }
+    }
+
+    /// Issue #282: `apply_env_overrides` must still actually read the real
+    /// process environment in production, not just delegate to a lookup
+    /// that is wired to nothing (AGENTS.md rule 8's "state the one
+    /// observable that would differ"). Every other test in this file loads
+    /// through `apply_overrides_from`/`load_from_with`'s injected lookup
+    /// instead of the real environment, so none of them can see the
+    /// OPENAI_API_KEY this test sets for a moment, and it needs no lock.
+    /// Keep it that way: a new test that calls plain `load_from` and
+    /// asserts on a key would race this one.
+    #[test]
+    fn apply_env_overrides_reads_the_real_process_environment() {
+        std::env::set_var("OPENAI_API_KEY", "real-env-wiring-check");
+        let mut config = Config::default();
+        config.apply_env_overrides();
+        std::env::remove_var("OPENAI_API_KEY");
+        assert_eq!(config.providers.openai.api_key, "real-env-wiring-check");
     }
 }
 
