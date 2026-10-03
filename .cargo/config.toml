@@ -22,3 +22,7 @@
 # section.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/Brepro"]
+
+# Same deterministic-link flag for the ARM64 release target (issue #367).
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/Brepro"]

@@ -865,6 +865,86 @@ Describe 'Publish-WingmanPackage (issue #172)' {
     }
 }
 
+Describe 'Get-WingmanTargetArchitecture (issue #367)' {
+    It 'maps the rustc host triples to package architectures' {
+        Get-WingmanTargetArchitecture -Triple 'x86_64-pc-windows-msvc'  | Should -Be 'x64'
+        Get-WingmanTargetArchitecture -Triple 'aarch64-pc-windows-msvc' | Should -Be 'arm64'
+    }
+    It 'throws on a triple the package cannot describe' {
+        { Get-WingmanTargetArchitecture -Triple 'i686-pc-windows-msvc' } | Should -Throw
+    }
+}
+
+Describe 'Get-ExeArchitecture (issue #367)' {
+    BeforeAll {
+        function script:New-FakePe([string]$Path, [uint16]$Machine) {
+            $b = New-Object byte[] 256
+            $b[0] = 0x4D; $b[1] = 0x5A
+            $b[0x3C] = 0x80
+            $b[0x80] = 0x50; $b[0x81] = 0x45
+            $b[0x84] = [byte]($Machine -band 0xFF); $b[0x85] = [byte]($Machine -shr 8)
+            [IO.File]::WriteAllBytes($Path, $b)
+        }
+    }
+    It 'reads x64 from machine 0x8664' {
+        New-FakePe (Join-Path $TestDrive 'x64.exe') 0x8664
+        Get-ExeArchitecture -Path (Join-Path $TestDrive 'x64.exe') | Should -Be 'x64'
+    }
+    It 'reads arm64 from machine 0xAA64' {
+        New-FakePe (Join-Path $TestDrive 'a64.exe') 0xAA64
+        Get-ExeArchitecture -Path (Join-Path $TestDrive 'a64.exe') | Should -Be 'arm64'
+    }
+    It 'defaults to x64 for a missing file, a non-PE file or an unknown machine' {
+        Get-ExeArchitecture -Path (Join-Path $TestDrive 'nope.exe') | Should -Be 'x64'
+        Set-Content (Join-Path $TestDrive 'junk.exe') -Value 'junk'
+        Get-ExeArchitecture -Path (Join-Path $TestDrive 'junk.exe') | Should -Be 'x64'
+        New-FakePe (Join-Path $TestDrive 'x86.exe') 0x014C
+        Get-ExeArchitecture -Path (Join-Path $TestDrive 'x86.exe') | Should -Be 'x64'
+    }
+}
+
+Describe 'Publish-WingmanPackage -Architecture (issue #367)' {
+    BeforeAll {
+        $script:id  = Get-WingmanIdentity
+        $script:sdk = [pscustomobject]@{ MakeAppx = 'unused-makeappx.exe'; SignTool = 'unused-signtool.exe' }
+        $script:repo = Join-Path $TestDrive 'arch-repo'
+        New-Item -ItemType Directory -Force -Path (Join-Path $repo 'packaging') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $repo 'assets') | Out-Null
+        Set-Content -Path (Join-Path $repo 'assets\icon.ico') -Encoding ascii -Value 'not-a-real-icon'
+        Set-Content -Path (Join-Path $repo 'packaging\AppxManifest.xml.in') -Encoding utf8 -Value @'
+<Package><Identity Publisher="@PUBLISHER@" Version="@VERSION@" ProcessorArchitecture="@ARCH@" /></Package>
+'@
+    }
+    BeforeEach {
+        $script:stageDir = Join-Path $TestDrive "stage-$([guid]::NewGuid())"
+        Mock -ModuleName Wingman.Common Build-Logos { }
+        Mock -ModuleName Wingman.Common Invoke-MakeAppxPack { }
+        Mock -ModuleName Wingman.Common Invoke-WingmanSignTool { }
+    }
+
+    It 'defaults to x64 so existing callers are unchanged' {
+        Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id -Version '0.4.0.0' | Out-Null
+        $m = Get-Content (Join-Path $stageDir 'layout\AppxManifest.xml') -Raw
+        $m | Should -Match 'ProcessorArchitecture="x64"'
+        $m | Should -Not -Match '@ARCH@'
+    }
+
+    It 'writes ProcessorArchitecture arm64 when asked' {
+        Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id -Version '0.4.0.0' -Architecture arm64 | Out-Null
+        (Get-Content (Join-Path $stageDir 'layout\AppxManifest.xml') -Raw) | Should -Match 'ProcessorArchitecture="arm64"'
+    }
+
+    It 'rejects an unknown architecture' {
+        { Publish-WingmanPackage -Sdk $sdk -Repo $repo -StageDir $stageDir -Identity $id -Version '0.4.0.0' -Architecture riscv } |
+            Should -Throw
+    }
+
+    It 'the real manifest template carries the @ARCH@ token, not a hard-coded x64' {
+        $real = Get-Content (Join-Path $PSScriptRoot 'AppxManifest.xml.in') -Raw
+        $real | Should -Match 'ProcessorArchitecture="@ARCH@"'
+    }
+}
+
 Describe 'Confirm-CertTrusted (issue #184)' {
     # Moved out of install.ps1 so every cmdlet it calls (Get-ChildItem,
     # Export-Certificate, Start-Process, Remove-Item) can be mocked here

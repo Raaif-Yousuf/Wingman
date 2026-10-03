@@ -78,12 +78,58 @@ jobs:
           path: target/release/*.exe
           if-no-files-found: error
 
+  arm64:
+    # Compile-only guard so the ARM64 target (Snapdragon Copilot+ PCs, issue
+    # #367) cannot rot. Cross-compiled on the x64 runner: cargo check never
+    # links or runs anything, so no ARM64 hardware is needed. The exe is
+    # built and packaged by release.yml.
+    name: cargo check aarch64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Ensure the pinned toolchain (rust-toolchain.toml) is installed
+        run: rustup show
+
+      - name: Add the ARM64 target
+        run: rustup target add aarch64-pc-windows-msvc
+
+      # Cross-compiling ring (a build script that runs the ARM64 C compiler)
+      # needs the Visual Studio ARM64 build tools. THEORY (unverified): the
+      # windows-latest image ships this component; this step is idempotent
+      # and installs it if it is missing. Owner: confirm on the first run.
+      - name: Ensure the VS ARM64 build tools
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $path = & $vswhere -latest -products * -property installationPath
+          $has = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if ($has) { Write-Host "ARM64 tools present."; exit 0 }
+          $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+            'modify', '--installPath', "`"$path`"",
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
+            '--quiet', '--norestart', '--nocache')
+          # 0 = installed, 3010 = installed but a reboot is pending (fine here).
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "Installing the VS ARM64 build tools failed (installer exit code $($p.ExitCode)). The ARM64 build cannot continue without them."
+          }
+          $still = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if (-not $still) { throw 'The VS installer reported success but the ARM64 build tools are still not present.' }
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check --target aarch64-pc-windows-msvc
+        run: cargo check --locked --target aarch64-pc-windows-msvc
+
   supply-chain:
     # cargo-deny-action is a Docker container action, and GitHub runs those
     # only on Linux runners ("Container action is only supported on Linux",
     # MEASURED 2026-09-24 on the first GitHub run of this workflow). Neither
     # step needs Windows: deny.toml's [graph] targets pin the dependency graph
-    # to x86_64-pc-windows-msvc wherever it is evaluated, and gitleaks scans
+    # to the two Windows targets (x86_64 and aarch64 msvc) wherever it is evaluated, and gitleaks scans
     # git history, not a build.
     name: cargo deny, gitleaks
     runs-on: ubuntu-latest
@@ -131,7 +177,7 @@ jobs:
       # the cmdlets a phase touches (Mock -ModuleName Wingman.Common), or -- for
       # the two tests that exercise Invoke-MakeAppxPack/Invoke-WingmanSignTool's
       # exit-code handling -- runs a tiny .cmd stub under $TestDrive instead of
-      # the real tool. None of the 77 tests shell out to a real makeappx.exe or
+      # the real tool. None of these tests shell out to a real makeappx.exe or
       # signtool.exe, so this job needs no Windows SDK install: what
       # windows-latest ships with (or doesn't) is irrelevant here.
       - name: Install Pester ${{ env.PESTER_VERSION }}
