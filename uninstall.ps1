@@ -117,9 +117,11 @@ if (-not $KeepCertificate) {
         if ($trusted) {
             Step "Removing the machine-wide certificate (one UAC prompt)"
             foreach ($c in $trusted) {
-                $inner = "Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object { `$_.Thumbprint -eq '$($c.Thumbprint)' } | Remove-Item -Force"
+                # The thumbprint is data, never part of the command text (issue #278).
+                $elevatedArgs = Get-ElevatedPowerShellArgumentList -Data @{ Thumbprint = $c.Thumbprint } -Script `
+                    'Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object { $_.Thumbprint -eq $Thumbprint } | Remove-Item -Force'
                 $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru `
-                     -ArgumentList '-NoProfile', '-NonInteractive', '-Command', $inner
+                     -ArgumentList $elevatedArgs
                 if ($p.ExitCode -ne 0) { Write-Warning "Could not remove certificate $($c.Thumbprint); remove it by hand in certlm.msc under Trusted People." }
             }
         }
