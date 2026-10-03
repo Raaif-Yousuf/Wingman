@@ -105,14 +105,17 @@
 //! finding for the alternative (a full `IDataObject` capture) this module
 //! does not attempt.
 //!
-//! # Not wired yet
+//! # Wired
 //!
-//! Same status `inputs::uia` had until #27 landed: most public items below
-//! are exercised only by this file's own tests. [`get_selection_foreground`]
-//! and [`get_selection_foreground_with_target`] ARE wired, via
-//! `actions::review_email::capture_input` (#38, #219) -- wiring a real key
-//! press or palette chip directly to this module for some other action is
-//! still a later issue.
+//! Every public item in this file is reachable from real, non-test code
+//! today, not only from this file's own tests. Two production call sites
+//! reach [`resolve`]'s `plan_from_probe`/`clipboard_fallback` machinery and
+//! therefore the whole pure-and-Win32 layer below: `actions::review_email::
+//! capture_input` (#38, #219) calls [`get_selection_foreground_with_target`],
+//! and `calc::ForegroundSelection::selected_text` (`App::calculate_selection`)
+//! calls [`get_selection_foreground`]. Wiring a real key press or palette
+//! chip directly to this module for some other action is still a later
+//! issue.
 //!
 //! # Selection identity and offsets (#219)
 //!
@@ -150,7 +153,6 @@ use std::time::Duration;
 
 /// Bounded length for the text this module returns (task brief: "bounded
 /// length (e.g. 20k chars, truncated flag)").
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub const DEFAULT_MAX_CHARS: usize = 20_000;
 
 /// How long the clipboard-fallback path waits for `WM_CLIPBOARDUPDATE` (or a
@@ -158,14 +160,12 @@ pub const DEFAULT_MAX_CHARS: usize = 20_000;
 /// restoring the clipboard anyway. Generous enough for a slow app to finish
 /// its own copy handler; still short enough that a card is never stuck
 /// waiting on it (AGENTS.md rule 7).
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub const DEFAULT_CLIPBOARD_WAIT_BUDGET: Duration = Duration::from_millis(1500);
 
 /// Result of probing the focused element for a `TextPattern` selection, the
 /// seam between the Win32 layer and [`plan_from_probe`]. Constructed by
 /// [`com::probe_from_element`] in production, and directly by this file's
 /// pure tests with no COM involved.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiaProbe {
     /// No element currently has UIA focus (or the lookup itself failed --
@@ -194,7 +194,6 @@ pub enum UiaProbe {
 /// caller-supplied `hwnd` (see [`SelectionTarget`]'s own doc comment for why
 /// `hwnd` is never read from UIA here). Produced only by
 /// [`com::probe_from_element`]'s single-contiguous-range case.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionIdentity {
     pub runtime_id: Vec<i32>,
@@ -223,7 +222,6 @@ pub struct SelectionIdentity {
 /// the desktop, not a window, the same reason
 /// `actions::review_email::com::capture_focused_compose_body` takes its
 /// `hwnd: isize` as a parameter instead of deriving one.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionTarget {
     pub hwnd: isize,
@@ -241,7 +239,6 @@ pub struct SelectionTarget {
 /// exposes. Pure and total: `None` in, `None` out, on either side -- kept
 /// separate from [`resolve`] so this combination has a plain unit test
 /// independent of any live UIA call.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 fn combine_target(
     foreground_hwnd: Option<isize>,
     identity: Option<SelectionIdentity>,
@@ -265,7 +262,6 @@ fn combine_target(
 /// itself so "empty selection falls back" and "over-length selection
 /// truncates" are both decided here, in one pure function, rather than
 /// duplicated between production code and tests.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionPlan {
     /// Use the UIA text as-is (already bounded). `identity` carries straight
@@ -293,7 +289,6 @@ pub enum SelectionPlan {
 /// support `TextPattern` in a way that reports selections" (measured against
 /// several real controls during design; not asserted here since it would
 /// require a live app).
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub fn plan_from_probe(probe: UiaProbe, max_chars: usize) -> SelectionPlan {
     match probe {
         UiaProbe::FocusedIsPassword => SelectionPlan::SkipPasswordField,
@@ -324,7 +319,6 @@ pub fn plan_from_probe(probe: UiaProbe, max_chars: usize) -> SelectionPlan {
 /// over the error type so this stays in the pure, no-`windows`-crate-types
 /// section and gets a plain unit test with no COM call involved;
 /// `com::probe_from_element` is the sole caller.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 fn resolve_is_password<E>(read: Result<bool, E>) -> bool {
     read.unwrap_or(true)
 }
@@ -334,7 +328,6 @@ fn resolve_is_password<E>(read: Result<bool, E>) -> bool {
 /// returning the truncated flag the task brief asks for. `total ==
 /// max_chars` keeps everything and is NOT truncated, matching
 /// `inputs::uia::bounded_count`'s inclusive-boundary convention.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub fn truncate_bounded(text: &str, max_chars: usize) -> (String, bool) {
     let mut chars = text.chars();
     let head: String = chars.by_ref().take(max_chars).collect();
@@ -348,7 +341,6 @@ pub fn truncate_bounded(text: &str, max_chars: usize) -> (String, bool) {
 /// just bytes in, `String` out, so the neighbouring cases (no terminator,
 /// empty buffer, an odd byte left over) are unit-tested without touching the
 /// real clipboard.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub fn decode_unicode_text(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
         .chunks_exact(2)
@@ -364,7 +356,6 @@ pub fn decode_unicode_text(bytes: &[u8]) -> String {
 /// here (rather than reusing `hotkey::Chord`, which also carries a trigger
 /// `vk` this module has no use for) so this file's pure functions stay free
 /// of any dependency on `hotkey.rs`.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModifierState {
     pub win: bool,
@@ -390,7 +381,6 @@ const VK_C: u32 = 0x43;
 /// GetAsyncKeyState(VK_RWIN)` (the same read `hotkey::current_chord` uses)
 /// cannot tell which physical key it was, and releasing a key that was
 /// never down is a harmless no-op keyup, not an error.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub fn modifier_release_plan(state: ModifierState) -> Vec<u32> {
     let mut plan = Vec::new();
     if state.win {
@@ -410,7 +400,6 @@ pub fn modifier_release_plan(state: ModifierState) -> Vec<u32> {
 }
 
 /// One synthetic key event in [`build_ctrl_c_plan`]'s output.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntheticKeyEvent {
     pub vk: u32,
@@ -422,7 +411,6 @@ pub struct SyntheticKeyEvent {
 /// Ctrl-down, C-down, C-up, Ctrl-up. Pure so the shape is asserted without
 /// ever calling `SendInput` (this module's tests never do -- see the module
 /// doc comment and [`win32::inject_events`]'s doc comment for why).
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub fn build_ctrl_c_plan(release: &[u32]) -> Vec<SyntheticKeyEvent> {
     let mut plan: Vec<SyntheticKeyEvent> = release
         .iter()
@@ -458,7 +446,6 @@ pub fn build_ctrl_c_plan(release: &[u32]) -> Vec<SyntheticKeyEvent> {
 /// the real shared clipboard is flaky and can clobber whatever the
 /// developer had copied, `executors::clipboard`'s `ClipboardAccess` doc
 /// comment says the identical thing about the single-format case).
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub trait RawClipboard {
     /// `GetClipboardSequenceNumber()`: bumped by Windows on every clipboard
     /// write, including ours -- the mechanism [`restore_and_verify`] uses to
@@ -478,7 +465,6 @@ pub trait RawClipboard {
 
 /// One point-in-time capture of every format in `formats_of_interest` that
 /// was actually present.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClipboardSnapshot {
     formats: Vec<(u32, Vec<u8>)>,
@@ -490,7 +476,6 @@ pub struct ClipboardSnapshot {
 /// the clipboard with exactly this shorter list, which is correct: a
 /// clipboard that never had `CF_HDROP` must not gain an empty `CF_HDROP`
 /// entry on restore.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub fn snapshot(clipboard: &impl RawClipboard, formats_of_interest: &[u32]) -> ClipboardSnapshot {
     let formats = formats_of_interest
         .iter()
@@ -500,7 +485,6 @@ pub fn snapshot(clipboard: &impl RawClipboard, formats_of_interest: &[u32]) -> C
 }
 
 /// Writes `snapshot` back to the clipboard, replacing whatever is there.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub fn restore(clipboard: &impl RawClipboard, snapshot: &ClipboardSnapshot) -> anyhow::Result<()> {
     clipboard.set_formats(&snapshot.formats)
 }
@@ -512,7 +496,6 @@ pub fn restore(clipboard: &impl RawClipboard, snapshot: &ClipboardSnapshot) -> a
 /// clipboard's sequence number higher than it was at capture time, that is
 /// expected and not a failure; what must never happen is a restore that
 /// silently touches nothing.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub fn restore_and_verify(
     clipboard: &impl RawClipboard,
     snapshot: &ClipboardSnapshot,
@@ -535,14 +518,12 @@ pub fn restore_and_verify(
 /// the safety net for every path that does not reach it (an early `?`, a
 /// panic unwind, a timeout branch that forgot to call it) -- best-effort
 /// there, since `Drop` cannot propagate a `Result`.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub struct ClipboardGuard<'a, C: RawClipboard> {
     clipboard: &'a C,
     snapshot: ClipboardSnapshot,
     done: bool,
 }
 
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 impl<'a, C: RawClipboard> ClipboardGuard<'a, C> {
     pub fn capture(clipboard: &'a C, formats_of_interest: &[u32]) -> Self {
         Self {
@@ -583,7 +564,6 @@ impl<'a, C: RawClipboard> Drop for ClipboardGuard<'a, C> {
 // ---------------------------------------------------------------------------
 
 /// Where the returned text came from.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionSource {
     Uia,
@@ -595,7 +575,6 @@ pub enum SelectionSource {
     SkippedPasswordField,
 }
 
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
     pub text: String,
@@ -615,8 +594,6 @@ pub struct Selection {
 // ---------------------------------------------------------------------------
 
 mod com {
-    #![allow(dead_code)] // see the module doc comment's "not wired yet"
-
     use super::{resolve_is_password, SelectionIdentity, UiaProbe};
     use windows::core::Interface;
     use windows::Win32::Foundation::HWND;
@@ -887,8 +864,6 @@ mod com {
 }
 
 mod win32 {
-    #![allow(dead_code)] // see the module doc comment's "not wired yet"
-
     use super::{RawClipboard, SyntheticKeyEvent};
     use crate::hotkey::INJECTED_MARKER;
     use std::sync::OnceLock;
@@ -1214,14 +1189,14 @@ mod win32 {
 // Public entry points
 // ---------------------------------------------------------------------------
 
-/// The real production entry point (not wired to `app.rs` yet -- see the
-/// module doc comment). Runs `TextPattern` first; if that yields no usable
-/// text, falls back to a clipboard-safe synthetic Ctrl+C. **Must be called
+/// The real production entry point, called by `calc::ForegroundSelection::
+/// selected_text` (itself reached from `App::calculate_selection`'s worker
+/// thread). Runs `TextPattern` first; if that yields no usable text, falls
+/// back to a clipboard-safe synthetic Ctrl+C. **Must be called
 /// from a dedicated worker thread**, same requirement as
 /// `inputs::uia::snapshot_foreground` (a hung UIA provider or a slow app's
 /// own clipboard handling can block for a while; never call this from the
 /// low-level keyboard hook's thread).
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub fn get_selection_foreground(
     max_chars: usize,
     clipboard_wait_budget: Duration,
@@ -1242,7 +1217,6 @@ pub fn get_selection_foreground(
 /// the same value `actions::review_email::capture_input` already threads
 /// through for the compose-body path -- see [`SelectionTarget`]'s doc
 /// comment for why this module never derives it from UIA itself.
-#[allow(dead_code)] // see the module doc comment's "not wired yet"
 pub fn get_selection_foreground_with_target(
     foreground_hwnd: isize,
     max_chars: usize,
