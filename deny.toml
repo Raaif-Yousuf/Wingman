@@ -3,7 +3,7 @@
 # Allowlist per issue #9 and AGENTS.md rule 2 (permissive licenses only):
 # MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, Unicode-3.0, Unlicense.
 #
-# Two crates on the actual x86_64-pc-windows-msvc dependency graph sit
+# Two crates on the actual x86_64-pc-windows-msvc and aarch64-pc-windows-msvc dependency graph sit
 # outside that list (see the comment on issue #9 and THIRD_PARTY_NOTICES.md
 # "Licensing note" for how each was found and verified):
 #   - clipboard-win 5.4.1, error-code 3.4.0: BSL-1.0 (Boost Software

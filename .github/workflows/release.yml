@@ -73,10 +73,19 @@ jobs:
           $has = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
           if ($has) { Write-Host "ARM64 tools present."; exit 0 }
           $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
-          Start-Process -FilePath $setup -Wait -ArgumentList @(
+          $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
             'modify', '--installPath', "`"$path`"",
             '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
             '--quiet', '--norestart', '--nocache')
+          # 0 = installed, 3010 = installed but a reboot is pending (fine here).
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "Installing the VS ARM64 build tools failed (installer exit code $($p.ExitCode)). The ARM64 build cannot continue without them."
+          }
+          $still = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if (-not $still) { throw 'The VS installer reported success but the ARM64 build tools are still not present.' }
+
+      - name: Add the ARM64 target
+        run: rustup target add aarch64-pc-windows-msvc
 
       # ARM64 build (issue #367), same reproducibility flags as above. Built
       # on the x64 runner with --target, so the exe lands in
@@ -158,6 +167,9 @@ jobs:
           # but Build-Msix.ps1 imports it itself, so pass the same inputs.
           $buildArgs = @{ Architecture = 'arm64' }
           if ('${{ steps.cert.outputs.has_cert }}' -eq 'true') {
+            if ([string]::IsNullOrEmpty($env:WINGMAN_MSIX_PFX_PASSWORD)) {
+              throw "WINGMAN_MSIX_PFX_BASE64 is set but WINGMAN_MSIX_PFX_PASSWORD is not."
+            }
             $buildArgs['PfxPath'] = '${{ steps.cert.outputs.pfx_path }}'
             $buildArgs['PfxPassword'] = ConvertTo-SecureString -String $env:WINGMAN_MSIX_PFX_PASSWORD -AsPlainText -Force
           }
@@ -205,7 +217,7 @@ jobs:
             'locally-signed, installable copy in the meantime.'
           }
           $sums = Get-Content dist\SHA256SUMS.txt -Raw
-          $verifyHint = 'Verify a download: (Get-FileHash .\wingman.exe -Algorithm SHA256).Hash.ToLower() should match its line in SHA256SUMS.txt.'
+          $verifyHint = 'Verify a download: (Get-FileHash .\<file> -Algorithm SHA256).Hash.ToLower() should match its line in SHA256SUMS.txt, for example wingman.exe, wingman.msix, wingman-arm64.exe or wingman-arm64.msix.'
           $notes = "$signedNote`n`n$verifyHint`n`n``````text`n$sums``````"
           $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           Set-Content -Path $notesPath -Value $notes -Encoding utf8

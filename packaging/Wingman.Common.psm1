@@ -285,6 +285,32 @@ function Get-WingmanTargetArchitecture {
     }
 }
 
+# Reads the PE header machine field of an exe (0x8664 x64, 0xAA64 arm64) so a
+# -SkipBuild install can pick the package architecture without rustc (issue
+# #367). Falls back to x64 when the file is missing, not a PE, or another
+# machine type, which matches the pre-ARM64 behaviour.
+function Get-ExeArchitecture {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $fs = [IO.File]::OpenRead($Path)
+        try {
+            $br = New-Object IO.BinaryReader($fs)
+            if ($fs.Length -lt 0x40 -or $br.ReadUInt16() -ne 0x5A4D) { return 'x64' }
+            $fs.Position = 0x3C
+            $peOffset = $br.ReadUInt32()
+            if ($peOffset + 6 -gt $fs.Length) { return 'x64' }
+            $fs.Position = $peOffset
+            if ($br.ReadUInt32() -ne 0x00004550) { return 'x64' }
+            $machine = $br.ReadUInt16()
+        } finally { $fs.Dispose() }
+        if ($machine -eq 0xAA64) { return 'arm64' }
+        return 'x64'
+    } catch {
+        return 'x64'
+    }
+}
+
 # Stages layout\Assets and layout\Public under $StageDir, renders the logos,
 # writes the PublicFolder placeholder, substitutes @VERSION@/@PUBLISHER@/@ARCH@ into
 # AppxManifest.xml.in, packs it and (if a certificate is given) signs the
@@ -677,6 +703,7 @@ Export-ModuleMember -Function @(
     'Invoke-WingmanSignTool',
     'Publish-WingmanPackage',
     'Get-WingmanTargetArchitecture',
+    'Get-ExeArchitecture',
     'Get-TopLevelPhaseMarkers',
     'Test-InstallPhaseOrder',
     'Confirm-CertTrusted'

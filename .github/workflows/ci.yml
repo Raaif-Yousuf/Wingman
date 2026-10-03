@@ -93,6 +93,12 @@ jobs:
       # needs the Visual Studio ARM64 build tools. THEORY (unverified): the
       # windows-latest image ships this component; this step is idempotent
       # and installs it if it is missing. Owner: confirm on the first run.
+      - name: Ensure the pinned toolchain (rust-toolchain.toml) is installed
+        run: rustup show
+
+      - name: Add the ARM64 target
+        run: rustup target add aarch64-pc-windows-msvc
+
       - name: Ensure the VS ARM64 build tools
         shell: pwsh
         run: |
@@ -101,10 +107,16 @@ jobs:
           $has = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
           if ($has) { Write-Host "ARM64 tools present."; exit 0 }
           $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
-          Start-Process -FilePath $setup -Wait -ArgumentList @(
+          $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
             'modify', '--installPath', "`"$path`"",
             '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
             '--quiet', '--norestart', '--nocache')
+          # 0 = installed, 3010 = installed but a reboot is pending (fine here).
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "Installing the VS ARM64 build tools failed (installer exit code $($p.ExitCode)). The ARM64 build cannot continue without them."
+          }
+          $still = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if (-not $still) { throw 'The VS installer reported success but the ARM64 build tools are still not present.' }
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -117,7 +129,7 @@ jobs:
     # only on Linux runners ("Container action is only supported on Linux",
     # MEASURED 2026-09-24 on the first GitHub run of this workflow). Neither
     # step needs Windows: deny.toml's [graph] targets pin the dependency graph
-    # to x86_64-pc-windows-msvc wherever it is evaluated, and gitleaks scans
+    # to the two Windows targets (x86_64 and aarch64 msvc) wherever it is evaluated, and gitleaks scans
     # git history, not a build.
     name: cargo deny, gitleaks
     runs-on: ubuntu-latest
@@ -165,7 +177,7 @@ jobs:
       # the cmdlets a phase touches (Mock -ModuleName Wingman.Common), or -- for
       # the two tests that exercise Invoke-MakeAppxPack/Invoke-WingmanSignTool's
       # exit-code handling -- runs a tiny .cmd stub under $TestDrive instead of
-      # the real tool. None of the 77 tests shell out to a real makeappx.exe or
+      # the real tool. None of these tests shell out to a real makeappx.exe or
       # signtool.exe, so this job needs no Windows SDK install: what
       # windows-latest ships with (or doesn't) is irrelevant here.
       - name: Install Pester ${{ env.PESTER_VERSION }}

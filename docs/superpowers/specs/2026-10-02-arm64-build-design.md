@@ -30,6 +30,11 @@ artifacts next to the x64 ones, and CI keeps the ARM64 target compiling.
 
 ## Open for the owner
 
+- THEORY (unverified): an x64 and an arm64 package with the same identity
+  (`RaaifYousuf.Wingman`) and the same version, both registered on one ARM64
+  machine, may make `Add-AppxPackage` refuse the second. Not solved here;
+  decision 5 says a machine installs exactly one, but nothing enforces it.
+
 - Whether to also ship a universal installer that picks the architecture.
 - Whether `cargo test` should run on a native ARM64 runner (decision 1
   alternative).

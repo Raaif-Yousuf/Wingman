@@ -179,12 +179,17 @@ Note "sdk     $(Split-Path $sdk.MakeAppx -Parent)"
 # The package ProcessorArchitecture must match the exe cargo builds, which is
 # the rustc host (issue #367: an ARM64 rustc builds an ARM64 exe). A bare
 # build with no --target never cross-compiles.
-$hostLine = & rustc -vV | Where-Object { $_ -like 'host: *' }
-if (-not $hostLine) { throw "Could not read the rustc host triple from rustc -vV." }
-$arch = Get-WingmanTargetArchitecture -Triple ($hostLine -replace '^host:\s*', '').Trim()
-Note "arch    $arch"
-
+# With -SkipBuild there may be no rustc at all, so the exe's own PE header
+# decides instead (defaulting to x64).
 $built = Join-Path $Repo "target\release\$($Identity.Current.ExeName)"
+if ($SkipBuild) {
+    $arch = if (Test-Path $built) { Get-ExeArchitecture -Path $built } else { 'x64' }
+} else {
+    $hostLine = & rustc -vV | Where-Object { $_ -like 'host: *' }
+    if (-not $hostLine) { throw "Could not read the rustc host triple from rustc -vV." }
+    $arch = Get-WingmanTargetArchitecture -Triple ($hostLine -replace '^host:\s*', '').Trim()
+}
+Note "arch    $arch"
 if (-not $SkipBuild) {
     Step "Building (cargo build --release)"
     & cargo build --release --manifest-path (Join-Path $Repo 'Cargo.toml')

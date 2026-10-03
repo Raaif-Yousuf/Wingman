@@ -875,6 +875,34 @@ Describe 'Get-WingmanTargetArchitecture (issue #367)' {
     }
 }
 
+Describe 'Get-ExeArchitecture (issue #367)' {
+    BeforeAll {
+        function script:New-FakePe([string]$Path, [uint16]$Machine) {
+            $b = New-Object byte[] 256
+            $b[0] = 0x4D; $b[1] = 0x5A
+            $b[0x3C] = 0x80
+            $b[0x80] = 0x50; $b[0x81] = 0x45
+            $b[0x84] = [byte]($Machine -band 0xFF); $b[0x85] = [byte]($Machine -shr 8)
+            [IO.File]::WriteAllBytes($Path, $b)
+        }
+    }
+    It 'reads x64 from machine 0x8664' {
+        New-FakePe (Join-Path $TestDrive 'x64.exe') 0x8664
+        Get-ExeArchitecture -Path (Join-Path $TestDrive 'x64.exe') | Should -Be 'x64'
+    }
+    It 'reads arm64 from machine 0xAA64' {
+        New-FakePe (Join-Path $TestDrive 'a64.exe') 0xAA64
+        Get-ExeArchitecture -Path (Join-Path $TestDrive 'a64.exe') | Should -Be 'arm64'
+    }
+    It 'defaults to x64 for a missing file, a non-PE file or an unknown machine' {
+        Get-ExeArchitecture -Path (Join-Path $TestDrive 'nope.exe') | Should -Be 'x64'
+        Set-Content (Join-Path $TestDrive 'junk.exe') -Value 'junk'
+        Get-ExeArchitecture -Path (Join-Path $TestDrive 'junk.exe') | Should -Be 'x64'
+        New-FakePe (Join-Path $TestDrive 'x86.exe') 0x014C
+        Get-ExeArchitecture -Path (Join-Path $TestDrive 'x86.exe') | Should -Be 'x64'
+    }
+}
+
 Describe 'Publish-WingmanPackage -Architecture (issue #367)' {
     BeforeAll {
         $script:id  = Get-WingmanIdentity
