@@ -4,10 +4,18 @@
 //! trait so tests never launch a real handler). See the connector design
 //! doc's ".ics generation rules" for the folding/escaping/timezone rules
 //! this file implements.
+//!
+//! **Issue #238**: nothing ever deleted a generated `.ics` file on the
+//! success path, so `%TEMP%\Wingman` grew without bound the more "Add to
+//! calendar" was used. [`IcsConnector::create_calendar_event`] now runs a
+//! best-effort [`cleanup_stale_ics_files`] sweep of its own temp directory
+//! before writing the new file -- see that function's doc comment for why
+//! stale means "older than [`MAX_ICS_FILE_AGE`]", not "every other file",
+//! and why a cleanup failure is always ignored.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -233,6 +241,10 @@ impl<O: Opener> Connector for IcsConnector<O> {
 
         std::fs::create_dir_all(&self.temp_dir)
             .with_context(|| format!("could not create {}", self.temp_dir.display()))?;
+        // #238: best-effort sweep of this connector's own old output before
+        // writing the new file. Never fails this action (see
+        // `cleanup_stale_ics_files`'s doc comment).
+        cleanup_stale_ics_files(&self.temp_dir);
         let path = self
             .temp_dir
             .join(format!("{}.ics", sanitize_filename(&uid)));
@@ -271,6 +283,65 @@ fn generate_uid() -> String {
 /// the file content is untouched.
 fn sanitize_filename(uid: &str) -> String {
     uid.replace('@', "_")
+}
+
+/// #238: how long a generated `.ics` file sits in the temp directory before
+/// [`cleanup_stale_ics_files`] is willing to delete it. Not deleted
+/// immediately on write (or on the next call), and not zero: the default
+/// calendar handler this connector just handed the file to
+/// (`ShellExecuteW("open", ...)`) can still be reading it asynchronously
+/// for a short while after that call returns, so removing it too eagerly
+/// risks deleting a file the calendar app has not finished opening yet. One
+/// day is long enough for any such read to have finished, short enough that
+/// `%TEMP%\Wingman` does not accumulate indefinitely.
+const MAX_ICS_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Pure: whether a file last modified at `modified` counts as stale at
+/// `now`, given `max_age`. A `now` that is not strictly after `modified` by
+/// more than `max_age` -- including `now` at or before `modified`, e.g. a
+/// clock adjustment, or a file modified in the same instant this check runs
+/// -- is never stale; only a nonnegative elapsed duration greater than
+/// `max_age` is.
+fn is_stale(modified: SystemTime, now: SystemTime, max_age: Duration) -> bool {
+    match now.duration_since(modified) {
+        Ok(elapsed) => elapsed > max_age,
+        Err(_) => false,
+    }
+}
+
+/// Best-effort sweep of `.ics` files this connector previously wrote in
+/// `dir`, deleting the ones older than [`MAX_ICS_FILE_AGE`] (#238). Called
+/// by `create_calendar_event` right before it writes a new file, not on a
+/// timer (rule 5: nothing runs while idle).
+///
+/// Only ever touches a file directly inside `dir` whose name ends in
+/// `.ics` -- nothing else in that directory, and nothing in a
+/// subdirectory. Every failure along the way (the directory cannot be
+/// read, one entry's metadata or modified time cannot be read, a delete
+/// fails because the calendar app still has the file open) is silently
+/// ignored and the sweep moves on to the next entry: this is cleanup, not
+/// the action itself, so it must never turn a successful "Add to
+/// calendar" into a failure (rule 7).
+fn cleanup_stale_ics_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "ics") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if is_stale(modified, now, MAX_ICS_FILE_AGE) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// #276: RFC 5545 `DATE`/`DATE-TIME` values require exactly a 4-digit year
@@ -1373,6 +1444,130 @@ END:VCALENDAR\r\n";
         let opener = RecordingOpener::default();
         let connector = IcsConnector::with_temp_dir_and_opener(dir.clone(), opener);
         connector.create_calendar_event(&sample_event()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- is_stale (#238, pure) ----------------------------------------------
+
+    #[test]
+    fn a_file_modified_within_max_age_is_not_stale() {
+        let modified = SystemTime::now();
+        let now = modified + Duration::from_secs(60);
+        assert!(!is_stale(modified, now, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn a_file_modified_past_max_age_is_stale() {
+        let modified = SystemTime::now();
+        let now = modified + Duration::from_secs(3601);
+        assert!(is_stale(modified, now, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn exactly_max_age_old_is_not_yet_stale() {
+        // The boundary is exclusive: `elapsed > max_age`, not `>=`, so a
+        // file exactly at the limit survives one more sweep.
+        let modified = SystemTime::now();
+        let now = modified + Duration::from_secs(3600);
+        assert!(!is_stale(modified, now, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn a_modified_time_after_now_is_never_stale() {
+        // Guards against a clock adjustment or a file modified in the same
+        // instant this check runs: `now.duration_since(modified)` errs, and
+        // that must never be read as "stale".
+        let now = SystemTime::now();
+        let modified = now + Duration::from_secs(60);
+        assert!(!is_stale(modified, now, Duration::from_secs(3600)));
+    }
+
+    // -- cleanup_stale_ics_files (#238, filesystem) --------------------------
+
+    /// Writes `name` under `dir` and backdates its modified time by
+    /// `age_secs` seconds, so `cleanup_stale_ics_files`'s age check has
+    /// something real to compare against. `std::fs::File::set_modified`
+    /// (stable since Rust 1.75, below this crate's 1.80 MSRV) needs no
+    /// extra dependency for this.
+    fn write_file_with_age(dir: &Path, name: &str, age_secs: u64) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"test").unwrap();
+        let backdated = SystemTime::now() - Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn cleanup_deletes_an_ics_file_older_than_max_age() {
+        let dir = test_temp_dir("cleanup-old");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = write_file_with_age(&dir, "old.ics", MAX_ICS_FILE_AGE.as_secs() + 60);
+
+        cleanup_stale_ics_files(&dir);
+
+        assert!(!stale.exists(), "a stale .ics file must be deleted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cleanup_keeps_a_recently_written_ics_file() {
+        let dir = test_temp_dir("cleanup-fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = write_file_with_age(&dir, "fresh.ics", 60);
+
+        cleanup_stale_ics_files(&dir);
+
+        assert!(fresh.exists(), "a freshly written .ics file must survive");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cleanup_never_touches_a_file_that_does_not_end_in_ics() {
+        let dir = test_temp_dir("cleanup-other-ext");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_but_not_ics =
+            write_file_with_age(&dir, "notes.txt", MAX_ICS_FILE_AGE.as_secs() + 60);
+
+        cleanup_stale_ics_files(&dir);
+
+        assert!(
+            old_but_not_ics.exists(),
+            "cleanup must only ever touch *.ics files in the exact directory"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cleanup_on_a_directory_that_does_not_exist_does_nothing_and_never_panics() {
+        let dir = test_temp_dir("cleanup-missing-dir");
+        // Deliberately never created.
+        cleanup_stale_ics_files(&dir);
+    }
+
+    #[test]
+    fn create_calendar_event_sweeps_its_own_old_ics_files_but_keeps_a_fresh_one() {
+        // End-to-end through the connector's injectable temp dir (rule 9:
+        // never the real `%TEMP%\Wingman`): a prior stale output file is
+        // gone after the next `create_calendar_event` call, a prior fresh
+        // one survives, and the newly written file is always present.
+        let dir = test_temp_dir("execute-sweeps-old-files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = write_file_with_age(&dir, "old-event.ics", MAX_ICS_FILE_AGE.as_secs() + 60);
+        let fresh = write_file_with_age(&dir, "recent-event.ics", 60);
+
+        let connector =
+            IcsConnector::with_temp_dir_and_opener(dir.clone(), RecordingOpener::default());
+        let result = connector.create_calendar_event(&sample_event()).unwrap();
+
+        assert!(!stale.exists(), "a stale .ics file must be swept away");
+        assert!(fresh.exists(), "a recently written .ics file must survive");
+        assert!(result.path.exists(), "the newly written file must exist");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
