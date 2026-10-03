@@ -1,0 +1,5 @@
+error[E0603]: tuple struct constructor `SendAuthorized` is private
+  --> tests/compile_fail/send_authorized_is_private.rs:55:25
+   |
+55 |         super::confirm::SendAuthorized(()) // error[E0603]: tuple struct constructor is private
+   |                         ^^^^^^^^^^^^^^ private tuple struct constructor
