@@ -63,6 +63,8 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "action_items" => Some(action_items_schema()),
         // #66: a read-only explanation of an error, shown on the card.
         "error_explanation" => Some(error_explanation_schema()),
+        // #75: a read-only definition of a selected word, shown on the card.
+        "word_definition" => Some(word_definition_schema()),
         // #67: two summary lines and a few bullets, shown on the card only.
         "page_summary" => Some(page_summary_schema()),
         _ => None,
@@ -84,6 +86,24 @@ fn error_explanation_schema() -> Value {
             "fix": {"type": "string"}
         },
         "required": ["meaning", "cause", "fix"],
+        "additionalProperties": false
+    })
+}
+
+/// The `word_definition` proposal schema (#75): `definition` then `example`,
+/// both plain strings. `definition` comes first because the card's headline
+/// is the first field, and the model should commit to the meaning before it
+/// writes a sentence that has to fit it (rule 3). Two fields rather than one
+/// free-text answer so a small local model fills in both. Not editable: the
+/// card shows it as an answer (`executor = "none"`).
+fn word_definition_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "definition": {"type": "string"},
+            "example": {"type": "string"}
+        },
+        "required": ["definition", "example"],
         "additionalProperties": false
     })
 }
@@ -516,6 +536,20 @@ mod tests {
                 .all(|p| p["type"] == "string" && p.get("editable").is_none()),
             "a read-only answer has no edit controls"
         );
+    }
+
+    #[test]
+    fn word_definition_asks_for_the_definition_then_an_example() {
+        let schema = schema_for("word_definition", false).expect("word_definition is registered");
+        let order: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["definition", "example"]);
+        assert_eq!(schema["required"], json!(["definition", "example"]));
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]

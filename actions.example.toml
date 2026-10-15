@@ -149,3 +149,18 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "define-this-word"
+name = "Define this word"
+group = "Study"
+inputs = ["selection"]
+proposal = "word_definition"
+executor = "none"
+confirm = false
+prompt = 'You are given a word or short phrase the user selected. Define it for a general reader. Fill the fields in this order. definition: the word as written, its part of speech in brackets, a colon, then a plain definition in one short sentence, at most 90 characters in total (for example "ephemeral (adjective): lasting a very short time"). example: one short sentence that uses the word naturally. If the selection has several common meanings, give the most common one. If it is an idiom or phrase, define the phrase. If the selection is a long passage, define only its single hardest word. If it is not a real word or phrase, say so in definition and write "None" in example. Never invent a meaning. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "local"
