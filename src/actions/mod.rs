@@ -103,10 +103,15 @@ pub struct Action {
     /// then a clear load error, not a parse-time rejection of a
     /// forward-referenced action nobody can run yet anyway.
     pub proposal: String,
-    /// Executor id, or `"none"` for a read-only action. Only `"none"` is
-    /// implemented -- no executor exists yet (expansion plan §17 Phase 2)
-    /// -- so any other value is accepted as data but never resolved to
-    /// anything; that resolution is a later issue's job, not this one's.
+    /// Executor id, or `"none"` for a read-only action. Resolved by
+    /// [`resolve_executor`] through `executors::registry::resolve`, which
+    /// knows `none`, `clipboard`, `calendar_add`, `image_clipboard`,
+    /// `replace_text` and `fill_form`; any other name is an error at
+    /// dispatch time. A hand-written `actions.toml` entry runs through the
+    /// generic path (`App::run_generic_action`), which reads this field.
+    /// The built-in "Add event from screen", "Fill this form" and "Review
+    /// this email" flows in `app.rs` currently resolve their executor by a
+    /// hardcoded name that matches this field instead of reading it back.
     pub executor: String,
     pub confirm: bool,
     pub prompt: String,
