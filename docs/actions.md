@@ -29,7 +29,9 @@ built-in.
 - **Merge is by `id`, wholesale, not per-field.** A user `[[actions]]` block
   whose `id` matches a built-in replaces that built-in's entire record --
   every field comes from the user's block, not a mix of old and new. A new
-  `id` is appended. (`merge_actions`, `src/actions/mod.rs`.)
+  `id` is appended. (`merge_actions`, `src/actions/mod.rs`.) For example, a
+  user action with the id `translate-selection` replaces the built-in
+  "Translate selection".
 - **`enabled = false` hides an action**, and so does listing its `group` in
   the top-level `disabled_groups = [...]` array. Both checks run after
   merge, so a disabled built-in whose group is later re-enabled still
@@ -46,7 +48,7 @@ disabled_groups = ["Study"]        # top level, applies across all actions
 
 [[actions]]
 id       = "translate-to-clipboard"   # stable identity; merge key
-name     = "Translate selection"   # shown in the (not yet built) palette
+name     = "Translate to clipboard"   # shown in the (not yet built) palette
 group    = "Writing"               # optional; omit for an ungrouped action
 inputs   = ["selection", "screen"] # catalogue metadata -- see below
 proposal = "text_answer"           # schema-registry key, actions::schema::schema_for
@@ -163,9 +165,11 @@ offer "Do it" at all.
 
 `actions::schema::schema_for(proposal, rate_difficulty) -> Option<Value>` is
 the one registry mapping a proposal name to the JSON Schema a model's
-completion must satisfy. Six kinds are registered today: `"verdict"` (today's
+completion must satisfy. Seven kinds are registered today: `"verdict"` (today's
 "Check my work"), `"calendar_event"` (#26), `"text_review"` (#38),
-`"form_fill"` (#40), `"text_answer"` (#242) and `"action_items"` (#314: a list of
+`"form_fill"` (#40), `"text_answer"` (#242), `"page_summary"` (#67: `bullets`,
+then two summary lines, shown on the card only; the first line is cut to 50 characters, the second to 90 so both fit the collapsed card, and bullets are
+clamped in code) and `"action_items"` (#314: a list of
 lines the `clipboard` executor copies as a Markdown checklist). Each schema function returns a `serde_json::json!`
 literal shaped like standard JSON Schema (`"type": "object"`, `"properties"`,
 `"required"`, `"additionalProperties": false`), plus one

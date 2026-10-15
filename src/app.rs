@@ -1377,6 +1377,11 @@ impl App {
                 // screenshot goes along (a selection-only action sends no image).
                 let gathered = gather_generic_inputs(&inputs, foreground_hwnd_isize, writes_back)?;
                 let planned = plan_generic_inputs(&inputs, &gathered)?;
+                if writes_back && actions::generic_replace::too_long(&gathered) {
+                    return Err(GenericFailure::UserState(
+                        actions::generic_replace::TOO_LONG_MESSAGE.to_string(),
+                    ));
+                }
                 let replace = writes_back
                     .then(|| actions::generic_replace::replace_plan(&gathered))
                     .flatten();
@@ -1458,14 +1463,19 @@ impl App {
         }
 
         if action.confirm {
-            self.pending_preview = Some(if action.executor == "replace_text" {
+            let writes_back = action.executor == "replace_text";
+            let title = if writes_back {
+                actions::generic_replace::preview_title(&action.name, replace.is_some())
+            } else {
+                action.name.clone()
+            };
+            self.pending_preview = Some(if writes_back {
                 PendingPreview::GenericReplace(action.clone(), replace)
             } else {
                 PendingPreview::Generic(action.clone())
             });
             self.pending_preview_generation =
-                self.card
-                    .show_preview(&action.name, &schema, &proposal, false);
+                self.card.show_preview(&title, &schema, &proposal, false);
             return;
         }
 
@@ -1587,6 +1597,7 @@ impl App {
                         let text = actions::generic_answer::result_card_text(
                             &action.name,
                             executor.name(),
+                            &action.proposal,
                             &undo.summary,
                             &proposal,
                         );
@@ -1619,61 +1630,44 @@ impl App {
     /// #68's half of [`App::on_preview_decided`]: writes the confirmed text
     /// over the selection through the action's `replace_text` executor (the
     /// same `do_review_confirmed` path "Review this email" uses, so the
-    /// executor's stale-target check applies). With no safe selection to
-    /// write over, the text is copied to the clipboard instead and the card
-    /// says so; it never ends silently.
+    /// executor's stale-target check applies). When the selection cannot be
+    /// written over, or the write fails, the confirmed text is copied to the
+    /// clipboard instead and the card says so; the user's text is never
+    /// dropped (`actions::generic_replace::replace_or_copy`).
     fn run_confirmed_generic_replace(
         &mut self,
         action: &actions::Action,
         plan: Option<Box<actions::generic_replace::ReplaceSelection>>,
         confirmed: confirm::Confirmed<Value>,
     ) {
-        let context = plan
-            .as_ref()
-            .and_then(|p| actions::generic_replace::review_context(p, confirmed.value()));
-        let Some(context) = context else {
-            self.copy_instead_of_replacing(action, confirmed);
-            return;
-        };
+        use actions::generic_replace::ReplaceReport;
         let title = format!("Couldn't run \"{}\"", action.name);
-        match actions::resolve_executor(action) {
-            Ok(executor) => {
-                match actions::review_email::do_review_confirmed(executor.as_ref(), &context) {
-                    Ok(undo) => {
+        let executors = actions::resolve_executor(action)
+            .and_then(|replace| Ok((replace, executors::registry::resolve("clipboard")?)));
+        match executors {
+            Ok((replace, copy)) => {
+                match actions::generic_replace::replace_or_copy(
+                    replace.as_ref(),
+                    copy.as_ref(),
+                    plan.as_deref(),
+                    confirmed,
+                ) {
+                    ReplaceReport::Replaced(summary) => {
                         self.card
-                            .show_answer("Selection replaced", &undo.summary, 0, None);
+                            .show_answer("Selection replaced", &summary, 0, None);
                     }
-                    Err(e) => {
-                        let detail = self.track_error(&title, &format!("{e:#}"));
+                    ReplaceReport::Copied(detail) => {
+                        self.card
+                            .show_answer("Copied to the clipboard", &detail, 0, None);
+                    }
+                    ReplaceReport::NothingToReplace => {
+                        self.card.show_answer("Nothing to replace", "", 0, None);
+                    }
+                    ReplaceReport::Failed(reason) => {
+                        let detail = self.track_error(&title, &reason);
                         self.card.show_error_with_details(&title, &detail);
                     }
                 }
-            }
-            Err(e) => {
-                let detail = self.track_error(&title, &format!("{e:#}"));
-                self.card.show_error_with_details(&title, &detail);
-            }
-        }
-        self.set_watch(true);
-    }
-
-    /// The fallback half of [`App::run_confirmed_generic_replace`]: copies the
-    /// confirmed `text` with the `clipboard` executor.
-    fn copy_instead_of_replacing(
-        &mut self,
-        action: &actions::Action,
-        confirmed: confirm::Confirmed<Value>,
-    ) {
-        let title = format!("Couldn't run \"{}\"", action.name);
-        match executors::registry::resolve("clipboard").and_then(|e| e.execute(confirmed)) {
-            Ok(undo) => {
-                let detail = format!(
-                    "{} {}",
-                    actions::generic_replace::COPIED_INSTEAD_DETAIL,
-                    undo.summary
-                );
-                self.card
-                    .show_answer("Copied to the clipboard", &detail, 0, None);
             }
             Err(e) => {
                 let detail = self.track_error(&title, &format!("{e:#}"));
