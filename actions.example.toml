@@ -45,6 +45,24 @@ enabled = true
 mode = "auto"
 
 [[actions]]
+id = "summarize-page"
+name = "Summarize this page"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "page_summary"
+executor = "none"
+confirm = false
+prompt = 'You are shown a long page (an article, a report, an email thread, a document), as text if some was selected and as a screenshot otherwise. Summarize what is on it. Fill `bullets` first: at most 5 plain-text points, one short sentence each, in the order they appear on the page. Then write `line1`: one short sentence, at most 50 characters, that says what this page is or announces. Then write `line2`: one sentence, at most 90 characters, that says what matters most to a reader. Use only what the page says: do not add facts, numbers or opinions that are not shown. If there is no readable page content, return an empty `line1`, an empty `line2` and no bullets. Use plain text only: no markdown, no bullet characters, no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
 id = "add-to-calendar"
 name = "Add event from screen"
 group = "Work"

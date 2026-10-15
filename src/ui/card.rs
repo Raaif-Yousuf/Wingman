@@ -1016,7 +1016,12 @@ const CARD_WIDTH_DP: i32 = 280;
 /// headline; three lines leaves real headroom for wider glyphs/short words
 /// that push wrapping earlier, so a full 90-character headline is never
 /// silently `DT_END_ELLIPSIS`'d.
-const HEADLINE_MAX_LINES: i32 = 3;
+pub(crate) const HEADLINE_MAX_LINES: i32 = 3;
+/// Characters that fit on one collapsed headline line once the chevron's
+/// width is reserved: (252dp content - 24dp chevron) / 4.5dp per glyph = 50.
+/// A budget for callers that must fit text in `HEADLINE_MAX_LINES`
+/// (`actions::page_summary`), not a measurement.
+pub(crate) const HEADLINE_CHARS_PER_LINE: usize = 50;
 /// Side length of the spinner/glyph square inside the pending card (issue
 /// #354: smaller than the old spinner-only card's full size, since the
 /// pending card now also carries a status line below the glyph).

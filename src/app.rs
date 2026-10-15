@@ -1574,6 +1574,7 @@ impl App {
                         let text = actions::generic_answer::result_card_text(
                             &action.name,
                             executor.name(),
+                            &action.proposal,
                             &undo.summary,
                             &proposal,
                         );

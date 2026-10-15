@@ -1088,7 +1088,10 @@ mod tests {
     fn dispatch_covers_every_built_in_action() {
         // Built-ins that run through the generic path on purpose: they need
         // nothing a plain `actions.toml` entry lacks.
-        let generic_on_purpose = [crate::actions::action_items::ACTION_ID];
+        let generic_on_purpose = [
+            crate::actions::action_items::ACTION_ID,
+            crate::actions::page_summary::ACTION_ID,
+        ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {
                 continue;
