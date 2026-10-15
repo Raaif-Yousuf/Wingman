@@ -91,7 +91,9 @@ use windows::Win32::Graphics::Gdi::{
     PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_RETURN,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
@@ -102,10 +104,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETCLIENTAREAANIMATION,
     SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
-    WM_SETTINGCHANGE, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_SETTINGCHANGE, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD,
+    WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -1486,6 +1489,50 @@ impl CardInner {
         }
     }
 
+    /// Paints a preview button for `WM_DRAWITEM` (#351): "Do it" in the
+    /// system accent, the rest as outlines, in the card's theme, or in the
+    /// system colors under high contrast.
+    fn draw_preview_button(&self, lparam: LPARAM) {
+        use crate::ui::card_buttons as btn;
+        let dis = lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT;
+        if dis.is_null() {
+            return;
+        }
+        let dis = unsafe { &*dis };
+        let palette = self.theme.palette();
+        let surface = btn::Surface {
+            bg: palette.bg,
+            border: palette.border,
+            text: palette.headline,
+            hint: palette.hint,
+        };
+        let role = if dis.CtlID == ID_PREVIEW_DO_IT as u32 {
+            btn::Role::Primary
+        } else {
+            btn::Role::Secondary
+        };
+        let hovered = button_is_hovered(dis.hwndItem);
+        let look = btn::look(
+            role,
+            btn::state_of(dis, hovered),
+            &surface,
+            btn::system_accent(),
+            btn::system_high_contrast().as_ref(),
+        );
+        let text = window_text(dis.hwndItem);
+        unsafe {
+            btn::draw(
+                dis,
+                &text,
+                self.fonts.body,
+                &look,
+                palette.bg,
+                self.scale(BUTTON_CORNER_DP),
+                self.scale(1),
+            );
+        }
+    }
+
     /// Switches to `theme`: drops the cached EDIT brush (it holds the old
     /// theme's color; `WM_CTLCOLOREDIT` rebuilds it) and repaints the card
     /// and its preview fields.
@@ -2440,6 +2487,10 @@ impl CardInner {
                 let _ = HWND(lparam.0 as *mut _); // the EDIT control; unused (every preview EDIT shares one theme)
                 Some(LRESULT(self.edit_bg_brush.0 as isize))
             }
+            WM_DRAWITEM => {
+                self.draw_preview_button(lparam);
+                Some(LRESULT(1))
+            }
             WM_PAINT => {
                 self.on_paint();
                 Some(LRESULT(0))
@@ -2956,19 +3007,9 @@ impl CardInner {
             &metrics.buttons.do_it,
             ID_PREVIEW_DO_IT,
             true,
-            true,
         );
         let edit_btn = metrics.buttons.edit.map(|rect| {
-            create_preview_button(
-                parent,
-                instance,
-                font,
-                "Edit",
-                &rect,
-                ID_PREVIEW_EDIT,
-                false,
-                true,
-            )
+            create_preview_button(parent, instance, font, "Edit", &rect, ID_PREVIEW_EDIT, true)
         });
         let mut btns = vec![do_it_btn];
         if let Some(edit_btn) = edit_btn {
@@ -3295,11 +3336,55 @@ const ID_PREVIEW_CANCEL: i32 = 3902;
 /// the same control apart.
 const PREVIEW_SUBCLASS_ID: usize = 1;
 
+/// Corner radius of the owner-drawn preview buttons, in dp.
+const BUTTON_CORNER_DP: i32 = 6;
+
+fn button_is_hovered(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetPropW;
+    let name = wide_z(BUTTON_HOVER_PROP);
+    !unsafe { GetPropW(hwnd, PCWSTR(name.as_ptr())) }.0.is_null()
+}
+
+fn set_button_hover(hwnd: HWND, hovered: bool) {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Graphics::Gdi::InvalidateRect;
+    use windows::Win32::UI::WindowsAndMessaging::{RemovePropW, SetPropW};
+    if button_is_hovered(hwnd) == hovered {
+        return;
+    }
+    let name = wide_z(BUTTON_HOVER_PROP);
+    unsafe {
+        if hovered {
+            let _ = SetPropW(hwnd, PCWSTR(name.as_ptr()), Some(HANDLE(1 as *mut c_void)));
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut track);
+        } else {
+            let _ = RemovePropW(hwnd, PCWSTR(name.as_ptr()));
+        }
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+fn is_owner_drawn_button(hwnd: HWND) -> bool {
+    let style =
+        unsafe { GetWindowLongPtrW(hwnd, windows::Win32::UI::WindowsAndMessaging::GWL_STYLE) };
+    crate::ui::card_buttons::is_owner_drawn(style as u32)
+}
+
 const WC_EDIT: &str = "EDIT";
 const WC_BUTTON: &str = "BUTTON";
 const ES_AUTOHSCROLL: u32 = 0x0080;
-const BS_PUSHBUTTON: u32 = 0x0000;
-const BS_DEFPUSHBUTTON: u32 = 0x0001;
+/// `WM_MOUSELEAVE`'s stable, documented value (winuser.h).
+const WM_MOUSELEAVE: u32 = 0x02A3;
+/// Window property set on an owner-drawn preview button while the mouse is
+/// over it (#351), read by the `WM_DRAWITEM` handler. No timer: the subclass
+/// sets it on `WM_MOUSEMOVE` and clears it on `WM_MOUSELEAVE`.
+const BUTTON_HOVER_PROP: &str = "Wingman.Card.ButtonHover";
 
 /// Live state for `CardState::Preview`. Owned by `CardInner.preview`; exists
 /// for exactly as long as the preview's child controls do (see
@@ -3469,7 +3554,14 @@ unsafe extern "system" fn preview_control_subclass(
             );
         }
     }
+    if msg == WM_MOUSEMOVE && is_owner_drawn_button(hwnd) {
+        set_button_hover(hwnd, true);
+    }
+    if msg == WM_MOUSELEAVE && is_owner_drawn_button(hwnd) {
+        set_button_hover(hwnd, false);
+    }
     if msg == WM_NCDESTROY {
+        set_button_hover(hwnd, false);
         let _ = RemoveWindowSubclass(hwnd, Some(preview_control_subclass), PREVIEW_SUBCLASS_ID);
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
@@ -3525,7 +3617,8 @@ fn create_preview_edit(
     Some(hwnd)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// A preview button. Owner-drawn (#351) so it follows the card's theme and
+/// the system accent; Enter, Space and Tab behave as for any push button.
 fn create_preview_button(
     parent: HWND,
     instance: HINSTANCE,
@@ -3533,7 +3626,6 @@ fn create_preview_button(
     text: &str,
     rect: &RECT,
     id: i32,
-    is_default: bool,
     enabled: bool,
 ) -> HWND {
     let class_w = wide_z(WC_BUTTON);
@@ -3541,11 +3633,7 @@ fn create_preview_button(
     let style = WS_CHILD.0
         | WS_VISIBLE.0
         | WS_TABSTOP.0
-        | if is_default {
-            BS_DEFPUSHBUTTON
-        } else {
-            BS_PUSHBUTTON
-        }
+        | crate::ui::card_buttons::BS_OWNERDRAW
         | if enabled { 0 } else { WS_DISABLED.0 };
     let hwnd = unsafe {
         CreateWindowExW(
@@ -4158,6 +4246,133 @@ mod tests {
             !queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS),
             "an answer card has no Copy details to activate"
         );
+    }
+
+    // -- owner-drawn preview buttons (#351) ---------------------------------
+
+    /// Sends a real `WM_DRAWITEM` for `button` to the card, drawing into an
+    /// off-screen bitmap, and returns the colour at `(x, y)` inside it.
+    fn drawn_pixel(card: &mut Card, button: HWND, id: i32, item_state: u32, x: i32, y: i32) -> u32 {
+        use windows::Win32::Graphics::Gdi::{DeleteDC, GetPixel};
+        use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(button, &mut rc);
+        }
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, rc.right.max(1), rc.bottom.max(1));
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            let dis = DRAWITEMSTRUCT {
+                CtlType: windows::Win32::UI::Controls::DRAWITEMSTRUCT_CTL_TYPE(4),
+                CtlID: id as u32,
+                itemID: 0,
+                itemAction: windows::Win32::UI::Controls::ODA_FLAGS(1),
+                itemState: windows::Win32::UI::Controls::ODS_FLAGS(item_state),
+                hwndItem: button,
+                hDC: dc,
+                rcItem: rc,
+                itemData: 0,
+            };
+            let handled = card.handle_message(
+                WM_DRAWITEM,
+                WPARAM(id as usize),
+                LPARAM(&dis as *const _ as isize),
+            );
+            assert_eq!(handled, Some(LRESULT(1)));
+            let c = GetPixel(dc, x, y).0;
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+            c
+        }
+    }
+
+    fn preview_card_for_buttons(theme: Theme) -> Card {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.inner.theme = theme;
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, true);
+        card
+    }
+
+    #[test]
+    fn do_it_is_painted_in_the_system_accent_and_cancel_style_is_not() {
+        use crate::ui::card_buttons::{system_accent, system_high_contrast};
+        if system_high_contrast().is_some() {
+            return;
+        }
+        for theme in [Theme::Light, Theme::Dark] {
+            let mut card = preview_card_for_buttons(theme);
+            let preview = card.inner.preview.as_ref().unwrap();
+            let (do_it, edit) = (preview.do_it_btn, preview.edit_btn.unwrap());
+            let do_px = drawn_pixel(&mut card, do_it, ID_PREVIEW_DO_IT, 0, 8, 12);
+            assert_eq!(do_px, system_accent(), "Do it fills with the accent");
+            let edit_px = drawn_pixel(&mut card, edit, ID_PREVIEW_EDIT, 0, 8, 12);
+            assert_eq!(
+                edit_px,
+                theme.palette().bg,
+                "Edit is an outline on the card background"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pressed_button_is_painted_differently_from_a_resting_one() {
+        let mut card = preview_card_for_buttons(Theme::Light);
+        let do_it = card.inner.preview.as_ref().unwrap().do_it_btn;
+        let rest = drawn_pixel(&mut card, do_it, ID_PREVIEW_DO_IT, 0, 8, 12);
+        let pressed = drawn_pixel(&mut card, do_it, ID_PREVIEW_DO_IT, 0x1, 8, 12);
+        if crate::ui::card_buttons::system_high_contrast().is_none() {
+            assert_ne!(rest, pressed);
+        }
+    }
+
+    #[test]
+    fn a_focused_button_gets_a_focus_ring() {
+        let mut card = preview_card_for_buttons(Theme::Light);
+        let edit = card.inner.preview.as_ref().unwrap().edit_btn.unwrap();
+        // The ring is drawn a few pixels inside the edge, on the vertical
+        // midline of the left side.
+        let ring_visible = (2..6).any(|x| {
+            drawn_pixel(&mut card, edit, ID_PREVIEW_EDIT, 0, x, 12)
+                != drawn_pixel(&mut card, edit, ID_PREVIEW_EDIT, 0x10, x, 12)
+        });
+        assert!(ring_visible, "focus must be visible");
+    }
+
+    #[test]
+    fn preview_buttons_are_owner_drawn_and_hover_follows_the_mouse() {
+        let card = preview_card_for_buttons(Theme::Light);
+        let do_it = card.inner.preview.as_ref().unwrap().do_it_btn;
+        assert!(is_owner_drawn_button(do_it));
+        assert!(!button_is_hovered(do_it));
+        let card_hwnd = card.hwnd();
+        unsafe {
+            let _ = preview_control_subclass(
+                do_it,
+                WM_MOUSEMOVE,
+                WPARAM(0),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+        assert!(button_is_hovered(do_it));
+        unsafe {
+            let _ = preview_control_subclass(
+                do_it,
+                WM_MOUSELEAVE,
+                WPARAM(0),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+        assert!(!button_is_hovered(do_it));
     }
 
     // -- live theme change (#431) ------------------------------------------
