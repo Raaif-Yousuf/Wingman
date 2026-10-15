@@ -138,8 +138,12 @@ that ever changed.
   the loopback-only rule providers get), because a connector's own HTTP
   needs might not funnel through `provider/common.rs`'s guard the same way.
   Until they exist, this is a statement about a future obligation, not
-  something Offline mode enforces today -- there is simply nothing else in
-  the crate that opens a network connection outside `src/provider/`.
+  something Offline mode enforces today. The one other place that opens a
+  network connection is `src/inputs/web_page.rs` (the confirmed link fetch of
+  "Summarize a link", #127): it refuses outright in Offline and Local mode
+  (not just non-loopback hosts), calls `offline_guard` on every hop as a
+  backstop, and a test (`only_the_known_files_call_ureq`) fails the build if
+  `ureq::` shows up in any other file outside `src/provider/common.rs`.
 - **Awareness does not exist yet.** There is nothing to stop.
 - **The guard is application-level, not OS-level.** It refuses inside
   Wingman's own request-building code, before a socket call. It does not
