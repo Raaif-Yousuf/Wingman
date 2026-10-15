@@ -242,12 +242,19 @@ pub struct ImageLimits {
 }
 
 /// Token accounting, when a provider's response reports it. Feeds
-/// `usage.rs` (Phase 2, not built yet); `None` for a provider or response
+/// `usage.rs` (spend totals, #21); `None` for a provider or response
 /// that doesn't carry it, never a guessed value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
+    /// Plain (uncached) input tokens.
     pub input_tokens: u32,
+    /// Output tokens, including thinking tokens (billed the same).
     pub output_tokens: u32,
+    /// Anthropic prompt-cache writes (billed above the input rate). Zero
+    /// from every other provider.
+    pub cache_write_tokens: u32,
+    /// Anthropic prompt-cache reads (billed far below the input rate).
+    pub cache_read_tokens: u32,
 }
 
 /// Why the provider stopped. A refusal, or an empty completion caused by

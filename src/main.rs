@@ -30,6 +30,7 @@ mod router;
 mod secrets;
 mod single_instance;
 mod ui;
+mod usage;
 
 fn main() {
     // Checked before any production init (hotkeys, tray icon, single

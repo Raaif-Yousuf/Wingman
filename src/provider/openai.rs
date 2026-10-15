@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use super::common;
-use super::{Caps, Completion, Effort, ImageLimits, Provider, Request, StopReason};
+use super::{Caps, Completion, Effort, ImageLimits, Provider, Request, StopReason, Usage};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -167,11 +167,17 @@ impl OpenAi {
             _ => StopReason::Other,
         };
 
-        Ok(Completion {
-            text,
-            usage: None,
-            stop,
-        })
+        // `output_tokens` already includes reasoning tokens.
+        let usage = value.get("usage").map(|u| {
+            let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
+            Usage {
+                input_tokens: count("input_tokens"),
+                output_tokens: count("output_tokens"),
+                ..Default::default()
+            }
+        });
+
+        Ok(Completion { text, usage, stop })
     }
 }
 
@@ -246,7 +252,7 @@ impl Provider for OpenAi {
             "openai",
         )?;
 
-        Self::parse_completion(&body_text)
+        crate::usage::tally(self.id(), &self.model, Self::parse_completion(&body_text))
     }
 }
 
@@ -421,6 +427,13 @@ mod tests {
     fn own_caps_matches_capabilities_for_the_configured_model() {
         let provider = OpenAi::new("k", "gpt-4.1", "low");
         assert_eq!(provider.own_caps(), provider.capabilities("gpt-4.1"));
+    }
+
+    #[test]
+    fn parse_completion_reads_usage_from_the_fixture() {
+        let body = include_str!("../../tests/fixtures/openai_response.json");
+        let u = OpenAi::parse_completion(body).unwrap().usage.unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (1200, 85));
     }
 
     #[test]

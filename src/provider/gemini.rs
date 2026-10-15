@@ -214,15 +214,16 @@ impl Gemini {
             _ => StopReason::Other,
         };
 
-        let usage = value.get("usageMetadata").map(|u| Usage {
-            input_tokens: u
-                .get("promptTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
-            output_tokens: u
-                .get("candidatesTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
+        // `thoughtsTokenCount` is separate from `candidatesTokenCount` on a
+        // thinking response and is billed as output, so it is added in.
+        let usage = value.get("usageMetadata").map(|u| {
+            let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
+            Usage {
+                input_tokens: count("promptTokenCount"),
+                output_tokens: count("candidatesTokenCount")
+                    .saturating_add(count("thoughtsTokenCount")),
+                ..Default::default()
+            }
         });
 
         Ok(Completion { text, usage, stop })
@@ -293,7 +294,7 @@ impl Provider for Gemini {
             "gemini",
         )?;
 
-        Self::parse_completion(&body_text)
+        crate::usage::tally(self.id(), &self.model, Self::parse_completion(&body_text))
     }
 }
 
@@ -601,6 +602,13 @@ mod tests {
     }
 
     // -- parse_completion: success -------------------------------------------
+
+    #[test]
+    fn parse_completion_adds_thinking_tokens_to_output() {
+        let body = r#"{"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":7}}"#;
+        let usage = Gemini::parse_completion(body).unwrap().usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (10, 12));
+    }
 
     #[test]
     fn parse_completion_extracts_text_and_usage_from_the_fixture() {
