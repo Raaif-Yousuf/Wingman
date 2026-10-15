@@ -711,7 +711,7 @@ impl App {
         let foreground_hwnd_isize =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
 
-        self.busy = true;
+        self.set_busy(true);
         // Disarmed for the whole in-flight window: a click while the spinner
         // is up must not touch the card.
         self.set_watch(false);
@@ -1044,7 +1044,7 @@ impl App {
             }
         };
 
-        self.busy = true;
+        self.set_busy(true);
         self.set_watch(false);
         // No model in this flow (see the doc comment above): `Working` is
         // the honest generic placeholder, not `AskingModel`.
@@ -1213,7 +1213,7 @@ impl App {
     /// doc comment). A provider-chain failure shows an error card (rule
     /// 7).
     fn on_calendar_result(&mut self, result: std::result::Result<Value, String>) {
-        self.busy = false;
+        self.set_busy(false);
 
         let proposal = match result {
             Ok(p) => p,
@@ -1428,7 +1428,7 @@ impl App {
         schema: Value,
         result: std::result::Result<Value, String>,
     ) {
-        self.busy = false;
+        self.set_busy(false);
 
         let proposal = match result {
             Ok(p) => p,
@@ -1736,7 +1736,7 @@ impl App {
         &mut self,
         result: std::result::Result<actions::review_email::ReviewOutcome, String>,
     ) {
-        self.busy = false;
+        self.set_busy(false);
 
         let outcome = match result {
             Ok(o) => o,
@@ -1916,7 +1916,7 @@ impl App {
     /// `self.pending_form_fill` is set here and consumed by
     /// `on_preview_decided`.
     fn on_form_fill_result(&mut self, result: std::result::Result<Value, String>) {
-        self.busy = false;
+        self.set_busy(false);
 
         let value = match result {
             Ok(v) => v,
@@ -2099,7 +2099,7 @@ impl App {
     /// lost, just not shown as a card until the user checks "Copy last
     /// answer" or asks again.
     fn record_last(&mut self, result: std::result::Result<Answer, String>) -> Answer {
-        self.busy = false;
+        self.set_busy(false);
         // The request that just finished may have spent money (#21).
         self.update_tooltip();
         let answer = match result {
@@ -2156,7 +2156,23 @@ impl App {
     /// next "Copy diagnostics" click includes this chain, in memory only,
     /// never written to disk (Hard Rule 5) and gone the moment the process
     /// exits or another error overwrites it.
+    /// Issue #327: the one place `busy` changes, so the tray's working badge
+    /// can never disagree with it. Starting a run also clears the previous
+    /// run's failure badge ("until the next press").
+    fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+        if busy {
+            self.tray.set_failed(false);
+        }
+        self.tray.set_busy(busy);
+        self.update_tooltip();
+    }
+
     fn record_last_error(&mut self, action: &str, raw_chain: &str) {
+        // Issue #327: every error card goes through here, so this is where
+        // the tray's failed badge is raised.
+        self.tray.set_failed(true);
+        self.update_tooltip();
         self.last_error = Some(LastError {
             action: action.to_string(),
             occurred_at: SystemTime::now(),
@@ -2281,7 +2297,7 @@ impl App {
             return;
         }
 
-        self.busy = true;
+        self.set_busy(true);
         self.set_watch(false);
         // Issue #354 follow-up review, finding 3: this reads the current
         // text selection, not a screenshot -- `ReadingSelection` says so
@@ -2746,6 +2762,7 @@ impl App {
         self.config.mode = mode;
         mode::set_current(mode);
         self.tray.set_mode(mode);
+        self.update_tooltip();
 
         let saved = self.config.save();
         match saved {
@@ -2804,6 +2821,8 @@ impl App {
                 None => base,
             }
         };
+        // Issue #327: lead with the state (working / failed / offline).
+        let tip = crate::ui::tray::state_tooltip(self.tray.icon_state(), &tip);
         self.tray.set_tooltip(&tip);
     }
 

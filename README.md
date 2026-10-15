@@ -261,6 +261,13 @@ starts it and stops there rather than asking. That is deliberate: the same
 bare launch is what runs at login, and asking on it would mean a billed API
 call every boot. With start-with-Windows on it is always running anyway.
 
+## Tray icon
+
+The icon shows what Wingman is doing: an orange dot while a request is in
+flight, grey while paused, a blue tint in Offline mode, and a red dot after a
+run failed (it clears when you start the next one). The tooltip says the same
+in words.
+
 ## Tray menu
 
 - **Ask now**: trigger without the hotkey
