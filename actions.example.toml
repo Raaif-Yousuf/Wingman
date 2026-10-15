@@ -131,3 +131,21 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "explain-this-error"
+name = "Explain this error"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "error_explanation"
+executor = "none"
+confirm = false
+prompt = 'You are shown an error message: an error dialog, a stack trace, a failed build or a log line, as text or as a screenshot of the screen. Find the error and explain it to someone who has not seen it before. Fill the fields in this order. meaning: what the error means, in one plain sentence of at most 85 characters. cause: the most likely cause, in one or two sentences. fix: the first thing to try, in one or two sentences, with a command or setting name when there is one. Quote error codes and file names exactly as shown and never invent one. If several errors are visible, explain the one in the foreground dialog or the first one in the trace. If you are not sure of the cause, say so in the cause field rather than guessing. If no error is visible, say so in meaning and write "None" in cause and fix. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"

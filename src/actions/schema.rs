@@ -61,10 +61,31 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "text_answer" => Some(text_answer_schema()),
         // #314: a list of action-item lines for the clipboard executor.
         "action_items" => Some(action_items_schema()),
+        // #66: a read-only explanation of an error, shown on the card.
+        "error_explanation" => Some(error_explanation_schema()),
         // #67: two summary lines and a few bullets, shown on the card only.
         "page_summary" => Some(page_summary_schema()),
         _ => None,
     }
+}
+
+/// The `error_explanation` proposal schema (#66): `meaning`, `cause`, `fix`,
+/// all plain strings, in that order (rule 3). The model has to say what the
+/// error is before it guesses a cause, and name the cause before it proposes
+/// a fix. Asking for three fields rather than one free-text answer is what
+/// makes a small local model fill in all three. Not editable: the card
+/// shows it as an answer (`executor = "none"`), so there is nothing to edit.
+fn error_explanation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "meaning": {"type": "string"},
+            "cause": {"type": "string"},
+            "fix": {"type": "string"}
+        },
+        "required": ["meaning", "cause", "fix"],
+        "additionalProperties": false
+    })
 }
 
 /// The `page_summary` proposal schema (#67). Property order is load-bearing
@@ -472,6 +493,29 @@ mod tests {
         assert_eq!(schema["properties"]["items"]["type"], "array");
         assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
         assert_eq!(schema["properties"]["items"]["editable"], true);
+    }
+
+    #[test]
+    fn error_explanation_asks_for_meaning_then_cause_then_fix() {
+        let schema =
+            schema_for("error_explanation", false).expect("error_explanation is registered");
+        let order: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["meaning", "cause", "fix"]);
+        assert_eq!(schema["required"], json!(["meaning", "cause", "fix"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|p| p["type"] == "string" && p.get("editable").is_none()),
+            "a read-only answer has no edit controls"
+        );
     }
 
     #[test]
