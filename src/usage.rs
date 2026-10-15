@@ -34,6 +34,21 @@
 //! one row per local date, provider and model. Only dollars, counts and
 //! token totals are stored, never prompts or answers. The old
 //! `spend.json` is imported once and renamed `spend.json.migrated`.
+//!
+//! # The daily budget (#101)
+//!
+//! `[budget] daily_usd` in config.toml is mirrored here by
+//! [`set_daily_budget`] (the request path has no `Config` in reach, same as
+//! the Offline mode and egress preview mirrors). `provider::common` calls
+//! [`check_budget`] before every request that leaves this machine, so a
+//! provider added later cannot skip it. Past the limit, billed requests are
+//! refused with a card-ready message and the chain falls through to a local
+//! provider if it has one. Crossing the warning line (default 80%) or the
+//! limit queues one notice per day for the next card ([`take_budget_notice`]).
+//! The check reads the same `usage_day` totals the tooltip shows, so unpriced
+//! requests are not counted: the budget is a floor, like the total.
+
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -356,6 +371,142 @@ fn local_date_today() -> String {
     format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay)
 }
 
+/// The configured daily budget (#101).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Budget {
+    pub limit_usd: f64,
+    /// Percent of the limit at which the warning notice appears (1 to 100).
+    pub warn_percent: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BudgetState {
+    Under,
+    Warn,
+    Exhausted,
+}
+
+static BUDGET: Mutex<Option<Budget>> = Mutex::new(None);
+static BUDGET_NOTICE: Mutex<Option<String>> = Mutex::new(None);
+/// The local date and the highest state a notice was already queued for.
+static NOTIFIED: Mutex<Option<(String, BudgetState)>> = Mutex::new(None);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Publishes `[budget]` for the request path. A limit that is not a positive
+/// number turns the budget off. Called at startup and on every config reload.
+pub fn set_daily_budget(daily_usd: f64, warn_percent: u8) {
+    *lock(&BUDGET) = budget_from(daily_usd, warn_percent);
+}
+
+fn budget_from(daily_usd: f64, warn_percent: u8) -> Option<Budget> {
+    (daily_usd.is_finite() && daily_usd > 0.0).then_some(Budget {
+        limit_usd: daily_usd,
+        warn_percent: warn_percent.clamp(1, 100),
+    })
+}
+
+pub fn budget_state(spent: f64, b: &Budget) -> BudgetState {
+    // A hair of slack so 0.05 of 0.05 is not lost to float error.
+    let spent = spent + 1e-9;
+    if spent >= b.limit_usd {
+        BudgetState::Exhausted
+    } else if spent >= b.limit_usd * f64::from(b.warn_percent) / 100.0 {
+        BudgetState::Warn
+    } else {
+        BudgetState::Under
+    }
+}
+
+fn exhausted_message(spent: f64, b: &Budget) -> String {
+    format!(
+        "Daily budget of ${:.2} reached (${spent:.2} spent today). Cloud requests are paused until tomorrow, and local models still work. Raise daily_usd under [budget] in config.toml, or set it to 0, to continue.",
+        b.limit_usd
+    )
+}
+
+fn warning_message(spent: f64, b: &Budget) -> String {
+    format!(
+        "You have used ${spent:.2} of your ${:.2} daily budget. Cloud requests stop at the limit.",
+        b.limit_usd
+    )
+}
+
+/// Ok while billed requests are allowed, else the card text.
+pub fn check_budget_with(b: &Budget, spent: f64) -> Result<(), String> {
+    match budget_state(spent, b) {
+        BudgetState::Exhausted => Err(exhausted_message(spent, b)),
+        _ => Ok(()),
+    }
+}
+
+/// What `provider::common` asks before a request leaves this machine. Fails
+/// open when the store cannot be read: accounting is never why an answer fails.
+pub fn check_budget() -> Result<(), String> {
+    let Some(b) = *lock(&BUDGET) else {
+        return Ok(());
+    };
+    match spent_today() {
+        Some(spent) => check_budget_with(&b, spent),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) static SPENT_OVERRIDE: Mutex<Option<f64>> = Mutex::new(None);
+
+fn spent_today() -> Option<f64> {
+    #[cfg(test)]
+    if let Some(v) = *lock(&SPENT_OVERRIDE) {
+        return Some(v);
+    }
+    let day = crate::store::global()
+        .and_then(|s| s.day_total(&local_date_today()))
+        .ok()?;
+    Some(day.map_or(0.0, |d| d.usd))
+}
+
+/// The notice to queue now, if the day's spend just reached a level no notice
+/// was queued for yet. Pure apart from `notified`.
+fn budget_notice_for(
+    spent: f64,
+    b: &Budget,
+    date: &str,
+    notified: &mut Option<(String, BudgetState)>,
+) -> Option<String> {
+    let state = budget_state(spent, b);
+    if state == BudgetState::Under {
+        return None;
+    }
+    let seen = match notified {
+        Some((d, s)) if d == date => *s,
+        _ => BudgetState::Under,
+    };
+    if state <= seen {
+        return None;
+    }
+    *notified = Some((date.to_string(), state));
+    Some(match state {
+        BudgetState::Exhausted => exhausted_message(spent, b),
+        _ => warning_message(spent, b),
+    })
+}
+
+/// Takes the pending budget notice, if any. `app.rs` adds it to the next card.
+pub fn take_budget_notice() -> Option<String> {
+    lock(&BUDGET_NOTICE).take()
+}
+
+fn queue_budget_notice(date: &str) {
+    let Some(b) = *lock(&BUDGET) else { return };
+    let Some(spent) = spent_today() else { return };
+    if let Some(text) = budget_notice_for(spent, &b, date, &mut lock(&NOTIFIED)) {
+        *lock(&BUDGET_NOTICE) = Some(text);
+    }
+}
+
 /// Counts one provider response toward today's total. Best effort: a failure
 /// to write is swallowed (rule 7: accounting must never be why an answer
 /// fails). A response with no usage block counts as unpriced.
@@ -368,6 +519,7 @@ pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
         // Never fails the request; the next card says so, once per run.
         crate::store::report(&e);
     }
+    queue_budget_notice(&date);
 }
 
 /// Counts the usage of a successful completion and passes the result through
@@ -619,5 +771,66 @@ mod tests {
             }
         }
         assert!(checked > 10);
+    }
+
+    // -- daily budget (#101) -------------------------------------------------
+
+    fn budget(limit: f64) -> Budget {
+        Budget {
+            limit_usd: limit,
+            warn_percent: 80,
+        }
+    }
+
+    #[test]
+    fn budget_state_has_three_levels() {
+        let b = budget(0.05);
+        assert_eq!(budget_state(0.0, &b), BudgetState::Under);
+        assert_eq!(budget_state(0.039, &b), BudgetState::Under);
+        assert_eq!(budget_state(0.04, &b), BudgetState::Warn);
+        assert_eq!(budget_state(0.049, &b), BudgetState::Warn);
+        // Float error must not let 5 one-cent requests slip under 5 cents.
+        assert_eq!(budget_state(0.01 * 5.0, &b), BudgetState::Exhausted);
+        assert_eq!(budget_state(0.05 + 0.01, &b), BudgetState::Exhausted);
+    }
+
+    #[test]
+    fn check_budget_with_refuses_only_at_the_limit_and_says_so() {
+        let b = budget(0.05);
+        assert!(check_budget_with(&b, 0.04).is_ok());
+        let err = check_budget_with(&b, 0.05).unwrap_err();
+        assert!(err.contains("Daily budget of $0.05 reached"), "{err}");
+        assert!(err.contains("local models still work"), "{err}");
+        assert!(!err.contains('\u{2014}'), "no em dash in card text");
+    }
+
+    #[test]
+    fn a_notice_is_queued_once_per_level_per_day() {
+        let b = budget(1.0);
+        let mut seen = None;
+        assert_eq!(budget_notice_for(0.5, &b, "d1", &mut seen), None);
+        let warn = budget_notice_for(0.8, &b, "d1", &mut seen).unwrap();
+        assert!(warn.contains("$0.80 of your $1.00"), "{warn}");
+        assert!(!warn.contains('\u{2014}'), "no em dash in card text");
+        assert_eq!(budget_notice_for(0.9, &b, "d1", &mut seen), None);
+        let stop = budget_notice_for(1.0, &b, "d1", &mut seen).unwrap();
+        assert!(stop.contains("reached"), "{stop}");
+        assert_eq!(budget_notice_for(1.5, &b, "d1", &mut seen), None);
+        // A new day starts again.
+        assert!(budget_notice_for(0.8, &b, "d2", &mut seen).is_some());
+    }
+
+    #[test]
+    fn a_limit_that_is_not_positive_turns_the_budget_off() {
+        for off in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(budget_from(off, 80), None, "{off}");
+        }
+        assert_eq!(
+            budget_from(2.0, 0),
+            Some(Budget {
+                limit_usd: 2.0,
+                warn_percent: 1
+            })
+        );
     }
 }

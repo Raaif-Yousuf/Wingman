@@ -296,6 +296,7 @@ in words.
 | key | default | what it does |
 |---|---|---|
 | `mode` | `"auto"` | `cloud` / `local` / `auto` / `offline`; see [`docs/offline.md`](docs/offline.md) |
+| `budget.daily_usd` | `0` (off) | daily limit in US dollars for cloud requests. A notice shows at `budget.warn_percent` (80) and at the limit; past it, cloud requests are refused with a card and local models still work. Counts from the same totals as the tray tooltip, so unpriced models are not included |
 | `capture.max_edge` | `1568` | long-edge downscale before upload; lower cuts cost |
 | `capture.monitor` | `"active"` | `"active"` follows the focused window; `"primary"` pins it |
 | `capture.redact` | `true` | paint over card numbers, IBANs, key-like tokens and email addresses in the screenshot before a cloud request; adds about 0.2 to 0.3 s. Local-only requests skip it. If the check cannot run, nothing is sent |
