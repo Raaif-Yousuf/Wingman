@@ -1485,21 +1485,32 @@ impl App {
         confirmed: confirm::Confirmed<Value>,
     ) {
         match actions::resolve_executor(action) {
-            Ok(executor) => match executor.execute(confirmed) {
-                Ok(undo) => {
-                    self.card.show_answer(&action.name, &undo.summary, 0, None);
+            Ok(executor) => {
+                // #441: `execute` consumes `confirmed`, so keep the value the
+                // card text may need (a read-only `"none"` action's answer).
+                let proposal = confirmed.value().clone();
+                match executor.execute(confirmed) {
+                    Ok(undo) => {
+                        let text = actions::generic_answer::result_card_text(
+                            &action.name,
+                            executor.name(),
+                            &undo.summary,
+                            &proposal,
+                        );
+                        self.card.show_answer(&text.headline, &text.detail, 0, None);
+                    }
+                    Err(e) => {
+                        let detail = self.track_error(
+                            &format!("Couldn't run \"{}\"", action.name),
+                            &format!("{e:#}"),
+                        );
+                        self.card.show_error_with_details(
+                            &format!("Couldn't run \"{}\"", action.name),
+                            &detail,
+                        );
+                    }
                 }
-                Err(e) => {
-                    let detail = self.track_error(
-                        &format!("Couldn't run \"{}\"", action.name),
-                        &format!("{e:#}"),
-                    );
-                    self.card.show_error_with_details(
-                        &format!("Couldn't run \"{}\"", action.name),
-                        &detail,
-                    );
-                }
-            },
+            }
             Err(e) => {
                 let detail = self.track_error(
                     &format!("Couldn't run \"{}\"", action.name),

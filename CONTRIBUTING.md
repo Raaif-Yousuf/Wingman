@@ -235,6 +235,9 @@ networked connector must follow.
   usually: press the hotkey with the action selected, confirm the card shows
   a translated result, done.
 
+A read-only action that only answers (`executor = "none"`, `confirm = false`)
+shows the proposal's own fields on the result card, not a fixed message.
+
 ### 6. Open the pull request
 
 Reference the catalogue entry (or open one) from the plan's §6 "Action
