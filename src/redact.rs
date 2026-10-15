@@ -25,6 +25,16 @@ use std::time::Duration;
 /// spec's MEASURED cost section); this is a generous ceiling, not a target.
 const OCR_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Prefix of the error [`apply`] returns when the check cannot run.
+pub const FAILURE_NEEDLE: &str = "Could not check the screenshot for private details";
+
+/// What the card says when [`apply`] fails, whatever the underlying cause.
+/// `app::humanize_error_chain` maps any error chain containing
+/// [`FAILURE_NEEDLE`] to this sentence, so a Win32-looking cause cannot turn
+/// it into "Something went wrong."
+pub const FAILURE_SENTENCE: &str =
+    "Could not check the screenshot for private details, so nothing was sent.";
+
 /// Pixels of padding added around a painted region, so anti-aliased glyph
 /// edges at the rect boundary do not survive.
 const PAD: f32 = 3.0;
@@ -195,7 +205,7 @@ pub fn apply_lines(raw: &mut RawShot, lines: &[OcrLine]) -> usize {
 /// send a screenshot nobody checked.
 pub fn apply(raw: &mut RawShot) -> Result<usize> {
     let out = crate::ocr::recognize(&raw.rgba, raw.width, raw.height, OCR_TIMEOUT)
-        .context("Could not check the screenshot for private details, so nothing was sent")?;
+        .context(FAILURE_NEEDLE)?;
     Ok(apply_lines(raw, &out.lines))
 }
 
@@ -223,6 +233,20 @@ mod tests {
         let t = format!("Total 100 {CARD}");
         let spans = crate::payment_denylist::card_number_spans(&t);
         assert_eq!(text_of(&t, spans), vec![CARD]);
+    }
+
+    #[test]
+    fn a_card_after_a_leading_digit_group_is_painted_to_its_last_digit() {
+        let t = format!("123456 {CARD}");
+        let spans = crate::payment_denylist::card_number_spans(&t);
+        assert!(!spans.is_empty());
+        let card_start = t.find(CARD).unwrap();
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.start <= card_start && s.end == t.len()),
+            "{spans:?}"
+        );
     }
 
     #[test]
@@ -522,7 +546,7 @@ mod tests {
         assert!(painted >= 1, "the card number must be found");
 
         // What a provider would receive: the real encode, then decode.
-        let shot = crate::capture::encode_for_chain(&mut raw, false).expect("encode");
+        let shot = crate::capture::encode_unredacted(&raw).expect("encode");
         let decoded = image::load_from_memory(&shot.png)
             .expect("decode PNG")
             .to_rgba8();

@@ -29,7 +29,9 @@ provider answers, the request carries:
    request, card numbers, IBANs, key-like tokens and email addresses that
    Windows OCR can read on the screenshot are painted over with solid boxes
    (`capture.redact`, on by default). This covers the image only: text sent
-   to a text-only model is not yet scrubbed the same way.
+   to a text-only model is not yet scrubbed the same way. A number that
+   Windows OCR splits across two lines, or does not read at all, may not be
+   painted over.
 2. The system prompt from `ui.prompt` in your config, sent alongside the
    image in the same request.
 

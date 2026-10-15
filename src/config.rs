@@ -1577,9 +1577,17 @@ impl Providers {
     /// first, then every cloud provider), so this errs toward redacting.
     pub fn sends_screenshot_off_machine(&self, mode: Mode) -> bool {
         let local = self.local_compat_names();
+        let ollama_is_here = !matches!(
+            crate::mode::classify_host(&self.ollama.base_url),
+            crate::mode::HostClass::NotLoopback
+        );
         self.selected_order_for_mode(mode, true)
             .iter()
-            .filter(|n| !crate::mode::is_local_provider(n, &local))
+            .filter(|n| {
+                let by_name_local = crate::mode::is_local_provider(n, &local);
+                let remote_ollama = n.as_str() == "ollama" && !ollama_is_here;
+                !by_name_local || remote_ollama
+            })
             .any(|n| self.provider_for(n).is_some_and(|p| p.ready()))
     }
 }
@@ -2095,6 +2103,17 @@ model = "gpt-5.5"
 
         p.order = vec!["ollama".to_string()];
         assert!(!p.sends_screenshot_off_machine(Mode::Auto));
+    }
+
+    #[test]
+    fn sends_screenshot_off_machine_counts_an_ollama_on_another_host_as_off_machine() {
+        let mut p = Config::default().providers;
+        p.order = vec!["ollama".to_string()];
+        p.ollama.base_url = "http://example.com:11434".to_string();
+        assert!(p.sends_screenshot_off_machine(Mode::Local));
+        assert!(p.sends_screenshot_off_machine(Mode::Auto));
+        p.ollama.base_url = "http://127.0.0.1:11434".to_string();
+        assert!(!p.sends_screenshot_off_machine(Mode::Local));
     }
 
     #[test]

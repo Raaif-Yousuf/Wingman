@@ -178,73 +178,70 @@ pub fn contains_iban(text: &str) -> bool {
 /// redaction (#103) can paint just that part of an OCR line. Unlike the
 /// boolean check, a number sitting after other digits in the same run
 /// ("Total 100 4111 1111 1111 1111") is found: every window of digit groups
-/// is tried, longest first.
+/// is tried, and every window that passes counts. Overlapping passing windows
+/// are merged into one span, so no digit of a matched card is left out even
+/// when other digits sit in front of it ("123456 4111 1111 1111 1111"): the
+/// leading digits get painted too, which is the safe direction.
 pub fn card_number_spans(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut spans = Vec::new();
     for run in runs_of(text, |c| c.is_ascii_digit() || c == ' ' || c == '-') {
         let groups = groups_of(text, run, |c| c.is_ascii_digit());
-        let mut i = 0;
-        while i < groups.len() {
-            let mut found = None;
-            let mut digits = String::new();
-            for g in &groups[i..] {
-                digits.push_str(&text[g.clone()]);
-                if digits.len() > 19 {
-                    break;
-                }
-                if digits.len() >= 12 && luhn_valid(&digits) {
-                    found = Some(g.end);
-                }
-            }
-            match found {
-                Some(end) => {
-                    spans.push(groups[i].start..end);
-                    i += groups[i..]
-                        .iter()
-                        .take_while(|g| g.end <= end)
-                        .count()
-                        .max(1);
-                }
-                None => i += 1,
-            }
-        }
+        spans.extend(passing_windows(text, &groups, 19, |digits| {
+            digits.len() >= 12 && luhn_valid(digits)
+        }));
     }
-    spans
+    merge_overlapping(spans)
 }
 
 /// Byte ranges of every IBAN in `text`: the same rule as [`contains_iban`],
-/// with positions (see [`card_number_spans`]).
+/// with positions and merging as in [`card_number_spans`].
 pub fn iban_spans(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut spans = Vec::new();
     for run in runs_of(text, |c| c.is_ascii_alphanumeric() || c == ' ') {
         let groups = groups_of(text, run, |c| c.is_ascii_alphanumeric());
-        let mut i = 0;
-        while i < groups.len() {
-            let mut found = None;
-            let mut candidate = String::new();
-            for g in &groups[i..] {
-                candidate.push_str(&text[g.clone()].to_ascii_uppercase());
-                if candidate.len() > 34 {
-                    break;
-                }
-                if candidate.len() >= 15 && iban_mod97_valid(&candidate) {
-                    found = Some(g.end);
-                }
+        spans.extend(passing_windows(text, &groups, 34, |s| {
+            s.len() >= 15 && iban_mod97_valid(s)
+        }));
+    }
+    merge_overlapping(spans)
+}
+
+/// Every window of consecutive `groups` whose concatenated, upper-cased text
+/// (at most `max_len` long) satisfies `valid`, as a byte range from the
+/// window's first group to its last.
+fn passing_windows(
+    text: &str,
+    groups: &[std::ops::Range<usize>],
+    max_len: usize,
+    valid: impl Fn(&str) -> bool,
+) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    for i in 0..groups.len() {
+        let mut joined = String::new();
+        for g in &groups[i..] {
+            joined.push_str(&text[g.clone()].to_ascii_uppercase());
+            if joined.len() > max_len {
+                break;
             }
-            match found {
-                Some(end) => {
-                    spans.push(groups[i].start..end);
-                    i += groups[i..]
-                        .iter()
-                        .take_while(|g| g.end <= end)
-                        .count()
-                        .max(1);
-                }
-                None => i += 1,
+            if valid(&joined) {
+                out.push(groups[i].start..g.end);
             }
         }
     }
-    spans
+    out
+}
+
+/// Sorts `ranges` and joins any that overlap.
+fn merge_overlapping(mut ranges: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
+    ranges.sort_by_key(|r| (r.start, r.end));
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for r in ranges {
+        match out.last_mut() {
+            Some(last) if r.start < last.end => last.end = last.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
 }
 
 /// Maximal byte ranges of `text` whose characters all satisfy `keep`.

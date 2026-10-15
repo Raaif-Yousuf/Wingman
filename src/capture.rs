@@ -173,23 +173,35 @@ pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Resu
 }
 
 /// The one way a screenshot becomes bytes a provider can receive (issue
-/// #103): when `redact` is true, private details (card numbers, IBANs,
-/// key-shaped tokens, emails) are painted over in `raw` itself first, then
-/// the pixels are encoded. Painting `raw` in place, not a copy, means the
-/// non-vision fallback's OCR over the same `raw` cannot read them back as
-/// text either. `redact` is false only when nothing can leave the machine
-/// (a local-only chain) or the user turned the setting off.
+/// #103). Unless `redact_setting` is off or the mode's chain cannot send the
+/// pixels off this machine (`Providers::sends_screenshot_off_machine`),
+/// private details (card numbers, IBANs, key-shaped tokens, emails) are
+/// painted over in `raw` itself first, then the pixels are encoded. Painting
+/// `raw` in place, not a copy, means the non-vision fallback's OCR over the
+/// same `raw` cannot read them back as text either.
 ///
 /// Fails closed: if redaction cannot run (OCR unavailable or timed out) this
 /// returns `Err` and the caller shows a card; no unchecked screenshot is
-/// ever encoded. Blocks on OCR when `redact` is true: worker thread only.
+/// ever encoded. Blocks on OCR when redacting: worker thread only.
 ///
-/// `encode` is private on purpose, so no caller can skip this. A
-/// source-scanning test in `app.rs` guards the call sites.
-pub fn encode_for_chain(raw: &mut RawShot, redact: bool) -> Result<Shot> {
-    if redact {
+/// `encode` is private and the decision lives here, so a caller cannot ask
+/// for an unredacted encode of a cloud-bound screenshot.
+pub fn encode_for_chain(
+    raw: &mut RawShot,
+    providers: &crate::config::Providers,
+    mode: crate::mode::Mode,
+    redact_setting: bool,
+) -> Result<Shot> {
+    if redact_setting && providers.sends_screenshot_off_machine(mode) {
         crate::redact::apply(raw)?;
     }
+    encode(raw)
+}
+
+/// Test-only plain encode, for tests that render a synthetic image and have
+/// nothing to redact.
+#[cfg(test)]
+pub(crate) fn encode_unredacted(raw: &RawShot) -> Result<Shot> {
     encode(raw)
 }
 

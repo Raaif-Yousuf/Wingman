@@ -3173,7 +3173,7 @@ fn encode_for_upload(
     mode: Mode,
     redact: bool,
 ) -> Result<crate::provider::Shot> {
-    capture::encode_for_chain(raw, redact && providers.sends_screenshot_off_machine(mode))
+    capture::encode_for_chain(raw, providers, mode, redact)
 }
 
 /// #24: the intent router's worker-thread body, called from
@@ -3717,6 +3717,10 @@ fn first_line(text: &str, max: usize) -> String {
 /// mapped to a specific human sentence. Matched by substring against the
 /// already-redacted chain, so it survives whatever context wraps it.
 const KNOWN_TECHNICAL_DETAILS: &[(&str, &str)] = &[
+    (
+        crate::redact::FAILURE_NEEDLE,
+        crate::redact::FAILURE_SENTENCE,
+    ),
     (
         "TzSpecificLocalTimeToSystemTime",
         "Couldn't read your clock settings.",
@@ -6216,6 +6220,30 @@ mod tests {
         );
     }
 
+    /// #103: the fail-closed card keeps its fixed sentence whatever the OCR
+    /// cause looks like, including an API-shaped one that would otherwise
+    /// become "Something went wrong."
+    #[test]
+    fn a_failed_screenshot_check_always_shows_the_fixed_sentence() {
+        for cause in [
+            "RoInitialize failed",
+            "OCR recognition timed out after 5s",
+            "no OCR-capable language is installed",
+        ] {
+            let err = anyhow::anyhow!(cause).context(crate::redact::FAILURE_NEEDLE);
+            let chain = worker_error_chain_text(&err);
+            assert_eq!(
+                humanize_error_chain(&chain),
+                crate::redact::FAILURE_SENTENCE,
+                "{cause}"
+            );
+        }
+        assert_eq!(
+            crate::redact::FAILURE_SENTENCE,
+            "Could not check the screenshot for private details, so nothing was sent."
+        );
+    }
+
     #[test]
     fn human_error_detail_appends_a_next_step() {
         let detail = human_error_detail("TzSpecificLocalTimeToSystemTime failed");
@@ -6746,12 +6774,12 @@ mod tests {
                 height,
             )
         };
-        let mut raw = capture::RawShot {
+        let raw = capture::RawShot {
             rgba,
             width,
             height,
         };
-        let shot = capture::encode_for_chain(&mut raw, false).expect("encode synthetic PNG");
+        let shot = capture::encode_unredacted(&raw).expect("encode synthetic PNG");
 
         let resolved = actions::load_actions()
             .expect("load_actions should succeed against whatever actions.toml (or none) is on this machine");
