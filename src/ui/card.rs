@@ -2603,6 +2603,7 @@ impl CardInner {
             edit_btn: None,
             previous_foreground,
             main_window_exists,
+            error: None,
         });
         // #225: from here until a decision is reported, tearing this
         // preview down is an abandonment and the owner has to be told. Set
@@ -2654,25 +2655,36 @@ impl CardInner {
             // invented here.
             return;
         }
-        let type_errors = preview.model.type_errors();
+        let type_errors = preview.model.type_error_fields();
         if !type_errors.is_empty() {
             // #284: an edit that cannot be read as its field's declared type
             // (a number field holding "abc") is never confirmed as a string.
-            // Treated like Cancel (nothing runs, the owner is told), then an
-            // error card names what to fix.
-            self.last_confirmed = None;
-            let generation = self.preview_generation;
-            self.preview_decision_pending = false;
-            self.close_preview();
-            self.notify_owner_of_preview_decision(generation);
-            self.show_collapsed(
-                "Couldn't use that edit",
-                &format!("{}. Nothing was done.", type_errors.join(". ")),
-                0,
-                None,
-            );
+            // The preview stays open with every other edit intact, the
+            // problem is shown in place of the title, and the first bad
+            // field takes focus.
+            let message = type_errors
+                .iter()
+                .map(|(_, m)| m.as_str())
+                .collect::<Vec<_>>()
+                .join(". ");
+            let first_bad = type_errors[0].0.clone();
+            preview.error = Some(message);
+            let target = preview
+                .edits
+                .iter()
+                .find(|(name, _)| *name == first_bad)
+                .map(|(_, hwnd)| *hwnd);
+            if let Some(hwnd) = target {
+                unsafe {
+                    let _ = SetFocus(Some(hwnd));
+                }
+            }
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, false);
+            }
             return;
         }
+        preview.error = None;
         let shown = preview.model.to_value();
         let confirmed = crate::ui::confirm::confirm_preview(
             &preview.model,
@@ -3150,9 +3162,12 @@ impl CardInner {
         let title_rect = metrics.title_rect;
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
+        if preview.error.is_some() {
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(rgb(224, 82, 82)));
+        }
         draw_text_line(
             hdc,
-            &preview.title,
+            preview.error.as_deref().unwrap_or(&preview.title),
             title_rect,
             DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
@@ -3254,6 +3269,9 @@ struct PreviewUi {
     /// Whether Wingman's main window exists yet -- gates whether the "Edit"
     /// button is created enabled. See `Card::show_preview`'s doc comment.
     main_window_exists: bool,
+    /// An edit that cannot be read as its field's type (#284), shown in place
+    /// of the title until "Do it" is pressed again with every edit valid.
+    error: Option<String>,
 }
 
 struct PreviewRowMetrics {
@@ -5037,27 +5055,52 @@ mod tests {
     }
 
     #[test]
-    fn preview_do_it_with_an_unparseable_typed_edit_shows_an_error_card_and_confirms_nothing() {
+    fn preview_do_it_with_an_unparseable_typed_edit_stays_open_and_confirms_nothing() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let schema = serde_json::json!({
             "type": "object",
-            "properties": { "count": { "type": "integer", "editable": true } }
+            "properties": {
+                "count": { "type": "integer", "editable": true },
+                "note": { "type": "string", "editable": true }
+            }
         });
-        let value = serde_json::json!({ "count": 3 });
+        let value = serde_json::json!({ "count": 3, "note": "keep me" });
         card.inner.show_preview("Typed", &schema, &value, false);
-        let edit = card.inner.preview.as_ref().expect("preview").edits[0].1;
-        let text: Vec<u16> = "abc\0".encode_utf16().collect();
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
-                edit,
-                windows::core::PCWSTR(text.as_ptr()),
-            );
-        }
+        let set_text = |hwnd: HWND, s: &str| {
+            let text: Vec<u16> = format!("{s}\0").encode_utf16().collect();
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                    hwnd,
+                    windows::core::PCWSTR(text.as_ptr()),
+                );
+            }
+        };
+        let (count_edit, note_edit) = {
+            let p = card.inner.preview.as_ref().expect("preview");
+            (p.edits[0].1, p.edits[1].1)
+        };
+        set_text(count_edit, "abc");
+        set_text(note_edit, "edited note");
         card.inner.preview_do_it();
         assert!(card.take_confirmed().is_none(), "nothing may be confirmed");
-        assert_eq!(card.state(), CardState::Collapsed, "an error card shows");
-        assert!(card.inner.headline.contains("Couldn't use that edit"));
-        assert!(card.inner.detail.contains("Count must be a whole number"));
+        assert_eq!(card.state(), CardState::Preview, "the preview stays open");
+        let p = card.inner.preview.as_ref().expect("preview still there");
+        assert_eq!(
+            p.error.as_deref(),
+            Some("Count must be a whole number"),
+            "the problem is shown inline"
+        );
+        assert_eq!(
+            p.model.to_value()["note"],
+            "edited note",
+            "other edits survive"
+        );
+
+        set_text(count_edit, "4");
+        card.inner.preview_do_it();
+        let confirmed = card.take_confirmed().expect("confirmed after the fix");
+        assert_eq!(confirmed.value()["count"], serde_json::json!(4));
+        assert_eq!(confirmed.value()["note"], "edited note");
     }
 
     #[test]
