@@ -239,7 +239,8 @@ win = false
 ```
 
 then **Reload settings** (or restart) to pick it up. The tray label shows
-the current key, or "not set". It is the one chord
+the current key, or "not set". To clear it, delete the `[hotkeys.pause]`
+table from `config.toml` and choose **Reload settings**. It is the one chord
 that still works while paused.
 
 ### Through Windows Settings instead

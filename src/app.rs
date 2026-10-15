@@ -2349,6 +2349,21 @@ impl App {
     }
 
     fn on_learned(&mut self, which: usize, chord: Chord) {
+        // Issue #202: the pause chord is matched first in the hook, so a
+        // chord shared with another slot would silently disable one of them.
+        // Refuse it with a card and keep the previous bindings. Checked
+        // before the system-shortcut warning below so the user is never
+        // asked to confirm a chord that is then refused anyway.
+        if let Some(other) = pause_clash(&self.config.hotkeys, which, chord) {
+            self.card.show_answer(
+                &format!("{} is already the {other}", chord_to_string(&chord)),
+                "Press a different key combo. The previous binding is unchanged.",
+                8,
+                None,
+            );
+            return;
+        }
+
         // Issue #112: a known system/app shortcut warns and keeps the
         // previous binding, unless the user just confirmed by capturing the
         // exact same chord again for this slot -- see
@@ -2371,19 +2386,6 @@ impl App {
             crate::hotkey_conflicts::LearnDecision::Apply => {
                 self.pending_conflict = None;
             }
-        }
-
-        // Issue #202: the pause chord is matched first in the hook, so a
-        // chord shared with another slot would silently disable one of them.
-        // Refuse it with a card and keep the previous bindings.
-        if let Some(other) = pause_clash(&self.config.hotkeys, which, chord) {
-            self.card.show_answer(
-                &format!("{} is already the {other}", chord_to_string(&chord)),
-                "Press a different key combo. The previous binding is unchanged.",
-                8,
-                None,
-            );
-            return;
         }
 
         apply_learned(&mut self.config.hotkeys, which, chord);

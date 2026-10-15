@@ -109,6 +109,9 @@ pub fn pause_clash(
         if hotkeys.secondary == chord {
             return Some(slot_name(HK_SECONDARY));
         }
+        if hotkeys.palette == Some(chord) {
+            return Some("palette key");
+        }
         None
     } else if hotkeys.pause == Some(chord) {
         Some(slot_name(HK_PAUSE))
@@ -1175,6 +1178,16 @@ mod tests {
         assert_eq!(pause_clash(&h, HK_PAUSE, free), None);
         // primary == secondary is pre-existing behaviour, not this check's job.
         assert_eq!(pause_clash(&h, HK_PRIMARY, h.secondary), None);
+    }
+
+    #[test]
+    fn pause_clash_includes_the_palette_chord() {
+        let mut h = default_hotkeys();
+        let p = chord(0x20, true, false, false, true);
+        h.palette = Some(p);
+        assert_eq!(pause_clash(&h, HK_PAUSE, p), Some("palette key"));
+        let free = chord(0x13, false, false, false, false);
+        assert_eq!(pause_clash(&h, HK_PAUSE, free), None);
     }
 
     #[test]
