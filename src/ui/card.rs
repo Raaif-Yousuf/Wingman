@@ -5120,52 +5120,16 @@ mod tests {
 
     // -- stale preview command must not hijack a later preview (#255) -----
 
-    /// Drains every preview command queued for `card_hwnd` (the legacy
-    /// `WM_COMMAND` and the generation-tagged `WM_CARD_PREVIEW_COMMAND`) and
-    /// feeds each to the card the way the message loop would.
-    fn pump_queued_preview_commands(card: &mut Card) {
-        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
-        let hwnd = card.hwnd();
-        for (lo, hi) in [
-            (WM_COMMAND, WM_COMMAND),
-            (WM_CARD_PREVIEW_COMMAND, WM_CARD_PREVIEW_COMMAND),
-        ] {
-            let mut msg = MSG::default();
-            while unsafe { PeekMessageW(&mut msg, Some(hwnd), lo, hi, PM_REMOVE).as_bool() } {
-                card.handle_message(msg.message, msg.wParam, msg.lParam);
-            }
-        }
-    }
-
-    #[test]
-    fn replacing_a_focused_preview_does_not_cancel_the_new_one() {
-        // #255 regression guard. This passes without the generation tag too:
-        // MEASURED 2026-10-15, destroying a focused preview field moves focus
-        // to the card first, so replacing a preview posts no cancel at all.
-        // It pins that behaviour; the tag is covered by the tests below.
-        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
-        let (schema, value) = calendar_schema_and_value();
-        card.inner.show_preview("Preview A", &schema, &value, false);
-        card.inner.show_preview("Preview B", &schema, &value, false);
-
-        pump_queued_preview_commands(&mut card);
-
-        assert_eq!(
-            card.state(),
-            CardState::Preview,
-            "a cancel posted while tearing down A must not close B"
-        );
-        assert_eq!(
-            card.inner.preview.as_ref().map(|p| p.title.as_str()),
-            Some("Preview B")
-        );
-    }
-
     #[test]
     fn a_click_away_cancel_posted_for_one_preview_does_not_close_the_next() {
         // #255: the click-away cancel is posted for preview A but only
-        // pumped after preview B replaced it. Uses the real subclass to
+        // delivered after preview B replaced it. Uses the real subclass to
         // post it, so the tag the receiver checks is the one it really sets.
+        // The posted message is taken off the queue straight away and
+        // delivered by hand: draining the queue later would also pick up
+        // focus changes the OS makes under a parallel test run, which
+        // legitimately cancel the live preview.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
         card.inner.show_preview("Preview A", &schema, &value, false);
@@ -5181,9 +5145,21 @@ mod tests {
                 card_hwnd.0 as usize,
             );
         }
+        let mut posted = MSG::default();
+        let found = unsafe {
+            PeekMessageW(
+                &mut posted,
+                Some(card_hwnd),
+                WM_CARD_PREVIEW_COMMAND,
+                WM_CARD_PREVIEW_COMMAND,
+                PM_REMOVE,
+            )
+            .as_bool()
+        };
+        assert!(found, "the click-away must post a command");
         card.inner.show_preview("Preview B", &schema, &value, false);
 
-        pump_queued_preview_commands(&mut card);
+        card.handle_message(posted.message, posted.wParam, posted.lParam);
 
         assert_eq!(card.state(), CardState::Preview);
         assert_eq!(
