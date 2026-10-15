@@ -29,7 +29,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::time::{Duration, Instant};
+use windows::core::HSTRING;
 use windows::Foundation::Rect;
+use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::{OcrEngine, OcrLine as WinOcrLine};
 use windows::Storage::Streams::DataWriter;
@@ -237,26 +239,208 @@ pub fn recognize(rgba: &[u8], width: u32, height: u32, timeout: Duration) -> Res
     result
 }
 
-fn recognize_inner(rgba: &[u8], width: u32, height: u32, timeout: Duration) -> Result<OcrOutput> {
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-        .context("OcrEngine::TryCreateFromUserProfileLanguages failed")?;
-    // THEORY (unverified): TryCreateFromUserProfileLanguages is documented
-    // as a WinRT "TryCreate" factory, which signals "nothing available" by
-    // returning a null interface inside an Ok result, not an Err -- not
-    // exercised on this machine, which has at least one OCR-capable
-    // language installed. Guarded defensively rather than assumed away.
-    if windows::core::Interface::as_raw(&engine).is_null() {
-        return Err(anyhow!(
-            "no OCR-capable language is installed for this user profile; \
-             install one under Settings > Time & language > Language & region"
-        ));
+/// What the `[capture] ocr_language` setting resolved to (issue #111).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanguageChoice {
+    /// Let Windows pick from the user's profile languages.
+    Profile,
+    /// Use this installed recognizer language (a tag from the installed list).
+    Tag(String),
+    /// The requested language has no installed OCR pack.
+    Missing,
+}
+
+/// Process-wide mirror of `Config::capture.ocr_language`. `recognize` runs
+/// on worker threads with no `Config` in reach, the same reason
+/// `config::set_egress_preview_enabled` exists. `App::run` and
+/// `App::apply_config` both call [`set_preferred_language`].
+static PREFERRED_LANGUAGE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+#[cfg(test)]
+static PREF_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn set_preferred_language(tag: &str) {
+    *PREFERRED_LANGUAGE.lock().unwrap_or_else(|e| e.into_inner()) = tag.trim().to_string();
+}
+
+/// The current setting; `"auto"` until something sets it.
+pub fn preferred_language() -> String {
+    let s = PREFERRED_LANGUAGE.lock().unwrap_or_else(|e| e.into_inner());
+    if s.is_empty() {
+        "auto".to_string()
+    } else {
+        s.clone()
     }
+}
+
+/// Primary language and optional script subtag of a BCP-47 tag, lowercased
+/// (`zh-Hans-CN` is `("zh", Some("hans"))`, `de-DE` is `("de", None)`).
+fn language_and_script(tag: &str) -> (String, Option<String>) {
+    let mut parts = tag.split(['-', '_']);
+    let lang = parts.next().unwrap_or("").to_ascii_lowercase();
+    let script = parts
+        .next()
+        .filter(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()))
+        .map(|p| p.to_ascii_lowercase());
+    (lang, script)
+}
+
+/// Region the OCR pack for a bare language is expected to have, so `de`
+/// resolves to `de-DE` however Windows orders its list.
+fn default_region_tag(lang: &str) -> String {
+    match lang {
+        "en" => "en-us".to_string(),
+        "pt" => "pt-br".to_string(),
+        "ja" => "ja-jp".to_string(),
+        "ko" => "ko-kr".to_string(),
+        "zh" => "zh-hans-cn".to_string(),
+        "sv" => "sv-se".to_string(),
+        "da" => "da-dk".to_string(),
+        "cs" => "cs-cz".to_string(),
+        "el" => "el-gr".to_string(),
+        "uk" => "uk-ua".to_string(),
+        other => format!("{other}-{other}"),
+    }
+}
+
+/// Pure language choice. `preferred` is `"auto"` (or empty) or a BCP-47 tag
+/// such as `de`, `de-DE` or `zh-Hans`; `available` is the installed
+/// recognizer tags.
+///
+/// Order: exact tag (case-insensitive); otherwise among packs of the same
+/// primary language (and, when the request names a script, the same script
+/// only, so `zh-Hans` never gets `zh-Hant-TW`): the language's default
+/// region (`de-DE`, `en-US`...), then alphabetical, so the answer does not
+/// depend on the order Windows lists packs in. A request with no pack is
+/// `Missing`, never silently swapped for a different language or script.
+pub fn select_language(preferred: &str, available: &[String]) -> LanguageChoice {
+    let want = preferred.trim();
+    if want.is_empty() || want.eq_ignore_ascii_case("auto") {
+        return LanguageChoice::Profile;
+    }
+    if let Some(t) = available.iter().find(|t| t.eq_ignore_ascii_case(want)) {
+        return LanguageChoice::Tag(t.clone());
+    }
+    let (want_lang, want_script) = language_and_script(want);
+    let default_tag = default_region_tag(&want_lang);
+    let mut candidates: Vec<&String> = available
+        .iter()
+        .filter(|t| {
+            let (lang, script) = language_and_script(t);
+            lang == want_lang && (want_script.is_none() || script == want_script)
+        })
+        .collect();
+    candidates.sort_by_key(|t| {
+        let lower = t.to_ascii_lowercase().replace('_', "-");
+        (lower != default_tag, lower)
+    });
+    match candidates.first() {
+        Some(t) => LanguageChoice::Tag((*t).clone()),
+        None => LanguageChoice::Missing,
+    }
+}
+
+/// The tag actually used by the last successful engine creation, for the
+/// diagnostics report.
+static LAST_USED_LANGUAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// One diagnostics line: the setting, and which pack it resolved to when
+/// that differs (`de, used de-DE`; `en-GB, used en-US`).
+pub fn language_report(requested: &str, used: Option<&str>) -> String {
+    match used {
+        None => format!("{requested} (not used yet)"),
+        Some(u) if u.eq_ignore_ascii_case(requested) => u.to_string(),
+        Some(u) => format!("{requested}, used {u}"),
+    }
+}
+
+/// Current `language_report` for the Copy diagnostics text.
+pub fn language_status() -> String {
+    let used = LAST_USED_LANGUAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    language_report(&preferred_language(), used.as_deref())
+}
+
+/// Card text for a requested language with no installed OCR pack (rule 7).
+pub fn missing_pack_message(requested: &str, available: &[String]) -> String {
+    let installed = if available.is_empty() {
+        "none".to_string()
+    } else {
+        available.join(", ")
+    };
+    format!(
+        "No OCR language pack is installed for \"{requested}\" (installed: {installed}). \
+         Add the language under Settings > Time & language > Language & region \
+         and make sure its optical character recognition feature is installed, \
+         or set ocr_language to \"auto\" in config.toml."
+    )
+}
+
+/// Tags of every OCR recognizer language installed on this machine.
+fn installed_language_tags() -> Result<Vec<String>> {
+    let langs = OcrEngine::AvailableRecognizerLanguages()
+        .context("OcrEngine::AvailableRecognizerLanguages")?;
+    let mut out = Vec::new();
+    for l in langs.into_iter() {
+        out.push(
+            l.LanguageTag()
+                .context("Language::LanguageTag")?
+                .to_string_lossy(),
+        );
+    }
+    Ok(out)
+}
+
+fn create_engine() -> Result<OcrEngine> {
+    let pref = preferred_language();
+    let available = if select_language(&pref, &[]) == LanguageChoice::Profile {
+        Vec::new() // auto never needs the list
+    } else {
+        installed_language_tags()?
+    };
+    match select_language(&pref, &available) {
+        LanguageChoice::Missing => Err(anyhow!(missing_pack_message(&pref, &available))),
+        LanguageChoice::Tag(tag) => {
+            let lang = Language::CreateLanguage(&HSTRING::from(tag.as_str()))
+                .context("Language::CreateLanguage")?;
+            let engine = OcrEngine::TryCreateFromLanguage(&lang)
+                .context("OcrEngine::TryCreateFromLanguage failed")?;
+            if windows::core::Interface::as_raw(&engine).is_null() {
+                return Err(anyhow!(missing_pack_message(&pref, &available)));
+            }
+            Ok(engine)
+        }
+        LanguageChoice::Profile => {
+            let engine = OcrEngine::TryCreateFromUserProfileLanguages()
+                .context("OcrEngine::TryCreateFromUserProfileLanguages failed")?;
+            // THEORY (unverified): TryCreateFromUserProfileLanguages is
+            // documented as a WinRT "TryCreate" factory, which signals
+            // "nothing available" by returning a null interface inside an Ok
+            // result, not an Err -- not exercised on this machine, which has
+            // at least one OCR-capable language installed. Guarded
+            // defensively rather than assumed away.
+            if windows::core::Interface::as_raw(&engine).is_null() {
+                return Err(anyhow!(
+                    "no OCR-capable language is installed for this user profile; \
+                     install one under Settings > Time & language > Language & region"
+                ));
+            }
+            Ok(engine)
+        }
+    }
+}
+
+fn recognize_inner(rgba: &[u8], width: u32, height: u32, timeout: Duration) -> Result<OcrOutput> {
+    let engine = create_engine()?;
 
     let language_tag = engine
         .RecognizerLanguage()
         .and_then(|l| l.LanguageTag())
         .map(|t| t.to_string_lossy())
         .unwrap_or_else(|_| "unknown".to_string());
+    *LAST_USED_LANGUAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(language_tag.clone());
 
     // A failure to query the limit is treated as "assume the conservative
     // default this crate already uses elsewhere" rather than aborting OCR
@@ -529,6 +713,147 @@ pub(crate) mod tests {
         assert_eq!(union_rect(a, b), union_rect(b, a));
     }
 
+    // -- select_language (issue #111) -------------------------------------
+
+    fn tags(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn auto_selects_the_user_profile_languages() {
+        assert_eq!(
+            select_language("auto", &tags(&["en-US", "de-DE"])),
+            LanguageChoice::Profile
+        );
+        assert_eq!(
+            select_language("", &tags(&["en-US"])),
+            LanguageChoice::Profile
+        );
+        assert_eq!(
+            select_language("  AUTO ", &tags(&[])),
+            LanguageChoice::Profile
+        );
+    }
+
+    #[test]
+    fn exact_tag_match_ignores_case() {
+        assert_eq!(
+            select_language("de-de", &tags(&["en-US", "de-DE"])),
+            LanguageChoice::Tag("de-DE".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_language_matches_a_regional_pack() {
+        assert_eq!(
+            select_language("de", &tags(&["en-US", "de-DE"])),
+            LanguageChoice::Tag("de-DE".to_string())
+        );
+    }
+
+    #[test]
+    fn exact_match_wins_over_a_primary_subtag_match() {
+        assert_eq!(
+            select_language("de-CH", &tags(&["de-DE", "de-CH"])),
+            LanguageChoice::Tag("de-CH".to_string())
+        );
+    }
+
+    #[test]
+    fn a_regional_request_falls_back_to_the_same_language_pack() {
+        assert_eq!(
+            select_language("en-GB", &tags(&["en-US"])),
+            LanguageChoice::Tag("en-US".to_string())
+        );
+    }
+
+    #[test]
+    fn script_subtag_must_match_the_pack_script() {
+        let packs = tags(&["zh-Hant-TW", "zh-Hans-CN"]);
+        assert_eq!(
+            select_language("zh-Hans", &packs),
+            LanguageChoice::Tag("zh-Hans-CN".to_string())
+        );
+        assert_eq!(
+            select_language("zh-Hans", &tags(&["zh-Hant-TW"])),
+            LanguageChoice::Missing
+        );
+        assert_eq!(
+            select_language("zh-Hant-HK", &packs),
+            LanguageChoice::Tag("zh-Hant-TW".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_language_prefers_its_default_region_whatever_the_list_order() {
+        assert_eq!(
+            select_language("de", &tags(&["de-CH", "de-DE"])),
+            LanguageChoice::Tag("de-DE".to_string())
+        );
+        assert_eq!(
+            select_language("de", &tags(&["de-DE", "de-CH"])),
+            LanguageChoice::Tag("de-DE".to_string())
+        );
+        assert_eq!(
+            select_language("en", &tags(&["en-GB", "en-US"])),
+            LanguageChoice::Tag("en-US".to_string())
+        );
+    }
+
+    #[test]
+    fn without_a_default_region_pack_the_choice_is_alphabetical() {
+        assert_eq!(
+            select_language("de", &tags(&["de-CH", "de-AT"])),
+            LanguageChoice::Tag("de-AT".to_string())
+        );
+        assert_eq!(
+            select_language("de", &tags(&["de-AT", "de-CH"])),
+            LanguageChoice::Tag("de-AT".to_string())
+        );
+    }
+
+    #[test]
+    fn language_report_says_requested_and_used() {
+        assert_eq!(language_report("auto", None), "auto (not used yet)");
+        assert_eq!(language_report("de", None), "de (not used yet)");
+        assert_eq!(language_report("de", Some("de-DE")), "de, used de-DE");
+        assert_eq!(language_report("en-US", Some("en-US")), "en-US");
+        assert_eq!(language_report("auto", Some("en-US")), "auto, used en-US");
+    }
+
+    #[test]
+    fn missing_pack_is_reported_not_silently_replaced() {
+        assert_eq!(
+            select_language("de", &tags(&["en-US"])),
+            LanguageChoice::Missing
+        );
+        assert_eq!(select_language("de", &[]), LanguageChoice::Missing);
+    }
+
+    #[test]
+    fn missing_pack_message_names_the_language_and_the_windows_setting() {
+        let msg = missing_pack_message("de", &tags(&["en-US", "fr-FR"]));
+        assert!(msg.contains("\"de\""), "{msg}");
+        assert!(msg.contains("en-US, fr-FR"), "{msg}");
+        assert!(msg.contains("Settings > Time & language"), "{msg}");
+        assert!(!msg.contains('\u{2014}'), "no em dash in a card string");
+    }
+
+    #[test]
+    fn missing_pack_message_copes_with_no_installed_packs() {
+        let msg = missing_pack_message("de", &[]);
+        assert!(msg.contains("none"), "{msg}");
+    }
+
+    #[test]
+    fn preferred_language_defaults_to_auto_and_round_trips() {
+        let _g = PREF_TEST_LOCK.lock().unwrap();
+        set_preferred_language("de");
+        assert_eq!(preferred_language(), "de");
+        set_preferred_language("auto");
+        assert_eq!(preferred_language(), "auto");
+    }
+
     // -- has_package_identity -------------------------------------------
 
     #[test]
@@ -646,6 +971,45 @@ pub(crate) mod tests {
             rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
         }
         rgba
+    }
+
+    /// Issue #111 hand check: lists the installed packs, then asks for a
+    /// language with no pack ("xx") and expects the card text, then for the
+    /// first installed pack and expects recognition under that tag. For the
+    /// German "done when", install the German pack and run with
+    /// `WINGMAN_OCR_LIVE_LANG=de` to also try that tag.
+    #[test]
+    #[ignore = "live WinRT OCR; run manually: cargo test ocr_live_language -- --ignored --nocapture"]
+    fn ocr_live_language_selection() {
+        let _g = PREF_TEST_LOCK.lock().unwrap();
+        let installed = installed_language_tags().expect("list packs");
+        println!("installed OCR packs: {installed:?}");
+        let rgba = unsafe { render_gdi_text_rgba("Wingman OCR 12345", 900, 160) };
+
+        set_preferred_language("xx");
+        let err = recognize(&rgba, 900, 160, Duration::from_secs(15)).unwrap_err();
+        println!("missing-pack card text: {err}");
+        assert!(err.to_string().contains("Settings > Time & language"));
+
+        assert!(
+            !installed.is_empty(),
+            "no OCR language pack is installed on this machine; install one under \
+             Settings > Time & language > Language & region and rerun"
+        );
+        let mut tries = vec![installed[0].clone()];
+        if let Ok(l) = std::env::var("WINGMAN_OCR_LIVE_LANG") {
+            tries.push(l);
+        }
+        for t in tries {
+            set_preferred_language(&t);
+            let out = recognize(&rgba, 900, 160, Duration::from_secs(15)).expect("recognize");
+            println!(
+                "requested {t}: used {} -> {:?}",
+                out.language_tag,
+                serialize_lines(&out.lines)
+            );
+        }
+        set_preferred_language("auto");
     }
 
     /// The measurement issue #30 exists to make: does `Windows.Media.Ocr`

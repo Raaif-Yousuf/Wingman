@@ -1,4 +1,5 @@
 pub mod card;
+pub(crate) mod card_placement;
 pub(crate) mod confirm;
 pub mod gallery;
 pub mod palette;

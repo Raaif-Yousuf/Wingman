@@ -41,7 +41,7 @@ step() {
 
 pester() {
     pwsh -NoProfile -Command '
-        $r = Invoke-Pester -Path packaging -PassThru -Output None
+        $r = Invoke-Pester -Path packaging, scripts -PassThru -Output None
         "Passed=$($r.PassedCount) Failed=$($r.FailedCount)"
         if ($r.FailedCount -gt 0) { $r.Failed | ForEach-Object { "failed: $($_.ExpandedName)" }; exit 1 }'
 }
@@ -51,6 +51,7 @@ pssa() {
         $f = @()
         foreach ($p in "install.ps1", "uninstall.ps1") { $f += Invoke-ScriptAnalyzer -Path $p -Severity Warning,Error }
         $f += Invoke-ScriptAnalyzer -Path packaging -Recurse -Severity Warning,Error
+        $f += Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Warning,Error
         $f | ForEach-Object { "$($_.ScriptName):$($_.Line) $($_.RuleName)" }
         if ($f.Count -gt 0) { exit 1 }'
 }

@@ -66,7 +66,11 @@
 use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
+use crate::config::CardCorner;
 use crate::speech::{spoken_text, Speaker};
+use crate::ui::card_placement::{
+    card_origin, dpi_to_apply, resolve_monitor, sort_left_to_right, MonitorChoice,
+};
 use crate::ui::text::draw_text_line;
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -78,11 +82,11 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     Arc, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint,
-    ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject, GetTextMetricsW,
-    IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect, SelectClipRgn,
-    SelectObject, SetBkColor, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT,
-    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
-    DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
+    EnumDisplayMonitors, ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject,
+    GetTextMetricsW, IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect,
+    SelectClipRgn, SelectObject, SetBkColor, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT,
+    DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP,
+    DT_VCENTER, DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND,
     PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
@@ -209,6 +213,10 @@ impl Card {
             theme,
             fonts: Fonts::null(),
             text_scale: 1.0,
+            corner: CardCorner::default(),
+            monitor: MonitorChoice::Cursor,
+            follow_anchor: POINT::default(),
+            place_from_cursor: false,
             anim_frame: 0,
             scroll_offset: 0,
             scroll_max: 0,
@@ -391,6 +399,13 @@ impl Card {
     /// unreadable or enormous.
     pub fn set_text_scale(&mut self, scale: f32) {
         self.inner.set_text_scale(scale);
+    }
+
+    /// Issue #109: `ui.card_corner` and `ui.card_monitor`. Takes effect the
+    /// next time a card is laid out.
+    pub fn set_placement(&mut self, corner: CardCorner, monitor: &str) {
+        self.inner.corner = corner;
+        self.inner.monitor = MonitorChoice::parse(monitor);
     }
 
     pub fn state(&self) -> CardState {
@@ -1069,6 +1084,19 @@ struct CardInner {
     /// User-tunable multiplier applied to every font size. Set via
     /// [`Card::set_text_scale`]; defaults to 1.0.
     text_scale: f32,
+    /// Issue #109: where the card sits (`ui.card_corner`).
+    corner: CardCorner,
+    /// Issue #109: which monitor it appears on (`ui.card_monitor`).
+    monitor: MonitorChoice,
+    /// Issue #109: for `CardCorner::FollowMouse`, the pointer position the
+    /// card is anchored to. Taken when Pending or Collapsed is laid out and
+    /// reused by Expanded and Preview, so a card the user is reading does
+    /// not chase the mouse.
+    follow_anchor: POINT,
+    /// Issue #109: set when a preview is shown from Hidden, so its layout
+    /// reads the pointer and the pointer's monitor afresh instead of using
+    /// the position an earlier card left behind. Consumed by `layout_preview`.
+    place_from_cursor: bool,
     anim_frame: u32,
     scroll_offset: i32,
     scroll_max: i32,
@@ -1607,26 +1635,55 @@ impl CardInner {
 
     // -- layout ------------------------------------------------------------
 
-    fn work_area_for_cursor(&self) -> RECT {
-        unsafe {
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            work_area_for_monitor(hmon)
+    /// The work area the card is about to be laid out in, and the first
+    /// step of every layout: it also switches the card to that monitor's DPI
+    /// (rebuilding the fonts) so the sizes the layout then computes are
+    /// right for the monitor the card is moving to, not the one it was last
+    /// on.
+    ///
+    /// `from_cursor` (Pending and Collapsed) picks the monitor the setting
+    /// names, else the one under the mouse, and records the pointer as the
+    /// `FollowMouse` anchor. Without it (Expanded, Preview) the card stays on
+    /// the monitor it is on, since the mouse may have moved on while the user
+    /// reads, unless the setting pins a monitor.
+    fn target_work_area(&mut self, from_cursor: bool) -> RECT {
+        use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+        let base = unsafe {
+            if from_cursor {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                self.follow_anchor = pt;
+                MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+            } else {
+                MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST)
+            }
+        };
+        let target =
+            if self.corner == CardCorner::FollowMouse || self.monitor == MonitorChoice::Cursor {
+                base
+            } else {
+                let primary = unsafe {
+                    MonitorFromPoint(
+                        POINT { x: 0, y: 0 },
+                        windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTOPRIMARY,
+                    )
+                };
+                let all: Vec<_> = sorted_monitors().into_iter().map(|(_, h)| h).collect();
+                resolve_monitor(self.monitor, base, primary, &all)
+            };
+        let (mut dx, mut dy) = (0u32, 0u32);
+        let queried =
+            unsafe { GetDpiForMonitor(target, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) }.is_ok();
+        if let Some(dpi) = dpi_to_apply(self.dpi, queried.then_some(dx)) {
+            self.dpi = dpi;
+            self.rebuild_fonts();
         }
-    }
-
-    fn work_area_for_self(&self) -> RECT {
-        unsafe {
-            let hmon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
-            work_area_for_monitor(hmon)
-        }
+        work_area_for_monitor(target)
     }
 
     fn place_bottom_right(&self, work: RECT, width: i32, height: i32) {
         let margin = self.scale(MARGIN_DP);
-        let x = (work.right - margin - width).max(work.left);
-        let y = (work.bottom - margin - height).max(work.top);
+        let (x, y) = card_origin(self.corner, work, margin, width, height, self.follow_anchor);
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -1641,17 +1698,18 @@ impl CardInner {
     }
 
     fn layout_pending(&mut self) {
+        let work = self.target_work_area(true);
         let padding = self.scale(PADDING_DP);
         let width = self.scale(PENDING_WIDTH_DP);
         let glyph_size = self.scale(PENDING_SIZE_DP);
         let gap = self.scale(PENDING_TEXT_GAP_DP);
         let text_line_h = self.line_height(self.fonts.body).max(1);
         let height = padding * 2 + glyph_size + gap + text_line_h;
-        let work = self.work_area_for_cursor();
         self.place_bottom_right(work, width, height);
     }
 
     fn layout_collapsed(&mut self) {
+        let work = self.target_work_area(true);
         let padding = self.scale(PADDING_DP);
         let width = self.scale(CARD_WIDTH_DP);
         let content_width = (width - padding * 2).max(1);
@@ -1666,11 +1724,11 @@ impl CardInner {
         // still expands when there is detail to show.
         let height = padding * 2 + headline_h;
 
-        let work = self.work_area_for_cursor();
         self.place_bottom_right(work, width, height);
     }
 
     fn layout_expanded(&mut self) {
+        let work = self.target_work_area(false);
         let padding = self.scale(PADDING_DP);
         let gap = self.scale(GAP_DP);
         let width = self.scale(CARD_WIDTH_DP);
@@ -1700,7 +1758,6 @@ impl CardInner {
         };
         let footer_gap = if footer_h > 0 { gap } else { 0 };
 
-        let work = self.work_area_for_self();
         let work_h = (work.bottom - work.top).max(1);
         let max_window_h = ((work_h as f32) * 0.6) as i32;
         let min_window_h =
@@ -2493,6 +2550,8 @@ impl CardInner {
         self.kill_timers();
 
         let previous_foreground = unsafe { GetForegroundWindow() };
+        // Issue #109: from Hidden the card has no current position.
+        self.place_from_cursor = self.state == CardState::Hidden;
 
         let model = PreviewModel::from_schema(schema, proposal_value);
 
@@ -2893,6 +2952,10 @@ impl CardInner {
     }
 
     fn layout_preview(&mut self) {
+        // A preview shown from Hidden has no position of its own yet: read
+        // the pointer afresh (see `place_from_cursor`).
+        let from_cursor = std::mem::take(&mut self.place_from_cursor);
+        let work = self.target_work_area(from_cursor);
         let fields = match &self.preview {
             Some(p) => p.model.fields().to_vec(),
             None => return,
@@ -2903,12 +2966,11 @@ impl CardInner {
             .map(|p| p.main_window_exists)
             .unwrap_or(false);
         let metrics = self.compute_preview_layout(&fields, main_window_exists);
-        // Preview does not track the cursor the way Pending/Collapsed do
-        // (`work_area_for_cursor`): once a form is up, the user's mouse is
-        // likely to move away while they read or type, and having the card
-        // hop monitors mid-edit would be actively hostile. Expanded makes
-        // the same choice for the same reason.
-        let work = self.work_area_for_self();
+        // A preview that replaces a visible card does not track the cursor
+        // the way Pending/Collapsed do: once a form is up, the user's mouse
+        // is likely to move away while they read or type, and having the
+        // card hop monitors mid-edit would be actively hostile. Expanded
+        // makes the same choice for the same reason.
         self.place_bottom_right(work, metrics.width, metrics.window_h);
     }
 
@@ -3415,6 +3477,33 @@ fn ray_point(cx: i32, cy: i32, angle_deg: f32, len: i32) -> (i32, i32) {
     (x, y)
 }
 
+/// Issue #109: every monitor, numbered left to right (what
+/// `ui.card_monitor = "2"` indexes into; see `sort_left_to_right`).
+fn sorted_monitors() -> Vec<(RECT, windows::Win32::Graphics::Gdi::HMONITOR)> {
+    use windows::Win32::Graphics::Gdi::HMONITOR;
+    unsafe extern "system" fn collect(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        rc: *mut RECT,
+        lparam: LPARAM,
+    ) -> windows::core::BOOL {
+        let out = &mut *(lparam.0 as *mut Vec<(RECT, HMONITOR)>);
+        out.push((*rc, hmon));
+        true.into()
+    }
+    let mut out: Vec<(RECT, HMONITOR)> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut out as *mut Vec<(RECT, HMONITOR)> as isize),
+        );
+    }
+    sort_left_to_right(&mut out);
+    out
+}
+
 fn work_area_for_monitor(hmon: windows::Win32::Graphics::Gdi::HMONITOR) -> RECT {
     unsafe {
         let mut mi = MONITORINFO {
@@ -3627,6 +3716,58 @@ mod tests {
         assert!(
             card.inner.copy_details_rect.is_none(),
             "an answer card must not show \"Copy details\""
+        );
+    }
+
+    #[test]
+    fn card_lands_in_the_configured_corner_of_the_cursor_monitor() {
+        // Issue #109, the wired-to-nothing check: the real window's position
+        // follows `set_placement`, not just the pure math.
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let work = card.inner.target_work_area(true);
+        let margin = card.inner.scale(MARGIN_DP);
+        let rect_of = |card: &Card| {
+            let mut rc = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(card.hwnd(), &mut rc);
+            }
+            rc
+        };
+
+        card.set_placement(CardCorner::TopLeft, "cursor");
+        card.show_answer("Right.", "Details.", 0, None);
+        let rc = rect_of(&card);
+        assert_eq!((rc.left, rc.top), (work.left + margin, work.top + margin));
+
+        card.set_placement(CardCorner::BottomRight, "cursor");
+        card.show_answer("Right.", "Details.", 0, None);
+        let rc = rect_of(&card);
+        assert_eq!(
+            (rc.right, rc.bottom),
+            (work.right - margin, work.bottom - margin)
+        );
+    }
+
+    #[test]
+    fn preview_from_hidden_anchors_follow_mouse_to_the_current_pointer() {
+        // Issue #109: a preview shown from Hidden used to place itself with
+        // whatever pointer position an earlier card had recorded.
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.set_placement(CardCorner::FollowMouse, "cursor");
+        card.inner.follow_anchor = POINT { x: -5000, y: -5000 };
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_preview("Add to calendar", &schema, &value, false);
+        let mut now = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut now);
+        }
+        assert_eq!(
+            (card.inner.follow_anchor.x, card.inner.follow_anchor.y),
+            (now.x, now.y)
         );
     }
 

@@ -253,6 +253,10 @@ pub struct Capture {
     /// screenshot before it is sent to a cloud provider (#103). On by
     /// default. A request whose providers are all local skips it either way.
     pub redact: bool,
+    /// OCR recognizer language (#111): "auto" (the Windows profile
+    /// languages) or a BCP-47 tag such as "de" or "de-DE" naming an
+    /// installed Windows OCR language pack.
+    pub ocr_language: String,
 }
 
 impl Default for Capture {
@@ -261,6 +265,7 @@ impl Default for Capture {
             max_edge: 1568,
             monitor: "active".to_string(),
             redact: true,
+            ocr_language: "auto".to_string(),
         }
     }
 }
@@ -524,6 +529,20 @@ pub fn compat_order_name(name: &str) -> String {
     format!("compat:{name}")
 }
 
+/// Issue #109: where the result card sits on its monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardCorner {
+    #[default]
+    BottomRight,
+    BottomLeft,
+    TopRight,
+    TopLeft,
+    /// Next to the mouse pointer, on the monitor the pointer is on
+    /// (`card_monitor` is ignored).
+    FollowMouse,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Ui {
@@ -532,6 +551,19 @@ pub struct Ui {
     /// Multiplies every font size in the card. 1.0 is the built-in default;
     /// lower is smaller. Clamped by the card to a readable range.
     pub text_scale: f32,
+    /// Issue #109: which corner of the monitor the card appears in, or
+    /// `follow_mouse`. Default `bottom_right`, the position before this
+    /// setting existed.
+    pub card_corner: CardCorner,
+    /// Issue #109: which monitor the card appears on. `"cursor"` (default)
+    /// is the one the mouse is on, `"primary"` pins it to the primary
+    /// monitor, and `"1"`, `"2"`, ... pin it to that monitor counting left
+    /// to right (top to bottom when two share a left edge). This is not the
+    /// numbering Windows Settings shows, and it changes if you rearrange or
+    /// dock monitors; use `"primary"` or `"cursor"` if that matters. A
+    /// number with no such monitor falls back to the cursor's. Anything
+    /// else also means `"cursor"`.
+    pub card_monitor: String,
     /// Show the 1-10/Ultra difficulty badge in the card's bottom-right
     /// corner. When off, the rating is not requested from the model at all,
     /// so the rubric costs nothing on every call. Defaults to `false`
@@ -553,6 +585,8 @@ impl Default for Ui {
         Self {
             card_seconds: 12,
             text_scale: 1.0,
+            card_corner: CardCorner::default(),
+            card_monitor: "cursor".to_string(),
             show_difficulty: false,
             prompt: DEFAULT_PROMPT.to_string(),
         }
@@ -1777,6 +1811,7 @@ win = true
         assert_eq!(config.providers.order, vec!["openai", "anthropic"]);
         assert_eq!(config.hotkeys.primary.vk, 0x86);
         assert_eq!(config.capture.max_edge, 1568);
+        assert_eq!(config.capture.ocr_language, "auto");
         assert_eq!(config.ui.card_seconds, 12);
         assert!(!config.ui.show_difficulty);
         // The file should now exist, created from defaults.
@@ -2579,6 +2614,28 @@ models = ["claude-sonnet-5"]
             cfg.providers.anthropic.models,
             vec!["claude-sonnet-5".to_string()]
         );
+    }
+
+    #[test]
+    fn card_position_defaults_keep_the_old_behaviour() {
+        // Issue #109: no setting means bottom right, on the mouse's monitor.
+        let cfg = Config::parse_or_default("");
+        assert_eq!(cfg.ui.card_corner, CardCorner::BottomRight);
+        assert_eq!(cfg.ui.card_monitor, "cursor");
+    }
+
+    #[test]
+    fn card_position_settings_parse() {
+        let cfg = Config::parse_or_default(
+            "[ui]
+card_corner = \"top_left\"
+card_monitor = \"2\"
+",
+        );
+        assert_eq!(cfg.ui.card_corner, CardCorner::TopLeft);
+        assert_eq!(cfg.ui.card_monitor, "2");
+        let cfg = Config::parse_or_default("[ui]\ncard_corner = \"follow_mouse\"\n");
+        assert_eq!(cfg.ui.card_corner, CardCorner::FollowMouse);
     }
 
     #[test]

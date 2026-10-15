@@ -110,6 +110,9 @@ pub struct DiagnosticsInput {
     /// listening on the configured Ollama port -- Win32-only, no HTTP (see
     /// that module's doc comment).
     pub ollama_health: String,
+    /// [`crate::ocr::language_status`]: the OCR language setting and which
+    /// installed pack it resolved to.
+    pub ocr_language: String,
     /// `None` when nothing has failed yet this session. See [`LastError`].
     pub last_error: Option<LastError>,
 }
@@ -266,6 +269,7 @@ pub fn render_report(input: &DiagnosticsInput) -> String {
         input.primary_hotkey, input.secondary_hotkey
     ));
     out.push_str(&format!("Ollama: {}\n", input.ollama_health));
+    out.push_str(&format!("OCR language: {}\n", input.ocr_language));
 
     out.push_str("\nEnv overrides present:");
     if input.env_overrides.is_empty() {
@@ -365,6 +369,7 @@ pub fn collect(config: &Config, last_error: Option<LastError>) -> DiagnosticsInp
         primary_hotkey: chord_to_string(&config.hotkeys.primary),
         secondary_hotkey: chord_to_string(&config.hotkeys.secondary),
         ollama_health,
+        ocr_language: crate::ocr::language_status(),
         last_error,
     }
 }
@@ -501,6 +506,7 @@ mod tests {
             primary_hotkey: "Win+Shift+F23".to_string(),
             secondary_hotkey: "Ctrl+Shift+/".to_string(),
             ollama_health: "Ollama is not running.".to_string(),
+            ocr_language: "de, used de-DE".to_string(),
             last_error: None,
         }
     }
@@ -717,6 +723,15 @@ mod tests {
         assert!(
             text.contains("TzSpecificLocalTimeToSystemTime failed: os error 87"),
             "{text}: the full chain must be present so Copy diagnostics is not an empty promise"
+        );
+    }
+
+    #[test]
+    fn render_report_shows_the_ocr_language_and_the_pack_used() {
+        let report = render_report(&sample_input());
+        assert!(
+            report.contains("OCR language: de, used de-DE\n"),
+            "{report}"
         );
     }
 
