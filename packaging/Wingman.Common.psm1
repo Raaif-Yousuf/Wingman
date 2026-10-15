@@ -600,6 +600,38 @@ function Invoke-PackageRegistrationPhase {
     }
 }
 
+# --- elevated child commands (issue #278) -------------------------------
+# Builds the argument list for a child powershell.exe so that NO value is ever
+# parsed as PowerShell. The old pattern interpolated a path into a quoted
+# -Command string, so a single quote in the path (C:\Users\O'Brien\...)
+# ended the literal and the rest ran as code in an elevated process. Here the
+# script text is fixed by the caller, and each value is passed base64-encoded
+# (alphabet A-Z a-z 0-9 + / =, which cannot end any string literal) and
+# decoded into a variable of the given name before the script runs. The whole
+# thing goes through -EncodedCommand (UTF-16LE base64), which Windows
+# PowerShell 5.1 and pwsh both accept, so there is no command-line quoting
+# layer for a value to break out of either. Pure: it starts nothing.
+function Get-ElevatedPowerShellArgumentList {
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)][string]$Script,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Data
+    )
+    $prelude = New-Object System.Text.StringBuilder
+    [void]$prelude.AppendLine('$ErrorActionPreference = ''Stop''')
+    foreach ($name in $Data.Keys) {
+        if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+            throw "Invalid variable name for an elevated command: '$name'."
+        }
+        $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$Data[$name]))
+        [void]$prelude.AppendLine("`$$name = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('$b64'))")
+    }
+    $full = $prelude.ToString() + $Script
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($full))
+    return @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
+}
+
 # --- certificate trust (issue #184) -------------------------------------
 # Windows' deployment service runs as SYSTEM, so it cannot see the per-user
 # store the signing certificate lives in: it has to be exported to a .cer
@@ -633,9 +665,11 @@ function Confirm-CertTrusted {
 
     try {
         Export-Certificate -Cert $Cert -FilePath $CerPath -Force | Out-Null
-        $inner = "Import-Certificate -FilePath '$CerPath' -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null"
+        # The path is data, never part of the command text (issue #278).
+        $elevatedArgs = Get-ElevatedPowerShellArgumentList -Data @{ CerPath = $CerPath } -Script `
+            'Import-Certificate -FilePath $CerPath -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null'
         $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru `
-             -ArgumentList '-NoProfile', '-NonInteractive', '-Command', $inner
+             -ArgumentList $elevatedArgs
         if ($p.ExitCode -ne 0) { throw "Trusting the certificate failed (exit $($p.ExitCode)). Without it Windows will refuse the package." }
 
         $ok = Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object { $_.Thumbprint -eq $Cert.Thumbprint }
@@ -663,5 +697,6 @@ Export-ModuleMember -Function @(
     'Publish-WingmanPackage',
     'Get-TopLevelPhaseMarkers',
     'Test-InstallPhaseOrder',
+    'Get-ElevatedPowerShellArgumentList',
     'Confirm-CertTrusted'
 )
