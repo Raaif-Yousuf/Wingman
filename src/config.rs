@@ -1747,8 +1747,7 @@ win = true
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "this is not { valid toml at all [[[").unwrap();
 
-        let config =
-            Config::load_from_with(&path, &|_| None).expect("load should still succeed");
+        let config = Config::load_from_with(&path, &|_| None).expect("load should still succeed");
         assert_eq!(config, Config::default());
 
         cleanup(&path);
@@ -3122,8 +3121,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
 
         // The next load's blank-field hydrate step gets the key back from
         // the store, exactly like `Config::load()` does after `import`.
-        let mut reloaded =
-            Config::load_from_with(&path, &|_| None).expect("reload should succeed");
+        let mut reloaded = Config::load_from_with(&path, &|_| None).expect("reload should succeed");
         assert_eq!(reloaded.providers.openai.api_key, "");
         reloaded.hydrate_secrets(&store);
         assert_eq!(reloaded.providers.openai.api_key, "sk-legacy-in-file");
@@ -3912,7 +3910,8 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let contents = include_str!("../tests/fixtures/config/unknown_future_keys.toml");
         let path = write_fixture("golden-unknown-keys", contents);
 
-        let cfg = Config::load_from_with(&path, &|_| None).expect("load should succeed despite unknown keys");
+        let cfg = Config::load_from_with(&path, &|_| None)
+            .expect("load should succeed despite unknown keys");
 
         assert_eq!(
             cfg.hotkeys.primary,
