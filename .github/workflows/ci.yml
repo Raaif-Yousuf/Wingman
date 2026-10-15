@@ -71,6 +71,10 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
+      - name: Performance budgets (exe size)
+        shell: pwsh
+        run: ./scripts/perf-budget.ps1
+
       - name: Upload exe artifact
         uses: actions/upload-artifact@v7
         with:
@@ -140,11 +144,11 @@ jobs:
           Install-Module -Name Pester -RequiredVersion $env:PESTER_VERSION `
             -Force -SkipPublisherCheck -Scope CurrentUser
 
-      - name: Invoke-Pester -Path packaging
+      - name: Invoke-Pester -Path packaging, scripts
         shell: pwsh
         run: |
           Import-Module Pester -RequiredVersion $env:PESTER_VERSION -Force
-          $r = Invoke-Pester -Path packaging -PassThru -Output Detailed
+          $r = Invoke-Pester -Path packaging, scripts -PassThru -Output Detailed
           "Passed=$($r.PassedCount) Failed=$($r.FailedCount)"
           if ($r.FailedCount -gt 0) {
             $r.Failed | ForEach-Object { "failed: $($_.ExpandedName)" }
@@ -173,6 +177,7 @@ jobs:
             $findings += Invoke-ScriptAnalyzer -Path $p -Severity Warning, Error
           }
           $findings += Invoke-ScriptAnalyzer -Path packaging -Recurse -Severity Warning, Error
+          $findings += Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Warning, Error
           $findings | ForEach-Object { "$($_.ScriptName):$($_.Line) $($_.RuleName) $($_.Message)" }
           "findings=$($findings.Count)"
           if ($findings.Count -gt 0) { exit 1 }
