@@ -26,6 +26,7 @@ mod pause;
 mod payment_denylist;
 mod profile;
 mod provider;
+mod redact;
 mod router;
 mod secrets;
 mod single_instance;

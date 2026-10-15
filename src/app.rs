@@ -701,7 +701,8 @@ impl App {
     /// ready, grab the screen, then hand the bytes to a worker so the
     /// message loop stays responsive during the call.
     fn ask(&mut self) {
-        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
+        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        else {
             return;
         };
 
@@ -718,13 +719,14 @@ impl App {
         let prompt = self.config.ui.prompt.clone();
         let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
+        let redact = self.config.capture.redact;
 
         // Issue #354 follow-up review: the pending card already started at
         // `AskingModel` inside `begin_model_action` (findings 1 and 2), so
         // there is nothing left to set here.
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
-                let shot = capture::encode(&raw)?;
+                let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                 worker(
                     &providers,
                     mode,
@@ -846,7 +848,7 @@ impl App {
         // worker thread, same constraint `ask` documents at its own capture
         // call site); encoding to PNG happens below, on the worker thread,
         // exactly like `ask` defers its own (more expensive) encode.
-        let raw = match capture::grab_raw(
+        let mut raw = match capture::grab_raw(
             &self.config.capture.monitor,
             router::ROUTER_IMAGE_LONG_EDGE,
             router::ROUTER_IMAGE_MAX_PIXELS,
@@ -857,6 +859,7 @@ impl App {
 
         let generation = self.palette.router_generation();
         let target = self.hwnd_isize();
+        let redact = self.config.capture.redact;
 
         // #359: a request is actually starting now (every earlier bail-out
         // above -- Paused, no ready provider, capture failure -- must never
@@ -866,7 +869,7 @@ impl App {
 
         std::thread::spawn(move || {
             let result: std::result::Result<router::RouterResult, String> =
-                router_worker(&providers, mode, &raw, &candidates).map_err(|e| {
+                router_worker(&providers, mode, &mut raw, redact, &candidates).map_err(|e| {
                     let chain_text = worker_error_chain_text(&e);
                     pack_error(
                         &human_error_detail(&chain_text),
@@ -1109,8 +1112,8 @@ impl App {
     /// that helper's `extra` closure so it still runs exactly where it did
     /// before -- after the readiness gate, before capture.
     fn add_event_from_screen(&mut self) {
-        let Some((raw, foreground_hwnd_isize, (today, offset_minutes))) =
-            self.begin_model_action(|app| match local_today_and_utc_offset() {
+        let Some((mut raw, foreground_hwnd_isize, (today, offset_minutes))) = self
+            .begin_model_action(|app| match local_today_and_utc_offset() {
                 Ok(v) => Some(v),
                 Err(e) => {
                     let detail = app.track_error("Couldn't read the local date", &format!("{e:#}"));
@@ -1126,9 +1129,10 @@ impl App {
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
         let target = self.hwnd_isize();
+        let redact = self.config.capture.redact;
         std::thread::spawn(move || {
             let result: std::result::Result<Value, String> = (|| -> Result<Value> {
-                let shot = capture::encode(&raw)?;
+                let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                 calendar_worker(
                     &providers,
                     mode,
@@ -1301,12 +1305,14 @@ impl App {
             return;
         };
 
-        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
+        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        else {
             return;
         };
 
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
+        let redact = self.config.capture.redact;
         let prompt = action.prompt.clone();
         let inputs = action.inputs.clone();
         let target = self.hwnd_isize();
@@ -1335,7 +1341,7 @@ impl App {
                         None => prompt.clone(),
                     };
                     let shot = if planned.screen {
-                        Some(capture::encode(&raw)?)
+                        Some(encode_for_upload(&mut raw, &providers, mode, redact)?)
                     } else {
                         None
                     };
@@ -1639,17 +1645,19 @@ impl App {
     /// `begin_model_action`, exactly like `add_event_from_screen`'s already
     /// does.
     fn review_this_email(&mut self) {
-        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
+        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        else {
             return;
         };
 
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
         let target = self.hwnd_isize();
+        let redact = self.config.capture.redact;
         std::thread::spawn(move || {
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
                 (|| -> Result<actions::review_email::ReviewOutcome> {
-                    let shot = capture::encode(&raw)?;
+                    let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                     review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
                 })()
                 .map_err(|e| {
@@ -1816,7 +1824,7 @@ impl App {
                 .unwrap_or_default(),
         )
         .is_none();
-        let Some((raw, foreground_hwnd_isize, ())) = self.begin_action(use_model, |_| Some(()))
+        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_action(use_model, |_| Some(()))
         else {
             return;
         };
@@ -1825,19 +1833,17 @@ impl App {
         let mode = self.config.mode;
         let require_tick_for = self.config.forms.require_tick_for;
         let target = self.hwnd_isize();
+        let redact = self.config.capture.redact;
         std::thread::spawn(move || {
-            let result: std::result::Result<Value, String> = (|| -> Result<Value> {
-                let shot = capture::encode(&raw)?;
-                form_fill_worker(
-                    &providers,
-                    mode,
-                    &shot,
-                    &raw,
-                    foreground_hwnd_isize,
-                    require_tick_for,
-                    use_model,
-                )
-            })()
+            let result: std::result::Result<Value, String> = form_fill_worker(
+                &providers,
+                mode,
+                &mut raw,
+                redact,
+                foreground_hwnd_isize,
+                require_tick_for,
+                use_model,
+            )
             .map_err(|e| {
                 let chain_text = worker_error_chain_text(&e);
                 pack_error(
@@ -3129,8 +3135,8 @@ fn review_worker(
 fn form_fill_worker(
     providers: &Providers,
     mode: Mode,
-    shot: &Shot,
-    raw: &capture::RawShot,
+    raw: &mut capture::RawShot,
+    redact: bool,
     foreground_hwnd: isize,
     require_tick_for: crate::config::RequireTickFor,
     use_model: bool,
@@ -3165,7 +3171,11 @@ fn form_fill_worker(
             && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
         let chain = providers.build_chain_for_mode(mode, ollama_ready);
 
-        let req = actions::fill_form::form_fill_request(shot, &unmapped, &profile);
+        // Encoded (and redacted) only here: with no model nothing is
+        // encoded or sent.
+        let shot = encode_for_upload(raw, providers, mode, redact)?;
+        let req = actions::fill_form::form_fill_request(&shot, &unmapped, &profile);
+        let raw = &*raw;
         let responses = chain.complete_parsed_with_fallback(
             &req,
             || non_vision_inputs(raw, foreground_hwnd),
@@ -3185,6 +3195,21 @@ fn form_fill_worker(
     })
 }
 
+/// #103: the only way `app.rs` turns a capture into a [`crate::provider::Shot`].
+/// Paints over private details in `raw` first when the user has not turned
+/// that off and the mode's chain could send the pixels off this machine (see
+/// `Providers::sends_screenshot_off_machine`); fails closed, so an OCR failure
+/// is an `Err` here and the caller's card says nothing was sent. Worker
+/// thread only: it blocks on OCR.
+fn encode_for_upload(
+    raw: &mut capture::RawShot,
+    providers: &Providers,
+    mode: Mode,
+    redact: bool,
+) -> Result<crate::provider::Shot> {
+    capture::encode_for_chain(raw, providers, mode, redact)
+}
+
 /// #24: the intent router's worker-thread body, called from
 /// `App::maybe_start_router`'s spawned thread. Mirrors [`worker`]'s
 /// mode-aware chain construction (same Auto-mode Ollama probe, same
@@ -3199,7 +3224,8 @@ fn form_fill_worker(
 fn router_worker(
     providers: &Providers,
     mode: Mode,
-    raw: &capture::RawShot,
+    raw: &mut capture::RawShot,
+    redact: bool,
     candidates: &[router::RouterCandidate],
 ) -> Result<router::RouterResult> {
     let ollama_ready = mode == Mode::Auto
@@ -3217,8 +3243,9 @@ fn router_worker(
     let provider = provider_for_router(providers, &target.provider, &target.model)
         .ok_or_else(|| anyhow::anyhow!("router: unrecognized provider \"{}\"", target.provider))?;
 
-    let shot = capture::encode(raw)?;
+    let shot = encode_for_upload(raw, providers, mode, redact)?;
     let chain = Chain::new(vec![provider]);
+    let raw: &capture::RawShot = raw;
     router::route(&chain, shot.png, candidates, || {
         router_non_vision_inputs(raw)
     })
@@ -3724,6 +3751,10 @@ fn first_line(text: &str, max: usize) -> String {
 /// mapped to a specific human sentence. Matched by substring against the
 /// already-redacted chain, so it survives whatever context wraps it.
 const KNOWN_TECHNICAL_DETAILS: &[(&str, &str)] = &[
+    (
+        crate::redact::FAILURE_NEEDLE,
+        crate::redact::FAILURE_SENTENCE,
+    ),
     (
         "TzSpecificLocalTimeToSystemTime",
         "Couldn't read your clock settings.",
@@ -6198,6 +6229,55 @@ mod tests {
         assert_ne!(human, "Something went wrong.");
     }
 
+    /// #103's wiring guard: every screenshot `app.rs` encodes goes through
+    /// `encode_for_upload` (which redacts), never `capture::encode`, which is
+    /// private to `capture` anyway. This scan keeps a new call site from
+    /// being added to the wrong helper, and fails if the scan itself stops
+    /// finding anything (CRLF-normalised, non-empty candidate set).
+    #[test]
+    fn every_screenshot_encode_in_app_goes_through_the_redacting_helper() {
+        let src = include_str!("app.rs").replace('\r', "");
+        // Needles are built from pieces so this test's own text never
+        // matches them.
+        let upload = ["encode_for", "_upload(&mut raw"].concat();
+        let router_upload = ["encode_for", "_upload(raw,"].concat();
+        let plain = ["capture", "::encode("].concat();
+        let encode_calls = src.matches(&upload).count() + src.matches(&router_upload).count();
+        assert!(
+            encode_calls >= 6,
+            "expected the six worker call sites, found {encode_calls}"
+        );
+        assert_eq!(
+            src.matches(&plain).count(),
+            0,
+            "the plain encode skips redaction; use the redacting helper"
+        );
+    }
+
+    /// #103: the fail-closed card keeps its fixed sentence whatever the OCR
+    /// cause looks like, including an API-shaped one that would otherwise
+    /// become "Something went wrong."
+    #[test]
+    fn a_failed_screenshot_check_always_shows_the_fixed_sentence() {
+        for cause in [
+            "RoInitialize failed",
+            "OCR recognition timed out after 5s",
+            "no OCR-capable language is installed",
+        ] {
+            let err = anyhow::anyhow!(cause).context(crate::redact::FAILURE_NEEDLE);
+            let chain = worker_error_chain_text(&err);
+            assert_eq!(
+                humanize_error_chain(&chain),
+                crate::redact::FAILURE_SENTENCE,
+                "{cause}"
+            );
+        }
+        assert_eq!(
+            crate::redact::FAILURE_SENTENCE,
+            "Could not check the screenshot for private details, so nothing was sent."
+        );
+    }
+
     #[test]
     fn human_error_detail_appends_a_next_step() {
         let detail = human_error_detail("TzSpecificLocalTimeToSystemTime failed");
@@ -6733,7 +6813,7 @@ mod tests {
             width,
             height,
         };
-        let shot = capture::encode(&raw).expect("encode synthetic PNG");
+        let shot = capture::encode_unredacted(&raw).expect("encode synthetic PNG");
 
         let resolved = actions::load_actions()
             .expect("load_actions should succeed against whatever actions.toml (or none) is on this machine");
