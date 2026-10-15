@@ -8,6 +8,7 @@
 pub mod action_items;
 pub mod calendar;
 pub mod define_word;
+pub mod explain_error;
 pub mod extract_text;
 pub mod fill_form;
 pub mod generic_answer;
@@ -223,6 +224,8 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 /// - `"action-items-checklist"` (#314, `action_items::builtin_action`):
 ///   proposal `action_items`, executor `clipboard`. Runs through the generic
 ///   dispatch path (`App::run_generic_action`), like an `actions.toml` entry.
+/// - `"explain-this-error"` (#66, `explain_error::builtin_action`): proposal
+///   `error_explanation`, executor `none`, so the answer is the card (#441).
 /// - `"define-this-word"` (#75, `define_word::builtin_action`): proposal
 ///   `word_definition`, executor `none`, selection only, so a text-only
 ///   local model can answer it.
@@ -261,6 +264,7 @@ pub fn builtin_actions() -> Vec<Action> {
         review_email::builtin_action(),
         fill_form::builtin_action(),
         action_items::builtin_action(),
+        explain_error::builtin_action(),
         define_word::builtin_action(),
     ]
 }
