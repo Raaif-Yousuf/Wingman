@@ -508,6 +508,17 @@ impl Drop for Card {
 /// window, so it is not part of the crate-wide `WM_APP_*` registry.
 const WM_CARD_SPEECH_END: u32 = WM_USER + 0x77;
 
+/// #255: a preview command (Do it, Cancel, Edit) posted by a preview child
+/// control's subclass: Enter, Esc, or a click-away `WM_KILLFOCUS`. `wparam`
+/// is the command id, `lparam` the preview generation that was live when it
+/// was posted. A real button click still arrives as `WM_COMMAND`. The tag is
+/// why this is its own message: a `WM_COMMAND` `lparam` already holds the
+/// button's `HWND`. A post that outlives its preview (the focused control's
+/// own destruction sends `WM_KILLFOCUS`, so replacing a preview posts a
+/// cancel that is only pumped after the new one is showing) carries an old
+/// generation and is dropped instead of closing the new preview.
+const WM_CARD_PREVIEW_COMMAND: u32 = WM_USER + 0x78;
+
 const CLASS_NAME: &str = "Wingman.Card.Window.7f3c1a9e";
 /// Rule 9: the preview state's real-Win32 test creates an actual `HWND` with
 /// real child controls, so it gets its own window class rather than sharing
@@ -2496,6 +2507,14 @@ impl CardInner {
                 }
                 Some(LRESULT(0))
             }
+            WM_CARD_PREVIEW_COMMAND => {
+                if self.state == CardState::Preview
+                    && preview_command_is_current(lparam.0 as u32, self.preview_generation)
+                {
+                    self.run_preview_command((wparam.0 & 0xFFFF) as i32);
+                }
+                Some(LRESULT(0))
+            }
             WM_KILLFOCUS => {
                 self.close_expanded();
                 Some(LRESULT(0))
@@ -3260,6 +3279,25 @@ fn preview_key_command(vk: u16) -> Option<i32> {
     }
 }
 
+/// Whether a command posted for `posted_generation` still belongs to the
+/// preview showing now (#255).
+fn preview_command_is_current(posted_generation: u32, live_generation: u32) -> bool {
+    posted_generation == live_generation
+}
+
+/// The generation of the preview currently showing in `card`, read off the
+/// window's own `CardInner`. Read-only and on the card's own thread, so it
+/// cannot race. Goes through `addr_of!` because `CardInner` may already be
+/// mutably borrowed further up this same call stack.
+unsafe fn live_preview_generation(card: HWND) -> u32 {
+    let ptr = GetWindowLongPtrW(card, GWLP_USERDATA) as *const CardInner;
+    if ptr.is_null() {
+        0
+    } else {
+        std::ptr::addr_of!((*ptr).preview_generation).read()
+    }
+}
+
 /// Issue #207: pure decision for a preview child control's `WM_KILLFOCUS`
 /// -- whether the new focus target means "click away" (cancel the preview,
 /// same as Esc) or staying within the card's own window group (do nothing:
@@ -3293,8 +3331,8 @@ fn preview_focus_left_the_card(new_focus_is_card_or_descendant: bool) -> bool {
 ///
 /// `dwrefdata` carries the parent card's `HWND` (as a `usize`, set at
 /// subclass time by [`subclass_preview_control`]) so a mapped key can
-/// `PostMessageW` a `WM_COMMAND` back to it, indistinguishable from a real
-/// button click.
+/// `PostMessageW` a [`WM_CARD_PREVIEW_COMMAND`] back to it, tagged with the
+/// preview generation so a late delivery cannot hit a newer preview (#255).
 ///
 /// Issue #207: the same `dwrefdata` is what makes click-away cancellation
 /// possible here too. `WM_KILLFOCUS` on the card's own `HWND` (handled in
@@ -3318,9 +3356,9 @@ unsafe extern "system" fn preview_control_subclass(
         if let Some(command_id) = preview_key_command(wparam.0 as u16) {
             let _ = PostMessageW(
                 Some(parent),
-                WM_COMMAND,
+                WM_CARD_PREVIEW_COMMAND,
                 WPARAM(command_id as usize),
-                LPARAM(0),
+                LPARAM(live_preview_generation(parent) as isize),
             );
             return LRESULT(0);
         }
@@ -3332,9 +3370,9 @@ unsafe extern "system" fn preview_control_subclass(
         if preview_focus_left_the_card(new_focus_is_card_or_descendant) {
             let _ = PostMessageW(
                 Some(parent),
-                WM_COMMAND,
+                WM_CARD_PREVIEW_COMMAND,
                 WPARAM(ID_PREVIEW_CANCEL as usize),
-                LPARAM(0),
+                LPARAM(live_preview_generation(parent) as isize),
             );
         }
     }
@@ -5067,10 +5105,156 @@ mod tests {
         let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
         assert!(
             found,
-            "preview_control_subclass must post a WM_COMMAND to the card window"
+            "preview_control_subclass must post a WM_CARD_PREVIEW_COMMAND to the card window"
         );
-        assert_eq!(msg.message, WM_COMMAND);
+        assert_eq!(msg.message, WM_CARD_PREVIEW_COMMAND);
         assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_DO_IT);
+    }
+
+    // -- stale preview command must not hijack a later preview (#255) -----
+
+    /// Drains every preview command queued for `card_hwnd` (the legacy
+    /// `WM_COMMAND` and the generation-tagged `WM_CARD_PREVIEW_COMMAND`) and
+    /// feeds each to the card the way the message loop would.
+    fn pump_queued_preview_commands(card: &mut Card) {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+        let hwnd = card.hwnd();
+        for (lo, hi) in [
+            (WM_COMMAND, WM_COMMAND),
+            (WM_CARD_PREVIEW_COMMAND, WM_CARD_PREVIEW_COMMAND),
+        ] {
+            let mut msg = MSG::default();
+            while unsafe { PeekMessageW(&mut msg, Some(hwnd), lo, hi, PM_REMOVE).as_bool() } {
+                card.handle_message(msg.message, msg.wParam, msg.lParam);
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_a_focused_preview_does_not_cancel_the_new_one() {
+        // #255 regression guard. This passes without the generation tag too:
+        // MEASURED 2026-10-15, destroying a focused preview field moves focus
+        // to the card first, so replacing a preview posts no cancel at all.
+        // It pins that behaviour; the tag is covered by the tests below.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner.show_preview("Preview A", &schema, &value, false);
+        card.inner.show_preview("Preview B", &schema, &value, false);
+
+        pump_queued_preview_commands(&mut card);
+
+        assert_eq!(
+            card.state(),
+            CardState::Preview,
+            "a cancel posted while tearing down A must not close B"
+        );
+        assert_eq!(
+            card.inner.preview.as_ref().map(|p| p.title.as_str()),
+            Some("Preview B")
+        );
+    }
+
+    #[test]
+    fn a_click_away_cancel_posted_for_one_preview_does_not_close_the_next() {
+        // #255: the click-away cancel is posted for preview A but only
+        // pumped after preview B replaced it. Uses the real subclass to
+        // post it, so the tag the receiver checks is the one it really sets.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner.show_preview("Preview A", &schema, &value, false);
+        let start_hwnd = card.inner.preview.as_ref().unwrap().edits[1].1;
+        let card_hwnd = card.hwnd();
+        unsafe {
+            let _ = preview_control_subclass(
+                start_hwnd,
+                WM_KILLFOCUS,
+                WPARAM(0),
+                LPARAM(0),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        }
+        card.inner.show_preview("Preview B", &schema, &value, false);
+
+        pump_queued_preview_commands(&mut card);
+
+        assert_eq!(card.state(), CardState::Preview);
+        assert_eq!(
+            card.inner.preview.as_ref().map(|p| p.title.as_str()),
+            Some("Preview B")
+        );
+    }
+
+    #[test]
+    fn stale_preview_command_is_ignored_and_current_one_runs() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner.show_preview("Preview", &schema, &value, false);
+        let live = card.inner.preview_generation;
+
+        card.handle_message(
+            WM_CARD_PREVIEW_COMMAND,
+            WPARAM(ID_PREVIEW_CANCEL as usize),
+            LPARAM(live.wrapping_sub(1) as isize),
+        );
+        assert_eq!(
+            card.state(),
+            CardState::Preview,
+            "stale cancel must be dropped"
+        );
+
+        card.handle_message(
+            WM_CARD_PREVIEW_COMMAND,
+            WPARAM(ID_PREVIEW_CANCEL as usize),
+            LPARAM(live as isize),
+        );
+        assert_eq!(
+            card.state(),
+            CardState::Hidden,
+            "current cancel must still close"
+        );
+    }
+
+    #[test]
+    fn preview_control_subclass_tags_posted_commands_with_the_live_generation() {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner.show_preview("Preview", &schema, &value, false);
+        let live = card.inner.preview_generation;
+        let start_hwnd = card.inner.preview.as_ref().unwrap().edits[0].1;
+        let card_hwnd = card.hwnd();
+
+        for (key, command) in [
+            (VK_ESCAPE, ID_PREVIEW_CANCEL),
+            (VK_RETURN, ID_PREVIEW_DO_IT),
+        ] {
+            unsafe {
+                let _ = preview_control_subclass(
+                    start_hwnd,
+                    WM_KEYDOWN,
+                    WPARAM(key.0 as usize),
+                    LPARAM(0),
+                    PREVIEW_SUBCLASS_ID,
+                    card_hwnd.0 as usize,
+                );
+            }
+
+            let mut msg = MSG::default();
+            let found = unsafe {
+                PeekMessageW(
+                    &mut msg,
+                    Some(card_hwnd),
+                    WM_CARD_PREVIEW_COMMAND,
+                    WM_CARD_PREVIEW_COMMAND,
+                    PM_REMOVE,
+                )
+                .as_bool()
+            };
+            assert!(found, "Esc and Enter must post a WM_CARD_PREVIEW_COMMAND");
+            assert_eq!((msg.wParam.0 & 0xFFFF) as i32, command);
+            assert_eq!(msg.lParam.0 as u32, live);
+        }
     }
 
     // -- click-away cancels the preview (#207) --------------------------
@@ -5132,9 +5316,9 @@ mod tests {
         let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
         assert!(
             found,
-            "a click-away WM_KILLFOCUS must post a WM_COMMAND to the card window"
+            "a click-away WM_KILLFOCUS must post a WM_CARD_PREVIEW_COMMAND to the card window"
         );
-        assert_eq!(msg.message, WM_COMMAND);
+        assert_eq!(msg.message, WM_CARD_PREVIEW_COMMAND);
         assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_CANCEL);
 
         unsafe {
@@ -5180,7 +5364,7 @@ mod tests {
         let mut msg = MSG::default();
         let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
         assert!(found, "wparam == 0 must also be treated as a click-away");
-        assert_eq!(msg.message, WM_COMMAND);
+        assert_eq!(msg.message, WM_CARD_PREVIEW_COMMAND);
         assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_CANCEL);
     }
 
@@ -5228,7 +5412,14 @@ mod tests {
         // posted.
         let mut msg = MSG::default();
         let found = unsafe {
-            PeekMessageW(&mut msg, Some(card_hwnd), WM_COMMAND, WM_COMMAND, PM_REMOVE).as_bool()
+            PeekMessageW(
+                &mut msg,
+                Some(card_hwnd),
+                WM_CARD_PREVIEW_COMMAND,
+                WM_CARD_PREVIEW_COMMAND,
+                PM_REMOVE,
+            )
+            .as_bool()
         };
         let cancelled = found && (msg.wParam.0 & 0xFFFF) as i32 == ID_PREVIEW_CANCEL;
         assert!(
