@@ -26,10 +26,12 @@
 //! makes the guard something a new provider cannot forget: see that file's
 //! `offline_guard` doc comment.
 //!
-//! # CONNECTORS HOOK (not built yet)
+//! # CONNECTORS HOOK (no networked connector yet)
 //!
-//! `connectors/*.rs` (Phase 3+) and the opt-in update checker (Phase 5) do
-//! not exist in this crate yet. When they land, each must call
+//! `connectors/` exists, but its only connector today, `ics` (#35), writes
+//! a local `.ics` file and makes no network call. The opt-in update
+//! checker (Phase 5) does not exist yet. The first networked connector,
+//! and the update checker when it lands, must each call
 //! `provider::common`-style guarded transport (or, if their HTTP needs
 //! diverge enough to need their own send path, call [`is_offline_now`] and
 //! [`classify_host`] themselves before opening a socket) -- the Modes

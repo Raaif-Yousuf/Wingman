@@ -735,12 +735,13 @@ pub(crate) fn post_json(
 // see `no_provider_file_calls_ureq_directly_outside_common_rs` below, which
 // fails the build if one shows up.
 //
-// CONNECTORS HOOK (not built yet, Phase 3+): `connectors/*.rs` and the
-// opt-in update checker (Phase 5) must call `offline_guard` (or an
-// equivalent guarded send path) the same way once they exist. The Modes
-// table requires both to be disabled OUTRIGHT in Offline mode, stricter
-// than the loopback-only rule providers get here -- this function alone is
-// not sufficient for them, only necessary.
+// CONNECTORS HOOK (no networked connector yet): `connectors/` exists, but
+// its only connector (`ics`, #35) is local-only. The first connector that
+// makes a network call, and the opt-in update checker (Phase 5, not built
+// yet), must call `offline_guard` (or an equivalent guarded send path) the
+// same way. The Modes table requires both to be disabled OUTRIGHT in
+// Offline mode, stricter than the loopback-only rule providers get here --
+// this function alone is not sufficient for them, only necessary.
 // ---------------------------------------------------------------------
 
 fn offline_guard(url: &str) -> Result<()> {
