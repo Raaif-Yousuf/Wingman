@@ -7,6 +7,7 @@
 
 pub mod action_items;
 pub mod calendar;
+pub mod define_word;
 pub mod extract_text;
 pub mod fill_form;
 pub mod generic_answer;
@@ -218,6 +219,9 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 /// - `"action-items-checklist"` (#314, `action_items::builtin_action`):
 ///   proposal `action_items`, executor `clipboard`. Runs through the generic
 ///   dispatch path (`App::run_generic_action`), like an `actions.toml` entry.
+/// - `"define-this-word"` (#75, `define_word::builtin_action`): proposal
+///   `word_definition`, executor `none`, selection only, so it works offline
+///   with a text-only local model.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -252,6 +256,7 @@ pub fn builtin_actions() -> Vec<Action> {
         review_email::builtin_action(),
         fill_form::builtin_action(),
         action_items::builtin_action(),
+        define_word::builtin_action(),
     ]
 }
 
@@ -445,9 +450,10 @@ mod tests {
         let builtins = builtin_actions();
         assert_eq!(
             builtins.len(),
-            6,
+            7,
             "check-my-work, extract-text-to-clipboard (#41), add-to-calendar (#39), \
-             review-this-email (#38), fill-this-form (#40), action-items-checklist (#314)"
+             review-this-email (#38), fill-this-form (#40), action-items-checklist (#314), \
+             define-this-word (#75)"
         );
         // Found by id, not by position, so this stays valid regardless of
         // what order the built-ins are in.

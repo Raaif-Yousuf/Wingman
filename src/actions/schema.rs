@@ -61,8 +61,28 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "text_answer" => Some(text_answer_schema()),
         // #314: a list of action-item lines for the clipboard executor.
         "action_items" => Some(action_items_schema()),
+        // #75: a read-only definition of a selected word, shown on the card.
+        "word_definition" => Some(word_definition_schema()),
         _ => None,
     }
+}
+
+/// The `word_definition` proposal schema (#75): `definition` then `example`,
+/// both plain strings. `definition` comes first because the card's headline
+/// is the first field, and the model should commit to the meaning before it
+/// writes a sentence that has to fit it (rule 3). Two fields rather than one
+/// free-text answer so a small local model fills in both. Not editable: the
+/// card shows it as an answer (`executor = "none"`).
+fn word_definition_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "definition": {"type": "string"},
+            "example": {"type": "string"}
+        },
+        "required": ["definition", "example"],
+        "additionalProperties": false
+    })
 }
 
 /// The `action_items` proposal schema (#314): one `items` list of short
@@ -453,6 +473,20 @@ mod tests {
         assert_eq!(schema["properties"]["items"]["type"], "array");
         assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
         assert_eq!(schema["properties"]["items"]["editable"], true);
+    }
+
+    #[test]
+    fn word_definition_asks_for_the_definition_then_an_example() {
+        let schema = schema_for("word_definition", false).expect("word_definition is registered");
+        let order: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["definition", "example"]);
+        assert_eq!(schema["required"], json!(["definition", "example"]));
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]

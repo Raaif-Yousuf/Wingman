@@ -9,18 +9,18 @@ that reuses an existing proposal schema and executor, not new Rust.
 
 Checked against the code, not the spec: `src/actions/mod.rs` (the `Action`
 model, merge and visibility rules), `src/actions/schema.rs` (the proposal
-schema registry) and the six built-in actions in `src/actions/*.rs`.
+schema registry) and the built-in actions in `src/actions/*.rs`.
 
 ## Where `actions.toml` lives
 
 `%APPDATA%\Wingman\actions.toml`, computed by `actions::path()`. A missing
 file is not an error -- it means "no overrides"; `load_actions_from` (the
-path-injectable core, used by every test) merges it with the six built-in
+path-injectable core, used by every test) merges it with the built-in
 actions from `actions::builtin_actions()` and filters to what should
 actually run or be shown. Nothing writes this file today (no Settings UI
 edits it yet): a user who wants to override or add an action creates or
 edits it by hand. `actions.example.toml` at the repo root is a real,
-loadable copy of today's six built-ins, kept in sync with `builtin_actions()`
+loadable copy of today's built-ins, kept in sync with `builtin_actions()`
 by hand -- diff it against a fresh `builtin_actions()` output if you change a
 built-in.
 
@@ -163,10 +163,12 @@ offer "Do it" at all.
 
 `actions::schema::schema_for(proposal, rate_difficulty) -> Option<Value>` is
 the one registry mapping a proposal name to the JSON Schema a model's
-completion must satisfy. Six kinds are registered today: `"verdict"` (today's
+completion must satisfy. These kinds are registered today: `"verdict"` (today's
 "Check my work"), `"calendar_event"` (#26), `"text_review"` (#38),
 `"form_fill"` (#40), `"text_answer"` (#242) and `"action_items"` (#314: a list of
-lines the `clipboard` executor copies as a Markdown checklist). Each schema function returns a `serde_json::json!`
+lines the `clipboard` executor copies as a Markdown checklist) and
+`"word_definition"` (#75: `definition`, `example`, a read-only answer for the
+card). Each schema function returns a `serde_json::json!`
 literal shaped like standard JSON Schema (`"type": "object"`, `"properties"`,
 `"required"`, `"additionalProperties": false`), plus one
 non-standard keyword:
