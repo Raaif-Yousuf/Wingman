@@ -575,6 +575,17 @@ impl App {
         &mut self,
         extra: impl FnOnce(&mut Self) -> Option<T>,
     ) -> Option<(capture::RawShot, isize, T)> {
+        self.begin_action(true, extra)
+    }
+
+    /// [`Self::begin_model_action`] with the readiness gate optional: `false`
+    /// for an action that has a model-free path (#132, "Fill this form"),
+    /// which must still pause/busy-check and capture with no provider set up.
+    fn begin_action<T>(
+        &mut self,
+        require_provider: bool,
+        extra: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<(capture::RawShot, isize, T)> {
         match model_action_gate(self.busy, pause::is_paused_now()) {
             ModelActionGate::Busy => return None,
             ModelActionGate::Paused => {
@@ -603,6 +614,7 @@ impl App {
             .unwrap_or_else(|_| "config.toml".into());
         if let Some((headline, detail)) =
             Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+                .filter(|_| require_provider)
         {
             // Issue #347: readiness-gate cards are always "go fix something
             // in Settings" cards (a missing API key or Ollama config), so a
@@ -1793,7 +1805,19 @@ impl App {
     /// gate runs first either way, exactly as it did before this used the
     /// shared helper.
     fn fill_form_from_screen(&mut self) {
-        let Some((raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(())) else {
+        // #132: with no provider ready the form is mapped from the profile
+        // alone (no model stage, nothing sent), instead of a "set up a model"
+        // card.
+        let use_model = Self::readiness_gate(
+            self.config.mode,
+            &self.config.providers,
+            &Config::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        )
+        .is_none();
+        let Some((raw, foreground_hwnd_isize, ())) = self.begin_action(use_model, |_| Some(()))
+        else {
             return;
         };
 
@@ -1811,6 +1835,7 @@ impl App {
                     &raw,
                     foreground_hwnd_isize,
                     require_tick_for,
+                    use_model,
                 )
             })()
             .map_err(|e| {
@@ -1876,7 +1901,7 @@ impl App {
         if !actions::fill_form::has_fillable_fields(&value) {
             self.card.show_answer(
                 "Nothing to fill",
-                "No fillable fields were found on the foreground window.",
+                &actions::fill_form::nothing_to_fill_detail(&value),
                 5,
                 None,
             );
@@ -3108,6 +3133,7 @@ fn form_fill_worker(
     raw: &capture::RawShot,
     foreground_hwnd: isize,
     require_tick_for: crate::config::RequireTickFor,
+    use_model: bool,
 ) -> Result<Value> {
     let profile = actions::fill_form::load_or_import_profile()
         .context("failed to load or import the profile")?;
@@ -3133,7 +3159,7 @@ fn form_fill_worker(
 
     let (mut mapped, unmapped) = actions::fill_form::map_candidates_locally(&candidates, &profile);
 
-    if !unmapped.is_empty() {
+    if actions::fill_form::model_stage_needed(use_model, &unmapped) {
         let ollama_ready = mode == Mode::Auto
             && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
             && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
@@ -3150,11 +3176,13 @@ fn form_fill_worker(
         ));
     }
 
-    Ok(actions::fill_form::build_proposal(
-        &candidates,
-        &mapped,
-        require_tick_for,
-    ))
+    let proposal = actions::fill_form::build_proposal(&candidates, &mapped, require_tick_for);
+    // Local-only run: say which fields were left alone.
+    Ok(if use_model {
+        proposal
+    } else {
+        actions::fill_form::with_unfilled_note(proposal, &unmapped)
+    })
 }
 
 /// #24: the intent router's worker-thread body, called from

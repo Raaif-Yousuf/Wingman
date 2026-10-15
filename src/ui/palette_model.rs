@@ -495,7 +495,8 @@ pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
 fn action_requires_model(action_id: &str) -> bool {
     let model_free = action_id == crate::actions::EXTRACT_TEXT_ACTION_ID
         || action_id == CALCULATE_SELECTION_ACTION_ID
-        || action_id == COPY_REGION_ACTION_ID;
+        || action_id == COPY_REGION_ACTION_ID
+        || action_id == crate::actions::fill_form::ACTION_ID;
     !model_free
 }
 
@@ -1187,6 +1188,11 @@ mod tests {
             .find(|a| a.id == CALCULATE_SELECTION_ACTION_ID)
             .unwrap();
         assert!(!calc.requires_model);
+        let fill = cat
+            .iter()
+            .find(|a| a.id == crate::actions::fill_form::ACTION_ID)
+            .expect("fill-this-form is in the catalogue");
+        assert!(!fill.requires_model, "#132: maps locally with no model");
     }
 
     // -- footer_line ---------------------------------------------------------
