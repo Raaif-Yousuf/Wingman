@@ -84,13 +84,11 @@ mod tests {
     }
 
     #[test]
-    fn a_real_proposal_has_the_field_the_clipboard_executor_copies() {
-        // The shape `text_answer`'s schema produces: one `text` string.
+    fn the_proposal_has_the_field_the_clipboard_executor_copies() {
+        // The shape `text_answer`'s schema produces: one `text` string, which
+        // is the field the clipboard executor copies.
         let schema = crate::actions::schema::schema_for("text_answer", false).unwrap();
         assert_eq!(schema["required"], json!(["text"]));
-        let proposal =
-            json!({"text": "Bar chart: sales rose each quarter of 2025, from 4 to 9 million."});
-        assert!(proposal["text"].as_str().unwrap().chars().count() <= 125);
     }
 
     #[test]
