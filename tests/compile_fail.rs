@@ -101,3 +101,23 @@ fn confirmed_privacy_boundary() {
     t.compile_fail("tests/compile_fail/confirmed_is_private.rs");
     t.pass("tests/compile_fail/confirmed_sanctioned_path_compiles.rs");
 }
+
+/// Issue #256: `SendAuthorized` makes the same unforgeability claim
+/// `Confirmed<P>` makes ("nothing outside this module can construct one
+/// directly"), but only `Confirmed<P>` had an automated gate for it. This
+/// mirrors `confirmed_privacy_boundary` above, against the same generated,
+/// doc-comment-safe copy of `confirm.rs`: `send_authorized_is_private.rs`
+/// proves a sibling module cannot write `SendAuthorized`'s private tuple
+/// field directly, and `send_authorized_sanctioned_path_compiles.rs` proves
+/// the sanctioned path (`user_confirmed_send` -> `authorize_send`) still
+/// works from that same sibling module, so the compile failure is
+/// specifically about the direct construction, not about nothing in
+/// `confirm` being reachable.
+#[test]
+fn send_authorized_privacy_boundary() {
+    write_include_safe_copy();
+
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/send_authorized_is_private.rs");
+    t.pass("tests/compile_fail/send_authorized_sanctioned_path_compiles.rs");
+}
