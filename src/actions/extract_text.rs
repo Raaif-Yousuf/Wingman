@@ -14,10 +14,11 @@
 //! screen on the main thread before the pending card shows) the same way
 //! `App::ask` does for the same reason.
 //!
-//! Registered in [`super::builtin_actions`] as catalogue metadata for the
-//! palette (#25, not yet built) to show one day; nothing on *this* path
-//! reads that `Action` entry back (see this module's doc comment there for
-//! why `proposal` is deliberately an unregistered schema name).
+//! Registered in [`super::builtin_actions`], which the Quick Ask palette
+//! (#25) reads to list this action and dispatch it to `App::extract_text`.
+//! Nothing on *this* path reads that `Action` entry's fields back (see its
+//! doc comment there for why `proposal` is deliberately an unregistered
+//! schema name).
 
 use anyhow::{Context, Result};
 use serde_json::json;
