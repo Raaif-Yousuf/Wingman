@@ -838,7 +838,15 @@ fn set_sz_tip(dst: &mut [u16], text: &str) {
         return;
     }
     let wide: Vec<u16> = text.encode_utf16().collect();
-    let n = wide.len().min(dst.len() - 1);
+    let mut n = wide.len().min(dst.len() - 1);
+    // #231: a cut point purely by code-unit count can land between a
+    // surrogate pair (an astral character, e.g. an emoji, encodes as a
+    // high surrogate 0xD800..=0xDBFF followed by a low surrogate). Back
+    // the cut up by one so a lone high surrogate is never left dangling
+    // right before the null terminator.
+    if n > 0 && n < wide.len() && (0xD800..=0xDBFF).contains(&wide[n - 1]) {
+        n -= 1;
+    }
     dst[..n].copy_from_slice(&wide[..n]);
     for slot in &mut dst[n..] {
         *slot = 0;
@@ -1982,5 +1990,60 @@ mod tests {
 
         drop(tray);
         let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    // -- #231: set_sz_tip never truncates mid-surrogate-pair ----------------
+
+    #[test]
+    fn set_sz_tip_backs_up_the_cut_off_a_surrogate_pair() {
+        // 126 ASCII chars (126 UTF-16 units) then one astral emoji (a
+        // surrogate pair, 2 more units) is exactly 128 units -- the cut
+        // point a naive `dst.len() - 1 == 127` would land on is index 127,
+        // i.e. right after the emoji's high surrogate (index 126) and
+        // before its low surrogate (index 127). Without the fix this would
+        // keep the lone high surrogate at dst[126] and drop its pair.
+        let text: String = "a".repeat(126) + "\u{1F600}"; // trailing emoji (U+1F600)
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        assert_eq!(wide.len(), 128, "fixture must be exactly 128 UTF-16 units");
+        assert!(
+            (0xD800..=0xDBFF).contains(&wide[126]),
+            "fixture's unit 126 must be a high surrogate"
+        );
+
+        let mut dst = [0u16; 128];
+        set_sz_tip(&mut dst, &text);
+
+        // The cut must have backed up to before the surrogate pair: all 126
+        // ASCII units survive, and everything from there on is the null
+        // terminator, not a lone high surrogate.
+        assert_eq!(&dst[..126], &wide[..126]);
+        assert_eq!(dst[126], 0, "must end with the null terminator");
+        assert_eq!(dst[127], 0);
+        assert!(
+            !(0xD800..=0xDBFF).contains(&dst[125]),
+            "no lone high surrogate must remain in the buffer"
+        );
+    }
+
+    #[test]
+    fn set_sz_tip_copies_a_short_string_exactly() {
+        let mut dst = [0xFFFFu16; 16];
+        set_sz_tip(&mut dst, "hi");
+
+        let expected: Vec<u16> = "hi".encode_utf16().collect();
+        assert_eq!(&dst[..2], expected.as_slice());
+        assert!(
+            dst[2..].iter().all(|&c| c == 0),
+            "everything past the copied text must be null-terminated"
+        );
+    }
+
+    #[test]
+    fn set_sz_tip_on_an_empty_dst_is_a_no_op() {
+        let mut dst: [u16; 0] = [];
+        // Must not panic (no `dst.len() - 1` underflow) and must leave the
+        // (empty) buffer untouched.
+        set_sz_tip(&mut dst, "Wingman");
+        assert!(dst.is_empty());
     }
 }
