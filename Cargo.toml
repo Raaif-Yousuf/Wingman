@@ -27,6 +27,7 @@ ureq = { version = "3.4", features = ["json"] }
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = "3.6"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dependencies.windows]
 version = "0.62"

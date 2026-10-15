@@ -28,14 +28,12 @@
 //! tooltip refreshes only after a request finishes (no timer, AGENTS.md
 //! rule 5), so it can show yesterday's total until the first press of a day.
 //!
-//! # The totals file
+//! # Where the totals live
 //!
-//! `%LOCALAPPDATA%\Wingman\spend.json`, one object keyed by local date. Only
-//! dollars and counts are stored, never prompts or answers.
-
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
+//! The `usage_day` table of the local store (`crate::store`, issue #46),
+//! one row per local date, provider and model. Only dollars, counts and
+//! token totals are stored, never prompts or answers. The old
+//! `spend.json` is imported once and renamed `spend.json.migrated`.
 
 use serde::{Deserialize, Serialize};
 
@@ -331,26 +329,6 @@ pub struct DayTotal {
     pub unpriced: u32,
 }
 
-/// Newest days kept in the totals file.
-const KEEP_DAYS: usize = 60;
-
-/// Adds one request to `days`, dropping the oldest days past [`KEEP_DAYS`].
-pub fn apply(days: &mut BTreeMap<String, DayTotal>, date: &str, cost: Option<f64>) {
-    let day = days.entry(date.to_string()).or_default();
-    day.requests += 1;
-    match cost {
-        Some(usd) => day.usd += usd,
-        None => day.unpriced += 1,
-    }
-    while days.len() > KEEP_DAYS {
-        let oldest = days.keys().next().cloned();
-        match oldest {
-            Some(k) => days.remove(&k),
-            None => break,
-        };
-    }
-}
-
 /// The tooltip fragment for `day`, or `None` when there is nothing to show
 /// (no requests, or only free local ones).
 pub fn format_tooltip_part(day: &DayTotal) -> Option<String> {
@@ -371,46 +349,6 @@ pub fn format_tooltip_part(day: &DayTotal) -> Option<String> {
     Some(format!("{amount} today{tail}"))
 }
 
-/// `%LOCALAPPDATA%\Wingman\spend.json`. Under `#[cfg(test)]` a per-process
-/// file in `%TEMP%` instead (AGENTS.md rule 9).
-fn totals_path() -> anyhow::Result<PathBuf> {
-    #[cfg(test)]
-    {
-        Ok(std::env::temp_dir().join(format!("wingman-test-spend-{}.json", std::process::id())))
-    }
-    #[cfg(not(test))]
-    {
-        Ok(crate::known_folder::local_app_data()?
-            .join("Wingman")
-            .join("spend.json"))
-    }
-}
-
-fn read_days(path: &std::path::Path) -> BTreeMap<String, DayTotal> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-/// Serialises the read-modify-write below across threads in this process.
-static FILE_LOCK: Mutex<()> = Mutex::new(());
-
-fn record_at(path: &std::path::Path, date: &str, cost: Option<f64>) -> anyhow::Result<()> {
-    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut days = read_days(path);
-    apply(&mut days, date, cost);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Write beside the target, then rename over it, so a crash mid-write
-    // never leaves a half-written totals file.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string(&days)?)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
 /// Today's date in local time, `YYYY-MM-DD`.
 fn local_date_today() -> String {
     use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -424,8 +362,11 @@ fn local_date_today() -> String {
 pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
     let date = local_date_today();
     let cost = request_cost(provider, model, &date, local, usage.as_ref());
-    if let Ok(path) = totals_path() {
-        let _ = record_at(&path, &date, cost);
+    let saved = crate::store::global()
+        .and_then(|s| s.record_usage(&date, provider, model, cost, usage.as_ref()));
+    if let Err(e) = saved {
+        // Never fails the request; the next card says so, once per run.
+        crate::store::report(&e);
     }
 }
 
@@ -445,12 +386,12 @@ pub fn tally(
     result
 }
 
-/// The tooltip fragment for today, read from disk.
+/// The tooltip fragment for today, read from the store.
 pub fn tooltip_part() -> Option<String> {
-    let path = totals_path().ok()?;
-    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let days = read_days(&path);
-    format_tooltip_part(days.get(&local_date_today())?)
+    let day = crate::store::global()
+        .and_then(|s| s.day_total(&local_date_today()))
+        .ok()??;
+    format_tooltip_part(&day)
 }
 
 #[cfg(test)]
@@ -534,27 +475,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_sums_a_day_and_counts_unpriced() {
-        let mut days = BTreeMap::new();
-        apply(&mut days, "2026-10-15", Some(0.01));
-        apply(&mut days, "2026-10-15", Some(0.02));
-        apply(&mut days, "2026-10-15", None);
-        let d = days["2026-10-15"];
-        assert!(close(d.usd, 0.03));
-        assert_eq!((d.requests, d.unpriced), (3, 1));
-    }
-
-    #[test]
-    fn apply_keeps_only_the_newest_days() {
-        let mut days = BTreeMap::new();
-        for i in 0..(KEEP_DAYS + 5) {
-            apply(&mut days, &format!("2026-01-{i:03}"), Some(0.0));
-        }
-        assert_eq!(days.len(), KEEP_DAYS);
-        assert!(!days.contains_key("2026-01-000"));
-    }
-
-    #[test]
     fn tooltip_part_shapes() {
         assert_eq!(format_tooltip_part(&DayTotal::default()), None);
         let local_only = DayTotal {
@@ -596,30 +516,18 @@ mod tests {
         assert!(!format_tooltip_part(&d).unwrap().contains('\u{2014}'));
     }
 
-    #[test]
-    fn record_at_persists_and_accumulates_across_reads() {
-        let path = std::env::temp_dir().join(format!(
-            "wingman-test-spend-record-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_file(&path);
-        record_at(&path, "2026-10-15", Some(0.25)).unwrap();
-        record_at(&path, "2026-10-15", None).unwrap();
-        let days = read_days(&path);
-        let _ = std::fs::remove_file(&path);
-        let d = days["2026-10-15"];
-        assert!(close(d.usd, 0.25));
-        assert_eq!((d.requests, d.unpriced), (2, 1));
-    }
-
     /// The wiring check: a completion passed through `tally` (what every
     /// provider's `complete` ends with) shows up in what the tooltip reads.
     #[test]
     fn tally_puts_a_completion_into_the_tooltip_text() {
-        let path = totals_path().unwrap();
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(tooltip_part(), None);
+        // Other tests may also record today through the shared test store,
+        // so compare against what is there before.
+        let today = local_date_today();
+        let before = crate::store::global()
+            .unwrap()
+            .day_total(&today)
+            .unwrap()
+            .unwrap_or_default();
         let completion = Completion {
             text: String::new(),
             usage: Some(usage(1_000_000, 0)),
@@ -627,8 +535,14 @@ mod tests {
         };
         let out = tally("anthropic", "claude-opus-5", false, Ok(completion)).unwrap();
         assert_eq!(out.usage.unwrap().input_tokens, 1_000_000);
-        assert_eq!(tooltip_part().unwrap(), "$5.00 today");
-        let _ = std::fs::remove_file(&path);
+        let after = crate::store::global()
+            .unwrap()
+            .day_total(&today)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.requests, before.requests + 1);
+        assert!(close(after.usd - before.usd, 5.0), "{after:?}");
+        assert!(tooltip_part().unwrap().contains("today"));
     }
 
     #[test]
@@ -705,32 +619,5 @@ mod tests {
             }
         }
         assert!(checked > 10);
-    }
-
-    #[test]
-    fn record_at_leaves_no_temp_file_behind() {
-        let path = std::env::temp_dir().join(format!(
-            "wingman-test-spend-atomic-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        record_at(&path, "2026-10-15", Some(1.0)).unwrap();
-        record_at(&path, "2026-10-15", Some(1.0)).unwrap();
-        let tmp = path.with_extension("json.tmp");
-        let ok = !tmp.exists() && close(read_days(&path)["2026-10-15"].usd, 2.0);
-        let _ = std::fs::remove_file(&path);
-        assert!(ok);
-    }
-
-    #[test]
-    fn a_corrupt_totals_file_reads_as_empty() {
-        let path = std::env::temp_dir().join(format!(
-            "wingman-test-spend-bad-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, "not json").unwrap();
-        assert!(read_days(&path).is_empty());
-        let _ = std::fs::remove_file(&path);
     }
 }
