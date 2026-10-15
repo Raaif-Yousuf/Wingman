@@ -72,15 +72,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgItem, GetMessageW,
-    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsChild, IsDialogMessageW,
-    LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
-    WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW, WNDCLASSEXW,
-    WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild,
+    IsDialogMessageW, LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
+    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
+    HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY,
+    WM_SETFONT, WM_SETREDRAW, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_CONTROLPARENT,
+    WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{Config, OllamaConfig, RequireTickFor};
@@ -205,6 +205,8 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     inner_ref.children = built.children;
     inner_ref.content_top_dp = built.content_top_dp;
     inner_ref.win_h_dp = built.win_h_dp;
+    // #342: the prompt starts hidden, so shrink the window to match.
+    unsafe { show_prompt_state(inner_ref) };
 
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -363,6 +365,9 @@ struct SettingsInner {
     content_top_dp: i32,
     win_h_dp: i32,
     prompt_edit: HWND,
+    /// #342: whether the Advanced group shows the Check my work prompt.
+    /// Starts collapsed on every open.
+    prompt_expanded: bool,
     /// The config this window was opened with -- fields not touched by the
     /// UI (e.g. model lists, hotkeys) are carried through from here.
     original: Config,
@@ -381,6 +386,7 @@ impl SettingsInner {
             content_top_dp: 0,
             win_h_dp: WIN_H_DP,
             prompt_edit: HWND(std::ptr::null_mut()),
+            prompt_expanded: false,
             original,
             result: None,
             should_close: false,
@@ -481,6 +487,10 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, DEFAULT_PROMPT);
         }
+        ID_PROMPT_TOGGLE if notify == BN_CLICKED => {
+            inner.prompt_expanded = !inner.prompt_expanded;
+            unsafe { show_prompt_state(inner) };
+        }
         ID_OPENAI_SHOW_KEY if notify == BN_CLICKED => {
             toggle_password(inner.hwnd, ID_OPENAI_SHOW_KEY, ID_OPENAI_KEY);
         }
@@ -568,6 +578,8 @@ const ID_OLLAMA_STATUS: i32 = 120;
 const ID_VALIDATION_MESSAGE: i32 = 121;
 /// #403: the fill-form tick-requirement combo (`config.forms.require_tick_for`).
 const ID_REQUIRE_TICK_FOR: i32 = 122;
+/// #342: shows or hides the Check my work prompt in the Advanced group.
+const ID_PROMPT_TOGGLE: i32 = 123;
 
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
@@ -601,6 +613,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_OLLAMA_STATUS", ID_OLLAMA_STATUS),
     ("ID_VALIDATION_MESSAGE", ID_VALIDATION_MESSAGE),
     ("ID_REQUIRE_TICK_FOR", ID_REQUIRE_TICK_FOR),
+    ("ID_PROMPT_TOGGLE", ID_PROMPT_TOGGLE),
 ];
 
 // ---------------------------------------------------------------------------
@@ -762,6 +775,9 @@ fn to_px(dp: i32, dpi: u32) -> i32 {
 /// further. (`MIN_PROMPT_EDIT_H` in dp, three text rows tall.)
 const MIN_PROMPT_EDIT_H: i32 = ROW_H * 3;
 
+/// Width of the "Show/Hide Check my work prompt" toggle (#342), in dp.
+const PROMPT_TOGGLE_W: i32 = 210;
+
 /// Rects for the Prompt group box and the Save/Cancel footer, computed
 /// purely from where the fixed-height groups above it end (`content_top`,
 /// in dp) and how tall the window's client area actually is (`win_h_dp`).
@@ -825,6 +841,41 @@ fn prompt_footer_layout(content_top: i32, win_h_dp: i32) -> PromptFooterLayout {
         reset_btn_y,
         buttons_y,
     }
+}
+
+/// Height of the Advanced group while the prompt is hidden (#342): the
+/// caption, one button row (the show/hide toggle) and a bottom margin.
+const COLLAPSED_PROMPT_GROUP_H: i32 = GROUP_LABEL_TOP + BTN_H + MARGIN;
+
+/// The footer layout for the Advanced group in either state (#342).
+/// Expanded is [`prompt_footer_layout`] unchanged. Collapsed has no edit box:
+/// the group is just its toggle row, so it does not stretch with the window.
+fn footer_layout(content_top: i32, win_h_dp: i32, expanded: bool) -> PromptFooterLayout {
+    if expanded {
+        return prompt_footer_layout(content_top, win_h_dp);
+    }
+    let buttons_h = BTN_H + MARGIN * 2;
+    let prompt_bottom = content_top + COLLAPSED_PROMPT_GROUP_H;
+    PromptFooterLayout {
+        prompt_top: content_top,
+        prompt_bottom,
+        prompt_edit_h: 0,
+        reset_btn_y: content_top + GROUP_LABEL_TOP,
+        buttons_y: (prompt_bottom + GROUP_GAP).max(win_h_dp - buttons_h + MARGIN),
+    }
+}
+
+/// The window height in dp for the Advanced group's state (#342).
+/// `fitted_dp` is what [`fitted_height_for_work_px`] allows on this monitor
+/// and `nc_dp` the title bar and borders. Expanded keeps the old behaviour
+/// (the full fitted height, the prompt box takes what is left). Collapsed is
+/// just tall enough for the footer, and never taller than the fit.
+fn window_height_dp(content_top: i32, expanded: bool, fitted_dp: i32, nc_dp: i32) -> i32 {
+    if expanded {
+        return fitted_dp;
+    }
+    let client = footer_layout(content_top, 0, false).buttons_y + BTN_H + MARGIN;
+    (client + nc_dp).min(fitted_dp)
 }
 
 // ---------------------------------------------------------------------------
@@ -933,8 +984,9 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     } else {
         inner.win_h_dp
     };
-    let old = prompt_footer_layout(inner.content_top_dp, inner.win_h_dp);
-    let new = prompt_footer_layout(inner.content_top_dp, client_h_dp);
+    // The design rects were recorded for the collapsed layout (#342).
+    let old = footer_layout(inner.content_top_dp, inner.win_h_dp, false);
+    let new = footer_layout(inner.content_top_dp, client_h_dp, inner.prompt_expanded);
 
     let new_font = build_font(dpi);
     // No repaint between the individual moves: one redraw at the end, so a
@@ -964,6 +1016,69 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
         None,
         RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
     );
+}
+
+/// #342: makes the window match `inner.prompt_expanded`: shows or hides the
+/// prompt box and its reset button, relabels the toggle, resizes the window
+/// (kept inside the monitor's work area) and re-lays-out the children.
+/// The prompt text stays in the hidden edit, so Save still reads it.
+unsafe fn show_prompt_state(inner: &mut SettingsInner) {
+    let cmd = if inner.prompt_expanded {
+        SW_SHOW
+    } else {
+        SW_HIDE
+    };
+    let _ = ShowWindow(inner.prompt_edit, cmd);
+    if let Some(reset) = get_dlg_item(inner.hwnd, ID_RESET_PROMPT) {
+        let _ = ShowWindow(reset, cmd);
+    }
+    if let Some(toggle) = get_dlg_item(inner.hwnd, ID_PROMPT_TOGGLE) {
+        set_text(toggle, prompt_toggle_label(inner.prompt_expanded));
+    }
+
+    let dpi = inner.dpi.max(1);
+    let mon = MonitorFromWindow(inner.hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let have_work = GetMonitorInfoW(mon, &mut mi).as_bool();
+    let work = mi.rcWork;
+    let fitted = fitted_height_for_work_px(if have_work { work.bottom - work.top } else { 0 }, dpi);
+
+    let mut wr = windows::Win32::Foundation::RECT::default();
+    let mut cr = windows::Win32::Foundation::RECT::default();
+    if GetWindowRect(inner.hwnd, &mut wr).is_err() || GetClientRect(inner.hwnd, &mut cr).is_err() {
+        apply_dpi(inner);
+        return;
+    }
+    let nc_dp = ((wr.bottom - wr.top) - (cr.bottom - cr.top)) * 96 / dpi as i32;
+    let h = to_px(
+        window_height_dp(inner.content_top_dp, inner.prompt_expanded, fitted, nc_dp),
+        dpi,
+    );
+    let mut y = wr.top;
+    if have_work && y + h > work.bottom {
+        y = (work.bottom - h).max(work.top);
+    }
+    let _ = SetWindowPos(
+        inner.hwnd,
+        None,
+        wr.left,
+        y,
+        wr.right - wr.left,
+        h,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    apply_dpi(inner);
+}
+
+fn prompt_toggle_label(expanded: bool) -> &'static str {
+    if expanded {
+        "Hide Check my work prompt"
+    } else {
+        "Show Check my work prompt"
+    }
 }
 
 fn wide_z(s: &str) -> Vec<u16> {
@@ -2010,7 +2125,7 @@ fn build_ui_recorded(
     y = forms_bottom + GROUP_GAP;
 
     // -- Prompt (grows to fill remaining space above the button row) ------
-    let footer = prompt_footer_layout(y, win_h_dp);
+    let footer = footer_layout(y, win_h_dp, false);
     let prompt_top = footer.prompt_top;
     let prompt_bottom = footer.prompt_bottom;
     y = prompt_top + GROUP_LABEL_TOP;
@@ -2030,6 +2145,11 @@ fn build_ui_recorded(
         ID_PROMPT_EDIT,
     );
     ctx.set_anchor(prompt_edit, Anchor::PromptEdit);
+    // #342: starts hidden behind the Advanced toggle; the text is still
+    // there for Save to read.
+    unsafe {
+        let _ = ShowWindow(prompt_edit, SW_HIDE);
+    }
     // WS_VSCROLL isn't representable via the `style` u32 alone without
     // pulling in the full WINDOW_STYLE const set; add it directly.
     unsafe {
@@ -2049,17 +2169,32 @@ fn build_ui_recorded(
         "Reset prompt to default",
         BS_PUSHBUTTON as u32,
         0,
-        content_x + MARGIN,
+        content_x + MARGIN + PROMPT_TOGGLE_W + 12,
         footer.reset_btn_y,
         200,
         reset_btn_h,
         ID_RESET_PROMPT,
     );
     ctx.set_anchor(reset_btn, Anchor::ResetBtn);
+    unsafe {
+        let _ = ShowWindow(reset_btn, SW_HIDE);
+    }
+    let toggle_btn = ctx.create(
+        WC_BUTTON,
+        prompt_toggle_label(false),
+        BS_PUSHBUTTON as u32,
+        0,
+        content_x + MARGIN,
+        footer.reset_btn_y,
+        PROMPT_TOGGLE_W,
+        reset_btn_h,
+        ID_PROMPT_TOGGLE,
+    );
+    ctx.set_anchor(toggle_btn, Anchor::ResetBtn);
 
     let prompt_group = ctx.create(
         WC_BUTTON,
-        "Prompt",
+        "Advanced",
         BS_GROUPBOX as u32,
         0,
         content_x,
@@ -2123,7 +2258,7 @@ fn build_ui_recorded(
         ID_MAX_EDGE,
         ID_CARD_SECONDS,
         ID_REQUIRE_TICK_FOR,
-        ID_PROMPT_EDIT,
+        ID_PROMPT_TOGGLE,
         ID_SAVE,
         ID_AUTOSTART,
     ] {
@@ -2147,6 +2282,7 @@ fn build_ui_recorded(
         ID_SHOW_DIFFICULTY,
         ID_TEXT_SCALE_TRACK,
         ID_REQUIRE_TICK_FOR,
+        ID_PROMPT_TOGGLE,
         ID_PROMPT_EDIT,
         ID_RESET_PROMPT,
         ID_SAVE,
@@ -3672,6 +3808,67 @@ mod tests {
         assert_eq!(footer.buttons_y, roomy_win_h_dp - buttons_h + MARGIN);
     }
 
+    // -- collapsed Advanced group (issue #342) ---------------------------
+    // The Check my work prompt is hidden behind a toggle, so the default
+    // window is shorter (also helps #481). These cover the pure layout.
+
+    #[test]
+    fn collapsed_layout_has_no_edit_box_and_is_shorter_than_expanded() {
+        let c = footer_layout(CONTENT_TOP_DP, 0, false);
+        let e = footer_layout(CONTENT_TOP_DP, 0, true);
+        assert_eq!(c.prompt_edit_h, 0);
+        assert!(c.prompt_bottom - c.prompt_top < e.prompt_bottom - e.prompt_top);
+        assert!(c.buttons_y < e.buttons_y);
+    }
+
+    #[test]
+    fn collapsed_toggle_row_sits_inside_the_group_and_above_the_footer() {
+        let c = footer_layout(CONTENT_TOP_DP, WIN_H_DP, false);
+        assert!(c.reset_btn_y >= c.prompt_top + GROUP_LABEL_TOP);
+        assert!(c.reset_btn_y + BTN_H <= c.prompt_bottom);
+        assert!(c.prompt_bottom <= c.buttons_y);
+    }
+
+    #[test]
+    fn expanded_footer_layout_is_the_original_prompt_layout() {
+        for h in [MIN_WIN_H_DP, 645, WIN_H_DP, 1200] {
+            let a = footer_layout(CONTENT_TOP_DP, h, true);
+            let b = prompt_footer_layout(CONTENT_TOP_DP, h);
+            assert_eq!(
+                (a.prompt_bottom, a.prompt_edit_h, a.reset_btn_y, a.buttons_y),
+                (b.prompt_bottom, b.prompt_edit_h, b.reset_btn_y, b.buttons_y)
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_window_needs_less_height_than_the_expanded_prompt_group() {
+        // Compare what each state needs, not the fitted window: the
+        // expanded group's minimum already ran past `WIN_H_DP` (#481).
+        let nc = 40;
+        let collapsed = window_height_dp(CONTENT_TOP_DP, false, 5000, nc);
+        let e = footer_layout(CONTENT_TOP_DP, 0, true);
+        let expanded_needed = e.buttons_y + BTN_H + MARGIN + nc;
+        assert!(collapsed + MIN_PROMPT_EDIT_H <= expanded_needed);
+        assert_eq!(
+            window_height_dp(CONTENT_TOP_DP, true, WIN_H_DP, nc),
+            WIN_H_DP
+        );
+    }
+
+    #[test]
+    fn collapsed_window_never_exceeds_the_screen_fit() {
+        assert_eq!(window_height_dp(CONTENT_TOP_DP, false, 500, 40), 500);
+    }
+
+    #[test]
+    fn collapsed_window_height_holds_exactly_the_footer() {
+        let nc = 40;
+        let h = window_height_dp(CONTENT_TOP_DP, false, 5000, nc);
+        let f = footer_layout(CONTENT_TOP_DP, h - nc, false);
+        assert_eq!(f.buttons_y + BTN_H + MARGIN, h - nc);
+    }
+
     // -- window smoke test ----------------------------------------------
     // Exercises real Win32 window + control creation/destruction, not just
     // compilation, modeled on card.rs's own smoke test. No window is ever
@@ -4125,7 +4322,7 @@ mod tests {
         // Save's top edge sits where the footer layout for the new client
         // height puts it, in dp at the new dpi.
         let client_dp = (client_size(hwnd).1 * 96 / 192).max(1);
-        let footer = prompt_footer_layout(unsafe { &*raw }.content_top_dp, client_dp);
+        let footer = footer_layout(unsafe { &*raw }.content_top_dp, client_dp, false);
         assert_eq!(top_in_parent_px(hwnd, save), to_px(footer.buttons_y, 192));
 
         // And back to 100%.
@@ -4140,6 +4337,98 @@ mod tests {
         }
         assert_eq!(client_size(save), (BTN_W, BTN_H));
         assert_eq!(font_height_of(save), font_96);
+    }
+
+    /// #342's wired-to-nothing check, with a real window: the prompt box is
+    /// hidden until the toggle is clicked (a real `WM_COMMAND` through the
+    /// production `wndproc`), clicking again hides it, and its text survives
+    /// both, so Save would still read it. If the toggle arm were missing the
+    /// edit would stay hidden after the first click.
+    #[test]
+    fn prompt_toggle_shows_and_hides_the_prompt_of_a_real_window() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+
+        let raw = Box::into_raw(Box::new(SettingsInner::new(Config::default())));
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let title = wide_z("Wingman settings (prompt toggle test)");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                Some(raw as *const c_void),
+            )
+        }
+        .expect("CreateWindowExW");
+        struct Guard(HWND, *mut SettingsInner);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                    drop(Box::from_raw(self.1));
+                }
+            }
+        }
+        let _guard = Guard(hwnd, raw);
+
+        let client_h_dp = client_size(hwnd).1;
+        let font = build_font(96);
+        let built = build_ui_recorded(hwnd, instance, 96, font, &Config::default(), client_h_dp);
+        {
+            let inner = unsafe { &mut *raw };
+            inner.hwnd = hwnd;
+            inner.font = font;
+            inner.prompt_edit = built.prompt_edit;
+            inner.children = built.children;
+            inner.content_top_dp = built.content_top_dp;
+            inner.win_h_dp = built.win_h_dp;
+        }
+        let prompt = get_dlg_item(hwnd, ID_PROMPT_EDIT).expect("prompt edit");
+        let reset = get_dlg_item(hwnd, ID_RESET_PROMPT).expect("reset button");
+        let toggle = get_dlg_item(hwnd, ID_PROMPT_TOGGLE).expect("toggle button");
+        let save = get_dlg_item(hwnd, ID_SAVE).expect("save");
+        let visible = |w: HWND| unsafe { IsWindowVisible(w) }.as_bool();
+        let click = || unsafe {
+            SendMessageW(
+                hwnd,
+                WM_COMMAND,
+                Some(WPARAM(ID_PROMPT_TOGGLE as usize)),
+                Some(LPARAM(0)),
+            );
+        };
+
+        // Collapsed at start: no prompt text on screen, the toggle is.
+        unsafe { show_prompt_state(&mut *raw) };
+        assert!(!visible(prompt) && !visible(reset));
+        assert!(visible(toggle));
+        let collapsed_save_y = top_in_parent_px(hwnd, save);
+
+        click();
+        assert!(visible(prompt) && visible(reset));
+        assert_eq!(get_text(toggle), "Hide Check my work prompt");
+        assert!(top_in_parent_px(hwnd, save) > collapsed_save_y);
+        assert_eq!(get_text(prompt), Config::default().ui.prompt);
+
+        click();
+        assert!(!visible(prompt) && !visible(reset));
+        assert_eq!(get_text(toggle), "Show Check my work prompt");
+        assert_eq!(top_in_parent_px(hwnd, save), collapsed_save_y);
+        // Hidden text is still readable, so Save keeps it.
+        assert_eq!(get_text(prompt), Config::default().ui.prompt);
     }
 
     fn direct_child_count(hwnd: HWND) -> usize {
