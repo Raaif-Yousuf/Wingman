@@ -249,6 +249,10 @@ pub struct Capture {
     pub max_edge: u32,
     /// "active" | "primary"
     pub monitor: String,
+    /// Paint over card numbers, IBANs, key-shaped tokens and emails in the
+    /// screenshot before it is sent to a cloud provider (#103). On by
+    /// default. A request whose providers are all local skips it either way.
+    pub redact: bool,
 }
 
 impl Default for Capture {
@@ -256,6 +260,7 @@ impl Default for Capture {
         Self {
             max_edge: 1568,
             monitor: "active".to_string(),
+            redact: true,
         }
     }
 }
@@ -1545,12 +1550,14 @@ impl Providers {
     /// requests through. Kept as the one place both callers share so they
     /// can never disagree about which providers `mode` allows.
     pub fn selected_order_for_mode(&self, mode: Mode, ollama_ready: bool) -> Vec<String> {
-        // #16: a compat endpoint's locality is decided by its configured
-        // `base_url` host, never by name (`mode::is_local_provider`'s doc) --
-        // this is the one place that host check happens, right before
-        // `select_providers` needs the answer.
-        let local_compat_names: Vec<String> = self
-            .compat
+        crate::mode::select_providers(mode, &self.order, ollama_ready, &self.local_compat_names())
+    }
+
+    /// #16: a compat endpoint's locality is decided by its configured
+    /// `base_url` host, never by name (`mode::is_local_provider`'s doc) --
+    /// this is the one place that host check happens.
+    fn local_compat_names(&self) -> Vec<String> {
+        self.compat
             .iter()
             .filter(|c| {
                 matches!(
@@ -1559,8 +1566,21 @@ impl Providers {
                 )
             })
             .map(|c| compat_order_name(&c.name))
-            .collect();
-        crate::mode::select_providers(mode, &self.order, ollama_ready, &local_compat_names)
+            .collect()
+    }
+
+    /// #103: whether a request in `mode` could send the screenshot off this
+    /// machine: any ready, non-local provider in the chain counts, not just
+    /// the first (a chain can fall from Ollama through to a cloud provider,
+    /// and the same pixels would go). Decided without the Auto-mode Ollama
+    /// probe by assuming Ollama IS ready, which is the larger chain (local
+    /// first, then every cloud provider), so this errs toward redacting.
+    pub fn sends_screenshot_off_machine(&self, mode: Mode) -> bool {
+        let local = self.local_compat_names();
+        self.selected_order_for_mode(mode, true)
+            .iter()
+            .filter(|n| !crate::mode::is_local_provider(n, &local))
+            .any(|n| self.provider_for(n).is_some_and(|p| p.ready()))
     }
 }
 
@@ -2055,6 +2075,49 @@ model = "gpt-5.5"
         ];
         let chain = config.providers.build_chain_for_mode(Mode::Offline, false);
         assert_eq!(chain.provider_names(), vec!["ollama"]);
+    }
+
+    /// #103: the redaction decision. Any ready cloud provider in the mode's
+    /// chain counts, even behind a local one; a local-only chain does not.
+    #[test]
+    fn sends_screenshot_off_machine_follows_the_chain_for_the_mode() {
+        let mut p = Config::default().providers;
+        p.openai.api_key = "test-key".to_string();
+        p.order = vec!["ollama".to_string(), "openai".to_string()];
+
+        assert!(p.sends_screenshot_off_machine(Mode::Cloud));
+        assert!(
+            p.sends_screenshot_off_machine(Mode::Auto),
+            "Ollama first, but the chain falls through to OpenAI"
+        );
+        assert!(!p.sends_screenshot_off_machine(Mode::Local));
+        assert!(!p.sends_screenshot_off_machine(Mode::Offline));
+
+        p.order = vec!["ollama".to_string()];
+        assert!(!p.sends_screenshot_off_machine(Mode::Auto));
+    }
+
+    #[test]
+    fn sends_screenshot_off_machine_ignores_a_cloud_provider_that_is_not_ready() {
+        let mut p = Config::default().providers;
+        p.openai.api_key = String::new();
+        p.order = vec!["openai".to_string()];
+        assert!(!p.sends_screenshot_off_machine(Mode::Cloud));
+    }
+
+    #[test]
+    fn sends_screenshot_off_machine_treats_a_loopback_compat_endpoint_as_local() {
+        let mut p = Config::default().providers;
+        p.compat = vec![compat_entry("lmstudio", "http://127.0.0.1:1234/v1")];
+        p.order = vec!["compat:lmstudio".to_string()];
+        assert!(!p.sends_screenshot_off_machine(Mode::Auto));
+    }
+
+    #[test]
+    fn capture_redact_is_on_by_default_and_can_be_turned_off() {
+        assert!(Config::default().capture.redact);
+        let cfg: Config = toml::from_str("[capture]\nredact = false\n").unwrap();
+        assert!(!cfg.capture.redact);
     }
 
     #[test]

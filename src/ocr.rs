@@ -54,6 +54,20 @@ pub struct OcrLine {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// The line's words with their own rects, so a caller can paint over
+    /// part of a line (screenshot redaction, #103) rather than all of it.
+    pub words: Vec<OcrWord>,
+}
+
+/// One recognized word and its bounding rect, in the same pixel space as
+/// [`OcrLine`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcrWord {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// The full result of one [`recognize`] call.
@@ -149,26 +163,44 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
     }
 }
 
-/// A line's bounding rect: the union of its words' bounding rects. `OcrLine`
-/// (the WinRT type) exposes no rect of its own, only per-word rects.
-/// Returns a zero rect for a line with no words -- the OCR engine should
-/// never produce one, but this avoids a panic rather than assuming that.
-fn line_bounding_rect(line: &WinOcrLine) -> Result<Rect> {
+/// A line's words with their rects, and the line's own bounding rect (the
+/// union of its words' rects: `OcrLine`, the WinRT type, exposes no rect of
+/// its own). Every rect is multiplied by `(sx, sy)` to map from the space
+/// the engine saw (possibly downscaled to `MaxImageDimension`) back to the
+/// caller's pixels. The line rect is a zero rect for a line with no words --
+/// the OCR engine should never produce one, but this avoids a panic rather
+/// than assuming that.
+fn line_words_and_rect(line: &WinOcrLine, sx: f32, sy: f32) -> Result<(Vec<OcrWord>, Rect)> {
     let words = line.Words().context("OcrLine::Words")?;
     let mut acc: Option<Rect> = None;
+    let mut out = Vec::new();
     for word in words.into_iter() {
         let r = word.BoundingRect().context("OcrWord::BoundingRect")?;
+        let r = Rect {
+            X: r.X * sx,
+            Y: r.Y * sy,
+            Width: r.Width * sx,
+            Height: r.Height * sy,
+        };
+        out.push(OcrWord {
+            text: word.Text().context("OcrWord::Text")?.to_string_lossy(),
+            x: r.X,
+            y: r.Y,
+            width: r.Width,
+            height: r.Height,
+        });
         acc = Some(match acc {
             None => r,
             Some(a) => union_rect(a, r),
         });
     }
-    Ok(acc.unwrap_or(Rect {
+    let rect = acc.unwrap_or(Rect {
         X: 0.0,
         Y: 0.0,
         Width: 0.0,
         Height: 0.0,
-    }))
+    });
+    Ok((out, rect))
 }
 
 /// Runs Windows OCR over one captured frame. **Must be called from a
@@ -261,16 +293,21 @@ fn recognize_inner(rgba: &[u8], width: u32, height: u32, timeout: Duration) -> R
         .context("OcrEngine::RecognizeAsync")?;
     let ocr_result = wait_bounded(&op, timeout)?;
 
+    // Rects come back in the (possibly downscaled) space the engine saw;
+    // map them to the caller's pixels so a painted region lands on the text.
+    let sx = width as f32 / fit_w as f32;
+    let sy = height as f32 / fit_h as f32;
     let mut lines = Vec::new();
     for line in ocr_result.Lines().context("OcrResult::Lines")?.into_iter() {
         let text = line.Text().context("OcrLine::Text")?.to_string_lossy();
-        let rect = line_bounding_rect(&line)?;
+        let (words, rect) = line_words_and_rect(&line, sx, sy)?;
         lines.push(OcrLine {
             text,
             x: rect.X,
             y: rect.Y,
             width: rect.Width,
             height: rect.Height,
+            words,
         });
     }
 
@@ -312,7 +349,7 @@ fn wait_bounded(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // -- rgba_to_bgra_premultiplied --------------------------------------
@@ -413,6 +450,7 @@ mod tests {
             y,
             width: 10.0,
             height: 10.0,
+            words: Vec::new(),
         }
     }
 
@@ -524,7 +562,7 @@ mod tests {
     /// `rgba_to_bgra_premultiplied`'s doc comment) -- a synthetic
     /// screenshot this test can run the real OCR pipeline over without a
     /// live screen capture. Test-only; not reachable from production code.
-    unsafe fn render_gdi_text_rgba(text: &str, width: u32, height: u32) -> Vec<u8> {
+    pub(crate) unsafe fn render_gdi_text_rgba(text: &str, width: u32, height: u32) -> Vec<u8> {
         use windows::Win32::Foundation::{COLORREF, RECT};
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,

@@ -172,6 +172,113 @@ pub fn contains_iban(text: &str) -> bool {
     false
 }
 
+/// Byte ranges of every card number in `text`: the same rule as
+/// [`contains_card_number`] (12 to 19 digits, optional space or hyphen
+/// separators, Luhn-valid), but returning where each one sits so screenshot
+/// redaction (#103) can paint just that part of an OCR line. Unlike the
+/// boolean check, a number sitting after other digits in the same run
+/// ("Total 100 4111 1111 1111 1111") is found: every window of digit groups
+/// is tried, longest first.
+pub fn card_number_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    for run in runs_of(text, |c| c.is_ascii_digit() || c == ' ' || c == '-') {
+        let groups = groups_of(text, run, |c| c.is_ascii_digit());
+        let mut i = 0;
+        while i < groups.len() {
+            let mut found = None;
+            let mut digits = String::new();
+            for g in &groups[i..] {
+                digits.push_str(&text[g.clone()]);
+                if digits.len() > 19 {
+                    break;
+                }
+                if digits.len() >= 12 && luhn_valid(&digits) {
+                    found = Some(g.end);
+                }
+            }
+            match found {
+                Some(end) => {
+                    spans.push(groups[i].start..end);
+                    i += groups[i..]
+                        .iter()
+                        .take_while(|g| g.end <= end)
+                        .count()
+                        .max(1);
+                }
+                None => i += 1,
+            }
+        }
+    }
+    spans
+}
+
+/// Byte ranges of every IBAN in `text`: the same rule as [`contains_iban`],
+/// with positions (see [`card_number_spans`]).
+pub fn iban_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    for run in runs_of(text, |c| c.is_ascii_alphanumeric() || c == ' ') {
+        let groups = groups_of(text, run, |c| c.is_ascii_alphanumeric());
+        let mut i = 0;
+        while i < groups.len() {
+            let mut found = None;
+            let mut candidate = String::new();
+            for g in &groups[i..] {
+                candidate.push_str(&text[g.clone()].to_ascii_uppercase());
+                if candidate.len() > 34 {
+                    break;
+                }
+                if candidate.len() >= 15 && iban_mod97_valid(&candidate) {
+                    found = Some(g.end);
+                }
+            }
+            match found {
+                Some(end) => {
+                    spans.push(groups[i].start..end);
+                    i += groups[i..]
+                        .iter()
+                        .take_while(|g| g.end <= end)
+                        .count()
+                        .max(1);
+                }
+                None => i += 1,
+            }
+        }
+    }
+    spans
+}
+
+/// Maximal byte ranges of `text` whose characters all satisfy `keep`.
+fn runs_of(text: &str, keep: impl Fn(char) -> bool) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        match (keep(c), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                runs.push(s..i);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        runs.push(s..text.len());
+    }
+    runs
+}
+
+/// Maximal sub-ranges of `run` whose characters satisfy `keep`.
+fn groups_of(
+    text: &str,
+    run: std::ops::Range<usize>,
+    keep: impl Fn(char) -> bool,
+) -> Vec<std::ops::Range<usize>> {
+    runs_of(&text[run.clone()], keep)
+        .into_iter()
+        .map(|r| run.start + r.start..run.start + r.end)
+        .collect()
+}
+
 /// Extracts maximal runs of ASCII letters/digits from `text`, treating
 /// spaces as separators that do not end a run (so `"GB29 NWBK 6016 1331
 /// 9268 19"` becomes one run), split wherever any other character appears.

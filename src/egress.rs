@@ -434,6 +434,49 @@ fn flush_run(run: &mut String, out: &mut String) {
 /// a run is a word, a status code or a short identifier.
 const MIN_TOKEN_CHARS: usize = 20;
 
+/// Byte ranges of the key-shaped tokens [`redact_opaque_tokens`] would
+/// scrub in `s`, for callers that need to know where they are (screenshot
+/// redaction paints the words over a span, #103). Same two rules as
+/// `flush_run`: a wide run that is long enough and
+/// [`looks_like_a_credential`] is one span; otherwise each narrow fragment of
+/// at least [`MIN_TOKEN_CHARS`] is. Single-line input only: the newline
+/// bridging in `redact_opaque_tokens` has no meaning for one OCR line.
+pub(crate) fn find_opaque_tokens(s: &str) -> Vec<std::ops::Range<usize>> {
+    fn runs(s: &str, keep: impl Fn(char) -> bool) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let mut start = None;
+        for (i, c) in s.char_indices() {
+            match (keep(c), start) {
+                (true, None) => start = Some(i),
+                (false, Some(b)) => {
+                    out.push(b..i);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(b) = start {
+            out.push(b..s.len());
+        }
+        out
+    }
+
+    let mut spans = Vec::new();
+    for run in runs(s, is_wide_token_char) {
+        let text = &s[run.clone()];
+        if text.chars().count() >= MIN_TOKEN_CHARS && looks_like_a_credential(text) {
+            spans.push(run);
+            continue;
+        }
+        for frag in runs(text, is_narrow_token_char) {
+            if text[frag.clone()].chars().count() >= MIN_TOKEN_CHARS {
+                spans.push(run.start + frag.start..run.start + frag.end);
+            }
+        }
+    }
+    spans
+}
+
 fn flush_fragment(fragment: &mut String, out: &mut String) {
     if fragment.chars().count() >= MIN_TOKEN_CHARS {
         out.push_str("[redacted]");

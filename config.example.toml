@@ -17,6 +17,7 @@ win = false
 [capture]
 max_edge = 1568
 monitor = "active"
+redact = true
 
 [providers]
 order = [

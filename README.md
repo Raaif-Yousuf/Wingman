@@ -285,6 +285,7 @@ call every boot. With start-with-Windows on it is always running anyway.
 | `mode` | `"auto"` | `cloud` / `local` / `auto` / `offline`; see [`docs/offline.md`](docs/offline.md) |
 | `capture.max_edge` | `1568` | long-edge downscale before upload; lower cuts cost |
 | `capture.monitor` | `"active"` | `"active"` follows the focused window; `"primary"` pins it |
+| `capture.redact` | `true` | paint over card numbers, IBANs, key-like tokens and email addresses in the screenshot before a cloud request; adds about 0.2 to 0.3 s. Local-only requests skip it. If the check cannot run, nothing is sent |
 | `providers.order` | `["openai", "anthropic"]` | fallback order; add `"ollama"`/`"gemini"` by hand, see [`docs/providers.md`](docs/providers.md) |
 | `providers.*.effort` | `"low"` | reasoning depth; raise for harder problems |
 | `providers.ollama.base_url` | `"http://127.0.0.1:11434"` | never `localhost`, see [`docs/providers.md`](docs/providers.md#ollama) |

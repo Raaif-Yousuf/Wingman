@@ -1,6 +1,7 @@
 # Screenshot redaction before upload
 
-Status: **draft, waiting for owner approval** (AGENTS.md rule 12). Issue #103.
+Status: **accepted, 2026-10-15** (AGENTS.md rule 12). Issue #103. Slices 1 and 2
+are built; see "Decisions (2026-10-15)" at the end.
 Supplements the [expansion plan](2026-09-16-expansion-plan-design.md) section 19
 and the [running app spec](2026-09-14-copilot-ask-design.md).
 
@@ -8,8 +9,8 @@ and the [running app spec](2026-09-14-copilot-ask-design.md).
 
 Redaction is a new stage that every cloud request passes through. It adds an OCR
 pass to the hot path, changes what leaves the machine, and needs a decision about
-what happens when it fails. Those are product decisions, so this stops at the
-design. The owner decisions are listed at the end.
+what happens when it fails. Those are product decisions, so they were settled in
+the design first. They are listed at the end.
 
 ## The problem
 
@@ -85,8 +86,8 @@ implementation PR must measure it before the stage is turned on.
 ## Painting
 
 A solid opaque rectangle, not a blur. Small blurred text can often be recovered
-or read by a model; a filled box cannot. The issue says "blurred": this is an
-owner decision (below). The paint function is pure over `(&mut RawShot, &[Rect])`
+or read by a model; a filled box cannot. The issue says "blurred"; the decision
+to use a box is recorded below. The paint function is pure over `(&mut RawShot, &[Rect])`
 and is tested by pixel comparison: inside the rectangle every pixel is the fill
 colour, outside it is unchanged.
 
@@ -108,12 +109,12 @@ will cost more; THEORY (unverified), not measured.
 
 OCR can time out or be unavailable (no language pack). Options:
 
-1. **Fail closed** (recommended for a P1 privacy feature): show a card, "Could not
-   check the screenshot for private details, so nothing was sent." Rule 7: a
-   failure ends in a card. A setting `privacy.redact = "auto" | "off"` lets the
-   user opt out knowingly.
+1. **Fail closed** (chosen): show a card, "Could not check the screenshot for
+   private details, so nothing was sent." Rule 7: a failure ends in a card. A
+   setting, built as `capture.redact` (a bool, default `true`), lets the user
+   opt out knowingly.
 2. Fail open: send unredacted. This breaks the one promise the feature exists
-   for, so it is not recommended.
+   for, so it is not used.
 
 ## The text path
 
@@ -147,20 +148,55 @@ contents).
 
 1. Pure pieces: span finders, `OcrLine` word rects, paint function. Observable
    only in tests, so it is not shipped alone as a feature.
-2. The stage and `encode_for_chain`, the `privacy.redact` setting, the egress
-   count, the failure card. Turns it on for cloud requests.
+2. The stage and `encode_for_chain`, the `capture.redact` setting, the egress
+   count (deferred, #508), the failure card. Turns it on for cloud requests.
 3. Password-field rectangles via UIA (after measuring).
 4. The text path.
 5. Manual blur in the region tool (separate issue, needs UI).
 
 Slices 1 and 2 land together (rule 8: no pipeline stage nobody calls).
 
-## Owner decisions needed
+## Decisions (2026-10-15)
 
-1. On by default for cloud requests, and **fail closed** when OCR fails?
-2. Solid box or blur? Recommendation: solid box.
-3. Accept about 0.2 to 0.3 s added to every cloud request?
-4. Include the text path in the first release, or ship pixels first and say so in
-   the README?
-5. Chain with any cloud provider counts as cloud (recommended), or only the
-   first provider?
+1. On by default for cloud requests. If OCR fails, fail closed: show a card and
+   send nothing.
+2. Solid boxes, not blur.
+3. About 0.2 to 0.3 s added to every cloud request is accepted.
+4. The pixel path ships first. The text path (the non-vision OCR and UIA text,
+   selected text, clipboard text) follows; it is tracked as #505. Until then
+   `PRIVACY.md` says plainly that the redaction covers the image only.
+5. A chain with any ready cloud provider counts as cloud.
+
+## As built (slices 1 and 2)
+
+- `src/redact.rs`: the span finders, word-to-span mapping, `paint` and `apply`.
+  `capture::encode_for_chain(&mut raw, redact)` is the only public way to encode
+  a screenshot; `encode` is private. `app.rs` reaches it through
+  `encode_for_upload`, which decides `redact` from the setting and
+  `Providers::sends_screenshot_off_machine(mode)`. That decision assumes Ollama is
+  ready in Auto mode (the larger chain), so it needs no network probe.
+- The pixels are painted in `raw` itself, not a copy. The non-vision fallback's
+  OCR runs over the same `raw`, so a painted card number is not read back out as
+  text either. This is partial text-path cover, not a replacement for #505: UIA
+  field values, selection and clipboard text are untouched.
+- The setting is `capture.redact`, a bool, default `true` (not the
+  `privacy.redact = "auto" | "off"` string sketched above). A Settings toggle is
+  #509.
+- The intent router's tiny capture goes through the same helper. At that size OCR
+  reads little, so it paints little; the router stays silent on failure by design.
+- Not built here: password-field rectangles (#506), the egress `redactions` count
+  (#508).
+- Known blind spot, MEASURED 2026-10-15: Windows OCR returned no line at all for a
+  rendered "Card 4111 1111 1111 1111", but read "Card 4539 1488 0343 6467"
+  normally. A number OCR does not return is not painted (#507).
+- The span finder for card numbers tries every window of digit groups in a run,
+  so it finds a number after other digits ("Total 100 4111 ..."). A side effect:
+  a long run of digit groups can contain a window that passes Luhn by chance
+  (about one in ten), and that window is painted. Too much is the safe direction.
+- The ignored live test
+  `cargo test redact_live -- --ignored --nocapture` renders a card number with
+  GDI, runs the real OCR and encode, decodes the PNG and checks the number is the
+  fill colour and the label next to it is not. MEASURED 2026-10-15 in a debug
+  build: `redact::apply` on that 900x160 image took 37 ms and painted one region.
+  The full-screen figure in the Cost section is the one that applies to real use;
+  a release-build timing was not taken.

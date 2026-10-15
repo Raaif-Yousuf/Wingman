@@ -172,11 +172,32 @@ pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Resu
     })
 }
 
+/// The one way a screenshot becomes bytes a provider can receive (issue
+/// #103): when `redact` is true, private details (card numbers, IBANs,
+/// key-shaped tokens, emails) are painted over in `raw` itself first, then
+/// the pixels are encoded. Painting `raw` in place, not a copy, means the
+/// non-vision fallback's OCR over the same `raw` cannot read them back as
+/// text either. `redact` is false only when nothing can leave the machine
+/// (a local-only chain) or the user turned the setting off.
+///
+/// Fails closed: if redaction cannot run (OCR unavailable or timed out) this
+/// returns `Err` and the caller shows a card; no unchecked screenshot is
+/// ever encoded. Blocks on OCR when `redact` is true: worker thread only.
+///
+/// `encode` is private on purpose, so no caller can skip this. A
+/// source-scanning test in `app.rs` guards the call sites.
+pub fn encode_for_chain(raw: &mut RawShot, redact: bool) -> Result<Shot> {
+    if redact {
+        crate::redact::apply(raw)?;
+    }
+    encode(raw)
+}
+
 /// Encode a [`RawShot`] to PNG. The expensive half of the old `grab` --
 /// see [`RawShot`]'s doc comment for why the caller runs this on a worker
 /// thread, after the pending card is already shown, rather than inline with
 /// [`grab_raw`].
-pub fn encode(raw: &RawShot) -> Result<Shot> {
+fn encode(raw: &RawShot) -> Result<Shot> {
     let png = encode_png(&raw.rgba, raw.width, raw.height)?;
     Ok(Shot {
         png,

@@ -158,6 +158,7 @@ mod tests {
             y: 0.0,
             width: 1.0,
             height: 1.0,
+            words: Vec::new(),
         }
     }
 
