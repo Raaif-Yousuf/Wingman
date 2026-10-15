@@ -3,3 +3,19 @@ error[E0603]: tuple struct constructor `SendAuthorized` is private
    |
 55 |         super::confirm::SendAuthorized(()) // error[E0603]: tuple struct constructor is private
    |                         ^^^^^^^^^^^^^^ private tuple struct constructor
+   |
+  ::: tests/compile_fail/generated/confirm_no_inner_doc.rs
+   |
+   | pub struct SendAuthorized(());
+   |                           -- a constructor is private if any of the fields is private
+   |
+note: the tuple struct constructor `SendAuthorized` is defined here
+  --> tests/compile_fail/generated/confirm_no_inner_doc.rs
+   |
+   | pub struct SendAuthorized(());
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: consider making the field publicly accessible
+  --> tests/compile_fail/generated/confirm_no_inner_doc.rs
+   |
+   | pub struct SendAuthorized(pub ());
+   |                           +++
