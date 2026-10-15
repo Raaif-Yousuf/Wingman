@@ -200,28 +200,56 @@ pub struct UreqTransport;
 
 impl TokenTransport for UreqTransport {
     fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<(u16, String)> {
-        let class = crate::mode::classify_host(url);
-        let loopback = class == crate::mode::HostClass::Loopback;
+        let loopback = crate::mode::classify_host(url) == crate::mode::HostClass::Loopback;
         if !loopback && !url.starts_with("https://") {
             bail!("refusing to send credentials over plain http");
         }
-        if crate::mode::is_offline_now() && !loopback {
-            bail!("Offline mode blocked the sign-in request. Turn off Offline mode to connect an account.");
-        }
-        let mut response = ureq::post(url)
-            .config()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .build()
-            .send_form(form.iter().copied())
-            .map_err(|e| anyhow!("sign-in request failed: {e}"))?;
-        let status = response.status().as_u16();
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .context("could not read the sign-in response")?;
-        Ok((status, body))
+        crate::provider::common::offline_guard(url)?;
+        let bytes_sent: usize = form.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+        let result = send_form(url, form);
+        log_egress(url, bytes_sent, &result);
+        result
     }
+}
+
+fn send_form(url: &str, form: &[(&str, &str)]) -> Result<(u16, String)> {
+    let mut response = ureq::post(url)
+        .config()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .send_form(form.iter().copied())
+        .map_err(|e| anyhow!("sign-in request failed: {e}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .context("could not read the sign-in response")?;
+    Ok((status, body))
+}
+
+/// Records one sign-in request in the egress log: host, path, status and
+/// sizes only. The form and the reply carry the code, verifier and tokens, so
+/// neither is ever passed in.
+fn log_egress(url: &str, bytes_sent: usize, result: &Result<(u16, String)>) {
+    use crate::egress::{build_entry, record, Outcome};
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host_and_path = after_scheme.split(['?', '#']).next().unwrap_or("");
+    let (outcome, received, error) = match result {
+        Ok((status, body)) if (200..300).contains(status) => (Outcome::Success, body.len(), None),
+        Ok((status, body)) => (Outcome::Failure, body.len(), Some(format!("HTTP {status}"))),
+        Err(_) => (Outcome::Failure, 0, Some("transport error".to_string())),
+    };
+    record(&build_entry(
+        &format!("oauth {host_and_path}"),
+        url,
+        &Value::Null,
+        false,
+        bytes_sent,
+        received,
+        outcome,
+        error.as_deref(),
+    ));
 }
 
 // -- PKCE -------------------------------------------------------------------
@@ -356,8 +384,10 @@ enum Callback {
         code: String,
         state: String,
     },
+    /// `?error=...`; `state` is `None` when the request did not carry one.
     Denied {
         error: String,
+        state: Option<String>,
     },
 }
 
@@ -385,7 +415,7 @@ fn parse_callback(request_head: &str) -> Callback {
         }
     }
     if let Some(error) = error {
-        return Callback::Denied { error };
+        return Callback::Denied { error, state };
     }
     match (code, state) {
         (Some(code), Some(state)) => Callback::Code { code, state },
@@ -407,10 +437,19 @@ fn respond(stream: &mut TcpStream, status: &str, message: &str) {
     let _ = stream.write_all(response.as_bytes());
 }
 
+/// How long one connection may take to send its request line and headers,
+/// in total (a client that dribbles bytes cannot stretch it).
+const REQUEST_HEAD_BUDGET: Duration = Duration::from_secs(2);
+
 fn read_request_head(stream: &mut TcpStream) -> String {
+    let deadline = Instant::now() + REQUEST_HEAD_BUDGET;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     while buf.len() < MAX_REQUEST_BYTES && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
         match stream.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -419,56 +458,75 @@ fn read_request_head(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Waits for the redirect and returns the authorization code. Polls the
-/// non-blocking listener only while a sign-in is in progress.
+/// Waits for the redirect and returns the authorization code. The accept is
+/// blocking, so nothing runs while the user is in the browser; a watchdog
+/// thread wakes it by connecting to the port when `timeout` passes. Requests
+/// that are not the real redirect (wrong path, wrong or missing `state`,
+/// including an `error` with the wrong `state`) are answered and ignored, so
+/// another page on this PC cannot abort or complete a sign-in it did not
+/// start.
 fn wait_for_code(
     listener: &TcpListener,
     expected_state: &str,
     timeout: Duration,
 ) -> Result<String> {
-    listener.set_nonblocking(true)?;
     let deadline = Instant::now() + timeout;
+    let addr = listener.local_addr()?;
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx.recv_timeout(timeout) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            let _ = TcpStream::connect_timeout(&addr, Duration::from_secs(1));
+        }
+    });
+    let result = accept_until_redirect(listener, expected_state, deadline);
+    drop(done_tx);
+    let _ = watchdog.join();
+    result
+}
+
+fn accept_until_redirect(
+    listener: &TcpListener,
+    expected_state: &str,
+    deadline: Instant,
+) -> Result<String> {
+    let timed_out = || anyhow!("timed out waiting for sign-in to finish in the browser");
+    let state_ok = |s: &str| constant_time_eq(s.as_bytes(), expected_state.as_bytes());
     loop {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                stream.set_nonblocking(false)?;
-                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-                let head = read_request_head(&mut stream);
-                match parse_callback(&head) {
-                    Callback::Other => respond(&mut stream, "404 Not Found", "Not found."),
-                    Callback::Denied { error } => {
-                        respond(
-                            &mut stream,
-                            "200 OK",
-                            "Sign-in was not completed. You can close this tab.",
-                        );
-                        bail!("sign-in was not completed ({})", sanitize(&error));
-                    }
-                    Callback::Code { code, state } => {
-                        if !constant_time_eq(state.as_bytes(), expected_state.as_bytes()) {
-                            respond(&mut stream, "400 Bad Request", "Sign-in failed.");
-                            bail!("sign-in response had the wrong state value; ignored");
-                        }
-                        respond(
-                            &mut stream,
-                            "200 OK",
-                            "Wingman is connected. You can close this tab.",
-                        );
-                        return Ok(code);
-                    }
-                }
+        let (mut stream, _) = listener.accept().context("loopback listener failed")?;
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        let head = read_request_head(&mut stream);
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        match parse_callback(&head) {
+            Callback::Other => respond(&mut stream, "404 Not Found", "Not found."),
+            Callback::Denied {
+                error,
+                state: Some(state),
+            } if state_ok(&state) => {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "Sign-in was not completed. You can close this tab.",
+                );
+                bail!("sign-in was not completed ({})", sanitize(&error));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    bail!("timed out waiting for sign-in to finish in the browser");
-                }
-                std::thread::sleep(Duration::from_millis(50));
+            Callback::Code { code, state } if state_ok(&state) => {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "Wingman is connected. You can close this tab.",
+                );
+                return Ok(code);
             }
-            Err(e) => return Err(e).context("loopback listener failed"),
+            Callback::Denied { .. } | Callback::Code { .. } => {
+                respond(&mut stream, "400 Bad Request", "Sign-in failed.")
+            }
         }
     }
 }
-
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -492,13 +550,11 @@ struct TokenReply {
 fn parse_token_reply(status: u16, body: &str) -> Result<TokenReply> {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     if !(200..300).contains(&status) {
-        let error = v["error"].as_str().unwrap_or("unknown_error");
-        let desc = v["error_description"].as_str().unwrap_or("");
-        bail!(
-            "token endpoint refused the request (HTTP {status}): {} {}",
-            sanitize(error),
-            sanitize(desc)
-        );
+        return Err(anyhow::Error::new(TokenError {
+            status,
+            code: sanitize(v["error"].as_str().unwrap_or("unknown_error")),
+            description: sanitize(v["error_description"].as_str().unwrap_or("")),
+        }));
     }
     let token = v["access_token"]
         .as_str()
@@ -529,9 +585,32 @@ fn with_client<'a>(
     form
 }
 
-/// True when a refused request means the stored refresh token is dead.
+/// The token endpoint refused a request. Carries only the provider's `error`
+/// code and description, never the response body.
+#[derive(Debug)]
+struct TokenError {
+    status: u16,
+    code: String,
+    description: String,
+}
+
+impl std::fmt::Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "token endpoint refused the request (HTTP {}): {} {}",
+            self.status, self.code, self.description
+        )
+    }
+}
+
+impl std::error::Error for TokenError {}
+
+/// True only when the provider's own `error` code is `invalid_grant`, so the
+/// stored refresh token is dead. Compares the parsed code, never the text.
 fn is_invalid_grant(err: &anyhow::Error) -> bool {
-    err.to_string().contains("invalid_grant")
+    err.downcast_ref::<TokenError>()
+        .is_some_and(|e| e.code == "invalid_grant")
 }
 
 // -- Public flow ----------------------------------------------------------------
@@ -547,6 +626,8 @@ pub fn authorize(
     store: &dyn SecretStore,
     timeout: Duration,
 ) -> Result<AccessToken> {
+    // Before anything is opened or bound: Offline mode means no sign-in.
+    crate::provider::common::offline_guard(&provider.auth_url)?;
     let pkce = Pkce::generate()?;
     let state = random_state()?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("could not open a loopback port")?;
@@ -593,6 +674,7 @@ pub fn access_token(
     transport: &dyn TokenTransport,
     store: &dyn SecretStore,
 ) -> Result<AccessToken> {
+    crate::provider::common::offline_guard(&provider.token_url)?;
     let target = provider.credential_target();
     let refresh = store
         .get(&target)?
@@ -627,7 +709,8 @@ pub fn access_token(
 }
 
 /// Revokes the stored token at the provider (when it has a revocation
-/// endpoint) and always forgets it locally, even if the remote call fails.
+/// endpoint) and always forgets it locally, even if the remote call fails or
+/// Offline mode blocks it (the call then returns that error).
 #[allow(dead_code)]
 pub fn revoke(
     provider: &OAuthProvider,
@@ -639,8 +722,8 @@ pub fn revoke(
         return Ok(());
     };
     let remote = match &provider.revoke_url {
-        Some(url) => transport
-            .post_form(url, &[("token", &refresh)])
+        Some(url) => crate::provider::common::offline_guard(url)
+            .and_then(|()| transport.post_form(url, &[("token", &refresh)]))
             .and_then(|(status, _)| {
                 if (200..300).contains(&status) {
                     Ok(())
@@ -659,6 +742,17 @@ mod tests {
     use super::*;
     use crate::secrets::InMemoryStore;
     use std::sync::{Arc, Mutex};
+
+    /// Every test that reaches the Offline guard takes the shared mode lock
+    /// and pins the mode, so a test in another module that sets Offline
+    /// cannot leak into it.
+    fn online() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::mode::MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::mode::set_current(crate::mode::Mode::Auto);
+        guard
+    }
 
     // -- PKCE ------------------------------------------------------------
 
@@ -734,7 +828,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_callback("GET /?error=access_denied&state=s HTTP/1.1\r\n"),
-            Callback::Denied { error } if error == "access_denied"
+            Callback::Denied { error, state: Some(s) } if error == "access_denied" && s == "s"
         ));
         assert!(matches!(
             parse_callback("GET /favicon.ico HTTP/1.1\r\n"),
@@ -923,6 +1017,7 @@ mod tests {
 
     #[test]
     fn authorize_exchanges_the_code_with_the_matching_verifier_and_stores_only_the_refresh_token() {
+        let _mode = online();
         let ep = fake_endpoint(vec![(200, token_json("ACCESS1", Some("REFRESH1")))]);
         let provider = provider_at(&ep.base);
         let store = InMemoryStore::default();
@@ -971,32 +1066,209 @@ mod tests {
     }
 
     #[test]
-    fn authorize_rejects_a_wrong_state_and_never_calls_the_token_endpoint() {
-        let ep = fake_endpoint(vec![]);
+    fn authorize_ignores_forged_callbacks_and_still_completes_on_the_real_one() {
+        let _mode = online();
+        let ep = fake_endpoint(vec![(200, token_json("A", Some("R")))]);
         let store = InMemoryStore::default();
-        let browser = FakeBrowser::new(|_| "/?code=EVIL&state=forged".to_string());
-        let err = authorize(
+        // A forged code, a forged denial and a denial with no state arrive
+        // first; none may abort or complete the flow.
+        fn forged_then_real(url: &str) -> String {
+            let redirect = query_param(url, "redirect_uri");
+            let port: u16 = redirect
+                .trim_start_matches("http://127.0.0.1:")
+                .trim_end_matches('/')
+                .parse()
+                .unwrap();
+            for bad in [
+                "/?code=EVIL&state=forged",
+                "/?error=access_denied&state=forged",
+                "/?error=access_denied",
+                "/?code=EVIL",
+            ] {
+                assert!(http_get(port, bad).contains("400 Bad Request") || bad == "/?code=EVIL");
+            }
+            approve(url)
+        }
+        let token = authorize(
             &provider_at(&ep.base),
             &test_client(),
-            &browser,
+            &FakeBrowser::new(forged_then_real),
             &UreqTransport,
             &store,
             Duration::from_secs(10),
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("state"), "{err}");
-        assert!(ep.requests.lock().unwrap().is_empty());
-        assert!(store
-            .get(&provider_at(&ep.base).credential_target())
-            .unwrap()
-            .is_none());
+        .unwrap();
+        assert_eq!(token.secret(), "A");
+        let reqs = ep.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(form_value(&reqs[0].1, "code").unwrap(), "AUTHCODE");
     }
 
     #[test]
+    fn a_slow_dribbling_client_cannot_hold_the_flow_past_the_timeout() {
+        let _mode = online();
+        struct Dribbler;
+        impl BrowserOpener for Dribbler {
+            fn open(&self, url: &str) -> Result<()> {
+                let redirect = query_param(url, "redirect_uri");
+                let port: u16 = redirect
+                    .trim_start_matches("http://127.0.0.1:")
+                    .trim_end_matches('/')
+                    .parse()
+                    .unwrap();
+                std::thread::spawn(move || {
+                    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                    for _ in 0..40 {
+                        if s.write_all(b"X").is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                });
+                Ok(())
+            }
+        }
+        let started = Instant::now();
+        let err = authorize(
+            &provider_at("http://127.0.0.1:1"),
+            &test_client(),
+            &Dribbler,
+            &UreqTransport,
+            &InMemoryStore::default(),
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    struct CountingBrowser(std::sync::atomic::AtomicUsize);
+    impl BrowserOpener for CountingBrowser {
+        fn open(&self, _: &str) -> Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct CountingTransport(std::sync::atomic::AtomicUsize);
+    impl TokenTransport for CountingTransport {
+        fn post_form(&self, _: &str, _: &[(&str, &str)]) -> Result<(u16, String)> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((200, "{}".into()))
+        }
+    }
+
+    fn offline_google() -> std::sync::MutexGuard<'static, ()> {
+        let guard = online();
+        crate::mode::set_current(crate::mode::Mode::Offline);
+        guard
+    }
+
+    #[test]
+    fn offline_mode_blocks_authorize_before_the_browser_opens() {
+        let _mode = offline_google();
+        let browser = CountingBrowser(Default::default());
+        let result = authorize(
+            &OAuthProvider::google(),
+            &test_client(),
+            &browser,
+            &UreqTransport,
+            &InMemoryStore::default(),
+            Duration::from_millis(200),
+        );
+        crate::mode::set_current(crate::mode::Mode::Auto);
+        assert!(result.unwrap_err().to_string().contains("Offline"));
+        assert_eq!(browser.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn offline_mode_blocks_a_silent_refresh() {
+        let _mode = offline_google();
+        let provider = OAuthProvider::google();
+        let store = InMemoryStore::default();
+        store.set(&provider.credential_target(), "KEEP").unwrap();
+        let transport = CountingTransport(Default::default());
+        let result = access_token(&provider, &test_client(), &transport, &store);
+        crate::mode::set_current(crate::mode::Mode::Auto);
+        assert!(result.is_err());
+        assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(is_connected(&provider, &store).unwrap());
+    }
+
+    #[test]
+    fn offline_mode_skips_the_remote_revoke_but_still_forgets_locally() {
+        let _mode = offline_google();
+        let provider = OAuthProvider::google();
+        let store = InMemoryStore::default();
+        store.set(&provider.credential_target(), "BYE").unwrap();
+        let transport = CountingTransport(Default::default());
+        let result = revoke(&provider, &transport, &store);
+        crate::mode::set_current(crate::mode::Mode::Auto);
+        assert!(result.is_err());
+        assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!is_connected(&provider, &store).unwrap());
+    }
+
+    #[test]
+    fn a_transient_error_that_mentions_invalid_grant_keeps_the_refresh_token() {
+        let _mode = online();
+        let ep = fake_endpoint(vec![(
+            503,
+            "{\"error\":\"temporarily_unavailable\",\"error_description\":\"not invalid_grant\"}"
+                .into(),
+        )]);
+        let provider = provider_at(&ep.base);
+        let store = InMemoryStore::default();
+        store.set(&provider.credential_target(), "KEEP").unwrap();
+        assert!(access_token(&provider, &test_client(), &UreqTransport, &store).is_err());
+        assert!(is_connected(&provider, &store).unwrap());
+    }
+
+    #[test]
+    fn only_files_that_must_use_ureq_mention_it() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root];
+        let mut scanned = 0;
+        let mut users = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let text = std::fs::read_to_string(&path).unwrap().replace('\r', "");
+                    scanned += 1;
+                    if text.contains("ureq::") || text.contains("use ureq") {
+                        users.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        assert!(scanned > 10, "scanned only {scanned} files");
+        users.sort();
+        assert_eq!(
+            users,
+            ["common.rs", "oauth.rs"],
+            "ureq may only be used in provider/common.rs and connectors/oauth.rs, \
+             which carry the Offline guard"
+        );
+    }
+    #[test]
+
     fn authorize_reports_a_denied_consent_without_the_endpoint() {
+        let _mode = online();
         let ep = fake_endpoint(vec![]);
         let store = InMemoryStore::default();
-        let browser = FakeBrowser::new(|_| "/?error=access_denied".to_string());
+        let browser = FakeBrowser::new(|url| {
+            format!(
+                "/?error=access_denied&state={}",
+                pct_encode(&query_param(url, "state"))
+            )
+        });
         let err = authorize(
             &provider_at(&ep.base),
             &test_client(),
@@ -1011,6 +1283,7 @@ mod tests {
 
     #[test]
     fn authorize_ignores_a_stray_request_and_still_gets_the_real_redirect() {
+        let _mode = online();
         let ep = fake_endpoint(vec![(200, token_json("A", Some("R")))]);
         let store = InMemoryStore::default();
         // Hits a wrong path first, then the real redirect.
@@ -1038,6 +1311,7 @@ mod tests {
 
     #[test]
     fn authorize_times_out_when_nobody_finishes_sign_in() {
+        let _mode = online();
         struct Silent;
         impl BrowserOpener for Silent {
             fn open(&self, _: &str) -> Result<()> {
@@ -1059,6 +1333,7 @@ mod tests {
 
     #[test]
     fn authorize_fails_when_the_provider_returns_no_refresh_token() {
+        let _mode = online();
         let ep = fake_endpoint(vec![(200, token_json("A", None))]);
         let store = InMemoryStore::default();
         let err = authorize(
@@ -1075,6 +1350,7 @@ mod tests {
 
     #[test]
     fn a_refused_exchange_reports_the_error_code_but_not_the_response_body() {
+        let _mode = online();
         let ep = fake_endpoint(vec![(
             400,
             "{\"error\":\"invalid_request\",\"error_description\":\"bad\",\"access_token\":\"LEAK\"}"
@@ -1101,6 +1377,7 @@ mod tests {
 
     #[test]
     fn access_token_refreshes_silently_and_stores_a_rotated_refresh_token() {
+        let _mode = online();
         let ep = fake_endpoint(vec![(200, token_json("ACCESS2", Some("REFRESH2")))]);
         let provider = provider_at(&ep.base);
         let store = InMemoryStore::default();
@@ -1122,6 +1399,7 @@ mod tests {
 
     #[test]
     fn access_token_without_a_stored_token_says_to_sign_in() {
+        let _mode = online();
         let err = access_token(
             &provider_at("http://127.0.0.1:1"),
             &test_client(),
@@ -1134,6 +1412,7 @@ mod tests {
 
     #[test]
     fn invalid_grant_forgets_the_dead_refresh_token() {
+        let _mode = online();
         let ep = fake_endpoint(vec![(400, "{\"error\":\"invalid_grant\"}".into())]);
         let provider = provider_at(&ep.base);
         let store = InMemoryStore::default();
@@ -1145,6 +1424,7 @@ mod tests {
 
     #[test]
     fn a_transient_refresh_failure_keeps_the_refresh_token() {
+        let _mode = online();
         let ep = fake_endpoint(vec![(
             503,
             "{\"error\":\"temporarily_unavailable\"}".into(),
@@ -1158,6 +1438,7 @@ mod tests {
 
     #[test]
     fn revoke_posts_the_token_and_forgets_it() {
+        let _mode = online();
         let ep = fake_endpoint(vec![(200, "{}".into())]);
         let provider = provider_at(&ep.base);
         let store = InMemoryStore::default();
@@ -1171,6 +1452,7 @@ mod tests {
 
     #[test]
     fn revoke_forgets_locally_even_when_the_provider_call_fails() {
+        let _mode = online();
         let ep = fake_endpoint(vec![(500, "{}".into())]);
         let provider = provider_at(&ep.base);
         let store = InMemoryStore::default();
@@ -1181,6 +1463,7 @@ mod tests {
 
     #[test]
     fn revoke_without_a_revocation_endpoint_only_forgets_locally() {
+        let _mode = online();
         let provider = OAuthProvider::microsoft();
         let store = InMemoryStore::default();
         store.set(&provider.credential_target(), "BYE").unwrap();
@@ -1199,12 +1482,16 @@ mod tests {
 
     #[test]
     fn real_transport_refuses_plain_http_to_a_non_loopback_host() {
-        let err = UreqTransport
-            .post_form("http://example.com/token", &[("a", "b")])
-            .unwrap_err();
-        assert!(err.to_string().contains("plain http"), "{err}");
+        let _mode = online();
+        for mode in [crate::mode::Mode::Auto, crate::mode::Mode::Offline] {
+            crate::mode::set_current(mode);
+            let err = UreqTransport
+                .post_form("http://example.com/token", &[("a", "b")])
+                .unwrap_err();
+            assert!(err.to_string().contains("plain http"), "{mode:?}: {err}");
+        }
+        crate::mode::set_current(crate::mode::Mode::Auto);
     }
-
     #[test]
     fn shell_browser_refuses_a_non_https_url() {
         assert!(ShellBrowser
