@@ -5,6 +5,7 @@
 //! See `docs/superpowers/specs/2026-09-17-action-model-design.md` for the
 //! rules this file implements and why.
 
+pub mod action_items;
 pub mod calendar;
 pub mod extract_text;
 pub mod fill_form;
@@ -224,6 +225,9 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `form_fill`, executor `fill_form` (#33, already shipped). See
 ///   `actions::fill_form`'s own module doc comment for the two-stage
 ///   (local-then-model) proposal it builds.
+/// - `"action-items-checklist"` (#314, `action_items::builtin_action`):
+///   proposal `action_items`, executor `clipboard`. Runs through the generic
+///   dispatch path (`App::run_generic_action`), like an `actions.toml` entry.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -271,6 +275,7 @@ pub fn builtin_actions() -> Vec<Action> {
         calendar::builtin_action(),
         review_email::builtin_action(),
         fill_form::builtin_action(),
+        action_items::builtin_action(),
     ]
 }
 
@@ -464,9 +469,10 @@ mod tests {
         let builtins = builtin_actions();
         assert_eq!(
             builtins.len(),
-            6,
+            7,
             "check-my-work, extract-text-to-clipboard (#41), read-qr-code (#313), \
-             add-to-calendar (#39), review-this-email (#38), fill-this-form (#40)"
+             add-to-calendar (#39), review-this-email (#38), fill-this-form (#40), \
+             action-items-checklist (#314)"
         );
         // Found by id, not by position, so this stays valid regardless of
         // what order the built-ins are in.

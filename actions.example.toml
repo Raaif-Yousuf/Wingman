@@ -110,3 +110,21 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "action-items-checklist"
+name = "Action items to checklist"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "action_items"
+executor = "clipboard"
+confirm = true
+prompt = """You are shown notes, an email thread, a chat message or a project page (as text, or as a screenshot if no text was selected). Find the action items: things a named person, or the reader, has to do. Return them in `items`, one short plain-text line per action item, in the order they appear, written as "Owner: task (due)". Use the owner's name exactly as shown; write "Me" when the text assigns it to the reader or to nobody in particular. Add the "(due)" part only when the screen states a date or deadline for that item, and copy it as written (for example "Fri" or "Oct 3"); never work out, guess or invent a date, and leave it off when none is shown. Do not include items that are already marked done, decisions, or general discussion. If there are no action items, return an empty list. Do not add bullets, numbers or checkbox characters: they are added for you. Use plain text only: no markdown, no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead)."""
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"

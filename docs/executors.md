@@ -65,6 +65,12 @@ no-em-dash prose (rule 11): it is the text a result card shows.
 pub fn resolve(name: &str) -> anyhow::Result<Box<dyn Executor>>
 ```
 
+The `"clipboard"` executor copies the confirmed proposal's `text` string. If
+there is no `text`, it reads `items` (an array of strings, or a newline-joined
+string) and copies them as a Markdown checklist, one `- [ ] ` line per item.
+`text` wins when both are present. A proposal with neither, or with no items,
+is an error and nothing is written to the clipboard.
+
 A plain `match` over the known names -- `"none"`, `"clipboard"`,
 `"calendar_add"`, `"image_clipboard"`, `"replace_text"`, `"fill_form"` --
 each constructing a fresh boxed executor. An unknown name (a typo in

@@ -67,6 +67,67 @@ pub const WM_APP_PALETTE_TOGGLE: u32 = WM_APP + 10;
 
 pub const HK_PRIMARY: usize = 1;
 pub const HK_SECONDARY: usize = 2;
+/// Learn-mode slot for the pause-toggle chord (issue #202). Only ever used as
+/// the `which` of [`HotkeyHook::start_learning`] / [`WM_APP_LEARNED`]: the
+/// hook never posts it in [`WM_APP_HOTKEY`], because a pause press has its
+/// own message ([`WM_APP_PAUSE_TOGGLE`]).
+pub const HK_PAUSE: usize = 3;
+
+/// Human name of a learn-mode slot, for the "Press the ... now" card.
+pub fn slot_name(which: usize) -> &'static str {
+    match which {
+        HK_PRIMARY => "Copilot key",
+        HK_SECONDARY => "secondary key",
+        _ => "pause key",
+    }
+}
+
+/// Stores a learned chord into the config slot `which` names.
+pub fn apply_learned(hotkeys: &mut crate::config::Hotkeys, which: usize, chord: Chord) {
+    match which {
+        HK_PRIMARY => hotkeys.primary = chord,
+        HK_SECONDARY => hotkeys.secondary = chord,
+        _ => hotkeys.pause = Some(chord),
+    }
+}
+
+/// The pause chord is matched before primary/secondary in `hook_proc`, so a
+/// pause chord equal to either would silently take that hotkey over (and a
+/// primary/secondary learned onto the pause chord would never fire). Returns
+/// the name of the other slot that learning `chord` into `which` would
+/// collide with, or `None`. Only collisions that involve the pause slot are
+/// checked; primary and secondary sharing a chord is not this function's job.
+pub fn pause_clash(
+    hotkeys: &crate::config::Hotkeys,
+    which: usize,
+    chord: Chord,
+) -> Option<&'static str> {
+    if which == HK_PAUSE {
+        if hotkeys.primary == chord {
+            return Some(slot_name(HK_PRIMARY));
+        }
+        if hotkeys.secondary == chord {
+            return Some(slot_name(HK_SECONDARY));
+        }
+        if hotkeys.palette == Some(chord) {
+            return Some("palette key");
+        }
+        None
+    } else if hotkeys.pause == Some(chord) {
+        Some(slot_name(HK_PAUSE))
+    } else {
+        None
+    }
+}
+
+/// Tray label text for the pause binding: the chord, or "not set" so an
+/// unbound pause key reads differently from a bound one.
+pub fn pause_binding_label(pause: Option<&Chord>) -> String {
+    match pause {
+        Some(c) => chord_to_string(c),
+        None => "not set".to_string(),
+    }
+}
 
 /// `dwExtraInfo` tag applied to every synthetic input event Wingman itself
 /// injects via `SendInput`, anywhere in the crate -- the ONE constant every
@@ -1048,6 +1109,92 @@ mod tests {
         let bare_ctrl_hotkey = chord(VK_CONTROL.0 as u32, false, false, false, false);
         assert!(matches(&bare_ctrl_hotkey, &bare_ctrl_hotkey));
         assert!(is_own_synthetic_input(INJECTED_MARKER));
+    }
+
+    // -- pause-key learn slot (issue #202) ----------------------------------
+
+    fn default_hotkeys() -> crate::config::Hotkeys {
+        crate::config::Hotkeys::default()
+    }
+
+    #[test]
+    fn slot_names_are_distinct_and_pause_is_named() {
+        assert_eq!(slot_name(HK_PRIMARY), "Copilot key");
+        assert_eq!(slot_name(HK_SECONDARY), "secondary key");
+        assert_eq!(slot_name(HK_PAUSE), "pause key");
+    }
+
+    #[test]
+    fn slot_ids_are_pairwise_unique() {
+        assert_ne!(HK_PRIMARY, HK_SECONDARY);
+        assert_ne!(HK_PRIMARY, HK_PAUSE);
+        assert_ne!(HK_SECONDARY, HK_PAUSE);
+    }
+
+    #[test]
+    fn apply_learned_writes_only_the_named_slot() {
+        let c = chord(0x13, false, false, false, false);
+
+        let mut h = default_hotkeys();
+        apply_learned(&mut h, HK_PAUSE, c);
+        assert_eq!(h.pause, Some(c));
+        assert_eq!(h.primary, default_hotkeys().primary);
+        assert_eq!(h.secondary, default_hotkeys().secondary);
+
+        let mut h = default_hotkeys();
+        apply_learned(&mut h, HK_PRIMARY, c);
+        assert_eq!(h.primary, c);
+        assert_eq!(h.pause, None);
+
+        let mut h = default_hotkeys();
+        apply_learned(&mut h, HK_SECONDARY, c);
+        assert_eq!(h.secondary, c);
+        assert_eq!(h.pause, None);
+    }
+
+    #[test]
+    fn pause_clash_is_reported_in_both_directions() {
+        let mut h = default_hotkeys();
+        let secondary = h.secondary;
+        // Learning pause onto an existing primary/secondary chord.
+        assert_eq!(pause_clash(&h, HK_PAUSE, secondary), Some("secondary key"));
+        assert_eq!(pause_clash(&h, HK_PAUSE, h.primary), Some("Copilot key"));
+        // Learning primary onto an already-bound pause chord.
+        let p = chord(0x13, false, false, false, false);
+        h.pause = Some(p);
+        assert_eq!(pause_clash(&h, HK_PRIMARY, p), Some("pause key"));
+        assert_eq!(pause_clash(&h, HK_SECONDARY, p), Some("pause key"));
+    }
+
+    #[test]
+    fn pause_clash_ignores_unrelated_chords_and_unset_pause() {
+        let h = default_hotkeys();
+        let free = chord(0x13, false, false, false, false);
+        assert_eq!(pause_clash(&h, HK_PAUSE, free), None);
+        assert_eq!(pause_clash(&h, HK_PRIMARY, free), None);
+        // Re-learning the pause slot onto its own current chord is not a clash.
+        let mut h = default_hotkeys();
+        h.pause = Some(free);
+        assert_eq!(pause_clash(&h, HK_PAUSE, free), None);
+        // primary == secondary is pre-existing behaviour, not this check's job.
+        assert_eq!(pause_clash(&h, HK_PRIMARY, h.secondary), None);
+    }
+
+    #[test]
+    fn pause_clash_includes_the_palette_chord() {
+        let mut h = default_hotkeys();
+        let p = chord(0x20, true, false, false, true);
+        h.palette = Some(p);
+        assert_eq!(pause_clash(&h, HK_PAUSE, p), Some("palette key"));
+        let free = chord(0x13, false, false, false, false);
+        assert_eq!(pause_clash(&h, HK_PAUSE, free), None);
+    }
+
+    #[test]
+    fn pause_binding_label_distinguishes_unset_from_set() {
+        assert_eq!(pause_binding_label(None), "not set");
+        let c = chord(0x13, true, false, false, false);
+        assert_eq!(pause_binding_label(Some(&c)), "Ctrl+VK(0x13)");
     }
 
     // -- every SendInput call site tags its INPUT (issue #209) --------------

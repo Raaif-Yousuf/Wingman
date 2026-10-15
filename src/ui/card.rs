@@ -104,8 +104,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
-    WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    WM_SETTINGCHANGE, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -767,6 +767,31 @@ fn detect_theme() -> Theme {
     }
 }
 
+/// Whether a `WM_SETTINGCHANGE` names the light/dark switch. Windows sends
+/// `"ImmersiveColorSet"` in `lparam` when the user changes app mode or the
+/// accent color.
+fn setting_change_is_theme(name: &str) -> bool {
+    name == "ImmersiveColorSet"
+}
+
+/// The text of a `WM_SETTINGCHANGE` `lparam` (a null-terminated UTF-16
+/// string, or null for the broadcasts that carry none).
+///
+/// # Safety
+/// `lparam` must be zero or point at a null-terminated UTF-16 string, which
+/// is what Windows guarantees for this message.
+unsafe fn setting_change_name(lparam: LPARAM) -> String {
+    let ptr = lparam.0 as *const u16;
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+}
+
 const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
 
 fn hkey_current_user() -> *mut c_void {
@@ -1200,10 +1225,8 @@ struct CardInner {
     /// Issue #350: the brush WM_CTLCOLOREDIT returns for preview EDIT
     /// fields, matching `self.theme`. Created lazily on first use and cached
     /// rather than created per-paint (WM_CTLCOLOREDIT fires on every
-    /// keystroke and repaint), and deleted once in WM_NCDESTROY -- the theme
-    /// never changes for the lifetime of a card window (no WM_SETTINGCHANGE
-    /// handler exists), so one brush for the window's whole life is correct,
-    /// not just an optimisation.
+    /// keystroke and repaint), and deleted in WM_NCDESTROY, or earlier when
+    /// a live theme change (`apply_theme`, #431) makes its color stale.
     edit_bg_brush: HBRUSH,
     /// Issue #354: which sub-stage the Pending state is in. Meaningless
     /// outside `CardState::Pending`; set to whatever stage the caller passed
@@ -1212,9 +1235,8 @@ struct CardInner {
     pending_stage: PendingStage,
     /// Issue #354: whether Windows' "Animation effects" setting was on the
     /// last time `show_pending` queried it (`client_area_animation_enabled`,
-    /// checked once per Pending session, not re-polled -- there is no
-    /// `WM_SETTINGCHANGE` handler in this module, matching `theme`'s own
-    /// once-per-window-life treatment noted on `edit_bg_brush` above). With
+    /// checked once per Pending session, not re-polled: its
+    /// `WM_SETTINGCHANGE` is not handled, only the theme's is). With
     /// it `false`, `paint_pending` draws a static glyph and `show_pending`
     /// never arms `TIMER_ANIM`.
     animations_enabled: bool,
@@ -1461,6 +1483,31 @@ impl CardInner {
             // ..." -> "Still working." countdown never outlives the card
             // state it belongs to.
             let _ = KillTimer(Some(self.hwnd), TIMER_STILL_WORKING);
+        }
+    }
+
+    /// Switches to `theme`: drops the cached EDIT brush (it holds the old
+    /// theme's color; `WM_CTLCOLOREDIT` rebuilds it) and repaints the card
+    /// and its preview fields.
+    fn apply_theme(&mut self, theme: Theme) {
+        if theme == self.theme {
+            return;
+        }
+        self.theme = theme;
+        if !self.edit_bg_brush.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.edit_bg_brush.0));
+            }
+            self.edit_bg_brush = HBRUSH(std::ptr::null_mut());
+        }
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ALLCHILDREN,
+            );
         }
     }
 
@@ -2523,6 +2570,15 @@ impl CardInner {
                 self.on_speech_end();
                 Some(LRESULT(0))
             }
+            // #431: the light/dark switch. Event-driven (no timer, rule 5):
+            // Windows broadcasts this to every top-level window, so the card
+            // hears it even while hidden.
+            WM_SETTINGCHANGE => {
+                if setting_change_is_theme(&unsafe { setting_change_name(lparam) }) {
+                    self.apply_theme(detect_theme());
+                }
+                Some(LRESULT(0))
+            }
             WM_DPICHANGED => {
                 let new_dpi = (wparam.0 & 0xFFFF) as u32;
                 self.dpi = new_dpi.max(1);
@@ -2603,6 +2659,7 @@ impl CardInner {
             edit_btn: None,
             previous_foreground,
             main_window_exists,
+            error: None,
         });
         // #225: from here until a decision is reported, tearing this
         // preview down is an abandonment and the owner has to be told. Set
@@ -2654,6 +2711,36 @@ impl CardInner {
             // invented here.
             return;
         }
+        let type_errors = preview.model.type_error_fields();
+        if !type_errors.is_empty() {
+            // #284: an edit that cannot be read as its field's declared type
+            // (a number field holding "abc") is never confirmed as a string.
+            // The preview stays open with every other edit intact, the
+            // problem is shown in place of the title, and the first bad
+            // field takes focus.
+            let message = type_errors
+                .iter()
+                .map(|(_, m)| m.as_str())
+                .collect::<Vec<_>>()
+                .join(". ");
+            let first_bad = type_errors[0].0.clone();
+            preview.error = Some(message);
+            let target = preview
+                .edits
+                .iter()
+                .find(|(name, _)| *name == first_bad)
+                .map(|(_, hwnd)| *hwnd);
+            if let Some(hwnd) = target {
+                unsafe {
+                    let _ = SetFocus(Some(hwnd));
+                }
+            }
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, false);
+            }
+            return;
+        }
+        preview.error = None;
         let shown = preview.model.to_value();
         let confirmed = crate::ui::confirm::confirm_preview(
             &preview.model,
@@ -3131,9 +3218,12 @@ impl CardInner {
         let title_rect = metrics.title_rect;
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
+        if preview.error.is_some() {
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(rgb(224, 82, 82)));
+        }
         draw_text_line(
             hdc,
-            &preview.title,
+            preview.error.as_deref().unwrap_or(&preview.title),
             title_rect,
             DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
@@ -3235,6 +3325,9 @@ struct PreviewUi {
     /// Whether Wingman's main window exists yet -- gates whether the "Edit"
     /// button is created enabled. See `Card::show_preview`'s doc comment.
     main_window_exists: bool,
+    /// An edit that cannot be read as its field's type (#284), shown in place
+    /// of the title until "Do it" is pressed again with every edit valid.
+    error: Option<String>,
 }
 
 struct PreviewRowMetrics {
@@ -4065,6 +4158,66 @@ mod tests {
             !queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS),
             "an answer card has no Copy details to activate"
         );
+    }
+
+    // -- live theme change (#431) ------------------------------------------
+
+    fn opposite(theme: Theme) -> Theme {
+        match theme {
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::Light,
+        }
+    }
+
+    #[test]
+    fn a_theme_setting_change_makes_the_card_re_read_the_theme() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let detected = detect_theme();
+        card.inner.theme = opposite(detected);
+        let name = wide_z("ImmersiveColorSet");
+
+        let handled =
+            card.handle_message(WM_SETTINGCHANGE, WPARAM(0), LPARAM(name.as_ptr() as isize));
+
+        assert!(handled.is_some());
+        assert_eq!(card.inner.theme, detected);
+    }
+
+    #[test]
+    fn an_unrelated_setting_change_leaves_the_theme_alone() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let forced = opposite(detect_theme());
+        card.inner.theme = forced;
+        let name = wide_z("intl");
+
+        card.handle_message(WM_SETTINGCHANGE, WPARAM(0), LPARAM(name.as_ptr() as isize));
+        card.handle_message(WM_SETTINGCHANGE, WPARAM(0), LPARAM(0));
+
+        assert_eq!(card.inner.theme, forced);
+    }
+
+    #[test]
+    fn a_new_theme_drops_the_cached_edit_brush() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let detected = detect_theme();
+        card.inner.theme = opposite(detected);
+        card.inner.edit_bg_brush =
+            unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x0012_3456)) };
+        let name = wide_z("ImmersiveColorSet");
+
+        card.handle_message(WM_SETTINGCHANGE, WPARAM(0), LPARAM(name.as_ptr() as isize));
+
+        assert!(
+            card.inner.edit_bg_brush.0.is_null(),
+            "the cached brush is the old theme's color and must be rebuilt"
+        );
+    }
+
+    #[test]
+    fn only_the_immersive_color_set_setting_is_a_theme_change() {
+        assert!(setting_change_is_theme("ImmersiveColorSet"));
+        assert!(!setting_change_is_theme("intl"));
+        assert!(!setting_change_is_theme(""));
     }
 
     #[test]
@@ -5022,6 +5175,69 @@ mod tests {
         // as every other best-effort Win32 call in this module.
         card.inner.preview_do_it();
         assert!(card.take_confirmed().is_some());
+    }
+
+    #[test]
+    fn preview_do_it_with_an_unparseable_typed_edit_stays_open_and_confirms_nothing() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer", "editable": true },
+                "note": { "type": "string", "editable": true }
+            }
+        });
+        let value = serde_json::json!({ "count": 3, "note": "keep me" });
+        card.inner.show_preview("Typed", &schema, &value, false);
+        let set_text = |hwnd: HWND, s: &str| {
+            let text: Vec<u16> = format!("{s}\0").encode_utf16().collect();
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                    hwnd,
+                    windows::core::PCWSTR(text.as_ptr()),
+                );
+            }
+        };
+        let (count_edit, note_edit) = {
+            let p = card.inner.preview.as_ref().expect("preview");
+            (p.edits[0].1, p.edits[1].1)
+        };
+        set_text(count_edit, "abc");
+        set_text(note_edit, "edited note");
+        card.inner.preview_do_it();
+        assert!(card.take_confirmed().is_none(), "nothing may be confirmed");
+        assert_eq!(card.state(), CardState::Preview, "the preview stays open");
+        let p = card.inner.preview.as_ref().expect("preview still there");
+        assert_eq!(
+            p.error.as_deref(),
+            Some("Count must be a whole number"),
+            "the problem is shown inline"
+        );
+        assert_eq!(
+            p.model.to_value()["note"],
+            "edited note",
+            "other edits survive"
+        );
+
+        set_text(count_edit, "4");
+        card.inner.preview_do_it();
+        let confirmed = card.take_confirmed().expect("confirmed after the fix");
+        assert_eq!(confirmed.value()["count"], serde_json::json!(4));
+        assert_eq!(confirmed.value()["note"], "edited note");
+    }
+
+    #[test]
+    fn preview_do_it_keeps_a_typed_field_typed() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "count": { "type": "integer", "editable": true } }
+        });
+        card.inner
+            .show_preview("Typed", &schema, &serde_json::json!({ "count": 3 }), false);
+        card.inner.preview_do_it();
+        let confirmed = card.take_confirmed().expect("confirmed");
+        assert_eq!(confirmed.value()["count"], serde_json::json!(3));
     }
 
     #[test]

@@ -28,7 +28,7 @@ about Wingman is checked against the code in this repo, not aspirational.
 |---|---|---|
 | **Footprint** | A tray icon, about 3.5 MB, 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
 | **Verifiable** | Offline mode refuses any non-loopback network call in code, enforced before a socket ever opens (see [`docs/offline.md`](docs/offline.md)). Open source under MIT: read the code yourself | Copilot Vision sends the screen to Microsoft's servers. Windows Recall shipped plaintext screenshots and had to be pulled twice before relaunching opt-in |
-| **Extensible** | An action is a small, readable definition: a prompt, an input list and an executor. Six built-in actions ship today (check my work, add event from screen, review this email, fill this form, copy text from screen, read QR code from screen); a hand-written `actions.toml` entry parses and shows in the palette but does not yet dispatch on confirm (issue #242). The framework is the product, actions are the contribution surface | Closed |
+| **Extensible** | An action is a small, readable definition: a prompt, an input list and an executor. Seven built-in actions ship today (check my work, add event from screen, review this email, fill this form, copy text from screen, read QR code from screen, action items to checklist); a hand-written `actions.toml` entry parses and shows in the palette but does not yet dispatch on confirm (issue #242). The framework is the product, actions are the contribution surface | Closed |
 | **Never the final button** | Fills, drafts and proposes. Never presses Send, Submit, Buy or Pay: a permanent rule, not a version-1 limit to be relaxed later | Copilot Actions and other "agent" products sell autonomy |
 | **Not a chatbot** | One press, one action, one card, done. No conversation view, no follow-up question | Copilot is a chat pane first, everything else second |
 | **Bring your own model** | OpenAI, Anthropic, Gemini, a local Ollama model, or any OpenAI-compatible endpoint (OpenRouter, Groq, LM Studio, llama.cpp, vLLM, ...) today. No account or subscription required for the app itself | Recall and Click to Do require a 40+ TOPS NPU; the strongest models sit behind Copilot Pro |
@@ -46,7 +46,7 @@ about Wingman is checked against the code in this repo, not aspirational.
 
 ## What works today
 
-Six built-in actions, built and running, all reachable from the tray menu:
+Seven built-in actions, built and running, all reachable from the tray menu:
 
 - **Check my work**: press the key, Wingman screenshots your active
   monitor, sends it to a vision model with a prompt tuned for checking a
@@ -70,7 +70,7 @@ Six built-in actions, built and running, all reachable from the tray menu:
 
 The confirm-and-execute loop, the executors (calendar add, form fill, text
 replace, image-to-clipboard) and the actions framework itself
-(`actions.toml`, six built-in actions loadable today) are built and wired,
+(`actions.toml`, seven built-in actions loadable today) are built and wired,
 not planned. What has landed alongside those actions:
 
 - **Four providers plus any OpenAI-compatible endpoint**: OpenAI, Anthropic
@@ -116,7 +116,7 @@ It fills, drafts and proposes; you finish. That rule is permanent, not a
 version-1 limitation to be relaxed later.
 
 Planned and not yet built: dispatch for an arbitrary hand-written
-`actions.toml` entry beyond the six built-in ids (issue #242), more
+`actions.toml` entry beyond the seven built-in ids (issue #242), more
 connectors beyond ics, and awareness. The actions-as-data framework, the
 confirm-and-execute loop, the built executors and the ics connector are
 built; see "What works today" above. Track what remains in
@@ -229,7 +229,8 @@ saved. Same for the secondary binding.
 
 A third, optional chord toggles Pause: running -> paused until resumed;
 paused, for any reason -> resume. Unlike primary/secondary it has no default
-binding and no tray "Set..." entry yet, so set it by hand in `config.toml`:
+binding. Use **Set pause key...** in the tray menu and press the key, or set
+it by hand in `config.toml`:
 
 ```toml
 [hotkeys.pause]
@@ -240,7 +241,9 @@ alt = false
 win = false
 ```
 
-then **Reload settings** (or restart) to pick it up. It is the one chord
+then **Reload settings** (or restart) to pick it up. The tray label shows
+the current key, or "not set". To clear it, delete the `[hotkeys.pause]`
+table from `config.toml` and choose **Reload settings**. It is the one chord
 that still works while paused.
 
 ### Through Windows Settings instead
@@ -275,8 +278,8 @@ call every boot. With start-with-Windows on it is always running anyway.
 - **Mode ▸**: Cloud / Local / Auto / Offline, radio-checked
 - **Pause ▸**: 1 hour / until tomorrow / until resumed; shown as **Resume**
   instead while already paused
-- **Set Copilot key...** / **Set secondary key...**: rebind by pressing the
-  key
+- **Set Copilot key...** / **Set secondary key...** / **Set pause key...**:
+  rebind by pressing the key
 - **Edit settings**: opens `config.toml`
 - **Reload settings**: re-read the file without restarting
 - **Quit**
@@ -298,7 +301,7 @@ call every boot. With start-with-Windows on it is always running anyway.
 | `ui.card_monitor` | `"cursor"` | which monitor the card appears on: `"cursor"` (the one the mouse is on), `"primary"`, or `"1"`, `"2"`, ... counting monitors left to right (not the numbers in Windows Settings, and they shift if you rearrange or dock monitors). Ignored by `follow_mouse` |
 | `providers.*.models` | see file | what the tray's model submenu offers (Ollama has no list; it uses `providers.ollama.model` directly) |
 | `ui.prompt` | see file | the system prompt, edit it to change what it checks |
-| `hotkeys.pause` | unset (absent from the file) | optional third chord: toggles Pause until resumed / Resume; no default, no tray learn button yet, see [Hotkeys](#hotkeys) |
+| `hotkeys.pause` | unset (absent from the file) | optional third chord: toggles Pause until resumed / Resume; no default, learnable from the tray's **Set pause key...**, see [Hotkeys](#hotkeys) |
 
 Roughly 1-2 cents and 3-8 seconds per check at the defaults.
 

@@ -126,6 +126,10 @@ pub mod cmd {
     /// needs to be unique among menu items.
     pub const VERSION_LABEL: u32 = 1029;
 
+    /// Issue #202: "Set pause key" learn-mode item, the third sibling of
+    /// `SET_PRIMARY`/`SET_SECONDARY`. See `App::start_learning` in `app.rs`.
+    pub const SET_PAUSE: u32 = 1030;
+
     /// Issue #124: builds a plain-text diagnostics report and copies it to
     /// the clipboard. See `App::copy_diagnostics` in `app.rs`.
     pub const COPY_DIAGNOSTICS: u32 = 1019;
@@ -184,7 +188,7 @@ pub mod cmd {
     /// active monitor locally and copy the text. See `App::read_qr` in
     /// `app.rs` and `actions::read_qr`. The Quick Ask palette also lists it
     /// (`DispatchTarget::ReadQr`); this tray item is the direct path.
-    pub const READ_QR: u32 = 1030;
+    pub const READ_QR: u32 = 1031;
 
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
@@ -241,6 +245,9 @@ pub struct Tray {
     /// parenthetical suffix is simply omitted.
     primary_label: String,
     secondary_label: String,
+    /// Display string for the pause-toggle binding (issue #202), or "not
+    /// set". Set via [`Tray::set_pause_binding`].
+    pause_label: String,
     /// Model lists and current-selection index for the two submenus. Set
     /// via [`Tray::set_models`]; empty until then, in which case the
     /// submenu shows a single greyed-out "none configured" entry.
@@ -288,6 +295,7 @@ impl Tray {
             instance,
             primary_label: String::new(),
             secondary_label: String::new(),
+            pause_label: String::new(),
             active_provider_openai: true,
             openai_models: Vec::new(),
             openai_current: None,
@@ -390,6 +398,12 @@ impl Tray {
     pub fn set_key_bindings(&mut self, primary: &str, secondary: &str) {
         self.primary_label = primary.to_string();
         self.secondary_label = secondary.to_string();
+    }
+
+    /// Display string for the "Set pause key" label (issue #202), e.g.
+    /// `hotkey::pause_binding_label(config.hotkeys.pause.as_ref())`.
+    pub fn set_pause_binding(&mut self, pause: &str) {
+        self.pause_label = pause.to_string();
     }
 
     /// Populates the two model submenus. `*_current` marks which entry gets
@@ -561,6 +575,12 @@ impl Tray {
             hmenu,
             cmd::SET_SECONDARY,
             &key_label("Set secondary key", &self.secondary_label),
+            !self.paused,
+        )?;
+        append_item_state(
+            hmenu,
+            cmd::SET_PAUSE,
+            &key_label("Set pause key", &self.pause_label),
             !self.paused,
         )?;
         append_item(hmenu, cmd::OPEN_SETTINGS, "Settings...")?;
@@ -1225,6 +1245,10 @@ mod tests {
             !item_is_greyed(hmenu_running, cmd::SET_SECONDARY),
             "SET_SECONDARY must not be greyed while running"
         );
+        assert!(
+            !item_is_greyed(hmenu_running, cmd::SET_PAUSE),
+            "SET_PAUSE must not be greyed while running"
+        );
         let _ = unsafe { DestroyMenu(hmenu_running) };
 
         tray.set_paused(true);
@@ -1238,6 +1262,10 @@ mod tests {
         assert!(
             item_is_greyed(hmenu_paused, cmd::SET_SECONDARY),
             "SET_SECONDARY must be greyed while paused"
+        );
+        assert!(
+            item_is_greyed(hmenu_paused, cmd::SET_PAUSE),
+            "SET_PAUSE must be greyed while paused"
         );
         let _ = unsafe { DestroyMenu(hmenu_paused) };
 
@@ -1588,6 +1616,7 @@ mod tests {
         ("COPY_LAST", cmd::COPY_LAST),
         ("SET_PRIMARY", cmd::SET_PRIMARY),
         ("SET_SECONDARY", cmd::SET_SECONDARY),
+        ("SET_PAUSE", cmd::SET_PAUSE),
         ("EDIT_SETTINGS", cmd::EDIT_SETTINGS),
         ("RELOAD", cmd::RELOAD),
         ("QUIT", cmd::QUIT),
