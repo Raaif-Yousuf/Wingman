@@ -40,14 +40,107 @@ pub struct Scan {
 }
 
 /// The longest side, in pixels, the detector is ever given. `rqrr` has no
-/// time limit of its own and its work grows steeply with the number of
-/// finder-pattern-like shapes it finds: on a noisy 4K frame it ran for about
-/// 24 minutes in the test profile and overflowed in a debug build (#528).
-/// Larger frames are shrunk by a whole-number factor first, so the worker is
-/// never busy for long. A code that is still readable at 1920 pixels wide
-/// (about 3 pixels per module for a typical code at half the screen width)
-/// is found; one smaller than that is reported as not found.
+/// time limit of its own, and its grouping step copies the whole image for
+/// every candidate triple of finder squares, so the cost is roughly the pixel
+/// count times the square of the number of finder-like shapes (#528). Larger
+/// frames are shrunk by a whole-number factor first. A code smaller than a
+/// few pixels per module after shrinking is reported as not found.
+/// The longest side, in pixels, the detector is ever given. `rqrr` has no
+/// time limit of its own: on a noisy 4K frame it ran for about 24 minutes in
+/// the test profile and overflowed in a debug build (#528). Larger frames are
+/// shrunk by a whole-number factor first.
+/// THEORY (unverified): the cause is the number of finder-pattern-like shapes
+/// in a large noisy frame, so shrinking removes it. MEASURED: native frames at
+/// the bound (1920x1080 noise, 1x5000, 5000x1) are checked by the tests
+/// `native_*` below; their result is recorded there. A code smaller than a
+/// few pixels per module after shrinking is reported as not found.
 const MAX_SIDE: usize = 1920;
+
+/// The most finder-like shapes (see [`finder_candidates`]) a frame may hold
+/// before the detector is not run at all. MEASURED 2026-10-15 (release, native
+/// 1920x1080, finder squares scattered at random): 20 squares took 44 ms, 100
+/// took 236 ms, 300 took 2.9 s, 600 took 6.1 s, and 1500 made `rqrr` itself panic
+/// (`geometry.rs`: `x <= i32::MAX`), which aborts a release build. A real
+/// screen holds three per code, plus a few false hits inside the data (a real
+/// code counted 10 here, 30 codes on one screen counted 240), so 150 covers
+/// about 18 codes on one screen.
+const MAX_FINDER_CANDIDATES: usize = 150;
+
+/// Greyscale below this is dark.
+const DARK_BELOW: u8 = 128;
+
+/// How many finder-pattern-like shapes `grey` holds, counting up to `cap + 1`
+/// and then stopping. A finder pattern is a row of dark, light, dark, light,
+/// dark runs in the ratio 1:1:3:1:1; hits that line up in consecutive rows
+/// are one shape, and a shape needs at least two rows. This is only a cheap
+/// count to keep `rqrr` away from pathological input, not a detector.
+fn finder_candidates(grey: &Grey, cap: usize) -> usize {
+    // (centre x, unit, first row, last row)
+    let mut open: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut count = 0usize;
+    for y in 0..grey.h {
+        let row = &grey.px[y * grey.w..(y + 1) * grey.w];
+        // Runs of equal darkness in this row: (start, length, dark).
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        for (x, &v) in row.iter().enumerate() {
+            let dark = v < DARK_BELOW;
+            match runs.last_mut() {
+                Some(r) if r.2 == dark => r.1 += 1,
+                _ => runs.push((x, 1, dark)),
+            }
+        }
+        for win in runs.windows(5) {
+            if !win[0].2 {
+                continue;
+            }
+            let total: usize = win.iter().map(|r| r.1).sum();
+            let unit = total / 7;
+            if unit == 0 {
+                continue;
+            }
+            let near = |len: usize, units: usize| {
+                len * 2 >= unit * (units * 2 - 1) && len * 2 <= unit * (units * 2 + 1)
+            };
+            let ok = near(win[0].1, 1)
+                && near(win[1].1, 1)
+                && near(win[2].1, 3)
+                && near(win[3].1, 1)
+                && near(win[4].1, 1);
+            if !ok {
+                continue;
+            }
+            let cx = win[0].0 + total / 2;
+            match open
+                .iter_mut()
+                .find(|o| o.0.abs_diff(cx) <= unit.max(o.1) * 2 && y - o.3 <= 1)
+            {
+                Some(o) => {
+                    o.0 = cx;
+                    o.3 = y;
+                }
+                None => open.push((cx, unit, y, y)),
+            }
+        }
+        // Shapes whose last hit is older than the previous row are finished.
+        open.retain(|o| {
+            if y - o.3 <= 1 {
+                return true;
+            }
+            if o.3 > o.2 {
+                count += 1;
+            }
+            false
+        });
+        if count + open.len() > cap {
+            // `open` may hold one-row noise, so confirm before giving up.
+            let tall = open.iter().filter(|o| o.3 > o.2).count();
+            if count + tall > cap {
+                return count + tall;
+            }
+        }
+    }
+    count + open.iter().filter(|o| o.3 > o.2).count()
+}
 
 /// A greyscale image: `px.len() == w * h`.
 struct Grey {
@@ -57,10 +150,10 @@ struct Grey {
 }
 
 /// `rgba` as greyscale, shrunk by the smallest whole-number factor (box
-/// average) that brings both sides to at most [`MAX_SIDE`]. Pure. The caller
+/// average) that brings both sides to at most `max_side`. Pure. The caller
 /// has already checked that `rgba` is exactly `w * h * 4` bytes.
-fn bounded_grey(rgba: &[u8], w: usize, h: usize) -> Grey {
-    let factor = w.max(h).div_ceil(MAX_SIDE).max(1);
+fn bounded_grey(rgba: &[u8], w: usize, h: usize, max_side: usize) -> Grey {
+    let factor = w.max(h).div_ceil(max_side).max(1);
     let (ow, oh) = (w.div_ceil(factor), h.div_ceil(factor));
     let mut px = Vec::with_capacity(ow * oh);
     for oy in 0..oh {
@@ -94,7 +187,15 @@ pub fn scan(rgba: &[u8], width: u32, height: u32) -> Scan {
     if w == 0 || h == 0 || w.checked_mul(h).and_then(|n| n.checked_mul(4)) != Some(rgba.len()) {
         return Scan::default();
     }
-    let grey = bounded_grey(rgba, w, h);
+    let grey = bounded_grey(rgba, w, h, MAX_SIDE);
+    if finder_candidates(&grey, MAX_FINDER_CANDIDATES) > MAX_FINDER_CANDIDATES {
+        // Too busy to be worth decoding, and past the point where `rqrr` is
+        // safe to run. Reported as a code that could not be read.
+        return Scan {
+            texts: Vec::new(),
+            unreadable: 1,
+        };
+    }
     let mut img =
         rqrr::PreparedImage::prepare_from_greyscale(grey.w, grey.h, |x, y| grey.px[y * grey.w + x]);
     let mut out = Scan::default();
@@ -802,8 +903,8 @@ mod tests {
     /// A 4K frame full of noise and finder-pattern-like squares, the worst
     /// plausible input for the detector. It must come back without panicking
     /// (the release build aborts on panic). Prints the time as a measurement.
-    /// Fast because the frame is shrunk before detection (#528): 0.2 s in the
-    /// test profile, 46 ms in release.
+    /// Fast because the frame is shrunk and counted before detection (#528): well under a second in the
+    /// test profile.
     #[test]
     fn scan_survives_a_4k_frame_of_finder_pattern_noise() {
         let (w, h) = (3840usize, 2160usize);
@@ -851,8 +952,8 @@ mod tests {
 
     #[test]
     fn the_detector_never_sees_more_than_the_bound() {
-        // Dimensions only: a 4K and an 8K frame, and an odd size that does
-        // not divide evenly. A black 3x3 bit more than the bound still fits.
+        // Dimensions only: 4K, 8K, an odd size that does not divide evenly,
+        // and a frame exactly at the bound.
         for (w, h) in [
             (3840usize, 2160usize),
             (7680, 4320),
@@ -860,7 +961,7 @@ mod tests {
             (1920, 1080),
         ] {
             let rgba = vec![0u8; w * h * 4];
-            let g = bounded_grey(&rgba, w, h);
+            let g = bounded_grey(&rgba, w, h, MAX_SIDE);
             assert!(
                 g.w <= MAX_SIDE && g.h <= MAX_SIDE,
                 "{w}x{h} -> {}x{}",
@@ -870,7 +971,7 @@ mod tests {
             assert_eq!(g.px.len(), g.w * g.h);
         }
         // Frames at or under the bound are not touched.
-        let g = bounded_grey(&vec![0u8; 800 * 600 * 4], 800, 600);
+        let g = bounded_grey(&vec![0u8; 800 * 600 * 4], 800, 600, MAX_SIDE);
         assert_eq!((g.w, g.h), (800, 600));
     }
 
@@ -879,11 +980,125 @@ mod tests {
         let mut rgba = vec![255u8; 8];
         rgba[..4].copy_from_slice(&[0, 0, 0, 255]);
         // 2x1 frame untouched: first pixel black, second white.
-        let g = bounded_grey(&rgba, 2, 1);
+        let g = bounded_grey(&rgba, 2, 1, MAX_SIDE);
         assert_eq!(g.px, vec![0, 255]);
         let shot = canvas(3840, 2160, &[("https://example.com/4k", 1000, 800)]);
         let found = scan(&shot.rgba, shot.width, shot.height);
         assert_eq!(found.texts, vec!["https://example.com/4k".to_string()]);
+    }
+
+    #[test]
+    fn averaging_is_exact_with_a_factor_of_two_and_a_partial_edge_block() {
+        // 5x3 frame, max side 2 -> factor 3, output 2x1. Grey values (red
+        // channel only, so luma = v * 299 / 1000 is not used: use grey pixels
+        // v,v,v where luma = v exactly).
+        let vals: [[u8; 5]; 3] = [
+            [0, 30, 60, 90, 120],
+            [10, 40, 70, 100, 130],
+            [20, 50, 80, 110, 140],
+        ];
+        let mut rgba = Vec::new();
+        for row in vals {
+            for v in row {
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        // Luma of (v,v,v) is (v*299 + v*587 + v*114)/1000 = v exactly.
+        let g = bounded_grey(&rgba, 5, 3, 2);
+        assert_eq!((g.w, g.h), (2, 1));
+        // Left block: columns 0..3 (9 pixels): sum 0+30+60+10+40+70+20+50+80 = 360 -> 40.
+        // Right block: columns 3..5 (6 pixels, partial): 90+120+100+130+110+140 = 690 -> 115.
+        assert_eq!(g.px, vec![40, 115]);
+        // Factor exactly 2 on an even frame.
+        let rgba: Vec<u8> = [0u8, 100, 200, 100]
+            .iter()
+            .flat_map(|&v| [v, v, v, 255])
+            .collect();
+        let g = bounded_grey(&rgba, 2, 2, 1);
+        assert_eq!((g.w, g.h, g.px), (1, 1, vec![100]));
+    }
+
+    /// Finder-pattern-like noise at a native size, no shrinking involved.
+    fn noise_frame(w: usize, h: usize, squares: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut rgba = vec![255u8; w * h * 4];
+        for px in rgba.chunks_exact_mut(4) {
+            px[..3].fill(if next() % 1000 < 5 { 0 } else { 255 });
+        }
+        if w > 40 && h > 40 {
+            for _ in 0..squares {
+                let (ox, oy) = (next() as usize % (w - 40), next() as usize % (h - 40));
+                for y in 0..35usize {
+                    for x in 0..35usize {
+                        let (mx, my) = (x / 5, y / 5);
+                        let dark = mx.min(6 - mx).min(my.min(6 - my)) != 1;
+                        let i = ((oy + y) * w + ox + x) * 4;
+                        rgba[i..i + 3].fill(if dark { 0 } else { 255 });
+                    }
+                }
+            }
+        }
+        rgba
+    }
+
+    #[test]
+    fn finder_count_sees_real_codes_and_ignores_plain_noise() {
+        let one = canvas(400, 400, &[("https://example.com", 50, 50)]);
+        let g = bounded_grey(&one.rgba, 400, 400, MAX_SIDE);
+        // A real code counts a few more than its three finders (false hits in
+        // the data), far under the cap.
+        let n = finder_candidates(&g, 1000);
+        assert!((3..=20).contains(&n), "{n}");
+        let blank = bounded_grey(&vec![255u8; 300 * 300 * 4], 300, 300, MAX_SIDE);
+        assert_eq!(finder_candidates(&blank, 1000), 0);
+        // Counting stops soon after the cap.
+        let many = noise_frame(1920, 1080, 600);
+        let g = bounded_grey(&many, 1920, 1080, MAX_SIDE);
+        assert!(finder_candidates(&g, MAX_FINDER_CANDIDATES) > MAX_FINDER_CANDIDATES);
+    }
+
+    #[test]
+    fn a_frame_with_too_many_finder_shapes_is_refused_not_scanned() {
+        // 1500 shapes made rqrr panic (release aborts); 600 took 6 s.
+        for squares in [300usize, 600, 1500] {
+            let rgba = noise_frame(1920, 1080, squares);
+            let started = std::time::Instant::now();
+            let found = scan(&rgba, 1920, 1080);
+            let took = started.elapsed();
+            eprintln!("MEASURED: {squares} finder squares at 1920x1080 refused in {took:?}");
+            assert!(found.texts.is_empty());
+            assert_eq!(found.unreadable, 1);
+            assert!(took.as_secs() < 2, "{took:?}");
+        }
+    }
+
+    #[test]
+    fn a_busy_but_plausible_frame_is_still_scanned_in_time() {
+        let rgba = noise_frame(1920, 1080, 20);
+        let started = std::time::Instant::now();
+        let found = scan(&rgba, 1920, 1080);
+        let took = started.elapsed();
+        eprintln!("MEASURED: 20 finder squares at 1920x1080 scanned in {took:?}");
+        assert_ne!(found.unreadable, 1, "refused a frame under the cap");
+        assert!(took.as_secs() < 5, "{took:?}");
+    }
+
+    #[test]
+    fn native_extreme_aspect_frames_do_not_panic_or_crawl() {
+        for (w, h) in [(1usize, 5000usize), (5000, 1), (5000, 3)] {
+            let rgba = noise_frame(w, h, 0);
+            let started = std::time::Instant::now();
+            let _ = scan(&rgba, w as u32, h as u32);
+            let took = started.elapsed();
+            eprintln!("MEASURED: native {w}x{h} scan took {took:?}");
+            assert!(took.as_secs() < 5, "{w}x{h}: {took:?}");
+        }
     }
 
     #[test]
