@@ -9,6 +9,8 @@
 
 pub mod civil_time;
 mod ics;
+#[allow(dead_code)]
+pub mod oauth;
 pub mod registry;
 
 // `Opener` is only named by `executors::calendar_add`'s tests today (to

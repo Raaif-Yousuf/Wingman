@@ -64,10 +64,9 @@ pub enum AuthKind {
   `google`/`microsoft` do not need an `AuthKind` change to land later, but
   **no connector implements either one yet**. There is no API-key-auth
   connector in this tree, and the OAuth PKCE loopback flow described below
-  is a design, not code: no `src/connectors/google.rs`, no
-  `src/connectors/microsoft.rs`, no loopback HTTP listener exists.
-  Issue #53 ("OAuth PKCE loopback flow shared by Google and Microsoft")
-  tracks writing it; see the 2026-09-16 expansion plan's §10
+  is built in `src/connectors/oauth.rs` (issue #53) but has no caller
+  yet: no `src/connectors/google.rs` or `src/connectors/microsoft.rs`
+  exists. See the 2026-09-16 expansion plan's §10
   ("Connectors") table and §12 ("Secrets and config") in
   `docs/superpowers/specs/2026-09-16-expansion-plan-design.md` for the
   planned shape: a loopback redirect on `127.0.0.1:<random port>`, PKCE, the
@@ -237,4 +236,4 @@ guarantee" section says the same thing from the offline-guard side.
 - [`docs/offline.md`](offline.md): the four modes exactly as `mode.rs`
   implements them, and what the Offline guard does and does not cover yet.
 - Issue #53: the OAuth PKCE loopback flow shared by Google and Microsoft,
-  not started.
+  built in src/connectors/oauth.rs (no connector calls it yet).

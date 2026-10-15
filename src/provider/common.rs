@@ -733,7 +733,7 @@ pub(crate) fn post_json(
 // this function alone is not sufficient for them, only necessary.
 // ---------------------------------------------------------------------
 
-fn offline_guard(url: &str) -> Result<()> {
+pub(crate) fn offline_guard(url: &str) -> Result<()> {
     if !crate::mode::is_offline_now() {
         return Ok(());
     }
