@@ -700,6 +700,63 @@ pub fn has_fillable_fields(proposal: &Value) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// No-model tier (#132)
+// ---------------------------------------------------------------------------
+
+/// The preview row key for the "left unfilled" note. It cannot collide with
+/// the `f<i>` field keys, and [`rebuild_after_confirm`] only reads `f<i>`.
+pub const UNFILLED_PREVIEW_KEY: &str = "unfilled";
+
+/// Whether the model stage runs at all: only when a provider is ready and the
+/// local mapper left something over. With no provider the form is mapped from
+/// the profile alone, and nothing is sent anywhere.
+pub fn model_stage_needed(provider_ready: bool, unmapped: &[UnmappedField]) -> bool {
+    provider_ready && !unmapped.is_empty()
+}
+
+/// Records the labels the local-only run could not fill, so the preview can
+/// say so. A no-op when there are none.
+pub fn with_unfilled_note(mut proposal: Value, unmapped: &[UnmappedField]) -> Value {
+    if unmapped.is_empty() {
+        return proposal;
+    }
+    if let Some(obj) = proposal.as_object_mut() {
+        let labels: Vec<Value> = unmapped
+            .iter()
+            .map(|u| Value::String(u.label.clone()))
+            .collect();
+        obj.insert("unfilled".to_string(), Value::Array(labels));
+    }
+    proposal
+}
+
+/// The labels recorded by [`with_unfilled_note`], in order.
+pub fn unfilled_labels(proposal: &Value) -> Vec<String> {
+    proposal
+        .get("unfilled")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Detail text for the card shown when a proposal has no fillable field.
+pub fn nothing_to_fill_detail(proposal: &Value) -> String {
+    let left = unfilled_labels(proposal);
+    if left.is_empty() {
+        "No fillable fields were found on the foreground window.".to_string()
+    } else {
+        format!(
+            "Nothing in your profile matches these fields: {}. Add a model in Settings to fill the rest.",
+            left.join(", ")
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Preview translation: merged proposal <-> the existing flat PreviewModel
 // ---------------------------------------------------------------------------
 
@@ -765,6 +822,21 @@ pub fn build_preview_schema_and_value(proposal: &Value) -> (Value, Value) {
                 Value::String(format_display_value(current, proposed, source)),
             );
         }
+    }
+
+    let left = unfilled_labels(proposal);
+    if !left.is_empty() {
+        properties.insert(
+            UNFILLED_PREVIEW_KEY.to_string(),
+            json!({
+                "type": "string",
+                "label": "Not filled (no model)",
+            }),
+        );
+        value_obj.insert(
+            UNFILLED_PREVIEW_KEY.to_string(),
+            Value::String(left.join(", ")),
+        );
     }
 
     (
@@ -2283,5 +2355,75 @@ mod tests {
             }
             let _ = std::fs::remove_file(&bin_path);
         }
+    }
+
+    // -- no-model tier (#132) --------------------------------------------
+
+    fn unmapped(i: usize, label: &str) -> UnmappedField {
+        UnmappedField {
+            candidate_index: i,
+            label: label.to_string(),
+            current: String::new(),
+        }
+    }
+
+    #[test]
+    fn model_stage_runs_only_with_a_provider_and_something_unmapped() {
+        let some = [unmapped(0, "Favourite colour")];
+        assert!(model_stage_needed(true, &some));
+        assert!(!model_stage_needed(false, &some), "no provider: local only");
+        assert!(!model_stage_needed(true, &[]), "nothing left to ask");
+        assert!(!model_stage_needed(false, &[]));
+    }
+
+    #[test]
+    fn local_only_run_lists_unmatched_fields_in_the_proposal_and_preview() {
+        let candidates = vec![
+            field(ControlKind::Edit, "Full name", FieldValue::Empty, true),
+            field(
+                ControlKind::Edit,
+                "Favourite colour",
+                FieldValue::Empty,
+                true,
+            ),
+        ];
+        let (mapped, left) = map_candidates_locally(&candidates, &sample_profile());
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(left.len(), 1);
+        let proposal = with_unfilled_note(
+            build_proposal(&candidates, &mapped, RequireTickFor::Sensitive),
+            &left,
+        );
+        assert_eq!(unfilled_labels(&proposal), vec!["Favourite colour"]);
+        let (schema, value) = build_preview_schema_and_value(&proposal);
+        let row = schema["properties"][UNFILLED_PREVIEW_KEY]["label"]
+            .as_str()
+            .unwrap();
+        assert!(row.contains("Not filled"), "{row}");
+        assert_eq!(value[UNFILLED_PREVIEW_KEY], "Favourite colour");
+        // The executor-facing shape is unchanged by the note.
+        let rebuilt = rebuild_after_confirm(&proposal, &value);
+        assert!(rebuilt.get("unfilled").is_none());
+        assert_eq!(rebuilt["fields"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn no_unmatched_fields_adds_no_note_and_no_row() {
+        let proposal = with_unfilled_note(json!({ "fields": [] }), &[]);
+        assert!(proposal.get("unfilled").is_none());
+        assert!(unfilled_labels(&proposal).is_empty());
+        let (schema, _) = build_preview_schema_and_value(&proposal);
+        assert!(schema["properties"].get(UNFILLED_PREVIEW_KEY).is_none());
+    }
+
+    #[test]
+    fn nothing_to_fill_detail_names_the_unmatched_fields_when_there_are_any() {
+        let plain = nothing_to_fill_detail(&json!({ "fields": [] }));
+        assert!(plain.contains("No fillable fields"), "{plain}");
+        let noted = nothing_to_fill_detail(&with_unfilled_note(
+            json!({ "fields": [] }),
+            &[unmapped(0, "Favourite colour"), unmapped(1, "Pet")],
+        ));
+        assert!(noted.contains("Favourite colour, Pet"), "{noted}");
     }
 }

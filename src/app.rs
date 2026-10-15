@@ -482,6 +482,35 @@ enum ModelActionGate {
     Proceed,
 }
 
+/// #132: what `App::begin_action` does beyond the pause/busy checks. A run
+/// that will not use a model (no provider ready, "Fill this form" only) must
+/// not require one, must not grab the screen (the form is read from the UI
+/// tree, so a capture failure would block a purely local fill for nothing),
+/// and must not claim on the card that a model is being asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BeginPlan {
+    require_provider: bool,
+    capture: bool,
+    asks_model: bool,
+}
+
+impl BeginPlan {
+    /// Every model-backed flow.
+    const MODEL: BeginPlan = BeginPlan {
+        require_provider: true,
+        capture: true,
+        asks_model: true,
+    };
+
+    fn for_fill_form(use_model: bool) -> BeginPlan {
+        BeginPlan {
+            require_provider: use_model,
+            capture: use_model,
+            asks_model: use_model,
+        }
+    }
+}
+
 fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
     if busy {
         ModelActionGate::Busy
@@ -549,9 +578,9 @@ impl App {
     /// roughly the same 40 lines almost verbatim (#214's own body: "the
     /// overnight task instructions asked for app.rs edits to stay additive
     /// and minimal since another agent was editing it concurrently"). A
-    /// future fill-form-from-screen action (fill_form.rs's own executor
-    /// already exists; nothing in `app.rs` calls it yet) should call this
-    /// too instead of adding a fourth near-copy.
+    /// fill-form-from-screen action (#40) goes through `begin_action`, the
+    /// same pipeline with a [`BeginPlan`] that lets it skip the readiness
+    /// gate and the capture when no model will be used (#132).
     ///
     /// `model_action_gate` decides the first three steps' precedence (busy
     /// beats paused beats readiness-blocked); this method's own `if`s
@@ -575,6 +604,19 @@ impl App {
         &mut self,
         extra: impl FnOnce(&mut Self) -> Option<T>,
     ) -> Option<(capture::RawShot, isize, T)> {
+        let (raw, foreground_hwnd, value) = self.begin_action(BeginPlan::MODEL, extra)?;
+        Some((raw?, foreground_hwnd, value))
+    }
+
+    /// [`Self::begin_model_action`] for an action with a model-free path
+    /// (#132, "Fill this form"): `plan` says whether the readiness gate, the
+    /// screen capture and the "asking a model" card apply. The returned
+    /// `RawShot` is `None` exactly when `plan.capture` is false.
+    fn begin_action<T>(
+        &mut self,
+        plan: BeginPlan,
+        extra: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<(Option<capture::RawShot>, isize, T)> {
         match model_action_gate(self.busy, pause::is_paused_now()) {
             ModelActionGate::Busy => return None,
             ModelActionGate::Paused => {
@@ -603,6 +645,7 @@ impl App {
             .unwrap_or_else(|_| "config.toml".into());
         if let Some((headline, detail)) =
             Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+                .filter(|_| plan.require_provider)
         {
             // Issue #347: readiness-gate cards are always "go fix something
             // in Settings" cards (a missing API key or Ollama config), so a
@@ -632,23 +675,27 @@ impl App {
         // network-free selection (`build_chain_for_mode(mode, true)`) --
         // "ready" here means "configured", not "reachable right now", which
         // is exactly the upper bound that gate's own doc comment describes.
-        let optimistic_chain = self
-            .config
-            .providers
-            .build_chain_for_mode(self.config.mode, true);
-        let image_limits = optimistic_chain
-            .first_ready_caps()
-            .and_then(|caps| caps.image_limits);
-        let (max_long_edge, max_pixels) =
-            capture::resolve_limits(image_limits, self.config.capture.max_edge);
-        let raw = match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
-            Ok(r) => r,
-            Err(e) => {
-                let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't capture the screen", &detail);
-                return None;
+        let raw = if plan.capture {
+            let optimistic_chain = self
+                .config
+                .providers
+                .build_chain_for_mode(self.config.mode, true);
+            let image_limits = optimistic_chain
+                .first_ready_caps()
+                .and_then(|caps| caps.image_limits);
+            let (max_long_edge, max_pixels) =
+                capture::resolve_limits(image_limits, self.config.capture.max_edge);
+            match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
+                    self.card
+                        .show_error_with_details("Couldn't capture the screen", &detail);
+                    return None;
+                }
             }
+        } else {
+            None
         };
         // Issue #18/#206: the foreground window's HWND, captured HERE on the
         // main thread, right alongside the pixel capture -- both are "what
@@ -678,9 +725,13 @@ impl App {
         // promise the worker reaches that exact provider (it may fail over)
         // but an honest "what Wingman is trying right now" cue, same as the
         // pre-existing reasoning this replaces.
-        let model_name = self.first_provider_model_label().unwrap_or_default();
-        self.card
-            .show_pending(crate::ui::card::PendingStage::AskingModel { model_name });
+        let stage = if plan.asks_model {
+            let model_name = self.first_provider_model_label().unwrap_or_default();
+            crate::ui::card::PendingStage::AskingModel { model_name }
+        } else {
+            crate::ui::card::PendingStage::ReadingForm
+        };
+        self.card.show_pending(stage);
 
         Some((raw, foreground_hwnd_isize, extra_value))
     }
@@ -1785,23 +1836,33 @@ impl App {
 
     /// #40: "Fill this form", the tray's fourth one-shot Look/Propose/Confirm/Do
     /// action. Shares `add_event_from_screen`/`review_this_email`'s pause/
-    /// busy/readiness/capture steps via `begin_model_action` (#214, closing
-    /// the "duplicated, not extracted" gap this doc comment used to note --
-    /// #214 landed after this action was first written). Unlike calendar,
+    /// busy/readiness/capture steps via `begin_action` (#214), with a
+    /// [`BeginPlan`] built from whether a provider is ready (#132): with none,
+    /// there is no readiness card, no screen capture and no model stage, and
+    /// the pending card says "Reading the form...". Unlike calendar,
     /// this needs no today/UTC offset; it needs the foreground window's
     /// handle (for the worker's own UIA walk, run off this thread so the
     /// message loop stays responsive) and `config.forms.require_tick_for`
     /// (#40, expansion plan §15's still-owed owner decision -- see
-    /// `config::RequireTickFor`), neither of which `begin_model_action`
-    /// needs to know about, same as `review_this_email`'s `extra`. The
-    /// model-free path (`form_fill_worker`'s call into
-    /// `actions::fill_form::map_candidates_locally`, skipped entirely when
-    /// every field maps from the local profile) lives inside the worker
-    /// closure below, unaffected by this: `begin_model_action`'s readiness
-    /// gate runs first either way, exactly as it did before this used the
-    /// shared helper.
+    /// `config::RequireTickFor`), neither of which `begin_action`
+    /// needs to know about, same as `review_this_email`'s `extra`. Local
+    /// mapping (`actions::fill_form::map_candidates_locally`) always runs in
+    /// the worker; the model stage runs only when a provider is ready and a
+    /// field is left over.
     fn fill_form_from_screen(&mut self) {
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        // #132: with no provider ready the form is mapped from the profile
+        // alone (no model stage, nothing sent), instead of a "set up a model"
+        // card.
+        let use_model = Self::readiness_gate(
+            self.config.mode,
+            &self.config.providers,
+            &Config::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        )
+        .is_none();
+        let Some((raw, foreground_hwnd_isize, ())) =
+            self.begin_action(BeginPlan::for_fill_form(use_model), |_| Some(()))
         else {
             return;
         };
@@ -1812,17 +1873,16 @@ impl App {
         let target = self.hwnd_isize();
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
-            let result: std::result::Result<Value, String> = (|| -> Result<Value> {
-                let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
-                form_fill_worker(
-                    &providers,
-                    mode,
-                    &shot,
-                    &raw,
-                    foreground_hwnd_isize,
-                    require_tick_for,
-                )
-            })()
+            let mut raw = raw;
+            let result: std::result::Result<Value, String> = form_fill_worker(
+                &providers,
+                mode,
+                &mut raw,
+                redact,
+                foreground_hwnd_isize,
+                require_tick_for,
+                use_model,
+            )
             .map_err(|e| {
                 let chain_text = worker_error_chain_text(&e);
                 pack_error(
@@ -1886,7 +1946,7 @@ impl App {
         if !actions::fill_form::has_fillable_fields(&value) {
             self.card.show_answer(
                 "Nothing to fill",
-                "No fillable fields were found on the foreground window.",
+                &actions::fill_form::nothing_to_fill_detail(&value),
                 5,
                 None,
             );
@@ -3114,10 +3174,11 @@ fn review_worker(
 fn form_fill_worker(
     providers: &Providers,
     mode: Mode,
-    shot: &Shot,
-    raw: &capture::RawShot,
+    raw: &mut Option<capture::RawShot>,
+    redact: bool,
     foreground_hwnd: isize,
     require_tick_for: crate::config::RequireTickFor,
+    use_model: bool,
 ) -> Result<Value> {
     let profile = actions::fill_form::load_or_import_profile()
         .context("failed to load or import the profile")?;
@@ -3143,13 +3204,20 @@ fn form_fill_worker(
 
     let (mut mapped, unmapped) = actions::fill_form::map_candidates_locally(&candidates, &profile);
 
-    if !unmapped.is_empty() {
+    if actions::fill_form::model_stage_needed(use_model, &unmapped) {
         let ollama_ready = mode == Mode::Auto
             && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
             && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
         let chain = providers.build_chain_for_mode(mode, ollama_ready);
 
-        let req = actions::fill_form::form_fill_request(shot, &unmapped, &profile);
+        // Encoded (and redacted) only here: with no model nothing is
+        // encoded or sent.
+        let raw = raw
+            .as_mut()
+            .context("no screen capture for the model request")?;
+        let shot = encode_for_upload(raw, providers, mode, redact)?;
+        let req = actions::fill_form::form_fill_request(&shot, &unmapped, &profile);
+        let raw = &*raw;
         let responses = chain.complete_parsed_with_fallback(
             &req,
             || non_vision_inputs(raw, foreground_hwnd),
@@ -3160,11 +3228,13 @@ fn form_fill_worker(
         ));
     }
 
-    Ok(actions::fill_form::build_proposal(
-        &candidates,
-        &mapped,
-        require_tick_for,
-    ))
+    let proposal = actions::fill_form::build_proposal(&candidates, &mapped, require_tick_for);
+    // Local-only run: say which fields were left alone.
+    Ok(if use_model {
+        proposal
+    } else {
+        actions::fill_form::with_unfilled_note(proposal, &unmapped)
+    })
 }
 
 /// #103: the only way `app.rs` turns a capture into a [`crate::provider::Shot`].
@@ -4597,6 +4667,7 @@ mod tests {
     use super::resolve_prompt_and_difficulty;
     use super::unreadable_secrets_card;
     use super::App;
+    use super::BeginPlan;
     use super::{final_settings_card, SettingsFinalCard};
     use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
@@ -4865,6 +4936,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn begin_plan_without_a_model_skips_gate_capture_and_model_card() {
+        let none = BeginPlan::for_fill_form(false);
+        assert!(!none.require_provider, "no provider must not block");
+        assert!(!none.capture, "nothing to capture when nothing is sent");
+        assert!(!none.asks_model, "the card must not claim a model is asked");
+        assert_eq!(BeginPlan::for_fill_form(true), BeginPlan::MODEL);
     }
 
     #[test]
