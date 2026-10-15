@@ -68,21 +68,118 @@ pub fn scan(rgba: &[u8], width: u32, height: u32) -> Scan {
     out
 }
 
-/// The host of an `http`/`https` URL, as a browser would take it: after the
-/// scheme, before the first `/`, `?` or `#`, with any `user:pass@` prefix
-/// removed and any port dropped. `None` for anything that is not a plain
-/// web link (Wi-Fi payloads, `mailto:`, plain text, `javascript:`).
-pub fn url_host(text: &str) -> Option<String> {
-    let text = text.trim();
-    let lower = text.to_ascii_lowercase();
-    let rest = if lower.starts_with("https://") {
-        &text["https://".len()..]
-    } else if lower.starts_with("http://") {
-        &text["http://".len()..]
+/// The authority part (`user@host:port`) of an `http`/`https` link, the way a
+/// browser would cut it out. Browsers drop tabs and newlines anywhere in a
+/// URL, ignore spaces and control characters at its ends, accept any run of
+/// `/` and `\` after `http:` or `https:`, and end the authority at the first
+/// `/`, `\`, `?` or `#`. `None` for anything that is not an `http` or
+/// `https` link.
+fn authority_of(text: &str) -> Option<String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c <= ' ');
+    let lower = cleaned.to_ascii_lowercase();
+    let rest = if lower.starts_with("https:") {
+        &cleaned["https:".len()..]
+    } else if lower.starts_with("http:") {
+        &cleaned["http:".len()..]
     } else {
         return None;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let rest = rest.trim_start_matches(['/', '\\']);
+    Some(
+        rest.split(['/', '\\', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_string(),
+    )
+}
+
+/// One host label in its ASCII form: unchanged if it is already ASCII,
+/// otherwise Punycode (RFC 3492) with the `xn--` prefix, which is what the
+/// address really is on the wire and exposes look-alike letters
+/// (`xn--pple-43d` is not `apple`).
+fn ascii_label(label: &str) -> String {
+    if label.is_ascii() {
+        return label.to_string();
+    }
+    const BASE: u32 = 36;
+    const TMIN: u32 = 1;
+    const TMAX: u32 = 26;
+    fn digit(d: u32) -> char {
+        if d < 26 {
+            (b'a' + d as u8) as char
+        } else {
+            (b'0' + (d - 26) as u8) as char
+        }
+    }
+    fn adapt(delta: u32, points: u32, first: bool) -> u32 {
+        let mut delta = if first { delta / 700 } else { delta / 2 };
+        delta += delta / points;
+        let mut k = 0;
+        while delta > ((BASE - TMIN) * TMAX) / 2 {
+            delta /= BASE - TMIN;
+            k += BASE;
+        }
+        k + (BASE - TMIN + 1) * delta / (delta + 38)
+    }
+    let encode = || -> Option<String> {
+        let input: Vec<u32> = label.chars().map(u32::from).collect();
+        let mut out: String = label.chars().filter(char::is_ascii).collect();
+        let basic = out.len() as u32;
+        let mut handled = basic;
+        if basic > 0 {
+            out.push('-');
+        }
+        let (mut n, mut delta, mut bias) = (128u32, 0u32, 72u32);
+        while (handled as usize) < input.len() {
+            let m = input.iter().copied().filter(|&c| c >= n).min()?;
+            delta = delta.checked_add((m - n).checked_mul(handled + 1)?)?;
+            n = m;
+            for &c in &input {
+                if c < n {
+                    delta = delta.checked_add(1)?;
+                }
+                if c == n {
+                    let (mut q, mut k) = (delta, BASE);
+                    loop {
+                        let t = if k <= bias {
+                            TMIN
+                        } else if k >= bias + TMAX {
+                            TMAX
+                        } else {
+                            k - bias
+                        };
+                        if q < t {
+                            break;
+                        }
+                        out.push(digit(t + (q - t) % (BASE - t)));
+                        q = (q - t) / (BASE - t);
+                        k += BASE;
+                    }
+                    out.push(digit(q));
+                    bias = adapt(delta, handled + 1, handled == basic);
+                    delta = 0;
+                    handled += 1;
+                }
+            }
+            delta += 1;
+            n += 1;
+        }
+        Some(format!("xn--{out}"))
+    };
+    encode().unwrap_or_else(|| "xn--(unreadable)".to_string())
+}
+
+/// The host of an `http`/`https` URL as a browser would take it (see
+/// [`authority_of`]), with any `user:pass@` prefix removed, any port dropped,
+/// letters lower-cased and any non-ASCII label shown in its Punycode form.
+/// `None` for anything that is not a plain web link (Wi-Fi payloads,
+/// `mailto:`, plain text, `javascript:`).
+pub fn url_host(text: &str) -> Option<String> {
+    let authority = authority_of(text)?;
     let host_port = authority.rsplit('@').next().unwrap_or("");
     let host = if let Some(stripped) = host_port.strip_prefix('[') {
         // IPv6 literal: keep the brackets, drop the port after `]`.
@@ -91,31 +188,80 @@ pub fn url_host(text: &str) -> Option<String> {
     } else {
         host_port.split(':').next().unwrap_or("")
     };
-    if host.is_empty() || host.chars().any(char::is_whitespace) {
-        None
-    } else {
-        Some(host.to_ascii_lowercase())
+    if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
     }
+    let host = host.to_lowercase();
+    Some(
+        host.split('.')
+            .map(ascii_label)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
 }
 
 /// Whether the URL's authority carries a `user@` part. Browsers ignore it
 /// for routing, and attackers use it to make `https://bank.com@evil.example`
 /// read like a bank link.
 fn has_userinfo(text: &str) -> bool {
-    let rest = text
-        .trim()
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or_default();
-    rest.split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .contains('@')
+    authority_of(text).is_some_and(|a| a.contains('@'))
+}
+
+/// Whether a payload starts like `scheme:something` (`javascript:...`,
+/// `file:///...`, `ms-settings:...`, `WIFI:...`) as opposed to plain text.
+fn looks_like_scheme(text: &str) -> bool {
+    let text = text.trim_start();
+    let mut chars = text.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut rest = chars.as_str();
+    let scheme_len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')))
+        .unwrap_or(rest.len());
+    rest = &rest[scheme_len..];
+    rest.strip_prefix(':')
+        .and_then(|after| after.chars().next())
+        .is_some_and(|c| !c.is_whitespace())
+}
+
+/// Characters that can reorder or hide what a person reads, or forge a line:
+/// shown as a visible `\u{..}` mark instead of being drawn.
+fn is_invisible_or_reordering(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{061C}'
+                | '\u{FEFF}'
+        )
+}
+
+/// `text` made safe to draw on the card: newlines and tabs as `\n`, `\r`,
+/// `\t`, other control, invisible and direction-changing characters as
+/// `\u{..}`. The clipboard keeps the exact text; only the card is escaped, so
+/// a payload cannot forge a "Site:" line or flip the order of what is shown.
+fn escape_for_card(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if is_invisible_or_reordering(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn shown(text: &str) -> String {
+    let text = escape_for_card(text);
     if text.chars().count() <= MAX_SHOWN_CHARS {
-        text.to_string()
+        text
     } else {
         let cut: String = text.chars().take(MAX_SHOWN_CHARS).collect();
         format!("{cut}... (shortened here, the whole text is on the clipboard)")
@@ -128,9 +274,17 @@ fn describe(text: &str) -> String {
     let mut out = shown(text);
     if let Some(host) = url_host(text) {
         out.push_str(&format!("\nSite: {host}. Not opened."));
+        if host.split('.').any(|label| label.starts_with("xn--")) {
+            out.push_str(
+                " It uses non-English letters, which can imitate English ones. \
+                 Check the address carefully.",
+            );
+        }
         if has_userinfo(text) {
             out.push_str(" The address has a name before the site, which can disguise it.");
         }
+    } else if looks_like_scheme(text) {
+        out.push_str("\nNot a web link. Not opened.");
     }
     out
 }
@@ -321,6 +475,8 @@ mod tests {
             Some("evil.example".into())
         );
         assert_eq!(url_host("http://[::1]:80/x"), Some("[::1]".into()));
+        // A browser reads extra slashes after the scheme as one.
+        assert_eq!(url_host("https:///path"), Some("path".into()));
     }
 
     #[test]
@@ -331,7 +487,6 @@ mod tests {
             "mailto:a@b.c",
             "javascript:alert(1)",
             "https://",
-            "https:///path",
             "https://has space.com",
         ] {
             assert_eq!(url_host(text), None, "{text}");
@@ -457,9 +612,205 @@ mod tests {
         assert!(exec.copied.borrow().is_none());
     }
 
+    // -- how a browser reads the address ------------------------------------
+
     #[test]
-    fn pipeline_takes_no_providers_or_mode_parameter() {
-        fn assert_shape<F: Fn(&RawShot, &dyn Executor) -> Result<Answer>>(_f: F) {}
-        assert_shape(run_pipeline);
+    fn a_backslash_ends_the_authority_like_a_slash() {
+        // A browser sends this to evil.example, not bank.com.
+        assert_eq!(
+            url_host("https://evil.example\\@bank.com/"),
+            Some("evil.example".into())
+        );
+        assert!(!has_userinfo("https://evil.example\\@bank.com/"));
+        assert_eq!(
+            url_host("http://bank.com\\@evil.example"),
+            Some("bank.com".into())
+        );
+        assert_eq!(
+            url_host("https:\\\\evil.example/x"),
+            Some("evil.example".into())
+        );
+        let card = card_for(&Scan {
+            texts: vec!["https://evil.example\\@bank.com/".into()],
+            unreadable: 0,
+        });
+        assert!(
+            card.detail.contains("Site: evil.example."),
+            "{}",
+            card.detail
+        );
+        assert!(!card.detail.contains("disguise"), "{}", card.detail);
+    }
+
+    #[test]
+    fn tabs_and_newlines_inside_an_address_do_not_hide_the_site() {
+        assert_eq!(
+            url_host("https://evil.exa\nmple/\t"),
+            Some("evil.example".into())
+        );
+    }
+
+    // -- what the card draws -------------------------------------------------
+
+    #[test]
+    fn a_newline_in_the_payload_cannot_forge_a_site_line() {
+        let payload = "https://evil.example/\nSite: bank.com. Not opened.";
+        let card = card_for(&Scan {
+            texts: vec![payload.into()],
+            unreadable: 0,
+        });
+        let site_lines: Vec<&str> = card
+            .detail
+            .lines()
+            .filter(|l| l.starts_with("Site:"))
+            .collect();
+        assert_eq!(site_lines.len(), 1, "{}", card.detail);
+        assert!(site_lines[0].starts_with("Site: evil.example."));
+        // Plain text too: it stays on one line.
+        let plain = card_for(&Scan {
+            texts: vec!["hi\nSite: bank.com. Not opened.".into()],
+            unreadable: 0,
+        });
+        assert_eq!(plain.detail.lines().count(), 1, "{}", plain.detail);
+        // The clipboard keeps the exact text.
+        let scan = Scan {
+            texts: vec![payload.into()],
+            unreadable: 0,
+        };
+        assert_eq!(clipboard_text(&scan).as_deref(), Some(payload));
+    }
+
+    #[test]
+    fn direction_and_invisible_characters_are_shown_as_marks() {
+        let payload = "pay\u{202E}moc.knab\u{202C} \u{2066}x\u{2069}\u{200E}\u{200F}\u{200B}";
+        let card = card_for(&Scan {
+            texts: vec![payload.into()],
+            unreadable: 0,
+        });
+        for c in [
+            '\u{202E}', '\u{202C}', '\u{2066}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{200B}',
+        ] {
+            assert!(!card.detail.contains(c), "{c:?} drawn raw: {}", card.detail);
+        }
+        assert!(card.detail.contains("\\u{202e}"), "{}", card.detail);
+    }
+
+    #[test]
+    fn a_look_alike_host_is_shown_in_punycode_and_flagged() {
+        // The first letter is Cyrillic U+0430, not Latin "a".
+        assert_eq!(
+            url_host("https://\u{0430}pple.com/"),
+            Some("xn--pple-43d.com".into())
+        );
+        assert_eq!(
+            url_host("https://B\u{00FC}cher.example"),
+            Some("xn--bcher-kva.example".into())
+        );
+        let card = card_for(&Scan {
+            texts: vec!["https://\u{0430}pple.com/".into()],
+            unreadable: 0,
+        });
+        assert!(
+            card.detail.contains("Site: xn--pple-43d.com."),
+            "{}",
+            card.detail
+        );
+        assert!(
+            card.detail.contains("non-English letters"),
+            "{}",
+            card.detail
+        );
+        let plain = card_for(&Scan {
+            texts: vec!["https://apple.com/".into()],
+            unreadable: 0,
+        });
+        assert!(!plain.detail.contains("non-English"), "{}", plain.detail);
+    }
+
+    #[test]
+    fn other_schemes_are_called_not_a_web_link() {
+        for text in [
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "ms-settings:network",
+            "WIFI:T:WPA;S:cafe;P:secret;;",
+        ] {
+            let card = card_for(&Scan {
+                texts: vec![text.into()],
+                unreadable: 0,
+            });
+            assert!(
+                card.detail.ends_with("\nNot a web link. Not opened."),
+                "{text}: {}",
+                card.detail
+            );
+        }
+        for text in ["hello", "Note: buy milk", "12:30"] {
+            let card = card_for(&Scan {
+                texts: vec![text.into()],
+                unreadable: 0,
+            });
+            assert_eq!(card.detail, text);
+        }
+    }
+
+    // -- robustness ----------------------------------------------------------
+
+    /// A 4K frame full of noise and finder-pattern-like squares, the worst
+    /// plausible input for the detector. It must come back without panicking
+    /// (the release build aborts on panic). Prints the time as a measurement.
+    #[test]
+    fn scan_survives_a_4k_frame_of_finder_pattern_noise() {
+        let (w, h) = (3840usize, 2160usize);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut rgba = vec![255u8; w * h * 4];
+        for px in rgba.chunks_exact_mut(4) {
+            let v = if next() % 1000 < 5 { 0 } else { 255 };
+            px[..3].fill(v);
+        }
+        for _ in 0..300 {
+            let (ox, oy) = (next() as usize % (w - 40), next() as usize % (h - 40));
+            for y in 0..35usize {
+                for x in 0..35usize {
+                    let (mx, my) = (x / 5, y / 5);
+                    let ring = mx.min(6 - mx).min(my.min(6 - my));
+                    let dark = ring != 1;
+                    let i = ((oy + y) * w + ox + x) * 4;
+                    rgba[i..i + 3].fill(if dark { 0 } else { 255 });
+                }
+            }
+        }
+        let started = std::time::Instant::now();
+        let found = scan(&rgba, w as u32, h as u32);
+        eprintln!(
+            "MEASURED: scan of 3840x2160 noise took {:?} (test profile), {} texts, {} unreadable",
+            started.elapsed(),
+            found.texts.len(),
+            found.unreadable
+        );
+        for text in &found.texts {
+            assert!(!card_for(&Scan {
+                texts: vec![text.clone()],
+                unreadable: 0
+            })
+            .detail
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn tiny_frames_do_not_panic() {
+        for (w, h) in [(1u32, 1u32), (3, 3), (7, 7), (21, 21), (1, 500), (500, 1)] {
+            let rgba = vec![0u8; (w * h * 4) as usize];
+            let _ = scan(&rgba, w, h);
+            let rgba = vec![255u8; (w * h * 4) as usize];
+            let _ = scan(&rgba, w, h);
+        }
     }
 }
