@@ -991,6 +991,7 @@ impl App {
         match palette_model::dispatch_target_for(action_id) {
             Some(DispatchTarget::CheckMyWork) => self.ask(),
             Some(DispatchTarget::ExtractText) => self.extract_text(),
+            Some(DispatchTarget::ReadQr) => self.read_qr(),
             Some(DispatchTarget::AddToCalendar) => self.add_event_from_screen(),
             Some(DispatchTarget::ReviewEmail) => self.review_this_email(),
             Some(DispatchTarget::FillForm) => self.fill_form_from_screen(),
@@ -1020,6 +1021,24 @@ impl App {
     /// (see that module's doc comment). The only gate is Paused, same as
     /// `ask`.
     fn extract_text(&mut self) {
+        self.run_model_free_screen_action(actions::extract_text::recognize_and_copy);
+    }
+
+    /// "Read QR code from screen" (#313): decode every QR code on the active
+    /// monitor and copy the text. Same flow, gates and card path as
+    /// `extract_text` (no provider, no `Mode`, no network); a link in a code
+    /// is shown on the card and never opened.
+    fn read_qr(&mut self) {
+        self.run_model_free_screen_action(actions::read_qr::read_and_copy);
+    }
+
+    /// The shared body of the model-free screen actions: gate on Paused,
+    /// capture on the main thread, then run `work` on a worker thread and
+    /// report through `WM_APP_RESULT`. See `extract_text` for the ordering.
+    fn run_model_free_screen_action(
+        &mut self,
+        work: fn(&crate::capture::RawShot) -> anyhow::Result<Answer>,
+    ) {
         if self.busy {
             return;
         }
@@ -1053,14 +1072,13 @@ impl App {
 
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
-            let result: std::result::Result<Answer, String> =
-                actions::extract_text::recognize_and_copy(&raw).map_err(|e| {
-                    let chain_text = worker_error_chain_text(&e);
-                    pack_error(
-                        &human_error_detail(&chain_text),
-                        &crate::egress::redact_opaque_tokens(&chain_text),
-                    )
-                });
+            let result: std::result::Result<Answer, String> = work(&raw).map_err(|e| {
+                let chain_text = worker_error_chain_text(&e);
+                pack_error(
+                    &human_error_detail(&chain_text),
+                    &crate::egress::redact_opaque_tokens(&chain_text),
+                )
+            });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -4478,6 +4496,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
+                    MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
                     MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
                     MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
                     MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),

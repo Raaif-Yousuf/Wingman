@@ -10,6 +10,7 @@ pub mod extract_text;
 pub mod fill_form;
 pub mod generic_answer;
 pub mod generic_inputs;
+pub mod read_qr;
 pub mod review_email;
 pub mod schema;
 
@@ -177,6 +178,11 @@ pub struct Resolved {
 /// for why.
 pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 
+/// The id of the "Read QR code from screen" built-in action (#313): decode
+/// every QR code on the active monitor with no model and no network, copy
+/// the text. See `actions::read_qr`.
+pub const READ_QR_ACTION_ID: &str = "read-qr-code";
+
 /// The built-in actions Wingman ships.
 ///
 /// - `"check-my-work"`: today's physics/statistics check, unchanged in
@@ -204,6 +210,10 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 ///   (`App::extract_text` ->
 ///   `actions::extract_text::{capture_screen, recognize_and_copy}`) still
 ///   does not read this `Action` value's `proposal`/`executor` fields back.
+/// - `"read-qr-code"` (#313): decode every QR code on the screen locally and
+///   copy the text, model-free like `extract-text-to-clipboard` (same
+///   deliberately unregistered proposal name, empty prompt, read-only
+///   clipboard executor). A link in a code is shown, never opened.
 /// - `"add-to-calendar"` (#39, `calendar::builtin_action`): the first action
 ///   that runs the full Look/Propose/Confirm/Do loop end to end.
 /// - `"review-this-email"` (#38, `review_email::builtin_action`): the
@@ -236,6 +246,20 @@ pub fn builtin_actions() -> Vec<Action> {
             group: Some("Work".to_string()),
             inputs: vec![InputKind::Screen],
             proposal: "ocr_text".to_string(),
+            executor: "clipboard".to_string(),
+            confirm: false,
+            prompt: String::new(),
+            prefer: Prefer::default(),
+            hotkey: None,
+            rate_difficulty: false,
+            enabled: true,
+        },
+        Action {
+            id: READ_QR_ACTION_ID.to_string(),
+            name: "Read QR code from screen".to_string(),
+            group: Some("Work".to_string()),
+            inputs: vec![InputKind::Screen],
+            proposal: "qr_text".to_string(),
             executor: "clipboard".to_string(),
             confirm: false,
             prompt: String::new(),
@@ -440,9 +464,9 @@ mod tests {
         let builtins = builtin_actions();
         assert_eq!(
             builtins.len(),
-            5,
-            "check-my-work, extract-text-to-clipboard (#41), add-to-calendar (#39), \
-             review-this-email (#38), fill-this-form (#40)"
+            6,
+            "check-my-work, extract-text-to-clipboard (#41), read-qr-code (#313), \
+             add-to-calendar (#39), review-this-email (#38), fill-this-form (#40)"
         );
         // Found by id, not by position, so this stays valid regardless of
         // what order the built-ins are in.
@@ -492,6 +516,21 @@ mod tests {
                 .any(|r| r.action.id == EXTRACT_TEXT_ACTION_ID),
             "extract-text-to-clipboard must be visible with no actions.toml"
         );
+    }
+
+    #[test]
+    fn builtin_read_qr_matches_the_design() {
+        let builtins = builtin_actions();
+        let a = builtins
+            .iter()
+            .find(|a| a.id == READ_QR_ACTION_ID)
+            .expect("read-qr-code is built in");
+        assert_eq!(a.name, "Read QR code from screen");
+        assert_eq!(a.group.as_deref(), Some("Work"));
+        assert_eq!(a.inputs, vec![InputKind::Screen]);
+        assert_eq!(a.executor, "clipboard");
+        assert!(!a.confirm && a.prompt.is_empty());
+        assert_eq!(schema::schema_for(&a.proposal, a.rate_difficulty), None);
     }
 
     // -- executor resolution (#31) -------------------------------------------

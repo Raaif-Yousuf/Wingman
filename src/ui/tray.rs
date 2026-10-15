@@ -180,6 +180,12 @@ pub mod cmd {
     /// `App::restore_last_form` in `app.rs`.
     pub const RESTORE_LAST_FORM: u32 = 1027;
 
+    /// Issue #313: "Read QR code from screen" -- decode every QR code on the
+    /// active monitor locally and copy the text. See `App::read_qr` in
+    /// `app.rs` and `actions::read_qr`. The Quick Ask palette also lists it
+    /// (`DispatchTarget::ReadQr`); this tray item is the direct path.
+    pub const READ_QR: u32 = 1030;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -497,6 +503,7 @@ impl Tray {
         // of pausing.
         append_item_state(hmenu, cmd::QUICK_ASK, "Quick Ask", !self.paused)?;
         append_item(hmenu, cmd::EXTRACT_TEXT, "Copy text from screen")?;
+        append_item(hmenu, cmd::READ_QR, "Read QR code from screen")?;
         append_item(hmenu, cmd::COPY_REGION, "Copy region to clipboard")?;
         append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
         // #115: works with no provider at all, but still honors Pause
@@ -1605,6 +1612,7 @@ mod tests {
         ("REVIEW_EMAIL", cmd::REVIEW_EMAIL),
         ("FILL_FORM", cmd::FILL_FORM),
         ("RESTORE_LAST_FORM", cmd::RESTORE_LAST_FORM),
+        ("READ_QR", cmd::READ_QR),
         ("VERSION_LABEL", cmd::VERSION_LABEL),
     ];
 

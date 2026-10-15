@@ -28,6 +28,11 @@ xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = "3.6"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# QR decoding (#313): pure Rust, no model, no network. (MIT OR Apache-2.0) AND
+# ISC (the ISC part is its port of the quirc detector), re-verified at adoption
+# 2026-10-15; its dependency chain is MIT/Apache/Zlib. Default features off:
+# the `img` feature only adds a second `image` coupling we do not use.
+rqrr = { version = "0.11", default-features = false }
 
 [dependencies.windows]
 version = "0.62"
@@ -101,6 +106,9 @@ features = ["std"]
 # [[bin]] section and tests/no_em_dash.rs's own doc comment for the same
 # fact). MIT OR Apache-2.0, re-verified at adoption 2026-09-18.
 trybuild = "1"
+# Test-only: renders QR fixtures for actions::read_qr (#313). Not linked into
+# the shipped exe. MIT OR Apache-2.0, re-verified at adoption 2026-10-15.
+qrcode = { version = "0.14.1", default-features = false }
 
 [profile.release]
 opt-level = "z"
