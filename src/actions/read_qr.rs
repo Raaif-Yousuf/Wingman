@@ -40,20 +40,14 @@ pub struct Scan {
 }
 
 /// The longest side, in pixels, the detector is ever given. `rqrr` has no
-/// time limit of its own, and its grouping step copies the whole image for
-/// every candidate triple of finder squares, so the cost is roughly the pixel
-/// count times the square of the number of finder-like shapes (#528). Larger
-/// frames are shrunk by a whole-number factor first. A code smaller than a
-/// few pixels per module after shrinking is reported as not found.
-/// The longest side, in pixels, the detector is ever given. `rqrr` has no
 /// time limit of its own: on a noisy 4K frame it ran for about 24 minutes in
 /// the test profile and overflowed in a debug build (#528). Larger frames are
-/// shrunk by a whole-number factor first.
-/// THEORY (unverified): the cause is the number of finder-pattern-like shapes
-/// in a large noisy frame, so shrinking removes it. MEASURED: native frames at
-/// the bound (1920x1080 noise, 1x5000, 5000x1) are checked by the tests
-/// `native_*` below; their result is recorded there. A code smaller than a
-/// few pixels per module after shrinking is reported as not found.
+/// shrunk by a whole-number factor first, which bounds the pixel count. The
+/// shrink alone does not bound the run time: MEASURED 2026-10-15, a native
+/// 1920x1080 frame of finder-like squares still took seconds and could panic
+/// inside `rqrr`, so [`MAX_FINDER_CANDIDATES`] is the second limit. A code
+/// smaller than a few pixels per module after shrinking is reported as not
+/// found.
 const MAX_SIDE: usize = 1920;
 
 /// The most finder-like shapes (see [`finder_candidates`]) a frame may hold
