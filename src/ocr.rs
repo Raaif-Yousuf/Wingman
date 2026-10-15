@@ -241,11 +241,46 @@ pub fn preferred_language() -> String {
     }
 }
 
+/// Primary language and optional script subtag of a BCP-47 tag, lowercased
+/// (`zh-Hans-CN` is `("zh", Some("hans"))`, `de-DE` is `("de", None)`).
+fn language_and_script(tag: &str) -> (String, Option<String>) {
+    let mut parts = tag.split(['-', '_']);
+    let lang = parts.next().unwrap_or("").to_ascii_lowercase();
+    let script = parts
+        .next()
+        .filter(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()))
+        .map(|p| p.to_ascii_lowercase());
+    (lang, script)
+}
+
+/// Region the OCR pack for a bare language is expected to have, so `de`
+/// resolves to `de-DE` however Windows orders its list.
+fn default_region_tag(lang: &str) -> String {
+    match lang {
+        "en" => "en-us".to_string(),
+        "pt" => "pt-br".to_string(),
+        "ja" => "ja-jp".to_string(),
+        "ko" => "ko-kr".to_string(),
+        "zh" => "zh-hans-cn".to_string(),
+        "sv" => "sv-se".to_string(),
+        "da" => "da-dk".to_string(),
+        "cs" => "cs-cz".to_string(),
+        "el" => "el-gr".to_string(),
+        "uk" => "uk-ua".to_string(),
+        other => format!("{other}-{other}"),
+    }
+}
+
 /// Pure language choice. `preferred` is `"auto"` (or empty) or a BCP-47 tag
-/// such as `de` or `de-DE`; `available` is the installed recognizer tags.
-/// Order: exact tag (case-insensitive), then the first pack sharing the
-/// primary language subtag (`de` finds `de-DE`, `en-GB` finds `en-US`).
-/// A language with no pack is `Missing`, never silently swapped for another.
+/// such as `de`, `de-DE` or `zh-Hans`; `available` is the installed
+/// recognizer tags.
+///
+/// Order: exact tag (case-insensitive); otherwise among packs of the same
+/// primary language (and, when the request names a script, the same script
+/// only, so `zh-Hans` never gets `zh-Hant-TW`): the language's default
+/// region (`de-DE`, `en-US`...), then alphabetical, so the answer does not
+/// depend on the order Windows lists packs in. A request with no pack is
+/// `Missing`, never silently swapped for a different language or script.
 pub fn select_language(preferred: &str, available: &[String]) -> LanguageChoice {
     let want = preferred.trim();
     if want.is_empty() || want.eq_ignore_ascii_case("auto") {
@@ -254,17 +289,46 @@ pub fn select_language(preferred: &str, available: &[String]) -> LanguageChoice 
     if let Some(t) = available.iter().find(|t| t.eq_ignore_ascii_case(want)) {
         return LanguageChoice::Tag(t.clone());
     }
-    let primary = |t: &str| {
-        t.split(['-', '_'])
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-    };
-    let want_primary = primary(want);
-    match available.iter().find(|t| primary(t) == want_primary) {
-        Some(t) => LanguageChoice::Tag(t.clone()),
+    let (want_lang, want_script) = language_and_script(want);
+    let default_tag = default_region_tag(&want_lang);
+    let mut candidates: Vec<&String> = available
+        .iter()
+        .filter(|t| {
+            let (lang, script) = language_and_script(t);
+            lang == want_lang && (want_script.is_none() || script == want_script)
+        })
+        .collect();
+    candidates.sort_by_key(|t| {
+        let lower = t.to_ascii_lowercase().replace('_', "-");
+        (lower != default_tag, lower)
+    });
+    match candidates.first() {
+        Some(t) => LanguageChoice::Tag((*t).clone()),
         None => LanguageChoice::Missing,
     }
+}
+
+/// The tag actually used by the last successful engine creation, for the
+/// diagnostics report.
+static LAST_USED_LANGUAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// One diagnostics line: the setting, and which pack it resolved to when
+/// that differs (`de, used de-DE`; `en-GB, used en-US`).
+pub fn language_report(requested: &str, used: Option<&str>) -> String {
+    match used {
+        None => format!("{requested} (not used yet)"),
+        Some(u) if u.eq_ignore_ascii_case(requested) => u.to_string(),
+        Some(u) => format!("{requested}, used {u}"),
+    }
+}
+
+/// Current `language_report` for the Copy diagnostics text.
+pub fn language_status() -> String {
+    let used = LAST_USED_LANGUAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    language_report(&preferred_language(), used.as_deref())
 }
 
 /// Card text for a requested language with no installed OCR pack (rule 7).
@@ -344,6 +408,7 @@ fn recognize_inner(rgba: &[u8], width: u32, height: u32, timeout: Duration) -> R
         .and_then(|l| l.LanguageTag())
         .map(|t| t.to_string_lossy())
         .unwrap_or_else(|_| "unknown".to_string());
+    *LAST_USED_LANGUAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(language_tag.clone());
 
     // A failure to query the limit is treated as "assume the conservative
     // default this crate already uses elsewhere" rather than aborting OCR
@@ -665,6 +730,60 @@ mod tests {
     }
 
     #[test]
+    fn script_subtag_must_match_the_pack_script() {
+        let packs = tags(&["zh-Hant-TW", "zh-Hans-CN"]);
+        assert_eq!(
+            select_language("zh-Hans", &packs),
+            LanguageChoice::Tag("zh-Hans-CN".to_string())
+        );
+        assert_eq!(
+            select_language("zh-Hans", &tags(&["zh-Hant-TW"])),
+            LanguageChoice::Missing
+        );
+        assert_eq!(
+            select_language("zh-Hant-HK", &packs),
+            LanguageChoice::Tag("zh-Hant-TW".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_language_prefers_its_default_region_whatever_the_list_order() {
+        assert_eq!(
+            select_language("de", &tags(&["de-CH", "de-DE"])),
+            LanguageChoice::Tag("de-DE".to_string())
+        );
+        assert_eq!(
+            select_language("de", &tags(&["de-DE", "de-CH"])),
+            LanguageChoice::Tag("de-DE".to_string())
+        );
+        assert_eq!(
+            select_language("en", &tags(&["en-GB", "en-US"])),
+            LanguageChoice::Tag("en-US".to_string())
+        );
+    }
+
+    #[test]
+    fn without_a_default_region_pack_the_choice_is_alphabetical() {
+        assert_eq!(
+            select_language("de", &tags(&["de-CH", "de-AT"])),
+            LanguageChoice::Tag("de-AT".to_string())
+        );
+        assert_eq!(
+            select_language("de", &tags(&["de-AT", "de-CH"])),
+            LanguageChoice::Tag("de-AT".to_string())
+        );
+    }
+
+    #[test]
+    fn language_report_says_requested_and_used() {
+        assert_eq!(language_report("auto", None), "auto (not used yet)");
+        assert_eq!(language_report("de", None), "de (not used yet)");
+        assert_eq!(language_report("de", Some("de-DE")), "de, used de-DE");
+        assert_eq!(language_report("en-US", Some("en-US")), "en-US");
+        assert_eq!(language_report("auto", Some("en-US")), "auto, used en-US");
+    }
+
+    #[test]
     fn missing_pack_is_reported_not_silently_replaced() {
         assert_eq!(
             select_language("de", &tags(&["en-US"])),
@@ -834,6 +953,11 @@ mod tests {
         println!("missing-pack card text: {err}");
         assert!(err.to_string().contains("Settings > Time & language"));
 
+        assert!(
+            !installed.is_empty(),
+            "no OCR language pack is installed on this machine; install one under \
+             Settings > Time & language > Language & region and rerun"
+        );
         let mut tries = vec![installed[0].clone()];
         if let Ok(l) = std::env::var("WINGMAN_OCR_LIVE_LANG") {
             tries.push(l);
