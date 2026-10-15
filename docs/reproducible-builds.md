@@ -103,6 +103,14 @@ in a linker flag gets path-translated unless it is embedded in a single
 token like `-Clink-arg=/Brepro` or `MSYS_NO_PATHCONV=1` is set -- this
 bit `.cargo/config.toml` itself, since TOML has no shell to mangle.)
 
+The same file sets `LIBSQLITE3_FLAGS` (`[env]`, with `force = true` so a
+stray variable in someone's shell cannot change the bundled SQLite's compile
+options). It is part of the build input: two builds with different values
+produce different exes. `rusqlite`'s bundled build compiles C with MSVC, so
+the two-build comparison above has to be repeated with the store in; that was
+not re-measured when the store landed (THEORY, unverified: MSVC's object
+output is deterministic for the same flags and source, as the Rust side is).
+
 ## SBOM
 
 `release.yml` generates a CycloneDX SBOM with `cargo cyclonedx` (installed

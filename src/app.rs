@@ -2064,7 +2064,16 @@ impl App {
 
     fn on_result(&mut self, result: std::result::Result<Answer, String>) {
         let is_err = result.is_err();
-        let answer = self.record_last(result);
+        let mut answer = self.record_last(result);
+        // A store failure never fails the request (#46); it rides on the
+        // next card instead, once per run.
+        if let Some(notice) = crate::store::take_notice() {
+            answer.detail = if answer.detail.is_empty() {
+                notice
+            } else {
+                format!("{}\n\n{notice}", answer.detail)
+            };
+        }
         if is_err {
             self.card
                 .show_error_with_details(&answer.headline, &answer.detail);

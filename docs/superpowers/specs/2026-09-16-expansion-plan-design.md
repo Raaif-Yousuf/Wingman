@@ -25,7 +25,7 @@ Owner decisions, 2026-09-16:
 ## 1. What we are building
 
 Today: press the Copilot key, a vision model checks the physics problem on
-screen, a card shows the verdict. One job, done well, ~2 MB, no runtime.
+screen, a card shows the verdict. One job, done well, ~3.3 MB (with the bundled SQLite store), no runtime.
 
 Target: **the key you press when you want something on your screen dealt
 with.** You are on a checkout page: it fills your details and hands back

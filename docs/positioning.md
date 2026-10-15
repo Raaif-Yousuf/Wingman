@@ -21,7 +21,7 @@ The owner's three, sharpened, plus two the research adds:
 
 | # | Wingman | Copilot on Windows |
 |---|---|---|
-| 1 | **Quiet.** A tray icon, ~2 MB, 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
+| 1 | **Quiet.** A tray icon, ~3.3 MB, 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
 | 2 | **Local and verifiable.** Offline mode refuses the network in code. An egress log shows every request and every byte. Screenshots are redacted before upload. The prompt is a text file you can read. Open source, so the claim can be checked | Copilot Vision sends the screen to Microsoft's servers. Recall shipped plaintext screenshots and had to be pulled twice before relaunching opt-in. "Trust us" from a vendor that lost the room |
 | 3 | **Yours to extend.** An action is a TOML file: prompt, inputs, executor. Read it, edit it, share it, install one from the gallery | Closed |
 | 4 | **Never the final button.** It fills, drafts and proposes. You press Send, Submit, Pay | Copilot Actions and every "agent" product sell autonomy, and autonomous irreversible actions are the single fastest trust-killer in the literature |

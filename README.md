@@ -26,7 +26,7 @@ about Wingman is checked against the code in this repo, not aspirational.
 
 | | Wingman | Copilot on Windows |
 |---|---|---|
-| **Footprint** | A tray icon, about 2 MB, 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
+| **Footprint** | A tray icon, about 3.3 MB, 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
 | **Verifiable** | Offline mode refuses any non-loopback network call in code, enforced before a socket ever opens (see [`docs/offline.md`](docs/offline.md)). Open source under MIT: read the code yourself | Copilot Vision sends the screen to Microsoft's servers. Windows Recall shipped plaintext screenshots and had to be pulled twice before relaunching opt-in |
 | **Extensible** | An action is a small, readable definition: a prompt, an input list and an executor. Five built-in actions ship today (check my work, add event from screen, review this email, fill this form, copy text from screen); a hand-written `actions.toml` entry parses and shows in the palette but does not yet dispatch on confirm (issue #242). The framework is the product, actions are the contribution surface | Closed |
 | **Never the final button** | Fills, drafts and proposes. Never presses Send, Submit, Buy or Pay: a permanent rule, not a version-1 limit to be relaxed later | Copilot Actions and other "agent" products sell autonomy |

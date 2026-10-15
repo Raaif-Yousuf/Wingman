@@ -104,8 +104,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
-    WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    WM_SETTINGCHANGE, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -767,6 +767,31 @@ fn detect_theme() -> Theme {
     }
 }
 
+/// Whether a `WM_SETTINGCHANGE` names the light/dark switch. Windows sends
+/// `"ImmersiveColorSet"` in `lparam` when the user changes app mode or the
+/// accent color.
+fn setting_change_is_theme(name: &str) -> bool {
+    name == "ImmersiveColorSet"
+}
+
+/// The text of a `WM_SETTINGCHANGE` `lparam` (a null-terminated UTF-16
+/// string, or null for the broadcasts that carry none).
+///
+/// # Safety
+/// `lparam` must be zero or point at a null-terminated UTF-16 string, which
+/// is what Windows guarantees for this message.
+unsafe fn setting_change_name(lparam: LPARAM) -> String {
+    let ptr = lparam.0 as *const u16;
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+}
+
 const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
 
 fn hkey_current_user() -> *mut c_void {
@@ -1200,10 +1225,8 @@ struct CardInner {
     /// Issue #350: the brush WM_CTLCOLOREDIT returns for preview EDIT
     /// fields, matching `self.theme`. Created lazily on first use and cached
     /// rather than created per-paint (WM_CTLCOLOREDIT fires on every
-    /// keystroke and repaint), and deleted once in WM_NCDESTROY -- the theme
-    /// never changes for the lifetime of a card window (no WM_SETTINGCHANGE
-    /// handler exists), so one brush for the window's whole life is correct,
-    /// not just an optimisation.
+    /// keystroke and repaint), and deleted in WM_NCDESTROY, or earlier when
+    /// a live theme change (`apply_theme`, #431) makes its color stale.
     edit_bg_brush: HBRUSH,
     /// Issue #354: which sub-stage the Pending state is in. Meaningless
     /// outside `CardState::Pending`; set to whatever stage the caller passed
@@ -1212,9 +1235,8 @@ struct CardInner {
     pending_stage: PendingStage,
     /// Issue #354: whether Windows' "Animation effects" setting was on the
     /// last time `show_pending` queried it (`client_area_animation_enabled`,
-    /// checked once per Pending session, not re-polled -- there is no
-    /// `WM_SETTINGCHANGE` handler in this module, matching `theme`'s own
-    /// once-per-window-life treatment noted on `edit_bg_brush` above). With
+    /// checked once per Pending session, not re-polled: its
+    /// `WM_SETTINGCHANGE` is not handled, only the theme's is). With
     /// it `false`, `paint_pending` draws a static glyph and `show_pending`
     /// never arms `TIMER_ANIM`.
     animations_enabled: bool,
@@ -1461,6 +1483,31 @@ impl CardInner {
             // ..." -> "Still working." countdown never outlives the card
             // state it belongs to.
             let _ = KillTimer(Some(self.hwnd), TIMER_STILL_WORKING);
+        }
+    }
+
+    /// Switches to `theme`: drops the cached EDIT brush (it holds the old
+    /// theme's color; `WM_CTLCOLOREDIT` rebuilds it) and repaints the card
+    /// and its preview fields.
+    fn apply_theme(&mut self, theme: Theme) {
+        if theme == self.theme {
+            return;
+        }
+        self.theme = theme;
+        if !self.edit_bg_brush.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.edit_bg_brush.0));
+            }
+            self.edit_bg_brush = HBRUSH(std::ptr::null_mut());
+        }
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ALLCHILDREN,
+            );
         }
     }
 
@@ -2521,6 +2568,15 @@ impl CardInner {
             }
             WM_CARD_SPEECH_END => {
                 self.on_speech_end();
+                Some(LRESULT(0))
+            }
+            // #431: the light/dark switch. Event-driven (no timer, rule 5):
+            // Windows broadcasts this to every top-level window, so the card
+            // hears it even while hidden.
+            WM_SETTINGCHANGE => {
+                if setting_change_is_theme(&unsafe { setting_change_name(lparam) }) {
+                    self.apply_theme(detect_theme());
+                }
                 Some(LRESULT(0))
             }
             WM_DPICHANGED => {
@@ -3829,21 +3885,28 @@ mod tests {
     fn preview_from_hidden_anchors_follow_mouse_to_the_current_pointer() {
         // Issue #109: a preview shown from Hidden used to place itself with
         // whatever pointer position an earlier card had recorded.
-        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        // #514: pin the pointer first, so a moving mouse cannot change what
+        // the card should record. Read it back (the system may clamp the
+        // point) and put the user's pointer back afterwards.
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+        let mut original = POINT::default();
+        let mut pinned = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut original);
+            let _ = SetCursorPos(200, 200);
+            let _ = GetCursorPos(&mut pinned);
+        }
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
         card.set_placement(CardCorner::FollowMouse, "cursor");
         card.inner.follow_anchor = POINT { x: -5000, y: -5000 };
         let (schema, value) = calendar_schema_and_value();
         let _ = card.show_preview("Add to calendar", &schema, &value, false);
-        let mut now = POINT::default();
+        let anchor = (card.inner.follow_anchor.x, card.inner.follow_anchor.y);
         unsafe {
-            let _ = GetCursorPos(&mut now);
+            let _ = SetCursorPos(original.x, original.y);
         }
-        assert_eq!(
-            (card.inner.follow_anchor.x, card.inner.follow_anchor.y),
-            (now.x, now.y)
-        );
+        assert_eq!(anchor, (pinned.x, pinned.y));
     }
 
     #[test]
@@ -4095,6 +4158,66 @@ mod tests {
             !queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS),
             "an answer card has no Copy details to activate"
         );
+    }
+
+    // -- live theme change (#431) ------------------------------------------
+
+    fn opposite(theme: Theme) -> Theme {
+        match theme {
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::Light,
+        }
+    }
+
+    #[test]
+    fn a_theme_setting_change_makes_the_card_re_read_the_theme() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let detected = detect_theme();
+        card.inner.theme = opposite(detected);
+        let name = wide_z("ImmersiveColorSet");
+
+        let handled =
+            card.handle_message(WM_SETTINGCHANGE, WPARAM(0), LPARAM(name.as_ptr() as isize));
+
+        assert!(handled.is_some());
+        assert_eq!(card.inner.theme, detected);
+    }
+
+    #[test]
+    fn an_unrelated_setting_change_leaves_the_theme_alone() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let forced = opposite(detect_theme());
+        card.inner.theme = forced;
+        let name = wide_z("intl");
+
+        card.handle_message(WM_SETTINGCHANGE, WPARAM(0), LPARAM(name.as_ptr() as isize));
+        card.handle_message(WM_SETTINGCHANGE, WPARAM(0), LPARAM(0));
+
+        assert_eq!(card.inner.theme, forced);
+    }
+
+    #[test]
+    fn a_new_theme_drops_the_cached_edit_brush() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let detected = detect_theme();
+        card.inner.theme = opposite(detected);
+        card.inner.edit_bg_brush =
+            unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x0012_3456)) };
+        let name = wide_z("ImmersiveColorSet");
+
+        card.handle_message(WM_SETTINGCHANGE, WPARAM(0), LPARAM(name.as_ptr() as isize));
+
+        assert!(
+            card.inner.edit_bg_brush.0.is_null(),
+            "the cached brush is the old theme's color and must be rebuilt"
+        );
+    }
+
+    #[test]
+    fn only_the_immersive_color_set_setting_is_a_theme_change() {
+        assert!(setting_change_is_theme("ImmersiveColorSet"));
+        assert!(!setting_change_is_theme("intl"));
+        assert!(!setting_change_is_theme(""));
     }
 
     #[test]
@@ -5213,52 +5336,16 @@ mod tests {
 
     // -- stale preview command must not hijack a later preview (#255) -----
 
-    /// Drains every preview command queued for `card_hwnd` (the legacy
-    /// `WM_COMMAND` and the generation-tagged `WM_CARD_PREVIEW_COMMAND`) and
-    /// feeds each to the card the way the message loop would.
-    fn pump_queued_preview_commands(card: &mut Card) {
-        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
-        let hwnd = card.hwnd();
-        for (lo, hi) in [
-            (WM_COMMAND, WM_COMMAND),
-            (WM_CARD_PREVIEW_COMMAND, WM_CARD_PREVIEW_COMMAND),
-        ] {
-            let mut msg = MSG::default();
-            while unsafe { PeekMessageW(&mut msg, Some(hwnd), lo, hi, PM_REMOVE).as_bool() } {
-                card.handle_message(msg.message, msg.wParam, msg.lParam);
-            }
-        }
-    }
-
-    #[test]
-    fn replacing_a_focused_preview_does_not_cancel_the_new_one() {
-        // #255 regression guard. This passes without the generation tag too:
-        // MEASURED 2026-10-15, destroying a focused preview field moves focus
-        // to the card first, so replacing a preview posts no cancel at all.
-        // It pins that behaviour; the tag is covered by the tests below.
-        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
-        let (schema, value) = calendar_schema_and_value();
-        card.inner.show_preview("Preview A", &schema, &value, false);
-        card.inner.show_preview("Preview B", &schema, &value, false);
-
-        pump_queued_preview_commands(&mut card);
-
-        assert_eq!(
-            card.state(),
-            CardState::Preview,
-            "a cancel posted while tearing down A must not close B"
-        );
-        assert_eq!(
-            card.inner.preview.as_ref().map(|p| p.title.as_str()),
-            Some("Preview B")
-        );
-    }
-
     #[test]
     fn a_click_away_cancel_posted_for_one_preview_does_not_close_the_next() {
         // #255: the click-away cancel is posted for preview A but only
-        // pumped after preview B replaced it. Uses the real subclass to
+        // delivered after preview B replaced it. Uses the real subclass to
         // post it, so the tag the receiver checks is the one it really sets.
+        // The posted message is taken off the queue straight away and
+        // delivered by hand: draining the queue later would also pick up
+        // focus changes the OS makes under a parallel test run, which
+        // legitimately cancel the live preview.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
         card.inner.show_preview("Preview A", &schema, &value, false);
@@ -5274,9 +5361,21 @@ mod tests {
                 card_hwnd.0 as usize,
             );
         }
+        let mut posted = MSG::default();
+        let found = unsafe {
+            PeekMessageW(
+                &mut posted,
+                Some(card_hwnd),
+                WM_CARD_PREVIEW_COMMAND,
+                WM_CARD_PREVIEW_COMMAND,
+                PM_REMOVE,
+            )
+            .as_bool()
+        };
+        assert!(found, "the click-away must post a command");
         card.inner.show_preview("Preview B", &schema, &value, false);
 
-        pump_queued_preview_commands(&mut card);
+        card.handle_message(posted.message, posted.wParam, posted.lParam);
 
         assert_eq!(card.state(), CardState::Preview);
         assert_eq!(

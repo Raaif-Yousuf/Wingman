@@ -4,7 +4,7 @@ A Windows 11 tray utility. Press the Copilot key (or a configurable secondary
 hotkey); it screenshots the active monitor, sends it to a vision LLM, and shows a
 one-line verdict in a notification card. Click the card to expand the full working.
 
-Target: single ~2 MB `copilot-ask.exe`, under 10 MB idle RSS, no runtime dependency.
+Target: single ~3.3 MB `copilot-ask.exe` (about 2.4 MB before the SQLite store, #46), under 10 MB idle RSS, no runtime dependency.
 
 ## Threading model
 
