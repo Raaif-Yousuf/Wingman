@@ -67,7 +67,7 @@ Five built-in actions, built and running, all reachable from the tray menu:
 
 The confirm-and-execute loop, the executors (calendar add, form fill, text
 replace, image-to-clipboard) and the actions framework itself
-(`actions.toml`, six built-in actions loadable today) are built and wired,
+(`actions.toml`, built-in actions loadable today) are built and wired,
 not planned. What has landed alongside those actions:
 
 - **Four providers plus any OpenAI-compatible endpoint**: OpenAI, Anthropic
@@ -113,7 +113,7 @@ It fills, drafts and proposes; you finish. That rule is permanent, not a
 version-1 limitation to be relaxed later.
 
 Planned and not yet built: dispatch for an arbitrary hand-written
-`actions.toml` entry beyond the six built-in ids (issue #242), more
+`actions.toml` entry beyond the built-in ids (issue #242), more
 connectors beyond ics, and awareness. The actions-as-data framework, the
 confirm-and-execute loop, the built executors and the ics connector are
 built; see "What works today" above. Track what remains in

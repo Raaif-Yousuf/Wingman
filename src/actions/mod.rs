@@ -7,6 +7,7 @@
 
 pub mod action_items;
 pub mod calendar;
+pub mod explain_error;
 pub mod extract_text;
 pub mod fill_form;
 pub mod generic_answer;
@@ -218,6 +219,8 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 /// - `"action-items-checklist"` (#314, `action_items::builtin_action`):
 ///   proposal `action_items`, executor `clipboard`. Runs through the generic
 ///   dispatch path (`App::run_generic_action`), like an `actions.toml` entry.
+/// - `"explain-this-error"` (#66, `explain_error::builtin_action`): proposal
+///   `error_explanation`, executor `none`, so the answer is the card (#441).
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -252,6 +255,7 @@ pub fn builtin_actions() -> Vec<Action> {
         review_email::builtin_action(),
         fill_form::builtin_action(),
         action_items::builtin_action(),
+        explain_error::builtin_action(),
     ]
 }
 
@@ -445,9 +449,10 @@ mod tests {
         let builtins = builtin_actions();
         assert_eq!(
             builtins.len(),
-            6,
+            7,
             "check-my-work, extract-text-to-clipboard (#41), add-to-calendar (#39), \
-             review-this-email (#38), fill-this-form (#40), action-items-checklist (#314)"
+             review-this-email (#38), fill-this-form (#40), action-items-checklist (#314), \
+             explain-this-error (#66)"
         );
         // Found by id, not by position, so this stays valid regardless of
         // what order the built-ins are in.
