@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use super::common;
-use super::{Caps, Completion, Effort, ImageLimits, Provider, Request, StopReason};
+use super::{Caps, Completion, Effort, ImageLimits, Provider, Request, StopReason, Usage};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -90,7 +90,7 @@ impl Anthropic {
     /// `Completion`. Returns a clear error if the model refused rather than
     /// answering. The text is returned as-is -- this provider never
     /// interprets it against a schema (#12).
-    fn parse_completion(body: &str) -> Result<Completion> {
+    pub(crate) fn parse_completion(body: &str) -> Result<Completion> {
         let value: Value =
             serde_json::from_str(body).context("anthropic: response body is not valid JSON")?;
 
@@ -133,9 +133,21 @@ impl Anthropic {
             _ => StopReason::Other,
         };
 
+        // `input_tokens` excludes the two cache fields; each is priced at its
+        // own rate (see `usage.rs`). Absent today (no `cache_control`, #180).
+        let usage = value.get("usage").map(|u| {
+            let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
+            Usage {
+                input_tokens: count("input_tokens"),
+                output_tokens: count("output_tokens"),
+                cache_write_tokens: count("cache_creation_input_tokens"),
+                cache_read_tokens: count("cache_read_input_tokens"),
+            }
+        });
+
         Ok(Completion {
             text: text.to_string(),
-            usage: None,
+            usage,
             stop,
         })
     }
@@ -195,7 +207,12 @@ impl Provider for Anthropic {
             "anthropic",
         )?;
 
-        Self::parse_completion(&body_text)
+        crate::usage::tally(
+            self.id(),
+            &self.model,
+            false,
+            Self::parse_completion(&body_text),
+        )
     }
 }
 
@@ -454,6 +471,25 @@ mod tests {
             provider.own_caps(),
             provider.capabilities("claude-haiku-4-5")
         );
+    }
+
+    #[test]
+    fn parse_completion_reads_usage_and_cache_tokens() {
+        let body = r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"{}"}],"usage":{"input_tokens":11,"output_tokens":22,"cache_creation_input_tokens":33,"cache_read_input_tokens":44}}"#;
+        let u = Anthropic::parse_completion(body).unwrap().usage.unwrap();
+        assert_eq!(
+            (
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_write_tokens,
+                u.cache_read_tokens
+            ),
+            (11, 22, 33, 44)
+        );
+        let plain = include_str!("../../tests/fixtures/anthropic_response.json");
+        let u = Anthropic::parse_completion(plain).unwrap().usage.unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (900, 60));
+        assert_eq!((u.cache_write_tokens, u.cache_read_tokens), (0, 0));
     }
 
     #[test]

@@ -1,0 +1,736 @@
+//! Token accounting and spend (#21): a local price table, a pure cost
+//! function, and per-day totals that the tray tooltip reads.
+//!
+//! # Where it is called from
+//!
+//! Every provider's `complete` calls [`record`] with the usage block it just
+//! parsed, so a new provider that calls it gets counted for free. The tray
+//! tooltip (`App::update_tooltip`) reads [`tooltip_part`].
+//!
+//! # The price table
+//!
+//! [`PRICES`] is the one place prices live. Each row names where the number
+//! came from and the date it was checked (AGENTS.md rule 10). A model with
+//! no row is never guessed: it is counted as "unpriced" so the tooltip says
+//! the total is a floor. To update a price, edit its row and the `CHECKED`
+//! date. When a vendor announces a future change, add a second row for the
+//! same model with a later `from` date: the newest row whose `from` is on or
+//! before the day of the request wins.
+//!
+//! Known gaps, all of which make the estimate an upper bound or a close
+//! approximation rather than a guess: OpenAI and Gemini cached-input
+//! discounts are not read (those tokens are billed at the full input rate
+//! here), and long-prompt surcharges (over 200k or 272k tokens) are ignored
+//! because a screenshot press is nowhere near them.
+//!
+//! Totals are a floor: only successful, parsed responses are counted, so a
+//! refused or failed call that the vendor still billed is not included. The
+//! tooltip refreshes only after a request finishes (no timer, AGENTS.md
+//! rule 5), so it can show yesterday's total until the first press of a day.
+//!
+//! # The totals file
+//!
+//! `%LOCALAPPDATA%\Wingman\spend.json`, one object keyed by local date. Only
+//! dollars and counts are stored, never prompts or answers.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+
+use crate::provider::{Completion, Usage};
+
+/// US dollars per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Price {
+    pub input: f64,
+    pub output: f64,
+    /// Anthropic prompt-cache write (5 minute) rate. Others: the input rate.
+    pub cache_write: f64,
+    /// Anthropic prompt-cache read rate. Others: the input rate.
+    pub cache_read: f64,
+}
+
+// `source` and `checked` are provenance for the person editing the table;
+// only the unit test reads them.
+#[cfg_attr(not(test), allow(dead_code))]
+struct PriceRow {
+    provider: &'static str,
+    model: &'static str,
+    /// First day (`YYYY-MM-DD`, local) this row applies.
+    from: &'static str,
+    price: Price,
+    /// Where the number came from.
+    source: &'static str,
+    /// When it was last compared with that source.
+    checked: &'static str,
+}
+
+const fn p(input: f64, output: f64, cache_write: f64, cache_read: f64) -> Price {
+    Price {
+        input,
+        output,
+        cache_write,
+        cache_read,
+    }
+}
+
+const fn row(
+    provider: &'static str,
+    model: &'static str,
+    from: &'static str,
+    price: Price,
+    source: &'static str,
+) -> PriceRow {
+    PriceRow {
+        provider,
+        model,
+        from,
+        price,
+        source,
+        checked: CHECKED,
+    }
+}
+
+const ANTHROPIC_SRC: &str = "https://platform.claude.com/docs/en/about-claude/pricing";
+const OPENAI_SRC: &str = "https://developers.openai.com/api/docs/pricing";
+const GEMINI_SRC: &str = "https://ai.google.dev/gemini-api/docs/pricing";
+/// MEASURED 2026-10-15: every row below was read from its `source` page on
+/// this date. Never edit a number without updating this.
+const CHECKED: &str = "2026-10-15";
+const ALWAYS: &str = "0000-01-01";
+
+const PRICES: &[PriceRow] = &[
+    // Anthropic. Cache write is the 5 minute rate.
+    row(
+        "anthropic",
+        "claude-opus-5",
+        ALWAYS,
+        p(5.0, 25.0, 6.25, 0.50),
+        ANTHROPIC_SRC,
+    ),
+    row(
+        "anthropic",
+        "claude-sonnet-5",
+        ALWAYS,
+        p(2.0, 10.0, 2.50, 0.20),
+        ANTHROPIC_SRC,
+    ),
+    row(
+        "anthropic",
+        "claude-opus-4-8",
+        ALWAYS,
+        p(5.0, 25.0, 6.25, 0.50),
+        ANTHROPIC_SRC,
+    ),
+    row(
+        "anthropic",
+        "claude-haiku-4-5",
+        ALWAYS,
+        p(1.0, 5.0, 1.25, 0.10),
+        ANTHROPIC_SRC,
+    ),
+    // Fable 5.1 cache reads are 0.025x input (the page's own footnote 1), not
+    // the 0.1x of the older rows: 10.0 * 0.025 = 0.25. Re-read 2026-10-15.
+    row(
+        "anthropic",
+        "claude-fable-5-1",
+        ALWAYS,
+        p(10.0, 50.0, 12.50, 0.25),
+        ANTHROPIC_SRC,
+    ),
+    // OpenAI (standard tier, up to 272k input tokens).
+    row(
+        "openai",
+        "gpt-5.5",
+        ALWAYS,
+        p(5.0, 30.0, 5.0, 0.50),
+        OPENAI_SRC,
+    ),
+    // No cached rate is listed for the Pro model: cached reads bill as input.
+    row(
+        "openai",
+        "gpt-5.5-pro",
+        ALWAYS,
+        p(30.0, 180.0, 30.0, 30.0),
+        OPENAI_SRC,
+    ),
+    row(
+        "openai",
+        "gpt-5.4",
+        ALWAYS,
+        p(2.5, 15.0, 2.5, 0.25),
+        OPENAI_SRC,
+    ),
+    row(
+        "openai",
+        "gpt-5.4-mini",
+        ALWAYS,
+        p(0.75, 4.5, 0.75, 0.075),
+        OPENAI_SRC,
+    ),
+    row(
+        "openai",
+        "gpt-5.4-nano",
+        ALWAYS,
+        p(0.20, 1.25, 0.20, 0.02),
+        OPENAI_SRC,
+    ),
+    row(
+        "openai",
+        "gpt-5.2",
+        ALWAYS,
+        p(1.75, 14.0, 1.75, 0.175),
+        OPENAI_SRC,
+    ),
+    row(
+        "openai",
+        "gpt-5.1",
+        ALWAYS,
+        p(1.25, 10.0, 1.25, 0.125),
+        OPENAI_SRC,
+    ),
+    row(
+        "openai",
+        "gpt-5",
+        ALWAYS,
+        p(1.25, 10.0, 1.25, 0.125),
+        OPENAI_SRC,
+    ),
+    row(
+        "openai",
+        "gpt-5-mini",
+        ALWAYS,
+        p(0.25, 2.0, 0.25, 0.025),
+        OPENAI_SRC,
+    ),
+    row(
+        "openai",
+        "gpt-4.1",
+        ALWAYS,
+        p(2.0, 8.0, 2.0, 0.50),
+        OPENAI_SRC,
+    ),
+    // Gemini (output includes thinking tokens). The 3.8 Flash page lists an
+    // introductory rate through 2026-12-31 and double from 2027-01-01
+    // (MEASURED 2026-10-15: the page says "$0.75 through December 31, 2026"
+    // and "$1.50 starting January 1, 2027"; output $3.75 then $7.50).
+    row(
+        "gemini",
+        "gemini-3.8-flash",
+        ALWAYS,
+        p(0.75, 3.75, 0.75, 0.75),
+        GEMINI_SRC,
+    ),
+    row(
+        "gemini",
+        "gemini-3.8-flash",
+        "2027-01-01",
+        p(1.50, 7.50, 1.50, 1.50),
+        GEMINI_SRC,
+    ),
+    row(
+        "gemini",
+        "gemini-3.1-pro-preview",
+        ALWAYS,
+        p(2.0, 12.0, 2.0, 2.0),
+        GEMINI_SRC,
+    ),
+    row(
+        "gemini",
+        "gemini-2.5-pro",
+        ALWAYS,
+        p(1.25, 10.0, 1.25, 1.25),
+        GEMINI_SRC,
+    ),
+    row(
+        "gemini",
+        "gemini-2.5-flash",
+        ALWAYS,
+        p(0.30, 2.5, 0.30, 0.30),
+        GEMINI_SRC,
+    ),
+    // THEORY (unverified): "gemini-3.5-flash" is in the default model list
+    // but the Gemini pricing page lists no such model on 2026-10-15 (it
+    // lists 3.6 Flash). Left unpriced on purpose, so it shows as unpriced.
+];
+
+/// `rest` is a dated snapshot suffix such as `-20251001`.
+fn is_date_suffix(rest: &str) -> bool {
+    rest.strip_prefix('-')
+        .is_some_and(|d| d.len() >= 6 && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The price for `model` on `date`, or `None` when the table has no row.
+pub fn price_for(provider: &str, model: &str, date: &str) -> Option<Price> {
+    PRICES
+        .iter()
+        .filter(|r| r.provider == provider && r.from <= date)
+        .filter(|r| model == r.model || model.strip_prefix(r.model).is_some_and(is_date_suffix))
+        .max_by_key(|r| (r.model.len(), r.from))
+        .map(|r| r.price)
+}
+
+/// Dollars for one response, or `None` when the model has no price.
+/// Ollama runs on the user's own machine: always free.
+pub fn cost_usd(provider: &str, model: &str, date: &str, usage: &Usage) -> Option<f64> {
+    if provider.starts_with("ollama") {
+        return Some(0.0);
+    }
+    let price = price_for(provider, model, date)?;
+    let per_million = |tokens: u32, rate: f64| f64::from(tokens) * rate / 1_000_000.0;
+    Some(
+        per_million(usage.input_tokens, price.input)
+            + per_million(usage.output_tokens, price.output)
+            + per_million(usage.cache_write_tokens, price.cache_write)
+            + per_million(usage.cache_read_tokens, price.cache_read),
+    )
+}
+
+/// Whether `base_url` points at this machine (a loopback host). A
+/// compat endpoint on loopback (LM Studio, llama.cpp) costs nothing.
+pub fn is_loopback_url(base_url: &str) -> bool {
+    let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(inner) = host_port.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || host == "::1"
+        || host.strip_prefix("127.").is_some_and(|r| {
+            r.split('.').count() == 3 && r.split('.').all(|o| o.parse::<u8>().is_ok())
+        })
+}
+
+/// The cost of one request. A request that ran on this machine (`local`) is
+/// free whether or not the response carried a usage block; anything else with
+/// no usage block or no price row is `None` (unpriced).
+pub fn request_cost(
+    provider: &str,
+    model: &str,
+    date: &str,
+    local: bool,
+    usage: Option<&Usage>,
+) -> Option<f64> {
+    if local || provider.starts_with("ollama") {
+        return Some(0.0);
+    }
+    cost_usd(provider, model, date, usage?)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct DayTotal {
+    pub usd: f64,
+    pub requests: u32,
+    /// Requests whose model had no price row, or that carried no usage block.
+    pub unpriced: u32,
+}
+
+/// Newest days kept in the totals file.
+const KEEP_DAYS: usize = 60;
+
+/// Adds one request to `days`, dropping the oldest days past [`KEEP_DAYS`].
+pub fn apply(days: &mut BTreeMap<String, DayTotal>, date: &str, cost: Option<f64>) {
+    let day = days.entry(date.to_string()).or_default();
+    day.requests += 1;
+    match cost {
+        Some(usd) => day.usd += usd,
+        None => day.unpriced += 1,
+    }
+    while days.len() > KEEP_DAYS {
+        let oldest = days.keys().next().cloned();
+        match oldest {
+            Some(k) => days.remove(&k),
+            None => break,
+        };
+    }
+}
+
+/// The tooltip fragment for `day`, or `None` when there is nothing to show
+/// (no requests, or only free local ones).
+pub fn format_tooltip_part(day: &DayTotal) -> Option<String> {
+    if day.usd <= 0.0 && day.unpriced == 0 {
+        return None;
+    }
+    let plus = if day.unpriced > 0 { "+" } else { "" };
+    let amount = if day.usd > 0.0 && day.usd < 0.005 {
+        "<$0.01".to_string()
+    } else {
+        format!("${:.2}{plus}", day.usd)
+    };
+    let tail = if day.unpriced > 0 {
+        format!(" ({} unpriced)", day.unpriced)
+    } else {
+        String::new()
+    };
+    Some(format!("{amount} today{tail}"))
+}
+
+/// `%LOCALAPPDATA%\Wingman\spend.json`. Under `#[cfg(test)]` a per-process
+/// file in `%TEMP%` instead (AGENTS.md rule 9).
+fn totals_path() -> anyhow::Result<PathBuf> {
+    #[cfg(test)]
+    {
+        Ok(std::env::temp_dir().join(format!("wingman-test-spend-{}.json", std::process::id())))
+    }
+    #[cfg(not(test))]
+    {
+        Ok(crate::known_folder::local_app_data()?
+            .join("Wingman")
+            .join("spend.json"))
+    }
+}
+
+fn read_days(path: &std::path::Path) -> BTreeMap<String, DayTotal> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Serialises the read-modify-write below across threads in this process.
+static FILE_LOCK: Mutex<()> = Mutex::new(());
+
+fn record_at(path: &std::path::Path, date: &str, cost: Option<f64>) -> anyhow::Result<()> {
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut days = read_days(path);
+    apply(&mut days, date, cost);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Write beside the target, then rename over it, so a crash mid-write
+    // never leaves a half-written totals file.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string(&days)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Today's date in local time, `YYYY-MM-DD`.
+fn local_date_today() -> String {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let t = unsafe { GetLocalTime() };
+    format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay)
+}
+
+/// Counts one provider response toward today's total. Best effort: a failure
+/// to write is swallowed (rule 7: accounting must never be why an answer
+/// fails). A response with no usage block counts as unpriced.
+pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
+    let date = local_date_today();
+    let cost = request_cost(provider, model, &date, local, usage.as_ref());
+    if let Ok(path) = totals_path() {
+        let _ = record_at(&path, &date, cost);
+    }
+}
+
+/// Counts the usage of a successful completion and passes the result through
+/// unchanged. What every provider's `complete` ends with.
+///
+/// `local` is true when the request ran on this machine and so costs nothing.
+pub fn tally(
+    provider: &str,
+    model: &str,
+    local: bool,
+    result: anyhow::Result<Completion>,
+) -> anyhow::Result<Completion> {
+    if let Ok(c) = &result {
+        record(provider, model, local, c.usage);
+    }
+    result
+}
+
+/// The tooltip fragment for today, read from disk.
+pub fn tooltip_part() -> Option<String> {
+    let path = totals_path().ok()?;
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let days = read_days(&path);
+    format_tooltip_part(days.get(&local_date_today())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(input: u32, output: u32) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            ..Default::default()
+        }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn cost_from_the_anthropic_fixture_usage_block() {
+        // tests/fixtures/anthropic_response.json: 900 in, 60 out, claude-opus-5.
+        let body = include_str!("../tests/fixtures/anthropic_response.json");
+        let u = crate::provider::anthropic::Anthropic::parse_completion(body)
+            .unwrap()
+            .usage
+            .expect("usage parsed");
+        let c = cost_usd("anthropic", "claude-opus-5", "2026-10-15", &u).unwrap();
+        // 900 * 5 / 1e6 + 60 * 25 / 1e6
+        assert!(close(c, 0.0045 + 0.0015), "{c}");
+    }
+
+    #[test]
+    fn anthropic_cache_tokens_use_their_own_rates() {
+        let u = Usage {
+            input_tokens: 100,
+            output_tokens: 0,
+            cache_write_tokens: 1_000_000,
+            cache_read_tokens: 1_000_000,
+        };
+        let c = cost_usd("anthropic", "claude-opus-5", "2026-10-15", &u).unwrap();
+        assert!(close(c, 100.0 * 5.0 / 1e6 + 6.25 + 0.50), "{c}");
+    }
+
+    #[test]
+    fn unknown_model_is_unpriced_not_zero() {
+        assert_eq!(
+            cost_usd("openai", "gpt-9", "2026-10-15", &usage(10, 10)),
+            None
+        );
+    }
+
+    #[test]
+    fn ollama_is_free_for_any_model() {
+        let c = cost_usd("ollama", "gemma3:4b", "2026-10-15", &usage(500, 50));
+        assert_eq!(c, Some(0.0));
+    }
+
+    #[test]
+    fn dated_snapshot_suffix_matches_but_a_different_model_does_not() {
+        assert!(price_for("anthropic", "claude-haiku-4-5-20251001", "2026-10-15").is_some());
+        assert!(price_for("openai", "gpt-5-nano", "2026-10-15").is_none());
+        assert!(price_for("openai", "gpt-5-mini", "2026-10-15").is_some());
+    }
+
+    #[test]
+    fn newest_row_on_or_before_the_day_wins() {
+        let before = price_for("gemini", "gemini-3.8-flash", "2026-12-31").unwrap();
+        let after = price_for("gemini", "gemini-3.8-flash", "2027-01-01").unwrap();
+        assert!(close(before.input, 0.75));
+        assert!(close(after.input, 1.50));
+    }
+
+    #[test]
+    fn every_row_names_a_source_and_a_check_date() {
+        assert!(!PRICES.is_empty());
+        for r in PRICES {
+            assert!(r.source.starts_with("https://"), "{}", r.model);
+            assert_eq!(r.checked.len(), 10, "{}", r.model);
+            assert_eq!(r.from.len(), 10, "{}", r.model);
+        }
+    }
+
+    #[test]
+    fn apply_sums_a_day_and_counts_unpriced() {
+        let mut days = BTreeMap::new();
+        apply(&mut days, "2026-10-15", Some(0.01));
+        apply(&mut days, "2026-10-15", Some(0.02));
+        apply(&mut days, "2026-10-15", None);
+        let d = days["2026-10-15"];
+        assert!(close(d.usd, 0.03));
+        assert_eq!((d.requests, d.unpriced), (3, 1));
+    }
+
+    #[test]
+    fn apply_keeps_only_the_newest_days() {
+        let mut days = BTreeMap::new();
+        for i in 0..(KEEP_DAYS + 5) {
+            apply(&mut days, &format!("2026-01-{i:03}"), Some(0.0));
+        }
+        assert_eq!(days.len(), KEEP_DAYS);
+        assert!(!days.contains_key("2026-01-000"));
+    }
+
+    #[test]
+    fn tooltip_part_shapes() {
+        assert_eq!(format_tooltip_part(&DayTotal::default()), None);
+        let local_only = DayTotal {
+            usd: 0.0,
+            requests: 4,
+            unpriced: 0,
+        };
+        assert_eq!(format_tooltip_part(&local_only), None);
+        let spend = DayTotal {
+            usd: 0.0432,
+            requests: 3,
+            unpriced: 0,
+        };
+        assert_eq!(format_tooltip_part(&spend).unwrap(), "$0.04 today");
+        let tiny = DayTotal {
+            usd: 0.004,
+            requests: 1,
+            unpriced: 0,
+        };
+        assert_eq!(format_tooltip_part(&tiny).unwrap(), "<$0.01 today");
+        let floor = DayTotal {
+            usd: 0.05,
+            requests: 2,
+            unpriced: 1,
+        };
+        assert_eq!(
+            format_tooltip_part(&floor).unwrap(),
+            "$0.05+ today (1 unpriced)"
+        );
+    }
+
+    #[test]
+    fn tooltip_text_has_no_em_dash() {
+        let d = DayTotal {
+            usd: 1.0,
+            requests: 1,
+            unpriced: 1,
+        };
+        assert!(!format_tooltip_part(&d).unwrap().contains('\u{2014}'));
+    }
+
+    #[test]
+    fn record_at_persists_and_accumulates_across_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "wingman-test-spend-record-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&path);
+        record_at(&path, "2026-10-15", Some(0.25)).unwrap();
+        record_at(&path, "2026-10-15", None).unwrap();
+        let days = read_days(&path);
+        let _ = std::fs::remove_file(&path);
+        let d = days["2026-10-15"];
+        assert!(close(d.usd, 0.25));
+        assert_eq!((d.requests, d.unpriced), (2, 1));
+    }
+
+    /// The wiring check: a completion passed through `tally` (what every
+    /// provider's `complete` ends with) shows up in what the tooltip reads.
+    #[test]
+    fn tally_puts_a_completion_into_the_tooltip_text() {
+        let path = totals_path().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(tooltip_part(), None);
+        let completion = Completion {
+            text: String::new(),
+            usage: Some(usage(1_000_000, 0)),
+            stop: crate::provider::StopReason::Complete,
+        };
+        let out = tally("anthropic", "claude-opus-5", false, Ok(completion)).unwrap();
+        assert_eq!(out.usage.unwrap().input_tokens, 1_000_000);
+        assert_eq!(tooltip_part().unwrap(), "$5.00 today");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_free_provider_is_never_unpriced_even_without_a_usage_block() {
+        assert_eq!(
+            request_cost("ollama", "gemma3:4b", "2026-10-15", true, None),
+            Some(0.0)
+        );
+        assert_eq!(
+            request_cost("openai-compat", "m", "2026-10-15", true, None),
+            Some(0.0)
+        );
+        // A metered provider with no usage block is unpriced.
+        assert_eq!(
+            request_cost("openai", "gpt-5.5", "2026-10-15", false, None),
+            None
+        );
+        // A non-loopback compat endpoint has no price rows: unpriced.
+        assert_eq!(
+            request_cost(
+                "openai-compat",
+                "m",
+                "2026-10-15",
+                false,
+                Some(&usage(1, 1))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn loopback_urls_are_recognised() {
+        for url in [
+            "http://127.0.0.1:1234/v1",
+            "http://localhost:8080",
+            "https://LOCALHOST/v1",
+            "http://[::1]:8080/v1",
+            "http://user:pw@127.0.0.5/v1",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "https://api.example.com/v1",
+            "http://192.168.1.5:1234/v1",
+            "http://127.0.0.1.evil.com/v1",
+            "https://localhost.example.com",
+            "http://10.0.0.1",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
+    }
+
+    /// Default model ids that are priced on purpose as "unknown".
+    const UNPRICED_ON_PURPOSE: &[(&str, &str)] = &[("gemini", "gemini-3.5-flash")];
+
+    #[test]
+    fn every_default_model_has_a_price_or_is_listed_as_exempt() {
+        let providers = crate::config::Config::default().providers;
+        let mut checked = 0;
+        for (id, cfg) in [
+            ("openai", &providers.openai),
+            ("anthropic", &providers.anthropic),
+            ("gemini", &providers.gemini),
+        ] {
+            for model in cfg.models.iter().chain(std::iter::once(&cfg.model)) {
+                checked += 1;
+                let exempt = UNPRICED_ON_PURPOSE.contains(&(id, model.as_str()));
+                let priced = price_for(id, model, "2026-10-15").is_some();
+                assert!(
+                    priced != exempt,
+                    "{id}/{model}: priced={priced} exempt={exempt}; add a PRICES row or an exemption (and drop a stale exemption)"
+                );
+            }
+        }
+        assert!(checked > 10);
+    }
+
+    #[test]
+    fn record_at_leaves_no_temp_file_behind() {
+        let path = std::env::temp_dir().join(format!(
+            "wingman-test-spend-atomic-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        record_at(&path, "2026-10-15", Some(1.0)).unwrap();
+        record_at(&path, "2026-10-15", Some(1.0)).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        let ok = !tmp.exists() && close(read_days(&path)["2026-10-15"].usd, 2.0);
+        let _ = std::fs::remove_file(&path);
+        assert!(ok);
+    }
+
+    #[test]
+    fn a_corrupt_totals_file_reads_as_empty() {
+        let path = std::env::temp_dir().join(format!(
+            "wingman-test-spend-bad-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_days(&path).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+}

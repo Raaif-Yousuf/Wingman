@@ -2007,6 +2007,8 @@ impl App {
     /// answer" or asks again.
     fn record_last(&mut self, result: std::result::Result<Answer, String>) -> Answer {
         self.busy = false;
+        // The request that just finished may have spent money (#21).
+        self.update_tooltip();
         let answer = match result {
             Ok(answer) => answer,
             Err(packed) => {
@@ -2700,7 +2702,11 @@ impl App {
         let tip = if ready.is_empty() {
             "Wingman: no API key configured".to_string()
         } else {
-            format!("Wingman: {} · {primary}", ready.join(", "))
+            let base = format!("Wingman: {} · {primary}", ready.join(", "));
+            match crate::usage::tooltip_part() {
+                Some(spend) => format!("{base} · {spend}"),
+                None => base,
+            }
         };
         self.tray.set_tooltip(&tip);
     }

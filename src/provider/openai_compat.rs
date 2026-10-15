@@ -242,6 +242,7 @@ impl OpenAiCompat {
             (Some(input), Some(output)) => Some(Usage {
                 input_tokens: input as u32,
                 output_tokens: output as u32,
+                ..Default::default()
             }),
             _ => None,
         };
@@ -332,7 +333,12 @@ impl Provider for OpenAiCompat {
             "openai-compat",
         )?;
 
-        Self::parse_completion(&body_text)
+        crate::usage::tally(
+            self.id(),
+            &self.model,
+            crate::usage::is_loopback_url(&self.base_url),
+            Self::parse_completion(&body_text),
+        )
     }
 }
 
