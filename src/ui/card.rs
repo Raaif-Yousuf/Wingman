@@ -3279,20 +3279,8 @@ fn preview_key_command(vk: u16) -> Option<i32> {
     }
 }
 
-/// Issue #207: pure decision for a preview child control's `WM_KILLFOCUS`
-/// -- whether the new focus target means "click away" (cancel the preview,
-/// same as Esc) or staying within the card's own window group (do nothing:
-/// Tab moving between two preview fields, or focus landing on the Do
-/// it/Edit button itself right before its own click fires).
-/// `new_focus_is_card_or_descendant` is
-/// `new_focus_hwnd == card_hwnd || IsChild(card_hwnd, new_focus_hwnd)`,
-/// computed by the caller (both need a live `HWND` comparison/`IsChild`
-/// call, so cannot be done here). `WM_KILLFOCUS`'s own "nothing is gaining
-/// focus" case (`wparam == 0`, e.g. the whole app losing the foreground to
-/// nothing in particular) needs no separate case: a null `HWND` is never
-/// the card's own and `IsChild` is never true for it, so it already
-/// computes `new_focus_is_card_or_descendant == false` the same as any
-/// other outside window.
+/// Whether a command posted for `posted_generation` still belongs to the
+/// preview showing now (#255).
 fn preview_command_is_current(posted_generation: u32, live_generation: u32) -> bool {
     posted_generation == live_generation
 }
@@ -3310,6 +3298,20 @@ unsafe fn live_preview_generation(card: HWND) -> u32 {
     }
 }
 
+/// Issue #207: pure decision for a preview child control's `WM_KILLFOCUS`
+/// -- whether the new focus target means "click away" (cancel the preview,
+/// same as Esc) or staying within the card's own window group (do nothing:
+/// Tab moving between two preview fields, or focus landing on the Do
+/// it/Edit button itself right before its own click fires).
+/// `new_focus_is_card_or_descendant` is
+/// `new_focus_hwnd == card_hwnd || IsChild(card_hwnd, new_focus_hwnd)`,
+/// computed by the caller (both need a live `HWND` comparison/`IsChild`
+/// call, so cannot be done here). `WM_KILLFOCUS`'s own "nothing is gaining
+/// focus" case (`wparam == 0`, e.g. the whole app losing the foreground to
+/// nothing in particular) needs no separate case: a null `HWND` is never
+/// the card's own and `IsChild` is never true for it, so it already
+/// computes `new_focus_is_card_or_descendant == false` the same as any
+/// other outside window.
 fn preview_focus_left_the_card(new_focus_is_card_or_descendant: bool) -> bool {
     !new_focus_is_card_or_descendant
 }
@@ -5103,7 +5105,7 @@ mod tests {
         let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
         assert!(
             found,
-            "preview_control_subclass must post a WM_COMMAND to the card window"
+            "preview_control_subclass must post a WM_CARD_PREVIEW_COMMAND to the card window"
         );
         assert_eq!(msg.message, WM_CARD_PREVIEW_COMMAND);
         assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_DO_IT);
@@ -5130,8 +5132,10 @@ mod tests {
 
     #[test]
     fn replacing_a_focused_preview_does_not_cancel_the_new_one() {
-        // #255: replacing preview A destroys its focused child, whose
-        // WM_KILLFOCUS posts a cancel. It is pumped after preview B shows.
+        // #255 regression guard. This passes without the generation tag too:
+        // MEASURED 2026-10-15, destroying a focused preview field moves focus
+        // to the card first, so replacing a preview posts no cancel at all.
+        // It pins that behaviour; the tag is covered by the tests below.
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
         card.inner.show_preview("Preview A", &schema, &value, false);
@@ -5221,31 +5225,36 @@ mod tests {
         let start_hwnd = card.inner.preview.as_ref().unwrap().edits[0].1;
         let card_hwnd = card.hwnd();
 
-        unsafe {
-            let _ = preview_control_subclass(
-                start_hwnd,
-                WM_KEYDOWN,
-                WPARAM(VK_ESCAPE.0 as usize),
-                LPARAM(0),
-                PREVIEW_SUBCLASS_ID,
-                card_hwnd.0 as usize,
-            );
-        }
+        for (key, command) in [
+            (VK_ESCAPE, ID_PREVIEW_CANCEL),
+            (VK_RETURN, ID_PREVIEW_DO_IT),
+        ] {
+            unsafe {
+                let _ = preview_control_subclass(
+                    start_hwnd,
+                    WM_KEYDOWN,
+                    WPARAM(key.0 as usize),
+                    LPARAM(0),
+                    PREVIEW_SUBCLASS_ID,
+                    card_hwnd.0 as usize,
+                );
+            }
 
-        let mut msg = MSG::default();
-        let found = unsafe {
-            PeekMessageW(
-                &mut msg,
-                Some(card_hwnd),
-                WM_CARD_PREVIEW_COMMAND,
-                WM_CARD_PREVIEW_COMMAND,
-                PM_REMOVE,
-            )
-            .as_bool()
-        };
-        assert!(found, "Esc must post a WM_CARD_PREVIEW_COMMAND");
-        assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_CANCEL);
-        assert_eq!(msg.lParam.0 as u32, live);
+            let mut msg = MSG::default();
+            let found = unsafe {
+                PeekMessageW(
+                    &mut msg,
+                    Some(card_hwnd),
+                    WM_CARD_PREVIEW_COMMAND,
+                    WM_CARD_PREVIEW_COMMAND,
+                    PM_REMOVE,
+                )
+                .as_bool()
+            };
+            assert!(found, "Esc and Enter must post a WM_CARD_PREVIEW_COMMAND");
+            assert_eq!((msg.wParam.0 & 0xFFFF) as i32, command);
+            assert_eq!(msg.lParam.0 as u32, live);
+        }
     }
 
     // -- click-away cancels the preview (#207) --------------------------
@@ -5307,7 +5316,7 @@ mod tests {
         let found = unsafe { PeekMessageW(&mut msg, Some(card_hwnd), 0, 0, PM_REMOVE).as_bool() };
         assert!(
             found,
-            "a click-away WM_KILLFOCUS must post a WM_COMMAND to the card window"
+            "a click-away WM_KILLFOCUS must post a WM_CARD_PREVIEW_COMMAND to the card window"
         );
         assert_eq!(msg.message, WM_CARD_PREVIEW_COMMAND);
         assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_CANCEL);
