@@ -26,10 +26,14 @@ rustflags = ["-C", "link-arg=/Brepro"]
 # Bundled SQLite (the local store, issue #46). libsqlite3-sys compiles the
 # amalgamation with FTS5 on (the knowledge track needs it) plus several things
 # Wingman never uses. These flags switch those off to keep the release exe
-# small: no loadable extensions, no JSON functions, no R-tree, no FTS3, no
+# small: no loadable extensions, no R-tree, no FTS3, no
 # STAT4, no soundex, no dbstat, no shared cache or progress callback, no
 # deprecated APIs, no memory statistics. MEASURED 2026-10-15: they save about
-# 235 KB of a 3.51 MB release exe. FTS5 and triggers must stay available; the
+# 200 KB of a 3.51 MB release exe. FTS5 and triggers must stay available; the
 # `fts5_is_compiled_in` test in src/store/mod.rs guards the first.
+# `force = true`: a LIBSQLITE3_FLAGS already set in someone's shell must not
+# change the compile options of the shipped exe (docs/reproducible-builds.md).
+# SQL JSON functions stay on (MEASURED 2026-10-15: switching them off saves only
+# about 36 KB, not worth a later slice hitting a missing json_extract).
 [env]
-LIBSQLITE3_FLAGS = "-DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_JSON -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_STAT4 -USQLITE_SOUNDEX -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS"
+LIBSQLITE3_FLAGS = { force = true, value = "-DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_STAT4 -USQLITE_SOUNDEX -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS" }

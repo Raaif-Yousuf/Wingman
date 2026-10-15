@@ -67,7 +67,9 @@ pub fn run(
 }
 
 /// `VACUUM INTO <db>.pre-v<N>`, keeping only the newest such copy. A bad
-/// migration is then recoverable by hand.
+/// migration is then recoverable by hand. The new copy is written under a
+/// temporary name and swapped in only once it is complete, so a failed
+/// snapshot never costs the previous one.
 fn snapshot_before_upgrade(
     conn: &Connection,
     db_path: &Path,
@@ -78,20 +80,25 @@ fn snapshot_before_upgrade(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let prefix = format!("{name}.pre-v");
+    let tmp = db_path.with_file_name(format!("{prefix}{version}.tmp"));
+    let target = db_path.with_file_name(format!("{prefix}{version}"));
+    let _ = std::fs::remove_file(&tmp);
+    conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            StoreError::Other(format!("could not back up the data before upgrading: {e}"))
+        })?;
     if let Some(dir) = db_path.parent() {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
-                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                if e.file_name().to_string_lossy().starts_with(&prefix) && e.path() != tmp {
                     let _ = std::fs::remove_file(e.path());
                 }
             }
         }
     }
-    let target = db_path.with_file_name(format!("{prefix}{version}"));
-    conn.execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])
-        .map_err(|e| {
-            StoreError::Other(format!("could not back up the data before upgrading: {e}"))
-        })?;
+    std::fs::rename(&tmp, &target)
+        .map_err(|e| StoreError::Other(format!("could not keep the backup: {e}")))?;
     Ok(())
 }
 
@@ -151,6 +158,27 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         drop(snap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_snapshot_keeps_the_previous_one() {
+        let dir = scratch("snap");
+        let path = dir.join("t.db");
+        let mut conn = Connection::open(&path).unwrap();
+        run(&mut conn, &[V1], Some(&path)).unwrap();
+        // An older snapshot from an earlier upgrade.
+        std::fs::write(dir.join("t.db.pre-v0"), b"older").unwrap();
+        // Block the new snapshot: its temporary name is a directory, so
+        // VACUUM INTO cannot write there and removing it as a file fails.
+        std::fs::create_dir(dir.join("t.db.pre-v1.tmp")).unwrap();
+
+        let err = run(&mut conn, &[V1, V2], Some(&path)).unwrap_err();
+
+        assert!(matches!(err, StoreError::Other(_)), "{err:?}");
+        assert_eq!(std::fs::read(dir.join("t.db.pre-v0")).unwrap(), b"older");
+        assert_eq!(current_version(&conn).unwrap(), 1);
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

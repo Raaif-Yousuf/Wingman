@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StoreError {
     /// The file was made by a newer Wingman; it is left untouched.
     Newer {
@@ -176,7 +176,10 @@ fn quarantine(path: &Path) -> Result<PathBuf, StoreError> {
 
 // -- the process-wide store ------------------------------------------------
 
-static GLOBAL: Mutex<Option<Arc<Store>>> = Mutex::new(None);
+/// The outcome of the one open attempt this run. A failure is kept too, so
+/// a broken store does not re-run the ACL step and the migrations (a spawned
+/// `icacls` each time) on every request.
+static GLOBAL: Slot = Mutex::new(None);
 static NOTICE: Mutex<Option<String>> = Mutex::new(None);
 static NOTICE_USED: AtomicBool = AtomicBool::new(false);
 
@@ -212,43 +215,96 @@ fn legacy_spend_path() -> Result<PathBuf, StoreError> {
     }
 }
 
-/// The real open: owner-only directory, recovery, migrations, imports.
+/// The real open, at the real paths.
 fn open_default() -> Result<Store, StoreError> {
-    let path = db_path()?;
+    sweep_stale_test_dirs();
+    open_in(&db_path()?, &legacy_spend_path()?, acl::restrict_dir)
+}
+
+/// Owner-only directory, recovery, migrations, imports.
+///
+/// The directory is restricted when it is created, not on every launch:
+/// spawning `icacls` costs tens of milliseconds on the UI thread at startup
+/// (MEASURED 2026-10-15, see the PR for the numbers). If the restriction
+/// fails, the directory is removed again so the next launch retries it
+/// instead of trusting an unrestricted folder.
+fn open_in(
+    path: &Path,
+    legacy_spend: &Path,
+    restrict: impl FnOnce(&Path) -> Result<(), StoreError>,
+) -> Result<Store, StoreError> {
     let dir = path
         .parent()
         .ok_or_else(|| StoreError::Other("the store path has no folder".to_string()))?;
-    std::fs::create_dir_all(dir).map_err(|e| StoreError::Other(e.to_string()))?;
-    acl::restrict_dir(dir)?;
-    let (store, recovered) = Store::open_recovering(&path)?;
+    if !dir.exists() {
+        std::fs::create_dir_all(dir).map_err(|e| StoreError::Other(e.to_string()))?;
+        if let Err(e) = restrict(dir) {
+            let _ = std::fs::remove_dir(dir);
+            return Err(e);
+        }
+    }
+    let (store, recovered) = Store::open_recovering(path)?;
     if let Some(n) = recovered {
         note(n);
     }
-    let legacy = legacy_spend_path()?;
-    if let Some(n) = import::spend_json(&mut store.lock(), &legacy)? {
+    if let Some(n) = import::spend_json(&mut store.lock(), legacy_spend)? {
         note(n);
     }
     Ok(store)
 }
 
-/// The shared store, opened on first use. A failed open is reported once and
-/// retried on the next call.
+/// Test builds only: removes `wingman-test-store-<pid>` directories left in
+/// `%TEMP%` by earlier runs (older than an hour, so a test process running
+/// right now in another worktree keeps its own).
+#[cfg(test)]
+fn sweep_stale_test_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let hour = Duration::from_secs(3600);
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("wingman-test-store-") {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > hour);
+        if old {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn sweep_stale_test_dirs() {}
+
+/// The shared store, opened on first use. The result of that one attempt,
+/// success or failure, is kept for the rest of the run; a failure is reported
+/// once. Restarting Wingman is the retry.
 pub fn global() -> Result<Arc<Store>, StoreError> {
-    let mut slot = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = slot.as_ref() {
-        return Ok(s.clone());
+    global_with(&GLOBAL, open_default)
+}
+
+type Slot = Mutex<Option<Result<Arc<Store>, StoreError>>>;
+
+fn global_with(
+    slot: &Slot,
+    open: impl FnOnce() -> Result<Store, StoreError>,
+) -> Result<Arc<Store>, StoreError> {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(done) = slot.as_ref() {
+        return done.clone();
     }
-    match open_default() {
-        Ok(s) => {
-            let s = Arc::new(s);
-            *slot = Some(s.clone());
-            Ok(s)
-        }
-        Err(e) => {
-            report(&e);
-            Err(e)
-        }
+    let opened = open().map(Arc::new);
+    if let Err(e) = &opened {
+        report(e);
     }
+    *slot = Some(opened.clone());
+    opened
 }
 
 /// Records a store failure for the next card. Only the first one per run is
@@ -416,6 +472,74 @@ mod tests {
             }
         }
         assert!(checked > 20, "only {checked} files scanned");
+    }
+
+    #[test]
+    fn a_failed_open_is_remembered_for_the_run() {
+        let slot: Slot = Mutex::new(None);
+        let mut calls = 0;
+        for _ in 0..3 {
+            let r = global_with(&slot, || {
+                calls += 1;
+                Err(StoreError::Acl("boom".to_string()))
+            });
+            assert!(matches!(r, Err(StoreError::Acl(_))));
+        }
+        assert_eq!(calls, 1, "a failed open must not be retried per call");
+    }
+
+    #[test]
+    fn the_acl_step_runs_only_when_the_directory_is_created() {
+        let dir = scratch("acl-once");
+        let path = dir.join("store").join("wingman.db");
+        let legacy = dir.join("spend.json");
+        let calls = std::cell::Cell::new(0);
+        let count = |_: &Path| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        drop(open_in(&path, &legacy, count).unwrap());
+        assert_eq!(calls.get(), 1, "a new directory is restricted");
+        drop(
+            open_in(&path, &legacy, |_: &Path| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap(),
+        );
+        assert_eq!(calls.get(), 1, "an existing directory is not re-restricted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_acl_step_removes_the_directory_so_the_next_launch_retries() {
+        let dir = scratch("acl-fail");
+        let path = dir.join("store").join("wingman.db");
+        let err = open_in(&path, &dir.join("spend.json"), |_: &Path| {
+            Err(StoreError::Acl("nope".to_string()))
+        })
+        .err()
+        .expect("must fail");
+        assert!(matches!(err, StoreError::Acl(_)));
+        assert!(!dir.join("store").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "timing probe: cargo test open_default_timing -- --ignored --nocapture"]
+    fn open_default_timing() {
+        // The cost of the first open on the UI thread: a brand-new install
+        // (directory, ACL step, migrations) and every later launch.
+        let dir = scratch("timing");
+        let path = dir.join("store").join("wingman.db");
+        let legacy = dir.join("spend.json");
+        let t = std::time::Instant::now();
+        drop(open_in(&path, &legacy, acl::restrict_dir).unwrap());
+        println!("first-ever launch: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        drop(open_in(&path, &legacy, acl::restrict_dir).unwrap());
+        println!("later launch: {:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

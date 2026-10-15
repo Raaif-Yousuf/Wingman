@@ -79,13 +79,16 @@ needed.
 
 **Binary size.** MEASURED 2026-10-15 (slice 1, same machine, `cargo build
 --release`): 2,438,656 bytes on master before, 3,507,200 with default bundled
-SQLite, 3,272,192 with the unused parts switched off through `LIBSQLITE3_FLAGS`
-in `.cargo/config.toml` (no loadable extensions, JSON, R-tree, FTS3, STAT4,
-soundex, dbstat, shared cache, progress callback, deprecated APIs). So the store
-costs about 0.83 MB, a third more than the old exe, and FTS5 stays on. The CI size
-gate (`perf-budgets.json`) was raised from 2,700,000 to 3,500,000 for it.
-Further trimming (window functions, triggers, views) was not tried: the FTS5
-external-content tables in slice 5 need triggers.
+SQLite, 3,309,056 with the unused parts switched off through `LIBSQLITE3_FLAGS`
+in `.cargo/config.toml` (no loadable extensions, R-tree, FTS3, STAT4, soundex,
+dbstat, shared cache, progress callback, deprecated APIs, memory statistics).
+So the store costs about 0.87 MB, a third more than the old exe, and FTS5 stays
+on. The CI size gate (`perf-budgets.json`) was raised from 2,700,000 to
+3,500,000 for it. SQL JSON functions were first switched off too, then put
+back: MEASURED 2026-10-15, that saved only about 36 KB, and no slice needs to be
+told that `json_extract` is missing. Further trimming (window functions,
+triggers, views) was not tried: the FTS5 external-content tables in slice 5
+need triggers.
 **Async.** `rusqlite` is blocking and synchronous. No runtime is added.
 
 **Vector search.** The plan and #85 name `sqlite-vec`. The options:
@@ -117,8 +120,10 @@ because WAL mode creates `wingman.db-wal` and `wingman.db-shm` on demand, and
 cover files SQLite creates later. Restricting the directory with inheritance
 (`icacls <dir> /inheritance:r /grant:r "<user>:(OI)(CI)F"`) covers all three and
 anything added (snapshots, a `.corrupt` copy). The ACL step is applied when the
-directory is created and once per process after that, the same shape as #277's
-once-per-process flag. The argument list is built by a pure function and unit
+directory is created, not on every launch: MEASURED 2026-10-15 (debug build), the
+first-ever open takes about 56 ms, almost all of it the icacls spawn, and later
+launches take about 3 ms. If the step fails, the new directory is removed so the
+next launch retries. The argument list is built by a pure function and unit
 tested; the existing `Config::restrict_acl` is file-only, so this is a sibling
 helper, not a change to it. If it fails the store does not open: a card says so
 (rule 7), because an unrestricted store is exactly what the rest of this spec

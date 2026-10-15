@@ -89,7 +89,12 @@ mod tests {
         let listing = String::from_utf8_lossy(&out.stdout).to_string();
         let user = std::env::var("USERNAME").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(listing.contains(&user), "{listing}");
+        // The ACE itself: the user, inherited, full control. (The user name
+        // alone is not enough: the temp path contains it.)
+        assert!(
+            listing.contains(&format!("{user}:(I)(F)")),
+            "no inherited full-control ACE for {user}: {listing}"
+        );
         for other in ["Everyone", "BUILTIN\\Users", "Authenticated Users"] {
             assert!(
                 !listing.contains(other),
