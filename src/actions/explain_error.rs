@@ -71,16 +71,23 @@ mod tests {
     }
 
     #[test]
-    fn the_card_shows_the_meaning_as_the_headline_and_all_three_lines() {
-        let text = "The file is locked by another program.\nCause: Another app has it open.\nFix: Close that app and retry.";
+    fn the_card_shows_the_meaning_as_the_headline_and_all_three_fields() {
         let card = result_card_text(
             "Explain this error",
             "none",
+            "error_explanation",
             "nothing to do",
-            &json!({ "text": text }),
+            &json!({
+                "meaning": "The file is locked by another program.",
+                "cause": "Another app has it open.",
+                "fix": "Close that app and retry."
+            }),
         );
         assert_eq!(card.headline, "The file is locked by another program.");
-        assert_eq!(card.detail, text);
+        assert_eq!(
+            card.detail,
+            "Meaning: The file is locked by another program.\nCause: Another app has it open.\nFix: Close that app and retry."
+        );
     }
 
     #[test]

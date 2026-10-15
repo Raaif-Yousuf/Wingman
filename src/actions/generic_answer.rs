@@ -26,14 +26,20 @@ pub struct CardText {
 /// For any executor other than `"none"` this is `(action_name, summary)`,
 /// exactly what the card showed before. For `"none"` it is the proposal's
 /// own content (see [`proposal_answer`]); a proposal with nothing to show
-/// falls back to the executor's summary under the action name.
+/// falls back to the executor's summary under the action name. A
+/// `page_summary` proposal (#67) has its own layout and limits, see
+/// [`super::page_summary::card_text`].
 pub fn result_card_text(
     action_name: &str,
     executor_name: &str,
+    proposal_kind: &str,
     summary: &str,
     proposal: &Value,
 ) -> CardText {
     if executor_name == "none" {
+        if proposal_kind == super::page_summary::PROPOSAL_KIND {
+            return super::page_summary::card_text(proposal);
+        }
         if let Some(answer) = proposal_answer(proposal) {
             return answer;
         }
@@ -126,6 +132,7 @@ mod tests {
         let card = result_card_text(
             "Define this word",
             "none",
+            "text_answer",
             "nothing to do",
             &json!({"text": "ephemeral: lasting a very short time"}),
         );
@@ -134,10 +141,33 @@ mod tests {
     }
 
     #[test]
+    fn a_page_summary_uses_its_own_card_layout() {
+        let card = result_card_text(
+            "Summarize this page",
+            "none",
+            "page_summary",
+            "nothing to do",
+            &json!({"bullets": ["one"], "line1": "First", "line2": "Second"}),
+        );
+        assert_eq!(card.headline, "First\nSecond");
+        assert_eq!(card.detail, "- one");
+        // The same fields under another proposal kind keep the generic layout.
+        let other = result_card_text(
+            "Act",
+            "none",
+            "text_answer",
+            "nothing to do",
+            &json!({"bullets": ["one"], "line1": "First", "line2": "Second"}),
+        );
+        assert_ne!(other.headline, "First\nSecond");
+    }
+
+    #[test]
     fn other_executors_keep_the_action_name_and_summary() {
         let card = result_card_text(
             "Translate",
             "clipboard",
+            "text_answer",
             "Copied to the clipboard",
             &json!({"text": "hola"}),
         );
@@ -154,7 +184,7 @@ mod tests {
             json!("x"),
             json!(null),
         ] {
-            let card = result_card_text("Act", "none", "nothing to do", &p);
+            let card = result_card_text("Act", "none", "text_answer", "nothing to do", &p);
             assert_eq!(card.headline, "Act", "{p}");
             assert_eq!(card.detail, "nothing to do", "{p}");
         }

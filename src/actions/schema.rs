@@ -63,6 +63,8 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "action_items" => Some(action_items_schema()),
         // #66: a read-only explanation of an error, shown on the card.
         "error_explanation" => Some(error_explanation_schema()),
+        // #67: two summary lines and a few bullets, shown on the card only.
+        "page_summary" => Some(page_summary_schema()),
         _ => None,
     }
 }
@@ -82,6 +84,23 @@ fn error_explanation_schema() -> Value {
             "fix": {"type": "string"}
         },
         "required": ["meaning", "cause", "fix"],
+        "additionalProperties": false
+    })
+}
+
+/// The `page_summary` proposal schema (#67). Property order is load-bearing
+/// (rule 3): `bullets` come first so the two lines are written from points the
+/// model has already settled on, the same reason `detail` precedes `headline`
+/// in the verdict schema. Nothing is editable: the card is read-only.
+fn page_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "bullets": {"type": "array", "items": {"type": "string"}},
+            "line1": {"type": "string"},
+            "line2": {"type": "string"}
+        },
+        "required": ["bullets", "line1", "line2"],
         "additionalProperties": false
     })
 }
@@ -497,6 +516,17 @@ mod tests {
                 .all(|p| p["type"] == "string" && p.get("editable").is_none()),
             "a read-only answer has no edit controls"
         );
+    }
+
+    #[test]
+    fn page_summary_puts_the_bullets_before_the_two_lines() {
+        let schema = schema_for("page_summary", false).expect("page_summary is registered");
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["bullets", "line1", "line2"]);
+        assert_eq!(schema["required"], json!(["bullets", "line1", "line2"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["bullets"]["type"], "array");
+        assert!(schema["properties"]["line1"].get("editable").is_none());
     }
 
     #[test]

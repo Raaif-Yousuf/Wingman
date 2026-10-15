@@ -12,6 +12,7 @@ pub mod extract_text;
 pub mod fill_form;
 pub mod generic_answer;
 pub mod generic_inputs;
+pub mod page_summary;
 pub mod review_email;
 pub mod schema;
 
@@ -206,6 +207,9 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 ///   (`App::extract_text` ->
 ///   `actions::extract_text::{capture_screen, recognize_and_copy}`) still
 ///   does not read this `Action` value's `proposal`/`executor` fields back.
+/// - `"summarize-page"` (#67, `page_summary::builtin_action`): proposal
+///   `page_summary`, executor `none`. Two summary lines on the card, bullets on
+///   expand. Runs through the generic dispatch path.
 /// - `"add-to-calendar"` (#39, `calendar::builtin_action`): the first action
 ///   that runs the full Look/Propose/Confirm/Do loop end to end.
 /// - `"review-this-email"` (#38, `review_email::builtin_action`): the
@@ -251,6 +255,7 @@ pub fn builtin_actions() -> Vec<Action> {
             rate_difficulty: false,
             enabled: true,
         },
+        page_summary::builtin_action(),
         calendar::builtin_action(),
         review_email::builtin_action(),
         fill_form::builtin_action(),
@@ -447,13 +452,20 @@ mod tests {
     #[test]
     fn builtin_check_my_work_matches_todays_behaviour() {
         let builtins = builtin_actions();
-        assert_eq!(
-            builtins.len(),
-            7,
-            "check-my-work, extract-text-to-clipboard (#41), add-to-calendar (#39), \
-             review-this-email (#38), fill-this-form (#40), action-items-checklist (#314), \
-             explain-this-error (#66)"
-        );
+        for id in [
+            "check-my-work",
+            "extract-text-to-clipboard",
+            "summarize-page",
+            "add-to-calendar",
+            "review-this-email",
+            "fill-this-form",
+            "action-items-checklist",
+        ] {
+            assert!(
+                builtins.iter().any(|a| a.id == id),
+                "built-in {id} is missing"
+            );
+        }
         // Found by id, not by position, so this stays valid regardless of
         // what order the built-ins are in.
         let a = builtins

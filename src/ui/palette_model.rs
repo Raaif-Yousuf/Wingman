@@ -1091,6 +1091,7 @@ mod tests {
         let generic_on_purpose = [
             crate::actions::action_items::ACTION_ID,
             crate::actions::explain_error::ACTION_ID,
+            crate::actions::page_summary::ACTION_ID,
         ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {
