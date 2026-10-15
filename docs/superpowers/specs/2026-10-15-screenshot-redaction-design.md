@@ -126,10 +126,10 @@ fallback sends the same digits as text would not meet the done-when.
 
 ## Preview and egress log
 
-The "show me what you're sending" image preview (section 19 of the expansion
-plan) is not built yet. When it is, it should read the encoded `Shot`, which is
-already redacted because redaction runs before `encode`, so it needs no extra
-work. The egress log row gains a count, `redactions: n`, so the log can say
+The "show me what you're sending" preview (section 19 of the expansion plan,
+#105) is built. It reads the `Request` that is about to be sent, whose image is
+the encoded `Shot`, already redacted because redaction runs before `encode`, so
+it shows the size of the redacted image and needed no extra work. The egress log row gains a count, `redactions: n`, so the log can say
 how many regions were painted without saying what they held (the log never stores
 contents).
 

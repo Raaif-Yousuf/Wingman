@@ -260,6 +260,13 @@ impl Provider for OpenAiCompat {
         "openai-compat"
     }
 
+    /// #105: a request to a literal loopback address stays on this machine,
+    /// so it needs no send preview. Same test `provider::common`'s send
+    /// guard applies to the request URL.
+    fn sends_off_machine(&self) -> bool {
+        crate::mode::classify_host(&self.base_url) != crate::mode::HostClass::Loopback
+    }
+
     fn ready(&self) -> bool {
         if self.base_url.trim().is_empty() {
             return false;
