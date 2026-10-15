@@ -12,6 +12,7 @@ pub mod fill_form;
 pub mod generic_answer;
 pub mod generic_inputs;
 pub mod read_qr;
+pub mod page_summary;
 pub mod review_email;
 pub mod schema;
 
@@ -215,6 +216,9 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   copy the text, model-free like `extract-text-to-clipboard` (same
 ///   deliberately unregistered proposal name, empty prompt, read-only
 ///   clipboard executor). A link in a code is shown, never opened.
+/// - `"summarize-page"` (#67, `page_summary::builtin_action`): proposal
+///   `page_summary`, executor `none`. Two summary lines on the card, bullets on
+///   expand. Runs through the generic dispatch path.
 /// - `"add-to-calendar"` (#39, `calendar::builtin_action`): the first action
 ///   that runs the full Look/Propose/Confirm/Do loop end to end.
 /// - `"review-this-email"` (#38, `review_email::builtin_action`): the
@@ -272,6 +276,7 @@ pub fn builtin_actions() -> Vec<Action> {
             rate_difficulty: false,
             enabled: true,
         },
+        page_summary::builtin_action(),
         calendar::builtin_action(),
         review_email::builtin_action(),
         fill_form::builtin_action(),
@@ -470,7 +475,7 @@ mod tests {
         assert_eq!(
             builtins.len(),
             7,
-            "check-my-work, extract-text-to-clipboard (#41), read-qr-code (#313), \
+            "check-my-work, extract-text-to-clipboard (#41), read-qr-code (#313), summarize-page (#67), \
              add-to-calendar (#39), review-this-email (#38), fill-this-form (#40), \
              action-items-checklist (#314)"
         );
