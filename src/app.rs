@@ -302,6 +302,7 @@ pub fn run() -> Result<()> {
 
     let mut card = Card::new(instance).context("creating the notification card")?;
     card.set_text_scale(config.ui.text_scale);
+    card.set_placement(config.ui.card_corner, &config.ui.card_monitor);
     // Issue #39: so the preview card can PostMessageW WM_APP_PREVIEW_DECIDED
     // here when "Do it"/Cancel closes it -- see Card::set_owner's doc
     // comment.
@@ -2502,6 +2503,8 @@ impl App {
         // A hand-edited `[egress_preview]` otherwise needs a full restart.
         crate::config::set_egress_preview_enabled(self.config.egress_preview.enabled);
         self.card.set_text_scale(self.config.ui.text_scale);
+        self.card
+            .set_placement(self.config.ui.card_corner, &self.config.ui.card_monitor);
         if let Some(hook) = &self.hook {
             hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
             // #181: a Reload/Settings-save always re-syncs the pause chord

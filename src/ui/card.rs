@@ -66,7 +66,9 @@
 use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
+use crate::config::CardCorner;
 use crate::speech::{spoken_text, Speaker};
+use crate::ui::card_placement::{card_origin, resolve_work_area, MonitorChoice};
 use crate::ui::text::draw_text_line;
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -78,11 +80,11 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     Arc, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint,
-    ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject, GetTextMetricsW,
-    IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect, SelectClipRgn,
-    SelectObject, SetBkColor, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT,
-    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
-    DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
+    EnumDisplayMonitors, ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject,
+    GetTextMetricsW, IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect,
+    SelectClipRgn, SelectObject, SetBkColor, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT,
+    DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP,
+    DT_VCENTER, DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND,
     PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
@@ -209,6 +211,9 @@ impl Card {
             theme,
             fonts: Fonts::null(),
             text_scale: 1.0,
+            corner: CardCorner::default(),
+            monitor: MonitorChoice::Cursor,
+            follow_anchor: POINT::default(),
             anim_frame: 0,
             scroll_offset: 0,
             scroll_max: 0,
@@ -391,6 +396,13 @@ impl Card {
     /// unreadable or enormous.
     pub fn set_text_scale(&mut self, scale: f32) {
         self.inner.set_text_scale(scale);
+    }
+
+    /// Issue #109: `ui.card_corner` and `ui.card_monitor`. Takes effect the
+    /// next time a card is laid out.
+    pub fn set_placement(&mut self, corner: CardCorner, monitor: &str) {
+        self.inner.corner = corner;
+        self.inner.monitor = MonitorChoice::parse(monitor);
     }
 
     pub fn state(&self) -> CardState {
@@ -1069,6 +1081,15 @@ struct CardInner {
     /// User-tunable multiplier applied to every font size. Set via
     /// [`Card::set_text_scale`]; defaults to 1.0.
     text_scale: f32,
+    /// Issue #109: where the card sits (`ui.card_corner`).
+    corner: CardCorner,
+    /// Issue #109: which monitor it appears on (`ui.card_monitor`).
+    monitor: MonitorChoice,
+    /// Issue #109: for `CardCorner::FollowMouse`, the pointer position the
+    /// card is anchored to. Taken when Pending or Collapsed is laid out and
+    /// reused by Expanded and Preview, so a card the user is reading does
+    /// not chase the mouse.
+    follow_anchor: POINT,
     anim_frame: u32,
     scroll_offset: i32,
     scroll_max: i32,
@@ -1607,26 +1628,48 @@ impl CardInner {
 
     // -- layout ------------------------------------------------------------
 
-    fn work_area_for_cursor(&self) -> RECT {
+    /// Pending and Collapsed: the monitor the setting names, else the one
+    /// under the mouse (always the mouse's for `FollowMouse`). Also records
+    /// the pointer as the `FollowMouse` anchor.
+    fn work_area_for_cursor(&mut self) -> RECT {
         unsafe {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
-            let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            work_area_for_monitor(hmon)
+            self.follow_anchor = pt;
+            let cursor_work = work_area_for_monitor(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST));
+            self.pinned_work_area(cursor_work)
         }
     }
 
+    /// Expanded and Preview: stays on the monitor the card is already on
+    /// (the mouse may have moved on while the user reads), unless the
+    /// setting pins a monitor.
     fn work_area_for_self(&self) -> RECT {
         unsafe {
-            let hmon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
-            work_area_for_monitor(hmon)
+            let self_work =
+                work_area_for_monitor(MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST));
+            self.pinned_work_area(self_work)
         }
+    }
+
+    /// `fallback` unless `ui.card_monitor` pins a monitor (and the card is
+    /// not following the mouse, which always stays on the mouse's monitor).
+    fn pinned_work_area(&self, fallback: RECT) -> RECT {
+        if self.corner == CardCorner::FollowMouse || self.monitor == MonitorChoice::Cursor {
+            return fallback;
+        }
+        let primary = work_area_for_monitor(unsafe {
+            MonitorFromPoint(
+                POINT { x: 0, y: 0 },
+                windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTOPRIMARY,
+            )
+        });
+        resolve_work_area(self.monitor, fallback, primary, &all_monitor_work_areas())
     }
 
     fn place_bottom_right(&self, work: RECT, width: i32, height: i32) {
         let margin = self.scale(MARGIN_DP);
-        let x = (work.right - margin - width).max(work.left);
-        let y = (work.bottom - margin - height).max(work.top);
+        let (x, y) = card_origin(self.corner, work, margin, width, height, self.follow_anchor);
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -3415,6 +3458,31 @@ fn ray_point(cx: i32, cy: i32, angle_deg: f32, len: i32) -> (i32, i32) {
     (x, y)
 }
 
+/// Issue #109: every monitor's work area, in the system's enumeration order
+/// (what `ui.card_monitor = "2"` indexes into).
+fn all_monitor_work_areas() -> Vec<RECT> {
+    unsafe extern "system" fn collect(
+        hmon: windows::Win32::Graphics::Gdi::HMONITOR,
+        _hdc: HDC,
+        _rc: *mut RECT,
+        lparam: LPARAM,
+    ) -> windows::core::BOOL {
+        let out = &mut *(lparam.0 as *mut Vec<RECT>);
+        out.push(work_area_for_monitor(hmon));
+        true.into()
+    }
+    let mut out: Vec<RECT> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut out as *mut Vec<RECT> as isize),
+        );
+    }
+    out
+}
+
 fn work_area_for_monitor(hmon: windows::Win32::Graphics::Gdi::HMONITOR) -> RECT {
     unsafe {
         let mut mi = MONITORINFO {
@@ -3627,6 +3695,37 @@ mod tests {
         assert!(
             card.inner.copy_details_rect.is_none(),
             "an answer card must not show \"Copy details\""
+        );
+    }
+
+    #[test]
+    fn card_lands_in_the_configured_corner_of_the_cursor_monitor() {
+        // Issue #109, the wired-to-nothing check: the real window's position
+        // follows `set_placement`, not just the pure math.
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        let work = card.inner.work_area_for_cursor();
+        let margin = card.inner.scale(MARGIN_DP);
+        let rect_of = |card: &Card| {
+            let mut rc = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(card.hwnd(), &mut rc);
+            }
+            rc
+        };
+
+        card.set_placement(CardCorner::TopLeft, "cursor");
+        card.show_answer("Right.", "Details.", 0, None);
+        let rc = rect_of(&card);
+        assert_eq!((rc.left, rc.top), (work.left + margin, work.top + margin));
+
+        card.set_placement(CardCorner::BottomRight, "cursor");
+        card.show_answer("Right.", "Details.", 0, None);
+        let rc = rect_of(&card);
+        assert_eq!(
+            (rc.right, rc.bottom),
+            (work.right - margin, work.bottom - margin)
         );
     }
 
