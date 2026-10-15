@@ -1253,6 +1253,9 @@ impl App {
         let proposal = match result {
             Ok(p) => p,
             Err(packed) => {
+                if self.quiet_send_cancel(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -1292,6 +1295,7 @@ impl App {
         if confirm_required {
             let schema = actions::schema::schema_for("calendar_event", false)
                 .expect("\"calendar_event\" is always registered in actions::schema");
+            arm_calendar_slot(&mut self.pending_preview);
             self.pending_preview_generation =
                 self.card
                     .show_preview("Add event from screen", &schema, &proposal, false);
@@ -1479,6 +1483,9 @@ impl App {
         let (proposal, replace) = match result {
             Ok(done) => done,
             Err(packed) => {
+                if self.quiet_send_cancel(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -1612,8 +1619,33 @@ impl App {
                 self.card
                     .show_pending(crate::ui::card::PendingStage::AskingModel { model_name });
             }
-            None => self.run_confirmed_calendar_add(confirmed),
+            Some(PendingPreview::Calendar) => self.run_confirmed_calendar_add(confirmed),
+            // Nothing is waiting on this decision, so nothing runs.
+            None => {}
         }
+    }
+
+    /// #105: the Wingman key while a send preview is waiting cancels it:
+    /// the worker is blocked on it and a second press would otherwise do
+    /// nothing, leaving it blocked. Returns whether it cancelled one.
+    fn cancel_pending_send_preview(&mut self) -> bool {
+        if !take_send_slot(&mut self.pending_preview) {
+            return false;
+        }
+        self.card.hide();
+        true
+    }
+
+    /// #105: ends a run the user cancelled at the send preview. Nothing was
+    /// sent and nothing was done, so there is no card and no failure state
+    /// (#392). Returns whether `packed` was such a cancel.
+    fn quiet_send_cancel(&mut self, packed: &str) -> bool {
+        if !is_send_cancelled(packed) {
+            return false;
+        }
+        self.card.hide();
+        self.set_watch(false);
+        true
     }
 
     /// #105: a worker is about to send a request off the machine and is
@@ -1889,6 +1921,9 @@ impl App {
         let outcome = match result {
             Ok(o) => o,
             Err(packed) => {
+                if self.quiet_send_cancel(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -2069,6 +2104,9 @@ impl App {
         let value = match result {
             Ok(v) => v,
             Err(packed) => {
+                if self.quiet_send_cancel(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -2211,6 +2249,12 @@ impl App {
     }
 
     fn on_result(&mut self, result: std::result::Result<Answer, String>) {
+        if let Err(packed) = &result {
+            if self.quiet_send_cancel(packed) {
+                self.set_busy(false);
+                return;
+            }
+        }
         let is_err = result.is_err();
         let mut answer = self.record_last(result);
         // A store failure never fails the request (#46); it rides on the
@@ -4431,10 +4475,40 @@ enum DeferredMessage {
     GenericActionResult(actions::Action, Value, GenericResult),
 }
 
+/// Marks the single preview slot as the calendar add, replacing whatever was
+/// there. A replaced `Send` drops its channel, which cancels that send.
+fn arm_calendar_slot(slot: &mut Option<PendingPreview>) {
+    *slot = Some(PendingPreview::Calendar);
+}
+
+/// Empties the slot if it holds a send preview, which wakes the blocked
+/// worker with no authorization. Returns whether it did. Any other pending
+/// preview is left alone.
+fn take_send_slot(slot: &mut Option<PendingPreview>) -> bool {
+    if matches!(slot, Some(PendingPreview::Send(_))) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Whether a worker's packed error is the user cancelling the send preview.
+/// Looks at the raw chain half, which keeps the cancel text verbatim.
+fn is_send_cancelled(packed: &str) -> bool {
+    unpack_error(packed)
+        .1
+        .contains(crate::provider::SEND_CANCELLED_TEXT)
+}
+
 /// Issue #225: which action is waiting on the preview currently on screen.
 /// See [`App::pending_preview`] for why this is one slot rather than one
 /// `Option` per kind.
 enum PendingPreview {
+    /// #25: the calendar add. Explicit rather than an empty slot, so an empty
+    /// slot can never be mistaken for it (a stale `Send` slot could
+    /// otherwise be released by a calendar "Do it").
+    Calendar,
     /// #38 "Review this email": the stashed target to write the edits back
     /// through, consumed by `run_review_executor`.
     Review(actions::review_email::ReviewContext),
@@ -4763,13 +4837,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         }
         WM_APP_HOTKEY => {
             let _which = wparam.0; // both bindings do the same thing
-            app.ask();
+            if !app.cancel_pending_send_preview() {
+                app.ask();
+            }
             LRESULT(0)
         }
         WM_APP_ACTIVATE => {
             // `ask` already no-ops while `busy`, so a second Copilot-key press
-            // landing here while a request is in flight is harmless.
-            app.ask();
+            // landing here while a request is in flight is harmless, except
+            // that it cancels a waiting send preview (#105).
+            if !app.cancel_pending_send_preview() {
+                app.ask();
+            }
             LRESULT(0)
         }
         WM_APP_RESULT => {
@@ -4922,6 +5001,44 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 
 #[cfg(test)]
 mod tests {
+    // -- #105 send preview slot ------------------------------------------
+
+    #[test]
+    fn the_key_cancels_a_pending_send_and_wakes_the_worker() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut slot = Some(super::PendingPreview::Send(tx));
+        assert!(super::take_send_slot(&mut slot));
+        assert!(slot.is_none());
+        assert!(rx.recv().is_err(), "the worker must be woken with nothing");
+    }
+
+    #[test]
+    fn the_key_leaves_any_other_pending_preview_alone() {
+        let mut slot = Some(super::PendingPreview::FormFill(serde_json::Value::Null));
+        assert!(!super::take_send_slot(&mut slot));
+        assert!(matches!(slot, Some(super::PendingPreview::FormFill(_))));
+        let mut empty = None;
+        assert!(!super::take_send_slot(&mut empty));
+    }
+
+    #[test]
+    fn a_calendar_preview_replaces_a_stale_send_slot() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut slot = Some(super::PendingPreview::Send(tx));
+        super::arm_calendar_slot(&mut slot);
+        assert!(matches!(slot, Some(super::PendingPreview::Calendar)));
+        assert!(rx.recv().is_err(), "the replaced send must not authorize");
+    }
+
+    #[test]
+    fn a_cancelled_send_is_recognised_through_the_packed_error() {
+        let chain = format!("{:#}", anyhow::Error::new(crate::provider::SendCancelled));
+        let packed = super::pack_error(&super::human_error_detail(&chain), &chain);
+        assert!(super::is_send_cancelled(&packed));
+        let other = super::pack_error("x", "anthropic: HTTP 500");
+        assert!(!super::is_send_cancelled(&other));
+    }
+
     use super::first_line;
     use super::resolve_prompt_and_difficulty;
     use super::unreadable_secrets_card;

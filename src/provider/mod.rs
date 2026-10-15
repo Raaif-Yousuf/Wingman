@@ -487,12 +487,14 @@ pub fn install_send_gate(gate: std::sync::Arc<dyn SendGate>) {
 #[derive(Debug)]
 pub struct SendCancelled;
 
+/// The text of a [`SendCancelled`]. `App` looks for it in a worker's error
+/// chain, which crosses a thread boundary as text, to end a cancel quietly.
+pub const SEND_CANCELLED_TEXT: &str =
+    "Not sent. You cancelled the preview, so nothing left this computer.";
+
 impl std::fmt::Display for SendCancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Not sent. You cancelled the preview, so nothing left this computer."
-        )
+        write!(f, "{SEND_CANCELLED_TEXT}")
     }
 }
 
@@ -557,6 +559,12 @@ impl Chain {
     /// the machine. The gate sees `req` as it will actually be sent (after
     /// redaction, and after the non-vision rewrite). Cancel is a
     /// [`SendCancelled`] error that the callers return at once.
+    ///
+    /// The one-shot repair request (#99) inside [`attempt_provider`] is not
+    /// previewed again. It goes to the same provider inside the same
+    /// authorization, carries only the model's own bad answer and the parse
+    /// error, and leaves the screenshot out, so nothing new about the user
+    /// leaves the computer.
     fn attempt<T>(
         &self,
         provider: &dyn Provider,

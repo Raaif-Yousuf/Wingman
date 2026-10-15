@@ -472,7 +472,8 @@ impl Card {
     }
 
     /// #105: the send preview. The same preview as [`Card::show_preview`],
-    /// with the confirm button reading "Send" instead of "Do it". Esc and
+    /// with the confirm button reading "Send" instead of "Do it", click-only (Enter
+    /// does nothing, #105). Esc and
     /// click-away still cancel.
     #[must_use = "store the generation; on_preview_decided needs it to reject a stale notification"]
     pub fn show_send_preview(
@@ -482,7 +483,7 @@ impl Card {
         proposal_value: &serde_json::Value,
     ) -> u32 {
         self.inner
-            .show_preview_labeled(title, schema, proposal_value, false, "Send");
+            .show_preview_labeled(title, schema, proposal_value, false, SEND_CONFIRM_LABEL);
         self.inner.preview_generation
     }
 
@@ -2738,7 +2739,8 @@ impl CardInner {
                     // Issue #77: Enter toggles "Read aloud" the same way.
                     self.read_aloud_activated();
                 } else if self.state == CardState::Preview {
-                    if let Some(command_id) = preview_key_command(wparam.0 as u16) {
+                    let enter_confirms = self.preview.as_ref().map_or(true, |p| p.enter_confirms);
+                    if let Some(command_id) = preview_key_command(wparam.0 as u16, enter_confirms) {
                         self.run_preview_command(command_id);
                     }
                 }
@@ -2871,6 +2873,7 @@ impl CardInner {
             main_window_exists,
             error: None,
             confirm_label,
+            enter_confirms: label_confirms_with_enter(confirm_label),
         });
         // #225: from here until a decision is reported, tearing this
         // preview down is an abandonment and the owner has to be told. Set
@@ -3112,11 +3115,18 @@ impl CardInner {
         let Some(preview) = self.preview.as_ref() else {
             return;
         };
-        let target = preview
-            .edits
-            .first()
-            .map(|(_, hwnd)| *hwnd)
-            .unwrap_or(preview.do_it_btn);
+        // #105: the send preview must not put focus on its Send button, or a
+        // stray space bar typed for another window would press it. Focus the
+        // card itself; Esc still reaches it.
+        let target = if preview.enter_confirms {
+            preview
+                .edits
+                .first()
+                .map(|(_, hwnd)| *hwnd)
+                .unwrap_or(preview.do_it_btn)
+        } else {
+            self.hwnd
+        };
         if !target.0.is_null() {
             unsafe {
                 let _ = SetFocus(Some(target));
@@ -3620,6 +3630,9 @@ struct PreviewUi {
     /// The confirm button's text: "Do it" for an action preview, "Send" for
     /// the send preview (#105).
     confirm_label: &'static str,
+    /// Whether Enter presses the confirm button; `false` for the send
+    /// preview (#105), which is click-only.
+    enter_confirms: bool,
 }
 
 struct PreviewRowMetrics {
@@ -3654,13 +3667,41 @@ struct PreviewLayoutMetrics {
 /// EDIT/BUTTON child forwards through the same mapping), so both agree by
 /// construction rather than by two hand-kept switch statements. Pure and
 /// unit-tested without a live window -- see the `tests` module below.
-fn preview_key_command(vk: u16) -> Option<i32> {
-    if vk == VK_RETURN.0 {
+///
+/// #105: `enter_confirms` is `false` for the send preview, where Enter does
+/// nothing. A key press meant for another window can land on the card the
+/// instant it takes focus, and that must never send a screenshot: Send is
+/// click-only, Esc still cancels.
+fn preview_key_command(vk: u16, enter_confirms: bool) -> Option<i32> {
+    if vk == VK_RETURN.0 && enter_confirms {
         Some(ID_PREVIEW_DO_IT)
     } else if vk == VK_ESCAPE.0 {
         Some(ID_PREVIEW_CANCEL)
     } else {
         None
+    }
+}
+
+/// The confirm button's text on the send preview (#105).
+const SEND_CONFIRM_LABEL: &str = "Send";
+
+/// Whether Enter may press the confirm button of a preview whose button reads
+/// `confirm_label`. Only the send preview refuses it (see
+/// [`preview_key_command`]).
+fn label_confirms_with_enter(confirm_label: &str) -> bool {
+    confirm_label != SEND_CONFIRM_LABEL
+}
+
+/// Whether Enter confirms the preview showing in `card`. Read-only, same
+/// reasoning as [`live_preview_generation`].
+unsafe fn live_preview_enter_confirms(card: HWND) -> bool {
+    let ptr = GetWindowLongPtrW(card, GWLP_USERDATA) as *const CardInner;
+    if ptr.is_null() {
+        return true;
+    }
+    match &*std::ptr::addr_of!((*ptr).preview) {
+        Some(p) => p.enter_confirms,
+        None => true,
     }
 }
 
@@ -3738,7 +3779,9 @@ unsafe extern "system" fn preview_control_subclass(
 ) -> LRESULT {
     let parent = HWND(ref_data as *mut c_void);
     if msg == WM_KEYDOWN {
-        if let Some(command_id) = preview_key_command(wparam.0 as u16) {
+        if let Some(command_id) =
+            preview_key_command(wparam.0 as u16, live_preview_enter_confirms(parent))
+        {
             let _ = PostMessageW(
                 Some(parent),
                 WM_CARD_PREVIEW_COMMAND,
@@ -5054,12 +5097,30 @@ mod tests {
 
     #[test]
     fn preview_key_command_maps_enter_to_do_it() {
-        assert_eq!(preview_key_command(VK_RETURN.0), Some(ID_PREVIEW_DO_IT));
+        assert_eq!(
+            preview_key_command(VK_RETURN.0, true),
+            Some(ID_PREVIEW_DO_IT)
+        );
+    }
+
+    /// #105: Enter must not send. Esc must still cancel.
+    #[test]
+    fn the_send_preview_ignores_enter_but_esc_still_cancels() {
+        assert!(!label_confirms_with_enter(SEND_CONFIRM_LABEL));
+        assert!(label_confirms_with_enter("Do it"));
+        assert_eq!(preview_key_command(VK_RETURN.0, false), None);
+        assert_eq!(
+            preview_key_command(VK_ESCAPE.0, false),
+            Some(ID_PREVIEW_CANCEL)
+        );
     }
 
     #[test]
     fn preview_key_command_maps_escape_to_cancel() {
-        assert_eq!(preview_key_command(VK_ESCAPE.0), Some(ID_PREVIEW_CANCEL));
+        assert_eq!(
+            preview_key_command(VK_ESCAPE.0, true),
+            Some(ID_PREVIEW_CANCEL)
+        );
     }
 
     #[test]
@@ -5067,7 +5128,7 @@ mod tests {
         // Spot-check a handful of unrelated virtual-key codes, including the
         // boundary values 0 and u16::MAX.
         for vk in [0u16, 1, 0x41 /* 'A' */, 0x09 /* Tab */, u16::MAX] {
-            assert_eq!(preview_key_command(vk), None, "vk={vk:#06x}");
+            assert_eq!(preview_key_command(vk, true), None, "vk={vk:#06x}");
         }
     }
 
