@@ -52,12 +52,14 @@ use crate::ui::confirm::Confirmed;
 /// cannot tell "clipboard was empty" from "clipboard held something this
 /// executor cannot preserve") and issue #410 tracking it separately.
 ///
-/// Nothing in `app.rs` calls an executor yet (the confirm card's "Do it"
-/// button does not exist -- see the 2026-09-17 executor design doc's "Out
-/// of scope"), so this and every other item in this module are unused
-/// outside their own tests until that issue lands, the same status
-/// `provider::Caps` has until Phase 2's router (`#[allow(dead_code)]`).
-#[allow(dead_code)]
+/// `app.rs`'s confirm paths resolve and run a real executor today:
+/// `copy_region` and `run_confirmed_form_fill`/`run_confirmed_calendar_add`/
+/// `run_review_executor` call `executors::registry::resolve` directly, and
+/// `on_calendar_result`/`on_generic_action_result`/
+/// `run_confirmed_generic_action` go through `actions::resolve_executor`.
+/// The one place outside this module that reads `Effect` is
+/// `ui::confirm::auto_confirm_read_only`, which only skips a real
+/// confirmation when `executor.effect() == Effect::ReadOnly`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
     ReadOnly,
@@ -69,13 +71,11 @@ pub enum Effect {
 /// what "restore" means for its own effect (expansion plan §6, "Undo where
 /// the platform allows"), and this keeps `Undo` usable for effects (like the
 /// clipboard) that have no natural serialized representation.
-#[allow(dead_code)] // see Effect's doc comment
 pub struct Undo {
     pub summary: String,
     restore: Box<dyn FnOnce() -> anyhow::Result<()> + Send>,
 }
 
-#[allow(dead_code)] // see Effect's doc comment
 impl Undo {
     /// For an executor with no prior state to restore (read-only actions:
     /// there is nothing to undo because nothing was written).
@@ -107,7 +107,6 @@ impl Undo {
 /// to obtain one -- see `ui::confirm`), and "preview equals execution": the
 /// confirmed value is consumed exactly once, by value, so there is no path
 /// to execute a stale or re-derived proposal.
-#[allow(dead_code)] // see Effect's doc comment
 pub trait Executor: Send + Sync {
     fn name(&self) -> &'static str;
     fn effect(&self) -> Effect;
