@@ -42,6 +42,10 @@ pub enum PendingStage {
     /// current text selection, not a screenshot -- this names that
     /// truthfully instead of reusing a screenshot-flavored line.
     ReadingSelection,
+    /// "Fill this form" with no model (#132): reads the form's fields from
+    /// the window and matches them to the profile on this PC. No screenshot,
+    /// no model, nothing sent.
+    ReadingForm,
     /// A generic, always-true placeholder for a pending flow that has no
     /// more specific honest text yet (e.g. `extract_text`'s OCR pass).
     Working,
@@ -80,6 +84,7 @@ pub fn pending_status_text(stage: &PendingStage) -> String {
             format!("Asking {}...", truncate(model_name, MAX_MODEL_NAME_CHARS))
         }
         PendingStage::ReadingSelection => "Reading your selection...".to_string(),
+        PendingStage::ReadingForm => "Reading the form...".to_string(),
         PendingStage::Working => "Working...".to_string(),
         PendingStage::StillWorking => "Still working.".to_string(),
     }
@@ -102,6 +107,13 @@ mod tests {
         let text = pending_status_text(&PendingStage::ReadingSelection);
         assert_eq!(text, "Reading your selection...");
         assert!(!text.to_lowercase().contains("screen"));
+    }
+
+    #[test]
+    fn reading_form_text_names_no_model_and_no_screenshot() {
+        let text = pending_status_text(&PendingStage::ReadingForm);
+        assert_eq!(text, "Reading the form...");
+        assert!(!text.to_lowercase().contains("asking"));
     }
 
     #[test]

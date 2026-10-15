@@ -492,6 +492,11 @@ pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
 /// read a proposal from, so one list covering every id (built-in or
 /// utility) is the only place this fact can live without splitting the rule
 /// across two different lookups.
+///
+/// "Fill this form" (#132) is listed as model-free: it maps from the profile
+/// on this PC when no provider is ready. This flag only matters when no model
+/// is configured (`grouped_rows` ignores it otherwise), so with a provider
+/// ready the action is not singled out as a free one.
 fn action_requires_model(action_id: &str) -> bool {
     let model_free = action_id == crate::actions::EXTRACT_TEXT_ACTION_ID
         || action_id == CALCULATE_SELECTION_ACTION_ID
@@ -1193,6 +1198,24 @@ mod tests {
             .find(|a| a.id == crate::actions::fill_form::ACTION_ID)
             .expect("fill-this-form is in the catalogue");
         assert!(!fill.requires_model, "#132: maps locally with no model");
+    }
+
+    #[test]
+    fn fill_form_is_not_singled_out_when_a_model_is_configured() {
+        let resolved = crate::actions::merge_actions(crate::actions::builtin_actions(), vec![]);
+        let cat = catalogue(&resolved);
+        let is_fill = |r: &Row| matches!(r, Row::Action { id, .. } if id == crate::actions::fill_form::ACTION_ID);
+        let with_model = build_rows(&cat, "", true);
+        assert!(!with_model.iter().any(|r| matches!(r, Row::Hint(_))));
+        assert!(with_model.iter().any(is_fill));
+        // No model: it leads the list ahead of the hint, with the free actions.
+        let without = build_rows(&cat, "", false);
+        let hint_at = without
+            .iter()
+            .position(|r| matches!(r, Row::Hint(_)))
+            .expect("hint when no model");
+        let fill_at = without.iter().position(is_fill).expect("listed");
+        assert!(fill_at < hint_at);
     }
 
     // -- footer_line ---------------------------------------------------------
