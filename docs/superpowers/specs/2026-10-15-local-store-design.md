@@ -1,6 +1,6 @@
 # Local store: SQLite schema, migrations and what moves in
 
-Status: **draft.** Issue #46. Supplements the
+Status: **accepted, 2026-10-15.** Issue #46. Supplements the
 [expansion plan](2026-09-16-expansion-plan-design.md) (`store.rs` row of the
 module table, section 18 Knowledge and memory) and the
 [running app spec](2026-09-14-copilot-ask-design.md).
@@ -12,8 +12,8 @@ log, the profile, memory, and the whole knowledge track (#81 to #88). It picks a
 dependency that adds C code to the build, decides what is encrypted and what is
 searchable, and fixes the shape of data users will have on disk for years.
 Migrations are forward-only, so a wrong first schema is paid for forever. That is
-architecture (AGENTS.md rule 12), so this stops at the design. Open questions are
-at the end, each with a recommendation.
+architecture (AGENTS.md rule 12), so this stops at the design. The decisions
+taken on the open points are listed at the end.
 
 No code is part of this change.
 
@@ -104,7 +104,7 @@ milliseconds on the dev laptop, small next to a model call. The slice that adds
 vectors measures it on real data before the choice is final. The design isolates
 the choice behind one trait (`VectorIndex`: `upsert`, `remove_doc`, `nearest`),
 so changing it later touches one file and, if the vectors move, one migration.
-Recommendation in the open questions.
+Decided: see Decisions, item 2.
 
 ## File location, ACL, pragmas
 
@@ -113,7 +113,7 @@ and its encrypted values are bound to one machine's user key anyway. The sparse
 package keeps `%LOCALAPPDATA%` writes real (AGENTS.md rule 4; a full MSIX would
 virtualize them).
 
-The plan says `%LOCALAPPDATA%\Wingman\wingman.db`; a subdirectory is proposed
+The plan says `%LOCALAPPDATA%\Wingman\wingman.db`; the store uses a subdirectory
 because WAL mode creates `wingman.db-wal` and `wingman.db-shm` on demand, and
 `egress.rs`'s way of restricting a file with `icacls /inheritance:r` does not
 cover files SQLite creates later. Restricting the directory with inheritance
@@ -314,15 +314,15 @@ label matching stay). Pure logic is not rewritten, only its persistence.
   source-scanning test (CRLF-normalised, with a non-empty candidate set) asserts
   no module outside `store/` names the store's tables.
 - **Egress rows hold no content.** Attachments are kind and size; snippets are a
-  source label and chunk id, never the snippet text (see Open questions for the
+  source label and chunk id, never the snippet text (see Decisions, item 5, for the
   trade-off). The `error` text keeps going through `redact_opaque_tokens` before
   it is stored, exactly as today.
 - **Encryption at rest.** `libsqlite3` has no encryption, DPAPI cannot be applied
-  under a full-text index, and #85 wants both. The options and a recommendation
-  are in the open questions. What is fixed here: whatever is encrypted uses the
+  under a full-text index, and #85 wants both. The decision is
+  in Decisions, item 1. What is fixed here: whatever is encrypted uses the
   existing `dpapi.rs` envelope with a new entropy constant (not
   `PROFILE_ENTROPY`), one value at a time, and the store directory is owner-only.
-- **Retention.** `usage_day`: 60 days, as today. `egress`: proposed 90 days and
+- **Retention.** `usage_day`: 60 days, as today. `egress`: 90 days and
   at most 10 000 rows, whichever is reached first, pruned inside the insert; the
   current 2 MB cap is a byte limit that does not mean anything for rows, and
   2 MB at the current row size is on the order of thousands of rows. Knowledge:
@@ -408,48 +408,14 @@ Manual check for slice 1: run the installed app after the upgrade from a build
 that had `spend.json`, press the key once, and look at the three observables
 above. The state of a fresh install and of an upgrade are both worth one run.
 
-## Open questions
+## Decisions (2026-10-15)
 
-Each has a recommendation; none blocks slice 1 except the first.
-
-1. **How is the data encrypted at rest?** Options: (A) owner-only ACL and
-   plaintext values: simplest, FTS5 and vectors work, but an administrator
-   account can read the file. (B) per-value DPAPI for the small authored tables
-   (`profile_field`, `memory_item`) and ACL-only plaintext for knowledge chunks
-   and their FTS index: the sensitive identity data is protected from other
-   accounts including administrators; the retrieval index is not. Memory search
-   then happens in Rust over decrypted values, which is fine at memory's size.
-   (C) SQLCipher (BSD-style license) with a random key wrapped by DPAPI: the
-   whole file is encrypted and FTS5 still works, but the build needs OpenSSL or
-   an equivalent, which is a much larger C build and exe (THEORY, unverified).
-   **Recommendation: B for slices 1 to 4 and say so honestly in `PRIVACY.md`;
-   keep the store API unchanged so C is a later swap if wanted.** #85's wording
-   "read from another account yields no plaintext" is met for ordinary accounts
-   by the directory ACL and should be reworded to say that.
-2. **Vectors: `sqlite-vec` or a BLOB with brute-force cosine in Rust?**
-   **Recommendation: BLOB plus brute force behind `VectorIndex`**, measure on
-   real data in slice 5, and adopt `sqlite-vec` only if the measurement or the
-   corpus size says so. It avoids a second C dependency and an `unsafe`
-   extension registration for something that is not faster.
-3. **Directory: `store\wingman.db` or the plan's flat `wingman.db`?**
-   **Recommendation: the subdirectory**, for the inheritable ACL over the WAL
-   files. Update the plan's module table to match.
-4. **Writer: a `Mutex<Connection>` or a dedicated writer thread?**
-   **Recommendation: the mutex**, because write errors must reach the caller and
-   there is no backlog worth queuing. Revisit only if ingest contention shows up
-   in measurement.
-5. **What do egress rows store about knowledge snippets: labels or text?** The
-   done-when of #106 only needs "the same snippets the chip showed". Storing the
-   text makes the egress log a second copy of the user's documents.
-   **Recommendation: source label, chunk id and a short hash, never the text.**
-6. **Egress retention: 90 days and 10 000 rows, and is 60 days of usage still
-   right?** **Recommendation: yes to both**, user-adjustable later on the Usage
-   page; they replace a byte cap that does not mean what it did.
-7. **Old files after import: rename and keep one release, or delete at once?**
-   **Recommendation: rename and keep one release**, since forward-only
-   migrations give no way back and a bad import would otherwise lose history.
-8. **Snapshot cadence: weekly at startup?** **Recommendation: yes**, checked at
-   startup so it needs no timer, two kept, authored tables only restored from it.
-9. **Update the wording of #46** (drop `conversations` and `messages`, say
-   `egress` and `memory_item`)? **Recommendation: yes**, once this spec is
-   accepted.
+1. **Encryption at rest: per-value DPAPI for the authored tables (`profile_field`, `memory_item`); owner-only ACL and plaintext for knowledge chunks and their FTS index.** Memory search runs in Rust over decrypted values. `PRIVACY.md` says plainly what is and is not encrypted. The store API stays the same so SQLCipher can replace this later. #85's "another account yields no plaintext" is reworded to cover ordinary accounts, which the directory ACL covers.
+2. **Vectors: a `chunk.embedding` BLOB with brute-force cosine in Rust behind `VectorIndex`.** Measured on real data in slice 5. `sqlite-vec` is adopted only if that measurement or the corpus size calls for it.
+3. **Location: `%LOCALAPPDATA%\Wingman\store\wingman.db`**, with an inheritable directory ACL. The plan's module table is updated to match.
+4. **Writes go through a `Mutex<Connection>`**, with read connections opened on demand. No writer thread; revisit only if ingest contention shows up in measurement.
+5. **Egress rows store a source label, chunk id and short hash for knowledge snippets, never the text.**
+6. **Retention: egress 90 days and at most 10 000 rows; usage 60 days.** Adjustable later on the Usage page.
+7. **Old files are renamed `.migrated` after import and kept for one release**, then removed by a later slice.
+8. **Snapshots: at startup when the last one is over seven days old, two kept; only authored tables are restored from them.**
+9. **Issue #46's body drops `conversations` and `messages` and names `egress` and `memory_item`.**
