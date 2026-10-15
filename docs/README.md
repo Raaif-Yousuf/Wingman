@@ -69,6 +69,7 @@ before they run. Both scripts explain the replacement in their message.
 | [reproducible-builds.md](reproducible-builds.md) | What is and is not verified byte-for-byte reproducible (`wingman.exe` is, `wingman.msix` is not yet), the `/Brepro`/`SOURCE_DATE_EPOCH`/toolchain-pin measurement, how to reproduce it, and the CycloneDX SBOM `release.yml` attaches to every release |
 | [actions.md](actions.md) | The `actions.toml` schema field by field, two worked examples, the proposal schema registry, and why `serde_json` keeps `preserve_order` |
 | [executors.md](executors.md) | The executor contract, the four rules, the `Confirmed<P>` privacy boundary, the stale-target check, and the never-Send/Submit/Buy/Pay rule |
+| [connectors.md](connectors.md) | The connector contract, `AuthKind`/`Capability`, the `ics` connector as a worked example, how to add one, and the Offline-mode rule for a networked connector |
 | [audit-coverage.md](audit-coverage.md) | Which parts of the tree an auditor has actually read, when, and what came out. The issue tracker cannot tell you where nobody has looked |
 | [positioning.md](positioning.md) | Positioning and launch research (Hacker News, GitHub, Windows enthusiast forums, tech press), the one-line pitch, and the launch-day checklist |
 

@@ -220,7 +220,10 @@ Only for actions that talk to an external service (a calendar, an email
 provider). Implement the `Connector` trait in `connectors/`: an id, an auth
 kind (OAuth PKCE loopback, API key, or none), and its capabilities. Tokens go
 through the secrets module into Windows Credential Manager, never into
-`config.toml` and never logged.
+`config.toml` and never logged. See [`docs/connectors.md`](docs/connectors.md)
+for the full contract (checked against the code), which auth kinds are
+actually implemented today versus only planned, and the Offline-mode rule a
+networked connector must follow.
 
 ### 5. Test it
 
