@@ -162,7 +162,7 @@ walkthrough's step 3 summarizes.
 [[actions]]
 id       = "translate-selection"
 name     = "Translate selection"
-inputs   = ["selection", "screen"]      # falls back to a screen region if nothing is selected
+inputs   = ["selection", "screen"]      # sends the selected text; the screen only if nothing is selected
 proposal = "text_answer"                # built-in schema: { text }
 executor = "clipboard"                  # read-only: copies `text` to the clipboard
 confirm  = false

@@ -1293,6 +1293,7 @@ impl App {
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
         let prompt = action.prompt.clone();
+        let inputs = action.inputs.clone();
         let target = self.hwnd_isize();
         // #242 review: the action and the schema it was dispatched with are
         // carried through the worker and back in the result payload, rather
@@ -1307,7 +1308,17 @@ impl App {
         let schema_for_result = schema.clone();
         std::thread::spawn(move || {
             let result: std::result::Result<Value, String> = (|| -> Result<Value> {
-                let shot = capture::encode(&raw)?;
+                // #484: gather what the action's `inputs` list asks for, then
+                // let the pure `plan` decide the user text and whether the
+                // screenshot goes along (a selection-only action sends no image).
+                let gathered = gather_generic_inputs(&inputs, foreground_hwnd_isize);
+                let planned = actions::generic_inputs::plan(&inputs, &gathered)
+                    .map_err(anyhow::Error::msg)?;
+                let shot = if planned.screen {
+                    Some(capture::encode(&raw)?)
+                } else {
+                    None
+                };
                 let ollama_ready = mode == Mode::Auto
                     && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
                     && mode::probe_ollama_ready(
@@ -1315,7 +1326,7 @@ impl App {
                         &providers.ollama.model,
                     );
                 let chain = providers.build_chain_for_mode(mode, ollama_ready);
-                let req = generic_action_request(&shot, &prompt, schema);
+                let req = generic_action_request(shot.as_ref(), &prompt, &planned.user, schema);
                 chain.complete_parsed_with_fallback(
                     &req,
                     || non_vision_inputs(&raw, foreground_hwnd_isize),
@@ -3333,7 +3344,20 @@ fn non_vision_inputs(
     .context("OCR unavailable")?;
     let ocr_text = crate::ocr::serialize_lines(&ocr_output.lines);
 
-    let uia_fields = std::thread::spawn(move || {
+    let uia_fields = uia_fields_text(foreground_hwnd);
+
+    Ok(crate::provider::NonVisionInputs {
+        ocr_text,
+        uia_fields,
+    })
+}
+
+/// The foreground window's UIA fields as compact text, or empty when UIA
+/// fails (a hung app, a COM error): the walk runs on its own short-lived
+/// thread, as `non_vision_inputs` always did, so it never blocks the caller
+/// past `DEFAULT_BUDGET`.
+fn uia_fields_text(foreground_hwnd: isize) -> String {
+    std::thread::spawn(move || {
         let hwnd = HWND(foreground_hwnd as *mut _);
         crate::inputs::uia::snapshot_hwnd(
             hwnd,
@@ -3345,12 +3369,44 @@ fn non_vision_inputs(
     .ok()
     .and_then(|r| r.ok())
     .map(|snapshot| crate::inputs::uia::format_compact(&snapshot.fields))
-    .unwrap_or_default();
+    .unwrap_or_default()
+}
 
-    Ok(crate::provider::NonVisionInputs {
-        ocr_text,
-        uia_fields,
-    })
+/// #484: reads the text inputs a generic action's `inputs` list names
+/// (selection, clipboard, UIA fields) using the existing readers, only the
+/// ones listed. Runs on the worker thread (the selection and UIA readers
+/// block against a slow app, see their module docs). A reader that fails
+/// yields nothing, and `actions::generic_inputs::plan` decides what that
+/// means for the request.
+fn gather_generic_inputs(
+    inputs: &[actions::InputKind],
+    foreground_hwnd: isize,
+) -> actions::generic_inputs::Gathered {
+    let mut gathered = actions::generic_inputs::Gathered::default();
+    if actions::generic_inputs::wants_selection(inputs) {
+        gathered.selection = crate::inputs::selection::get_selection_foreground(
+            crate::inputs::selection::DEFAULT_MAX_CHARS,
+            crate::inputs::selection::DEFAULT_CLIPBOARD_WAIT_BUDGET,
+        )
+        .ok()
+        .map(|s| s.text);
+    }
+    if actions::generic_inputs::wants_clipboard(inputs) {
+        gathered.clipboard = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_text())
+            .ok()
+            .map(|t| {
+                crate::inputs::selection::truncate_bounded(
+                    &t,
+                    crate::inputs::selection::DEFAULT_MAX_CHARS,
+                )
+                .0
+            });
+    }
+    if actions::generic_inputs::wants_uia(inputs) {
+        gathered.uia = Some(uia_fields_text(foreground_hwnd));
+    }
+    gathered
 }
 
 /// #23: the precedence rule from the design spec's "Origin tracking"

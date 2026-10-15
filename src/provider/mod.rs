@@ -704,11 +704,20 @@ pub fn calendar_request(shot: &Shot, prompt: &str) -> Request {
 /// proposal, ...)`); this function does not re-look it up, so a proposal
 /// name with no registered schema is the caller's load error to report, not
 /// a silent `None` here.
-pub fn generic_action_request(shot: &Shot, prompt: &str, schema: Value) -> Request {
+///
+/// #484: `user` is the user turn and `shot` is `Some` only when the action's
+/// `inputs` call for the screenshot (`actions::generic_inputs::plan` decides
+/// both), so a selection-only action sends its text and no image.
+pub fn generic_action_request(
+    shot: Option<&Shot>,
+    prompt: &str,
+    user: &str,
+    schema: Value,
+) -> Request {
     Request {
         system: prompt.to_string(),
-        user: "Look at the screen and respond.".to_string(),
-        images: vec![shot.png.clone()],
+        user: user.to_string(),
+        images: shot.map(|s| vec![s.png.clone()]).unwrap_or_default(),
         schema: Some(schema),
         effort: Effort::Unset,
         max_tokens: 0,
@@ -1686,6 +1695,31 @@ mod tests {
         assert_eq!(req.images, vec![s.png]);
         assert_eq!(req.effort, Effort::Unset);
         assert_eq!(req.max_tokens, 0);
+    }
+
+    // -- generic_action_request (#484) ------------------------------------
+
+    #[test]
+    fn generic_action_request_with_a_screenshot_attaches_it() {
+        let s = shot();
+        let schema = serde_json::json!({"type": "object"});
+        let req = generic_action_request(Some(&s), "sys", "Look at the screen.", schema.clone());
+        assert_eq!(req.system, "sys");
+        assert_eq!(req.user, "Look at the screen.");
+        assert_eq!(req.images, vec![s.png]);
+        assert_eq!(req.schema, Some(schema));
+    }
+
+    #[test]
+    fn generic_action_request_without_a_screenshot_sends_text_and_no_image() {
+        let req = generic_action_request(
+            None,
+            "sys",
+            "Selected text:\nhola",
+            serde_json::json!({"type": "object"}),
+        );
+        assert_eq!(req.user, "Selected text:\nhola");
+        assert!(req.images.is_empty(), "no image for a text-only action");
     }
 
     #[test]
