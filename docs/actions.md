@@ -165,10 +165,12 @@ offer "Do it" at all.
 the one registry mapping a proposal name to the JSON Schema a model's
 completion must satisfy. These kinds are registered today: `"verdict"` (today's
 "Check my work"), `"calendar_event"` (#26), `"text_review"` (#38),
-`"form_fill"` (#40), `"text_answer"` (#242) and `"action_items"` (#314: a list of
+`"form_fill"` (#40), `"text_answer"` (#242), `"page_summary"` (#67: `bullets`,
+then two summary lines, shown on the card only; the first line is cut to 50 characters, the second to 90 so both fit the collapsed card, and bullets are
+clamped in code), `"action_items"` (#314: a list of
 lines the `clipboard` executor copies as a Markdown checklist) and
-`"word_definition"` (#75: `definition`, `example`, a read-only answer for the
-card). Each schema function returns a `serde_json::json!`
+`"word_definition"` (#75: `definition`, `example`, a read-only answer for
+the card). Each schema function returns a `serde_json::json!`
 literal shaped like standard JSON Schema (`"type": "object"`, `"properties"`,
 `"required"`, `"additionalProperties": false`), plus one
 non-standard keyword:

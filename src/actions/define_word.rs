@@ -3,8 +3,9 @@
 //!
 //! A generic action over the selection only. It has no `screen` input on
 //! purpose: the selected text alone goes to the model, so a text-only local
-//! model can answer it and it works in Offline mode (a screenshot would need
-//! a vision model). The proposal is `word_definition` and the executor is
+//! model can answer it (a screenshot would need a vision model). Which model
+//! answers is decided by the configured mode and providers, as for every
+//! action. The proposal is `word_definition` and the executor is
 //! `"none"`, so the model's answer is the card (#441) and nothing is written
 //! anywhere. `prefer.mode = "local"` records that a local model suits this
 //! action; nothing reads `prefer.mode` yet (see `docs/actions.md`).
@@ -54,7 +55,7 @@ mod tests {
         assert_eq!(
             a.inputs,
             vec![InputKind::Selection],
-            "no screen input: it must work with a text-only local model, offline"
+            "no screen input: a text-only local model must be able to answer it"
         );
         assert_eq!(a.proposal, "word_definition");
         assert_eq!(a.executor, "none");
@@ -92,6 +93,7 @@ mod tests {
         let card = result_card_text(
             "Define this word",
             "none",
+            "word_definition",
             "nothing to do",
             &json!({
                 "definition": "ephemeral (adjective): lasting a very short time",
