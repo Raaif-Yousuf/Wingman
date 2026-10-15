@@ -2483,6 +2483,9 @@ impl CardInner {
         main_window_exists: bool,
     ) {
         self.leave_preview_if_active();
+        // Issue #77: the preview replaces whatever was showing, including an
+        // answer being read aloud.
+        self.stop_reading();
         // The preview never auto-dismisses on a timer (rule 5 and safety:
         // an action that writes something must never fire because nobody
         // was there to see a countdown) -- so, unlike show_pending/
@@ -4766,6 +4769,23 @@ mod tests {
              owner about the FIRST one before showing the second"
         );
         assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn show_preview_stops_a_card_that_is_being_read_aloud() {
+        // Issue #77: a preview replacing an expanded answer must stop the
+        // voice and clear `reading`, like hide() and the other show_* paths.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("Right.", "Details.", 0, None);
+        card.inner.try_expand();
+        card.inner.reading = true;
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_preview("Add to calendar", &schema, &value, false);
+        assert!(
+            !card.inner.reading,
+            "a preview must stop the read-aloud state"
+        );
     }
 
     #[test]

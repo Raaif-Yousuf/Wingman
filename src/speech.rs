@@ -61,16 +61,22 @@ impl Speaker {
     /// lparam 0) when an utterance finishes or is stopped.
     pub(crate) fn new(notify_hwnd: HWND, notify_msg: u32) -> anyhow::Result<Self> {
         unsafe {
-            // Already initialized on this thread (S_FALSE) or initialized
-            // with another model (RPC_E_CHANGED_MODE): both leave COM usable,
-            // so the result is deliberately not checked. Never uninitialized:
-            // the main thread owns COM for the life of the process.
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            // Nothing else initializes COM on the main thread, so this call
+            // is what makes it a single-threaded apartment. S_FALSE (already
+            // an STA) is fine. RPC_E_CHANGED_MODE (the thread is already
+            // another model) is an error: the voice's notify window needs an
+            // STA, so it fails to the "Can't read aloud" card instead of
+            // proceeding. Never uninitialized: the thread keeps its apartment
+            // for the life of the process.
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+                .ok()
+                .map_err(|e| anyhow::anyhow!("Wingman: could not start the system voice: {e}"))?;
             let voice: ISpVoice = CoCreateInstance(&SpVoice, None, CLSCTX_ALL)
                 .map_err(|e| anyhow::anyhow!("Wingman: no system voice is available: {e}"))?;
             voice.SetNotifyWindowMessage(notify_hwnd, notify_msg, WPARAM(0), LPARAM(0))?;
-            // Notify only, queue nothing: the card never reads the events,
-            // so queuing them would just grow an unread queue.
+            // Notify and queue the end-of-stream event: the card drains the
+            // queue in `ended_streams` each time the notification arrives, so
+            // it never grows.
             let end = event_mask(SPEI_END_INPUT_STREAM.0);
             voice.SetInterest(end, end)?;
             Ok(Self { voice })
