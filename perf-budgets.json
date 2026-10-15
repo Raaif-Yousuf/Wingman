@@ -1,8 +1,8 @@
 {
   "exe_size_bytes": {
-    "max": 2700000,
-    "measured": 2422784,
+    "max": 3500000,
+    "measured": 3272192,
     "measured_on": "2026-10-15",
-    "reason": "Release exe is about 2 MB by design (AGENTS.md); roughly 11 percent headroom so a normal feature fits and a heavy dependency does not."
+    "reason": "Raised from 2,700,000 for the bundled SQLite of the local store (#46, store spec): 2,438,656 before and 3,272,192 after on the same machine, with unused SQLite parts switched off in .cargo/config.toml. Roughly 7 percent headroom."
   }
 }

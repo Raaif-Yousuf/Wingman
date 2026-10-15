@@ -22,7 +22,7 @@ separate Phase 0 item) exists; regenerate this file whenever `Cargo.lock`
 changes materially, by rerunning the command above against the current lock
 file and updating the table.
 
-148 crates resolve for this target as of `Cargo.lock`. Issue #160 dropped
+156 crates resolve for this target as of `Cargo.lock`. Issue #160 dropped
 the direct dependency `dirs` (and its `dirs-sys` -> `option-ext` transitive
 chain, plus the `windows-sys` 0.61.2 pulled in only by `dirs-sys`) in favor
 of a direct `SHGetKnownFolderPath` call through the `windows` crate this
@@ -35,9 +35,9 @@ Dev-dependencies are in scope for this file: it documents what is
 reachable from `cargo test`'s dependency graph on this platform, not only
 what links into the shipped `wingman.exe`.
 `cargo metadata --format-version 1 --filter-platform x86_64-pc-windows-msvc`
-resolves 149 packages for this target; the one package this file does not
+resolves 157 packages for this target; the one package this file does not
 list is `wingman` itself (the file covers third-party dependencies, not the
-project), so 149 - 1 = 148 matches the table below.
+project), so 157 - 1 = 156 matches the table below.
 
 ## Direct dependencies
 
@@ -48,6 +48,7 @@ project), so 149 - 1 = 148 matches the table below.
 | base64 | 0.23.1 | MIT OR Apache-2.0 | https://github.com/marshallpierce/rust-base64 |
 | embed-resource | 3.0.11 (build) | MIT | https://github.com/nabijaczleweli/rust-embed-resource |
 | image | 0.25.10 | MIT OR Apache-2.0 | https://github.com/image-rs/image |
+| rusqlite | 0.40.2 (feature `bundled`) | MIT | https://github.com/rusqlite/rusqlite |
 | serde | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde |
 | serde_json | 1.0.151 | MIT OR Apache-2.0 | https://github.com/serde-rs/json |
 | toml | 1.1.6 | MIT OR Apache-2.0 | https://github.com/toml-rs/toml |
@@ -120,15 +121,19 @@ state, not a pending action.
 | embed-resource | 3.0.11 | MIT |
 | equivalent | 1.0.2 | Apache-2.0 OR MIT |
 | error-code | 3.4.0 | BSL-1.0 |
+| fallible-iterator | 0.3.0 | MIT OR Apache-2.0 |
+| fallible-streaming-iterator | 0.1.9 | MIT OR Apache-2.0 |
 | fax | 0.2.7 | MIT |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 |
 | find-msvc-tools | 0.1.12 | MIT OR Apache-2.0 |
 | flate2 | 1.1.10 | MIT OR Apache-2.0 |
+| foldhash | 0.2.0 | Zlib |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |
 | getrandom | 0.2.17 | MIT OR Apache-2.0 |
 | glob | 0.3.4 | MIT OR Apache-2.0 |
 | half | 2.7.1 | MIT OR Apache-2.0 |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |
+| hashlink | 0.12.2 | MIT OR Apache-2.0 |
 | http | 1.5.0 | MIT OR Apache-2.0 |
 | httparse | 1.10.1 | MIT OR Apache-2.0 |
 | icu_collections | 2.3.0 | Unicode-3.0 |
@@ -144,6 +149,7 @@ state, not a pending action.
 | indexmap | 2.14.2 | Apache-2.0 OR MIT |
 | itoa | 1.0.18 | MIT OR Apache-2.0 |
 | libc | 0.2.189 | MIT OR Apache-2.0 |
+| libsqlite3-sys | 0.38.2 | MIT |
 | litemap | 0.8.3 | Unicode-3.0 |
 | litrs | 1.0.0 | MIT OR Apache-2.0 |
 | log | 0.4.34 | MIT OR Apache-2.0 |
@@ -155,6 +161,7 @@ state, not a pending action.
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 |
+| pkg-config | 0.3.34 | MIT OR Apache-2.0 |
 | png | 0.18.1 | MIT OR Apache-2.0 |
 | potential_utf | 0.1.6 | Unicode-3.0 |
 | powerfmt | 0.2.0 | MIT OR Apache-2.0 |
@@ -163,8 +170,9 @@ state, not a pending action.
 | quick-error | 2.0.1 | MIT/Apache-2.0 |
 | quote | 1.0.47 | MIT OR Apache-2.0 |
 | ring | 0.17.14 | Apache-2.0 AND ISC |
+| rusqlite | 0.40.2 | MIT |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 |
-| rustls | 0.23.45 | Apache-2.0 OR ISC OR MIT |
+| rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT |
 | rustls-pki-types | 1.15.1 | MIT OR Apache-2.0 |
 | rustls-webpki | 0.103.15 | ISC |
 | scopeguard | 1.2.0 | MIT OR Apache-2.0 |
@@ -203,6 +211,7 @@ state, not a pending action.
 | url | 2.5.8 | MIT OR Apache-2.0 |
 | utf8-zero | 0.8.1 | MIT OR Apache-2.0 |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT |
+| vcpkg | 0.2.15 | MIT OR Apache-2.0 |
 | version_check | 0.9.5 | MIT/Apache-2.0 |
 | vswhom | 0.1.0 | MIT |
 | vswhom-sys | 0.1.3 | MIT |
@@ -251,6 +260,14 @@ Full license texts are published by each project at the repository URLs
 above (direct dependencies) or on crates.io (`https://crates.io/crates/<name>`
 for any transitive one) and are not reproduced here; none of them require
 that, only attribution, which this file provides.
+
+## SQLite itself
+
+`rusqlite`'s `bundled` feature compiles the SQLite amalgamation (inside
+`libsqlite3-sys`) into the exe. SQLite is in the public domain
+(https://sqlite.org/copyright.html): it is not a crate, so `cargo deny` does
+not list it, and it has no license text to reproduce. `rusqlite` and
+`libsqlite3-sys` are MIT. Added with the local store, issue #46.
 
 ## Copied code
 

@@ -100,7 +100,7 @@ action framework is the product and actions are the contribution surface.
 | Config | `toml` in `%APPDATA%\Wingman\config.toml`, owner-only ACL, env overrides |
 | Packaging | sparse MSIX, self-signed cert, `install.ps1` self-elevates once; identity `RaaifYousuf.Wingman` |
 | Local models | Ollama 0.34 on `127.0.0.1:11434`; Intel Arc iGPUs need `OLLAMA_IGPU_ENABLE=1` or Vulkan drops it and runs CPU-only; the only oracle for GPU use is `size_vram > 0` on `/api/ps` |
-| Release profile | `opt-level = "z"`, LTO, `panic = "abort"`, stripped; ~2 MB exe, under 10 MB idle |
+| Release profile | `opt-level = "z"`, LTO, `panic = "abort"`, stripped; ~3.3 MB exe (bundled SQLite included, #46), under 10 MB idle |
 
 ---
 

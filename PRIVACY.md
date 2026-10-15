@@ -159,22 +159,33 @@ exact steps.
 
 ## How to wipe your data
 
+Wingman keeps files in two folders. To remove all of them:
+
 ```powershell
 Remove-Item "$env:APPDATA\Wingman" -Recurse -Force
+Remove-Item "$env:LOCALAPPDATA\Wingman" -Recurse -Force
 ```
 
-Deletes `config.toml`. If a key is still sitting in the file (rather than
-Credential Manager) it goes with it, but rotate any exposed key with your
-provider regardless; deleting the file does not invalidate it. A saved
-credential in Windows Credential Manager (`Wingman/<provider>`) is not
-touched by this and must be removed separately (Credential Manager app,
-"Windows Credentials", or `cmdkey /delete:Wingman/<provider>`) if you want it
-gone too.
+- `%APPDATA%\Wingman` holds `config.toml` (your settings, and a key if one is
+  still sitting in the file rather than Credential Manager) and, if you used
+  Fill this form, your encrypted profile (`profile.bin`).
+- `%LOCALAPPDATA%\Wingman` holds the local store (`store\wingman.db`, the
+  daily spend totals behind the tray tooltip), the egress log (`egress.log`:
+  one line per request, with sizes and kinds, never content), and, after an
+  upgrade, the old `spend.json.migrated`. The `store` folder is readable only
+  by your Windows account.
+
+Deleting `config.toml` removes a key that was stored in it, but rotate any
+exposed key with your provider regardless; deleting the file does not
+invalidate it. A saved credential in Windows Credential Manager
+(`Wingman/<provider>`) is not touched by this and must be removed separately
+(Credential Manager app, "Windows Credentials", or
+`cmdkey /delete:Wingman/<provider>`) if you want it gone too.
 
 A pre-rename install may also still have
 `%APPDATA%\copilot-ask\config.toml` (`Config::old_path`, `src/config.rs`):
 the rename migration only ever copies it forward, never deletes it, so
 remove that folder too if it exists.
 
-There is currently nothing else on disk to remove: no cache, no history, no
-awareness store, because none of those exist yet.
+There is no cache, no history of your questions or answers, and no awareness
+store, because none of those exist yet.

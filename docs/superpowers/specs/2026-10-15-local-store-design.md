@@ -71,23 +71,21 @@ compile options are not ours to choose, and FTS5 is not guaranteed there. A
 bundled build pins both. Cost: a C compile in the build (MSVC, already required
 for the `windows` crate) and a larger exe.
 
-**FTS5.** THEORY (unverified): the `bundled` feature compiles SQLite with FTS5
-enabled. The first slice settles it with a test that runs
-`CREATE VIRTUAL TABLE t USING fts5(x)` and a `MATCH` query. If it fails, the
-fix is a `LIBSQLITE3_FLAGS=-DSQLITE_ENABLE_FTS5` build setting, and that goes in
-the slice.
+**FTS5.** MEASURED 2026-10-15 (slice 1): the `bundled` feature of
+`libsqlite3-sys` 0.38.2 compiles SQLite with `SQLITE_ENABLE_FTS5` (its build
+script sets it by default), and the `fts5_is_compiled_in` test creates an FTS5
+table and runs a `MATCH` against the bundled build. No extra build flag was
+needed.
 
-**Binary size.** Not measured. THEORY (unverified): SQLite with FTS5 adds on the
-order of 1 MB at `opt-level = "z"` with LTO, against the roughly 2 MB release exe
-AGENTS.md records, so the exe could plausibly grow by half. The first slice
-records the exact before and after in its PR (release build of master versus the
-branch) and AGENTS.md's number is updated from the result. Options if the number
-is unacceptable: `SQLITE_OMIT_*` flags for features Wingman never uses (loadable
-extensions, JSON1, deprecated APIs, the shell), set through `LIBSQLITE3_FLAGS`.
-The exe is not the only budget: the plan's section 19 mentions performance
-gates (exe size, startup, idle RSS); this change must fit whatever those gates are
-when they land.
-
+**Binary size.** MEASURED 2026-10-15 (slice 1, same machine, `cargo build
+--release`): 2,438,656 bytes on master before, 3,507,200 with default bundled
+SQLite, 3,272,192 with the unused parts switched off through `LIBSQLITE3_FLAGS`
+in `.cargo/config.toml` (no loadable extensions, JSON, R-tree, FTS3, STAT4,
+soundex, dbstat, shared cache, progress callback, deprecated APIs). So the store
+costs about 0.83 MB, a third more than the old exe, and FTS5 stays on. The CI size
+gate (`perf-budgets.json`) was raised from 2,700,000 to 3,500,000 for it.
+Further trimming (window functions, triggers, views) was not tried: the FTS5
+external-content tables in slice 5 need triggers.
 **Async.** `rusqlite` is blocking and synchronous. No runtime is added.
 
 **Vector search.** The plan and #85 name `sqlite-vec`. The options:
@@ -170,8 +168,9 @@ the insert that would exceed the limit, or at startup, never on a schedule.
 Opening costs one file open at the first use after launch; the tray tooltip
 needs today's spend, so that open happens on first tooltip draw. THEORY
 (unverified): a warm open and the `user_version` read is a few milliseconds.
-Slice 1 measures idle RSS with the store open and idle, and idle power as the
-project already measures it.
+Idle RSS with the store open and idle, and idle power as the project already
+measures it, are a manual check on the installed app (slice 1's PR lists it);
+they were not measured in the build.
 
 ## Schema
 
@@ -376,7 +375,7 @@ is only readable by the same Windows user, which is the intended property.
 - Corruption and refusal paths: a garbage file, a truncated file, a file whose
   `user_version` is higher than known, a read-only directory. Each must return a
   typed error that maps to a card, and never panic.
-- FTS5 availability test (the THEORY above) and, when vectors land, the scoring
+- FTS5 availability test (done, slice 1) and, when vectors land, the scoring
   test against known vectors.
 - Concurrency: two threads recording usage concurrently both land (the property
   `FILE_LOCK` gave `usage.rs` today).

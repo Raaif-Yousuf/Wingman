@@ -30,6 +30,7 @@ mod router;
 mod secrets;
 mod single_instance;
 mod speech;
+mod store;
 mod ui;
 mod usage;
 
