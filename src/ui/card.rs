@@ -471,6 +471,29 @@ impl Card {
         self.inner.preview_generation
     }
 
+    /// [`Card::show_preview`] with an optional small line under the fields
+    /// (#228: "Answered by X (Y was unavailable)"). Display only: it is not
+    /// a field, so it never reaches the confirmed value or an executor.
+    #[must_use = "store the generation; on_preview_decided needs it to reject a stale notification"]
+    pub fn show_preview_with_note(
+        &mut self,
+        title: &str,
+        schema: &serde_json::Value,
+        proposal_value: &serde_json::Value,
+        main_window_exists: bool,
+        note: Option<&str>,
+    ) -> u32 {
+        self.inner.show_preview_labeled(
+            title,
+            schema,
+            proposal_value,
+            main_window_exists,
+            "Do it",
+            note,
+        );
+        self.inner.preview_generation
+    }
+
     /// #105: the send preview. The same preview as [`Card::show_preview`],
     /// with the confirm button reading "Send" instead of "Do it", click-only (Enter
     /// does nothing, #105). Esc and
@@ -482,8 +505,14 @@ impl Card {
         schema: &serde_json::Value,
         proposal_value: &serde_json::Value,
     ) -> u32 {
-        self.inner
-            .show_preview_labeled(title, schema, proposal_value, false, SEND_CONFIRM_LABEL);
+        self.inner.show_preview_labeled(
+            title,
+            schema,
+            proposal_value,
+            false,
+            SEND_CONFIRM_LABEL,
+            None,
+        );
         self.inner.preview_generation
     }
 
@@ -2813,7 +2842,14 @@ impl CardInner {
         proposal_value: &Value,
         main_window_exists: bool,
     ) {
-        self.show_preview_labeled(title, schema, proposal_value, main_window_exists, "Do it");
+        self.show_preview_labeled(
+            title,
+            schema,
+            proposal_value,
+            main_window_exists,
+            "Do it",
+            None,
+        );
     }
 
     /// [`CardInner::show_preview`] with the confirm button's text chosen by
@@ -2825,6 +2861,7 @@ impl CardInner {
         proposal_value: &Value,
         main_window_exists: bool,
         confirm_label: &'static str,
+        note: Option<&str>,
     ) {
         self.leave_preview_if_active();
         // Issue #77: the preview replaces whatever was showing, including an
@@ -2874,6 +2911,7 @@ impl CardInner {
             error: None,
             confirm_label,
             enter_confirms: label_confirms_with_enter(confirm_label),
+            note: note.filter(|n| !n.is_empty()).map(str::to_string),
         });
         // #225: from here until a decision is reported, tearing this
         // preview down is an abandonment and the owner has to be told. Set
@@ -3421,6 +3459,24 @@ impl CardInner {
             y - row_gap + gap
         };
 
+        let note_rect = self
+            .preview
+            .as_ref()
+            .and_then(|p| p.note.as_deref())
+            .map(|text| {
+                let h = self
+                    .measure_wrapped(self.fonts.body, text, content_width)
+                    .max(self.line_height(self.fonts.body).max(1));
+                let rect = RECT {
+                    left: content_left,
+                    top: y,
+                    right: content_right,
+                    bottom: y + h,
+                };
+                y += h + gap;
+                rect
+            });
+
         let btn_h = self.scale(PREVIEW_BUTTON_H_DP);
         let btn_w = self.scale(PREVIEW_BUTTON_W_DP);
         let do_it = RECT {
@@ -3452,6 +3508,7 @@ impl CardInner {
             width,
             window_h,
             title_rect,
+            note_rect,
             rows,
             buttons: PreviewButtonMetrics { do_it, edit },
         }
@@ -3505,6 +3562,17 @@ impl CardInner {
                 };
                 draw_text_line(hdc, &field.value, value_rect, value_format);
             }
+        }
+
+        if let (Some(rect), Some(note)) = (metrics.note_rect, preview.note.as_deref()) {
+            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
+            draw_text_line(
+                hdc,
+                note,
+                rect,
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
         }
     }
 }
@@ -3633,6 +3701,9 @@ struct PreviewUi {
     /// Whether Enter presses the confirm button; `false` for the send
     /// preview (#105), which is click-only.
     enter_confirms: bool,
+    /// #228: a small display-only line under the fields, naming the model
+    /// that answered when a fallback did. Not a field: never confirmed.
+    note: Option<String>,
 }
 
 struct PreviewRowMetrics {
@@ -3655,6 +3726,8 @@ struct PreviewLayoutMetrics {
     width: i32,
     window_h: i32,
     title_rect: RECT,
+    /// #228: where the footer note goes, `None` when there is none.
+    note_rect: Option<RECT>,
     /// Same length and order as the `fields` slice `compute_preview_layout`
     /// was called with.
     rows: Vec<PreviewRowMetrics>,
@@ -5258,6 +5331,32 @@ mod tests {
         assert!(texts.iter().any(|t| t == "Send"), "{texts:?}");
         assert!(!texts.iter().any(|t| t == "Do it"), "{texts:?}");
         assert!(!texts.iter().any(|t| t == "Cancel"), "{texts:?}");
+    }
+
+    #[test]
+    fn preview_note_gets_its_own_row_above_the_buttons_and_never_becomes_a_field() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "title": { "type": "string", "editable": false } }
+        });
+        let value = serde_json::json!({ "title": "Standup" });
+        let note = "Answered by gemma3:4b (GPT-5.5 was unavailable)";
+
+        let _ = card.show_preview_with_note("Add event", &schema, &value, false, None);
+        let fields = card.inner.preview.as_ref().unwrap().model.fields().to_vec();
+        let plain = card.inner.compute_preview_layout(&fields, false);
+        assert!(plain.note_rect.is_none());
+
+        let _ = card.show_preview_with_note("Add event", &schema, &value, false, Some(note));
+        let fields = card.inner.preview.as_ref().unwrap().model.fields().to_vec();
+        let noted = card.inner.compute_preview_layout(&fields, false);
+        let rect = noted.note_rect.expect("a note row");
+        assert!(rect.top >= noted.rows[0].value_rect.bottom);
+        assert!(rect.bottom <= noted.buttons.do_it.top);
+        assert!(noted.window_h > plain.window_h);
+        // Display only: the note is not a field, so it cannot be confirmed.
+        assert_eq!(fields.len(), 1);
     }
 
     #[test]
