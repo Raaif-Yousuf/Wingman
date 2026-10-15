@@ -654,6 +654,7 @@ mod com {
     /// (see the win32 test module's doc comment), the same shape
     /// `inputs::uia::snapshot_hwnd` uses relative to
     /// `inputs::uia::snapshot_foreground`.
+    #[cfg_attr(not(test), allow(dead_code))] // test-only seam, see above
     pub(super) fn probe_element(hwnd: HWND) -> anyhow::Result<UiaProbe> {
         let _apartment = ComApartment::enter()?;
         let automation: IUIAutomation =
