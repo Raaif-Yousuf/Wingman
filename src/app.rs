@@ -207,6 +207,10 @@ struct App {
     /// abandonment for a preview that has already been replaced, and acting
     /// on it would clear the state belonging to the preview now on screen.
     pending_preview_generation: u32,
+    /// #228: the footer line for the answer now being shown, set by each
+    /// action result handler from the worker's attribution and `None` unless
+    /// a fallback answered.
+    fallback_footer: Option<String>,
     /// #40: the `Undo` the most recent successful `fill_form` run returned,
     /// so "Restore last form" (tray) can put its fields back. `FnOnce`
     /// (`executors::Undo::undo` consumes it), so this is `take()`n on use --
@@ -356,6 +360,7 @@ pub fn run() -> Result<()> {
         pending_conflict: None,
         pending_preview: None,
         pending_preview_generation: 0,
+        fallback_footer: None,
         last_form_undo: None,
         last_error: None,
     });
@@ -1248,6 +1253,7 @@ impl App {
     /// doc comment). A provider-chain failure shows an error card (rule
     /// 7).
     fn on_calendar_result(&mut self, result: std::result::Result<Value, String>) {
+        self.take_fallback_footer();
         self.set_busy(false);
 
         let proposal = match result {
@@ -1296,9 +1302,13 @@ impl App {
             let schema = actions::schema::schema_for("calendar_event", false)
                 .expect("\"calendar_event\" is always registered in actions::schema");
             arm_calendar_slot(&mut self.pending_preview);
-            self.pending_preview_generation =
-                self.card
-                    .show_preview("Add event from screen", &schema, &proposal, false);
+            self.pending_preview_generation = self.card.show_preview_with_note(
+                "Add event from screen",
+                &schema,
+                &proposal,
+                false,
+                self.fallback_footer.as_deref(),
+            );
             // Preview manages its own lifecycle (Do it / Cancel / Esc) and
             // takes real focus -- unlike Collapsed/Expanded it is never
             // dismissed by a click elsewhere (Card::show_preview's "Focus"
@@ -1441,11 +1451,11 @@ impl App {
                     );
                 let chain = providers.build_chain_for_mode(mode, ollama_ready);
                 let req = generic_action_request(shot.as_ref(), &system, &planned.user, schema);
-                let proposal = chain.complete_parsed_with_fallback(
+                let proposal = noting_attribution(chain.complete_parsed_with_fallback_attributed(
                     &req,
                     || non_vision_inputs(&raw, foreground_hwnd_isize),
                     |c| actions::parse_generic_proposal(&c.text),
-                )?;
+                ))?;
                 Ok((proposal, replace))
             })()
             .map_err(pack_generic_failure);
@@ -1478,6 +1488,7 @@ impl App {
         schema: Value,
         result: GenericResult,
     ) {
+        self.take_fallback_footer();
         self.set_busy(false);
 
         let (proposal, replace) = match result {
@@ -1515,8 +1526,13 @@ impl App {
             } else {
                 PendingPreview::Generic(action.clone())
             });
-            self.pending_preview_generation =
-                self.card.show_preview(&title, &schema, &proposal, false);
+            self.pending_preview_generation = self.card.show_preview_with_note(
+                &title,
+                &schema,
+                &proposal,
+                false,
+                self.fallback_footer.as_deref(),
+            );
             return;
         }
 
@@ -1698,6 +1714,7 @@ impl App {
                                 format!("{detail}\n\n{notice}")
                             };
                         }
+                        let detail = with_fallback_footer(&detail, self.fallback_footer.as_deref());
                         self.card.show_answer(&text.headline, &detail, 0, None);
                     }
                     Err(e) => {
@@ -1916,6 +1933,7 @@ impl App {
         &mut self,
         result: std::result::Result<actions::review_email::ReviewOutcome, String>,
     ) {
+        self.take_fallback_footer();
         self.set_busy(false);
 
         let outcome = match result {
@@ -1934,8 +1952,9 @@ impl App {
         };
 
         if actions::review_email::is_good_to_go(&outcome.proposal) {
-            self.card
-                .show_answer("Good to go", "No changes needed.", 5, None);
+            let detail =
+                with_fallback_footer("No changes needed.", self.fallback_footer.as_deref());
+            self.card.show_answer("Good to go", &detail, 5, None);
             self.set_watch(true);
             return;
         }
@@ -1958,6 +1977,7 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n")
             };
+            let detail = with_fallback_footer(&detail, self.fallback_footer.as_deref());
             self.card
                 .show_answer("Review needs edits", &detail, 0, None);
             self.set_watch(true);
@@ -1981,9 +2001,13 @@ impl App {
 
         let schema = actions::schema::schema_for("text_review", false)
             .expect("\"text_review\" is always registered in actions::schema");
-        self.pending_preview_generation =
-            self.card
-                .show_preview("Review this email", &schema, &outcome.proposal, false);
+        self.pending_preview_generation = self.card.show_preview_with_note(
+            "Review this email",
+            &schema,
+            &outcome.proposal,
+            false,
+            self.fallback_footer.as_deref(),
+        );
         // Same "Preview manages its own lifecycle" reasoning as
         // `on_calendar_result`'s own return here -- the global click
         // watcher stays disarmed.
@@ -2099,6 +2123,7 @@ impl App {
     /// `self.pending_form_fill` is set here and consumed by
     /// `on_preview_decided`.
     fn on_form_fill_result(&mut self, result: std::result::Result<Value, String>) {
+        self.take_fallback_footer();
         self.set_busy(false);
 
         let value = match result {
@@ -2142,9 +2167,13 @@ impl App {
 
         let (schema, preview_value) = actions::fill_form::build_preview_schema_and_value(&value);
         self.pending_preview = Some(PendingPreview::FormFill(value));
-        self.pending_preview_generation =
-            self.card
-                .show_preview("Fill this form", &schema, &preview_value, false);
+        self.pending_preview_generation = self.card.show_preview_with_note(
+            "Fill this form",
+            &schema,
+            &preview_value,
+            false,
+            self.fallback_footer.as_deref(),
+        );
     }
 
     /// #268: `run_form_fill_executor`'s headline, derived from what
@@ -2248,7 +2277,15 @@ impl App {
         self.set_watch(true);
     }
 
+    /// #228: takes the worker's attribution into [`App::fallback_footer`].
+    /// Called first in every action result handler, so a run that never
+    /// reached a model (or failed) cannot show the previous run's footer.
+    fn take_fallback_footer(&mut self) {
+        self.fallback_footer = fallback_footer_for(crate::provider::take_attribution().as_ref());
+    }
+
     fn on_result(&mut self, result: std::result::Result<Answer, String>) {
+        self.take_fallback_footer();
         if let Err(packed) = &result {
             if self.quiet_send_cancel(packed) {
                 self.set_busy(false);
@@ -2277,9 +2314,10 @@ impl App {
             self.card
                 .show_error_with_details(&answer.headline, &answer.detail);
         } else {
+            let detail = with_fallback_footer(&answer.detail, self.fallback_footer.as_deref());
             self.card.show_answer(
                 &answer.headline,
-                &answer.detail,
+                &detail,
                 self.config.ui.card_seconds,
                 answer.difficulty,
             );
@@ -3292,11 +3330,11 @@ fn worker(
     // OCR/UIA the first time some provider in `chain` needs it, never for a
     // chain where every ready provider has vision.
     let req = physics_request(shot, prompt, want_difficulty);
-    chain.complete_parsed_with_fallback(
+    noting_attribution(chain.complete_parsed_with_fallback_attributed(
         &req,
         || non_vision_inputs(raw, foreground_hwnd),
         |c| parse_answer(&c.text),
-    )
+    ))
 }
 
 /// #39: the calendar-flow analogue of [`worker`] -- loads and resolves the
@@ -3339,11 +3377,11 @@ fn calendar_worker(
     let chain = providers.build_chain_for_mode(mode, ollama_ready);
 
     let req = calendar_request(shot, &prompt);
-    chain.complete_parsed_with_fallback(
+    noting_attribution(chain.complete_parsed_with_fallback_attributed(
         &req,
         || non_vision_inputs(raw, foreground_hwnd),
         |c| actions::calendar::parse_calendar_proposal(&c.text),
-    )
+    ))
 }
 
 /// #38: the review-email flow's analogue of [`worker`]/[`calendar_worker`].
@@ -3389,11 +3427,11 @@ fn review_worker(
         && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
     let chain = providers.build_chain_for_mode(mode, ollama_ready);
 
-    let proposal = chain.complete_parsed_with_fallback(
+    let proposal = noting_attribution(chain.complete_parsed_with_fallback_attributed(
         &req,
         || non_vision_inputs(raw, foreground_hwnd),
         |c| actions::review_email::parse_text_review_proposal(&c.text),
-    )?;
+    ))?;
 
     Ok(actions::review_email::ReviewOutcome {
         proposal,
@@ -3465,11 +3503,11 @@ fn form_fill_worker(
         let shot = encode_for_upload(raw, providers, mode, redact)?;
         let req = actions::fill_form::form_fill_request(&shot, &unmapped, &profile);
         let raw = &*raw;
-        let responses = chain.complete_parsed_with_fallback(
+        let responses = noting_attribution(chain.complete_parsed_with_fallback_attributed(
             &req,
             || non_vision_inputs(raw, foreground_hwnd),
             |c| actions::fill_form::parse_model_response(&c.text),
-        )?;
+        ))?;
         mapped.extend(actions::fill_form::merge_model_response(
             &unmapped, &responses, &profile,
         ));
@@ -3618,6 +3656,34 @@ fn first_provider_model_label(mode: Mode, providers: &Providers) -> Option<Strin
         Some(name.clone())
     } else {
         Some(format!("{name}:{model}"))
+    }
+}
+
+/// #228: hands a chain result's attribution to the main thread (see
+/// `provider::take_attribution`) and returns the bare value, so a worker
+/// body reads the same as before the attribution existed.
+fn noting_attribution<T>(result: Result<(T, crate::provider::Attribution)>) -> Result<T> {
+    result.map(|(value, attribution)| {
+        crate::provider::record_attribution(Some(attribution));
+        value
+    })
+}
+
+/// #228: the card footer for `attribution`: a line only when a fallback
+/// answered, `None` for a first-choice answer or no model at all.
+fn fallback_footer_for(attribution: Option<&crate::provider::Attribution>) -> Option<String> {
+    attribution?
+        .fallback()
+        .map(|(answered, first)| palette_model::fallback_footer(answered, first))
+}
+
+/// #228: `detail` with the footer as its last paragraph, or `detail`
+/// unchanged when there is none.
+fn with_fallback_footer(detail: &str, footer: Option<&str>) -> String {
+    match footer {
+        None => detail.to_string(),
+        Some(f) if detail.is_empty() => f.to_string(),
+        Some(f) => format!("{detail}\n\n{f}"),
     }
 }
 
@@ -7347,5 +7413,57 @@ mod tests {
                  window, got none (\"review-email\" is not in this catalogue yet)"
             );
         }
+    }
+
+    use crate::app::{fallback_footer_for, noting_attribution, with_fallback_footer};
+    // -- #228: the fallback footer on cards -----------------------------
+
+    fn attribution(answered: &str, first: Option<&str>) -> crate::provider::Attribution {
+        crate::provider::Attribution {
+            answered: answered.to_string(),
+            first_choice: first.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn footer_is_absent_when_the_first_choice_answered() {
+        let a = attribution("openai:gpt-5.5", None);
+        assert_eq!(fallback_footer_for(Some(&a)), None);
+        assert_eq!(fallback_footer_for(None), None);
+    }
+
+    #[test]
+    fn footer_names_the_answering_model_on_a_fallback() {
+        let a = attribution("ollama:gemma3:4b", Some("openai:gpt-5.5"));
+        assert_eq!(
+            fallback_footer_for(Some(&a)).as_deref(),
+            Some("Answered by gemma3:4b (GPT-5.5 was unavailable)")
+        );
+    }
+
+    #[test]
+    fn card_text_carries_the_footer_only_on_a_fallback() {
+        let footer = "Answered by gemma3:4b (GPT-5.5 was unavailable)";
+        assert_eq!(with_fallback_footer("working", None), "working");
+        assert_eq!(
+            with_fallback_footer("working", Some(footer)),
+            format!("working\n\n{footer}")
+        );
+        assert_eq!(with_fallback_footer("", Some(footer)), footer);
+    }
+
+    #[test]
+    fn a_worker_result_hands_its_attribution_to_the_main_thread_once() {
+        let _ = crate::provider::take_attribution();
+        let value = noting_attribution(Ok((
+            7,
+            attribution("ollama:gemma3:4b", Some("openai:gpt-5.5")),
+        )))
+        .unwrap();
+        assert_eq!(value, 7);
+        let taken = crate::provider::take_attribution();
+        assert!(fallback_footer_for(taken.as_ref()).is_some());
+        // A run that never reaches a model finds nothing left over.
+        assert!(crate::provider::take_attribution().is_none());
     }
 }

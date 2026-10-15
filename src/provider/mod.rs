@@ -316,6 +316,47 @@ pub struct Completion {
     pub stop: StopReason,
 }
 
+/// #228: which provider answered a [`Chain`] request. Labels are
+/// `"<id>:<model>"` ([`Provider::model_label`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attribution {
+    /// The model that actually answered.
+    pub answered: String,
+    /// The first ready provider's model, set only when it was NOT the one
+    /// that answered (it failed, was refused, or could not be given the
+    /// input). `None` means the first choice answered.
+    pub first_choice: Option<String>,
+}
+
+impl Attribution {
+    /// `(answered, first choice)` when a fallback answered, else `None`.
+    /// The card says nothing at all for a first-choice answer.
+    pub fn fallback(&self) -> Option<(&str, &str)> {
+        self.first_choice
+            .as_deref()
+            .map(|first| (self.answered.as_str(), first))
+    }
+}
+
+/// The last action worker's attribution, handed to the main thread the way
+/// `store::take_notice` hands over a store failure. Written by the worker
+/// that ran the chain, taken by the matching result handler.
+static LAST_ATTRIBUTION: std::sync::Mutex<Option<Attribution>> = std::sync::Mutex::new(None);
+
+/// Records (or clears, with `None`) the attribution for the run in flight.
+pub fn record_attribution(attribution: Option<Attribution>) {
+    *LAST_ATTRIBUTION.lock().unwrap_or_else(|e| e.into_inner()) = attribution;
+}
+
+/// Takes the recorded attribution, leaving none, so a later run that never
+/// reaches a model cannot inherit it.
+pub fn take_attribution() -> Option<Attribution> {
+    LAST_ATTRIBUTION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
 /// Issue #18/#206: the ingredients [`non_vision_request`] substitutes for
 /// the screenshot when a provider in a [`Chain`] reports `Caps.vision ==
 /// false` -- a text-only local model, or a compat endpoint configured
@@ -444,6 +485,14 @@ pub trait Provider: Send + Sync {
     /// have no single configured model to report on rely on the default.
     fn own_caps(&self) -> Caps {
         Caps::default()
+    }
+
+    /// `"<id>:<model>"` for the model this provider is configured with, the
+    /// shape `ui::palette_model::friendly_model_name` reads. #228: lets
+    /// [`Chain`] say which model answered. Defaults to the bare id for a
+    /// provider with no single configured model.
+    fn model_label(&self) -> String {
+        self.id().to_string()
     }
 
     /// Runs one single-turn request and returns the whole result. No
@@ -681,10 +730,26 @@ impl Chain {
     pub fn complete_parsed_with_fallback<T>(
         &self,
         req: &Request,
+        fallback: impl FnMut() -> anyhow::Result<NonVisionInputs>,
+        parse: impl FnMut(&Completion) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.complete_parsed_with_fallback_attributed(req, fallback, parse)
+            .map(|(value, _)| value)
+    }
+
+    /// #228: [`complete_parsed_with_fallback`](Self::complete_parsed_with_fallback)
+    /// that also says which provider answered, so a card can name a
+    /// fallback. The first ready provider is the "first choice": a provider
+    /// that is not ready is skipped without being tried, so it was never
+    /// the choice.
+    pub fn complete_parsed_with_fallback_attributed<T>(
+        &self,
+        req: &Request,
         mut fallback: impl FnMut() -> anyhow::Result<NonVisionInputs>,
         mut parse: impl FnMut(&Completion) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
+    ) -> anyhow::Result<(T, Attribution)> {
         let mut first_err: Option<anyhow::Error> = None;
+        let mut first_choice: Option<String> = None;
         // Cached as a `String` error (not `anyhow::Error`) purely so this
         // can be cloned/reused across every provider that needs it without
         // `anyhow::Error: Clone` (it is not) forcing `fallback` to be
@@ -692,9 +757,15 @@ impl Chain {
         // once" guarantee this method promises.
         let mut cached_fallback: Option<Result<NonVisionInputs, String>> = None;
 
-        for provider in &self.providers {
+        let mut first_idx: Option<usize> = None;
+
+        for (idx, provider) in self.providers.iter().enumerate() {
             if !provider.ready() {
                 continue;
+            }
+            if first_idx.is_none() {
+                first_idx = Some(idx);
+                first_choice = Some(provider.model_label());
             }
 
             let needs_fallback = !req.images.is_empty() && !provider.own_caps().vision;
@@ -722,7 +793,17 @@ impl Chain {
             };
 
             match self.attempt(provider.as_ref(), effective.as_ref(), &mut parse) {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    let answered = Attribution {
+                        answered: provider.model_label(),
+                        first_choice: if first_idx == Some(idx) {
+                            None
+                        } else {
+                            first_choice.clone()
+                        },
+                    };
+                    return Ok((value, answered));
+                }
                 Err(e) if e.downcast_ref::<SendCancelled>().is_some() => return Err(e),
                 Err(e) => {
                     if first_err.is_none() {
@@ -3266,5 +3347,125 @@ mod tests {
             asked[0].1.contains("OCR WORDS"),
             "the preview must show the OCR text that is really sent: {asked:?}"
         );
+    }
+
+    // -- #228: which provider answered ----------------------------------
+
+    /// A provider with a model label, so attribution tests can tell
+    /// "openai:gpt-5.5" from "ollama:gemma3:4b".
+    struct Labelled {
+        id: &'static str,
+        label: &'static str,
+        ready: bool,
+        ok: bool,
+    }
+
+    impl Provider for Labelled {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn ready(&self) -> bool {
+            self.ready
+        }
+        fn model_label(&self) -> String {
+            self.label.to_string()
+        }
+        fn capabilities(&self, _model: &str) -> Caps {
+            Caps {
+                vision: true,
+                ..Caps::default()
+            }
+        }
+        fn own_caps(&self) -> Caps {
+            self.capabilities("")
+        }
+        fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+            if self.ok {
+                ok_completion()
+            } else {
+                Err(anyhow::anyhow!("{} failed", self.id))
+            }
+        }
+    }
+
+    fn labelled(id: &'static str, label: &'static str, ready: bool, ok: bool) -> Box<dyn Provider> {
+        Box::new(Labelled {
+            id,
+            label,
+            ready,
+            ok,
+        })
+    }
+
+    fn attributed(chain: &Chain) -> anyhow::Result<Attribution> {
+        chain
+            .complete_parsed_with_fallback_attributed(
+                &req(),
+                || Ok(NonVisionInputs::default()),
+                |c| parse_answer(&c.text),
+            )
+            .map(|(_, attribution)| attribution)
+    }
+
+    #[test]
+    fn first_choice_answering_is_not_a_fallback() {
+        let chain = Chain::new(vec![
+            labelled("openai", "openai:gpt-5.5", true, true),
+            labelled("ollama", "ollama:gemma3:4b", true, true),
+        ]);
+        let a = attributed(&chain).unwrap();
+        assert_eq!(a.answered, "openai:gpt-5.5");
+        assert_eq!(a.fallback(), None);
+    }
+
+    #[test]
+    fn a_later_provider_answering_names_both_models() {
+        let chain = Chain::new(vec![
+            labelled("openai", "openai:gpt-5.5", true, false),
+            labelled("ollama", "ollama:gemma3:4b", true, true),
+        ]);
+        let a = attributed(&chain).unwrap();
+        assert_eq!(a.answered, "ollama:gemma3:4b");
+        assert_eq!(a.fallback(), Some(("ollama:gemma3:4b", "openai:gpt-5.5")));
+    }
+
+    #[test]
+    fn a_not_ready_first_provider_is_not_the_first_choice() {
+        // Skipped silently (no key): the second one is the real first choice,
+        // so nothing was "unavailable" in the sense of a failed attempt.
+        let chain = Chain::new(vec![
+            labelled("openai", "openai:gpt-5.5", false, true),
+            labelled("ollama", "ollama:gemma3:4b", true, true),
+        ]);
+        let a = attributed(&chain).unwrap();
+        assert_eq!(a.answered, "ollama:gemma3:4b");
+        assert_eq!(a.fallback(), None);
+    }
+
+    #[test]
+    fn a_refusal_from_the_first_provider_counts_as_a_fallback() {
+        // The daily budget guard (#540) refuses with a plain `Err` from
+        // `complete`, which is exactly what `Labelled { ok: false }` does,
+        // so a budget refusal that falls through to a local model shows the
+        // footer. (A cancelled send preview ends the run instead of falling
+        // through, so there is no answer to attribute in that case.)
+        let chain = Chain::new(vec![
+            labelled("anthropic", "anthropic:claude-opus-4-8", true, false),
+            labelled("ollama", "ollama:gemma3:4b", true, true),
+        ]);
+        assert!(attributed(&chain).unwrap().fallback().is_some());
+    }
+
+    #[test]
+    fn the_unattributed_entry_point_still_returns_just_the_value() {
+        let chain = Chain::new(vec![labelled("openai", "openai:gpt-5.5", true, true)]);
+        let answer = chain
+            .complete_parsed_with_fallback(
+                &req(),
+                || Ok(NonVisionInputs::default()),
+                |c| parse_answer(&c.text),
+            )
+            .unwrap();
+        assert_eq!(answer.headline, "42");
     }
 }
