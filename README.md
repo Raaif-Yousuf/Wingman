@@ -226,7 +226,8 @@ saved. Same for the secondary binding.
 
 A third, optional chord toggles Pause: running -> paused until resumed;
 paused, for any reason -> resume. Unlike primary/secondary it has no default
-binding and no tray "Set..." entry yet, so set it by hand in `config.toml`:
+binding. Use **Set pause key...** in the tray menu and press the key, or set
+it by hand in `config.toml`:
 
 ```toml
 [hotkeys.pause]
@@ -237,7 +238,9 @@ alt = false
 win = false
 ```
 
-then **Reload settings** (or restart) to pick it up. It is the one chord
+then **Reload settings** (or restart) to pick it up. The tray label shows
+the current key, or "not set". To clear it, delete the `[hotkeys.pause]`
+table from `config.toml` and choose **Reload settings**. It is the one chord
 that still works while paused.
 
 ### Through Windows Settings instead
@@ -272,8 +275,8 @@ call every boot. With start-with-Windows on it is always running anyway.
 - **Mode ▸**: Cloud / Local / Auto / Offline, radio-checked
 - **Pause ▸**: 1 hour / until tomorrow / until resumed; shown as **Resume**
   instead while already paused
-- **Set Copilot key...** / **Set secondary key...**: rebind by pressing the
-  key
+- **Set Copilot key...** / **Set secondary key...** / **Set pause key...**:
+  rebind by pressing the key
 - **Edit settings**: opens `config.toml`
 - **Reload settings**: re-read the file without restarting
 - **Quit**
@@ -295,7 +298,7 @@ call every boot. With start-with-Windows on it is always running anyway.
 | `ui.card_monitor` | `"cursor"` | which monitor the card appears on: `"cursor"` (the one the mouse is on), `"primary"`, or `"1"`, `"2"`, ... counting monitors left to right (not the numbers in Windows Settings, and they shift if you rearrange or dock monitors). Ignored by `follow_mouse` |
 | `providers.*.models` | see file | what the tray's model submenu offers (Ollama has no list; it uses `providers.ollama.model` directly) |
 | `ui.prompt` | see file | the system prompt, edit it to change what it checks |
-| `hotkeys.pause` | unset (absent from the file) | optional third chord: toggles Pause until resumed / Resume; no default, no tray learn button yet, see [Hotkeys](#hotkeys) |
+| `hotkeys.pause` | unset (absent from the file) | optional third chord: toggles Pause until resumed / Resume; no default, learnable from the tray's **Set pause key...**, see [Hotkeys](#hotkeys) |
 
 Roughly 1-2 cents and 3-8 seconds per check at the defaults.
 
