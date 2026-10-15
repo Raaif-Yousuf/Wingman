@@ -129,12 +129,13 @@ impl<C: ClipboardAccess + 'static> Executor for ClipboardExecutor<C> {
 
         self.clipboard.set_text(&text)?;
 
+        let shown = summary_excerpt(&text);
         let summary = if lost_unrestorable_content {
             format!(
-                "copied \"{text}\" to the clipboard. Its previous contents were in a format that could not be preserved and cannot be restored."
+                "copied \"{shown}\" to the clipboard. Its previous contents were in a format that could not be preserved and cannot be restored."
             )
         } else {
-            format!("copied \"{text}\" to the clipboard")
+            format!("copied \"{shown}\" to the clipboard")
         };
 
         let clipboard = Arc::clone(&self.clipboard);
@@ -151,10 +152,46 @@ impl<C: ClipboardAccess + 'static> Executor for ClipboardExecutor<C> {
     }
 }
 
+/// The most characters of the copied text the undo description quotes. The
+/// clipboard always gets the whole text; a long copy (a whole screen of OCR
+/// text, a big QR payload) must not make the description huge.
+const SUMMARY_EXCERPT_CHARS: usize = 80;
+
+/// A short, single-line excerpt of `text` for the undo description.
+fn summary_excerpt(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if flat.chars().count() <= SUMMARY_EXCERPT_CHARS {
+        flat
+    } else {
+        let cut: String = flat.chars().take(SUMMARY_EXCERPT_CHARS).collect();
+        format!("{cut}...")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn a_long_copy_gets_a_short_undo_description() {
+        let executor = ClipboardExecutor::with_clipboard(FakeClipboard::default());
+        let long = "x".repeat(5000);
+        let confirmed = confirmed_with(serde_json::json!({ "text": long }), &executor);
+
+        let undo = executor.execute(confirmed).unwrap();
+
+        assert!(undo.summary.chars().count() < 200, "{}", undo.summary);
+        assert_eq!(executor.clipboard.get_text().unwrap().len(), 5000);
+    }
+
+    #[test]
+    fn the_undo_description_is_one_line() {
+        assert_eq!(summary_excerpt("a\nb\tc"), "a b c");
+    }
 
     use crate::ui::confirm::Proposal;
 

@@ -45,6 +45,21 @@ enabled = true
 mode = "auto"
 
 [[actions]]
+id = "read-qr-code"
+name = "Read QR code from screen"
+group = "Work"
+inputs = ["screen"]
+proposal = "qr_text"
+executor = "clipboard"
+confirm = false
+prompt = ""
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
 id = "summarize-page"
 name = "Summarize this page"
 group = "Work"
