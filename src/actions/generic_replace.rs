@@ -143,7 +143,7 @@ fn copy_report(
     match copy.execute(confirmed) {
         Ok(_) => ReplaceReport::Copied(detail),
         Err(e) => ReplaceReport::Failed(match replace_error {
-            Some(r) => format!("{r}. Copying the text also failed: {e:#}"),
+            Some(r) => format!("{}. Copying the text also failed: {e:#}", r.trim_end_matches('.')),
             None => format!("{e:#}"),
         }),
     }
