@@ -71,16 +71,17 @@ use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgItem, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgCtrlID, GetDlgItem,
+    GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild,
     IsDialogMessageW, LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
     TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
     HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY,
-    WM_SETFONT, WM_SETREDRAW, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_CONTROLPARENT,
-    WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE,
+    WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_DISABLED,
+    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 
 use crate::config::{Config, OllamaConfig, RequireTickFor};
@@ -207,6 +208,26 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     inner_ref.win_h_dp = built.win_h_dp;
     // #342: the prompt starts hidden, so shrink the window to match.
     unsafe { show_prompt_state(inner_ref) };
+    unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mut wr = windows::Win32::Foundation::RECT::default();
+        if GetMonitorInfoW(mon, &mut mi).as_bool() && GetWindowRect(hwnd, &mut wr).is_ok() {
+            let (x, y) = center_in_work(&mi.rcWork, wr.right - wr.left, wr.bottom - wr.top);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
 
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -237,6 +258,25 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
 /// compare/store, never a critical section.
 static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 
+/// The command Enter triggers when `ctrl_id` has focus (#342): a focused
+/// push button other than Save is pressed (Enter on Cancel cancels, on the
+/// prompt toggle toggles); anywhere else Enter saves.
+fn enter_command(ctrl_id: i32) -> i32 {
+    match ctrl_id {
+        ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT => ctrl_id,
+        _ => ID_SAVE,
+    }
+}
+
+/// The top-left that centres a `w` x `h` window in `work` (#342): used once
+/// after the initial collapse, so the shorter window does not sit where the
+/// old taller one was cascaded. Never above or left of the work area.
+fn center_in_work(work: &windows::Win32::Foundation::RECT, w: i32, h: i32) -> (i32, i32) {
+    let x = work.left + ((work.right - work.left) - w) / 2;
+    let y = work.top + ((work.bottom - work.top) - h) / 2;
+    (x.max(work.left), y.max(work.top))
+}
+
 fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
     loop {
         let mut msg = MSG::default();
@@ -263,11 +303,17 @@ fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
                 continue;
             }
             // Enter submits, except inside the multiline prompt box, where
-            // ES_WANTRETURN means Enter should insert a newline instead.
+            // ES_WANTRETURN means Enter should insert a newline instead, and
+            // on a focused push button, where it presses that button (#342).
             if vk == VK_RETURN.0 as u32 && msg.hwnd != prompt_edit {
+                let ctrl_id = unsafe { GetDlgCtrlID(msg.hwnd) };
                 unsafe {
-                    let _ =
-                        PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(ID_SAVE as usize), LPARAM(0));
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_COMMAND,
+                        WPARAM(enter_command(ctrl_id) as usize),
+                        LPARAM(0),
+                    );
                 }
                 continue;
             }
@@ -1075,9 +1121,9 @@ unsafe fn show_prompt_state(inner: &mut SettingsInner) {
 
 fn prompt_toggle_label(expanded: bool) -> &'static str {
     if expanded {
-        "Hide Check my work prompt"
+        "Hide Check my work &prompt"
     } else {
-        "Show Check my work prompt"
+        "Show Check my work &prompt"
     }
 }
 
@@ -2164,6 +2210,18 @@ fn build_ui_recorded(
         );
     }
 
+    let toggle_btn = ctx.create(
+        WC_BUTTON,
+        prompt_toggle_label(false),
+        BS_PUSHBUTTON as u32,
+        0,
+        content_x + MARGIN,
+        footer.reset_btn_y,
+        PROMPT_TOGGLE_W,
+        reset_btn_h,
+        ID_PROMPT_TOGGLE,
+    );
+    ctx.set_anchor(toggle_btn, Anchor::ResetBtn);
     let reset_btn = ctx.create(
         WC_BUTTON,
         "Reset prompt to default",
@@ -2179,18 +2237,6 @@ fn build_ui_recorded(
     unsafe {
         let _ = ShowWindow(reset_btn, SW_HIDE);
     }
-    let toggle_btn = ctx.create(
-        WC_BUTTON,
-        prompt_toggle_label(false),
-        BS_PUSHBUTTON as u32,
-        0,
-        content_x + MARGIN,
-        footer.reset_btn_y,
-        PROMPT_TOGGLE_W,
-        reset_btn_h,
-        ID_PROMPT_TOGGLE,
-    );
-    ctx.set_anchor(toggle_btn, Anchor::ResetBtn);
 
     let prompt_group = ctx.create(
         WC_BUTTON,
@@ -2258,7 +2304,7 @@ fn build_ui_recorded(
         ID_MAX_EDGE,
         ID_CARD_SECONDS,
         ID_REQUIRE_TICK_FOR,
-        ID_PROMPT_TOGGLE,
+        ID_PROMPT_EDIT,
         ID_SAVE,
         ID_AUTOSTART,
     ] {
@@ -3857,6 +3903,44 @@ mod tests {
     }
 
     #[test]
+    fn enter_presses_the_focused_button_and_saves_elsewhere() {
+        assert_eq!(enter_command(ID_PROMPT_TOGGLE), ID_PROMPT_TOGGLE);
+        assert_eq!(enter_command(ID_RESET_PROMPT), ID_RESET_PROMPT);
+        assert_eq!(enter_command(ID_CANCEL), ID_CANCEL);
+        assert_eq!(enter_command(ID_SAVE), ID_SAVE);
+        assert_eq!(enter_command(ID_CARD_SECONDS), ID_SAVE);
+        assert_eq!(enter_command(0), ID_SAVE);
+    }
+
+    #[test]
+    fn center_in_work_centres_and_never_leaves_the_work_area() {
+        let w = windows::Win32::Foundation::RECT {
+            left: 0,
+            top: 20,
+            right: 1920,
+            bottom: 1060,
+        };
+        assert_eq!(center_in_work(&w, 620, 840), (650, 120));
+        // Taller than the work area: pinned to the top-left, not above it.
+        assert_eq!(center_in_work(&w, 2000, 2000), (0, 20));
+    }
+
+    /// Tab order follows creation order: edit, then toggle, then reset, the
+    /// same as the visual order when expanded (#342).
+    #[test]
+    fn prompt_controls_are_created_in_visual_tab_order() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let pos = |needle: &str| {
+            src.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
+        let edit = pos("    let prompt_edit = ctx.create(");
+        let toggle = pos("    let toggle_btn = ctx.create(");
+        let reset = pos("    let reset_btn = ctx.create(");
+        assert!(edit < toggle && toggle < reset);
+    }
+
+    #[test]
     fn collapsed_window_never_exceeds_the_screen_fit() {
         assert_eq!(window_height_dp(CONTENT_TOP_DP, false, 500, 40), 500);
     }
@@ -4419,13 +4503,13 @@ mod tests {
 
         click();
         assert!(visible(prompt) && visible(reset));
-        assert_eq!(get_text(toggle), "Hide Check my work prompt");
+        assert_eq!(get_text(toggle), "Hide Check my work &prompt");
         assert!(top_in_parent_px(hwnd, save) > collapsed_save_y);
         assert_eq!(get_text(prompt), Config::default().ui.prompt);
 
         click();
         assert!(!visible(prompt) && !visible(reset));
-        assert_eq!(get_text(toggle), "Show Check my work prompt");
+        assert_eq!(get_text(toggle), "Show Check my work &prompt");
         assert_eq!(top_in_parent_px(hwnd, save), collapsed_save_y);
         // Hidden text is still readable, so Save keeps it.
         assert_eq!(get_text(prompt), Config::default().ui.prompt);
