@@ -1,10 +1,11 @@
 //! Label matching: maps a form field's visible label (e.g. "E-mail
 //! address", "Phone", "Postcode/ZIP") to a [`FieldKind`] this profile
-//! stores a value for. Scaffolding for the "Fill this form" action (issue
-//! #40, expansion plan §6), which is not implemented yet -- this module
-//! only provides the pure, tested mapping it will need. No UI, no executor,
-//! no Win32 here; see #50 for the profile settings page and #40 for the
-//! action itself.
+//! stores a value for. This is the local, no-model mapping stage of the
+//! shipped "Fill this form" action (issue #40, expansion plan §6):
+//! `actions::fill_form::map_candidates_locally` calls [`match_label`] on
+//! every fillable field before anything is sent to a model. No UI, no
+//! executor, no Win32 here; see #50 for the profile settings page and #40
+//! for the action itself.
 //!
 //! Pure by design (AGENTS.md rule 8: pure logic is unit-tested) so it can
 //! be exercised without a UIA tree or a live form.
