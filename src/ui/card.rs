@@ -85,13 +85,15 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject,
     GetTextMetricsW, IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect,
     SelectClipRgn, SelectObject, SetBkColor, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT,
-    DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP,
+    DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP,
     DT_VCENTER, DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND,
     PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_UP,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
@@ -103,9 +105,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
-    WM_SETTINGCHANGE, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR,
+    WM_SETFONT, WM_SETTINGCHANGE, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -220,6 +222,7 @@ impl Card {
             anim_frame: 0,
             scroll_offset: 0,
             scroll_max: 0,
+            scroll_page: 0,
             ex_noactivate_removed: false,
             preview: None,
             last_confirmed: None,
@@ -1025,6 +1028,60 @@ const PENDING_TEXT_GAP_DP: i32 = 8;
 const GAP_DP: i32 = 6;
 const WHEEL_SCROLL_DP: i32 = 48;
 
+// -- "there is more" cues (#353) ----------------------------------------
+
+/// Width reserved at the right of a collapsed headline for the chevron that
+/// says "click for the rest".
+const CHEVRON_RESERVE_DP: i32 = 24;
+/// Half the chevron's width, in dp.
+const CHEVRON_HALF_DP: i32 = 5;
+/// Extra height, beyond one body line, of the fade at the bottom of an
+/// overflowing expanded card.
+const FADE_EXTRA_DP: i32 = 10;
+
+/// Whether a card in `state` with this `detail` has more to show on click:
+/// the one rule behind the chevron, the hand cursor and the layout space
+/// reserved for the chevron.
+fn card_has_more_to_show(state: CardState, detail_is_empty: bool) -> bool {
+    state == CardState::Collapsed && !detail_is_empty
+}
+
+/// How opaque the fade is on `row` of `rows`, in percent: from nearly clear
+/// at the top to solid at the last row, so the text underneath dissolves.
+fn fade_percent(row: i32, rows: i32) -> u32 {
+    if rows <= 0 {
+        return 100;
+    }
+    (((row + 1) * 100) / rows).clamp(0, 100) as u32
+}
+
+/// `from` moved `pct` percent of the way to `to`, per channel (`COLORREF`s).
+fn blend_colors(from: u32, to: u32, pct: u32) -> u32 {
+    let t = pct.min(100);
+    let mix = |shift: u32| {
+        let a = (from >> shift) & 0xFF;
+        let b = (to >> shift) & 0xFF;
+        ((a * (100 - t) + b * t + 50) / 100) << shift
+    };
+    mix(0) | mix(8) | mix(16)
+}
+
+/// Where an expanded card scrolls to for a key, or `None` when the key does
+/// not scroll. Down/Up move a line, PageDown/PageUp a page, Home/End the
+/// ends; the result is always inside `0..=max`.
+fn scroll_target_for_key(vk: u16, offset: i32, max: i32, line: i32, page: i32) -> Option<i32> {
+    let target = match vk {
+        k if k == VK_DOWN.0 => offset + line,
+        k if k == VK_UP.0 => offset - line,
+        k if k == VK_NEXT.0 => offset + page,
+        k if k == VK_PRIOR.0 => offset - page,
+        k if k == VK_HOME.0 => 0,
+        k if k == VK_END.0 => max,
+        _ => return None,
+    };
+    Some(target.clamp(0, max.max(0)))
+}
+
 // -- Difficulty badge (Collapsed / Expanded only) -----------------------
 
 /// Distance from the card's outer edge to the badge's outer edge. Smaller
@@ -1136,6 +1193,8 @@ struct CardInner {
     anim_frame: u32,
     scroll_offset: i32,
     scroll_max: i32,
+    /// Height of the scrollable area in Expanded, for PageUp/PageDown (#353).
+    scroll_page: i32,
     /// True while WS_EX_NOACTIVATE has been removed (i.e. while Expanded).
     ex_noactivate_removed: bool,
     /// Live state for `CardState::Preview`, `None` in every other state.
@@ -1486,6 +1545,12 @@ impl CardInner {
         }
     }
 
+    fn scroll_key_target(&self, vk: u16) -> Option<i32> {
+        let line = self.line_height(self.fonts.body).max(1);
+        let page = (self.scroll_page - line).max(line);
+        scroll_target_for_key(vk, self.scroll_offset, self.scroll_max, line, page)
+    }
+
     /// Switches to `theme`: drops the cached EDIT brush (it holds the old
     /// theme's color; `WM_CTLCOLOREDIT` rebuilds it) and repaints the card
     /// and its preview fields.
@@ -1826,6 +1891,7 @@ impl CardInner {
         let viewport_h = (window_h - padding * 2 - footer_gap - footer_h).max(1);
 
         self.scroll_max = (content_h - viewport_h).max(0);
+        self.scroll_page = viewport_h;
         self.scroll_offset = self.scroll_offset.clamp(0, self.scroll_max);
 
         let footer = if footer_h > 0 {
@@ -1992,7 +2058,45 @@ impl CardInner {
     /// site must use this (not the raw content width) so the reserved space
     /// stays in sync between measurement and drawing.
     fn headline_content_width(&self, content_w: i32) -> i32 {
-        (content_w - self.badge_reserve(self.difficulty)).max(1)
+        (content_w - self.badge_reserve(self.difficulty) - self.chevron_reserve()).max(1)
+    }
+
+    /// Space kept free at the right of a collapsed headline for the "click
+    /// for more" chevron (#353); zero when there is nothing more to show.
+    fn chevron_reserve(&self) -> i32 {
+        if card_has_more_to_show(self.state, self.detail.is_empty()) {
+            self.scale(CHEVRON_RESERVE_DP)
+        } else {
+            0
+        }
+    }
+
+    /// Draws a down chevron centred on `(cx, cy)`.
+    unsafe fn draw_chevron(&self, hdc: HDC, cx: i32, cy: i32, color: u32) {
+        let half = self.scale(CHEVRON_HALF_DP);
+        let pen = CreatePen(
+            PS_SOLID,
+            self.scale(2).max(1),
+            windows::Win32::Foundation::COLORREF(color),
+        );
+        let old = SelectObject(hdc, HGDIOBJ(pen.0));
+        let points = [
+            POINT {
+                x: cx - half,
+                y: cy - half / 2,
+            },
+            POINT {
+                x: cx,
+                y: cy + half / 2,
+            },
+            POINT {
+                x: cx + half,
+                y: cy - half / 2,
+            },
+        ];
+        let _ = windows::Win32::Graphics::Gdi::Polyline(hdc, &points);
+        SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
     }
 
     // -- painting --------------------------------------------------------
@@ -2222,6 +2326,12 @@ impl CardInner {
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
 
+        if self.chevron_reserve() > 0 {
+            let cx = headline_rect.right + self.chevron_reserve() / 2;
+            let cy = headline_rect.top + headline_line_h / 2;
+            self.draw_chevron(hdc, cx, cy, palette.hint);
+        }
+
         self.paint_difficulty_badge(hdc, rc);
     }
 
@@ -2292,43 +2402,33 @@ impl CardInner {
         }
 
         // The content is capped at 60% of the work area, so long answers get
-        // clipped mid-line. Without a marker there is nothing to suggest the
-        // rest is one scroll away, so draw a hint over the bottom edge -- but
-        // only while there is actually something below the fold.
+        // clipped mid-line. While there is more below the fold the bottom
+        // edge fades into the card colour and a chevron points down (#353),
+        // so it reads as "scroll" rather than as a finished card.
         if self.scroll_offset < self.scroll_max {
             let line_h = self.line_height(self.fonts.body).max(1);
-            let band_h = line_h + self.scale(6);
-            let band = RECT {
-                left: rc.left + 1,
-                top: content_bottom - line_h,
-                right: rc.right - 1,
-                bottom: content_bottom,
-            };
-            // Paint the card colour back over the clipped line so the hint sits
-            // on a clean strip rather than on top of half a word.
-            let bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(palette.bg));
-            FillRect(hdc, &band, bg);
-            let _ = DeleteObject(HGDIOBJ(bg.0));
-            // Reuse the headline's badge reservation so the hint (which is
-            // also right-aligned, in the same bottom-right corner the badge
-            // occupies) does not draw underneath it either. Anchored off
-            // `content_bottom` (the scroll area's own bottom edge, #425),
-            // not the window's, so it never lands on top of the "Copy
-            // details" footer when both are present.
-            let hint_rect = RECT {
-                left: content_left,
-                top: content_bottom - band_h + self.scale(2),
-                right: content_left + headline_w,
-                bottom: content_bottom,
-            };
-            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-            draw_text_line(
-                hdc,
-                "more below",
-                hint_rect,
-                DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
-            );
+            let fade_h = line_h + self.scale(FADE_EXTRA_DP);
+            let top = (content_bottom - fade_h).max(content_top);
+            let rows = content_bottom - top;
+            for row in 0..rows {
+                let pct = fade_percent(row, rows);
+                for x in (rc.left + 1)..(rc.right - 1) {
+                    let under = windows::Win32::Graphics::Gdi::GetPixel(hdc, x, top + row).0;
+                    let blended = blend_colors(under, palette.bg, pct);
+                    let _ = windows::Win32::Graphics::Gdi::SetPixel(
+                        hdc,
+                        x,
+                        top + row,
+                        windows::Win32::Foundation::COLORREF(blended),
+                    );
+                }
+            }
+            // Anchored off `content_bottom` (the scroll area's own bottom
+            // edge, #425) and left of the badge reservation, so it never
+            // lands on the "Copy details" footer or the difficulty badge.
+            let cx = content_left + headline_w - self.scale(CHEVRON_HALF_DP);
+            let cy = content_bottom - line_h / 2;
+            self.draw_chevron(hdc, cx, cy, palette.detail);
         }
 
         self.paint_difficulty_badge(hdc, rc);
@@ -2511,6 +2611,23 @@ impl CardInner {
                 }
                 Some(LRESULT(0))
             }
+            // #353: a card with more to show is clickable, so say so.
+            WM_SETCURSOR => {
+                let hit_test = (lparam.0 & 0xFFFF) as u32;
+                if hit_test == 1 /* HTCLIENT */
+                    && card_has_more_to_show(self.state, self.detail.is_empty())
+                {
+                    unsafe {
+                        use windows::Win32::UI::WindowsAndMessaging::{SetCursor, IDC_HAND};
+                        if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
+                            SetCursor(Some(cursor));
+                        }
+                    }
+                    Some(LRESULT(1))
+                } else {
+                    None
+                }
+            }
             WM_MOUSEWHEEL => {
                 if self.state == CardState::Expanded {
                     let raw = (wparam.0 & 0xFFFF_FFFF) as u32;
@@ -2526,6 +2643,16 @@ impl CardInner {
             WM_KEYDOWN => {
                 if self.state == CardState::Expanded && wparam.0 as u16 == VK_ESCAPE.0 {
                     self.close_expanded();
+                } else if let Some(target) = self
+                    .scroll_key_target(wparam.0 as u16)
+                    .filter(|_| self.state == CardState::Expanded)
+                {
+                    // #353: an overflowing expanded card scrolls from the
+                    // keyboard, not only with the mouse wheel.
+                    if target != self.scroll_offset {
+                        self.scroll_offset = target;
+                        self.invalidate();
+                    }
                 } else if self.state == CardState::Expanded
                     && wparam.0 as u16 == VK_RETURN.0
                     && self.copy_details_rect.is_some()
@@ -4158,6 +4285,154 @@ mod tests {
             !queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS),
             "an answer card has no Copy details to activate"
         );
+    }
+
+    // -- "there is more" cues (#353) ----------------------------------------
+
+    /// Paints the card into an off-screen bitmap and returns its size and
+    /// every pixel, row by row.
+    fn render(card: &Card) -> (i32, i32, Vec<u32>) {
+        use windows::Win32::Graphics::Gdi::{DeleteDC, GetPixel};
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(card.hwnd(), &mut rc);
+        }
+        let (w, h) = (rc.right, rc.bottom);
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w.max(1), h.max(1));
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            card.inner.paint_into(dc, rc);
+            for y in 0..h {
+                for x in 0..w {
+                    pixels.push(GetPixel(dc, x, y).0);
+                }
+            }
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+        }
+        (w, h, pixels)
+    }
+
+    #[test]
+    fn only_a_collapsed_card_with_detail_has_more_to_show() {
+        assert!(card_has_more_to_show(CardState::Collapsed, false));
+        assert!(!card_has_more_to_show(CardState::Collapsed, true));
+        assert!(!card_has_more_to_show(CardState::Expanded, false));
+        assert!(!card_has_more_to_show(CardState::Preview, false));
+    }
+
+    #[test]
+    fn the_fade_grows_to_solid_at_the_last_row() {
+        assert_eq!(fade_percent(0, 4), 25);
+        assert_eq!(fade_percent(3, 4), 100);
+        assert_eq!(fade_percent(0, 0), 100);
+        let ramp: Vec<u32> = (0..10).map(|r| fade_percent(r, 10)).collect();
+        assert!(ramp.windows(2).all(|w| w[0] < w[1]), "{ramp:?}");
+    }
+
+    #[test]
+    fn colors_blend_per_channel() {
+        assert_eq!(blend_colors(0x0000_0000, 0x00FF_FFFF, 0), 0x0000_0000);
+        assert_eq!(blend_colors(0x0000_0000, 0x00FF_FFFF, 100), 0x00FF_FFFF);
+        assert_eq!(blend_colors(0x0000_0000, 0x00FE_FEFE, 50), 0x007F_7F7F);
+    }
+
+    #[test]
+    fn scroll_keys_move_by_line_page_and_ends_inside_the_range() {
+        let t = |vk: u16, off: i32| scroll_target_for_key(vk, off, 100, 10, 40);
+        assert_eq!(t(VK_DOWN.0, 0), Some(10));
+        assert_eq!(t(VK_UP.0, 5), Some(0));
+        assert_eq!(t(VK_NEXT.0, 0), Some(40));
+        assert_eq!(t(VK_NEXT.0, 90), Some(100));
+        assert_eq!(t(VK_PRIOR.0, 30), Some(0));
+        assert_eq!(t(VK_HOME.0, 70), Some(0));
+        assert_eq!(t(VK_END.0, 0), Some(100));
+        assert_eq!(t(VK_RETURN.0, 0), None);
+    }
+
+    #[test]
+    fn a_card_with_detail_visibly_differs_from_one_without() {
+        let mut with = Card::new_for_test(instance()).expect("Card::new_for_test");
+        with.show_answer("Same headline", "More to read.", 0, None);
+        let mut without = Card::new_for_test(instance()).expect("Card::new_for_test");
+        without.show_answer("Same headline", "", 0, None);
+        assert!(with.inner.chevron_reserve() > 0);
+        assert_eq!(without.inner.chevron_reserve(), 0);
+        let (w, h, a) = render(&with);
+        let (w2, h2, b) = render(&without);
+        assert_eq!((w, h), (w2, h2), "same headline, same size");
+        // The chevron sits in the strip reserved at the right of the headline.
+        let padding = with.inner.scale(PADDING_DP);
+        let strip_left = w - padding - with.inner.chevron_reserve();
+        let strip = |px: &[u32]| {
+            (0..h)
+                .flat_map(|y| (strip_left..w - padding).map(move |x| px[(y * w + x) as usize]))
+                .collect::<Vec<u32>>()
+        };
+        assert_ne!(strip(&a), strip(&b), "the chevron must be painted");
+    }
+
+    #[test]
+    fn a_clickable_card_asks_for_the_hand_cursor() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_answer("Headline", "Detail.", 0, None);
+        let over_client = LPARAM(1); // HTCLIENT
+        assert_eq!(
+            card.handle_message(WM_SETCURSOR, WPARAM(0), over_client),
+            Some(LRESULT(1))
+        );
+        card.show_answer("Headline", "", 0, None);
+        assert_eq!(
+            card.handle_message(WM_SETCURSOR, WPARAM(0), over_client),
+            None
+        );
+    }
+
+    fn long_expanded_card() -> Card {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let detail = "A line of the working.\n".repeat(80);
+        card.show_answer("Headline", &detail, 0, None);
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(card.inner.scroll_max > 0, "the detail must overflow");
+        card
+    }
+
+    #[test]
+    fn page_down_and_end_scroll_an_overflowing_expanded_card() {
+        let mut card = long_expanded_card();
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_NEXT.0 as usize), LPARAM(0));
+        assert!(card.inner.scroll_offset > 0, "PageDown must scroll");
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_END.0 as usize), LPARAM(0));
+        assert_eq!(card.inner.scroll_offset, card.inner.scroll_max);
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_HOME.0 as usize), LPARAM(0));
+        assert_eq!(card.inner.scroll_offset, 0);
+        assert_eq!(card.state(), CardState::Expanded, "scrolling never closes");
+    }
+
+    #[test]
+    fn the_chevron_shows_only_while_there_is_more_below() {
+        let mut card = long_expanded_card();
+        let (w, h, above) = render(&card);
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_END.0 as usize), LPARAM(0));
+        let (_, _, at_end) = render(&card);
+        let palette = card.inner.theme.palette();
+        let padding = card.inner.scale(PADDING_DP);
+        // The short text lines leave the right side of the scroll area
+        // empty, so the only thing that can be there is the cue.
+        let cue_count = |px: &[u32]| {
+            (padding..h - padding)
+                .flat_map(|y| (w / 2..w - padding).map(move |x| px[(y * w + x) as usize]))
+                .filter(|&c| c == palette.detail)
+                .count()
+        };
+        assert!(cue_count(&above) > 0, "chevron while more is below");
+        assert_eq!(cue_count(&at_end), 0, "no chevron at the end");
     }
 
     // -- live theme change (#431) ------------------------------------------
