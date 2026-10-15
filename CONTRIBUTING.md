@@ -143,13 +143,15 @@ it will be asked to amend (`git commit --amend -s` for the last commit, or
 
 ## Add an action in 20 minutes
 
-This walks through adding **Translate selection**, the catalogue action the
-expansion plan names as the worked example (§6), because it needs no new
-executor: it reads the current text selection and hands back translated text
-copied to the clipboard. Every step below runs against the shipped
-framework end to end (#242): add the block below to `actions.toml`, press
-the hotkey, pick "Translate selection" from the palette, and it runs for
-real.
+This walks through adding **Translate to clipboard**, a variant of the
+catalogue action the expansion plan names as the worked example (§6), because
+it needs no new executor: it reads the current text selection and hands back
+translated text copied to the clipboard. (Wingman's own "Translate selection"
+is built in and shows the translation on a card first, then replaces the
+selected text in place: its entry is in `src/actions/translate.rs`.) Every
+step below runs against the shipped framework end to end (#242): add the
+block below to `actions.toml`, press the hotkey, pick "Translate to
+clipboard" from the palette, and it runs for real.
 
 See [`docs/actions.md`](docs/actions.md) for the full `actions.toml` schema
 (checked against the code, with worked examples) and
@@ -160,16 +162,15 @@ walkthrough's step 3 summarizes.
 
 ```toml
 [[actions]]
-id       = "translate-selection"
-name     = "Translate selection"
+id       = "translate-to-clipboard"
+name     = "Translate to clipboard"
 inputs   = ["selection", "screen"]      # sends the selected text; the screen only if nothing is selected
 proposal = "text_answer"                # built-in schema: { text }
 executor = "clipboard"                  # read-only: copies `text` to the clipboard
 confirm  = false
 prompt   = """
-Translate the selected text to the user's preferred language (see the
-`preferred_language` setting; default English). Return only the translation,
-as `text`.
+Translate the selected text into English. Return only the translation, as
+`text`.
 """
 prefer   = { mode = "auto" }
 ```

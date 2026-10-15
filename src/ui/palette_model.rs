@@ -1088,7 +1088,10 @@ mod tests {
     fn dispatch_covers_every_built_in_action() {
         // Built-ins that run through the generic path on purpose: they need
         // nothing a plain `actions.toml` entry lacks.
-        let generic_on_purpose = [crate::actions::action_items::ACTION_ID];
+        let generic_on_purpose = [
+            crate::actions::action_items::ACTION_ID,
+            crate::actions::translate::ACTION_ID,
+        ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {
                 continue;
@@ -1157,8 +1160,10 @@ mod tests {
     #[test]
     fn unknown_action_id_dispatches_generically_instead_of_to_nothing() {
         assert_eq!(
-            dispatch_target_for("translate-selection"),
-            Some(DispatchTarget::Generic("translate-selection".to_string()))
+            dispatch_target_for("translate-to-clipboard"),
+            Some(DispatchTarget::Generic(
+                "translate-to-clipboard".to_string()
+            ))
         );
         assert_eq!(
             dispatch_target_for("not-a-real-action"),

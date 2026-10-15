@@ -11,8 +11,10 @@ pub mod extract_text;
 pub mod fill_form;
 pub mod generic_answer;
 pub mod generic_inputs;
+pub mod generic_replace;
 pub mod review_email;
 pub mod schema;
+pub mod translate;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -218,6 +220,9 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 /// - `"action-items-checklist"` (#314, `action_items::builtin_action`):
 ///   proposal `action_items`, executor `clipboard`. Runs through the generic
 ///   dispatch path (`App::run_generic_action`), like an `actions.toml` entry.
+/// - `"translate-selection"` (#68, `translate::builtin_action`): proposal
+///   `text_answer`, executor `replace_text`. Confirms on a card, then writes
+///   the translation over the selection (`actions::generic_replace`).
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -252,6 +257,7 @@ pub fn builtin_actions() -> Vec<Action> {
         review_email::builtin_action(),
         fill_form::builtin_action(),
         action_items::builtin_action(),
+        translate::builtin_action(),
     ]
 }
 
@@ -445,9 +451,10 @@ mod tests {
         let builtins = builtin_actions();
         assert_eq!(
             builtins.len(),
-            6,
+            7,
             "check-my-work, extract-text-to-clipboard (#41), add-to-calendar (#39), \
-             review-this-email (#38), fill-this-form (#40), action-items-checklist (#314)"
+             review-this-email (#38), fill-this-form (#40), action-items-checklist (#314), \
+             translate-selection (#68)"
         );
         // Found by id, not by position, so this stays valid regardless of
         // what order the built-ins are in.
@@ -527,7 +534,7 @@ mod tests {
         // sample predates #23's `enabled` field default).
         let toml_str = r#"
 [[actions]]
-id       = "translate-selection"
+id       = "translate-to-clipboard"
 name     = "Translate selection"
 inputs   = ["selection", "screen"]
 proposal = "text_answer"
@@ -541,7 +548,7 @@ mode = "auto"
         let file = parse_actions_file(toml_str).expect("CONTRIBUTING's example must parse");
         assert_eq!(file.actions.len(), 1);
         let a = &file.actions[0];
-        assert_eq!(a.id, "translate-selection");
+        assert_eq!(a.id, "translate-to-clipboard");
         assert_eq!(a.inputs, vec![InputKind::Selection, InputKind::Screen]);
         assert_eq!(a.proposal, "text_answer");
         assert_eq!(a.prefer.mode, "auto");
@@ -564,12 +571,12 @@ mode = "auto"
     /// shaped like that schema.
     #[test]
     fn contributing_md_translate_selection_example_dispatches_and_runs_end_to_end() {
-        let path = scratch_path("translate-selection-e2e");
+        let path = scratch_path("translate-to-clipboard-e2e");
         write(
             &path,
             r#"
 [[actions]]
-id       = "translate-selection"
+id       = "translate-to-clipboard"
 name     = "Translate selection"
 inputs   = ["selection", "screen"]
 proposal = "text_answer"
@@ -584,7 +591,7 @@ mode = "auto"
         let resolved = load_actions_from(&path).unwrap();
         let action = resolved
             .iter()
-            .find(|r| r.action.id == "translate-selection")
+            .find(|r| r.action.id == "translate-to-clipboard")
             .map(|r| r.action.clone())
             .expect("the new action must be present after merge");
 
@@ -592,13 +599,15 @@ mode = "auto"
         // to nothing (the bug this issue reports).
         let catalogue = crate::ui::palette_model::catalogue(&resolved);
         assert!(
-            catalogue.iter().any(|row| row.id == "translate-selection"),
+            catalogue
+                .iter()
+                .any(|row| row.id == "translate-to-clipboard"),
             "a non-built-in action must still appear in the palette"
         );
         assert_eq!(
-            crate::ui::palette_model::dispatch_target_for("translate-selection"),
+            crate::ui::palette_model::dispatch_target_for("translate-to-clipboard"),
             Some(crate::ui::palette_model::DispatchTarget::Generic(
-                "translate-selection".to_string()
+                "translate-to-clipboard".to_string()
             )),
             "a non-built-in action id must dispatch generically, not to nothing"
         );
@@ -712,7 +721,7 @@ not_a_real_field = true
     #[test]
     fn user_action_with_a_new_id_is_appended_not_merged() {
         let mut new_action = builtin_actions()[0].clone();
-        new_action.id = "translate-selection".to_string();
+        new_action.id = "translate-to-clipboard".to_string();
         new_action.name = "Translate selection".to_string();
         let builtin_count = builtin_actions().len();
         let merged = merge_actions(builtin_actions(), vec![new_action]);
@@ -723,7 +732,7 @@ not_a_real_field = true
         );
         let appended = merged
             .iter()
-            .find(|r| r.action.id == "translate-selection")
+            .find(|r| r.action.id == "translate-to-clipboard")
             .expect("the new user action must be appended, not merged into a builtin");
         assert_eq!(appended.origin, Origin::User);
     }
