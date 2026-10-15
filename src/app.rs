@@ -40,8 +40,9 @@ use crate::connectors::civil_time::{CivilDate, CivilDateTime};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::executors;
 use crate::hotkey::{
-    chord_to_string, Chord, HotkeyHook, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
-    WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
+    apply_learned, chord_to_string, pause_binding_label, pause_clash, slot_name, Chord, HotkeyHook,
+    HK_PAUSE, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE,
+    WM_APP_PAUSE_TOGGLE,
 };
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
@@ -2339,13 +2340,8 @@ impl App {
             return;
         };
         hook.start_learning(which);
-        let slot = if which == HK_PRIMARY {
-            "Copilot key"
-        } else {
-            "secondary key"
-        };
         self.card.show_answer(
-            &format!("Press the {slot} now"),
+            &format!("Press the {} now", slot_name(which)),
             "Whatever you press next becomes the binding. Modifiers on their own are ignored. Times out in 10 seconds.",
             11,
             None,
@@ -2377,13 +2373,26 @@ impl App {
             }
         }
 
-        if which == HK_PRIMARY {
-            self.config.hotkeys.primary = chord;
-        } else {
-            self.config.hotkeys.secondary = chord;
+        // Issue #202: the pause chord is matched first in the hook, so a
+        // chord shared with another slot would silently disable one of them.
+        // Refuse it with a card and keep the previous bindings.
+        if let Some(other) = pause_clash(&self.config.hotkeys, which, chord) {
+            self.card.show_answer(
+                &format!("{} is already the {other}", chord_to_string(&chord)),
+                "Press a different key combo. The previous binding is unchanged.",
+                8,
+                None,
+            );
+            return;
         }
+
+        apply_learned(&mut self.config.hotkeys, which, chord);
         if let Some(hook) = &self.hook {
-            hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
+            if which == HK_PAUSE {
+                hook.set_pause_chord(self.config.hotkeys.pause);
+            } else {
+                hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
+            }
         }
         let saved = self.config.save();
         self.refresh_tray_labels();
@@ -2766,6 +2775,8 @@ impl App {
         let primary = chord_to_string(&self.config.hotkeys.primary);
         let secondary = chord_to_string(&self.config.hotkeys.secondary);
         self.tray.set_key_bindings(&primary, &secondary);
+        self.tray
+            .set_pause_binding(&pause_binding_label(self.config.hotkeys.pause.as_ref()));
 
         let p = &self.config.providers;
         let openai_first = p.order.first().map(String::as_str) != Some("anthropic");
@@ -4467,7 +4478,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 // would silently swallow the next key pressed anywhere.
                 if !matches!(
                     decode(id),
-                    MenuChoice::Command(cmd::SET_PRIMARY) | MenuChoice::Command(cmd::SET_SECONDARY)
+                    MenuChoice::Command(cmd::SET_PRIMARY)
+                        | MenuChoice::Command(cmd::SET_SECONDARY)
+                        | MenuChoice::Command(cmd::SET_PAUSE)
                 ) {
                     if let Some(h) = &app.hook {
                         h.cancel_learning();
@@ -4487,6 +4500,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
                     MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
                     MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
+                    MenuChoice::Command(cmd::SET_PAUSE) => app.start_learning(HK_PAUSE),
                     MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
                     MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
