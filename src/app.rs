@@ -6860,8 +6860,13 @@ mod tests {
         // matches them.
         let upload = ["encode_for", "_upload(&mut raw"].concat();
         let router_upload = ["encode_for", "_upload(raw,"].concat();
+        // The generic worker's screenshot is optional (#127), so it reaches
+        // the helper through a borrowed `screen`.
+        let optional_upload = ["encode_for", "_upload(screen,"].concat();
         let plain = ["capture", "::encode("].concat();
-        let encode_calls = src.matches(&upload).count() + src.matches(&router_upload).count();
+        let encode_calls = src.matches(&upload).count()
+            + src.matches(&router_upload).count()
+            + src.matches(&optional_upload).count();
         assert!(
             encode_calls >= 6,
             "expected the six worker call sites, found {encode_calls}"
