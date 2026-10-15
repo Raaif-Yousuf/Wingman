@@ -287,6 +287,8 @@ pub fn run() -> Result<()> {
     // this line the toggle is permanently off and the preview never
     // appears, whatever config.toml says.
     crate::config::set_egress_preview_enabled(config.egress_preview.enabled);
+    // #111: `ocr::recognize` runs on worker threads with no Config in reach.
+    crate::ocr::set_preferred_language(&config.capture.ocr_language);
     let chain = Arc::new(config.build_chain());
 
     let hwnd = create_owner_window(instance)?;
@@ -2502,6 +2504,7 @@ impl App {
         // Settings save, the same way `set_mode` already does for the mode.
         // A hand-edited `[egress_preview]` otherwise needs a full restart.
         crate::config::set_egress_preview_enabled(self.config.egress_preview.enabled);
+        crate::ocr::set_preferred_language(&self.config.capture.ocr_language);
         self.card.set_text_scale(self.config.ui.text_scale);
         self.card
             .set_placement(self.config.ui.card_corner, &self.config.ui.card_monitor);
