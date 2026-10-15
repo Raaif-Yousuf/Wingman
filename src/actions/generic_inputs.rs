@@ -90,10 +90,11 @@ pub fn wants_page_text(inputs: &[InputKind]) -> bool {
 /// would only add cost and noise. Decided here, not in the gatherer, so the
 /// rule is unit-tested without a window.
 pub fn needs_page_text(inputs: &[InputKind], gathered: &Gathered) -> bool {
+    // A password field ends the action in `plan`, so the page would be read
+    // and then thrown away.
     wants_page_text(inputs)
         && !(wants_selection(inputs)
-            && !gathered.selection_in_password_field
-            && usable(&gathered.selection).is_some())
+            && (gathered.selection_in_password_field || usable(&gathered.selection).is_some()))
 }
 
 fn wants_any_text(inputs: &[InputKind]) -> bool {
@@ -449,6 +450,13 @@ just this"
         // A selection that was not requested does not count.
         assert!(needs_page_text(&[PageText], &sel));
         // A blank selection is no selection.
+        // A password field ends the action, so the page is not read.
+        let password = Gathered {
+            selection_in_password_field: true,
+            ..Gathered::default()
+        };
+        assert!(!needs_page_text(&[Selection, PageText], &password));
+        assert!(needs_page_text(&[PageText], &password));
         let blank = g(Some("  "), None, None);
         assert!(needs_page_text(&[Selection, PageText], &blank));
     }

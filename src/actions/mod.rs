@@ -33,9 +33,11 @@ use serde::{Deserialize, Serialize};
 /// scattered across `mod.rs` and `app.rs`) so the two can never drift.
 pub const DEFAULT_ACTION_ID: &str = "check-my-work";
 
-/// What an action gathers before the model is asked. Only `Screen` is ever
-/// produced today (`capture::grab_raw`); the rest are inert until their
-/// gathering code lands (expansion plan §7 "Inputs"). A closed enum, not a
+/// What an action gathers before the model is asked. A generic action's
+/// worker gathers `Screen`, `Selection`, `Clipboard`, `Uia` and `PageText`
+/// (`actions::generic_inputs`); `Window` and `Region` are treated as
+/// `Screen`, and `Text` and `Context` are accepted but gathered by nothing
+/// yet (expansion plan §7 "Inputs"). A closed enum, not a
 /// bare `String`, so an action naming an input Wingman doesn't gather yet
 /// (a typo, or a forward reference to a later phase) is a parse error
 /// instead of a silently-ignored string.

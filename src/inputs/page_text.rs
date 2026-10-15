@@ -13,8 +13,18 @@
 //!   that is a password field, and read each one's `TextPattern`
 //!   `DocumentRange` with a length limit.
 //!
-//! Call [`read_foreground_page`] from a worker thread, never the keyboard
+//! Call [`read_page_text`] from a worker thread, never the keyboard
 //! hook's thread (a hung provider can block for the UIA timeout).
+//!
+//! `THEORY (unverified)`: password detection is per `Document` element only.
+//! A password `<input>` inside a web page is not a document of its own, so
+//! its characters (bullets in Chrome and Edge) could appear in the page
+//! text; no real secret should, since browsers expose the masked value.
+//! Manual check: open a login page with a typed password, run Summarize this
+//! page, and confirm the request has no password text.
+//!
+//! Wired observable: a Chrome article's Summarize this page request contains
+//! a "Page text:" section and no image.
 //!
 //! `THEORY (unverified)`: Chrome and Edge build their web accessibility tree
 //! when the first UIA client asks, so the first read right after the browser
@@ -50,6 +60,11 @@ pub struct DocCandidate {
     /// characters, so a longer document is noticed). Empty when the element
     /// has no `TextPattern`, is a password field or could not be read.
     pub text: String,
+    /// The length of the text as UIA returned it, in UTF-16 units (what
+    /// `GetText`'s limit counts). Reaching the limit means the document may
+    /// have been cut, which a scalar count of `text` cannot show for text
+    /// with characters outside the BMP (an emoji is one char, two units).
+    pub utf16_len: usize,
     /// `IsPassword` was true (or could not be read: fail closed). Its text
     /// is never used, and the reader never asks for it.
     pub is_password: bool,
@@ -82,14 +97,23 @@ pub fn pick_page_text(candidates: Vec<DocCandidate>, max_chars: usize) -> Option
                 _ => Some(next),
             },
         )?;
-    let (text, truncated) = truncate_bounded(best.1.text.trim(), max_chars);
+    let hit_limit = best.1.utf16_len > max_chars;
+    let (mut text, cut_by_chars) = truncate_bounded(best.1.text.trim(), max_chars);
+    let truncated = hit_limit || cut_by_chars;
+    if truncated && text.ends_with('\u{FFFD}') {
+        // `GetText` can cut between the two halves of a surrogate pair; the
+        // lossy BSTR conversion leaves a replacement character there.
+        text.pop();
+    }
     Some(PageText { text, truncated })
 }
 
 /// Runs `read` up to `attempts` times, pausing between tries, until
-/// [`pick_page_text`] finds a page. A read that fails counts as an attempt
-/// with nothing found; the last failure is not an error to the caller (no
-/// text means the action falls back to the screen).
+/// [`pick_page_text`] finds a page. Only a read that worked but found no
+/// text is retried (a browser still building its tree). A read that fails
+/// ends at once with `None`: a hung provider already cost the UIA timeout,
+/// and a second try would cost it again. No text means the action falls back
+/// to the screen.
 pub fn read_with_retry(
     mut read: impl FnMut() -> anyhow::Result<Vec<DocCandidate>>,
     max_chars: usize,
@@ -100,10 +124,8 @@ pub fn read_with_retry(
         if attempt > 0 {
             pause();
         }
-        if let Some(page) = read()
-            .ok()
-            .and_then(|candidates| pick_page_text(candidates, max_chars))
-        {
+        let candidates = read().ok()?;
+        if let Some(page) = pick_page_text(candidates, max_chars) {
             return Some(page);
         }
     }
@@ -203,23 +225,26 @@ mod com {
         if is_password {
             return DocCandidate {
                 text: String::new(),
+                utf16_len: 0,
                 is_password: true,
             };
         }
-        let text = (|| -> anyhow::Result<String> {
+        let (text, utf16_len) = (|| -> anyhow::Result<(String, usize)> {
             let unknown = unsafe { element.GetCurrentPattern(UIA_TextPatternId) }?;
             if is_null(&unknown) {
-                return Ok(String::new());
+                return Ok((String::new(), 0));
             }
             let pattern: IUIAutomationTextPattern = unknown.cast()?;
             let range = unsafe { pattern.DocumentRange() }?;
             // One more than the cap, so a longer document reads as truncated.
             let limit = i32::try_from(max_chars.saturating_add(1)).unwrap_or(i32::MAX);
-            Ok(unsafe { range.GetText(limit) }?.to_string())
+            let bstr = unsafe { range.GetText(limit) }?;
+            Ok((bstr.to_string(), bstr.len()))
         })()
         .unwrap_or_default();
         DocCandidate {
             text,
+            utf16_len,
             is_password: false,
         }
     }
@@ -233,6 +258,7 @@ mod tests {
     fn doc(text: &str) -> DocCandidate {
         DocCandidate {
             text: text.to_string(),
+            utf16_len: text.encode_utf16().count(),
             is_password: false,
         }
     }
@@ -258,6 +284,7 @@ mod tests {
     fn a_password_document_is_never_used_even_if_largest() {
         let secret = DocCandidate {
             text: "hunter2 hunter2 hunter2".into(),
+            utf16_len: 23,
             is_password: true,
         };
         let p = pick_page_text(vec![doc("page"), secret.clone()], 100).unwrap();
@@ -327,8 +354,9 @@ mod tests {
     }
 
     #[test]
-    fn failures_end_in_none_after_the_attempts_are_used() {
+    fn a_failed_read_is_not_retried() {
         let reads = Cell::new(0);
+        let pauses = Cell::new(0);
         let page = read_with_retry(
             || {
                 reads.set(reads.get() + 1);
@@ -336,9 +364,52 @@ mod tests {
             },
             100,
             2,
+            || pauses.set(pauses.get() + 1),
+        );
+        assert_eq!(page, None);
+        assert_eq!((reads.get(), pauses.get()), (1, 0));
+    }
+
+    #[test]
+    fn no_documents_at_all_is_retried_then_gives_up() {
+        let reads = Cell::new(0);
+        let page = read_with_retry(
+            || {
+                reads.set(reads.get() + 1);
+                Ok(vec![])
+            },
+            100,
+            2,
             || {},
         );
         assert_eq!(page, None);
         assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
+    fn emoji_heavy_text_cut_by_the_utf16_limit_is_flagged() {
+        // 40,000 astral characters are 80,000 UTF-16 units. UIA is asked for
+        // max + 1 units, so what comes back is 30,000 whole characters and a
+        // lone half of the next pair (a replacement character after the
+        // lossy conversion): fewer than max characters, yet cut.
+        let max = 60_000;
+        let mut text = "\u{1F600}".repeat(30_000);
+        text.push('\u{FFFD}');
+        let cand = DocCandidate {
+            utf16_len: max + 1,
+            text,
+            is_password: false,
+        };
+        let p = pick_page_text(vec![cand], max).unwrap();
+        assert!(p.truncated);
+        assert_eq!(p.text.chars().count(), 30_000);
+        assert!(!p.text.ends_with('\u{FFFD}'));
+    }
+
+    #[test]
+    fn a_whole_document_just_under_the_limit_is_not_flagged() {
+        let p = pick_page_text(vec![doc("\u{1F600}\u{1F600}")], 4).unwrap();
+        assert!(!p.truncated);
+        assert_eq!(p.text.chars().count(), 2);
     }
 }
