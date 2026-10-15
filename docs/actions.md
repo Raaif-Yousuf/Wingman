@@ -29,7 +29,9 @@ built-in.
 - **Merge is by `id`, wholesale, not per-field.** A user `[[actions]]` block
   whose `id` matches a built-in replaces that built-in's entire record --
   every field comes from the user's block, not a mix of old and new. A new
-  `id` is appended. (`merge_actions`, `src/actions/mod.rs`.)
+  `id` is appended. (`merge_actions`, `src/actions/mod.rs`.) For example, a
+  user action with the id `translate-selection` replaces the built-in
+  "Translate selection".
 - **`enabled = false` hides an action**, and so does listing its `group` in
   the top-level `disabled_groups = [...]` array. Both checks run after
   merge, so a disabled built-in whose group is later re-enabled still
@@ -45,8 +47,8 @@ built-in.
 disabled_groups = ["Study"]        # top level, applies across all actions
 
 [[actions]]
-id       = "translate-selection"   # stable identity; merge key
-name     = "Translate selection"   # shown in the (not yet built) palette
+id       = "translate-to-clipboard"   # stable identity; merge key
+name     = "Translate to clipboard"   # shown in the (not yet built) palette
 group    = "Writing"               # optional; omit for an ungrouped action
 inputs   = ["selection", "screen"] # catalogue metadata -- see below
 proposal = "text_answer"           # schema-registry key, actions::schema::schema_for

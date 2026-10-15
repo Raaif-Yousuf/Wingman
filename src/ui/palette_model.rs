@@ -1092,6 +1092,7 @@ mod tests {
             crate::actions::action_items::ACTION_ID,
             crate::actions::explain_error::ACTION_ID,
             crate::actions::define_word::ACTION_ID,
+            crate::actions::translate::ACTION_ID,
             crate::actions::page_summary::ACTION_ID,
         ];
         for a in crate::actions::builtin_actions() {
@@ -1162,8 +1163,10 @@ mod tests {
     #[test]
     fn unknown_action_id_dispatches_generically_instead_of_to_nothing() {
         assert_eq!(
-            dispatch_target_for("translate-selection"),
-            Some(DispatchTarget::Generic("translate-selection".to_string()))
+            dispatch_target_for("translate-to-clipboard"),
+            Some(DispatchTarget::Generic(
+                "translate-to-clipboard".to_string()
+            ))
         );
         assert_eq!(
             dispatch_target_for("not-a-real-action"),

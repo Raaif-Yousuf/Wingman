@@ -164,3 +164,18 @@ enabled = true
 
 [actions.prefer]
 mode = "local"
+
+[[actions]]
+id = "translate-selection"
+name = "Translate selection"
+group = "Writing"
+inputs = ["selection"]
+proposal = "text_answer"
+executor = "replace_text"
+confirm = true
+prompt = "You are given a piece of text the user selected. Translate it into English and return only the translation in `text`. Keep the meaning, tone, line breaks, numbers, names, URLs and formatting characters exactly as they were. Do not add notes, quotation marks, a language name or an explanation. If the text is already in English, return it unchanged. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes unless the original text has them."
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"

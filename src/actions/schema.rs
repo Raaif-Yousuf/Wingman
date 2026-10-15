@@ -50,7 +50,7 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "text_review" => Some(text_review_schema()),
         "form_fill" => Some(form_fill_schema()),
         // #242: CONTRIBUTING.md's "Add an action in 20 minutes" worked
-        // example (`translate-selection`) is `proposal = "text_answer"`,
+        // example (`translate-to-clipboard`) is `proposal = "text_answer"`,
         // `executor = "clipboard"` (this module's own doc comment above
         // said this arm lands "the same day its first action lands" -- the
         // generic dispatch path is that day). One property, matching
