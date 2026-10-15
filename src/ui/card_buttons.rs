@@ -109,25 +109,14 @@ pub(crate) fn blend(from: u32, to: u32, pct: u32) -> u32 {
     pack(fr + (tr - fr) * t, fg + (tg - fg) * t, fb + (tb - fb) * t)
 }
 
-fn linear(channel: f32) -> f32 {
-    let c = channel / 255.0;
-    if c <= 0.03928 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn luminance(c: u32) -> f32 {
-    let (r, g, b) = channels(c);
-    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
-}
-
-/// Black or white text for `fill`: white on every accent but the pale ones,
-/// the way Windows' own accent buttons read (a strict contrast-ratio pick
-/// would put black on the default blue).
+/// Black or white text for `fill`, whichever has the higher WCAG contrast
+/// ratio against it.
 pub(crate) fn readable_on(fill: u32) -> u32 {
-    if luminance(fill) > 0.4 {
+    use crate::ui::card::{contrast_ratio, relative_luminance};
+    let l = relative_luminance(fill);
+    let against_black = contrast_ratio(l, 0.0);
+    let against_white = contrast_ratio(l, 1.0);
+    if against_black >= against_white {
         0x0000_0000
     } else {
         0x00FF_FFFF
@@ -407,9 +396,19 @@ mod tests {
     fn text_on_the_accent_is_readable_for_light_and_dark_accents() {
         assert_eq!(readable_on(0x00FF_FFFF), 0x0000_0000, "black on white");
         assert_eq!(readable_on(0x0000_0000), 0x00FF_FFFF, "white on black");
-        // A pale yellow accent needs dark text; the default blue needs white.
+        // A pale yellow accent needs dark text; a deep blue needs white.
         assert_eq!(readable_on(rgb(255, 240, 120)), 0x0000_0000);
-        assert_eq!(readable_on(ACCENT), 0x00FF_FFFF);
+        assert_eq!(readable_on(rgb(0, 40, 120)), 0x00FF_FFFF);
+        // Mid accents (the default blue, an orange) get whichever of black
+        // and white has the higher contrast, never the weaker one.
+        use crate::ui::card::{contrast_ratio, relative_luminance};
+        for accent in [ACCENT, rgb(0xF7, 0x63, 0x0C)] {
+            let l = relative_luminance(accent);
+            let chosen = relative_luminance(readable_on(accent));
+            let other = relative_luminance(0x00FF_FFFF - readable_on(accent));
+            assert!(contrast_ratio(l, chosen) >= contrast_ratio(l, other));
+        }
+        assert_eq!(readable_on(rgb(0xF7, 0x63, 0x0C)), 0x0000_0000);
     }
 
     fn rgb(r: u32, g: u32, b: u32) -> u32 {

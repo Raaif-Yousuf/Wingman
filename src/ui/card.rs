@@ -710,7 +710,7 @@ fn srgb_channel_to_linear(channel: u8) -> f64 {
 /// WCAG 2 relative luminance of a packed `0x00BBGGRR` colour (the same
 /// layout [`rgb`] builds): linearize each channel, then combine with the
 /// standard luma weights.
-fn relative_luminance(color: u32) -> f64 {
+pub(crate) fn relative_luminance(color: u32) -> f64 {
     let r = (color & 0xFF) as u8;
     let g = ((color >> 8) & 0xFF) as u8;
     let b = ((color >> 16) & 0xFF) as u8;
@@ -723,7 +723,7 @@ fn relative_luminance(color: u32) -> f64 {
 /// (https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio): the lighter one over
 /// the darker, each padded by 0.05 so black-on-black still gives a defined
 /// 1:1 rather than dividing by zero.
-fn contrast_ratio(l1: f64, l2: f64) -> f64 {
+pub(crate) fn contrast_ratio(l1: f64, l2: f64) -> f64 {
     let (lighter, darker) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
     (lighter + 0.05) / (darker + 0.05)
 }
