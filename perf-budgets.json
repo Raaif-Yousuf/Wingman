@@ -1,8 +1,8 @@
 {
   "exe_size_bytes": {
     "max": 3700000,
-    "measured": 3503104,
+    "measured": 3511296,
     "measured_on": "2026-10-15",
-    "reason": "Raised from 3,500,000 for the offline QR-code decoder (rqrr, #313): 3,329,536 before and 3,503,104 after on the same machine, about 174 KB. Roughly 5 percent headroom."
+    "reason": "Raised from 3,500,000 for the offline QR-code decoder (rqrr, #313): 3,329,536 before and 3,503,104 after on the same machine (3,511,296 once merged with master), about 174 KB. Roughly 5 percent headroom."
   }
 }
