@@ -26,9 +26,9 @@ about Wingman is checked against the code in this repo, not aspirational.
 
 | | Wingman | Copilot on Windows |
 |---|---|---|
-| **Footprint** | A tray icon, about 3.3 MB, 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
+| **Footprint** | A tray icon, about 3.5 MB, 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
 | **Verifiable** | Offline mode refuses any non-loopback network call in code, enforced before a socket ever opens (see [`docs/offline.md`](docs/offline.md)). Open source under MIT: read the code yourself | Copilot Vision sends the screen to Microsoft's servers. Windows Recall shipped plaintext screenshots and had to be pulled twice before relaunching opt-in |
-| **Extensible** | An action is a small, readable definition: a prompt, an input list and an executor. Five built-in actions ship today (check my work, add event from screen, review this email, fill this form, copy text from screen); a hand-written `actions.toml` entry parses and shows in the palette but does not yet dispatch on confirm (issue #242). The framework is the product, actions are the contribution surface | Closed |
+| **Extensible** | An action is a small, readable definition: a prompt, an input list and an executor. Seven built-in actions ship today (check my work, add event from screen, review this email, fill this form, copy text from screen, read QR code from screen, action items to checklist); a hand-written `actions.toml` entry parses and shows in the palette but does not yet dispatch on confirm (issue #242). The framework is the product, actions are the contribution surface | Closed |
 | **Never the final button** | Fills, drafts and proposes. Never presses Send, Submit, Buy or Pay: a permanent rule, not a version-1 limit to be relaxed later | Copilot Actions and other "agent" products sell autonomy |
 | **Not a chatbot** | One press, one action, one card, done. No conversation view, no follow-up question | Copilot is a chat pane first, everything else second |
 | **Bring your own model** | OpenAI, Anthropic, Gemini, a local Ollama model, or any OpenAI-compatible endpoint (OpenRouter, Groq, LM Studio, llama.cpp, vLLM, ...) today. No account or subscription required for the app itself | Recall and Click to Do require a 40+ TOPS NPU; the strongest models sit behind Copilot Pro |
@@ -46,7 +46,7 @@ about Wingman is checked against the code in this repo, not aspirational.
 
 ## What works today
 
-Five built-in actions, built and running, all reachable from the tray menu:
+Seven built-in actions, built and running, all reachable from the tray menu:
 
 - **Check my work**: press the key, Wingman screenshots your active
   monitor, sends it to a vision model with a prompt tuned for checking a
@@ -64,10 +64,13 @@ Five built-in actions, built and running, all reachable from the tray menu:
   calls `confirm::confirm(...)` before the executor runs.
 - **Copy text from screen**: OCRs the active monitor and copies the text to
   the clipboard.
+- **Read QR code from screen**: decodes every QR code on the active
+  monitor locally (no model, no network, works in Offline mode) and copies
+  the text. A link is shown with its real site and never opened.
 
 The confirm-and-execute loop, the executors (calendar add, form fill, text
 replace, image-to-clipboard) and the actions framework itself
-(`actions.toml`, six built-in actions loadable today) are built and wired,
+(`actions.toml`, built-in actions loadable today) are built and wired,
 not planned. What has landed alongside those actions:
 
 - **Four providers plus any OpenAI-compatible endpoint**: OpenAI, Anthropic
@@ -113,7 +116,7 @@ It fills, drafts and proposes; you finish. That rule is permanent, not a
 version-1 limitation to be relaxed later.
 
 Planned and not yet built: dispatch for an arbitrary hand-written
-`actions.toml` entry beyond the six built-in ids (issue #242), more
+`actions.toml` entry beyond the built-in ids (issue #242), more
 connectors beyond ics, and awareness. The actions-as-data framework, the
 confirm-and-execute loop, the built executors and the ics connector are
 built; see "What works today" above. Track what remains in
@@ -293,6 +296,7 @@ in words.
 | key | default | what it does |
 |---|---|---|
 | `mode` | `"auto"` | `cloud` / `local` / `auto` / `offline`; see [`docs/offline.md`](docs/offline.md) |
+| `budget.daily_usd` | `0` (off) | daily limit in US dollars for cloud requests. A notice shows at `budget.warn_percent` (80) and at the limit; past it, cloud requests are refused with a card and local models still work. Counts from the same totals as the tray tooltip, so unpriced models are not included |
 | `capture.max_edge` | `1568` | long-edge downscale before upload; lower cuts cost |
 | `capture.monitor` | `"active"` | `"active"` follows the focused window; `"primary"` pins it |
 | `capture.redact` | `true` | paint over card numbers, IBANs, key-like tokens and email addresses in the screenshot before a cloud request; adds about 0.2 to 0.3 s. Local-only requests skip it. If the check cannot run, nothing is sent |

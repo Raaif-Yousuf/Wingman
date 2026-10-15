@@ -288,6 +288,8 @@ pub fn run() -> Result<()> {
     // this line the toggle is permanently off and the preview never
     // appears, whatever config.toml says.
     crate::config::set_egress_preview_enabled(config.egress_preview.enabled);
+    // #101: same reason: the send guard has no `Config` in reach.
+    crate::usage::set_daily_budget(config.budget.daily_usd, config.budget.warn_percent);
     // #111: `ocr::recognize` runs on worker threads with no Config in reach.
     crate::ocr::set_preferred_language(&config.capture.ocr_language);
     let chain = Arc::new(config.build_chain());
@@ -992,6 +994,7 @@ impl App {
         match palette_model::dispatch_target_for(action_id) {
             Some(DispatchTarget::CheckMyWork) => self.ask(),
             Some(DispatchTarget::ExtractText) => self.extract_text(),
+            Some(DispatchTarget::ReadQr) => self.read_qr(),
             Some(DispatchTarget::AddToCalendar) => self.add_event_from_screen(),
             Some(DispatchTarget::ReviewEmail) => self.review_this_email(),
             Some(DispatchTarget::FillForm) => self.fill_form_from_screen(),
@@ -1021,6 +1024,24 @@ impl App {
     /// (see that module's doc comment). The only gate is Paused, same as
     /// `ask`.
     fn extract_text(&mut self) {
+        self.run_model_free_screen_action(actions::extract_text::recognize_and_copy);
+    }
+
+    /// "Read QR code from screen" (#313): decode every QR code on the active
+    /// monitor and copy the text. Same flow, gates and card path as
+    /// `extract_text` (no provider, no `Mode`, no network); a link in a code
+    /// is shown on the card and never opened.
+    fn read_qr(&mut self) {
+        self.run_model_free_screen_action(actions::read_qr::read_and_copy);
+    }
+
+    /// The shared body of the model-free screen actions: gate on Paused,
+    /// capture on the main thread, then run `work` on a worker thread and
+    /// report through `WM_APP_RESULT`. See `extract_text` for the ordering.
+    fn run_model_free_screen_action(
+        &mut self,
+        work: fn(&crate::capture::RawShot) -> anyhow::Result<Answer>,
+    ) {
         if self.busy {
             return;
         }
@@ -1054,14 +1075,13 @@ impl App {
 
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
-            let result: std::result::Result<Answer, String> =
-                actions::extract_text::recognize_and_copy(&raw).map_err(|e| {
-                    let chain_text = worker_error_chain_text(&e);
-                    pack_error(
-                        &human_error_detail(&chain_text),
-                        &crate::egress::redact_opaque_tokens(&chain_text),
-                    )
-                });
+            let result: std::result::Result<Answer, String> = work(&raw).map_err(|e| {
+                let chain_text = worker_error_chain_text(&e);
+                pack_error(
+                    &human_error_detail(&chain_text),
+                    &crate::egress::redact_opaque_tokens(&chain_text),
+                )
+            });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1355,6 +1375,9 @@ impl App {
         let redact = self.config.capture.redact;
         let prompt = action.prompt.clone();
         let inputs = action.inputs.clone();
+        // #68: an action that writes the answer over the selection needs the
+        // selection's UIA identity as well as its text.
+        let writes_back = action.executor == "replace_text";
         let target = self.hwnd_isize();
         // #242 review: the action and the schema it was dispatched with are
         // carried through the worker and back in the result payload, rather
@@ -1368,38 +1391,46 @@ impl App {
         let action_for_result = action.clone();
         let schema_for_result = schema.clone();
         std::thread::spawn(move || {
-            let result: std::result::Result<Value, String> =
-                (|| -> Result<Value, GenericFailure> {
-                    // #484: gather what the action's `inputs` list asks for, then
-                    // let the pure `plan` decide the user text and whether the
-                    // screenshot goes along (a selection-only action sends no image).
-                    let gathered = gather_generic_inputs(&inputs, foreground_hwnd_isize)?;
-                    let planned = plan_generic_inputs(&inputs, &gathered)?;
-                    // #493: gathered text is data, not instructions.
-                    let system = match planned.system_note {
-                        Some(note) => format!("{prompt}\n\n{note}"),
-                        None => prompt.clone(),
-                    };
-                    let shot = if planned.screen {
-                        Some(encode_for_upload(&mut raw, &providers, mode, redact)?)
-                    } else {
-                        None
-                    };
-                    let ollama_ready = mode == Mode::Auto
-                        && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
-                        && mode::probe_ollama_ready(
-                            &providers.ollama.base_url,
-                            &providers.ollama.model,
-                        );
-                    let chain = providers.build_chain_for_mode(mode, ollama_ready);
-                    let req = generic_action_request(shot.as_ref(), &system, &planned.user, schema);
-                    Ok(chain.complete_parsed_with_fallback(
-                        &req,
-                        || non_vision_inputs(&raw, foreground_hwnd_isize),
-                        |c| actions::parse_generic_proposal(&c.text),
-                    )?)
-                })()
-                .map_err(pack_generic_failure);
+            let result: GenericResult = (|| -> Result<_, GenericFailure> {
+                // #484: gather what the action's `inputs` list asks for, then
+                // let the pure `plan` decide the user text and whether the
+                // screenshot goes along (a selection-only action sends no image).
+                let gathered = gather_generic_inputs(&inputs, foreground_hwnd_isize, writes_back)?;
+                let planned = plan_generic_inputs(&inputs, &gathered)?;
+                if writes_back && actions::generic_replace::too_long(&gathered) {
+                    return Err(GenericFailure::UserState(
+                        actions::generic_replace::TOO_LONG_MESSAGE.to_string(),
+                    ));
+                }
+                let replace = writes_back
+                    .then(|| actions::generic_replace::replace_plan(&gathered))
+                    .flatten();
+                // #493: gathered text is data, not instructions.
+                let system = match planned.system_note {
+                    Some(note) => format!("{prompt}\n\n{note}"),
+                    None => prompt.clone(),
+                };
+                let shot = if planned.screen {
+                    Some(encode_for_upload(&mut raw, &providers, mode, redact)?)
+                } else {
+                    None
+                };
+                let ollama_ready = mode == Mode::Auto
+                    && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+                    && mode::probe_ollama_ready(
+                        &providers.ollama.base_url,
+                        &providers.ollama.model,
+                    );
+                let chain = providers.build_chain_for_mode(mode, ollama_ready);
+                let req = generic_action_request(shot.as_ref(), &system, &planned.user, schema);
+                let proposal = chain.complete_parsed_with_fallback(
+                    &req,
+                    || non_vision_inputs(&raw, foreground_hwnd_isize),
+                    |c| actions::parse_generic_proposal(&c.text),
+                )?;
+                Ok((proposal, replace))
+            })()
+            .map_err(pack_generic_failure);
             let payload = Box::into_raw(Box::new((action_for_result, schema_for_result, result)));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1427,12 +1458,12 @@ impl App {
         &mut self,
         action: actions::Action,
         schema: Value,
-        result: std::result::Result<Value, String>,
+        result: GenericResult,
     ) {
         self.set_busy(false);
 
-        let proposal = match result {
-            Ok(p) => p,
+        let (proposal, replace) = match result {
+            Ok(done) => done,
             Err(packed) => {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
@@ -1452,10 +1483,19 @@ impl App {
         }
 
         if action.confirm {
-            self.pending_preview = Some(PendingPreview::Generic(action.clone()));
+            let writes_back = action.executor == "replace_text";
+            let title = if writes_back {
+                actions::generic_replace::preview_title(&action.name, replace.is_some())
+            } else {
+                action.name.clone()
+            };
+            self.pending_preview = Some(if writes_back {
+                PendingPreview::GenericReplace(action.clone(), replace)
+            } else {
+                PendingPreview::Generic(action.clone())
+            });
             self.pending_preview_generation =
-                self.card
-                    .show_preview(&action.name, &schema, &proposal, false);
+                self.card.show_preview(&title, &schema, &proposal, false);
             return;
         }
 
@@ -1547,6 +1587,9 @@ impl App {
             Some(PendingPreview::Generic(action)) => {
                 self.run_confirmed_generic_action(&action, confirmed);
             }
+            Some(PendingPreview::GenericReplace(action, plan)) => {
+                self.run_confirmed_generic_replace(&action, plan, confirmed);
+            }
             None => self.run_confirmed_calendar_add(confirmed),
         }
     }
@@ -1574,10 +1617,19 @@ impl App {
                         let text = actions::generic_answer::result_card_text(
                             &action.name,
                             executor.name(),
+                            &action.proposal,
                             &undo.summary,
                             &proposal,
                         );
-                        self.card.show_answer(&text.headline, &text.detail, 0, None);
+                        let mut detail = text.detail;
+                        if let Some(notice) = crate::usage::take_budget_notice() {
+                            detail = if detail.is_empty() {
+                                notice
+                            } else {
+                                format!("{detail}\n\n{notice}")
+                            };
+                        }
+                        self.card.show_answer(&text.headline, &detail, 0, None);
                     }
                     Err(e) => {
                         let detail = self.track_error(
@@ -1598,6 +1650,56 @@ impl App {
                 );
                 self.card
                     .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
+            }
+        }
+        self.set_watch(true);
+    }
+
+    /// #68's half of [`App::on_preview_decided`]: writes the confirmed text
+    /// over the selection through the action's `replace_text` executor (the
+    /// same `do_review_confirmed` path "Review this email" uses, so the
+    /// executor's stale-target check applies). When the selection cannot be
+    /// written over, or the write fails, the confirmed text is copied to the
+    /// clipboard instead and the card says so; the user's text is never
+    /// dropped (`actions::generic_replace::replace_or_copy`).
+    fn run_confirmed_generic_replace(
+        &mut self,
+        action: &actions::Action,
+        plan: Option<Box<actions::generic_replace::ReplaceSelection>>,
+        confirmed: confirm::Confirmed<Value>,
+    ) {
+        use actions::generic_replace::ReplaceReport;
+        let title = format!("Couldn't run \"{}\"", action.name);
+        let executors = actions::resolve_executor(action)
+            .and_then(|replace| Ok((replace, executors::registry::resolve("clipboard")?)));
+        match executors {
+            Ok((replace, copy)) => {
+                match actions::generic_replace::replace_or_copy(
+                    replace.as_ref(),
+                    copy.as_ref(),
+                    plan.as_deref(),
+                    confirmed,
+                ) {
+                    ReplaceReport::Replaced(summary) => {
+                        self.card
+                            .show_answer("Selection replaced", &summary, 0, None);
+                    }
+                    ReplaceReport::Copied(detail) => {
+                        self.card
+                            .show_answer("Copied to the clipboard", &detail, 0, None);
+                    }
+                    ReplaceReport::NothingToReplace => {
+                        self.card.show_answer("Nothing to replace", "", 0, None);
+                    }
+                    ReplaceReport::Failed(reason) => {
+                        let detail = self.track_error(&title, &reason);
+                        self.card.show_error_with_details(&title, &detail);
+                    }
+                }
+            }
+            Err(e) => {
+                let detail = self.track_error(&title, &format!("{e:#}"));
+                self.card.show_error_with_details(&title, &detail);
             }
         }
         self.set_watch(true);
@@ -2076,7 +2178,14 @@ impl App {
         let mut answer = self.record_last(result);
         // A store failure never fails the request (#46); it rides on the
         // next card instead, once per run.
-        if let Some(notice) = crate::store::take_notice() {
+        // #101: the daily budget warning rides the same way.
+        for notice in [
+            crate::store::take_notice(),
+            crate::usage::take_budget_notice(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             answer.detail = if answer.detail.is_empty() {
                 notice
             } else {
@@ -2622,6 +2731,10 @@ impl App {
         // Settings save, the same way `set_mode` already does for the mode.
         // A hand-edited `[egress_preview]` otherwise needs a full restart.
         crate::config::set_egress_preview_enabled(self.config.egress_preview.enabled);
+        crate::usage::set_daily_budget(
+            self.config.budget.daily_usd,
+            self.config.budget.warn_percent,
+        );
         crate::ocr::set_preferred_language(&self.config.capture.ocr_language);
         self.card.set_text_scale(self.config.ui.text_scale);
         self.card
@@ -3543,6 +3656,18 @@ enum GenericFailure {
     Fault(anyhow::Error),
 }
 
+/// What a generic action's worker sends back (#242): the model's proposal,
+/// plus the selection to write it over when the action's executor is
+/// `replace_text` and the selection can be written back safely (#68), or an
+/// error packed with [`pack_error`].
+type GenericResult = std::result::Result<
+    (
+        Value,
+        Option<Box<actions::generic_replace::ReplaceSelection>>,
+    ),
+    String,
+>;
+
 impl From<anyhow::Error> for GenericFailure {
     fn from(e: anyhow::Error) -> Self {
         GenericFailure::Fault(e)
@@ -3580,14 +3705,24 @@ fn pack_generic_failure(f: GenericFailure) -> String {
 fn gather_generic_inputs(
     inputs: &[actions::InputKind],
     foreground_hwnd: isize,
+    with_selection_target: bool,
 ) -> Result<actions::generic_inputs::Gathered, GenericFailure> {
     let mut gathered = actions::generic_inputs::Gathered::default();
     if actions::generic_inputs::wants_selection(inputs) {
-        let selection = crate::inputs::selection::get_selection_foreground(
-            crate::inputs::selection::DEFAULT_MAX_CHARS,
-            crate::inputs::selection::DEFAULT_CLIPBOARD_WAIT_BUDGET,
-        )
+        let selection = if with_selection_target {
+            crate::inputs::selection::get_selection_foreground_with_target(
+                foreground_hwnd,
+                crate::inputs::selection::DEFAULT_MAX_CHARS,
+                crate::inputs::selection::DEFAULT_CLIPBOARD_WAIT_BUDGET,
+            )
+        } else {
+            crate::inputs::selection::get_selection_foreground(
+                crate::inputs::selection::DEFAULT_MAX_CHARS,
+                crate::inputs::selection::DEFAULT_CLIPBOARD_WAIT_BUDGET,
+            )
+        }
         .context("couldn't put your clipboard back after reading the selection")?;
+        gathered.selection_target = selection.target.clone();
         gathered.selection_in_password_field =
             selection.source == crate::inputs::selection::SelectionSource::SkippedPasswordField;
         gathered.selection_truncated = selection.truncated;
@@ -4253,7 +4388,7 @@ enum DeferredMessage {
     /// `WM_APP_GENERIC_ACTION_RESULT` (#242). Carries the exact `Action`
     /// and schema `run_generic_action` dispatched with, not just the id --
     /// see `on_generic_action_result`'s doc comment for why.
-    GenericActionResult(actions::Action, Value, std::result::Result<Value, String>),
+    GenericActionResult(actions::Action, Value, GenericResult),
 }
 
 /// Issue #225: which action is waiting on the preview currently on screen.
@@ -4273,6 +4408,13 @@ enum PendingPreview {
     /// `actions::load_actions()` call between the model's proposal and the
     /// user's confirm click.
     Generic(actions::Action),
+    /// #68: a generic action whose executor is `replace_text`: the selection
+    /// to write the confirmed text over, or `None` when it cannot be written
+    /// back safely, in which case the text is copied instead.
+    GenericReplace(
+        actions::Action,
+        Option<Box<actions::generic_replace::ReplaceSelection>>,
+    ),
 }
 
 /// What `wnd_proc` should do with a message addressed to the owner window
@@ -4478,14 +4620,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     // #242: same treatment as WM_APP_CALENDAR_RESULT above.
                     WM_APP_GENERIC_ACTION_RESULT => {
                         let (action, schema, result) = *unsafe {
-                            Box::from_raw(
-                                lparam.0
-                                    as *mut (
-                                        actions::Action,
-                                        Value,
-                                        std::result::Result<Value, String>,
-                                    ),
-                            )
+                            Box::from_raw(lparam.0 as *mut (actions::Action, Value, GenericResult))
                         };
                         DeferredMessage::GenericActionResult(action, schema, result)
                     }
@@ -4533,6 +4668,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
+                    MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
                     MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
                     MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
                     MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
@@ -4612,11 +4748,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_APP_GENERIC_ACTION_RESULT => {
-            let (action, schema, result) = unsafe {
-                *Box::from_raw(
-                    lparam.0 as *mut (actions::Action, Value, std::result::Result<Value, String>),
-                )
-            };
+            let (action, schema, result) =
+                unsafe { *Box::from_raw(lparam.0 as *mut (actions::Action, Value, GenericResult)) };
             app.on_generic_action_result(action, schema, result);
             LRESULT(0)
         }
@@ -5900,7 +6033,7 @@ mod tests {
 
         // Non-empty-candidate-set check (issue #281 was exactly a guard
         // that skipped this and passed vacuously once its own scan broke):
-        // today there are 6 (set_current, set_egress_preview_enabled,
+        // today there are 7 (set_current, set_egress_preview_enabled, set_daily_budget,
         // set_text_scale, set_mode, set_pause_chord, set_palette_chord);
         // require a comfortable margin under that so losing one candidate
         // to a future refactor cannot silently zero out this check.

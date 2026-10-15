@@ -45,6 +45,39 @@ enabled = true
 mode = "auto"
 
 [[actions]]
+id = "read-qr-code"
+name = "Read QR code from screen"
+group = "Work"
+inputs = ["screen"]
+proposal = "qr_text"
+executor = "clipboard"
+confirm = false
+prompt = ""
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
+id = "summarize-page"
+name = "Summarize this page"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "page_summary"
+executor = "none"
+confirm = false
+prompt = 'You are shown a long page (an article, a report, an email thread, a document), as text if some was selected and as a screenshot otherwise. Summarize what is on it. Fill `bullets` first: at most 5 plain-text points, one short sentence each, in the order they appear on the page. Then write `line1`: one short sentence, at most 50 characters, that says what this page is or announces. Then write `line2`: one sentence, at most 90 characters, that says what matters most to a reader. Use only what the page says: do not add facts, numbers or opinions that are not shown. If there is no readable page content, return an empty `line1`, an empty `line2` and no bullets. Use plain text only: no markdown, no bullet characters, no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
 id = "add-to-calendar"
 name = "Add event from screen"
 group = "Work"
@@ -108,6 +141,87 @@ proposal = "action_items"
 executor = "clipboard"
 confirm = true
 prompt = """You are shown notes, an email thread, a chat message or a project page (as text, or as a screenshot if no text was selected). Find the action items: things a named person, or the reader, has to do. Return them in `items`, one short plain-text line per action item, in the order they appear, written as "Owner: task (due)". Use the owner's name exactly as shown; write "Me" when the text assigns it to the reader or to nobody in particular. Add the "(due)" part only when the screen states a date or deadline for that item, and copy it as written (for example "Fri" or "Oct 3"); never work out, guess or invent a date, and leave it off when none is shown. Do not include items that are already marked done, decisions, or general discussion. If there are no action items, return an empty list. Do not add bullets, numbers or checkbox characters: they are added for you. Use plain text only: no markdown, no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead)."""
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
+id = "explain-this-error"
+name = "Explain this error"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "error_explanation"
+executor = "none"
+confirm = false
+prompt = 'You are shown an error message: an error dialog, a stack trace, a failed build or a log line, as text or as a screenshot of the screen. Find the error and explain it to someone who has not seen it before. Fill the fields in this order. meaning: what the error means, in one plain sentence of at most 85 characters. cause: the most likely cause, in one or two sentences. fix: the first thing to try, in one or two sentences, with a command or setting name when there is one. Quote error codes and file names exactly as shown and never invent one. If several errors are visible, explain the one in the foreground dialog or the first one in the trace. If you are not sure of the cause, say so in the cause field rather than guessing. If no error is visible, say so in meaning and write "None" in cause and fix. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
+id = "define-this-word"
+name = "Define this word"
+group = "Study"
+inputs = ["selection"]
+proposal = "word_definition"
+executor = "none"
+confirm = false
+prompt = 'You are given a word or short phrase the user selected. Define it for a general reader. Fill the fields in this order. definition: the word as written, its part of speech in brackets, a colon, then a plain definition in one short sentence, at most 90 characters in total (for example "ephemeral (adjective): lasting a very short time"). example: one short sentence that uses the word naturally. If the selection has several common meanings, give the most common one. If it is an idiom or phrase, define the phrase. If the selection is a long passage, define only its single hardest word. If it is not a real word or phrase, say so in definition and write "None" in example. Never invent a meaning. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "local"
+
+[[actions]]
+id = "translate-selection"
+name = "Translate selection"
+group = "Writing"
+inputs = ["selection"]
+proposal = "text_answer"
+executor = "replace_text"
+confirm = true
+prompt = "You are given a piece of text the user selected. Translate it into English and return only the translation in `text`. Keep the meaning, tone, line breaks, numbers, names, URLs and formatting characters exactly as they were. Do not add notes, quotation marks, a language name or an explanation. If the text is already in English, return it unchanged. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes unless the original text has them."
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
+id = "describe-image-alt-text"
+name = "Describe image (alt text)"
+group = "Work"
+inputs = ["screen"]
+proposal = "text_answer"
+executor = "clipboard"
+confirm = true
+prompt = 'You are shown a screenshot that contains an image, chart, graph, photo or diagram. Pick the main one: the largest, or the one in the foreground. Write alt text for it in `text`: one plain sentence of at most 125 characters, for someone who cannot see it. Say what it shows and, for a chart or graph, the one thing it says (the trend or the biggest value, and what is measured). Do not start with "image of", "picture of" or "chart of". Use only what is visible: never guess names, numbers or places that are not shown. If there is no image, chart or photo on the screen, say so in one sentence. Use plain text only: no markdown, no quotation marks around the sentence, no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
+id = "explain-this-screen"
+name = "Explain what's on screen"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "screen_explanation"
+executor = "none"
+confirm = false
+prompt = """You are shown what is on the user's screen, as text if some was selected and as a screenshot otherwise. Explain it to someone who has not looked at it closely. First fill `detail`: two to four short plain sentences. If it is a dialog or a message, say what it asks or says and what each choice would do. If it is an error, say what it means and what to try. If it is an article or a page, say what it is about and its main point. If it is code, say what it does. If it is anything else, say what it is and what it is for. Then fill `headline`: one sentence of at most 120 characters that sums up `detail`. Use only what is shown: never guess names, numbers or consequences that are not visible. Quote error codes and file names exactly as shown. Do not tell the user to press, click or submit anything. If the screen is blank or unreadable, return an empty `headline` and an empty `detail`. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead)."""
 rate_difficulty = false
 enabled = true
 

@@ -166,6 +166,8 @@ pub struct Config {
     /// and `provider::common`'s `send_preview_guard` for what turning it on
     /// actually does today versus what still has to be wired up.
     pub egress_preview: EgressPreview,
+    /// #101 daily cost budget. Default off.
+    pub budget: Budget,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -4336,6 +4338,32 @@ pub struct EgressPreview {
     pub enabled: bool,
 }
 
+/// #101 `[budget]`: a daily limit on billed (cloud) requests. Past
+/// `daily_usd`, a request that would leave this machine for a billed provider
+/// is refused with a card and the chain falls through to a local provider if
+/// it has one; local models are never counted or blocked. At `warn_percent`
+/// of the limit, and again at the limit, the next card carries a notice.
+/// Counted from the same local totals as the tray tooltip (`usage.rs`), so a
+/// model with no price row is not counted: the limit is a floor.
+/// `App::run` and `App::apply_config` mirror it into `usage::set_daily_budget`.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Budget {
+    /// US dollars per local day. 0 (the default) means no budget.
+    pub daily_usd: f64,
+    /// Percent of `daily_usd` at which the warning appears.
+    pub warn_percent: u8,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            daily_usd: 0.0,
+            warn_percent: 80,
+        }
+    }
+}
+
 /// Process-wide mirror of `Config::egress_preview.enabled`, read by
 /// `provider::common::send_preview_guard` on every completion request --
 /// the same "decision lives in `mode.rs`/config, enforcement lives in
@@ -4370,6 +4398,27 @@ pub fn set_egress_preview_enabled(on: bool) {
 
 pub fn egress_preview_enabled() -> bool {
     EGRESS_PREVIEW_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn budget_defaults_to_off_with_an_80_percent_warning() {
+        let b = Config::default().budget;
+        assert_eq!(b.daily_usd, 0.0);
+        assert_eq!(b.warn_percent, 80);
+    }
+
+    #[test]
+    fn a_budget_table_in_config_toml_is_read() {
+        let c: Config = toml::from_str("[budget]\ndaily_usd = 0.05\n").unwrap();
+        assert_eq!(c.budget.daily_usd, 0.05);
+        assert_eq!(c.budget.warn_percent, 80);
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.budget, Budget::default());
+    }
 }
 
 #[cfg(test)]

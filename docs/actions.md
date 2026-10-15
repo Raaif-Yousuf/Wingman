@@ -9,18 +9,18 @@ that reuses an existing proposal schema and executor, not new Rust.
 
 Checked against the code, not the spec: `src/actions/mod.rs` (the `Action`
 model, merge and visibility rules), `src/actions/schema.rs` (the proposal
-schema registry) and the six built-in actions in `src/actions/*.rs`.
+schema registry) and the built-in actions in `src/actions/*.rs`.
 
 ## Where `actions.toml` lives
 
 `%APPDATA%\Wingman\actions.toml`, computed by `actions::path()`. A missing
 file is not an error -- it means "no overrides"; `load_actions_from` (the
-path-injectable core, used by every test) merges it with the six built-in
+path-injectable core, used by every test) merges it with the built-in
 actions from `actions::builtin_actions()` and filters to what should
 actually run or be shown. Nothing writes this file today (no Settings UI
 edits it yet): a user who wants to override or add an action creates or
 edits it by hand. `actions.example.toml` at the repo root is a real,
-loadable copy of today's six built-ins, kept in sync with `builtin_actions()`
+loadable copy of today's built-ins, kept in sync with `builtin_actions()`
 by hand -- diff it against a fresh `builtin_actions()` output if you change a
 built-in.
 
@@ -29,7 +29,9 @@ built-in.
 - **Merge is by `id`, wholesale, not per-field.** A user `[[actions]]` block
   whose `id` matches a built-in replaces that built-in's entire record --
   every field comes from the user's block, not a mix of old and new. A new
-  `id` is appended. (`merge_actions`, `src/actions/mod.rs`.)
+  `id` is appended. (`merge_actions`, `src/actions/mod.rs`.) For example, a
+  user action with the id `translate-selection` replaces the built-in
+  "Translate selection".
 - **`enabled = false` hides an action**, and so does listing its `group` in
   the top-level `disabled_groups = [...]` array. Both checks run after
   merge, so a disabled built-in whose group is later re-enabled still
@@ -45,8 +47,8 @@ built-in.
 disabled_groups = ["Study"]        # top level, applies across all actions
 
 [[actions]]
-id       = "translate-selection"   # stable identity; merge key
-name     = "Translate selection"   # shown in the (not yet built) palette
+id       = "translate-to-clipboard"   # stable identity; merge key
+name     = "Translate to clipboard"   # shown in the (not yet built) palette
 group    = "Writing"               # optional; omit for an ungrouped action
 inputs   = ["selection", "screen"] # catalogue metadata -- see below
 proposal = "text_answer"           # schema-registry key, actions::schema::schema_for
@@ -163,10 +165,17 @@ offer "Do it" at all.
 
 `actions::schema::schema_for(proposal, rate_difficulty) -> Option<Value>` is
 the one registry mapping a proposal name to the JSON Schema a model's
-completion must satisfy. Six kinds are registered today: `"verdict"` (today's
+completion must satisfy. These kinds are registered today: `"verdict"` (today's
 "Check my work"), `"calendar_event"` (#26), `"text_review"` (#38),
-`"form_fill"` (#40), `"text_answer"` (#242) and `"action_items"` (#314: a list of
-lines the `clipboard` executor copies as a Markdown checklist). Each schema function returns a `serde_json::json!`
+`"form_fill"` (#40), `"text_answer"` (#242), `"page_summary"` (#67: `bullets`,
+then two summary lines, shown on the card only; the first line is cut to 50 characters, the second to 90 so both fit the collapsed card, and bullets are
+clamped in code), `"action_items"` (#314: a list of
+lines the `clipboard` executor copies as a Markdown checklist),
+`"error_explanation"` (#66: `meaning`, `cause`, `fix`, a read-only answer for
+the card), `"word_definition"` (#75: `definition`, `example`, a read-only answer for
+the card) and `"screen_explanation"` (#131: `detail`, then a one-sentence
+`headline`; the headline is cut to fit the collapsed card and the detail shows
+on expand). Each schema function returns a `serde_json::json!`
 literal shaped like standard JSON Schema (`"type": "object"`, `"properties"`,
 `"required"`, `"additionalProperties": false`), plus one
 non-standard keyword:

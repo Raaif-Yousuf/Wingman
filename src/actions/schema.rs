@@ -50,7 +50,7 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "text_review" => Some(text_review_schema()),
         "form_fill" => Some(form_fill_schema()),
         // #242: CONTRIBUTING.md's "Add an action in 20 minutes" worked
-        // example (`translate-selection`) is `proposal = "text_answer"`,
+        // example (`translate-to-clipboard`) is `proposal = "text_answer"`,
         // `executor = "clipboard"` (this module's own doc comment above
         // said this arm lands "the same day its first action lands" -- the
         // generic dispatch path is that day). One property, matching
@@ -61,8 +61,87 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "text_answer" => Some(text_answer_schema()),
         // #314: a list of action-item lines for the clipboard executor.
         "action_items" => Some(action_items_schema()),
+        // #66: a read-only explanation of an error, shown on the card.
+        "error_explanation" => Some(error_explanation_schema()),
+        // #75: a read-only definition of a selected word, shown on the card.
+        "word_definition" => Some(word_definition_schema()),
+        // #67: two summary lines and a few bullets, shown on the card only.
+        "page_summary" => Some(page_summary_schema()),
+        // #131: a short explanation of whatever is on screen, shown on the card.
+        "screen_explanation" => Some(screen_explanation_schema()),
         _ => None,
     }
+}
+
+/// The `error_explanation` proposal schema (#66): `meaning`, `cause`, `fix`,
+/// all plain strings, in that order (rule 3). The model has to say what the
+/// error is before it guesses a cause, and name the cause before it proposes
+/// a fix. Asking for three fields rather than one free-text answer is what
+/// makes a small local model fill in all three. Not editable: the card
+/// shows it as an answer (`executor = "none"`), so there is nothing to edit.
+fn error_explanation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "meaning": {"type": "string"},
+            "cause": {"type": "string"},
+            "fix": {"type": "string"}
+        },
+        "required": ["meaning", "cause", "fix"],
+        "additionalProperties": false
+    })
+}
+
+/// The `word_definition` proposal schema (#75): `definition` then `example`,
+/// both plain strings. `definition` comes first because the card's headline
+/// is the first field, and the model should commit to the meaning before it
+/// writes a sentence that has to fit it (rule 3). Two fields rather than one
+/// free-text answer so a small local model fills in both. Not editable: the
+/// card shows it as an answer (`executor = "none"`).
+fn word_definition_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "definition": {"type": "string"},
+            "example": {"type": "string"}
+        },
+        "required": ["definition", "example"],
+        "additionalProperties": false
+    })
+}
+
+/// The `page_summary` proposal schema (#67). Property order is load-bearing
+/// (rule 3): `bullets` come first so the two lines are written from points the
+/// model has already settled on, the same reason `detail` precedes `headline`
+/// in the verdict schema. Nothing is editable: the card is read-only.
+fn page_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "bullets": {"type": "array", "items": {"type": "string"}},
+            "line1": {"type": "string"},
+            "line2": {"type": "string"}
+        },
+        "required": ["bullets", "line1", "line2"],
+        "additionalProperties": false
+    })
+}
+
+/// The `screen_explanation` proposal schema (#131): `detail` then `headline`.
+/// Property order is load-bearing (rule 3), the same as in the verdict schema:
+/// the model writes the explanation first and then sums it up, so the
+/// one-line headline is a summary of what it already said, not a claim it
+/// then has to back up. Nothing is editable: the card is read-only.
+fn screen_explanation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "detail": {"type": "string"},
+            "headline": {"type": "string"}
+        },
+        "required": ["detail", "headline"],
+        "additionalProperties": false
+    })
 }
 
 /// The `action_items` proposal schema (#314): one `items` list of short
@@ -453,6 +532,65 @@ mod tests {
         assert_eq!(schema["properties"]["items"]["type"], "array");
         assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
         assert_eq!(schema["properties"]["items"]["editable"], true);
+    }
+
+    #[test]
+    fn error_explanation_asks_for_meaning_then_cause_then_fix() {
+        let schema =
+            schema_for("error_explanation", false).expect("error_explanation is registered");
+        let order: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["meaning", "cause", "fix"]);
+        assert_eq!(schema["required"], json!(["meaning", "cause", "fix"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|p| p["type"] == "string" && p.get("editable").is_none()),
+            "a read-only answer has no edit controls"
+        );
+    }
+
+    #[test]
+    fn word_definition_asks_for_the_definition_then_an_example() {
+        let schema = schema_for("word_definition", false).expect("word_definition is registered");
+        let order: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["definition", "example"]);
+        assert_eq!(schema["required"], json!(["definition", "example"]));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn page_summary_puts_the_bullets_before_the_two_lines() {
+        let schema = schema_for("page_summary", false).expect("page_summary is registered");
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["bullets", "line1", "line2"]);
+        assert_eq!(schema["required"], json!(["bullets", "line1", "line2"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["bullets"]["type"], "array");
+        assert!(schema["properties"]["line1"].get("editable").is_none());
+    }
+
+    #[test]
+    fn screen_explanation_puts_the_detail_before_the_headline() {
+        let schema =
+            schema_for("screen_explanation", false).expect("screen_explanation is registered");
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["detail", "headline"]);
+        assert_eq!(schema["required"], json!(["detail", "headline"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"]["headline"].get("editable").is_none());
     }
 
     #[test]

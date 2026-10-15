@@ -448,6 +448,7 @@ pub fn handle_key(state: &mut PaletteState, key: PaletteKey) -> PaletteOutcome {
 pub enum DispatchTarget {
     CheckMyWork,
     ExtractText,
+    ReadQr,
     AddToCalendar,
     ReviewEmail,
     FillForm,
@@ -476,6 +477,7 @@ pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
     match action_id {
         crate::actions::DEFAULT_ACTION_ID => Some(DispatchTarget::CheckMyWork),
         crate::actions::EXTRACT_TEXT_ACTION_ID => Some(DispatchTarget::ExtractText),
+        crate::actions::READ_QR_ACTION_ID => Some(DispatchTarget::ReadQr),
         crate::actions::calendar::ACTION_ID => Some(DispatchTarget::AddToCalendar),
         crate::actions::review_email::ACTION_ID => Some(DispatchTarget::ReviewEmail),
         crate::actions::fill_form::ACTION_ID => Some(DispatchTarget::FillForm),
@@ -499,6 +501,7 @@ pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
 /// ready the action is not singled out as a free one.
 fn action_requires_model(action_id: &str) -> bool {
     let model_free = action_id == crate::actions::EXTRACT_TEXT_ACTION_ID
+        || action_id == crate::actions::READ_QR_ACTION_ID
         || action_id == CALCULATE_SELECTION_ACTION_ID
         || action_id == COPY_REGION_ACTION_ID
         || action_id == crate::actions::fill_form::ACTION_ID;
@@ -1088,7 +1091,15 @@ mod tests {
     fn dispatch_covers_every_built_in_action() {
         // Built-ins that run through the generic path on purpose: they need
         // nothing a plain `actions.toml` entry lacks.
-        let generic_on_purpose = [crate::actions::action_items::ACTION_ID];
+        let generic_on_purpose = [
+            crate::actions::action_items::ACTION_ID,
+            crate::actions::explain_error::ACTION_ID,
+            crate::actions::define_word::ACTION_ID,
+            crate::actions::translate::ACTION_ID,
+            crate::actions::page_summary::ACTION_ID,
+            crate::actions::describe_image::ACTION_ID,
+            crate::actions::explain_screen::ACTION_ID,
+        ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {
                 continue;
@@ -1119,6 +1130,10 @@ mod tests {
         assert_eq!(
             dispatch_target_for(crate::actions::fill_form::ACTION_ID),
             Some(DispatchTarget::FillForm)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::READ_QR_ACTION_ID),
+            Some(DispatchTarget::ReadQr)
         );
         assert_eq!(
             dispatch_target_for(CALCULATE_SELECTION_ACTION_ID),
@@ -1157,8 +1172,10 @@ mod tests {
     #[test]
     fn unknown_action_id_dispatches_generically_instead_of_to_nothing() {
         assert_eq!(
-            dispatch_target_for("translate-selection"),
-            Some(DispatchTarget::Generic("translate-selection".to_string()))
+            dispatch_target_for("translate-to-clipboard"),
+            Some(DispatchTarget::Generic(
+                "translate-to-clipboard".to_string()
+            ))
         );
         assert_eq!(
             dispatch_target_for("not-a-real-action"),
@@ -1194,6 +1211,11 @@ mod tests {
             .find(|a| a.id == crate::actions::EXTRACT_TEXT_ACTION_ID)
             .unwrap();
         assert!(!extract_text.requires_model);
+        let read_qr = cat
+            .iter()
+            .find(|a| a.id == crate::actions::READ_QR_ACTION_ID)
+            .expect("read-qr-code is in the catalogue");
+        assert!(!read_qr.requires_model, "#313: decodes locally, no model");
         let calc = cat
             .iter()
             .find(|a| a.id == CALCULATE_SELECTION_ACTION_ID)

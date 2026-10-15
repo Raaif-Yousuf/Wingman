@@ -9,7 +9,7 @@
 //! text; the screenshot is sent only when `screen`/`window`/`region` is
 //! listed (or no text input is) AND no listed text input produced anything.
 //! That is the "falls back to the screen if nothing is selected" behaviour
-//! `CONTRIBUTING.md`'s `translate-selection` example promises.
+//! `CONTRIBUTING.md`'s `translate-to-clipboard` example promises.
 //!
 //! `text` and `context` are accepted in the list but gathered by nothing
 //! yet; they neither add text nor count as a reason to send the screen.
@@ -41,6 +41,10 @@ pub struct Gathered {
     pub selection_in_password_field: bool,
     /// The selection was cut to the reader's length limit.
     pub selection_truncated: bool,
+    /// The selection's UIA identity, read only for an action that writes
+    /// back (executor `replace_text`, #68). `None` when the control gave no
+    /// single re-resolvable range.
+    pub selection_target: Option<crate::inputs::selection::SelectionTarget>,
     pub clipboard: Option<String>,
     pub clipboard_truncated: bool,
     pub uia: Option<String>,

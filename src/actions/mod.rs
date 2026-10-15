@@ -7,12 +7,20 @@
 
 pub mod action_items;
 pub mod calendar;
+pub mod define_word;
+pub mod describe_image;
+pub mod explain_error;
+pub mod explain_screen;
 pub mod extract_text;
 pub mod fill_form;
 pub mod generic_answer;
 pub mod generic_inputs;
+pub mod generic_replace;
+pub mod page_summary;
+pub mod read_qr;
 pub mod review_email;
 pub mod schema;
+pub mod translate;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -178,6 +186,11 @@ pub struct Resolved {
 /// for why.
 pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 
+/// The id of the "Read QR code from screen" built-in action (#313): decode
+/// every QR code on the active monitor with no model and no network, copy
+/// the text. See `actions::read_qr`.
+pub const READ_QR_ACTION_ID: &str = "read-qr-code";
+
 /// The built-in actions Wingman ships.
 ///
 /// - `"check-my-work"`: today's physics/statistics check, unchanged in
@@ -205,6 +218,13 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 ///   (`App::extract_text` ->
 ///   `actions::extract_text::{capture_screen, recognize_and_copy}`) still
 ///   does not read this `Action` value's `proposal`/`executor` fields back.
+/// - `"read-qr-code"` (#313): decode every QR code on the screen locally and
+///   copy the text, model-free like `extract-text-to-clipboard` (same
+///   deliberately unregistered proposal name, empty prompt, read-only
+///   clipboard executor). A link in a code is shown, never opened.
+/// - `"summarize-page"` (#67, `page_summary::builtin_action`): proposal
+///   `page_summary`, executor `none`. Two summary lines on the card, bullets on
+///   expand. Runs through the generic dispatch path.
 /// - `"add-to-calendar"` (#39, `calendar::builtin_action`): the first action
 ///   that runs the full Look/Propose/Confirm/Do loop end to end.
 /// - `"review-this-email"` (#38, `review_email::builtin_action`): the
@@ -218,6 +238,20 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 /// - `"action-items-checklist"` (#314, `action_items::builtin_action`):
 ///   proposal `action_items`, executor `clipboard`. Runs through the generic
 ///   dispatch path (`App::run_generic_action`), like an `actions.toml` entry.
+/// - `"explain-this-error"` (#66, `explain_error::builtin_action`): proposal
+///   `error_explanation`, executor `none`, so the answer is the card (#441).
+/// - `"define-this-word"` (#75, `define_word::builtin_action`): proposal
+///   `word_definition`, executor `none`, selection only, so a text-only
+///   local model can answer it.
+/// - `"translate-selection"` (#68, `translate::builtin_action`): proposal
+///   `text_answer`, executor `replace_text`. Confirms on a card, then writes
+///   the translation over the selection (`actions::generic_replace`).
+/// - `"describe-image-alt-text"` (#113, `describe_image::builtin_action`):
+///   proposal `text_answer`, executor `clipboard`. One sentence of alt text for
+///   the image on screen, confirmed on a card, then copied.
+/// - `"explain-this-screen"` (#131, `explain_screen::builtin_action`): proposal
+///   `screen_explanation`, executor `none`. A one-sentence headline on the
+///   collapsed card, a short explanation on expand. Works on any screen.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -248,10 +282,30 @@ pub fn builtin_actions() -> Vec<Action> {
             rate_difficulty: false,
             enabled: true,
         },
+        Action {
+            id: READ_QR_ACTION_ID.to_string(),
+            name: "Read QR code from screen".to_string(),
+            group: Some("Work".to_string()),
+            inputs: vec![InputKind::Screen],
+            proposal: "qr_text".to_string(),
+            executor: "clipboard".to_string(),
+            confirm: false,
+            prompt: String::new(),
+            prefer: Prefer::default(),
+            hotkey: None,
+            rate_difficulty: false,
+            enabled: true,
+        },
+        page_summary::builtin_action(),
         calendar::builtin_action(),
         review_email::builtin_action(),
         fill_form::builtin_action(),
         action_items::builtin_action(),
+        explain_error::builtin_action(),
+        define_word::builtin_action(),
+        translate::builtin_action(),
+        describe_image::builtin_action(),
+        explain_screen::builtin_action(),
     ]
 }
 
@@ -443,12 +497,21 @@ mod tests {
     #[test]
     fn builtin_check_my_work_matches_todays_behaviour() {
         let builtins = builtin_actions();
-        assert_eq!(
-            builtins.len(),
-            6,
-            "check-my-work, extract-text-to-clipboard (#41), add-to-calendar (#39), \
-             review-this-email (#38), fill-this-form (#40), action-items-checklist (#314)"
-        );
+        for id in [
+            "check-my-work",
+            "summarize-page",
+            "read-qr-code",
+            "summarize-page",
+            "add-to-calendar",
+            "review-this-email",
+            "fill-this-form",
+            "action-items-checklist",
+        ] {
+            assert!(
+                builtins.iter().any(|a| a.id == id),
+                "built-in {id} is missing"
+            );
+        }
         // Found by id, not by position, so this stays valid regardless of
         // what order the built-ins are in.
         let a = builtins
@@ -499,6 +562,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn builtin_read_qr_matches_the_design() {
+        let builtins = builtin_actions();
+        let a = builtins
+            .iter()
+            .find(|a| a.id == READ_QR_ACTION_ID)
+            .expect("read-qr-code is built in");
+        assert_eq!(a.name, "Read QR code from screen");
+        assert_eq!(a.group.as_deref(), Some("Work"));
+        assert_eq!(a.inputs, vec![InputKind::Screen]);
+        assert_eq!(a.executor, "clipboard");
+        assert!(!a.confirm && a.prompt.is_empty());
+        assert_eq!(schema::schema_for(&a.proposal, a.rate_difficulty), None);
+    }
+
     // -- executor resolution (#31) -------------------------------------------
 
     #[test]
@@ -527,8 +605,8 @@ mod tests {
         // sample predates #23's `enabled` field default).
         let toml_str = r#"
 [[actions]]
-id       = "translate-selection"
-name     = "Translate selection"
+id       = "translate-to-clipboard"
+name     = "Translate to clipboard"
 inputs   = ["selection", "screen"]
 proposal = "text_answer"
 executor = "clipboard"
@@ -541,7 +619,7 @@ mode = "auto"
         let file = parse_actions_file(toml_str).expect("CONTRIBUTING's example must parse");
         assert_eq!(file.actions.len(), 1);
         let a = &file.actions[0];
-        assert_eq!(a.id, "translate-selection");
+        assert_eq!(a.id, "translate-to-clipboard");
         assert_eq!(a.inputs, vec![InputKind::Selection, InputKind::Screen]);
         assert_eq!(a.proposal, "text_answer");
         assert_eq!(a.prefer.mode, "auto");
@@ -564,13 +642,13 @@ mode = "auto"
     /// shaped like that schema.
     #[test]
     fn contributing_md_translate_selection_example_dispatches_and_runs_end_to_end() {
-        let path = scratch_path("translate-selection-e2e");
+        let path = scratch_path("translate-to-clipboard-e2e");
         write(
             &path,
             r#"
 [[actions]]
-id       = "translate-selection"
-name     = "Translate selection"
+id       = "translate-to-clipboard"
+name     = "Translate to clipboard"
 inputs   = ["selection", "screen"]
 proposal = "text_answer"
 executor = "clipboard"
@@ -584,7 +662,7 @@ mode = "auto"
         let resolved = load_actions_from(&path).unwrap();
         let action = resolved
             .iter()
-            .find(|r| r.action.id == "translate-selection")
+            .find(|r| r.action.id == "translate-to-clipboard")
             .map(|r| r.action.clone())
             .expect("the new action must be present after merge");
 
@@ -592,13 +670,15 @@ mode = "auto"
         // to nothing (the bug this issue reports).
         let catalogue = crate::ui::palette_model::catalogue(&resolved);
         assert!(
-            catalogue.iter().any(|row| row.id == "translate-selection"),
+            catalogue
+                .iter()
+                .any(|row| row.id == "translate-to-clipboard"),
             "a non-built-in action must still appear in the palette"
         );
         assert_eq!(
-            crate::ui::palette_model::dispatch_target_for("translate-selection"),
+            crate::ui::palette_model::dispatch_target_for("translate-to-clipboard"),
             Some(crate::ui::palette_model::DispatchTarget::Generic(
-                "translate-selection".to_string()
+                "translate-to-clipboard".to_string()
             )),
             "a non-built-in action id must dispatch generically, not to nothing"
         );
@@ -712,8 +792,8 @@ not_a_real_field = true
     #[test]
     fn user_action_with_a_new_id_is_appended_not_merged() {
         let mut new_action = builtin_actions()[0].clone();
-        new_action.id = "translate-selection".to_string();
-        new_action.name = "Translate selection".to_string();
+        new_action.id = "translate-to-clipboard".to_string();
+        new_action.name = "Translate to clipboard".to_string();
         let builtin_count = builtin_actions().len();
         let merged = merge_actions(builtin_actions(), vec![new_action]);
         assert_eq!(merged.len(), builtin_count + 1);
@@ -723,7 +803,7 @@ not_a_real_field = true
         );
         let appended = merged
             .iter()
-            .find(|r| r.action.id == "translate-selection")
+            .find(|r| r.action.id == "translate-to-clipboard")
             .expect("the new user action must be appended, not merged into a builtin");
         assert_eq!(appended.origin, Origin::User);
     }
