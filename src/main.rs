@@ -29,6 +29,7 @@ mod provider;
 mod router;
 mod secrets;
 mod single_instance;
+mod speech;
 mod ui;
 mod usage;
 

@@ -66,6 +66,7 @@
 use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
+use crate::speech::{spoken_text, Speaker};
 use crate::ui::text::draw_text_line;
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -99,7 +100,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
-    WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -218,6 +219,11 @@ impl Card {
             open_settings_on_click: false,
             copy_details_available: false,
             copy_details_rect: None,
+            read_aloud_available: false,
+            read_aloud_rect: None,
+            speaker: None,
+            reading: false,
+            reading_stream: 0,
             preview_decision_pending: false,
             preview_generation: 0,
             edit_bg_brush: HBRUSH(std::ptr::null_mut()),
@@ -319,6 +325,8 @@ impl Card {
     ) {
         self.inner
             .show_collapsed(headline, detail, auto_dismiss_secs, difficulty);
+        // Issue #77: an answer card offers "Read aloud" once expanded.
+        self.inner.read_aloud_available = true;
     }
 
     pub fn show_error(&mut self, headline: &str, detail: &str) {
@@ -478,6 +486,12 @@ impl Drop for Card {
 // ---------------------------------------------------------------------------
 // Window class registration (once per process)
 // ---------------------------------------------------------------------------
+
+/// Issue #77: the system voice posts this to the card's own window when an
+/// utterance ends or is stopped (`speech::Speaker::new`'s notify message).
+/// Deliberately in the `WM_USER` range, not `WM_APP_*`: it never leaves this
+/// window, so it is not part of the crate-wide `WM_APP_*` registry.
+const WM_CARD_SPEECH_END: u32 = WM_USER + 0x77;
 
 const CLASS_NAME: &str = "Wingman.Card.Window.7f3c1a9e";
 /// Rule 9: the preview state's real-Win32 test creates an actual `HWND` with
@@ -1115,6 +1129,24 @@ struct CardInner {
     /// math. `None` whenever there is nothing to show (not an error card,
     /// or not Expanded yet); recomputed by every `layout_expanded` call.
     copy_details_rect: Option<RECT>,
+    /// Issue #77: `true` while the card is an answer card (set only by
+    /// [`Card::show_answer`]), i.e. one with a "Read aloud" footer to offer
+    /// once Expanded. Mutually exclusive with `copy_details_available`:
+    /// both share the one pinned footer row.
+    read_aloud_available: bool,
+    /// The "Read aloud" footer's hit-test rect while Expanded, same
+    /// coordinates and same no-scroll-math reasoning as `copy_details_rect`.
+    read_aloud_rect: Option<RECT>,
+    /// The system voice, created on the first "Read aloud" click (so a card
+    /// that is never read aloud never touches COM or SAPI). Lives on the
+    /// main STA thread, like the card.
+    speaker: Option<Speaker>,
+    /// `true` from the click that starts the voice until the voice ends or
+    /// is stopped; drives the footer label ("Read aloud" / "Stop reading").
+    reading: bool,
+    /// The voice's stream number for the utterance `reading` refers to, so
+    /// the end of a replaced utterance is not taken for the end of this one.
+    reading_stream: u32,
     preview_decision_pending: bool,
     /// Issue #225: incremented on every [`CardInner::show_preview`], and
     /// posted as `WM_APP_PREVIEW_DECIDED`'s `WPARAM` so the owner can tell
@@ -1321,6 +1353,10 @@ impl CardInner {
         // "Copy details" affordance for an error it isn't.
         self.copy_details_available = false;
         self.copy_details_rect = None;
+        // Issue #77: likewise, only `Card::show_answer` turns "Read aloud"
+        // on, right after this call returns.
+        self.read_aloud_available = false;
+        self.read_aloud_rect = None;
 
         unsafe {
             if auto_dismiss_secs > 0 {
@@ -1339,6 +1375,7 @@ impl CardInner {
 
     fn hide(&mut self) {
         self.leave_preview_if_active();
+        self.stop_reading();
         self.kill_timers();
         self.set_noactivate(true);
         self.state = CardState::Hidden;
@@ -1369,6 +1406,8 @@ impl CardInner {
     }
 
     fn reset_activation_and_timers(&mut self) {
+        // Issue #77: a new card replaces the old one, so its voice stops too.
+        self.stop_reading();
         self.kill_timers();
         self.set_noactivate(true);
     }
@@ -1480,6 +1519,92 @@ impl CardInner {
         }
     }
 
+    /// Issue #77: `true` when `(x, y)` (client-window coordinates) lands on
+    /// the pinned "Read aloud" footer; `false` when there is no such footer.
+    fn point_hits_read_aloud(&self, x: i32, y: i32) -> bool {
+        let Some(r) = self.read_aloud_rect else {
+            return false;
+        };
+        (r.left..r.right).contains(&x) && (r.top..r.bottom).contains(&y)
+    }
+
+    /// Issue #77: the footer's label for the current state.
+    fn read_aloud_label(&self) -> &'static str {
+        if self.reading {
+            "Stop reading"
+        } else {
+            "Read aloud"
+        }
+    }
+
+    /// Issue #77: click or Enter on the "Read aloud" footer. Starts the voice
+    /// on the headline and detail, or stops it if it is already reading. A
+    /// voice that cannot be created or spoken to ends in an error card
+    /// (AGENTS.md rule 7), never a silent no-op.
+    fn read_aloud_activated(&mut self) {
+        if self.reading {
+            self.stop_reading();
+            self.invalidate();
+            return;
+        }
+        let text = spoken_text(&self.headline, &self.detail);
+        if text.is_empty() {
+            return;
+        }
+        if self.speaker.is_none() {
+            match Speaker::new(self.hwnd, WM_CARD_SPEECH_END) {
+                Ok(s) => self.speaker = Some(s),
+                Err(e) => {
+                    self.show_collapsed("Can't read aloud", &format!("{e:#}"), 0, None);
+                    return;
+                }
+            }
+        }
+        let result = match &self.speaker {
+            Some(s) => s.speak(&text),
+            None => return,
+        };
+        match result {
+            Ok(stream) => {
+                self.reading = true;
+                self.reading_stream = stream;
+                self.invalidate();
+            }
+            Err(e) => self.show_collapsed("Can't read aloud", &format!("{e:#}"), 0, None),
+        }
+    }
+
+    /// Issue #77: cuts off the voice, if it is reading. Called when the card
+    /// hides or is replaced, so dismissing a card stops the speech.
+    fn stop_reading(&mut self) {
+        if self.reading {
+            if let Some(s) = &self.speaker {
+                s.stop();
+            }
+            self.reading = false;
+        }
+    }
+
+    /// Issue #77: the voice posted its notification. Only the end of the
+    /// utterance this card is reading clears `reading`; the end of one that
+    /// was just replaced (it can arrive after the new one has started) is
+    /// ignored.
+    fn on_speech_end(&mut self) {
+        let Some(speaker) = &self.speaker else {
+            return;
+        };
+        let ended = speaker.ended_streams();
+        if self.reading && ended.contains(&self.reading_stream) {
+            self.reading = false;
+            self.invalidate();
+        }
+    }
+
+    /// The pinned footer row's rect, whichever footer the card has.
+    fn footer_rect(&self) -> Option<RECT> {
+        self.copy_details_rect.or(self.read_aloud_rect)
+    }
+
     // -- layout ------------------------------------------------------------
 
     fn work_area_for_cursor(&self) -> RECT {
@@ -1568,7 +1693,7 @@ impl CardInner {
         // needs no scroll_offset math (see `copy_details_rect`'s doc
         // comment). Only an error card (`copy_details_available`) reserves
         // the space at all.
-        let footer_h = if self.copy_details_available {
+        let footer_h = if self.copy_details_available || self.read_aloud_available {
             self.line_height(self.fonts.body).max(1)
         } else {
             0
@@ -1588,7 +1713,7 @@ impl CardInner {
         self.scroll_max = (content_h - viewport_h).max(0);
         self.scroll_offset = self.scroll_offset.clamp(0, self.scroll_max);
 
-        self.copy_details_rect = if footer_h > 0 {
+        let footer = if footer_h > 0 {
             let top = window_h - padding - footer_h;
             Some(RECT {
                 left: padding,
@@ -1599,6 +1724,10 @@ impl CardInner {
         } else {
             None
         };
+        // Issue #77: the one pinned footer row is "Copy details" on an error
+        // card and "Read aloud" on an answer card, never both.
+        self.copy_details_rect = footer.filter(|_| self.copy_details_available);
+        self.read_aloud_rect = footer.filter(|_| self.read_aloud_available);
 
         self.place_bottom_right(work, width, window_h);
     }
@@ -1991,7 +2120,7 @@ impl CardInner {
         // makes -- otherwise a long detail could scroll text underneath (or
         // the clip region could cut into) the footer row.
         let footer_reserve = self
-            .copy_details_rect
+            .footer_rect()
             .map(|r| (rc.bottom - r.top) + gap - padding)
             .unwrap_or(0)
             .max(0);
@@ -2094,13 +2223,18 @@ impl CardInner {
         // `IntersectClipRect`, which only ever narrows -- painting here,
         // after that clip has already applied to everything above, still
         // draws within it unless the clip is reset, so reset it first).
-        if let Some(footer_rect) = self.copy_details_rect {
+        if let Some(footer_rect) = self.footer_rect() {
+            let label = if self.copy_details_rect.is_some() {
+                "Copy details"
+            } else {
+                self.read_aloud_label()
+            };
             let _ = SelectClipRgn(hdc, None);
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
             draw_text_line(
                 hdc,
-                "Copy details",
+                label,
                 footer_rect,
                 DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
             );
@@ -2254,6 +2388,8 @@ impl CardInner {
                     let (x, y) = crate::dismiss::unpack_point(lparam.0 as u32);
                     if self.point_hits_copy_details(x, y) {
                         self.copy_details_activated();
+                    } else if self.point_hits_read_aloud(x, y) {
+                        self.read_aloud_activated();
                     }
                 } else {
                     self.try_expand();
@@ -2283,6 +2419,12 @@ impl CardInner {
                     // Enter activates "Copy details" while it is showing, the
                     // same way it already activates "Do it" in Preview.
                     self.copy_details_activated();
+                } else if self.state == CardState::Expanded
+                    && wparam.0 as u16 == VK_RETURN.0
+                    && self.read_aloud_rect.is_some()
+                {
+                    // Issue #77: Enter toggles "Read aloud" the same way.
+                    self.read_aloud_activated();
                 } else if self.state == CardState::Preview {
                     if let Some(command_id) = preview_key_command(wparam.0 as u16) {
                         self.run_preview_command(command_id);
@@ -2299,6 +2441,10 @@ impl CardInner {
             }
             WM_KILLFOCUS => {
                 self.close_expanded();
+                Some(LRESULT(0))
+            }
+            WM_CARD_SPEECH_END => {
+                self.on_speech_end();
                 Some(LRESULT(0))
             }
             WM_DPICHANGED => {
@@ -2337,6 +2483,9 @@ impl CardInner {
         main_window_exists: bool,
     ) {
         self.leave_preview_if_active();
+        // Issue #77: the preview replaces whatever was showing, including an
+        // answer being read aloud.
+        self.stop_reading();
         // The preview never auto-dismisses on a timer (rule 5 and safety:
         // an action that writes something must never fire because nobody
         // was there to see a countdown) -- so, unlike show_pending/
@@ -3482,6 +3631,143 @@ mod tests {
     }
 
     #[test]
+    fn expanded_answer_card_reserves_a_read_aloud_footer() {
+        // Issue #77.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(
+            card.inner.read_aloud_rect.is_some(),
+            "answer card needs \"Read aloud\""
+        );
+        assert!(card.inner.copy_details_rect.is_none());
+        assert_eq!(card.inner.read_aloud_label(), "Read aloud");
+    }
+
+    #[test]
+    fn expanded_error_card_has_no_read_aloud_footer() {
+        // Issue #77 neighbour: the one footer row belongs to "Copy details"
+        // on an error card, and an error is not read aloud.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "tracked detail");
+        card.inner.try_expand();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert!(card.inner.read_aloud_rect.is_none());
+        assert!(card.inner.copy_details_rect.is_some());
+    }
+
+    #[test]
+    fn error_card_after_an_answer_card_drops_the_read_aloud_footer() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("Right.", "Details.", 0, None);
+        card.show_error("Oops", "detail");
+        card.inner.try_expand();
+        assert!(card.inner.read_aloud_rect.is_none());
+    }
+
+    #[test]
+    fn clicking_off_the_read_aloud_footer_does_not_start_the_voice() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("Right.", "Details.", 0, None);
+        card.inner.try_expand();
+        let r = card.inner.read_aloud_rect.expect("footer");
+        assert!(!card.inner.point_hits_read_aloud(r.left, r.top - 1));
+        let lparam = LPARAM(((r.top - 1) << 16 | (r.left & 0xFFFF)) as isize);
+        let _ = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), lparam);
+        assert!(!card.inner.reading);
+        assert!(
+            card.inner.speaker.is_none(),
+            "no click on the footer, no COM voice"
+        );
+    }
+
+    /// Pumps this thread's messages for `ms`, dispatching each. SAPI's
+    /// notify window lives on the thread that created the voice and only
+    /// forwards the end-of-speech message to the card while the thread is
+    /// pumped, as the app's main loop does.
+    fn pump_messages(ms: u64) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < deadline {
+            let mut msg = MSG::default();
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Issue #77, needs a working system voice, so `#[ignore]`d. Run
+    /// `cargo test read_aloud_live -- --ignored --nocapture`. Clicking the
+    /// footer starts the voice (label flips), hiding the card stops it.
+    #[test]
+    #[ignore]
+    fn read_aloud_live_click_speaks_and_hide_stops() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer(
+            "Right.",
+            "This answer is long enough that the voice is still talking when we look. \
+             Keep going keep going keep going keep going keep going keep going.",
+            0,
+            None,
+        );
+        card.inner.try_expand();
+        let r = card.inner.read_aloud_rect.expect("footer");
+        let (x, y) = (r.left + 2, r.top + 2);
+        let lparam = LPARAM(((y << 16) | (x & 0xFFFF)) as isize);
+        let _ = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), lparam);
+        assert!(card.inner.reading, "click must start the voice");
+        assert_eq!(card.inner.read_aloud_label(), "Stop reading");
+        // The first utterance can take a moment to start (voice engine load).
+        let speaker = card.inner.speaker.as_ref().unwrap();
+        let started = (0..60).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            speaker.is_speaking()
+        });
+        assert!(started, "the voice must start speaking");
+        card.hide();
+        assert!(!card.inner.reading);
+        let speaker = card.inner.speaker.as_ref().unwrap();
+        let stopped = (0..60).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            !speaker.is_speaking()
+        });
+        assert!(stopped, "hide must stop the voice");
+    }
+
+    /// Issue #77, needs a working system voice: a short utterance that ends
+    /// by itself notifies the card (`WM_CARD_SPEECH_END`), which clears
+    /// `reading`.
+    #[test]
+    #[ignore]
+    fn read_aloud_live_natural_end_posts_notification() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("Hi.", "Ok.", 0, None);
+        card.inner.try_expand();
+        card.inner.read_aloud_activated();
+        assert!(card.inner.reading);
+        // No manual on_speech_end call: only the voice's own notification,
+        // delivered to the card's wndproc, may clear `reading`.
+        pump_messages(3000);
+        assert!(
+            !card.inner.reading,
+            "label must flip back after the voice ends"
+        );
+    }
+
+    #[test]
     fn clicking_copy_details_posts_wm_app_card_copy_details() {
         use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
 
@@ -4483,6 +4769,23 @@ mod tests {
              owner about the FIRST one before showing the second"
         );
         assert_eq!(msg.message, WM_APP_PREVIEW_DECIDED);
+    }
+
+    #[test]
+    fn show_preview_stops_a_card_that_is_being_read_aloud() {
+        // Issue #77: a preview replacing an expanded answer must stop the
+        // voice and clear `reading`, like hide() and the other show_* paths.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("Right.", "Details.", 0, None);
+        card.inner.try_expand();
+        card.inner.reading = true;
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_preview("Add to calendar", &schema, &value, false);
+        assert!(
+            !card.inner.reading,
+            "a preview must stop the read-aloud state"
+        );
     }
 
     #[test]
