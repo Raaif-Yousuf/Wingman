@@ -1307,38 +1307,39 @@ impl App {
         let action_for_result = action.clone();
         let schema_for_result = schema.clone();
         std::thread::spawn(move || {
-            let result: std::result::Result<Value, String> = (|| -> Result<Value> {
-                // #484: gather what the action's `inputs` list asks for, then
-                // let the pure `plan` decide the user text and whether the
-                // screenshot goes along (a selection-only action sends no image).
-                let gathered = gather_generic_inputs(&inputs, foreground_hwnd_isize);
-                let planned = actions::generic_inputs::plan(&inputs, &gathered)
-                    .map_err(anyhow::Error::msg)?;
-                let shot = if planned.screen {
-                    Some(capture::encode(&raw)?)
-                } else {
-                    None
-                };
-                let ollama_ready = mode == Mode::Auto
-                    && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
-                    && mode::probe_ollama_ready(
-                        &providers.ollama.base_url,
-                        &providers.ollama.model,
-                    );
-                let chain = providers.build_chain_for_mode(mode, ollama_ready);
-                let req = generic_action_request(shot.as_ref(), &prompt, &planned.user, schema);
-                chain.complete_parsed_with_fallback(
-                    &req,
-                    || non_vision_inputs(&raw, foreground_hwnd_isize),
-                    |c| actions::parse_generic_proposal(&c.text),
-                )
-            })()
-            .map_err(|e| {
-                pack_error(
-                    &human_error_detail(&format!("{e:#}")),
-                    &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
-                )
-            });
+            let result: std::result::Result<Value, String> =
+                (|| -> Result<Value, GenericFailure> {
+                    // #484: gather what the action's `inputs` list asks for, then
+                    // let the pure `plan` decide the user text and whether the
+                    // screenshot goes along (a selection-only action sends no image).
+                    let gathered = gather_generic_inputs(&inputs, foreground_hwnd_isize)?;
+                    let planned = actions::generic_inputs::plan(&inputs, &gathered)
+                        .map_err(GenericFailure::UserState)?;
+                    // #493: gathered text is data, not instructions.
+                    let system = match planned.system_note {
+                        Some(note) => format!("{prompt}\n\n{note}"),
+                        None => prompt.clone(),
+                    };
+                    let shot = if planned.screen {
+                        Some(capture::encode(&raw)?)
+                    } else {
+                        None
+                    };
+                    let ollama_ready = mode == Mode::Auto
+                        && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+                        && mode::probe_ollama_ready(
+                            &providers.ollama.base_url,
+                            &providers.ollama.model,
+                        );
+                    let chain = providers.build_chain_for_mode(mode, ollama_ready);
+                    let req = generic_action_request(shot.as_ref(), &system, &planned.user, schema);
+                    Ok(chain.complete_parsed_with_fallback(
+                        &req,
+                        || non_vision_inputs(&raw, foreground_hwnd_isize),
+                        |c| actions::parse_generic_proposal(&c.text),
+                    )?)
+                })()
+                .map_err(pack_generic_failure);
             let payload = Box::into_raw(Box::new((action_for_result, schema_for_result, result)));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -3378,41 +3379,70 @@ fn uia_fields_text(foreground_hwnd: isize) -> String {
     .unwrap_or_default()
 }
 
+/// Why a generic action's worker ended without an answer (#493). A
+/// `UserState` is the user's situation (nothing selected, a password field),
+/// shown as its own plain message; a `Fault` is a real failure and keeps the
+/// "use Copy diagnostics" next step.
+enum GenericFailure {
+    UserState(String),
+    Fault(anyhow::Error),
+}
+
+impl From<anyhow::Error> for GenericFailure {
+    fn from(e: anyhow::Error) -> Self {
+        GenericFailure::Fault(e)
+    }
+}
+
+/// Packs a [`GenericFailure`] for the result message (see [`pack_error`]).
+fn pack_generic_failure(f: GenericFailure) -> String {
+    match f {
+        GenericFailure::UserState(message) => pack_error(&message, &message),
+        GenericFailure::Fault(e) => pack_error(
+            &human_error_detail(&format!("{e:#}")),
+            &crate::egress::redact_opaque_tokens(&format!("{e:#}")),
+        ),
+    }
+}
+
 /// #484: reads the text inputs a generic action's `inputs` list names
 /// (selection, clipboard, UIA fields) using the existing readers, only the
 /// ones listed. Runs on the worker thread (the selection and UIA readers
-/// block against a slow app, see their module docs). A reader that fails
-/// yields nothing, and `actions::generic_inputs::plan` decides what that
-/// means for the request.
+/// block against a slow app, see their module docs). An empty or unreadable
+/// input yields nothing, and `actions::generic_inputs::plan` decides what
+/// that means for the request. The selection reader's only error is a
+/// clipboard that could not be restored after its Ctrl+C fallback, which is
+/// reported as its own failure (rule 7), never as "nothing selected".
 fn gather_generic_inputs(
     inputs: &[actions::InputKind],
     foreground_hwnd: isize,
-) -> actions::generic_inputs::Gathered {
+) -> Result<actions::generic_inputs::Gathered, GenericFailure> {
     let mut gathered = actions::generic_inputs::Gathered::default();
     if actions::generic_inputs::wants_selection(inputs) {
-        gathered.selection = crate::inputs::selection::get_selection_foreground(
+        let selection = crate::inputs::selection::get_selection_foreground(
             crate::inputs::selection::DEFAULT_MAX_CHARS,
             crate::inputs::selection::DEFAULT_CLIPBOARD_WAIT_BUDGET,
         )
-        .ok()
-        .map(|s| s.text);
+        .context("couldn't put your clipboard back after reading the selection")?;
+        gathered.selection_in_password_field =
+            selection.source == crate::inputs::selection::SelectionSource::SkippedPasswordField;
+        gathered.selection_truncated = selection.truncated;
+        gathered.selection = Some(selection.text);
     }
     if actions::generic_inputs::wants_clipboard(inputs) {
-        gathered.clipboard = arboard::Clipboard::new()
-            .and_then(|mut c| c.get_text())
-            .ok()
-            .map(|t| {
-                crate::inputs::selection::truncate_bounded(
-                    &t,
-                    crate::inputs::selection::DEFAULT_MAX_CHARS,
-                )
-                .0
-            });
+        if let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            let (text, truncated) = crate::inputs::selection::truncate_bounded(
+                &text,
+                crate::inputs::selection::DEFAULT_MAX_CHARS,
+            );
+            gathered.clipboard = Some(text);
+            gathered.clipboard_truncated = truncated;
+        }
     }
     if actions::generic_inputs::wants_uia(inputs) {
         gathered.uia = Some(uia_fields_text(foreground_hwnd));
     }
-    gathered
+    Ok(gathered)
 }
 
 /// #23: the precedence rule from the design spec's "Origin tracking"
@@ -6133,6 +6163,25 @@ mod tests {
             detail,
             "Couldn't read your clock settings. Try again, and if it keeps happening, use Copy diagnostics for details."
         );
+    }
+
+    /// #493: a user-state failure ("nothing is selected") is a plain
+    /// message; only a real fault gets the "use Copy diagnostics" step.
+    #[test]
+    fn generic_user_state_failure_has_no_diagnostics_suffix_but_a_fault_does() {
+        use super::{pack_generic_failure, unpack_error, GenericFailure};
+        let message = "Nothing is selected. Select some text first.";
+        let packed = pack_generic_failure(GenericFailure::UserState(message.to_string()));
+        let (human, chain) = unpack_error(&packed);
+        assert_eq!(human, message);
+        assert_eq!(chain, message);
+
+        let fault = pack_generic_failure(GenericFailure::Fault(anyhow::anyhow!(
+            "couldn't put your clipboard back after reading the selection"
+        )));
+        let (human, _) = unpack_error(&fault);
+        assert!(human.starts_with("couldn't put your clipboard back"));
+        assert!(human.contains("Copy diagnostics"));
     }
 
     /// #349's "Done when": no card's visible text may contain a Win32/API
