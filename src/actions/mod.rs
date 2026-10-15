@@ -8,6 +8,7 @@
 pub mod action_items;
 pub mod calendar;
 pub mod define_word;
+pub mod describe_image;
 pub mod explain_error;
 pub mod extract_text;
 pub mod fill_form;
@@ -234,6 +235,9 @@ pub const EXTRACT_TEXT_ACTION_ID: &str = "extract-text-to-clipboard";
 /// - `"translate-selection"` (#68, `translate::builtin_action`): proposal
 ///   `text_answer`, executor `replace_text`. Confirms on a card, then writes
 ///   the translation over the selection (`actions::generic_replace`).
+/// - `"describe-image-alt-text"` (#113, `describe_image::builtin_action`):
+///   proposal `text_answer`, executor `clipboard`. One sentence of alt text for
+///   the image on screen, confirmed on a card, then copied.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -272,6 +276,7 @@ pub fn builtin_actions() -> Vec<Action> {
         explain_error::builtin_action(),
         define_word::builtin_action(),
         translate::builtin_action(),
+        describe_image::builtin_action(),
     ]
 }
 

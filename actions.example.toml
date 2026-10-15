@@ -179,3 +179,18 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "describe-image-alt-text"
+name = "Describe image (alt text)"
+group = "Work"
+inputs = ["screen"]
+proposal = "text_answer"
+executor = "clipboard"
+confirm = true
+prompt = 'You are shown a screenshot that contains an image, chart, graph, photo or diagram. Pick the main one: the largest, or the one in the foreground. Write alt text for it in `text`: one plain sentence of at most 125 characters, for someone who cannot see it. Say what it shows and, for a chart or graph, the one thing it says (the trend or the biggest value, and what is measured). Do not start with "image of", "picture of" or "chart of". Use only what is visible: never guess names, numbers or places that are not shown. If there is no image, chart or photo on the screen, say so in one sentence. Use plain text only: no markdown, no quotation marks around the sentence, no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
