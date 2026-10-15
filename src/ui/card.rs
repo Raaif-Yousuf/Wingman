@@ -4435,6 +4435,42 @@ mod tests {
         assert_eq!(cue_count(&at_end), 0, "no chevron at the end");
     }
 
+    #[test]
+    fn the_bottom_edge_fades_text_only_while_there_is_more_below() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let detail = "mmmm mmmm mmmm mmmm mmmm mmmm mmmm mmmm mmmm mmmm
+"
+        .repeat(80);
+        card.show_answer("Headline", &detail, 0, None);
+        card.inner.try_expand();
+        assert!(card.inner.scroll_max > 0);
+        let padding = card.inner.scale(PADDING_DP);
+        let gap = card.inner.scale(GAP_DP);
+        let line = card.inner.line_height(card.inner.fonts.body).max(1);
+        let fade_h = line + card.inner.scale(FADE_EXTRA_DP);
+        let ink = card.inner.theme.palette().detail;
+        // Pixels in the fade band, left half (the chevron is on the right),
+        // that are full-strength text colour: a fade blends every one of them.
+        let solid_ink = |card: &Card| {
+            let (w, h, px) = render(card);
+            let bottom = card
+                .inner
+                .footer_rect()
+                .map(|r| r.top - gap)
+                .unwrap_or(h - padding);
+            (bottom - fade_h..bottom)
+                .flat_map(|y| (padding..w / 2).map(move |x| (x, y)))
+                .filter(|&(x, y)| px[(y * w + x) as usize] == ink)
+                .count()
+        };
+        assert_eq!(solid_ink(&card), 0, "text under the fade is blended away");
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_END.0 as usize), LPARAM(0));
+        assert!(
+            solid_ink(&card) > 0,
+            "without more below the same band is plain text"
+        );
+    }
+
     // -- live theme change (#431) ------------------------------------------
 
     fn opposite(theme: Theme) -> Theme {
