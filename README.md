@@ -299,6 +299,7 @@ in words.
 | `capture.max_edge` | `1568` | long-edge downscale before upload; lower cuts cost |
 | `capture.monitor` | `"active"` | `"active"` follows the focused window; `"primary"` pins it |
 | `capture.redact` | `true` | paint over card numbers, IBANs, key-like tokens and email addresses in the screenshot before a cloud request; adds about 0.2 to 0.3 s. Local-only requests skip it. If the check cannot run, nothing is sent |
+| `egress_preview.enabled` | `false` | before any request leaves this computer, show a card with what will be sent (the image size, the prompt and the text) and the provider it goes to; **Send** sends it, Esc cancels and nothing is sent. Requests to Ollama on 127.0.0.1 stay on this machine and are not shown. The Quick Ask suggestion that reads your screen when the palette opens is skipped while this is on |
 | `providers.order` | `["openai", "anthropic"]` | fallback order; add `"ollama"`/`"gemini"` by hand, see [`docs/providers.md`](docs/providers.md) |
 | `providers.*.effort` | `"low"` | reasoning depth; raise for harder problems |
 | `providers.ollama.base_url` | `"http://127.0.0.1:11434"` | never `localhost`, see [`docs/providers.md`](docs/providers.md#ollama) |

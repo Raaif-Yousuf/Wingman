@@ -214,6 +214,13 @@ impl Provider for Ollama {
         "ollama"
     }
 
+    /// #105: a request to a literal loopback address stays on this machine,
+    /// so it needs no send preview. Same test `provider::common`'s send
+    /// guard applies to the request URL.
+    fn sends_off_machine(&self) -> bool {
+        crate::mode::classify_host(&self.base_url) != crate::mode::HostClass::Loopback
+    }
+
     fn ready(&self) -> bool {
         // No API key to gate on -- a local server either answers or the
         // request fails with a transport error, which `Chain` already

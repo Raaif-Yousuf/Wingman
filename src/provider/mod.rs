@@ -452,7 +452,51 @@ pub trait Provider: Send + Sync {
     /// needed before anything can be shown, and streaming would only add a
     /// thread-crossing path and a class of partial-state bugs).
     fn complete(&self, req: &Request) -> anyhow::Result<Completion>;
+
+    /// #105: whether a request to this provider leaves the machine. Defaults
+    /// to `true`, so a new provider is previewed until it says otherwise.
+    /// Ollama and a compat endpoint on a loopback address override this.
+    fn sends_off_machine(&self) -> bool {
+        true
+    }
 }
+
+/// #105 "Show me what you're sending". Asked once per provider attempt, on
+/// the worker thread, before a request that leaves the machine is made while
+/// `config.egress_preview.enabled` is on. It returns the proof the user
+/// pressed Send, or `None` for Cancel (or anything that is not a clear Send).
+/// `ui::send_gate` is the one real implementation.
+pub trait SendGate: Send + Sync {
+    fn confirm(
+        &self,
+        provider_id: &str,
+        req: &Request,
+    ) -> Option<crate::ui::confirm::SendAuthorized>;
+}
+
+static SEND_GATE: std::sync::OnceLock<std::sync::Arc<dyn SendGate>> = std::sync::OnceLock::new();
+
+/// Installs the process-wide gate every [`Chain`] built afterwards uses. Set
+/// once at startup; a second call is ignored.
+pub fn install_send_gate(gate: std::sync::Arc<dyn SendGate>) {
+    let _ = SEND_GATE.set(gate);
+}
+
+/// The user cancelled the send preview. Stops the whole chain: falling
+/// through to the next provider would only ask the same question again.
+#[derive(Debug)]
+pub struct SendCancelled;
+
+impl std::fmt::Display for SendCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Not sent. You cancelled the preview, so nothing left this computer."
+        )
+    }
+}
+
+impl std::error::Error for SendCancelled {}
 
 /// Runs a list of providers in order, falling through to the next on any
 /// failure (transport error, non-2xx, or unparseable body). A provider that
@@ -461,11 +505,75 @@ pub trait Provider: Send + Sync {
 /// *first* encountered error is surfaced.
 pub struct Chain {
     providers: Vec<Box<dyn Provider>>,
+    /// #105: `true` for a chain that must never show the send preview (see
+    /// [`Chain::without_prompt`]).
+    no_prompt: bool,
+    /// Test seam: used instead of the process-wide gate.
+    #[cfg(test)]
+    test_gate: Option<std::sync::Arc<dyn SendGate>>,
 }
 
 impl Chain {
     pub fn new(providers: Vec<Box<dyn Provider>>) -> Self {
-        Self { providers }
+        Self {
+            providers,
+            no_prompt: false,
+            #[cfg(test)]
+            test_gate: None,
+        }
+    }
+
+    /// #105: this chain never shows the send preview. With the toggle on, a
+    /// request that leaves the machine is then refused by the send guard
+    /// instead of asking. Used by the Quick Ask router, which runs on its
+    /// own when the palette opens and so must not pop a card.
+    pub fn without_prompt(mut self) -> Self {
+        self.no_prompt = true;
+        self
+    }
+
+    /// Test seam: a chain with a specific gate instead of the global one.
+    #[cfg(test)]
+    fn with_gate(mut self, gate: std::sync::Arc<dyn SendGate>) -> Self {
+        self.test_gate = Some(gate);
+        self
+    }
+
+    /// The gate to ask, looked up when a request is made (not when the chain
+    /// is built, so a chain built before startup finished still prompts).
+    fn gate(&self) -> Option<std::sync::Arc<dyn SendGate>> {
+        if self.no_prompt {
+            return None;
+        }
+        #[cfg(test)]
+        if let Some(gate) = &self.test_gate {
+            return Some(gate.clone());
+        }
+        SEND_GATE.get().cloned()
+    }
+
+    /// One provider attempt, behind the send preview when it applies: the
+    /// toggle is on, a gate is installed and this provider's request leaves
+    /// the machine. The gate sees `req` as it will actually be sent (after
+    /// redaction, and after the non-vision rewrite). Cancel is a
+    /// [`SendCancelled`] error that the callers return at once.
+    fn attempt<T>(
+        &self,
+        provider: &dyn Provider,
+        req: &Request,
+        parse: &mut impl FnMut(&Completion) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        if let Some(gate) = self.gate() {
+            if crate::config::egress_preview_enabled() && provider.sends_off_machine() {
+                let Some(authorized) = gate.confirm(provider.id(), req) else {
+                    return Err(SendCancelled.into());
+                };
+                return common::with_send_authorized(authorized, || {
+                    attempt_provider(provider, req, parse)
+                });
+            }
+        }
+        attempt_provider(provider, req, parse)
     }
 
     /// Tries each ready provider in order, returning the first success. See
@@ -522,8 +630,9 @@ impl Chain {
             if !provider.ready() {
                 continue;
             }
-            match attempt_provider(provider.as_ref(), req, &mut parse) {
+            match self.attempt(provider.as_ref(), req, &mut parse) {
                 Ok(value) => return Ok(value),
+                Err(e) if e.downcast_ref::<SendCancelled>().is_some() => return Err(e),
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -604,8 +713,9 @@ impl Chain {
                 std::borrow::Cow::Borrowed(req)
             };
 
-            match attempt_provider(provider.as_ref(), effective.as_ref(), &mut parse) {
+            match self.attempt(provider.as_ref(), effective.as_ref(), &mut parse) {
                 Ok(value) => return Ok(value),
+                Err(e) if e.downcast_ref::<SendCancelled>().is_some() => return Err(e),
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -2849,5 +2959,304 @@ mod tests {
             rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
         }
         rgba
+    }
+
+    // -- #105 "Show me what you're sending": the chain-level gate ----------
+
+    /// Records every question the gate was asked and answers with a fixed
+    /// decision. `authorize` builds the real proof the same way the card's
+    /// Send handler does.
+    struct FakeGate {
+        send: bool,
+        asked: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeGate {
+        fn new(send: bool) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                send,
+                asked: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn asked(&self) -> Vec<(String, String)> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl SendGate for FakeGate {
+        fn confirm(
+            &self,
+            provider_id: &str,
+            req: &Request,
+        ) -> Option<crate::ui::confirm::SendAuthorized> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((provider_id.to_string(), req.user.clone()));
+            self.send.then(|| {
+                crate::ui::confirm::authorize_send(crate::ui::confirm::user_confirmed_send())
+            })
+        }
+    }
+
+    /// A provider that stands in for the HTTP boundary: `complete` runs the
+    /// real send guard against a cloud URL, so it only succeeds when the
+    /// chain granted an authorization for this very attempt.
+    struct GuardProbe {
+        id: &'static str,
+        off_machine: bool,
+        reached: AtomicU32,
+    }
+
+    impl GuardProbe {
+        fn new(id: &'static str, off_machine: bool) -> Self {
+            Self {
+                id,
+                off_machine,
+                reached: AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl Provider for GuardProbe {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn capabilities(&self, _model: &str) -> Caps {
+            Caps::default()
+        }
+        fn own_caps(&self) -> Caps {
+            Caps {
+                vision: true,
+                ..Caps::default()
+            }
+        }
+        fn sends_off_machine(&self) -> bool {
+            self.off_machine
+        }
+        fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+            common::send_preview_guard("https://api.example.com/v1")?;
+            self.reached.fetch_add(1, Ordering::SeqCst);
+            Ok(Completion {
+                text: "{}".to_string(),
+                usage: None,
+                stop: StopReason::Complete,
+            })
+        }
+    }
+
+    fn gated_request() -> Request {
+        Request {
+            system: "sys".to_string(),
+            user: "the real user text".to_string(),
+            images: vec![vec![1, 2, 3]],
+            schema: None,
+            effort: Effort::Unset,
+            max_tokens: 0,
+        }
+    }
+
+    fn chain_of(providers: Vec<std::sync::Arc<GuardProbe>>) -> Chain {
+        struct Shared(std::sync::Arc<GuardProbe>);
+        impl Provider for Shared {
+            fn id(&self) -> &'static str {
+                self.0.id()
+            }
+            fn capabilities(&self, m: &str) -> Caps {
+                self.0.capabilities(m)
+            }
+            fn own_caps(&self) -> Caps {
+                self.0.own_caps()
+            }
+            fn sends_off_machine(&self) -> bool {
+                self.0.sends_off_machine()
+            }
+            fn complete(&self, req: &Request) -> anyhow::Result<Completion> {
+                self.0.complete(req)
+            }
+        }
+        Chain::new(
+            providers
+                .into_iter()
+                .map(|p| Box::new(Shared(p)) as Box<dyn Provider>)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn send_preview_cancel_never_reaches_the_provider_or_the_next_one() {
+        let _g = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(true);
+        let first = std::sync::Arc::new(GuardProbe::new("first", true));
+        let second = std::sync::Arc::new(GuardProbe::new("second", true));
+        let gate = FakeGate::new(false);
+        let chain = chain_of(vec![first.clone(), second.clone()]).with_gate(gate.clone());
+
+        let result = chain.complete_parsed(&gated_request(), |c| Ok(c.text.clone()));
+
+        crate::config::set_egress_preview_enabled(false);
+        let err = result.expect_err("a cancelled preview must fail");
+        assert!(err.downcast_ref::<SendCancelled>().is_some(), "{err:#}");
+        assert_eq!(first.reached.load(Ordering::SeqCst), 0);
+        assert_eq!(second.reached.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.asked().len(), 1, "cancel must not ask again");
+        assert!(!err.to_string().contains('\u{2014}'), "rule 11: {err}");
+    }
+
+    #[test]
+    fn send_preview_send_runs_the_attempt_inside_an_authorized_scope() {
+        let _g = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(true);
+        let probe = std::sync::Arc::new(GuardProbe::new("cloud", true));
+        let gate = FakeGate::new(true);
+        let chain = chain_of(vec![probe.clone()]).with_gate(gate.clone());
+
+        let result = chain.complete_parsed(&gated_request(), |c| Ok(c.text.clone()));
+
+        crate::config::set_egress_preview_enabled(false);
+        assert_eq!(result.unwrap(), "{}");
+        assert_eq!(probe.reached.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            gate.asked(),
+            vec![("cloud".to_string(), "the real user text".to_string())]
+        );
+    }
+
+    #[test]
+    fn send_preview_is_asked_once_per_cloud_provider_so_a_fallback_is_previewed_too() {
+        let _g = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(true);
+        let first = std::sync::Arc::new(GuardProbe::new("first", true));
+        let second = std::sync::Arc::new(GuardProbe::new("second", true));
+        let gate = FakeGate::new(true);
+        let chain = chain_of(vec![first.clone(), second.clone()]).with_gate(gate.clone());
+
+        // The first provider's answer fails validation, so the chain falls
+        // through to the second, which is a different destination.
+        let mut calls = 0;
+        let result = chain.complete_parsed(&gated_request(), |c| {
+            calls += 1;
+            if calls <= 2 {
+                anyhow::bail!("bad answer")
+            }
+            Ok(c.text.clone())
+        });
+
+        crate::config::set_egress_preview_enabled(false);
+        assert!(result.is_ok(), "{result:?}");
+        let ids: Vec<String> = gate.asked().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn send_preview_is_skipped_for_a_provider_that_stays_on_this_machine() {
+        let _g = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(true);
+        let local = std::sync::Arc::new(GuardProbe::new("local", false));
+        let gate = FakeGate::new(false);
+        let chain = chain_of(vec![local.clone()]).with_gate(gate.clone());
+
+        // The probe's own guard call uses a cloud URL, so it is refused
+        // here; what matters is that the gate was never consulted.
+        let _ = chain.complete_parsed(&gated_request(), |c| Ok(c.text.clone()));
+
+        crate::config::set_egress_preview_enabled(false);
+        assert!(gate.asked().is_empty());
+    }
+
+    #[test]
+    fn send_preview_is_skipped_when_the_toggle_is_off() {
+        let _g = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(false);
+        let probe = std::sync::Arc::new(GuardProbe::new("cloud", true));
+        let gate = FakeGate::new(false);
+        let chain = chain_of(vec![probe.clone()]).with_gate(gate.clone());
+
+        let result = chain.complete_parsed(&gated_request(), |c| Ok(c.text.clone()));
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(gate.asked().is_empty(), "default off must never prompt");
+    }
+
+    #[test]
+    fn a_chain_without_prompt_is_refused_by_the_guard_not_asked() {
+        let _g = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(true);
+        let probe = std::sync::Arc::new(GuardProbe::new("cloud", true));
+        let gate = FakeGate::new(true);
+        let chain = chain_of(vec![probe.clone()])
+            .with_gate(gate.clone())
+            .without_prompt();
+
+        let result = chain.complete_parsed(&gated_request(), |c| Ok(c.text.clone()));
+
+        crate::config::set_egress_preview_enabled(false);
+        let err = result.expect_err("the guard must refuse an unconfirmed request");
+        assert!(err.to_string().contains("Nothing was sent"), "{err:#}");
+        assert!(gate.asked().is_empty());
+        assert_eq!(probe.reached.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn send_preview_shows_the_rewritten_request_a_non_vision_provider_will_get() {
+        let _g = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(true);
+
+        struct NoVision;
+        impl Provider for NoVision {
+            fn id(&self) -> &'static str {
+                "novision"
+            }
+            fn capabilities(&self, _m: &str) -> Caps {
+                Caps::default()
+            }
+            fn own_caps(&self) -> Caps {
+                Caps::default()
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+                common::send_preview_guard("https://api.example.com/v1")?;
+                Ok(Completion {
+                    text: "{}".to_string(),
+                    usage: None,
+                    stop: StopReason::Complete,
+                })
+            }
+        }
+        let gate = FakeGate::new(true);
+        let chain = Chain::new(vec![Box::new(NoVision)]).with_gate(gate.clone());
+
+        let result = chain.complete_parsed_with_fallback(
+            &gated_request(),
+            || {
+                Ok(NonVisionInputs {
+                    ocr_text: "OCR WORDS".to_string(),
+                    uia_fields: String::new(),
+                })
+            },
+            |c| Ok(c.text.clone()),
+        );
+
+        crate::config::set_egress_preview_enabled(false);
+        assert!(result.is_ok(), "{result:?}");
+        let asked = gate.asked();
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0].1.contains("OCR WORDS"),
+            "the preview must show the OCR text that is really sent: {asked:?}"
+        );
     }
 }

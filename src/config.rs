@@ -161,10 +161,8 @@ pub struct Config {
     pub forms: Forms,
     /// #105 "Show me what you're sending". Default off (existing behaviour
     /// unchanged): there is no Settings UI to flip this yet
-    /// (`ui/settings.rs`, Phase 3), so today the only way to turn it on is
-    /// hand-editing `config.toml`. See [`EgressPreview`]'s own doc comment
-    /// and `provider::common`'s `send_preview_guard` for what turning it on
-    /// actually does today versus what still has to be wired up.
+    /// (`ui/settings.rs`), so today the only way to turn it on is
+    /// hand-editing `config.toml`. See [`EgressPreview`]'s own doc comment.
     pub egress_preview: EgressPreview,
 }
 
@@ -4322,14 +4320,13 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
 
 /// #105 "Show me what you're sending": a toggle that shows the exact
 /// request about to leave the machine (image dims/size, text, snippets)
-/// with a Send or Cancel before it does. `enabled` alone does not, by
-/// itself, make that preview happen -- see `provider::common`'s
-/// `send_preview_guard`/`with_send_authorized` and `ui::confirm`'s
-/// `SendToken`/`SendAuthorized` for the structural gate this flag feeds,
-/// and that module's doc comment for exactly what still needs wiring
-/// (`App::ask` showing `ui::preview::RequestPreview`) before turning this on
-/// produces the real Send/Cancel UX rather than every request failing
-/// closed with a card naming why.
+/// with a Send or Cancel before it does. With `enabled` on, every request
+/// that leaves the machine is held until the preview card is confirmed:
+/// `provider::Chain` asks `ui::send_gate` before each cloud provider
+/// attempt, and `provider::common`'s `send_preview_guard` refuses anything
+/// that was not confirmed (see `ui::confirm`'s `SendToken`/`SendAuthorized`).
+/// A request to a loopback address (Ollama) never leaves the machine and is
+/// not previewed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EgressPreview {

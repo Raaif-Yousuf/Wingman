@@ -183,16 +183,11 @@ pub struct SendToken(());
 /// (via `tests/compile_fail/send_authorized_is_private.rs`) `include!`s
 /// this file into a throwaway crate with a sibling `attacker` module and
 /// proves that module still cannot construct `SendAuthorized(())` directly.
-#[allow(dead_code)]
 pub struct SendAuthorized(());
 
-/// Stand-in for the future preview card's "Send" / Enter handler, mirroring
-/// [`user_confirmed`]'s doc comment: nothing calls this yet (#105's
-/// remaining wiring is `App::ask` showing `ui::preview::RequestPreview` via
-/// the existing `Card::show_preview` machinery and calling this only on
-/// "Send"), so it exists now purely so [`authorize_send`] has exactly one
-/// sanctioned caller shape to compile against.
-#[allow(dead_code)]
+/// Called by the send preview card's "Send" handler and nowhere else
+/// (`ui::send_gate::decide`), mirroring [`user_confirmed`]: Cancel, Esc and
+/// an abandoned preview never reach it, so no [`SendToken`] exists for them.
 pub(crate) fn user_confirmed_send() -> SendToken {
     SendToken(())
 }
@@ -203,7 +198,6 @@ pub(crate) fn user_confirmed_send() -> SendToken {
 /// module can ever produce a `SendAuthorized` -- which is exactly what
 /// makes `provider::common::send_preview_guard` a structural gate rather
 /// than a checked boolean a caller could simply forget to set.
-#[allow(dead_code)]
 pub(crate) fn authorize_send(_token: SendToken) -> SendAuthorized {
     SendAuthorized(())
 }

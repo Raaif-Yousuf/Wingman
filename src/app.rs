@@ -126,6 +126,14 @@ pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
 /// `WM_APP + 16`: `+15` is already `crate::ui::card::WM_APP_CARD_OPEN_SETTINGS`.
 pub const WM_APP_GENERIC_ACTION_RESULT: u32 = WM_APP + 16;
 
+/// #105: posted by a worker thread (`ui::send_gate::WindowSendGate`) that is
+/// about to send a request off the machine while "Show me what you're
+/// sending" is on. `lparam` is `Box::into_raw(Box::new(ui::send_gate::SendRequest))`;
+/// the handler takes ownership and shows the preview card. `WM_APP + 18`:
+/// `+17` is already `crate::ui::card::WM_APP_CARD_COPY_DETAILS`. Dropping the
+/// request (as the Settings-open `Ignore` path does) cancels the send.
+pub const WM_APP_SEND_PREVIEW: u32 = WM_APP + 18;
+
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
 /// How long to wait after hiding a visible card before capturing, so the
@@ -293,6 +301,12 @@ pub fn run() -> Result<()> {
     let chain = Arc::new(config.build_chain());
 
     let hwnd = create_owner_window(instance)?;
+    // #105: every `Chain` built from here on asks the owner window to show
+    // the send preview before a request leaves the machine (when the toggle
+    // is on). Installed before anything can build a chain.
+    crate::provider::install_send_gate(Arc::new(crate::ui::send_gate::WindowSendGate::new(
+        hwnd.0 as isize,
+    )));
 
     // Registering does not depend on the window existing yet, but doing it
     // right after keeps every piece of startup wiring for the tray icon
@@ -1588,8 +1602,31 @@ impl App {
             Some(PendingPreview::GenericReplace(action, plan)) => {
                 self.run_confirmed_generic_replace(&action, plan, confirmed);
             }
+            Some(PendingPreview::Send(reply)) => {
+                crate::ui::send_gate::decide(reply, true);
+                // The preview card is gone; show the spinner again while
+                // the request this Send released is in flight.
+                let model_name = self.first_provider_model_label().unwrap_or_default();
+                self.card
+                    .show_pending(crate::ui::card::PendingStage::AskingModel { model_name });
+            }
             None => self.run_confirmed_calendar_add(confirmed),
         }
+    }
+
+    /// #105: a worker is about to send a request off the machine and is
+    /// blocked on the answer. Shows what will be sent on the preview card
+    /// ("Send" or Esc). It reuses the one preview slot: if another preview is
+    /// already on screen the request is dropped, which cancels that send
+    /// rather than stacking a second slot (#225).
+    fn on_send_preview(&mut self, request: crate::ui::send_gate::SendRequest) {
+        if matches!(self.card.state(), crate::ui::card::CardState::Preview) {
+            return;
+        }
+        let (schema, value) = request.preview.to_schema_and_value();
+        let title = crate::ui::send_gate::title_for(&request.provider_id);
+        self.pending_preview = Some(PendingPreview::Send(request.reply));
+        self.pending_preview_generation = self.card.show_send_preview(&title, &schema, &value);
     }
 
     /// #242's half of [`App::on_preview_decided`]: resolves `action`'s own
@@ -3431,7 +3468,10 @@ fn router_worker(
         .ok_or_else(|| anyhow::anyhow!("router: unrecognized provider \"{}\"", target.provider))?;
 
     let shot = encode_for_upload(raw, providers, mode, redact)?;
-    let chain = Chain::new(vec![provider]);
+    // #105: the router runs by itself when the palette opens, so it never
+    // shows the send preview; with the toggle on, a cloud request is refused
+    // by the send guard instead and the press simply gets no suggestion.
+    let chain = Chain::new(vec![provider]).without_prompt();
     let raw: &capture::RawShot = raw;
     router::route(&chain, shot.png, candidates, || {
         router_non_vision_inputs(raw)
@@ -4394,6 +4434,11 @@ enum PendingPreview {
         actions::Action,
         Option<Box<actions::generic_replace::ReplaceSelection>>,
     ),
+    /// #105: a worker is blocked before a request that leaves the machine,
+    /// waiting for this preview's answer. Holds the channel back to it:
+    /// "Send" answers it (`ui::send_gate::decide`), and every other way the
+    /// preview ends drops it, which cancels the send.
+    Send(std::sync::mpsc::Sender<confirm::SendAuthorized>),
 }
 
 /// What `wnd_proc` should do with a message addressed to the owner window
@@ -4503,7 +4548,12 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // freed explicitly below too.
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
-        | WM_APP_ROUTER_RESULT => SettingsReentrancy::Ignore,
+        | WM_APP_ROUTER_RESULT
+        // #105: a send preview cannot be answered while Settings is
+        // modal-open, so it is dropped, which cancels the send (the worker
+        // sees the reply channel close and the request ends in a card).
+        // The boxed `SendRequest` is freed explicitly below.
+        | WM_APP_SEND_PREVIEW => SettingsReentrancy::Ignore,
         _ => SettingsReentrancy::Fallback,
     }
 }
@@ -4557,6 +4607,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
                 } else if msg == WM_APP_PALETTE_RUN {
                     drop(unsafe { Box::from_raw(lparam.0 as *mut String) });
+                } else if msg == WM_APP_SEND_PREVIEW {
+                    drop(unsafe {
+                        Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest)
+                    });
                 } else if msg == WM_APP_ROUTER_RESULT {
                     drop(unsafe {
                         Box::from_raw(
@@ -4736,6 +4790,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_preview_decided(wparam.0 as u32);
             LRESULT(0)
         }
+        WM_APP_SEND_PREVIEW => {
+            // #105: the worker is blocked until this is answered or dropped.
+            let request =
+                unsafe { *Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest) };
+            app.on_send_preview(request);
+            LRESULT(0)
+        }
         WM_APP_CARD_OPEN_SETTINGS => {
             // Issue #347: a click on a "settings needed" card. No payload.
             app.open_settings();
@@ -4851,6 +4912,7 @@ mod tests {
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
         WM_APP_GENERIC_ACTION_RESULT, WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
+        WM_APP_SEND_PREVIEW,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
@@ -5594,6 +5656,7 @@ mod tests {
         ("WM_APP_CARD_OPEN_SETTINGS", WM_APP_CARD_OPEN_SETTINGS),
         ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
+        ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
     ];
 
     #[test]
@@ -5849,6 +5912,7 @@ mod tests {
             include_str!("ui/card.rs"),
             include_str!("ui/palette.rs"),
             include_str!("ui/region.rs"),
+            include_str!("ui/send_gate.rs"),
             include_str!("ui/settings.rs"),
             include_str!("ui/tray.rs"),
             include_str!("inputs/selection.rs"),
@@ -6117,6 +6181,11 @@ mod tests {
         (
             "WM_APP_CARD_COPY_DETAILS",
             WM_APP_CARD_COPY_DETAILS,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_SEND_PREVIEW",
+            WM_APP_SEND_PREVIEW,
             SettingsReentrancy::Ignore,
         ),
     ];
