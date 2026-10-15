@@ -183,6 +183,13 @@ A proposal name with no registered schema returns `None`; the caller
 that as a load error for anything that actually needs a completion, never as
 "send no schema".
 
+**Note:** this registry is only for `actions.toml` proposal schemas. The
+intent router builds its own JSON Schema separately: `src/router.rs`'s
+`router_schema` constrains the router's `{summary, intent, confidence}`
+classification completion, and is never looked up through
+`actions::schema::schema_for`. If you are enumerating every JSON Schema this
+crate sends to a model, `router_schema` is one more beyond the list above.
+
 ## Why `serde_json` keeps `preserve_order` (AGENTS.md rule 3)
 
 This is the single most surprising rule in the repo, and it is not
