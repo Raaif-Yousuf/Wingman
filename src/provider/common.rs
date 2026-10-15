@@ -33,28 +33,16 @@ use crate::ui::confirm::SendAuthorized;
 // "Show me what you're sending" (#105): a structural send gate.
 //
 // `SEND_AUTHORIZED` is thread-local, not a shared/global flag, because the
-// only real caller (a future `App::ask` once the preview card is wired up,
-// see this section's doc comment below) already crosses from the main
-// thread (which shows the card and gets the user's decision) to a fresh
-// worker thread (which alone calls into this module) per request -- see
-// `app.rs`'s `ask`. [`with_send_authorized`] is meant to wrap exactly that
-// worker closure's call into `Chain::complete`/`complete_parsed*`, so the
-// authorization is scoped to the one request it was granted for and can
-// never leak into an unrelated later request on a reused thread (a fresh
-// `std::thread::spawn` per request already means there is no reuse today,
-// but the explicit reset at the end of `with_send_authorized` keeps that
-// true even if that ever changes).
+// only real caller (`Chain`, once `ui::send_gate` has shown the preview and the
+// user pressed Send) runs on a worker thread, while the card and the user's
+// decision live on the main thread. [`with_send_authorized`] wraps exactly
+// the one provider attempt the Send was granted for, so the authorization
+// can never leak into an unrelated later request on a reused thread (the
+// explicit reset at the end of `with_send_authorized` keeps that true).
 //
-// STILL OWED (out of this agent's file scope -- app.rs is contended
-// tonight, see the task's file-scope note): nothing calls
-// `with_send_authorized` yet. Until `App::ask` is wired to show
-// `ui::preview::RequestPreview` via the existing `Card::show_preview`/
-// `PreviewModel` machinery (#26) and calls `ui::confirm::user_confirmed_send`
-// only on "Send", turning `config.egress_preview.enabled` on makes EVERY
-// request fail closed with [`send_preview_guard`]'s error (a card naming
-// why, rule 7) rather than silently sending unreviewed -- which is the
-// correct fail-safe direction for a half-wired safety feature, but is not
-// yet the full "Send/Cancel preview" UX #105 describes.
+// With the toggle on and no authorization, [`send_preview_guard`] refuses
+// every non-loopback request with a card naming why (rule 7), so a path
+// that forgets the preview fails closed rather than sending unreviewed.
 // ---------------------------------------------------------------------
 
 thread_local! {
@@ -70,15 +58,6 @@ thread_local! {
 /// runs with the authorization in effect and the flag is always reset
 /// afterward, success or panic-unwind alike (`Drop` guard), so one
 /// confirmed "Send" can never be reused for a second, later request.
-// #105: part of the "Show me what you're sending" gate. The structural half is
-// done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
-// authorized, `send_preview_guard` refuses every request, which is the
-// fail-safe direction. What remains is `App::ask` showing this preview via
-// `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
-// Deliberately not wired yet: that means adding a third pending kind to the
-// preview state machine, which has a live P1 (#225, two pending slots that can
-// both be Some at once). Sequenced after #225 on purpose.
-#[allow(dead_code)]
 pub(crate) fn with_send_authorized<R>(authorized: SendAuthorized, f: impl FnOnce() -> R) -> R {
     let _ = authorized;
     struct ResetOnDrop;
@@ -95,8 +74,17 @@ pub(crate) fn with_send_authorized<R>(authorized: SendAuthorized, f: impl FnOnce
 /// #105: refuses to proceed when `config::egress_preview_enabled()` is on
 /// and this thread has no live [`with_send_authorized`] scope. No em dash
 /// (rule 11) -- this text reaches the result card verbatim.
-fn send_preview_guard() -> Result<()> {
+///
+/// Decision: a request to a literal loopback address (Ollama on 127.0.0.1)
+/// never leaves the machine, so it needs no preview and is let through.
+/// Anything else, including a LAN host or `localhost` by name, is treated as
+/// leaving the machine. `url` is the request's own URL, so this is decided
+/// at the one boundary every request crosses rather than per provider.
+pub(crate) fn send_preview_guard(url: &str) -> Result<()> {
     if !crate::config::egress_preview_enabled() {
+        return Ok(());
+    }
+    if crate::mode::classify_host(url) == crate::mode::HostClass::Loopback {
         return Ok(());
     }
     if SEND_AUTHORIZED.with(|c| c.get()) {
@@ -533,7 +521,7 @@ pub(crate) fn post_json_with(
     timeout: Duration,
     tag: &str,
 ) -> Result<String> {
-    send_preview_guard()?;
+    send_preview_guard(url)?;
     offline_guard(url)?;
     budget_guard(url)?;
 
@@ -858,7 +846,7 @@ pub(crate) fn post_json_with_connect_timeout(
     total_timeout: Duration,
     tag: &str,
 ) -> Result<String> {
-    send_preview_guard()?;
+    send_preview_guard(url)?;
     offline_guard(url)?;
     budget_guard(url)?;
 
@@ -1950,6 +1938,49 @@ mod tests {
             "default behaviour must be unchanged"
         );
         assert_eq!(transport.call_count(), 1);
+    }
+
+    #[test]
+    fn send_preview_guard_lets_a_loopback_url_through_unconfirmed() {
+        let _g = network_guard();
+        crate::config::set_egress_preview_enabled(true);
+
+        let local = send_preview_guard("http://127.0.0.1:11434/api/chat");
+        let cloud = send_preview_guard("https://api.anthropic.com/v1/messages");
+        // `localhost` by name is not a literal loopback address (rule 6),
+        // so it is treated as leaving the machine.
+        let by_name = send_preview_guard("http://localhost:11434/api/chat");
+
+        crate::config::set_egress_preview_enabled(false);
+
+        assert!(local.is_ok(), "Ollama on 127.0.0.1 needs no preview");
+        assert!(cloud.is_err());
+        assert!(by_name.is_err());
+    }
+
+    #[test]
+    fn post_json_with_connect_timeout_reaches_loopback_with_preview_on() {
+        let _g = network_guard();
+        crate::config::set_egress_preview_enabled(true);
+
+        // Nothing listens on port 9 of loopback, so this fails with a
+        // transport error, not with the send guard's refusal.
+        let result = post_json_with_connect_timeout(
+            "http://127.0.0.1:9/api/chat",
+            &[],
+            &json!({}),
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+            "ollama",
+        );
+
+        crate::config::set_egress_preview_enabled(false);
+
+        let err = result.expect_err("nothing is listening");
+        assert!(
+            !err.to_string().contains("Show me what you're sending"),
+            "a loopback request must not be refused by the send guard: {err:#}"
+        );
     }
 
     #[test]

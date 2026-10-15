@@ -45,6 +45,12 @@ pub struct Field {
     /// Whether the schema's `required` array names this field. Used by
     /// [`PreviewModel::missing_required`] to gate "Do it".
     pub required: bool,
+    /// Whether the schema asked for a wrapped, multi-line value
+    /// (`"multiline": true`): the label sits on its own line and the value
+    /// is word-wrapped across the full card width below it, up to a line
+    /// cap. Only meaningful for a non-editable field. The send preview (#105)
+    /// uses it so the real prompt and text are readable, not one clipped line.
+    pub multiline: bool,
 }
 
 /// The preview form's full state: an ordered list of fields, built once from
@@ -176,6 +182,11 @@ impl PreviewModel {
                         value: field_value,
                         editable,
                         required: required.contains(&name.as_str()),
+                        multiline: !editable
+                            && def
+                                .get("multiline")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
                     }
                 })
                 .collect(),
@@ -433,22 +444,12 @@ fn label_for(name: &str) -> String {
 /// even if it wanted to. This is the issue's own documented fallback ("the
 /// image, or its dimensions and size if you cannot render it").
 ///
-/// If issue #103's redaction work has landed by the time a real thumbnail
-/// preview is built, that later code must render the REDACTED image here,
-/// never the original -- showing the unredacted image in a "here's what's
-/// being sent" preview would be exactly the lie #103 exists to prevent.
-/// This type carries no pixels at all, so that dependency does not apply to
-/// it, only to whatever eventually adds real image rendering.
+/// It is built from the `Request`'s own PNG bytes, which are already the
+/// REDACTED image (#103: `capture::encode_for_chain` redacts before the
+/// request exists), so the size and dimensions shown are those of what
+/// really leaves the machine, never of the unredacted capture. If a real
+/// thumbnail is ever drawn here, it must come from the same bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// #105: part of the "Show me what you're sending" gate. The structural half is
-// done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
-// authorized, `send_preview_guard` refuses every request, which is the
-// fail-safe direction. What remains is `App::ask` showing this preview via
-// `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
-// Deliberately not wired yet: that means adding a third pending kind to the
-// preview state machine, which has a live P1 (#225, two pending slots that can
-// both be Some at once). Sequenced after #225 on purpose.
-#[allow(dead_code)]
 pub struct RequestImagePreview {
     pub size_bytes: usize,
     pub width: Option<u32>,
@@ -467,15 +468,6 @@ pub struct RequestImagePreview {
 /// actually lives) -- [`RequestPreview::from_request`] only ever reads a
 /// [`crate::provider::Request`], which has no field for one.
 #[derive(Debug, Clone, PartialEq)]
-// #105: part of the "Show me what you're sending" gate. The structural half is
-// done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
-// authorized, `send_preview_guard` refuses every request, which is the
-// fail-safe direction. What remains is `App::ask` showing this preview via
-// `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
-// Deliberately not wired yet: that means adding a third pending kind to the
-// preview state machine, which has a live P1 (#225, two pending slots that can
-// both be Some at once). Sequenced after #225 on purpose.
-#[allow(dead_code)]
 pub struct RequestPreview {
     pub images: Vec<RequestImagePreview>,
     pub system_text: String,
@@ -486,15 +478,6 @@ pub struct RequestPreview {
 }
 
 impl RequestPreview {
-    // #105: part of the "Show me what you're sending" gate. The structural half is
-    // done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
-    // authorized, `send_preview_guard` refuses every request, which is the
-    // fail-safe direction. What remains is `App::ask` showing this preview via
-    // `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
-    // Deliberately not wired yet: that means adding a third pending kind to the
-    // preview state machine, which has a live P1 (#225, two pending slots that can
-    // both be Some at once). Sequenced after #225 on purpose.
-    #[allow(dead_code)]
     pub fn from_request(req: &crate::provider::Request) -> Self {
         let images = req
             .images
@@ -524,7 +507,6 @@ impl RequestPreview {
     /// `PreviewModel::from_schema` builds every field non-editable by
     /// construction -- confirming this preview can never "edit" the value
     /// into something the request being sent doesn't actually carry.
-    #[allow(dead_code)] // #105, same as the type above: not wired until #225 lands.
     pub fn to_schema_and_value(&self) -> (Value, Value) {
         let mut properties = Map::new();
         let mut value = Map::new();
@@ -545,7 +527,11 @@ impl RequestPreview {
         if !self.system_text.is_empty() {
             properties.insert(
                 "system".to_string(),
-                serde_json::json!({"type": "string", "label": "System prompt"}),
+                serde_json::json!({
+                    "type": "string",
+                    "label": format!("System prompt ({} characters)", self.system_text.chars().count()),
+                    "multiline": true,
+                }),
             );
             value.insert(
                 "system".to_string(),
@@ -555,7 +541,11 @@ impl RequestPreview {
 
         properties.insert(
             "user".to_string(),
-            serde_json::json!({"type": "string", "label": "Text"}),
+            serde_json::json!({
+                "type": "string",
+                "label": format!("Text ({} characters)", self.user_text.chars().count()),
+                "multiline": true,
+            }),
         );
         value.insert("user".to_string(), Value::String(self.user_text.clone()));
 
@@ -579,15 +569,6 @@ impl RequestPreview {
     }
 }
 
-// #105: part of the "Show me what you're sending" gate. The structural half is
-// done (see `ui::confirm::SendAuthorized`): with the toggle on and nothing
-// authorized, `send_preview_guard` refuses every request, which is the
-// fail-safe direction. What remains is `App::ask` showing this preview via
-// `Card::show_preview` and calling `ui::confirm::user_confirmed_send` on Send.
-// Deliberately not wired yet: that means adding a third pending kind to the
-// preview state machine, which has a live P1 (#225, two pending slots that can
-// both be Some at once). Sequenced after #225 on purpose.
-#[allow(dead_code)]
 fn human_bytes(n: usize) -> String {
     if n >= 1_000_000 {
         format!("{:.1} MB", n as f64 / 1_000_000.0)
@@ -1145,6 +1126,36 @@ mod request_preview_tests {
 
         let image_field = model.fields().iter().find(|f| f.name == "image_0").unwrap();
         assert!(image_field.label.contains("340 x 200"), "{image_field:?}");
+    }
+
+    #[test]
+    fn to_schema_and_value_shows_the_prompt_and_text_as_multiline_with_their_length() {
+        let req = request_with("Be helpful.", "What is on screen?", vec![]);
+        let preview = RequestPreview::from_request(&req);
+        let (schema, value) = preview.to_schema_and_value();
+        let model = PreviewModel::from_schema(&schema, &value);
+
+        let system = model.fields().iter().find(|f| f.name == "system").unwrap();
+        let user = model.fields().iter().find(|f| f.name == "user").unwrap();
+        assert!(system.multiline && user.multiline);
+        assert_eq!(system.label, "System prompt (11 characters)");
+        assert_eq!(user.label, "Text (18 characters)");
+        // The image row and the snippets row stay single-line.
+        let snippets = model
+            .fields()
+            .iter()
+            .find(|f| f.name == "snippets")
+            .unwrap();
+        assert!(!snippets.multiline);
+    }
+
+    #[test]
+    fn multiline_is_ignored_for_an_editable_field() {
+        let schema = serde_json::json!({"properties": {
+            "a": {"type": "string", "editable": true, "multiline": true},
+        }});
+        let model = PreviewModel::from_schema(&schema, &serde_json::json!({"a": "x"}));
+        assert!(!model.fields()[0].multiline);
     }
 
     #[test]

@@ -471,6 +471,22 @@ impl Card {
         self.inner.preview_generation
     }
 
+    /// #105: the send preview. The same preview as [`Card::show_preview`],
+    /// with the confirm button reading "Send" instead of "Do it", click-only (Enter
+    /// does nothing, #105). Esc and
+    /// click-away still cancel.
+    #[must_use = "store the generation; on_preview_decided needs it to reject a stale notification"]
+    pub fn show_send_preview(
+        &mut self,
+        title: &str,
+        schema: &serde_json::Value,
+        proposal_value: &serde_json::Value,
+    ) -> u32 {
+        self.inner
+            .show_preview_labeled(title, schema, proposal_value, false, SEND_CONFIRM_LABEL);
+        self.inner.preview_generation
+    }
+
     /// Takes the `Confirmed<Value>` produced by the last "Do it" / Enter, if
     /// any. A take, not a peek: the stored value is cleared by this call, so
     /// the same confirmation can never be handed to an executor twice.
@@ -2723,7 +2739,8 @@ impl CardInner {
                     // Issue #77: Enter toggles "Read aloud" the same way.
                     self.read_aloud_activated();
                 } else if self.state == CardState::Preview {
-                    if let Some(command_id) = preview_key_command(wparam.0 as u16) {
+                    let enter_confirms = self.preview.as_ref().map_or(true, |p| p.enter_confirms);
+                    if let Some(command_id) = preview_key_command(wparam.0 as u16, enter_confirms) {
                         self.run_preview_command(command_id);
                     }
                 }
@@ -2796,6 +2813,19 @@ impl CardInner {
         proposal_value: &Value,
         main_window_exists: bool,
     ) {
+        self.show_preview_labeled(title, schema, proposal_value, main_window_exists, "Do it");
+    }
+
+    /// [`CardInner::show_preview`] with the confirm button's text chosen by
+    /// the caller ("Send" for #105's send preview).
+    fn show_preview_labeled(
+        &mut self,
+        title: &str,
+        schema: &Value,
+        proposal_value: &Value,
+        main_window_exists: bool,
+        confirm_label: &'static str,
+    ) {
         self.leave_preview_if_active();
         // Issue #77: the preview replaces whatever was showing, including an
         // answer being read aloud.
@@ -2842,6 +2872,8 @@ impl CardInner {
             previous_foreground,
             main_window_exists,
             error: None,
+            confirm_label,
+            enter_confirms: label_confirms_with_enter(confirm_label),
         });
         // #225: from here until a decision is reported, tearing this
         // preview down is an abandonment and the owner has to be told. Set
@@ -3083,11 +3115,18 @@ impl CardInner {
         let Some(preview) = self.preview.as_ref() else {
             return;
         };
-        let target = preview
-            .edits
-            .first()
-            .map(|(_, hwnd)| *hwnd)
-            .unwrap_or(preview.do_it_btn);
+        // #105: the send preview must not put focus on its Send button, or a
+        // stray space bar typed for another window would press it. Focus the
+        // card itself; Esc still reaches it.
+        let target = if preview.enter_confirms {
+            preview
+                .edits
+                .first()
+                .map(|(_, hwnd)| *hwnd)
+                .unwrap_or(preview.do_it_btn)
+        } else {
+            self.hwnd
+        };
         if !target.0.is_null() {
             unsafe {
                 let _ = SetFocus(Some(target));
@@ -3130,11 +3169,16 @@ impl CardInner {
             }
         }
 
+        let confirm_label = self
+            .preview
+            .as_ref()
+            .map(|p| p.confirm_label)
+            .unwrap_or("Do it");
         let do_it_btn = create_preview_button(
             parent,
             instance,
             font,
-            "Do it",
+            confirm_label,
             &metrics.buttons.do_it,
             ID_PREVIEW_DO_IT,
             true,
@@ -3294,7 +3338,15 @@ impl CardInner {
         let label_max_w = ((content_width as f32) * PREVIEW_LABEL_MAX_FRACTION) as i32;
         let measured_label_w: Vec<i32> = fields
             .iter()
-            .map(|f| self.measure_label(self.fonts.body, &f.label).0)
+            .map(|f| {
+                // A multi-line field puts its label on its own line, so it
+                // must not widen the label column of the other rows.
+                if f.multiline {
+                    0
+                } else {
+                    self.measure_label(self.fonts.body, &f.label).0
+                }
+            })
             .collect();
         let label_w = label_column_width(&measured_label_w, label_min_w, label_max_w);
         let value_x = content_left + label_w + self.scale(6);
@@ -3302,6 +3354,34 @@ impl CardInner {
 
         let mut rows = Vec::with_capacity(fields.len());
         for (field, &measured_w) in fields.iter().zip(measured_label_w.iter()) {
+            if field.multiline {
+                // #105: the label on its own line, then the value wrapped
+                // across the full width, capped so a long OCR dump cannot
+                // push the buttons off the screen (the last visible line
+                // ends in an ellipsis when the text is longer).
+                let line_h = self.line_height(self.fonts.body).max(1);
+                let wrapped_h = self.measure_wrapped(self.fonts.body, &field.value, content_width);
+                let value_h = wrapped_h.clamp(line_h, line_h * PREVIEW_MULTILINE_MAX_LINES);
+                let label_rect = RECT {
+                    left: content_left,
+                    top: y,
+                    right: content_right,
+                    bottom: y + row_h,
+                };
+                let value_rect = RECT {
+                    left: content_left,
+                    top: y + row_h,
+                    right: content_right,
+                    bottom: y + row_h + value_h,
+                };
+                rows.push(PreviewRowMetrics {
+                    label_rect,
+                    value_rect,
+                    label_wrapped: false,
+                });
+                y += row_h + value_h + row_gap;
+                continue;
+            }
             // A label that still does not fit the (clamped) column wraps to
             // a second line rather than ellipsizing, per #355's "Done
             // when": the whole label must be visible, not just wider.
@@ -3418,12 +3498,12 @@ impl CardInner {
                 let value_rect = row.value_rect;
                 SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
                 SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
-                draw_text_line(
-                    hdc,
-                    &field.value,
-                    value_rect,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-                );
+                let value_format = if field.multiline {
+                    DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS
+                } else {
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
+                };
+                draw_text_line(hdc, &field.value, value_rect, value_format);
             }
         }
     }
@@ -3444,6 +3524,9 @@ const PREVIEW_BUTTON_W_DP: i32 = 84;
 /// (#355): even the widest label never pushes the value column below 55%
 /// of the available space.
 const PREVIEW_LABEL_MAX_FRACTION: f32 = 0.45;
+/// Most lines a multi-line preview value (#105, the send preview's prompt and
+/// text) may take before it ends in an ellipsis.
+const PREVIEW_MULTILINE_MAX_LINES: i32 = 10;
 
 /// Sizes the preview label column from the widest measured label (#355),
 /// clamped between `min_w` (the old fixed 84dp floor) and `max_w` (45% of
@@ -3544,6 +3627,12 @@ struct PreviewUi {
     /// An edit that cannot be read as its field's type (#284), shown in place
     /// of the title until "Do it" is pressed again with every edit valid.
     error: Option<String>,
+    /// The confirm button's text: "Do it" for an action preview, "Send" for
+    /// the send preview (#105).
+    confirm_label: &'static str,
+    /// Whether Enter presses the confirm button; `false` for the send
+    /// preview (#105), which is click-only.
+    enter_confirms: bool,
 }
 
 struct PreviewRowMetrics {
@@ -3578,13 +3667,41 @@ struct PreviewLayoutMetrics {
 /// EDIT/BUTTON child forwards through the same mapping), so both agree by
 /// construction rather than by two hand-kept switch statements. Pure and
 /// unit-tested without a live window -- see the `tests` module below.
-fn preview_key_command(vk: u16) -> Option<i32> {
-    if vk == VK_RETURN.0 {
+///
+/// #105: `enter_confirms` is `false` for the send preview, where Enter does
+/// nothing. A key press meant for another window can land on the card the
+/// instant it takes focus, and that must never send a screenshot: Send is
+/// click-only, Esc still cancels.
+fn preview_key_command(vk: u16, enter_confirms: bool) -> Option<i32> {
+    if vk == VK_RETURN.0 && enter_confirms {
         Some(ID_PREVIEW_DO_IT)
     } else if vk == VK_ESCAPE.0 {
         Some(ID_PREVIEW_CANCEL)
     } else {
         None
+    }
+}
+
+/// The confirm button's text on the send preview (#105).
+const SEND_CONFIRM_LABEL: &str = "Send";
+
+/// Whether Enter may press the confirm button of a preview whose button reads
+/// `confirm_label`. Only the send preview refuses it (see
+/// [`preview_key_command`]).
+fn label_confirms_with_enter(confirm_label: &str) -> bool {
+    confirm_label != SEND_CONFIRM_LABEL
+}
+
+/// Whether Enter confirms the preview showing in `card`. Read-only, same
+/// reasoning as [`live_preview_generation`].
+unsafe fn live_preview_enter_confirms(card: HWND) -> bool {
+    let ptr = GetWindowLongPtrW(card, GWLP_USERDATA) as *const CardInner;
+    if ptr.is_null() {
+        return true;
+    }
+    match &*std::ptr::addr_of!((*ptr).preview) {
+        Some(p) => p.enter_confirms,
+        None => true,
     }
 }
 
@@ -3662,7 +3779,9 @@ unsafe extern "system" fn preview_control_subclass(
 ) -> LRESULT {
     let parent = HWND(ref_data as *mut c_void);
     if msg == WM_KEYDOWN {
-        if let Some(command_id) = preview_key_command(wparam.0 as u16) {
+        if let Some(command_id) =
+            preview_key_command(wparam.0 as u16, live_preview_enter_confirms(parent))
+        {
             let _ = PostMessageW(
                 Some(parent),
                 WM_CARD_PREVIEW_COMMAND,
@@ -4978,12 +5097,30 @@ mod tests {
 
     #[test]
     fn preview_key_command_maps_enter_to_do_it() {
-        assert_eq!(preview_key_command(VK_RETURN.0), Some(ID_PREVIEW_DO_IT));
+        assert_eq!(
+            preview_key_command(VK_RETURN.0, true),
+            Some(ID_PREVIEW_DO_IT)
+        );
+    }
+
+    /// #105: Enter must not send. Esc must still cancel.
+    #[test]
+    fn the_send_preview_ignores_enter_but_esc_still_cancels() {
+        assert!(!label_confirms_with_enter(SEND_CONFIRM_LABEL));
+        assert!(label_confirms_with_enter("Do it"));
+        assert_eq!(preview_key_command(VK_RETURN.0, false), None);
+        assert_eq!(
+            preview_key_command(VK_ESCAPE.0, false),
+            Some(ID_PREVIEW_CANCEL)
+        );
     }
 
     #[test]
     fn preview_key_command_maps_escape_to_cancel() {
-        assert_eq!(preview_key_command(VK_ESCAPE.0), Some(ID_PREVIEW_CANCEL));
+        assert_eq!(
+            preview_key_command(VK_ESCAPE.0, true),
+            Some(ID_PREVIEW_CANCEL)
+        );
     }
 
     #[test]
@@ -4991,7 +5128,7 @@ mod tests {
         // Spot-check a handful of unrelated virtual-key codes, including the
         // boundary values 0 and u16::MAX.
         for vk in [0u16, 1, 0x41 /* 'A' */, 0x09 /* Tab */, u16::MAX] {
-            assert_eq!(preview_key_command(vk), None, "vk={vk:#06x}");
+            assert_eq!(preview_key_command(vk, true), None, "vk={vk:#06x}");
         }
     }
 
@@ -5106,6 +5243,61 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn send_preview_confirm_button_reads_send_and_there_is_no_cancel() {
+        // #105: the send preview is the normal preview with "Send" on the
+        // confirm button. Observable if wired to nothing: the button would
+        // still read "Do it".
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_send_preview("Send to anthropic?", &schema, &value);
+
+        let texts = preview_button_texts(card.hwnd());
+        assert!(texts.iter().any(|t| t == "Send"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "Do it"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "Cancel"), "{texts:?}");
+    }
+
+    #[test]
+    fn multiline_preview_rows_stack_the_label_and_wrap_the_value_up_to_a_cap() {
+        let card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let field = |name: &str, value: &str, multiline: bool| Field {
+            name: name.to_string(),
+            label: name.to_string(),
+            value: value.to_string(),
+            editable: false,
+            required: false,
+            multiline,
+        };
+        let long = "word ".repeat(2000);
+        let fields = vec![
+            field("short", "x", false),
+            field("short_multi", "x", true),
+            field("long_multi", &long, true),
+        ];
+        let metrics = card.inner.compute_preview_layout(&fields, false);
+        let line_h = card.inner.line_height(card.inner.fonts.body).max(1);
+
+        let single = &metrics.rows[0];
+        let one = &metrics.rows[1];
+        let capped = &metrics.rows[2];
+
+        // The label sits above the value, not beside it, and the value
+        // spans from the card's left padding.
+        assert_eq!(one.value_rect.left, one.label_rect.left);
+        assert!(one.value_rect.top >= one.label_rect.bottom);
+        assert!(one.value_rect.left < single.value_rect.left);
+
+        // Short text takes one line; a huge dump stops at the cap, so the
+        // buttons stay on screen.
+        assert_eq!(one.value_rect.bottom - one.value_rect.top, line_h);
+        assert_eq!(
+            capped.value_rect.bottom - capped.value_rect.top,
+            line_h * PREVIEW_MULTILINE_MAX_LINES
+        );
+        assert!(metrics.buttons.do_it.top >= capped.value_rect.bottom);
     }
 
     #[test]
@@ -5380,6 +5572,7 @@ mod tests {
                 value: "2000-01-01".to_string(),
                 editable: false,
                 required: false,
+                multiline: false,
             }];
             let metrics = card.inner.compute_preview_layout(&fields, false);
             let row = &metrics.rows[0];

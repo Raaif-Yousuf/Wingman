@@ -474,15 +474,17 @@ pub enum OverlayOutcome {
 /// window, and the same reason `App::extract_text`/`App::ask` do their
 /// Win32-only steps on the main thread before handing off to a worker.
 ///
-/// MEASURED 2026-09-17 (`ui::region::tests::measure_overlay_open_latency`,
-/// `cargo test ui::region::tests::measure_overlay_open_latency -- --ignored
-/// --nocapture`, unoptimized `dev` profile, this machine's attached
-/// monitor(s)): `Overlay::open` (virtual-desktop capture + dim + window
-/// creation/show, i.e. everything before the user can start dragging) took
-/// 1029.3 ms. Dominated by the multi-monitor `xcap` capture + per-pixel dim
-/// pass at native resolution, not window creation itself -- a release build
-/// (`opt-level = "z"`, LTO) would very likely be faster, but this number is
-/// from a debug build and has not been re-measured in release.
+/// MEASURED 2026-10-15 (release profile, `opt-level = "z"` + LTO, one
+/// built-in panel at 1280x800 logical (scaled), `cargo test --release --bin
+/// wingman measure_overlay_open_latency -- --ignored --nocapture`, four runs):
+/// `Overlay::open` (virtual-desktop capture + dim + window creation/show,
+/// i.e. everything before the user can start dragging) took 327.7 ms on the
+/// first run and 278.8 to 293.7 ms on the next three. The earlier debug-build
+/// figure was 1029.3 ms. Decision: no further work for now; about 0.3 s reads
+/// as the picker opening, not a hang. Not measured: several monitors or a 4K
+/// panel, where the capture and the per-pixel dim pass grow with the pixel
+/// count. If that turns out slow, capture the monitors in parallel and dim
+/// in integer arithmetic.
 pub fn select_region(instance: HINSTANCE) -> anyhow::Result<Option<RawShot>> {
     let mut overlay = Overlay::open(instance)?;
     let outcome = overlay.run();
@@ -2314,7 +2316,7 @@ mod tests {
             Ok(overlay) => {
                 let elapsed = start.elapsed();
                 println!(
-                    "MEASURED 2026-09-17: Overlay::open latency: {:.1} ms",
+                    "Overlay::open latency: {:.1} ms",
                     elapsed.as_secs_f64() * 1000.0
                 );
                 drop(overlay);

@@ -1380,42 +1380,6 @@ mod tests {
         assert!(text.starts_with('a') && text.ends_with('b'), "{text}");
     }
 
-    /// The HTTP library is called from exactly two files, each behind the
-    /// Offline guard. A new caller elsewhere must go through one of them, or
-    /// be added here on purpose.
-    #[test]
-    fn only_the_known_files_call_ureq() {
-        fn walk(dir: &std::path::Path, hits: &mut Vec<String>, seen: &mut usize) {
-            for entry in std::fs::read_dir(dir).expect("read src") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    walk(&path, hits, seen);
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    *seen += 1;
-                    let text = std::fs::read_to_string(&path).expect("read source file");
-                    // Built from pieces so this file does not match itself.
-                    if text.replace('\r', "").contains(concat!("ure", "q::")) {
-                        hits.push(path.to_string_lossy().replace('\\', "/"));
-                    }
-                }
-            }
-        }
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let (mut hits, mut seen) = (Vec::new(), 0);
-        walk(&src, &mut hits, &mut seen);
-        assert!(seen > 50, "the scan found only {seen} source files");
-        hits.sort();
-        let names: Vec<&str> = hits
-            .iter()
-            .map(|h| h.rsplit("/src/").next().unwrap_or(h))
-            .collect();
-        assert_eq!(
-            names,
-            ["inputs/web_page.rs", "provider/common.rs"],
-            "who calls the HTTP library changed: every caller must sit behind the Offline guard"
-        );
-    }
-
     /// Live check of the real transport (the pinned resolver, TLS, the body
     /// cap), against a public page. `#[ignore]`d because it needs the
     /// internet: `cargo test web_page_live -- --ignored --nocapture`.

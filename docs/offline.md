@@ -142,8 +142,8 @@ that ever changed.
   network connection is `src/inputs/web_page.rs` (the confirmed link fetch of
   "Summarize a link", #127): it refuses outright in Offline and Local mode
   (not just non-loopback hosts), calls `offline_guard` on every hop as a
-  backstop, and a test (`only_the_known_files_call_ureq`) fails the build if
-  `ureq::` shows up in any other file outside `src/provider/common.rs`.
+  backstop, and a test (`only_files_that_must_use_ureq_mention_it`, in
+  `connectors/oauth.rs`) fails the build if `ureq` shows up in any other file.
 - **Awareness does not exist yet.** There is nothing to stop.
 - **The guard is application-level, not OS-level.** It refuses inside
   Wingman's own request-building code, before a socket call. It does not

@@ -126,6 +126,14 @@ pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
 /// `WM_APP + 16`: `+15` is already `crate::ui::card::WM_APP_CARD_OPEN_SETTINGS`.
 pub const WM_APP_GENERIC_ACTION_RESULT: u32 = WM_APP + 16;
 
+/// #105: posted by a worker thread (`ui::send_gate::WindowSendGate`) that is
+/// about to send a request off the machine while "Show me what you're
+/// sending" is on. `lparam` is `Box::into_raw(Box::new(ui::send_gate::SendRequest))`;
+/// the handler takes ownership and shows the preview card. `WM_APP + 18`:
+/// `+17` is already `crate::ui::card::WM_APP_CARD_COPY_DETAILS`. Dropping the
+/// request (as the Settings-open `Ignore` path does) cancels the send.
+pub const WM_APP_SEND_PREVIEW: u32 = WM_APP + 18;
+
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
 /// How long to wait after hiding a visible card before capturing, so the
@@ -295,6 +303,12 @@ pub fn run() -> Result<()> {
     let chain = Arc::new(config.build_chain());
 
     let hwnd = create_owner_window(instance)?;
+    // #105: every `Chain` built from here on asks the owner window to show
+    // the send preview before a request leaves the machine (when the toggle
+    // is on). Installed before anything can build a chain.
+    crate::provider::install_send_gate(Arc::new(crate::ui::send_gate::WindowSendGate::new(
+        hwnd.0 as isize,
+    )));
 
     // Registering does not depend on the window existing yet, but doing it
     // right after keeps every piece of startup wiring for the tray icon
@@ -1239,6 +1253,9 @@ impl App {
         let proposal = match result {
             Ok(p) => p,
             Err(packed) => {
+                if self.quiet_send_cancel(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -1278,6 +1295,7 @@ impl App {
         if confirm_required {
             let schema = actions::schema::schema_for("calendar_event", false)
                 .expect("\"calendar_event\" is always registered in actions::schema");
+            arm_calendar_slot(&mut self.pending_preview);
             self.pending_preview_generation =
                 self.card
                     .show_preview("Add event from screen", &schema, &proposal, false);
@@ -1518,6 +1536,9 @@ impl App {
         let (proposal, replace) = match result {
             Ok(done) => done,
             Err(packed) => {
+                if self.quiet_send_cancel(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -1682,8 +1703,56 @@ impl App {
                     }
                 }
             }
-            None => self.run_confirmed_calendar_add(confirmed),
+            Some(PendingPreview::Send(reply)) => {
+                crate::ui::send_gate::decide(reply, true);
+                // The preview card is gone; show the spinner again while
+                // the request this Send released is in flight.
+                let model_name = self.first_provider_model_label().unwrap_or_default();
+                self.card
+                    .show_pending(crate::ui::card::PendingStage::AskingModel { model_name });
+            }
+            Some(PendingPreview::Calendar) => self.run_confirmed_calendar_add(confirmed),
+            // Nothing is waiting on this decision, so nothing runs.
+            None => {}
         }
+    }
+
+    /// #105: the Wingman key while a send preview is waiting cancels it:
+    /// the worker is blocked on it and a second press would otherwise do
+    /// nothing, leaving it blocked. Returns whether it cancelled one.
+    fn cancel_pending_send_preview(&mut self) -> bool {
+        if !take_send_slot(&mut self.pending_preview) {
+            return false;
+        }
+        self.card.hide();
+        true
+    }
+
+    /// #105: ends a run the user cancelled at the send preview. Nothing was
+    /// sent and nothing was done, so there is no card and no failure state
+    /// (#392). Returns whether `packed` was such a cancel.
+    fn quiet_send_cancel(&mut self, packed: &str) -> bool {
+        if !is_send_cancelled(packed) {
+            return false;
+        }
+        self.card.hide();
+        self.set_watch(false);
+        true
+    }
+
+    /// #105: a worker is about to send a request off the machine and is
+    /// blocked on the answer. Shows what will be sent on the preview card
+    /// ("Send" or Esc). It reuses the one preview slot: if another preview is
+    /// already on screen the request is dropped, which cancels that send
+    /// rather than stacking a second slot (#225).
+    fn on_send_preview(&mut self, request: crate::ui::send_gate::SendRequest) {
+        if matches!(self.card.state(), crate::ui::card::CardState::Preview) {
+            return;
+        }
+        let (schema, value) = request.preview.to_schema_and_value();
+        let title = crate::ui::send_gate::title_for(&request.provider_id);
+        self.pending_preview = Some(PendingPreview::Send(request.reply));
+        self.pending_preview_generation = self.card.show_send_preview(&title, &schema, &value);
     }
 
     /// #242's half of [`App::on_preview_decided`]: resolves `action`'s own
@@ -1944,6 +2013,9 @@ impl App {
         let outcome = match result {
             Ok(o) => o,
             Err(packed) => {
+                if self.quiet_send_cancel(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -2124,6 +2196,9 @@ impl App {
         let value = match result {
             Ok(v) => v,
             Err(packed) => {
+                if self.quiet_send_cancel(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -2266,6 +2341,12 @@ impl App {
     }
 
     fn on_result(&mut self, result: std::result::Result<Answer, String>) {
+        if let Err(packed) = &result {
+            if self.quiet_send_cancel(packed) {
+                self.set_busy(false);
+                return;
+            }
+        }
         let is_err = result.is_err();
         let mut answer = self.record_last(result);
         // A store failure never fails the request (#46); it rides on the
@@ -3544,7 +3625,10 @@ fn router_worker(
         .ok_or_else(|| anyhow::anyhow!("router: unrecognized provider \"{}\"", target.provider))?;
 
     let shot = encode_for_upload(raw, providers, mode, redact)?;
-    let chain = Chain::new(vec![provider]);
+    // #105: the router runs by itself when the palette opens, so it never
+    // shows the send preview; with the toggle on, a cloud request is refused
+    // by the send guard instead and the press simply gets no suggestion.
+    let chain = Chain::new(vec![provider]).without_prompt();
     let raw: &capture::RawShot = raw;
     router::route(&chain, shot.png, candidates, || {
         router_non_vision_inputs(raw)
@@ -4571,10 +4655,40 @@ enum DeferredMessage {
     GenericActionResult(actions::Action, Value, GenericResult),
 }
 
+/// Marks the single preview slot as the calendar add, replacing whatever was
+/// there. A replaced `Send` drops its channel, which cancels that send.
+fn arm_calendar_slot(slot: &mut Option<PendingPreview>) {
+    *slot = Some(PendingPreview::Calendar);
+}
+
+/// Empties the slot if it holds a send preview, which wakes the blocked
+/// worker with no authorization. Returns whether it did. Any other pending
+/// preview is left alone.
+fn take_send_slot(slot: &mut Option<PendingPreview>) -> bool {
+    if matches!(slot, Some(PendingPreview::Send(_))) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Whether a worker's packed error is the user cancelling the send preview.
+/// Looks at the raw chain half, which keeps the cancel text verbatim.
+fn is_send_cancelled(packed: &str) -> bool {
+    unpack_error(packed)
+        .1
+        .contains(crate::provider::SEND_CANCELLED_TEXT)
+}
+
 /// Issue #225: which action is waiting on the preview currently on screen.
 /// See [`App::pending_preview`] for why this is one slot rather than one
 /// `Option` per kind.
 enum PendingPreview {
+    /// #25: the calendar add. Explicit rather than an empty slot, so an empty
+    /// slot can never be mistaken for it (a stale `Send` slot could
+    /// otherwise be released by a calendar "Do it").
+    Calendar,
     /// #38 "Review this email": the stashed target to write the edits back
     /// through, consumed by `run_review_executor`.
     Review(actions::review_email::ReviewContext),
@@ -4598,6 +4712,11 @@ enum PendingPreview {
     /// #127: a linked-page action's confirmation card. Carries the action's
     /// id; "Do it" starts the fetch step with the address on the card.
     FetchLink(String),
+    /// #105: a worker is blocked before a request that leaves the machine,
+    /// waiting for this preview's answer. Holds the channel back to it:
+    /// "Send" answers it (`ui::send_gate::decide`), and every other way the
+    /// preview ends drops it, which cancels the send.
+    Send(std::sync::mpsc::Sender<confirm::SendAuthorized>),
 }
 
 /// What `wnd_proc` should do with a message addressed to the owner window
@@ -4707,7 +4826,12 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // freed explicitly below too.
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
-        | WM_APP_ROUTER_RESULT => SettingsReentrancy::Ignore,
+        | WM_APP_ROUTER_RESULT
+        // #105: a send preview cannot be answered while Settings is
+        // modal-open, so it is dropped, which cancels the send (the worker
+        // sees the reply channel close and the request ends in a card).
+        // The boxed `SendRequest` is freed explicitly below.
+        | WM_APP_SEND_PREVIEW => SettingsReentrancy::Ignore,
         _ => SettingsReentrancy::Fallback,
     }
 }
@@ -4761,6 +4885,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
                 } else if msg == WM_APP_PALETTE_RUN {
                     drop(unsafe { Box::from_raw(lparam.0 as *mut String) });
+                } else if msg == WM_APP_SEND_PREVIEW {
+                    drop(unsafe {
+                        Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest)
+                    });
                 } else if msg == WM_APP_ROUTER_RESULT {
                     drop(unsafe {
                         Box::from_raw(
@@ -4892,13 +5020,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         }
         WM_APP_HOTKEY => {
             let _which = wparam.0; // both bindings do the same thing
-            app.ask();
+            if !app.cancel_pending_send_preview() {
+                app.ask();
+            }
             LRESULT(0)
         }
         WM_APP_ACTIVATE => {
             // `ask` already no-ops while `busy`, so a second Copilot-key press
-            // landing here while a request is in flight is harmless.
-            app.ask();
+            // landing here while a request is in flight is harmless, except
+            // that it cancels a waiting send preview (#105).
+            if !app.cancel_pending_send_preview() {
+                app.ask();
+            }
             LRESULT(0)
         }
         WM_APP_RESULT => {
@@ -4938,6 +5071,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         }
         WM_APP_PREVIEW_DECIDED => {
             app.on_preview_decided(wparam.0 as u32);
+            LRESULT(0)
+        }
+        WM_APP_SEND_PREVIEW => {
+            // #105: the worker is blocked until this is answered or dropped.
+            let request =
+                unsafe { *Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest) };
+            app.on_send_preview(request);
             LRESULT(0)
         }
         WM_APP_CARD_OPEN_SETTINGS => {
@@ -5044,6 +5184,44 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 
 #[cfg(test)]
 mod tests {
+    // -- #105 send preview slot ------------------------------------------
+
+    #[test]
+    fn the_key_cancels_a_pending_send_and_wakes_the_worker() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut slot = Some(super::PendingPreview::Send(tx));
+        assert!(super::take_send_slot(&mut slot));
+        assert!(slot.is_none());
+        assert!(rx.recv().is_err(), "the worker must be woken with nothing");
+    }
+
+    #[test]
+    fn the_key_leaves_any_other_pending_preview_alone() {
+        let mut slot = Some(super::PendingPreview::FormFill(serde_json::Value::Null));
+        assert!(!super::take_send_slot(&mut slot));
+        assert!(matches!(slot, Some(super::PendingPreview::FormFill(_))));
+        let mut empty = None;
+        assert!(!super::take_send_slot(&mut empty));
+    }
+
+    #[test]
+    fn a_calendar_preview_replaces_a_stale_send_slot() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut slot = Some(super::PendingPreview::Send(tx));
+        super::arm_calendar_slot(&mut slot);
+        assert!(matches!(slot, Some(super::PendingPreview::Calendar)));
+        assert!(rx.recv().is_err(), "the replaced send must not authorize");
+    }
+
+    #[test]
+    fn a_cancelled_send_is_recognised_through_the_packed_error() {
+        let chain = format!("{:#}", anyhow::Error::new(crate::provider::SendCancelled));
+        let packed = super::pack_error(&super::human_error_detail(&chain), &chain);
+        assert!(super::is_send_cancelled(&packed));
+        let other = super::pack_error("x", "anthropic: HTTP 500");
+        assert!(!super::is_send_cancelled(&other));
+    }
+
     use super::first_line;
     use super::resolve_prompt_and_difficulty;
     use super::unreadable_secrets_card;
@@ -5055,6 +5233,7 @@ mod tests {
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
         WM_APP_GENERIC_ACTION_RESULT, WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
+        WM_APP_SEND_PREVIEW,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
@@ -5798,6 +5977,7 @@ mod tests {
         ("WM_APP_CARD_OPEN_SETTINGS", WM_APP_CARD_OPEN_SETTINGS),
         ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
+        ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
     ];
 
     #[test]
@@ -6053,6 +6233,7 @@ mod tests {
             include_str!("ui/card.rs"),
             include_str!("ui/palette.rs"),
             include_str!("ui/region.rs"),
+            include_str!("ui/send_gate.rs"),
             include_str!("ui/settings.rs"),
             include_str!("ui/tray.rs"),
             include_str!("inputs/selection.rs"),
@@ -6321,6 +6502,11 @@ mod tests {
         (
             "WM_APP_CARD_COPY_DETAILS",
             WM_APP_CARD_COPY_DETAILS,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_SEND_PREVIEW",
+            WM_APP_SEND_PREVIEW,
             SettingsReentrancy::Ignore,
         ),
     ];
