@@ -22,12 +22,22 @@ separate Phase 0 item) exists; regenerate this file whenever `Cargo.lock`
 changes materially, by rerunning the command above against the current lock
 file and updating the table.
 
-142 crates resolve for this target as of `Cargo.lock` after issue #160
-dropped the direct dependency `dirs` (and its `dirs-sys` -> `option-ext`
-transitive chain, plus the `windows-sys` 0.61.2 pulled in only by
-`dirs-sys`) in favor of a direct `SHGetKnownFolderPath` call through the
-`windows` crate this project already depends on
-(`src/known_folder.rs`).
+148 crates resolve for this target as of `Cargo.lock`. Issue #160 dropped
+the direct dependency `dirs` (and its `dirs-sys` -> `option-ext` transitive
+chain, plus the `windows-sys` 0.61.2 pulled in only by `dirs-sys`) in favor
+of a direct `SHGetKnownFolderPath` call through the `windows` crate this
+project already depends on (`src/known_folder.rs`). Issue #280 later found
+this file had not been regenerated since the `trybuild` dev-dependency
+(#203) landed: `trybuild` and the transitive chain only it needs -- `glob`,
+`target-tuple`, `termcolor`, `winapi-util`, and a second `windows-sys` line
+(0.61.2 again, this time pulled in by `winapi-util`) -- are included below.
+Dev-dependencies are in scope for this file: it documents what is
+reachable from `cargo test`'s dependency graph on this platform, not only
+what links into the shipped `wingman.exe`.
+`cargo metadata --format-version 1 --filter-platform x86_64-pc-windows-msvc`
+resolves 149 packages for this target; the one package this file does not
+list is `wingman` itself (the file covers third-party dependencies, not the
+project), so 149 - 1 = 148 matches the table below.
 
 ## Direct dependencies
 
@@ -41,6 +51,7 @@ transitive chain, plus the `windows-sys` 0.61.2 pulled in only by
 | serde | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde |
 | serde_json | 1.0.151 | MIT OR Apache-2.0 | https://github.com/serde-rs/json |
 | toml | 1.1.6 | MIT OR Apache-2.0 | https://github.com/toml-rs/toml |
+| trybuild | 1.0.121 (dev) | MIT OR Apache-2.0 | https://github.com/dtolnay/trybuild |
 | ureq | 3.4.2 | MIT OR Apache-2.0 | https://github.com/algesten/ureq |
 | windows | 0.62.2 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs |
 | xcap | 0.9.8 | **Apache-2.0 only** | https://github.com/nashaofu/xcap |
@@ -49,6 +60,11 @@ transitive chain, plus the `windows-sys` 0.61.2 pulled in only by
 permissive and allowed as a dependency, but code cannot be copied from it
 under the MIT-only copied-code rule; only used as a library, never copied
 from, here).
+
+`trybuild` is a dev-dependency (#203): it drives a compile-fail test and
+never links into the shipped `wingman.exe`, but AGENTS.md rule 2's license
+check still applies to it and to the crates it alone pulls in, so it and
+they are listed here and in the table below.
 
 ## Licensing note (flagged, not blocking)
 
@@ -110,6 +126,7 @@ state, not a pending action.
 | flate2 | 1.1.10 | MIT OR Apache-2.0 |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |
 | getrandom | 0.2.17 | MIT OR Apache-2.0 |
+| glob | 0.3.4 | MIT OR Apache-2.0 |
 | half | 2.7.1 | MIT OR Apache-2.0 |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |
 | http | 1.5.0 | MIT OR Apache-2.0 |
@@ -165,6 +182,8 @@ state, not a pending action.
 | syn | 2.0.119 | MIT OR Apache-2.0 |
 | syn | 3.0.5 | MIT OR Apache-2.0 |
 | synstructure | 0.13.2 | MIT |
+| target-tuple | 1.0.2 | MIT OR Apache-2.0 |
+| termcolor | 1.4.1 | Unlicense OR MIT |
 | thiserror | 2.0.20 | MIT OR Apache-2.0 |
 | thiserror-impl | 2.0.20 | MIT OR Apache-2.0 |
 | tiff | 0.11.3 | MIT |
@@ -176,6 +195,7 @@ state, not a pending action.
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 |
 | toml_parser | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |
 | toml_writer | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
+| trybuild | 1.0.121 | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | untrusted | 0.9.0 | ISC |
 | ureq | 3.4.2 | MIT OR Apache-2.0 |
@@ -189,6 +209,7 @@ state, not a pending action.
 | webpki-roots | 1.0.9 | CDLA-Permissive-2.0 |
 | weezl | 0.1.12 | MIT OR Apache-2.0 |
 | widestring | 1.2.1 | MIT OR Apache-2.0 |
+| winapi-util | 0.1.11 | Unlicense OR MIT |
 | windows | 0.62.2 | MIT OR Apache-2.0 |
 | windows-collections | 0.3.2 | MIT OR Apache-2.0 |
 | windows-core | 0.62.2 | MIT OR Apache-2.0 |
@@ -201,6 +222,7 @@ state, not a pending action.
 | windows-strings | 0.5.1 | MIT OR Apache-2.0 |
 | windows-sys | 0.59.0 | MIT OR Apache-2.0 |
 | windows-sys | 0.60.2 | MIT OR Apache-2.0 |
+| windows-sys | 0.61.2 | MIT OR Apache-2.0 |
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 |
 | windows-targets | 0.53.5 | MIT OR Apache-2.0 |
 | windows-threading | 0.2.1 | MIT OR Apache-2.0 |
