@@ -140,13 +140,15 @@ pub mod cmd {
     /// Issue #41: "Copy text from screen" -- OCR the active monitor and copy
     /// the text to the clipboard, offline and model-free. See
     /// `App::extract_text` in `app.rs` and `actions::extract_text`. The
-    /// palette (#25) does not exist yet, so this tray item is the only way
-    /// to reach the action today.
+    /// Quick Ask palette (#25) also lists and runs this action
+    /// (`DispatchTarget::ExtractText` in `ui/palette_model.rs`); this tray
+    /// item stays as a direct path that skips opening the palette first.
     pub const EXTRACT_TEXT: u32 = 1020;
     /// Issue #115: evaluates the current selection as an arithmetic
     /// expression or a unit conversion, no model involved. See
-    /// `App::calculate_selection` in `app.rs`. Stands in for a palette entry
-    /// until #25's action palette exists.
+    /// `App::calculate_selection` in `app.rs`. The Quick Ask palette (#25)
+    /// also lists and runs it (`CALCULATE_SELECTION_ACTION_ID` in
+    /// `ui/palette_model.rs`); this tray item is the direct path.
     pub const CALCULATE_SELECTION: u32 = 1021;
 
     /// Issue #29: "Copy region to clipboard" -- opens the full-desktop
@@ -166,11 +168,10 @@ pub mod cmd {
     /// (`fixed_cmd_ids_are_pairwise_unique`).
     pub const QUICK_ASK: u32 = 1024;
     /// Issue #38: runs the built-in "Review this email" action (Look,
-    /// Propose, Confirm, Do). See `App::review_this_email` in `app.rs`. The
-    /// palette (#25) does not exist on master yet, so -- same as
-    /// `EXTRACT_TEXT` above -- this tray item is the only way to reach the
-    /// action today; the palette's own action dispatch table should add
-    /// `actions::review_email::ACTION_ID` to its built-ins once it lands.
+    /// Propose, Confirm, Do). See `App::review_this_email` in `app.rs`. Same
+    /// as `EXTRACT_TEXT` above: the Quick Ask palette (#25) also lists and
+    /// runs this action (`DispatchTarget::ReviewEmail` in
+    /// `ui/palette_model.rs`), and this tray item is the direct path.
     pub const REVIEW_EMAIL: u32 = 1025;
     /// Issue #40: runs the built-in "Fill this form" action (Look, Propose,
     /// Confirm, Do). See `App::fill_form_from_screen` in `app.rs`.
