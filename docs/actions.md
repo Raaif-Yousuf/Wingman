@@ -172,8 +172,10 @@ then two summary lines, shown on the card only; the first line is cut to 50 char
 clamped in code), `"action_items"` (#314: a list of
 lines the `clipboard` executor copies as a Markdown checklist),
 `"error_explanation"` (#66: `meaning`, `cause`, `fix`, a read-only answer for
-the card) and `"word_definition"` (#75: `definition`, `example`, a read-only answer for
-the card). Each schema function returns a `serde_json::json!`
+the card), `"word_definition"` (#75: `definition`, `example`, a read-only answer for
+the card) and `"screen_explanation"` (#131: `detail`, then a one-sentence
+`headline`; the headline is cut to fit the collapsed card and the detail shows
+on expand). Each schema function returns a `serde_json::json!`
 literal shaped like standard JSON Schema (`"type": "object"`, `"properties"`,
 `"required"`, `"additionalProperties": false`), plus one
 non-standard keyword:
