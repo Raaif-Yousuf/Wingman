@@ -2654,6 +2654,25 @@ impl CardInner {
             // invented here.
             return;
         }
+        let type_errors = preview.model.type_errors();
+        if !type_errors.is_empty() {
+            // #284: an edit that cannot be read as its field's declared type
+            // (a number field holding "abc") is never confirmed as a string.
+            // Treated like Cancel (nothing runs, the owner is told), then an
+            // error card names what to fix.
+            self.last_confirmed = None;
+            let generation = self.preview_generation;
+            self.preview_decision_pending = false;
+            self.close_preview();
+            self.notify_owner_of_preview_decision(generation);
+            self.show_collapsed(
+                "Couldn't use that edit",
+                &format!("{}. Nothing was done.", type_errors.join(". ")),
+                0,
+                None,
+            );
+            return;
+        }
         let shown = preview.model.to_value();
         let confirmed = crate::ui::confirm::confirm_preview(
             &preview.model,
@@ -5015,6 +5034,44 @@ mod tests {
         // as every other best-effort Win32 call in this module.
         card.inner.preview_do_it();
         assert!(card.take_confirmed().is_some());
+    }
+
+    #[test]
+    fn preview_do_it_with_an_unparseable_typed_edit_shows_an_error_card_and_confirms_nothing() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "count": { "type": "integer", "editable": true } }
+        });
+        let value = serde_json::json!({ "count": 3 });
+        card.inner.show_preview("Typed", &schema, &value, false);
+        let edit = card.inner.preview.as_ref().expect("preview").edits[0].1;
+        let text: Vec<u16> = "abc\0".encode_utf16().collect();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                edit,
+                windows::core::PCWSTR(text.as_ptr()),
+            );
+        }
+        card.inner.preview_do_it();
+        assert!(card.take_confirmed().is_none(), "nothing may be confirmed");
+        assert_eq!(card.state(), CardState::Collapsed, "an error card shows");
+        assert!(card.inner.headline.contains("Couldn't use that edit"));
+        assert!(card.inner.detail.contains("Count must be a whole number"));
+    }
+
+    #[test]
+    fn preview_do_it_keeps_a_typed_field_typed() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "count": { "type": "integer", "editable": true } }
+        });
+        card.inner
+            .show_preview("Typed", &schema, &serde_json::json!({ "count": 3 }), false);
+        card.inner.preview_do_it();
+        let confirmed = card.take_confirmed().expect("confirmed");
+        assert_eq!(confirmed.value()["count"], serde_json::json!(3));
     }
 
     #[test]
