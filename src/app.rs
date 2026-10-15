@@ -712,7 +712,7 @@ impl App {
         let foreground_hwnd_isize =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
 
-        self.busy = true;
+        self.set_busy(true);
         // Disarmed for the whole in-flight window: a click while the spinner
         // is up must not touch the card.
         self.set_watch(false);
@@ -1045,7 +1045,7 @@ impl App {
             }
         };
 
-        self.busy = true;
+        self.set_busy(true);
         self.set_watch(false);
         // No model in this flow (see the doc comment above): `Working` is
         // the honest generic placeholder, not `AskingModel`.
@@ -1214,14 +1214,14 @@ impl App {
     /// doc comment). A provider-chain failure shows an error card (rule
     /// 7).
     fn on_calendar_result(&mut self, result: std::result::Result<Value, String>) {
-        self.busy = false;
+        self.set_busy(false);
 
         let proposal = match result {
             Ok(p) => p,
             Err(packed) => {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
-                self.record_last_error(&headline, chain);
+                self.record_run_failure(&headline, human, chain);
                 self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
@@ -1429,14 +1429,14 @@ impl App {
         schema: Value,
         result: std::result::Result<Value, String>,
     ) {
-        self.busy = false;
+        self.set_busy(false);
 
         let proposal = match result {
             Ok(p) => p,
             Err(packed) => {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
-                self.record_last_error(&headline, chain);
+                self.record_run_failure(&headline, human, chain);
                 self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
@@ -1745,14 +1745,14 @@ impl App {
         &mut self,
         result: std::result::Result<actions::review_email::ReviewOutcome, String>,
     ) {
-        self.busy = false;
+        self.set_busy(false);
 
         let outcome = match result {
             Ok(o) => o,
             Err(packed) => {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
-                self.record_last_error(&headline, chain);
+                self.record_run_failure(&headline, human, chain);
                 self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
@@ -1925,14 +1925,14 @@ impl App {
     /// `self.pending_form_fill` is set here and consumed by
     /// `on_preview_decided`.
     fn on_form_fill_result(&mut self, result: std::result::Result<Value, String>) {
-        self.busy = false;
+        self.set_busy(false);
 
         let value = match result {
             Ok(v) => v,
             Err(packed) => {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
-                self.record_last_error(&headline, chain);
+                self.record_run_failure(&headline, human, chain);
                 self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
@@ -2108,7 +2108,7 @@ impl App {
     /// lost, just not shown as a card until the user checks "Copy last
     /// answer" or asks again.
     fn record_last(&mut self, result: std::result::Result<Answer, String>) -> Answer {
-        self.busy = false;
+        self.set_busy(false);
         // The request that just finished may have spent money (#21).
         self.update_tooltip();
         let answer = match result {
@@ -2120,7 +2120,7 @@ impl App {
                 // comment for why a tuple isn't used instead.
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
-                self.record_last_error(&headline, chain);
+                self.record_run_failure(&headline, human, chain);
                 Answer {
                     headline,
                     detail: human.to_string(),
@@ -2152,10 +2152,18 @@ impl App {
         }
     }
 
-    /// Issue #124: "Copy diagnostics" tray item. Builds a plain-text report
-    /// (`diagnostics::render_report`) and puts it on the clipboard -- no
-    /// file writes, no network. See `diagnostics.rs`'s module doc for the
-    /// redaction guarantee.
+    /// Issue #327: the one place `busy` changes, so the tray's working badge
+    /// can never disagree with it. Starting a run also clears the previous
+    /// run's failure badge ("until the next press").
+    fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+        if busy {
+            self.tray.set_failed(false);
+        }
+        self.tray.set_busy(busy);
+        self.update_tooltip();
+    }
+
     /// Review of #349/#426: records `raw_chain` (redacted, #253) as
     /// [`App::last_error`] and returns [`human_error_detail`]'s display
     /// text for it -- a drop-in replacement for calling
@@ -2171,6 +2179,18 @@ impl App {
             occurred_at: SystemTime::now(),
             chain: crate::egress::redact_opaque_tokens(raw_chain),
         });
+    }
+
+    /// Issue #327: records a failed worker run (model or action) and, only
+    /// if it was a real fault (see [`is_run_fault`]), raises the tray's red
+    /// dot. A user-state message ("Nothing is selected") is recorded the same
+    /// way but does not raise it.
+    fn record_run_failure(&mut self, action: &str, human: &str, raw_chain: &str) {
+        self.record_last_error(action, raw_chain);
+        if is_run_fault(human) {
+            self.tray.set_failed(true);
+            self.update_tooltip();
+        }
     }
 
     fn track_error(&mut self, action: &str, raw_chain: &str) -> String {
@@ -2290,7 +2310,7 @@ impl App {
             return;
         }
 
-        self.busy = true;
+        self.set_busy(true);
         self.set_watch(false);
         // Issue #354 follow-up review, finding 3: this reads the current
         // text selection, not a screenshot -- `ReadingSelection` says so
@@ -2765,6 +2785,7 @@ impl App {
         self.config.mode = mode;
         mode::set_current(mode);
         self.tray.set_mode(mode);
+        self.update_tooltip();
 
         let saved = self.config.save();
         match saved {
@@ -2825,6 +2846,8 @@ impl App {
                 None => base,
             }
         };
+        // Issue #327: lead with the state (working / failed / offline).
+        let tip = crate::ui::tray::state_tooltip(self.tray.icon_state(), &tip);
         self.tray.set_tooltip(&tip);
     }
 
@@ -4089,10 +4112,19 @@ fn worker_error_chain_text(e: &anyhow::Error) -> String {
 /// plus a next step, for the many call sites that pass
 /// `human_error_detail`'s output straight to `show_error`'s `detail`.
 fn human_error_detail(raw_chain: &str) -> String {
-    format!(
-        "{} Try again, and if it keeps happening, use Copy diagnostics for details.",
-        humanize_error_chain(raw_chain)
-    )
+    format!("{} {DIAGNOSTICS_STEP}", humanize_error_chain(raw_chain))
+}
+
+/// The next step every real fault's card detail ends with.
+const DIAGNOSTICS_STEP: &str =
+    "Try again, and if it keeps happening, use Copy diagnostics for details.";
+
+/// Issue #327: whether a failed run's human text came from a real fault (a
+/// model or action error, built by [`human_error_detail`]) rather than a
+/// user-state message such as "Nothing is selected", which is plain text with
+/// no diagnostics step (#493). Only real faults raise the tray's failed dot.
+fn is_run_fault(human: &str) -> bool {
+    human.ends_with(DIAGNOSTICS_STEP)
 }
 
 /// Separator `pack_error`/`unpack_error` use. A control character no real
@@ -6361,6 +6393,28 @@ mod tests {
             crate::redact::FAILURE_SENTENCE,
             "Could not check the screenshot for private details, so nothing was sent."
         );
+    }
+
+    /// #327: only a real fault raises the tray's red dot. A user-state
+    /// message ("Nothing selected") and a plain unpacked string do not.
+    #[test]
+    fn only_real_faults_count_as_run_failures() {
+        use super::{
+            is_run_fault, pack_generic_failure, unpack_error, GenericFailure, ERROR_PACK_SEP,
+        };
+
+        assert!(is_run_fault(&human_error_detail("connection refused")));
+
+        let fault = pack_generic_failure(GenericFailure::Fault(anyhow::anyhow!("boom")));
+        assert!(is_run_fault(unpack_error(&fault).0));
+
+        let user = pack_generic_failure(GenericFailure::UserState("Nothing is selected".into()));
+        assert!(!is_run_fault(unpack_error(&user).0));
+
+        // Calculate's "nothing selected" is sent as a plain, unpacked string.
+        let plain = "Nothing selected. Select an expression first.";
+        assert!(!is_run_fault(unpack_error(plain).0));
+        assert!(!plain.contains(ERROR_PACK_SEP));
     }
 
     #[test]
