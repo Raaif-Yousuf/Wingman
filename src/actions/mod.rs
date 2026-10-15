@@ -9,6 +9,7 @@ pub mod action_items;
 pub mod calendar;
 pub mod define_word;
 pub mod explain_error;
+pub mod explain_screen;
 pub mod extract_text;
 pub mod fill_form;
 pub mod generic_answer;
@@ -244,6 +245,9 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 /// - `"translate-selection"` (#68, `translate::builtin_action`): proposal
 ///   `text_answer`, executor `replace_text`. Confirms on a card, then writes
 ///   the translation over the selection (`actions::generic_replace`).
+/// - `"explain-this-screen"` (#131, `explain_screen::builtin_action`): proposal
+///   `screen_explanation`, executor `none`. A one-sentence headline on the
+///   collapsed card, a short explanation on expand. Works on any screen.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -296,6 +300,7 @@ pub fn builtin_actions() -> Vec<Action> {
         explain_error::builtin_action(),
         define_word::builtin_action(),
         translate::builtin_action(),
+        explain_screen::builtin_action(),
     ]
 }
 

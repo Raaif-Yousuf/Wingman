@@ -40,6 +40,9 @@ pub fn result_card_text(
         if proposal_kind == super::page_summary::PROPOSAL_KIND {
             return super::page_summary::card_text(proposal);
         }
+        if proposal_kind == super::explain_screen::PROPOSAL_KIND {
+            return super::explain_screen::card_text(proposal);
+        }
         if let Some(answer) = proposal_answer(proposal) {
             return answer;
         }
@@ -160,6 +163,28 @@ mod tests {
             &json!({"bullets": ["one"], "line1": "First", "line2": "Second"}),
         );
         assert_ne!(other.headline, "First\nSecond");
+    }
+
+    #[test]
+    fn a_screen_explanation_shows_the_headline_collapsed_and_the_detail_expanded() {
+        let card = result_card_text(
+            "Explain what's on screen",
+            "none",
+            "screen_explanation",
+            "nothing to do",
+            &json!({"detail": "A longer explanation.", "headline": "A short one."}),
+        );
+        assert_eq!(card.headline, "A short one.");
+        assert_eq!(card.detail, "A longer explanation.");
+        // Not the generic layout, which would lead with the first field.
+        let other = result_card_text(
+            "Act",
+            "none",
+            "text_answer",
+            "nothing to do",
+            &json!({"detail": "A longer explanation.", "headline": "A short one."}),
+        );
+        assert_ne!(other.headline, "A short one.");
     }
 
     #[test]

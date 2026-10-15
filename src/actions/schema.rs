@@ -67,6 +67,8 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "word_definition" => Some(word_definition_schema()),
         // #67: two summary lines and a few bullets, shown on the card only.
         "page_summary" => Some(page_summary_schema()),
+        // #131: a short explanation of whatever is on screen, shown on the card.
+        "screen_explanation" => Some(screen_explanation_schema()),
         _ => None,
     }
 }
@@ -121,6 +123,23 @@ fn page_summary_schema() -> Value {
             "line2": {"type": "string"}
         },
         "required": ["bullets", "line1", "line2"],
+        "additionalProperties": false
+    })
+}
+
+/// The `screen_explanation` proposal schema (#131): `detail` then `headline`.
+/// Property order is load-bearing (rule 3), the same as in the verdict schema:
+/// the model writes the explanation first and then sums it up, so the
+/// one-line headline is a summary of what it already said, not a claim it
+/// then has to back up. Nothing is editable: the card is read-only.
+fn screen_explanation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "detail": {"type": "string"},
+            "headline": {"type": "string"}
+        },
+        "required": ["detail", "headline"],
         "additionalProperties": false
     })
 }
@@ -561,6 +580,17 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"]["bullets"]["type"], "array");
         assert!(schema["properties"]["line1"].get("editable").is_none());
+    }
+
+    #[test]
+    fn screen_explanation_puts_the_detail_before_the_headline() {
+        let schema =
+            schema_for("screen_explanation", false).expect("screen_explanation is registered");
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["detail", "headline"]);
+        assert_eq!(schema["required"], json!(["detail", "headline"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"]["headline"].get("editable").is_none());
     }
 
     #[test]
