@@ -290,6 +290,8 @@ call every boot. With start-with-Windows on it is always running anyway.
 | `providers.ollama.base_url` | `"http://127.0.0.1:11434"` | never `localhost`, see [`docs/providers.md`](docs/providers.md#ollama) |
 | `ui.card_seconds` | `12` | auto-dismiss for the collapsed card; `0` = never |
 | `ui.text_scale` | `1.0` | multiplies the card's font size; lower is smaller |
+| `ui.card_corner` | `"bottom_right"` | where the card sits: `bottom_right`, `bottom_left`, `top_right`, `top_left`, or `follow_mouse` (next to the pointer) |
+| `ui.card_monitor` | `"cursor"` | which monitor the card appears on: `"cursor"` (the one the mouse is on), `"primary"`, or `"1"`, `"2"`, ... counting monitors left to right (not the numbers in Windows Settings, and they shift if you rearrange or dock monitors). Ignored by `follow_mouse` |
 | `providers.*.models` | see file | what the tray's model submenu offers (Ollama has no list; it uses `providers.ollama.model` directly) |
 | `ui.prompt` | see file | the system prompt, edit it to change what it checks |
 | `hotkeys.pause` | unset (absent from the file) | optional third chord: toggles Pause until resumed / Resume; no default, no tray learn button yet, see [Hotkeys](#hotkeys) |
