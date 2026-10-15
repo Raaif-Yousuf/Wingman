@@ -6,10 +6,10 @@
 //! Q3 numbers (Fri)"). The confirm card shows those lines and lets the user
 //! edit them; "Do it" runs the `"clipboard"` executor, which turns the
 //! confirmed lines into `- [ ] ...` lines with [`checklist`]. The preview
-//! card hands the executor one string per field (what was shown, after any
-//! edits), so the lines arrive newline-joined: [`checklist_from_value`]
-//! accepts that and a plain array, and the marker is added in Rust rather
-//! than trusted to the model.
+//! card hands the executor `items` as an array of strings (what was shown,
+//! after any edits). [`checklist_from_value`] also accepts a newline-joined
+//! string, for a hand-written `actions.toml` action that produces one. The
+//! marker is added in Rust rather than trusted to the model.
 
 use serde_json::Value;
 
@@ -60,9 +60,9 @@ pub fn checklist(lines: &str) -> String {
 }
 
 /// The checklist for a confirmed proposal's `items` field, whether it is a
-/// newline-joined string (what the preview card produces) or an array of
-/// strings (an unedited model proposal). `None` when there is no `items`
-/// field or it holds no items.
+/// array of strings (what the preview card produces) or a newline-joined
+/// string (kept for a hand-written `actions.toml` action). `None` when there
+/// is no `items` field or it holds no items.
 pub fn checklist_from_value(proposal: &Value) -> Option<String> {
     let joined = match proposal.get("items")? {
         Value::String(s) => s.clone(),
@@ -75,6 +75,15 @@ pub fn checklist_from_value(proposal: &Value) -> Option<String> {
     };
     let list = checklist(&joined);
     (!list.is_empty()).then_some(list)
+}
+
+/// What the card says when the screen holds no action items.
+pub const NO_ITEMS_HEADLINE: &str = "No action items found";
+
+/// Whether a model proposal for the `action_items` kind has nothing to list.
+/// Always false for any other proposal kind.
+pub fn is_empty_result(proposal_kind: &str, proposal: &Value) -> bool {
+    proposal_kind == "action_items" && checklist_from_value(proposal).is_none()
 }
 
 /// Drops a leading list marker: `-`, `*`, a bullet character, `[ ]`/`[x]`
@@ -166,6 +175,17 @@ mod tests {
         ] {
             assert_eq!(checklist_from_value(&v), None, "{v}");
         }
+    }
+
+    #[test]
+    fn an_empty_action_items_proposal_ends_in_the_no_items_card() {
+        for v in [json!({"items": []}), json!({"items": [" "]}), json!({})] {
+            assert!(is_empty_result("action_items", &v), "{v}");
+        }
+        assert!(!is_empty_result("action_items", &json!({"items": ["a"]})));
+        // Other proposal kinds are never treated as empty by this check.
+        assert!(!is_empty_result("text_answer", &json!({"items": []})));
+        assert_eq!(NO_ITEMS_HEADLINE, "No action items found");
     }
 
     #[test]

@@ -67,9 +67,8 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
 
 /// The `action_items` proposal schema (#314): one `items` list of short
 /// strings ("Dana: send the Q3 numbers (Fri)"). Editable, so the confirm card
-/// lets the user fix a line; it comes back from the card as one
-/// newline-joined string, which `executors::clipboard` turns into a
-/// checklist (`actions::action_items::checklist_from_value`).
+/// lets the user fix a line; it comes back from the card as an array of
+/// strings, which `executors::clipboard` turns into a checklist (`actions::action_items::checklist_from_value`).
 fn action_items_schema() -> Value {
     json!({
         "type": "object",

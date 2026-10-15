@@ -215,20 +215,48 @@ mod tests {
     }
 
     #[test]
-    fn items_become_a_markdown_checklist_when_there_is_no_text_field() {
+    fn items_from_the_preview_card_become_a_markdown_checklist() {
+        use crate::ui::preview::PreviewModel;
+        let schema = crate::actions::schema::schema_for("action_items", false).unwrap();
+        let proposal =
+            serde_json::json!({"items": ["Dana: send the Q3 numbers (Fri)", "Me: book the room"]});
+        let mut model = PreviewModel::from_schema(&schema, &proposal);
         let executor = ClipboardExecutor::with_clipboard(FakeClipboard::default());
-        // The preview card hands over one newline-joined string per field.
-        let confirmed = confirmed_with(
-            serde_json::json!({"items": "Dana: send the Q3 numbers (Fri)
-Me: book the room"}),
-            &executor,
-        );
-        executor.execute(confirmed).unwrap();
+        executor
+            .execute(confirmed_with(model.to_value(), &executor))
+            .unwrap();
+        let want = "- [ ] Dana: send the Q3 numbers (Fri)\n- [ ] Me: book the room";
+        assert_eq!(executor.clipboard.get_text().unwrap(), want);
+
+        // An edited line is what gets copied.
+        assert!(model.set_value(
+            "items",
+            "Dana: send the Q3 numbers (Mon)\nMe: book the room"
+        ));
+        executor
+            .execute(confirmed_with(model.to_value(), &executor))
+            .unwrap();
         assert_eq!(
             executor.clipboard.get_text().unwrap(),
-            "- [ ] Dana: send the Q3 numbers (Fri)
-- [ ] Me: book the room"
+            "- [ ] Dana: send the Q3 numbers (Mon)\n- [ ] Me: book the room"
         );
+    }
+
+    #[test]
+    fn a_text_field_wins_over_items() {
+        let executor = ClipboardExecutor::with_clipboard(FakeClipboard::default());
+        let confirmed =
+            confirmed_with(serde_json::json!({"text": "hi", "items": ["a"]}), &executor);
+        executor.execute(confirmed).unwrap();
+        assert_eq!(executor.clipboard.get_text().unwrap(), "hi");
+    }
+
+    #[test]
+    fn items_as_a_joined_string_still_work_for_hand_written_actions() {
+        let executor = ClipboardExecutor::with_clipboard(FakeClipboard::default());
+        let confirmed = confirmed_with(serde_json::json!({"items": "a\nb"}), &executor);
+        executor.execute(confirmed).unwrap();
+        assert_eq!(executor.clipboard.get_text().unwrap(), "- [ ] a\n- [ ] b");
     }
 
     #[test]

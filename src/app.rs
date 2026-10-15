@@ -1443,6 +1443,14 @@ impl App {
             }
         };
 
+        // #314: nothing to list or copy is an answer, not a blank preview.
+        if actions::action_items::is_empty_result(&action.proposal, &proposal) {
+            self.card
+                .show_answer(actions::action_items::NO_ITEMS_HEADLINE, "", 0, None);
+            self.set_watch(true);
+            return;
+        }
+
         if action.confirm {
             self.pending_preview = Some(PendingPreview::Generic(action.clone()));
             self.pending_preview_generation =
