@@ -1313,8 +1313,7 @@ impl App {
                     // let the pure `plan` decide the user text and whether the
                     // screenshot goes along (a selection-only action sends no image).
                     let gathered = gather_generic_inputs(&inputs, foreground_hwnd_isize)?;
-                    let planned = actions::generic_inputs::plan(&inputs, &gathered)
-                        .map_err(GenericFailure::UserState)?;
+                    let planned = plan_generic_inputs(&inputs, &gathered)?;
                     // #493: gathered text is data, not instructions.
                     let system = match planned.system_note {
                         Some(note) => format!("{prompt}\n\n{note}"),
@@ -3392,6 +3391,15 @@ impl From<anyhow::Error> for GenericFailure {
     fn from(e: anyhow::Error) -> Self {
         GenericFailure::Fault(e)
     }
+}
+
+/// Runs the pure input plan; whatever it refuses with (nothing selected, a
+/// password field) is the user's situation, so it routes to `UserState`.
+fn plan_generic_inputs(
+    inputs: &[actions::InputKind],
+    gathered: &actions::generic_inputs::Gathered,
+) -> Result<actions::generic_inputs::RequestInputs, GenericFailure> {
+    actions::generic_inputs::plan(inputs, gathered).map_err(GenericFailure::UserState)
 }
 
 /// Packs a [`GenericFailure`] for the result message (see [`pack_error`]).
@@ -6169,12 +6177,42 @@ mod tests {
     /// message; only a real fault gets the "use Copy diagnostics" step.
     #[test]
     fn generic_user_state_failure_has_no_diagnostics_suffix_but_a_fault_does() {
-        use super::{pack_generic_failure, unpack_error, GenericFailure};
-        let message = "Nothing is selected. Select some text first.";
-        let packed = pack_generic_failure(GenericFailure::UserState(message.to_string()));
-        let (human, chain) = unpack_error(&packed);
-        assert_eq!(human, message);
-        assert_eq!(chain, message);
+        use super::{pack_generic_failure, plan_generic_inputs, unpack_error, GenericFailure};
+        use crate::actions::generic_inputs::{Gathered, PASSWORD_FIELD_MESSAGE};
+        use crate::actions::InputKind;
+
+        // The real refusals, routed the way the worker routes them.
+        let empty = Gathered::default();
+        let password = Gathered {
+            selection_in_password_field: true,
+            ..Gathered::default()
+        };
+        let cases: [(&[InputKind], &Gathered, Option<&str>); 4] = [
+            (&[InputKind::Selection], &empty, Some("Nothing is selected")),
+            (
+                &[InputKind::Clipboard],
+                &empty,
+                Some("clipboard has no text"),
+            ),
+            (&[InputKind::Uia], &empty, Some("any text from the window")),
+            (&[InputKind::Selection, InputKind::Screen], &password, None),
+        ];
+        for (inputs, gathered, expect) in cases {
+            let failure = plan_generic_inputs(inputs, gathered).unwrap_err();
+            let GenericFailure::UserState(message) = &failure else {
+                panic!("a refused plan must be a UserState failure: {inputs:?}");
+            };
+            match expect {
+                Some(fragment) => assert!(message.contains(fragment), "{message}"),
+                None => assert_eq!(message, PASSWORD_FIELD_MESSAGE),
+            }
+            let message = message.clone();
+            let packed = pack_generic_failure(failure);
+            let (human, chain) = unpack_error(&packed);
+            assert_eq!(human, message);
+            assert_eq!(chain, message);
+            assert!(!human.contains("Copy diagnostics"), "{human}");
+        }
 
         let fault = pack_generic_failure(GenericFailure::Fault(anyhow::anyhow!(
             "couldn't put your clipboard back after reading the selection"

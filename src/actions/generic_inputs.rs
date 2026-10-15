@@ -231,12 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_selected_message_is_a_plain_instruction() {
-        let e = plan(&[Selection], &Gathered::default()).unwrap_err();
-        assert!(!e.contains("diagnostics"), "{e}");
-    }
-
-    #[test]
     fn selection_only_sends_the_text_and_no_screen() {
         let r = plan(&[Selection], &g(Some("hola"), None, None)).unwrap();
         assert_eq!(r.user, "Selected text:\nhola");
