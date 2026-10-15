@@ -296,6 +296,8 @@ pub fn run() -> Result<()> {
     // this line the toggle is permanently off and the preview never
     // appears, whatever config.toml says.
     crate::config::set_egress_preview_enabled(config.egress_preview.enabled);
+    // #101: same reason: the send guard has no `Config` in reach.
+    crate::usage::set_daily_budget(config.budget.daily_usd, config.budget.warn_percent);
     // #111: `ocr::recognize` runs on worker threads with no Config in reach.
     crate::ocr::set_preferred_language(&config.capture.ocr_language);
     let chain = Arc::new(config.build_chain());
@@ -1656,7 +1658,15 @@ impl App {
                             &undo.summary,
                             &proposal,
                         );
-                        self.card.show_answer(&text.headline, &text.detail, 0, None);
+                        let mut detail = text.detail;
+                        if let Some(notice) = crate::usage::take_budget_notice() {
+                            detail = if detail.is_empty() {
+                                notice
+                            } else {
+                                format!("{detail}\n\n{notice}")
+                            };
+                        }
+                        self.card.show_answer(&text.headline, &detail, 0, None);
                     }
                     Err(e) => {
                         let detail = self.track_error(
@@ -2205,7 +2215,14 @@ impl App {
         let mut answer = self.record_last(result);
         // A store failure never fails the request (#46); it rides on the
         // next card instead, once per run.
-        if let Some(notice) = crate::store::take_notice() {
+        // #101: the daily budget warning rides the same way.
+        for notice in [
+            crate::store::take_notice(),
+            crate::usage::take_budget_notice(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             answer.detail = if answer.detail.is_empty() {
                 notice
             } else {
@@ -2751,6 +2768,10 @@ impl App {
         // Settings save, the same way `set_mode` already does for the mode.
         // A hand-edited `[egress_preview]` otherwise needs a full restart.
         crate::config::set_egress_preview_enabled(self.config.egress_preview.enabled);
+        crate::usage::set_daily_budget(
+            self.config.budget.daily_usd,
+            self.config.budget.warn_percent,
+        );
         crate::ocr::set_preferred_language(&self.config.capture.ocr_language);
         self.card.set_text_scale(self.config.ui.text_scale);
         self.card
@@ -6076,7 +6097,7 @@ mod tests {
 
         // Non-empty-candidate-set check (issue #281 was exactly a guard
         // that skipped this and passed vacuously once its own scan broke):
-        // today there are 6 (set_current, set_egress_preview_enabled,
+        // today there are 7 (set_current, set_egress_preview_enabled, set_daily_budget,
         // set_text_scale, set_mode, set_pause_chord, set_palette_chord);
         // require a comfortable margin under that so losing one candidate
         // to a future refactor cannot silently zero out this check.

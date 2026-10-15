@@ -523,6 +523,7 @@ pub(crate) fn post_json_with(
 ) -> Result<String> {
     send_preview_guard(url)?;
     offline_guard(url)?;
+    budget_guard(url)?;
 
     let policy = env.policy;
     let mut retries = 0u32;
@@ -747,6 +748,19 @@ fn offline_guard(url: &str) -> Result<()> {
     }
 }
 
+/// #101: refuses a request that would be billed once today's spend has
+/// reached `[budget] daily_usd`. A loopback URL is free (Ollama, LM Studio)
+/// and always passes. Called by `post_json_with`, the only send path for a
+/// billed provider, so a new provider or action cannot skip it. A refusal is
+/// an ordinary `Err`: the chain falls through to a local provider if it has
+/// one, and otherwise the message becomes the card.
+fn budget_guard(url: &str) -> Result<()> {
+    if crate::usage::is_loopback_url(url) {
+        return Ok(());
+    }
+    crate::usage::check_budget().map_err(|m| anyhow!(m))
+}
+
 /// GET, single attempt, no retry (#19, for `mode::probe_ollama_ready`): the
 /// caller treats any failure as "not reachable" and degrades gracefully, so
 /// a retry here would only add latency to exactly the path issue #19
@@ -792,6 +806,7 @@ pub(crate) fn post_json_read_body<T>(
     read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
 ) -> Result<T> {
     offline_guard(url)?;
+    budget_guard(url)?;
 
     let mut response = ureq::post(url)
         .config()
@@ -833,6 +848,7 @@ pub(crate) fn post_json_with_connect_timeout(
 ) -> Result<String> {
     send_preview_guard(url)?;
     offline_guard(url)?;
+    budget_guard(url)?;
 
     // #191: no retry loop here (Ollama is local/loopback and unbilled), so
     // an attempt logged from this function is never a retry.
@@ -2317,5 +2333,160 @@ mod tests {
             offenders.is_empty(),
             "these interpolate a raw error into user-facing text; use `{{}}` with `redact_detail(&e)`: {offenders:?}"
         );
+    }
+
+    // -- daily budget (#101) -------------------------------------------------
+
+    /// Sets the budget and the spend `usage::check_budget` sees, and puts both
+    /// back on drop (also when an assertion panics), so no other test in the
+    /// binary ever sees them. Callers hold `network_guard()` for the whole test.
+    struct BudgetScope;
+
+    impl BudgetScope {
+        fn new(limit_usd: f64, spent: f64) -> Self {
+            crate::usage::set_daily_budget(limit_usd, 80);
+            *crate::usage::SPENT_OVERRIDE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(spent);
+            BudgetScope
+        }
+    }
+
+    impl Drop for BudgetScope {
+        fn drop(&mut self) {
+            crate::usage::set_daily_budget(0.0, 80);
+            *crate::usage::SPENT_OVERRIDE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    fn post_to(url: &str, transport: &ScriptedTransport) -> Result<String> {
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv {
+            transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
+        post_json_with(&env, url, &[], &json!({}), Duration::from_secs(1), "test")
+    }
+
+    #[test]
+    fn a_spent_budget_refuses_a_cloud_request_before_the_transport_runs() {
+        let _g = network_guard();
+        let _b = BudgetScope::new(0.05, 0.05);
+        let transport = ScriptedTransport::new(vec![ok("must not be reached")]);
+        let err = post_to("https://api.example.com/v1/x", &transport).unwrap_err();
+        assert!(err.to_string().contains("Daily budget"), "{err}");
+        assert_eq!(transport.call_count(), 0);
+    }
+
+    #[test]
+    fn a_spent_budget_still_allows_a_loopback_request() {
+        let _g = network_guard();
+        let _b = BudgetScope::new(0.05, 9.0);
+        for url in ["http://127.0.0.1:1234/v1/x", "http://localhost:1234/v1/x"] {
+            let transport = ScriptedTransport::new(vec![ok("local")]);
+            assert_eq!(post_to(url, &transport).unwrap(), "local", "{url}");
+            assert_eq!(transport.call_count(), 1);
+        }
+    }
+
+    #[test]
+    fn a_cloud_request_goes_through_under_the_limit_or_with_no_budget() {
+        let _g = network_guard();
+        {
+            let _b = BudgetScope::new(0.05, 0.04);
+            let transport = ScriptedTransport::new(vec![ok("billed")]);
+            assert_eq!(
+                post_to("https://api.example.com/v1/x", &transport).unwrap(),
+                "billed"
+            );
+        }
+        // Budget off (the default) however much was spent.
+        let _b = BudgetScope::new(0.0, 99.0);
+        let transport = ScriptedTransport::new(vec![ok("billed")]);
+        assert_eq!(
+            post_to("https://api.example.com/v1/x", &transport).unwrap(),
+            "billed"
+        );
+    }
+
+    /// The chain half: a cloud provider that is refused by the budget falls
+    /// through to the local one in the same chain, and the user still gets an
+    /// answer.
+    #[test]
+    fn a_refused_cloud_provider_falls_through_to_the_local_one_in_the_chain() {
+        use crate::provider::{Caps, Chain, Completion, Provider, Request, StopReason};
+
+        struct Posts(&'static str, &'static str);
+        impl Provider for Posts {
+            fn id(&self) -> &'static str {
+                self.0
+            }
+            fn capabilities(&self, _: &str) -> Caps {
+                Caps::default()
+            }
+            fn complete(&self, _: &Request) -> Result<Completion> {
+                let transport = ScriptedTransport::new(vec![ok("answer")]);
+                post_to(self.1, &transport).map(|text| Completion {
+                    text,
+                    usage: None,
+                    stop: StopReason::Complete,
+                })
+            }
+        }
+
+        let _g = network_guard();
+        let _b = BudgetScope::new(0.05, 1.0);
+        let chain = Chain::new(vec![
+            Box::new(Posts("cloud", "https://api.example.com/v1/x")),
+            Box::new(Posts("local", "http://127.0.0.1:11434/v1/x")),
+        ]);
+        let req = Request {
+            system: String::new(),
+            user: "hi".into(),
+            images: vec![],
+            schema: None,
+            effort: crate::provider::Effort::Low,
+            max_tokens: 0,
+        };
+        assert_eq!(chain.complete(&req).unwrap().text, "answer");
+
+        let cloud_only = Chain::new(vec![Box::new(Posts(
+            "cloud",
+            "https://api.example.com/v1/x",
+        ))]);
+        let err = cloud_only.complete(&req).unwrap_err();
+        assert!(err.to_string().contains("Daily budget"), "{err}");
+    }
+
+    #[test]
+    fn a_spent_budget_refuses_the_other_send_paths_too() {
+        let _g = network_guard();
+        let _b = BudgetScope::new(0.05, 0.05);
+        // Never reaches the network: the guard answers first.
+        let err = post_json_with_connect_timeout(
+            "https://api.example.invalid/v1/x",
+            &[],
+            &json!({}),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Daily budget"), "{err}");
+        let err = post_json_read_body(
+            "https://api.example.invalid/v1/x",
+            &json!({}),
+            Duration::from_millis(50),
+            "test",
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Daily budget"), "{err}");
     }
 }

@@ -209,3 +209,21 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "explain-this-screen"
+name = "Explain what's on screen"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "screen_explanation"
+executor = "none"
+confirm = false
+prompt = """You are shown what is on the user's screen, as text if some was selected and as a screenshot otherwise. Explain it to someone who has not looked at it closely. First fill `detail`: two to four short plain sentences. If it is a dialog or a message, say what it asks or says and what each choice would do. If it is an error, say what it means and what to try. If it is an article or a page, say what it is about and its main point. If it is code, say what it does. If it is anything else, say what it is and what it is for. Then fill `headline`: one sentence of at most 120 characters that sums up `detail`. Use only what is shown: never guess names, numbers or consequences that are not visible. Quote error codes and file names exactly as shown. Do not tell the user to press, click or submit anything. If the screen is blank or unreadable, return an empty `headline` and an empty `detail`. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead)."""
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"

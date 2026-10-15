@@ -103,3 +103,7 @@ require_tick_for = "sensitive"
 
 [egress_preview]
 enabled = false
+
+[budget]
+daily_usd = 0.0
+warn_percent = 80
