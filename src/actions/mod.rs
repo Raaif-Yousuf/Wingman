@@ -11,8 +11,8 @@ pub mod extract_text;
 pub mod fill_form;
 pub mod generic_answer;
 pub mod generic_inputs;
-pub mod read_qr;
 pub mod page_summary;
+pub mod read_qr;
 pub mod review_email;
 pub mod schema;
 
@@ -474,7 +474,7 @@ mod tests {
         let builtins = builtin_actions();
         assert_eq!(
             builtins.len(),
-            7,
+            8,
             "check-my-work, extract-text-to-clipboard (#41), read-qr-code (#313), summarize-page (#67), \
              add-to-calendar (#39), review-this-email (#38), fill-this-form (#40), \
              action-items-checklist (#314)"

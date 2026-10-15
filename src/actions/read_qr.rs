@@ -39,8 +39,54 @@ pub struct Scan {
     pub unreadable: usize,
 }
 
+/// The longest side, in pixels, the detector is ever given. `rqrr` has no
+/// time limit of its own and its work grows steeply with the number of
+/// finder-pattern-like shapes it finds: on a noisy 4K frame it ran for about
+/// 24 minutes in the test profile and overflowed in a debug build (#528).
+/// Larger frames are shrunk by a whole-number factor first, so the worker is
+/// never busy for long. A code that is still readable at 1920 pixels wide
+/// (about 3 pixels per module for a typical code at half the screen width)
+/// is found; one smaller than that is reported as not found.
+const MAX_SIDE: usize = 1920;
+
+/// A greyscale image: `px.len() == w * h`.
+struct Grey {
+    px: Vec<u8>,
+    w: usize,
+    h: usize,
+}
+
+/// `rgba` as greyscale, shrunk by the smallest whole-number factor (box
+/// average) that brings both sides to at most [`MAX_SIDE`]. Pure. The caller
+/// has already checked that `rgba` is exactly `w * h * 4` bytes.
+fn bounded_grey(rgba: &[u8], w: usize, h: usize) -> Grey {
+    let factor = w.max(h).div_ceil(MAX_SIDE).max(1);
+    let (ow, oh) = (w.div_ceil(factor), h.div_ceil(factor));
+    let mut px = Vec::with_capacity(ow * oh);
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let (x1, y1) = (((ox + 1) * factor).min(w), ((oy + 1) * factor).min(h));
+            let (mut sum, mut n) = (0u32, 0u32);
+            for y in oy * factor..y1 {
+                for x in ox * factor..x1 {
+                    let i = (y * w + x) * 4;
+                    // Rec. 601 luma in integers: no float work per pixel.
+                    sum += (u32::from(rgba[i]) * 299
+                        + u32::from(rgba[i + 1]) * 587
+                        + u32::from(rgba[i + 2]) * 114)
+                        / 1000;
+                    n += 1;
+                }
+            }
+            px.push((sum / n.max(1)) as u8);
+        }
+    }
+    Grey { px, w: ow, h: oh }
+}
+
 /// Find and decode every QR code in an RGBA image. Pure CPU work, so it runs
-/// on the worker thread; a 4K screenshot takes a fraction of a second.
+/// on the worker thread. The detector only ever sees an image of at most
+/// [`MAX_SIDE`] pixels on a side, so the time is bounded.
 pub fn scan(rgba: &[u8], width: u32, height: u32) -> Scan {
     let (w, h) = (width as usize, height as usize);
     // A short or empty buffer must never index out of range (the worker
@@ -48,12 +94,9 @@ pub fn scan(rgba: &[u8], width: u32, height: u32) -> Scan {
     if w == 0 || h == 0 || w.checked_mul(h).and_then(|n| n.checked_mul(4)) != Some(rgba.len()) {
         return Scan::default();
     }
-    let mut img = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| {
-        let i = (y * w + x) * 4;
-        // Rec. 601 luma in integers: no float work per pixel.
-        ((u32::from(rgba[i]) * 299 + u32::from(rgba[i + 1]) * 587 + u32::from(rgba[i + 2]) * 114)
-            / 1000) as u8
-    });
+    let grey = bounded_grey(rgba, w, h);
+    let mut img =
+        rqrr::PreparedImage::prepare_from_greyscale(grey.w, grey.h, |x, y| grey.px[y * grey.w + x]);
     let mut out = Scan::default();
     for grid in img.detect_grids() {
         match grid.decode() {
@@ -759,6 +802,8 @@ mod tests {
     /// A 4K frame full of noise and finder-pattern-like squares, the worst
     /// plausible input for the detector. It must come back without panicking
     /// (the release build aborts on panic). Prints the time as a measurement.
+    /// Fast because the frame is shrunk before detection (#528): 0.2 s in the
+    /// test profile, 46 ms in release.
     #[test]
     fn scan_survives_a_4k_frame_of_finder_pattern_noise() {
         let (w, h) = (3840usize, 2160usize);
@@ -802,6 +847,43 @@ mod tests {
             .detail
             .is_empty());
         }
+    }
+
+    #[test]
+    fn the_detector_never_sees_more_than_the_bound() {
+        // Dimensions only: a 4K and an 8K frame, and an odd size that does
+        // not divide evenly. A black 3x3 bit more than the bound still fits.
+        for (w, h) in [
+            (3840usize, 2160usize),
+            (7680, 4320),
+            (3841, 2161),
+            (1920, 1080),
+        ] {
+            let rgba = vec![0u8; w * h * 4];
+            let g = bounded_grey(&rgba, w, h);
+            assert!(
+                g.w <= MAX_SIDE && g.h <= MAX_SIDE,
+                "{w}x{h} -> {}x{}",
+                g.w,
+                g.h
+            );
+            assert_eq!(g.px.len(), g.w * g.h);
+        }
+        // Frames at or under the bound are not touched.
+        let g = bounded_grey(&vec![0u8; 800 * 600 * 4], 800, 600);
+        assert_eq!((g.w, g.h), (800, 600));
+    }
+
+    #[test]
+    fn shrinking_keeps_the_picture_and_a_code_still_reads_on_a_4k_screen() {
+        let mut rgba = vec![255u8; 8];
+        rgba[..4].copy_from_slice(&[0, 0, 0, 255]);
+        // 2x1 frame untouched: first pixel black, second white.
+        let g = bounded_grey(&rgba, 2, 1);
+        assert_eq!(g.px, vec![0, 255]);
+        let shot = canvas(3840, 2160, &[("https://example.com/4k", 1000, 800)]);
+        let found = scan(&shot.rgba, shot.width, shot.height);
+        assert_eq!(found.texts, vec!["https://example.com/4k".to_string()]);
     }
 
     #[test]
