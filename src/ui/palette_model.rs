@@ -617,6 +617,17 @@ fn friendly_model_name(provider_model: &str) -> String {
     model.to_string()
 }
 
+/// #228: the card's footer line when a fallback answered, e.g. `"Answered by
+/// gemma3:4b (GPT-5.5 was unavailable)"`. Both arguments are
+/// `"<provider>:<model>"` labels. No em dash (rule 11).
+pub fn fallback_footer(answered: &str, first_choice: &str) -> String {
+    format!(
+        "Answered by {} ({} was unavailable)",
+        friendly_model_name(answered),
+        friendly_model_name(first_choice)
+    )
+}
+
 /// `"Auto · GPT-5.5"`, or just `"Offline"` when `provider_model` is `None`
 /// (nothing configured / ready). No em dash (rule 11).
 pub fn footer_line(mode_label: &str, provider_model: Option<&str>) -> String {
@@ -1299,5 +1310,22 @@ mod tests {
         let b = footer_line("Auto", None);
         assert!(!a.contains('\u{2014}'));
         assert!(!b.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn fallback_footer_names_both_models() {
+        assert_eq!(
+            fallback_footer("ollama:gemma3:4b", "openai:gpt-5.5"),
+            "Answered by gemma3:4b (GPT-5.5 was unavailable)"
+        );
+        assert_eq!(
+            fallback_footer("anthropic:claude-opus-4-8", "openai:gpt-5.5"),
+            "Answered by Claude Opus 4.8 (GPT-5.5 was unavailable)"
+        );
+    }
+
+    #[test]
+    fn fallback_footer_has_no_em_dash() {
+        assert!(!fallback_footer("ollama:x", "openai:y").contains('\u{2014}'));
     }
 }

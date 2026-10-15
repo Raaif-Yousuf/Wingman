@@ -259,6 +259,10 @@ impl Provider for Ollama {
         self.capabilities(&self.model)
     }
 
+    fn model_label(&self) -> String {
+        format!("{}:{}", self.id(), self.model)
+    }
+
     fn complete(&self, req: &Request) -> Result<Completion> {
         let body = self.build_body(req);
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));

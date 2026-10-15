@@ -237,6 +237,10 @@ impl Provider for OpenAi {
         self.capabilities(&self.model)
     }
 
+    fn model_label(&self) -> String {
+        format!("{}:{}", self.id(), self.model)
+    }
+
     fn complete(&self, req: &Request) -> Result<Completion> {
         let body = self.build_body(req);
 
