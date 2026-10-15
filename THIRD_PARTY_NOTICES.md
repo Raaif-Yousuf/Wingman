@@ -22,7 +22,8 @@ separate Phase 0 item) exists; regenerate this file whenever `Cargo.lock`
 changes materially, by rerunning the command above against the current lock
 file and updating the table.
 
-156 crates resolve for this target as of `Cargo.lock`. Issue #160 dropped
+162 crates resolve for this target as of `Cargo.lock` (including the QR-code
+decoder `rqrr` and its chain `g2p`, `g2gen`, `g2poly` and `lru`, plus the dev-only `qrcode`). Issue #160 dropped
 the direct dependency `dirs` (and its `dirs-sys` -> `option-ext` transitive
 chain, plus the `windows-sys` 0.61.2 pulled in only by `dirs-sys`) in favor
 of a direct `SHGetKnownFolderPath` call through the `windows` crate this
@@ -35,9 +36,9 @@ Dev-dependencies are in scope for this file: it documents what is
 reachable from `cargo test`'s dependency graph on this platform, not only
 what links into the shipped `wingman.exe`.
 `cargo metadata --format-version 1 --filter-platform x86_64-pc-windows-msvc`
-resolves 157 packages for this target; the one package this file does not
+resolves 163 packages for this target; the one package this file does not
 list is `wingman` itself (the file covers third-party dependencies, not the
-project), so 157 - 1 = 156 matches the table below.
+project), so 163 - 1 = 162 matches the table below.
 
 ## Direct dependencies
 
@@ -48,11 +49,13 @@ project), so 157 - 1 = 156 matches the table below.
 | base64 | 0.23.1 | MIT OR Apache-2.0 | https://github.com/marshallpierce/rust-base64 |
 | embed-resource | 3.0.11 (build) | MIT | https://github.com/nabijaczleweli/rust-embed-resource |
 | image | 0.25.10 | MIT OR Apache-2.0 | https://github.com/image-rs/image |
+| rqrr | 0.11.0 (default features off) | (MIT OR Apache-2.0) AND ISC | https://github.com/WanzenBug/rqrr |
 | rusqlite | 0.40.2 (feature `bundled`) | MIT | https://github.com/rusqlite/rusqlite |
 | serde | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde |
 | serde_json | 1.0.151 | MIT OR Apache-2.0 | https://github.com/serde-rs/json |
 | toml | 1.1.6 | MIT OR Apache-2.0 | https://github.com/toml-rs/toml |
 | trybuild | 1.0.121 (dev) | MIT OR Apache-2.0 | https://github.com/dtolnay/trybuild |
+| qrcode | 0.14.1 (dev) | MIT OR Apache-2.0 | https://github.com/kennytm/qrcode-rust |
 | ureq | 3.4.2 | MIT OR Apache-2.0 | https://github.com/algesten/ureq |
 | windows | 0.62.2 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs |
 | xcap | 0.9.8 | **Apache-2.0 only** | https://github.com/nashaofu/xcap |
@@ -129,6 +132,9 @@ state, not a pending action.
 | flate2 | 1.1.10 | MIT OR Apache-2.0 |
 | foldhash | 0.2.0 | Zlib |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |
+| g2gen | 1.2.2 | MIT/Apache-2.0 |
+| g2p | 1.2.2 | MIT/Apache-2.0 |
+| g2poly | 1.2.2 | MIT/Apache-2.0 |
 | getrandom | 0.2.17 | MIT OR Apache-2.0 |
 | glob | 0.3.4 | MIT OR Apache-2.0 |
 | half | 2.7.1 | MIT OR Apache-2.0 |
@@ -153,6 +159,7 @@ state, not a pending action.
 | litemap | 0.8.3 | Unicode-3.0 |
 | litrs | 1.0.0 | MIT OR Apache-2.0 |
 | log | 0.4.34 | MIT OR Apache-2.0 |
+| lru | 0.18.5 | MIT |
 | memchr | 2.8.3 | Unlicense OR MIT |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 |
@@ -168,8 +175,10 @@ state, not a pending action.
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
 | pxfm | 0.1.30 | BSD-3-Clause OR Apache-2.0 |
 | quick-error | 2.0.1 | MIT/Apache-2.0 |
+| qrcode | 0.14.1 | MIT OR Apache-2.0 |
 | quote | 1.0.47 | MIT OR Apache-2.0 |
 | ring | 0.17.14 | Apache-2.0 AND ISC |
+| rqrr | 0.11.0 | (MIT OR Apache-2.0) AND ISC |
 | rusqlite | 0.40.2 | MIT |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 |
 | rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT |
