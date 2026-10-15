@@ -206,6 +206,7 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     inner_ref.children = built.children;
     inner_ref.content_top_dp = built.content_top_dp;
     inner_ref.win_h_dp = built.win_h_dp;
+    inner_ref.ollama_link_url = built.ollama_link_url;
     // #342: the prompt starts hidden, so shrink the window to match.
     unsafe { show_prompt_state(inner_ref) };
     unsafe {
@@ -263,7 +264,7 @@ static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 /// prompt toggle toggles); anywhere else Enter saves.
 fn enter_command(ctrl_id: i32) -> i32 {
     match ctrl_id {
-        ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT => ctrl_id,
+        ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK => ctrl_id,
         _ => ID_SAVE,
     }
 }
@@ -411,6 +412,8 @@ struct SettingsInner {
     content_top_dp: i32,
     win_h_dp: i32,
     prompt_edit: HWND,
+    /// #343: where the Ollama group's link button goes, if it has one.
+    ollama_link_url: Option<&'static str>,
     /// #342: whether the Advanced group shows the Check my work prompt.
     /// Starts collapsed on every open.
     prompt_expanded: bool,
@@ -432,6 +435,7 @@ impl SettingsInner {
             content_top_dp: 0,
             win_h_dp: WIN_H_DP,
             prompt_edit: HWND(std::ptr::null_mut()),
+            ollama_link_url: None,
             prompt_expanded: false,
             original,
             result: None,
@@ -530,6 +534,16 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 let _ = DestroyWindow(inner.hwnd);
             }
         }
+        ID_OLLAMA_LINK if notify == BN_CLICKED => {
+            if let Some(url) = inner.ollama_link_url {
+                if !open_url(url) {
+                    // Rule 7: say so inline, never a dialog or a silent no-op.
+                    if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
+                        set_text(status, &format!("Could not open your browser. Go to {url}"));
+                    }
+                }
+            }
+        }
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, DEFAULT_PROMPT);
         }
@@ -624,6 +638,8 @@ const ID_OLLAMA_STATUS: i32 = 120;
 const ID_VALIDATION_MESSAGE: i32 = 121;
 /// #403: the fill-form tick-requirement combo (`config.forms.require_tick_for`).
 const ID_REQUIRE_TICK_FOR: i32 = 122;
+/// #343: the Ollama group's link button (Get Ollama / Local models).
+const ID_OLLAMA_LINK: i32 = 124;
 /// #342: shows or hides the Check my work prompt in the Advanced group.
 const ID_PROMPT_TOGGLE: i32 = 123;
 
@@ -659,6 +675,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_OLLAMA_STATUS", ID_OLLAMA_STATUS),
     ("ID_VALIDATION_MESSAGE", ID_VALIDATION_MESSAGE),
     ("ID_REQUIRE_TICK_FOR", ID_REQUIRE_TICK_FOR),
+    ("ID_OLLAMA_LINK", ID_OLLAMA_LINK),
     ("ID_PROMPT_TOGGLE", ID_PROMPT_TOGGLE),
 ];
 
@@ -821,6 +838,8 @@ fn to_px(dp: i32, dpi: u32) -> i32 {
 /// further. (`MIN_PROMPT_EDIT_H` in dp, three text rows tall.)
 const MIN_PROMPT_EDIT_H: i32 = ROW_H * 3;
 
+/// Width of the Ollama group's link button (#343), in dp.
+const OLLAMA_LINK_W: i32 = 120;
 /// Width of the "Show/Hide Check my work prompt" toggle (#342), in dp.
 const PROMPT_TOGGLE_W: i32 = 210;
 
@@ -1484,6 +1503,102 @@ fn should_query_ollama_details(ollama_configured: bool, health: &OllamaHealth) -
         )
 }
 
+/// #343: where "Get Ollama" goes.
+const OLLAMA_DOWNLOAD_URL: &str = "https://ollama.com/download";
+/// #343: where "Local models" goes (the Ollama section of `docs/providers.md`).
+const OLLAMA_DOCS_URL: &str =
+    "https://github.com/Raaif-Yousuf/Wingman/blob/master/docs/providers.md#ollama";
+
+/// What the Ollama group shows (#343): the text, and an optional button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OllamaSection {
+    text: String,
+    /// `(button label, url)`.
+    link: Option<(&'static str, &'static str)>,
+}
+
+/// Turns the status line into an actionable section (#343). `status` is the
+/// existing health/GPU line, `listening` whether anything answers on the
+/// port, `installed` whether an Ollama install was found, `configured`
+/// whether Ollama is already in `providers.order`.
+/// - Not installed: say what it is and offer the download.
+/// - Installed, not running: say what to do (no link; nothing to open).
+/// - Running: the status line, plus a pointer to the docs when Ollama is not
+///   set up as a provider yet.
+fn ollama_section(
+    status: String,
+    listening: bool,
+    installed: bool,
+    configured: bool,
+) -> OllamaSection {
+    if !listening {
+        return if installed {
+            OllamaSection {
+                text: "Ollama is installed but not running. Start Ollama, then reopen Settings."
+                    .to_string(),
+                link: None,
+            }
+        } else {
+            OllamaSection {
+                text: "Ollama runs AI models on this PC, free and offline.".to_string(),
+                link: Some(("Get Ollama", OLLAMA_DOWNLOAD_URL)),
+            }
+        };
+    }
+    let text = if configured {
+        status
+    } else {
+        format!("{status} To use it, see Local models.")
+    };
+    OllamaSection {
+        text,
+        link: Some(("Local models", OLLAMA_DOCS_URL)),
+    }
+}
+
+/// Where an Ollama install would be (#343): the default per-user install
+/// folder, then each `PATH` entry. Pure; [`ollama_installed`] checks disk.
+fn ollama_install_candidates(
+    local_app_data: Option<&str>,
+    path_var: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(l) = local_app_data.filter(|l| !l.is_empty()) {
+        out.push(std::path::Path::new(l).join(r"Programs\Ollama\ollama.exe"));
+    }
+    if let Some(p) = path_var {
+        for dir in p.split(';').filter(|d| !d.is_empty()) {
+            out.push(std::path::Path::new(dir).join("ollama.exe"));
+        }
+    }
+    out
+}
+
+fn ollama_installed() -> bool {
+    let local = std::env::var("LOCALAPPDATA").ok();
+    let path = std::env::var("PATH").ok();
+    ollama_install_candidates(local.as_deref(), path.as_deref())
+        .iter()
+        .any(|p| p.is_file())
+}
+
+/// Opens `url` in the default browser. `false` when the shell refused
+/// (`ShellExecuteW` returns a value above 32 on success).
+fn open_url(url: &str) -> bool {
+    let wide = wide_z(url);
+    let r = unsafe {
+        windows::Win32::UI::Shell::ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    r.0 as isize > 32
+}
+
 /// Combines #15's health check with #14's GPU/CPU indicator into the one
 /// status line Settings shows for Ollama. Computed once, synchronously,
 /// when Settings opens (AGENTS.md rule 5: discovery happens on demand,
@@ -1491,13 +1606,14 @@ fn should_query_ollama_details(ollama_configured: bool, health: &OllamaHealth) -
 /// and always runs; the two HTTP calls it can make (`/api/ps`, `/api/tags`)
 /// only run when [`should_query_ollama_details`] says so (#188), and are
 /// bounded by [`OLLAMA_STATUS_HTTP_BUDGET`] in total when they do.
-fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> String {
+fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, bool) {
     let port = ollama_admin::port_from_base_url(&cfg.base_url).unwrap_or(11434);
     let health = ollama_admin::query_ollama_health(port);
     let health_msg = health.message();
+    let listening = matches!(health, OllamaHealth::Listening { .. });
 
     if !should_query_ollama_details(ollama_configured, &health) {
-        return health_msg;
+        return (health_msg, listening);
     }
 
     let budget_start = std::time::Instant::now();
@@ -1507,7 +1623,7 @@ fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> String {
             GpuStatus::Cpu => format!("{} is loaded on CPU.", cfg.model),
             GpuStatus::NotLoaded => format!("{} is not loaded yet.", cfg.model),
         },
-        Err(_) => return health_msg,
+        Err(_) => return (health_msg, listening),
     };
 
     // Whatever's left of the budget after `/api/ps`, capped at zero rather
@@ -1532,7 +1648,7 @@ fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> String {
         }
     };
 
-    format!("{health_msg} {gpu_line}{vision_line}")
+    (format!("{health_msg} {gpu_line}{vision_line}"), listening)
 }
 
 /// Builds every child control and returns the prompt edit's `HWND` (the
@@ -1557,6 +1673,8 @@ struct BuiltUi {
     content_top_dp: i32,
     /// The client height (dp) the elastic region was laid out for.
     win_h_dp: i32,
+    /// #343: the Ollama link button's target, if one was created.
+    ollama_link_url: Option<&'static str>,
 }
 
 fn build_ui_recorded(
@@ -1824,18 +1942,40 @@ fn build_ui_recorded(
     let ollama_top = y;
     y += GROUP_LABEL_TOP;
     let ollama_configured = config.providers.order.iter().any(|p| p == "ollama");
-    let ollama_status = ollama_status_line(&config.providers.ollama, ollama_configured);
+    let (status, listening) = ollama_status_line(&config.providers.ollama, ollama_configured);
+    let section = ollama_section(status, listening, ollama_installed(), ollama_configured);
+    // The link button sits at the right of the two text rows, so it adds no
+    // height to the window (#481).
+    let link_w = if section.link.is_some() {
+        OLLAMA_LINK_W + 12
+    } else {
+        0
+    };
     ctx.create(
         WC_STATIC,
-        &ollama_status,
+        &section.text,
         0,
         0,
         content_x + MARGIN,
         y,
-        content_w - 2 * MARGIN,
+        content_w - 2 * MARGIN - link_w,
         ROW_H * 2,
         ID_OLLAMA_STATUS,
     );
+    let ollama_link_url = section.link.map(|(label, url)| {
+        ctx.create(
+            WC_BUTTON,
+            label,
+            BS_PUSHBUTTON as u32,
+            0,
+            content_x + content_w - MARGIN - OLLAMA_LINK_W,
+            y + (ROW_H * 2 - BTN_H) / 2,
+            OLLAMA_LINK_W,
+            BTN_H,
+            ID_OLLAMA_LINK,
+        );
+        url
+    });
     y += ROW_H * 2;
     let ollama_bottom = y + 8;
     ctx.create(
@@ -2328,6 +2468,7 @@ fn build_ui_recorded(
         ID_SHOW_DIFFICULTY,
         ID_TEXT_SCALE_TRACK,
         ID_REQUIRE_TICK_FOR,
+        ID_OLLAMA_LINK,
         ID_PROMPT_TOGGLE,
         ID_PROMPT_EDIT,
         ID_RESET_PROMPT,
@@ -2344,6 +2485,7 @@ fn build_ui_recorded(
         children: ctx.children.into_inner(),
         content_top_dp,
         win_h_dp,
+        ollama_link_url,
     }
 }
 
@@ -2963,7 +3105,76 @@ mod tests {
             model: "gemma3:4b".to_string(),
             effort: "low".to_string(),
         };
-        assert_eq!(ollama_status_line(&cfg, true), "Ollama is not running.");
+        assert_eq!(
+            ollama_status_line(&cfg, true),
+            ("Ollama is not running.".to_string(), false)
+        );
+    }
+
+    // -- ollama_section (#343, pure) ---------------------------------------
+
+    #[test]
+    fn ollama_section_not_installed_offers_the_download() {
+        let sec = ollama_section("Ollama is not running.".into(), false, false, false);
+        assert!(sec.text.starts_with("Ollama runs AI models on this PC"));
+        assert_eq!(
+            sec.link,
+            Some(("Get Ollama", "https://ollama.com/download"))
+        );
+    }
+
+    #[test]
+    fn ollama_section_installed_but_stopped_says_to_start_it_and_has_no_link() {
+        let sec = ollama_section("Ollama is not running.".into(), false, true, true);
+        assert_eq!(
+            sec.text,
+            "Ollama is installed but not running. Start Ollama, then reopen Settings."
+        );
+        assert_eq!(sec.link, None);
+    }
+
+    #[test]
+    fn ollama_section_running_links_to_the_local_models_docs() {
+        let sec = ollama_section("Ollama is running.".into(), true, true, false);
+        assert_eq!(sec.text, "Ollama is running. To use it, see Local models.");
+        let (label, url) = sec.link.expect("a link");
+        assert_eq!(label, "Local models");
+        assert!(url.ends_with("docs/providers.md#ollama"), "{url}");
+        // Already set up as a provider: no nudge, the link stays.
+        let sec = ollama_section("Ollama is running.".into(), true, true, true);
+        assert_eq!(sec.text, "Ollama is running.");
+        assert!(sec.link.is_some());
+    }
+
+    #[test]
+    fn ollama_section_text_has_no_em_dash() {
+        for (l, i, c) in [
+            (false, false, false),
+            (false, true, true),
+            (true, true, false),
+        ] {
+            assert!(!ollama_section("x".into(), l, i, c)
+                .text
+                .contains('\u{2014}'));
+        }
+    }
+
+    #[test]
+    fn ollama_install_candidates_cover_the_default_folder_and_path() {
+        let c = ollama_install_candidates(Some(r"C:\Users\me\AppData\Local"), Some(r"C:\a;;D:\b"));
+        let s: Vec<String> = c
+            .iter()
+            .map(|p| p.to_string_lossy().replace('/', "\\"))
+            .collect();
+        assert_eq!(
+            s,
+            vec![
+                r"C:\Users\me\AppData\Local\Programs\Ollama\ollama.exe".to_string(),
+                r"C:\a\ollama.exe".to_string(),
+                r"D:\b\ollama.exe".to_string(),
+            ]
+        );
+        assert!(ollama_install_candidates(None, None).is_empty());
     }
 
     // -- should_query_ollama_details (#188, pure) -------------------------
@@ -3026,7 +3237,7 @@ mod tests {
             effort: "low".to_string(),
         };
 
-        let status = ollama_status_line(&cfg, false);
+        let (status, _) = ollama_status_line(&cfg, false);
         // The Win32-only health check still runs (it's cheap) and is all
         // this status line shows when not configured -- no GPU/CPU or
         // vision-count sentence appended, which is what the HTTP calls
@@ -3907,6 +4118,7 @@ mod tests {
         assert_eq!(enter_command(ID_PROMPT_TOGGLE), ID_PROMPT_TOGGLE);
         assert_eq!(enter_command(ID_RESET_PROMPT), ID_RESET_PROMPT);
         assert_eq!(enter_command(ID_CANCEL), ID_CANCEL);
+        assert_eq!(enter_command(ID_OLLAMA_LINK), ID_OLLAMA_LINK);
         assert_eq!(enter_command(ID_SAVE), ID_SAVE);
         assert_eq!(enter_command(ID_CARD_SECONDS), ID_SAVE);
         assert_eq!(enter_command(0), ID_SAVE);
