@@ -1,5 +1,6 @@
-//! "Summarize this page" (#67): a two-line summary of whatever is on screen
-//! (or the selected text), with about five bullets behind a click.
+//! "Summarize this page" (#67): a two-line summary of the page in the window
+//! (the selected text if there is one, else the page text read through UI
+//! Automation (#104), else the screen), with about five bullets behind a click.
 //!
 //! The model fills `bullets`, then `line1` and `line2` (the bullets first, so
 //! the two lines are written from points it has already committed to; see
@@ -43,7 +44,7 @@ pub const NOTHING_HEADLINE: &str = "Nothing to summarize";
 
 /// The action's prompt. The limits are asked for here and enforced in
 /// [`card_text`].
-pub const BASE_PROMPT: &str = "You are shown a long page (an article, a report, an email thread, a document), as text if some was selected and as a screenshot otherwise. Summarize what is on it. Fill `bullets` first: at most 5 plain-text points, one short sentence each, in the order they appear on the page. Then write `line1`: one short sentence, at most 50 characters, that says what this page is or announces. Then write `line2`: one sentence, at most 90 characters, that says what matters most to a reader. Use only what the page says: do not add facts, numbers or opinions that are not shown. If there is no readable page content, return an empty `line1`, an empty `line2` and no bullets. Use plain text only: no markdown, no bullet characters, no LaTeX, and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
+pub const BASE_PROMPT: &str = "You are shown a long page (an article, a report, an email thread, a document), as text (the selection if there is one, otherwise the page text read from the window) and as a screenshot only when no text could be read. Summarize what is on it. Fill `bullets` first: at most 5 plain-text points, one short sentence each, in the order they appear on the page. Then write `line1`: one short sentence, at most 50 characters, that says what this page is or announces. Then write `line2`: one sentence, at most 90 characters, that says what matters most to a reader. Use only what the page says: do not add facts, numbers or opinions that are not shown. If there is no readable page content, return an empty `line1`, an empty `line2` and no bullets. Use plain text only: no markdown, no bullet characters, no LaTeX, and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
 
 /// The built-in action: group Work, the selection when there is one and the
 /// screen otherwise, proposal `page_summary`, executor `none`,
@@ -53,7 +54,7 @@ pub fn builtin_action() -> Action {
         id: ACTION_ID.to_string(),
         name: "Summarize this page".to_string(),
         group: Some("Work".to_string()),
-        inputs: vec![InputKind::Selection, InputKind::Screen],
+        inputs: vec![InputKind::Selection, InputKind::PageText, InputKind::Screen],
         proposal: PROPOSAL_KIND.to_string(),
         executor: "none".to_string(),
         confirm: false,
@@ -234,7 +235,10 @@ mod tests {
     fn the_action_entry_is_wired_the_way_the_issue_describes() {
         let a = builtin_action();
         assert_eq!(a.id, ACTION_ID);
-        assert_eq!(a.inputs, vec![InputKind::Selection, InputKind::Screen]);
+        assert_eq!(
+            a.inputs,
+            vec![InputKind::Selection, InputKind::PageText, InputKind::Screen]
+        );
         assert_eq!(a.proposal, PROPOSAL_KIND);
         assert_eq!(a.executor, "none");
         assert!(!a.confirm, "read-only, the card is the result");

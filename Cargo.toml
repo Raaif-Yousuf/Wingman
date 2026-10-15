@@ -69,6 +69,8 @@ features = [
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_System_Time",
+  # inputs/page_text.rs (#104): the VARIANT a UIA property condition takes.
+  "Win32_System_Variant",
   "Win32_UI_Accessibility",
   # Issue #30 (OCR): RoInitialize/RoUninitialize, to give the calling
   # worker thread a WinRT apartment before touching any Windows.Media.Ocr

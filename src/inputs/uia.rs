@@ -35,12 +35,10 @@
 //! thread must never block or every application on the desktop stops
 //! receiving keyboard input for as long as the call takes.
 //!
-//! Nothing in `app.rs` calls anything in this module yet -- wiring a real
-//! key press or palette action to `snapshot_foreground` is a later issue
-//! (the same status `executors/` had until #31's registry landed, and
-//! `executors::uia_guard::is_forbidden_target` still has today). Every
-//! public item below carries `#[allow(dead_code)]` for that reason; they
-//! are all exercised by this file's own tests.
+//! `app.rs`'s generic-action worker calls [`snapshot_hwnd`] (the `uia` input,
+//! #484). [`snapshot_foreground`] has no caller yet; the
+//! `#[allow(dead_code)]` attributes below date from before the wiring and
+//! are harmless. Every public item is exercised by this file's own tests.
 
 use std::time::Duration;
 

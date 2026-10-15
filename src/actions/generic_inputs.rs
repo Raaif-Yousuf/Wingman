@@ -11,6 +11,10 @@
 //! That is the "falls back to the screen if nothing is selected" behaviour
 //! `CONTRIBUTING.md`'s `translate-to-clipboard` example promises.
 //!
+//! `page_text` (#104) is the whole document text of the foreground browser
+//! or reader, read through UI Automation. It is the fallback for a listed
+//! `selection`: when something is selected, only that is sent.
+//!
 //! `text` and `context` are accepted in the list but gathered by nothing
 //! yet; they neither add text nor count as a reason to send the screen.
 //! `window` and `region` are treated as `screen`: the capture is the active
@@ -48,6 +52,10 @@ pub struct Gathered {
     pub clipboard: Option<String>,
     pub clipboard_truncated: bool,
     pub uia: Option<String>,
+    /// The foreground browser or reader's document text (#104).
+    pub page_text: Option<String>,
+    /// The page text was cut to the reader's length limit.
+    pub page_text_truncated: bool,
 }
 
 /// What the request carries: the user turn's text, whether a screenshot is
@@ -72,8 +80,28 @@ pub fn wants_uia(inputs: &[InputKind]) -> bool {
     inputs.contains(&InputKind::Uia)
 }
 
+pub fn wants_page_text(inputs: &[InputKind]) -> bool {
+    inputs.contains(&InputKind::PageText)
+}
+
+/// Whether the worker should read the page text: it is listed, and no listed
+/// selection already produced text. A selection means the user pointed at
+/// the part they care about, so reading (and sending) the whole page too
+/// would only add cost and noise. Decided here, not in the gatherer, so the
+/// rule is unit-tested without a window.
+pub fn needs_page_text(inputs: &[InputKind], gathered: &Gathered) -> bool {
+    // A password field ends the action in `plan`, so the page would be read
+    // and then thrown away.
+    wants_page_text(inputs)
+        && !(wants_selection(inputs)
+            && (gathered.selection_in_password_field || usable(&gathered.selection).is_some()))
+}
+
 fn wants_any_text(inputs: &[InputKind]) -> bool {
-    wants_selection(inputs) || wants_clipboard(inputs) || wants_uia(inputs)
+    wants_selection(inputs)
+        || wants_clipboard(inputs)
+        || wants_uia(inputs)
+        || wants_page_text(inputs)
 }
 
 fn wants_screen(inputs: &[InputKind]) -> bool {
@@ -100,6 +128,12 @@ pub fn plan(inputs: &[InputKind], gathered: &Gathered) -> Result<RequestInputs, 
     }
     if let Some(t) = usable(&gathered.uia).filter(|_| wants_uia(inputs)) {
         sections.push(section("Window fields", t, false));
+    }
+    // The page is the fallback for a selection (see `needs_page_text`).
+    if sections.is_empty() {
+        if let Some(t) = usable(&gathered.page_text).filter(|_| wants_page_text(inputs)) {
+            sections.push(section("Page text", t, gathered.page_text_truncated));
+        }
     }
 
     if !sections.is_empty() {
@@ -142,6 +176,8 @@ fn missing_message(inputs: &[InputKind]) -> String {
         "Nothing is selected. Select some text first (password fields are never read).".to_string()
     } else if wants_clipboard(inputs) {
         "The clipboard has no text. Copy some text first.".to_string()
+    } else if wants_page_text(inputs) {
+        "Couldn't read any text from the page.".to_string()
     } else {
         "Couldn't read any text from the window.".to_string()
     }
@@ -330,5 +366,98 @@ mod tests {
         // Clipboard has text but the action only asked for the selection.
         let e = plan(&[Selection], &g(None, Some("c"), None)).unwrap_err();
         assert!(e.contains("Nothing is selected"));
+    }
+
+    fn page(text: &str, truncated: bool) -> Gathered {
+        Gathered {
+            page_text: Some(text.to_string()),
+            page_text_truncated: truncated,
+            ..Gathered::default()
+        }
+    }
+
+    #[test]
+    fn page_text_is_sent_as_text_with_no_screen() {
+        let r = plan(&[PageText, Screen], &page("Long article body", false)).unwrap();
+        assert_eq!(
+            r.user,
+            "Page text:
+Long article body"
+        );
+        assert!(!r.screen);
+        assert_eq!(r.system_note, Some(UNTRUSTED_TEXT_NOTE));
+    }
+
+    #[test]
+    fn cut_page_text_says_so() {
+        let r = plan(&[PageText], &page("body", true)).unwrap();
+        assert_eq!(
+            r.user,
+            "Page text (cut to fit a length limit, so it may be incomplete):
+body"
+        );
+    }
+
+    #[test]
+    fn page_text_unreadable_falls_back_to_the_screen_or_errors() {
+        for blank in [
+            None,
+            Some(""),
+            Some(
+                " 
+ ",
+            ),
+        ] {
+            let gathered = Gathered {
+                page_text: blank.map(String::from),
+                ..Gathered::default()
+            };
+            let r = plan(&[PageText, Screen], &gathered).unwrap();
+            assert!(r.screen && r.user == SCREEN_USER_TEXT);
+            let e = plan(&[PageText], &gathered).unwrap_err();
+            assert!(e.contains("any text from the page"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_selection_wins_over_the_page_text() {
+        let gathered = Gathered {
+            selection: Some("just this".into()),
+            ..page("whole page", false)
+        };
+        let r = plan(&[Selection, PageText, Screen], &gathered).unwrap();
+        assert_eq!(
+            r.user,
+            "Selected text:
+just this"
+        );
+    }
+
+    #[test]
+    fn page_text_that_was_not_requested_is_never_sent() {
+        let e = plan(&[Selection], &page("whole page", false)).unwrap_err();
+        assert!(e.contains("Nothing is selected"));
+    }
+
+    #[test]
+    fn the_page_is_only_read_when_listed_and_no_selection_was_found() {
+        let none = Gathered::default();
+        let sel = g(Some("s"), None, None);
+        assert!(needs_page_text(&[Selection, PageText], &none));
+        assert!(needs_page_text(&[PageText], &none));
+        assert!(!needs_page_text(&[Selection, PageText], &sel));
+        assert!(!needs_page_text(&[Selection, Screen], &none));
+        // A selection that was not requested does not count.
+        assert!(needs_page_text(&[PageText], &sel));
+        // A blank selection is no selection.
+        // A password field ends the action, so the page is not read.
+        let password = Gathered {
+            selection_in_password_field: true,
+            ..Gathered::default()
+        };
+        assert!(!needs_page_text(&[Selection, PageText], &password));
+        assert!(needs_page_text(&[PageText], &password));
+        let blank = g(Some("  "), None, None);
+        assert!(needs_page_text(&[Selection, PageText], &blank));
     }
 }
