@@ -53,6 +53,61 @@ pub struct Field {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewModel {
     fields: Vec<Field>,
+    /// One per entry of `fields`: what the schema says the field is, so
+    /// [`PreviewModel::to_value`] can hand back the declared JSON type (#284).
+    typing: Vec<Typing>,
+}
+
+/// The JSON type a schema property declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Text,
+    Integer,
+    Number,
+    Boolean,
+    Array,
+}
+
+impl Kind {
+    fn from_def(def: &Value) -> Kind {
+        Self::from_type_keyword(def.get("type")).unwrap_or(Kind::Text)
+    }
+
+    /// The kind a schema `"type"` keyword names (a union with `"null"` counts
+    /// as its other member), or `None` when absent or not a known scalar or
+    /// array type.
+    fn from_type_keyword(keyword: Option<&Value>) -> Option<Kind> {
+        let name = match keyword {
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|s| *s != "null"),
+            _ => None,
+        };
+        match name {
+            Some("integer") => Some(Kind::Integer),
+            Some("number") => Some(Kind::Number),
+            Some("boolean") => Some(Kind::Boolean),
+            Some("array") => Some(Kind::Array),
+            Some("string") => Some(Kind::Text),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Typing {
+    kind: Kind,
+    /// For an array property, the kind its schema's `items.type` declares.
+    items: Option<Kind>,
+    /// The proposal's own value for this field (`Null` when absent). Handed
+    /// back untouched while the text on screen is still what was displayed,
+    /// so a value the card can only show lossily (an array of objects) is
+    /// never flattened.
+    original: Value,
+    /// The text [`display_string`] produced for `original`.
+    initial: String,
 }
 
 impl PreviewModel {
@@ -92,6 +147,7 @@ impl PreviewModel {
         let empty_map = Map::new();
         let value_obj = value.as_object().unwrap_or(&empty_map);
 
+        let mut typing = Vec::new();
         let fields = match properties {
             Some(props) => props
                 .iter()
@@ -106,6 +162,14 @@ impl PreviewModel {
                         .map(str::to_string)
                         .unwrap_or_else(|| label_for(name));
                     let field_value = value_obj.get(name).map(display_string).unwrap_or_default();
+                    typing.push(Typing {
+                        kind: Kind::from_def(def),
+                        items: Kind::from_type_keyword(
+                            def.get("items").and_then(|i| i.get("type")),
+                        ),
+                        original: value_obj.get(name).cloned().unwrap_or(Value::Null),
+                        initial: field_value.clone(),
+                    });
                     Field {
                         name: name.clone(),
                         label,
@@ -118,7 +182,7 @@ impl PreviewModel {
             None => Vec::new(),
         };
 
-        Self { fields }
+        Self { fields, typing }
     }
 
     pub fn fields(&self) -> &[Field] {
@@ -158,18 +222,120 @@ impl PreviewModel {
     }
 
     /// The JSON object "Do it" builds a `Confirmed<Value>` from: exactly the
-    /// values currently shown (after any edits), one string field per row,
-    /// in schema order. This -- not the original proposal value passed to
-    /// [`PreviewModel::from_schema`] -- is what `ui::confirm::confirm_preview`
-    /// receives, which is what makes "what executes equals what was shown"
-    /// true by construction rather than by care taken at each call site.
+    /// values currently shown (after any edits), one entry per row, in schema
+    /// order, each with the type its schema property declares (#284): an
+    /// untouched field keeps the proposal's own value, an edited one is
+    /// parsed back to the declared type. A text that does not parse stays a
+    /// string here; [`PreviewModel::type_errors`] is the gate that stops such
+    /// a value from ever being confirmed. This -- not the original proposal
+    /// value passed to [`PreviewModel::from_schema`] -- is what
+    /// `ui::confirm::confirm_preview` receives, which is what makes "what
+    /// executes equals what was shown" true by construction rather than by
+    /// care taken at each call site.
     pub fn to_value(&self) -> Value {
         let mut map = Map::new();
-        for field in &self.fields {
-            map.insert(field.name.clone(), Value::String(field.value.clone()));
+        for (field, typing) in self.fields.iter().zip(&self.typing) {
+            let value =
+                typed_value(field, typing).unwrap_or_else(|_| Value::String(field.value.clone()));
+            map.insert(field.name.clone(), value);
         }
         Value::Object(map)
     }
+
+    /// One plain sentence per field whose current text cannot be read as the
+    /// type its schema property declares (a number field holding "abc").
+    /// "Do it" refuses to confirm while this is non-empty.
+    #[cfg(test)]
+    pub fn type_errors(&self) -> Vec<String> {
+        self.type_error_fields()
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    /// [`PreviewModel::type_errors`] with each message paired with the schema
+    /// property name it is about, so the card can focus the field.
+    pub fn type_error_fields(&self) -> Vec<(String, String)> {
+        self.fields
+            .iter()
+            .zip(&self.typing)
+            .filter_map(|(field, typing)| {
+                typed_value(field, typing)
+                    .err()
+                    .map(|message| (field.name.clone(), message))
+            })
+            .collect()
+    }
+}
+
+/// The value one field contributes to [`PreviewModel::to_value`], or the
+/// sentence describing why its text cannot be read as its declared type.
+fn typed_value(field: &Field, typing: &Typing) -> Result<Value, String> {
+    if field.value == typing.initial && typing.kind != Kind::Text {
+        return Ok(typing.original.clone());
+    }
+    let text = field.value.trim();
+    let bad = |what: &str| format!("{} must be {what}", field.label);
+    match typing.kind {
+        Kind::Text => Ok(Value::String(field.value.clone())),
+        Kind::Integer | Kind::Number | Kind::Boolean if text.is_empty() => Ok(Value::Null),
+        Kind::Integer => text
+            .parse::<i64>()
+            .map(Value::from)
+            .map_err(|_| bad("a whole number")),
+        Kind::Number => parse_number(text).ok_or_else(|| bad("a number")),
+        Kind::Boolean => match text.to_ascii_lowercase().as_str() {
+            "true" => Ok(Value::Bool(true)),
+            "false" => Ok(Value::Bool(false)),
+            _ => Err(bad("true or false")),
+        },
+        Kind::Array => {
+            let original = typing.original.as_array();
+            if original.is_some_and(|a| a.iter().any(|v| !v.is_string() && !v.is_number())) {
+                return Err(format!("{} cannot be edited as text", field.label));
+            }
+            let item_kind = typing.items.unwrap_or_else(|| {
+                if original.is_some_and(|a| !a.is_empty() && a.iter().all(Value::is_number)) {
+                    Kind::Number
+                } else {
+                    Kind::Text
+                }
+            });
+            field
+                .value
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(|l| match item_kind {
+                    Kind::Integer => l
+                        .parse::<i64>()
+                        .map(Value::from)
+                        .map_err(|_| bad("one whole number per line")),
+                    Kind::Number => parse_number(l).ok_or_else(|| bad("one number per line")),
+                    Kind::Boolean => match l.to_ascii_lowercase().as_str() {
+                        "true" => Ok(Value::Bool(true)),
+                        "false" => Ok(Value::Bool(false)),
+                        _ => Err(bad("one true or false per line")),
+                    },
+                    Kind::Text | Kind::Array => Ok(Value::String(l.to_string())),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array)
+        }
+    }
+}
+
+/// A JSON number from text: a whole number stays an integer (`5`, not
+/// `5.0`), anything else must be a finite decimal.
+fn parse_number(text: &str) -> Option<Value> {
+    if let Ok(i) = text.parse::<i64>() {
+        return Some(Value::from(i));
+    }
+    text.parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite())
+        .and_then(serde_json::Number::from_f64)
+        .map(Value::Number)
 }
 
 /// Renders a JSON scalar the way a single-line text field should show it.
@@ -626,6 +792,181 @@ mod tests {
         assert_eq!(shown["title"], "Standup");
         assert_eq!(shown["end"], "09:15");
         assert_eq!(shown["location"], "Room 2");
+    }
+
+    // -- #284: to_value keeps the schema's declared types -------------------
+
+    fn typed_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer", "editable": true },
+                "ratio": { "type": "number", "editable": true },
+                "urgent": { "type": "boolean", "editable": true },
+                "tags": { "type": "array", "editable": true },
+                "name": { "type": "string", "editable": true }
+            }
+        })
+    }
+
+    fn typed_value_sample() -> Value {
+        serde_json::json!({
+            "count": 3, "ratio": 0.5, "urgent": true,
+            "tags": ["a", "b"], "name": "x"
+        })
+    }
+
+    #[test]
+    fn to_value_round_trips_non_string_properties_untouched() {
+        let model = PreviewModel::from_schema(&typed_schema(), &typed_value_sample());
+        assert_eq!(model.to_value(), typed_value_sample());
+    }
+
+    #[test]
+    fn to_value_parses_edited_text_back_to_the_declared_type() {
+        let mut model = PreviewModel::from_schema(&typed_schema(), &typed_value_sample());
+        model.set_value("count", " 7 ");
+        model.set_value("ratio", "2.25");
+        model.set_value("urgent", "False");
+        model.set_value("tags", "x\n\n y \nz");
+        let v = model.to_value();
+        assert_eq!(v["count"], serde_json::json!(7));
+        assert_eq!(v["ratio"], serde_json::json!(2.25));
+        assert_eq!(v["urgent"], serde_json::json!(false));
+        assert_eq!(v["tags"], serde_json::json!(["x", "y", "z"]));
+        assert_eq!(v["name"], "x");
+        assert!(model.type_errors().is_empty());
+    }
+
+    #[test]
+    fn unparseable_edits_are_reported_by_field() {
+        let mut model = PreviewModel::from_schema(&typed_schema(), &typed_value_sample());
+        model.set_value("count", "3.5");
+        model.set_value("ratio", "abc");
+        model.set_value("urgent", "maybe");
+        let errors = model.type_errors();
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors[0].contains("Count") && errors[0].contains("whole number"));
+        assert!(errors[1].contains("Ratio"));
+        assert!(errors[2].contains("Urgent"));
+    }
+
+    #[test]
+    fn blank_typed_field_becomes_null_not_an_empty_string() {
+        let mut model = PreviewModel::from_schema(&typed_schema(), &typed_value_sample());
+        model.set_value("count", "");
+        assert_eq!(model.to_value()["count"], Value::Null);
+        assert!(model.type_errors().is_empty());
+    }
+
+    #[test]
+    fn untouched_array_of_objects_is_not_flattened_and_editing_it_is_an_error() {
+        let schema = text_review_schema();
+        let value = serde_json::json!({
+            "verdict": "needs_changes",
+            "edits": [{"before": "teh", "after": "the", "reason": "typo"}],
+            "missing_attachment": false
+        });
+        let mut model = PreviewModel::from_schema(&schema, &value);
+        let v = model.to_value();
+        assert_eq!(v["edits"], value["edits"]);
+        assert_eq!(v["missing_attachment"], serde_json::json!(false));
+        assert!(model.type_errors().is_empty());
+        // `edits` is not marked editable in the model-facing schema, so a
+        // write is refused and the original survives.
+        assert!(!model.set_value("edits", "teh -> the"));
+        assert_eq!(model.to_value()["edits"], value["edits"]);
+    }
+
+    fn single(def: Value, original: Value) -> PreviewModel {
+        PreviewModel::from_schema(
+            &serde_json::json!({ "properties": { "f": def } }),
+            &serde_json::json!({ "f": original }),
+        )
+    }
+
+    #[test]
+    fn integer_edit_accepts_a_sign_and_rejects_exponent_fraction_and_overflow() {
+        let def = serde_json::json!({ "type": "integer", "editable": true });
+        let mut m = single(def, serde_json::json!(1));
+        m.set_value("f", "+5");
+        assert_eq!(m.to_value()["f"], serde_json::json!(5));
+        for bad in ["1e3", "2.0", "99999999999999999999", "0x10"] {
+            m.set_value("f", bad);
+            assert_eq!(m.type_errors().len(), 1, "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn nullable_union_type_is_read_as_its_non_null_member() {
+        let def = serde_json::json!({ "type": ["null", "integer"], "editable": true });
+        let mut m = single(def, Value::Null);
+        assert_eq!(m.to_value()["f"], Value::Null);
+        m.set_value("f", "8");
+        assert_eq!(m.to_value()["f"], serde_json::json!(8));
+        m.set_value("f", "eight");
+        assert_eq!(m.type_errors().len(), 1);
+    }
+
+    #[test]
+    fn enum_string_field_stays_text() {
+        let def = serde_json::json!({
+            "type": "string", "enum": ["a", "b"], "editable": true
+        });
+        let mut m = single(def, serde_json::json!("a"));
+        m.set_value("f", "b");
+        assert_eq!(m.to_value()["f"], "b");
+        assert!(m.type_errors().is_empty());
+    }
+
+    #[test]
+    fn whole_number_in_a_number_field_stays_an_integer_value() {
+        let def = serde_json::json!({ "type": "number", "editable": true });
+        let mut m = single(def, serde_json::json!(0.5));
+        m.set_value("f", "5");
+        assert_eq!(m.to_value()["f"], serde_json::json!(5));
+        assert!(m.to_value()["f"].is_i64(), "5 must not become 5.0");
+        m.set_value("f", "5.5");
+        assert_eq!(m.to_value()["f"], serde_json::json!(5.5));
+        m.set_value("f", "inf");
+        assert_eq!(m.type_errors().len(), 1);
+    }
+
+    #[test]
+    fn array_items_type_decides_the_element_type() {
+        let ints = serde_json::json!({
+            "type": "array", "items": { "type": "integer" }, "editable": true
+        });
+        let mut m = single(ints, serde_json::json!([]));
+        m.set_value("f", "1\n2");
+        let v = m.to_value();
+        assert!(v["f"][0].is_i64() && v["f"][1].is_i64(), "{v}");
+        m.set_value("f", "1\n2.5");
+        assert_eq!(m.type_errors().len(), 1);
+
+        let strs = serde_json::json!({
+            "type": "array", "items": { "type": "string" }, "editable": true
+        });
+        let mut m = single(strs, serde_json::json!([1, 2]));
+        m.set_value("f", "7\n8");
+        assert_eq!(m.to_value()["f"], serde_json::json!(["7", "8"]));
+    }
+
+    #[test]
+    fn array_without_items_type_falls_back_to_the_original_values() {
+        let def = serde_json::json!({ "type": "array", "editable": true });
+        let mut m = single(def, serde_json::json!([1, 2]));
+        m.set_value("f", "3\n4");
+        assert_eq!(m.to_value()["f"], serde_json::json!([3, 4]));
+    }
+
+    #[test]
+    fn type_error_fields_name_the_property() {
+        let mut model = PreviewModel::from_schema(&typed_schema(), &typed_value_sample());
+        model.set_value("ratio", "abc");
+        let fields = model.type_error_fields();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].0, "ratio");
     }
 
     // -- #38: text_review's `edits` array field ------------------------------
