@@ -56,10 +56,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
-    GetIconInfo, LoadIconW, RegisterWindowMessageW, SetForegroundWindow, SetMenuItemInfoW,
-    TrackPopupMenu, HICON, HMENU, ICONINFO, IDI_APPLICATION, MENUITEMINFOW, MFS_CHECKED,
-    MFT_RADIOCHECK, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE,
-    MIIM_STATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
+    GetIconInfo, GetSystemMetrics, LoadIconW, LoadImageW, RegisterWindowMessageW,
+    SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenu, HICON, HMENU, ICONINFO, IDI_APPLICATION,
+    IMAGE_ICON, LR_DEFAULTCOLOR, MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MF_DISABLED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE, MIIM_STATE, SM_CXSMICON, SM_CYSMICON,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 /// Posted by the shell to this app's window proc on tray icon activity.
@@ -398,13 +399,13 @@ impl Tray {
             }
             IconState::Working => {
                 if self.working_icon.is_none() {
-                    self.working_icon = make_working_icon(self.base_icon);
+                    self.working_icon = make_working_icon(self.instance, self.base_icon);
                 }
                 self.working_icon.unwrap_or(self.base_icon)
             }
             IconState::Failed => {
                 if self.failed_icon.is_none() {
-                    self.failed_icon = make_failed_icon(self.base_icon);
+                    self.failed_icon = make_failed_icon(self.instance, self.base_icon);
                 }
                 self.failed_icon.unwrap_or(self.base_icon)
             }
@@ -1123,14 +1124,43 @@ fn make_offline_icon(icon: HICON) -> Option<HICON> {
 
 /// Issue #327: the icon with a small orange dot in its bottom-right corner,
 /// shown while a request is in flight.
-fn make_working_icon(icon: HICON) -> Option<HICON> {
-    derive_icon_with_edit(icon, |px, w, h| draw_badge(px, w, h, WORKING_BADGE_BGRA))
+fn make_working_icon(instance: HINSTANCE, base: HICON) -> Option<HICON> {
+    derive_badged_icon(instance, base, WORKING_BADGE_BGRA)
 }
 
 /// Issue #327: the icon with a small red dot, shown after a run failed until
 /// the next one starts.
-fn make_failed_icon(icon: HICON) -> Option<HICON> {
-    derive_icon_with_edit(icon, |px, w, h| draw_badge(px, w, h, FAILED_BADGE_BGRA))
+fn make_failed_icon(instance: HINSTANCE, base: HICON) -> Option<HICON> {
+    derive_badged_icon(instance, base, FAILED_BADGE_BGRA)
+}
+
+/// Loads the embedded icon at the small-icon size the tray actually shows
+/// (`SM_CXSMICON` x `SM_CYSMICON`, 16px at 100%, 24px at 150%), so a badge
+/// drawn on it is crisp rather than a downsampled 32px blob. The caller owns
+/// the result and must `DestroyIcon` it. `None` if the resource is missing
+/// (e.g. in a test binary), in which case the caller uses the base icon.
+fn load_small_icon(instance: HINSTANCE) -> Option<HICON> {
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let embedded = PCWSTR(EMBEDDED_ICON_ID as usize as *const u16);
+    let handle =
+        unsafe { LoadImageW(Some(instance), embedded, IMAGE_ICON, w, h, LR_DEFAULTCOLOR) }.ok()?;
+    Some(HICON(handle.0))
+}
+
+/// Draws `color`'s badge on the small-size icon (see [`load_small_icon`]),
+/// falling back to `base` when no small icon can be loaded.
+fn derive_badged_icon(instance: HINSTANCE, base: HICON, color: [u8; 4]) -> Option<HICON> {
+    let small = load_small_icon(instance);
+    let derived = derive_icon_with_edit(small.unwrap_or(base), |px, w, h| {
+        draw_badge(px, w, h, color)
+    });
+    if let Some(s) = small {
+        let _ = unsafe { DestroyIcon(s) };
+    }
+    derived
 }
 
 /// Shared GDI plumbing behind [`make_greyed_icon`] and [`make_offline_icon`]
@@ -2059,7 +2089,10 @@ mod tests {
     #[test]
     fn make_working_and_failed_icons_succeed_against_a_real_icon() {
         let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }.expect("LoadIconW(IDI_APPLICATION)");
-        for derived in [make_working_icon(icon), make_failed_icon(icon)] {
+        // A null instance has no embedded resource, so this also exercises
+        // the fall back to the base icon.
+        let none = HINSTANCE(std::ptr::null_mut());
+        for derived in [make_working_icon(none, icon), make_failed_icon(none, icon)] {
             let d = derived.expect("badge icon should derive from a real system icon");
             let _ = unsafe { DestroyIcon(d) };
         }
@@ -2224,14 +2257,21 @@ mod tests {
     #[test]
     fn draw_badge_paints_the_bottom_right_corner_only() {
         let (w, h) = (32i32, 32i32);
-        let mut px = vec![[10u8, 20, 30, 255]; (w * h) as usize];
+        // A fully transparent fixture, like the empty corner of a real icon:
+        // a badge that forgot to set alpha would stay invisible.
+        let clear = [10u8, 20, 30, 0];
+        let mut px = vec![clear; (w * h) as usize];
         let red = [0u8, 0, 220, 255];
         draw_badge(&mut px, w, h, red);
-        // Centre of the badge is the badge colour.
+        // Centre of the badge is the badge colour, fully opaque.
         assert_eq!(px[((h - 9) * w + (w - 9)) as usize], red);
-        // The opposite corner is untouched.
-        assert_eq!(px[0], [10, 20, 30, 255]);
-        assert_eq!(px[(w - 1) as usize], [10, 20, 30, 255]);
+        // Every pixel the badge touched, rim included, is opaque.
+        let painted: Vec<_> = px.iter().filter(|p| **p != clear).collect();
+        assert!(!painted.is_empty());
+        assert!(painted.iter().all(|p| p[3] == 255), "{painted:?}");
+        // The opposite corners are untouched.
+        assert_eq!(px[0], clear);
+        assert_eq!(px[(w - 1) as usize], clear);
     }
 
     #[test]

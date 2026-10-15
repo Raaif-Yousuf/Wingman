@@ -1220,7 +1220,7 @@ impl App {
             Err(packed) => {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
-                self.record_last_error(&headline, chain);
+                self.record_run_failure(&headline, human, chain);
                 self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
@@ -1435,7 +1435,7 @@ impl App {
             Err(packed) => {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
-                self.record_last_error(&headline, chain);
+                self.record_run_failure(&headline, human, chain);
                 self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
@@ -1743,7 +1743,7 @@ impl App {
             Err(packed) => {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
-                self.record_last_error(&headline, chain);
+                self.record_run_failure(&headline, human, chain);
                 self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
@@ -1923,7 +1923,7 @@ impl App {
             Err(packed) => {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
-                self.record_last_error(&headline, chain);
+                self.record_run_failure(&headline, human, chain);
                 self.card.show_error_with_details(&headline, human);
                 self.set_watch(true);
                 return;
@@ -2111,7 +2111,7 @@ impl App {
                 // comment for why a tuple isn't used instead.
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
-                self.record_last_error(&headline, chain);
+                self.record_run_failure(&headline, human, chain);
                 Answer {
                     headline,
                     detail: human.to_string(),
@@ -2143,19 +2143,6 @@ impl App {
         }
     }
 
-    /// Issue #124: "Copy diagnostics" tray item. Builds a plain-text report
-    /// (`diagnostics::render_report`) and puts it on the clipboard -- no
-    /// file writes, no network. See `diagnostics.rs`'s module doc for the
-    /// redaction guarantee.
-    /// Review of #349/#426: records `raw_chain` (redacted, #253) as
-    /// [`App::last_error`] and returns [`human_error_detail`]'s display
-    /// text for it -- a drop-in replacement for calling
-    /// `human_error_detail` directly at every call site that shows an
-    /// error card, so "use Copy diagnostics for details" (the sentence
-    /// every card detail ends with) is never a pointer at nothing: the very
-    /// next "Copy diagnostics" click includes this chain, in memory only,
-    /// never written to disk (Hard Rule 5) and gone the moment the process
-    /// exits or another error overwrites it.
     /// Issue #327: the one place `busy` changes, so the tray's working badge
     /// can never disagree with it. Starting a run also clears the previous
     /// run's failure badge ("until the next press").
@@ -2168,16 +2155,33 @@ impl App {
         self.update_tooltip();
     }
 
+    /// Review of #349/#426: records `raw_chain` (redacted, #253) as
+    /// [`App::last_error`] and returns [`human_error_detail`]'s display
+    /// text for it -- a drop-in replacement for calling
+    /// `human_error_detail` directly at every call site that shows an
+    /// error card, so "use Copy diagnostics for details" (the sentence
+    /// every card detail ends with) is never a pointer at nothing: the very
+    /// next "Copy diagnostics" click includes this chain, in memory only,
+    /// never written to disk (Hard Rule 5) and gone the moment the process
+    /// exits or another error overwrites it.
     fn record_last_error(&mut self, action: &str, raw_chain: &str) {
-        // Issue #327: every error card goes through here, so this is where
-        // the tray's failed badge is raised.
-        self.tray.set_failed(true);
-        self.update_tooltip();
         self.last_error = Some(LastError {
             action: action.to_string(),
             occurred_at: SystemTime::now(),
             chain: crate::egress::redact_opaque_tokens(raw_chain),
         });
+    }
+
+    /// Issue #327: records a failed worker run (model or action) and, only
+    /// if it was a real fault (see [`is_run_fault`]), raises the tray's red
+    /// dot. A user-state message ("Nothing is selected") is recorded the same
+    /// way but does not raise it.
+    fn record_run_failure(&mut self, action: &str, human: &str, raw_chain: &str) {
+        self.record_last_error(action, raw_chain);
+        if is_run_fault(human) {
+            self.tray.set_failed(true);
+            self.update_tooltip();
+        }
     }
 
     fn track_error(&mut self, action: &str, raw_chain: &str) -> String {
@@ -4087,10 +4091,19 @@ fn worker_error_chain_text(e: &anyhow::Error) -> String {
 /// plus a next step, for the many call sites that pass
 /// `human_error_detail`'s output straight to `show_error`'s `detail`.
 fn human_error_detail(raw_chain: &str) -> String {
-    format!(
-        "{} Try again, and if it keeps happening, use Copy diagnostics for details.",
-        humanize_error_chain(raw_chain)
-    )
+    format!("{} {DIAGNOSTICS_STEP}", humanize_error_chain(raw_chain))
+}
+
+/// The next step every real fault's card detail ends with.
+const DIAGNOSTICS_STEP: &str =
+    "Try again, and if it keeps happening, use Copy diagnostics for details.";
+
+/// Issue #327: whether a failed run's human text came from a real fault (a
+/// model or action error, built by [`human_error_detail`]) rather than a
+/// user-state message such as "Nothing is selected", which is plain text with
+/// no diagnostics step (#493). Only real faults raise the tray's failed dot.
+fn is_run_fault(human: &str) -> bool {
+    human.ends_with(DIAGNOSTICS_STEP)
 }
 
 /// Separator `pack_error`/`unpack_error` use. A control character no real
@@ -6356,6 +6369,28 @@ mod tests {
             crate::redact::FAILURE_SENTENCE,
             "Could not check the screenshot for private details, so nothing was sent."
         );
+    }
+
+    /// #327: only a real fault raises the tray's red dot. A user-state
+    /// message ("Nothing selected") and a plain unpacked string do not.
+    #[test]
+    fn only_real_faults_count_as_run_failures() {
+        use super::{
+            is_run_fault, pack_generic_failure, unpack_error, GenericFailure, ERROR_PACK_SEP,
+        };
+
+        assert!(is_run_fault(&human_error_detail("connection refused")));
+
+        let fault = pack_generic_failure(GenericFailure::Fault(anyhow::anyhow!("boom")));
+        assert!(is_run_fault(unpack_error(&fault).0));
+
+        let user = pack_generic_failure(GenericFailure::UserState("Nothing is selected".into()));
+        assert!(!is_run_fault(unpack_error(&user).0));
+
+        // Calculate's "nothing selected" is sent as a plain, unpacked string.
+        let plain = "Nothing selected. Select an expression first.";
+        assert!(!is_run_fault(unpack_error(plain).0));
+        assert!(!plain.contains(ERROR_PACK_SEP));
     }
 
     #[test]
