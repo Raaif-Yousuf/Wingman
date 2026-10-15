@@ -3792,21 +3792,28 @@ mod tests {
     fn preview_from_hidden_anchors_follow_mouse_to_the_current_pointer() {
         // Issue #109: a preview shown from Hidden used to place itself with
         // whatever pointer position an earlier card had recorded.
-        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        // #514: pin the pointer first, so a moving mouse cannot change what
+        // the card should record. Read it back (the system may clamp the
+        // point) and put the user's pointer back afterwards.
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+        let mut original = POINT::default();
+        let mut pinned = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut original);
+            let _ = SetCursorPos(200, 200);
+            let _ = GetCursorPos(&mut pinned);
+        }
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
         card.set_placement(CardCorner::FollowMouse, "cursor");
         card.inner.follow_anchor = POINT { x: -5000, y: -5000 };
         let (schema, value) = calendar_schema_and_value();
         let _ = card.show_preview("Add to calendar", &schema, &value, false);
-        let mut now = POINT::default();
+        let anchor = (card.inner.follow_anchor.x, card.inner.follow_anchor.y);
         unsafe {
-            let _ = GetCursorPos(&mut now);
+            let _ = SetCursorPos(original.x, original.y);
         }
-        assert_eq!(
-            (card.inner.follow_anchor.x, card.inner.follow_anchor.y),
-            (now.x, now.y)
-        );
+        assert_eq!(anchor, (pinned.x, pinned.y));
     }
 
     #[test]
