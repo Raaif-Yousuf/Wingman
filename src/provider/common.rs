@@ -818,6 +818,7 @@ pub(crate) fn post_json_read_body<T>(
     read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
 ) -> Result<T> {
     offline_guard(url)?;
+    budget_guard(url)?;
 
     let mut response = ureq::post(url)
         .config()
@@ -859,6 +860,7 @@ pub(crate) fn post_json_with_connect_timeout(
 ) -> Result<String> {
     send_preview_guard()?;
     offline_guard(url)?;
+    budget_guard(url)?;
 
     // #191: no retry loop here (Ollama is local/loopback and unbilled), so
     // an attempt logged from this function is never a retry.
@@ -2428,6 +2430,32 @@ mod tests {
             "https://api.example.com/v1/x",
         ))]);
         let err = cloud_only.complete(&req).unwrap_err();
+        assert!(err.to_string().contains("Daily budget"), "{err}");
+    }
+
+    #[test]
+    fn a_spent_budget_refuses_the_other_send_paths_too() {
+        let _g = network_guard();
+        let _b = BudgetScope::new(0.05, 0.05);
+        // Never reaches the network: the guard answers first.
+        let err = post_json_with_connect_timeout(
+            "https://api.example.invalid/v1/x",
+            &[],
+            &json!({}),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Daily budget"), "{err}");
+        let err = post_json_read_body(
+            "https://api.example.invalid/v1/x",
+            &json!({}),
+            Duration::from_millis(50),
+            "test",
+            |_| Ok(()),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("Daily budget"), "{err}");
     }
 }

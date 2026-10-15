@@ -811,6 +811,7 @@ mod tests {
         assert_eq!(budget_notice_for(0.5, &b, "d1", &mut seen), None);
         let warn = budget_notice_for(0.8, &b, "d1", &mut seen).unwrap();
         assert!(warn.contains("$0.80 of your $1.00"), "{warn}");
+        assert!(!warn.contains('\u{2014}'), "no em dash in card text");
         assert_eq!(budget_notice_for(0.9, &b, "d1", &mut seen), None);
         let stop = budget_notice_for(1.0, &b, "d1", &mut seen).unwrap();
         assert!(stop.contains("reached"), "{stop}");
