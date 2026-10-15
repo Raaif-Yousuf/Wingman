@@ -19,7 +19,8 @@ pub(crate) enum MonitorChoice {
     Cursor,
     /// The primary monitor.
     Primary,
-    /// The n-th monitor in the system's enumeration order, 1-based.
+    /// The n-th monitor counting left to right (ties broken top to bottom),
+    /// 1-based. See [`sort_left_to_right`].
     Index(usize),
 }
 
@@ -39,20 +40,40 @@ impl MonitorChoice {
     }
 }
 
-/// Picks the work area the card is placed in. A pinned index with no such
-/// monitor (it was unplugged) falls back to the cursor's monitor, so the
-/// card never lands off screen.
-pub(crate) fn resolve_work_area(
+/// Picks the monitor the card is placed on, from whatever the caller uses
+/// to identify one (a handle, a rectangle). `all` must already be in
+/// [`sort_left_to_right`] order. A pinned index with no such monitor (it was
+/// unplugged) falls back to the cursor's monitor, so the card never lands
+/// off screen.
+pub(crate) fn resolve_monitor<T: Copy>(
     choice: MonitorChoice,
-    cursor_work: RECT,
-    primary_work: RECT,
-    all_work: &[RECT],
-) -> RECT {
+    cursor: T,
+    primary: T,
+    all: &[T],
+) -> T {
     match choice {
-        MonitorChoice::Cursor => cursor_work,
-        MonitorChoice::Primary => primary_work,
-        MonitorChoice::Index(n) => all_work.get(n - 1).copied().unwrap_or(cursor_work),
+        MonitorChoice::Cursor => cursor,
+        MonitorChoice::Primary => primary,
+        MonitorChoice::Index(n) => all.get(n - 1).copied().unwrap_or(cursor),
     }
+}
+
+/// Orders monitors left to right by the left edge of their full rectangle,
+/// top to bottom on a tie. This is what `card_monitor = "2"` counts by: it
+/// is stable and easy to explain, unlike the system's enumeration order
+/// (which is not the numbering in Windows Settings and can change after
+/// docking).
+pub(crate) fn sort_left_to_right<T>(monitors: &mut [(RECT, T)]) {
+    monitors.sort_by_key(|(r, _)| (r.left, r.top));
+}
+
+/// The DPI the card must switch to before laying out on a monitor whose
+/// effective DPI is `target`, or `None` when it already matches or the
+/// query failed (`None`/`0`). A card keeps the DPI of the monitor it was
+/// last on, so without this its first show on a different-DPI monitor is the
+/// wrong size.
+pub(crate) fn dpi_to_apply(current: u32, target: Option<u32>) -> Option<u32> {
+    target.filter(|&t| t > 0 && t != current)
 }
 
 /// Top-left of a `w` x `h` card inside `work`. The card always ends up fully
@@ -156,36 +177,69 @@ mod tests {
     fn resolve_picks_each_monitor() {
         let all = [PRIMARY, LEFT, ABOVE];
         assert_eq!(
-            resolve_work_area(MonitorChoice::Cursor, LEFT, PRIMARY, &all),
+            resolve_monitor(MonitorChoice::Cursor, LEFT, PRIMARY, &all),
             LEFT
         );
         assert_eq!(
-            resolve_work_area(MonitorChoice::Primary, LEFT, PRIMARY, &all),
+            resolve_monitor(MonitorChoice::Primary, LEFT, PRIMARY, &all),
             PRIMARY
         );
         assert_eq!(
-            resolve_work_area(MonitorChoice::Index(1), PRIMARY, PRIMARY, &all),
+            resolve_monitor(MonitorChoice::Index(1), PRIMARY, PRIMARY, &all),
             PRIMARY
         );
         assert_eq!(
-            resolve_work_area(MonitorChoice::Index(2), PRIMARY, PRIMARY, &all),
+            resolve_monitor(MonitorChoice::Index(2), PRIMARY, PRIMARY, &all),
             LEFT
         );
         assert_eq!(
-            resolve_work_area(MonitorChoice::Index(3), PRIMARY, PRIMARY, &all),
+            resolve_monitor(MonitorChoice::Index(3), PRIMARY, PRIMARY, &all),
             ABOVE
         );
     }
 
     #[test]
+    fn monitors_are_numbered_left_to_right_then_top_to_bottom() {
+        // Enumeration order as a docked laptop might report it: primary
+        // first, the others after, not in screen order.
+        let mut v = vec![(PRIMARY, "primary"), (ABOVE, "above"), (LEFT, "left")];
+        sort_left_to_right(&mut v);
+        let names: Vec<_> = v.iter().map(|(_, n)| *n).collect();
+        // LEFT (x -2560) first; PRIMARY and ABOVE tie at x 0, ABOVE is higher.
+        assert_eq!(names, vec!["left", "above", "primary"]);
+    }
+
+    #[test]
+    fn sort_keeps_a_single_monitor_and_an_empty_list() {
+        let mut one = vec![(PRIMARY, 1)];
+        sort_left_to_right(&mut one);
+        assert_eq!(one.len(), 1);
+        let mut none: Vec<(RECT, i32)> = Vec::new();
+        sort_left_to_right(&mut none);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn dpi_switches_only_when_the_target_monitor_differs() {
+        assert_eq!(dpi_to_apply(96, Some(192)), Some(192));
+        assert_eq!(dpi_to_apply(192, Some(96)), Some(96));
+        assert_eq!(dpi_to_apply(144, Some(144)), None);
+    }
+
+    #[test]
+    fn dpi_ignores_a_failed_or_zero_query() {
+        assert_eq!(dpi_to_apply(96, None), None);
+        assert_eq!(dpi_to_apply(96, Some(0)), None);
+    }
+    #[test]
     fn resolve_unplugged_index_falls_back_to_the_cursor_monitor() {
         let all = [PRIMARY, LEFT];
         assert_eq!(
-            resolve_work_area(MonitorChoice::Index(3), LEFT, PRIMARY, &all),
+            resolve_monitor(MonitorChoice::Index(3), LEFT, PRIMARY, &all),
             LEFT
         );
         assert_eq!(
-            resolve_work_area(MonitorChoice::Index(1), LEFT, PRIMARY, &[]),
+            resolve_monitor(MonitorChoice::Index(1), LEFT, PRIMARY, &[]),
             LEFT
         );
     }

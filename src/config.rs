@@ -547,9 +547,12 @@ pub struct Ui {
     pub card_corner: CardCorner,
     /// Issue #109: which monitor the card appears on. `"cursor"` (default)
     /// is the one the mouse is on, `"primary"` pins it to the primary
-    /// monitor, and `"1"`, `"2"`, ... pin it to that monitor in the
-    /// system's enumeration order. A number with no such monitor falls back
-    /// to the cursor's. Anything else also means `"cursor"`.
+    /// monitor, and `"1"`, `"2"`, ... pin it to that monitor counting left
+    /// to right (top to bottom when two share a left edge). This is not the
+    /// numbering Windows Settings shows, and it changes if you rearrange or
+    /// dock monitors; use `"primary"` or `"cursor"` if that matters. A
+    /// number with no such monitor falls back to the cursor's. Anything
+    /// else also means `"cursor"`.
     pub card_monitor: String,
     /// Show the 1-10/Ultra difficulty badge in the card's bottom-right
     /// corner. When off, the rating is not requested from the model at all,
