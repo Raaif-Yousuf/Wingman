@@ -49,6 +49,9 @@ pub enum InputKind {
     Clipboard,
     Text,
     Uia,
+    /// The foreground browser or reader's document text, read through UI
+    /// Automation (#104).
+    PageText,
     Context,
 }
 

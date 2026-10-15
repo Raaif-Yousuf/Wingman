@@ -3647,6 +3647,21 @@ fn uia_fields_text(foreground_hwnd: isize) -> String {
     .unwrap_or_default()
 }
 
+/// #104: the document text of the foreground browser or reader, read through
+/// UI Automation on its own thread (its own COM apartment, like
+/// [`uia_fields_text`]). `None` when the window exposes no readable page.
+fn page_text_of(foreground_hwnd: isize) -> Option<crate::inputs::page_text::PageText> {
+    std::thread::spawn(move || {
+        crate::inputs::page_text::read_page_text(
+            HWND(foreground_hwnd as *mut _),
+            crate::inputs::page_text::DEFAULT_MAX_CHARS,
+        )
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
 /// Why a generic action's worker ended without an answer (#493). A
 /// `UserState` is the user's situation (nothing selected, a password field),
 /// shown as its own plain message; a `Fault` is a real failure and keeps the
@@ -3740,6 +3755,13 @@ fn gather_generic_inputs(
     }
     if actions::generic_inputs::wants_uia(inputs) {
         gathered.uia = Some(uia_fields_text(foreground_hwnd));
+    }
+    // #104: the page is read after the selection, because a selection wins.
+    if actions::generic_inputs::needs_page_text(inputs, &gathered) {
+        if let Some(page) = page_text_of(foreground_hwnd) {
+            gathered.page_text = Some(page.text);
+            gathered.page_text_truncated = page.truncated;
+        }
     }
     Ok(gathered)
 }

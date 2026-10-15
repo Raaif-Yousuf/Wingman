@@ -6,6 +6,7 @@
 //! Today this holds [`uia`] (#27) and [`selection`] (#28). OCR (#30) is
 //! also built, but lives outside this module in `src/ocr.rs`.
 
+pub mod page_text;
 pub mod selection;
 pub mod uia;
 pub(crate) mod uia_automation;
