@@ -188,10 +188,8 @@ pub struct Hotkeys {
     /// alt = false
     /// win = false
     /// ```
-    /// No tray "Set pause key..." learn-mode entry yet -- config.toml only;
-    /// see the follow-up issue this one filed for that (learn mode needs a
-    /// third `HK_*` slot and tray menu item, which is not the "small
-    /// extension" #181 scoped itself to). `hotkey::HotkeyHook::set_pause_chord`
+    /// The tray's "Set pause key" item (issue #202) learns and saves it, so
+    /// hand-editing is optional. `hotkey::HotkeyHook::set_pause_chord`
     /// is how the hook learns about it; see that method's doc comment for
     /// the lock-free packed-chord path.
     #[serde(skip_serializing_if = "Option::is_none")]
