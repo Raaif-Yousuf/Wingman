@@ -8,6 +8,7 @@
 pub mod calendar;
 pub mod extract_text;
 pub mod fill_form;
+pub mod generic_answer;
 pub mod review_email;
 pub mod schema;
 

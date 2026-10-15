@@ -1,7 +1,9 @@
 //! The `"none"` executor (#31): what "Check my work" resolves to today. A
 //! read-only action that only shows a card has nothing for an executor to
 //! do, so this stays a no-op by construction -- there is no state to record
-//! and nothing to undo.
+//! and nothing to undo. A generic action that resolves to it shows the
+//! model's own answer, not this executor's summary (#441): see
+//! `actions::generic_answer::result_card_text`.
 
 use crate::ui::confirm::Confirmed;
 
