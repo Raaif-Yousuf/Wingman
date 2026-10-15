@@ -249,6 +249,10 @@ pub struct Capture {
     pub max_edge: u32,
     /// "active" | "primary"
     pub monitor: String,
+    /// OCR recognizer language (#111): "auto" (the Windows profile
+    /// languages) or a BCP-47 tag such as "de" or "de-DE" naming an
+    /// installed Windows OCR language pack.
+    pub ocr_language: String,
 }
 
 impl Default for Capture {
@@ -256,6 +260,7 @@ impl Default for Capture {
         Self {
             max_edge: 1568,
             monitor: "active".to_string(),
+            ocr_language: "auto".to_string(),
         }
     }
 }
@@ -1749,6 +1754,7 @@ win = true
         assert_eq!(config.providers.order, vec!["openai", "anthropic"]);
         assert_eq!(config.hotkeys.primary.vk, 0x86);
         assert_eq!(config.capture.max_edge, 1568);
+        assert_eq!(config.capture.ocr_language, "auto");
         assert_eq!(config.ui.card_seconds, 12);
         assert!(!config.ui.show_difficulty);
         // The file should now exist, created from defaults.
