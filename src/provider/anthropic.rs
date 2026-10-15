@@ -207,7 +207,12 @@ impl Provider for Anthropic {
             "anthropic",
         )?;
 
-        crate::usage::tally(self.id(), &self.model, Self::parse_completion(&body_text))
+        crate::usage::tally(
+            self.id(),
+            &self.model,
+            false,
+            Self::parse_completion(&body_text),
+        )
     }
 }
 

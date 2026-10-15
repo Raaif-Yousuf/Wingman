@@ -23,6 +23,11 @@
 //! here), and long-prompt surcharges (over 200k or 272k tokens) are ignored
 //! because a screenshot press is nowhere near them.
 //!
+//! Totals are a floor: only successful, parsed responses are counted, so a
+//! refused or failed call that the vendor still billed is not included. The
+//! tooltip refreshes only after a request finishes (no timer, AGENTS.md
+//! rule 5), so it can show yesterday's total until the first press of a day.
+//!
 //! # The totals file
 //!
 //! `%LOCALAPPDATA%\Wingman\spend.json`, one object keyed by local date. Only
@@ -126,6 +131,8 @@ const PRICES: &[PriceRow] = &[
         p(1.0, 5.0, 1.25, 0.10),
         ANTHROPIC_SRC,
     ),
+    // Fable 5.1 cache reads are 0.025x input (the page's own footnote 1), not
+    // the 0.1x of the older rows: 10.0 * 0.025 = 0.25. Re-read 2026-10-15.
     row(
         "anthropic",
         "claude-fable-5-1",
@@ -206,7 +213,9 @@ const PRICES: &[PriceRow] = &[
         OPENAI_SRC,
     ),
     // Gemini (output includes thinking tokens). The 3.8 Flash page lists an
-    // introductory rate through 2026-12-31 and double from 2027-01-01.
+    // introductory rate through 2026-12-31 and double from 2027-01-01
+    // (MEASURED 2026-10-15: the page says "$0.75 through December 31, 2026"
+    // and "$1.50 starting January 1, 2027"; output $3.75 then $7.50).
     row(
         "gemini",
         "gemini-3.8-flash",
@@ -277,6 +286,41 @@ pub fn cost_usd(provider: &str, model: &str, date: &str, usage: &Usage) -> Optio
             + per_million(usage.cache_write_tokens, price.cache_write)
             + per_million(usage.cache_read_tokens, price.cache_read),
     )
+}
+
+/// Whether `base_url` points at this machine (a loopback host). A
+/// compat endpoint on loopback (LM Studio, llama.cpp) costs nothing.
+pub fn is_loopback_url(base_url: &str) -> bool {
+    let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(inner) = host_port.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || host == "::1"
+        || host.strip_prefix("127.").is_some_and(|r| {
+            r.split('.').count() == 3 && r.split('.').all(|o| o.parse::<u8>().is_ok())
+        })
+}
+
+/// The cost of one request. A request that ran on this machine (`local`) is
+/// free whether or not the response carried a usage block; anything else with
+/// no usage block or no price row is `None` (unpriced).
+pub fn request_cost(
+    provider: &str,
+    model: &str,
+    date: &str,
+    local: bool,
+    usage: Option<&Usage>,
+) -> Option<f64> {
+    if local || provider.starts_with("ollama") {
+        return Some(0.0);
+    }
+    cost_usd(provider, model, date, usage?)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -359,7 +403,11 @@ fn record_at(path: &std::path::Path, date: &str, cost: Option<f64>) -> anyhow::R
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string(&days)?)?;
+    // Write beside the target, then rename over it, so a crash mid-write
+    // never leaves a half-written totals file.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string(&days)?)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -373,9 +421,9 @@ fn local_date_today() -> String {
 /// Counts one provider response toward today's total. Best effort: a failure
 /// to write is swallowed (rule 7: accounting must never be why an answer
 /// fails). A response with no usage block counts as unpriced.
-pub fn record(provider: &str, model: &str, usage: Option<Usage>) {
+pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
     let date = local_date_today();
-    let cost = usage.and_then(|u| cost_usd(provider, model, &date, &u));
+    let cost = request_cost(provider, model, &date, local, usage.as_ref());
     if let Ok(path) = totals_path() {
         let _ = record_at(&path, &date, cost);
     }
@@ -383,13 +431,16 @@ pub fn record(provider: &str, model: &str, usage: Option<Usage>) {
 
 /// Counts the usage of a successful completion and passes the result through
 /// unchanged. What every provider's `complete` ends with.
+///
+/// `local` is true when the request ran on this machine and so costs nothing.
 pub fn tally(
     provider: &str,
     model: &str,
+    local: bool,
     result: anyhow::Result<Completion>,
 ) -> anyhow::Result<Completion> {
     if let Ok(c) = &result {
-        record(provider, model, c.usage);
+        record(provider, model, local, c.usage);
     }
     result
 }
@@ -574,10 +625,101 @@ mod tests {
             usage: Some(usage(1_000_000, 0)),
             stop: crate::provider::StopReason::Complete,
         };
-        let out = tally("anthropic", "claude-opus-5", Ok(completion)).unwrap();
+        let out = tally("anthropic", "claude-opus-5", false, Ok(completion)).unwrap();
         assert_eq!(out.usage.unwrap().input_tokens, 1_000_000);
         assert_eq!(tooltip_part().unwrap(), "$5.00 today");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_free_provider_is_never_unpriced_even_without_a_usage_block() {
+        assert_eq!(
+            request_cost("ollama", "gemma3:4b", "2026-10-15", true, None),
+            Some(0.0)
+        );
+        assert_eq!(
+            request_cost("openai-compat", "m", "2026-10-15", true, None),
+            Some(0.0)
+        );
+        // A metered provider with no usage block is unpriced.
+        assert_eq!(
+            request_cost("openai", "gpt-5.5", "2026-10-15", false, None),
+            None
+        );
+        // A non-loopback compat endpoint has no price rows: unpriced.
+        assert_eq!(
+            request_cost(
+                "openai-compat",
+                "m",
+                "2026-10-15",
+                false,
+                Some(&usage(1, 1))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn loopback_urls_are_recognised() {
+        for url in [
+            "http://127.0.0.1:1234/v1",
+            "http://localhost:8080",
+            "https://LOCALHOST/v1",
+            "http://[::1]:8080/v1",
+            "http://user:pw@127.0.0.5/v1",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "https://api.example.com/v1",
+            "http://192.168.1.5:1234/v1",
+            "http://127.0.0.1.evil.com/v1",
+            "https://localhost.example.com",
+            "http://10.0.0.1",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
+    }
+
+    /// Default model ids that are priced on purpose as "unknown".
+    const UNPRICED_ON_PURPOSE: &[(&str, &str)] = &[("gemini", "gemini-3.5-flash")];
+
+    #[test]
+    fn every_default_model_has_a_price_or_is_listed_as_exempt() {
+        let providers = crate::config::Config::default().providers;
+        let mut checked = 0;
+        for (id, cfg) in [
+            ("openai", &providers.openai),
+            ("anthropic", &providers.anthropic),
+            ("gemini", &providers.gemini),
+        ] {
+            for model in cfg.models.iter().chain(std::iter::once(&cfg.model)) {
+                checked += 1;
+                let exempt = UNPRICED_ON_PURPOSE.contains(&(id, model.as_str()));
+                let priced = price_for(id, model, "2026-10-15").is_some();
+                assert!(
+                    priced != exempt,
+                    "{id}/{model}: priced={priced} exempt={exempt}; add a PRICES row or an exemption (and drop a stale exemption)"
+                );
+            }
+        }
+        assert!(checked > 10);
+    }
+
+    #[test]
+    fn record_at_leaves_no_temp_file_behind() {
+        let path = std::env::temp_dir().join(format!(
+            "wingman-test-spend-atomic-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        record_at(&path, "2026-10-15", Some(1.0)).unwrap();
+        record_at(&path, "2026-10-15", Some(1.0)).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        let ok = !tmp.exists() && close(read_days(&path)["2026-10-15"].usd, 2.0);
+        let _ = std::fs::remove_file(&path);
+        assert!(ok);
     }
 
     #[test]

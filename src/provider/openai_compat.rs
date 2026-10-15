@@ -333,7 +333,12 @@ impl Provider for OpenAiCompat {
             "openai-compat",
         )?;
 
-        crate::usage::tally(self.id(), &self.model, Self::parse_completion(&body_text))
+        crate::usage::tally(
+            self.id(),
+            &self.model,
+            crate::usage::is_loopback_url(&self.base_url),
+            Self::parse_completion(&body_text),
+        )
     }
 }
 
