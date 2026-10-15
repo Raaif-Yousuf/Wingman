@@ -25,7 +25,13 @@ only if the first one fails, never more than one at a time. Whichever
 provider answers, the request carries:
 
 1. A screenshot of your active monitor, downscaled to `capture.max_edge`
-   pixels on the long edge (1568 by default) and PNG-encoded.
+   pixels on the long edge (1568 by default) and PNG-encoded. Before a cloud
+   request, card numbers, IBANs, key-like tokens and email addresses that
+   Windows OCR can read on the screenshot are painted over with solid boxes
+   (`capture.redact`, on by default). This covers the image only: text sent
+   to a text-only model is not yet scrubbed the same way. A number that
+   Windows OCR splits across two lines, or does not read at all, may not be
+   painted over.
 2. The system prompt from `ui.prompt` in your config, sent alongside the
    image in the same request.
 
