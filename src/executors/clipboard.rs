@@ -108,10 +108,13 @@ impl<C: ClipboardAccess + 'static> Executor for ClipboardExecutor<C> {
 
     fn execute(&self, confirmed: Confirmed<serde_json::Value>) -> Result<Undo> {
         let value = confirmed.into_value();
+        // A `"text"` field is copied as is. A proposal with `"items"` instead
+        // (#314, `action_items`) is copied as a Markdown checklist.
         let text = value
             .get("text")
             .and_then(|v| v.as_str())
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| crate::actions::action_items::checklist_from_value(&value));
         let Some(text) = text else {
             bail!("clipboard executor: proposal has no \"text\" field to copy");
         };
@@ -209,6 +212,31 @@ mod tests {
         executor: &ClipboardExecutor<FakeClipboard>,
     ) -> Confirmed<serde_json::Value> {
         crate::ui::confirm::auto_confirm_read_only(executor, Proposal::new(value)).unwrap()
+    }
+
+    #[test]
+    fn items_become_a_markdown_checklist_when_there_is_no_text_field() {
+        let executor = ClipboardExecutor::with_clipboard(FakeClipboard::default());
+        // The preview card hands over one newline-joined string per field.
+        let confirmed = confirmed_with(
+            serde_json::json!({"items": "Dana: send the Q3 numbers (Fri)
+Me: book the room"}),
+            &executor,
+        );
+        executor.execute(confirmed).unwrap();
+        assert_eq!(
+            executor.clipboard.get_text().unwrap(),
+            "- [ ] Dana: send the Q3 numbers (Fri)
+- [ ] Me: book the room"
+        );
+    }
+
+    #[test]
+    fn empty_items_are_an_error_not_an_empty_clipboard_write() {
+        let executor = ClipboardExecutor::with_clipboard(FakeClipboard::seeded("keep me"));
+        let confirmed = confirmed_with(serde_json::json!({"items": ""}), &executor);
+        assert!(executor.execute(confirmed).is_err());
+        assert_eq!(executor.clipboard.get_text().unwrap(), "keep me");
     }
 
     #[test]

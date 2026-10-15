@@ -59,8 +59,30 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         // `actions.toml` action that just wants a short model-produced
         // string copied to the clipboard or shown on a card.
         "text_answer" => Some(text_answer_schema()),
+        // #314: a list of action-item lines for the clipboard executor.
+        "action_items" => Some(action_items_schema()),
         _ => None,
     }
+}
+
+/// The `action_items` proposal schema (#314): one `items` list of short
+/// strings ("Dana: send the Q3 numbers (Fri)"). Editable, so the confirm card
+/// lets the user fix a line; it comes back from the card as one
+/// newline-joined string, which `executors::clipboard` turns into a
+/// checklist (`actions::action_items::checklist_from_value`).
+fn action_items_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {"type": "string"},
+                "editable": true
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": false
+    })
 }
 
 /// The `text_answer` proposal schema (#242): a single `text` field. See
@@ -422,6 +444,16 @@ mod tests {
         let schema = schema_for("text_answer", false).expect("text_answer is registered");
         assert_eq!(schema["required"], json!(["text"]));
         assert_eq!(schema["properties"]["text"]["type"], "string");
+    }
+
+    #[test]
+    fn action_items_is_one_editable_list_of_strings() {
+        let schema = schema_for("action_items", false).expect("action_items is registered");
+        assert_eq!(schema["required"], json!(["items"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["items"]["type"], "array");
+        assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
+        assert_eq!(schema["properties"]["items"]["editable"], true);
     }
 
     #[test]
