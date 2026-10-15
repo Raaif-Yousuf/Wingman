@@ -662,4 +662,32 @@ mod tests {
         );
         assert!(!second.lines.is_empty());
     }
+
+    /// The measurement the screenshot-redaction design (#103) rests on: how
+    /// long does `recognize` take on a REAL capture of the screen this test
+    /// runs on, at the size a cloud request would be sent? Prints only
+    /// timings and counts, never any recognized text.
+    ///
+    /// ```text
+    /// cargo test ocr_live_times_a_real_screen_capture -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "live screen capture plus WinRT OCR; run manually, see this test's doc comment"]
+    fn ocr_live_times_a_real_screen_capture() {
+        let raw = crate::capture::grab_raw("primary", 1568, 1568 * 28 * 28)
+            .expect("screen capture failed");
+        let mut runs = Vec::new();
+        let mut line_count = 0;
+        for _ in 0..5 {
+            let start = Instant::now();
+            let out = recognize(&raw.rgba, raw.width, raw.height, Duration::from_secs(15))
+                .expect("OCR failed on a real capture");
+            runs.push(start.elapsed().as_millis());
+            line_count = out.lines.len();
+        }
+        println!(
+            "MEASURED: OCR of a real {}x{} capture: runs_ms={runs:?} lines={line_count}",
+            raw.width, raw.height
+        );
+    }
 }
