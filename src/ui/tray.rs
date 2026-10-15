@@ -56,10 +56,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
-    GetIconInfo, LoadIconW, RegisterWindowMessageW, SetForegroundWindow, SetMenuItemInfoW,
-    TrackPopupMenu, HICON, HMENU, ICONINFO, IDI_APPLICATION, MENUITEMINFOW, MFS_CHECKED,
-    MFT_RADIOCHECK, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE,
-    MIIM_STATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
+    GetIconInfo, GetSystemMetrics, LoadIconW, LoadImageW, RegisterWindowMessageW,
+    SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenu, HICON, HMENU, ICONINFO, IDI_APPLICATION,
+    IMAGE_ICON, LR_DEFAULTCOLOR, MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MF_DISABLED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE, MIIM_STATE, SM_CXSMICON, SM_CYSMICON,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 /// Posted by the shell to this app's window proc on tray icon activity.
@@ -279,6 +280,13 @@ pub struct Tray {
     /// tint. Defaults to `Auto`, same as [`crate::mode::Mode::default`],
     /// until [`Tray::set_mode`] is called with the loaded config's value.
     mode: crate::mode::Mode,
+    /// Issue #327: a request is in flight / the last run failed. Set via
+    /// [`Tray::set_busy`] and [`Tray::set_failed`]; see [`icon_state`].
+    busy: bool,
+    failed: bool,
+    /// Lazily derived badge icons, same ownership rules as `greyed_icon`.
+    working_icon: Option<HICON>,
+    failed_icon: Option<HICON>,
 }
 
 impl Tray {
@@ -306,6 +314,10 @@ impl Tray {
             paused: false,
             offline_icon: None,
             mode: crate::mode::Mode::default(),
+            busy: false,
+            failed: false,
+            working_icon: None,
+            failed_icon: None,
         })
     }
 
@@ -329,6 +341,12 @@ impl Tray {
         if let Some(icon) = self.offline_icon.take() {
             let _ = unsafe { DestroyIcon(icon) };
         }
+        if let Some(icon) = self.working_icon.take() {
+            let _ = unsafe { DestroyIcon(icon) };
+        }
+        if let Some(icon) = self.failed_icon.take() {
+            let _ = unsafe { DestroyIcon(icon) };
+        }
         apply_icon(self.hwnd, self.resolve_icon());
         Ok(())
     }
@@ -344,6 +362,30 @@ impl Tray {
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
         apply_icon(self.hwnd, self.resolve_icon());
+    }
+
+    /// Issue #327: show (or clear) the working badge. Only touches the
+    /// shell icon when the resolved state actually changes.
+    pub fn set_busy(&mut self, busy: bool) {
+        self.update_state(|t| t.busy = busy);
+    }
+
+    /// Issue #327: show (or clear) the last-run-failed badge.
+    pub fn set_failed(&mut self, failed: bool) {
+        self.update_state(|t| t.failed = failed);
+    }
+
+    /// The state the icon is showing right now, for tooltip text.
+    pub fn icon_state(&self) -> IconState {
+        icon_state(self.paused, self.busy, self.failed, self.mode)
+    }
+
+    fn update_state(&mut self, change: impl FnOnce(&mut Self)) {
+        let before = self.icon_state();
+        change(self);
+        if self.icon_state() != before {
+            apply_icon(self.hwnd, self.resolve_icon());
+        }
     }
 
     /// Issue #19: radio-check `mode` in the tray's "Mode" submenu and, for
@@ -362,19 +404,33 @@ impl Tray {
     /// single most safety-relevant state (nothing runs, rule 5/7) is never
     /// masked by a less urgent one.
     fn resolve_icon(&mut self) -> HICON {
-        if self.paused {
-            if self.greyed_icon.is_none() {
-                self.greyed_icon = make_greyed_icon(self.base_icon);
+        match self.icon_state() {
+            IconState::Paused => {
+                if self.greyed_icon.is_none() {
+                    self.greyed_icon = make_greyed_icon(self.base_icon);
+                }
+                self.greyed_icon.unwrap_or(self.base_icon)
             }
-            return self.greyed_icon.unwrap_or(self.base_icon);
-        }
-        if self.mode == crate::mode::Mode::Offline {
-            if self.offline_icon.is_none() {
-                self.offline_icon = make_offline_icon(self.base_icon);
+            IconState::Working => {
+                if self.working_icon.is_none() {
+                    self.working_icon = make_working_icon(self.instance, self.base_icon);
+                }
+                self.working_icon.unwrap_or(self.base_icon)
             }
-            return self.offline_icon.unwrap_or(self.base_icon);
+            IconState::Failed => {
+                if self.failed_icon.is_none() {
+                    self.failed_icon = make_failed_icon(self.instance, self.base_icon);
+                }
+                self.failed_icon.unwrap_or(self.base_icon)
+            }
+            IconState::Offline => {
+                if self.offline_icon.is_none() {
+                    self.offline_icon = make_offline_icon(self.base_icon);
+                }
+                self.offline_icon.unwrap_or(self.base_icon)
+            }
+            IconState::Idle => self.base_icon,
         }
-        self.base_icon
     }
 
     /// Update the tooltip shown when hovering the icon (the spec: "shows the
@@ -611,6 +667,12 @@ impl Drop for Tray {
             let _ = unsafe { DestroyIcon(icon) };
         }
         if let Some(icon) = self.offline_icon.take() {
+            let _ = unsafe { DestroyIcon(icon) };
+        }
+        if let Some(icon) = self.working_icon.take() {
+            let _ = unsafe { DestroyIcon(icon) };
+        }
+        if let Some(icon) = self.failed_icon.take() {
             let _ = unsafe { DestroyIcon(icon) };
         }
     }
@@ -969,6 +1031,74 @@ const GREY_FACTOR: f32 = 0.45;
 /// apply.
 const OFFLINE_TINT_FACTOR: f32 = 0.35;
 
+/// Badge colours (BGRA) for the Working and Failed icons (issue #327).
+const WORKING_BADGE_BGRA: [u8; 4] = [0, 150, 255, 255];
+const FAILED_BADGE_BGRA: [u8; 4] = [40, 40, 220, 255];
+
+/// What the tray icon shows (issue #327). Event-driven: it is recomputed
+/// only when one of its inputs changes, never on a timer, and every state is
+/// a static icon (no animation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconState {
+    Idle,
+    Working,
+    Paused,
+    Offline,
+    Failed,
+}
+
+/// Pure decision for which state wins. Paused is dominant (nothing runs, the
+/// safest thing to show). A request in flight beats everything else, since
+/// "did my press register" is the point of the badge. A failed last run
+/// beats Offline because it is news; Offline is a standing mode.
+pub fn icon_state(paused: bool, busy: bool, failed: bool, mode: crate::mode::Mode) -> IconState {
+    if paused {
+        IconState::Paused
+    } else if busy {
+        IconState::Working
+    } else if failed {
+        IconState::Failed
+    } else if mode == crate::mode::Mode::Offline {
+        IconState::Offline
+    } else {
+        IconState::Idle
+    }
+}
+
+/// Tooltip for `state` wrapped around the normal `base` text. The state
+/// leads, so `set_sz_tip`'s truncation of long text drops the tail of
+/// `base`, never the state. Paused text comes from `pause::tooltip_text`
+/// and is passed through unchanged.
+pub fn state_tooltip(state: IconState, base: &str) -> String {
+    match state {
+        IconState::Idle | IconState::Paused => base.to_string(),
+        IconState::Working => format!("Working... · {base}"),
+        IconState::Failed => format!("Last run failed · {base}"),
+        IconState::Offline => format!("Offline · {base}"),
+    }
+}
+
+/// Draws a filled dot with a white rim in the bottom-right corner of a
+/// top-down `width` x `height` BGRA buffer. Pure; a buffer shorter than
+/// `width * height` or a non-positive size is left alone.
+fn draw_badge(px: &mut [[u8; 4]], width: i32, height: i32, color: [u8; 4]) {
+    if width < 2 || height < 2 || px.len() < (width as usize) * (height as usize) {
+        return;
+    }
+    let r = (width.min(height) / 4).max(2);
+    let (cx, cy) = (width - r - 1, height - r - 1);
+    for y in 0..height {
+        for x in 0..width {
+            let d2 = (x - cx).pow(2) + (y - cy).pow(2);
+            if d2 > r * r {
+                continue;
+            }
+            let inner = r < 4 || d2 <= (r - 1) * (r - 1);
+            px[(y * width + x) as usize] = if inner { color } else { [255, 255, 255, 255] };
+        }
+    }
+}
+
 /// Desaturate and dim a single 32bpp BGRA pixel toward the "greyed out"
 /// look, blending its color toward its own luma and scaling its alpha, both
 /// by `factor`. Pure and allocation-free so the transform itself is
@@ -1019,6 +1149,47 @@ fn make_offline_icon(icon: HICON) -> Option<HICON> {
     derive_icon_with_transform(icon, |px| offline_tint_pixel(px, OFFLINE_TINT_FACTOR))
 }
 
+/// Issue #327: the icon with a small orange dot in its bottom-right corner,
+/// shown while a request is in flight.
+fn make_working_icon(instance: HINSTANCE, base: HICON) -> Option<HICON> {
+    derive_badged_icon(instance, base, WORKING_BADGE_BGRA)
+}
+
+/// Issue #327: the icon with a small red dot, shown after a run failed until
+/// the next one starts.
+fn make_failed_icon(instance: HINSTANCE, base: HICON) -> Option<HICON> {
+    derive_badged_icon(instance, base, FAILED_BADGE_BGRA)
+}
+
+/// Loads the embedded icon at the small-icon size the tray actually shows
+/// (`SM_CXSMICON` x `SM_CYSMICON`, 16px at 100%, 24px at 150%), so a badge
+/// drawn on it is crisp rather than a downsampled 32px blob. The caller owns
+/// the result and must `DestroyIcon` it. `None` if the resource is missing
+/// (e.g. in a test binary), in which case the caller uses the base icon.
+fn load_small_icon(instance: HINSTANCE) -> Option<HICON> {
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let embedded = PCWSTR(EMBEDDED_ICON_ID as usize as *const u16);
+    let handle =
+        unsafe { LoadImageW(Some(instance), embedded, IMAGE_ICON, w, h, LR_DEFAULTCOLOR) }.ok()?;
+    Some(HICON(handle.0))
+}
+
+/// Draws `color`'s badge on the small-size icon (see [`load_small_icon`]),
+/// falling back to `base` when no small icon can be loaded.
+fn derive_badged_icon(instance: HINSTANCE, base: HICON, color: [u8; 4]) -> Option<HICON> {
+    let small = load_small_icon(instance);
+    let derived = derive_icon_with_edit(small.unwrap_or(base), |px, w, h| {
+        draw_badge(px, w, h, color)
+    });
+    if let Some(s) = small {
+        let _ = unsafe { DestroyIcon(s) };
+    }
+    derived
+}
+
 /// Shared GDI plumbing behind [`make_greyed_icon`] and [`make_offline_icon`]
 /// (issue #19 factored this out of what was originally `make_greyed_icon`
 /// alone, so the two icon variants can never let their DIB-handling drift
@@ -1034,6 +1205,20 @@ fn make_offline_icon(icon: HICON) -> Option<HICON> {
 fn derive_icon_with_transform(
     icon: HICON,
     transform: impl Fn([u8; 4]) -> [u8; 4],
+) -> Option<HICON> {
+    derive_icon_with_edit(icon, |pixels, _, _| {
+        for px in pixels.iter_mut() {
+            *px = transform(*px);
+        }
+    })
+}
+
+/// [`derive_icon_with_transform`]'s plumbing, generalized to an edit of the
+/// whole pixel buffer (top-down BGRA, `width` x `height`) so a variant can
+/// depend on pixel position, as the corner badges of [`draw_badge`] do.
+fn derive_icon_with_edit(
+    icon: HICON,
+    edit: impl FnOnce(&mut [[u8; 4]], i32, i32),
 ) -> Option<HICON> {
     unsafe {
         let mut info = ICONINFO::default();
@@ -1107,9 +1292,7 @@ fn derive_icon_with_transform(
 
         let pixel_count = width as usize * height as usize;
         let pixels = std::slice::from_raw_parts_mut(bits_ptr as *mut [u8; 4], pixel_count);
-        for px in pixels.iter_mut() {
-            *px = transform(*px);
-        }
+        edit(pixels, width, height);
 
         let new_info = ICONINFO {
             fIcon: BOOL(1),
@@ -1941,6 +2124,18 @@ mod tests {
     }
 
     #[test]
+    fn make_working_and_failed_icons_succeed_against_a_real_icon() {
+        let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }.expect("LoadIconW(IDI_APPLICATION)");
+        // A null instance has no embedded resource, so this also exercises
+        // the fall back to the base icon.
+        let none = HINSTANCE(std::ptr::null_mut());
+        for derived in [make_working_icon(none, icon), make_failed_icon(none, icon)] {
+            let d = derived.expect("badge icon should derive from a real system icon");
+            let _ = unsafe { DestroyIcon(d) };
+        }
+    }
+
+    #[test]
     fn tray_set_mode_offline_derives_and_caches_the_tinted_icon_against_a_real_window() {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::WindowsAndMessaging::{
@@ -2028,6 +2223,100 @@ mod tests {
 
         drop(tray);
         let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    // -- #327: which icon for which state ----------------------------------
+
+    use crate::mode::Mode;
+
+    #[test]
+    fn icon_state_has_one_row_per_state() {
+        assert_eq!(icon_state(false, false, false, Mode::Auto), IconState::Idle);
+        assert_eq!(
+            icon_state(false, true, false, Mode::Auto),
+            IconState::Working
+        );
+        assert_eq!(
+            icon_state(true, false, false, Mode::Auto),
+            IconState::Paused
+        );
+        assert_eq!(
+            icon_state(false, false, false, Mode::Offline),
+            IconState::Offline
+        );
+        assert_eq!(
+            icon_state(false, false, true, Mode::Auto),
+            IconState::Failed
+        );
+    }
+
+    #[test]
+    fn icon_state_precedence_is_paused_working_failed_offline() {
+        // Everything at once: paused wins.
+        assert_eq!(
+            icon_state(true, true, true, Mode::Offline),
+            IconState::Paused
+        );
+        // Not paused: a request in flight beats a stale failure and Offline.
+        assert_eq!(
+            icon_state(false, true, true, Mode::Offline),
+            IconState::Working
+        );
+        // Idle but failed beats Offline.
+        assert_eq!(
+            icon_state(false, false, true, Mode::Offline),
+            IconState::Failed
+        );
+    }
+
+    #[test]
+    fn state_tooltip_leads_with_the_state_and_idle_is_unchanged() {
+        assert_eq!(state_tooltip(IconState::Idle, "Wingman: x"), "Wingman: x");
+        assert_eq!(
+            state_tooltip(IconState::Working, "Wingman: x"),
+            "Working... · Wingman: x"
+        );
+        assert_eq!(
+            state_tooltip(IconState::Failed, "Wingman: x"),
+            "Last run failed · Wingman: x"
+        );
+        assert_eq!(
+            state_tooltip(IconState::Offline, "Wingman: x"),
+            "Offline · Wingman: x"
+        );
+        // Paused text is produced by `pause::tooltip_text`, not here.
+        assert_eq!(state_tooltip(IconState::Paused, "Paused"), "Paused");
+        for s in [IconState::Working, IconState::Failed, IconState::Offline] {
+            assert!(!state_tooltip(s, "b").contains('\u{2014}'));
+        }
+    }
+
+    #[test]
+    fn draw_badge_paints_the_bottom_right_corner_only() {
+        let (w, h) = (32i32, 32i32);
+        // A fully transparent fixture, like the empty corner of a real icon:
+        // a badge that forgot to set alpha would stay invisible.
+        let clear = [10u8, 20, 30, 0];
+        let mut px = vec![clear; (w * h) as usize];
+        let red = [0u8, 0, 220, 255];
+        draw_badge(&mut px, w, h, red);
+        // Centre of the badge is the badge colour, fully opaque.
+        assert_eq!(px[((h - 9) * w + (w - 9)) as usize], red);
+        // Every pixel the badge touched, rim included, is opaque.
+        let painted: Vec<_> = px.iter().filter(|p| **p != clear).collect();
+        assert!(!painted.is_empty());
+        assert!(painted.iter().all(|p| p[3] == 255), "{painted:?}");
+        // The opposite corners are untouched.
+        assert_eq!(px[0], clear);
+        assert_eq!(px[(w - 1) as usize], clear);
+    }
+
+    #[test]
+    fn draw_badge_tolerates_tiny_and_degenerate_sizes() {
+        for (w, h) in [(1i32, 1i32), (2, 2), (16, 16), (0, 0)] {
+            let mut px = vec![[0u8; 4]; (w * h) as usize];
+            draw_badge(&mut px, w, h, [1, 2, 3, 255]);
+        }
     }
 
     // -- #231: set_sz_tip never truncates mid-surrogate-pair ----------------
