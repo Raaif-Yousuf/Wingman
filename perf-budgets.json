@@ -1,9 +1,9 @@
 {
   "exe_size_bytes": {
-    "max": 3900000,
-    "measured": 3800576,
+    "max": 4000000,
+    "measured": 3902976,
     "measured_on": "2026-10-16",
-    "reason": "Raised from 3,500,000 for the offline QR-code decoder (rqrr, #313): 3,329,536 before and 3,503,104 after on the same machine (3,511,296 once merged with master), about 174 KB. Then raised from 3,700,000 to 3,800,000 for the live model lists (#380): CI measured 3,722,752 with them. Then raised to 3,900,000 for the password manager window painting and Store app matching (#575, #636): CI measured 3,800,576 with them."
+    "reason": "Raised from 3,500,000 for the offline QR-code decoder (rqrr, #313): 3,329,536 before and 3,503,104 after on the same machine (3,511,296 once merged with master), about 174 KB. Then raised from 3,700,000 to 3,800,000 for the live model lists (#380): CI measured 3,722,752 with them. Then raised to 3,900,000 for the password manager window painting and Store app matching (#575, #636): CI measured 3,800,576 with them. Then raised to 4,000,000 for the PC check for local models (#328): CI measured 3,902,976 with it merged on top of master."
   },
   "startup_ms": {
     "max": 2000,
