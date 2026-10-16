@@ -290,13 +290,14 @@ since a local server has no rate limit to retry against.
 
 ## How to add Ollama, Gemini or a compat endpoint to `providers.order` by hand today
 
-Settings (`src/ui/settings.rs`) has key/model/effort fields for OpenAI and
-Anthropic, and an "Active provider" choice of ChatGPT, Claude or Ollama
-(local) that moves that provider to the front of `providers.order` (issue
-#183). Gemini has no key/model/effort fields in Settings (issue #195), and
-there is no UI to add a `"gemini"` or `"compat:<name>"` entry to the order.
+Settings (`src/ui/settings.rs`) has key/model/effort fields for OpenAI,
+Anthropic and Gemini (issue #195), a model picker for Ollama (issue #183),
+and an "Active provider" choice of ChatGPT, Claude, Ollama (local) or Gemini
+that moves that provider to the front of `providers.order`. The tray's
+Provider submenu does the same. There is no UI to add a `"compat:<name>"`
+entry to the order.
 
-To use Gemini or an OpenAI-compatible endpoint today, edit
+To use an OpenAI-compatible endpoint today, edit
 `%APPDATA%\Wingman\config.toml` by hand (**Open config.toml** in the tray
 menu) and add the provider name to `providers.order`, e.g.:
 
@@ -312,10 +313,9 @@ api_key = "..."
 model = "..."
 ```
 
-Gemini additionally needs `providers.gemini.api_key` set (or the
-`GEMINI_API_KEY` environment variable) since it has no Settings field to
-paste a key into. Ollama needs nothing beyond the order entry: its
-`base_url`/`model`/`effort` already have working defaults in
+Gemini needs a key: paste it in Settings, or set the `GEMINI_API_KEY`
+environment variable. Ollama needs nothing beyond being first or listed in
+the order: its `base_url`/`model`/`effort` already have working defaults in
 `OllamaConfig::default`. A compat endpoint needs its own
 `[[providers.compat]]` table (`CompatConfig`, `src/config.rs`), one entry
 per endpoint, matched to the order by its `name` (`"compat:<name>"` in
@@ -323,12 +323,11 @@ per endpoint, matched to the order by its `name` (`"compat:<name>"` in
 `name`).
 
 **What a Settings save does to the order:** it keeps every entry you added
-by hand (Gemini, compat endpoints, a duplicate) where it was
+by hand (compat endpoints, a duplicate) where it was
 (`merge_provider_order`, issue #194). Only the choice in "Active provider"
-changes it: picking ChatGPT or Claude swaps those two, and picking Ollama
-puts it first. A config that leads with Gemini or a compat endpoint shows
-as ChatGPT in that control; saving without touching it leaves the order
-alone.
+changes it: picking ChatGPT or Claude swaps those two, and picking Ollama or
+Gemini puts it first. A config that leads with a compat endpoint shows as
+ChatGPT in that control; saving without touching it leaves the order alone.
 
 ## Model discovery
 

@@ -5219,6 +5219,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::USE_OLLAMA) => {
                         app.set_provider(ActiveProvider::Ollama)
                     }
+                    MenuChoice::Command(cmd::USE_GEMINI) => {
+                        app.set_provider(ActiveProvider::Gemini)
+                    }
                     MenuChoice::Command(cmd::PAUSE_1H) => app.pause_for(PauseChoice::OneHour),
                     MenuChoice::Command(cmd::PAUSE_UNTIL_TOMORROW) => {
                         app.pause_for(PauseChoice::UntilTomorrow)
