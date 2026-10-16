@@ -158,6 +158,20 @@ pub fn gathered_from(page: web_page::Page) -> super::generic_inputs::Gathered {
     }
 }
 
+/// `proposal` with the site the page was really read from added, when a
+/// redirect made that a different site from the one the user confirmed.
+pub fn note_final_host(mut proposal: Value, confirmed_host: &str, final_host: &str) -> Value {
+    if confirmed_host != final_host {
+        if let Some(object) = proposal.as_object_mut() {
+            object.insert(
+                super::page_summary::READ_FROM_KEY.to_string(),
+                Value::from(final_host),
+            );
+        }
+    }
+    proposal
+}
+
 /// The card text when no link was found anywhere.
 pub const NO_LINK_MESSAGE: &str =
     "No web link found. Select a link, or have one on screen, and try again.";
@@ -295,6 +309,25 @@ mod tests {
         assert!(a.confirm);
         // No model ever fills this proposal, so the registry does not know it.
         assert!(super::super::schema::schema_for(CONFIRM_PROPOSAL, false).is_none());
+    }
+
+    #[test]
+    fn a_redirect_to_another_host_is_marked_for_the_result_card() {
+        use super::super::page_summary::{card_text, READ_FROM_KEY};
+        let proposal = json!({"line1": "A page.", "bullets": []});
+        let marked = note_final_host(proposal.clone(), "a.example", "b.example");
+        assert_eq!(marked[READ_FROM_KEY], "b.example");
+        assert!(card_text(&marked).detail.contains("b.example"));
+        // The same site: untouched.
+        assert_eq!(
+            note_final_host(proposal.clone(), "a.example", "a.example"),
+            proposal
+        );
+        // A different name is named, even `www.` of the same site.
+        assert_ne!(
+            note_final_host(proposal.clone(), "a.example", "www.a.example"),
+            proposal
+        );
     }
 
     #[test]

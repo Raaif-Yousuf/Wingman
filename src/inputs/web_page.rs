@@ -356,6 +356,12 @@ pub fn fetch_with(net: &dyn Net, raw_url: &str) -> Result<Page, String> {
             ));
         }
 
+        // The lookup used some of the time: the request gets what is left.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            net.record(&host, 0, Some("timed out"));
+            return Err(format!("{host} took too long to answer."));
+        }
         let hop = match net.get(&target, &addrs, remaining) {
             Ok(hop) => hop,
             Err(e) => {
@@ -509,6 +515,9 @@ pub fn network_refusal() -> Option<String> {
 /// and `ureq` connected only to the addresses the policy approved.
 pub struct RealNet;
 
+/// The most addresses ureq's resolver result holds.
+const MAX_PINNED_ADDRS: usize = 16;
+
 /// Hands `ureq` the already-checked addresses instead of a second lookup.
 #[derive(Debug)]
 struct PinnedResolver(Vec<SocketAddr>);
@@ -524,7 +533,9 @@ impl ureq::unversioned::resolver::Resolver for PinnedResolver {
             return Err(ureq::Error::HostNotFound);
         }
         let mut out = self.empty();
-        for addr in &self.0 {
+        // ureq keeps at most 16 and its `push` does not check the capacity:
+        // a 17th would panic, and a release build aborts on panic.
+        for addr in self.0.iter().take(MAX_PINNED_ADDRS) {
             out.push(*addr);
         }
         Ok(out)
@@ -547,51 +558,8 @@ impl Net for RealNet {
     }
 
     fn get(&self, target: &Target, addrs: &[IpAddr], timeout: Duration) -> Result<Hop, String> {
-        let pinned = PinnedResolver(addrs.iter().map(|ip| SocketAddr::new(*ip, 443)).collect());
-        let config = ureq::Agent::config_builder()
-            // Redirects are followed by `fetch_with`, one checked hop at a time.
-            .max_redirects(0)
-            .max_redirects_will_error(false)
-            .http_status_as_error(false)
-            .https_only(true)
-            // A proxy would do its own lookup and skip the address check.
-            .proxy(None)
-            .timeout_global(Some(timeout))
-            .user_agent(concat!(
-                "Wingman/",
-                env!("CARGO_PKG_VERSION"),
-                " (link summary)"
-            ))
-            .accept("text/html, application/xhtml+xml, text/plain;q=0.9")
-            .build();
-        let agent = ureq::Agent::with_parts(
-            config,
-            ureq::unversioned::transport::DefaultConnector::default(),
-            pinned,
-        );
-        let response = agent.get(&target.url).call().map_err(|e| e.to_string())?;
-        let (parts, mut body) = response.into_parts();
-        let header = |name: &str| {
-            parts
-                .headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        };
-        let mut bytes = Vec::new();
-        let mut reader = body.as_reader().take(MAX_BODY_BYTES as u64 + 1);
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("reading the page failed: {e}"))?;
-        let body_truncated = bytes.len() > MAX_BODY_BYTES;
-        bytes.truncate(MAX_BODY_BYTES);
-        Ok(Hop {
-            status: parts.status.as_u16(),
-            content_type: header("content-type"),
-            location: header("location"),
-            body: bytes,
-            body_truncated,
-        })
+        let pinned = addrs.iter().map(|ip| SocketAddr::new(*ip, 443)).collect();
+        fetch_hop(&target.url, pinned, timeout, true)
     }
 
     fn record(&self, host: &str, bytes_received: usize, error: Option<&str>) {
@@ -611,6 +579,62 @@ impl Net for RealNet {
             error,
         ));
     }
+}
+
+/// One GET of `url` (no redirects followed), connecting only to `pinned`.
+/// `https_only` is true outside the pinning test, which has no certificate
+/// to offer a plain local listener.
+fn fetch_hop(
+    url: &str,
+    pinned: Vec<SocketAddr>,
+    timeout: Duration,
+    https_only: bool,
+) -> Result<Hop, String> {
+    let pinned = PinnedResolver(pinned);
+    let config = ureq::Agent::config_builder()
+        // Redirects are followed by `fetch_with`, one checked hop at a time.
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .http_status_as_error(false)
+        .https_only(https_only)
+        // A proxy would do its own lookup and skip the address check.
+        .proxy(None)
+        .timeout_global(Some(timeout))
+        .user_agent(concat!(
+            "Wingman/",
+            env!("CARGO_PKG_VERSION"),
+            " (link summary)"
+        ))
+        .accept("text/html, application/xhtml+xml, text/plain;q=0.9")
+        .build();
+    let agent = ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        pinned,
+    );
+    let response = agent.get(url).call().map_err(|e| e.to_string())?;
+    let (parts, mut body) = response.into_parts();
+    let header = |name: &str| {
+        parts
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let mut bytes = Vec::new();
+    let mut reader = body.as_reader().take(MAX_BODY_BYTES as u64 + 1);
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("reading the page failed: {e}"))?;
+    let body_truncated = bytes.len() > MAX_BODY_BYTES;
+    bytes.truncate(MAX_BODY_BYTES);
+    Ok(Hop {
+        status: parts.status.as_u16(),
+        content_type: header("content-type"),
+        location: header("location"),
+        body: bytes,
+        body_truncated,
+    })
 }
 
 /// Fetches the page behind `raw_url` over the real network.
@@ -957,6 +981,9 @@ mod tests {
         resolved: RefCell<Vec<String>>,
         gets: RefCell<Vec<(String, Vec<IpAddr>)>>,
         logged: RefCell<Vec<(String, usize, Option<String>)>>,
+        /// How long every lookup takes, and the time each request was given.
+        resolve_delay: Duration,
+        get_timeouts: RefCell<Vec<Duration>>,
     }
 
     impl FakeNet {
@@ -967,6 +994,8 @@ mod tests {
                 resolved: RefCell::new(Vec::new()),
                 gets: RefCell::new(Vec::new()),
                 logged: RefCell::new(Vec::new()),
+                resolve_delay: Duration::ZERO,
+                get_timeouts: RefCell::new(Vec::new()),
             }
         }
         fn host(mut self, name: &str, ip: IpAddr) -> Self {
@@ -981,13 +1010,15 @@ mod tests {
 
     impl Net for FakeNet {
         fn resolve(&self, host: &str, _timeout: Duration) -> Result<Vec<IpAddr>, String> {
+            std::thread::sleep(self.resolve_delay);
             self.resolved.borrow_mut().push(host.to_string());
             self.dns
                 .get(host)
                 .cloned()
                 .ok_or_else(|| format!("no such host {host}"))
         }
-        fn get(&self, target: &Target, addrs: &[IpAddr], _t: Duration) -> Result<Hop, String> {
+        fn get(&self, target: &Target, addrs: &[IpAddr], timeout: Duration) -> Result<Hop, String> {
+            self.get_timeouts.borrow_mut().push(timeout);
             self.gets
                 .borrow_mut()
                 .push((target.url.clone(), addrs.to_vec()));
@@ -1406,6 +1437,84 @@ mod tests {
         assert!(err.contains("public website name"), "{err}");
         let err = fetch_page("http://example.com/").unwrap_err();
         assert!(err.contains("https"), "{err}");
+    }
+
+    #[test]
+    fn the_request_gets_the_time_left_after_the_lookup() {
+        let mut net = FakeNet::new()
+            .host("example.com", PUBLIC)
+            .page("https://example.com/", html("<p>x</p>"));
+        net.resolve_delay = Duration::from_millis(300);
+        fetch(&net, "https://example.com/").unwrap();
+        let given = net.get_timeouts.borrow()[0];
+        assert!(
+            given <= TOTAL_TIMEOUT - Duration::from_millis(250),
+            "the request was given {given:?}, as if the lookup took no time"
+        );
+    }
+
+    // -- the real transport's pinned resolver ----------------------------------
+
+    fn resolve_pinned(addrs: Vec<SocketAddr>) -> Result<usize, ureq::Error> {
+        use ureq::unversioned::resolver::Resolver;
+        let uri: ureq::http::Uri = "https://example.com/".parse().unwrap();
+        let timeout = ureq::unversioned::transport::NextTimeout {
+            after: ureq::unversioned::transport::time::Duration::from_secs(5),
+            reason: ureq::Timeout::Global,
+        };
+        PinnedResolver(addrs)
+            .resolve(&uri, &ureq::config::Config::default(), timeout)
+            .map(|found| found.len())
+    }
+
+    #[test]
+    fn a_dns_answer_with_many_addresses_does_not_overflow_the_resolver() {
+        // ureq keeps 16 and its `push` does not check: 17 would panic, and a
+        // release build aborts on panic.
+        let many: Vec<SocketAddr> = (1..=40u8)
+            .map(|n| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, n)), 443))
+            .collect();
+        assert_eq!(resolve_pinned(many[..17].to_vec()).unwrap(), 16);
+        assert_eq!(resolve_pinned(many).unwrap(), 16);
+        assert_eq!(
+            resolve_pinned(vec![SocketAddr::new(PUBLIC, 443)]).unwrap(),
+            1
+        );
+        assert!(resolve_pinned(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn the_real_transport_connects_to_the_pinned_address_not_to_a_lookup() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut seen = [0u8; 512];
+            let _ = std::io::Read::read(&mut conn, &mut seen);
+            let body = "pinned ok";
+            let _ = write!(
+                conn,
+                "HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: {}
+Connection: close
+
+{body}",
+                body.len()
+            );
+        });
+        // `.invalid` can never resolve, so only the pin can reach the listener.
+        let hop = fetch_hop(
+            &format!("http://pin-test.invalid:{}/", addr.port()),
+            vec![addr],
+            Duration::from_secs(5),
+            false,
+        )
+        .expect("the request should reach the pinned listener");
+        server.join().unwrap();
+        assert_eq!(hop.status, 200);
+        assert_eq!(hop.body, b"pinned ok");
     }
 
     #[test]

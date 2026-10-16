@@ -1453,10 +1453,16 @@ impl App {
                 }
                 // #127 step 2: the user confirmed this address. The page is the
                 // only input: the selection and the screen are not read again.
+                let mut redirected_to: Option<(String, String)> = None;
                 let (gathered, inputs) = match &link_step {
                     actions::link_summary::Step::Fetch(url) => {
                         let page = crate::inputs::web_page::fetch_page(url)
                             .map_err(GenericFailure::UserState)?;
+                        // A redirect to another site is named on the result card.
+                        let confirmed = crate::inputs::web_page::parse_target(url)
+                            .map(|t| t.host)
+                            .unwrap_or_default();
+                        redirected_to = Some((confirmed, page.host.clone()));
                         (
                             actions::link_summary::gathered_from(page),
                             vec![actions::InputKind::LinkedPage],
@@ -1509,6 +1515,12 @@ impl App {
                     },
                     |c| actions::parse_generic_proposal(&c.text),
                 ))?;
+                let proposal = match redirected_to {
+                    Some((confirmed, read)) => {
+                        actions::link_summary::note_final_host(proposal, &confirmed, &read)
+                    }
+                    None => proposal,
+                };
                 Ok((proposal, replace))
             })()
             .map_err(pack_generic_failure);
