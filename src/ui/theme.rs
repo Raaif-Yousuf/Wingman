@@ -329,25 +329,57 @@ fn contrast_between(a: u32, b: u32) -> f64 {
 // Type, radius and spacing
 // ---------------------------------------------------------------------------
 
-/// Headline size relative to the system message font. Deliberately below
-/// 1.0: the headline should read smaller than a stock notification.
-pub(crate) const HEADLINE_FONT_SCALE: f32 = 0.85;
-/// Just under the headline, so the two stay distinguishable by size as a
-/// second cue after colour. Neither is bold.
-pub(crate) const DETAIL_FONT_SCALE: f32 = 0.8;
-/// The smallest text: at-a-glance annotations such as the badge label.
-pub(crate) const SMALL_FONT_SCALE: f32 = 0.7;
+/// The Windows 11 type ramp, in px at 96 DPI (scaled per window by
+/// `type_height_px`). Sentence case, no ALL CAPS.
+///
+/// Subtitle: titles on larger surfaces, semibold.
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const TYPE_SUBTITLE_PX: i32 = 20;
+/// Body: field labels and values, button text. The card headline is this
+/// size in semibold ("body strong").
+pub(crate) const TYPE_BODY_PX: i32 = 14;
+/// Caption: detail text, footer links, the status line and the badge.
+pub(crate) const TYPE_CAPTION_PX: i32 = 12;
+/// Line height for body text, in px at 96 DPI.
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const TYPE_BODY_LINE_PX: i32 = 20;
+/// Line height for caption text, in px at 96 DPI.
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const TYPE_CAPTION_LINE_PX: i32 = 16;
+/// The preferred face, installed on Windows 11. Surfaces fall back to the
+/// system message font's face when it is missing.
+pub(crate) const PREFERRED_FONT_FACE: &str = "Segoe UI Variable Text";
 /// The face used when the system message font cannot be read.
 pub(crate) const FALLBACK_FONT_FACE: &str = "Segoe UI";
 
-/// Outer margin around a surface, in dp (logical pixels at 96 DPI).
-pub(crate) const MARGIN_DP: i32 = 14;
+/// A `LOGFONTW::lfHeight` for a ramp size: negative (character height, not
+/// cell height), scaled for `dpi` and the user's `text_scale`, never zero.
+pub(crate) fn type_height_px(ramp_px: i32, dpi: u32, text_scale: f32) -> i32 {
+    let v = (ramp_px as f32 * dpi as f32 / 96.0 * text_scale).round() as i32;
+    -v.max(1)
+}
+
+/// Spacing on the 4 px grid, in dp (logical pixels at 96 DPI).
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const SPACE_XS_DP: i32 = 4;
+pub(crate) const SPACE_SM_DP: i32 = 8;
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const SPACE_MD_DP: i32 = 12;
+pub(crate) const SPACE_LG_DP: i32 = 16;
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const SPACE_XL_DP: i32 = 24;
+
+/// Outer margin around a surface, in dp.
+pub(crate) const MARGIN_DP: i32 = SPACE_LG_DP;
 /// Inner padding of a surface, in dp.
-pub(crate) const PADDING_DP: i32 = 14;
+pub(crate) const PADDING_DP: i32 = SPACE_LG_DP;
 /// The gap between stacked elements, in dp.
-pub(crate) const GAP_DP: i32 = 6;
+pub(crate) const GAP_DP: i32 = SPACE_SM_DP;
 /// Corner radius of owner-drawn controls, in dp.
-pub(crate) const CONTROL_RADIUS_DP: i32 = 6;
+pub(crate) const CONTROL_RADIUS_DP: i32 = 4;
+/// Corner radius of a top-level window, in dp (what `DWMWCP_ROUND` draws).
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const WINDOW_RADIUS_DP: i32 = 8;
 
 #[cfg(test)]
 mod tests {
@@ -375,6 +407,35 @@ mod tests {
         assert_eq!(DARK.text_dim, rgb(190, 190, 190));
         assert_eq!(DARK.text_faint, rgb(140, 140, 140));
         assert_eq!(DARK.danger, rgb(240, 100, 100));
+    }
+
+    #[test]
+    fn type_ramp_scales_with_dpi_and_text_scale() {
+        assert_eq!(type_height_px(TYPE_BODY_PX, 96, 1.0), -14);
+        assert_eq!(type_height_px(TYPE_CAPTION_PX, 96, 1.0), -12);
+        assert_eq!(type_height_px(TYPE_SUBTITLE_PX, 96, 1.0), -20);
+        assert_eq!(type_height_px(TYPE_BODY_PX, 144, 1.0), -21);
+        assert_eq!(type_height_px(TYPE_BODY_PX, 96, 1.5), -21);
+        assert_eq!(type_height_px(TYPE_CAPTION_PX, 192, 1.0), -24);
+        // Never zero, whatever the inputs.
+        assert_eq!(type_height_px(TYPE_CAPTION_PX, 96, 0.0), -1);
+    }
+
+    #[test]
+    fn type_ramp_orders_and_spacing_sits_on_the_grid() {
+        const { assert!(TYPE_SUBTITLE_PX > TYPE_BODY_PX && TYPE_BODY_PX > TYPE_CAPTION_PX) };
+        const { assert!(TYPE_BODY_LINE_PX > TYPE_BODY_PX && TYPE_CAPTION_LINE_PX > TYPE_CAPTION_PX) };
+        for s in [
+            SPACE_XS_DP,
+            SPACE_SM_DP,
+            SPACE_MD_DP,
+            SPACE_LG_DP,
+            SPACE_XL_DP,
+        ] {
+            assert_eq!(s % 4, 0);
+        }
+        assert_eq!((MARGIN_DP, PADDING_DP, GAP_DP), (16, 16, 8));
+        assert_eq!((CONTROL_RADIUS_DP, WINDOW_RADIUS_DP), (4, 8));
     }
 
     #[test]
