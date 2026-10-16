@@ -959,6 +959,20 @@ fn first_run_adopted_card(
     ("Using Ollama on this PC".to_string(), detail)
 }
 
+/// #892: the detail the first-run card shows. The probe's Ollama text is only
+/// for a setup that is merely empty; when config.toml did not parse, the card
+/// is the broken-file one and must keep saying so.
+fn first_run_card_detail(
+    gate_detail: String,
+    found: &FirstRun,
+    load_problem: Option<&str>,
+) -> String {
+    if load_problem.is_some() {
+        return gate_detail;
+    }
+    first_run_detail(found).unwrap_or(gate_detail)
+}
+
 /// #133: the readiness card's detail when Ollama is running but has nothing
 /// that can read the screen; `None` leaves the usual card alone. The card
 /// already opens Settings, where the model can be downloaded.
@@ -1226,9 +1240,7 @@ impl App {
             self.set_watch(true);
             return;
         }
-        if let Some(d) = first_run_detail(&found) {
-            detail = d;
-        }
+        detail = first_run_card_detail(detail, &found, self.config.load_problem.as_deref());
         self.card.show_settings_needed(&headline, &detail);
     }
 
@@ -8276,6 +8288,22 @@ mod tests {
             App::readiness_gate(Mode::Offline, &providers, path)
         );
         assert!(super::setup_gate(Mode::Cloud, &cloud_ready_providers(), path, problem).is_none());
+    }
+
+    #[test]
+    fn a_broken_file_card_keeps_its_detail_whatever_the_ollama_probe_found() {
+        let broken = "The file is here".to_string();
+        for found in [FirstRun::NoVisionModel, FirstRun::VisionUnknown] {
+            assert_eq!(
+                super::first_run_card_detail(broken.clone(), &found, Some("line 3")),
+                broken
+            );
+            assert_ne!(
+                super::first_run_card_detail(broken.clone(), &found, None),
+                broken,
+                "without a load problem the probe's detail still applies"
+            );
+        }
     }
 
     #[test]
