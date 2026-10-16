@@ -91,6 +91,10 @@ call. Run it with no `--screenshot` argument to step through the same
 states interactively with Right/Left. Attach the before and after PNGs so a
 reviewer can see the visual change without reproducing it locally.
 
+Add `--theme light`, `--theme dark` or `--theme high-contrast` to draw the card
+states in that theme without changing your Windows settings. The palette and
+Settings states still follow the system theme.
+
 ## Config compatibility
 
 `config.toml`'s shape only ever grows: `#[serde(default)]` on every struct

@@ -5,10 +5,8 @@
 //! palettes and their contrast can be unit-tested. Colours are GDI
 //! `COLORREF` values (`0x00BBGGRR`), the same layout `rgb` builds.
 //!
-//! Slice 1 holds what the card paints today, with the same values. The
-//! palette and region overlay move onto it in later slices, and the card
-//! learns to follow high contrast then too; until then the high-contrast
-//! pieces are only exercised by the tests.
+//! The card paints from these tokens in light, dark and high contrast. The
+//! palette and region overlay move onto them in later slices.
 
 use windows::Win32::Graphics::Gdi::{
     GetSysColor, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
@@ -35,7 +33,6 @@ pub(crate) enum Theme {
 impl Theme {
     /// High contrast wins over the light/dark app mode, the way Windows
     /// itself treats it.
-    #[allow(dead_code)] // wired in by the palette and region slices
     pub(crate) fn resolve(apps_use_light_theme: bool, high_contrast: bool) -> Theme {
         if high_contrast {
             Theme::HighContrast
@@ -88,11 +85,10 @@ pub(crate) const DARK: Tokens = Tokens {
     danger: rgb(240, 100, 100),
 };
 
-/// The Windows system colours that matter in high contrast, read once per
-/// theme change by [`SysColors::read`] and passed in so the mapping stays
-/// pure.
+/// The Windows system colours that matter in high contrast, read again on
+/// every theme change by [`SysColors::read`] and passed in so the mapping
+/// stays pure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // wired in by the palette and region slices
 pub(crate) struct SysColors {
     pub(crate) window: u32,
     pub(crate) window_text: u32,
@@ -101,7 +97,6 @@ pub(crate) struct SysColors {
     pub(crate) highlight_text: u32,
 }
 
-#[allow(dead_code)] // wired in by the palette and region slices
 impl SysColors {
     /// The current system colours (`GetSysColor`).
     pub(crate) fn read() -> SysColors {
@@ -120,7 +115,6 @@ impl SysColors {
 
 impl Tokens {
     /// The tokens for `theme`. Only high contrast looks at `sys`.
-    #[allow(dead_code)] // wired in by the palette and region slices
     pub(crate) fn for_theme(theme: Theme, sys: &SysColors) -> Tokens {
         match theme {
             Theme::Light => LIGHT,
@@ -139,6 +133,27 @@ impl Tokens {
         }
     }
 }
+
+/// Windows' high-contrast black and high-contrast white themes. The tests
+/// hold them to the contrast bar; the UI gallery's `--theme high-contrast`
+/// draws with the black one, so a screenshot needs no change to the
+/// machine's real settings.
+#[cfg(any(test, debug_assertions))]
+pub(crate) const HC_BLACK: SysColors = SysColors {
+    window: 0x0000_0000,
+    window_text: 0x00FF_FFFF,
+    gray_text: rgb(0x3F, 0xF2, 0x3F),
+    highlight: 0x00FF_FF00,
+    highlight_text: 0x0000_0000,
+};
+#[cfg(test)]
+const HC_WHITE: SysColors = SysColors {
+    window: 0x00FF_FFFF,
+    window_text: 0x0000_0000,
+    gray_text: rgb(0, 0x60, 0),
+    highlight: rgb(0x37, 0x00, 0x6E),
+    highlight_text: 0x00FF_FFFF,
+};
 
 /// Difficulty badge fill: green, amber, red stops at ranks 1, 5 and 10.
 /// Three stops (not a straight green to red blend) so the middle reads as
@@ -223,22 +238,6 @@ mod tests {
     /// Ratios from WCAG 2: body text needs 4.5, large text and UI parts 3.
     const AA_TEXT: f64 = 4.5;
     const AA_LARGE: f64 = 3.0;
-
-    /// Windows' high-contrast black and high-contrast white themes.
-    const HC_BLACK: SysColors = SysColors {
-        window: 0x0000_0000,
-        window_text: 0x00FF_FFFF,
-        gray_text: rgb(0x3F, 0xF2, 0x3F),
-        highlight: 0x00FF_FF00,
-        highlight_text: 0x0000_0000,
-    };
-    const HC_WHITE: SysColors = SysColors {
-        window: 0x00FF_FFFF,
-        window_text: 0x0000_0000,
-        gray_text: rgb(0, 0x60, 0),
-        highlight: rgb(0x37, 0x00, 0x6E),
-        highlight_text: 0x00FF_FFFF,
-    };
 
     #[test]
     fn light_and_dark_values_are_the_ones_the_card_always_painted() {

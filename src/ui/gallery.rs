@@ -10,14 +10,29 @@
 
 use std::path::PathBuf;
 
-/// Parsed `--ui-gallery [--screenshot <dir>]` invocation.
+/// Parsed `--ui-gallery [--screenshot <dir>] [--theme <name>]` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GalleryArgs {
     pub screenshot_dir: Option<PathBuf>,
+    /// The raw `--theme` value. Checked by the driver with
+    /// [`theme_from_arg`], so a typo is an error and not a silent default.
+    pub theme: Option<String>,
+}
+
+/// The theme a `--theme` value names: `light`, `dark` or `high-contrast`
+/// (Windows' high contrast black). `None` for anything else.
+pub fn theme_from_arg(name: &str) -> Option<crate::ui::theme::Theme> {
+    use crate::ui::theme::Theme;
+    match name {
+        "light" => Some(Theme::Light),
+        "dark" => Some(Theme::Dark),
+        "high-contrast" => Some(Theme::HighContrast),
+        _ => None,
+    }
 }
 
 /// Recognizes `--ui-gallery` (optionally followed anywhere later by
-/// `--screenshot <dir>`) among `args` (normally `std::env::args().skip(1)`
+/// `--screenshot <dir>` and `--theme <name>`) among `args` (normally `std::env::args().skip(1)`
 /// collected by the caller). Returns `None` when `--ui-gallery` is absent.
 /// `--screenshot` with no following value is treated as if `--screenshot`
 /// were absent (documented, not an error): the gallery still runs
@@ -27,15 +42,23 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
         return None;
     }
     let mut screenshot_dir = None;
+    let mut theme = None;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         if a == "--screenshot" {
             if let Some(dir) = iter.next() {
                 screenshot_dir = Some(PathBuf::from(dir));
             }
+        } else if a == "--theme" {
+            if let Some(name) = iter.next() {
+                theme = Some(name.clone());
+            }
         }
     }
-    Some(GalleryArgs { screenshot_dir })
+    Some(GalleryArgs {
+        screenshot_dir,
+        theme,
+    })
 }
 
 /// One state the gallery can drive `Card` or `Palette` into.
@@ -64,6 +87,9 @@ pub enum GalleryState {
     CardPendingStillWorking,
     CardPreviewCalendar,
     CardPreviewFormLongLabels,
+    /// The preview's title line replaced by an error message, drawn in the
+    /// error colour (a number field holding text).
+    CardPreviewError,
     PaletteDefault,
     PaletteRouterSuggestion,
     PaletteNoMatches,
@@ -94,6 +120,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardPendingStillWorking,
         CardPreviewCalendar,
         CardPreviewFormLongLabels,
+        CardPreviewError,
         PaletteDefault,
         PaletteRouterSuggestion,
         PaletteNoMatches,
@@ -123,6 +150,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardPendingStillWorking => "card-pending-still-working",
         CardPreviewCalendar => "card-preview-calendar",
         CardPreviewFormLongLabels => "card-preview-form-long-labels",
+        CardPreviewError => "card-preview-error",
         PaletteDefault => "palette-default",
         PaletteRouterSuggestion => "palette-router-suggestion",
         PaletteNoMatches => "palette-no-matches",
@@ -193,6 +221,14 @@ mod driver {
         };
 
         let mut card = Card::new_for_test(instance)?;
+        if let Some(name) = &args.theme {
+            let theme = theme_from_arg(name).ok_or_else(|| {
+                anyhow::anyhow!("--theme {name:?} is not one of light, dark, high-contrast")
+            })?;
+            // The Card states only: the palette and Settings still follow
+            // the live system theme.
+            card.force_theme_for_gallery(theme);
+        }
         let mut palette = Palette::new_for_test(instance)?;
         let mut settings: Option<GalleryWindow> = None;
 
@@ -429,6 +465,13 @@ mod driver {
                 let (schema, value) = form_long_labels_fixture();
                 let _ = card.show_preview("Fill out this form", &schema, &value, false);
             }
+            CardPreviewError => {
+                card.hide();
+                palette.hide();
+                let (schema, value) = calendar_fixture();
+                let _ = card.show_preview("Add to calendar", &schema, &value, false);
+                card.set_preview_error_for_gallery("Start must be a time, like 09:00.");
+            }
             PaletteDefault => {
                 card.hide();
                 palette.hide();
@@ -572,9 +615,30 @@ mod tests {
         assert_eq!(
             parse_gallery_args(&args(&["--ui-gallery"])),
             Some(GalleryArgs {
-                screenshot_dir: None
+                screenshot_dir: None,
+                theme: None
             })
         );
+    }
+
+    #[test]
+    fn ui_gallery_with_a_theme_override() {
+        let parsed = parse_gallery_args(&args(&["--ui-gallery", "--theme", "high-contrast"]))
+            .expect("--ui-gallery is present");
+        assert_eq!(parsed.theme.as_deref(), Some("high-contrast"));
+        // A trailing --theme with no value is absent, like --screenshot.
+        let parsed = parse_gallery_args(&args(&["--ui-gallery", "--theme"])).unwrap();
+        assert_eq!(parsed.theme, None);
+    }
+
+    #[test]
+    fn theme_names_map_to_themes_and_a_typo_maps_to_none() {
+        use crate::ui::theme::Theme;
+        assert_eq!(theme_from_arg("light"), Some(Theme::Light));
+        assert_eq!(theme_from_arg("dark"), Some(Theme::Dark));
+        assert_eq!(theme_from_arg("high-contrast"), Some(Theme::HighContrast));
+        assert_eq!(theme_from_arg("hc"), None);
+        assert_eq!(theme_from_arg(""), None);
     }
 
     #[test]
@@ -582,7 +646,8 @@ mod tests {
         assert_eq!(
             parse_gallery_args(&args(&["--ui-gallery", "--screenshot", "out"])),
             Some(GalleryArgs {
-                screenshot_dir: Some(PathBuf::from("out"))
+                screenshot_dir: Some(PathBuf::from("out")),
+                theme: None
             })
         );
     }
@@ -592,7 +657,8 @@ mod tests {
         assert_eq!(
             parse_gallery_args(&args(&["--ui-gallery", "--screenshot"])),
             Some(GalleryArgs {
-                screenshot_dir: None
+                screenshot_dir: None,
+                theme: None
             })
         );
     }
@@ -610,7 +676,8 @@ mod tests {
                 "--qux"
             ])),
             Some(GalleryArgs {
-                screenshot_dir: Some(PathBuf::from("C:\\out dir"))
+                screenshot_dir: Some(PathBuf::from("C:\\out dir")),
+                theme: None
             })
         );
     }
@@ -626,9 +693,10 @@ mod tests {
     fn state_list_has_the_expected_count_and_no_duplicates() {
         let states = gallery_states();
         // 5 card-answer variants (short + 4 difficulty badges) + error + 4
-        // pending sub-stages (#354) + 2 previews = 12 card states, + 4
-        // palette states + 4 settings states (#560) = 20.
-        assert_eq!(states.len(), 20);
+        // pending sub-stages (#354) + 3 previews (calendar, long labels,
+        // the error title) = 13 card states, + 4 palette states + 4 settings
+        // states (#560) = 21.
+        assert_eq!(states.len(), 21);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
