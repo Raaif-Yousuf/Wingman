@@ -141,7 +141,7 @@ impl Ollama {
         });
 
         if let Some(schema) = &req.schema {
-            body["format"] = schema.clone();
+            body["format"] = common::wire_schema(schema);
         }
 
         body
@@ -363,6 +363,18 @@ mod tests {
         );
         // Not the bare "json" string form.
         assert!(body["format"].is_object());
+    }
+
+    /// #719: the UI-only `editable` keyword never goes out.
+    #[test]
+    fn no_registered_schema_sends_the_editable_keyword() {
+        let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        for kind in crate::actions::schema::PROPOSAL_KINDS {
+            let mut r = req("sys", false);
+            r.schema = crate::actions::schema::schema_for(kind, false);
+            let body = serde_json::to_string(&provider.build_body(&r)).unwrap();
+            assert!(!body.contains("editable"), "{kind}: {body}");
+        }
     }
 
     #[test]
