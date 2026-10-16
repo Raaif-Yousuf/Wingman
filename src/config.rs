@@ -2250,8 +2250,10 @@ win = true
         // Config::save checks the gate before the secret store; the check is
         // shared, so prove it refuses with no path touched.
         let path = scratch_path("711-gate-first");
-        let mut config = Config::default();
-        config.load_problem = Some("config.toml has an error at line 1, column 1".into());
+        let config = Config {
+            load_problem: Some("config.toml has an error at line 1, column 1".into()),
+            ..Config::default()
+        };
         assert!(config.check_save_allowed(&path).is_err());
         assert!(!path.exists());
     }
@@ -2266,8 +2268,10 @@ win = true
         bak.push(".bak");
         fs::create_dir_all(PathBuf::from(&bak)).unwrap();
 
-        let mut config = Config::default();
-        config.mode = Mode::Local;
+        let config = Config {
+            mode: Mode::Local,
+            ..Config::default()
+        };
         let _ = take_backup_warning();
         config.save_to(&path).expect("the save still goes ahead");
         assert!(fs::read_to_string(&path).unwrap().contains("local"));
