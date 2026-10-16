@@ -3127,10 +3127,7 @@ fn build_ui_recorded(
     combo_add(active_combo, "Claude (Anthropic)");
     combo_add(active_combo, "Ollama (local)");
     combo_add(active_combo, "Gemini (Google)");
-    combo_select_index(
-        active_combo,
-        choice_from_order(&config.providers.order) as i32,
-    );
+    combo_select_index(active_combo, combo_index_for_order(&config.providers.order));
     r.advance();
 
     // OpenAI
@@ -4468,8 +4465,21 @@ fn order_from_choice(choice: usize) -> Vec<String> {
 /// The "Active provider" combo index for `order` (an index into
 /// `ActiveProvider::ALL`: ChatGPT, Claude, Ollama, Gemini). A config led by
 /// anything else shows as ChatGPT.
+#[cfg(test)]
 fn choice_from_order(order: &[String]) -> usize {
     ActiveProvider::from_order(order).index()
+}
+
+/// Issue #302: the combo index to preselect for `order`. An order led by
+/// something the combo does not list (a `compat:` endpoint) selects nothing,
+/// instead of showing ChatGPT as if it were the active provider. An empty
+/// order still reads as ChatGPT, the default.
+fn combo_index_for_order(order: &[String]) -> i32 {
+    match ActiveProvider::leading(order) {
+        Some(p) => p.index() as i32,
+        None if order.is_empty() => 0,
+        None => -1,
+    }
 }
 
 /// #194: `build_config`'s provider-order merge. `choice` (the Settings
@@ -4499,6 +4509,11 @@ fn choice_from_order(order: &[String]) -> usize {
 /// Switching away from an order led by one of them puts the chosen provider
 /// first, since the swap above alone would leave the old leader answering.
 fn merge_provider_order(configured: &[String], choice: usize) -> Vec<String> {
+    // Nothing selected (the combo was left empty because a `compat:` entry
+    // leads, #302): the user chose nothing, so keep the order as it is.
+    if choice >= ActiveProvider::ALL.len() {
+        return configured.to_vec();
+    }
     let chosen = ActiveProvider::from_index(choice);
     if matches!(chosen, ActiveProvider::Ollama | ActiveProvider::Gemini) {
         if configured.is_empty() {
@@ -6096,6 +6111,20 @@ mod tests {
     }
 
     #[test]
+    fn a_compat_leader_selects_nothing_and_a_save_keeps_the_order() {
+        let order = vec![
+            "compat:groq".to_string(),
+            "anthropic".to_string(),
+            "openai".to_string(),
+        ];
+        assert_eq!(combo_index_for_order(&order), -1);
+        assert_eq!(combo_index_for_order(&[]), 0);
+        assert_eq!(combo_index_for_order(&["gemini".to_string()]), 3);
+        // CB_GETCURSEL returns -1 for "nothing", read as usize.
+        assert_eq!(merge_provider_order(&order, (-1i32) as usize), order);
+    }
+
+    #[test]
     fn choice_from_order_defaults_to_zero_for_unknown_or_empty() {
         assert_eq!(choice_from_order(&[]), 0);
         assert_eq!(choice_from_order(&["bogus".to_string()]), 0);
@@ -6568,7 +6597,7 @@ mod tests {
         RawForm {
             // What the combo would show for this config, so an untouched
             // form is an untouched save.
-            provider_choice: choice_from_order(&original.providers.order),
+            provider_choice: combo_index_for_order(&original.providers.order) as usize,
             ollama_model: original.providers.ollama.model.clone(),
             openai_key: original.providers.openai.api_key.clone(),
             openai_model: original.providers.openai.model.clone(),
@@ -6951,6 +6980,29 @@ mod tests {
         raw.require_tick_for = String::new();
         let cfg = build_config(&original, &raw);
         assert_eq!(cfg.forms.require_tick_for, RequireTickFor::All);
+    }
+
+    #[test]
+    fn build_config_keeps_a_compat_leading_order_on_an_untouched_save() {
+        let mut original = Config::default();
+        original.providers.order = vec![
+            "compat:groq".to_string(),
+            "anthropic".to_string(),
+            "openai".to_string(),
+        ];
+        let raw = raw_from(&original);
+        // Production reads CB_GETCURSEL = -1 for an empty combo.
+        assert_eq!(raw.provider_choice, (-1i32) as usize);
+        assert_eq!(
+            build_config(&original, &raw).providers.order,
+            original.providers.order
+        );
+        let mut max = raw_from(&original);
+        max.provider_choice = usize::MAX;
+        assert_eq!(
+            build_config(&original, &max).providers.order,
+            original.providers.order
+        );
     }
 
     #[test]

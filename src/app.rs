@@ -27,10 +27,10 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW,
-    TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, MSG, PBT_APMRESUMEAUTOMATIC, SW_SHOWNORMAL,
-    WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST, WM_TIMECHANGE, WM_TIMER,
-    WNDCLASSEXW, WS_OVERLAPPED,
+    GetWindowLongPtrW, KillTimer, PeekMessageW, PostQuitMessage, RegisterClassExW, SetTimer,
+    SetWindowLongPtrW, TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, MSG, PBT_APMRESUMEAUTOMATIC,
+    PM_REMOVE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST,
+    WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use crate::actions;
@@ -1088,12 +1088,17 @@ impl App {
             });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_RESULT,
                     WPARAM(0),
                     LPARAM(payload as isize),
-                );
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_RESULT, LPARAM(payload as isize));
+                }
             }
         });
     }
@@ -1244,12 +1249,17 @@ impl App {
             });
             let payload = Box::into_raw(Box::new((generation, result)));
             unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_ROUTER_RESULT,
                     WPARAM(0),
                     LPARAM(payload as isize),
-                );
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_ROUTER_RESULT, LPARAM(payload as isize));
+                }
             }
         });
     }
@@ -1423,12 +1433,17 @@ impl App {
             });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_RESULT,
                     WPARAM(0),
                     LPARAM(payload as isize),
-                );
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_RESULT, LPARAM(payload as isize));
+                }
             }
         });
     }
@@ -1557,12 +1572,17 @@ impl App {
             });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_CALENDAR_RESULT,
                     WPARAM(0),
                     LPARAM(payload as isize),
-                );
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_CALENDAR_RESULT, LPARAM(payload as isize));
+                }
             }
         });
     }
@@ -1884,12 +1904,17 @@ impl App {
             });
             let payload = Box::into_raw(Box::new((action_for_result, schema_for_result, result)));
             unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_GENERIC_ACTION_RESULT,
                     WPARAM(0),
                     LPARAM(payload as isize),
-                );
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_GENERIC_ACTION_RESULT, LPARAM(payload as isize));
+                }
             }
         });
     }
@@ -2391,12 +2416,17 @@ impl App {
                 });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_REVIEW_RESULT,
                     WPARAM(0),
                     LPARAM(payload as isize),
-                );
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_REVIEW_RESULT, LPARAM(payload as isize));
+                }
             }
         });
     }
@@ -2600,12 +2630,17 @@ impl App {
             });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_FORM_FILL_RESULT,
                     WPARAM(0),
                     LPARAM(payload as isize),
-                );
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_FORM_FILL_RESULT, LPARAM(payload as isize));
+                }
             }
         });
     }
@@ -3074,12 +3109,17 @@ impl App {
             });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_RESULT,
                     WPARAM(0),
                     LPARAM(payload as isize),
-                );
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_RESULT, LPARAM(payload as isize));
+                }
             }
         });
     }
@@ -3500,6 +3540,12 @@ impl App {
 
         let name = provider.label();
         match saved {
+            // Issue #569: a provider with no key would fail on the next
+            // press, so say so now and point at Settings.
+            Ok(()) if provider_needs_key(provider, &self.config.providers, self.config.mode) => {
+                let (headline, detail) = missing_key_card(provider);
+                self.card.show_settings_needed(&headline, &detail);
+            }
             Ok(()) => self.card.show_answer(name, "", 3, None),
             Err(e) => {
                 let headline = format!("Using {name}: not saved");
@@ -5458,6 +5504,79 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
     }
 }
 
+/// Issue #569: whether `provider` is a keyed cloud provider with no key.
+/// Ollama needs none. A stored key that could not be read counts as present;
+/// the unreadable-key card already covers it.
+fn provider_needs_key(provider: ActiveProvider, providers: &Providers, mode: Mode) -> bool {
+    // Local and Offline never use a cloud provider, so a missing key is not
+    // why nothing is answering there: show the plain card.
+    if matches!(mode, Mode::Local | Mode::Offline) {
+        return false;
+    }
+    let key = match provider {
+        ActiveProvider::OpenAi => &providers.openai.api_key,
+        ActiveProvider::Anthropic => &providers.anthropic.api_key,
+        ActiveProvider::Gemini => &providers.gemini.api_key,
+        ActiveProvider::Ollama => return false,
+    };
+    key.trim().is_empty()
+}
+
+/// The card for choosing `provider` from the tray with no key set.
+fn missing_key_card(provider: ActiveProvider) -> (String, String) {
+    (
+        format!("{} needs an API key", provider.label()),
+        format!(
+            "Click here to open Settings and paste a {} key. Wingman will use it as soon as it is saved.",
+            provider.label()
+        ),
+    )
+}
+
+/// Free the boxed payload a `WM_APP_*` message carries, if `msg` is one that
+/// carries one. Returns whether it was one. Used where a message is dropped
+/// unhandled (Settings is open, or the window is being destroyed) so the
+/// worker's `Box::into_raw` is never leaked.
+fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
+    let p = lparam.0;
+    if p == 0 {
+        return false;
+    }
+    unsafe {
+        match msg {
+            WM_APP_LEARNED => drop(Box::from_raw(p as *mut Chord)),
+            WM_APP_PALETTE_RUN => drop(Box::from_raw(p as *mut String)),
+            WM_APP_SEND_PREVIEW => drop(Box::from_raw(p as *mut crate::ui::send_gate::SendRequest)),
+            WM_APP_PENDING_STAGE => drop(Box::from_raw(p as *mut crate::ui::card::PendingStage)),
+            WM_APP_ROUTER_RESULT => drop(Box::from_raw(
+                p as *mut (u64, std::result::Result<router::RouterResult, String>),
+            )),
+            WM_APP_RESULT => drop(Box::from_raw(p as *mut std::result::Result<Answer, String>)),
+            WM_APP_CALENDAR_RESULT | WM_APP_FORM_FILL_RESULT => {
+                drop(Box::from_raw(p as *mut std::result::Result<Value, String>))
+            }
+            WM_APP_REVIEW_RESULT => drop(Box::from_raw(
+                p as *mut std::result::Result<actions::review_email::ReviewOutcome, String>,
+            )),
+            WM_APP_GENERIC_ACTION_RESULT => drop(Box::from_raw(
+                p as *mut (actions::Action, Value, GenericResult),
+            )),
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Issue #302: `DestroyWindow` discards messages still queued for the window,
+/// so a worker result posted just before Quit would never reach `wnd_proc` and
+/// its box would leak. Pull each one out and free it.
+fn drain_queued_payloads(hwnd: HWND) {
+    let mut m = MSG::default();
+    while unsafe { PeekMessageW(&mut m, Some(hwnd), WM_APP, 0xBFFF, PM_REMOVE) }.as_bool() {
+        free_boxed_payload(m.message, m.lParam);
+    }
+}
+
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         OWNER_HWND.with(|h| h.set(hwnd.0 as isize));
@@ -5503,24 +5622,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 // free them so none leaks. (WM_APP_CALENDAR_RESULT,
                 // WM_APP_REVIEW_RESULT and WM_APP_FORM_FILL_RESULT are all
                 // Defer, not Ignore -- issue #213/#40.)
-                if msg == WM_APP_LEARNED {
-                    drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
-                } else if msg == WM_APP_PALETTE_RUN {
-                    drop(unsafe { Box::from_raw(lparam.0 as *mut String) });
-                } else if msg == WM_APP_SEND_PREVIEW {
-                    drop(unsafe {
-                        Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest)
-                    });
-                } else if msg == WM_APP_PENDING_STAGE {
-                    drop(unsafe { Box::from_raw(lparam.0 as *mut crate::ui::card::PendingStage) });
-                } else if msg == WM_APP_ROUTER_RESULT {
-                    drop(unsafe {
-                        Box::from_raw(
-                            lparam.0
-                                as *mut (u64, std::result::Result<router::RouterResult, String>),
-                        )
-                    });
-                }
+                free_boxed_payload(msg, lparam);
                 return LRESULT(0);
             }
             SettingsReentrancy::Defer => {
@@ -5855,6 +5957,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // the loop exits, so the tray icon actually disappears.
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
             drop(unsafe { Box::from_raw(ptr) });
+            drain_queued_payloads(hwnd);
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
@@ -6168,6 +6271,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn choosing_a_keyed_provider_with_no_key_needs_a_key() {
+        use crate::config::{ActiveProvider as P, Providers};
+        let mut providers = Providers::default();
+        providers.gemini.api_key.clear();
+        providers.openai.api_key = "k".to_string();
+        let need = |p, m| super::provider_needs_key(p, &providers, m);
+        assert!(need(P::Gemini, Mode::Cloud));
+        assert!(need(P::Gemini, Mode::Auto));
+        assert!(!need(P::OpenAi, Mode::Cloud));
+        assert!(!need(P::Ollama, Mode::Cloud));
+        providers.gemini.api_key = "  ".to_string();
+        assert!(super::provider_needs_key(
+            P::Gemini,
+            &providers,
+            Mode::Cloud
+        ));
+        providers.gemini.api_key = "k".to_string();
+        assert!(!super::provider_needs_key(
+            P::Gemini,
+            &providers,
+            Mode::Cloud
+        ));
+    }
+
+    #[test]
+    fn local_and_offline_modes_never_claim_a_key_is_the_problem() {
+        use crate::config::{ActiveProvider as P, Providers};
+        let mut providers = Providers::default();
+        providers.gemini.api_key.clear();
+        for mode in [Mode::Local, Mode::Offline] {
+            assert!(!super::provider_needs_key(P::Gemini, &providers, mode));
+        }
+    }
+
+    #[test]
+    fn the_missing_key_card_names_the_provider_and_where_to_add_it() {
+        let (headline, detail) = super::missing_key_card(crate::config::ActiveProvider::Gemini);
+        assert_eq!(headline, "Gemini needs an API key");
+        assert!(detail.contains("Settings"), "{detail}");
+    }
+
+    #[test]
+    fn free_boxed_payload_frees_a_boxed_message_and_ignores_the_rest() {
+        use windows::Win32::Foundation::LPARAM;
+        let boxed = Box::into_raw(Box::new("palette action".to_string()));
+        assert!(super::free_boxed_payload(
+            WM_APP_PALETTE_RUN,
+            LPARAM(boxed as isize)
+        ));
+        // Messages that carry no box, and a null lparam, are left alone.
+        assert!(!super::free_boxed_payload(WM_APP_TRAY, LPARAM(0)));
+        assert!(!super::free_boxed_payload(WM_APP_TRAY, LPARAM(8)));
+        assert!(!super::free_boxed_payload(WM_APP_PALETTE_RUN, LPARAM(0)));
     }
 
     #[test]
