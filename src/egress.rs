@@ -314,6 +314,10 @@ pub fn model_from(url: &str, body: &Value) -> Option<String> {
 /// scrubbed whole only when it also [`looks_like_a_credential`]. See that
 /// function for the discriminator and its one known false positive.
 ///
+/// #273 also scrubs a hex secret of 32 or more digits cut into short pieces
+/// by those separators (no upper case, so the credential test passes it by);
+/// see [`hex_chain_spans`].
+///
 /// #253 made this matter twice over: it is now the same function that
 /// scrubs the error text `provider::common` returns to the caller, which
 /// rule 7 puts on the card and which a user pastes into a bug report.
@@ -409,31 +413,16 @@ fn looks_like_a_credential(run: &str) -> bool {
     upper && lower && digit
 }
 
-/// Scrub one maximal wide run, then fall back to the original per-fragment
-/// rule inside it.
-///
-/// Order matters: the wide test runs first so a credential split across
-/// separators is caught as one thing, and only what it declines is handed
-/// to the narrow rule, which still scrubs a long run on length alone with
-/// no character-class test. Nothing the original function redacted stops
-/// being redacted.
+/// Scrub one maximal wide run: every span [`token_spans`] finds becomes
+/// `[redacted]`, the rest is copied through.
 fn flush_run(run: &mut String, out: &mut String) {
-    if run.chars().count() >= MIN_TOKEN_CHARS && looks_like_a_credential(run) {
+    let mut at = 0;
+    for span in token_spans(run) {
+        out.push_str(&run[at..span.start]);
         out.push_str("[redacted]");
-        run.clear();
-        return;
+        at = span.end;
     }
-
-    let mut fragment = String::new();
-    for c in run.chars() {
-        if is_narrow_token_char(c) {
-            fragment.push(c);
-        } else {
-            flush_fragment(&mut fragment, out);
-            out.push(c);
-        }
-    }
-    flush_fragment(&mut fragment, out);
+    out.push_str(&run[at..]);
     run.clear();
 }
 
@@ -441,56 +430,145 @@ fn flush_run(run: &mut String, out: &mut String) {
 /// a run is a word, a status code or a short identifier.
 const MIN_TOKEN_CHARS: usize = 20;
 
-/// Byte ranges of the key-shaped tokens [`redact_opaque_tokens`] would
-/// scrub in `s`, for callers that need to know where they are (screenshot
-/// redaction paints the words over a span, #103). Same two rules as
-/// `flush_run`: a wide run that is long enough and
-/// [`looks_like_a_credential`] is one span; otherwise each narrow fragment of
-/// at least [`MIN_TOKEN_CHARS`] is. Single-line input only: the newline
-/// bridging in `redact_opaque_tokens` has no meaning for one OCR line.
-pub(crate) fn find_opaque_tokens(s: &str) -> Vec<std::ops::Range<usize>> {
-    fn runs(s: &str, keep: impl Fn(char) -> bool) -> Vec<std::ops::Range<usize>> {
-        let mut out = Vec::new();
-        let mut start = None;
-        for (i, c) in s.char_indices() {
-            match (keep(c), start) {
-                (true, None) => start = Some(i),
-                (false, Some(b)) => {
-                    out.push(b..i);
-                    start = None;
-                }
-                _ => {}
-            }
-        }
-        if let Some(b) = start {
-            out.push(b..s.len());
-        }
-        out
+/// A hex secret (a 128-bit key is 32 digits) cut into short pieces by
+/// separators is scrubbed once the pieces add up to this many hex digits.
+const MIN_HEX_CHAIN_DIGITS: usize = 32;
+
+/// The byte ranges of one wide run that get scrubbed, sorted and
+/// non-overlapping. Three rules, in the order they were added:
+///
+/// 1. the whole run, when it is long enough and
+///    [`looks_like_a_credential`];
+/// 2. each narrow fragment of at least [`MIN_TOKEN_CHARS`], on length alone
+///    (the original rule: nothing it redacted stops being redacted);
+/// 3. a chain of hex pieces (#273, see [`hex_chain_spans`]).
+///
+/// Shared by [`redact_opaque_tokens`] and [`find_opaque_tokens`] so the log
+/// and the screenshot painter can never disagree about what a secret is.
+fn token_spans(run: &str) -> Vec<std::ops::Range<usize>> {
+    if run.chars().count() >= MIN_TOKEN_CHARS && looks_like_a_credential(run) {
+        return std::iter::once(0..run.len()).collect();
     }
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (i, c) in run.char_indices() {
+        match (is_narrow_token_char(c), start) {
+            (true, None) => start = Some(i),
+            (false, Some(b)) => {
+                spans.push(b..i);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(b) = start {
+        spans.push(b..run.len());
+    }
+    spans.retain(|r| run[r.clone()].chars().count() >= MIN_TOKEN_CHARS);
+    spans.extend(hex_chain_spans(run));
+    spans.sort_by_key(|r| r.start);
+
+    // Merge overlaps: a long hex fragment is found by rules 2 and 3.
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(spans.len());
+    for span in spans {
+        match merged.last_mut() {
+            Some(last) if span.start <= last.end => last.end = last.end.max(span.end),
+            _ => merged.push(span),
+        }
+    }
+    merged
+}
+
+/// #273: a same-case hex secret split by `/ + = . - _` is a row of short
+/// fragments, none long enough for the narrow rule and none mixed-case
+/// enough for [`looks_like_a_credential`]. Find chains of consecutive pieces
+/// that are each nothing but hex digits, joined by a single separator, and
+/// scrub a chain of [`MIN_HEX_CHAIN_DIGITS`] or more digits.
+///
+/// A piece that is not all hex (`api`, `v1`, `key`) ends the chain, which is
+/// what keeps lower-case URLs and paths alone. The span starts at the first
+/// digit and ends at the last, so `key=` and the following space survive.
+fn hex_chain_spans(run: &str) -> Vec<std::ops::Range<usize>> {
+    let is_sep = |c: char| matches!(c, '/' | '+' | '=' | '.' | '-' | '_');
+    // (byte range, all hex digits and non-empty) per piece, split on separators.
+    let mut pieces: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
+    let mut start = 0;
+    for (i, c) in run.char_indices() {
+        if is_sep(c) {
+            pieces.push((
+                start..i,
+                !run[start..i].is_empty() && all_hex(&run[start..i]),
+            ));
+            start = i + c.len_utf8();
+        }
+    }
+    pieces.push((
+        start..run.len(),
+        !run[start..].is_empty() && all_hex(&run[start..]),
+    ));
 
     let mut spans = Vec::new();
-    for run in runs(s, is_wide_token_char) {
-        let text = &s[run.clone()];
-        if text.chars().count() >= MIN_TOKEN_CHARS && looks_like_a_credential(text) {
-            spans.push(run);
-            continue;
-        }
-        for frag in runs(text, is_narrow_token_char) {
-            if text[frag.clone()].chars().count() >= MIN_TOKEN_CHARS {
-                spans.push(run.start + frag.start..run.start + frag.end);
+    let mut chain: Option<(usize, usize, usize)> = None; // (first byte, last byte, digits)
+    let mut close = |chain: &mut Option<(usize, usize, usize)>| {
+        if let Some((from, to, digits)) = chain.take() {
+            if digits >= MIN_HEX_CHAIN_DIGITS {
+                spans.push(from..to);
             }
         }
+    };
+    for (range, hex) in &pieces {
+        if !hex {
+            close(&mut chain);
+            continue;
+        }
+        // Pieces are separated by exactly one separator char (an empty piece
+        // between two separators is not hex and already broke the chain).
+        match &mut chain {
+            Some((_, to, digits)) => {
+                *to = range.end;
+                *digits += range.len();
+            }
+            None => chain = Some((range.start, range.end, range.len())),
+        }
+    }
+    close(&mut chain);
+    spans
+}
+
+fn all_hex(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Byte ranges of the key-shaped tokens [`redact_opaque_tokens`] would
+/// scrub in `s`, for callers that need to know where they are (screenshot
+/// redaction paints the words over a span, #103). Same rules as
+/// `flush_run`, by way of [`token_spans`]. Single-line input only: the
+/// newline bridging in `redact_opaque_tokens` has no meaning for one OCR
+/// line.
+pub(crate) fn find_opaque_tokens(s: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (i, c) in s.char_indices() {
+        match (is_wide_token_char(c), start) {
+            (true, None) => start = Some(i),
+            (false, Some(b)) => {
+                spans.extend(run_spans(s, b..i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(b) = start {
+        spans.extend(run_spans(s, b..s.len()));
     }
     spans
 }
 
-fn flush_fragment(fragment: &mut String, out: &mut String) {
-    if fragment.chars().count() >= MIN_TOKEN_CHARS {
-        out.push_str("[redacted]");
-    } else {
-        out.push_str(fragment);
-    }
-    fragment.clear();
+fn run_spans(s: &str, run: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
+    token_spans(&s[run.clone()])
+        .into_iter()
+        .map(|r| run.start + r.start..run.start + r.end)
+        .collect()
 }
 
 /// Builds the row [`record`] will persist for one HTTP attempt. `provider`
@@ -1073,6 +1151,98 @@ mod tests {
     fn redact_opaque_tokens_leaves_a_normal_multiline_sentence_intact() {
         let message = "The request failed because the connection\nwas reset by the remote host while streaming the response body.";
         assert_eq!(redact_opaque_tokens(message), message);
+    }
+
+    // -- #273: a same-case hex secret split by separators -------------------
+
+    /// A 40-character hex token cut into short pieces by `/`, `-`, `.` or
+    /// `_` leaves every piece under `MIN_TOKEN_CHARS` and no upper case, so
+    /// neither the credential heuristic nor the narrow rule catches it.
+    /// Decision: 32 or more hex digits in one chain are scrubbed.
+    const HEX40: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn split_hex(sep: &str, hex: &str) -> String {
+        hex.as_bytes()
+            .chunks(8)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+
+    #[test]
+    fn redact_opaque_tokens_scrubs_split_hex_in_a_url_path() {
+        for sep in ["/", "-", ".", "_", "+", "="] {
+            let token = split_hex(sep, HEX40);
+            let message = format!("GET https://api.example.com/v1/{token} failed");
+            let redacted = redact_opaque_tokens(&message);
+            for piece in token.split(sep) {
+                assert!(!redacted.contains(piece), "sep {sep:?}: {redacted}");
+            }
+            assert!(
+                redacted.contains("https://api.example.com/v1/"),
+                "{redacted}"
+            );
+            assert!(redacted.ends_with(" failed"), "{redacted}");
+        }
+    }
+
+    #[test]
+    fn redact_opaque_tokens_scrubs_split_hex_after_key_equals() {
+        let token = split_hex("/", HEX40);
+        let redacted = redact_opaque_tokens(&format!("auth failed key={token} (401)"));
+        assert!(redacted.starts_with("auth failed key="), "{redacted}");
+        assert!(redacted.ends_with(" (401)"), "{redacted}");
+        assert!(!redacted.contains("01234567"), "{redacted}");
+        assert!(redacted.contains("[redacted]"), "{redacted}");
+    }
+
+    #[test]
+    fn redact_opaque_tokens_scrubs_split_upper_case_hex() {
+        let token = split_hex("/", &HEX40.to_uppercase());
+        let redacted = redact_opaque_tokens(&format!("key {token} rejected"));
+        assert!(!redacted.contains("89ABCDEF"), "{redacted}");
+    }
+
+    /// One digit under the floor: 31 hex digits split into short pieces are
+    /// left alone, so the new rule stops exactly at 32.
+    #[test]
+    fn redact_opaque_tokens_leaves_split_hex_under_thirty_two_digits() {
+        let token = split_hex("/", &HEX40[..31]);
+        let message = format!("see {token} for details");
+        assert_eq!(redact_opaque_tokens(&message), message);
+        let token = split_hex("/", &HEX40[..32]);
+        let message = format!("see {token} for details");
+        assert!(redact_opaque_tokens(&message).contains("[redacted]"));
+    }
+
+    /// Hex pieces with a non-hex word between them are not one chain.
+    #[test]
+    fn redact_opaque_tokens_hex_chain_stops_at_a_non_hex_piece() {
+        let message = "/dead/beef/cafe/0123/archive/abcd/ef01/2345/6789/abcd/ef01/2345";
+        assert_eq!(redact_opaque_tokens(message), message);
+    }
+
+    #[test]
+    fn redact_opaque_tokens_leaves_ordinary_lowercase_text_alone() {
+        for message in [
+            "POST https://api.openai.com/v1/chat/completions returned 429",
+            "could not read c:/users/someone/appdata/roaming/wingman/state.json",
+            "the connection was reset by the remote host before any response",
+            "error sending request for url (http://127.0.0.1:11434/api/chat)",
+        ] {
+            assert_eq!(redact_opaque_tokens(message), message);
+        }
+    }
+
+    /// `find_opaque_tokens` (screenshot redaction) must agree with the text
+    /// redaction, so a split hex secret is painted over as well.
+    #[test]
+    fn find_opaque_tokens_reports_a_split_hex_chain() {
+        let token = split_hex("/", HEX40);
+        let text = format!("key {token} end");
+        let spans = find_opaque_tokens(&text);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(&text[spans[0].clone()], token);
     }
 
     #[test]
