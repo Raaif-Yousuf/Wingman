@@ -202,6 +202,8 @@ pub mod cmd {
     pub const OPENAI_MODEL_BASE: u32 = 2000;
     /// Base id for the Anthropic model submenu, same scheme.
     pub const ANTHROPIC_MODEL_BASE: u32 = 2100;
+    /// Base id for the Ollama model submenu (#567), same scheme.
+    pub const OLLAMA_MODEL_BASE: u32 = 2200;
     /// Exclusive upper bound for each range — keep the lists under this many
     /// entries, and clamp if a longer list is ever passed in.
     pub const MODEL_RANGE: u32 = 100;
@@ -225,6 +227,8 @@ pub enum MenuChoice {
     OpenAiModel(usize),
     /// Index into the `anthropic` slice last passed to `set_models`.
     AnthropicModel(usize),
+    /// Index into the list last passed to `set_ollama_models` (#567).
+    OllamaModel(usize),
 }
 
 /// Decode a command id returned by [`Tray::on_tray_message`] into a
@@ -236,9 +240,19 @@ pub fn decode(id: u32) -> MenuChoice {
         .contains(&id)
     {
         MenuChoice::AnthropicModel((id - cmd::ANTHROPIC_MODEL_BASE) as usize)
+    } else if (cmd::OLLAMA_MODEL_BASE..cmd::OLLAMA_MODEL_BASE + cmd::MODEL_RANGE).contains(&id) {
+        MenuChoice::OllamaModel((id - cmd::OLLAMA_MODEL_BASE) as usize)
     } else {
         MenuChoice::Command(id)
     }
+}
+
+/// See [`Tray::shown`].
+#[derive(Default)]
+struct ShownModels {
+    openai: Vec<String>,
+    anthropic: Vec<String>,
+    ollama: Vec<String>,
 }
 
 pub struct Tray {
@@ -265,6 +279,19 @@ pub struct Tray {
     openai_current: Option<usize>,
     anthropic_models: Vec<String>,
     anthropic_current: Option<usize>,
+    /// #567: the Ollama submenu. `ollama_pulled` is the last list Ollama
+    /// reported (name, supports vision), empty until a background refresh
+    /// lands; the rest is derived from it plus the configured model by
+    /// [`ollama_entries`].
+    ollama_pulled: Vec<(String, bool)>,
+    ollama_models: Vec<String>,
+    /// The model names the open menu was built from. A pick is resolved
+    /// against this, not the live lists above, because a reload can replace
+    /// those while the popup is still on screen. Taken by
+    /// [`Tray::snapshot_models`] when the menu opens.
+    shown: ShownModels,
+    ollama_labels: Vec<String>,
+    ollama_current: Option<usize>,
     /// The icon loaded by [`add_icon`] (embedded resource or the
     /// `IDI_APPLICATION` fallback). `LoadIconW`'s result is a *shared*
     /// system handle -- unlike [`greyed_icon`](Self::greyed_icon), it is
@@ -314,6 +341,11 @@ impl Tray {
             openai_models: Vec::new(),
             openai_current: None,
             anthropic_models: Vec::new(),
+            ollama_pulled: Vec::new(),
+            ollama_models: Vec::new(),
+            shown: ShownModels::default(),
+            ollama_labels: Vec::new(),
+            ollama_current: None,
             anthropic_current: None,
             base_icon,
             greyed_icon: None,
@@ -497,6 +529,30 @@ impl Tray {
         self.anthropic_current = current;
     }
 
+    /// #567: sets the Ollama submenu from the pulled models (name, supports
+    /// vision) and the configured model. The configured model is always
+    /// shown and radio-checked, even when Ollama reported nothing. Only
+    /// affects the next menu built.
+    pub fn set_ollama_models(&mut self, pulled: &[(String, bool)], current: &str) {
+        self.ollama_pulled = pulled.to_vec();
+        self.set_ollama_current(current);
+    }
+
+    /// #567: re-derives the Ollama submenu for a new configured model,
+    /// keeping the last pulled list.
+    pub fn set_ollama_current(&mut self, current: &str) {
+        let (names, labels, idx) = ollama_entries(&self.ollama_pulled, current);
+        self.ollama_models = names;
+        self.ollama_labels = labels;
+        self.ollama_current = idx;
+    }
+
+    /// Resolve a [`MenuChoice::OllamaModel`] index back to a bare model name
+    /// (no vision badge).
+    pub fn ollama_model_at(&self, index: usize) -> Option<&str> {
+        self.shown.ollama.get(index).map(String::as_str)
+    }
+
     /// Handle the `WM_APP_TRAY` message. Returns `Some(cmd::OPEN_SETTINGS)` on
     /// left-click/Enter activation, or the chosen menu command id on
     /// right-click/context-menu activation (`None` if the menu was
@@ -509,13 +565,24 @@ impl Tray {
     /// from the list gets appended), so callers must resolve through here
     /// rather than re-indexing their own copy.
     pub fn openai_model_at(&self, index: usize) -> Option<&str> {
-        self.openai_models.get(index).map(String::as_str)
+        self.shown.openai.get(index).map(String::as_str)
     }
 
     /// Resolve a [`MenuChoice::AnthropicModel`] index back to a model id.
     /// See [`Tray::openai_model_at`].
     pub fn anthropic_model_at(&self, index: usize) -> Option<&str> {
-        self.anthropic_models.get(index).map(String::as_str)
+        self.shown.anthropic.get(index).map(String::as_str)
+    }
+
+    /// Remembers the model names the menu about to open is built from, so a
+    /// pick resolves to the entry the user clicked even if the lists change
+    /// while the popup is open (a reload, a finished refresh).
+    fn snapshot_models(&mut self) {
+        self.shown = ShownModels {
+            openai: self.openai_models.clone(),
+            anthropic: self.anthropic_models.clone(),
+            ollama: self.ollama_models.clone(),
+        };
     }
 
     /// Whether this tray message opens the menu, which takes the foreground
@@ -530,7 +597,10 @@ impl Tray {
         let event = (lparam.0 as u32) & 0xFFFF;
         match event {
             e if e == WM_LBUTTONUP || e == NIN_SELECT => Some(cmd::OPEN_SETTINGS),
-            e if e == WM_CONTEXTMENU || e == WM_RBUTTONUP => self.show_menu(),
+            e if e == WM_CONTEXTMENU || e == WM_RBUTTONUP => {
+                self.snapshot_models();
+                self.show_menu()
+            }
             _ => None,
         }
     }
@@ -630,6 +700,11 @@ impl Tray {
             "ChatGPT model",
             cmd::OPENAI_MODEL_BASE,
             &self.openai_models,
+            &self
+                .openai_models
+                .iter()
+                .map(|m| menu_label(m))
+                .collect::<Vec<_>>(),
             self.openai_current,
         )?;
         append_model_submenu(
@@ -637,7 +712,20 @@ impl Tray {
             "Claude model",
             cmd::ANTHROPIC_MODEL_BASE,
             &self.anthropic_models,
+            &self
+                .anthropic_models
+                .iter()
+                .map(|m| menu_label(m))
+                .collect::<Vec<_>>(),
             self.anthropic_current,
+        )?;
+        append_model_submenu(
+            setup,
+            "Ollama model",
+            cmd::OLLAMA_MODEL_BASE,
+            &self.ollama_models,
+            &self.ollama_labels,
+            self.ollama_current,
         )?;
         append_separator(setup)?;
         // #185: greyed out while paused. Arming learn mode can never
@@ -918,6 +1006,7 @@ fn append_model_submenu(
     label: &str,
     base_id: u32,
     models: &[String],
+    labels: &[String],
     current: Option<usize>,
 ) -> Result<()> {
     let submenu = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
@@ -942,13 +1031,60 @@ fn append_model_submenu(
     // with the other submenu or the fixed cmd::* ids.
     for (i, model) in models.iter().enumerate() {
         let id = base_id + i as u32;
-        append_item(submenu, id, model)?;
+        match labels.get(i) {
+            Some(label) => append_item(submenu, id, label)?,
+            None => append_item(submenu, id, &menu_label(model))?,
+        }
         if current == Some(i) {
             mark_radio_checked(submenu, id);
         }
     }
 
     Ok(())
+}
+
+/// #567: the Ollama submenu's names, display labels and radio index from the
+/// pulled models and the configured one. Vision models carry " (vision)", as
+/// in Settings. The configured model is always present (see
+/// [`clamp_model_list`]), so a model that is not pulled, or Ollama being
+/// unreachable, still shows what is in use.
+fn ollama_entries(
+    pulled: &[(String, bool)],
+    current: &str,
+) -> (Vec<String>, Vec<String>, Option<usize>) {
+    let names: Vec<String> = pulled.iter().map(|(n, _)| n.clone()).collect();
+    let (names, idx) = clamp_model_list(&names, current);
+    let labels = names
+        .iter()
+        .map(|n| match pulled.iter().find(|(p, _)| p == n) {
+            Some((_, true)) => format!("{} (vision)", menu_label(n)),
+            _ => menu_label(n),
+        })
+        .collect();
+    (names, labels, idx)
+}
+
+/// Longest model name shown in a menu item, in characters.
+const MENU_LABEL_MAX: usize = 60;
+
+/// A model name made safe to show as menu text: control characters dropped,
+/// cut to [`MENU_LABEL_MAX`] characters, and `&` doubled so Windows shows an
+/// ampersand instead of underlining the next letter. Display only: the name
+/// that gets saved is always the original.
+fn menu_label(name: &str) -> String {
+    let clean: String = name.chars().filter(|c| !c.is_control()).collect();
+    let mut out = String::new();
+    for (i, c) in clean.chars().enumerate() {
+        if i == MENU_LABEL_MAX {
+            out.push_str("...");
+            break;
+        }
+        if c == '&' {
+            out.push('&');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Clamp `list` to at most `cmd::MODEL_RANGE` entries and make sure
@@ -2259,7 +2395,12 @@ mod tests {
         // Not fixed menu commands. The two *_MODEL_BASE values start the
         // dynamic model-submenu ranges (dispatched by MenuChoice::OpenAiModel /
         // AnthropicModel, not by exact id) and MODEL_RANGE is that width.
-        const DYNAMIC: &[&str] = &["MODEL_RANGE", "OPENAI_MODEL_BASE", "ANTHROPIC_MODEL_BASE"];
+        const DYNAMIC: &[&str] = &[
+            "MODEL_RANGE",
+            "OPENAI_MODEL_BASE",
+            "ANTHROPIC_MODEL_BASE",
+            "OLLAMA_MODEL_BASE",
+        ];
 
         let declared: Vec<&str> = include_str!("tray.rs")
             .lines()
@@ -2336,6 +2477,120 @@ mod tests {
         for p in ActiveProvider::ALL {
             assert!(!provider_menu_label(p).contains('\u{2014}'));
         }
+    }
+
+    // -- #567: the Ollama model submenu ---------------------------------------
+
+    fn pulled(list: &[(&str, bool)]) -> Vec<(String, bool)> {
+        list.iter().map(|(n, v)| (n.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn ollama_entries_badge_vision_models_and_mark_the_current_one() {
+        let (names, labels, current) = ollama_entries(
+            &pulled(&[("gemma3:4b", true), ("qwen3:8b", false)]),
+            "qwen3:8b",
+        );
+        assert_eq!(names, ["gemma3:4b", "qwen3:8b"]);
+        assert_eq!(labels, ["gemma3:4b (vision)", "qwen3:8b"]);
+        assert_eq!(current, Some(1));
+    }
+
+    #[test]
+    fn ollama_entries_keep_a_configured_model_that_is_not_pulled() {
+        let (names, labels, current) = ollama_entries(&pulled(&[("gemma3:4b", true)]), "my-tune");
+        assert_eq!(names, ["gemma3:4b", "my-tune"]);
+        assert_eq!(labels, ["gemma3:4b (vision)", "my-tune"]);
+        assert_eq!(current, Some(1));
+    }
+
+    #[test]
+    fn ollama_entries_with_nothing_pulled_show_only_the_configured_model() {
+        let (names, labels, current) = ollama_entries(&[], "gemma3:4b");
+        assert_eq!(names, ["gemma3:4b"]);
+        assert_eq!(labels, ["gemma3:4b"]);
+        assert_eq!(current, Some(0));
+    }
+
+    #[test]
+    fn ollama_entries_stay_inside_the_id_range() {
+        let many: Vec<(String, bool)> = (0..250).map(|i| (format!("m{i}"), false)).collect();
+        let (names, labels, current) = ollama_entries(&many, "m249");
+        assert_eq!(names.len(), cmd::MODEL_RANGE as usize);
+        assert_eq!(labels.len(), names.len());
+        assert_eq!(names[current.unwrap()], "m249");
+    }
+
+    #[test]
+    fn decode_routes_the_ollama_range_to_its_own_choice() {
+        assert_eq!(
+            decode(cmd::OLLAMA_MODEL_BASE + 3),
+            MenuChoice::OllamaModel(3)
+        );
+        assert_eq!(
+            decode(cmd::OLLAMA_MODEL_BASE + cmd::MODEL_RANGE),
+            MenuChoice::Command(cmd::OLLAMA_MODEL_BASE + cmd::MODEL_RANGE)
+        );
+    }
+
+    #[test]
+    fn ollama_model_submenu_lists_pulled_models_and_checks_the_current_one() {
+        let tree = built_menu_tree(|t| {
+            t.set_ollama_models(
+                &pulled(&[("gemma3:4b", true), ("qwen3:8b", false)]),
+                "qwen3:8b",
+            );
+        });
+        let sub = find_sub(find_sub(&tree, "Providers and keys"), "Ollama model");
+        let got: Vec<(u32, &str, bool)> = sub
+            .iter()
+            .filter_map(|n| match n {
+                Node::Item(id, t, _, c) => Some((*id, t.as_str(), *c)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (cmd::OLLAMA_MODEL_BASE, "gemma3:4b (vision)", false),
+                (cmd::OLLAMA_MODEL_BASE + 1, "qwen3:8b", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn ollama_model_at_resolves_the_bare_name() {
+        let mut seen = None;
+        built_menu_tree(|t| {
+            t.set_ollama_models(&pulled(&[("gemma3:4b", true)]), "gemma3:4b");
+            t.snapshot_models();
+            // A reload while the popup is open replaces the live list; the
+            // pick still resolves against what was on screen.
+            t.set_ollama_models(&pulled(&[("other:1b", false)]), "other:1b");
+            seen = Some((
+                t.ollama_model_at(0).map(str::to_owned),
+                t.ollama_model_at(1).map(str::to_owned),
+            ));
+        });
+        assert_eq!(seen, Some((Some("gemma3:4b".to_string()), None)));
+    }
+
+    #[test]
+    fn menu_label_escapes_ampersands_strips_controls_and_truncates() {
+        assert_eq!(menu_label("a&b"), "a&&b");
+        assert_eq!(menu_label("a\u{7}b\nc"), "abc");
+        assert_eq!(
+            menu_label(&"x".repeat(100)),
+            format!("{}...", "x".repeat(60))
+        );
+        assert_eq!(menu_label(&"x".repeat(60)), "x".repeat(60));
+    }
+
+    #[test]
+    fn ollama_entries_escape_the_label_but_keep_the_stored_name() {
+        let (names, labels, _) = ollama_entries(&pulled(&[("a&b", true)]), "a&b");
+        assert_eq!(names, ["a&b"]);
+        assert_eq!(labels, ["a&&b (vision)"]);
     }
 
     // -- grey_pixel (issue #20's paused icon) -------------------------------

@@ -143,6 +143,115 @@ pub const WM_APP_SEND_PREVIEW: u32 = WM_APP + 18;
 /// is dropped. `WM_APP + 19`: `+18` is `WM_APP_SEND_PREVIEW`.
 pub const WM_APP_PENDING_STAGE: u32 = WM_APP + 19;
 
+/// #567: what Ollama reported for one base URL, as (name, supports vision).
+type PulledOllamaModels = (String, Vec<(String, bool)>);
+
+/// #567: whether the tray should ask Ollama for its models at all. Only when
+/// Ollama is in `providers.order` or the base URL is a loopback address, so a
+/// config that points at some other host never gets a request from a menu
+/// open.
+fn ollama_menu_refresh_wanted(order: &[String], base_url: &str) -> bool {
+    mode::should_probe_ollama(order, base_url)
+        || matches!(mode::classify_host(base_url), mode::HostClass::Loopback)
+}
+
+/// #567: the models Ollama has pulled, for the tray's Ollama submenu. The
+/// tray menu is built on the UI thread the moment it is right-clicked, so it
+/// must never wait on Ollama: [`OllamaModelCache::refresh`] asks on a worker
+/// thread and parks the answer here, and the next menu open picks it up.
+/// Event-driven (a menu open, a reload, startup), never a timer.
+#[derive(Default)]
+struct OllamaModelCache {
+    state: Arc<std::sync::Mutex<CacheState>>,
+}
+
+#[derive(Default)]
+struct CacheState {
+    /// The base URL a fetch is running for, if any.
+    in_flight: Option<String>,
+    /// The last finished answer. An unreachable server stores an empty list,
+    /// so the menu falls back to the configured model only.
+    result: Option<PulledOllamaModels>,
+}
+
+impl OllamaModelCache {
+    /// Starts a background fetch from Ollama's `/api/tags`. The whole request,
+    /// body included, is capped at 3 seconds (a global timeout, not just the
+    /// connect).
+    fn refresh(&self, base_url: &str) {
+        let _ = self.refresh_with(base_url, |url| {
+            crate::provider::ollama_admin::list_tags_with_timeout(url, Duration::from_secs(3))
+                .map(|models| {
+                    models
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.name.clone(),
+                                crate::provider::ollama_admin::vision_from_tags_entry(m),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+    }
+
+    /// [`OllamaModelCache::refresh`] with the fetch passed in, so tests need
+    /// no network. Does nothing while a fetch for the same URL is running; a
+    /// different URL starts its own fetch, and only the one for the URL most
+    /// recently asked for may store its answer.
+    fn refresh_with(
+        &self,
+        base_url: &str,
+        fetch: impl FnOnce(&str) -> Vec<(String, bool)> + Send + 'static,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        {
+            let Ok(mut state) = self.state.lock() else {
+                return None;
+            };
+            if state.in_flight.as_deref() == Some(base_url) {
+                return None;
+            }
+            state.in_flight = Some(base_url.to_string());
+        }
+        let url = base_url.to_string();
+        let state = Arc::clone(&self.state);
+        let spawned = std::thread::Builder::new()
+            .name("tray-ollama-models".into())
+            .spawn({
+                let state = Arc::clone(&state);
+                let url = url.clone();
+                move || {
+                    let pulled = fetch(&url);
+                    if let Ok(mut state) = state.lock() {
+                        if state.in_flight.as_deref() == Some(url.as_str()) {
+                            state.in_flight = None;
+                            state.result = Some((url, pulled));
+                        }
+                    }
+                }
+            });
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                if let Ok(mut state) = state.lock() {
+                    if state.in_flight.as_deref() == Some(url.as_str()) {
+                        state.in_flight = None;
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// The finished list, if there is one for `base_url` (a list fetched for
+    /// an address the config has since left is dropped).
+    fn take_for(&self, base_url: &str) -> Option<Vec<(String, bool)>> {
+        let taken = self.state.lock().ok()?.result.take()?;
+        (taken.0 == base_url).then_some(taken.1)
+    }
+}
+
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
 /// How long to wait after hiding a visible card before capturing, so the
@@ -173,6 +282,8 @@ struct App {
     /// a later hotkey press. `refuse_if_password_manager` honours it as well
     /// as the live check.
     password_manager_hint: bool,
+    /// #567: the pulled Ollama models, refreshed off the UI thread.
+    ollama_models: OllamaModelCache,
     /// #339: the palette's own answer, taken in `toggle_palette` before it
     /// showed. Read only when the palette runs an action, so a stale value
     /// from an earlier session can never apply: every open overwrites it.
@@ -408,6 +519,7 @@ pub fn run() -> Result<()> {
         hook: None,
         watcher: None,
         password_manager_hint: false,
+        ollama_models: OllamaModelCache::default(),
         palette_password_manager: false,
         busy: false,
         last: None,
@@ -3342,13 +3454,33 @@ impl App {
             return;
         }
         *slot = model.clone();
+        self.commit_model_pick(&model);
+    }
 
+    /// #567: apply a model chosen from the tray's Ollama submenu. Same shape
+    /// as [`App::pick_model`]; the config value written is the bare name, not
+    /// the "(vision)" label.
+    fn pick_ollama_model(&mut self, index: usize) {
+        let Some(model) = self.tray.ollama_model_at(index).map(str::to_owned) else {
+            return;
+        };
+        if self.config.providers.ollama.model == model {
+            return;
+        }
+        self.config.providers.ollama.model = model.clone();
+        self.commit_model_pick(&model);
+    }
+
+    /// The part of a tray model pick that comes after the config field is
+    /// set: rebuild the chain so the pick is live, save, refresh the tray and
+    /// say what happened on a card.
+    fn commit_model_pick(&mut self, model: &str) {
         self.chain = Arc::new(self.config.build_chain());
         let saved = self.config.save();
         self.refresh_tray_labels();
 
         match saved {
-            Ok(()) => self.card.show_answer(&model, "", 3, None),
+            Ok(()) => self.card.show_answer(model, "", 3, None),
             Err(e) => {
                 let headline = format!("Using {model}: not saved");
                 let human = self.track_error(&headline, &format!("{e:#}"));
@@ -3418,6 +3550,19 @@ impl App {
         self.set_watch(true);
     }
 
+    /// #567: hand the tray the newest Ollama model list a background refresh
+    /// has produced (if any), then start another so the next menu open is
+    /// current. Called when the tray menu is about to open.
+    fn sync_ollama_menu(&mut self) {
+        let ollama = &self.config.providers.ollama;
+        if let Some(pulled) = self.ollama_models.take_for(&ollama.base_url) {
+            self.tray.set_ollama_models(&pulled, &ollama.model);
+        }
+        if ollama_menu_refresh_wanted(&self.config.providers.order, &ollama.base_url) {
+            self.ollama_models.refresh(&ollama.base_url);
+        }
+    }
+
     fn refresh_tray_labels(&mut self) {
         let primary = chord_to_string(&self.config.hotkeys.primary);
         let secondary = chord_to_string(&self.config.hotkeys.secondary);
@@ -3434,6 +3579,13 @@ impl App {
             &p.anthropic.models,
             &p.anthropic.model,
         );
+        // #567: the Ollama submenu keeps its last pulled list; only the
+        // checked model follows the config. A fresh list is fetched in the
+        // background (never here), see `OllamaModelCache`.
+        self.tray.set_ollama_current(&p.ollama.model);
+        if ollama_menu_refresh_wanted(&p.order, &p.ollama.base_url) {
+            self.ollama_models.refresh(&p.ollama.base_url);
+        }
 
         self.update_tooltip();
     }
@@ -5443,6 +5595,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // `Tray::show_menu`), so ask who was in front first. Only on the
             // menu gesture, so tray hover traffic costs nothing.
             let menu_hint = Tray::opens_menu(lparam) && app.password_manager_now();
+            // #567: show what the last background refresh found, then start
+            // the next one. Never waits on Ollama, so the menu opens at once.
+            if Tray::opens_menu(lparam) {
+                app.sync_ollama_menu();
+            }
             if let Some(id) = app.tray.on_tray_message(lparam) {
                 app.password_manager_hint = menu_hint;
                 // Choosing anything other than a rebind disarms a learn mode
@@ -5461,6 +5618,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 match decode(id) {
                     MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
+                    MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
                     MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
@@ -6502,6 +6660,73 @@ mod tests {
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
     ];
 
+    // -- #567: the tray's Ollama model cache --------------------------------
+
+    fn names(list: &[(&str, bool)]) -> Vec<(String, bool)> {
+        list.iter().map(|(n, v)| (n.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn ollama_cache_hands_over_a_finished_list_once_and_resets_in_flight() {
+        let cache = super::OllamaModelCache::default();
+        let url = "http://127.0.0.1:11434";
+        let h = cache
+            .refresh_with(url, |_| names(&[("gemma3:4b", true)]))
+            .expect("a fetch starts");
+        h.join().unwrap();
+        assert!(cache.state.lock().unwrap().in_flight.is_none());
+        assert_eq!(cache.take_for(url), Some(names(&[("gemma3:4b", true)])));
+        assert_eq!(cache.take_for(url), None, "taken once");
+        // in_flight was reset, so another fetch can start.
+        assert!(cache.refresh_with(url, |_| Vec::new()).is_some());
+    }
+
+    #[test]
+    fn ollama_cache_drops_a_list_for_another_url() {
+        let cache = super::OllamaModelCache::default();
+        cache
+            .refresh_with("http://127.0.0.1:11434", |_| names(&[("a", false)]))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(cache.take_for("http://127.0.0.1:9999"), None);
+    }
+
+    #[test]
+    fn ollama_cache_respawns_for_a_new_url_and_ignores_the_stale_answer() {
+        use std::sync::mpsc;
+        let cache = super::OllamaModelCache::default();
+        let (release_old, wait_old) = mpsc::channel::<()>();
+        let old = cache
+            .refresh_with("http://old", move |_| {
+                let _ = wait_old.recv();
+                names(&[("old", false)])
+            })
+            .unwrap();
+        // Same URL while running: no second fetch.
+        assert!(cache.refresh_with("http://old", |_| Vec::new()).is_none());
+        // New URL: its own fetch, and it finishes first.
+        cache
+            .refresh_with("http://new", |_| names(&[("new", false)]))
+            .expect("a changed URL respawns")
+            .join()
+            .unwrap();
+        release_old.send(()).unwrap();
+        old.join().unwrap();
+        assert_eq!(cache.take_for("http://new"), Some(names(&[("new", false)])));
+        assert_eq!(cache.take_for("http://old"), None);
+    }
+
+    #[test]
+    fn ollama_menu_refresh_is_wanted_only_for_ollama_in_the_chain_or_loopback() {
+        use super::ollama_menu_refresh_wanted as wanted;
+        let order = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(wanted(&order(&["openai"]), "http://127.0.0.1:11434"));
+        assert!(wanted(&order(&["ollama"]), "http://192.168.1.5:11434"));
+        assert!(!wanted(&order(&["openai"]), "http://192.168.1.5:11434"));
+        assert!(!wanted(&order(&["openai"]), "http://localhost:11434"));
+    }
+
     #[test]
     fn wm_app_ids_are_pairwise_unique() {
         for (i, (name_a, id_a)) in ALL_WM_APP_IDS.iter().enumerate() {
@@ -6568,7 +6793,12 @@ mod tests {
         // Not fixed menu commands. The two *_MODEL_BASE values start the
         // dynamic model-submenu ranges (dispatched by MenuChoice::OpenAiModel /
         // AnthropicModel, not by exact id) and MODEL_RANGE is that width.
-        const DYNAMIC: &[&str] = &["MODEL_RANGE", "OPENAI_MODEL_BASE", "ANTHROPIC_MODEL_BASE"];
+        const DYNAMIC: &[&str] = &[
+            "MODEL_RANGE",
+            "OPENAI_MODEL_BASE",
+            "ANTHROPIC_MODEL_BASE",
+            "OLLAMA_MODEL_BASE",
+        ];
         // Display-only items: added disabled (greyed), so no click can ever
         // produce their WM_COMMAND and they need no wnd_proc arm (#317).
         const DISPLAY_ONLY: &[&str] = &["VERSION_LABEL"];
