@@ -52,6 +52,8 @@ features = [
   "Win32_Graphics_DirectWrite",
   # D2D1_PIXEL_FORMAT's DXGI_FORMAT (issue #216).
   "Win32_Graphics_Dxgi_Common",
+  # ollama_gpu_fix.rs (#382): enumerate adapters to find an Intel GPU.
+  "Win32_Graphics_Dxgi",
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Dwm",
   "Win32_NetworkManagement_IpHelper",
