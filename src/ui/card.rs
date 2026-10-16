@@ -1613,6 +1613,9 @@ impl CardInner {
         self.copy_feedback = CopyFeedback::None;
         self.set_noactivate(true);
         self.state = CardState::Hidden;
+        // Issue #729: nothing is showing, so nothing needs a click-away hook.
+        // Every hide goes through here, the auto-dismiss timer included.
+        crate::dismiss::disarm();
         // Issue #356: no headline is showing any more, so the accessible
         // name reverts to the plain app name set at `Card::create`, rather
         // than leaking the last-shown headline into a window nothing is
