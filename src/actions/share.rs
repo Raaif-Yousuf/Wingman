@@ -12,9 +12,10 @@
 //!   (no `disabled_groups`, no `replace`, no unknown key).
 //! - Decision: an imported action never carries a hotkey and is always
 //!   enabled. A shared file must not grab a key chord on someone's machine.
-//! - Decision: an executor that writes (`replace_text`, `fill_form`,
-//!   `calendar_add`) always confirms. An imported `confirm = false` is turned
-//!   on and the preview says so.
+//! - Decision: every executor except `none` (`replace_text`, `fill_form`,
+//!   `calendar_add`, and also `clipboard` and `image_clipboard`, which the app
+//!   would otherwise auto-run as read-only) always confirms. An imported
+//!   `confirm = false` is turned on and the preview says so.
 //! - Decision: nothing runs on import, and nothing is overwritten. An id that
 //!   is already used (a built-in or one in the user's file) gets the next free
 //!   `-2`, `-3`, ... suffix. The user sees the final id in the preview.
@@ -192,12 +193,15 @@ pub fn parse_import(text: &str) -> Result<Import> {
     if !action.enabled {
         action.enabled = true;
     }
-    let writes = crate::executors::registry::resolve(&action.executor)
-        .map(|e| e.effect() == crate::executors::Effect::Writes)
-        .unwrap_or(true);
-    if writes && !action.confirm {
+    // Only "none" does nothing. Every other executor (the clipboard ones
+    // included, which the app treats as read-only and would auto-run) must
+    // ask first.
+    if action.executor != "none" && !action.confirm {
         action.confirm = true;
-        notes.push("It changes things, so it always asks first. Confirm was turned on.".into());
+        notes.push(
+            "It acts on your computer (it changes something or uses the clipboard), so it always asks first. Confirm was turned on."
+                .into(),
+        );
     }
     Ok(Import { action, notes })
 }
@@ -439,7 +443,20 @@ prompt = "Tidy these notes."
     }
 
     #[test]
-    fn a_read_only_executor_may_keep_confirm_off() {
+    fn clipboard_executors_cannot_turn_confirm_off() {
+        for exec in ["clipboard", "image_clipboard"] {
+            let text = GOOD
+                .replace("replace_text", exec)
+                .replace("selection", "screen")
+                .replace("confirm = true", "confirm = false");
+            let i = parse_import(&text).unwrap_or_else(|e| panic!("{exec}: {e:#}"));
+            assert!(i.action.confirm, "{exec}");
+            assert!(i.notes.iter().any(|n| n.contains("Confirm was turned on")));
+        }
+    }
+
+    #[test]
+    fn the_none_executor_may_keep_confirm_off() {
         let text = GOOD
             .replace("replace_text", "none")
             .replace("confirm = true", "confirm = false");
