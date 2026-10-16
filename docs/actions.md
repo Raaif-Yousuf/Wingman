@@ -178,7 +178,10 @@ the card) and `"screen_explanation"` (#131: `detail`, then a one-sentence
 on expand) and `"scam_check"` (#312: `signs`, then a `verdict` of
 `likely_scam`, `suspicious` or `no_clear_signs`; the card shows a fixed label
 for the verdict, the signs under "Seen in it:" and a fixed next step, never
-"safe", and has no model-written advice because the screen text is untrusted).
+"safe", and has no model-written advice because the screen text is untrusted) and `"time_list"` (#315: `times`, each
+with the text, the clock time, the date if shown and the zone as written; the
+model only reads them, and `actions::time_zones` converts them to the local zone
+from Windows' own time zone data).
 Each schema function returns a `serde_json::json!`
 literal shaped like standard JSON Schema (`"type": "object"`, `"properties"`,
 `"required"`, `"additionalProperties": false`), plus one

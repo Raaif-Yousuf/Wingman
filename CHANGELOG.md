@@ -9,6 +9,9 @@ tagged release.
 
 ### Added
 
+- "Convert times to my time zone" action: reads each time and zone on
+  screen and lists it in your local time, day included. Ambiguous zones
+  (CST, IST, BST) show every reading (issue #315).
 - Ollama provider: local models over `127.0.0.1:11434`, with a health check
   that tells apart a real server from the stock Ollama tray app's CPU-only
   respawn, model discovery (`/api/tags`, `/api/show`) with a live or
