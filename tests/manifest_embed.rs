@@ -38,3 +38,25 @@ fn resource_script_embeds_the_manifest() {
     // Resource type 24 (RT_MANIFEST), id 1 (the process manifest).
     assert!(line.trim_start().starts_with("1 24"), "got: {line}");
 }
+
+#[test]
+fn manifest_requests_as_invoker() {
+    let manifest = read("assets/app.manifest");
+    assert!(manifest.contains("requestedExecutionLevel level=\"asInvoker\""));
+}
+
+/// The built exe, not just the source: the manifest is stored as plain text
+/// in the resource section, so it can be found in the file's bytes. If
+/// `build.rs` stopped embedding it, Settings would silently go back to
+/// classic controls.
+#[test]
+fn the_built_exe_carries_the_common_controls_manifest() {
+    let exe = std::fs::read(env!("CARGO_BIN_EXE_wingman")).expect("read the built exe");
+    let needle = b"Microsoft.Windows.Common-Controls";
+    assert!(
+        exe.windows(needle.len()).any(|w| w == needle),
+        "the built exe has no common controls manifest"
+    );
+    let invoker = b"asInvoker";
+    assert!(exe.windows(invoker.len()).any(|w| w == invoker));
+}
