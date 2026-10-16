@@ -7389,7 +7389,7 @@ mod tests {
         );
         assert_eq!(
             crate::redact::ADMIN_APP_SENTENCE,
-            "Wingman can't check an app running as administrator for password fields, so nothing was sent."
+            "Wingman can't check this app for password fields (it may be running as administrator), so nothing was sent."
         );
     }
 
