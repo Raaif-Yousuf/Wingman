@@ -97,6 +97,10 @@
 use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
+use crate::ui::theme::{
+    detect_theme, ensure_contrast, setting_change_affects_theme, setting_change_name, SysColors,
+    Theme, Tokens,
+};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     COLORREF, D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
@@ -122,9 +126,10 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
-    GetStockObject, InvalidateRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow,
-    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, FW_NORMAL, FW_SEMIBOLD, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TRANSPARENT,
+    GetStockObject, InvalidateRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW,
+    PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -137,10 +142,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE,
-    WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_PRINTCLIENT, WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_TABSTOP, WS_VISIBLE,
+    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+    WM_THEMECHANGED, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 /// `WM_MOUSELEAVE`'s stable, documented value (winuser.h) -- not re-exported
@@ -203,6 +209,11 @@ const PADDING: i32 = 8;
 /// re-created" applies to size too) between the query box and the row list;
 /// blank when [`PaletteInner::router_summary`] is `None`.
 const ROUTER_SUMMARY_HEIGHT: i32 = 18;
+/// Space between the selection bar and an action's text, so the bar is not drawn
+/// over the first letter.
+const ROW_TEXT_INSET: i32 = 12;
+/// How far the query box's hairline sits outside the edit control.
+const QUERY_BORDER_OUTSET: i32 = 3;
 
 /// #359: shown in the router summary band from the moment
 /// `App::maybe_start_router` actually starts a background request until the
@@ -287,6 +298,8 @@ impl Palette {
     }
 
     fn create(instance: HINSTANCE, class_name: &str) -> anyhow::Result<Self> {
+        let theme = detect_theme();
+        let sys = SysColors::read();
         let inner = Box::new(PaletteInner {
             hwnd: HWND(std::ptr::null_mut()),
             edit_hwnd: HWND(std::ptr::null_mut()),
@@ -305,6 +318,11 @@ impl Palette {
             hover: None,
             tracking_leave: false,
             suppress_en_change: false,
+            theme,
+            sys,
+            colors: palette_colors(theme, &sys, live_accent(theme, &sys)),
+            theme_forced: false,
+            edit_brush: HBRUSH(std::ptr::null_mut()),
         });
         let raw = Box::into_raw(inner);
 
@@ -513,6 +531,17 @@ impl Palette {
             Some(crate::ui::palette_model::Row::Action { id, .. }) => Some(id.clone()),
             _ => None,
         }
+    }
+
+    /// The UI gallery's `--theme`: draws in `theme` whatever the system is
+    /// set to and ignores later theme messages. High contrast uses Windows'
+    /// high contrast black colours. Never touches the registry.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn force_theme_for_gallery(&mut self, theme: Theme) {
+        self.inner.theme = theme;
+        self.inner.sys = crate::ui::theme::HC_BLACK;
+        self.inner.theme_forced = true;
+        self.inner.apply_colors();
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -884,23 +913,71 @@ fn colorref_to_d2d(c: COLORREF) -> D2D1_COLOR_F {
     }
 }
 
-fn selected_row_color() -> COLORREF {
-    COLORREF(crate::ui::theme::rgb(0x3A, 0x44, 0x55))
+/// Every colour the palette draws, for one theme (#579). Built from the shared
+/// tokens in `theme.rs`, so there are no literal colours in this file and the
+/// palette follows light, dark and high contrast like the card does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaletteColors {
+    background: u32,
+    /// The hairline around the query box.
+    border: u32,
+    /// Action row text.
+    text: u32,
+    /// Group headers.
+    header: u32,
+    /// The "no matching actions" hint.
+    hint: u32,
+    footer: u32,
+    /// The router's suggestion line.
+    summary: u32,
+    /// The fill of the selected and the hovered row.
+    selected_fill: u32,
+    selected_text: u32,
+    /// The 3 px bar on the selected row.
+    bar: u32,
 }
 
-/// The palette's background.
-fn background_color() -> COLORREF {
-    COLORREF(0x0026_2626)
+/// The user's accent for the selection bar in `theme`, kept at 3:1 against the
+/// theme's surface (the same shade and fit the primary button uses). Read live,
+/// so call it when the theme or the accent changes, never per paint.
+fn live_accent(theme: Theme, sys: &SysColors) -> u32 {
+    crate::ui::card_buttons::system_accent(theme, Tokens::for_theme(theme, sys).surface)
 }
-
-/// The 3 px bar on the selected row.
-fn accent_color() -> COLORREF {
-    COLORREF(0x00FF_B080)
-}
-
-/// Action row text.
-fn row_text_color() -> COLORREF {
-    COLORREF(0x00E6_E6E6)
+/// The palette's colours in `theme`. High contrast uses the system colours
+/// only: the selected row is the system highlight, as in a Windows list.
+fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
+    use crate::ui::card_buttons::blend;
+    let t = Tokens::for_theme(theme, sys);
+    if theme == Theme::HighContrast {
+        return PaletteColors {
+            background: t.surface,
+            border: t.border,
+            text: t.text,
+            header: t.text,
+            hint: t.text,
+            footer: t.text,
+            summary: t.text,
+            selected_fill: sys.highlight,
+            selected_text: sys.highlight_text,
+            // The whole row is the highlight, so the bar is the same colour.
+            bar: sys.highlight,
+        };
+    }
+    // An accent from live_accent already clears 3:1; this keeps any other
+    // caller honest too.
+    let bar = ensure_contrast(accent, t.surface, 3.0);
+    PaletteColors {
+        background: t.surface,
+        border: t.border,
+        text: t.text,
+        header: t.text_dim,
+        hint: t.text_faint,
+        footer: t.text_faint,
+        summary: t.text_dim,
+        selected_fill: blend(t.surface, bar, 16),
+        selected_text: t.text,
+        bar,
+    }
 }
 
 /// The palette's GDI font: Segoe UI, `D2D_FONT_SIZE_DIP` tall at `dpi`, in
@@ -919,7 +996,7 @@ fn gdi_font(dpi: u32, weight: i32) -> HFONT {
     unsafe { CreateFontIndirectW(&lf) }
 }
 
-/// D2D/DirectWrite equivalent of ``draw_text_line`` (imported from
+/// D2D/DirectWrite equivalent of `draw_text_line` (imported from
 /// `crate::ui::text` for the GDI fallback path below): draws one line of
 /// `text` in `rect` (logical/DIP coordinates -- see the module doc comment)
 /// with `color`, or does nothing at all when `text` is empty. Unlike the GDI
@@ -1021,6 +1098,24 @@ struct PaletteInner {
     /// by `show`) and skips the redundant `rebuild_state` (`show` already
     /// calls it with the real, empty query right after).
     suppress_en_change: bool,
+    /// #579: the theme the palette is drawn in, the system colours it was
+    /// built from, and the colours themselves. Read when the window is made and
+    /// again on every message that can change them (`refresh_theme`), never per
+    /// paint.
+    theme: Theme,
+    sys: SysColors,
+    colors: PaletteColors,
+    /// The gallery's --theme: later theme messages are ignored.
+    theme_forced: bool,
+    /// The brush WM_CTLCOLOREDIT returns for the query box, in the
+    /// background colour. Created on first use, dropped when the theme changes.
+    edit_brush: HBRUSH,
+}
+
+impl Drop for PaletteInner {
+    fn drop(&mut self) {
+        self.drop_edit_brush();
+    }
 }
 
 impl PaletteInner {
@@ -1271,6 +1366,44 @@ impl PaletteInner {
         }
     }
 
+    /// #579: reads the theme, the system colours and the accent again and
+    /// repaints. Runs on every message that can change them. It repaints even
+    /// when the theme is the same: switching between two high contrast
+    /// schemes, or picking a new accent, changes the colours and not the theme.
+    fn refresh_theme(&mut self) {
+        if self.theme_forced {
+            return;
+        }
+        self.theme = detect_theme();
+        self.sys = SysColors::read();
+        self.apply_colors();
+    }
+
+    fn apply_colors(&mut self) {
+        self.colors = palette_colors(self.theme, &self.sys, live_accent(self.theme, &self.sys));
+        self.drop_edit_brush();
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ALLCHILDREN,
+            );
+        }
+    }
+
+    /// The cached query box brush holds the old background; the next
+    /// `WM_CTLCOLOREDIT` makes a new one.
+    fn drop_edit_brush(&mut self) {
+        if !self.edit_brush.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.edit_brush.0));
+            }
+            self.edit_brush = HBRUSH(std::ptr::null_mut());
+        }
+    }
+
     /// Takes the key-forwarded `WM_COMMAND` id, runs it through the pure
     /// state machine, and acts on the outcome: repaint, dispatch, or hide.
     fn on_palette_key_command(&mut self, key: crate::ui::palette_model::PaletteKey) {
@@ -1341,6 +1474,7 @@ impl PaletteInner {
     /// `D2DERR_RECREATE_TARGET` (device loss), in which case the target is
     /// dropped so the NEXT paint's `ensure_target` call rebuilds it fresh.
     fn try_paint_d2d(&mut self) -> bool {
+        let colors = self.colors;
         let Some(renderer) = &mut self.d2d else {
             return false;
         };
@@ -1374,7 +1508,21 @@ impl PaletteInner {
 
         unsafe {
             target.BeginDraw();
-            target.Clear(Some(&colorref_to_d2d(background_color()) as *const _));
+            target.Clear(Some(
+                &colorref_to_d2d(COLORREF(colors.background)) as *const _
+            ));
+            if let Ok(brush) = target
+                .CreateSolidColorBrush(&colorref_to_d2d(COLORREF(colors.border)) as *const _, None)
+            {
+                let o = QUERY_BORDER_OUTSET as f32;
+                let rect = D2D_RECT_F {
+                    left: pad - o,
+                    top: pad - o,
+                    right: content_w - pad + o,
+                    bottom: pad + EDIT_HEIGHT as f32 + o,
+                };
+                target.DrawRectangle(&rect as *const _, &brush, 1.0, None);
+            }
         }
 
         // #24: the router summary band is always reserved (see
@@ -1392,7 +1540,7 @@ impl PaletteInner {
                 &summary_format,
                 summary,
                 band_rect,
-                COLORREF(0x0080_B080),
+                COLORREF(colors.summary),
             );
         }
         y += ROUTER_SUMMARY_HEIGHT as f32;
@@ -1418,21 +1566,41 @@ impl PaletteInner {
             };
             match row {
                 crate::ui::palette_model::Row::Header(name) => {
-                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(0x0090_9090));
+                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(colors.header));
                 }
                 crate::ui::palette_model::Row::Hint(text) => {
-                    draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(0x0080_8080));
+                    draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(colors.hint));
                 }
                 crate::ui::palette_model::Row::Action { name, .. } => {
-                    if i == self.state.selected || self.hover == Some(i) {
+                    // The selected row has the fill and the bar; a row only
+                    // hovered gets an outline in the bar colour (3:1 on the
+                    // background), so the two never look alike.
+                    if i == self.state.selected {
                         if let Ok(hl) = unsafe {
                             target.CreateSolidColorBrush(
-                                &colorref_to_d2d(selected_row_color()) as *const _,
+                                &colorref_to_d2d(COLORREF(colors.selected_fill)) as *const _,
                                 None,
                             )
                         } {
                             unsafe {
                                 target.FillRectangle(&row_rect as *const _, &hl);
+                            }
+                        }
+                    } else if self.hover == Some(i) {
+                        if let Ok(outline) = unsafe {
+                            target.CreateSolidColorBrush(
+                                &colorref_to_d2d(COLORREF(colors.bar)) as *const _,
+                                None,
+                            )
+                        } {
+                            let inset = D2D_RECT_F {
+                                left: row_rect.left + 0.5,
+                                top: row_rect.top + 0.5,
+                                right: row_rect.right - 0.5,
+                                bottom: row_rect.bottom - 0.5,
+                            };
+                            unsafe {
+                                target.DrawRectangle(&inset as *const _, &outline, 1.0, None);
                             }
                         }
                     }
@@ -1446,7 +1614,7 @@ impl PaletteInner {
 
                         if let Ok(accent) = unsafe {
                             target.CreateSolidColorBrush(
-                                &colorref_to_d2d(accent_color()) as *const _,
+                                &colorref_to_d2d(COLORREF(colors.bar)) as *const _,
                                 None,
                             )
                         } {
@@ -1455,7 +1623,21 @@ impl PaletteInner {
                             }
                         }
                     }
-                    draw_text_line_d2d(&target, &format, name, row_rect, row_text_color());
+                    let text_rect = D2D_RECT_F {
+                        left: row_rect.left + ROW_TEXT_INSET as f32,
+                        ..row_rect
+                    };
+                    draw_text_line_d2d(
+                        &target,
+                        &format,
+                        name,
+                        text_rect,
+                        COLORREF(if i == self.state.selected {
+                            colors.selected_text
+                        } else {
+                            colors.text
+                        }),
+                    );
                 }
             }
         }
@@ -1471,7 +1653,7 @@ impl PaletteInner {
             &format,
             &self.footer_text,
             footer_rect,
-            COLORREF(0x0080_8080),
+            COLORREF(colors.footer),
         );
 
         if let Err(e) = unsafe { target.EndDraw(None, None) } {
@@ -1493,11 +1675,12 @@ impl PaletteInner {
     /// tested as the path it replaces, not a second, thinner
     /// implementation.
     fn paint_gdi(&self, hdc: windows::Win32::Graphics::Gdi::HDC) {
+        let colors = self.colors;
         unsafe {
             let mut rc = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rc);
 
-            let bg = CreateSolidBrush(background_color());
+            let bg = CreateSolidBrush(COLORREF(colors.background));
             FillRect(hdc, &rc, bg);
             let _ = DeleteObject(bg.into());
 
@@ -1508,6 +1691,46 @@ impl PaletteInner {
             let old_font = SelectObject(hdc, HGDIOBJ(normal.0));
 
             let pad = scale(PADDING, self.dpi);
+
+            // The query box's hairline: four thin fills round the edit.
+            let line = scale(1, self.dpi).max(1);
+            let o = scale(QUERY_BORDER_OUTSET, self.dpi);
+            let (l, t, r, b) = (
+                pad - o,
+                pad - o,
+                rc.right - pad + o,
+                pad + scale(EDIT_HEIGHT, self.dpi) + o,
+            );
+            let border = CreateSolidBrush(COLORREF(colors.border));
+            for edge in [
+                RECT {
+                    left: l,
+                    top: t,
+                    right: r,
+                    bottom: t + line,
+                },
+                RECT {
+                    left: l,
+                    top: b - line,
+                    right: r,
+                    bottom: b,
+                },
+                RECT {
+                    left: l,
+                    top: t,
+                    right: l + line,
+                    bottom: b,
+                },
+                RECT {
+                    left: r - line,
+                    top: t,
+                    right: r,
+                    bottom: b,
+                },
+            ] {
+                FillRect(hdc, &edge, border);
+            }
+            let _ = DeleteObject(border.into());
             let row_h = scale(ROW_HEIGHT, self.dpi);
             let mut y = pad + scale(EDIT_HEIGHT, self.dpi) + pad;
 
@@ -1521,7 +1744,7 @@ impl PaletteInner {
                     right: rc.right - pad,
                     bottom: y + scale(ROUTER_SUMMARY_HEIGHT, self.dpi),
                 };
-                SetTextColor(hdc, COLORREF(0x0080_B080));
+                SetTextColor(hdc, COLORREF(colors.summary));
                 // Semibold, like the Direct2D path (#361), freed after the line.
                 let bold = gdi_font(self.dpi, FW_SEMIBOLD.0 as i32);
                 SelectObject(hdc, HGDIOBJ(bold.0));
@@ -1558,7 +1781,7 @@ impl PaletteInner {
                 };
                 match row {
                     crate::ui::palette_model::Row::Header(name) => {
-                        SetTextColor(hdc, COLORREF(0x0090_9090));
+                        SetTextColor(hdc, COLORREF(colors.header));
                         draw_text_line(
                             hdc,
                             name,
@@ -1567,7 +1790,7 @@ impl PaletteInner {
                         );
                     }
                     crate::ui::palette_model::Row::Hint(text) => {
-                        SetTextColor(hdc, COLORREF(0x0080_8080));
+                        SetTextColor(hdc, COLORREF(colors.hint));
                         draw_text_line(
                             hdc,
                             text,
@@ -1576,13 +1799,37 @@ impl PaletteInner {
                         );
                     }
                     crate::ui::palette_model::Row::Action { name, .. } => {
-                        if i == self.state.selected || self.hover == Some(i) {
-                            let hl = CreateSolidBrush(selected_row_color());
+                        if i == self.state.selected {
+                            let hl = CreateSolidBrush(COLORREF(colors.selected_fill));
                             FillRect(hdc, &row_rect, hl);
                             let _ = DeleteObject(hl.into());
+                        } else if self.hover == Some(i) {
+                            let outline = CreateSolidBrush(COLORREF(colors.bar));
+                            let line = scale(1, self.dpi).max(1);
+                            for edge in [
+                                RECT {
+                                    bottom: row_rect.top + line,
+                                    ..row_rect
+                                },
+                                RECT {
+                                    top: row_rect.bottom - line,
+                                    ..row_rect
+                                },
+                                RECT {
+                                    right: row_rect.left + line,
+                                    ..row_rect
+                                },
+                                RECT {
+                                    left: row_rect.right - line,
+                                    ..row_rect
+                                },
+                            ] {
+                                FillRect(hdc, &edge, outline);
+                            }
+                            let _ = DeleteObject(outline.into());
                         }
                         if i == self.state.selected {
-                            let accent = CreateSolidBrush(accent_color());
+                            let accent = CreateSolidBrush(COLORREF(colors.bar));
                             let accent_rect = RECT {
                                 left: row_rect.left,
                                 top: row_rect.top,
@@ -1592,11 +1839,22 @@ impl PaletteInner {
                             FillRect(hdc, &accent_rect, accent);
                             let _ = DeleteObject(accent.into());
                         }
-                        SetTextColor(hdc, row_text_color());
+                        SetTextColor(
+                            hdc,
+                            COLORREF(if i == self.state.selected {
+                                colors.selected_text
+                            } else {
+                                colors.text
+                            }),
+                        );
+                        let text_rect = RECT {
+                            left: row_rect.left + scale(ROW_TEXT_INSET, self.dpi),
+                            ..row_rect
+                        };
                         draw_text_line(
                             hdc,
                             name,
-                            row_rect,
+                            text_rect,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                         );
                     }
@@ -1609,7 +1867,7 @@ impl PaletteInner {
                 right: rc.right - pad,
                 bottom: rc.bottom,
             };
-            SetTextColor(hdc, COLORREF(0x0080_8080));
+            SetTextColor(hdc, COLORREF(colors.footer));
             draw_text_line(
                 hdc,
                 &self.footer_text,
@@ -1638,6 +1896,32 @@ impl PaletteInner {
                 Some(LRESULT(0))
             }
             WM_ERASEBKGND => Some(LRESULT(1)), // we paint the whole client area ourselves
+            // #579: without this the query box keeps the stock white
+            // background and black text whatever the theme.
+            WM_CTLCOLOREDIT => {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                unsafe {
+                    SetTextColor(hdc, COLORREF(self.colors.text));
+                    SetBkColor(hdc, COLORREF(self.colors.background));
+                    if self.edit_brush.0.is_null() {
+                        self.edit_brush = CreateSolidBrush(COLORREF(self.colors.background));
+                    }
+                }
+                Some(LRESULT(self.edit_brush.0 as isize))
+            }
+            // #579: the light/dark switch, the high contrast switch and a new
+            // contrast scheme or accent. Windows sends these to every top-level
+            // window, hidden or not, so the palette hears them with no timer.
+            WM_SETTINGCHANGE => {
+                if setting_change_affects_theme(wparam.0, &unsafe { setting_change_name(lparam) }) {
+                    self.refresh_theme();
+                }
+                Some(LRESULT(0))
+            }
+            WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+                self.refresh_theme();
+                Some(LRESULT(0))
+            }
             WM_COMMAND => {
                 let wp = wparam.0 as u32;
                 let notify = (wp >> 16) & 0xFFFF;
@@ -1892,32 +2176,207 @@ mod tests {
     // #357: pure hit-test tests, written before `row_at` exists (RED first).
     // `dpi` is 96 throughout (logical == physical) so the expected pixel
     // values are the raw layout constants.
-    // #476: the accent bar carries "this row is selected" (3:1 against the
-    // background); the row text must stay readable on the selected fill (4.5:1).
+    // #476, #579: every colour the palette draws comes from the theme tokens.
+    // The bar carries "this row is selected" (3:1 against what it sits on);
+    // text must stay readable on every surface it is drawn on (4.5:1).
     mod colour_tests {
-        use super::super::{accent_color, background_color, row_text_color, selected_row_color};
-        use crate::ui::theme::{contrast_ratio, relative_luminance};
-        use windows::Win32::Foundation::COLORREF;
+        use super::super::{palette_colors, PaletteColors};
+        use crate::ui::theme::{contrast_ratio, relative_luminance, Theme, HC_BLACK, HC_WHITE};
 
-        fn ratio(a: COLORREF, b: COLORREF) -> f64 {
-            contrast_ratio(relative_luminance(a.0), relative_luminance(b.0))
+        fn ratio(a: u32, b: u32) -> f64 {
+            contrast_ratio(relative_luminance(a), relative_luminance(b))
+        }
+
+        /// Every theme, and accents from near-invisible to extreme, so no user
+        /// accent can make the bar or the text unreadable.
+        fn cases() -> Vec<(String, Theme, PaletteColors)> {
+            let accents = [
+                0x00D4_7800, // the Windows default blue
+                0x0000_F0FF, // pale yellow
+                0x0010_0808, // near black
+                0x00FF_FFFF, // white
+                0x0020_20C0, // red
+            ];
+            let mut out = Vec::new();
+            for (name, theme, sys) in [
+                ("light", Theme::Light, HC_BLACK),
+                ("dark", Theme::Dark, HC_BLACK),
+                ("hc-black", Theme::HighContrast, HC_BLACK),
+                ("hc-white", Theme::HighContrast, HC_WHITE),
+            ] {
+                for accent in accents {
+                    out.push((
+                        format!("{name} accent {accent:#08x}"),
+                        theme,
+                        palette_colors(theme, &sys, accent),
+                    ));
+                }
+            }
+            out
         }
 
         #[test]
-        fn accent_bar_has_at_least_3_to_1_contrast_with_background() {
-            let r = ratio(accent_color(), background_color());
-            assert!(r >= 3.0, "accent bar vs background is {r:.2}:1");
+        fn every_text_colour_has_at_least_4_5_to_1_on_the_background() {
+            let cases = cases();
+            assert_eq!(cases.len(), 20, "the test must look at every case");
+            for (name, _, c) in cases {
+                for (what, fg) in [
+                    ("text", c.text),
+                    ("header", c.header),
+                    ("hint", c.hint),
+                    ("footer", c.footer),
+                    ("summary", c.summary),
+                ] {
+                    let r = ratio(fg, c.background);
+                    assert!(r >= 4.5, "{name}: {what} is {r:.2}:1 on the background");
+                }
+            }
         }
 
         #[test]
-        fn row_text_has_at_least_4_5_to_1_contrast_on_the_selected_row() {
-            let r = ratio(row_text_color(), selected_row_color());
-            assert!(r >= 4.5, "row text vs selected row is {r:.2}:1");
+        fn row_text_has_at_least_4_5_to_1_on_the_selected_row() {
+            for (name, _, c) in cases() {
+                let r = ratio(c.selected_text, c.selected_fill);
+                assert!(r >= 4.5, "{name}: selected text is {r:.2}:1 on its row");
+            }
         }
 
         #[test]
-        fn selected_row_is_still_distinct_from_the_background() {
-            assert_ne!(selected_row_color(), background_color());
+        fn the_bar_and_the_hover_outline_have_at_least_3_to_1_on_the_background() {
+            // The hover outline is drawn in the bar colour, so this holds both.
+            for (name, theme, c) in cases() {
+                // In high contrast the whole row is the system highlight and
+                // the bar is that colour: the row itself must stand out.
+                let (bar, under) = if theme == Theme::HighContrast {
+                    (c.selected_fill, c.background)
+                } else {
+                    (c.bar, c.background)
+                };
+                let r = ratio(bar, under);
+                assert!(r >= 3.0, "{name}: the selection is {r:.2}:1");
+            }
+        }
+
+        #[test]
+        fn the_selected_row_is_still_distinct_from_the_background() {
+            for (name, _, c) in cases() {
+                assert_ne!(c.selected_fill, c.background, "{name}");
+            }
+        }
+
+        #[test]
+        fn light_and_dark_differ_and_high_contrast_uses_the_system_colours() {
+            let light = palette_colors(Theme::Light, &HC_BLACK, 0x00D4_7800);
+            let dark = palette_colors(Theme::Dark, &HC_BLACK, 0x00D4_7800);
+            assert_ne!(light.background, dark.background);
+            assert!(relative_luminance(light.background) > relative_luminance(dark.background));
+            let hc = palette_colors(Theme::HighContrast, &HC_WHITE, 0x00D4_7800);
+            assert_eq!(hc.background, HC_WHITE.window);
+            assert_eq!(hc.text, HC_WHITE.window_text);
+            assert_eq!(hc.selected_fill, HC_WHITE.highlight);
+            assert_eq!(hc.selected_text, HC_WHITE.highlight_text);
+        }
+    }
+
+    // #579: the palette is a top-level window, so Windows broadcasts every
+    // theme change to it even while it is hidden.
+    mod live_theme_tests {
+        use super::*;
+        use crate::ui::theme::HC_BLACK;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, DeleteDC, GetBkColor, GetDC, GetTextColor, ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{WM_SYSCOLORCHANGE, WM_THEMECHANGED};
+
+        fn live_colors() -> PaletteColors {
+            let (theme, sys) = (detect_theme(), SysColors::read());
+            palette_colors(theme, &sys, live_accent(theme, &sys))
+        }
+
+        #[test]
+        fn a_theme_message_makes_the_palette_read_the_system_again() {
+            for msg in [WM_THEMECHANGED, WM_SYSCOLORCHANGE] {
+                let mut p = Palette::new_for_test(instance()).unwrap();
+                // Stale colours, as if the theme had just changed.
+                p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+                assert_ne!(p.inner.colors, live_colors(), "the setup must differ");
+                unsafe {
+                    SendMessageW(p.hwnd(), msg, Some(WPARAM(0)), Some(LPARAM(0)));
+                }
+                assert_eq!(p.inner.colors, live_colors(), "message {msg:#x}");
+            }
+        }
+
+        #[test]
+        fn a_theme_setting_change_makes_the_palette_read_the_system_again() {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+            let name = wide_z("ImmersiveColorSet");
+            unsafe {
+                SendMessageW(
+                    p.hwnd(),
+                    WM_SETTINGCHANGE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(name.as_ptr() as isize)),
+                );
+            }
+            assert_eq!(p.inner.colors, live_colors());
+            // An unrelated setting leaves it alone.
+            p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+            let other = wide_z("intl");
+            unsafe {
+                SendMessageW(
+                    p.hwnd(),
+                    WM_SETTINGCHANGE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(other.as_ptr() as isize)),
+                );
+            }
+            assert_ne!(p.inner.colors, live_colors());
+        }
+
+        #[test]
+        fn a_forced_theme_ignores_theme_messages() {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.force_theme_for_gallery(Theme::Dark);
+            let forced = p.inner.colors;
+            assert_eq!(
+                forced,
+                palette_colors(Theme::Dark, &HC_BLACK, live_accent(Theme::Dark, &HC_BLACK))
+            );
+            unsafe {
+                SendMessageW(p.hwnd(), WM_THEMECHANGED, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+            assert_eq!(p.inner.colors, forced);
+        }
+
+        /// The query box is a child EDIT: without `WM_CTLCOLOREDIT` it keeps
+        /// the stock white background and black text in a dark palette.
+        #[test]
+        fn the_query_box_gets_the_palette_text_and_background_colours() {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.force_theme_for_gallery(Theme::Dark);
+            let (screen, hdc);
+            let result;
+            unsafe {
+                screen = GetDC(None);
+                hdc = CreateCompatibleDC(Some(screen));
+                result = SendMessageW(
+                    p.hwnd(),
+                    WM_CTLCOLOREDIT,
+                    Some(WPARAM(hdc.0 as usize)),
+                    Some(LPARAM(p.edit_hwnd().0 as isize)),
+                );
+            }
+            let colors = p.inner.colors;
+            let (bk, text) = unsafe { (GetBkColor(hdc), GetTextColor(hdc)) };
+            unsafe {
+                let _ = DeleteDC(hdc);
+                ReleaseDC(None, screen);
+            }
+            assert_ne!(result.0, 0, "WM_CTLCOLOREDIT must return a brush");
+            assert_eq!(bk.0, colors.background);
+            assert_eq!(text.0, colors.text);
         }
     }
     mod row_at_tests {
@@ -2016,8 +2475,11 @@ mod tests {
             let _ = DeleteDC(mem);
             ReleaseDC(None, screen);
         }
-        assert_eq!(selected, selected_row_color(), "the selected row fill");
-        assert_eq!(empty, background_color(), "the palette background");
+        assert_eq!(
+            selected.0, p.inner.colors.selected_fill,
+            "the selected row fill"
+        );
+        assert_eq!(empty.0, p.inner.colors.background, "the palette background");
     }
     #[test]
     fn window_and_edit_control_are_created() {
