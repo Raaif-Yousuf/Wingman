@@ -95,6 +95,35 @@ jobs:
           path: target/release/*.exe
           if-no-files-found: error
 
+  size-report:
+    # Informational: which crates take the bytes in the release exe, in the
+    # job summary. A separate job so it adds no time to the gating one (it
+    # needs its own unstripped build). It never fails the run.
+    name: exe size by crate (informational)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-bloat
+        run: cargo install cargo-bloat --locked
+
+      - name: cargo bloat --crates
+        shell: pwsh
+        env:
+          # The release profile strips symbols and cargo-bloat needs them.
+          CARGO_PROFILE_RELEASE_STRIP: none
+        run: |
+          $out = cargo bloat --release --crates -n 25 2>&1 | Out-String
+          $out
+          "## Exe size by crate (unstripped build, informational)`n" +
+            '```' + "`n" + $out + "`n" + '```' |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
   supply-chain:
     # cargo-deny-action is a Docker container action, and GitHub runs those
     # only on Linux runners ("Container action is only supported on Linux",

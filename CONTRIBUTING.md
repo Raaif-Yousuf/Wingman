@@ -105,6 +105,28 @@ simulated yet: the matrix writes them once as `<state>--system--<percent>.png`
 at your real display scale. The palette pictures are black for now (issue
 #626).
 
+## Checking the size of the exe
+
+The release exe has a size budget in `perf-budgets.json`, and CI fails above
+it. Before you add a dependency or turn on a feature, see what it costs:
+
+```
+cargo install cargo-bloat --locked
+$env:CARGO_PROFILE_RELEASE_STRIP = "none"   # bash: export CARGO_PROFILE_RELEASE_STRIP=none
+cargo bloat --release --crates -n 30        # bytes per crate
+cargo bloat --release -n 50                 # biggest single functions
+```
+
+The release profile strips symbols, and `cargo bloat` needs them, so turn
+stripping off for the run. Build once without your change and once with it,
+and put both exe sizes (`target\release\wingman.exe`, with stripping back on)
+in the pull request. Some things that help: switch off default features
+you do not use (`default-features = false`), prefer a few lines of your own
+over a crate for one small job, and check `cargo tree -d` for two versions of
+the same crate. Bundled SQLite is the biggest single piece; its compile flags
+are in `.cargo/config.toml`. CI also prints the biggest crates in the job
+summary of every run (informational, it never fails the build).
+
 ## Config compatibility
 
 `config.toml`'s shape only ever grows: `#[serde(default)]` on every struct
