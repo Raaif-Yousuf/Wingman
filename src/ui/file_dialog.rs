@@ -1,6 +1,6 @@
-//! Open and save dialogs for an action file (#117), and the yes/no question
-//! that shows what an imported action does. Win32 only: the logic that
-//! decides what is allowed lives in `actions::share`.
+//! Open and save dialogs for an action file (#117). Win32 only: the logic
+//! that decides what is allowed lives in `actions::share`. These run a nested
+//! message loop, so call them only through `App::run_os_dialog`.
 //!
 //! Checked by hand: tray > Help and diagnostics > Import action from file
 //! opens the dialog filtered to `.toml`; Export action to file opens a save
@@ -13,9 +13,6 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
     OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO,
 };
 
 /// `MAX_PATH` plus room for a long name; the dialog refuses a longer pick.
@@ -107,23 +104,6 @@ pub fn pick_action_file(owner: HWND) -> Option<PathBuf> {
 /// cancelled.
 pub fn pick_save_path(owner: HWND, action_id: &str) -> Option<PathBuf> {
     run_dialog(owner, true, &suggested_file_name(action_id))
-}
-
-/// A Yes/No question. `No` is what a closed box returns, so closing it adds
-/// nothing.
-pub fn ask_yes_no(owner: HWND, title: &str, text: &str) -> bool {
-    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: both buffers are nul-terminated and outlive the call.
-    let answer = unsafe {
-        MessageBoxW(
-            Some(owner),
-            PCWSTR(text.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND,
-        )
-    };
-    answer == IDYES
 }
 
 #[cfg(test)]

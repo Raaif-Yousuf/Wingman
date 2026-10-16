@@ -41,10 +41,11 @@ pub const MAX_FILE_BYTES: u64 = 16 * 1024;
 const MAX_ID_CHARS: usize = 64;
 const MAX_NAME_CHARS: usize = 80;
 const MAX_GROUP_CHARS: usize = 40;
-const MAX_PROMPT_CHARS: usize = 8000;
+/// Decision: an imported prompt must fit on the confirmation card in full
+/// (the card is narrow and shows at most ten wrapped lines per field), so the
+/// user always reads all of it before saying yes. A longer prompt is refused.
+const MAX_PROMPT_CHARS: usize = 300;
 const MAX_INPUTS: usize = 12;
-/// How many characters of the prompt the confirmation shows.
-const PREVIEW_PROMPT_CHARS: usize = 700;
 /// The highest suffix tried when an id is taken.
 const MAX_RENAME_SUFFIX: u32 = 99;
 
@@ -75,6 +76,9 @@ pub struct Prepared {
     /// The id the file carried, when it had to be changed.
     pub renamed_from: Option<String>,
     pub notes: Vec<String>,
+    /// The file as it was when this was prepared; `commit` refuses if the
+    /// file is different by then.
+    base: String,
     new_contents: String,
 }
 
@@ -120,9 +124,22 @@ pub fn read_import_file(path: &Path) -> Result<String> {
     String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("that file is not UTF-8 text"))
 }
 
+/// Unicode "format" characters (category Cf) that change how text is drawn
+/// without showing: the right-to-left override U+202E, zero-width marks and
+/// the like. `char` has no category lookup, so the ranges are listed.
+fn is_format_char(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x08E2 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x1D173..=0x1D17A
+        | 0xE0001 | 0xE0020..=0xE007F)
+}
+
 fn has_control(s: &str, allow_newlines: bool) -> bool {
-    s.chars()
-        .any(|c| c.is_control() && !(allow_newlines && matches!(c, '\n' | '\r' | '\t')))
+    s.chars().any(|c| {
+        is_format_char(c)
+            || (c.is_control() && !(allow_newlines && matches!(c, '\n' | '\r' | '\t')))
+    })
 }
 
 fn id_is_plain(id: &str) -> bool {
@@ -245,6 +262,7 @@ pub fn prepare(user_path: &Path, import: Import) -> Result<Prepared> {
 
     let entry = toml::to_string(&ShareOut { actions: [&action] })
         .context("could not write the action as TOML")?;
+    let existing_text = existing.clone();
     let mut new_contents = existing;
     if !new_contents.is_empty() && !new_contents.ends_with('\n') {
         new_contents.push('\n');
@@ -264,14 +282,27 @@ pub fn prepare(user_path: &Path, import: Import) -> Result<Prepared> {
         action,
         renamed_from,
         notes,
+        base: existing_text,
         new_contents,
     })
 }
 
 impl Prepared {
     /// Writes the prepared file: a temp file next to it, then a rename, so a
-    /// crash leaves the old file whole.
+    /// crash leaves the old file whole. Refuses if `actions.toml` is not the
+    /// file this was prepared against (an edit made while the user was
+    /// deciding must not be lost); nothing is written then.
     pub fn commit(&self, user_path: &Path) -> Result<()> {
+        let now = match fs::read_to_string(user_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(anyhow::Error::new(e).context("could not read your actions.toml")),
+        };
+        if now != self.base {
+            anyhow::bail!(
+                "your actions.toml changed while you were deciding, so nothing was added. Import the file again"
+            );
+        }
         if let Some(dir) = user_path.parent() {
             fs::create_dir_all(dir)
                 .with_context(|| format!("could not create {}", dir.display()))?;
@@ -285,42 +316,54 @@ impl Prepared {
         })
     }
 
-    /// What the user is asked to approve: name, id, executor, inputs, the
-    /// start of the prompt and anything that was changed.
-    pub fn preview(&self) -> String {
+    /// The preview card's fields, in the order the card shows them. The notes
+    /// (what was changed, and that nothing runs yet) come first so they are
+    /// never pushed off the card; every line break is folded to a space so a
+    /// value cannot fake extra lines.
+    pub fn preview_value(&self) -> serde_json::Value {
         let a = &self.action;
+        let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut notes = vec!["It will not run until you choose it.".to_string()];
+        if let Some(old) = &self.renamed_from {
+            notes.push(format!(
+                "The id \"{old}\" is already used, so it is added as \"{}\".",
+                a.id
+            ));
+        }
+        notes.extend(self.notes.iter().cloned());
         let inputs = a
             .inputs
             .iter()
             .map(|i| format!("{i:?}").to_lowercase())
             .collect::<Vec<_>>()
             .join(", ");
-        let confirm = if a.confirm {
-            "asks before it does anything"
-        } else {
-            "shows its answer without asking"
-        };
-        let mut prompt: String = a.prompt.chars().take(PREVIEW_PROMPT_CHARS).collect();
-        if a.prompt.chars().count() > PREVIEW_PROMPT_CHARS {
-            prompt.push_str("...");
-        }
-        let mut text = format!(
-            "Add this action?\n\nName: {}\nId: {}\nExecutor: {} ({})\nLooks at: {}\n\nPrompt:\n{}\n",
-            a.name, a.id, a.executor, confirm, inputs, prompt
-        );
-        if let Some(old) = &self.renamed_from {
-            text.push_str(&format!(
-                "\nThe id \"{old}\" is already used, so this one is added as \"{}\".\n",
-                a.id
-            ));
-        }
-        for note in &self.notes {
-            text.push('\n');
-            text.push_str(note);
-        }
-        text.push_str("\n\nIt will not run until you choose it.");
-        text
+        let ask = if a.confirm { "asks first" } else { "no ask" };
+        serde_json::json!({
+            "notes": notes.join(" "),
+            "name": one_line(&a.name),
+            "id": a.id,
+            "executor": format!("{} ({ask})", a.executor),
+            "looks_at": inputs,
+            "prompt": one_line(&a.prompt),
+        })
     }
+}
+
+/// The schema for [`Prepared::preview_value`]: every row is read-only text, so
+/// nothing on the card can be edited into the file.
+pub fn preview_schema() -> serde_json::Value {
+    let text = |label: &str, multiline: bool| serde_json::json!({"type": "string", "label": label, "multiline": multiline});
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "notes": text("Notes", true),
+            "name": text("Name", false),
+            "id": text("Id", false),
+            "executor": text("Executor", false),
+            "looks_at": text("Looks at", false),
+            "prompt": text("Prompt", true),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -528,7 +571,10 @@ prompt = "Tidy these notes."
             p.renamed_from.as_deref(),
             Some(crate::actions::DEFAULT_ACTION_ID)
         );
-        assert!(p.preview().contains("already used"));
+        assert!(p.preview_value()["notes"]
+            .as_str()
+            .unwrap()
+            .contains("already used"));
         cleanup(&path);
     }
 
@@ -595,16 +641,87 @@ prompt = "Tidy these notes."
     fn the_preview_names_the_action_executor_and_prompt() {
         let path = scratch("preview");
         let p = prepare(&path, parse_import(GOOD).unwrap()).unwrap();
-        let text = p.preview();
-        for part in [
-            "Tidy notes",
-            "tidy-notes",
-            "replace_text",
-            "asks before",
-            "Tidy these notes.",
-        ] {
-            assert!(text.contains(part), "{part}: {text}");
+        let v = p.preview_value();
+        assert_eq!(v["name"], "Tidy notes");
+        assert_eq!(v["id"], "tidy-notes");
+        assert!(v["executor"].as_str().unwrap().contains("replace_text"));
+        assert_eq!(v["prompt"], "Tidy these notes.");
+        // Every key the card shows has a row in the schema, notes first.
+        let schema = preview_schema();
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys[0], "notes");
+        for k in v.as_object().unwrap().keys() {
+            assert!(schema["properties"].get(k).is_some(), "{k}");
         }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn the_preview_folds_newlines_and_leads_with_the_notes() {
+        let path = scratch("fold");
+        let text = GOOD
+            .replace("confirm = true", "confirm = false")
+            .replace("Tidy these notes.", "one\\n\\n\\n\\ntwo");
+        let p = prepare(&path, parse_import(&text).unwrap()).unwrap();
+        let v = p.preview_value();
+        assert_eq!(v["prompt"], "one two");
+        let notes = v["notes"].as_str().unwrap();
+        assert!(notes.starts_with("It will not run until you choose it."));
+        assert!(notes.contains("Confirm was turned on"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_prompt_too_long_to_show_whole_is_refused() {
+        let ok = "x".repeat(MAX_PROMPT_CHARS);
+        assert!(parse_import(&GOOD.replace("Tidy these notes.", &ok)).is_ok());
+        let long = "x".repeat(MAX_PROMPT_CHARS + 1);
+        assert!(parse_import(&GOOD.replace("Tidy these notes.", &long)).is_err());
+    }
+
+    #[test]
+    fn invisible_format_characters_are_refused() {
+        for bad in ["\\u202e", "\\u200b", "\\ufeff", "\\u2066"] {
+            assert!(
+                parse_import(&GOOD.replace("Tidy notes", &format!("Tidy{bad}notes"))).is_err(),
+                "name {bad}"
+            );
+            assert!(
+                parse_import(&GOOD.replace("Tidy these notes.", &format!("a{bad}b"))).is_err(),
+                "prompt {bad}"
+            );
+            assert!(
+                parse_import(&GOOD.replace("\"Writing\"", &format!("\"W{bad}\""))).is_err(),
+                "group {bad}"
+            );
+        }
+        assert!(parse_import(&GOOD.replace("tidy-notes", "tidy\\u202e")).is_err());
+    }
+
+    #[test]
+    fn an_edit_made_while_the_user_decides_is_not_lost() {
+        let path = scratch("stale");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "# before\n").unwrap();
+        let p = prepare(&path, parse_import(GOOD).unwrap()).unwrap();
+        fs::write(&path, "# before\n# edited meanwhile\n").unwrap();
+        assert!(p.commit(&path).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# before\n# edited meanwhile\n"
+        );
+        assert!(!path.with_extension("toml.new").exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_file_that_appears_while_the_user_decides_is_not_overwritten() {
+        let path = scratch("appears");
+        let p = prepare(&path, parse_import(GOOD).unwrap()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "# new file\n").unwrap();
+        assert!(p.commit(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# new file\n");
         cleanup(&path);
     }
 
