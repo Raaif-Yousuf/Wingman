@@ -67,6 +67,10 @@ Seven built-in actions, built and running, all reachable from the tray menu:
 - **Read QR code from screen**: decodes every QR code on the active
   monitor locally (no model, no network, works in Offline mode) and copies
   the text. A link is shown with its real site and never opened.
+- **Relative dates to real dates**: finds phrases like "next Tuesday", "in
+  3 days" or "end of the month" in the selection (or on screen) and lists the
+  date each one works out to, from today's date on your PC. No model, no
+  network. A phrase with two possible readings shows both.
 
 The confirm-and-execute loop, the executors (calendar add, form fill, text
 replace, image-to-clipboard) and the actions framework itself

@@ -304,6 +304,24 @@ enabled = true
 mode = "auto"
 
 [[actions]]
+id = "resolve-relative-dates"
+name = "Relative dates to real dates"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "relative_dates"
+executor = "none"
+confirm = false
+prompt = ""
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
 id = "explain-this-code"
 name = "Explain this code"
 group = "Code"

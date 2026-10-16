@@ -1491,6 +1491,7 @@ impl App {
             Some(DispatchTarget::CheckMyWork) => self.ask(Trigger::Palette),
             Some(DispatchTarget::ExtractText) => self.extract_text(),
             Some(DispatchTarget::ReadQr) => self.read_qr(),
+            Some(DispatchTarget::ResolveDates) => self.resolve_dates(),
             Some(DispatchTarget::AddToCalendar) => self.add_event_from_screen(),
             Some(DispatchTarget::ReviewEmail) => self.review_this_email(),
             Some(DispatchTarget::FillForm) => self.fill_form_from_screen(),
@@ -1531,12 +1532,36 @@ impl App {
         self.run_model_free_screen_action(actions::read_qr::read_and_copy);
     }
 
+    /// "Relative dates to real dates" (#336): list what phrases like "next
+    /// Tuesday" in the selection (else on screen) work out to. Same flow,
+    /// gates and card path as `extract_text` (no provider, no `Mode`, no
+    /// network). Today's local date is read here, on the main thread, and
+    /// handed to the worker.
+    fn resolve_dates(&mut self) {
+        if self.busy {
+            return;
+        }
+        let today = match local_today_and_utc_offset() {
+            Ok((today, _)) => today,
+            Err(e) => {
+                let detail = self.track_error("Couldn't read the local date", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't read the local date", &detail);
+                return;
+            }
+        };
+        let week = local_week_start();
+        self.run_model_free_screen_action(move |raw| {
+            actions::relative_dates::run(raw, today, week)
+        });
+    }
+
     /// The shared body of the model-free screen actions: gate on Paused,
     /// capture on the main thread, then run `work` on a worker thread and
     /// report through `WM_APP_RESULT`. See `extract_text` for the ordering.
     fn run_model_free_screen_action(
         &mut self,
-        work: fn(&crate::capture::RawShot) -> anyhow::Result<Answer>,
+        work: impl FnOnce(&crate::capture::RawShot) -> anyhow::Result<Answer> + Send + 'static,
     ) {
         if self.busy {
             return;
@@ -4533,6 +4558,33 @@ fn with_fallback_footer(detail: &str, footer: Option<&str>) -> String {
         Some(f) if detail.is_empty() => f.to_string(),
         Some(f) => format!("{detail}\n\n{f}"),
     }
+}
+
+/// The first day of the week the user's Windows region sets (#336), for "this
+/// week" and "next week". Monday when Windows cannot say. Win32, so checked by
+/// hand (rule 8): set the region's first day of the week to Sunday and run
+/// "Relative dates to real dates" on "Friday this week" on a Sunday; the date
+/// moves a week.
+fn local_week_start() -> actions::dates::WeekStart {
+    use windows::core::PCWSTR;
+    use windows::Win32::Globalization::{
+        GetLocaleInfoEx, LOCALE_IFIRSTDAYOFWEEK, LOCALE_RETURN_NUMBER,
+    };
+    // With LOCALE_RETURN_NUMBER the answer is a DWORD written into the buffer.
+    let mut buf = [0u16; 2];
+    let written = unsafe {
+        GetLocaleInfoEx(
+            PCWSTR::null(),
+            LOCALE_IFIRSTDAYOFWEEK | LOCALE_RETURN_NUMBER,
+            Some(&mut buf),
+        )
+    };
+    let value = if written > 0 {
+        u32::from(buf[0]) | (u32::from(buf[1]) << 16)
+    } else {
+        0
+    };
+    actions::dates::week_start_from_locale(value)
 }
 
 /// #39: today's local date and current local UTC offset, for the "Add
