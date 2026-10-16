@@ -489,6 +489,13 @@ pub fn run() -> Result<()> {
     }
     let _ = crate::autostart::remove_old_run_value();
 
+    // #769: delete old calendar files once at startup, on a short-lived
+    // thread (one directory read), so a lone event's file does not wait for
+    // the next "Add to calendar". No timer: nothing runs while idle.
+    let _ = std::thread::Builder::new()
+        .name("ics-startup-sweep".into())
+        .spawn(|| crate::connectors::IcsConnector::new().sweep_stale());
+
     let config = Config::load().unwrap_or_default();
     // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
     // anything below can start a request (the hotkey hook isn't installed
