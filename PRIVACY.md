@@ -52,8 +52,8 @@ HTTP call to a local Ollama server, only ever `127.0.0.1` (never
 has no server of its own; there is no Wingman-operated backend anywhere in
 the path. Exact per-provider request shapes are in
 [`docs/providers.md`](docs/providers.md). The response (the verdict text
-and, if the opt-in `ui.show_difficulty` setting is on, the difficulty
-rating) is shown in the card and is not written anywhere except the
+and, if the Check my work action's `rate_difficulty` option is on, the
+difficulty rating) is shown in the card and is not written anywhere except the
 in-memory "last answer" the tray's **Copy last answer** reads from.
 
 In Auto mode (the default), before a cloud request is sent Wingman may also

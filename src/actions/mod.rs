@@ -141,11 +141,10 @@ pub struct Action {
     pub prefer: Prefer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hotkey: Option<ActionHotkey>,
-    /// #197 part 2: ask for and render the 1-10/Ultra difficulty badge for
-    /// this action. Only meaningful for the `"verdict"` proposal kind
-    /// today. Defaults to `false` -- see the design spec's "Origin
-    /// tracking" section for why this ORs with `config.ui.show_difficulty`
-    /// rather than replacing it.
+    /// #197: ask for and render the 1-10/Ultra difficulty badge for this
+    /// action. Only meaningful for the `"verdict"` proposal kind today.
+    /// Defaults to `false`. This is the only switch for the rating: the old
+    /// global `ui.show_difficulty` setting was retired.
     #[serde(default)]
     pub rate_difficulty: bool,
     /// The disabled flag from #23's Done-when. `true` unless the action (or

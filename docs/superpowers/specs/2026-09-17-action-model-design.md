@@ -10,8 +10,9 @@ Scope: the `Action` data model, the built-in catalogue (one action: "Check
 my work"), the `actions.toml` merge/override/disable rules, and the proposal
 JSON-schema registry. Out of scope: the palette (#25), the intent router,
 any new executor, the settings Actions page (#48), and moving
-`ui.show_difficulty`'s Settings checkbox anywhere (#197 part 2 only adds the
-action-level option; the config-level toggle is untouched).
+`ui.show_difficulty`'s Settings checkbox anywhere (#197 part 2 only added the
+action-level option; the config-level toggle was retired afterwards, see the
+update under "Origin tracking").
 
 ## Why a design doc (rule 12)
 
@@ -153,21 +154,22 @@ override happens to paste back the exact default text, or the moment
 `DEFAULT_PROMPT` itself is edited). `Origin::User` is recorded at merge time,
 the one place that genuinely knows whether an id came from the user file.
 
-The same reasoning does **not** apply to difficulty: `rate_difficulty` and
-`config.ui.show_difficulty` are independent booleans answering the same
-question ("send the rubric"), not two candidate values for the same field,
-so they simply OR:
+Difficulty is simpler: the rubric is sent when the resolved action's
+`rate_difficulty` is on.
 
 ```rust
-want_difficulty = config.ui.show_difficulty || resolved_action.action.rate_difficulty;
+want_difficulty = resolved_action.action.rate_difficulty;
 ```
 
-Both default `false`, so a fresh install and every existing config.toml
-(`show_difficulty` already defaulted to `false` as of #197 part 1, commit
-`d88f78b`) still send no rubric -- identical to today. Issue #197's "the
-global toggle keeps working as an override for existing users" is exactly
-this OR: whichever install left `show_difficulty = true` in an old config
-keeps getting the badge with zero actions.toml involvement.
+**Update (#197, final part):** this section first described an OR with a
+global `config.ui.show_difficulty`, kept so existing configs would keep
+their badge. Decision: that global setting and its Settings checkbox are
+removed, and the rating lives only on the Check my work action. An old
+config.toml that still has `show_difficulty` loads fine (unknown keys are
+ignored) and the key is dropped on the next save. To keep the badge, override
+the Check my work entry in `actions.toml` with `rate_difficulty = true`; an
+override replaces the whole entry, including its prompt (see
+`docs/actions.md`).
 
 ## Proposal schema registry
 
@@ -212,9 +214,9 @@ ordinary two-way function call, not a build-graph cycle.
 never the main thread) gains one step before building `physics_request`:
 load and resolve the action catalog, find `"check-my-work"`, and derive the
 effective prompt and difficulty flag per the rules above. `ask()`'s call
-site is unchanged -- it already clones `config.ui.prompt` and
-`config.ui.show_difficulty` onto the worker thread; those become the
-`Builtin`-path fallback values `worker` consults instead of the only values.
+site is unchanged -- it already clones `config.ui.prompt` onto
+the worker thread; that becomes the `Builtin`-path fallback value `worker`
+consults instead of the only value.
 
 A load or parse failure (`actions::load_actions()` returning `Err`, e.g. a
 malformed `actions.toml`, or the default action missing/disabled) is
@@ -243,6 +245,5 @@ split `Config::load` / `Config::load_from` already uses.
 - No Settings UI for actions (#48) or for `disabled_groups`; both are
   hand-edited TOML for now, same maturity level `providers.compat` had
   before its own settings page.
-- `ui.show_difficulty`'s Settings checkbox is not moved, relabelled, or
-  duplicated; #197 part 2 is satisfied by the OR rule above, not by UI
-  surgery.
+- `ui.show_difficulty`'s Settings checkbox was not touched by #197 part 2;
+  the final part of #197 removed it (see the update above).
