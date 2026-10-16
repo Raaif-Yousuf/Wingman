@@ -1993,6 +1993,30 @@ impl App {
             return;
         }
 
+        // #69: no table on screen, or a reply that is not a table, is an
+        // answer, not an empty preview.
+        let table_headline = if actions::table::is_unreadable(&action.proposal, &proposal) {
+            Some(actions::table::NOT_READ_HEADLINE)
+        } else if actions::table::is_empty_result(&action.proposal, &proposal) {
+            Some(actions::table::NO_TABLE_HEADLINE)
+        } else {
+            None
+        };
+        if let Some(headline) = table_headline {
+            self.card
+                .show_answer(headline, &with_pending_notices(""), 0, None);
+            self.set_watch(true);
+            return;
+        }
+        // A table past the caps is cut, and the card shows the cut table and
+        // says so, so what is shown is what is copied.
+        let (proposal, note) = match actions::table::Table::from_value(&proposal) {
+            Some(t) if action.proposal == actions::table::PROPOSAL_KIND && t.capped => {
+                (t.to_value(), Some(actions::table::CAPPED_NOTE.to_string()))
+            }
+            _ => (proposal, self.fallback_footer.clone()),
+        };
+
         if action.confirm {
             let writes_back = action.executor == "replace_text";
             let title = if writes_back {
@@ -2010,7 +2034,7 @@ impl App {
                 &schema,
                 &proposal,
                 false,
-                self.fallback_footer.as_deref(),
+                note.as_deref(),
             );
             return;
         }
@@ -3612,7 +3636,7 @@ impl App {
 
         let p = &self.config.providers;
         self.tray
-            .set_active_provider(ActiveProvider::from_order(&p.order));
+            .set_active_provider(ActiveProvider::shown_for(&p.order));
         self.tray.set_models(
             &p.openai.models,
             &p.openai.model,

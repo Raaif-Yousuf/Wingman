@@ -149,6 +149,24 @@ enabled = true
 mode = "auto"
 
 [[actions]]
+id = "table-to-csv"
+name = "Table to CSV"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "table"
+executor = "clipboard"
+confirm = true
+prompt = 'You are shown a table (as text, or as a screenshot if no text was selected). Find the main table. First fill `columns` with its column headers in order, copied as shown; if the table has no header row, use "Column 1", "Column 2" and so on. Then fill `rows` with one list of cells per table row, in order, left to right, each cell as a plain string copied exactly as shown: keep the numbers, currency symbols, percent signs and units as written, and do not reformat, round, sum or correct anything. Use an empty string for an empty cell, so every row has as many cells as there are columns. Do not include the header row in `rows`, and do not include total rows unless the table shows them. If a cell has several lines, join them with a space. If there is no table, return empty lists. Use plain text only: no markdown and no LaTeX.'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
 id = "explain-this-error"
 name = "Explain this error"
 group = "Work"

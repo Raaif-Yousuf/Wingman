@@ -567,7 +567,7 @@ mod driver {
                 card.hide();
                 palette.hide();
                 // Without `--theme` it follows the live system theme.
-                let theme = region_theme.unwrap_or_else(crate::ui::card::detect_theme);
+                let theme = region_theme.unwrap_or_else(crate::ui::theme::detect_theme);
                 *region = Some(Overlay::open_for_gallery(instance, theme)?);
             }
             SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => {

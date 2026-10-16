@@ -61,6 +61,9 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "text_answer" => Some(text_answer_schema()),
         // #314: a list of action-item lines for the clipboard executor.
         "action_items" => Some(action_items_schema()),
+        // #69: header names, then rows of cells, for the clipboard executor
+        // to write as CSV. Reused by the receipt (#70) and chart (#114) actions.
+        "table" => Some(table_schema()),
         // #66: a read-only explanation of an error, shown on the card.
         "error_explanation" => Some(error_explanation_schema()),
         // #75: a read-only definition of a selected word, shown on the card.
@@ -211,6 +214,26 @@ fn action_items_schema() -> Value {
             }
         },
         "required": ["items"],
+        "additionalProperties": false
+    })
+}
+
+/// The `table` proposal schema (#69): `columns` (the header names), then
+/// `rows` (a list of cell lists). Property order is load-bearing (rule 3):
+/// naming the columns first fixes how many cells each row has before the
+/// model starts filling rows. Not editable: the card lists the rows, and
+/// `executors::clipboard` writes them as CSV (`actions::table::csv_from_value`).
+fn table_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "columns": {"type": "array", "items": {"type": "string"}},
+            "rows": {
+                "type": "array",
+                "items": {"type": "array", "items": {"type": "string"}}
+            }
+        },
+        "required": ["columns", "rows"],
         "additionalProperties": false
     })
 }
@@ -584,6 +607,25 @@ mod tests {
         assert_eq!(schema["properties"]["items"]["type"], "array");
         assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
         assert_eq!(schema["properties"]["items"]["editable"], true);
+    }
+
+    #[test]
+    fn table_names_the_columns_before_the_rows() {
+        let schema = schema_for("table", false).expect("table is registered");
+        let order: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["columns", "rows"]);
+        assert_eq!(schema["required"], json!(["columns", "rows"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["rows"]["items"]["type"], "array");
+        assert_eq!(
+            schema["properties"]["rows"]["items"]["items"]["type"],
+            "string"
+        );
     }
 
     #[test]

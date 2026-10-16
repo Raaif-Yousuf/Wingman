@@ -745,7 +745,7 @@ impl Overlay {
             window_snapshot,
             hint_monitor,
             hint_dpi,
-            theme: crate::ui::card::detect_theme(),
+            theme: crate::ui::theme::detect_theme(),
             sys: SysColors::read(),
             theme_forced: false,
         });
@@ -1131,7 +1131,7 @@ impl OverlayInner {
         if self.theme_forced {
             return;
         }
-        self.theme = crate::ui::card::detect_theme();
+        self.theme = crate::ui::theme::detect_theme();
         self.sys = SysColors::read();
         self.invalidate();
     }
@@ -1201,8 +1201,8 @@ impl OverlayInner {
             }
             WM_SETTINGCHANGE => {
                 // SAFETY: Windows passes a null-terminated string or null.
-                let name = unsafe { crate::ui::card::setting_change_name(lparam) };
-                if crate::ui::card::setting_change_affects_theme(wparam.0, &name) {
+                let name = unsafe { crate::ui::theme::setting_change_name(lparam) };
+                if crate::ui::theme::setting_change_affects_theme(wparam.0, &name) {
                     self.refresh_theme();
                 }
                 None
