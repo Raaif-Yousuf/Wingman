@@ -770,20 +770,17 @@ pub(crate) fn offline_guard(url: &str) -> Result<()> {
 /// `offline_guard` does not need to refuse in Local. A request that is not a
 /// provider call (a cloud model-list lookup carries the saved API key) has no
 /// such selection in front of it, so it gets this stricter check at the send
-/// itself: refused in Local as well as Offline unless the host is loopback.
-/// If the mode cannot be read the atomic degrades to Auto, so a request that
-/// should have been refused is the risk; the mode is always published at
-/// startup, so this does not happen in practice.
+/// itself. It fails closed: a non-loopback host is allowed only when the mode
+/// is positively Auto or Cloud; any other mode refuses it.
 pub(crate) fn loopback_only_guard(url: &str) -> Result<()> {
     offline_guard(url)?;
-    if crate::mode::current() == crate::mode::Mode::Local
-        && crate::mode::classify_host(url) != crate::mode::HostClass::Loopback
-    {
-        return Err(anyhow!(
+    match crate::mode::current() {
+        crate::mode::Mode::Auto | crate::mode::Mode::Cloud => Ok(()),
+        _ if crate::mode::classify_host(url) == crate::mode::HostClass::Loopback => Ok(()),
+        _ => Err(anyhow!(
             "Local mode blocked a request to a non-local address. Switch to Auto or Cloud to allow it."
-        ));
+        )),
     }
-    Ok(())
 }
 
 /// #505: the body that actually leaves, given the request's URL, and the
@@ -2513,7 +2510,15 @@ mod tests {
     /// list endpoints, and a loopback list (a local server) still works.
     #[test]
     fn the_model_list_get_is_refused_in_local_mode_for_a_cloud_host() {
+        /// Puts the mode back to Auto even when an assert fails.
+        struct RestoreMode;
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                crate::mode::set_current(crate::mode::Mode::Auto);
+            }
+        }
         let _g = network_guard();
+        let _restore = RestoreMode;
         crate::mode::set_current(crate::mode::Mode::Local);
         let err = get_json_with_headers(
             "https://api.anthropic.com/v1/models",
@@ -2525,7 +2530,6 @@ mod tests {
         let loopback = loopback_only_guard("http://127.0.0.1:9/v1/models");
         crate::mode::set_current(crate::mode::Mode::Cloud);
         let cloud = loopback_only_guard("https://api.openai.com/v1/models");
-        crate::mode::set_current(crate::mode::Mode::Auto);
         let msg = err.to_string();
         assert!(msg.contains("Local"), "{msg}");
         assert!(!msg.contains("sk-test"), "{msg}");
