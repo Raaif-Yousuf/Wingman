@@ -177,7 +177,18 @@ pub fn replace_or_copy(
                 "Could not replace in place: {}. The text is on the clipboard.",
                 reason.trim_end_matches('.')
             );
-            copy_report(copy, confirmed, detail, Some(reason))
+            // #694: the clipboard gets the same line endings the write
+            // would have used. Same already-confirmed decision, re-wrapped
+            // with the matched text (see `do_review_confirmed`).
+            let mut value = confirmed.into_value();
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("text".to_string(), Value::String(context.new_text.clone()));
+            }
+            let matched = crate::ui::confirm::confirm(
+                crate::ui::confirm::Proposal::new(value),
+                crate::ui::confirm::user_confirmed(),
+            );
+            copy_report(copy, matched, detail, Some(reason))
         }
     }
 }
@@ -415,6 +426,29 @@ mod tests {
             copy.seen.lock().unwrap().clone(),
             Some(json!({"text": "hello (edited)"})),
             "the clipboard gets exactly what the user confirmed"
+        );
+    }
+
+    #[test]
+    fn a_failed_replace_copies_the_edited_text_with_the_selections_line_endings() {
+        // #694: an edited multi-line value must not land on the clipboard
+        // with LF when the selection was CRLF.
+        let replace = Fake::new("replace_text", Err(anyhow::anyhow!("the text changed")));
+        let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
+        let plan = ReplaceSelection {
+            target: target(),
+            selected_text: "a\r\nb".into(),
+        };
+        let report = replace_or_copy(
+            &replace,
+            &copy,
+            Some(&plan),
+            confirmed(json!({"text": "x\ny\nz"})),
+        );
+        assert!(matches!(report, ReplaceReport::Copied(_)), "{report:?}");
+        assert_eq!(
+            copy.seen.lock().unwrap().clone(),
+            Some(json!({"text": "x\r\ny\r\nz"}))
         );
     }
 
