@@ -24,6 +24,7 @@ mod inputs;
 mod known_folder;
 mod mode;
 mod ocr;
+mod owner_acl;
 mod password_managers;
 mod pause;
 mod payment_denylist;
