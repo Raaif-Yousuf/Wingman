@@ -68,12 +68,15 @@ impl OpenAi {
             "input": [{"role": "user", "content": content}],
             "reasoning": {"effort": effort.as_str().unwrap_or("")},
             "max_output_tokens": max_tokens,
+            // The Responses API keeps a response (its input image included)
+            // unless told not to. Wingman promises nothing is kept (#721).
+            "store": false,
         });
 
         if let Some(schema) = &req.schema {
             body["text"] = json!({"format": {
                 "type": "json_schema", "name": "answer", "strict": true,
-                "schema": schema
+                "schema": common::wire_schema(schema)
             }});
         }
 
@@ -154,11 +157,26 @@ impl OpenAi {
             // (see `tests/fixtures/openai_response_no_message.json`), not
             // a generic malformed response (#155).
             if status == Some("incomplete") {
+                // Incomplete because of the content filter is a decline, not
+                // a budget problem (#731).
+                let reason = value
+                    .get("incomplete_details")
+                    .and_then(|d| d.get("reason"))
+                    .and_then(Value::as_str);
+                if reason == Some("content_filter") {
+                    return Err(super::declined_error("openai", "content_filter"));
+                }
                 return Err(anyhow!(
                     "openai: The model ran out of room before answering. Lower the effort setting or raise the token limit."
                 ));
             }
-            return Err(anyhow!("openai: no message text found in output[]"));
+            return Err(match status {
+                Some(s) => anyhow!(
+                    "openai: no message text found in output[] (status: {})",
+                    super::safe_reason(s)
+                ),
+                None => anyhow!("openai: no message text found in output[]"),
+            });
         }
 
         let stop = match status {
@@ -171,7 +189,19 @@ impl OpenAi {
         // includes the cached part, so the cached count is split out and
         // billed at the cached rate. The Responses API reports it under
         // `input_tokens_details`; the chat-style name is read as a fallback.
-        let usage = value.get("usage").map(|u| {
+        let usage = Self::usage_of(&value);
+
+        Ok(Completion { text, usage, stop })
+    }
+
+    /// The usage block of a body, whether or not it holds an answer: a
+    /// refusal or a truncated reply was billed too (#730).
+    pub(crate) fn parse_usage(body: &str) -> Option<Usage> {
+        Self::usage_of(&serde_json::from_str::<Value>(body).ok()?)
+    }
+
+    fn usage_of(value: &Value) -> Option<Usage> {
+        value.get("usage").map(|u| {
             let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
             let cached = ["input_tokens_details", "prompt_tokens_details"]
                 .iter()
@@ -189,9 +219,7 @@ impl OpenAi {
                 cache_read_tokens: cached,
                 ..Default::default()
             }
-        });
-
-        Ok(Completion { text, usage, stop })
+        })
     }
 }
 
@@ -275,6 +303,7 @@ impl Provider for OpenAi {
             &self.model,
             false,
             Self::parse_completion(&body_text),
+            || Self::parse_usage(&body_text),
         )
     }
 }
@@ -282,7 +311,7 @@ impl Provider for OpenAi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{parse_answer, physics_request, Shot};
+    use crate::provider::{parse_answer, physics_request_no_note, Shot};
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -294,7 +323,7 @@ mod tests {
     }
 
     fn req(prompt: &str, want_difficulty: bool) -> Request {
-        physics_request(&sample_shot(), prompt, want_difficulty)
+        physics_request_no_note(&sample_shot(), prompt, want_difficulty)
     }
 
     #[test]
@@ -319,6 +348,7 @@ mod tests {
             ]}],
             "reasoning": {"effort": "low"},
             "max_output_tokens": 2500,
+            "store": false,
             "text": {"format": {
                 "type": "json_schema", "name": "answer", "strict": true,
                 "schema": {"type": "object",
@@ -348,6 +378,7 @@ mod tests {
             ]}],
             "reasoning": {"effort": "low"},
             "max_output_tokens": 2500,
+            "store": false,
             "text": {"format": {
                 "type": "json_schema", "name": "answer", "strict": true,
                 "schema": {"type": "object",
@@ -388,7 +419,7 @@ mod tests {
     fn golden_request_body_no_difficulty_is_byte_identical() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
         let body = provider.build_body(&req("system prompt text", false));
-        let golden = r#"{"model":"gpt-5.5","instructions":"system prompt text","input":[{"role":"user","content":[{"type":"input_text","text":"Check my working."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw==","detail":"high"}]}],"reasoning":{"effort":"low"},"max_output_tokens":2500,"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"}},"required":["detail","headline"],"additionalProperties":false}}}}"#;
+        let golden = r#"{"model":"gpt-5.5","instructions":"system prompt text","input":[{"role":"user","content":[{"type":"input_text","text":"Check my working."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw==","detail":"high"}]}],"reasoning":{"effort":"low"},"max_output_tokens":2500,"store":false,"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"}},"required":["detail","headline"],"additionalProperties":false}}}}"#;
         assert_eq!(serde_json::to_string(&body).unwrap(), golden);
     }
 
@@ -396,7 +427,7 @@ mod tests {
     fn golden_request_body_with_difficulty_is_byte_identical() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
         let body = provider.build_body(&req("system prompt text", true));
-        let golden = r#"{"model":"gpt-5.5","instructions":"system prompt text\n\nAlso rate how difficult the PROBLEM ON SCREEN is for a HUMAN STUDENT. Add a third field:\n- difficulty: THIRD, after headline, once you have actually worked the problem through. Exactly one of \"1\" through \"10\", or \"U\".\n\nCalibration is the hard part, so read this carefully. You solve nearly all of these easily; that is NOT the scale. Do not rate your own confidence, your own effort, or how quickly you found the answer. Rate how hard the problem would be for a student at the level it is aimed at. Rating by your own effort compresses everything into 1-5 and makes the whole scale useless.\n\nAnchors:\n1 = an easy high-school question. One step, one formula. (speed = distance / time)\n2 = high-school, a couple of steps.\n3 = easy university intro-course level. (a block on an incline; moment of inertia of a disk)\n4 = intro university, several steps or a small subtlety.\n5 = medium university level. Mid-degree material: multi-step, and you must choose the method rather than being told it.\n6 = upper-undergraduate, harder than routine homework.\n7 = hard university level. Typically GRADUATE coursework: quantum perturbation theory, Lagrangian mechanics with constraints, a non-obvious statistical derivation.\n8 = graduate coursework that most of the class would get wrong.\n9 = very hard for an undergraduate. Qualifying-exam standard.\n10 = a PhD student in the field would struggle. Open-ended derivations and proofs requiring a specialist technique, not just more algebra.\nU = Ultra: a professor would struggle. Research-level, or a known-hard proof.\n\nUse the WHOLE range. Most routine homework is 2-5. If the problem is recognisably graduate-level, it starts at 7, not 5. If it asks you to PROVE a general theorem rather than compute a value, it is almost never below 8.\n\nIf there is no problem to rate at all -- the screen shows no question, or you are asking for something to be made visible -- answer \"N\". Do NOT reach for \"U\" in that case: \"U\" means the problem is extraordinarily hard, not that you could not find one.","input":[{"role":"user","content":[{"type":"input_text","text":"Check my working."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw==","detail":"high"}]}],"reasoning":{"effort":"low"},"max_output_tokens":2500,"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"},"difficulty":{"type":"string","enum":["1","2","3","4","5","6","7","8","9","10","U","N"]}},"required":["detail","headline","difficulty"],"additionalProperties":false}}}}"#;
+        let golden = r#"{"model":"gpt-5.5","instructions":"system prompt text\n\nAlso rate how difficult the PROBLEM ON SCREEN is for a HUMAN STUDENT. Add a third field:\n- difficulty: THIRD, after headline, once you have actually worked the problem through. Exactly one of \"1\" through \"10\", or \"U\".\n\nCalibration is the hard part, so read this carefully. You solve nearly all of these easily; that is NOT the scale. Do not rate your own confidence, your own effort, or how quickly you found the answer. Rate how hard the problem would be for a student at the level it is aimed at. Rating by your own effort compresses everything into 1-5 and makes the whole scale useless.\n\nAnchors:\n1 = an easy high-school question. One step, one formula. (speed = distance / time)\n2 = high-school, a couple of steps.\n3 = easy university intro-course level. (a block on an incline; moment of inertia of a disk)\n4 = intro university, several steps or a small subtlety.\n5 = medium university level. Mid-degree material: multi-step, and you must choose the method rather than being told it.\n6 = upper-undergraduate, harder than routine homework.\n7 = hard university level. Typically GRADUATE coursework: quantum perturbation theory, Lagrangian mechanics with constraints, a non-obvious statistical derivation.\n8 = graduate coursework that most of the class would get wrong.\n9 = very hard for an undergraduate. Qualifying-exam standard.\n10 = a PhD student in the field would struggle. Open-ended derivations and proofs requiring a specialist technique, not just more algebra.\nU = Ultra: a professor would struggle. Research-level, or a known-hard proof.\n\nUse the WHOLE range. Most routine homework is 2-5. If the problem is recognisably graduate-level, it starts at 7, not 5. If it asks you to PROVE a general theorem rather than compute a value, it is almost never below 8.\n\nIf there is no problem to rate at all -- the screen shows no question, or you are asking for something to be made visible -- answer \"N\". Do NOT reach for \"U\" in that case: \"U\" means the problem is extraordinarily hard, not that you could not find one.","input":[{"role":"user","content":[{"type":"input_text","text":"Check my working."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw==","detail":"high"}]}],"reasoning":{"effort":"low"},"max_output_tokens":2500,"store":false,"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"},"difficulty":{"type":"string","enum":["1","2","3","4","5","6","7","8","9","10","U","N"]}},"required":["detail","headline","difficulty"],"additionalProperties":false}}}}"#;
         assert_eq!(serde_json::to_string(&body).unwrap(), golden);
     }
 
@@ -559,6 +590,30 @@ mod tests {
         assert!(!msg.contains("no message text"), "{msg}");
     }
 
+    /// #731: `incomplete` because of the content filter is a decline, not a
+    /// budget problem, so it must not tell the user to lower the effort.
+    #[test]
+    fn parse_completion_reports_a_content_filter_as_a_decline() {
+        let body = r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}"#;
+        let msg = OpenAi::parse_completion(body).unwrap_err().to_string();
+        assert!(msg.contains("declined"), "{msg}");
+        assert!(msg.contains("content_filter"), "{msg}");
+        assert!(!msg.contains("ran out of room"), "{msg}");
+        let other = r#"{"status":"failed","output":[]}"#;
+        let msg = OpenAi::parse_completion(other).unwrap_err().to_string();
+        assert!(msg.contains("failed"), "{msg}");
+    }
+
+    /// #730: usage is readable from an incomplete body with no message.
+    #[test]
+    fn parse_usage_reads_an_incomplete_body_with_no_message() {
+        let body = r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":300,"output_tokens":2500}}"#;
+        assert!(OpenAi::parse_completion(body).is_err());
+        let u = OpenAi::parse_usage(body).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (300, 2500));
+        assert!(OpenAi::parse_usage("nope").is_none());
+    }
+
     /// Neighbour of the above: a body with no message and no `status:
     /// "incomplete"` is a genuinely malformed response, not budget
     /// exhaustion, and must keep the generic message.
@@ -663,6 +718,18 @@ mod tests {
         r.effort = Effort::High;
         let body = provider.build_body(&r);
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    /// #719: the UI-only `editable` keyword never goes out.
+    #[test]
+    fn no_registered_schema_sends_the_editable_keyword() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
+        for kind in crate::actions::schema::PROPOSAL_KINDS {
+            let mut r = req("sys", false);
+            r.schema = crate::actions::schema::schema_for(kind, false);
+            let body = serde_json::to_string(&provider.build_body(&r)).unwrap();
+            assert!(!body.contains("editable"), "{kind}: {body}");
+        }
     }
 
     /// #12 neighbour: a request with no schema (a future plain-text action)

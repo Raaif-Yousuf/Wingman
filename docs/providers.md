@@ -196,6 +196,10 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   it, Ollama silently runs CPU-only. Set it before starting `ollama serve`
   (or the equivalent for however Ollama is launched on the target machine),
   not in Wingman's config.
+  On a machine with an Intel GPU, when Settings sees the model loaded on the CPU
+  (or the stock tray app listening), a "Fix it" button sets the variable for your
+  Windows account, quits the stock tray app, restarts `ollama serve`, and
+  re-checks `size_vram` (`provider/ollama_gpu_fix.rs`, #382).
 - **The only oracle for GPU use is `size_vram > 0` on `/api/ps`**
   (AGENTS.md rule 6): `ollama_admin::gpu_status_for` reads this field
   directly rather than trusting `ollama ps`'s own PROCESSOR column, which

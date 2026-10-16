@@ -104,6 +104,7 @@ use crate::hotkey::{
     LearnedVerdict, HK_PRIMARY, HK_SECONDARY, WM_APP_LEARNED,
 };
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
+use crate::provider::ollama_gpu_fix;
 use crate::provider::DEFAULT_PROMPT;
 
 // ---------------------------------------------------------------------------
@@ -174,7 +175,7 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     let inner_ref = unsafe { &mut *raw };
     inner_ref.hwnd = hwnd;
 
-    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+    let dpi = dpi_for(hwnd);
     inner_ref.font = build_font(dpi);
     let fitted_h = fitted_height_dp(hwnd, dpi);
 
@@ -313,6 +314,47 @@ fn center_in_work(work: &windows::Win32::Foundation::RECT, w: i32, h: i32) -> (i
     (x.max(work.left), y.max(work.top))
 }
 
+/// Enter and Esc for the Settings window. Returns true when the key was used
+/// and must not be dispatched further.
+unsafe fn handle_key(hwnd: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
+    let vk = msg.wParam.0 as u32;
+    // #776: with a combo list open, Enter and Esc belong to the list (pick or
+    // close); they must not save or cancel the window.
+    if (vk == VK_ESCAPE.0 as u32 || vk == VK_RETURN.0 as u32) && wheel_over_open_combo(msg.hwnd) {
+        let _ = TranslateMessage(msg);
+        DispatchMessageW(msg);
+        return true;
+    }
+    if vk == VK_ESCAPE.0 as u32 {
+        // #345: while a Change is pending, Esc cancels that, not the whole
+        // window. (The hook normally swallows this Esc and reports it as a
+        // captured key instead; see `judge_learned`.)
+        if !cancel_learning_if_active(hwnd) {
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_COMMAND,
+                WPARAM(ID_CANCEL as usize),
+                LPARAM(0),
+            );
+        }
+        return true;
+    }
+    // Enter submits, except inside the multiline prompt box, where
+    // ES_WANTRETURN means Enter should insert a newline instead, and on a
+    // focused push button, where it presses that button (#342).
+    if vk == VK_RETURN.0 as u32 && msg.hwnd != prompt_edit {
+        let ctrl_id = GetDlgCtrlID(msg.hwnd);
+        let _ = PostMessageW(
+            Some(hwnd),
+            WM_COMMAND,
+            WPARAM(enter_command(ctrl_id) as usize),
+            LPARAM(0),
+        );
+        return true;
+    }
+    false
+}
+
 fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
     // #481: the focused window as of the last message, to scroll a newly
     // focused control into view without a timer.
@@ -334,40 +376,11 @@ fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
 
         let belongs_to_us = msg.hwnd == hwnd || unsafe { IsChild(hwnd, msg.hwnd) }.as_bool();
 
-        if belongs_to_us && msg.message == WM_KEYDOWN {
-            let vk = msg.wParam.0 as u32;
-            if vk == VK_ESCAPE.0 as u32 {
-                // #345: while a Change is pending, Esc cancels that, not the
-                // whole window. (The hook normally swallows this Esc and
-                // reports it as a captured key instead; see `judge_learned`.)
-                if unsafe { cancel_learning_if_active(hwnd) } {
-                    continue;
-                }
-                unsafe {
-                    let _ = PostMessageW(
-                        Some(hwnd),
-                        WM_COMMAND,
-                        WPARAM(ID_CANCEL as usize),
-                        LPARAM(0),
-                    );
-                }
-                continue;
-            }
-            // Enter submits, except inside the multiline prompt box, where
-            // ES_WANTRETURN means Enter should insert a newline instead, and
-            // on a focused push button, where it presses that button (#342).
-            if vk == VK_RETURN.0 as u32 && msg.hwnd != prompt_edit {
-                let ctrl_id = unsafe { GetDlgCtrlID(msg.hwnd) };
-                unsafe {
-                    let _ = PostMessageW(
-                        Some(hwnd),
-                        WM_COMMAND,
-                        WPARAM(enter_command(ctrl_id) as usize),
-                        LPARAM(0),
-                    );
-                }
-                continue;
-            }
+        if belongs_to_us
+            && msg.message == WM_KEYDOWN
+            && unsafe { handle_key(hwnd, &msg, prompt_edit) }
+        {
+            continue;
         }
 
         // #481: the wheel scrolls the body wherever the pointer is in the
@@ -485,6 +498,8 @@ struct SettingsInner {
     /// #343: where the Ollama group's link button goes, if it has one. Set
     /// when the status probe reports (#527).
     ollama_link_url: Option<&'static str>,
+    /// #382: the button is "Fix it" (the Intel GPU fix) rather than a link.
+    ollama_fix: bool,
     /// #527: the Ollama status probe's result, filled by its worker.
     ollama_status: OllamaStatusSlot,
     /// #183: the pulled-model list the background fetch reports into.
@@ -542,6 +557,7 @@ impl SettingsInner {
             body: HWND(std::ptr::null_mut()),
             body_dpi: 96,
             ollama_link_url: None,
+            ollama_fix: false,
             ollama_status: Default::default(),
             ollama_tags: Default::default(),
             cloud_models: Default::default(),
@@ -652,6 +668,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        // The gallery's simulated DPI stays whatever monitor this is.
+        #[cfg(any(test, debug_assertions))]
+        WM_DPICHANGED if forced_dpi().is_some() => LRESULT(0),
         WM_DPICHANGED => {
             on_dpi_changed(inner, wparam, lparam);
             LRESULT(0)
@@ -723,7 +742,8 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 return;
             }
             if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-                set_text(msg, "");
+                // Back to the standing hint (#778), not blank.
+                set_text(msg, &env_key_hint(&env_hint_vars()));
             }
 
             // Autostart is registry state rather than a Config field, so it is
@@ -732,7 +752,17 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             // Run key on every Save.
             let want = checkbox_checked(inner.hwnd, ID_AUTOSTART);
             if want != crate::autostart::is_enabled() {
-                let _ = crate::autostart::set_enabled(want);
+                // Rule 7: a failed registry write must not end in "Settings
+                // saved". Say so here, show the real state, keep the window.
+                if crate::autostart::set_enabled(want).is_err() {
+                    if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                        set_text(msg, autostart_failure_message());
+                    }
+                    if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+                        set_checkbox(box_, crate::autostart::is_enabled());
+                    }
+                    return;
+                }
             }
             inner.result = Some(finalize_config(inner, &raw));
             unsafe {
@@ -745,6 +775,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 let _ = DestroyWindow(inner.hwnd);
             }
         }
+        ID_OLLAMA_LINK if notify == BN_CLICKED && inner.ollama_fix => start_gpu_fix(inner),
         ID_OLLAMA_LINK if notify == BN_CLICKED => {
             if let Some(url) = inner.ollama_link_url {
                 if !open_url(url) {
@@ -757,7 +788,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         }
         ID_PULL_BUTTON if notify == BN_CLICKED => on_pull_button(inner),
         ID_RESET_PROMPT => {
-            set_text(inner.prompt_edit, DEFAULT_PROMPT);
+            set_text(inner.prompt_edit, &prompt_to_edit(DEFAULT_PROMPT));
         }
         ID_CARD_CORNER if notify == CBN_SELCHANGE => sync_card_display_enabled(inner.hwnd),
         ID_GEMINI_MODEL if notify == CBN_SELCHANGE => sync_gemini_thinking_enabled(inner.hwnd),
@@ -1101,6 +1132,26 @@ const WIN_H_DP: i32 = 918 + 4 * (ROW_H + ROW_GAP);
 
 /// The one-line hint under the model dropdowns (#427). Plain words, no dash.
 const MODEL_LIST_HINT: &str = "Missing a cloud model? Add its name to models in config.toml.";
+
+/// #674: shown instead of [`MODEL_LIST_HINT`] when the mode keeps every
+/// request on this computer, so the user knows why no live cloud list loads.
+const MODEL_LIST_HINT_LOCAL: &str = "Local mode: live cloud model lists are not fetched.";
+const MODEL_LIST_HINT_OFFLINE: &str = "Offline mode: live cloud model lists are not fetched.";
+
+/// Whether the mode allows asking a cloud vendor for its model list. Both
+/// Local and Offline are loopback only (#674); the saved key rides along.
+fn cloud_list_allowed(mode: crate::mode::Mode) -> bool {
+    !matches!(mode, crate::mode::Mode::Local | crate::mode::Mode::Offline)
+}
+
+/// The hint line under the cloud model dropdowns for `mode`.
+fn model_list_hint_for(mode: crate::mode::Mode) -> &'static str {
+    match mode {
+        crate::mode::Mode::Local => MODEL_LIST_HINT_LOCAL,
+        crate::mode::Mode::Offline => MODEL_LIST_HINT_OFFLINE,
+        _ => MODEL_LIST_HINT,
+    }
+}
 /// The shortest the window is ever made, in dp: the pinned footer and a sliver
 /// of body. It is only a floor against a failed or absurd monitor query (see
 /// `fitted_height_for_work_px`); a real work area is always taller, and a
@@ -1128,6 +1179,28 @@ const GROUP_LABEL_TOP: i32 = 20; // room for the groupbox caption
 const LABEL_W: i32 = 130;
 const BTN_W: i32 = 100;
 const BTN_H: i32 = 28;
+
+/// The DPI the Settings window lays out at: the window's real one, floored
+/// at 1. Every layout call goes through here so the UI gallery can simulate
+/// another display scale (`--dpi`, issue #745); debug and test builds only.
+fn dpi_for(hwnd: HWND) -> u32 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(dpi) = forced_dpi() {
+        return dpi;
+    }
+    unsafe { GetDpiForWindow(hwnd) }.max(1)
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The gallery's simulated DPI for this thread's Settings window, if any.
+    static FORCED_DPI: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, debug_assertions))]
+fn forced_dpi() -> Option<u32> {
+    FORCED_DPI.with(std::cell::Cell::get)
+}
 
 fn to_px(dp: i32, dpi: u32) -> i32 {
     ((dp as i64 * dpi as i64 + 48) / 96) as i32
@@ -1687,7 +1760,7 @@ unsafe extern "system" fn body_wndproc(
         WM_VSCROLL => {
             let si = body_scroll_info(hwnd);
             if si.nPage != 0 {
-                let dpi = GetDpiForWindow(hwnd).max(1);
+                let dpi = dpi_for(hwnd);
                 let max = max_scroll(si.nMax + 1, si.nPage as i32);
                 let target = scroll_request_target(
                     (wparam.0 & 0xFFFF) as u32,
@@ -1824,7 +1897,7 @@ unsafe fn ensure_visible(body: HWND, ctrl: HWND) {
     }
     // Room above for the group's caption (and the window's top margin for the
     // first group), a little below.
-    let dpi = GetDpiForWindow(body).max(1);
+    let dpi = dpi_for(body);
     let pad_top = to_px(GROUP_LABEL_TOP + MARGIN, dpi);
     let pad_bottom = to_px(ROW_GAP, dpi);
     let new = scroll_into_view(
@@ -1888,10 +1961,7 @@ unsafe fn scroll_with_wheel(main: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
         return false;
     }
     let delta = ((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-    scroll_body_to(
-        body,
-        si.nPos + wheel_scroll_px(delta, GetDpiForWindow(main).max(1)),
-    );
+    scroll_body_to(body, si.nPos + wheel_scroll_px(delta, dpi_for(main)));
     true
 }
 
@@ -2230,9 +2300,11 @@ fn fill_model_combo(hwnd: HWND, models: &[String], active: &str) {
     for m in &list {
         combo_add(hwnd, m);
     }
-    combo_select(hwnd, active);
-    if unsafe { SendMessageW(hwnd, CB_GETCURSEL, None, None).0 } < 0 && !list.is_empty() {
-        combo_select_index(hwnd, 0);
+    // Exact match by position: CB_SELECTSTRING matches a prefix, which opened
+    // "gpt-5" as "gpt-5.5" (#775). `active` is always in `list` unless empty.
+    let index = list.iter().position(|m| *m == active).unwrap_or(0);
+    if !list.is_empty() {
+        combo_select_index(hwnd, index as i32);
     }
 }
 
@@ -2389,7 +2461,7 @@ fn spawn_cloud_models_fetch(
     sync: std::sync::Arc<CloudSync>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    if crate::mode::is_offline_now() {
+    if !cloud_list_allowed(crate::mode::current()) {
         return;
     }
     let keys = [
@@ -2455,6 +2527,19 @@ fn key_to_fetch(original: &str, form_text: &str, last_fetched: &str) -> Option<S
     Some(key.to_string())
 }
 
+/// Whether a typed `key` has the shape of vendor `index`'s keys (#678), so a
+/// key pasted into the wrong vendor's field is not sent to that vendor.
+/// OpenAI keys start `sk-` (Anthropic's `sk-ant-` do not count), Anthropic's
+/// `sk-ant-`, Gemini's `AIza`.
+fn key_fits_vendor(index: usize, key: &str) -> bool {
+    let key = key.trim();
+    match index {
+        0 => key.starts_with("sk-") && !key.starts_with("sk-ant-"),
+        1 => key.starts_with("sk-ant-"),
+        _ => key.starts_with("AIza"),
+    }
+}
+
 /// #585: the user left a key field. Fetch that vendor's list with what is
 /// typed now, saved or not. Nothing runs in Offline mode.
 fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
@@ -2478,7 +2563,15 @@ fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
     let Some(key) = key_to_fetch(original, &get_text(edit), &last) else {
         return;
     };
-    if crate::mode::is_offline_now() {
+    if !cloud_list_allowed(crate::mode::current()) {
+        return;
+    }
+    if !key_fits_vendor(index, &key) {
+        // No key text: the report is pasted into public issues.
+        crate::diagnostics::note_warning(&format!(
+            "Live model list skipped for {}: the typed key has an unrecognised format",
+            CLOUD_VENDORS[index].tag()
+        ));
         return;
     }
     spawn_one_cloud_fetch(
@@ -2519,16 +2612,22 @@ fn spawn_one_cloud_fetch(
                 }
             };
             // A newer fetch for this vendor started while this one ran: its
-            // result wins, so this one is dropped.
+            // result wins, so this one is dropped. The check and the store
+            // happen under one lock, so an older worker cannot pass the check
+            // and then store after a newer one finished (#678).
+            let Ok(mut guard) = slots.lock() else {
+                return;
+            };
             if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
                 return;
             }
-            if let Ok(mut guard) = slots.lock() {
-                guard[index] = Some(ids);
-            }
+            guard[index] = Some(ids);
+            // The fetched-key record is written under the same slots lock
+            // (always slots first, then keys), so it cannot go stale.
             if let Ok(mut keys) = sync.fetched_keys.lock() {
                 keys[index] = key.trim().to_string();
             }
+            drop(guard);
             post_while_open(&alive, || unsafe {
                 let _ = PostMessageW(
                     Some(HWND(hwnd_raw as *mut c_void)),
@@ -2629,12 +2728,16 @@ fn spawn_ollama_status_probe(
     let _ = std::thread::Builder::new()
         .name("settings-ollama-status".into())
         .spawn(move || {
-            let (status, listening, stock_tray) = ollama_status_line(&cfg, ollama_configured);
+            let (status, listening, stock_tray, gpu) = ollama_status_line(&cfg, ollama_configured);
             // Only searched for when nothing listens: it is not needed
             // otherwise.
             let installed = !listening && ollama_installed();
             let section = ollama_section(status, listening, installed, ollama_configured);
             let section = without_link_for_stock_tray(section, stock_tray);
+            let section = with_gpu_fix(
+                section,
+                gpu_fix_offer(listening, stock_tray, gpu, &cfg.base_url),
+            );
             if let Ok(mut guard) = slot.lock() {
                 *guard = Some(section);
             }
@@ -2656,11 +2759,14 @@ fn apply_ollama_section(inner: &mut SettingsInner, section: &OllamaSection) {
         set_text(status, &section.text);
     }
     inner.ollama_link_url = section.link.map(|(_, url)| url);
+    inner.ollama_fix = section.fix;
     if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
-        if let Some((label, _)) = section.link {
+        if section.fix {
+            set_text(link, "Fix it");
+        } else if let Some((label, _)) = section.link {
             set_text(link, label);
         }
-        let cmd = if section.link.is_some() {
+        let cmd = if section.link.is_some() || section.fix {
             SW_SHOW
         } else {
             SW_HIDE
@@ -2937,6 +3043,9 @@ struct OllamaSection {
     text: String,
     /// `(button label, url)`.
     link: Option<(&'static str, &'static str)>,
+    /// #382: the button is "Fix it" (Ollama is on the CPU of an Intel GPU
+    /// machine), not a link.
+    fix: bool,
 }
 
 /// Turns the status line into an actionable section (#343). `status` is the
@@ -2959,11 +3068,13 @@ fn ollama_section(
                 text: "Ollama is installed but not running. Start Ollama, then reopen Settings."
                     .to_string(),
                 link: None,
+                fix: false,
             }
         } else {
             OllamaSection {
                 text: "Ollama runs AI models on this PC, free and offline.".to_string(),
                 link: Some(("Get Ollama", OLLAMA_DOWNLOAD_URL)),
+                fix: false,
             }
         };
     }
@@ -2978,6 +3089,7 @@ fn ollama_section(
     OllamaSection {
         text,
         link: Some(("Local models", OLLAMA_DOCS_URL)),
+        fix: false,
     }
 }
 
@@ -2989,6 +3101,146 @@ fn without_link_for_stock_tray(mut section: OllamaSection, stock_tray: bool) -> 
         section.link = None;
     }
     section
+}
+
+/// #382: the text of the "Fix it" offer, or `None` when it is not offered:
+/// an Intel GPU is present (DXGI vendor id), Ollama is on the CPU, the server
+/// is on this machine (the fix stops local processes), no fix is already
+/// running, and this is not portable mode (#130 makes no registry writes).
+fn gpu_fix_offer(
+    listening: bool,
+    stock_tray: bool,
+    gpu: Option<GpuStatus>,
+    base_url: &str,
+) -> Option<String> {
+    let kind = match (listening, stock_tray) {
+        (false, _) => None,
+        (true, true) => Some(ListenerKind::StockTrayServer),
+        (true, false) => Some(ListenerKind::Other),
+    };
+    // Cheap checks first: only enumerate adapters when it could matter.
+    if !ollama_gpu_fix::should_offer_fix(true, kind, gpu)
+        || !ollama_gpu_fix::is_loopback_base_url(base_url)
+        || ollama_gpu_fix::is_running()
+        || crate::portable::is_portable()
+    {
+        return None;
+    }
+    if !ollama_gpu_fix::has_intel_gpu(&ollama_gpu_fix::adapter_vendor_ids()) {
+        return None;
+    }
+    Some(ollama_gpu_fix::offer_text(
+        ollama_gpu_fix::current_user_value().as_deref(),
+    ))
+}
+
+/// #382: swaps the section for the fix offer: the text says what the button
+/// will do, and the button is "Fix it" instead of a link.
+fn with_gpu_fix(mut section: OllamaSection, offer: Option<String>) -> OllamaSection {
+    if let Some(text) = offer {
+        section.text = text;
+        section.link = None;
+        section.fix = true;
+    }
+    section
+}
+
+/// #382: the "Fix it" click. Runs [`ollama_gpu_fix::run_fix`] on a worker
+/// (it stops and starts Ollama and can take a minute), showing each step in
+/// the status text through the same slot and message the probe uses. The
+/// button is hidden while it runs and comes back only if the result says to
+/// try again. Not run in tests: it kills real processes.
+fn start_gpu_fix(inner: &mut SettingsInner) {
+    inner.ollama_fix = false;
+    // Hidden first, so a refusal below never leaves a dead "Fix it".
+    if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
+        unsafe {
+            let _ = ShowWindow(link, SW_HIDE);
+        }
+    }
+    let cfg = inner.original.providers.ollama.clone();
+    // Refuse before touching anything, and say so inline (rule 7).
+    let refusal = if !ollama_gpu_fix::is_loopback_base_url(&cfg.base_url) {
+        Some("The fix only works on an Ollama running on this PC.")
+    } else {
+        None
+    };
+    let guard = if refusal.is_none() {
+        ollama_gpu_fix::try_begin()
+    } else {
+        None
+    };
+    if guard.is_none() {
+        let msg = refusal.unwrap_or("A fix is already running.");
+        if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
+            set_text(status, msg);
+        }
+        return;
+    }
+    if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
+        unsafe {
+            let _ = ShowWindow(link, SW_HIDE);
+        }
+    }
+    if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
+        set_text(status, ollama_gpu_fix::RUNNING_TEXT);
+    }
+    let slot = inner.ollama_status.clone();
+    let alive = inner.alive.clone();
+    let hwnd_raw = inner.hwnd.0 as isize;
+    let post = move |slot: &OllamaStatusSlot, section: OllamaSection| {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(section);
+        }
+        post_while_open(&alive, || unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd_raw as *mut c_void)),
+                WM_OLLAMA_STATUS,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        });
+    };
+    let spawned = std::thread::Builder::new()
+        .name("settings-ollama-gpu-fix".into())
+        .spawn(move || {
+            let _guard = guard;
+            let mut sys = ollama_gpu_fix::RealSystem {
+                port: ollama_admin::port_from_base_url(&cfg.base_url).unwrap_or(11434),
+                base_url: cfg.base_url.clone(),
+                model: cfg.model.clone(),
+            };
+            let mut step = |line: &str| {
+                post(
+                    &slot,
+                    OllamaSection {
+                        text: format!("Fixing: {line}"),
+                        link: None,
+                        fix: false,
+                    },
+                )
+            };
+            let outcome = ollama_gpu_fix::run_fix(
+                &mut sys,
+                ollama_gpu_fix::default_exe(),
+                &ollama_gpu_fix::trusted_roots(),
+                &mut step,
+            );
+            post(
+                &slot,
+                OllamaSection {
+                    text: outcome.message(),
+                    link: None,
+                    fix: outcome.retryable(),
+                },
+            );
+        });
+    if spawned.is_err() {
+        // Rule 7: say so inline. Nothing was touched.
+        if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
+            set_text(status, "Could not start the fix. Nothing was changed.");
+        }
+    }
 }
 
 /// Where an Ollama install would be (#343): the default per-user install
@@ -3112,7 +3364,10 @@ fn health_message(health: &OllamaHealth) -> String {
 /// can make (`/api/ps`, `/api/tags`) only run when
 /// [`should_query_ollama_details`] says so (#188), and are bounded by
 /// [`OLLAMA_STATUS_HTTP_BUDGET`] in total when they do.
-fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, bool, bool) {
+fn ollama_status_line(
+    cfg: &OllamaConfig,
+    ollama_configured: bool,
+) -> (String, bool, bool, Option<GpuStatus>) {
     let port = ollama_admin::port_from_base_url(&cfg.base_url).unwrap_or(11434);
     let health = ollama_admin::query_ollama_health(port);
     let health_msg = health_message(&health);
@@ -3127,18 +3382,23 @@ fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, b
     );
 
     if !should_query_ollama_details(ollama_configured, &health) {
-        return (health_msg, listening, stock);
+        return (health_msg, listening, stock, None);
     }
 
     let budget_start = std::time::Instant::now();
-    let gpu_line = match ollama_admin::ps_with_timeout(&cfg.base_url, OLLAMA_STATUS_HTTP_BUDGET) {
-        Ok(entries) => match ollama_admin::gpu_status_for(&entries, &cfg.model) {
-            GpuStatus::Gpu => format!("{} is loaded on GPU.", cfg.model),
-            GpuStatus::Cpu => format!("{} is loaded on CPU.", cfg.model),
-            GpuStatus::NotLoaded => format!("{} is not loaded yet.", cfg.model),
-        },
-        Err(_) => return (health_msg, listening, stock),
-    };
+    let (gpu, gpu_line) =
+        match ollama_admin::ps_with_timeout(&cfg.base_url, OLLAMA_STATUS_HTTP_BUDGET) {
+            Ok(entries) => {
+                let gpu = ollama_admin::gpu_status_for(&entries, &cfg.model);
+                let line = match gpu {
+                    GpuStatus::Gpu => format!("{} is loaded on GPU.", cfg.model),
+                    GpuStatus::Cpu => format!("{} is loaded on CPU.", cfg.model),
+                    GpuStatus::NotLoaded => format!("{} is not loaded yet.", cfg.model),
+                };
+                (gpu, line)
+            }
+            Err(_) => return (health_msg, listening, stock, None),
+        };
 
     // Whatever's left of the budget after `/api/ps`, capped at zero rather
     // than going negative -- a slow first call must not hand the second
@@ -3166,6 +3426,7 @@ fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, b
         join_within(OLLAMA_TEXT_BUDGET, &[&health_msg, &gpu_line, &vision_line]),
         listening,
         stock,
+        Some(gpu),
     )
 }
 
@@ -3520,7 +3781,7 @@ fn build_ui_recorded(
     // Ollama's list comes from what is pulled, so this sits above its row.
     ctx.create(
         WC_STATIC,
-        MODEL_LIST_HINT,
+        model_list_hint_for(config.mode),
         0,
         0,
         r.x,
@@ -3779,6 +4040,12 @@ fn build_ui_recorded(
         ID_AUTOSTART,
     );
     set_checkbox(autostart, crate::autostart::is_enabled());
+    // Portable mode (#130) makes no registry writes, so the switch is greyed.
+    if crate::portable::is_portable() {
+        unsafe {
+            let _ = EnableWindow(autostart, false);
+        }
+    }
     r.advance();
 
     let hotkeys_bottom = r.y + 4;
@@ -4123,7 +4390,7 @@ fn build_ui_recorded(
     let content_top_dp = footer.prompt_top;
     let prompt_edit = ctx.create(
         WC_EDIT,
-        &config.ui.prompt,
+        &prompt_to_edit(&config.ui.prompt),
         (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) as u32,
         WS_EX_BORDER,
         content_x + MARGIN,
@@ -4203,7 +4470,7 @@ fn build_ui_recorded(
     let validation = ctx.create(
         WC_STATIC,
         "",
-        0,
+        0x4000, // SS_ENDELLIPSIS
         0,
         content_x + MARGIN,
         buttons_y + (BTN_H - ROW_H) / 2,
@@ -4212,6 +4479,8 @@ fn build_ui_recorded(
         ID_VALIDATION_MESSAGE,
     );
     ctx.set_anchor(validation, Anchor::Footer);
+    // #778: a key an environment variable overrides cannot be edited here.
+    lock_env_key_fields(hwnd);
     let cancel = ctx.create(
         WC_BUTTON,
         "Cancel",
@@ -4402,7 +4671,7 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
             .map(|h| unsafe { SendMessageW(h, TBM_GETPOS, None, None).0 as f32 / 100.0 })
             .unwrap_or(inner.original.ui.text_scale),
         prompt: get_dlg_item(hwnd, ID_PROMPT_EDIT)
-            .map(get_text)
+            .map(|h| prompt_from_edit(&get_text(h)))
             .unwrap_or_default(),
         require_tick_for: combo_selected_text(hwnd, ID_REQUIRE_TICK_FOR),
         card_corner: combo_selected_text(hwnd, ID_CARD_CORNER),
@@ -4613,11 +4882,7 @@ fn choice_from_order(order: &[String]) -> usize {
 /// instead of showing ChatGPT as if it were the active provider. An empty
 /// order still reads as ChatGPT, the default.
 fn combo_index_for_order(order: &[String]) -> i32 {
-    match ActiveProvider::leading(order) {
-        Some(p) => p.index() as i32,
-        None if order.is_empty() => 0,
-        None => -1,
-    }
+    ActiveProvider::shown_for(order).map_or(-1, |p| p.index() as i32)
 }
 
 /// #194: `build_config`'s provider-order merge. `choice` (the Settings
@@ -5096,6 +5361,94 @@ fn resolve_key_field(original: &str, form_text: &str) -> String {
     }
 }
 
+// Test seam: the env var names to treat as set, instead of the process
+// environment (which is shared by every test thread).
+#[cfg(test)]
+thread_local! {
+    static ENV_KEYS_SET: std::cell::RefCell<Option<Vec<&'static str>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn env_var_is_set(var: &str) -> bool {
+    #[cfg(test)]
+    if let Some(set) = ENV_KEYS_SET.with(|c| c.borrow().clone()) {
+        return set.contains(&var);
+    }
+    std::env::var(var).is_ok()
+}
+
+/// The key fields whose environment variable is set (#778): the variable wins
+/// over the stored key, so a key typed here would never be used or saved.
+/// Pairs the field's control id with the variable name.
+fn env_locked_key_fields() -> Vec<(i32, &'static str)> {
+    let fields = [
+        ("openai", ID_OPENAI_KEY),
+        ("anthropic", ID_ANTHROPIC_KEY),
+        ("gemini", ID_GEMINI_KEY),
+    ];
+    crate::config::ENV_OVERRIDE_VARS
+        .iter()
+        .filter(|(_, var)| env_var_is_set(var))
+        .filter_map(|(provider, var)| {
+            fields
+                .iter()
+                .find(|(p, _)| p == provider)
+                .map(|(_, id)| (*id, *var))
+        })
+        .collect()
+}
+
+/// The line Settings shows while `vars` are set in the environment. Short:
+/// it shares the footer row with the buttons.
+fn env_key_hint(vars: &[&str]) -> String {
+    match vars {
+        [] => String::new(),
+        [one] => format!("{one} is set and wins over this field."),
+        _ => "Environment API keys are set and win over these fields.".to_string(),
+    }
+}
+
+/// Greys out the key fields an environment variable overrides and says why
+/// in the footer message (#778).
+fn lock_env_key_fields(hwnd: HWND) {
+    let locked = env_locked_key_fields();
+    for (id, _) in &locked {
+        if let Some(edit) = get_dlg_item(hwnd, *id) {
+            unsafe {
+                let _ = EnableWindow(edit, false);
+            }
+        }
+    }
+    if let Some(msg) = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE) {
+        set_text(msg, &env_key_hint(&env_hint_vars()));
+    }
+}
+
+/// The names of the set key variables, for [`env_key_hint`].
+fn env_hint_vars() -> Vec<&'static str> {
+    env_locked_key_fields()
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect()
+}
+
+/// What Save says when the start-with-Windows switch could not be changed
+/// (#777). The window stays open so nothing is lost.
+fn autostart_failure_message() -> &'static str {
+    "Could not change Start with Windows."
+}
+
+/// The prompt as the multiline edit wants it: CRLF line breaks (#779). The
+/// edit shows a bare LF as a box and does not break the line.
+fn prompt_to_edit(prompt: &str) -> String {
+    prompt.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+/// The prompt as saved: LF line breaks only (#779).
+fn prompt_from_edit(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 /// Merges parsed form values onto a clone of `original`. Any field the form
 /// could not produce a sane value for (a blank combo selection, unparsable
 /// numeric text) falls back to the value already in `original` rather than
@@ -5103,7 +5456,11 @@ fn resolve_key_field(original: &str, form_text: &str) -> String {
 fn build_config(original: &Config, raw: &RawForm) -> Config {
     let mut cfg = original.clone();
 
-    cfg.providers.order = merge_provider_order(&original.providers.order, raw.provider_choice);
+    // Only a changed selection touches the order: an untouched Save must not
+    // add a vendor the user left out on purpose (#780).
+    if raw.provider_choice as i32 != combo_index_for_order(&original.providers.order) {
+        cfg.providers.order = merge_provider_order(&original.providers.order, raw.provider_choice);
+    }
 
     let ollama_model = strip_vision_badge(raw.ollama_model.trim());
     if !ollama_model.is_empty() {
@@ -5144,12 +5501,21 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     }
 
     cfg.ui.card_seconds = parse_u32_or(&raw.card_seconds_text, original.ui.card_seconds);
-    cfg.ui.text_scale = clamp_text_scale(raw.text_scale_raw);
-    cfg.ui.prompt = if raw.prompt.trim().is_empty() {
-        original.ui.prompt.clone()
+    // The slider works in whole percent, so an untouched slider keeps a
+    // hand-edited value it cannot show (2.5, 0.4, 1.255).
+    let pct = |v: f32| (clamp_text_scale(v) * 100.0).round() as i32;
+    cfg.ui.text_scale = if pct(raw.text_scale_raw) == pct(original.ui.text_scale) {
+        original.ui.text_scale
     } else {
-        raw.prompt.clone()
+        clamp_text_scale(raw.text_scale_raw)
     };
+    // An unchanged box keeps the stored prompt byte for byte, CRLF or LF.
+    cfg.ui.prompt =
+        if raw.prompt.trim().is_empty() || raw.prompt == prompt_from_edit(&original.ui.prompt) {
+            original.ui.prompt.clone()
+        } else {
+            raw.prompt.clone()
+        };
 
     cfg.ui.card_corner = label_to_card_corner(&raw.card_corner).unwrap_or(original.ui.card_corner);
     if let Some(v) = label_to_card_monitor(&raw.card_monitor) {
@@ -5220,8 +5586,10 @@ pub struct GalleryWindow {
 
 #[cfg(debug_assertions)]
 impl GalleryWindow {
-    /// Opens the window and shows it without taking focus.
-    pub fn open(instance: HINSTANCE) -> Option<GalleryWindow> {
+    /// Opens the window and shows it without taking focus. `dpi` lays it out
+    /// at that DPI whatever the monitor says (the gallery's `--dpi`); `None`
+    /// uses the window's own.
+    pub fn open(instance: HINSTANCE, dpi: Option<u32>) -> Option<GalleryWindow> {
         static ONCE: std::sync::Once = std::sync::Once::new();
         static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         ONCE.call_once(|| {
@@ -5231,6 +5599,7 @@ impl GalleryWindow {
             return None;
         }
         ensure_common_controls();
+        FORCED_DPI.with(|f| f.set(dpi.map(|d| d.max(1))));
 
         let config = Config::default();
         let raw = Box::into_raw(Box::new(SettingsInner::new(config.clone())));
@@ -5253,6 +5622,7 @@ impl GalleryWindow {
             )
         };
         let Ok(hwnd) = created else {
+            FORCED_DPI.with(|f| f.set(None));
             unsafe { drop(Box::from_raw(raw)) };
             return None;
         };
@@ -5260,7 +5630,7 @@ impl GalleryWindow {
         let gallery = GalleryWindow { raw };
         let inner = unsafe { &mut *raw };
         inner.hwnd = hwnd;
-        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        let dpi = dpi_for(hwnd);
         inner.font = build_font(dpi);
         let fitted_h = fitted_height_dp(hwnd, dpi);
         unsafe {
@@ -5331,6 +5701,7 @@ impl GalleryWindow {
 impl Drop for GalleryWindow {
     fn drop(&mut self) {
         // WM_DESTROY frees the font and flags the close; the Box is ours.
+        FORCED_DPI.with(|f| f.set(None));
         unsafe {
             let _ = DestroyWindow((*self.raw).hwnd);
             drop(Box::from_raw(self.raw));
@@ -5404,8 +5775,37 @@ mod tests {
         };
         assert_eq!(
             ollama_status_line(&cfg, true),
-            ("Ollama is not running.".to_string(), false, false)
+            ("Ollama is not running.".to_string(), false, false, None)
         );
+    }
+
+    // -- GPU fix section (#382, pure) ---------------------------------------
+
+    #[test]
+    fn with_gpu_fix_replaces_the_text_and_makes_the_button_a_fix() {
+        let running = ollama_section("Ollama is running.".to_string(), true, true, true);
+        let fixed = with_gpu_fix(running.clone(), Some("offer".to_string()));
+        assert!(fixed.fix);
+        assert_eq!(fixed.link, None);
+        assert_eq!(fixed.text, "offer");
+        assert_eq!(with_gpu_fix(running.clone(), None), running);
+    }
+
+    #[test]
+    fn the_gpu_fix_offer_is_never_made_when_nothing_listens() {
+        let url = "http://127.0.0.1:11434";
+        assert_eq!(gpu_fix_offer(false, false, None, url), None);
+        assert_eq!(gpu_fix_offer(true, false, Some(GpuStatus::Gpu), url), None);
+    }
+
+    #[test]
+    fn the_gpu_fix_offer_is_never_made_for_a_remote_server() {
+        let remote = "http://192.168.1.5:11434";
+        assert_eq!(
+            gpu_fix_offer(true, false, Some(GpuStatus::Cpu), remote),
+            None
+        );
+        assert_eq!(gpu_fix_offer(true, true, None, remote), None);
     }
 
     // -- ollama_section (#343, pure) ---------------------------------------
@@ -6080,7 +6480,7 @@ mod tests {
             effort: "low".to_string(),
         };
 
-        let (status, _, _) = ollama_status_line(&cfg, false);
+        let (status, _, _, _) = ollama_status_line(&cfg, false);
         // The Win32-only health check still runs (it's cheap) and is all
         // this status line shows when not configured -- no GPU/CPU or
         // vision-count sentence appended, which is what the HTTP calls
@@ -6315,10 +6715,47 @@ mod tests {
         );
     }
 
+    /// #678: a key typed into the wrong vendor's field is not fetched with.
+    #[test]
+    fn a_typed_key_is_fetched_only_for_its_own_vendor() {
+        let anthropic = "sk-ant-api03-xyz";
+        let openai = "sk-proj-abc";
+        let gemini = "AIzaSyABC";
+        assert!(key_fits_vendor(0, openai));
+        assert!(!key_fits_vendor(0, anthropic));
+        assert!(!key_fits_vendor(0, gemini));
+        assert!(key_fits_vendor(1, anthropic));
+        assert!(!key_fits_vendor(1, openai));
+        assert!(key_fits_vendor(2, &format!(" {gemini} ")));
+        assert!(!key_fits_vendor(2, openai));
+        assert!(!key_fits_vendor(0, ""));
+    }
+
     #[test]
     fn the_model_list_hint_is_one_short_line_without_a_dash() {
-        assert!(MODEL_LIST_HINT.len() <= 64, "it must fit one row");
-        assert!(!MODEL_LIST_HINT.contains('\u{2014}'));
+        for h in [
+            MODEL_LIST_HINT,
+            MODEL_LIST_HINT_LOCAL,
+            MODEL_LIST_HINT_OFFLINE,
+        ] {
+            assert!(h.len() <= 64, "it must fit one row: {h}");
+            assert!(!h.contains('\u{2014}'));
+        }
+    }
+
+    /// #674: only Auto and Cloud may ask a cloud vendor for its model list,
+    /// and Local and Offline say why they do not.
+    #[test]
+    fn cloud_lists_are_skipped_in_local_and_offline_with_a_reason() {
+        use crate::mode::Mode;
+        assert!(cloud_list_allowed(Mode::Auto));
+        assert!(cloud_list_allowed(Mode::Cloud));
+        assert!(!cloud_list_allowed(Mode::Local));
+        assert!(!cloud_list_allowed(Mode::Offline));
+        assert_eq!(model_list_hint_for(Mode::Auto), MODEL_LIST_HINT);
+        assert_eq!(model_list_hint_for(Mode::Cloud), MODEL_LIST_HINT);
+        assert!(model_list_hint_for(Mode::Local).starts_with("Local"));
+        assert!(model_list_hint_for(Mode::Offline).starts_with("Offline"));
     }
 
     /// #427 wired-to-nothing: the hint is a real control in the built window,
@@ -6707,6 +7144,184 @@ mod tests {
         original.providers.order = names(&["gemini", "openai", "anthropic"]);
         let cfg = build_config(&original, &raw_from(&original));
         assert_eq!(cfg.providers.order, original.providers.order);
+    }
+
+    // -- untouched Save is a no-op (#775, #779, #780) ----------------------
+
+    /// A config that exercises the fields an untouched Save used to change.
+    fn round_trip_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.providers.order = names(&["openai", "gemini"]);
+        cfg.providers.openai.model = "gpt-5".to_string();
+        cfg.ui.prompt = "line one\nline two\n\nline four".to_string();
+        cfg.ui.card_seconds = 9;
+        cfg.ui.text_scale = 1.25;
+        cfg
+    }
+
+    #[test]
+    fn an_untouched_save_never_adds_a_vendor_to_the_order() {
+        for order in [
+            vec!["openai"],
+            vec!["anthropic"],
+            vec!["openai", "gemini"],
+            vec!["ollama"],
+            vec!["gemini", "anthropic"],
+        ] {
+            let mut original = Config::default();
+            original.providers.order = names(&order);
+            let cfg = build_config(&original, &raw_from(&original));
+            assert_eq!(cfg.providers.order, original.providers.order, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn choosing_a_provider_still_changes_the_order() {
+        let mut original = Config::default();
+        original.providers.order = names(&["openai"]);
+        let mut raw = raw_from(&original);
+        raw.provider_choice = 1;
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.order, names(&["anthropic", "openai"]));
+    }
+
+    #[test]
+    fn an_untouched_save_keeps_a_hand_edited_text_scale_and_a_crlf_prompt() {
+        for scale in [2.5_f32, 0.4, 1.255] {
+            let mut original = Config::default();
+            original.ui.text_scale = scale;
+            original.ui.prompt = "one\r\ntwo".to_string();
+            // What the form reads back: the slider in whole percent.
+            let mut raw = raw_from(&original);
+            raw.text_scale_raw = (clamp_text_scale(scale) * 100.0).round() / 100.0;
+            raw.prompt = prompt_from_edit(&prompt_to_edit(&original.ui.prompt));
+            let cfg = build_config(&original, &raw);
+            assert_eq!(cfg.ui.text_scale, scale);
+            assert_eq!(cfg.ui.prompt, "one\r\ntwo");
+            // Moving the slider still changes it.
+            raw.text_scale_raw = 1.0;
+            assert_eq!(build_config(&original, &raw).ui.text_scale, 1.0);
+        }
+    }
+
+    #[test]
+    fn enter_and_esc_with_a_dropdown_open_do_not_save_or_cancel_the_window() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IsWindow, PeekMessageW, PM_REMOVE, SW_SHOWNA, WM_KEYDOWN,
+        };
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let combo = get_dlg_item(hwnd, ID_OPENAI_MODEL).unwrap();
+            for key in [VK_ESCAPE, VK_RETURN] {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOWNA);
+                    SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(1)), None);
+                }
+                assert!(unsafe { wheel_over_open_combo(combo) }, "list did not open");
+                let msg = MSG {
+                    hwnd: combo,
+                    message: WM_KEYDOWN,
+                    wParam: WPARAM(key.0 as usize),
+                    ..Default::default()
+                };
+                assert!(unsafe { handle_key(hwnd, &msg, inner.prompt_edit) });
+                // No Save or Cancel was queued, and the window is alive.
+                let mut queued = MSG::default();
+                let posted = unsafe {
+                    PeekMessageW(&mut queued, Some(hwnd), WM_COMMAND, WM_COMMAND, PM_REMOVE)
+                };
+                assert!(!posted.as_bool(), "a command was posted for {key:?}");
+                assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
+                assert!(inner.result.is_none());
+                unsafe {
+                    SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(0)), None);
+                }
+            }
+            // With the list closed, Esc still cancels the window.
+            let msg = MSG {
+                hwnd: combo,
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_ESCAPE.0 as usize),
+                ..Default::default()
+            };
+            assert!(unsafe { handle_key(hwnd, &msg, inner.prompt_edit) });
+            let mut queued = MSG::default();
+            let posted =
+                unsafe { PeekMessageW(&mut queued, Some(hwnd), WM_COMMAND, WM_COMMAND, PM_REMOVE) };
+            assert!(posted.as_bool());
+        });
+    }
+
+    #[test]
+    fn the_env_hint_survives_a_save_that_clears_other_messages() {
+        ENV_KEYS_SET.with(|c| *c.borrow_mut() = Some(vec!["GEMINI_API_KEY"]));
+        assert_eq!(env_hint_vars(), vec!["GEMINI_API_KEY"]);
+        ENV_KEYS_SET.with(|c| *c.borrow_mut() = None);
+    }
+
+    #[test]
+    fn the_prompt_box_text_uses_crlf_and_the_saved_prompt_uses_lf() {
+        assert_eq!(prompt_to_edit("a\nb\n\nc"), "a\r\nb\r\n\r\nc");
+        assert_eq!(prompt_to_edit("a\r\nb"), "a\r\nb");
+        assert_eq!(prompt_from_edit("a\r\nb\r\n\r\nc"), "a\nb\n\nc");
+        assert_eq!(prompt_from_edit(&prompt_to_edit("x\ny")), "x\ny");
+    }
+
+    #[test]
+    fn the_env_hint_names_the_variable_and_has_no_dash() {
+        assert_eq!(env_key_hint(&[]), "");
+        let one = env_key_hint(&["OPENAI_API_KEY"]);
+        assert!(one.contains("OPENAI_API_KEY"), "{one}");
+        let many = env_key_hint(&["OPENAI_API_KEY", "GEMINI_API_KEY"]);
+        assert!(!many.is_empty());
+        assert!(!one.contains('\u{2014}') && !many.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn an_autostart_failure_message_is_plain_and_has_no_dash() {
+        let m = autostart_failure_message();
+        assert!(
+            !m.is_empty() && m.len() <= 45 && !m.contains('\u{2014}'),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn a_model_that_prefixes_a_listed_one_opens_as_itself() {
+        let cfg = round_trip_config();
+        assert!(cfg.providers.openai.models.iter().any(|m| m == "gpt-5"));
+        assert!(cfg.providers.openai.models.iter().any(|m| m == "gpt-5.5"));
+        with_window(cfg, |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            assert_eq!(read_form(inner).providers.openai.model, "gpt-5");
+        });
+    }
+
+    #[test]
+    fn opening_settings_and_saving_with_no_edits_changes_nothing() {
+        let original = round_trip_config();
+        with_window(original.clone(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            assert_eq!(read_form(inner), original);
+            // The multiline prompt shows real line breaks.
+            let shown = get_text(get_dlg_item(hwnd, ID_PROMPT_EDIT).unwrap());
+            assert_eq!(shown, "line one\r\nline two\r\n\r\nline four");
+        });
+    }
+
+    #[test]
+    fn an_env_set_key_field_is_disabled_and_the_window_says_why() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+        ENV_KEYS_SET.with(|c| *c.borrow_mut() = Some(vec!["OPENAI_API_KEY"]));
+        with_window(Config::default(), |hwnd, _raw| {
+            let key = get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap();
+            let other = get_dlg_item(hwnd, ID_ANTHROPIC_KEY).unwrap();
+            assert!(!unsafe { IsWindowEnabled(key) }.as_bool());
+            assert!(unsafe { IsWindowEnabled(other) }.as_bool());
+            let msg = get_text(get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).unwrap());
+            assert!(msg.contains("OPENAI_API_KEY"), "{msg}");
+        });
+        ENV_KEYS_SET.with(|c| *c.borrow_mut() = None);
     }
 
     #[test]
@@ -7690,7 +8305,7 @@ mod tests {
 
         let prompt_edit = build_ui(hwnd, instance, dpi, inner_ref.font, &config, WIN_H_DP);
         assert!(!prompt_edit.0.is_null());
-        assert_eq!(get_text(prompt_edit), config.ui.prompt);
+        assert_eq!(get_text(prompt_edit), prompt_to_edit(&config.ui.prompt));
 
         // Exercise a value round trip through the real controls.
         set_text(prompt_edit, "hello from a test");
@@ -7923,6 +8538,43 @@ mod tests {
             let _ = DestroyWindow(hwnd);
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
+    }
+
+    // -- gallery DPI seam (#745) -------------------------------------------
+
+    /// #745 wired check: a gallery Settings window opened at 240 DPI lays
+    /// out at 240 (inner.dpi, `dpi_for`, the Save button's width), is
+    /// bigger than one at 96, and a `WM_DPICHANGED` cannot replace it. If the
+    /// override were wired to nothing, both buttons would be the same size.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_forced_gallery_dpi_lays_settings_out_at_that_dpi() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let save_w = |w: &GalleryWindow| {
+            let save = get_dlg_item(w.hwnd(), ID_SAVE).expect("Save button");
+            client_size(save).0
+        };
+        let small = GalleryWindow::open(instance, Some(96)).expect("open at 96");
+        let small_w = save_w(&small);
+        drop(small);
+        let big = GalleryWindow::open(instance, Some(240)).expect("open at 240");
+        assert_eq!(dpi_for(big.hwnd()), 240);
+        assert_eq!(unsafe { &*big.raw }.dpi, 240);
+        let big_w = save_w(&big);
+        assert!(big_w * 100 / small_w >= 235, "{small_w} -> {big_w}");
+        unsafe {
+            SendMessageW(
+                big.hwnd(),
+                WM_DPICHANGED,
+                Some(WPARAM(96 | (96 << 16))),
+                Some(LPARAM(0)),
+            );
+        }
+        assert_eq!(unsafe { &*big.raw }.dpi, 240, "a DPI message must not win");
+        drop(big);
+        assert_eq!(forced_dpi(), None, "closing the window clears the override");
     }
 
     // -- WM_DPICHANGED (#233) ---------------------------------------------
@@ -8390,7 +9042,10 @@ mod tests {
         // a short screen; the scrolling content is what grows.
         assert!(top_in_parent_px(hwnd, save) >= collapsed_save_y);
         assert!(content() > collapsed_content, "the body did not grow");
-        assert_eq!(get_text(prompt), Config::default().ui.prompt);
+        assert_eq!(
+            get_text(prompt),
+            prompt_to_edit(&Config::default().ui.prompt)
+        );
 
         click();
         assert!(!visible(prompt) && !visible(reset));
@@ -8398,7 +9053,10 @@ mod tests {
         assert_eq!(top_in_parent_px(hwnd, save), collapsed_save_y);
         assert_eq!(content(), collapsed_content);
         // Hidden text is still readable, so Save keeps it.
-        assert_eq!(get_text(prompt), Config::default().ui.prompt);
+        assert_eq!(
+            get_text(prompt),
+            prompt_to_edit(&Config::default().ui.prompt)
+        );
     }
 
     /// #481: the window's direct children are the pinned footer controls and

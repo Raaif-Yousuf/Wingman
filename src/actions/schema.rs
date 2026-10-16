@@ -27,6 +27,24 @@
 
 use serde_json::{json, Value};
 
+/// Every proposal kind [`schema_for`] answers for, so a test can walk them all.
+#[cfg(test)]
+pub(crate) const PROPOSAL_KINDS: [&str; 13] = [
+    "verdict",
+    "calendar_event",
+    "text_review",
+    "form_fill",
+    "text_answer",
+    "action_items",
+    "table",
+    "error_explanation",
+    "word_definition",
+    "page_summary",
+    "screen_explanation",
+    "time_list",
+    "scam_check",
+];
+
 /// Looks up the JSON Schema for `proposal`. `rate_difficulty` only affects
 /// `"verdict"` (whether its `difficulty` property and rubric-driven enum are
 /// present); it is accepted unconditionally rather than only for the kinds
@@ -61,6 +79,9 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "text_answer" => Some(text_answer_schema()),
         // #314: a list of action-item lines for the clipboard executor.
         "action_items" => Some(action_items_schema()),
+        // #69: header names, then rows of cells, for the clipboard executor
+        // to write as tab-separated text. Reused by the receipt (#70) and chart (#114) actions.
+        "table" => Some(table_schema()),
         // #66: a read-only explanation of an error, shown on the card.
         "error_explanation" => Some(error_explanation_schema()),
         // #75: a read-only definition of a selected word, shown on the card.
@@ -73,6 +94,8 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "time_list" => Some(time_list_schema()),
         // #312: signs, then a calibrated verdict.
         "scam_check" => Some(scam_check_schema()),
+        // #335: jargon terms with a plain meaning each, shown on the card.
+        "jargon_terms" => Some(jargon_terms_schema()),
         _ => None,
     }
 }
@@ -176,6 +199,34 @@ fn screen_explanation_schema() -> Value {
     })
 }
 
+/// The `jargon_terms` proposal schema (#335): `terms`, each a `term` copied
+/// from the screen and then its `meaning`. Property order is load-bearing
+/// (rule 3): the model names the term before it explains it, so the meaning
+/// is about the term it just copied. The lengths are clamped in code
+/// (`actions::jargon::card_text`), not in the schema. Nothing is editable:
+/// the card is read-only.
+fn jargon_terms_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "terms": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "term": {"type": "string"},
+                        "meaning": {"type": "string"}
+                    },
+                    "required": ["term", "meaning"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["terms"],
+        "additionalProperties": false
+    })
+}
+
 /// The `scam_check` proposal schema (#312): `signs`, then `verdict`. There is
 /// no advice field on purpose: the text on screen is untrusted, so what to do
 /// next is fixed card text, never model words. Property order is load-bearing (rule 3): the model lists what it
@@ -211,6 +262,26 @@ fn action_items_schema() -> Value {
             }
         },
         "required": ["items"],
+        "additionalProperties": false
+    })
+}
+
+/// The `table` proposal schema (#69): `columns` (the header names), then
+/// `rows` (a list of cell lists). Property order is load-bearing (rule 3):
+/// naming the columns first fixes how many cells each row has before the
+/// model starts filling rows. Not editable: the card lists the rows, and
+/// `executors::clipboard` writes them as tab-separated text (`actions::table::tsv_from_value`).
+fn table_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "columns": {"type": "array", "items": {"type": "string"}},
+            "rows": {
+                "type": "array",
+                "items": {"type": "array", "items": {"type": "string"}}
+            }
+        },
+        "required": ["columns", "rows"],
         "additionalProperties": false
     })
 }
@@ -587,6 +658,25 @@ mod tests {
     }
 
     #[test]
+    fn table_names_the_columns_before_the_rows() {
+        let schema = schema_for("table", false).expect("table is registered");
+        let order: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["columns", "rows"]);
+        assert_eq!(schema["required"], json!(["columns", "rows"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["rows"]["items"]["type"], "array");
+        assert_eq!(
+            schema["properties"]["rows"]["items"]["items"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
     fn error_explanation_asks_for_meaning_then_cause_then_fix() {
         let schema =
             schema_for("error_explanation", false).expect("error_explanation is registered");
@@ -643,6 +733,22 @@ mod tests {
         assert_eq!(schema["required"], json!(["detail", "headline"]));
         assert_eq!(schema["additionalProperties"], false);
         assert!(schema["properties"]["headline"].get("editable").is_none());
+    }
+
+    #[test]
+    fn jargon_terms_names_the_term_before_its_meaning() {
+        let schema = schema_for("jargon_terms", false).expect("jargon_terms is registered");
+        let item = &schema["properties"]["terms"]["items"];
+        let order: Vec<&str> = item["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["term", "meaning"]);
+        assert_eq!(item["required"], json!(["term", "meaning"]));
+        assert_eq!(item["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["terms"]));
     }
 
     #[test]

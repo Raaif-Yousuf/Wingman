@@ -37,7 +37,7 @@
 //!
 //! `app.rs`'s generic-action worker calls [`snapshot_hwnd`] (the `uia` input,
 //! #484). [`snapshot_foreground`] has no caller yet; the
-//! `#[allow(dead_code)]` attributes below date from before the wiring and
+//! Some `#[allow(dead_code)]` attributes below date from before the wiring and
 //! are harmless. Every public item is exercised by this file's own tests.
 
 use std::time::Duration;
@@ -53,7 +53,7 @@ use windows::Win32::Foundation::HWND;
 /// text/label elements, panes, ...) is walked only so it can serve as a
 /// label source for [`build_snapshot`]'s "nearest preceding Text element"
 /// fallback, never emitted itself.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlKind {
     Edit,
@@ -64,7 +64,7 @@ pub enum ControlKind {
     List,
 }
 
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 impl ControlKind {
     fn from_raw(raw: RawControlType) -> Option<Self> {
         match raw {
@@ -96,7 +96,7 @@ impl ControlKind {
 /// element" means, so the walk has to recognize it too. `Other` covers
 /// everything else (buttons, panes, ...), walked past but never labeled
 /// from and never emitted.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum RawControlType {
     Edit,
@@ -114,17 +114,21 @@ enum RawControlType {
 /// `String` containing a placeholder: it is a type error to accidentally
 /// serialize a redacted field's *real* text, because there is no real text
 /// stored in this variant to serialize.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldValue {
     Text(String),
     /// `IsPassword` was true. The real value was never read into this
     /// process for this element -- see [`com::extract`]'s doc comment.
     Redacted,
+    /// The control has a `ValuePattern` and it reads as empty.
     Empty,
+    /// The control has no `ValuePattern`, so its text could not be read. It
+    /// may hold text, so this is NOT the same as `Empty` (#675).
+    Unreadable,
 }
 
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rect {
     pub left: i32,
@@ -144,7 +148,7 @@ impl From<windows::Win32::Foundation::RECT> for Rect {
     }
 }
 
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSnapshot {
     /// The window this field was walked from, as a raw `HWND` pointer value
@@ -175,7 +179,7 @@ pub struct FieldSnapshot {
 
 /// The result of one walk: whatever fields were found within the element
 /// and time budget, plus whether the budget cut the walk short.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub fields: Vec<FieldSnapshot>,
@@ -187,7 +191,7 @@ pub struct Snapshot {
 /// produces from a real `IUIAutomationElement`, and what the tests in this
 /// file construct directly to exercise [`build_snapshot`] without any COM
 /// call.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 #[derive(Debug, Clone, Default)]
 struct RawElement {
     /// See [`FieldSnapshot::hwnd`]. Set by [`com::walk`] from the window
@@ -216,9 +220,9 @@ struct RawElement {
     focusable: bool,
 }
 
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 pub const DEFAULT_MAX_ELEMENTS: usize = 500;
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 pub const DEFAULT_BUDGET: Duration = Duration::from_millis(750);
 
 // ---------------------------------------------------------------------------
@@ -234,7 +238,7 @@ pub const DEFAULT_BUDGET: Duration = Duration::from_millis(750);
 /// element with a non-empty name is walked), else `HelpText`, else empty.
 /// Non-editable elements (including Text elements themselves) are never
 /// emitted as fields; they only ever update `last_text`.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 fn build_snapshot(elements: &[RawElement]) -> Vec<FieldSnapshot> {
     let mut last_text: Option<&str> = None;
     let mut fields = Vec::new();
@@ -273,7 +277,8 @@ fn build_snapshot(elements: &[RawElement]) -> Vec<FieldSnapshot> {
         } else {
             match &el.value {
                 Some(v) if !v.is_empty() => FieldValue::Text(v.clone()),
-                _ => FieldValue::Empty,
+                Some(_) => FieldValue::Empty,
+                None => FieldValue::Unreadable,
             }
         };
 
@@ -304,7 +309,7 @@ fn build_snapshot(elements: &[RawElement]) -> Vec<FieldSnapshot> {
 /// over the error type so this stays in the pure, no-`windows`-crate-types
 /// section and gets a plain unit test with no COM call involved;
 /// `com::extract` is the sole caller.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 fn resolve_is_password<E>(read: Result<bool, E>) -> bool {
     read.unwrap_or(true)
 }
@@ -316,7 +321,7 @@ fn resolve_is_password<E>(read: Result<bool, E>) -> bool {
 /// property in `com::extract` already behaves, instead of aborting the whole
 /// snapshot. Generic over the error type for the same reason as
 /// [`resolve_is_password`]; `com::extract` is the sole caller.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 fn resolve_control_type<E>(read: Result<RawControlType, E>) -> RawControlType {
     read.unwrap_or_default()
 }
@@ -324,7 +329,7 @@ fn resolve_control_type<E>(read: Result<RawControlType, E>) -> RawControlType {
 /// #591: an element whose fetch failed is skipped (`None`) and the snapshot is
 /// marked partial, so one bad element costs only itself instead of aborting
 /// the whole walk. Generic over the error type like [`resolve_control_type`].
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 fn skip_failed_element<T, E>(read: Result<T, E>, partial: &mut bool) -> Option<T> {
     match read {
         Ok(v) => Some(v),
@@ -340,7 +345,7 @@ fn skip_failed_element<T, E>(read: Result<T, E>, partial: &mut bool) -> Option<T
 /// the boundary is unit-tested without a COM call: `total == max_elements`
 /// keeps everything and is NOT truncated (the cap is inclusive), one more
 /// than that truncates.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 fn bounded_count(total: usize, max_elements: usize) -> (usize, bool) {
     if total > max_elements {
         (max_elements, true)
@@ -352,7 +357,7 @@ fn bounded_count(total: usize, max_elements: usize) -> (usize, bool) {
 /// One line per field, token-efficient for a model prompt: empty label and
 /// empty value are both omitted rather than printed as `""`. A redacted
 /// field never prints the real text, only the `[redacted]` marker.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 pub fn format_compact(fields: &[FieldSnapshot]) -> String {
     fields
         .iter()
@@ -361,7 +366,7 @@ pub fn format_compact(fields: &[FieldSnapshot]) -> String {
         .join("\n")
 }
 
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 fn format_line(field: &FieldSnapshot) -> String {
     let mut line = field.control_type.as_str().to_string();
 
@@ -375,7 +380,7 @@ fn format_line(field: &FieldSnapshot) -> String {
             line.push_str(v);
         }
         FieldValue::Redacted => line.push_str(": [redacted]"),
-        FieldValue::Text(_) | FieldValue::Empty => {}
+        FieldValue::Text(_) | FieldValue::Empty | FieldValue::Unreadable => {}
     }
 
     if !field.enabled {
@@ -396,7 +401,7 @@ fn format_line(field: &FieldSnapshot) -> String {
 ///
 /// See the module doc comment for the threading requirement (worker thread
 /// only).
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 pub fn snapshot_hwnd(
     hwnd: HWND,
     max_elements: usize,
@@ -740,7 +745,7 @@ impl PasswordLookup {
 /// Snapshots the current foreground window. A thin wrapper: every
 /// constraint on [`snapshot_hwnd`] (threading, budget, truncation) applies
 /// unchanged.
-#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+#[allow(dead_code)] // some items have no caller outside tests
 pub fn snapshot_foreground(max_elements: usize, budget: Duration) -> anyhow::Result<Snapshot> {
     let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
     anyhow::ensure!(!hwnd.0.is_null(), "no foreground window");
@@ -752,10 +757,10 @@ pub fn snapshot_foreground(max_elements: usize, budget: Duration) -> anyhow::Res
 // ---------------------------------------------------------------------------
 
 mod com {
-    // See the module doc comment's "nothing calls this yet" -- covers every
+    // Covers every
     // item in this submodule at once rather than one attribute apiece,
     // since all of it (the COM apartment guard, the walk, the extraction)
-    // is reached only through `super::snapshot_hwnd`, itself unwired.
+    // is reached only through `super::snapshot_hwnd`; some items have no non-test caller.
     #![allow(dead_code)]
 
     use super::{resolve_control_type, resolve_is_password, RawControlType, RawElement, Rect};
@@ -1356,7 +1361,7 @@ mod tests {
             },
         ];
         let fields = build_snapshot(&elements);
-        assert_eq!(fields[0].value, FieldValue::Empty);
+        assert_eq!(fields[0].value, FieldValue::Unreadable);
         assert_eq!(fields[1].value, FieldValue::Empty);
     }
 

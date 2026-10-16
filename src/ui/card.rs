@@ -73,10 +73,10 @@ use crate::ui::card_placement::{
 };
 use crate::ui::text::draw_text_line;
 use crate::ui::theme::{
-    contrast_ratio, relative_luminance, rgb, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK,
-    BADGE_INK_LIGHT, BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, DETAIL_FONT_SCALE,
-    FALLBACK_FONT_FACE, GAP_DP, HEADLINE_FONT_SCALE, MARGIN_DP, PADDING_DP,
-    SMALL_FONT_SCALE as BADGE_FONT_SCALE,
+    contrast_ratio, detect_theme, relative_luminance, rgb, setting_change_affects_theme,
+    setting_change_name, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK, BADGE_INK_LIGHT,
+    BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, DETAIL_FONT_SCALE, FALLBACK_FONT_FACE,
+    GAP_DP, HEADLINE_FONT_SCALE, MARGIN_DP, PADDING_DP, SMALL_FONT_SCALE as BADGE_FONT_SCALE,
 };
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -109,14 +109,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
     HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETCLIENTAREAANIMATION,
-    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SPI_SETHIGHCONTRAST, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
-    WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFONT,
-    WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD,
-    WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
-    WS_VISIBLE,
+    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+    WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -224,6 +223,7 @@ impl Card {
             theme,
             sys: SysColors::read(),
             theme_forced: false,
+            dpi_forced: false,
             fonts: Fonts::null(),
             text_scale: 1.0,
             corner: CardCorner::default(),
@@ -572,6 +572,16 @@ impl Card {
         }
     }
 
+    /// The UI gallery's `--dpi`: lays the card out at `dpi` whatever the
+    /// monitor says, and ignores later DPI changes. Fonts and every layout
+    /// measure are rebuilt for it. Never touches display or registry settings.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn force_dpi_for_gallery(&mut self, dpi: u32) {
+        self.inner.dpi = dpi.max(1);
+        self.inner.dpi_forced = true;
+        self.inner.rebuild_fonts();
+    }
+
     /// The UI gallery's expanded answer: what a click on the card does.
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn expand_for_gallery(&mut self) {
@@ -813,101 +823,6 @@ fn badge_text_color(fill: u32) -> u32 {
         BADGE_INK_DARK
     } else {
         BADGE_INK_LIGHT
-    }
-}
-
-/// Reads `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`.
-///
-/// `windows` 0.62 is built in this project *without* the `Win32_System_Registry`
-/// feature (see `Cargo.toml`, owned by another agent), so `RegGetValueW` is not
-/// available through the `windows` crate here. Rather than touch `Cargo.toml`,
-/// this module declares the one registry function it needs itself and links
-/// directly against `advapi32.dll` (a standard system import library, not a
-/// new crate dependency).
-fn detect_theme() -> Theme {
-    Theme::resolve(
-        registry_apps_use_light_theme(),
-        crate::ui::card_buttons::system_high_contrast().is_some(),
-    )
-}
-
-/// Whether a `WM_SETTINGCHANGE` names the light/dark switch. Windows sends
-/// `"ImmersiveColorSet"` in `lparam` when the user changes app mode or the
-/// accent color.
-fn setting_change_is_theme(name: &str) -> bool {
-    name == "ImmersiveColorSet"
-}
-
-/// Whether a `WM_SETTINGCHANGE` is one the card's theme depends on: the
-/// light/dark switch, or the high contrast flag (`wparam` is
-/// `SPI_SETHIGHCONTRAST`; its `lparam` carries no name).
-fn setting_change_affects_theme(wparam: usize, name: &str) -> bool {
-    wparam == SPI_SETHIGHCONTRAST.0 as usize || setting_change_is_theme(name)
-}
-
-/// The text of a `WM_SETTINGCHANGE` `lparam` (a null-terminated UTF-16
-/// string, or null for the broadcasts that carry none).
-///
-/// # Safety
-/// `lparam` must be zero or point at a null-terminated UTF-16 string, which
-/// is what Windows guarantees for this message.
-unsafe fn setting_change_name(lparam: LPARAM) -> String {
-    let ptr = lparam.0 as *const u16;
-    if ptr.is_null() {
-        return String::new();
-    }
-    let mut len = 0;
-    while *ptr.add(len) != 0 {
-        len += 1;
-    }
-    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
-}
-
-const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
-
-fn hkey_current_user() -> *mut c_void {
-    // HKEY_CURRENT_USER is defined by the Windows headers as
-    // ((HKEY)(ULONG_PTR)((LONG)0x80000001)) — i.e. sign-extended.
-    (0x8000_0001u32 as i32 as isize) as *mut c_void
-}
-
-#[link(name = "advapi32")]
-extern "system" {
-    fn RegGetValueW(
-        hkey: *mut c_void,
-        lpsubkey: *const u16,
-        lpvalue: *const u16,
-        dwflags: u32,
-        pdwtype: *mut u32,
-        pvdata: *mut c_void,
-        pcbdata: *mut u32,
-    ) -> i32;
-}
-
-fn registry_apps_use_light_theme() -> bool {
-    let subkey = wide_z(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
-    let value = wide_z("AppsUseLightTheme");
-    let mut data: u32 = 1; // default to light on any failure
-    let mut size: u32 = std::mem::size_of::<u32>() as u32;
-    let status = unsafe {
-        RegGetValueW(
-            hkey_current_user(),
-            subkey.as_ptr(),
-            value.as_ptr(),
-            RRF_RT_REG_DWORD,
-            std::ptr::null_mut(),
-            &mut data as *mut u32 as *mut c_void,
-            &mut size,
-        )
-    };
-    if status == 0 {
-        data != 0
-    } else {
-        // #356: a dark desktop would get a light card with no explanation.
-        crate::diagnostics::note_warning(&format!(
-            "Card: could not read the app theme setting (error {status}), using the light theme"
-        ));
-        true
     }
 }
 
@@ -1266,6 +1181,22 @@ fn is_copy_key(vk: u16, lparam: isize, shift: bool, alt: bool) -> bool {
     vk == 0x43 && lparam & 0x4000_0000 == 0 && !shift && !alt
 }
 
+/// #376: Ctrl+Shift+C copies the card as an image. Not for auto-repeat, and
+/// not with Alt. Plain C and Ctrl+C stay the text copy.
+fn is_copy_image_key(vk: u16, lparam: isize, ctrl: bool, shift: bool, alt: bool) -> bool {
+    vk == 0x43 && lparam & 0x4000_0000 == 0 && ctrl && shift && !alt
+}
+
+/// Gdi hands back BGRA with alpha left at zero. The clipboard image wants
+/// RGBA, opaque: the card is a solid surface.
+fn bgra_to_opaque_rgba(bgra: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bgra.len());
+    for px in bgra.chunks_exact(4) {
+        out.extend_from_slice(&[px[2], px[1], px[0], 255]);
+    }
+    out
+}
+
 /// Issue #531: a link squeezed to nothing counts as not there.
 fn rect_has_area(r: RECT) -> bool {
     r.right > r.left && r.bottom > r.top
@@ -1348,6 +1279,9 @@ struct CardInner {
     /// Set by the UI gallery's `--theme`: `theme` and `sys` are simulated
     /// and no theme message may replace them.
     theme_forced: bool,
+    /// Set by the UI gallery's `--dpi`: `dpi` is simulated and neither the
+    /// monitor the card moves to nor `WM_DPICHANGED` may replace it.
+    dpi_forced: bool,
     fonts: Fonts,
     /// User-tunable multiplier applied to every font size. Set via
     /// [`Card::set_text_scale`]; defaults to 1.0.
@@ -1693,6 +1627,9 @@ impl CardInner {
         self.copy_feedback = CopyFeedback::None;
         self.set_noactivate(true);
         self.state = CardState::Hidden;
+        // Issue #729: nothing is showing, so nothing needs a click-away hook.
+        // Every hide goes through here, the auto-dismiss timer included.
+        crate::dismiss::disarm();
         // Issue #356: no headline is showing any more, so the accessible
         // name reverts to the plain app name set at `Card::create`, rather
         // than leaking the last-shown headline into a window nothing is
@@ -2113,9 +2050,87 @@ impl CardInner {
     /// answer stays on screen.
     fn copy_activated(&mut self) {
         let text = answer_clipboard_text(&self.headline, &self.detail);
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-            Ok(()) => self.mark_copied(),
-            Err(_) => self.mark_copy_failed(),
+        // Decision (#716): the answer came from the user's screen, so it is
+        // kept out of the cloud clipboard, but stays in local Win+V history.
+        // If the exclusion cannot be written, fall back to a plain copy so
+        // the card never says "failed" when the text is on the clipboard.
+        use arboard::SetExtWindows;
+        let copied = arboard::Clipboard::new()
+            .and_then(|mut c| c.set().exclude_from_cloud().text(text.clone()))
+            .is_ok()
+            || arboard::Clipboard::new()
+                .and_then(|mut c| c.set_text(text))
+                .is_ok();
+        if copied {
+            self.mark_copied();
+        } else {
+            self.mark_copy_failed();
+        }
+    }
+
+    /// #376: the card as it is drawn now, as opaque RGBA rows plus the size.
+    /// Drawn with `paint_into` into a memory bitmap, never read from the
+    /// screen, so a window over the card cannot leak in. The keyboard focus
+    /// ring is left out; everything else is exactly what the card shows.
+    fn render_rgba(&mut self) -> Option<(Vec<u8>, u32, u32)> {
+        use windows::Win32::Graphics::Gdi::{
+            CreateDIBSection, GdiFlush, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        let mut rc = RECT::default();
+        unsafe { GetClientRect(self.hwnd, &mut rc).ok()? };
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let focus = self.focus_link.take();
+        let mut out = None;
+        unsafe {
+            let mem_dc = CreateCompatibleDC(None);
+            if !mem_dc.0.is_null() {
+                let bmi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w,
+                        biHeight: -h, // top-down
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut pixels: *mut c_void = std::ptr::null_mut();
+                if let Ok(bmp) =
+                    CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut pixels, None, 0)
+                {
+                    if !pixels.is_null() {
+                        let old = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+                        self.paint_into(mem_dc, rc);
+                        let _ = GdiFlush();
+                        let len = (w as usize) * (h as usize) * 4;
+                        let bgra = std::slice::from_raw_parts(pixels as *const u8, len);
+                        out = Some((bgra_to_opaque_rgba(bgra), w as u32, h as u32));
+                        SelectObject(mem_dc, old);
+                    }
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                }
+                let _ = DeleteDC(mem_dc);
+            }
+        }
+        self.focus_link = focus;
+        out
+    }
+
+    /// #376: Ctrl+Shift+C. The result is said on the Copy link, like the
+    /// text copy, and never a silent no-op (AGENTS.md rule 7).
+    fn copy_image_activated(&mut self) {
+        let copied = self.render_rgba().is_some_and(|(rgba, w, h)| {
+            crate::executors::image_clipboard::copy_rgba(&rgba, w, h).is_ok()
+        });
+        if copied {
+            self.mark_copied();
+        } else {
+            self.mark_copy_failed();
         }
     }
 
@@ -2160,7 +2175,9 @@ impl CardInner {
         let (mut dx, mut dy) = (0u32, 0u32);
         let queried =
             unsafe { GetDpiForMonitor(target, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) }.is_ok();
-        if let Some(dpi) = dpi_to_apply(self.dpi, queried.then_some(dx)) {
+        if self.dpi_forced {
+            // The gallery's simulated DPI stays whatever monitor this is.
+        } else if let Some(dpi) = dpi_to_apply(self.dpi, queried.then_some(dx)) {
             self.dpi = dpi;
             self.rebuild_fonts();
         }
@@ -3100,6 +3117,18 @@ impl CardInner {
                     // Issue #531: C and Ctrl+C copy the answer.
                     self.copy_activated();
                 } else if self.state == CardState::Expanded
+                    && self.copy_rect.is_some()
+                    && is_copy_image_key(
+                        wparam.0 as u16,
+                        lparam.0,
+                        key_is_down(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0),
+                        key_is_down(VK_SHIFT.0),
+                        key_is_down(VK_MENU.0),
+                    )
+                {
+                    // #376: Ctrl+Shift+C copies the card as an image.
+                    self.copy_image_activated();
+                } else if self.state == CardState::Expanded
                     && wparam.0 as u16 == VK_RETURN.0
                     && self.copy_details_rect.is_some()
                 {
@@ -3159,6 +3188,7 @@ impl CardInner {
                 self.refresh_theme();
                 Some(LRESULT(0))
             }
+            WM_DPICHANGED if self.dpi_forced => Some(LRESULT(0)),
             WM_DPICHANGED => {
                 let new_dpi = (wparam.0 & 0xFFFF) as u32;
                 self.dpi = new_dpi.max(1);
@@ -3551,9 +3581,12 @@ impl CardInner {
             if !field.editable {
                 continue;
             }
-            if let Some(hwnd) =
-                create_preview_edit(parent, instance, font, &field.value, &row.value_rect)
-            {
+            let rect = if field.multiline {
+                row.value_rect
+            } else {
+                centered_edit_rect(&row.value_rect, self.line_height(font))
+            };
+            if let Some(hwnd) = create_preview_edit(parent, instance, font, &field.value, &rect) {
                 subclass_preview_control(hwnd, parent);
                 edits.push((field.name.clone(), hwnd));
             }
@@ -3615,7 +3648,12 @@ impl CardInner {
         };
         for (name, hwnd) in &preview.edits {
             if let Some(idx) = fields.iter().position(|f| &f.name == name) {
-                let r = &metrics.rows[idx].value_rect;
+                let cell = metrics.rows[idx].value_rect;
+                let r = &if fields[idx].multiline {
+                    cell
+                } else {
+                    centered_edit_rect(&cell, self.line_height(font))
+                };
                 unsafe {
                     let _ = SetWindowPos(
                         *hwnd,
@@ -4253,6 +4291,36 @@ fn subclass_preview_control(hwnd: HWND, parent: HWND) {
     }
 }
 
+/// #743: where a preview's EDIT control goes inside its row's value cell. A
+/// plain value is drawn vertically centred in the cell, but an EDIT draws its
+/// text from the top of its own box, so a full-height box put the text above
+/// the label and the plain values. One text line high, centred, lines up.
+fn centered_edit_rect(cell: &RECT, line_h: i32) -> RECT {
+    let line_h = line_h.clamp(1, (cell.bottom - cell.top).max(1));
+    let top = cell.top + ((cell.bottom - cell.top) - line_h) / 2;
+    RECT {
+        left: cell.left,
+        top,
+        right: cell.right,
+        bottom: top + line_h,
+    }
+}
+
+/// `EM_SETMARGINS` with `EC_LEFTMARGIN | EC_RIGHTMARGIN` and no margin, so
+/// an edit's text starts where a plain value's does (#743).
+fn clear_edit_margins(edit: HWND) {
+    const EM_SETMARGINS: u32 = 0x00D3;
+    const EC_LEFTMARGIN_AND_RIGHT: usize = 0x0001 | 0x0002;
+    unsafe {
+        SendMessageW(
+            edit,
+            EM_SETMARGINS,
+            Some(WPARAM(EC_LEFTMARGIN_AND_RIGHT)),
+            Some(LPARAM(0)),
+        );
+    }
+}
+
 fn create_preview_edit(
     parent: HWND,
     instance: HINSTANCE,
@@ -4289,6 +4357,7 @@ fn create_preview_edit(
             Some(LPARAM(1)),
         );
     }
+    clear_edit_margins(hwnd);
     Some(hwnd)
 }
 
@@ -4919,6 +4988,64 @@ mod tests {
         card.inner.try_expand();
         assert!(card.inner.copy_key_applies(0x43, 0, false, false));
         assert!(!card.inner.copy_key_applies(VK_RETURN.0, 0, false, false));
+    }
+
+    #[test]
+    fn only_ctrl_shift_c_copies_the_card_as_an_image() {
+        assert!(is_copy_image_key(0x43, 0, true, true, false));
+        assert!(!is_copy_image_key(0x43, 0, true, false, false));
+        assert!(!is_copy_image_key(0x43, 0, false, true, false));
+        assert!(!is_copy_image_key(0x43, 0, true, true, true));
+        assert!(!is_copy_image_key(0x43, 0x4000_0000, true, true, false));
+        assert!(!is_copy_image_key(0x56, 0, true, true, false));
+        // The text copy keys must not become the image copy.
+        assert!(!is_copy_key(0x43, 0, true, false));
+    }
+
+    #[test]
+    fn gdi_pixels_become_opaque_rgba() {
+        assert_eq!(
+            bgra_to_opaque_rgba(&[1, 2, 3, 0, 10, 20, 30, 7]),
+            vec![3, 2, 1, 255, 30, 20, 10, 255]
+        );
+    }
+
+    #[test]
+    fn the_card_renders_to_a_bitmap_of_its_size_with_its_text_in_it() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_model_answer("Right.", "Details.", 0, None);
+        card.inner.try_expand();
+        card.inner.focus_link = Some(FooterLink::Copy);
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(card.inner.hwnd, &mut rc);
+        }
+        let (rgba, w, h) = card.inner.render_rgba().expect("a visible card renders");
+        assert_eq!(
+            (w as i32, h as i32),
+            (rc.right - rc.left, rc.bottom - rc.top)
+        );
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
+        // The text is in it: inside the border, many pixels differ from the
+        // fill (read from the padding, a few pixels in from the corner).
+        let at = |x: u32, y: u32| ((y * w + x) * 4) as usize;
+        let bg = rgba[at(3, 3)..at(3, 3) + 4].to_vec();
+        let mut inked = 0;
+        for y in 2..h - 2 {
+            for x in 2..w - 2 {
+                if rgba[at(x, y)..at(x, y) + 4] != bg[..] {
+                    inked += 1;
+                }
+            }
+        }
+        assert!(inked > 100, "only {inked} pixels differ from the fill");
+        assert_eq!(
+            card.inner.focus_link,
+            Some(FooterLink::Copy),
+            "rendering must give the focus back"
+        );
     }
 
     #[test]
@@ -5643,23 +5770,34 @@ mod tests {
     #[test]
     fn a_theme_message_sent_to_the_real_window_reaches_the_card() {
         // Through the window procedure, not `handle_message`: a card whose
-        // class never routed the message would pass the tests above.
-        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
-        card.inner.sys = SysColors {
-            window: 1,
-            window_text: 2,
-            gray_text: 3,
-            hotlight: 6,
-            highlight: 4,
-            highlight_text: 5,
-        };
-        let hwnd = card.inner.hwnd;
-        unsafe {
-            SendMessageW(hwnd, WM_SYSCOLORCHANGE, None, None);
+        // class never routed the message would pass the tests above. All three
+        // messages (#658), each on a fresh card with stale values.
+        let name = wide_z("ImmersiveColorSet");
+        for msg in [WM_SETTINGCHANGE, WM_THEMECHANGED, WM_SYSCOLORCHANGE] {
+            let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+            let detected = detect_theme();
+            card.inner.theme = opposite(detected);
+            card.inner.sys = SysColors {
+                window: 1,
+                window_text: 2,
+                gray_text: 3,
+                hotlight: 6,
+                highlight: 4,
+                highlight_text: 5,
+            };
+            let hwnd = card.inner.hwnd;
+            let lparam = if msg == WM_SETTINGCHANGE {
+                Some(LPARAM(name.as_ptr() as isize))
+            } else {
+                None
+            };
+            unsafe {
+                SendMessageW(hwnd, msg, None, lparam);
+            }
+            assert_eq!(card.inner.theme, detected, "message {msg:#x}");
+            assert_eq!(card.inner.sys, SysColors::read(), "message {msg:#x}");
         }
-        assert_eq!(card.inner.sys, SysColors::read());
     }
-
     #[test]
     fn the_high_contrast_setting_change_makes_the_card_re_read_the_theme() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
@@ -5669,20 +5807,11 @@ mod tests {
 
         card.handle_message(
             WM_SETTINGCHANGE,
-            WPARAM(SPI_SETHIGHCONTRAST.0 as usize),
+            WPARAM(windows::Win32::UI::WindowsAndMessaging::SPI_SETHIGHCONTRAST.0 as usize),
             LPARAM(empty.as_ptr() as isize),
         );
 
         assert_eq!(card.inner.theme, detected);
-    }
-
-    #[test]
-    fn only_theme_names_and_the_high_contrast_flag_are_theme_changes() {
-        let hc = SPI_SETHIGHCONTRAST.0 as usize;
-        assert!(setting_change_affects_theme(0, "ImmersiveColorSet"));
-        assert!(setting_change_affects_theme(hc, ""));
-        assert!(!setting_change_affects_theme(0, "intl"));
-        assert!(!setting_change_affects_theme(0, ""));
     }
 
     #[test]
@@ -5766,6 +5895,67 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_is_one_line_high_and_centred_in_its_value_cell() {
+        let cell = RECT {
+            left: 100,
+            top: 40,
+            right: 300,
+            bottom: 70,
+        };
+        let r = centered_edit_rect(&cell, 20);
+        assert_eq!((r.left, r.right), (100, 300));
+        assert_eq!((r.top, r.bottom), (45, 65));
+        // The same gap above and below, like a vertically centred plain value.
+        assert_eq!(r.top - cell.top, cell.bottom - r.bottom);
+        // A line taller than the cell never grows it, and never goes below 1.
+        let tall = centered_edit_rect(&cell, 99);
+        assert_eq!((tall.top, tall.bottom), (40, 70));
+        assert!(centered_edit_rect(&cell, 0).bottom > 40);
+    }
+
+    #[test]
+    fn a_live_preview_edit_sits_inside_its_row_and_one_line_high() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_preview("Add to calendar", &schema, &value, false);
+        let preview = card.inner.preview.as_ref().expect("preview");
+        assert!(!preview.edits.is_empty());
+        let line_h = card.inner.line_height(card.inner.fonts.body);
+        for (_, hwnd) in &preview.edits {
+            let mut r = RECT::default();
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(*hwnd, &mut r);
+            }
+            assert_eq!(r.bottom - r.top, line_h);
+        }
+    }
+
+    fn card_width(card: &Card) -> i32 {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(card.hwnd(), &mut r);
+        }
+        r.right - r.left
+    }
+
+    #[test]
+    fn a_forced_dpi_lays_the_card_out_at_that_dpi_and_survives_dpi_messages() {
+        let mut small = Card::new_for_test(instance()).expect("Card::new_for_test");
+        small.force_dpi_for_gallery(96);
+        small.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        let mut big = Card::new_for_test(instance()).expect("Card::new_for_test");
+        big.force_dpi_for_gallery(240);
+        big.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        assert_eq!(small.inner.dpi, 96);
+        assert_eq!(big.inner.dpi, 240, "a layout must not reset the DPI");
+        // 250%: the card is 2.5 times as wide (give or take rounding).
+        let (s, b) = (card_width(&small), card_width(&big));
+        assert!(s > 0 && (b * 100 / s) >= 240, "width {s} -> {b}");
+        big.handle_message(WM_DPICHANGED, WPARAM(96), LPARAM(0));
+        assert_eq!(big.inner.dpi, 240, "a DPI message must not replace it");
+    }
+
+    #[test]
     fn a_preview_error_replaces_the_title() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
@@ -5817,13 +6007,6 @@ mod tests {
             card.inner.edit_bg_brush.0.is_null(),
             "the cached brush is the old theme's color and must be rebuilt"
         );
-    }
-
-    #[test]
-    fn only_the_immersive_color_set_setting_is_a_theme_change() {
-        assert!(setting_change_is_theme("ImmersiveColorSet"));
-        assert!(!setting_change_is_theme("intl"));
-        assert!(!setting_change_is_theme(""));
     }
 
     #[test]

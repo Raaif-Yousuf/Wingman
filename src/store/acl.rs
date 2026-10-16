@@ -25,19 +25,18 @@ pub fn acl_args(dir: &Path, user: &str) -> Vec<OsString> {
 /// store must not open: an unrestricted store is what this module exists to
 /// avoid.
 pub fn restrict_dir(dir: &Path) -> Result<(), StoreError> {
-    let user = std::env::var("USERNAME")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .ok_or_else(|| {
-            StoreError::Acl("the USERNAME environment variable is not set".to_string())
-        })?;
-    // CREATE_NO_WINDOW: Wingman has no console, so without this flag icacls
-    // flashes a console window.
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = std::process::Command::new("icacls")
-        .args(acl_args(dir, &user))
-        .creation_flags(CREATE_NO_WINDOW)
+    // Portable mode (#130): an owner-only folder from one PC would lock the
+    // next user out, and FAT/exFAT has no ACLs to set. Skipped, so the store
+    // keeps the drive's permissions and the drive should be kept private.
+    if crate::portable::skip_acl() {
+        return Ok(());
+    }
+    // #736: the grant names the current user by SID, and `icacls` is the
+    // one in the system folder (no console window, see `icacls_command`).
+    let account = crate::owner_acl::grant_account().map_err(StoreError::Acl)?;
+    let output = crate::owner_acl::icacls_command()
+        .map_err(StoreError::Acl)?
+        .args(acl_args(dir, &account))
         .output()
         .map_err(|e| StoreError::Acl(format!("could not run icacls: {e}")))?;
     if !output.status.success() {
@@ -82,18 +81,29 @@ mod tests {
         restrict_dir(&dir).expect("restrict should succeed");
         let child = dir.join("later.db-wal");
         std::fs::write(&child, b"x").unwrap();
-        let out = std::process::Command::new("icacls")
+        let out = crate::owner_acl::icacls_command()
+            .unwrap()
             .arg(&child)
             .output()
             .expect("icacls should run");
         let listing = String::from_utf8_lossy(&out.stdout).to_string();
-        let user = std::env::var("USERNAME").unwrap();
+        // The grant names the current user by SID, so ask icacls whether
+        // that SID has an ACE on the file (it prints "SID Found" if so).
+        let sid = crate::owner_acl::grant_account().unwrap();
+        let found = crate::owner_acl::icacls_command()
+            .unwrap()
+            .arg(&child)
+            .arg("/findsid")
+            .arg(&sid)
+            .output()
+            .expect("icacls should run");
+        let found = String::from_utf8_lossy(&found.stdout).to_string();
         let _ = std::fs::remove_dir_all(&dir);
-        // The ACE itself: the user, inherited, full control. (The user name
-        // alone is not enough: the temp path contains it.)
+        assert!(found.contains("SID Found"), "no ACE for {sid}: {found}");
+        // That ACE is inherited full control.
         assert!(
-            listing.contains(&format!("{user}:(I)(F)")),
-            "no inherited full-control ACE for {user}: {listing}"
+            listing.contains(":(I)(F)"),
+            "no inherited full-control ACE: {listing}"
         );
         for other in ["Everyone", "BUILTIN\\Users", "Authenticated Users"] {
             assert!(
