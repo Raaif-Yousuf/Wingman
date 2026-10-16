@@ -309,6 +309,18 @@ fn resolve_is_password<E>(read: Result<bool, E>) -> bool {
     read.unwrap_or(true)
 }
 
+/// #434: resolves a `CachedControlType` read, already mapped to a
+/// [`RawControlType`], to a plain value. A failed read degrades to
+/// [`RawControlType::Other`] (the walked-past-never-emitted bucket) so one
+/// non-conformant element costs only itself, the way every other cached
+/// property in `com::extract` already behaves, instead of aborting the whole
+/// snapshot. Generic over the error type for the same reason as
+/// [`resolve_is_password`]; `com::extract` is the sole caller.
+#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+fn resolve_control_type<E>(read: Result<RawControlType, E>) -> RawControlType {
+    read.unwrap_or_default()
+}
+
 /// How many of `total` walked elements to keep, and whether that is fewer
 /// than `total` (the caller must then report `truncated: true`). Pure so
 /// the boundary is unit-tested without a COM call: `total == max_elements`
@@ -404,7 +416,7 @@ mod com {
     // is reached only through `super::snapshot_hwnd`, itself unwired.
     #![allow(dead_code)]
 
-    use super::{resolve_is_password, RawControlType, RawElement, Rect};
+    use super::{resolve_control_type, resolve_is_password, RawControlType, RawElement, Rect};
     use std::time::{Duration, Instant};
     use windows::core::Interface;
     use windows::Win32::Foundation::HWND;
@@ -582,7 +594,8 @@ mod com {
     }
 
     fn extract(el: &IUIAutomationElement) -> anyhow::Result<RawElement> {
-        let control_type = map_control_type(unsafe { el.CachedControlType() }?);
+        let control_type =
+            resolve_control_type(unsafe { el.CachedControlType() }.map(map_control_type));
         let name = unsafe { el.CachedName() }
             .map(|b| b.to_string())
             .unwrap_or_default();
@@ -867,6 +880,48 @@ mod tests {
     fn resolve_is_password_reports_a_successful_read_unchanged() {
         assert!(!resolve_is_password::<()>(Ok(false)));
         assert!(resolve_is_password::<()>(Ok(true)));
+    }
+
+    // -- #434: one unreadable ControlType degrades that element only -------
+
+    #[test]
+    fn an_unreadable_control_type_degrades_to_other_instead_of_failing() {
+        assert_eq!(
+            resolve_control_type::<()>(Err(())),
+            RawControlType::Other,
+            "a failed CachedControlType read must default, like every sibling property"
+        );
+    }
+
+    #[test]
+    fn a_readable_control_type_is_reported_unchanged() {
+        for t in [
+            RawControlType::Edit,
+            RawControlType::ComboBox,
+            RawControlType::Document,
+            RawControlType::CheckBox,
+            RawControlType::RadioButton,
+            RawControlType::List,
+            RawControlType::Text,
+            RawControlType::Other,
+        ] {
+            assert_eq!(resolve_control_type::<()>(Ok(t)), t);
+        }
+    }
+
+    #[test]
+    fn an_element_with_a_degraded_control_type_is_skipped_and_its_neighbours_survive() {
+        let with_id = |id: i32| RawElement {
+            runtime_id: vec![id],
+            ..edit("field")
+        };
+        let degraded = RawElement {
+            control_type: resolve_control_type::<()>(Err(())),
+            ..with_id(2)
+        };
+        let fields = build_snapshot(&[with_id(1), degraded, with_id(3)]);
+        let ids: Vec<Vec<i32>> = fields.iter().map(|f| f.runtime_id.clone()).collect();
+        assert_eq!(ids, vec![vec![1], vec![3]]);
     }
 
     #[test]
