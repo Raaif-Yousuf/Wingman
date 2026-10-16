@@ -42,6 +42,7 @@ instructions live there, not duplicated here.
 | `working-an-issue` | Before starting or closing any GitHub issue |
 | `filing-findings` | Before filing an issue about something you noticed, and for the shared-machine cargo RAM rules |
 | `auditing-a-module` | Auditing a module or file set for defects worth filing, and when dispatched as a read-only auditor in a fan-out |
+| `native-ui` | Changing, auditing or reviewing anything a user sees: the Windows 11 target, the theme tokens, and the gallery visual check |
 
 Agents (`.claude/agents/`): `cold-diff-reviewer` reviews a diff with no ticket
 or author framing, checking for this repo's recorded bug shapes.
