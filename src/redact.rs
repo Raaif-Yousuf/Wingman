@@ -539,8 +539,11 @@ fn apply_password_fields(raw: &mut RawShot) -> Result<usize> {
     let Some(map) = raw.screen.clone() else {
         return Ok(0);
     };
+    // `apply` runs only for a request that is being redacted, and every such
+    // capture starts a lookup (`capture::needs_password_lookup`). A map with
+    // none is a capture path that forgot: refuse rather than send unchecked.
     let Some(lookup) = &map.lookup else {
-        return Ok(0);
+        return Err(anyhow::anyhow!("no password field lookup was started").context(FAILURE_NEEDLE));
     };
     // The lookup started when the capture was taken; only what is left of its
     // budget is waited for here.
@@ -1209,8 +1212,15 @@ mod tests {
             let at = capture.find(f).unwrap_or_else(|| panic!("{f} exists"));
             let body = &capture[at..at + capture[at..].find("\n}\n").unwrap()];
             assert!(body.contains("screen: Some(ScreenMap::for_capture("), "{f}");
-            assert!(body.contains("PasswordLookup::start("), "{f}");
         }
+        let at = capture.find("pub fn grab_raw_for(").unwrap();
+        let body = &capture[at..at + capture[at..].find("\n}\n").unwrap()];
+        assert!(body.contains("PasswordLookup::start"), "grab_raw_for");
+        // The decision to look is one helper, used by the gate and by the
+        // capture call sites.
+        assert!(capture.contains("if needs_password_lookup(redact_setting, providers, mode)"));
+        let app = norm(include_str!("app.rs"));
+        assert_eq!(app.matches("capture::needs_password_lookup(").count(), 2);
         // The router's capture names the window under the palette.
         let app = norm(include_str!("app.rs"));
         let at = app.find("fn maybe_start_router(").expect("router fn");
@@ -1262,9 +1272,10 @@ mod tests {
     }
 
     #[test]
-    fn a_map_with_no_lookup_paints_nothing() {
+    fn a_map_with_no_lookup_is_refused_while_redacting() {
         let mut raw = shot_with(None);
-        assert_eq!(apply_password_fields(&mut raw).unwrap(), 0);
+        let err = apply_password_fields(&mut raw).unwrap_err();
+        assert!(format!("{err:#}").contains(FAILURE_NEEDLE), "{err:#}");
     }
 
     #[test]

@@ -214,13 +214,20 @@ Slices 1 and 2 land together (rule 8: no pipeline stage nobody calls).
   text is read. `redact::apply` collects the result and only waits for what is
   left of a 1.5 s budget counted from the start; at most 64 rectangles come
   back. The boxes are padded and clipped like OCR regions.
-- Failure policy: a timeout, a thread that cannot start and an unexpected UIA
-  error fail closed with the generic card. A window that no longer exists has
-  no fields. An access denied answer (an app running as administrator) fails
-  closed with its own card: "Wingman can't check an app running as
-  administrator for password fields, so nothing was sent." THEORY (unverified):
-  that UIA answers E_ACCESSDENIED for an elevated window; it was not run
-  against one.
+- Failure policy: a timeout, a thread that cannot start, too many running lookup
+  threads (at most 4 at once), more than 64 password fields (never cut) and any
+  UIA error on a window that still exists fail closed with the generic card. A
+  window that no longer exists has no fields. An app running as administrator
+  while Wingman is not (read from the process token, or an access denied when
+  opening it) fails closed with its own card: "Wingman can't check an app
+  running as administrator for password fields, so nothing was sent." The
+  token check was not run against a real elevated window.
+- The lookup starts only when the request is redacted
+  (`capture::needs_password_lookup`, the same test `encode_for_chain` makes).
+  Text extraction and the region copy start none. `redact::apply` refuses a
+  screen map with no lookup, so a capture path that forgets fails closed.
+- If the foreground window is one of Wingman's own (tray menu, a card), the
+  lookup asks the next visible, titled window of another process behind it.
 - The router's capture runs while Wingman's palette is in front, so it asks
   about the window that was in front before the palette opened (none: no
   fields).

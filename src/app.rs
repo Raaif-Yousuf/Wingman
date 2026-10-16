@@ -837,7 +837,20 @@ impl App {
                 .and_then(|caps| caps.image_limits);
             let (max_long_edge, max_pixels) =
                 capture::resolve_limits(image_limits, self.config.capture.max_edge);
-            match capture::grab_raw(&self.config.capture.monitor, max_long_edge, max_pixels) {
+            let lookup = capture::LookupWindow::when(
+                capture::needs_password_lookup(
+                    self.config.capture.redact,
+                    &self.config.providers,
+                    self.config.mode,
+                ),
+                capture::LookupWindow::Foreground,
+            );
+            match capture::grab_raw_for(
+                &self.config.capture.monitor,
+                max_long_edge,
+                max_pixels,
+                lookup,
+            ) {
                 Ok(r) => Some(r),
                 Err(e) => {
                     let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
@@ -1059,7 +1072,10 @@ impl App {
             &self.config.capture.monitor,
             router::ROUTER_IMAGE_LONG_EDGE,
             router::ROUTER_IMAGE_MAX_PIXELS,
-            capture::LookupWindow::Window(underlying_window),
+            capture::LookupWindow::when(
+                capture::needs_password_lookup(self.config.capture.redact, &providers, mode),
+                capture::LookupWindow::Window(underlying_window),
+            ),
         ) {
             Ok(r) => r,
             Err(_) => return,

@@ -130,22 +130,106 @@ pub struct ScreenMap {
 /// Which window's password fields a capture asks about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupWindow {
-    /// Whatever is in front when the capture is taken.
+    /// Whatever is in front when the capture is taken. If that window is
+    /// one of Wingman's own (the tray menu, a card), the next visible window
+    /// of another process behind it is asked about instead.
     Foreground,
     /// A window remembered earlier (the router capture runs while Wingman's
     /// own palette is in front). 0 means there is none: no fields.
     Window(isize),
+    /// No lookup: nothing in this request is redacted (the pixels stay on
+    /// this machine, or redaction is off), so nobody would use the answer.
+    None,
 }
 
 impl LookupWindow {
-    /// The raw `HWND` value to ask about. Reads the foreground window when
-    /// this is [`LookupWindow::Foreground`], so call it at capture time.
-    fn resolve(self) -> isize {
-        match self {
-            Self::Foreground => unsafe { GetForegroundWindow() }.0 as isize,
-            Self::Window(h) => h,
+    /// `window` when a password lookup is needed, [`LookupWindow::None`]
+    /// when it is not. `needed` comes from [`needs_password_lookup`].
+    pub fn when(needed: bool, window: LookupWindow) -> Self {
+        if needed {
+            window
+        } else {
+            Self::None
         }
     }
+
+    /// The raw `HWND` value to ask about, `None` for no lookup. Reads the
+    /// foreground window when this is [`LookupWindow::Foreground`], so call
+    /// it at capture time. Never one of Wingman's own windows.
+    fn resolve(self) -> Option<isize> {
+        let hwnd = match self {
+            Self::Foreground => unsafe { GetForegroundWindow() }.0 as isize,
+            Self::Window(h) => h,
+            Self::None => return None,
+        };
+        Some(not_ours(hwnd))
+    }
+}
+
+/// Whether the pixels of a request in `mode` are painted at all: the same
+/// test [`encode_for_chain`] makes. The password lookup is started only when
+/// this is true, so a request that redacts nothing pays nothing.
+pub fn needs_password_lookup(
+    redact_setting: bool,
+    providers: &crate::config::Providers,
+    mode: crate::mode::Mode,
+) -> bool {
+    redact_setting && providers.sends_screenshot_off_machine(mode)
+}
+
+/// Walks the window order from `start` for a window of another process.
+/// `start` itself when it is not ours; 0 when there is none within `limit`
+/// steps. Pure over the three window queries so the walk is tested without
+/// windows.
+fn first_foreign_window(
+    start: isize,
+    own_pid: u32,
+    pid_of: &dyn Fn(isize) -> u32,
+    shown: &dyn Fn(isize) -> bool,
+    next: &dyn Fn(isize) -> isize,
+    limit: usize,
+) -> isize {
+    let mut h = start;
+    for _ in 0..limit {
+        if h == 0 {
+            return 0;
+        }
+        if pid_of(h) != own_pid && shown(h) {
+            return h;
+        }
+        h = next(h);
+    }
+    0
+}
+
+/// `hwnd` unless it belongs to Wingman: then the next visible, titled
+/// top-level window of another process behind it (0 if none), so the tray
+/// menu or a card in front does not become the lookup target.
+fn not_ours(hwnd: isize) -> isize {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindow, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible, GW_HWNDNEXT,
+    };
+    let own = unsafe { GetCurrentProcessId() };
+    let h = |v: isize| HWND(v as *mut _);
+    let pid_of = |v: isize| {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h(v), Some(&mut pid)) };
+        pid
+    };
+    let shown = |v: isize| {
+        unsafe { IsWindowVisible(h(v)) }.as_bool() && unsafe { GetWindowTextLengthW(h(v)) } > 0
+    };
+    let next = |v: isize| {
+        unsafe { GetWindow(h(v), GW_HWNDNEXT) }
+            .map(|w| w.0 as isize)
+            .unwrap_or(0)
+    };
+    if hwnd == 0 || pid_of(hwnd) != own {
+        return hwnd;
+    }
+    first_foreign_window(hwnd, own, &pid_of, &shown, &next, 200)
 }
 
 impl ScreenMap {
@@ -233,6 +317,7 @@ pub fn resolve_limits(
 /// `monitor_mode` is `"active"` (the monitor under the foreground window) or
 /// `"primary"` (always the system's primary monitor). Anything else is
 /// treated as `"active"`.
+#[cfg(test)]
 pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Result<RawShot> {
     grab_raw_for(
         monitor_mode,
@@ -251,7 +336,9 @@ pub fn grab_raw_for(
     max_pixels: u64,
     lookup_window: LookupWindow,
 ) -> Result<RawShot> {
-    let lookup = crate::inputs::uia::PasswordLookup::start(lookup_window.resolve());
+    let lookup = lookup_window
+        .resolve()
+        .map(crate::inputs::uia::PasswordLookup::start);
     let rect = match monitor_mode {
         "primary" => primary_monitor_rect()?,
         _ => active_monitor_rect()?,
@@ -294,13 +381,7 @@ pub fn grab_raw_for(
         width: final_w,
         height: final_h,
         screen: Some(ScreenMap::for_capture(
-            origin_x,
-            origin_y,
-            w,
-            h,
-            final_w,
-            final_h,
-            Some(lookup),
+            origin_x, origin_y, w, h, final_w, final_h, lookup,
         )),
     })
 }
@@ -325,7 +406,7 @@ pub fn encode_for_chain(
     mode: crate::mode::Mode,
     redact_setting: bool,
 ) -> Result<Shot> {
-    if redact_setting && providers.sends_screenshot_off_machine(mode) {
+    if needs_password_lookup(redact_setting, providers, mode) {
         crate::redact::apply(raw)?;
     }
     encode(raw)
@@ -567,7 +648,6 @@ pub fn virtual_desktop_rect() -> Result<RECT> {
 /// is clamped to the real desktop bounds first, so a gap pixel is never
 /// actually selectable.
 pub fn grab_virtual_desktop_raw() -> Result<RawShot> {
-    let lookup = crate::inputs::uia::PasswordLookup::start(LookupWindow::Foreground.resolve());
     let desktop = virtual_desktop_rect()?;
     let width = (desktop.right - desktop.left).max(1) as u32;
     let height = (desktop.bottom - desktop.top).max(1) as u32;
@@ -609,7 +689,10 @@ pub fn grab_virtual_desktop_raw() -> Result<RawShot> {
             height,
             width,
             height,
-            Some(lookup),
+            // No password lookup: the region tool's picture goes to the
+            // clipboard, not to a model. If it ever did, `redact::apply`
+            // refuses a map with no lookup, so it would fail closed.
+            None,
         )),
     })
 }
@@ -1343,6 +1426,40 @@ mod tests {
         assert!(m
             .to_image(sr(i32::MIN, i32::MIN, i32::MAX, i32::MAX))
             .is_some());
+    }
+
+    // -- password lookup target (#506) -------------------------------------
+
+    #[test]
+    fn first_foreign_window_skips_our_windows_and_hidden_ones() {
+        use super::first_foreign_window;
+        // Z-order 1 -> 2 -> 3 -> 4 -> end. Windows 1 and 2 are ours, 3 is
+        // another process but hidden, 4 is the one we want.
+        let pid = |h: isize| if h <= 2 { 7 } else { 9 };
+        let shown = |h: isize| h != 3;
+        let next = |h: isize| if h < 4 { h + 1 } else { 0 };
+        assert_eq!(first_foreign_window(1, 7, &pid, &shown, &next, 50), 4);
+        // Already another process's window: unchanged.
+        assert_eq!(first_foreign_window(4, 7, &pid, &shown, &next, 50), 4);
+        // Nothing foreign and visible behind it: none.
+        let only_ours = |_: isize| 7;
+        assert_eq!(first_foreign_window(1, 7, &only_ours, &shown, &next, 50), 0);
+        // The step limit ends a long (or looping) walk.
+        let looping = |h: isize| if h == 1 { 2 } else { 1 };
+        assert_eq!(
+            first_foreign_window(1, 7, &only_ours, &shown, &looping, 10),
+            0
+        );
+        assert_eq!(first_foreign_window(0, 7, &pid, &shown, &next, 50), 0);
+    }
+
+    #[test]
+    fn no_lookup_window_means_no_lookup_and_when_gates_it() {
+        use super::LookupWindow::*;
+        assert_eq!(None.resolve(), Option::None);
+        assert_eq!(Window(0).resolve(), Some(0));
+        assert_eq!(super::LookupWindow::when(false, Foreground), None);
+        assert_eq!(super::LookupWindow::when(true, Window(5)), Window(5));
     }
 
     // -- blit_into (issue #29's virtual-desktop compositing) -------------
