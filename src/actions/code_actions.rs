@@ -39,6 +39,19 @@ pub const FIX_PROMPT: &str = "You are given a piece of code the user selected. F
 /// paste-ready block is the goal.
 pub const TESTS_PROMPT: &str = "You are given a piece of code the user selected. Write unit tests for it and return them in `text`, ready to paste. Use the test framework that fits the language and that the code already suggests (for example pytest for Python, Jest for JavaScript or TypeScript, the built-in test module for Rust, JUnit for Java, xUnit for C#); if the code gives no hint, pick the most common one. Cover the normal cases, the edge cases and the error cases you can see in the code. Give each test a clear name and keep each one short. Do not include the code under test itself. Return only the test code: no markdown fences, no notes, no explanation before or after. Use the same programming language as the code. Never invent functions, files or libraries that the selection does not show.";
 
+/// Shown instead of calling the model when the selection was cut to the
+/// length limit: an explanation, a fix or tests for part of the code would
+/// read as if they covered all of it. (Fix is also refused by the generic
+/// replace path with its own message.)
+pub const TOO_LONG_MESSAGE: &str =
+    "The selection is too long to read in full. Select less code and try again.";
+
+/// Whether `action_id` is one of the code actions, which refuse a selection
+/// that was cut to the length limit.
+pub fn refuses_cut_selection(action_id: &str) -> bool {
+    [EXPLAIN_ID, FIX_ID, TESTS_ID].contains(&action_id)
+}
+
 fn code_action(id: &str, name: &str, executor: &str, confirm: bool, prompt: &str) -> Action {
     Action {
         id: id.to_string(),
@@ -103,6 +116,16 @@ mod tests {
         let prompts: std::collections::HashSet<&str> =
             actions.iter().map(|a| a.prompt.as_str()).collect();
         assert_eq!(prompts.len(), 3, "each action has its own prompt");
+    }
+
+    #[test]
+    fn every_code_action_refuses_a_cut_selection_and_others_do_not() {
+        for id in [EXPLAIN_ID, FIX_ID, TESTS_ID] {
+            assert!(refuses_cut_selection(id), "{id}");
+        }
+        assert!(!refuses_cut_selection("translate-selection"));
+        assert!(!refuses_cut_selection(""));
+        assert!(!TOO_LONG_MESSAGE.contains('\u{2014}'));
     }
 
     #[test]

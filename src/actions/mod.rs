@@ -22,6 +22,7 @@ pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
 pub mod review_email;
+pub mod rewrite_tone;
 pub mod scam_check;
 pub mod schema;
 pub mod time_zones;
@@ -413,6 +414,10 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `code_actions::builtin_actions`): group Code, the selection only. Explain
 ///   is a read-only card, Fix confirms then replaces the selection, Tests
 ///   confirms then copies.
+/// - `"rewrite-shorter"`, `"rewrite-friendlier"`, `"rewrite-formal"` (#72,
+///   `rewrite_tone::builtin_actions`): proposal `text_answer`, executor
+///   `replace_text`. Rewrite the selection in a fixed tone, confirmed on a
+///   card, then written over the selection like "Translate selection".
 pub fn builtin_actions() -> Vec<Action> {
     let mut actions = vec![
         Action {
@@ -472,6 +477,7 @@ pub fn builtin_actions() -> Vec<Action> {
         scam_check::builtin_action(),
     ];
     actions.extend(code_actions::builtin_actions());
+    actions.extend(rewrite_tone::builtin_actions());
     actions
 }
 

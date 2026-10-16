@@ -329,3 +329,48 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "rewrite-shorter"
+name = "Rewrite: shorter"
+group = "Writing"
+inputs = ["selection"]
+proposal = "text_answer"
+executor = "replace_text"
+confirm = true
+prompt = "You are given a piece of text the user selected. Rewrite it to be shorter and tighter. Cut filler and repetition, keep every point that matters, and do not change the tone. Keep the meaning, facts, numbers, names, dates, URLs and the language of the original exactly: change only the wording and tone, and do not add or remove information. Keep the line breaks and formatting characters where they still make sense. Return only the rewritten text in `text`, with no notes, quotation marks or explanation. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes unless the original text has them."
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
+id = "rewrite-friendlier"
+name = "Rewrite: friendlier"
+group = "Writing"
+inputs = ["selection"]
+proposal = "text_answer"
+executor = "replace_text"
+confirm = true
+prompt = "You are given a piece of text the user selected. Rewrite it in a warmer, friendlier tone. Sound natural and kind, not gushing, and do not make it much longer. Keep the meaning, facts, numbers, names, dates, URLs and the language of the original exactly: change only the wording and tone, and do not add or remove information. Keep the line breaks and formatting characters where they still make sense. Return only the rewritten text in `text`, with no notes, quotation marks or explanation. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes unless the original text has them."
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
+id = "rewrite-formal"
+name = "Rewrite: more formal"
+group = "Writing"
+inputs = ["selection"]
+proposal = "text_answer"
+executor = "replace_text"
+confirm = true
+prompt = "You are given a piece of text the user selected. Rewrite it in a more formal, professional tone. Avoid slang, contractions and casual phrases, and do not make it much longer. Keep the meaning, facts, numbers, names, dates, URLs and the language of the original exactly: change only the wording and tone, and do not add or remove information. Keep the line breaks and formatting characters where they still make sense. Return only the rewritten text in `text`, with no notes, quotation marks or explanation. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes unless the original text has them."
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"

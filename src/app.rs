@@ -1785,6 +1785,7 @@ impl App {
         // #68: an action that writes the answer over the selection needs the
         // selection's UIA identity as well as its text.
         let writes_back = action.executor == "replace_text";
+        let cut_selection_refused = actions::code_actions::refuses_cut_selection(&action.id);
         let target = self.hwnd_isize();
         // #242 review: the action and the schema it was dispatched with are
         // carried through the worker and back in the result payload, rather
@@ -1855,6 +1856,13 @@ impl App {
                     if writes_back && actions::generic_replace::too_long(&gathered) {
                         return Err(GenericFailure::UserState(
                             actions::generic_replace::TOO_LONG_MESSAGE.to_string(),
+                        ));
+                    }
+                    // #73: an explanation or tests for part of the code would
+                    // read as if they covered all of it.
+                    if cut_selection_refused && actions::generic_replace::too_long(&gathered) {
+                        return Err(GenericFailure::UserState(
+                            actions::code_actions::TOO_LONG_MESSAGE.to_string(),
                         ));
                     }
                     let replace = writes_back
@@ -1991,6 +1999,23 @@ impl App {
             );
             self.set_watch(true);
             return;
+        }
+
+        // A write-back whose text is the selection as it was has nothing to
+        // write: say so instead of showing a pointless preview.
+        if action.executor == "replace_text" {
+            if let Some(plan) = replace.as_deref() {
+                if actions::generic_replace::is_unchanged(&plan.selected_text, &proposal) {
+                    self.card.show_answer(
+                        actions::generic_replace::NO_CHANGES_HEADLINE,
+                        &with_pending_notices(""),
+                        0,
+                        None,
+                    );
+                    self.set_watch(true);
+                    return;
+                }
+            }
         }
 
         if action.confirm {
