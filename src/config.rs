@@ -4594,10 +4594,7 @@ mod egress_preview_tests {
     fn active_provider_falls_back_to_openai_for_other_leaders() {
         assert_eq!(ActiveProvider::from_order(&[]), ActiveProvider::OpenAi);
         // #677: what the pickers show.
-        assert_eq!(
-            ActiveProvider::shown_for(&[]),
-            Some(ActiveProvider::OpenAi)
-        );
+        assert_eq!(ActiveProvider::shown_for(&[]), Some(ActiveProvider::OpenAi));
         assert_eq!(
             ActiveProvider::shown_for(&order(&["compat:lmstudio", "anthropic"])),
             None
