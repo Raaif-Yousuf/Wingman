@@ -4957,13 +4957,19 @@ mod tests {
         );
         assert_eq!(rgba.len(), (w * h * 4) as usize);
         assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
-        // Not a blank surface: the text and the border differ from the fill.
-        let mid = ((h / 2 * w + w / 2) * 4) as usize;
-        let bg = &rgba[mid..mid + 4];
-        assert!(
-            rgba.chunks_exact(4).any(|p| p != bg),
-            "the card has content, not one flat colour"
-        );
+        // The text is in it: inside the border, many pixels differ from the
+        // fill (read from the padding, a few pixels in from the corner).
+        let at = |x: u32, y: u32| ((y * w + x) * 4) as usize;
+        let bg = rgba[at(3, 3)..at(3, 3) + 4].to_vec();
+        let mut inked = 0;
+        for y in 2..h - 2 {
+            for x in 2..w - 2 {
+                if rgba[at(x, y)..at(x, y) + 4] != bg[..] {
+                    inked += 1;
+                }
+            }
+        }
+        assert!(inked > 100, "only {inked} pixels differ from the fill");
         assert_eq!(
             card.inner.focus_link,
             Some(FooterLink::Copy),

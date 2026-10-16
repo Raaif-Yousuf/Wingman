@@ -319,11 +319,13 @@ mod win32 {
         let _guard = OpenGuard::open()?;
         unsafe { EmptyClipboard() }?;
         let hglobal = alloc_hglobal_bytes(bytes)?;
-        // Ownership transfers to the clipboard on success; must not be
-        // freed here either way -- same reasoning
-        // `inputs::selection::win32::Win32Clipboard::set_formats` documents.
-        unsafe { SetClipboardData(CF_DIB, Some(HANDLE(hglobal.0))) }
-            .map_err(|e| anyhow::anyhow!("SetClipboardData(CF_DIB) failed: {e}"))?;
+        // Ownership transfers to the clipboard on success only. When the call
+        // fails the memory is still ours, so free it (#376 made this
+        // reachable from a key press).
+        if let Err(e) = unsafe { SetClipboardData(CF_DIB, Some(HANDLE(hglobal.0))) } {
+            let _ = unsafe { GlobalFree(Some(hglobal)) };
+            anyhow::bail!("SetClipboardData(CF_DIB) failed: {e}");
+        }
         Ok(())
     }
 }

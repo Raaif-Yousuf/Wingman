@@ -277,6 +277,12 @@ flight, grey while paused, a blue tint in Offline mode, and a red dot after a
 run failed (it clears when you start the next one). The tooltip says the same
 in words.
 
+## Keys on the card
+
+On an open answer card, `C` or `Ctrl+C` copies the text, and `Ctrl+Shift+C`
+copies the card as an image. `Tab` moves between the footer links, `Enter` or
+`Space` runs the one that has focus, and `Esc` closes the card.
+
 ## Cost on the card
 
 A cloud answer ends with a small line such as `About $0.002`: what that answer
