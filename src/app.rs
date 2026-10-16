@@ -8406,13 +8406,13 @@ mod tests {
     /// larger draft downscaled afterward), through the REAL intent router
     /// (`router::build_request`/`router::parse_router_result`, the same
     /// functions `App::router_worker` calls) against local Ollama
-    /// `gemma3:4b`. Run manually (AGENTS.md build rules -- never bare
+    /// `qwen3.5:4b` (or `WINGMAN_ROUTER_LIVE_MODEL`). Run manually (AGENTS.md build rules -- never bare
     /// `cargo test`):
     /// ```text
     /// CARGO_TARGET_DIR=... RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2 \
     ///   cargo test router_live -- --ignored --nocapture
     /// ```
-    /// Requires a local Ollama server on 127.0.0.1:11434 with `gemma3:4b`
+    /// Requires a local Ollama server on 127.0.0.1:11434 with the model
     /// pulled. Expects `intent == Some("review-this-email")` when that action
     /// exists in `actions::load_actions()`'s catalogue (added by a sibling
     /// agent in parallel, per #24's task description); otherwise only
@@ -8421,7 +8421,7 @@ mod tests {
     /// "0"`), the same convention `provider/mod.rs`'s and `ollama.rs`'s own
     /// live checks already use.
     ///
-    /// MEASURED 2026-09-17 (this crate's dev profile, `gemma3:4b`, catalogue
+    /// MEASURED 2026-09-17 (this crate's dev profile, `gemma3:4b` then, catalogue
     /// of 5 rows -- "review-email" not yet on master at measurement time):
     /// elapsed 45.71s (cold: the model was not already loaded going in --
     /// see `keep_alive`'s doc on why every OTHER live check in this crate
@@ -8441,6 +8441,11 @@ mod tests {
     /// expansion plan's own router default is `qwen3.5:4b`, not
     /// `gemma3:4b` (this test's model choice is fixed by the task that
     /// created it, not a production recommendation).
+    ///
+    /// MEASURED 2026-10-16 (#223, `qwen3.5:4b`, real catalogue with
+    /// `review-this-email`, revised prompt): 5 of 5 runs picked
+    /// `review-this-email` with a prose summary and no echoed id; see
+    /// `router::ROUTER_SYSTEM_PREFIX`.
     ///
     /// Separately: an early draft of this test's GDI renderer crashed
     /// (`STATUS_ACCESS_VIOLATION`) on a blank line in the body text --
