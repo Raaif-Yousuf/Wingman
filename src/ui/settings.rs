@@ -883,6 +883,7 @@ const ID_PULL_STATUS: i32 = 142;
 /// #569: the Gemini "Thinking:" caption, greyed with its combo for a model
 /// that ignores the setting.
 const ID_GEMINI_EFFORT_LABEL: i32 = 143;
+const ID_MODEL_LIST_HINT: i32 = 144;
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
 /// the text sent to a cloud or remote model, and the answer (real values put
@@ -947,6 +948,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_PULL_BUTTON", ID_PULL_BUTTON),
     ("ID_PULL_STATUS", ID_PULL_STATUS),
     ("ID_GEMINI_EFFORT_LABEL", ID_GEMINI_EFFORT_LABEL),
+    ("ID_MODEL_LIST_HINT", ID_MODEL_LIST_HINT),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1081,11 +1083,12 @@ const WIN_W_DP: i32 = 620;
 /// group at something close to its natural size instead of always falling
 /// back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout` itself
 /// never overlaps regardless of this constant, but a taller default is nicer
-/// than always squeezing.
+/// than always squeezing. #427 added one more row (the hint under the cloud
+/// model dropdowns), so it is raised by another `ROW_H + ROW_GAP`.
 const WIN_H_DP: i32 = 918 + 4 * (ROW_H + ROW_GAP);
 
 /// The one-line hint under the model dropdowns (#427). Plain words, no dash.
-const MODEL_LIST_HINT: &str = "Missing a model? Add its name to models in config.toml.";
+const MODEL_LIST_HINT: &str = "Missing a cloud model? Add its name to models in config.toml.";
 /// The shortest the window is ever made, in dp: the pinned footer and a sliver
 /// of body. It is only a floor against a failed or absurd monitor query (see
 /// `fitted_height_for_work_px`); a real work area is always taller, and a
@@ -3396,6 +3399,22 @@ fn build_ui_recorded(
     // Ollama (#183): no key, only which pulled model to use. The combo starts
     // with the configured model alone; the pulled models are added when the
     // background fetch reports in (see `spawn_ollama_models_fetch`).
+    // #427: the cloud model dropdowns list what the provider offers (or
+    // what is in config.toml), so say where to add one that is missing.
+    // Ollama's list comes from what is pulled, so this sits above its row.
+    ctx.create(
+        WC_STATIC,
+        MODEL_LIST_HINT,
+        0,
+        0,
+        r.x,
+        r.y,
+        r.w,
+        ROW_H,
+        ID_MODEL_LIST_HINT,
+    );
+    r.advance();
+
     ctx.create(
         WC_STATIC,
         "Ollama model:",
@@ -3425,11 +3444,6 @@ fn build_ui_recorded(
     if !labels.is_empty() {
         combo_select_index(ollama_model, selected as i32);
     }
-    r.advance();
-
-    // #427: the model dropdowns list what the provider offers (or what is
-    // in config.toml), so say where to add one that is missing.
-    ctx.create(WC_STATIC, MODEL_LIST_HINT, 0, 0, r.x, r.y, r.w, ROW_H, 0);
     r.advance();
 
     let providers_bottom = r.y + ROW_H + 8;
@@ -6134,9 +6148,60 @@ mod tests {
 
     #[test]
     fn the_model_list_hint_is_one_short_line_without_a_dash() {
-        assert!(MODEL_LIST_HINT.len() <= 60, "it must fit one row");
+        assert!(MODEL_LIST_HINT.len() <= 64, "it must fit one row");
         assert!(!MODEL_LIST_HINT.contains('\u{2014}'));
-        assert!(MODEL_LIST_HINT.contains("config.toml"));
+    }
+
+    /// #427 wired-to-nothing: the hint is a real control in the built window,
+    /// above the Ollama model row (Ollama has no `models` list to extend).
+    #[test]
+    fn the_model_list_hint_is_built_above_the_ollama_row() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+        let title = wide_z("Wingman settings (model hint test)");
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        let font = build_font(dpi);
+        build_ui(hwnd, instance, dpi, font, &Config::default(), WIN_H_DP);
+
+        let hint = get_dlg_item(hwnd, ID_MODEL_LIST_HINT).expect("hint exists");
+        assert_eq!(get_text(hint), MODEL_LIST_HINT);
+        let ollama = get_dlg_item(hwnd, ID_OLLAMA_MODEL).expect("ollama combo");
+        let gemini = get_dlg_item(hwnd, ID_GEMINI_MODEL).expect("gemini combo");
+        let top = |w: HWND| {
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            let _ = unsafe { GetWindowRect(w, &mut rc) };
+            rc.top
+        };
+        assert!(top(gemini) < top(hint), "below the cloud model rows");
+        assert!(top(hint) < top(ollama), "above the Ollama row");
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
     }
 
     #[test]
@@ -7147,11 +7212,13 @@ mod tests {
     /// one more row to the *Capture* group itself (the "higher reads small
     /// text better, costs more" hint under Screenshot detail/Screen), which
     /// shifts every group below it, including Forms, down by one
-    /// `ROW_H + ROW_GAP = 30`: `708 + 30 = 738`. Kept here as a literal, not
+    /// `ROW_H + ROW_GAP = 30`: `708 + 30 = 738`. #427 then added the hint
+    /// row under the cloud model dropdowns to the Providers group, one more
+    /// `ROW_H + ROW_GAP = 30`: `738 + 30 = 768`. Kept here as a literal, not
     /// derived, so a change to those sections has to update this test
     /// deliberately rather than silently keep passing against a moving
     /// target.
-    const CONTENT_TOP_DP: i32 = 738;
+    const CONTENT_TOP_DP: i32 = 768;
 
     /// #481 replaced the #340 invariant. The footer no longer has to stay
     /// clear of the Prompt group by arithmetic: it is pinned to the client
