@@ -110,7 +110,7 @@ impl Gemini {
         let mut generation_config = json!({});
         if let Some(schema) = &req.schema {
             generation_config["responseMimeType"] = json!("application/json");
-            generation_config["responseJsonSchema"] = schema.clone();
+            generation_config["responseJsonSchema"] = common::wire_schema(schema);
         }
 
         let effort = if req.effort != Effort::Unset {
@@ -483,6 +483,18 @@ mod tests {
                 .get("difficulty")
                 .is_none()
         );
+    }
+
+    /// #719: the UI-only `editable` keyword never goes out.
+    #[test]
+    fn no_registered_schema_sends_the_editable_keyword() {
+        let provider = Gemini::new("k", "gemini-3.8-flash", "low");
+        for kind in crate::actions::schema::PROPOSAL_KINDS {
+            let mut r = req("sys", false);
+            r.schema = crate::actions::schema::schema_for(kind, false);
+            let body = serde_json::to_string(&provider.build_body(&r)).unwrap();
+            assert!(!body.contains("editable"), "{kind}: {body}");
+        }
     }
 
     #[test]
