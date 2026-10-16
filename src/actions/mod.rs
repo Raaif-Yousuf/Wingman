@@ -7,6 +7,7 @@
 
 pub mod action_items;
 pub mod calendar;
+pub mod chart_table;
 pub mod code_actions;
 pub mod convert_times;
 pub mod define_word;
@@ -470,6 +471,7 @@ pub fn builtin_actions() -> Vec<Action> {
         fill_form::builtin_action(),
         action_items::builtin_action(),
         table::builtin_action(),
+        chart_table::builtin_action(),
         receipt::builtin_action(),
         explain_error::builtin_action(),
         define_word::builtin_action(),

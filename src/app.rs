@@ -2260,6 +2260,14 @@ impl App {
             }
             _ => (proposal, self.fallback_footer.clone()),
         };
+        // #114: values read off a chart are estimates. The headers say so (and
+        // so does the CSV), and the card says so under the rows.
+        let (proposal, note) = if action.id == actions::chart_table::ACTION_ID {
+            let (marked, card_note) = actions::chart_table::finish(&proposal, note.as_deref());
+            (marked, Some(card_note))
+        } else {
+            (proposal, note)
+        };
 
         if action.confirm {
             let writes_back = action.executor == "replace_text";
