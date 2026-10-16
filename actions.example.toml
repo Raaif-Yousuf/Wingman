@@ -284,3 +284,48 @@ enabled = true
 
 [actions.prefer]
 mode = "auto"
+
+[[actions]]
+id = "explain-this-code"
+name = "Explain this code"
+group = "Code"
+inputs = ["selection"]
+proposal = "text_answer"
+executor = "none"
+confirm = false
+prompt = 'You are given a piece of code the user selected. Explain what it does to a developer who has not seen it. Return it in `text`. The first line is one plain sentence of at most 85 characters saying what the code does. After a blank line, give a short walk through of the steps in plain sentences, and mention anything surprising, risky or likely to break. Do not rewrite the code and do not paste large parts of it back; quote a name or a short expression only when it helps. Never invent functions, files or libraries that the selection does not show. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
+id = "fix-this-code"
+name = "Fix this code"
+group = "Code"
+inputs = ["selection"]
+proposal = "text_answer"
+executor = "replace_text"
+confirm = true
+prompt = "You are given a piece of code the user selected. Find the bug or bugs in it and return the whole corrected code in `text`, so it can replace the selection as is. Change as little as possible: keep the names, structure, comments, formatting and style of the original, and fix only what is wrong. Do not add features, refactor, or explain. If you find nothing wrong, return the code unchanged. Return only the code: no markdown fences, no notes, no explanation before or after. Use the same programming language as the code. Never invent functions, files or libraries that the selection does not show."
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
+id = "write-tests-for-code"
+name = "Write tests for this code"
+group = "Code"
+inputs = ["selection"]
+proposal = "text_answer"
+executor = "clipboard"
+confirm = true
+prompt = "You are given a piece of code the user selected. Write unit tests for it and return them in `text`, ready to paste. Use the test framework that fits the language and that the code already suggests (for example pytest for Python, Jest for JavaScript or TypeScript, the built-in test module for Rust, JUnit for Java, xUnit for C#); if the code gives no hint, pick the most common one. Cover the normal cases, the edge cases and the error cases you can see in the code. Give each test a clear name and keep each one short. Do not include the code under test itself. Return only the test code: no markdown fences, no notes, no explanation before or after. Use the same programming language as the code. Never invent functions, files or libraries that the selection does not show."
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
