@@ -1116,3 +1116,18 @@ function Remove-Item { process { Write-Output "REMOVED:$($_.Thumbprint)" } }
         ($out -join "`n") | Should -BeExactly 'REMOVED:BBBB'
     }
 }
+
+Describe 'Registration stays sparse (issue #251)' {
+    It 'registers the package with -ExternalLocation' {
+        $src = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Wingman.Common.psm1') -Raw) -replace "`r", ''
+        $calls = @($src -split "`n" | Where-Object { $_ -match '^\s*Add-AppxPackage\b' })
+        $calls.Count | Should -BeGreaterThan 0
+        foreach ($c in $calls) { $c | Should -Match '-ExternalLocation' }
+    }
+
+    It 'tells release readers to install with install.ps1, not the msix' {
+        $yml = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\.github\workflows\release.yml') -Raw) -replace "`r", ''
+        $yml | Should -Match 'never by double-clicking wingman\.msix'
+        $yml | Should -Match '\$notes = "\$signedNote`n`n\$installNote'
+    }
+}
