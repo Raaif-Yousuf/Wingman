@@ -77,6 +77,11 @@ const HEADER_LEN: usize = 5;
 /// of its own -- `unprotect(profile_bytes, None)` still fails.
 pub const PROFILE_ENTROPY: &[u8] = b"Wingman/profile/v1";
 
+/// Entropy for the per-value envelopes in the store's `profile_field` table
+/// (issue #46). Different from [`PROFILE_ENTROPY`] on purpose: a value from the
+/// old `profile.bin` file and a value from the store cannot be swapped.
+pub const PROFILE_FIELD_ENTROPY: &[u8] = b"Wingman/store/profile_field/v1";
+
 /// Zeroizes a buffer this module owns, in place. `write_volatile` (rather
 /// than a plain `*b = 0` loop or `slice::fill`) stops the compiler from
 /// proving the writes are dead -- because nothing reads the buffer again

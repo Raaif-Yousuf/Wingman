@@ -10,11 +10,14 @@
   start when a Wingman is already running. It also refuses to run unless the
   CI environment variable is set or -AllowLocal is passed.
 
-  The child gets its own empty APPDATA and LOCALAPPDATA and no *_API_KEY
-  variables, but that does NOT isolate it from a real machine: the config
-  path comes from SHGetKnownFolderPath (not the environment) and keys can
-  also come from Windows Credential Manager. That is why a clean runner, or
-  an explicit -AllowLocal, is required.
+  The script copies the exe into a scratch folder next to an empty
+  wingman.portable marker (portable mode, #681) and launches that copy, so
+  the config, the store, the egress log and the crash note all land in the
+  scratch folder, and the Run key is left alone. The child also gets its own
+  empty APPDATA and LOCALAPPDATA and no *_API_KEY variables. The file side is
+  hermetic; keys can still come from Windows Credential Manager, which
+  portable mode does not move, so a clean runner is the safest place and the
+  script still needs CI or -AllowLocal.
 
   Steps:
     1. Launch. The owner window must appear and the process must go idle.
@@ -88,9 +91,13 @@ public static extern System.IntPtr FindWindowW(string cls, string title);
 public static extern bool PostMessageW(System.IntPtr hwnd, uint msg, System.UIntPtr wparam, System.IntPtr lparam);
 '@
 
-$exe = (Resolve-Path -LiteralPath $ExePath).Path
 $data = Join-Path ([IO.Path]::GetTempPath()) ('wingman-smoke-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $data | Out-Null
+# Portable mode: the marker next to a copy of the exe moves every file the app
+# writes into this folder (see src/portable.rs).
+$exe = Join-Path $data 'wingman.exe'
+Copy-Item -LiteralPath (Resolve-Path -LiteralPath $ExePath).Path -Destination $exe
+New-Item -ItemType File -Path (Join-Path $data 'wingman.portable') | Out-Null
 
 function Invoke-Wingman {
     param([string[]] $Arguments = @())

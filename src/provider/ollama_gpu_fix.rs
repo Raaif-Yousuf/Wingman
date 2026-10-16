@@ -21,9 +21,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
-};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
     REG_OPTION_NON_VOLATILE, REG_SZ,
@@ -431,25 +428,15 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Intel adapters via DXGI. Empty when DXGI cannot be asked (then no fix is
-/// offered: the safe outcome, since the button changes things).
+/// Vendor ids of the hardware DXGI adapters (one shared enumeration, in
+/// `machine`). Empty when DXGI cannot be asked (then no fix is offered: the
+/// safe outcome, since the button changes things).
 pub fn adapter_vendor_ids() -> Vec<u32> {
-    let mut out = Vec::new();
-    unsafe {
-        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
-            return out;
-        };
-        let mut i = 0;
-        while let Ok(adapter) = factory.EnumAdapters1(i) {
-            i += 1;
-            if let Ok(desc) = adapter.GetDesc1() {
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                    out.push(desc.VendorId);
-                }
-            }
-        }
-    }
-    out
+    crate::machine::adapters()
+        .unwrap_or_default()
+        .iter()
+        .map(|g| g.vendor_id)
+        .collect()
 }
 
 /// Writes a `REG_SZ` under `HKCU\<key_path>`, creating the key. The key and
