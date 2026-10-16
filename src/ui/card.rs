@@ -1212,7 +1212,11 @@ enum CopyFeedback {
 /// A rotation needs ~16-33ms/frame to read as smooth; the old text-dot
 /// animation could get away with much slower ticks, but a spinner cannot.
 const ANIM_INTERVAL_MS: u32 = 20;
-const PENDING_SAFETY_TIMEOUT_SECS: u32 = 30;
+/// A last resort if the worker never reports back. Derived from the provider
+/// timeouts for a typical chain. A longer chain can outlast it, which is
+/// recoverable: a press while busy shows the working card again (#723).
+const PENDING_SAFETY_TIMEOUT_SECS: u32 =
+    crate::provider::worst_case_run_secs(crate::provider::TYPICAL_CHAIN_LEN) as u32;
 /// How long "Asking {model}..." stays up before the line changes to "Still
 /// working." -- issue #354's "after a few seconds".
 const STILL_WORKING_DELAY_MS: u32 = 4000;
@@ -4519,6 +4523,16 @@ fn utf16(s: &str) -> Vec<u16> {
 mod tests {
     use super::*;
     use crate::ui::theme;
+
+    /// #723: the pending card must outlive the slowest honest request: every
+    /// provider in the chain at its own wall clock.
+    #[test]
+    fn pending_safety_timeout_outlasts_a_full_provider_chain() {
+        let timeout = u64::from(std::hint::black_box(PENDING_SAFETY_TIMEOUT_SECS));
+        assert!(timeout >= 4 * crate::provider::common::MAX_TOTAL_WALL_CLOCK_SECS);
+        assert!(timeout >= 4 * crate::provider::ollama::TOTAL_TIMEOUT_SECS);
+    }
+
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
     fn instance() -> HINSTANCE {
@@ -5835,7 +5849,10 @@ mod tests {
         assert_eq!(p.bg, sys.window);
         assert_eq!(p.headline, sys.window_text);
         assert_eq!(p.detail, sys.window_text);
-        assert_eq!(p.hint, sys.gray_text);
+        assert_eq!(
+            p.hint, sys.window_text,
+            "live labels are never GrayText (#816)"
+        );
         assert_eq!(p.danger, sys.window_text);
         // Dark ignores the system colours.
         assert_eq!(palette_for(Theme::Dark, &sys).bg, theme::DARK.surface);

@@ -19,6 +19,36 @@ pub struct PaletteAction {
     /// `false` for the offline utilities (#132): "Copy text from screen",
     /// "Calculate selection", "Copy region to clipboard".
     pub requires_model: bool,
+    /// What running this action can change (#306). The options card's key
+    /// pick reads it: only an action that cannot touch anything without a
+    /// further Enter, and cannot overwrite the clipboard, may be run by a
+    /// bare key press.
+    pub effect: Effect,
+}
+
+/// What running an action can change, the `effect` column of the catalogue.
+/// Declared most-restrictive-last so a new variant is a conscious choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// Read-only: shows an answer, changes nothing.
+    None,
+    /// Writes the clipboard with no further confirmation.
+    Clipboard,
+    /// Ends in a preview card and waits for Enter before it writes.
+    Preview,
+}
+
+/// The effect of an executor id (`actions::resolve_executor`'s names). An
+/// executor that writes only after the preview is `Preview`; the clipboard
+/// ones are `Clipboard`; `"none"` is `None`. An unknown id fails at dispatch
+/// with an error card and writes nothing, but is classed `Clipboard` anyway,
+/// the more restrictive of the two, so a typo can never become key-pickable.
+pub fn effect_for_executor(executor: &str) -> Effect {
+    match executor {
+        "none" => Effect::None,
+        "calendar_add" | "replace_text" | "fill_form" => Effect::Preview,
+        _ => Effect::Clipboard,
+    }
 }
 
 /// One row the palette shows.
@@ -454,6 +484,9 @@ pub enum DispatchTarget {
     FillForm,
     CalculateSelection,
     CopyRegion,
+    /// "Relative dates to real dates" (#336): finds the phrases locally, no
+    /// model, so it has its own arm like the other model-free built-ins.
+    ResolveDates,
     /// Any other action id (#242): a user-authored `actions.toml` entry,
     /// carried by value so `App::dispatch_palette_action` can look the
     /// action back up by id without a second table.
@@ -481,6 +514,7 @@ pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
         crate::actions::calendar::ACTION_ID => Some(DispatchTarget::AddToCalendar),
         crate::actions::review_email::ACTION_ID => Some(DispatchTarget::ReviewEmail),
         crate::actions::fill_form::ACTION_ID => Some(DispatchTarget::FillForm),
+        crate::actions::relative_dates::ACTION_ID => Some(DispatchTarget::ResolveDates),
         CALCULATE_SELECTION_ACTION_ID => Some(DispatchTarget::CalculateSelection),
         COPY_REGION_ACTION_ID => Some(DispatchTarget::CopyRegion),
         _ => Some(DispatchTarget::Generic(action_id.to_string())),
@@ -504,7 +538,8 @@ fn action_requires_model(action_id: &str) -> bool {
         || action_id == crate::actions::READ_QR_ACTION_ID
         || action_id == CALCULATE_SELECTION_ACTION_ID
         || action_id == COPY_REGION_ACTION_ID
-        || action_id == crate::actions::fill_form::ACTION_ID;
+        || action_id == crate::actions::fill_form::ACTION_ID
+        || action_id == crate::actions::relative_dates::ACTION_ID;
     !model_free
 }
 
@@ -519,6 +554,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
             name: r.action.name.clone(),
             group: r.action.group.clone(),
             requires_model: action_requires_model(&r.action.id),
+            effect: effect_for_executor(&r.action.executor),
         })
         .collect();
     out.push(PaletteAction {
@@ -526,12 +562,14 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
         name: "Calculate selection".to_string(),
         group: None,
         requires_model: false,
+        effect: Effect::None,
     });
     out.push(PaletteAction {
         id: COPY_REGION_ACTION_ID.to_string(),
         name: "Copy region to clipboard".to_string(),
         group: None,
         requires_model: false,
+        effect: Effect::Clipboard,
     });
     out
 }
@@ -650,6 +688,7 @@ mod tests {
             name: name.to_string(),
             group: group.map(|g| g.to_string()),
             requires_model,
+            effect: Effect::None,
         }
     }
 
@@ -1160,6 +1199,10 @@ mod tests {
             Some(DispatchTarget::ReadQr)
         );
         assert_eq!(
+            dispatch_target_for(crate::actions::relative_dates::ACTION_ID),
+            Some(DispatchTarget::ResolveDates)
+        );
+        assert_eq!(
             dispatch_target_for(CALCULATE_SELECTION_ACTION_ID),
             Some(DispatchTarget::CalculateSelection)
         );
@@ -1250,6 +1293,74 @@ mod tests {
             .find(|a| a.id == crate::actions::fill_form::ACTION_ID)
             .expect("fill-this-form is in the catalogue");
         assert!(!fill.requires_model, "#132: maps locally with no model");
+        let dates = cat
+            .iter()
+            .find(|a| a.id == crate::actions::relative_dates::ACTION_ID)
+            .expect("resolve-relative-dates is in the catalogue");
+        assert!(!dates.requires_model, "#336: resolves locally, no model");
+    }
+
+    /// #306: the `effect` column. A clipboard writer is never key-picked, a
+    /// preview needs Enter, a read-only action changes nothing.
+    #[test]
+    fn catalogue_effect_column_for_the_built_ins() {
+        let resolved = crate::actions::merge_actions(crate::actions::builtin_actions(), vec![]);
+        let cat = catalogue(&resolved);
+        let effect = |id: &str| {
+            cat.iter()
+                .find(|a| a.id == id)
+                .unwrap_or_else(|| panic!("{id} is in the catalogue"))
+                .effect
+        };
+        assert_eq!(effect(crate::actions::DEFAULT_ACTION_ID), Effect::None);
+        assert_eq!(
+            effect(crate::actions::explain_screen::ACTION_ID),
+            Effect::None
+        );
+        assert_eq!(
+            effect(crate::actions::EXTRACT_TEXT_ACTION_ID),
+            Effect::Clipboard
+        );
+        assert_eq!(effect(crate::actions::READ_QR_ACTION_ID), Effect::Clipboard);
+        assert_eq!(effect(COPY_REGION_ACTION_ID), Effect::Clipboard);
+        assert_eq!(effect(CALCULATE_SELECTION_ACTION_ID), Effect::None);
+        assert_eq!(effect(crate::actions::calendar::ACTION_ID), Effect::Preview);
+        assert_eq!(
+            effect(crate::actions::review_email::ACTION_ID),
+            Effect::Preview
+        );
+        assert_eq!(
+            effect(crate::actions::fill_form::ACTION_ID),
+            Effect::Preview
+        );
+    }
+
+    #[test]
+    fn effect_for_executor_never_calls_an_unknown_executor_key_pickable() {
+        assert_eq!(effect_for_executor("none"), Effect::None);
+        assert_eq!(effect_for_executor("clipboard"), Effect::Clipboard);
+        assert_eq!(effect_for_executor("image_clipboard"), Effect::Clipboard);
+        assert_eq!(effect_for_executor("replace_text"), Effect::Preview);
+        assert_eq!(effect_for_executor("calendar_add"), Effect::Preview);
+        assert_eq!(effect_for_executor("fill_form"), Effect::Preview);
+        assert_eq!(effect_for_executor("typo"), Effect::Clipboard);
+        assert_eq!(effect_for_executor(""), Effect::Clipboard);
+    }
+
+    #[test]
+    fn every_built_in_executor_has_an_effect_that_matches_its_resolution() {
+        // A built-in whose executor is "none" must be read-only, and one that
+        // resolves to anything else must not be.
+        let resolved = crate::actions::merge_actions(crate::actions::builtin_actions(), vec![]);
+        assert!(!resolved.is_empty());
+        for r in &resolved {
+            assert_eq!(
+                effect_for_executor(&r.action.executor) == Effect::None,
+                r.action.executor == "none",
+                "{}",
+                r.action.id
+            );
+        }
     }
 
     #[test]
