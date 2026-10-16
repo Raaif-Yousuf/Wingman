@@ -42,6 +42,11 @@ pub const UNTRUSTED_WEB_NOTE: &str = "The user turn contains the text of a web p
 pub const PASSWORD_FIELD_MESSAGE: &str =
     "The selection is in a password field, so Wingman did not read it.";
 
+/// Shown when a password field has the focus and the action would have fallen
+/// back to the screenshot (#500).
+pub const PASSWORD_FOCUS_MESSAGE: &str =
+    "A password field is focused, so Wingman did not look at the screen.";
+
 /// The text each listed text input produced. `None` means not requested or
 /// nothing usable (blank or unreadable).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -49,6 +54,10 @@ pub struct Gathered {
     pub selection: Option<String>,
     /// The selection reader said the focused element is a password field.
     pub selection_in_password_field: bool,
+    /// A password field has the focus, read for an action that lists a text
+    /// input and the screen but not the selection (#500). Only matters when
+    /// the request would fall back to the screenshot.
+    pub focus_in_password_field: bool,
     /// The selection was cut to the reader's length limit.
     pub selection_truncated: bool,
     /// The selection's UIA identity, read only for an action that writes
@@ -127,6 +136,14 @@ fn wants_screen(inputs: &[InputKind]) -> bool {
         .any(|k| matches!(k, InputKind::Screen | InputKind::Window | InputKind::Region))
 }
 
+/// Whether the worker should check for a focused password field: a text input
+/// is listed next to the screen, so an empty text could fall back to the
+/// screenshot, and the selection reader (which checks it itself) is not
+/// listed (#500).
+pub fn needs_focus_probe(inputs: &[InputKind]) -> bool {
+    wants_any_text(inputs) && wants_screen(inputs) && !wants_selection(inputs)
+}
+
 /// Whether the request could carry the screenshot, decided from the `inputs`
 /// list alone, before anything is gathered (#494). `false` for a text-only
 /// action: [`plan`] never sends the screen for it, so `App` skips the capture
@@ -188,6 +205,11 @@ pub fn plan(inputs: &[InputKind], gathered: &Gathered) -> Result<RequestInputs, 
     // asked for no text input at all (the pre-#484 behaviour, and what an
     // empty or `text`/`context`-only list still means).
     if screen_may_be_needed(inputs) {
+        // #500: a text input came back empty, so the screen is the fallback,
+        // and it could show the focused password field.
+        if gathered.focus_in_password_field && wants_any_text(inputs) {
+            return Err(PASSWORD_FOCUS_MESSAGE.to_string());
+        }
         return Ok(RequestInputs {
             user: SCREEN_USER_TEXT.to_string(),
             screen: true,
@@ -343,6 +365,65 @@ mod tests {
             ..Gathered::default()
         };
         assert!(plan(&[Selection, Clipboard], &gathered).is_err());
+    }
+
+    #[test]
+    fn focused_password_field_blocks_the_screen_fallback_of_any_text_input() {
+        let gathered = Gathered {
+            focus_in_password_field: true,
+            ..Gathered::default()
+        };
+        for inputs in [
+            vec![Clipboard, Screen],
+            vec![Uia, Screen],
+            vec![PageText, Screen],
+            vec![LinkedPage, Window],
+            vec![Clipboard, Uia, Region],
+        ] {
+            assert_eq!(
+                plan(&inputs, &gathered).unwrap_err(),
+                PASSWORD_FOCUS_MESSAGE,
+                "{inputs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn focused_password_field_does_not_block_gathered_text_or_a_plain_screen_action() {
+        let gathered = Gathered {
+            focus_in_password_field: true,
+            clipboard: Some("c".into()),
+            ..Gathered::default()
+        };
+        let r = plan(&[Clipboard, Screen], &gathered).unwrap();
+        assert_eq!(r.user, "Clipboard text:\nc");
+        assert!(!r.screen);
+        // A screen-only action lists no text input, so the flag is not read.
+        let flag = Gathered {
+            focus_in_password_field: true,
+            ..Gathered::default()
+        };
+        assert!(plan(&[Screen], &flag).unwrap().screen);
+    }
+
+    #[test]
+    fn the_focus_probe_runs_only_for_text_plus_screen_without_a_selection() {
+        for inputs in [
+            vec![Clipboard, Screen],
+            vec![Uia, Window],
+            vec![PageText, Region],
+        ] {
+            assert!(needs_focus_probe(&inputs), "{inputs:?}");
+        }
+        for inputs in [
+            vec![],
+            vec![Screen],
+            vec![Clipboard],
+            vec![Selection, Screen],
+            vec![Selection, Clipboard, Screen],
+        ] {
+            assert!(!needs_focus_probe(&inputs), "{inputs:?}");
+        }
     }
 
     #[test]

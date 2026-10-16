@@ -1212,6 +1212,15 @@ pub fn get_selection_foreground(
     resolve(probe, max_chars, clipboard_wait_budget, None)
 }
 
+/// Whether the focused element is a password field (#500). Fails closed: an
+/// unreadable `IsPassword` counts as a password field (`resolve_is_password`),
+/// but a UIA error that yields no element at all is "no", since the caller only
+/// uses this to refuse a screenshot fallback. Same worker-thread requirement
+/// as [`get_selection_foreground`].
+pub fn focused_is_password() -> bool {
+    matches!(com::probe_focused(), Ok(UiaProbe::FocusedIsPassword))
+}
+
 /// Same as [`get_selection_foreground`], plus a [`Selection::target`] when
 /// the UIA path can support one (#219). `foreground_hwnd` is the caller's
 /// already-known foreground window handle (e.g. `GetForegroundWindow()`),
