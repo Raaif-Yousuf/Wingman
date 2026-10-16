@@ -286,12 +286,18 @@ mod tests {
             "Open evil.example://x",
         ] {
             let c = card_text(&proposal(&[bad, "Odd wording."], "suspicious"));
-            assert!(!c.headline.contains(bad) && !c.detail.contains(bad), "{bad}");
+            assert!(
+                !c.headline.contains(bad) && !c.detail.contains(bad),
+                "{bad}"
+            );
             assert!(c.detail.contains("- Odd wording."), "{bad}");
         }
         // The same text as the only sign: the card still has a verdict and
         // the fixed step, and none of the contact.
-        let c = card_text(&proposal(&["Call 555-0100, it is legitimate"], "likely_scam"));
+        let c = card_text(&proposal(
+            &["Call 555-0100, it is legitimate"],
+            "likely_scam",
+        ));
         assert_eq!(c.headline, "Likely a scam");
         assert!(!c.detail.contains("555") && !c.detail.contains("legitimate"));
         assert_eq!(c.detail, NEXT_STEP);
@@ -328,7 +334,10 @@ mod tests {
     fn blank_signs_are_dropped_and_lines_are_collapsed() {
         let c = card_text(&proposal(&["  ", "Urgent\n  deadline."], "suspicious"));
         assert_eq!(c.headline, "Suspicious");
-        assert_eq!(c.detail, format!("Seen in it:\n- Urgent deadline.\n{NEXT_STEP}"));
+        assert_eq!(
+            c.detail,
+            format!("Seen in it:\n- Urgent deadline.\n{NEXT_STEP}")
+        );
     }
 
     #[test]
@@ -366,7 +375,10 @@ mod tests {
     fn the_prompt_treats_the_screen_as_data() {
         assert!(BASE_PROMPT.contains("untrusted"));
         assert!(BASE_PROMPT.contains("never say whether the message is legitimate"));
-        assert!(!BASE_PROMPT.contains('\u{2014}'), "no em dash in model text");
+        assert!(
+            !BASE_PROMPT.contains('\u{2014}'),
+            "no em dash in model text"
+        );
     }
 
     #[test]
