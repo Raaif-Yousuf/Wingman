@@ -77,7 +77,14 @@ pub fn gate(paused: bool) -> std::result::Result<(), (&'static str, &'static str
 /// the same ordering and for the same reason `App::ask` captures before
 /// `show_pending` (the card must not appear in its own screenshot).
 pub fn capture_screen() -> Result<RawShot> {
-    crate::capture::grab_raw("active", u32::MAX, u64::MAX)
+    // The text is read here and copied to the clipboard: nothing leaves the
+    // machine, so no password lookup (#506).
+    crate::capture::grab_raw_for(
+        "active",
+        u32::MAX,
+        u64::MAX,
+        crate::capture::LookupWindow::None,
+    )
 }
 
 /// OCR `raw`, and if any text was found, copy it to the clipboard through
@@ -148,6 +155,7 @@ mod tests {
             rgba: vec![0; 4],
             width: 1,
             height: 1,
+            screen: None,
         }
     }
 

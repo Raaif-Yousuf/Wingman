@@ -413,7 +413,9 @@ mod tests {
             .expect("no palette.show call");
         assert!(ask < show, "the palette steals the foreground when shown");
         assert!(
-            body.contains("self.maybe_start_router(candidates, password_manager_in_front)"),
+            body.contains(
+                "self.maybe_start_router(candidates, password_manager_in_front, underlying)"
+            ),
             "toggle_palette must hand its answer to the router"
         );
     }

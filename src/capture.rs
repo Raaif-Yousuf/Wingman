@@ -92,6 +92,192 @@ pub struct RawShot {
     pub rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Where these pixels sit on the screen, so screen rectangles (a UIA
+    /// password field) can be mapped onto them (#506). `None` for an image
+    /// that is not a screen capture (a test canvas): nothing can be mapped.
+    pub screen: Option<ScreenMap>,
+}
+
+/// A rectangle in virtual-screen coordinates (physical pixels; the process is
+/// per-monitor-v2 DPI aware, so UIA and `GetMonitorInfoW` agree). `right` and
+/// `bottom` are exclusive. Can be negative (a monitor left of or above the
+/// primary one) and is untrusted input from another process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// How a [`RawShot`]'s pixels relate to the virtual screen: the screen
+/// position of pixel (0, 0) and how many screen pixels one image pixel
+/// covers (above 1.0 once `fit_for_model` has shrunk the capture). Carries
+/// the password-field lookup that was started when the capture was taken, so
+/// it describes the window as the user saw it, not as it is when the worker
+/// runs, and runs while the capture and encode do.
+#[derive(Debug, Clone)]
+pub struct ScreenMap {
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub scale_x: f64,
+    pub scale_y: f64,
+    /// The password-field lookup started at capture time. `None` for a map
+    /// built without one (a test).
+    pub lookup: Option<crate::inputs::uia::PasswordLookup>,
+}
+
+/// Which window's password fields a capture asks about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupWindow {
+    /// Whatever is in front when the capture is taken. If that window is
+    /// one of Wingman's own (the tray menu, a card), the next visible window
+    /// of another process behind it is asked about instead.
+    Foreground,
+    /// A window remembered earlier (the router capture runs while Wingman's
+    /// own palette is in front). 0 means there is none: no fields.
+    Window(isize),
+    /// No lookup: nothing in this request is redacted (the pixels stay on
+    /// this machine, or redaction is off), so nobody would use the answer.
+    None,
+}
+
+impl LookupWindow {
+    /// `window` when a password lookup is needed, [`LookupWindow::None`]
+    /// when it is not. `needed` comes from [`needs_password_lookup`].
+    pub fn when(needed: bool, window: LookupWindow) -> Self {
+        if needed {
+            window
+        } else {
+            Self::None
+        }
+    }
+
+    /// The raw `HWND` value to ask about, `None` for no lookup. Reads the
+    /// foreground window when this is [`LookupWindow::Foreground`], so call
+    /// it at capture time. Never one of Wingman's own windows.
+    fn resolve(self) -> Option<isize> {
+        let hwnd = match self {
+            Self::Foreground => unsafe { GetForegroundWindow() }.0 as isize,
+            Self::Window(h) => h,
+            Self::None => return None,
+        };
+        Some(not_ours(hwnd))
+    }
+}
+
+/// Whether the pixels of a request in `mode` are painted at all: the same
+/// test [`encode_for_chain`] makes. The password lookup is started only when
+/// this is true, so a request that redacts nothing pays nothing.
+pub fn needs_password_lookup(
+    redact_setting: bool,
+    providers: &crate::config::Providers,
+    mode: crate::mode::Mode,
+) -> bool {
+    redact_setting && providers.sends_screenshot_off_machine(mode)
+}
+
+/// Walks the window order from `start` for a window of another process.
+/// `start` itself when it is not ours; 0 when there is none within `limit`
+/// steps. Pure over the three window queries so the walk is tested without
+/// windows.
+fn first_foreign_window(
+    start: isize,
+    own_pid: u32,
+    pid_of: &dyn Fn(isize) -> u32,
+    shown: &dyn Fn(isize) -> bool,
+    next: &dyn Fn(isize) -> isize,
+    limit: usize,
+) -> isize {
+    let mut h = start;
+    for _ in 0..limit {
+        if h == 0 {
+            return 0;
+        }
+        if pid_of(h) != own_pid && shown(h) {
+            return h;
+        }
+        h = next(h);
+    }
+    0
+}
+
+/// `hwnd` unless it belongs to Wingman: then the next visible, titled
+/// top-level window of another process behind it (0 if none), so the tray
+/// menu or a card in front does not become the lookup target.
+fn not_ours(hwnd: isize) -> isize {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindow, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible, GW_HWNDNEXT,
+    };
+    let own = unsafe { GetCurrentProcessId() };
+    let h = |v: isize| HWND(v as *mut _);
+    let pid_of = |v: isize| {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h(v), Some(&mut pid)) };
+        pid
+    };
+    let shown = |v: isize| {
+        unsafe { IsWindowVisible(h(v)) }.as_bool() && unsafe { GetWindowTextLengthW(h(v)) } > 0
+    };
+    let next = |v: isize| {
+        unsafe { GetWindow(h(v), GW_HWNDNEXT) }
+            .map(|w| w.0 as isize)
+            .unwrap_or(0)
+    };
+    if hwnd == 0 || pid_of(hwnd) != own {
+        return hwnd;
+    }
+    first_foreign_window(hwnd, own, &pid_of, &shown, &next, 200)
+}
+
+impl ScreenMap {
+    /// The map of a monitor whose top-left is `(left, top)` and whose native
+    /// size is `native_w` x `native_h`, captured and then resized to
+    /// `width` x `height`.
+    pub fn for_capture(
+        left: i32,
+        top: i32,
+        native_w: u32,
+        native_h: u32,
+        width: u32,
+        height: u32,
+        lookup: Option<crate::inputs::uia::PasswordLookup>,
+    ) -> Self {
+        Self {
+            origin_x: f64::from(left),
+            origin_y: f64::from(top),
+            scale_x: f64::from(native_w.max(1)) / f64::from(width.max(1)),
+            scale_y: f64::from(native_h.max(1)) / f64::from(height.max(1)),
+            lookup,
+        }
+    }
+
+    /// The map of a crop of this image taken at `rect` (buffer-local pixels).
+    pub fn cropped(&self, rect: RectPx) -> Self {
+        Self {
+            origin_x: self.origin_x + f64::from(rect.x) * self.scale_x,
+            origin_y: self.origin_y + f64::from(rect.y) * self.scale_y,
+            ..self.clone()
+        }
+    }
+
+    /// `rect` as float image pixels `(x0, y0, x1, y1)`, not clipped. `None`
+    /// for a map that cannot be inverted (a scale that is zero or not
+    /// finite) or a rect that is empty or reversed.
+    pub fn to_image(&self, rect: ScreenRect) -> Option<(f32, f32, f32, f32)> {
+        let ok = |s: f64| s.is_finite() && s > 0.0;
+        if !(ok(self.scale_x) && ok(self.scale_y))
+            || rect.right <= rect.left
+            || rect.bottom <= rect.top
+        {
+            return None;
+        }
+        let x = |v: i32| ((f64::from(v) - self.origin_x) / self.scale_x) as f32;
+        let y = |v: i32| ((f64::from(v) - self.origin_y) / self.scale_y) as f32;
+        Some((x(rect.left), y(rect.top), x(rect.right), y(rect.bottom)))
+    }
 }
 
 /// Resolves the `(max_long_edge, max_pixels)` [`fit_for_model`] should use
@@ -131,7 +317,28 @@ pub fn resolve_limits(
 /// `monitor_mode` is `"active"` (the monitor under the foreground window) or
 /// `"primary"` (always the system's primary monitor). Anything else is
 /// treated as `"active"`.
+#[cfg(test)]
 pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Result<RawShot> {
+    grab_raw_for(
+        monitor_mode,
+        max_long_edge,
+        max_pixels,
+        LookupWindow::Foreground,
+    )
+}
+
+/// [`grab_raw`], with the window whose password fields are looked up named.
+/// The lookup thread starts here, before the monitor is grabbed, so it runs
+/// alongside the capture, the resize and the encode (#506).
+pub fn grab_raw_for(
+    monitor_mode: &str,
+    max_long_edge: u32,
+    max_pixels: u64,
+    lookup_window: LookupWindow,
+) -> Result<RawShot> {
+    let lookup = lookup_window
+        .resolve()
+        .map(crate::inputs::uia::PasswordLookup::start);
     let rect = match monitor_mode {
         "primary" => primary_monitor_rect()?,
         _ => active_monitor_rect()?,
@@ -154,6 +361,10 @@ pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Resu
     let image = target
         .capture_image()
         .map_err(|e| anyhow!("capturing monitor: {e}"))?;
+    let (origin_x, origin_y) = (
+        target.x().unwrap_or(rect.left),
+        target.y().unwrap_or(rect.top),
+    );
 
     let (w, h) = (image.width(), image.height());
     let (nw, nh) = fit_for_model(w, h, max_long_edge, max_pixels);
@@ -169,6 +380,9 @@ pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Resu
         rgba: resized.into_raw(),
         width: final_w,
         height: final_h,
+        screen: Some(ScreenMap::for_capture(
+            origin_x, origin_y, w, h, final_w, final_h, lookup,
+        )),
     })
 }
 
@@ -192,7 +406,7 @@ pub fn encode_for_chain(
     mode: crate::mode::Mode,
     redact_setting: bool,
 ) -> Result<Shot> {
-    if redact_setting && providers.sends_screenshot_off_machine(mode) {
+    if needs_password_lookup(redact_setting, providers, mode) {
         crate::redact::apply(raw)?;
     }
     encode(raw)
@@ -468,6 +682,18 @@ pub fn grab_virtual_desktop_raw() -> Result<RawShot> {
         rgba,
         width,
         height,
+        screen: Some(ScreenMap::for_capture(
+            desktop.left,
+            desktop.top,
+            width,
+            height,
+            width,
+            height,
+            // No password lookup: the region tool's picture goes to the
+            // clipboard, not to a model. If it ever did, `redact::apply`
+            // refuses a map with no lookup, so it would fail closed.
+            None,
+        )),
     })
 }
 
@@ -545,6 +771,7 @@ pub fn crop_rgba(rgba: &[u8], width: u32, height: u32, rect: RectPx) -> RawShot 
             rgba: vec![0; 4],
             width: 1,
             height: 1,
+            screen: None,
         };
     }
 
@@ -568,6 +795,9 @@ pub fn crop_rgba(rgba: &[u8], width: u32, height: u32, rect: RectPx) -> RawShot 
         rgba: out,
         width: cw,
         height: ch,
+        // The caller owns the source's map and sets the crop's with
+        // `ScreenMap::cropped` (this takes bare pixels).
+        screen: None,
     }
 }
 
@@ -930,6 +1160,7 @@ mod tests {
             rgba: checkerboard_rgba(w, h),
             width: w,
             height: h,
+            screen: None,
         };
         let shot = encode(&raw).expect("encode");
         assert_eq!(shot.width, w);
@@ -1117,6 +1348,118 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- ScreenMap (#506) --------------------------------------------------
+
+    fn sr(left: i32, top: i32, right: i32, bottom: i32) -> super::ScreenRect {
+        super::ScreenRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn screen_map_full_size_capture_subtracts_the_monitor_origin() {
+        let m = super::ScreenMap::for_capture(100, 50, 800, 600, 800, 600, None);
+        assert_eq!(
+            m.to_image(sr(110, 60, 210, 80)),
+            Some((10.0, 10.0, 110.0, 30.0))
+        );
+    }
+
+    #[test]
+    fn screen_map_follows_a_downscale() {
+        // 2000x1000 monitor shrunk to 1000x500: one image pixel is two screen pixels.
+        let m = super::ScreenMap::for_capture(0, 0, 2000, 1000, 1000, 500, None);
+        assert_eq!(
+            m.to_image(sr(200, 100, 600, 300)),
+            Some((100.0, 50.0, 300.0, 150.0))
+        );
+    }
+
+    #[test]
+    fn screen_map_handles_a_monitor_left_of_and_above_the_primary() {
+        let m = super::ScreenMap::for_capture(-1920, -200, 1920, 1080, 1920, 1080, None);
+        assert_eq!(
+            m.to_image(sr(-1900, -190, -1800, -170)),
+            Some((20.0, 10.0, 120.0, 30.0))
+        );
+    }
+
+    #[test]
+    fn screen_map_of_a_crop_moves_the_origin_by_the_crop_offset() {
+        let whole = super::ScreenMap::for_capture(0, 0, 2000, 1000, 1000, 500, None);
+        let crop = whole.cropped(RectPx {
+            x: 100,
+            y: 50,
+            w: 200,
+            h: 100,
+        });
+        // Screen (200,100) is image (100,50) of the whole, (0,0) of the crop.
+        assert_eq!(
+            crop.to_image(sr(200, 100, 400, 200)),
+            Some((0.0, 0.0, 100.0, 50.0))
+        );
+    }
+
+    #[test]
+    fn screen_map_refuses_what_it_cannot_map_instead_of_panicking() {
+        let m = super::ScreenMap::for_capture(0, 0, 100, 100, 100, 100, None);
+        assert_eq!(m.to_image(sr(10, 10, 10, 20)), None, "empty");
+        assert_eq!(m.to_image(sr(30, 10, 10, 20)), None, "reversed");
+        let bad = super::ScreenMap {
+            scale_x: 0.0,
+            ..m.clone()
+        };
+        assert_eq!(bad.to_image(sr(0, 0, 5, 5)), None);
+        let nan = super::ScreenMap {
+            scale_y: f64::NAN,
+            ..m.clone()
+        };
+        assert_eq!(nan.to_image(sr(0, 0, 5, 5)), None);
+        // A zero-sized capture still builds a usable (non-zero) scale.
+        let z = super::ScreenMap::for_capture(0, 0, 0, 0, 0, 0, None);
+        assert!(z.scale_x > 0.0 && z.scale_y > 0.0);
+        assert!(m
+            .to_image(sr(i32::MIN, i32::MIN, i32::MAX, i32::MAX))
+            .is_some());
+    }
+
+    // -- password lookup target (#506) -------------------------------------
+
+    #[test]
+    fn first_foreign_window_skips_our_windows_and_hidden_ones() {
+        use super::first_foreign_window;
+        // Z-order 1 -> 2 -> 3 -> 4 -> end. Windows 1 and 2 are ours, 3 is
+        // another process but hidden, 4 is the one we want.
+        let pid = |h: isize| if h <= 2 { 7 } else { 9 };
+        let shown = |h: isize| h != 3;
+        let next = |h: isize| if h < 4 { h + 1 } else { 0 };
+        assert_eq!(first_foreign_window(1, 7, &pid, &shown, &next, 50), 4);
+        // Already another process's window: unchanged.
+        assert_eq!(first_foreign_window(4, 7, &pid, &shown, &next, 50), 4);
+        // Nothing foreign and visible behind it: none.
+        let only_ours = |_: isize| 7;
+        assert_eq!(first_foreign_window(1, 7, &only_ours, &shown, &next, 50), 0);
+        // The step limit ends a long (or looping) walk.
+        let looping = |h: isize| if h == 1 { 2 } else { 1 };
+        assert_eq!(
+            first_foreign_window(1, 7, &only_ours, &shown, &looping, 10),
+            0
+        );
+        assert_eq!(first_foreign_window(0, 7, &pid, &shown, &next, 50), 0);
+    }
+
+    #[test]
+    fn no_lookup_window_means_no_lookup_and_when_gates_it() {
+        use super::LookupWindow::*;
+        assert_eq!(None.resolve(), Option::None);
+        assert_eq!(Window(0).resolve(), Some(0));
+        assert_eq!(super::LookupWindow::when(false, Foreground), None);
+        assert_eq!(super::LookupWindow::when(true, Window(5)), Window(5));
     }
 
     // -- blit_into (issue #29's virtual-desktop compositing) -------------

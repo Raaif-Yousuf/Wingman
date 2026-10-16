@@ -526,6 +526,7 @@ mod tests {
             rgba,
             width: width as u32,
             height: height as u32,
+            screen: None,
         }
     }
 
