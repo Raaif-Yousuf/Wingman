@@ -659,19 +659,24 @@ fn startup_card(
         "Another program holds Wingman's startup lock".to_string(),
         "Wingman started anyway. If you see two Wingman tray icons, quit one of them.".to_string(),
     );
-    let first = match (config_problem, unreadable.is_empty()) {
-        (Some(problem), _) => Some(config_problem_card(problem)),
-        (None, false) => Some(unreadable_secrets_card(unreadable)),
-        (None, true) => None,
-    };
-    match (first, lock_squatted) {
-        (None, false) => None,
-        (Some(card), false) => Some(card),
-        (None, true) => Some(squat),
-        (Some((headline, detail)), true) => {
-            Some((headline, format!("{detail}\n\n{}. {}", squat.0, squat.1)))
-        }
+    // Every problem that applies, in order; the first one's headline leads
+    // and the rest are joined, so none is dropped.
+    let mut cards = Vec::new();
+    if let Some(problem) = config_problem {
+        cards.push(config_problem_card(problem));
     }
+    if !unreadable.is_empty() {
+        cards.push(unreadable_secrets_card(unreadable));
+    }
+    if lock_squatted {
+        cards.push(squat);
+    }
+    let mut cards = cards.into_iter();
+    let (headline, mut detail) = cards.next()?;
+    for (h, d) in cards {
+        detail = format!("{detail}\n\n{h}. {d}");
+    }
+    Some((headline, detail))
 }
 
 /// #711: config.toml exists but did not parse. Names the line and column
@@ -680,8 +685,9 @@ fn config_problem_card(problem: &str) -> (String, String) {
     (
         "Settings file not read".to_string(),
         format!(
-            "{problem}. Wingman is using default settings and will not save over your file. \
-             Fix it, then choose Reload settings from the tray menu."
+            "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
+             computer) and will not save over your file. Fix it, then choose Reload settings \
+             from the tray menu."
         ),
     )
 }
@@ -4546,6 +4552,7 @@ fn with_pending_notices(detail: &str) -> String {
         [
             crate::store::take_notice(),
             crate::usage::take_budget_notice(),
+            crate::config::take_backup_warning(),
             crate::actions::take_skipped_notice(),
         ]
         .into_iter()
@@ -7676,6 +7683,8 @@ mod tests {
             both.contains(problem) && both.contains("startup lock"),
             "{both}"
         );
+        assert!(both.contains("Stored API key unreadable"), "{both}");
+        assert!(both.contains("Offline"), "{both}");
     }
 
     /// #237: the owner window must exist before the single-instance name is

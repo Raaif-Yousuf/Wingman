@@ -782,6 +782,105 @@ fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
     }
 }
 
+/// #711: paths already backed up since their last load, so one load that
+/// rewrites the file twice (repair, then key import) keeps the first, original
+/// copy rather than an intermediate one.
+static BACKED_UP: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// A backup that could not be made, for the next card. See [`take_backup_warning`].
+static BACKUP_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// True the first time it is called for `path` since [`forget_backed_up`].
+fn mark_backed_up(path: &Path) -> bool {
+    let mut done = lock_ignoring_poison(&BACKED_UP);
+    if done.iter().any(|p| p == path) {
+        return false;
+    }
+    done.push(path.to_path_buf());
+    true
+}
+
+fn forget_backed_up(path: &Path) {
+    lock_ignoring_poison(&BACKED_UP).retain(|p| p != path);
+}
+
+/// Takes the pending "could not keep a backup" warning, if any. `app.rs` adds
+/// it to the next card.
+pub fn take_backup_warning() -> Option<String> {
+    lock_ignoring_poison(&BACKUP_WARNING).take()
+}
+
+/// `text` with every `api_key` value emptied, comments and layout kept. Both
+/// the usual `api_key = "..."` line and any other place a parsed key value
+/// appears quoted are blanked, so a backup never holds a key.
+fn blank_api_keys(text: &str) -> String {
+    fn collect(v: &toml::Value, out: &mut Vec<String>) {
+        match v {
+            toml::Value::Table(t) => {
+                for (k, v) in t {
+                    match v {
+                        toml::Value::String(s) if k == "api_key" && !s.is_empty() => {
+                            out.push(s.clone())
+                        }
+                        _ => collect(v, out),
+                    }
+                }
+            }
+            toml::Value::Array(a) => a.iter().for_each(|v| collect(v, out)),
+            _ => {}
+        }
+    }
+    let mut keys = Vec::new();
+    if let Ok(v) = text.parse::<toml::Value>() {
+        collect(&v, &mut keys);
+    }
+    let mut out: String = text
+        .split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_start();
+            let rest = body.strip_prefix("api_key").map(str::trim_start);
+            if rest.is_some_and(|r| r.starts_with('=')) {
+                let indent = &line[..line.len() - body.len()];
+                let eol = &line[line.trim_end_matches(['\r', '\n']).len()..];
+                format!("{indent}api_key = \"\"{eol}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    for k in keys {
+        out = out.replace(&format!("\"{k}\""), "\"\"");
+        out = out.replace(&format!("'{k}'"), "''");
+    }
+    out
+}
+
+/// Writes `<path>.bak` (temp, restrict, rename) from the current file with
+/// its API keys blanked.
+fn backup_without_keys(path: &Path) -> Result<()> {
+    let text = fs::read_to_string(path).context("could not read the old config")?;
+    let mut bak_name = path.as_os_str().to_os_string();
+    bak_name.push(".bak");
+    let bak = PathBuf::from(bak_name);
+    let mut tmp_name = bak.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    let made = fs::write(&tmp, blank_api_keys(&text))
+        .context("could not write the backup")
+        .and_then(|_| {
+            #[cfg(windows)]
+            Config::restrict_acl(&tmp)?;
+            fs::rename(&tmp, &bak).context("could not move the backup into place")
+        });
+    if made.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    made
+}
+
 impl Config {
     /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {
@@ -917,6 +1016,8 @@ impl Config {
             match Self::parse_reporting_repair(&contents) {
                 Ok((cfg, repaired)) => {
                     note_mtime(path, mtime);
+                    // A fresh load: the next save takes a fresh backup.
+                    forget_backed_up(path);
                     if repaired {
                         // Best effort: the in-memory value is already correct, so a
                         // failed write here is not worth failing the load over.
@@ -1179,6 +1280,9 @@ impl Config {
     fn not_loaded(problem: String) -> Config {
         let mut cfg = Config::default();
         cfg.backfill();
+        // Fail safe: the file may have said Offline or set a budget, and
+        // defaults would be looser. Nothing leaves the machine until it parses.
+        cfg.mode = Mode::Offline;
         cfg.load_problem = Some(problem);
         cfg
     }
@@ -1342,24 +1446,24 @@ impl Config {
     /// [`Config::load_from`] does (rule 9).
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
+        // #711: checked before the secret store is touched, so a refused save
+        // writes nothing anywhere.
+        self.check_save_allowed(&path)?;
         let mut on_disk = self.clone();
         on_disk.push_secrets_to_store(&CredManagerStore, &|name| std::env::var(name).is_ok())?;
         on_disk.save_to(&path)
     }
 
-    /// Same as [`Config::save`] but against an arbitrary path, and without
-    /// any Credential Manager access -- whatever `api_key` is already on
-    /// `self` is what gets written. Writes atomically (temp file + rename)
-    /// so a reader never observes a half-written file.
-    pub fn save_to(&self, path: &Path) -> Result<()> {
-        // #711: defaults standing in for an unreadable file must never replace it.
+    /// #711: refuses a save that would clobber the user's file.
+    fn check_save_allowed(&self, path: &Path) -> Result<()> {
+        // Defaults standing in for an unreadable file must never replace it.
         if let Some(problem) = &self.load_problem {
             anyhow::bail!(
                 "{problem}, so Wingman did not save over it. Fix the file, then choose \
                  Reload settings from the tray menu"
             );
         }
-        // #711: a hand edit made after this config was read is not clobbered.
+        // A hand edit made after this config was read is not clobbered.
         if let (Some(seen), Some(now)) = (seen_mtime(path), file_mtime(path)) {
             if seen != now {
                 anyhow::bail!(
@@ -1368,6 +1472,15 @@ impl Config {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Same as [`Config::save`] but against an arbitrary path, and without
+    /// any Credential Manager access -- whatever `api_key` is already on
+    /// `self` is what gets written. Writes atomically (temp file + rename)
+    /// so a reader never observes a half-written file.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        self.check_save_allowed(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context("failed to create config directory")?;
         }
@@ -1395,28 +1508,15 @@ impl Config {
             );
         }
 
-        // #711: one generation of backup, itself written temp-then-rename and
-        // restricted the same way (it can hold what the file held). Failing to
-        // make it aborts the save: the old file is the only copy.
-        if path.exists() {
-            let mut bak_name = path.as_os_str().to_os_string();
-            bak_name.push(".bak");
-            let bak = PathBuf::from(bak_name);
-            let mut bak_tmp_name = bak.as_os_str().to_os_string();
-            bak_tmp_name.push(".tmp");
-            let bak_tmp = PathBuf::from(bak_tmp_name);
-            let made = fs::copy(path, &bak_tmp)
-                .context("failed to copy the old config to a backup")
-                .and_then(|_| {
-                    #[cfg(windows)]
-                    Self::restrict_acl(&bak_tmp)?;
-                    fs::rename(&bak_tmp, &bak)
-                        .context("failed to move the config backup into place")
-                });
-            if let Err(e) = made {
-                let _ = fs::remove_file(&bak_tmp);
-                let _ = fs::remove_file(&tmp_path);
-                return Err(e);
+        // #711: one generation of backup, taken on the first save after each
+        // load (so the hand-edited original survives the load's own repair or
+        // key-import rewrites). It never holds an API key. A backup that cannot
+        // be made only warns: the atomic write below still goes ahead.
+        if path.exists() && mark_backed_up(path) {
+            if let Err(e) = backup_without_keys(path) {
+                *lock_ignoring_poison(&BACKUP_WARNING) = Some(format!(
+                    "Wingman could not keep a backup copy of config.toml ({e:#}). Your settings were saved."
+                ));
             }
         }
 
@@ -2077,6 +2177,7 @@ win = true
         assert_eq!(
             Config {
                 load_problem: None,
+                mode: Mode::default(),
                 ..config
             },
             Config::default()
@@ -2091,6 +2192,88 @@ win = true
         let f = fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_from_epoch))
             .unwrap();
+    }
+
+    #[test]
+    fn a_file_that_did_not_parse_runs_offline() {
+        let path = scratch_path("711-offline");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "mode = \"offline\"\n[budget\n").unwrap();
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        assert_eq!(config.mode, Mode::Offline);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_backup_never_holds_an_api_key_but_keeps_comments() {
+        let path = scratch_path("711-bak-no-key");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# my note\n[providers.openai]\napi_key = \"x\"\n[providers.anthropic]\n  api_key='y'\n";
+        fs::write(&path, original).unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        config.save_to(&path).unwrap();
+
+        let mut bak = path.as_os_str().to_os_string();
+        bak.push(".bak");
+        let bak_text = fs::read_to_string(PathBuf::from(bak)).unwrap();
+        assert!(bak_text.contains("# my note"), "{bak_text}");
+        assert!(
+            !bak_text.contains("\"x\"") && !bak_text.contains("'y'"),
+            "{bak_text}"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn one_load_that_rewrites_twice_keeps_the_original_as_the_backup() {
+        let path = scratch_path("711-bak-first-only");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# hand written\nmode = \"cloud\"\n";
+        fs::write(&path, original).unwrap();
+
+        // The load repairs (first save), then a second save follows.
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        config.save_to(&path).unwrap();
+        config.save_to(&path).unwrap();
+
+        let mut bak = path.as_os_str().to_os_string();
+        bak.push(".bak");
+        assert_eq!(fs::read_to_string(PathBuf::from(bak)).unwrap(), original);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_refused_save_writes_nothing_before_the_gate() {
+        // Config::save checks the gate before the secret store; the check is
+        // shared, so prove it refuses with no path touched.
+        let path = scratch_path("711-gate-first");
+        let mut config = Config::default();
+        config.load_problem = Some("config.toml has an error at line 1, column 1".into());
+        assert!(config.check_save_allowed(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_made_does_not_block_the_save() {
+        let path = scratch_path("711-bak-fails");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "mode = \"cloud\"\n").unwrap();
+        // A directory where the .bak file goes makes the rename fail.
+        let mut bak = path.as_os_str().to_os_string();
+        bak.push(".bak");
+        fs::create_dir_all(PathBuf::from(&bak)).unwrap();
+
+        let mut config = Config::default();
+        config.mode = Mode::Local;
+        let _ = take_backup_warning();
+        config.save_to(&path).expect("the save still goes ahead");
+        assert!(fs::read_to_string(&path).unwrap().contains("local"));
+        assert!(take_backup_warning().is_some());
+
+        cleanup(&path);
     }
 
     #[test]
