@@ -156,8 +156,23 @@ pub const WM_APP_FIRST_RUN: u32 = WM_APP + 20;
 /// `Box::into_raw(Box::new(Result<ExecDone, String>))`; the handler takes
 /// ownership and shows the result card. The executors can take seconds, so
 /// they never run on the message loop, which is also the keyboard hook's
-/// thread. `WM_APP + 21`: `+21` is taken by the machine check result.
+/// thread. `WM_APP + 22`: `+21` is `WM_APP_MACHINE_CHECK_RESULT`.
 pub const WM_APP_EXECUTOR_DONE: u32 = WM_APP + 22;
+
+/// #328: posted by the "Check this PC for local models" worker thread when
+/// its reads finish. `lparam` is
+/// `Box::into_raw(Box::new(machine::MachineFacts))`; the receiver takes
+/// ownership. The reads (including a loopback `/api/ps` call) run off the
+/// message thread because that thread also hosts the low-level keyboard
+/// hook, which Windows drops if it stalls. `WM_APP + 21`: `+20` is
+/// `WM_APP_FIRST_RUN`.
+pub const WM_APP_MACHINE_CHECK_RESULT: u32 = WM_APP + 21;
+
+/// Set while a machine check is gathering, so a second click does not start
+/// a second worker. Cleared by the worker just before it posts, so an
+/// ignored (Settings open) or dropped result can never leave it stuck.
+static MACHINE_CHECK_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// #567: what Ollama reported for one base URL, as (name, supports vision).
 type PulledOllamaModels = (String, Vec<(String, bool)>);
@@ -2257,6 +2272,14 @@ impl App {
             }
             _ => (proposal, self.fallback_footer.clone()),
         };
+        // #114: values read off a chart are estimates. The headers say so (and
+        // so does the CSV), and the card says so under the rows.
+        let (proposal, note) = if action.id == actions::chart_table::ACTION_ID {
+            let (marked, card_note) = actions::chart_table::finish(&proposal, note.as_deref());
+            (marked, Some(card_note))
+        } else {
+            (proposal, note)
+        };
 
         if action.confirm {
             let writes_back = action.executor == "replace_text";
@@ -2404,6 +2427,7 @@ impl App {
                     .show_pending(crate::ui::card::PendingStage::AskingModel { model_name });
             }
             Some(PendingPreview::Calendar) => self.run_confirmed_calendar_add(confirmed),
+            Some(PendingPreview::ImportAction(prepared)) => self.commit_import(&prepared),
             // Nothing is waiting on this decision, so nothing runs.
             None => {}
         }
@@ -3390,6 +3414,46 @@ impl App {
         }
     }
 
+    /// Issue #328: "Check this PC for local models". Reads RAM, GPU, battery
+    /// and Ollama's GPU use once, on click, on a worker thread (the message
+    /// thread also hosts the keyboard hook and must never wait on a
+    /// socket), then `on_machine_check_result` shows the verdict. Nothing is
+    /// kept and nothing polls.
+    fn check_machine(&mut self) {
+        use std::sync::atomic::Ordering;
+        if MACHINE_CHECK_RUNNING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        let target = self.hwnd_isize();
+        let base_url = self.config.providers.ollama.base_url.clone();
+        std::thread::spawn(move || {
+            let facts = crate::machine::gather(&base_url);
+            MACHINE_CHECK_RUNNING.store(false, Ordering::SeqCst);
+            let payload = Box::into_raw(Box::new(facts));
+            unsafe {
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_MACHINE_CHECK_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_MACHINE_CHECK_RESULT, LPARAM(payload as isize));
+                }
+            }
+        });
+    }
+
+    fn on_machine_check_result(&mut self, facts: &crate::machine::MachineFacts) {
+        let verdict = crate::machine::verdict(facts);
+        self.card
+            .show_answer(&verdict.headline, &verdict.detail(), 20, None);
+    }
+
     /// Issue #115: "Calculate selection" tray item. Model-free: reads the
     /// current selection (UIA, falling back to a clipboard-safe Ctrl+C --
     /// see `inputs::selection`) and evaluates it locally via `calc`, with no
@@ -4146,11 +4210,22 @@ impl App {
         }
     }
 
-    fn set_watch(&self, on: bool) {
+    fn set_watch(&mut self, on: bool) {
+        let failed = match &self.watcher {
+            Some(w) if on => !w.arm(),
+            _ => false,
+        };
+        // Never overwrite a real earlier error: the card being shown may be it.
+        if failed && self.last_error.is_none() {
+            // Issue #729: no click-away for this card. Record it for
+            // "Copy diagnostics" rather than failing the card itself.
+            self.record_last_error(
+                "Click-away dismissal unavailable",
+                "SetWindowsHookExW(WH_MOUSE_LL) failed",
+            );
+        }
         if let Some(w) = &self.watcher {
-            if on {
-                w.arm();
-            } else {
+            if !on {
                 w.disarm();
             }
         }
@@ -4182,6 +4257,139 @@ impl App {
 
     fn hwnd_isize(&self) -> isize {
         OWNER_HWND.with(|h| h.get())
+    }
+
+    /// #117: hands the tray the actions the user wrote, for "Export action".
+    /// Called as the menu opens; a missing or broken actions.toml shows none.
+    fn sync_export_menu(&mut self) {
+        let written = actions::load_actions()
+            .map(|a| actions::share::export_candidates(&a))
+            .unwrap_or_default();
+        self.tray.set_export_actions(&written);
+    }
+
+    /// #117: runs an OS file dialog without `&mut App` being reachable from it.
+    /// The dialog pumps this thread's messages, so `wnd_proc` can be entered
+    /// while it is open; `SETTINGS_OPEN` makes that entry defer or ignore
+    /// everything instead of forming a second `&mut App` (see its doc
+    /// comment). What was deferred is delivered afterwards, as
+    /// `open_settings` does. The closure must not touch `self`.
+    fn run_os_dialog<T>(&mut self, dialog: impl FnOnce() -> T) -> T {
+        // Like `open_settings`: no card timers or click watcher while the
+        // nested loop runs.
+        self.card.hide();
+        self.set_watch(false);
+        SETTINGS_OPEN.with(|c| c.set(true));
+        let out = dialog();
+        SETTINGS_OPEN.with(|c| c.set(false));
+        let pending: VecDeque<DeferredMessage> =
+            PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
+            self.try_restore_tray_icon()
+        } else {
+            None
+        };
+        if PAUSE_REEVALUATE_PENDING.with(|c| c.replace(false)) {
+            self.reevaluate_pause(self.hwnd());
+        }
+        self.deliver_deferred(pending);
+        self.show_tray_restore_error(tray_restore_error);
+        out
+    }
+
+    /// #117: tray > Import action from file. Pick a file, check it, and show
+    /// what it does on a preview card. Only "Do it" adds it to actions.toml
+    /// (`on_preview_decided`); Esc or a click away adds nothing. Nothing runs.
+    fn import_action(&mut self) {
+        let owner = HWND(self.hwnd_isize() as *mut _);
+        let Some(file) = self.run_os_dialog(|| crate::ui::file_dialog::pick_action_file(owner))
+        else {
+            return;
+        };
+        let prepared = (|| -> anyhow::Result<actions::share::Prepared> {
+            let text = actions::share::read_import_file(&file)?;
+            let import = actions::share::parse_import(&text)?;
+            actions::share::prepare(&actions::path()?, import)
+        })();
+        match prepared {
+            Ok(prepared) => {
+                let value = prepared.preview_value();
+                self.pending_preview = Some(PendingPreview::ImportAction(Box::new(prepared)));
+                self.pending_preview_generation = self.card.show_preview(
+                    "Add this action?",
+                    &actions::share::preview_schema(),
+                    &value,
+                    false,
+                );
+            }
+            Err(e) => {
+                let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't import the action", &detail);
+            }
+        }
+    }
+
+    /// #117: the user said "Do it" on an import preview. Re-checks that
+    /// actions.toml is still the file the preview was made against.
+    fn commit_import(&mut self, prepared: &actions::share::Prepared) {
+        let result = actions::path().and_then(|path| prepared.commit(&path));
+        match result {
+            Ok(()) => self.card.show_answer(
+                "Action added",
+                &format!("{} is in the Quick Ask list.", prepared.action.name),
+                4,
+                None,
+            ),
+            Err(e) => {
+                let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't import the action", &detail);
+            }
+        }
+    }
+
+    /// #117: tray > Export action to file > (one of your actions).
+    fn export_action(&mut self, index: usize) {
+        let Some(id) = self.tray.export_action_at(index).map(str::to_owned) else {
+            return;
+        };
+        let owner = HWND(self.hwnd_isize() as *mut _);
+        let mut turned_off = false;
+        let text = actions::load_actions().and_then(|all| {
+            let found = all
+                .iter()
+                .find(|r| r.action.id == id && r.origin == actions::Origin::User)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the action \"{id}\" is no longer in actions.toml")
+                })?;
+            turned_off = actions::share::imports_turned_off(&found.action);
+            actions::share::export_toml(&found.action)
+        });
+        let outcome = text.and_then(|text| {
+            let picked = self.run_os_dialog(|| crate::ui::file_dialog::pick_save_path(owner, &id));
+            let Some(path) = picked else {
+                return Ok(None);
+            };
+            std::fs::write(&path, text)
+                .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
+            Ok(Some(()))
+        });
+        match outcome {
+            Ok(Some(())) if turned_off => self.card.show_answer(
+                "Action saved",
+                "Its prompt is long, so it will be added turned off. Whoever imports it must read the prompt in actions.toml, then turn it on.",
+                8,
+                None,
+            ),
+            Ok(Some(())) => self.card.show_answer("Action saved", "", 3, None),
+            Ok(None) => {}
+            Err(e) => {
+                let detail = self.track_error("Couldn't export the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't export the action", &detail);
+            }
+        }
     }
 }
 
@@ -5840,6 +6048,9 @@ enum PendingPreview {
     /// "Send" answers it (`ui::send_gate::decide`), and every other way the
     /// preview ends drops it, which cancels the send.
     Send(std::sync::mpsc::Sender<confirm::SendAuthorized>),
+    /// #117: an action file waiting for "Do it" before it is added to
+    /// actions.toml.
+    ImportAction(Box<actions::share::Prepared>),
 }
 
 /// What `wnd_proc` should do with a message addressed to the owner window
@@ -5957,6 +6168,10 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
+        // #328: an on-demand card; Settings hides every card when it
+        // opens, so a result arriving then has nothing to show on. The
+        // boxed facts are freed below.
+        | WM_APP_MACHINE_CHECK_RESULT
         // #105: a send preview cannot be answered while Settings is
         // modal-open, so it is dropped, which cancels the send (the worker
         // sees the reply channel close and the request ends in a card).
@@ -6010,6 +6225,9 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_PALETTE_RUN => drop(Box::from_raw(p as *mut String)),
             WM_APP_SEND_PREVIEW => drop(Box::from_raw(p as *mut crate::ui::send_gate::SendRequest)),
             WM_APP_PENDING_STAGE => drop(Box::from_raw(p as *mut crate::ui::card::PendingStage)),
+            WM_APP_MACHINE_CHECK_RESULT => {
+                drop(Box::from_raw(p as *mut crate::machine::MachineFacts))
+            }
             WM_APP_FIRST_RUN => drop(Box::from_raw(p as *mut FirstRun)),
             WM_APP_ROUTER_RESULT => drop(Box::from_raw(
                 p as *mut (u64, std::result::Result<router::RouterResult, String>),
@@ -6163,6 +6381,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // the next one. Never waits on Ollama, so the menu opens at once.
             if Tray::opens_menu(lparam) {
                 app.sync_ollama_menu();
+                app.sync_export_menu();
             }
             if let Some(id) = app.tray.on_tray_message(lparam) {
                 app.password_manager_hint = menu_hint;
@@ -6183,6 +6402,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
                     MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
+                    MenuChoice::ExportAction(i) => app.export_action(i),
+                    MenuChoice::Command(cmd::IMPORT_ACTION) => app.import_action(),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
                     MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
@@ -6200,6 +6421,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
                     MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
                     MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
+                    MenuChoice::Command(cmd::CHECK_MACHINE) => app.check_machine(),
                     MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
                     MenuChoice::Command(cmd::USE_OPENAI) => {
                         app.set_provider(ActiveProvider::OpenAi)
@@ -6326,6 +6548,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>) };
             app.on_exec_done(result);
+            LRESULT(0)
+        }
+        WM_APP_MACHINE_CHECK_RESULT => {
+            let facts = unsafe { *Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts) };
+            app.on_machine_check_result(&facts);
             LRESULT(0)
         }
         WM_APP_PENDING_STAGE => {
@@ -6508,8 +6735,8 @@ mod tests {
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
-        WM_APP_GENERIC_ACTION_RESULT, WM_APP_PENDING_STAGE, WM_APP_RESULT, WM_APP_REVIEW_RESULT,
-        WM_APP_ROUTER_RESULT, WM_APP_SEND_PREVIEW,
+        WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
+        WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT, WM_APP_SEND_PREVIEW,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
@@ -6767,6 +6994,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #328: a machine-check result dropped unhandled (Settings open, window
+    /// closing, post failure) must free its boxed facts, not leak them.
+    #[test]
+    fn free_boxed_payload_frees_a_machine_check_result() {
+        let facts = Box::into_raw(Box::new(crate::machine::MachineFacts {
+            ram_bytes: None,
+            gpus: None,
+            ollama: crate::machine::OllamaState::NotRunning,
+            power: crate::machine::Power::Unknown,
+        }));
+        assert!(super::free_boxed_payload(
+            super::WM_APP_MACHINE_CHECK_RESULT,
+            windows::Win32::Foundation::LPARAM(facts as isize)
+        ));
     }
 
     #[test]
@@ -7505,6 +7748,7 @@ mod tests {
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
+        ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
         ("WM_APP_FIRST_RUN", WM_APP_FIRST_RUN),
         ("WM_APP_EXECUTOR_DONE", WM_APP_EXECUTOR_DONE),
     ];
@@ -7647,6 +7891,7 @@ mod tests {
             "OPENAI_MODEL_BASE",
             "ANTHROPIC_MODEL_BASE",
             "OLLAMA_MODEL_BASE",
+            "ACTION_EXPORT_BASE",
         ];
         // Display-only items: added disabled (greyed), so no click can ever
         // produce their WM_COMMAND and they need no wnd_proc arm (#317).
@@ -8185,6 +8430,11 @@ mod tests {
         (
             "WM_APP_PENDING_STAGE",
             WM_APP_PENDING_STAGE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_MACHINE_CHECK_RESULT",
+            WM_APP_MACHINE_CHECK_RESULT,
             SettingsReentrancy::Ignore,
         ),
         (

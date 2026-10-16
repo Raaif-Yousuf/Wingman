@@ -1105,6 +1105,7 @@ mod tests {
         let generic_on_purpose = [
             crate::actions::action_items::ACTION_ID,
             crate::actions::table::ACTION_ID,
+            crate::actions::chart_table::ACTION_ID,
             crate::actions::receipt::ACTION_ID,
             crate::actions::explain_error::ACTION_ID,
             crate::actions::define_word::ACTION_ID,
