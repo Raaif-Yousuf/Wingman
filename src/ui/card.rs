@@ -288,12 +288,18 @@ impl Card {
         // corners on older systems or DWM failures is an acceptable degrade.
         unsafe {
             let pref = DWMWCP_ROUND;
-            let _ = DwmSetWindowAttribute(
+            if let Err(e) = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_WINDOW_CORNER_PREFERENCE,
                 &pref as *const DWM_WINDOW_CORNER_PREFERENCE as *const c_void,
                 std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
-            );
+            ) {
+                // #356: say so in "Copy diagnostics" instead of failing silently.
+                crate::diagnostics::note_warning(&format!(
+                    "Card: rounded corners unavailable ({}), using square corners",
+                    e.code()
+                ));
+            }
         }
 
         Ok(Card {
@@ -882,6 +888,10 @@ fn registry_apps_use_light_theme() -> bool {
     if status == 0 {
         data != 0
     } else {
+        // #356: a dark desktop would get a light card with no explanation.
+        crate::diagnostics::note_warning(&format!(
+            "Card: could not read the app theme setting (error {status}), using the light theme"
+        ));
         true
     }
 }
