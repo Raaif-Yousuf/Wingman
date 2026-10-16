@@ -6396,6 +6396,7 @@ mod tests {
                 ID_MONITOR,
                 ID_CARD_CORNER,
                 ID_TEXT_SCALE_TRACK,
+                ID_CARD_SECONDS,
                 ID_CARD_MONITOR,
                 ID_REQUIRE_TICK_FOR,
             ];
