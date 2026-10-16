@@ -51,6 +51,17 @@ pub trait ImageClipboardAccess: Send + Sync {
     fn has_any_content(&self) -> bool;
 }
 
+/// Puts an RGBA image (top-down rows, `width * height * 4` bytes) on the
+/// real clipboard as `CF_DIB`. For the card's "copy as image" (#376); the
+/// executor itself goes through the same encoder.
+pub(crate) fn copy_rgba(rgba: &[u8], width: u32, height: u32) -> Result<()> {
+    let expected = (width as usize) * (height as usize) * 4;
+    if width == 0 || height == 0 || rgba.len() != expected {
+        anyhow::bail!("image is {} bytes, expected {expected}", rgba.len());
+    }
+    Win32ImageClipboard.set_dib(&encode_dib(rgba, width, height))
+}
+
 /// The real clipboard, via raw Win32 calls (`arboard`, already a crate
 /// dependency, does not expose a byte-exact `CF_DIB` write on Windows --
 /// this needs the literal format this executor's own tests golden-check).

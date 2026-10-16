@@ -1170,6 +1170,22 @@ fn is_copy_key(vk: u16, lparam: isize, shift: bool, alt: bool) -> bool {
     vk == 0x43 && lparam & 0x4000_0000 == 0 && !shift && !alt
 }
 
+/// #376: Ctrl+Shift+C copies the card as an image. Not for auto-repeat, and
+/// not with Alt. Plain C and Ctrl+C stay the text copy.
+fn is_copy_image_key(vk: u16, lparam: isize, ctrl: bool, shift: bool, alt: bool) -> bool {
+    vk == 0x43 && lparam & 0x4000_0000 == 0 && ctrl && shift && !alt
+}
+
+/// Gdi hands back BGRA with alpha left at zero. The clipboard image wants
+/// RGBA, opaque: the card is a solid surface.
+fn bgra_to_opaque_rgba(bgra: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bgra.len());
+    for px in bgra.chunks_exact(4) {
+        out.extend_from_slice(&[px[2], px[1], px[0], 255]);
+    }
+    out
+}
+
 /// Issue #531: a link squeezed to nothing counts as not there.
 fn rect_has_area(r: RECT) -> bool {
     r.right > r.left && r.bottom > r.top
@@ -2020,6 +2036,72 @@ impl CardInner {
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
             Ok(()) => self.mark_copied(),
             Err(_) => self.mark_copy_failed(),
+        }
+    }
+
+    /// #376: the card as it is drawn now, as opaque RGBA rows plus the size.
+    /// Drawn with `paint_into` into a memory bitmap, never read from the
+    /// screen, so a window over the card cannot leak in. The keyboard focus
+    /// ring is left out; everything else is exactly what the card shows.
+    fn render_rgba(&mut self) -> Option<(Vec<u8>, u32, u32)> {
+        use windows::Win32::Graphics::Gdi::{
+            CreateDIBSection, GdiFlush, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        let mut rc = RECT::default();
+        unsafe { GetClientRect(self.hwnd, &mut rc).ok()? };
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let focus = self.focus_link.take();
+        let mut out = None;
+        unsafe {
+            let mem_dc = CreateCompatibleDC(None);
+            if !mem_dc.0.is_null() {
+                let bmi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w,
+                        biHeight: -h, // top-down
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut pixels: *mut c_void = std::ptr::null_mut();
+                if let Ok(bmp) =
+                    CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut pixels, None, 0)
+                {
+                    if !pixels.is_null() {
+                        let old = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+                        self.paint_into(mem_dc, rc);
+                        let _ = GdiFlush();
+                        let len = (w as usize) * (h as usize) * 4;
+                        let bgra = std::slice::from_raw_parts(pixels as *const u8, len);
+                        out = Some((bgra_to_opaque_rgba(bgra), w as u32, h as u32));
+                        SelectObject(mem_dc, old);
+                    }
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                }
+                let _ = DeleteDC(mem_dc);
+            }
+        }
+        self.focus_link = focus;
+        out
+    }
+
+    /// #376: Ctrl+Shift+C. The result is said on the Copy link, like the
+    /// text copy, and never a silent no-op (AGENTS.md rule 7).
+    fn copy_image_activated(&mut self) {
+        let copied = self.render_rgba().is_some_and(|(rgba, w, h)| {
+            crate::executors::image_clipboard::copy_rgba(&rgba, w, h).is_ok()
+        });
+        if copied {
+            self.mark_copied();
+        } else {
+            self.mark_copy_failed();
         }
     }
 
@@ -3003,6 +3085,18 @@ impl CardInner {
                 ) {
                     // Issue #531: C and Ctrl+C copy the answer.
                     self.copy_activated();
+                } else if self.state == CardState::Expanded
+                    && self.copy_rect.is_some()
+                    && is_copy_image_key(
+                        wparam.0 as u16,
+                        lparam.0,
+                        key_is_down(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0),
+                        key_is_down(VK_SHIFT.0),
+                        key_is_down(VK_MENU.0),
+                    )
+                {
+                    // #376: Ctrl+Shift+C copies the card as an image.
+                    self.copy_image_activated();
                 } else if self.state == CardState::Expanded
                     && wparam.0 as u16 == VK_RETURN.0
                     && self.copy_details_rect.is_some()
@@ -4823,6 +4917,58 @@ mod tests {
         card.inner.try_expand();
         assert!(card.inner.copy_key_applies(0x43, 0, false, false));
         assert!(!card.inner.copy_key_applies(VK_RETURN.0, 0, false, false));
+    }
+
+    #[test]
+    fn only_ctrl_shift_c_copies_the_card_as_an_image() {
+        assert!(is_copy_image_key(0x43, 0, true, true, false));
+        assert!(!is_copy_image_key(0x43, 0, true, false, false));
+        assert!(!is_copy_image_key(0x43, 0, false, true, false));
+        assert!(!is_copy_image_key(0x43, 0, true, true, true));
+        assert!(!is_copy_image_key(0x43, 0x4000_0000, true, true, false));
+        assert!(!is_copy_image_key(0x56, 0, true, true, false));
+        // The text copy keys must not become the image copy.
+        assert!(!is_copy_key(0x43, 0, true, false));
+    }
+
+    #[test]
+    fn gdi_pixels_become_opaque_rgba() {
+        assert_eq!(
+            bgra_to_opaque_rgba(&[1, 2, 3, 0, 10, 20, 30, 7]),
+            vec![3, 2, 1, 255, 30, 20, 10, 255]
+        );
+    }
+
+    #[test]
+    fn the_card_renders_to_a_bitmap_of_its_size_with_its_text_in_it() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_model_answer("Right.", "Details.", 0, None);
+        card.inner.try_expand();
+        card.inner.focus_link = Some(FooterLink::Copy);
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(card.inner.hwnd, &mut rc);
+        }
+        let (rgba, w, h) = card.inner.render_rgba().expect("a visible card renders");
+        assert_eq!(
+            (w as i32, h as i32),
+            (rc.right - rc.left, rc.bottom - rc.top)
+        );
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
+        // Not a blank surface: the text and the border differ from the fill.
+        let mid = ((h / 2 * w + w / 2) * 4) as usize;
+        let bg = &rgba[mid..mid + 4];
+        assert!(
+            rgba.chunks_exact(4).any(|p| p != bg),
+            "the card has content, not one flat colour"
+        );
+        assert_eq!(
+            card.inner.focus_link,
+            Some(FooterLink::Copy),
+            "rendering must give the focus back"
+        );
     }
 
     #[test]
