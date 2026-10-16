@@ -298,7 +298,7 @@ static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 fn enter_command(ctrl_id: i32) -> i32 {
     match ctrl_id {
         ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK | ID_CHANGE_PRIMARY
-        | ID_CHANGE_SECONDARY | ID_PULL_BUTTON => ctrl_id,
+        | ID_CHANGE_SECONDARY | ID_PULL_BUTTON | ID_OPEN_CONFIG => ctrl_id,
         // #635: Enter in the Pull model box starts the pull.
         ID_PULL_NAME => ID_PULL_BUTTON,
         _ => ID_SAVE,
@@ -786,6 +786,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 }
             }
         }
+        ID_OPEN_CONFIG if notify == BN_CLICKED => open_config_file(inner),
         ID_PULL_BUTTON if notify == BN_CLICKED => on_pull_button(inner),
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, &prompt_to_edit(DEFAULT_PROMPT));
@@ -926,6 +927,8 @@ const ID_PULL_STATUS: i32 = 142;
 /// that ignores the setting.
 const ID_GEMINI_EFFORT_LABEL: i32 = 143;
 const ID_MODEL_LIST_HINT: i32 = 144;
+/// The "Open config file" button beside the model hint (#823).
+const ID_OPEN_CONFIG: i32 = 145;
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
 /// the text sent to a cloud or remote model, and the answer (real values put
@@ -991,6 +994,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_PULL_STATUS", ID_PULL_STATUS),
     ("ID_GEMINI_EFFORT_LABEL", ID_GEMINI_EFFORT_LABEL),
     ("ID_MODEL_LIST_HINT", ID_MODEL_LIST_HINT),
+    ("ID_OPEN_CONFIG", ID_OPEN_CONFIG),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1133,7 +1137,7 @@ const WIN_W_DP: i32 = 620;
 const WIN_H_DP: i32 = 918 + 8 * (ROW_H + ROW_GAP);
 
 /// The one-line hint under the model dropdowns (#427). Plain words, no dash.
-const MODEL_LIST_HINT: &str = "Missing a cloud model? Add its name to models in config.toml.";
+const MODEL_LIST_HINT: &str = "Missing a model? Add it in the config file.";
 
 /// #674: shown instead of [`MODEL_LIST_HINT`] when the mode keeps every
 /// request on this computer, so the user knows why no live cloud list loads.
@@ -1648,7 +1652,11 @@ fn nc_width_px(hwnd: HWND) -> i32 {
 
 /// #624: the width of the Card group's first label. Its text is about 262px
 /// at 96 dpi; at 260dp it wrapped and the second line was clipped.
-const CARD_SECONDS_LABEL_W: i32 = 300;
+const CARD_SECONDS_EDIT_W: i32 = 50;
+/// The Card group's first row (#823): a short title, the number box, then
+/// what the number means. 0 is explained in words, not as a code.
+const CARD_SECONDS_LABEL: &str = "Hide the card after:";
+const CARD_SECONDS_UNIT: &str = "seconds (0 keeps it open)";
 
 /// #597: whether the Card display choice has any effect for this Card
 /// position label. "Next to the mouse" follows the pointer's own monitor, so
@@ -3276,6 +3284,33 @@ fn ollama_installed() -> bool {
         .any(|p| p.is_file())
 }
 
+/// The second shortcut's line (#823): named by what it is for, since the
+/// Copilot key line above it already says which key is the first.
+fn secondary_label(chord: &crate::hotkey::Chord) -> String {
+    format!("Shortcut for any keyboard: {}", chord_to_string(chord))
+}
+
+/// Width of the "Open config file" button, in dp (#823).
+const OPEN_CONFIG_W: i32 = 120;
+
+/// Shown on the validation line when the config file cannot be opened (rule 7:
+/// never a silent no-op, never a dialog).
+const OPEN_CONFIG_FAILED: &str = "Could not open the config file. Save once to create it.";
+
+/// Opens the config file in the user's default editor. A missing file or a
+/// refusal from the shell is said on the validation line.
+fn open_config_file(inner: &SettingsInner) {
+    let opened = match Config::path() {
+        Ok(path) if path.exists() => open_url(&path.to_string_lossy()),
+        _ => false,
+    };
+    if !opened {
+        if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+            set_text(msg, OPEN_CONFIG_FAILED);
+        }
+    }
+}
+
 /// Opens `url` in the default browser. `false` when the shell refused
 /// (`ShellExecuteW` returns a value above 32 on success).
 fn open_url(url: &str) -> bool {
@@ -3570,7 +3605,17 @@ fn build_ui_recorded(
     );
     r.advance();
 
-    ctx.create(WC_STATIC, "Thinking:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "Thinking time:",
+        0,
+        0,
+        r.x,
+        r.y,
+        LABEL_W,
+        ROW_H,
+        0,
+    );
     let openai_effort = ctx.create(
         WC_COMBOBOX,
         "",
@@ -3647,7 +3692,17 @@ fn build_ui_recorded(
     );
     r.advance();
 
-    ctx.create(WC_STATIC, "Thinking:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "Thinking time:",
+        0,
+        0,
+        r.x,
+        r.y,
+        LABEL_W,
+        ROW_H,
+        0,
+    );
     let anthropic_effort = ctx.create(
         WC_COMBOBOX,
         "",
@@ -3726,7 +3781,7 @@ fn build_ui_recorded(
 
     ctx.create(
         WC_STATIC,
-        "Thinking:",
+        "Thinking time:",
         0,
         0,
         r.x,
@@ -3770,9 +3825,20 @@ fn build_ui_recorded(
         0,
         r.x,
         r.y,
-        r.w,
+        r.w - OPEN_CONFIG_W - 8,
         ROW_H,
         ID_MODEL_LIST_HINT,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Open config file",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + r.w - OPEN_CONFIG_W,
+        r.y,
+        OPEN_CONFIG_W,
+        ROW_H,
+        ID_OPEN_CONFIG,
     );
     r.advance();
 
@@ -3971,10 +4037,7 @@ fn build_ui_recorded(
     r.advance();
     ctx.create(
         WC_STATIC,
-        &format!(
-            "Other shortcut: {}",
-            chord_to_string(&config.hotkeys.secondary)
-        ),
+        &secondary_label(&config.hotkeys.secondary),
         0,
         0,
         r.x,
@@ -4169,12 +4232,12 @@ fn build_ui_recorded(
 
     ctx.create(
         WC_STATIC,
-        "Hide the card after this many seconds (0 = never):",
+        CARD_SECONDS_LABEL,
         0,
         0,
         r.x,
         r.y,
-        CARD_SECONDS_LABEL_W,
+        LABEL_W,
         ROW_H,
         0,
     );
@@ -4183,11 +4246,22 @@ fn build_ui_recorded(
         &config.ui.card_seconds.to_string(),
         (ES_NUMBER | ES_AUTOHSCROLL) as u32,
         WS_EX_CLIENTEDGE,
-        r.x + CARD_SECONDS_LABEL_W + 4,
+        r.x + LABEL_W,
         r.y,
-        50,
+        CARD_SECONDS_EDIT_W,
         ROW_H,
         ID_CARD_SECONDS,
+    );
+    ctx.create(
+        WC_STATIC,
+        CARD_SECONDS_UNIT,
+        0,
+        0,
+        r.x + LABEL_W + CARD_SECONDS_EDIT_W + 8,
+        r.y,
+        r.w - LABEL_W - CARD_SECONDS_EDIT_W - 8,
+        ROW_H,
+        0,
     );
     r.advance();
 
@@ -4236,17 +4310,7 @@ fn build_ui_recorded(
 
     // #498: where the card appears. The monitor list is read when Settings
     // opens, so a display plugged in afterwards shows up next time.
-    ctx.create(
-        WC_STATIC,
-        "Card position:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
+    ctx.create(WC_STATIC, "Card corner:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let corner = ctx.create(
         WC_COMBOBOX,
         "",
@@ -4266,7 +4330,7 @@ fn build_ui_recorded(
 
     ctx.create(
         WC_STATIC,
-        "Card display:",
+        "Card monitor:",
         0,
         0,
         r.x,
@@ -4320,7 +4384,7 @@ fn build_ui_recorded(
 
     ctx.create(
         WC_STATIC,
-        "Require a tick to fill:",
+        "Review before filling:",
         0,
         0,
         r.x,
@@ -4719,10 +4783,7 @@ fn set_hotkey_labels(hwnd: HWND, hotkeys: &Hotkeys) {
         );
     }
     if let Some(l) = get_dlg_item(hwnd, ID_SECONDARY_LABEL) {
-        set_text(
-            l,
-            &format!("Other shortcut: {}", chord_to_string(&hotkeys.secondary)),
-        );
+        set_text(l, &secondary_label(&hotkeys.secondary));
     }
 }
 
@@ -6271,6 +6332,48 @@ mod tests {
                 assert_eq!(x_of(id), first, "control id {id} is off the field column");
             }
         });
+    }
+
+    /// #823: Settings speaks in plain words. No control text carries a config
+    /// term (a "(0 =" magic value, or a tell to edit config.toml), and the
+    /// second shortcut and the form tick are named by what they do.
+    #[test]
+    fn settings_labels_are_plain_words_not_config_terms() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let texts: Vec<String> = inner.children.iter().map(|c| get_text(c.hwnd)).collect();
+            assert!(texts.len() > 40, "the window was built: {}", texts.len());
+            for t in &texts {
+                assert!(!t.contains("(0 ="), "magic zero in a label: {t}");
+                assert!(
+                    !t.contains("config.toml"),
+                    "tells the user to edit a file: {t}"
+                );
+                assert!(!t.starts_with("Other shortcut"), "unnamed shortcut: {t}");
+                assert!(!t.starts_with("Require a tick"), "unclear label: {t}");
+                assert!(
+                    t != "Card display:" && t != "Card position:",
+                    "two names for one thing: {t}"
+                );
+            }
+            assert!(texts.iter().any(|t| t.starts_with("Hide the card after")));
+            assert!(texts
+                .iter()
+                .any(|t| t.starts_with("Shortcut for any keyboard")));
+        });
+    }
+
+    /// #823 wired-to-nothing: the "Open config file" button is a real control
+    /// in the built window, Enter on it presses it, and its failure line is
+    /// plain words.
+    #[test]
+    fn the_open_config_button_exists_and_takes_enter() {
+        with_window(Config::default(), |hwnd, _raw| {
+            let button = get_dlg_item(hwnd, ID_OPEN_CONFIG).expect("button exists");
+            assert_eq!(get_text(button), "Open config file");
+        });
+        assert_eq!(enter_command(ID_OPEN_CONFIG), ID_OPEN_CONFIG);
+        assert!(!OPEN_CONFIG_FAILED.contains('\u{2014}'));
     }
 
     /// Dispatches this thread's queued messages until `done` is true or 10 s
@@ -9247,7 +9350,7 @@ mod tests {
             unsafe { GetClientRect(label, &mut r) }.expect("label rect");
             r.right - r.left
         };
-        let text = "Hide the card after this many seconds (0 = never):";
+        let text = CARD_SECONDS_LABEL;
         let wide: Vec<u16> = text.encode_utf16().collect();
         let dc = unsafe { GetDC(Some(body)) };
         let old = unsafe { SelectObject(dc, HGDIOBJ((&*win.1).font.0)) };
