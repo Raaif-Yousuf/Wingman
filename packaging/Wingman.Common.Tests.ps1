@@ -1145,4 +1145,11 @@ Describe 'Registration stays sparse (issue #251)' {
         $yml | Should -Match 'never by double-clicking wingman\.msix'
         $yml | Should -Match '\$notes = "\$signedNote`n`n\$installNote'
     }
+
+    It 'builds the zip the README Download section points to and uploads it' {
+        $yml = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\.github\workflows\release.yml') -Raw) -replace "`r", ''
+        $yml | Should -Match 'Compress-Archive'
+        $yml | Should -Match 'gh release upload \$tag dist\\wingman-\$tag-windows-x64\.zip'
+        $yml | Should -Match 'gh release create \$tag dist\\wingman-\$tag-windows-x64\.zip'
+    }
 }
