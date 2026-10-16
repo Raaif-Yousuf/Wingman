@@ -2770,7 +2770,8 @@ impl App {
                 let headline = Self::form_fill_headline(&undo.summary);
                 self.card
                     .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
-                self.last_form_undo = Some(undo);
+                // #645: a fill with nothing restorable offers no Restore.
+                self.last_form_undo = undo.is_restorable().then_some(undo);
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
@@ -2792,7 +2793,7 @@ impl App {
         let Some(undo) = self.last_form_undo.take() else {
             self.card.show_answer(
                 "Nothing to restore",
-                "No form has been filled since Wingman started, or it was already restored.",
+                "No form fill that can be restored since Wingman started, or it was already restored.",
                 5,
                 None,
             );

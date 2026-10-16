@@ -74,6 +74,7 @@ pub enum Effect {
 pub struct Undo {
     pub summary: String,
     restore: Box<dyn FnOnce() -> anyhow::Result<()> + Send>,
+    restorable: bool,
 }
 
 impl Undo {
@@ -83,6 +84,7 @@ impl Undo {
         Self {
             summary: summary.into(),
             restore: Box::new(|| Ok(())),
+            restorable: false,
         }
     }
 
@@ -94,7 +96,14 @@ impl Undo {
         Self {
             summary: summary.into(),
             restore: Box::new(restore),
+            restorable: true,
         }
+    }
+
+    /// Whether `undo` can put anything back. False for [`Undo::none`], so a
+    /// caller that offers a Restore keeps nothing to offer (#645).
+    pub fn is_restorable(&self) -> bool {
+        self.restorable
     }
 
     pub fn undo(self) -> anyhow::Result<()> {

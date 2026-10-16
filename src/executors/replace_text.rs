@@ -534,6 +534,7 @@ mod tests {
                 control_type: self.element.control_type.clone(),
                 is_password: self.element.is_password,
                 current_text: self.element.text.borrow().clone(),
+                value_readable: true,
             };
             if let Some(typed) = self.typed_after_resolve.borrow_mut().take() {
                 *self.element.text.borrow_mut() = typed;

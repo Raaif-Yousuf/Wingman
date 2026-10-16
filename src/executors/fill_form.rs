@@ -487,6 +487,9 @@ struct FilledField {
 fn do_fill(access: &Arc<dyn TextElementAccess>, form: &FormFill) -> Result<Undo> {
     let mut results: Vec<FieldResult> = Vec::with_capacity(form.fields.len());
     let mut filled: Vec<FilledField> = Vec::new();
+    // #645: fields typed into with no ValuePattern. Their old text was never
+    // read, so Undo cannot put it back; they stay out of `filled`.
+    let mut not_restorable: Vec<String> = Vec::new();
 
     for field in &form.fields {
         let resolved = match access.resolve(&field.target) {
@@ -514,12 +517,16 @@ fn do_fill(access: &Arc<dyn TextElementAccess>, form: &FormFill) -> Result<Undo>
         match access.write_with_fallback(&field.target, &field.expected_current_text, &field.value)
         {
             Ok(()) => {
-                filled.push(FilledField {
-                    target: field.target.clone(),
-                    label: field.label.clone(),
-                    prior_value: resolved.current_text.clone(),
-                    expected_after_write: field.value.clone(),
-                });
+                if resolved.value_readable {
+                    filled.push(FilledField {
+                        target: field.target.clone(),
+                        label: field.label.clone(),
+                        prior_value: resolved.current_text.clone(),
+                        expected_after_write: field.value.clone(),
+                    });
+                } else {
+                    not_restorable.push(field.label.clone());
+                }
                 results.push(FieldResult {
                     label: field.label.clone(),
                     outcome: FieldOutcome::Filled,
@@ -539,7 +546,16 @@ fn do_fill(access: &Arc<dyn TextElementAccess>, form: &FormFill) -> Result<Undo>
         }
     }
 
-    let summary = format_outcomes(&results);
+    let mut summary = format_outcomes(&results);
+    for label in &not_restorable {
+        summary.push_str(&format!(
+            " Undo cannot restore \"{label}\": its old text could not be read before it was replaced."
+        ));
+    }
+    if filled.is_empty() {
+        // Nothing can be put back, so do not offer an Undo that "succeeds".
+        return Ok(Undo::none(summary));
+    }
     let undo_access = Arc::clone(access);
     Ok(Undo::recording(summary, move || {
         restore_fields(&undo_access, &filled)
@@ -615,6 +631,9 @@ mod tests {
         control_type: String,
         is_password: bool,
         text: RefCell<String>,
+        /// False models a control with no ValuePattern: its text reads as ""
+        /// and writes go through the typed fallback (#645).
+        value_readable: bool,
     }
 
     struct FakeAccess {
@@ -647,7 +666,12 @@ mod tests {
                 automation_id: field.automation_id.clone(),
                 control_type: field.control_type.clone(),
                 is_password: field.is_password,
-                current_text: field.text.borrow().clone(),
+                current_text: if field.value_readable {
+                    field.text.borrow().clone()
+                } else {
+                    String::new()
+                },
+                value_readable: field.value_readable,
             };
             if let Some(typed) = self.typed_after_resolve.borrow_mut().remove(target) {
                 *field.text.borrow_mut() = typed;
@@ -666,7 +690,12 @@ mod tests {
                 .fields
                 .get(target)
                 .ok_or_else(|| anyhow!("fake: unknown target"))?;
-            target::ensure_unchanged(expected_current_text, &field.text.borrow())?;
+            let live = if field.value_readable {
+                field.text.borrow().clone()
+            } else {
+                String::new()
+            };
+            target::ensure_unchanged(expected_current_text, &live)?;
             *field.text.borrow_mut() = new_text.to_string();
             Ok(())
         }
@@ -689,6 +718,7 @@ mod tests {
             control_type: control_type.to_string(),
             is_password,
             text: RefCell::new(text.to_string()),
+            value_readable: true,
         }
     }
 
@@ -888,6 +918,7 @@ mod tests {
             control_type: control_type.to_string(),
             is_password,
             current_text: current_text.to_string(),
+            value_readable: true,
         }
     }
 
@@ -1525,6 +1556,74 @@ mod tests {
             *access.fields[&target_for("email")].text.borrow(),
             "old@example.com"
         );
+    }
+
+    #[test]
+    fn a_typed_fallback_field_is_not_restorable_and_the_summary_says_so() {
+        // #645: a control with no ValuePattern reads as "" both before and
+        // after, so its old text is unknown and Undo could only ever report it
+        // as "edited". It is left out of Undo and the card says so.
+        let mut typed = field("notes", "Edit", false, "Notes", "");
+        typed.value_readable = false;
+        let access = access(vec![
+            ("notes", typed),
+            (
+                "name",
+                field("name", "Edit", false, "Full name", "old name"),
+            ),
+        ]);
+        let executor = FillFormExecutor::with_access(access.clone());
+        let form = form_json(vec![
+            field_json("notes", "Notes", "hello", false, false, ""),
+            field_json("name", "Full name", "Ada", false, false, "old name"),
+        ]);
+
+        let undo = executor.execute(confirmed(form)).unwrap();
+        assert!(undo.summary.contains("Filled 2 of 2 fields"));
+        assert!(undo.summary.contains("Notes"), "{}", undo.summary);
+        assert!(
+            undo.summary.contains("Undo cannot restore"),
+            "{}",
+            undo.summary
+        );
+        assert!(!undo.summary.contains("Full name"), "{}", undo.summary);
+        assert!(!undo.summary.contains('\u{2014}'));
+
+        // Undo succeeds for the readable field and does not report the
+        // typed one as skipped.
+        undo.undo().expect("undo must succeed");
+        assert_eq!(
+            *access.fields[&target_for("name")].text.borrow(),
+            "old name"
+        );
+        assert_eq!(
+            access.write_calls.borrow().len(),
+            3,
+            "two fill writes plus one restore, none for the typed field"
+        );
+    }
+
+    #[test]
+    fn when_no_written_field_is_restorable_there_is_no_undo() {
+        let mut typed = field("notes", "Edit", false, "Notes", "");
+        typed.value_readable = false;
+        let access = access(vec![("notes", typed)]);
+        let executor = FillFormExecutor::with_access(access.clone());
+        let form = form_json(vec![field_json(
+            "notes", "Notes", "hello", false, false, "",
+        )]);
+
+        let undo = executor.execute(confirmed(form)).unwrap();
+        assert!(
+            undo.summary.contains("Undo cannot restore"),
+            "{}",
+            undo.summary
+        );
+        assert!(
+            !undo.is_restorable(),
+            "nothing was recorded, so no Restore is offered"
+        );
+        assert_eq!(access.write_calls.borrow().len(), 1);
     }
 
     #[test]
