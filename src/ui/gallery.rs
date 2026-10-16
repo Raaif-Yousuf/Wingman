@@ -159,6 +159,8 @@ pub enum GalleryState {
     /// The same with the Tab focus rectangle on the first link (#606).
     CardAnswerFocused,
     CardError,
+    /// #831: the first-launch welcome card (a click-to-open-Settings card).
+    CardWelcome,
     /// Issue #354. Replaces the old single glyph-only `CardPending` state:
     /// the pending card now always carries a status line, so each sub-stage
     /// gets its own gallery entry instead of one generic "pending" shot.
@@ -209,6 +211,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardAnswerExpanded,
         CardAnswerFocused,
         CardError,
+        CardWelcome,
         CardPendingReadingSelection,
         CardPendingAskingModelShort,
         CardPendingAskingModelLong,
@@ -243,6 +246,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardAnswerExpanded => "card-answer-expanded",
         CardAnswerFocused => "card-answer-focused",
         CardError => "card-error",
+        CardWelcome => "card-welcome",
         CardPendingReadingSelection => "card-pending-reading-selection",
         CardPendingAskingModelShort => "card-pending-asking-model-short",
         CardPendingAskingModelLong => "card-pending-asking-model-long",
@@ -688,6 +692,12 @@ mod driver {
                     "The request timed out. Check your connection and try again.",
                 );
             }
+            CardWelcome => {
+                card.hide();
+                palette.hide();
+                let (headline, detail) = crate::app::welcome_card("Ctrl+Shift+/");
+                card.show_settings_needed(&headline, &detail);
+            }
             CardPendingReadingSelection => {
                 card.hide();
                 palette.hide();
@@ -1052,8 +1062,8 @@ mod tests {
         // pending sub-stages (#354) + 3 previews (calendar, long labels,
         // the error title) + the expanded answer, with and without link
         // focus = 15 card states, + 4 palette states + 4 settings states
-        // (#560) + the region overlay (#580) = 24.
-        assert_eq!(states.len(), 24);
+        // (#560) + the region overlay (#580) + the welcome card (#831) = 25.
+        assert_eq!(states.len(), 25);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
