@@ -512,6 +512,14 @@ impl Tray {
         self.anthropic_models.get(index).map(String::as_str)
     }
 
+    /// Whether this tray message opens the menu, which takes the foreground
+    /// (see `show_menu`). The caller reads who was in front BEFORE
+    /// `on_tray_message` runs (#339).
+    pub fn opens_menu(lparam: LPARAM) -> bool {
+        let event = (lparam.0 as u32) & 0xFFFF;
+        event == WM_CONTEXTMENU || event == WM_RBUTTONUP
+    }
+
     pub fn on_tray_message(&mut self, lparam: LPARAM) -> Option<u32> {
         let event = (lparam.0 as u32) & 0xFFFF;
         match event {

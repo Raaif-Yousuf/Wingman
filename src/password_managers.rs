@@ -12,10 +12,24 @@
 //! versions and window titles. Titles are matched only where they are
 //! reliable: the Windows Credential Manager control panel, and the
 //! browsers' own password pages (best effort: a browser can retitle them).
+//!
+//! # Limits
+//!
+//! Only the FOREGROUND window is checked. A password manager visible beside
+//! it is still in a full-monitor screenshot. Store/UWP builds run under
+//! `ApplicationFrameHost.exe`, so their process name says nothing and they
+//! are not covered. The tray menu and the palette take the foreground
+//! before an action runs, so `App` remembers who was in front when they
+//! opened (see `password_manager_hint` in `app.rs`).
 
 /// Executable names (lowercase, with `.exe`) of password managers and of
 /// Windows' own credential screens. Matched against the file name of the
 /// foreground window's process, case-insensitively.
+///
+/// THEORY (unverified): the names for LastPass, Keeper, Proton Pass and
+/// RoboForm are guesses from the vendors' installers, not measured on a
+/// machine with each installed. `capture.extra_password_managers` covers a
+/// wrong guess.
 pub const KNOWN_EXECUTABLES: &[&str] = &[
     "1password.exe",
     "bitwarden.exe",
@@ -285,7 +299,9 @@ mod tests {
     /// asks first and hands the answer down.
     fn guard_marker(name: &str) -> &'static str {
         match name {
-            "maybe_start_router" => "password_manager_in_front",
+            // The parameter name alone also matches the signature, so the
+            // marker is the use: the early return.
+            "maybe_start_router" => "|| password_manager_in_front",
             _ => "refuse_if_password_manager(",
         }
     }
@@ -293,10 +309,32 @@ mod tests {
     /// Calls that put pixels or a selection in Wingman's hands from a
     /// main-thread entry point.
     const READ_MARKERS: &[&str] = &[
-        "capture::grab_raw(",
+        "grab_raw(",
         "capture_screen()",
         "select_region(",
+        "grab_virtual_desktop_raw(",
         "ForegroundSelection",
+    ];
+
+    /// Calls that read the window's contents (selection, UI tree, page text,
+    /// OCR). They run on worker threads spawned after a guarded entry point,
+    /// so they live in free functions; those are listed in [`WORKER_SIDE`].
+    const WORKER_READS: &[&str] = &[
+        "get_selection_foreground",
+        "snapshot_hwnd(",
+        "read_page_text(",
+        "ocr::recognize(",
+    ];
+
+    /// `app.rs` functions that use [`WORKER_READS`] and are reached only
+    /// from a worker closure that a guarded entry point spawned. A new read
+    /// function must be added here on purpose, with that reasoning.
+    const WORKER_SIDE: &[&str] = &[
+        "non_vision_inputs",
+        "uia_fields_text",
+        "page_text_of",
+        "gather_generic_inputs",
+        "ocr_text_for",
     ];
 
     #[test]
@@ -311,12 +349,51 @@ mod tests {
             let guard = body
                 .find(guard_marker(name))
                 .unwrap_or_else(|| panic!("{name} never checks for a password manager"));
-            for marker in READ_MARKERS {
+            for marker in READ_MARKERS.iter().chain(WORKER_READS) {
                 if let Some(read) = body.find(marker) {
                     assert!(guard < read, "{name} reads ({marker}) before the guard");
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_hint_from_tray_and_palette_reaches_the_guard() {
+        let fns = app_functions();
+        let body_of = |name: &str| {
+            fns.iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("app.rs has no fn {name}"))
+                .1
+                .clone()
+        };
+        // The guard asks the helper, and the helper honours the hint.
+        assert!(body_of("refuse_if_password_manager").contains("self.password_manager_now()"));
+        let now = body_of("password_manager_now");
+        assert!(now.contains("self.password_manager_hint"));
+        assert!(now.contains("foreground_is_password_manager("));
+        // The palette sets the hint for its dispatch, then clears it.
+        let dispatch = body_of("dispatch_palette_action");
+        let set = dispatch
+            .find("self.password_manager_hint = self.palette_password_manager;")
+            .expect("the palette dispatch never sets the hint");
+        let run = dispatch
+            .find("self.dispatch_palette_target(")
+            .expect("no dispatch call");
+        let clear = dispatch
+            .find("self.password_manager_hint = false;")
+            .expect("the palette dispatch never clears the hint");
+        assert!(set < run && run < clear);
+        // The tray reads who was in front before the menu takes the foreground.
+        let proc_src = lf(include_str!("app.rs"));
+        let ask = proc_src
+            .find("Tray::opens_menu(lparam) && app.password_manager_now()")
+            .expect("wnd_proc never asks before the tray menu opens");
+        let menu = proc_src
+            .find("app.tray.on_tray_message(lparam)")
+            .expect("wnd_proc never calls on_tray_message");
+        assert!(ask < menu, "the tray menu takes the foreground first");
+        assert!(proc_src.contains("app.password_manager_hint = menu_hint;"));
     }
 
     #[test]
@@ -327,12 +404,16 @@ mod tests {
             .find(|(n, _)| n == "toggle_palette")
             .expect("app.rs has no fn toggle_palette");
         let ask = body
-            .find("foreground_is_password_manager(")
+            .find("self.password_manager_now()")
             .expect("toggle_palette never asks whether a password manager is in front");
         let show = body
             .find("self.palette.show(")
             .expect("no palette.show call");
         assert!(ask < show, "the palette steals the foreground when shown");
+        assert!(
+            body.contains("self.maybe_start_router(candidates, password_manager_in_front)"),
+            "toggle_palette must hand its answer to the router"
+        );
     }
 
     #[test]
@@ -340,17 +421,88 @@ mod tests {
         let fns = app_functions();
         let candidates: Vec<&str> = fns
             .iter()
-            .filter(|(_, body)| READ_MARKERS.iter().any(|m| body.contains(m)))
+            .filter(|(_, body)| {
+                READ_MARKERS
+                    .iter()
+                    .chain(WORKER_READS)
+                    .any(|m| body.contains(m))
+            })
             .map(|(n, _)| n.as_str())
             .collect();
         assert!(!candidates.is_empty(), "no read sites found; scanner blind");
+        assert!(
+            candidates.iter().any(|n| WORKER_SIDE.contains(n)),
+            "WORKER_SIDE names no fn that reads; the list is stale"
+        );
         let unguarded: Vec<&&str> = candidates
             .iter()
-            .filter(|n| !GUARDED.contains(*n))
+            .filter(|n| !GUARDED.contains(*n) && !WORKER_SIDE.contains(*n))
             .collect();
         assert!(
             unguarded.is_empty(),
-            "these app.rs fns capture or read but are not in GUARDED (add the guard, then list them): {unguarded:?}"
+            "these app.rs fns capture or read but are in neither GUARDED nor WORKER_SIDE (add the guard, then list them): {unguarded:?}"
+        );
+        for name in WORKER_SIDE {
+            assert!(
+                candidates.contains(name),
+                "{name} is in WORKER_SIDE but no longer reads anything; remove it"
+            );
+        }
+    }
+
+    /// Every file under `src` that calls a screen-capture function, outside
+    /// its own definition and its tests. A new caller elsewhere must be
+    /// reviewed for the guard and added here on purpose.
+    #[test]
+    fn only_known_files_capture_the_screen() {
+        const ALLOWED: &[&str] = &[
+            "app.rs",                // guarded entry points, checked above
+            "actions/extract_text.rs", // wrapper called only from the guarded fn
+            "ui/region.rs",          // select_region, called only from copy_region
+        ];
+        const CAPTURE_CALLS: &[&str] = &[
+            "grab_raw(",
+            "grab_virtual_desktop_raw(",
+            "select_region(",
+            "capture_screen(",
+        ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(files.len() > 40, "found only {} source files", files.len());
+        let mut callers: Vec<String> = Vec::new();
+        for path in &files {
+            let src = lf(&std::fs::read_to_string(path).unwrap());
+            let live = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+            let calls = live.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.contains("fn ")
+                    && CAPTURE_CALLS.iter().any(|c| t.contains(c))
+            });
+            if calls {
+                let rel = path.strip_prefix(&root).unwrap();
+                callers.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        assert!(callers.len() >= 2, "scanner found no callers: {callers:?}");
+        let unknown: Vec<&String> = callers
+            .iter()
+            .filter(|c| c.as_str() != "password_managers.rs" && !ALLOWED.contains(&c.as_str()))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "these files capture the screen and are not on the allowlist: {unknown:?}"
         );
     }
 }
