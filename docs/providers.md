@@ -52,10 +52,11 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   `strict: true`, and the schema verbatim from `Request::schema`. Property
   order is preserved end to end (`serde_json`'s `preserve_order`, AGENTS.md
   rule 3): `detail` before `headline` before `difficulty`. `difficulty` is
-  opt-in (`ui.show_difficulty`, default `false` as of issue #197): when off,
+  opt-in (an action's `rate_difficulty`, default `false`; the old global
+  `ui.show_difficulty` setting is gone, issue #197): when off,
   the property is left out of the schema entirely and nothing is appended to
   the system prompt to ask for it, so it costs zero extra tokens unless the
-  user turns it on.
+  action turns it on.
 - **Images:** `input_image` content parts with a `data:image/png;base64,...`
   URL, `detail: "high"`.
 - **Retry/429:** shared with Anthropic and Gemini via
