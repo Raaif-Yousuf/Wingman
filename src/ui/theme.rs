@@ -5,8 +5,8 @@
 //! palettes and their contrast can be unit-tested. Colours are GDI
 //! `COLORREF` values (`0x00BBGGRR`), the same layout `rgb` builds.
 //!
-//! The card paints from these tokens in light, dark and high contrast. The
-//! palette and region overlay move onto them in later slices.
+//! The card and the region overlay paint from these tokens in light, dark and
+//! high contrast. The palette and Settings move onto them in later slices.
 
 use windows::Win32::Graphics::Gdi::{
     GetSysColor, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_HOTLIGHT,
@@ -156,7 +156,7 @@ pub(crate) const HC_BLACK: SysColors = SysColors {
     highlight_text: 0x0000_0000,
 };
 #[cfg(test)]
-const HC_WHITE: SysColors = SysColors {
+pub(crate) const HC_WHITE: SysColors = SysColors {
     window: 0x00FF_FFFF,
     window_text: 0x0000_0000,
     gray_text: rgb(0, 0x60, 0),
