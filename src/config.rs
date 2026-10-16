@@ -247,11 +247,13 @@ pub struct Capture {
     pub max_edge: u32,
     /// "active" | "primary"
     pub monitor: String,
-    /// Paint over card numbers, IBANs, key-shaped tokens and emails in the
-    /// screenshot before it is sent to a cloud provider (#103). On by
-    /// default. Text in the request body (selection, page text, OCR text,
-    /// field values) gets the same rules, with markers like `[email]` (#505).
-    /// A request whose providers are all local skips it either way.
+    /// One switch for three things, on by default (#103, #505, #506), and
+    /// the Settings checkbox (#509): paint over card numbers, IBANs,
+    /// key-shaped tokens, emails and password fields in the screenshot; mask
+    /// the same details in text sent to a cloud or remote model (selection,
+    /// page text, OCR text, field values) with markers like `[email 1]`; and
+    /// put the real values back into the answer. A request whose providers
+    /// are all local skips it either way.
     pub redact: bool,
     /// OCR recognizer language (#111): "auto" (the Windows profile
     /// languages) or a BCP-47 tag such as "de" or "de-DE" naming an
