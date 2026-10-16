@@ -1179,7 +1179,7 @@ fn next_footer_focus(
 /// The title line of a preview that rejected an edit. High contrast has one
 /// ink for everything (#648), so the message says it is an error in words.
 fn preview_error_title(message: &str, theme: Theme) -> String {
-    if theme == Theme::HighContrast {
+    if theme == Theme::HighContrast && !message.starts_with("Error") {
         format!("Error: {message}")
     } else {
         message.to_string()
@@ -2044,7 +2044,9 @@ impl CardInner {
 
     /// #606: Enter or Space on the focused link. `false` when none is focused.
     fn activate_focused_link(&mut self) -> bool {
-        match self.focus_link {
+        // Never run a link that is not on screen.
+        let shown = self.footer_links();
+        match self.focus_link.filter(|l| shown.contains(l)) {
             Some(FooterLink::CopyDetails) => self.copy_details_activated(),
             Some(FooterLink::ReadAloud) => self.read_aloud_activated(),
             Some(FooterLink::Copy) => self.copy_activated(),
@@ -2292,6 +2294,13 @@ impl CardInner {
             let (read, copy) = footer_links_layout(f, read_w, copy_w, gap);
             self.read_aloud_rect = read;
             self.copy_rect = (self.copy_available && rect_has_area(copy)).then_some(copy);
+        }
+        // #606: a re-layout (a DPI change) can drop the focused link.
+        if self
+            .focus_link
+            .is_some_and(|l| !self.footer_links().contains(&l))
+        {
+            self.focus_link = None;
         }
 
         self.place_bottom_right(work, width, window_h);
@@ -5243,12 +5252,35 @@ mod tests {
     }
 
     #[test]
+    fn a_focused_link_that_is_no_longer_shown_is_not_activated() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        card.inner.focus_link = Some(FooterLink::CopyDetails);
+        card.inner.copy_details_rect = None;
+        card.inner.copy_details_available = false;
+        assert!(!card.inner.activate_focused_link());
+        // The next layout drops the stale focus too.
+        card.inner.layout_expanded();
+        assert_eq!(card.inner.focus_link, None);
+    }
+
+    #[test]
     fn a_new_card_starts_with_no_focused_link() {
         let mut card = expanded_model_answer();
         card.inner.move_footer_focus(false);
         assert!(card.inner.focus_link.is_some());
         card.show_model_answer("next", "detail", 0, None);
         assert_eq!(card.inner.focus_link, None);
+    }
+
+    #[test]
+    fn a_high_contrast_error_already_saying_error_is_not_prefixed_twice() {
+        assert_eq!(
+            preview_error_title("Error: bad time", Theme::HighContrast),
+            "Error: bad time"
+        );
     }
 
     #[test]
