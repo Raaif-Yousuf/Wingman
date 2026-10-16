@@ -3939,12 +3939,20 @@ fn noting_attribution<T>(result: Result<(T, crate::provider::Attribution)>) -> R
     })
 }
 
-/// #228: the card footer for `attribution`: a line only when a fallback
-/// answered, `None` for a first-choice answer or no model at all.
+/// #228, #486: the card footer for `attribution`, one line. It names the
+/// answering model when a fallback answered, and says what the answer cost
+/// when it was billed and priced. `None` for a free first-choice answer, an
+/// unpriced one, or no model at all.
 fn fallback_footer_for(attribution: Option<&crate::provider::Attribution>) -> Option<String> {
-    attribution?
+    let a = attribution?;
+    let fallback = a
         .fallback()
-        .map(|(answered, first)| palette_model::fallback_footer(answered, first))
+        .map(|(answered, first)| palette_model::fallback_footer(answered, first));
+    let cost = a.cost_usd.and_then(crate::usage::format_cost);
+    match (fallback, cost) {
+        (Some(f), Some(c)) => Some(format!("{f}. {c}")),
+        (f, c) => f.or(c),
+    }
 }
 
 /// #228: `detail` with the footer as its last paragraph, or `detail`
@@ -7941,7 +7949,37 @@ mod tests {
         crate::provider::Attribution {
             answered: answered.to_string(),
             first_choice: first.map(str::to_string),
+            cost_usd: None,
         }
+    }
+
+    #[test]
+    fn footer_shows_the_cost_of_a_billed_first_choice_answer() {
+        let mut a = attribution("openai:gpt-5.5", None);
+        a.cost_usd = Some(0.002);
+        assert_eq!(
+            fallback_footer_for(Some(&a)).as_deref(),
+            Some("About $0.002")
+        );
+    }
+
+    #[test]
+    fn footer_joins_the_fallback_note_and_the_cost_into_one_line() {
+        let mut a = attribution("anthropic:claude-opus-5", Some("openai:gpt-5.5"));
+        a.cost_usd = Some(0.002);
+        assert_eq!(
+            fallback_footer_for(Some(&a)).as_deref(),
+            Some("Answered by Claude Opus 5 (GPT-5.5 was unavailable). About $0.002")
+        );
+    }
+
+    #[test]
+    fn footer_has_no_cost_for_a_free_or_unpriced_answer() {
+        let mut a = attribution("ollama:gemma3:4b", None);
+        a.cost_usd = Some(0.0);
+        assert_eq!(fallback_footer_for(Some(&a)), None);
+        a.cost_usd = None;
+        assert_eq!(fallback_footer_for(Some(&a)), None);
     }
 
     #[test]

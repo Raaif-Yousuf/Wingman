@@ -275,6 +275,14 @@ flight, grey while paused, a blue tint in Offline mode, and a red dot after a
 run failed (it clears when you start the next one). The tooltip says the same
 in words.
 
+## Cost on the card
+
+A cloud answer ends with a small line such as `About $0.002`: what that answer
+cost, from the same price table as the tray tooltip and the egress log. Local
+models show nothing, and so does a model with no listed price (a made-up
+number would be worse). If a fallback model answered, the same line also says
+which one.
+
 ## Tray menu
 
 - **Ask now (same as the key)**: trigger without the hotkey
