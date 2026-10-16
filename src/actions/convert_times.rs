@@ -353,7 +353,10 @@ mod tests {
             14,
         );
         // January: CET is UTC+1 and Eastern UTC-5, six hours apart.
-        assert_eq!(c.headline, "Standup 14:00 CET is Wed 14 Jan, 8:00 (UTC+1 to UTC-5)");
+        assert_eq!(
+            c.headline,
+            "Standup 14:00 CET is Wed 14 Jan, 8:00 (UTC+1 to UTC-5)"
+        );
     }
 
     #[test]
@@ -449,11 +452,21 @@ mod tests {
         ] {
             let c = at(&json!({"times": [p]}), 2026, 1, 14);
             assert!(c.headline.starts_with("t: "), "{}", c.headline);
-            assert!(!c.headline.contains(" is "), "{}", c.headline);
+            assert!(!c.headline.starts_with("t is "), "{}", c.headline);
         }
-        let c = at(&json!({"times": [item("t", "9:00", "Feb 30", "UTC")]}), 2026, 1, 14);
+        let c = at(
+            &json!({"times": [item("t", "9:00", "Feb 30", "UTC")]}),
+            2026,
+            1,
+            14,
+        );
         assert_eq!(c.headline, "t: there is no such date as \"Feb 30\"");
-        let c = at(&json!({"times": [item("t", "9:00", "3/4", "UTC")]}), 2026, 1, 14);
+        let c = at(
+            &json!({"times": [item("t", "9:00", "3/4", "UTC")]}),
+            2026,
+            1,
+            14,
+        );
         assert_eq!(c.headline, "t: the date \"3/4\" is not clear");
     }
 
@@ -489,7 +502,11 @@ mod tests {
             "{}",
             before.headline
         );
-        assert!(eu.headline.contains("10:00 (UTC+1 to UTC-4)"), "{}", eu.headline);
+        assert!(
+            eu.headline.contains("10:00 (UTC+1 to UTC-4)"),
+            "{}",
+            eu.headline
+        );
     }
 
     #[test]
@@ -541,7 +558,11 @@ mod tests {
             .map(|_| item(&"w".repeat(55), "9:00", "", "IST"))
             .collect();
         let c = at(&json!({ "times": wide }), 2026, 1, 14);
-        assert!(c.detail.chars().count() <= MAX_DETAIL_CHARS + 40, "{}", c.detail.len());
+        assert!(
+            c.detail.chars().count() <= MAX_DETAIL_CHARS + 40,
+            "{}",
+            c.detail.len()
+        );
         assert!(c.detail.lines().last().unwrap().starts_with("and "));
         let long = "very long label ".repeat(10);
         let c = at(

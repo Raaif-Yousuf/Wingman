@@ -59,6 +59,7 @@ use std::time::Duration;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, DeleteObject, EnumFontFamiliesExW, GetDC, ReleaseDC, FW_NORMAL, HFONT,
     HGDIOBJ, LOGFONTW, TEXTMETRICW,
@@ -66,10 +67,14 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
-use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX};
-use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, SetScrollInfo, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX,
+};
+use windows::Win32::UI::HiDpi::{
+    GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgCtrlID, GetDlgItem,
     GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild,
@@ -82,6 +87,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_DISABLED,
     WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
     WS_VSCROLL,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetParent, GetScrollInfo, GetWindow, GW_CHILD, GW_HWNDNEXT, SB_VERT, SCROLLINFO,
+    SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SM_CXVSCROLL, WM_MOUSEWHEEL,
+    WM_VSCROLL,
 };
 
 use crate::config::{Config, OllamaConfig, RequireTickFor};
@@ -122,7 +132,7 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     // 96dpi guess for the very first CreateWindowExW call, before we have an
     // HWND to ask GetDpiForWindow about -- corrected immediately below, same
     // two-step approach card.rs uses for its own fonts.
-    let w0 = to_px(WIN_W_DP, 96);
+    let w0 = window_width_px(96);
     let h0 = to_px(WIN_H_DP, 96);
 
     let create_result = unsafe {
@@ -169,28 +179,18 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
             Some(HWND_TOP),
             0,
             0,
-            to_px(WIN_W_DP, dpi),
+            window_width_px(dpi),
             to_px(fitted_h, dpi),
             SWP_NOMOVE | SWP_NOZORDER,
         );
     }
 
-    // The layout positions the button row from the bottom, so it needs the
-    // CLIENT height, not the window height -- the caption and borders are
-    // ~100px at 250% scaling, which is enough to push Save and Cancel below
-    // the visible area. Ask the window what it actually got.
-    //
-    // Issue #340 MEASURED 2026-09-24: this used to clamp the result up to
-    // at least `MIN_WIN_H_DP` (`.max(MIN_WIN_H_DP)`). On a small screen at
-    // high DPI (reproduced here at 1280x800 @ 240dpi/250%) the real client
-    // area can be smaller than `MIN_WIN_H_DP`, and clamping up made
-    // `build_ui` believe it had more room than it actually did -- the
-    // Prompt group and the Save/Cancel footer both got positioned using a
-    // taller height than the real client rect, landing partly or fully
-    // below the visible window. `prompt_footer_layout` already keeps the
-    // footer below the Prompt group for *any* `win_h_dp`, however small, so
-    // this only needs the true measured value, floored at 1 so a later
-    // subtraction never goes negative.
+    // The layout pins the button row to the bottom of the client area, so it
+    // needs the CLIENT height, not the window height: the caption and borders
+    // are ~100px at 250% scaling. Ask the window what it actually got.
+    // Floored at 1 so a later subtraction never goes negative. (#340 had this
+    // clamp up to a minimum, which made `build_ui` believe in room the screen
+    // did not have; with the body scrolling (#481) the true value is right.)
     let client_h_dp = {
         let mut rc = windows::Win32::Foundation::RECT::default();
         if unsafe { GetClientRect(hwnd, &mut rc) }.is_ok() {
@@ -202,11 +202,7 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
 
     inner_ref.dpi = dpi;
     let built = build_ui_recorded(hwnd, instance, dpi, inner_ref.font, config, client_h_dp);
-    inner_ref.prompt_edit = built.prompt_edit;
-    inner_ref.children = built.children;
-    inner_ref.content_top_dp = built.content_top_dp;
-    inner_ref.win_h_dp = built.win_h_dp;
-    inner_ref.ollama_link_url = built.ollama_link_url;
+    inner_ref.adopt(built);
     // #342: the prompt starts hidden, so shrink the window to match.
     unsafe { show_prompt_state(inner_ref) };
     unsafe {
@@ -279,6 +275,9 @@ fn center_in_work(work: &windows::Win32::Foundation::RECT, w: i32, h: i32) -> (i
 }
 
 fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
+    // #481: the focused window as of the last message, to scroll a newly
+    // focused control into view without a timer.
+    let mut last_focus = HWND(std::ptr::null_mut());
     loop {
         let mut msg = MSG::default();
         let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
@@ -320,10 +319,25 @@ fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
             }
         }
 
+        // #481: the wheel scrolls the body wherever the pointer is in the
+        // window (a control under it would otherwise eat the notch).
+        if belongs_to_us && unsafe { scroll_with_wheel(hwnd, &msg, prompt_edit) } {
+            continue;
+        }
+
         unsafe {
             if !IsDialogMessageW(hwnd, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
+            }
+            let focus = GetFocus();
+            if focus != last_focus {
+                last_focus = focus;
+                // Only keyboard moves scroll: scrolling between a click's
+                // mouse-down and mouse-up would cancel the click.
+                if !is_mouse_message(msg.message) {
+                    follow_focus(hwnd, focus);
+                }
             }
         }
 
@@ -412,6 +426,11 @@ struct SettingsInner {
     content_top_dp: i32,
     win_h_dp: i32,
     prompt_edit: HWND,
+    /// #481: the scrolling body that holds every group above the footer.
+    body: HWND,
+    /// The dpi the body's scroll position is expressed in, so a dpi change
+    /// can rescale it.
+    body_dpi: u32,
     /// #343: where the Ollama group's link button goes, if it has one.
     ollama_link_url: Option<&'static str>,
     /// #342: whether the Advanced group shows the Check my work prompt.
@@ -435,12 +454,26 @@ impl SettingsInner {
             content_top_dp: 0,
             win_h_dp: WIN_H_DP,
             prompt_edit: HWND(std::ptr::null_mut()),
+            body: HWND(std::ptr::null_mut()),
+            body_dpi: 96,
             ollama_link_url: None,
             prompt_expanded: false,
             original,
             result: None,
             should_close: false,
         }
+    }
+
+    /// Takes over what `build_ui_recorded` built. Call after `dpi` is set:
+    /// the controls were laid out for it.
+    fn adopt(&mut self, built: BuiltUi) {
+        self.prompt_edit = built.prompt_edit;
+        self.body = built.body;
+        self.body_dpi = self.dpi;
+        self.children = built.children;
+        self.content_top_dp = built.content_top_dp;
+        self.win_h_dp = built.win_h_dp;
+        self.ollama_link_url = built.ollama_link_url;
     }
 }
 
@@ -641,6 +674,8 @@ const ID_REQUIRE_TICK_FOR: i32 = 122;
 const ID_OLLAMA_LINK: i32 = 124;
 /// #342: shows or hides the Check my work prompt in the Advanced group.
 const ID_PROMPT_TOGGLE: i32 = 123;
+/// #481: the scrolling body window that holds every group above the footer.
+const ID_BODY: i32 = 125;
 
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
@@ -675,6 +710,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_REQUIRE_TICK_FOR", ID_REQUIRE_TICK_FOR),
     ("ID_OLLAMA_LINK", ID_OLLAMA_LINK),
     ("ID_PROMPT_TOGGLE", ID_PROMPT_TOGGLE),
+    ("ID_BODY", ID_BODY),
 ];
 
 // ---------------------------------------------------------------------------
@@ -695,6 +731,9 @@ const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const CB_ADDSTRING: u32 = 0x0143;
 const CB_SETCURSEL: u32 = 0x014E;
 const CB_GETCURSEL: u32 = 0x0147;
+const CB_GETDROPPEDSTATE: u32 = 0x0157;
+#[cfg(test)]
+const CB_SHOWDROPDOWN: u32 = 0x014F;
 const CB_SELECTSTRING: u32 = 0x014D;
 const TBM_GETPOS: u32 = 0x0400;
 const TBM_SETRANGE: u32 = 0x0406;
@@ -766,6 +805,10 @@ fn fitted_height_for_work_px(work_px: i32, dpi: u32) -> i32 {
     }
     // Leave room for the title bar and a little breathing space.
     let avail_dp = (work_px * 96 / dpi.max(1) as i32) - 48;
+    // #481: the body scrolls, so the window can be as short as the screen
+    // needs. The floor only guards a failed or absurd query, and holds the
+    // pinned footer plus a sliver of body; it never lifts the window above
+    // a work area that is really that small.
     WIN_H_DP.min(avail_dp).max(MIN_WIN_H_DP)
 }
 
@@ -803,21 +846,24 @@ const WIN_W_DP: i32 = 620;
 /// never overlaps regardless of this constant, but a taller default is nicer
 /// than always squeezing.
 const WIN_H_DP: i32 = 918;
-/// Below this the prompt box stops being usable; scroll rather than shrink
-/// further (not yet built -- see `prompt_footer_layout`'s doc comment).
+/// The shortest the window is ever made, in dp: the pinned footer and a sliver
+/// of body. It is only a floor against a failed or absurd monitor query (see
+/// `fitted_height_for_work_px`); a real work area is always taller, and a
+/// shorter one just scrolls (#481).
 ///
-/// This is only a floor against a failed/absurd monitor query (see its use
-/// in `fitted_height_dp` and the `client_h_dp` fallback in `show_modal`),
-/// not a guarantee that content never gets clipped: that guarantee is
-/// `prompt_footer_layout`'s job now (issue #340), and it holds for whatever
-/// `win_h_dp` the window actually ends up with, however small. MEASURED
-/// 2026-09-24: raising this constant to try to force enough room for the
-/// Prompt group is a trap -- `show_modal`'s `client_h_dp` clamps the real,
-/// measured client height *up* to at least `MIN_WIN_H_DP`
-/// (`.max(MIN_WIN_H_DP)`), so a large `MIN_WIN_H_DP` makes `build_ui` believe
-/// the window is taller than it actually is on a small screen, which pushes
-/// the footer below the real visible area instead of fixing anything.
-const MIN_WIN_H_DP: i32 = 420;
+/// History (#340, MEASURED 2026-09-24): this used to be 420 and
+/// `show_modal` clamped the measured client height up to it, which made
+/// `build_ui` think the window was taller than it was and pushed the footer
+/// below the visible area on small, high-DPI screens. Neither the floor nor
+/// that clamp exists in that form any more: the footer is pinned to the real
+/// client bottom and the body scrolls.
+const MIN_WIN_H_DP: i32 = 2 * FOOTER_H_DP;
+
+/// Height of the pinned Save/Cancel footer, in dp: the button row and its
+/// top and bottom margins (#481).
+const FOOTER_H_DP: i32 = BTN_H + MARGIN * 2;
+/// Space kept below the last group inside the scrolling body, in dp.
+const BODY_PAD_BOTTOM: i32 = MARGIN / 2;
 
 const MARGIN: i32 = 16;
 const ROW_H: i32 = 22;
@@ -845,25 +891,18 @@ const PROMPT_TOGGLE_W: i32 = 210;
 /// purely from where the fixed-height groups above it end (`content_top`,
 /// in dp) and how tall the window's client area actually is (`win_h_dp`).
 ///
-/// Issue #340: the previous code placed the footer at a fixed offset from
-/// `win_h_dp` (`win_h_dp - buttons_h`) while the Prompt group's *top* came
-/// from `content_top`, a value that does not shrink with the window. At
-/// high DPI on a small monitor `fitted_height_dp` shrinks `win_h_dp` well
-/// below `content_top`, so the footer's fixed offset from the (now much
-/// smaller) `win_h_dp` landed *above* `content_top`, drawing Save/Cancel on
-/// top of the Prompt box. MEASURED 2026-09-24 (issue #340 screenshot, 150%
-/// scaling).
+/// #481: the footer (Save, Cancel, the validation line) is pinned to the
+/// bottom of the client area and the groups live in a scrolling body above
+/// it, so nothing can be cut off however short the window is: what does not
+/// fit scrolls. `buttons_y` is therefore always `win_h_dp` minus the footer,
+/// and [`PromptFooterLayout::content_h`] says how tall the body's content is,
+/// which the caller compares with the viewport to size the scroll range.
 ///
-/// This function makes the invariant structural instead of incidental: the
-/// footer is always placed below the Prompt group's actual bottom, never
-/// derived from `win_h_dp` alone. When there's enough room the footer still
-/// sits flush with the bottom of the window (unchanged from before); when
-/// there isn't, the Prompt group takes its minimum height and the footer is
-/// pushed down to clear it, which can push the footer below the visible
-/// window on a very short client area rather than overlapping it -- clipping
-/// instead of overlap. `fitted_height_dp`'s `MIN_WIN_H_DP` is sized so that
-/// case does not occur on a 1080p screen at up to 200% scaling (see its own
-/// comment).
+/// History: issue #340 (MEASURED 2026-09-24, 150% scaling) had the footer
+/// placed from `win_h_dp` while the Prompt group's top did not shrink with
+/// the window, so Save and Cancel were drawn over the Prompt box. Pinning
+/// the footer and scrolling the body makes that overlap impossible rather
+/// than merely avoided: the two live in different windows.
 struct PromptFooterLayout {
     prompt_top: i32,
     prompt_bottom: i32,
@@ -872,8 +911,14 @@ struct PromptFooterLayout {
     buttons_y: i32,
 }
 
+impl PromptFooterLayout {
+    /// The height of everything in the scrolling body, in dp.
+    fn content_h(&self) -> i32 {
+        self.prompt_bottom + BODY_PAD_BOTTOM
+    }
+}
+
 fn prompt_footer_layout(content_top: i32, win_h_dp: i32) -> PromptFooterLayout {
-    let buttons_h = BTN_H + MARGIN * 2;
     let reset_btn_h = BTN_H;
     let prompt_top = content_top;
     let prompt_label_bottom = prompt_top + GROUP_LABEL_TOP;
@@ -884,25 +929,22 @@ fn prompt_footer_layout(content_top: i32, win_h_dp: i32) -> PromptFooterLayout {
     // group's own border.
     let min_prompt_group_h = GROUP_LABEL_TOP + MIN_PROMPT_EDIT_H + ROW_GAP + reset_btn_h + MARGIN;
 
-    let desired_prompt_bottom = win_h_dp - buttons_h;
+    // With room to spare the group stretches to the viewport's bottom, so a
+    // tall window shows no scrollbar range; without it the group takes its
+    // minimum and the body scrolls.
+    let desired_prompt_bottom = win_h_dp - FOOTER_H_DP - BODY_PAD_BOTTOM;
     let prompt_bottom = desired_prompt_bottom.max(prompt_top + min_prompt_group_h);
 
     let prompt_edit_h = ((prompt_bottom - MARGIN) - prompt_label_bottom - reset_btn_h - ROW_GAP)
         .max(MIN_PROMPT_EDIT_H);
     let reset_btn_y = prompt_label_bottom + prompt_edit_h + ROW_GAP;
 
-    // Flush with the window bottom when there's room (matches the original
-    // layout exactly); otherwise pinned just below the Prompt group's own
-    // bottom, which by construction is always >= where the reset button
-    // ends, so Save/Cancel can never land on the Prompt box.
-    let buttons_y = (prompt_bottom + GROUP_GAP).max(win_h_dp - buttons_h + MARGIN);
-
     PromptFooterLayout {
         prompt_top,
         prompt_bottom,
         prompt_edit_h,
         reset_btn_y,
-        buttons_y,
+        buttons_y: win_h_dp - BTN_H - MARGIN,
     }
 }
 
@@ -917,14 +959,12 @@ fn footer_layout(content_top: i32, win_h_dp: i32, expanded: bool) -> PromptFoote
     if expanded {
         return prompt_footer_layout(content_top, win_h_dp);
     }
-    let buttons_h = BTN_H + MARGIN * 2;
-    let prompt_bottom = content_top + COLLAPSED_PROMPT_GROUP_H;
     PromptFooterLayout {
         prompt_top: content_top,
-        prompt_bottom,
+        prompt_bottom: content_top + COLLAPSED_PROMPT_GROUP_H,
         prompt_edit_h: 0,
         reset_btn_y: content_top + GROUP_LABEL_TOP,
-        buttons_y: (prompt_bottom + GROUP_GAP).max(win_h_dp - buttons_h + MARGIN),
+        buttons_y: win_h_dp - BTN_H - MARGIN,
     }
 }
 
@@ -932,13 +972,86 @@ fn footer_layout(content_top: i32, win_h_dp: i32, expanded: bool) -> PromptFoote
 /// `fitted_dp` is what [`fitted_height_for_work_px`] allows on this monitor
 /// and `nc_dp` the title bar and borders. Expanded keeps the old behaviour
 /// (the full fitted height, the prompt box takes what is left). Collapsed is
-/// just tall enough for the footer, and never taller than the fit.
+/// just tall enough for the whole body and the footer, and never taller than
+/// the fit; anything beyond the fit scrolls (#481).
 fn window_height_dp(content_top: i32, expanded: bool, fitted_dp: i32, nc_dp: i32) -> i32 {
     if expanded {
         return fitted_dp;
     }
-    let client = footer_layout(content_top, 0, false).buttons_y + BTN_H + MARGIN;
+    let client = footer_layout(content_top, 0, false).content_h() + FOOTER_H_DP;
     (client + nc_dp).min(fitted_dp)
+}
+
+// ---------------------------------------------------------------------------
+// Scrolling body (#481). The pure arithmetic: positions and sizes are all in
+// physical pixels, content coordinates start at the top of the body's content.
+// ---------------------------------------------------------------------------
+
+/// How far the body can scroll: the content's overflow past the viewport.
+fn max_scroll(content: i32, viewport: i32) -> i32 {
+    (content - viewport).max(0)
+}
+
+/// `pos` limited to the scrollable range.
+fn clamp_scroll(pos: i32, content: i32, viewport: i32) -> i32 {
+    pos.clamp(0, max_scroll(content, viewport))
+}
+
+/// The scroll position that makes the content-space span `top..bottom`
+/// visible with the least movement: unchanged when it already is, the
+/// nearest edge otherwise. A span taller than the viewport is aligned to its
+/// top, so what the user just focused starts in view.
+fn scroll_into_view(pos: i32, content: i32, viewport: i32, top: i32, bottom: i32) -> i32 {
+    let pos = clamp_scroll(pos, content, viewport);
+    let target = if top < pos {
+        top
+    } else if bottom > pos + viewport {
+        if bottom - top >= viewport {
+            top
+        } else {
+            bottom - viewport
+        }
+    } else {
+        pos
+    };
+    clamp_scroll(target, content, viewport)
+}
+
+/// WM_MOUSEWHEEL's notch size.
+const WHEEL_DELTA: i32 = 120;
+
+/// The change in scroll position for a wheel `delta` at `dpi`: three rows per
+/// notch, and against the wheel's direction (wheel up scrolls the content
+/// down the screen, so the position decreases).
+fn wheel_scroll_px(delta: i32, dpi: u32) -> i32 {
+    -(delta * 3 * to_px(ROW_H, dpi)) / WHEEL_DELTA
+}
+
+// The low word of a WM_VSCROLL wParam.
+const SB_LINEUP: u32 = 0;
+const SB_LINEDOWN: u32 = 1;
+const SB_PAGEUP: u32 = 2;
+const SB_PAGEDOWN: u32 = 3;
+const SB_THUMBPOSITION: u32 = 4;
+const SB_THUMBTRACK: u32 = 5;
+const SB_TOP: u32 = 6;
+const SB_BOTTOM: u32 = 7;
+
+/// Where a `WM_VSCROLL` request `code` leaves the position, limited to
+/// `0..=max`. `track` is the thumb's live position. An unknown code changes
+/// nothing.
+fn scroll_request_target(code: u32, pos: i32, track: i32, line: i32, page: i32, max: i32) -> i32 {
+    let target = match code {
+        SB_LINEUP => pos - line,
+        SB_LINEDOWN => pos + line,
+        SB_PAGEUP => pos - page,
+        SB_PAGEDOWN => pos + page,
+        SB_THUMBPOSITION | SB_THUMBTRACK => track,
+        SB_TOP => 0,
+        SB_BOTTOM => max,
+        _ => pos,
+    };
+    target.clamp(0, max.max(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,25 +1151,63 @@ unsafe fn on_dpi_changed(inner: &mut SettingsInner, wparam: WPARAM, lparam: LPAR
 }
 
 /// Rebuilds the font and re-lays-out the children for `inner.dpi`, using the
-/// window's current client height for the elastic Prompt region.
+/// window's current client size: the footer is pinned to the bottom, the body
+/// fills the rest, and its scroll range follows the content (#481).
 unsafe fn apply_dpi(inner: &mut SettingsInner) {
     let dpi = inner.dpi;
     let mut rc = windows::Win32::Foundation::RECT::default();
-    let client_h_dp = if GetClientRect(inner.hwnd, &mut rc).is_ok() {
-        ((rc.bottom - rc.top) * 96 / dpi as i32).max(1)
+    let (client_w_px, client_h_px) = if GetClientRect(inner.hwnd, &mut rc).is_ok() {
+        (rc.right - rc.left, rc.bottom - rc.top)
     } else {
-        inner.win_h_dp
+        (to_px(WIN_W_DP, dpi), to_px(inner.win_h_dp, dpi))
     };
+    let client_h_dp = (client_h_px * 96 / dpi as i32).max(1);
     // The design rects were recorded for the collapsed layout (#342).
     let old = footer_layout(inner.content_top_dp, inner.win_h_dp, false);
     let new = footer_layout(inner.content_top_dp, client_h_dp, inner.prompt_expanded);
+
+    // The body is the client area above the footer. Its scroll position
+    // carries over a dpi change (rescaled) and is kept inside the new range.
+    let view_px = (client_h_px - to_px(FOOTER_H_DP, dpi)).max(1);
+    let content_px = to_px(new.content_h(), dpi);
+    let have_body = !inner.body.0.is_null();
+    let old_pos = if have_body {
+        body_scroll_info(inner.body).nPos
+    } else {
+        0
+    };
+    let pos = clamp_scroll(
+        (old_pos as i64 * dpi as i64 / inner.body_dpi.max(1) as i64) as i32,
+        content_px,
+        view_px,
+    );
+    inner.body_dpi = dpi;
+    // The footer sits right of the body's scrollbar, so it is shifted over by
+    // the bar's width to keep its right edge on the window's.
+    let sbw = scrollbar_width_px(dpi);
 
     let new_font = build_font(dpi);
     // No repaint between the individual moves: one redraw at the end, so a
     // drag across monitors does not flicker.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
+    if have_body {
+        let _ = SetWindowPos(
+            inner.body,
+            None,
+            0,
+            0,
+            client_w_px.max(1),
+            view_px,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
     for c in &inner.children {
         let (x, y, w, h) = child_rect_px(c, &old, &new, dpi);
+        let (x, y) = if c.anchor == Anchor::Footer {
+            (x + sbw, y)
+        } else {
+            (x, y - pos)
+        };
         let _ = SetWindowPos(c.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         SendMessageW(
             c.hwnd,
@@ -1064,6 +1215,9 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
             Some(WPARAM(new_font.0 as usize)),
             Some(LPARAM(1)),
         );
+    }
+    if have_body {
+        set_body_scroll(inner.body, content_px, view_px, pos);
     }
     // Every child now uses the new font, so the old one can go.
     if !inner.font.0.is_null() {
@@ -1134,6 +1288,317 @@ unsafe fn show_prompt_state(inner: &mut SettingsInner) {
         SWP_NOZORDER | SWP_NOACTIVATE,
     );
     apply_dpi(inner);
+    // Opening the prompt on a short window: bring the box into view.
+    if inner.prompt_expanded && !inner.body.0.is_null() {
+        ensure_visible(inner.body, inner.prompt_edit);
+    }
+}
+
+/// The settings window's outer width in px: the design width plus the body's
+/// scrollbar, which is always shown (disabled when unneeded) so the layout
+/// never shifts (#481).
+fn window_width_px(dpi: u32) -> i32 {
+    to_px(WIN_W_DP, dpi) + scrollbar_width_px(dpi)
+}
+
+// ---------------------------------------------------------------------------
+// Scrolling body (#481)
+// ---------------------------------------------------------------------------
+// Every group lives in a child window (the body) with its own vertical
+// scrollbar; Save, Cancel and the validation line are siblings of the body, so
+// they stay pinned at the bottom of the client area. The scrollbar's own state
+// (range = content height, page = viewport height, position) is the single
+// source of truth for the scroll offset: nothing else stores it.
+
+/// The body's window class. Tests get their own name (rule 9).
+#[cfg(test)]
+const BODY_CLASS_NAME: &str = "Wingman.Settings.Body.Test.5c1d8e03";
+#[cfg(not(test))]
+const BODY_CLASS_NAME: &str = "Wingman.Settings.Body.c41f0a7e";
+
+static BODY_CLASS_INIT: std::sync::Once = std::sync::Once::new();
+static BODY_CLASS_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn ensure_body_class_registered(instance: HINSTANCE) -> bool {
+    BODY_CLASS_INIT.call_once(|| {
+        let class_name = wide_z(BODY_CLASS_NAME);
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: Default::default(),
+            lpfnWndProc: Some(body_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: instance,
+            hIcon: Default::default(),
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+            hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(
+                (windows::Win32::Graphics::Gdi::COLOR_BTNFACE.0 as isize + 1) as *mut c_void,
+            ),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            hIconSm: Default::default(),
+        };
+        let _ = BODY_CLASS_OK.set(unsafe { RegisterClassExW(&wc) } != 0);
+    });
+    BODY_CLASS_OK.get().copied().unwrap_or(false)
+}
+
+/// Creates the (empty) body under `parent`, sized to the client area above
+/// the footer. The caller adds the controls and later lays them out.
+fn create_body(parent: HWND, instance: HINSTANCE, dpi: u32) -> HWND {
+    if !ensure_body_class_registered(instance) {
+        return HWND(std::ptr::null_mut());
+    }
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    let (w, h) = if unsafe { GetClientRect(parent, &mut rc) }.is_ok() {
+        (rc.right - rc.left, rc.bottom - rc.top)
+    } else {
+        (to_px(WIN_W_DP, dpi), to_px(WIN_H_DP, dpi))
+    };
+    let class_name = wide_z(BODY_CLASS_NAME);
+    unsafe {
+        CreateWindowExW(
+            WS_EX_CONTROLPARENT,
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR::null(),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+            0,
+            0,
+            w.max(1),
+            (h - to_px(FOOTER_H_DP, dpi)).max(1),
+            Some(parent),
+            Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                ID_BODY as *mut c_void,
+            )),
+            Some(instance),
+            None,
+        )
+    }
+    .unwrap_or(HWND(std::ptr::null_mut()))
+}
+
+/// The body forwards what its controls tell their parent (button clicks, the
+/// trackbar) up to the settings window, and runs its own scrollbar.
+unsafe extern "system" fn body_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND | WM_HSCROLL => {
+            let parent = GetParent(hwnd).unwrap_or_default();
+            SendMessageW(parent, msg, Some(wparam), Some(lparam))
+        }
+        WM_VSCROLL => {
+            let si = body_scroll_info(hwnd);
+            if si.nPage != 0 {
+                let dpi = GetDpiForWindow(hwnd).max(1);
+                let max = max_scroll(si.nMax + 1, si.nPage as i32);
+                let target = scroll_request_target(
+                    (wparam.0 & 0xFFFF) as u32,
+                    si.nPos,
+                    si.nTrackPos,
+                    to_px(ROW_H, dpi),
+                    si.nPage as i32,
+                    max,
+                );
+                scroll_body_to(hwnd, target);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// The body's scroll state; `nPage == 0` means no range has been set yet.
+unsafe fn body_scroll_info(body: HWND) -> SCROLLINFO {
+    let mut si = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE | SIF_POS | SIF_TRACKPOS,
+        ..Default::default()
+    };
+    let _ = GetScrollInfo(body, SB_VERT, &mut si);
+    si
+}
+
+/// Gives the body's scrollbar its range (the content height), page (the
+/// viewport height) and position, all in pixels. The bar stays visible but
+/// disabled when nothing overflows, so the body's client width never changes.
+unsafe fn set_body_scroll(body: HWND, content_px: i32, view_px: i32, pos: i32) {
+    let si = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL,
+        nMin: 0,
+        nMax: (content_px - 1).max(0),
+        nPage: view_px.max(1) as u32,
+        nPos: pos,
+        nTrackPos: 0,
+    };
+    SetScrollInfo(body, SB_VERT, &si, true);
+}
+
+/// The width of a vertical scrollbar at `dpi`.
+fn scrollbar_width_px(dpi: u32) -> i32 {
+    unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) }.max(0)
+}
+
+/// Scrolls the body to `target` (limited to its range) by moving every one of
+/// its child controls, hidden ones too, so a later show lands in place.
+/// `ScrollWindowEx` is not used: it only moves children that intersect the
+/// viewport, which would leave the off-screen ones behind.
+unsafe fn scroll_body_to(body: HWND, target: i32) {
+    let si = body_scroll_info(body);
+    if si.nPage == 0 {
+        return;
+    }
+    let new = clamp_scroll(target, si.nMax + 1, si.nPage as i32);
+    if new == si.nPos {
+        return;
+    }
+    let pos = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_POS,
+        nPos: new,
+        ..Default::default()
+    };
+    SetScrollInfo(body, SB_VERT, &pos, true);
+
+    let dy = si.nPos - new;
+    SendMessageW(body, WM_SETREDRAW, Some(WPARAM(0)), None);
+    let mut cur = GetWindow(body, GW_CHILD).ok();
+    while let Some(c) = cur {
+        let mut r = windows::Win32::Foundation::RECT::default();
+        if GetWindowRect(c, &mut r).is_ok() {
+            let mut pt = windows::Win32::Foundation::POINT {
+                x: r.left,
+                y: r.top,
+            };
+            if ScreenToClient(body, &mut pt).as_bool() {
+                let _ = SetWindowPos(
+                    c,
+                    None,
+                    pt.x,
+                    pt.y + dy,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+        cur = GetWindow(c, GW_HWNDNEXT).ok();
+    }
+    SendMessageW(body, WM_SETREDRAW, Some(WPARAM(1)), None);
+    let _ = RedrawWindow(
+        Some(body),
+        None,
+        None,
+        RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+    );
+}
+
+/// Scrolls the body just enough to show `ctrl` (a control in the body, or one
+/// of its own children such as a combo's edit), with a little room around it.
+unsafe fn ensure_visible(body: HWND, ctrl: HWND) {
+    let si = body_scroll_info(body);
+    if si.nPage == 0 || ctrl == body || !IsChild(body, ctrl).as_bool() {
+        return;
+    }
+    // Walk up to the control that is the body's direct child.
+    let mut c = ctrl;
+    loop {
+        match GetParent(c) {
+            Ok(p) if p == body => break,
+            Ok(p) => c = p,
+            Err(_) => return,
+        }
+    }
+    let mut r = windows::Win32::Foundation::RECT::default();
+    if GetWindowRect(c, &mut r).is_err() {
+        return;
+    }
+    let mut top = windows::Win32::Foundation::POINT {
+        x: r.left,
+        y: r.top,
+    };
+    let mut bottom = windows::Win32::Foundation::POINT {
+        x: r.left,
+        y: r.bottom,
+    };
+    if !ScreenToClient(body, &mut top).as_bool() || !ScreenToClient(body, &mut bottom).as_bool() {
+        return;
+    }
+    // Room above for the group's caption (and the window's top margin for the
+    // first group), a little below.
+    let dpi = GetDpiForWindow(body).max(1);
+    let pad_top = to_px(GROUP_LABEL_TOP + MARGIN, dpi);
+    let pad_bottom = to_px(ROW_GAP, dpi);
+    let new = scroll_into_view(
+        si.nPos,
+        si.nMax + 1,
+        si.nPage as i32,
+        top.y + si.nPos - pad_top,
+        bottom.y + si.nPos + pad_bottom,
+    );
+    scroll_body_to(body, new);
+}
+
+/// Whether keyboard focus moved to a control inside the body: scrolls it into
+/// view. Called by the message loop whenever the focused window changes, which
+/// covers Tab, Shift+Tab, mnemonics and clicks without a timer.
+unsafe fn follow_focus(main: HWND, focus: HWND) {
+    if let Ok(body) = GetDlgItem(Some(main), ID_BODY) {
+        ensure_visible(body, focus);
+    }
+}
+
+/// Whether `message` is a mouse button message (client or non-client).
+fn is_mouse_message(message: u32) -> bool {
+    // WM_LBUTTONDOWN..WM_MBUTTONDBLCLK, WM_NCLBUTTONDOWN..WM_NCMBUTTONDBLCLK.
+    (0x0201..=0x0209).contains(&message) || (0x00A1..=0x00A9).contains(&message)
+}
+
+/// The prompt keeps the wheel when the pointer is over it; where the focus is
+/// does not matter.
+fn wheel_is_over_prompt(under_cursor: HWND, prompt_edit: HWND) -> bool {
+    under_cursor == prompt_edit
+}
+
+/// Whether `ctrl` is a combo with its list open (the list scrolls itself).
+unsafe fn wheel_over_open_combo(ctrl: HWND) -> bool {
+    SendMessageW(ctrl, CB_GETDROPPEDSTATE, None, None).0 != 0
+}
+
+/// Turns a mouse wheel message for the settings window into body scrolling.
+/// Returns true when it was used. Left alone: a wheel over the Check my work
+/// prompt (decided by the window under the cursor, not the focused one: it
+/// scrolls its text) and a wheel while a combo's list is open (the list
+/// scrolls itself).
+unsafe fn scroll_with_wheel(main: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
+    if msg.message != WM_MOUSEWHEEL {
+        return false;
+    }
+    // The wheel's lParam is the pointer in screen coordinates.
+    let pt = windows::Win32::Foundation::POINT {
+        x: (msg.lParam.0 & 0xFFFF) as u16 as i16 as i32,
+        y: ((msg.lParam.0 >> 16) & 0xFFFF) as u16 as i16 as i32,
+    };
+    if wheel_is_over_prompt(WindowFromPoint(pt), prompt_edit) || wheel_over_open_combo(msg.hwnd) {
+        return false;
+    }
+    let Ok(body) = GetDlgItem(Some(main), ID_BODY) else {
+        return false;
+    };
+    let si = body_scroll_info(body);
+    if si.nPage == 0 {
+        return false;
+    }
+    let delta = ((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+    scroll_body_to(
+        body,
+        si.nPos + wheel_scroll_px(delta, GetDpiForWindow(main).max(1)),
+    );
+    true
 }
 
 fn prompt_toggle_label(expanded: bool) -> &'static str {
@@ -1174,8 +1639,16 @@ fn get_text(hwnd: HWND) -> String {
     }
 }
 
+/// The control `id` of the settings window `hwnd`: a direct child (the
+/// footer) or one inside the scrolling body (#481).
 fn get_dlg_item(hwnd: HWND, id: i32) -> Option<HWND> {
-    unsafe { GetDlgItem(Some(hwnd), id).ok() }
+    unsafe {
+        if let Ok(h) = GetDlgItem(Some(hwnd), id) {
+            return Some(h);
+        }
+        let body = GetDlgItem(Some(hwnd), ID_BODY).ok()?;
+        GetDlgItem(Some(body), id).ok()
+    }
 }
 
 fn combo_selected_text(hwnd: HWND, id: i32) -> String {
@@ -1335,7 +1808,9 @@ impl Rows {
 }
 
 struct Ctx {
-    parent: HWND,
+    /// Where [`Ctx::create`] puts the next control: the scrolling body, then
+    /// the window itself for the pinned footer (#481).
+    parent: std::cell::Cell<HWND>,
     instance: HINSTANCE,
     dpi: u32,
     font: HFONT,
@@ -1372,7 +1847,7 @@ impl Ctx {
                 to_px(y, self.dpi),
                 to_px(w, self.dpi),
                 to_px(h, self.dpi),
-                Some(self.parent),
+                Some(self.parent.get()),
                 Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
                     id as *mut c_void,
                 )),
@@ -1666,6 +2141,8 @@ fn build_ui(
 /// What [`build_ui`] built, plus what a later DPI change needs to redo it.
 struct BuiltUi {
     prompt_edit: HWND,
+    /// The scrolling window the groups live in (#481).
+    body: HWND,
     children: Vec<ChildLayout>,
     /// Where the fixed-height groups end, in dp (the Prompt group's top).
     content_top_dp: i32,
@@ -1683,8 +2160,11 @@ fn build_ui_recorded(
     config: &Config,
     win_h_dp: i32,
 ) -> BuiltUi {
+    // #481: created first, so it is first in tab order; the footer controls
+    // made last are the last stops.
+    let body = create_body(hwnd, instance, dpi);
     let ctx = Ctx {
-        parent: hwnd,
+        parent: std::cell::Cell::new(if body.0.is_null() { hwnd } else { body }),
         instance,
         dpi,
         font,
@@ -2378,6 +2858,8 @@ fn build_ui_recorded(
     ctx.set_anchor(prompt_group, Anchor::PromptGroup);
 
     // -- Save / Cancel ------------------------------------------------
+    // Pinned footer: a sibling of the body, not inside it, so it never scrolls.
+    ctx.parent.set(hwnd);
     let buttons_y = footer.buttons_y;
     // #344: inline "that field is wrong" message, blank until a Save
     // attempt fails validation. Sits to the left of the Save/Cancel row so
@@ -2467,6 +2949,7 @@ fn build_ui_recorded(
 
     BuiltUi {
         prompt_edit,
+        body,
         children: ctx.children.into_inner(),
         content_top_dp,
         win_h_dp,
@@ -3995,53 +4478,43 @@ mod tests {
     /// target.
     const CONTENT_TOP_DP: i32 = 738;
 
-    fn footer_does_not_overlap(win_h_dp: i32) -> bool {
+    /// #481 replaced the #340 invariant. The footer no longer has to stay
+    /// clear of the Prompt group by arithmetic: it is pinned to the client
+    /// bottom and the group lives in the scrolling body, so what matters is
+    /// that the body's content is tall enough to hold the whole group (the
+    /// scroll range reaches its last control) at any window height.
+    fn prompt_group_is_inside_the_scrolling_content(win_h_dp: i32) -> bool {
         let footer = prompt_footer_layout(CONTENT_TOP_DP, win_h_dp);
         let reset_btn_bottom = footer.reset_btn_y + BTN_H;
-        reset_btn_bottom <= footer.buttons_y && footer.prompt_bottom <= footer.buttons_y
+        reset_btn_bottom <= footer.prompt_bottom && footer.prompt_top == CONTENT_TOP_DP
     }
 
     #[test]
-    fn footer_does_not_overlap_prompt_at_96_dpi_full_height() {
-        // 96dpi (100%), `fitted_height_dp` leaves the window at its full
-        // design height.
-        assert!(footer_does_not_overlap(WIN_H_DP));
+    fn prompt_group_is_inside_the_scrolling_content_at_96_dpi_full_height() {
+        assert!(prompt_group_is_inside_the_scrolling_content(WIN_H_DP));
     }
 
     #[test]
-    fn footer_does_not_overlap_prompt_at_144_dpi_shrunk_height() {
-        // 144dpi (150%) on a 1080p screen: `fitted_height_dp` shrinks the
-        // window to roughly 645dp of usable client height (MEASURED via
-        // the same formula `fitted_height_dp` uses, for a ~1040px-tall work
-        // area at 144dpi: (1040*96/144) - 48 ~= 645), well below
-        // `CONTENT_TOP_DP`. This is the exact shape of issue #340's
-        // screenshot.
-        assert!(footer_does_not_overlap(645));
+    fn prompt_group_is_inside_the_scrolling_content_at_144_dpi_shrunk_height() {
+        // 144dpi (150%) on a 1080p screen: the fitted window is ~645dp of
+        // client height, well below `CONTENT_TOP_DP`: issue #340's and
+        // #481's screenshots. The content is taller than the view, so it
+        // scrolls instead of being cut off.
+        assert!(prompt_group_is_inside_the_scrolling_content(645));
+        let f = prompt_footer_layout(CONTENT_TOP_DP, 645);
+        assert!(f.content_h() > 645 - FOOTER_H_DP);
     }
 
     #[test]
-    fn footer_does_not_overlap_prompt_at_the_configured_minimum_height() {
-        assert!(footer_does_not_overlap(MIN_WIN_H_DP));
+    fn prompt_group_is_inside_the_scrolling_content_at_the_minimum_height() {
+        assert!(prompt_group_is_inside_the_scrolling_content(MIN_WIN_H_DP));
     }
 
     #[test]
     fn footer_sits_flush_with_the_window_bottom_when_there_is_room() {
-        // Unchanged from the pre-#340 behaviour when the window is tall
-        // enough: Save/Cancel hug the bottom edge rather than floating
-        // higher than necessary. Even `WIN_H_DP` (918, raised by #403's
-        // Forms group and #341's Capture hint line) is not tall enough for
-        // `CONTENT_TOP_DP` (738) plus the Prompt group's minimum (issue
-        // #340's underlying finding: the original design height never
-        // actually had room for its own content -- see `MIN_WIN_H_DP`'s
-        // comment), so this uses a window tall enough to exercise the
-        // "plenty of room" branch specifically. Needs
-        // `win_h_dp - buttons_h >= CONTENT_TOP_DP + min_prompt_group_h`
-        // (738 + 138 = 876, so > 936) to actually land in the flush branch
-        // rather than the minimum-height one; 950 gives headroom.
         let roomy_win_h_dp = 950;
         let footer = prompt_footer_layout(CONTENT_TOP_DP, roomy_win_h_dp);
-        let buttons_h = BTN_H + MARGIN * 2;
-        assert_eq!(footer.buttons_y, roomy_win_h_dp - buttons_h + MARGIN);
+        assert_eq!(footer.buttons_y, roomy_win_h_dp - BTN_H - MARGIN);
     }
 
     // -- collapsed Advanced group (issue #342) ---------------------------
@@ -4054,7 +4527,7 @@ mod tests {
         let e = footer_layout(CONTENT_TOP_DP, 0, true);
         assert_eq!(c.prompt_edit_h, 0);
         assert!(c.prompt_bottom - c.prompt_top < e.prompt_bottom - e.prompt_top);
-        assert!(c.buttons_y < e.buttons_y);
+        assert!(c.content_h() < e.content_h());
     }
 
     #[test]
@@ -4062,7 +4535,7 @@ mod tests {
         let c = footer_layout(CONTENT_TOP_DP, WIN_H_DP, false);
         assert!(c.reset_btn_y >= c.prompt_top + GROUP_LABEL_TOP);
         assert!(c.reset_btn_y + BTN_H <= c.prompt_bottom);
-        assert!(c.prompt_bottom <= c.buttons_y);
+        assert!(c.content_h() <= WIN_H_DP - FOOTER_H_DP);
     }
 
     #[test]
@@ -4084,7 +4557,7 @@ mod tests {
         let nc = 40;
         let collapsed = window_height_dp(CONTENT_TOP_DP, false, 5000, nc);
         let e = footer_layout(CONTENT_TOP_DP, 0, true);
-        let expanded_needed = e.buttons_y + BTN_H + MARGIN + nc;
+        let expanded_needed = e.content_h() + FOOTER_H_DP + nc;
         assert!(collapsed + MIN_PROMPT_EDIT_H <= expanded_needed);
         assert_eq!(
             window_height_dp(CONTENT_TOP_DP, true, WIN_H_DP, nc),
@@ -4137,11 +4610,124 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_window_height_holds_exactly_the_footer() {
+    fn collapsed_window_height_holds_exactly_the_body_and_the_footer() {
         let nc = 40;
         let h = window_height_dp(CONTENT_TOP_DP, false, 5000, nc);
         let f = footer_layout(CONTENT_TOP_DP, h - nc, false);
+        // No scroll range when it fits: the content is exactly the view.
+        assert_eq!(f.content_h() + FOOTER_H_DP, h - nc);
         assert_eq!(f.buttons_y + BTN_H + MARGIN, h - nc);
+    }
+
+    // -- scrolling body (issue #481) ---------------------------------------
+
+    #[test]
+    fn max_scroll_is_the_overflow_and_never_negative() {
+        assert_eq!(max_scroll(900, 600), 300);
+        assert_eq!(max_scroll(600, 600), 0);
+        assert_eq!(max_scroll(300, 600), 0);
+    }
+
+    #[test]
+    fn clamp_scroll_keeps_the_position_inside_the_range() {
+        assert_eq!(clamp_scroll(-5, 900, 600), 0);
+        assert_eq!(clamp_scroll(120, 900, 600), 120);
+        assert_eq!(clamp_scroll(999, 900, 600), 300);
+        assert_eq!(clamp_scroll(50, 300, 600), 0);
+    }
+
+    #[test]
+    fn scroll_into_view_leaves_a_visible_rect_alone() {
+        assert_eq!(scroll_into_view(100, 1000, 400, 150, 200), 100);
+    }
+
+    #[test]
+    fn scroll_into_view_brings_a_rect_below_the_view_up_to_the_bottom_edge() {
+        assert_eq!(scroll_into_view(0, 1000, 400, 500, 530), 130);
+    }
+
+    #[test]
+    fn scroll_into_view_brings_a_rect_above_the_view_down_to_the_top_edge() {
+        assert_eq!(scroll_into_view(300, 1000, 400, 120, 150), 120);
+    }
+
+    #[test]
+    fn scroll_into_view_never_leaves_the_range() {
+        // Focus on the last control: the target is the very bottom.
+        assert_eq!(scroll_into_view(0, 1000, 400, 980, 1000), 600);
+        // The first control: the very top.
+        assert_eq!(scroll_into_view(500, 1000, 400, 0, 22), 0);
+    }
+
+    #[test]
+    fn scroll_into_view_aligns_the_top_of_a_rect_taller_than_the_view() {
+        assert_eq!(scroll_into_view(0, 2000, 300, 500, 1000), 500);
+    }
+
+    #[test]
+    fn wheel_scrolls_three_rows_per_notch_against_the_wheel_direction() {
+        let row = to_px(ROW_H, 96);
+        assert_eq!(wheel_scroll_px(120, 96), -3 * row);
+        assert_eq!(wheel_scroll_px(-120, 96), 3 * row);
+        assert_eq!(wheel_scroll_px(60, 96), -3 * row / 2);
+        assert_eq!(wheel_scroll_px(0, 96), 0);
+        // Rows are bigger at 150%.
+        assert_eq!(wheel_scroll_px(-120, 144), 3 * to_px(ROW_H, 144));
+    }
+
+    #[test]
+    fn mouse_messages_are_recognised_and_keys_are_not() {
+        assert!(is_mouse_message(0x0201)); // WM_LBUTTONDOWN
+        assert!(is_mouse_message(0x0202)); // WM_LBUTTONUP
+        assert!(is_mouse_message(0x00A1)); // WM_NCLBUTTONDOWN
+        assert!(!is_mouse_message(0x0100)); // WM_KEYDOWN
+        assert!(!is_mouse_message(0x020A)); // WM_MOUSEWHEEL
+    }
+
+    #[test]
+    fn scrollbar_requests_map_to_positions() {
+        // (code, pos, track, line, page, max)
+        let t = |code, pos| scroll_request_target(code, pos, 77, 20, 300, 500);
+        assert_eq!(t(SB_LINEUP, 100), 80);
+        assert_eq!(t(SB_LINEDOWN, 100), 120);
+        assert_eq!(t(SB_PAGEUP, 100), 0);
+        assert_eq!(t(SB_PAGEDOWN, 100), 400);
+        assert_eq!(t(SB_THUMBTRACK, 100), 77);
+        assert_eq!(t(SB_THUMBPOSITION, 100), 77);
+        assert_eq!(t(SB_TOP, 100), 0);
+        assert_eq!(t(SB_BOTTOM, 100), 500);
+        assert_eq!(t(SB_LINEDOWN, 490), 500);
+        assert_eq!(t(SB_LINEUP, 5), 0);
+        assert_eq!(t(99, 100), 100);
+    }
+
+    #[test]
+    fn the_window_never_asks_for_more_height_than_the_work_area_holds() {
+        // 1080p at 150%: the 1040px work area is ~693dp, less the title bar
+        // allowance. This is the screen in the issue.
+        let h = fitted_height_for_work_px(1040, 144);
+        assert!(to_px(h, 144) <= 1040, "{h}dp does not fit");
+        // A short, very scaled screen must still fit: no floor above it.
+        let h = fitted_height_for_work_px(740, 240);
+        assert!(to_px(h, 240) <= 740, "{h}dp does not fit");
+    }
+
+    #[test]
+    fn the_footer_is_pinned_to_the_bottom_whatever_the_content() {
+        for h in [300, 645, WIN_H_DP, 1500] {
+            for expanded in [false, true] {
+                let f = footer_layout(CONTENT_TOP_DP, h, expanded);
+                assert_eq!(f.buttons_y, h - BTN_H - MARGIN, "h={h} expanded={expanded}");
+            }
+        }
+    }
+
+    #[test]
+    fn content_is_taller_than_a_short_view_and_fills_a_tall_one_exactly() {
+        let short = footer_layout(CONTENT_TOP_DP, 600, true);
+        assert!(short.content_h() > 600 - FOOTER_H_DP, "must scroll");
+        let tall = footer_layout(CONTENT_TOP_DP, 1500, true);
+        assert_eq!(tall.content_h(), 1500 - FOOTER_H_DP, "no needless scroll");
     }
 
     // -- window smoke test ----------------------------------------------
@@ -4535,13 +5121,10 @@ mod tests {
             let inner = unsafe { &mut *raw };
             inner.hwnd = hwnd;
             inner.font = font;
-            inner.prompt_edit = built.prompt_edit;
-            inner.children = built.children;
-            inner.content_top_dp = built.content_top_dp;
-            inner.win_h_dp = built.win_h_dp;
+            inner.adopt(built);
         }
         let child_count = unsafe { &*raw }.children.len();
-        assert_eq!(direct_child_count(hwnd), child_count);
+        assert_children_split_between_footer_and_body(hwnd, raw, child_count);
 
         let save = get_dlg_item(hwnd, ID_SAVE).expect("Save button");
         assert_eq!(client_size(save), (BTN_W, BTN_H));
@@ -4591,8 +5174,8 @@ mod tests {
             (suggested.right - suggested.left).min(max_track_w)
         );
         assert_eq!(unsafe { &*raw }.dpi, 192);
-        assert_eq!(direct_child_count(hwnd), unsafe { &*raw }.children.len());
-        assert_eq!(direct_child_count(hwnd), child_count);
+        assert_eq!(unsafe { &*raw }.children.len(), child_count);
+        assert_children_split_between_footer_and_body(hwnd, raw, child_count);
 
         // Save's top edge sits where the footer layout for the new client
         // height puts it, in dp at the new dpi.
@@ -4612,6 +5195,145 @@ mod tests {
         }
         assert_eq!(client_size(save), (BTN_W, BTN_H));
         assert_eq!(font_height_of(save), font_96);
+    }
+
+    /// #481's wired-to-nothing check, with a real window: one far shorter than
+    /// its content. If the body were not scrolling (no range, no `WM_VSCROLL`
+    /// arm, children not moved) the Prompt toggle would stay below the view
+    /// after the scroll message; if the footer were inside the body Save
+    /// would move with it.
+    #[test]
+    fn a_short_window_scrolls_its_body_and_keeps_the_footer_pinned() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+
+        let raw = Box::into_raw(Box::new(SettingsInner::new(Config::default())));
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let title = wide_z("Wingman settings (scroll test)");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(400, 96),
+                None,
+                None,
+                Some(instance),
+                Some(raw as *const c_void),
+            )
+        }
+        .expect("CreateWindowExW");
+        struct Guard(HWND, *mut SettingsInner);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                    drop(Box::from_raw(self.1));
+                }
+            }
+        }
+        let _guard = Guard(hwnd, raw);
+
+        let client_h_px = client_size(hwnd).1;
+        let font = build_font(96);
+        let built = build_ui_recorded(
+            hwnd,
+            instance,
+            96,
+            font,
+            &Config::default(),
+            client_h_px.max(1),
+        );
+        {
+            let inner = unsafe { &mut *raw };
+            inner.hwnd = hwnd;
+            inner.font = font;
+            inner.adopt(built);
+            unsafe { apply_dpi(inner) };
+        }
+        let body = unsafe { &*raw }.body;
+        let view_px = client_h_px - to_px(FOOTER_H_DP, 96);
+
+        // The range covers the content; the body fills the client above the
+        // footer and Save sits below it, inside the window.
+        let si = unsafe { body_scroll_info(body) };
+        assert_eq!(si.nPage as i32, view_px);
+        assert!(
+            si.nMax + 1 > view_px,
+            "content {} must overflow the {view_px}px view",
+            si.nMax + 1
+        );
+        let save = get_dlg_item(hwnd, ID_SAVE).expect("Save");
+        let save_y = top_in_parent_px(hwnd, save);
+        assert!(save_y >= view_px, "Save {save_y} overlaps the body");
+        assert!(save_y + to_px(BTN_H, 96) <= client_h_px, "Save is cut off");
+
+        // The Advanced toggle starts below the view and a scroll to the
+        // bottom (what the scrollbar's End does) brings it into the view.
+        let toggle = get_dlg_item(hwnd, ID_PROMPT_TOGGLE).expect("toggle");
+        assert!(top_in_parent_px(body, toggle) >= view_px, "starts in view");
+        unsafe {
+            SendMessageW(
+                body,
+                WM_VSCROLL,
+                Some(WPARAM(SB_BOTTOM as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+        let t = top_in_parent_px(body, toggle);
+        assert!(t >= 0 && t + to_px(BTN_H, 96) <= view_px, "toggle at {t}");
+        assert_eq!(top_in_parent_px(hwnd, save), save_y, "the footer moved");
+        assert_eq!(
+            unsafe { body_scroll_info(body) }.nPos,
+            si.nMax + 1 - view_px
+        );
+
+        // The wheel (as the message loop passes it) scrolls back up.
+        let wheel = |delta: i16| MSG {
+            hwnd: toggle,
+            message: WM_MOUSEWHEEL,
+            wParam: WPARAM((delta as u16 as usize) << 16),
+            ..Default::default()
+        };
+        let before = unsafe { body_scroll_info(body) }.nPos;
+        assert!(unsafe { scroll_with_wheel(hwnd, &wheel(120), HWND(std::ptr::null_mut())) });
+        let after = unsafe { body_scroll_info(body) }.nPos;
+        assert_eq!(after, before + wheel_scroll_px(120, 96));
+        // ...but the prompt box keeps its own wheel.
+        let prompt = get_dlg_item(hwnd, ID_PROMPT_EDIT).expect("prompt");
+        // The prompt is judged by the window under the cursor, not the
+        // focused one (parallel tests overlap windows, so the pointer's
+        // window is passed in here rather than found with WindowFromPoint).
+        assert!(wheel_is_over_prompt(prompt, prompt));
+        assert!(!wheel_is_over_prompt(toggle, prompt));
+        // An open combo keeps the wheel; a closed one does not.
+        let combo = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER).expect("combo");
+        assert!(!unsafe { wheel_over_open_combo(combo) });
+        unsafe { SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(1)), None) };
+        assert!(unsafe { wheel_over_open_combo(combo) });
+        unsafe { SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(0)), None) };
+
+        // Focus on the first control scrolls the top back into view, and a
+        // control already in view does not move it.
+        let first = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER).expect("first field");
+        unsafe { follow_focus(hwnd, first) };
+        assert_eq!(unsafe { body_scroll_info(body) }.nPos, 0);
+        let first_y = top_in_parent_px(body, first);
+        unsafe { follow_focus(hwnd, first) };
+        assert_eq!(top_in_parent_px(body, first), first_y);
+        // And the last one scrolls down again. A combo's inner edit counts as
+        // the combo.
+        unsafe { follow_focus(hwnd, toggle) };
+        let t = top_in_parent_px(body, toggle);
+        assert!(t >= 0 && t + to_px(BTN_H, 96) <= view_px, "toggle at {t}");
     }
 
     /// #342's wired-to-nothing check, with a real window: the prompt box is
@@ -4667,10 +5389,7 @@ mod tests {
             let inner = unsafe { &mut *raw };
             inner.hwnd = hwnd;
             inner.font = font;
-            inner.prompt_edit = built.prompt_edit;
-            inner.children = built.children;
-            inner.content_top_dp = built.content_top_dp;
-            inner.win_h_dp = built.win_h_dp;
+            inner.adopt(built);
         }
         let prompt = get_dlg_item(hwnd, ID_PROMPT_EDIT).expect("prompt edit");
         let reset = get_dlg_item(hwnd, ID_RESET_PROMPT).expect("reset button");
@@ -4691,19 +5410,45 @@ mod tests {
         assert!(!visible(prompt) && !visible(reset));
         assert!(visible(toggle));
         let collapsed_save_y = top_in_parent_px(hwnd, save);
+        let body = unsafe { &*raw }.body;
+        let content = || unsafe { body_scroll_info(body) }.nMax;
+        let collapsed_content = content();
 
         click();
         assert!(visible(prompt) && visible(reset));
         assert_eq!(get_text(toggle), "Hide Check my work &prompt");
-        assert!(top_in_parent_px(hwnd, save) > collapsed_save_y);
+        // #481: Save is pinned to the bottom, so the window may not grow on
+        // a short screen; the scrolling content is what grows.
+        assert!(top_in_parent_px(hwnd, save) >= collapsed_save_y);
+        assert!(content() > collapsed_content, "the body did not grow");
         assert_eq!(get_text(prompt), Config::default().ui.prompt);
 
         click();
         assert!(!visible(prompt) && !visible(reset));
         assert_eq!(get_text(toggle), "Show Check my work &prompt");
         assert_eq!(top_in_parent_px(hwnd, save), collapsed_save_y);
+        assert_eq!(content(), collapsed_content);
         // Hidden text is still readable, so Save keeps it.
         assert_eq!(get_text(prompt), Config::default().ui.prompt);
+    }
+
+    /// #481: the window's direct children are the pinned footer controls and
+    /// the one body; every other recorded control lives inside the body.
+    fn assert_children_split_between_footer_and_body(
+        hwnd: HWND,
+        raw: *mut SettingsInner,
+        child_count: usize,
+    ) {
+        let inner = unsafe { &*raw };
+        let footer = inner
+            .children
+            .iter()
+            .filter(|c| c.anchor == Anchor::Footer)
+            .count();
+        assert!(footer >= 3, "Save, Cancel and the validation line");
+        assert!(!inner.body.0.is_null(), "no scrolling body");
+        assert_eq!(direct_child_count(hwnd), footer + 1);
+        assert_eq!(direct_child_count(inner.body), child_count - footer);
     }
 
     fn direct_child_count(hwnd: HWND) -> usize {

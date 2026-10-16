@@ -21,6 +21,7 @@ pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
 pub mod review_email;
+pub mod scam_check;
 pub mod schema;
 pub mod time_zones;
 pub mod translate;
@@ -271,6 +272,10 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   proposal `time_list`, executor `none`. The model reads each time and its
 ///   zone as written; Rust converts them to the local zone (`time_zones`).
 ///   Ambiguous zones list every reading.
+/// - `"is-this-a-scam"` (#312, `scam_check::builtin_action`): proposal
+///   `scam_check`, executor `none`. A calibrated verdict (likely a scam,
+///   suspicious, no clear signs) with the signs behind it, for the message or
+///   page on screen.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -327,6 +332,7 @@ pub fn builtin_actions() -> Vec<Action> {
         explain_screen::builtin_action(),
         link_summary::builtin_action(),
         convert_times::builtin_action(),
+        scam_check::builtin_action(),
     ]
 }
 

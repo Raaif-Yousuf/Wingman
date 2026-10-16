@@ -147,8 +147,7 @@ fn parse_offset(s: &str) -> Option<i32> {
     let rest = chars.as_str();
     // ASCII digits and colons only, so the byte slices below are on
     // character boundaries, and short enough that nothing can overflow.
-    if rest.is_empty() || rest.len() > 5 || !rest.bytes().all(|b| b.is_ascii_digit() || b == b':')
-    {
+    if rest.is_empty() || rest.len() > 5 || !rest.bytes().all(|b| b.is_ascii_digit() || b == b':') {
         return None;
     }
     let (h, m): (i32, i32) = if let Some((h, m)) = rest.split_once(':') {
@@ -633,8 +632,7 @@ impl TzProvider for WindowsZones {
     fn utc_to_local(&self, zone: &ZoneId, utc_secs: i64) -> Option<CivilDateTime> {
         use windows::Win32::Foundation::SYSTEMTIME;
         use windows::Win32::System::Time::{
-            GetTimeZoneInformationForYear, SystemTimeToTzSpecificLocalTime,
-            TIME_ZONE_INFORMATION,
+            GetTimeZoneInformationForYear, SystemTimeToTzSpecificLocalTime, TIME_ZONE_INFORMATION,
         };
         let key = match zone {
             ZoneId::Windows(key) => Some(*key),
@@ -1149,7 +1147,14 @@ mod tests {
     #[test]
     fn long_or_impossible_offsets_are_unknown() {
         for z in [
-            "+71582789", "UTC+71582789", "+1260", "+1:60", "+15:00", "-12:01", "+123", "+1:2",
+            "+71582789",
+            "UTC+71582789",
+            "+1260",
+            "+1:60",
+            "+15:00",
+            "-12:01",
+            "+123",
+            "+1:2",
             "+1:234",
         ] {
             assert_eq!(parse_zone(z), ZoneParse::Unknown, "{z}");
@@ -1160,7 +1165,13 @@ mod tests {
 
     #[test]
     fn years_outside_the_windows_range_are_refused() {
-        for d in ["0000-01-01", "1600-05-05", "30828-01-01", "99999 Oct 1", "1/2/70000"] {
+        for d in [
+            "0000-01-01",
+            "1600-05-05",
+            "30828-01-01",
+            "99999 Oct 1",
+            "1/2/70000",
+        ] {
             assert!(parse_date(d).is_err(), "{d}");
         }
         assert!(parse_date("1601-01-01").unwrap().is_some());
@@ -1179,8 +1190,14 @@ mod tests {
         assert_eq!(off("Israel Standard Time", 2027, 3, 27, 12), Some(180));
         assert_eq!(off("Israel Standard Time", 2027, 10, 31, 12), Some(120));
         // Newfoundland (half hour), Sydney (southern summer) and Pacific.
-        assert_eq!(off("Newfoundland Standard Time", 2027, 1, 15, 12), Some(-210));
-        assert_eq!(off("Newfoundland Standard Time", 2027, 7, 15, 12), Some(-150));
+        assert_eq!(
+            off("Newfoundland Standard Time", 2027, 1, 15, 12),
+            Some(-210)
+        );
+        assert_eq!(
+            off("Newfoundland Standard Time", 2027, 7, 15, 12),
+            Some(-150)
+        );
         assert_eq!(off("AUS Eastern Standard Time", 2027, 1, 15, 12), Some(660));
         assert_eq!(off("AUS Eastern Standard Time", 2027, 7, 15, 12), Some(600));
         assert_eq!(off("Pacific Standard Time", 2031, 7, 15, 12), Some(-420));
