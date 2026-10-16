@@ -7883,10 +7883,10 @@ mod tests {
     #[test]
     fn an_empty_chain_error_is_recognised_by_its_text() {
         let err = anyhow::Error::new(crate::provider::NoProviders);
-        let packed = super::pack_error("x", &format!("{err:#}"));
+        let packed = super::pack_error("x", &super::worker_error_chain_text(&err));
         assert!(super::is_no_providers(&packed));
         let wrapped = anyhow::anyhow!("boom").context("outer");
-        let packed = super::pack_error("x", &format!("{wrapped:#}"));
+        let packed = super::pack_error("x", &super::worker_error_chain_text(&wrapped));
         assert!(!super::is_no_providers(&packed));
     }
 
