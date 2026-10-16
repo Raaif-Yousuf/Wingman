@@ -69,12 +69,14 @@ idle. Every failure ends in a card. Redaction applies before any upload.
 - **Capture backend.** `Cargo.toml` takes `xcap = "0.9"` with default
   features, and xcap 0.9.8's `wgc` feature is off by default, so a monitor
   capture here goes through `gdi::capture_monitor`: `BitBlt` with `SRCCOPY`
-  and no `CAPTUREBLT`. THEORY (unverified, read from the crate source):
-  `BitBlt` without `CAPTUREBLT` skips layered windows, so today's capture may
-  not contain a layered overlay even without the affinity flag. The flag is
-  still required (below), because the user's screen share, a recorder and any
-  future switch to the `wgc` feature all read the composed desktop. Slice 0
-  measures both.
+  and no `CAPTUREBLT`. MEASURED 2026-10-16 (Windows 11 26300, `examples/capture_exclusion_spike.rs`):
+  the theory that this path skips layered windows is false. A solid 64x64
+  layered window (`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
+  WS_EX_NOACTIVATE`, updated with `UpdateLayeredWindow`) was in the
+  `capture_image` result in 4096 of 4096 pixels without the affinity flag, so
+  the flag is what keeps labels out of Wingman's own capture, not the capture
+  path. The flag is also what keeps them out of a screen share or a recorder.
+  See "Excluding the overlay from capture" for the full result.
 - **Exe size.** `perf-budgets.json` records 3,800,576 bytes measured against a
   gate of 3,900,000, about 99 KB of headroom, shared with the options card,
   Settings dark mode and knowledge specs. AGENTS.md's "about 3.5 MB" is stale.
@@ -223,28 +225,36 @@ press, a region capture, and any later awareness capture (#330) never read
 Wingman's own labels as screen content. It also keeps labels out of the user's
 screen share and recordings.
 
-- **Slice 0 gate, before this spec is approved.** The whole design hangs on
-  this working for the exact window kind used here: a `WS_EX_LAYERED` popup
-  updated with `UpdateLayeredWindow`, not any window. A 20-line throwaway
-  program records, for that window with and without the flag: (a) whether
-  `xcap`'s monitor capture as Wingman uses it (the GDI `BitBlt` path) contains
-  the labels, (b) whether a `wgc` or DXGI capture does, since the `wgc` feature
-  could be enabled later and a screen share uses the composed desktop, and (c)
-  whether `PrintWindow` on the overlay returns the labels, for the gallery. The
-  result is written into this spec, replacing the theories. If the flag does
-  not hold for a layered window, the design changes (see open question 3)
-  before anything else is built.
-- **Fail closed.** If the call fails, the overlay is not shown and the summary
-  card says "Could not show marks on screen here, here they are". A visible
-  overlay that a later capture can read is a privacy and feedback problem
-  (a translation of private text re-uploaded as "the screen").
-- **Belt and braces.** The key dismisses the overlay before a press captures
-  anything (the shared key rule), and every Wingman-initiated capture path
-  hides the overlay first, exactly as the palette hides itself first.
-- **Demos.** A screen recorder that honours the flag will not show the labels,
-  which defeats the #332 demo GIF. A config field `overlay.capturable` (default
-  `false`, documented as "for recording a demo") skips the flag, and the
-  gallery sets it so overlay states can be screenshotted.
+- **Slice 0 result.** MEASURED 2026-10-16 on the dev machine (Windows 11
+  26300, one primary monitor, per-monitor-v2 DPI), by
+  `examples/capture_exclusion_spike.rs`: a 64x64 solid-colour window shown for
+  300 ms in the monitor's top-left corner, captured with `xcap`'s
+  `Monitor::capture_image` exactly as `src/capture.rs` calls it, and with
+  `PrintWindow(PW_RENDERFULLCONTENT)`, counting pixels of that colour.
+
+  | Window | Flag | `SetWindowDisplayAffinity` | `xcap` (GDI BitBlt) | `xcap` with its `wgc` feature | `PrintWindow` |
+  |---|---|---|---|---|---|
+  | layered, click-through, topmost, no-activate | none | n/a | 4096 / 4096 | 4096 / 4096 | 4096 / 4096 |
+  | same | `WDA_EXCLUDEFROMCAPTURE` | succeeds, reads back 0x11 | 0 / 4096 | 0 / 4096 | 0 / 4096 |
+  | plain popup, not layered | none | n/a | 4096 / 4096 | 4096 / 4096 | 4096 / 4096 |
+  | same | `WDA_EXCLUDEFROMCAPTURE` | succeeds, reads back 0x11 | 0 / 4096 | 0 / 4096 | 0 / 4096 |
+
+  So: the call succeeds on a layered, transparent, topmost, no-activate window
+  and on a plain one; the flag holds for Wingman's capture path, for the
+  Windows Graphics Capture path, and for `PrintWindow`; and without the flag the
+  overlay is in every capture (the old theory that `BitBlt` without
+  `CAPTUREBLT` skips layered windows is false on this build). The excluded
+  region reads as whatever is behind the window, not as black. Not measured:
+  DXGI desktop duplication (the `windows` features `Win32_Graphics_Direct3D11`
+  and `Win32_Graphics_Direct3D` are not enabled, and the WGC path above already
+  covers the compositor-level capture a screen share uses), a second monitor,
+  Windows 10, and an `UpdateLayeredWindow` bitmap with per-pixel partial alpha
+  (labels will have some; the flag acts on the whole window, so it is not
+  expected to differ, but only a solid colour was checked).
+  Consequences for the design: open question 3 is answered, so no
+  hide-before-capture fallback is needed; the affinity call stays a hard guard
+  (see "When a guard cannot run") because a failed call means the labels are in
+  the capture; and manual check 1 stays as the end-to-end proof in the real app.
 
 ## When the screen changes
 
@@ -903,14 +913,10 @@ against the **real** OCR in an `#[ignore]`d live test (the pattern of
 
 Each ships alone and has an observable.
 
-0. **Spike, before approval (no product change).** The throwaway program from
-   "Excluding the overlay from capture": a layered window with
-   `WDA_EXCLUDEFROMCAPTURE`, captured through `xcap` as Wingman uses it, through
-   a `wgc` or DXGI capture, and through `PrintWindow`, with and without the flag.
-   Written into this spec. Gate: if the flag does not hold for a layered window,
-   this design is revised before slice 1 starts. Cheap enough to do now rather
-   than after merge.
-1. **Anchor core and layout (pure).** `anchor`, `layout`, the alpha pass,
+0. **Spike (done 2026-10-16, no product change).** `examples/capture_exclusion_spike.rs`:
+   a layered window with `WDA_EXCLUDEFROMCAPTURE`, captured through `xcap` (GDI
+   and `wgc`) and `PrintWindow`, with and without the flag. The flag holds for
+   all three; result in "Excluding the overlay from capture". Slice 1 can start.1. **Anchor core and layout (pure).** `anchor`, `layout`, the alpha pass,
    `state`, the shared span helpers extracted from `redact.rs`. It has no
    runtime caller until slice 2, so the new modules carry
    `#[cfg_attr(not(test), allow(dead_code))]`, and slice 2's done criterion is
@@ -989,11 +995,12 @@ the question stays open.
    into exact matches. The token count must be measured on real captures before
    slice 6; revisit if it is larger than 600.
 3. **Does the display affinity flag hold for a layered window under `xcap`?**
-   Unknown, and the whole design hangs on it, so it is the Slice 0 spike, run
-   before this spec is approved rather than before slice 2 merges. If it does
-   not hold, hide the overlay before every Wingman capture and treat awareness
-   capture (#330) as blocked on a different exclusion.
-4. **Any key dismisses, or only keys that can change content?** Any non-modifier
+   Yes. MEASURED 2026-10-16 (see "Excluding the overlay from capture"): the
+   call succeeds and the window is absent from the GDI capture, the `wgc`
+   capture and `PrintWindow`. No hide-before-capture fallback is needed for
+   Wingman's own captures, and awareness capture (#330) is not blocked on a
+   different exclusion. The fallback stays only for the case where the call
+   itself fails, which means no overlay.4. **Any key dismisses, or only keys that can change content?** Any non-modifier
    key while the foreground window is in the target set, decided on the main
    thread, never inside the hook callback. A narrower list would miss an app's
    own shortcuts. The cost is that a stray key press hides the overlay, which is
