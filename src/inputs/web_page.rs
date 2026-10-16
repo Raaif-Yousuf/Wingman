@@ -23,7 +23,7 @@
 //!    within [`TOTAL_TIMEOUT`]. HTML is reduced to text by
 //!    [`super::html_text`].
 //!
-//! Every hop is one row in the local egress log (`egress.log`): the host and
+//! Every hop is one row in the local egress log (the store's `egress` table): the host and
 //! the bytes received, never the path, query or content. A fetch is a plain
 //! GET with no cookies, no credentials and no proxy; it is not billed, so the
 //! daily budget guard (`budget_guard`, which only the model calls reach)

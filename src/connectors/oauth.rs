@@ -1418,8 +1418,7 @@ mod tests {
         let _mode = online();
         let reply = token_json("ACCESSLEAK", Some("REFRESHLEAK"));
         let ep = fake_endpoint(vec![(200, reply), (400, "BODYLEAK".to_string())]);
-        let log = crate::egress::log_path().unwrap();
-        let saved = std::fs::read_to_string(&log).unwrap_or_default();
+        let before_rows = crate::egress::rows().unwrap().len();
         let url = format!("{}/token?client_secret=QUERYLEAK#FRAGLEAK", ep.base);
         let form = [
             ("code", "CODELEAK"),
@@ -1428,15 +1427,11 @@ mod tests {
         ];
         UreqTransport.post_form(&url, &form).unwrap();
         UreqTransport.post_form(&url, &form).unwrap();
-        let after = std::fs::read_to_string(&log).unwrap_or_default();
-        std::fs::write(&log, &saved).unwrap();
-
-        let before_rows = saved.replace('\r', "").lines().count();
-        let rows: Vec<String> = after
-            .replace('\r', "")
-            .lines()
+        let rows: Vec<String> = crate::egress::rows()
+            .unwrap()
+            .iter()
             .skip(before_rows)
-            .map(str::to_string)
+            .map(|e| serde_json::to_string(e).unwrap())
             .collect();
         let host = ep.base.trim_start_matches("http://").to_string();
         let mine: Vec<&String> = rows
