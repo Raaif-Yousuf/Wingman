@@ -710,6 +710,68 @@ fn pull_with_stall(
     )
 }
 
+// ===========================================================================
+// #133: first-run detection
+// ===========================================================================
+
+/// What a first press with nothing configured found on the Ollama port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstRun {
+    /// Nothing listens, or whatever listens does not answer like Ollama.
+    NotRunning,
+    /// Ollama answers but has no model that can read an image.
+    NoVisionModel,
+    /// Ollama answers and `model` can read an image. `kind` says whether it
+    /// is the stock tray server (which may be running on the CPU only).
+    Found { model: String, kind: ListenerKind },
+}
+
+/// The model to use from a `/api/tags` listing: `preferred` when it is
+/// installed and sees images, else the first installed model that does.
+/// "Sees images" is [`vision_from_tags_entry`]: the server's own
+/// `capabilities` list when it sent one, the static name list otherwise.
+pub fn pick_first_run_model(tags: &[TagsModel], preferred: &str) -> Option<String> {
+    tags.iter()
+        .find(|m| m.name == preferred && vision_from_tags_entry(m))
+        .or_else(|| tags.iter().find(|m| vision_from_tags_entry(m)))
+        .map(|m| m.name.clone())
+}
+
+/// Pure decision behind [`probe_first_run`]. `tags` is only called when a
+/// process owns the port, so a machine without Ollama makes no HTTP call.
+pub fn first_run_outcome(
+    health: &OllamaHealth,
+    tags: impl FnOnce() -> Result<Vec<TagsModel>>,
+    preferred: &str,
+) -> FirstRun {
+    let OllamaHealth::Listening { kind, .. } = health else {
+        return FirstRun::NotRunning;
+    };
+    match tags() {
+        Err(_) => FirstRun::NotRunning,
+        Ok(models) => match pick_first_run_model(&models, preferred) {
+            Some(model) => FirstRun::Found { model, kind: *kind },
+            None => FirstRun::NoVisionModel,
+        },
+    }
+}
+
+/// How long the first-run probe may wait for `/api/tags`. It runs on the key
+/// press that hit the readiness gate, so it stays short.
+const FIRST_RUN_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Looks for a usable local Ollama: who owns the port (read-only Win32
+/// queries, [`query_ollama_health`]), then `/api/tags`. Called only from the
+/// readiness gate, never on a timer.
+pub fn probe_first_run(base_url: &str, preferred: &str) -> FirstRun {
+    let port = port_from_base_url(base_url).unwrap_or(11434);
+    first_run_outcome(
+        &query_ollama_health(port),
+        || list_tags_with_timeout(base_url, FIRST_RUN_TIMEOUT),
+        preferred,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,5 +1442,116 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let err = pull(&base, "nope", &cancel, |_| {}).unwrap_err();
         assert!(err.to_string().contains("file does not exist"), "{err}");
+    }
+
+    // -- #133: first-run detection (pure decision) -------------------------
+
+    fn tag(name: &str, caps: &[&str]) -> TagsModel {
+        TagsModel {
+            name: name.to_string(),
+            size: 0,
+            details: TagsDetails::default(),
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    fn listening(kind: ListenerKind) -> OllamaHealth {
+        OllamaHealth::Listening {
+            pid: 1,
+            image_path: String::new(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn first_run_prefers_the_configured_model_when_it_has_vision() {
+        let tags = vec![
+            tag("qwen3.5:9b", &["vision"]),
+            tag("gemma3:4b", &["vision"]),
+        ];
+        assert_eq!(
+            pick_first_run_model(&tags, "gemma3:4b").as_deref(),
+            Some("gemma3:4b")
+        );
+    }
+
+    #[test]
+    fn first_run_takes_the_first_vision_model_when_the_configured_one_is_absent() {
+        let tags = vec![
+            tag("llama3.1:8b", &["completion"]),
+            tag("qwen3.5:9b", &["vision"]),
+        ];
+        assert_eq!(
+            pick_first_run_model(&tags, "gemma3:4b").as_deref(),
+            Some("qwen3.5:9b")
+        );
+    }
+
+    #[test]
+    fn first_run_trusts_the_capabilities_array_over_the_name_list() {
+        // A name on the fallback list, but the server says no vision.
+        let tags = vec![tag("gemma3:1b", &["completion"])];
+        assert_eq!(pick_first_run_model(&tags, "gemma3:4b"), None);
+        // A name nobody has heard of, but the server says vision.
+        let tags = vec![tag("mystery:7b", &["completion", "vision"])];
+        assert_eq!(
+            pick_first_run_model(&tags, "gemma3:4b").as_deref(),
+            Some("mystery:7b")
+        );
+    }
+
+    #[test]
+    fn first_run_uses_the_name_list_only_when_there_is_no_capabilities_array() {
+        let tags = vec![tag("gemma3:12b", &[])];
+        assert_eq!(
+            pick_first_run_model(&tags, "gemma3:4b").as_deref(),
+            Some("gemma3:12b")
+        );
+        let tags = vec![tag("llama3.1:8b", &[])];
+        assert_eq!(pick_first_run_model(&tags, "gemma3:4b"), None);
+    }
+
+    #[test]
+    fn first_run_outcome_does_not_even_ask_when_nothing_listens() {
+        let out = first_run_outcome(
+            &OllamaHealth::NotListening,
+            || panic!("must not make an HTTP call when nothing listens"),
+            "gemma3:4b",
+        );
+        assert_eq!(out, FirstRun::NotRunning);
+    }
+
+    #[test]
+    fn first_run_outcome_covers_every_listener_answer() {
+        let h = listening(ListenerKind::Other);
+        assert_eq!(
+            first_run_outcome(&h, || Err(anyhow!("refused")), "gemma3:4b"),
+            FirstRun::NotRunning,
+            "a listener that does not speak Ollama is not Ollama"
+        );
+        assert_eq!(
+            first_run_outcome(
+                &h,
+                || Ok(vec![tag("llama3.1:8b", &["completion"])]),
+                "gemma3:4b"
+            ),
+            FirstRun::NoVisionModel
+        );
+        assert_eq!(
+            first_run_outcome(&h, || Ok(vec![]), "gemma3:4b"),
+            FirstRun::NoVisionModel
+        );
+        let stock = listening(ListenerKind::StockTrayServer);
+        assert_eq!(
+            first_run_outcome(
+                &stock,
+                || Ok(vec![tag("gemma3:4b", &["vision"])]),
+                "gemma3:4b"
+            ),
+            FirstRun::Found {
+                model: "gemma3:4b".to_string(),
+                kind: ListenerKind::StockTrayServer
+            }
+        );
     }
 }

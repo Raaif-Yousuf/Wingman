@@ -47,6 +47,7 @@ use crate::hotkey::{
 };
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
+use crate::provider::ollama_admin::{self, FirstRun};
 use crate::provider::{
     calendar_request, generic_action_request, parse_answer, physics_request,
     review_request_from_screen, review_request_from_text, Answer, Chain, Provider, Shot,
@@ -756,6 +757,19 @@ impl BeginPlan {
     }
 }
 
+/// #133: the readiness card's detail when Ollama is running but has nothing
+/// that can read the screen; `None` leaves the usual card alone. The card
+/// already opens Settings, where the model can be downloaded.
+fn first_run_detail(found: &FirstRun) -> Option<String> {
+    match found {
+        FirstRun::NoVisionModel => Some(
+            "Ollama is running, but none of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
+                .to_string(),
+        ),
+        FirstRun::NotRunning | FirstRun::Found { .. } => None,
+    }
+}
+
 fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
     if busy {
         ModelActionGate::Busy
@@ -813,6 +827,35 @@ impl App {
                 "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
             ),
         })
+    }
+
+    /// #133: on the press that hit the readiness gate with nothing set up,
+    /// asks whether a local Ollama with a vision model is answering. When it
+    /// is, it becomes the setup (saved, chain rebuilt) and the press goes on
+    /// to ask it. `None` when this setup is not eligible (a key, a chosen
+    /// provider or Cloud mode) so nothing is probed at all.
+    fn first_run_local(&mut self) -> Option<FirstRun> {
+        let providers = &self.config.providers;
+        if !providers.first_run_local_eligible(self.config.mode)
+            || matches!(
+                mode::classify_host(&providers.ollama.base_url),
+                mode::HostClass::NotLoopback
+            )
+        {
+            return None;
+        }
+        let found =
+            ollama_admin::probe_first_run(&providers.ollama.base_url, &providers.ollama.model);
+        if let FirstRun::Found { model, .. } = &found {
+            if self.config.providers.adopt_local_model(model) {
+                self.chain = Arc::new(self.config.build_chain());
+                if let Err(e) = self.config.save() {
+                    self.track_error("Couldn't save the local model choice", &format!("{e:#}"));
+                }
+                self.refresh_tray_labels();
+            }
+        }
+        Some(found)
     }
 
     /// #339: a password manager is in front now, or was when Wingman's own
@@ -921,10 +964,18 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        if let Some((headline, detail)) =
-            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-                .filter(|_| plan.require_provider)
-        {
+        let mut blocked = Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+            .filter(|_| plan.require_provider);
+        // #133: nothing is set up. Look for a local Ollama once, right here
+        // on this press (never on a timer, never on a bare launch).
+        let first_run = blocked.as_ref().and_then(|_| self.first_run_local());
+        if matches!(first_run, Some(FirstRun::Found { .. })) {
+            blocked = None;
+        }
+        if let Some((headline, mut detail)) = blocked {
+            if let Some(d) = first_run.as_ref().and_then(first_run_detail) {
+                detail = d;
+            }
             // Issue #347: readiness-gate cards are always "go fix something
             // in Settings" cards (a missing API key or Ollama config), so a
             // click opens Settings directly instead of just expanding.
@@ -6337,6 +6388,26 @@ mod tests {
         assert!(!none.capture, "nothing to capture when nothing is sent");
         assert!(!none.asks_model, "the card must not claim a model is asked");
         assert_eq!(BeginPlan::for_fill_form(true), BeginPlan::MODEL);
+    }
+
+    // -- first-run readiness (issue #133) ----------------------------------
+
+    #[test]
+    fn first_run_card_only_changes_the_card_when_ollama_has_no_vision_model() {
+        use crate::provider::ollama_admin::{FirstRun, ListenerKind};
+        assert!(super::first_run_detail(&FirstRun::NotRunning).is_none());
+        let found = FirstRun::Found {
+            model: "gemma3:4b".to_string(),
+            kind: ListenerKind::Other,
+        };
+        assert!(super::first_run_detail(&found).is_none());
+        let detail = super::first_run_detail(&FirstRun::NoVisionModel).expect("a detail");
+        assert!(detail.contains("gemma3:4b"), "{detail}");
+        assert!(detail.contains("Settings"), "{detail}");
+        assert!(
+            !detail.contains('\u{2014}') && !detail.contains('\u{2013}'),
+            "{detail}"
+        );
     }
 
     #[test]
