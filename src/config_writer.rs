@@ -1,0 +1,1156 @@
+//! Field-level writes to `config.toml` (#870, slice 0 of the Settings pages
+//! spec, `docs/superpowers/specs/2026-10-16-settings-pages-and-instant-apply-design.md`).
+//!
+//! `Config::save_to` re-serialises the whole typed `Config`, so every save drops
+//! the user's comments, unknown keys and key order, and silently reverts a hand
+//! edit made since the file was read. This module changes one field instead: it
+//! reads the file as it is on disk now, patches only the touched keys with
+//! `toml_edit` (everything else stays byte for byte, including CRLF line
+//! endings), and writes the result through the same atomic path `save_to` uses
+//! (`config::write_file_atomically`).
+//!
+//! Three pieces:
+//! - [`FieldChange`]: one key to set or remove, as a value rather than a
+//!   `Config`. [`diff`] turns "the config before" and "the config after" into the
+//!   list of keys that really changed, which is how the Settings window will say
+//!   what the user touched.
+//! - [`write_changes`]: the fresh read, patch and atomic write, with the rules
+//!   below.
+//! - [`ConfigWriter`]: one thread that blocks on a channel (no polling) and does
+//!   the file and `icacls` work, so the UI thread, which hosts the keyboard
+//!   hook, never touches the disk.
+//!
+//! Rules this module keeps:
+//! - A file that does not parse (as TOML, or as a `Config`) is never written.
+//!   The error names the line and column and quotes no file text (a value could
+//!   be an API key).
+//! - No API key ever goes into the file here: a change that would write a
+//!   non-empty `api_key` is refused, and [`diff`] never produces one. Keys belong
+//!   to Credential Manager.
+//! - If the file changes between the read and the rename, the read and patch run
+//!   again once on top of the new content; a second change fails the write
+//!   rather than overwrite it.
+//! - A change that leaves the file unchanged writes nothing.
+
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
+
+use crate::config::Config;
+use crate::mode::Mode;
+
+/// One key to change in `config.toml`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldChange {
+    /// Set `path` (table names, then the key) to `value`.
+    Set {
+        path: Vec<String>,
+        value: toml::Value,
+    },
+    /// Remove `path`. Missing is fine.
+    Remove { path: Vec<String> },
+}
+
+impl FieldChange {
+    /// Set `path` to any serializable value. The tests use it now; the Settings
+    /// window's commit step does from #871.
+    #[allow(dead_code)]
+    pub fn set(path: &[&str], value: impl serde::Serialize) -> Result<Self> {
+        Ok(FieldChange::Set {
+            path: path.iter().map(|s| s.to_string()).collect(),
+            value: toml::Value::try_from(value).context("could not turn the value into TOML")?,
+        })
+    }
+
+    /// `mode = "..."`, the first field to move to the writer (the tray's Mode
+    /// submenu).
+    pub fn mode(mode: Mode) -> Self {
+        FieldChange::Set {
+            path: vec!["mode".to_string()],
+            value: toml::Value::try_from(mode).expect("a Mode always serializes"),
+        }
+    }
+
+    /// The key this change is about.
+    pub fn path(&self) -> &[String] {
+        match self {
+            FieldChange::Set { path, .. } | FieldChange::Remove { path } => path,
+        }
+    }
+
+    /// Patches `doc` and nothing else. Setting a key that is not in the file
+    /// adds it (and any missing table above it); a table written inline
+    /// (`primary = { vk = 134 }`) is patched in place. The old value's trailing
+    /// comment stays with the new one.
+    pub fn apply(&self, doc: &mut DocumentMut) -> Result<()> {
+        let path = self.path();
+        let Some((key, parents)) = path.split_last() else {
+            bail!("a config change needs a key");
+        };
+        if let FieldChange::Set { value, .. } = self {
+            if key == "api_key" && !is_blank_string(value) {
+                bail!(
+                    "an API key is never written to config.toml; it belongs in Credential Manager"
+                );
+            }
+        }
+        let create = matches!(self, FieldChange::Set { .. });
+        let mut table: &mut dyn TableLike = doc.as_table_mut();
+        for name in parents {
+            if !table.contains_key(name) {
+                if !create {
+                    return Ok(());
+                }
+                let mut made = Table::new();
+                // Implicit: only `[a.b]` is printed, not an empty `[a]` above it.
+                made.set_implicit(true);
+                table.insert(name, Item::Table(made));
+            }
+            table = table
+                .get_mut(name)
+                .and_then(Item::as_table_like_mut)
+                .with_context(|| format!("`{name}` in config.toml is not a table"))?;
+        }
+        match self {
+            FieldChange::Remove { .. } => {
+                table.remove(key);
+            }
+            FieldChange::Set { value, .. } => {
+                let mut item = to_item(value);
+                match table.get_mut(key) {
+                    // Replace the value where it stands. `insert` would replace
+                    // the key too, and with it the comment lines above it.
+                    Some(slot) => {
+                        if let (Some(old), Item::Value(new)) = (slot.as_value(), &mut item) {
+                            *new.decor_mut() = old.decor().clone();
+                        }
+                        *slot = item;
+                    }
+                    None => {
+                        table.insert(key, item);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_blank_string(v: &toml::Value) -> bool {
+    matches!(v, toml::Value::String(s) if s.is_empty())
+}
+
+fn to_item(v: &toml::Value) -> Item {
+    match v {
+        toml::Value::Table(t) => {
+            let mut table = Table::new();
+            for (k, v) in t {
+                table.insert(k, to_item(v));
+            }
+            Item::Table(table)
+        }
+        toml::Value::Array(a) if !a.is_empty() && a.iter().all(toml::Value::is_table) => {
+            let mut tables = toml_edit::ArrayOfTables::new();
+            for v in a {
+                if let Item::Table(t) = to_item(v) {
+                    tables.push(t);
+                }
+            }
+            Item::ArrayOfTables(tables)
+        }
+        other => Item::Value(to_value(other)),
+    }
+}
+
+fn to_value(v: &toml::Value) -> Value {
+    match v {
+        toml::Value::String(s) => Value::from(s.as_str()),
+        toml::Value::Integer(i) => Value::from(*i),
+        toml::Value::Float(f) => Value::from(*f),
+        toml::Value::Boolean(b) => Value::from(*b),
+        toml::Value::Datetime(d) => Value::from(*d),
+        toml::Value::Array(a) => Value::Array(a.iter().map(to_value).collect()),
+        toml::Value::Table(t) => {
+            let mut inline = toml_edit::InlineTable::new();
+            for (k, v) in t {
+                inline.insert(k, to_value(v));
+            }
+            Value::InlineTable(inline)
+        }
+    }
+}
+
+/// The keys that differ between two configs, as the smallest set of changes:
+/// a changed leaf, a key present only after (set), a key present only before
+/// (remove). Arrays and the like are one leaf. `api_key` is skipped everywhere:
+/// keys go to Credential Manager, never to the file.
+#[allow(dead_code)] // Settings' Save sends only these (#871); slice 0 ships the tested writer first.
+pub fn diff(before: &Config, after: &Config) -> Result<Vec<FieldChange>> {
+    let before = toml::Value::try_from(before).context("could not read the old settings")?;
+    let after = toml::Value::try_from(after).context("could not read the new settings")?;
+    let mut out = Vec::new();
+    walk(&mut Vec::new(), &before, &after, &mut out);
+    Ok(out)
+}
+
+fn walk(
+    path: &mut Vec<String>,
+    before: &toml::Value,
+    after: &toml::Value,
+    out: &mut Vec<FieldChange>,
+) {
+    match (before, after) {
+        (toml::Value::Table(b), toml::Value::Table(a)) => {
+            for (key, new) in a {
+                path.push(key.clone());
+                match b.get(key) {
+                    Some(old) => walk(path, old, new, out),
+                    None => push_set(path, new, out),
+                }
+                path.pop();
+            }
+            for key in b.keys().filter(|k| !a.contains_key(*k)) {
+                path.push(key.clone());
+                if path.last().map(String::as_str) != Some("api_key") {
+                    out.push(FieldChange::Remove { path: path.clone() });
+                }
+                path.pop();
+            }
+        }
+        (b, a) if b != a => push_set(path, a, out),
+        _ => {}
+    }
+}
+
+fn push_set(path: &[String], value: &toml::Value, out: &mut Vec<FieldChange>) {
+    if path.last().map(String::as_str) == Some("api_key") {
+        return;
+    }
+    out.push(FieldChange::Set {
+        path: path.to_vec(),
+        value: value.clone(),
+    });
+}
+
+/// Drops every change whose key is changed again later, keeping the later one
+/// ("latest wins") and the order of the survivors.
+pub fn coalesce(changes: Vec<FieldChange>) -> Vec<FieldChange> {
+    let keep: Vec<bool> = (0..changes.len())
+        .map(|i| {
+            !changes[i + 1..]
+                .iter()
+                .any(|later| later.path() == changes[i].path())
+        })
+        .collect();
+    changes
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(c, k)| k.then_some(c))
+        .collect()
+}
+
+/// Reads `path` fresh, applies `changes`, writes atomically. See the module doc
+/// for the rules.
+pub fn write_changes(path: &Path, changes: &[FieldChange]) -> Result<()> {
+    write_changes_with(path, changes, &mut |_| {})
+}
+
+/// [`write_changes`] with a hook that runs after each read and patch, before the
+/// "did the file change" check, so a test can edit the file at that exact point.
+fn write_changes_with(
+    path: &Path,
+    changes: &[FieldChange],
+    between_read_and_write: &mut dyn FnMut(u32),
+) -> Result<()> {
+    for attempt in 0..2 {
+        let seen = crate::config::file_mtime(path);
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            // No file yet: the defaults stand in, and the file starts with the
+            // changed keys only.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => bail!("config.toml could not be read, so Wingman did not change it"),
+        };
+        refuse_unparseable(&text)?;
+        let mut doc: DocumentMut = text
+            .parse()
+            .map_err(|e: toml_edit::TomlError| anyhow::anyhow!(refusal(&text, e.span())))?;
+        for change in changes {
+            change.apply(&mut doc)?;
+        }
+        let out = match_line_endings(&text, doc.to_string());
+        // A patch must never produce a file Wingman itself would refuse to load.
+        if let Err(e) = toml::from_str::<Config>(&out) {
+            bail!(
+                "that change would leave config.toml unreadable ({}), so nothing was written",
+                crate::config::describe_error_span(&out, e.span())
+            );
+        }
+        between_read_and_write(attempt);
+        if crate::config::file_mtime(path) != seen {
+            continue;
+        }
+        if out == text {
+            return Ok(());
+        }
+        return crate::config::write_file_atomically(path, &out);
+    }
+    bail!("config.toml changed while Wingman was saving it, so nothing was written. Try again")
+}
+
+fn refusal(text: &str, span: Option<std::ops::Range<usize>>) -> String {
+    format!(
+        "{}, so Wingman did not change it. Fix the file, then choose Reload settings from the tray menu",
+        crate::config::describe_error_span(text, span)
+    )
+}
+
+/// The file as it stands must be one Wingman can load: not just TOML, but a
+/// `Config`. Otherwise a patch could rewrite a file the user is halfway through
+/// fixing.
+fn refuse_unparseable(text: &str) -> Result<()> {
+    if let Err(e) = toml::from_str::<Config>(text) {
+        bail!(refusal(text, e.span()));
+    }
+    Ok(())
+}
+
+/// `toml_edit` writes `\n` for any line it adds and for some it keeps. A file
+/// that uses `\r\n` (a Windows checkout with `core.autocrlf=true`, Notepad) must
+/// stay that way, not turn into a mixed file. So the result gets the original's
+/// dominant ending throughout. A file that already mixed the two is normalised
+/// to whichever it used more.
+fn match_line_endings(original: &str, patched: String) -> String {
+    let crlf = original.matches("\r\n").count();
+    let lf = original.matches('\n').count();
+    let wants_crlf = crlf * 2 > lf;
+    if crlf == 0 && !wants_crlf {
+        return patched;
+    }
+    let unix = patched.replace("\r\n", "\n");
+    if wants_crlf {
+        unix.replace('\n', "\r\n")
+    } else {
+        unix
+    }
+}
+
+/// What the writer thread tells the caller when a job is done.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteReply {
+    /// What the caller called the job (for its card or status line).
+    pub label: String,
+    /// `Err` holds a plain sentence.
+    pub result: Result<(), String>,
+}
+
+struct Job {
+    changes: Vec<FieldChange>,
+    label: String,
+    done: Box<dyn FnOnce(WriteReply) + Send>,
+}
+
+/// The writer thread's handle. Cheap to share; the thread ends when the last
+/// handle is dropped.
+pub struct ConfigWriter {
+    jobs: mpsc::Sender<Job>,
+}
+
+impl ConfigWriter {
+    /// Starts the `settings-writer` thread for `path`. It blocks on the channel,
+    /// so it costs nothing while idle. Jobs that queue up while it writes are
+    /// coalesced into one write (latest value of each key wins) and every job is
+    /// told the one result.
+    pub fn spawn(path: PathBuf) -> Self {
+        let (tx, rx) = mpsc::channel::<Job>();
+        // If the thread cannot start, `rx` is dropped with the closure and
+        // `submit` finds the channel closed, which it reports.
+        let _ = std::thread::Builder::new()
+            .name("settings-writer".into())
+            .spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    let mut jobs = vec![first];
+                    jobs.extend(rx.try_iter());
+                    let all = jobs.iter().flat_map(|j| j.changes.clone()).collect();
+                    let result = write_changes(&path, &coalesce(all)).map_err(|e| format!("{e:#}"));
+                    for job in jobs {
+                        (job.done)(WriteReply {
+                            label: job.label,
+                            result: result.clone(),
+                        });
+                    }
+                }
+            });
+        Self { jobs: tx }
+    }
+
+    /// Queues `changes`; `done` runs on the writer thread with the result. If the
+    /// thread is gone, `done` runs here with an error, so a caller always hears
+    /// back.
+    pub fn submit(
+        &self,
+        label: &str,
+        changes: Vec<FieldChange>,
+        done: impl FnOnce(WriteReply) + Send + 'static,
+    ) {
+        let job = Job {
+            changes,
+            label: label.to_string(),
+            done: Box::new(done),
+        };
+        if let Err(mpsc::SendError(job)) = self.jobs.send(job) {
+            (job.done)(WriteReply {
+                label: job.label,
+                result: Err("the settings writer is not running".to_string()),
+            });
+        }
+    }
+}
+
+/// The writer for the real `%APPDATA%\Wingman\config.toml`, started on first use.
+pub fn global() -> Result<&'static ConfigWriter, String> {
+    static WRITER: std::sync::OnceLock<Result<ConfigWriter, String>> = std::sync::OnceLock::new();
+    WRITER
+        .get_or_init(|| {
+            Config::path()
+                .map(ConfigWriter::spawn)
+                .map_err(|e| format!("{e:#}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A hand-edited file: comments of every kind, an unknown key and table, an
+    /// inline table, an array, and values in a non-default order.
+    const HAND_EDITED: &str = r#"# My Wingman settings. Hand-edited, please keep.
+mode = "auto"   # switch to offline on planes
+
+[hotkeys]
+# the Copilot key
+primary = { vk = 134, ctrl = false, shift = true, alt = false, win = true }
+secondary = { vk = 191, ctrl = true, shift = true, alt = false, win = false }
+
+[providers]
+order = ["openai", "anthropic"]  # try OpenAI first
+
+[providers.openai]
+model = "gpt-5.5"   # the cheap one
+# api_key lives in Credential Manager
+
+[ui]
+card_seconds = 12 # I read slowly
+# my own notes
+favourite_colour = "teal"
+
+[unknown_future_table]
+x = 1
+"#;
+
+    /// A scratch directory of its own per test (rule 9: never the real
+    /// `%APPDATA%\Wingman`).
+    fn scratch(tag: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "wingman-config-writer-test-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("config.toml")
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    fn crlf(s: &str) -> String {
+        s.replace("\r\n", "\n").replace('\n', "\r\n")
+    }
+
+    fn set(path: &[&str], v: impl serde::Serialize) -> FieldChange {
+        FieldChange::set(path, v).unwrap()
+    }
+
+    /// Writes `text` to a scratch file, applies `changes`, returns what is on
+    /// disk afterwards.
+    fn patched(tag: &str, text: &str, changes: &[FieldChange]) -> String {
+        let path = scratch(tag);
+        std::fs::write(&path, text).unwrap();
+        write_changes(&path, changes).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        cleanup(&path);
+        out
+    }
+
+    /// `text` with exactly one substring swapped, which asserts it was there.
+    fn replaced(text: &str, from: &str, to: &str) -> String {
+        assert!(text.contains(from), "fixture lost {from:?}");
+        text.replacen(from, to, 1)
+    }
+
+    fn chord(vk: u32, ctrl: bool) -> crate::hotkey::Chord {
+        crate::hotkey::Chord {
+            vk,
+            ctrl,
+            shift: false,
+            alt: false,
+            win: false,
+        }
+    }
+
+    // -- one field changes, everything else stays byte for byte -------------
+
+    #[test]
+    fn changing_one_field_leaves_every_other_byte_alone() {
+        let out = patched(
+            "one-field",
+            HAND_EDITED,
+            &[FieldChange::mode(Mode::Offline)],
+        );
+        assert_eq!(
+            out,
+            replaced(HAND_EDITED, r#"mode = "auto""#, r#"mode = "offline""#)
+        );
+    }
+
+    #[test]
+    fn the_changed_value_keeps_its_trailing_comment() {
+        let out = patched(
+            "trailing",
+            HAND_EDITED,
+            &[set(&["ui", "card_seconds"], 30u32)],
+        );
+        assert!(out.contains("card_seconds = 30 # I read slowly"), "{out}");
+    }
+
+    #[test]
+    fn comments_unknown_keys_and_order_survive_several_changes() {
+        let out = patched(
+            "several",
+            HAND_EDITED,
+            &[
+                FieldChange::mode(Mode::Cloud),
+                set(&["ui", "card_seconds"], 5u32),
+                set(&["providers", "openai", "model"], "gpt-5.5-mini"),
+            ],
+        );
+        let expected = replaced(
+            &replaced(
+                &replaced(HAND_EDITED, r#"mode = "auto""#, r#"mode = "cloud""#),
+                "card_seconds = 12",
+                "card_seconds = 5",
+            ),
+            r#"model = "gpt-5.5""#,
+            r#"model = "gpt-5.5-mini""#,
+        );
+        assert_eq!(out, expected);
+        assert!(out.contains("favourite_colour = \"teal\""));
+        assert!(out.contains("[unknown_future_table]"));
+    }
+
+    #[test]
+    fn a_hand_edit_made_since_the_window_opened_is_not_overwritten() {
+        // The writer has no memory of what the file said earlier: it reads the
+        // file now. A value the user changed by hand in the meantime survives a
+        // change to a different field.
+        let edited = replaced(HAND_EDITED, "card_seconds = 12", "card_seconds = 99");
+        let out = patched("hand-edit", &edited, &[FieldChange::mode(Mode::Local)]);
+        assert!(out.contains("card_seconds = 99 # I read slowly"), "{out}");
+        assert!(out.contains(r#"mode = "local""#));
+    }
+
+    // -- a field that is not in the file yet --------------------------------
+
+    #[test]
+    fn a_missing_key_is_added_inside_its_existing_table() {
+        let out = patched(
+            "missing-key",
+            HAND_EDITED,
+            &[set(&["ui", "text_scale"], 1.25f32)],
+        );
+        let loaded: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(loaded["ui"]["text_scale"].as_float(), Some(1.25));
+        assert_eq!(loaded["ui"]["card_seconds"].as_integer(), Some(12));
+        assert!(out.contains("# my own notes"));
+        // Added to [ui], not to the table after it.
+        let ui = out.find("[ui]").unwrap();
+        let unknown = out.find("[unknown_future_table]").unwrap();
+        let added = out.find("text_scale").unwrap();
+        assert!(ui < added && added < unknown, "{out}");
+    }
+
+    #[test]
+    fn a_missing_table_is_created_with_a_plain_header() {
+        let out = patched(
+            "missing-table",
+            HAND_EDITED,
+            &[set(&["capture", "redact"], true)],
+        );
+        assert!(out.contains("[capture]\nredact = true"), "{out}");
+        assert!(
+            out.starts_with(HAND_EDITED),
+            "existing text must be untouched:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_missing_nested_table_prints_only_the_leaf_header() {
+        let out = patched(
+            "missing-nested",
+            "",
+            &[set(&["providers", "ollama", "model"], "qwen3-vl")],
+        );
+        assert_eq!(out, "[providers.ollama]\nmodel = \"qwen3-vl\"\n");
+    }
+
+    #[test]
+    fn a_missing_top_level_key_is_added() {
+        let out = patched(
+            "missing-top",
+            "[ui]\ncard_seconds = 4\n",
+            &[FieldChange::mode(Mode::Auto)],
+        );
+        let loaded: Config = toml::from_str(&out).unwrap();
+        assert_eq!(loaded.mode, Mode::Auto);
+        assert_eq!(loaded.ui.card_seconds, 4);
+    }
+
+    #[test]
+    fn a_missing_file_is_created_holding_only_the_changed_key() {
+        let path = scratch("no-file");
+        assert!(!path.exists());
+        write_changes(&path, &[FieldChange::mode(Mode::Offline)]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mode = \"offline\"\n"
+        );
+        cleanup(&path);
+    }
+
+    // -- arrays and inline tables -------------------------------------------
+
+    #[test]
+    fn an_array_is_replaced_and_the_comments_around_it_survive() {
+        let out = patched(
+            "array",
+            HAND_EDITED,
+            &[set(&["providers", "order"], vec!["gemini", "openai"])],
+        );
+        let loaded: Config = toml::from_str(&out).unwrap();
+        assert_eq!(loaded.providers.order, vec!["gemini", "openai"]);
+        assert!(out.contains("# try OpenAI first"), "{out}");
+        assert!(out.contains("# the Copilot key"));
+    }
+
+    #[test]
+    fn a_key_inside_an_inline_table_is_patched_in_place() {
+        let out = patched(
+            "inline",
+            HAND_EDITED,
+            &[set(&["hotkeys", "primary", "vk"], 135u32)],
+        );
+        assert_eq!(
+            out,
+            replaced(
+                HAND_EDITED,
+                "primary = { vk = 134,",
+                "primary = { vk = 135,"
+            )
+        );
+    }
+
+    #[test]
+    fn a_missing_key_is_added_inside_an_inline_table() {
+        let text = "[hotkeys]\npalette = { vk = 32, ctrl = true, shift = false, alt = false, win = false }\n";
+        let out = patched(
+            "inline-add",
+            text,
+            &[set(&["hotkeys", "palette", "label"], "Quick Ask")],
+        );
+        let loaded: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            loaded["hotkeys"]["palette"]["label"].as_str(),
+            Some("Quick Ask")
+        );
+        assert_eq!(loaded["hotkeys"]["palette"]["vk"].as_integer(), Some(32));
+        assert!(out.contains("palette = {"), "still inline: {out}");
+    }
+
+    #[test]
+    fn an_array_of_tables_is_replaced_and_the_rest_is_kept() {
+        let text = "# endpoints\n[[providers.compat]]\nname = \"a\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\n[ui]\ncard_seconds = 7 # keep\n";
+        let compat = vec![toml::Value::try_from(crate::config::CompatConfig {
+            name: "b".into(),
+            ..Default::default()
+        })
+        .unwrap()];
+        let out = patched(
+            "aot",
+            text,
+            &[FieldChange::Set {
+                path: vec!["providers".into(), "compat".into()],
+                value: toml::Value::Array(compat),
+            }],
+        );
+        let loaded: Config = toml::from_str(&out).unwrap();
+        assert_eq!(loaded.providers.compat.len(), 1);
+        assert_eq!(loaded.providers.compat[0].name, "b");
+        assert!(out.contains("card_seconds = 7 # keep"), "{out}");
+    }
+
+    #[test]
+    fn a_dotted_key_table_is_patched_too() {
+        let text = "ui.card_seconds = 9 # dotted\nui.favourite = \"x\"\n";
+        let out = patched("dotted", text, &[set(&["ui", "card_seconds"], 3u32)]);
+        assert_eq!(out, "ui.card_seconds = 3 # dotted\nui.favourite = \"x\"\n");
+    }
+
+    // -- removing -------------------------------------------------------------
+
+    #[test]
+    fn removing_a_key_drops_only_that_key() {
+        let out = patched(
+            "remove",
+            HAND_EDITED,
+            &[FieldChange::Remove {
+                path: vec!["ui".into(), "card_seconds".into()],
+            }],
+        );
+        assert!(!out.contains("card_seconds"));
+        assert!(out.contains("favourite_colour"));
+    }
+
+    #[test]
+    fn removing_a_key_that_is_not_there_changes_nothing() {
+        let out = patched(
+            "remove-absent",
+            HAND_EDITED,
+            &[FieldChange::Remove {
+                path: vec!["nope".into(), "nothing".into()],
+            }],
+        );
+        assert_eq!(out, HAND_EDITED);
+    }
+
+    // -- CRLF (autocrlf checkouts on Windows, Notepad) -------------------------
+
+    #[test]
+    fn a_crlf_file_stays_crlf_when_a_value_is_replaced() {
+        let text = crlf(HAND_EDITED);
+        let out = patched("crlf-replace", &text, &[FieldChange::mode(Mode::Offline)]);
+        assert_eq!(
+            out,
+            replaced(&text, r#"mode = "auto""#, r#"mode = "offline""#)
+        );
+    }
+
+    #[test]
+    fn a_crlf_file_stays_crlf_when_keys_and_tables_are_added() {
+        let text = crlf(HAND_EDITED);
+        let out = patched(
+            "crlf-add",
+            &text,
+            &[
+                set(&["ui", "text_scale"], 1.5f32),
+                set(&["capture", "redact"], true),
+            ],
+        );
+        let bare_lf = out.replace("\r\n", "").contains('\n');
+        assert!(!bare_lf, "a bare LF crept into a CRLF file:\n{out:?}");
+        assert!(out.contains("text_scale = 1.5\r\n"));
+        assert!(out.contains("[capture]\r\nredact = true\r\n"));
+        assert!(out.contains("# my own notes\r\n"));
+    }
+
+    #[test]
+    fn a_file_that_mixes_endings_is_written_with_the_one_it_uses_most() {
+        let mostly_crlf =
+            "mode = \"auto\"\r\n[ui]\r\ncard_seconds = 4\ncard_monitor = \"cursor\"\r\n";
+        let out = patched(
+            "mixed-crlf",
+            mostly_crlf,
+            &[set(&["ui", "card_seconds"], 6u32)],
+        );
+        assert!(!out.replace("\r\n", "").contains('\n'), "{out:?}");
+        assert!(out.contains("card_seconds = 6\r\n"));
+        let mostly_lf = "mode = \"auto\"\r\n[ui]\ncard_seconds = 4\ncard_monitor = \"cursor\"\n";
+        let out = patched("mixed-lf", mostly_lf, &[set(&["ui", "card_seconds"], 6u32)]);
+        assert!(!out.contains('\r'), "{out:?}");
+        assert!(out.contains("card_seconds = 6\n"));
+    }
+
+    #[test]
+    fn an_lf_file_stays_lf() {
+        let out = patched("lf", HAND_EDITED, &[set(&["capture", "redact"], true)]);
+        assert!(!out.contains('\r'));
+    }
+
+    // -- a file that does not parse is never written ---------------------------
+
+    #[test]
+    fn a_file_that_does_not_parse_is_refused_and_left_exactly_as_it_is() {
+        let broken = "mode = \"auto\"\n[providers.openai]\napi_key = \"sk-SECRET-VALUE\nmodel = \n";
+        let path = scratch("broken");
+        std::fs::write(&path, broken).unwrap();
+        let err = write_changes(&path, &[FieldChange::mode(Mode::Offline)]).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("line"), "{message}");
+        assert!(message.contains("did not change it"), "{message}");
+        assert!(
+            !message.contains("SECRET"),
+            "the error must not quote file text: {message}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let tmp = path.with_extension("toml.tmp");
+        assert!(!tmp.exists(), "no temp file may be left behind");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_file_that_is_toml_but_not_a_config_is_refused_too() {
+        let text = "mode = \"sideways\"\n";
+        let path = scratch("bad-type");
+        std::fs::write(&path, text).unwrap();
+        assert!(write_changes(&path, &[set(&["ui", "card_seconds"], 3u32)]).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_patch_that_would_make_the_file_unloadable_writes_nothing() {
+        let path = scratch("bad-patch");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        // card_seconds is a number; a string there would not load.
+        let err = write_changes(&path, &[set(&["ui", "card_seconds"], "soon")]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("nothing was written"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), HAND_EDITED);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_key_that_is_not_a_table_is_reported_not_overwritten() {
+        let path = scratch("not-table");
+        std::fs::write(&path, "[ui]\ncard_seconds = 4\n").unwrap();
+        let err =
+            write_changes(&path, &[set(&["ui", "card_seconds", "deeper"], 1u32)]).unwrap_err();
+        assert!(format!("{err:#}").contains("is not a table"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[ui]\ncard_seconds = 4\n"
+        );
+        cleanup(&path);
+    }
+
+    // -- no API key in the file ------------------------------------------------
+
+    #[test]
+    fn an_api_key_change_is_refused() {
+        let path = scratch("api-key");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let err = write_changes(
+            &path,
+            &[set(&["providers", "openai", "api_key"], "sk-live-key")],
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("Credential Manager"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), HAND_EDITED);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn blanking_an_api_key_is_allowed() {
+        let text = "[providers.openai]\napi_key = \"\"\n";
+        let out = patched(
+            "blank-key",
+            text,
+            &[set(&["providers", "openai", "api_key"], "")],
+        );
+        assert_eq!(out, text);
+    }
+
+    // -- writes nothing when nothing changes -----------------------------------
+
+    #[test]
+    fn setting_a_value_to_what_it_already_is_does_not_touch_the_file() {
+        let path = scratch("noop");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let before = crate::config::file_mtime(&path);
+        write_changes(&path, &[FieldChange::mode(Mode::Auto)]).unwrap();
+        assert_eq!(crate::config::file_mtime(&path), before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), HAND_EDITED);
+        cleanup(&path);
+    }
+
+    // -- the atomic write: ACL failure, races ----------------------------------
+
+    #[test]
+    fn a_failed_acl_step_aborts_the_write_and_leaves_the_file_alone() {
+        let path = scratch("acl");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        crate::config::FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.set(true));
+        let result = write_changes(&path, &[FieldChange::mode(Mode::Offline)]);
+        crate::config::FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.set(false));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), HAND_EDITED);
+        assert!(!path.with_extension("toml.tmp").exists());
+        cleanup(&path);
+    }
+
+    /// Replaces the file and moves its modified time `secs` into the future, so
+    /// the change shows even on a coarse clock.
+    fn edit_file(path: &Path, text: &str, secs: u64) {
+        std::fs::write(path, text).unwrap();
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn an_edit_between_the_read_and_the_write_is_kept_and_the_change_applied_on_top() {
+        let path = scratch("race-once");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let during = replaced(HAND_EDITED, "card_seconds = 12", "card_seconds = 77");
+        let mut hook = |attempt: u32| {
+            if attempt == 0 {
+                edit_file(&path, &during, 5);
+            }
+        };
+        write_changes_with(&path, &[FieldChange::mode(Mode::Offline)], &mut hook).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.contains("card_seconds = 77"),
+            "the hand edit was lost:\n{out}"
+        );
+        assert!(out.contains(r#"mode = "offline""#), "{out}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_file_that_keeps_changing_fails_the_write_and_keeps_the_last_edit() {
+        let path = scratch("race-twice");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let mut hook = |attempt: u32| {
+            let text = replaced(
+                HAND_EDITED,
+                "card_seconds = 12",
+                &format!("card_seconds = 7{attempt}"),
+            );
+            edit_file(&path, &text, 10 * (u64::from(attempt) + 1));
+        };
+        let err =
+            write_changes_with(&path, &[FieldChange::mode(Mode::Offline)], &mut hook).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("changed while Wingman was saving"),
+            "{err:#}"
+        );
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.contains("card_seconds = 71"),
+            "the last edit must stand:\n{out}"
+        );
+        assert!(out.contains(r#"mode = "auto""#));
+        cleanup(&path);
+    }
+
+    // -- diff and coalesce (pure) -----------------------------------------------
+
+    #[test]
+    fn diff_lists_only_the_fields_that_changed() {
+        let before = Config::default();
+        let mut after = before.clone();
+        after.ui.card_seconds += 1;
+        after.capture.redact = !after.capture.redact;
+        after.mode = Mode::Offline;
+        let changes = diff(&before, &after).unwrap();
+        let mut paths: Vec<String> = changes.iter().map(|c| c.path().join(".")).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["capture.redact", "mode", "ui.card_seconds"]);
+    }
+
+    #[test]
+    fn diff_of_equal_configs_is_empty() {
+        assert!(diff(&Config::default(), &Config::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn diff_never_carries_an_api_key() {
+        let before = Config::default();
+        let mut after = before.clone();
+        after.providers.openai.api_key = "sk-typed-in-settings".into();
+        after.providers.gemini.api_key = "g-typed".into();
+        assert!(diff(&before, &after).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diff_treats_an_array_as_one_value() {
+        let before = Config::default();
+        let mut after = before.clone();
+        after.providers.order = vec!["ollama".into()];
+        let changes = diff(&before, &after).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path(), ["providers", "order"]);
+    }
+
+    #[test]
+    fn diff_removes_an_optional_table_that_was_cleared_and_sets_one_that_appeared() {
+        let mut before = Config::default();
+        before.hotkeys.pause = Some(chord(0x13, false));
+        let mut after = before.clone();
+        after.hotkeys.pause = None;
+        let removed = diff(&before, &after).unwrap();
+        assert_eq!(
+            removed,
+            vec![FieldChange::Remove {
+                path: vec!["hotkeys".into(), "pause".into()]
+            }]
+        );
+        let added = diff(&after, &before).unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].path(), ["hotkeys", "pause"]);
+    }
+
+    #[test]
+    fn applying_a_diff_to_the_file_reproduces_the_new_config() {
+        let before: Config = toml::from_str(HAND_EDITED).unwrap();
+        let mut after = before.clone();
+        after.ui.card_seconds = 3;
+        after.mode = Mode::Cloud;
+        after.hotkeys.pause = Some(chord(0x13, true));
+        after.providers.order = vec!["anthropic".into()];
+        let out = patched("roundtrip", HAND_EDITED, &diff(&before, &after).unwrap());
+        let loaded: Config = toml::from_str(&out).unwrap();
+        assert_eq!(loaded.ui.card_seconds, 3);
+        assert_eq!(loaded.mode, Mode::Cloud);
+        assert_eq!(loaded.hotkeys.pause, after.hotkeys.pause);
+        assert_eq!(loaded.providers.order, vec!["anthropic"]);
+        assert!(out.contains("# My Wingman settings."));
+        assert!(out.contains("favourite_colour"));
+    }
+
+    #[test]
+    fn coalesce_keeps_the_latest_change_per_key_in_order() {
+        let a1 = set(&["ui", "card_seconds"], 1u32);
+        let m = FieldChange::mode(Mode::Cloud);
+        let a2 = set(&["ui", "card_seconds"], 2u32);
+        let m2 = FieldChange::mode(Mode::Local);
+        let other = set(&["capture", "redact"], true);
+        let out = coalesce(vec![a1, m, a2.clone(), other.clone(), m2.clone()]);
+        assert_eq!(out, vec![a2, other, m2]);
+    }
+
+    // -- the writer thread ------------------------------------------------------
+
+    fn replies(writer: &ConfigWriter, jobs: Vec<(&str, Vec<FieldChange>)>) -> Vec<WriteReply> {
+        let (tx, rx) = mpsc::channel();
+        let n = jobs.len();
+        for (label, changes) in jobs {
+            let tx = tx.clone();
+            writer.submit(label, changes, move |r| {
+                let _ = tx.send(r);
+            });
+        }
+        (0..n)
+            .map(|_| {
+                rx.recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("reply")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_writer_thread_writes_and_reports_back() {
+        let path = scratch("thread");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let writer = ConfigWriter::spawn(path.clone());
+        let got = replies(
+            &writer,
+            vec![("Mode", vec![FieldChange::mode(Mode::Offline)])],
+        );
+        assert_eq!(got[0].label, "Mode");
+        assert_eq!(got[0].result, Ok(()));
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            out,
+            replaced(HAND_EDITED, r#"mode = "auto""#, r#"mode = "offline""#)
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn the_writer_thread_reports_a_refusal_as_a_plain_sentence() {
+        let path = scratch("thread-broken");
+        std::fs::write(&path, "mode = \n").unwrap();
+        let writer = ConfigWriter::spawn(path.clone());
+        let got = replies(
+            &writer,
+            vec![("Mode", vec![FieldChange::mode(Mode::Offline)])],
+        );
+        let message = got[0].result.clone().unwrap_err();
+        assert!(message.contains("did not change it"), "{message}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mode = \n");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rapid_changes_to_different_fields_are_all_written_and_all_reported() {
+        let path = scratch("thread-rapid");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let writer = ConfigWriter::spawn(path.clone());
+        let jobs: Vec<(&str, Vec<FieldChange>)> = vec![
+            ("one", vec![set(&["ui", "card_seconds"], 1u32)]),
+            ("two", vec![set(&["capture", "redact"], true)]),
+            ("three", vec![set(&["ui", "card_seconds"], 3u32)]),
+        ];
+        let got = replies(&writer, jobs);
+        assert!(got.iter().all(|r| r.result.is_ok()));
+        let loaded: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.ui.card_seconds, 3, "the latest value of a key wins");
+        assert!(loaded.capture.redact);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_writer_whose_thread_is_gone_still_calls_back_with_an_error() {
+        let (tx, rx) = mpsc::channel::<Job>();
+        drop(rx);
+        let writer = ConfigWriter { jobs: tx };
+        let got = replies(&writer, vec![("x", vec![FieldChange::mode(Mode::Auto)])]);
+        assert!(got[0].result.is_err());
+    }
+
+    // -- guards ----------------------------------------------------------------
+
+    /// The tray's Mode change reaches the file only through the writer thread:
+    /// no whole-config save, and so no file or `icacls` work on the UI thread
+    /// that hosts the keyboard hook.
+    #[test]
+    fn the_tray_mode_change_goes_through_the_writer_thread() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let start = app
+            .find("    fn set_mode(&mut self, mode: Mode) {")
+            .expect("set_mode moved: this scan is no longer looking at anything");
+        let rest = &app[start..];
+        let end = rest.find("\n    }\n").expect("end of set_mode");
+        let body = &rest[..end];
+        assert!(
+            body.contains("config_writer::"),
+            "set_mode must use the writer:\n{body}"
+        );
+        assert!(
+            !body.contains("config.save("),
+            "set_mode must not re-serialise the whole config on the UI thread:\n{body}"
+        );
+    }
+}

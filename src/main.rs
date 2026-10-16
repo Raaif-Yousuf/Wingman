@@ -11,6 +11,7 @@ mod capture;
 mod config;
 #[cfg(test)]
 mod config_example;
+mod config_writer;
 mod connectors;
 mod crash_note;
 mod diagnostics;

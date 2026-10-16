@@ -21,6 +21,12 @@ serde = { version = "1.0", features = ["derive"] }
 # arithmetic and contradicts itself. Do not remove this feature.
 serde_json = { version = "1.0", features = ["preserve_order"] }
 toml = "1.1"
+# Comment-preserving config writes (#870, src/config_writer.rs): Settings changes one
+# field and keeps every comment, unknown key and hand edit in config.toml. (MIT
+# OR Apache-2.0, re-verified 2026-10-16.) It shares toml_parser,
+# toml_datetime and winnow with `toml` 1.1, so there is no second parser in the
+# exe.
+toml_edit = "0.25"
 base64 = "0.23"
 anyhow = "1.0"
 # Pinned exactly: src/inputs/web_page.rs connects only to addresses it already

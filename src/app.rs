@@ -161,6 +161,15 @@ pub const WM_APP_FIRST_RUN: u32 = WM_APP + 20;
 /// thread. `WM_APP + 22`: `+21` is `WM_APP_MACHINE_CHECK_RESULT`.
 pub const WM_APP_EXECUTOR_DONE: u32 = WM_APP + 22;
 
+/// #870: posted by the `settings-writer` thread (`config_writer`) when a change
+/// to `config.toml` has been written or refused. `lparam` is
+/// `Box::into_raw(Box::new(config_writer::WriteReply))`; the handler takes
+/// ownership, re-reads the file (so a hand edit made meanwhile is picked up) and
+/// shows the result. The file and `icacls` work runs off the message thread,
+/// which also hosts the keyboard hook. `WM_APP + 23`: `+22` is
+/// `WM_APP_EXECUTOR_DONE`.
+pub const WM_APP_CONFIG_WRITTEN: u32 = WM_APP + 23;
+
 /// #328: posted by the "Check this PC for local models" worker thread when
 /// its reads finish. `lparam` is
 /// `Box::into_raw(Box::new(machine::MachineFacts))`; the receiver takes
@@ -4064,6 +4073,7 @@ impl App {
                     self.on_generic_action_result(action, schema, result)
                 }
                 DeferredMessage::ExecutorDone(result) => self.on_exec_done(result),
+                DeferredMessage::ConfigWritten(reply) => self.on_config_written(reply),
             }
         }
     }
@@ -4293,9 +4303,11 @@ impl App {
     /// Issue #19: switch `Mode`, publish it to the process-wide atomic the
     /// Offline guard reads (`mode::set_current`), radio-check it in the
     /// tray and update the icon (`Tray::set_mode`), and persist it --
-    /// mirrors `set_provider`'s shape exactly. Unlike Pause, Mode IS
-    /// persisted (`Config.mode`), so unlike `pause_for`/`resume` this
-    /// writes to disk, same as every other tray setting change.
+    /// mirrors `set_provider`'s shape. Unlike Pause, Mode IS persisted
+    /// (`Config.mode`). The write changes only the `mode` key, on the
+    /// `settings-writer` thread (#870): comments, unknown keys and hand edits in
+    /// `config.toml` stay, and no file work runs on this thread. The outcome
+    /// comes back as `WM_APP_CONFIG_WRITTEN` (`on_config_written`).
     fn set_mode(&mut self, mode: Mode) {
         if self.config.mode == mode {
             return;
@@ -4313,20 +4325,70 @@ impl App {
         mode::set_current(mode);
         self.tray.set_mode(mode);
         self.update_tooltip();
+        self.persist_field(mode.label(), crate::config_writer::FieldChange::mode(mode));
+        self.set_watch(true);
+    }
 
-        let saved = self.config.save();
-        match saved {
-            Ok(()) => self.card.show_answer(mode.label(), "", 3, None),
-            Err(e) => {
-                let headline = format!("Using {}: not saved", mode.label());
-                let human = self.track_error(&headline, &format!("{e:#}"));
+    /// Hands one field change to the writer thread. `label` names it in the
+    /// card that reports the outcome. Never blocks and never touches the disk
+    /// here; if the writer cannot even be reached the failure is posted back
+    /// like any other, so it still ends in a card (rule 7).
+    fn persist_field(&self, label: &str, change: crate::config_writer::FieldChange) {
+        use crate::config_writer::WriteReply;
+        let target = self.hwnd_isize();
+        let done = move |reply: WriteReply| {
+            let payload = Box::into_raw(Box::new(reply));
+            unsafe {
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_CONFIG_WRITTEN,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_CONFIG_WRITTEN, LPARAM(payload as isize));
+                }
+            }
+        };
+        match crate::config_writer::global() {
+            Ok(writer) => writer.submit(label, vec![change], done),
+            Err(reason) => done(WriteReply {
+                label: label.to_string(),
+                result: Err(reason),
+            }),
+        }
+    }
+
+    /// The writer thread's answer. On success the file is read again, so
+    /// whatever the user hand-edited meanwhile is applied too, and nothing
+    /// afterwards saves a stale copy over it; the card is the one the old
+    /// in-line save showed. On failure the change is live until quit but not on
+    /// disk, and the card says so.
+    fn on_config_written(&mut self, reply: crate::config_writer::WriteReply) {
+        match reply.result {
+            Ok(()) => {
+                match Config::load() {
+                    Ok(config) if config.load_problem.is_none() => {
+                        self.config = config;
+                        self.apply_config();
+                    }
+                    // The file was edited into something unreadable after our
+                    // write: keep the settings already running, as Reload does.
+                    _ => {}
+                }
+                self.card.show_answer(&reply.label, "", 3, None);
+            }
+            Err(reason) => {
+                let headline = format!("Using {}: not saved", reply.label);
+                let human = self.track_error(&headline, &reason);
                 self.card.show_error_with_details(
                     &headline,
                     &format!("It will revert when you quit.\n\n{human}"),
                 );
             }
         }
-        self.set_watch(true);
     }
 
     /// #567: hand the tray the newest Ollama model list a background refresh
@@ -6375,6 +6437,9 @@ enum DeferredMessage {
     GenericActionResult(actions::Action, Value, GenericResult),
     /// `WM_APP_EXECUTOR_DONE` (#712).
     ExecutorDone(std::result::Result<ExecDone, String>),
+    /// `WM_APP_CONFIG_WRITTEN` (#870): a failed write must still end in a card
+    /// when Settings was open at the time.
+    ConfigWritten(crate::config_writer::WriteReply),
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -6572,7 +6637,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_PREVIEW_DECIDED
         | WM_APP_FORM_FILL_RESULT
         | WM_APP_GENERIC_ACTION_RESULT
-        | WM_APP_EXECUTOR_DONE => SettingsReentrancy::Defer,
+        | WM_APP_EXECUTOR_DONE
+        | WM_APP_CONFIG_WRITTEN => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
@@ -6688,6 +6754,9 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_EXECUTOR_DONE => drop(Box::from_raw(
                 p as *mut std::result::Result<ExecDone, String>,
             )),
+            WM_APP_CONFIG_WRITTEN => {
+                drop(Box::from_raw(p as *mut crate::config_writer::WriteReply))
+            }
             _ => return false,
         }
     }
@@ -6947,6 +7016,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     WM_APP_EXECUTOR_DONE => DeferredMessage::ExecutorDone(unsafe {
                         *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>)
                     }),
+                    WM_APP_CONFIG_WRITTEN => DeferredMessage::ConfigWritten(unsafe {
+                        *Box::from_raw(lparam.0 as *mut crate::config_writer::WriteReply)
+                    }),
                     _ => {
                         unreachable!("the reentrancy policies only return Defer for the ids above")
                     }
@@ -7065,6 +7137,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>) };
             app.on_exec_done(result);
+            LRESULT(0)
+        }
+        WM_APP_CONFIG_WRITTEN => {
+            let reply =
+                unsafe { *Box::from_raw(lparam.0 as *mut crate::config_writer::WriteReply) };
+            app.on_config_written(reply);
             LRESULT(0)
         }
         WM_APP_MACHINE_CHECK_RESULT => {
@@ -7257,6 +7335,7 @@ mod tests {
     use super::unreadable_secrets_card;
     use super::App;
     use super::BeginPlan;
+    use super::WM_APP_CONFIG_WRITTEN;
     use super::WM_APP_FIRST_RUN;
     use super::{
         exec_work_calendar, exec_work_form_fill, exec_work_restore, ExecDone, WM_APP_EXECUTOR_DONE,
@@ -8516,6 +8595,7 @@ mod tests {
         ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
         ("WM_APP_FIRST_RUN", WM_APP_FIRST_RUN),
         ("WM_APP_EXECUTOR_DONE", WM_APP_EXECUTOR_DONE),
+        ("WM_APP_CONFIG_WRITTEN", WM_APP_CONFIG_WRITTEN),
     ];
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -9277,6 +9357,11 @@ mod tests {
         (
             "WM_APP_EXECUTOR_DONE",
             WM_APP_EXECUTOR_DONE,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_CONFIG_WRITTEN",
+            WM_APP_CONFIG_WRITTEN,
             SettingsReentrancy::Defer,
         ),
     ];
