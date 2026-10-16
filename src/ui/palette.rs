@@ -111,16 +111,20 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
     GetStockObject, InvalidateRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow,
     CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, FW_NORMAL, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TRANSPARENT,
+    DT_VCENTER, FW_NORMAL, FW_SEMIBOLD, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -338,6 +342,23 @@ impl Palette {
         let inner_ref = unsafe { &mut *raw };
         inner_ref.hwnd = hwnd;
         inner_ref.dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+
+        // Best-effort rounded corners (Windows 11), as the card does (#361).
+        // A square window on an older system is an acceptable degrade.
+        unsafe {
+            let pref = DWMWCP_ROUND;
+            if let Err(e) = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &pref as *const DWM_WINDOW_CORNER_PREFERENCE as *const c_void,
+                std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+            ) {
+                crate::diagnostics::note_warning(&format!(
+                    "Palette: rounded corners unavailable ({}), using square corners",
+                    e.code()
+                ));
+            }
+        }
 
         // #216: created once, here, right after the HWND exists -- never
         // per paint (see the module doc comment's "Rendering" section for
@@ -713,6 +734,8 @@ struct PaletteRenderer {
     dwrite_factory: IDWriteFactory,
     target: Option<ID2D1HwndRenderTarget>,
     text_format: Option<IDWriteTextFormat>,
+    /// Semibold, for the router's suggestion (#361).
+    summary_format: Option<IDWriteTextFormat>,
 }
 
 impl PaletteRenderer {
@@ -730,6 +753,7 @@ impl PaletteRenderer {
             dwrite_factory,
             target: None,
             text_format: None,
+            summary_format: None,
         })
     }
 
@@ -766,19 +790,24 @@ impl PaletteRenderer {
             .ok();
         }
         if self.target.is_some() && self.text_format.is_none() {
-            self.text_format = self.build_text_format();
+            self.text_format = self.build_text_format(DWRITE_FONT_WEIGHT_NORMAL);
         }
+        if self.target.is_some() && self.summary_format.is_none() {
+            self.summary_format = self.build_text_format(DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        }
+        // The semibold format is a nicety: without it the summary uses the row
+        // format, and the palette stays on Direct2D.
         self.target.is_some() && self.text_format.is_some()
     }
 
-    fn build_text_format(&self) -> Option<IDWriteTextFormat> {
+    fn build_text_format(&self, weight: DWRITE_FONT_WEIGHT) -> Option<IDWriteTextFormat> {
         let family = wide_z(D2D_FONT_FAMILY);
         let locale = wide_z(D2D_LOCALE);
         let format = unsafe {
             self.dwrite_factory.CreateTextFormat(
                 PCWSTR(family.as_ptr()),
                 None,
-                DWRITE_FONT_WEIGHT_NORMAL,
+                weight,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
                 D2D_FONT_SIZE_DIP,
@@ -836,6 +865,7 @@ impl PaletteRenderer {
     fn drop_target(&mut self) {
         self.target = None;
         self.text_format = None;
+        self.summary_format = None;
     }
 }
 
@@ -1331,6 +1361,10 @@ impl PaletteInner {
             .text_format
             .clone()
             .expect("ensure_target just confirmed Some");
+        let summary_format = renderer
+            .summary_format
+            .clone()
+            .unwrap_or_else(|| format.clone());
 
         let pad = PADDING as f32;
         let row_h = ROW_HEIGHT as f32;
@@ -1353,7 +1387,13 @@ impl PaletteInner {
                 right: content_w - pad,
                 bottom: y + ROUTER_SUMMARY_HEIGHT as f32,
             };
-            draw_text_line_d2d(&target, &format, summary, band_rect, COLORREF(0x0080_B080));
+            draw_text_line_d2d(
+                &target,
+                &summary_format,
+                summary,
+                band_rect,
+                COLORREF(0x0080_B080),
+            );
         }
         y += ROUTER_SUMMARY_HEIGHT as f32;
 
@@ -1464,8 +1504,8 @@ impl PaletteInner {
             SetBkMode(hdc, TRANSPARENT);
             // Segoe UI at this window's DPI, like the DirectWrite path (the stock
             // GUI font is neither Segoe nor scaled), freed below.
-            let gdi_font = gdi_font(self.dpi, FW_NORMAL.0 as i32);
-            let old_font = SelectObject(hdc, HGDIOBJ(gdi_font.0));
+            let normal = gdi_font(self.dpi, FW_NORMAL.0 as i32);
+            let old_font = SelectObject(hdc, HGDIOBJ(normal.0));
 
             let pad = scale(PADDING, self.dpi);
             let row_h = scale(ROW_HEIGHT, self.dpi);
@@ -1482,12 +1522,17 @@ impl PaletteInner {
                     bottom: y + scale(ROUTER_SUMMARY_HEIGHT, self.dpi),
                 };
                 SetTextColor(hdc, COLORREF(0x0080_B080));
+                // Semibold, like the Direct2D path (#361), freed after the line.
+                let bold = gdi_font(self.dpi, FW_SEMIBOLD.0 as i32);
+                SelectObject(hdc, HGDIOBJ(bold.0));
                 draw_text_line(
                     hdc,
                     summary,
                     band_rect,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                 );
+                SelectObject(hdc, HGDIOBJ(normal.0));
+                let _ = DeleteObject(bold.into());
             }
             y += scale(ROUTER_SUMMARY_HEIGHT, self.dpi);
 
@@ -1573,7 +1618,7 @@ impl PaletteInner {
             );
 
             SelectObject(hdc, old_font);
-            let _ = DeleteObject(gdi_font.into());
+            let _ = DeleteObject(normal.into());
         }
     }
 
@@ -2457,6 +2502,45 @@ mod tests {
         );
     }
 
+    /// #361: the palette is a `WS_POPUP`, which DWM leaves square unless asked.
+    #[test]
+    fn the_palette_window_asks_for_rounded_corners() {
+        use windows::Win32::Graphics::Dwm::{
+            DwmGetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+            DWM_WINDOW_CORNER_PREFERENCE,
+        };
+        let p = Palette::new_for_test(instance()).unwrap();
+        let mut pref = DWM_WINDOW_CORNER_PREFERENCE(0);
+        unsafe {
+            DwmGetWindowAttribute(
+                p.hwnd(),
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &mut pref as *mut DWM_WINDOW_CORNER_PREFERENCE as *mut c_void,
+                std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+            )
+            .expect("DwmGetWindowAttribute must read the corner preference back");
+        }
+        assert_eq!(pref, DWMWCP_ROUND);
+    }
+
+    /// #361: the router's suggestion is a hint, so it is set in semibold and
+    /// reads as different from the rows and headers around it.
+    #[test]
+    fn the_router_summary_is_semibold_and_the_rows_are_not() {
+        use windows::Win32::Graphics::DirectWrite::{
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        };
+        let p = Palette::new_for_test(instance()).unwrap();
+        let mut renderer = PaletteRenderer::new().expect("Direct2D factories");
+        assert!(renderer.ensure_target(p.hwnd(), 96, 560, 400));
+        let row = renderer.text_format.as_ref().unwrap();
+        let summary = renderer.summary_format.as_ref().unwrap();
+        assert_eq!(unsafe { row.GetFontWeight() }, DWRITE_FONT_WEIGHT_NORMAL);
+        assert_eq!(
+            unsafe { summary.GetFontWeight() },
+            DWRITE_FONT_WEIGHT_SEMI_BOLD
+        );
+    }
     // -- show latency (#25's Done-when: under 100 ms) -----------------------
 
     #[test]
