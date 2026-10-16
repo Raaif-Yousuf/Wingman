@@ -311,6 +311,9 @@ pub struct Page {
 pub struct Hop {
     pub status: u16,
     pub content_type: Option<String>,
+    /// The Content-Encoding header. Wingman asks for none, so anything but
+    /// identity is a server compressing unprompted, and the bytes are unreadable.
+    pub content_encoding: Option<String>,
     pub location: Option<String>,
     pub body: Vec<u8>,
     /// More body was available than [`MAX_BODY_BYTES`].
@@ -405,6 +408,12 @@ fn is_redirect(status: u16) -> bool {
 
 /// The text of one successful response.
 fn page_from(host: &str, hop: &Hop) -> Result<Page, String> {
+    // Wingman does not ask for compressed bodies, so a server that sends one
+    // anyway would be read as garbage text. Refuse it instead.
+    let encoding = hop.content_encoding.as_deref().unwrap_or("").trim();
+    if !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity") {
+        return Err(format!("{host} sent compressed data Wingman can't read."));
+    }
     let content_type = hop.content_type.as_deref().unwrap_or("");
     let media = content_type
         .split(';')
@@ -721,6 +730,7 @@ fn fetch_hop(
     Ok(Hop {
         status: parts.status.as_u16(),
         content_type: header("content-type"),
+        content_encoding: header("content-encoding"),
         location: header("location"),
         body: bytes,
         body_truncated,
@@ -1407,6 +1417,40 @@ mod tests {
                 },
             );
             fetch(&net, "https://example.com/").unwrap_or_else(|e| panic!("{ct}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_compressed_body_is_refused_with_a_clear_message() {
+        for enc in ["gzip", "br", "deflate", "GZIP", "gzip, br"] {
+            let net = FakeNet::new().host("example.com", PUBLIC).page(
+                "https://example.com/",
+                Hop {
+                    status: 200,
+                    content_type: Some("text/html".into()),
+                    content_encoding: Some(enc.into()),
+                    body: vec![0x1f, 0x8b, 0x08, 0x00],
+                    ..Hop::default()
+                },
+            );
+            let err = fetch(&net, "https://example.com/").unwrap_err();
+            assert!(
+                err.contains("compressed data Wingman can't read"),
+                "{enc}: {err}"
+            );
+        }
+        for enc in [None, Some("identity"), Some("")] {
+            let net = FakeNet::new().host("example.com", PUBLIC).page(
+                "https://example.com/",
+                Hop {
+                    status: 200,
+                    content_type: Some("text/html".into()),
+                    content_encoding: enc.map(String::from),
+                    body: b"<p>ok</p>".to_vec(),
+                    ..Hop::default()
+                },
+            );
+            fetch(&net, "https://example.com/").unwrap_or_else(|e| panic!("{enc:?}: {e}"));
         }
     }
 
