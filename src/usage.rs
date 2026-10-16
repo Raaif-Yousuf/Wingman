@@ -616,8 +616,14 @@ pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
     queue_budget_notice(&date);
 }
 
-/// Counts the usage of a successful completion and passes the result through
-/// unchanged. What every provider's `complete` ends with.
+/// Counts the usage of a completion and passes the result through unchanged.
+/// What every provider's `complete` ends with.
+///
+/// A reply that did not become an answer (a refusal, a truncated thinking
+/// reply, a blocked prompt) was still billed, so `error_usage` reads the
+/// usage block out of the raw body for that case (#730). It runs only on an
+/// `Err`, and when it finds nothing (a body that is not JSON) nothing is
+/// counted: there is no usage to count.
 ///
 /// `local` is true when the request ran on this machine and so costs nothing.
 pub fn tally(
@@ -625,9 +631,15 @@ pub fn tally(
     model: &str,
     local: bool,
     result: anyhow::Result<Completion>,
+    error_usage: impl FnOnce() -> Option<Usage>,
 ) -> anyhow::Result<Completion> {
-    if let Ok(c) = &result {
-        record(provider, model, local, c.usage);
+    match &result {
+        Ok(c) => record(provider, model, local, c.usage),
+        Err(_) => {
+            if let Some(usage) = error_usage() {
+                record(provider, model, local, Some(usage));
+            }
+        }
     }
     result
 }
@@ -856,16 +868,63 @@ mod tests {
             usage: Some(usage(1_000_000, 0)),
             stop: crate::provider::StopReason::Complete,
         };
-        let out = tally("anthropic", "claude-opus-5", false, Ok(completion)).unwrap();
+        let out = tally("anthropic", "claude-opus-5", false, Ok(completion), || None).unwrap();
         assert_eq!(out.usage.unwrap().input_tokens, 1_000_000);
         let after = crate::store::global()
             .unwrap()
             .day_total(&today)
             .unwrap()
             .unwrap();
-        assert_eq!(after.requests, before.requests + 1);
-        assert!(close(after.usd - before.usd, 5.0), "{after:?}");
+        // At least this request: another test may record into the same
+        // store at the same moment.
+        assert!(after.requests > before.requests, "{before:?} {after:?}");
+        assert!(after.usd - before.usd >= 4.99, "{before:?} {after:?}");
         assert!(tooltip_part().unwrap().contains("today"));
+    }
+
+    /// #730: a reply that is an error (here `max_tokens` with no text, the
+    /// whole budget spent thinking) still costs money, so it is counted.
+    #[test]
+    fn tally_counts_the_usage_of_a_reply_that_is_an_error() {
+        let body = r#"{"stop_reason":"max_tokens","content":[{"type":"thinking","thinking":"..."}],"usage":{"input_tokens":1000000,"output_tokens":0}}"#;
+        let today = local_date_today();
+        let before = crate::store::global()
+            .unwrap()
+            .day_total(&today)
+            .unwrap()
+            .unwrap_or_default();
+        let result = crate::provider::anthropic::Anthropic::parse_completion(body);
+        assert!(result.is_err());
+        let out = tally("anthropic", "claude-opus-5", false, result, || {
+            crate::provider::anthropic::Anthropic::parse_usage(body)
+        });
+        assert!(out.is_err(), "the error still reaches the caller");
+        let after = crate::store::global()
+            .unwrap()
+            .day_total(&today)
+            .unwrap()
+            .unwrap();
+        assert!(after.requests > before.requests, "{before:?} {after:?}");
+        assert!(after.usd - before.usd >= 4.99, "{before:?} {after:?}");
+    }
+
+    /// An error with no usage block anywhere (a body that is not JSON) adds
+    /// nothing: there is nothing to count.
+    #[test]
+    fn tally_adds_nothing_for_an_error_with_no_usage() {
+        let called = std::cell::Cell::new(false);
+        let out = tally(
+            "anthropic",
+            "claude-opus-5",
+            false,
+            Err(anyhow::anyhow!("bad")),
+            || {
+                called.set(true);
+                None
+            },
+        );
+        assert!(out.is_err());
+        assert!(called.get());
     }
 
     #[test]

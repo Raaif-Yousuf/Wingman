@@ -261,21 +261,27 @@ pub struct Usage {
     pub cache_read_tokens: u32,
 }
 
-/// The usage block of a successful response body, by the tag the provider
-/// passes to `common::post_json` (each tag is that provider's `id()`). `None`
-/// for an unknown tag, a body that does not parse, or one with no usage. The
-/// egress log reads this at the HTTP boundary (#487), where the response is
-/// in hand but the provider has not parsed it yet.
+/// The usage block of a response body, by the tag the provider passes to
+/// `common::post_json` (each tag is that provider's `id()`). `None` for an
+/// unknown tag, a body that does not parse, or one with no usage. Read even
+/// when the body is a refusal or a truncated reply, because those were billed
+/// too (#730). The egress log reads this at the HTTP boundary (#487), where
+/// the response is in hand but the provider has not parsed it yet.
 pub(crate) fn usage_from_body(tag: &str, body: &str) -> Option<Usage> {
-    let parsed = match tag {
-        "anthropic" => anthropic::Anthropic::parse_completion(body),
-        "openai" => openai::OpenAi::parse_completion(body),
-        "gemini" => gemini::Gemini::parse_completion(body),
-        "ollama" => ollama::Ollama::parse_completion(body),
-        "openai-compat" => openai_compat::OpenAiCompat::parse_completion(body),
-        _ => return None,
-    };
-    parsed.ok()?.usage
+    match tag {
+        "anthropic" => anthropic::Anthropic::parse_usage(body),
+        "openai" => openai::OpenAi::parse_usage(body),
+        "gemini" => gemini::Gemini::parse_usage(body),
+        "ollama" => ollama::Ollama::parse_usage(body),
+        "openai-compat" => openai_compat::OpenAiCompat::parse_usage(body),
+        _ => None,
+    }
+}
+
+/// The error for a reply the model's own filter blocked (#731): the same
+/// words for every provider, naming the vendor's raw reason.
+pub(crate) fn declined_error(tag: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!("{tag}: the model declined to answer ({reason})")
 }
 
 /// Why the provider stopped. A refusal, or an empty completion caused by
