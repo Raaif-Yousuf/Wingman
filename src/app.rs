@@ -500,6 +500,10 @@ pub fn run() -> Result<()> {
         .name("ics-startup-sweep".into())
         .spawn(|| crate::connectors::IcsConnector::new().sweep_stale());
 
+    // #831: read before `Config::load`, which creates the file on a first
+    // run. If the path cannot be found, say it existed: no welcome is the
+    // safe side.
+    let config_existed = Config::path().map(|p| p.exists()).unwrap_or(true);
     let config = Config::load().unwrap_or_default();
     // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
     // anything below can start a request (the hotkey hook isn't installed
@@ -663,6 +667,22 @@ pub fn run() -> Result<()> {
         app.card.show_error_with_details(&headline, &detail);
     }
 
+    // #831: after every startup problem card above, so it never replaces one.
+    // No model call: this is text only.
+    let opens_settings = crate::single_instance::first_launch_action(std::env::args())
+        == crate::single_instance::FirstLaunchAction::OpenSettings;
+    let other_card = !matches!(app.card.state(), crate::ui::card::CardState::Hidden);
+    let welcome = match (Config::path(), Config::old_path()) {
+        (Ok(path), Ok(old)) => {
+            should_show_welcome(&path, &old, config_existed, opens_settings, other_card)
+        }
+        _ => false,
+    };
+    if welcome {
+        let (headline, detail) = welcome_card(&chord_to_string(&app.config.hotkeys.secondary));
+        app.card.show_settings_needed(&headline, &detail);
+    }
+
     // Non-fatal: without it the card still auto-dismisses on its timer.
     app.watcher = ClickWatcher::install(hwnd).ok();
 
@@ -722,6 +742,38 @@ fn startup_card(
         detail = format!("{detail}\n\n{h}. {d}");
     }
     Some((headline, detail))
+}
+
+/// #831: whether to show the welcome card. A bare launch must not ask a
+/// model, and the login autostart is a bare launch too, so the only "first
+/// time" signal is the config file: absent before this start's
+/// `Config::load` AND present after it (this start created it, which is what
+/// remembers it). A folder that cannot be written leaves no file, so the card
+/// never repeats (#879). A leftover pre-rename `copilot-ask` config means a
+/// returning user whose migration did not finish. Also skipped when
+/// `--settings` is already opening Settings or a startup problem card shows.
+/// It reads only paths and flags, so a check that cannot run shows no card.
+fn should_show_welcome(
+    config_path: &std::path::Path,
+    old_path: &std::path::Path,
+    existed_before: bool,
+    opens_settings: bool,
+    other_card: bool,
+) -> bool {
+    !existed_before && config_path.exists() && !old_path.exists() && !opens_settings && !other_card
+}
+
+/// #831: the first-launch welcome card. `secondary` is the display form of
+/// the second hotkey. Shown through the settings-needed card, so a click
+/// opens Settings. No em dash (rule 11).
+pub(crate) fn welcome_card(secondary: &str) -> (String, String) {
+    (
+        "Wingman is running".to_string(),
+        format!(
+            "Press the Copilot key or {secondary}. The icon may be under the ^ arrow in the tray; \
+             drag it out to keep it in view. Click here to open Settings."
+        ),
+    )
 }
 
 /// #793: whether `mode` may be switched on while the config file's state is
@@ -1468,11 +1520,6 @@ impl App {
             return;
         }
 
-        // #506: the window under the palette, read before the palette takes
-        // the foreground. The router's capture looks for password fields
-        // there, not in Wingman's own palette.
-        let underlying =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
         let resolved = match actions::load_actions_report() {
             Ok(report) => {
                 self.show_skipped_notice(&report);
@@ -1503,24 +1550,20 @@ impl App {
             self.first_provider_model_label().as_deref(),
         );
 
-        // #24: candidates are built from the SAME catalogue about to be
-        // shown, before it moves into `Palette::show` below.
-        let candidates = router::candidates_from_catalogue(&catalogue);
-        // #339: asked BEFORE the palette takes the foreground. The router
-        // sends a screenshot, so it must not run over a password manager.
-        let password_manager_in_front = self.password_manager_now();
-        self.palette_password_manager = password_manager_in_front;
+        // #339: asked BEFORE the palette takes the foreground, read when the
+        // palette runs an action.
+        self.palette_password_manager = self.password_manager_now();
+        // #805: opening the palette sends nothing, no screenshot and no
+        // model request. A request starts only when the user picks an
+        // action (or, later, from the options card), never from this call.
         self.palette.show(catalogue, model_configured, footer);
-        self.maybe_start_router(candidates, password_manager_in_front, underlying);
     }
 
-    /// #24: the intent router's hook, called right after
-    /// [`App::toggle_palette`]'s `Palette::show` -- the palette is already
-    /// visible and painted by the time this runs (`Palette::show` forces a
-    /// synchronous first paint), so nothing here can add to the palette's
-    /// own sub-100ms show latency; only the eventual card-free suggestion
-    /// arrives late. Mirrors `App::ask`'s own capture-on-main-thread-then-
-    /// spawn ordering.
+    /// #24: starts the intent router: a small screenshot and one cheap model
+    /// call. Since #805 nothing calls this: opening the palette sends no
+    /// request, and the router belongs to the key press and the options card
+    /// (#307). Mirrors `App::ask`'s own capture-on-main-thread-then-spawn
+    /// ordering.
     ///
     /// A silent no-op (never a card, never a hint) when: Paused; no
     /// provider is ready at all (the cheap, optimistic "is anything
@@ -1531,6 +1574,7 @@ impl App {
     /// failure the user is told about (rule 7's "every failure ends in a
     /// card" is about the action the user actually asked for; the router
     /// never was one).
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     fn maybe_start_router(
         &mut self,
         candidates: Vec<router::RouterCandidate>,
@@ -5006,6 +5050,7 @@ fn encode_for_upload(
 /// repair attempt), but there is no multi-provider fallback: the router
 /// only ever tries the one cheapest ready provider, and if that fails, this
 /// press simply gets no suggestion.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn router_worker(
     providers: &Providers,
     mode: Mode,
@@ -5056,6 +5101,7 @@ fn router_worker(
 /// `Chain::complete_parsed_with_fallback`'s caller); router failures are
 /// silent by the time they reach the user regardless (see
 /// `App::maybe_start_router`'s doc comment), so this never becomes a card.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::NonVisionInputs> {
     let ocr_output = crate::ocr::recognize(
         &raw.rgba,
@@ -5076,6 +5122,7 @@ fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::N
 /// one-line call into [`Providers::models_for`] (`config.rs`), which used
 /// to be hand-mirrored here -- see that function's doc for why keeping
 /// exactly one copy of this name-to-model-list mapping matters.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn router_models_for(providers: &Providers, name: &str) -> Vec<String> {
     providers.models_for(name)
 }
@@ -5086,6 +5133,7 @@ fn router_models_for(providers: &Providers, name: &str) -> Vec<String> {
 /// [`Providers::provider_for_named_model`] (`config.rs`) with
 /// `Some(model)`, which used to be a hand-mirrored match with the same five
 /// arms here -- see that function's doc for the drift this closed off.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn provider_for_router(
     providers: &Providers,
     name: &str,
@@ -6415,7 +6463,11 @@ fn is_no_providers(packed: &str) -> bool {
 /// cannot probe Ollama, so it lets an Ollama-only setup through; when the
 /// worker then finds nothing answering, this says what to do. Any other
 /// setup gets the gate's own card.
-fn empty_chain_card(mode: Mode, providers: &Providers, config_path: &str) -> (String, String) {
+pub(crate) fn empty_chain_card(
+    mode: Mode,
+    providers: &Providers,
+    config_path: &str,
+) -> (String, String) {
     if mode == Mode::Auto
         && crate::mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
     {
@@ -7563,6 +7615,39 @@ mod tests {
         assert!(seen >= 7, "expected the result post sites, found {seen}");
     }
 
+    /// #805: opening the palette sends nothing. The router's request (a
+    /// screenshot to a model) used to start at the end of `toggle_palette`;
+    /// it now belongs to the key press and the options card. Scans the body
+    /// of `toggle_palette` for anything that captures the screen or starts a
+    /// model request.
+    #[test]
+    fn opening_the_palette_sends_no_model_request() {
+        let src = lf(include_str!("app.rs"));
+        let start = src
+            .find("    fn toggle_palette(&mut self) {")
+            .expect("toggle_palette exists");
+        let body = &src[start..];
+        let end = body.find("\n    }\n").expect("toggle_palette ends");
+        let body = &body[..end];
+        assert!(
+            body.contains("self.palette.show("),
+            "the scan found the wrong body"
+        );
+        for forbidden in [
+            "maybe_start_router",
+            "router_worker",
+            "capture::",
+            "grab_raw",
+            "thread::spawn",
+            "set_router_pending",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "toggle_palette starts a request again: {forbidden}"
+            );
+        }
+    }
+
     /// #723: the stuck bound covers every provider in a chain at its own
     /// wall clock, so a healthy run is never called stuck.
     #[test]
@@ -8029,6 +8114,51 @@ mod tests {
             assert!(!headline.contains('\u{2014}'), "{headline}");
             assert!(!detail.contains('\u{2014}'), "{detail}");
         }
+    }
+
+    // -- #831: the welcome card on the very first launch -------------------
+
+    #[test]
+    fn welcome_decision_against_a_scratch_folder() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("wingman-test-welcome-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        let old = dir.join("old-config.toml");
+        let show = |existed, settings, other| {
+            super::should_show_welcome(&cfg, &old, existed, settings, other)
+        };
+
+        // Unwritable folder: load could not create the file, so no card.
+        assert!(!show(false, false, false));
+
+        // Fresh start: absent before, created by this start.
+        fs::write(&cfg, "").unwrap();
+        assert!(show(false, false, false));
+
+        // Every later launch (and autostart): the file existed before.
+        assert!(!show(true, false, false));
+        // install.ps1's `--settings` launch already opens Settings.
+        assert!(!show(false, true, false));
+        // A startup problem card must not be replaced.
+        assert!(!show(false, false, true));
+
+        // Unfinished copilot-ask migration: a returning user.
+        fs::write(&old, "").unwrap();
+        assert!(!show(false, false, false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn welcome_card_names_the_keys_and_the_tray_icon() {
+        let (headline, detail) = super::welcome_card("Ctrl+Shift+/");
+        assert!(headline.starts_with("Wingman is running"), "{headline}");
+        assert!(detail.contains("Copilot key"), "{detail}");
+        assert!(detail.contains("Ctrl+Shift+/"), "{detail}");
+        assert!(detail.contains("tray"), "{detail}");
+        assert!(detail.contains("Click here"), "{detail}");
+        assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
     }
 
     // -- #832: an empty chain at run time ends in the setup card ----------

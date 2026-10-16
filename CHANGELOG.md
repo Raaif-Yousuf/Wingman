@@ -9,6 +9,11 @@ tagged release.
 
 ### Changed
 
+- A `config.toml` that does not parse no longer gets replaced by defaults. Wingman starts in Offline mode, shows a card naming the problem, and does not save over the file until it parses again (use Reload settings after fixing it). Before a save changes the file, one copy is kept as `config.toml.bak` with the API keys blanked (issue #711).
+- Settings refuses Save when `config.toml` changed on disk while the window was open, so a hand edit is never overwritten.
+- Quit is refused while Ollama is being restarted by the fix card.
+- Settings has an "Open config file" button and plainer labels. The card uses a clearer type ramp, and buttons follow the Windows accent colour.
+- Table to CSV now copies tab-separated text, so it pastes into spreadsheet columns.
 - Settings now uses the modern Windows 11 controls (rounded combo boxes and buttons, themed checkboxes and slider) instead of the classic look. The app now carries a manifest that asks for them (issues #807, #820).
 
 ### Added
@@ -61,9 +66,10 @@ tagged release.
   override replaces the whole entry, prompt included). An old `config.toml`
   that still has `show_difficulty` loads fine and the key is dropped on the
   next save.
-- Product name: the app is now referred to as Wingman in documentation; the
-  crate, binary and installed paths still say `copilot-ask` until the Phase 0
-  rename (issue #1) lands.
+- Product name: the app is now called Wingman. The crate, binary, window
+  classes, config directory and package identity were renamed from
+  `copilot-ask` on 2026-09-16 (issue #1); the first run copies the old config
+  directory forward and leaves it in place.
 - Provider API keys now live in Windows Credential Manager
   (`Wingman/<provider>`), never in `config.toml` (issue #2).
 - `install.ps1` now restarts the previous `wingman.exe` if a phase-2

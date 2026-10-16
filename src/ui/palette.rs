@@ -97,6 +97,10 @@
 use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
+use crate::ui::theme::{
+    detect_theme, ensure_contrast, setting_change_affects_theme, setting_change_name, SysColors,
+    Theme, Tokens,
+};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     COLORREF, D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
@@ -111,15 +115,21 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject, InvalidateRect,
-    SelectObject, SetBkMode, SetTextColor, UpdateWindow, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
+    GetStockObject, InvalidateRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW,
+    PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -132,9 +142,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE,
-    WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+    WM_THEMECHANGED, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
     WS_VISIBLE,
 };
 
@@ -198,10 +209,16 @@ const PADDING: i32 = 8;
 /// re-created" applies to size too) between the query box and the row list;
 /// blank when [`PaletteInner::router_summary`] is `None`.
 const ROUTER_SUMMARY_HEIGHT: i32 = 18;
+/// Space between the selection bar and an action's text, so the bar is not drawn
+/// over the first letter.
+const ROW_TEXT_INSET: i32 = 12;
+/// How far the query box's hairline sits outside the edit control.
+const QUERY_BORDER_OUTSET: i32 = 3;
 
 /// #359: shown in the router summary band from the moment
 /// `App::maybe_start_router` actually starts a background request until the
 /// result (or a failure) replaces or clears it. No em dash (rule 11).
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 const ROUTER_LOOKING_TEXT: &str = "Looking at your screen...";
 
 fn scale(v: i32, dpi: u32) -> i32 {
@@ -282,6 +299,8 @@ impl Palette {
     }
 
     fn create(instance: HINSTANCE, class_name: &str) -> anyhow::Result<Self> {
+        let theme = detect_theme();
+        let sys = SysColors::read();
         let inner = Box::new(PaletteInner {
             hwnd: HWND(std::ptr::null_mut()),
             edit_hwnd: HWND(std::ptr::null_mut()),
@@ -300,6 +319,11 @@ impl Palette {
             hover: None,
             tracking_leave: false,
             suppress_en_change: false,
+            theme,
+            sys,
+            colors: palette_colors(theme, &sys, live_accent(theme, &sys)),
+            theme_forced: false,
+            edit_brush: HBRUSH(std::ptr::null_mut()),
         });
         let raw = Box::into_raw(inner);
 
@@ -337,6 +361,23 @@ impl Palette {
         let inner_ref = unsafe { &mut *raw };
         inner_ref.hwnd = hwnd;
         inner_ref.dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+
+        // Best-effort rounded corners (Windows 11), as the card does (#361).
+        // A square window on an older system is an acceptable degrade.
+        unsafe {
+            let pref = DWMWCP_ROUND;
+            if let Err(e) = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &pref as *const DWM_WINDOW_CORNER_PREFERENCE as *const c_void,
+                std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+            ) {
+                crate::diagnostics::note_warning(&format!(
+                    "Palette: rounded corners unavailable ({}), using square corners",
+                    e.code()
+                ));
+            }
+        }
 
         // #216: created once, here, right after the HWND exists -- never
         // per paint (see the module doc comment's "Rendering" section for
@@ -442,6 +483,7 @@ impl Palette {
     }
 
     /// #359: see [`PaletteInner::set_router_pending`].
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub fn set_router_pending(&mut self, generation: u64) {
         self.inner.set_router_pending(generation);
     }
@@ -491,6 +533,17 @@ impl Palette {
             Some(crate::ui::palette_model::Row::Action { id, .. }) => Some(id.clone()),
             _ => None,
         }
+    }
+
+    /// The UI gallery's `--theme`: draws in `theme` whatever the system is
+    /// set to and ignores later theme messages. High contrast uses Windows'
+    /// high contrast black colours. Never touches the registry.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn force_theme_for_gallery(&mut self, theme: Theme) {
+        self.inner.theme = theme;
+        self.inner.sys = crate::ui::theme::HC_BLACK;
+        self.inner.theme_forced = true;
+        self.inner.apply_colors();
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -712,6 +765,8 @@ struct PaletteRenderer {
     dwrite_factory: IDWriteFactory,
     target: Option<ID2D1HwndRenderTarget>,
     text_format: Option<IDWriteTextFormat>,
+    /// Semibold, for the router's suggestion (#361).
+    summary_format: Option<IDWriteTextFormat>,
 }
 
 impl PaletteRenderer {
@@ -729,6 +784,7 @@ impl PaletteRenderer {
             dwrite_factory,
             target: None,
             text_format: None,
+            summary_format: None,
         })
     }
 
@@ -765,19 +821,24 @@ impl PaletteRenderer {
             .ok();
         }
         if self.target.is_some() && self.text_format.is_none() {
-            self.text_format = self.build_text_format();
+            self.text_format = self.build_text_format(DWRITE_FONT_WEIGHT_NORMAL);
         }
+        if self.target.is_some() && self.summary_format.is_none() {
+            self.summary_format = self.build_text_format(DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        }
+        // The semibold format is a nicety: without it the summary uses the row
+        // format, and the palette stays on Direct2D.
         self.target.is_some() && self.text_format.is_some()
     }
 
-    fn build_text_format(&self) -> Option<IDWriteTextFormat> {
+    fn build_text_format(&self, weight: DWRITE_FONT_WEIGHT) -> Option<IDWriteTextFormat> {
         let family = wide_z(D2D_FONT_FAMILY);
         let locale = wide_z(D2D_LOCALE);
         let format = unsafe {
             self.dwrite_factory.CreateTextFormat(
                 PCWSTR(family.as_ptr()),
                 None,
-                DWRITE_FONT_WEIGHT_NORMAL,
+                weight,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
                 D2D_FONT_SIZE_DIP,
@@ -835,6 +896,7 @@ impl PaletteRenderer {
     fn drop_target(&mut self) {
         self.target = None;
         self.text_format = None;
+        self.summary_format = None;
     }
 }
 
@@ -853,8 +915,87 @@ fn colorref_to_d2d(c: COLORREF) -> D2D1_COLOR_F {
     }
 }
 
-fn selected_row_color() -> COLORREF {
-    COLORREF(0x0098_7858)
+/// Every colour the palette draws, for one theme (#579). Built from the shared
+/// tokens in `theme.rs`, so there are no literal colours in this file and the
+/// palette follows light, dark and high contrast like the card does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaletteColors {
+    background: u32,
+    /// The hairline around the query box.
+    border: u32,
+    /// Action row text.
+    text: u32,
+    /// Group headers.
+    header: u32,
+    /// The "no matching actions" hint.
+    hint: u32,
+    footer: u32,
+    /// The router's suggestion line.
+    summary: u32,
+    /// The fill of the selected and the hovered row.
+    selected_fill: u32,
+    selected_text: u32,
+    /// The 3 px bar on the selected row.
+    bar: u32,
+}
+
+/// The user's accent for the selection bar in `theme`, kept at 3:1 against the
+/// theme's surface (the same shade and fit the primary button uses). Read live,
+/// so call it when the theme or the accent changes, never per paint.
+fn live_accent(theme: Theme, sys: &SysColors) -> u32 {
+    crate::ui::card_buttons::system_accent(theme, Tokens::for_theme(theme, sys).surface)
+}
+/// The palette's colours in `theme`. High contrast uses the system colours
+/// only: the selected row is the system highlight, as in a Windows list.
+fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
+    use crate::ui::card_buttons::blend;
+    let t = Tokens::for_theme(theme, sys);
+    if theme == Theme::HighContrast {
+        return PaletteColors {
+            background: t.surface,
+            border: t.border,
+            text: t.text,
+            header: t.text,
+            hint: t.text,
+            footer: t.text,
+            summary: t.text,
+            selected_fill: sys.highlight,
+            selected_text: sys.highlight_text,
+            // The whole row is the highlight, so the bar is the same colour.
+            bar: sys.highlight,
+        };
+    }
+    // An accent from live_accent already clears 3:1; this keeps any other
+    // caller honest too.
+    let bar = ensure_contrast(accent, t.surface, 3.0);
+    PaletteColors {
+        background: t.surface,
+        border: t.border,
+        text: t.text,
+        header: t.text_dim,
+        hint: t.text_faint,
+        footer: t.text_faint,
+        summary: t.text_dim,
+        selected_fill: blend(t.surface, bar, 16),
+        selected_text: t.text,
+        bar,
+    }
+}
+
+/// The palette's GDI font: Segoe UI, `D2D_FONT_SIZE_DIP` tall at `dpi`, in
+/// `weight`. The caller frees it with `DeleteObject`.
+fn gdi_font(dpi: u32, weight: i32) -> HFONT {
+    let mut lf = LOGFONTW {
+        lfHeight: -scale(D2D_FONT_SIZE_DIP as i32, dpi),
+        lfWeight: weight,
+        lfCharSet: DEFAULT_CHARSET,
+        lfQuality: CLEARTYPE_QUALITY,
+        ..Default::default()
+    };
+    for (slot, unit) in lf.lfFaceName.iter_mut().zip(D2D_FONT_FAMILY.encode_utf16()) {
+        *slot = unit;
+    }
+    unsafe { CreateFontIndirectW(&lf) }
 }
 
 /// D2D/DirectWrite equivalent of `draw_text_line` (imported from
@@ -959,6 +1100,24 @@ struct PaletteInner {
     /// by `show`) and skips the redundant `rebuild_state` (`show` already
     /// calls it with the real, empty query right after).
     suppress_en_change: bool,
+    /// #579: the theme the palette is drawn in, the system colours it was
+    /// built from, and the colours themselves. Read when the window is made and
+    /// again on every message that can change them (`refresh_theme`), never per
+    /// paint.
+    theme: Theme,
+    sys: SysColors,
+    colors: PaletteColors,
+    /// The gallery's --theme: later theme messages are ignored.
+    theme_forced: bool,
+    /// The brush WM_CTLCOLOREDIT returns for the query box, in the
+    /// background colour. Created on first use, dropped when the theme changes.
+    edit_brush: HBRUSH,
+}
+
+impl Drop for PaletteInner {
+    fn drop(&mut self) {
+        self.drop_edit_brush();
+    }
 }
 
 impl PaletteInner {
@@ -1092,6 +1251,7 @@ impl PaletteInner {
     /// existing "user already interacted" paths above (`show`, `hide`,
     /// `on_palette_key_command`'s Up/Down/PageUp/PageDown arm, `EN_CHANGE`).
     /// No timer involved (rule 5): this only ever changes on those events.
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     fn set_router_pending(&mut self, generation: u64) {
         if crate::router::is_stale(generation, self.router_generation) {
             return;
@@ -1209,6 +1369,44 @@ impl PaletteInner {
         }
     }
 
+    /// #579: reads the theme, the system colours and the accent again and
+    /// repaints. Runs on every message that can change them. It repaints even
+    /// when the theme is the same: switching between two high contrast
+    /// schemes, or picking a new accent, changes the colours and not the theme.
+    fn refresh_theme(&mut self) {
+        if self.theme_forced {
+            return;
+        }
+        self.theme = detect_theme();
+        self.sys = SysColors::read();
+        self.apply_colors();
+    }
+
+    fn apply_colors(&mut self) {
+        self.colors = palette_colors(self.theme, &self.sys, live_accent(self.theme, &self.sys));
+        self.drop_edit_brush();
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ALLCHILDREN,
+            );
+        }
+    }
+
+    /// The cached query box brush holds the old background; the next
+    /// `WM_CTLCOLOREDIT` makes a new one.
+    fn drop_edit_brush(&mut self) {
+        if !self.edit_brush.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.edit_brush.0));
+            }
+            self.edit_brush = HBRUSH(std::ptr::null_mut());
+        }
+    }
+
     /// Takes the key-forwarded `WM_COMMAND` id, runs it through the pure
     /// state machine, and acts on the outcome: repaint, dispatch, or hide.
     fn on_palette_key_command(&mut self, key: crate::ui::palette_model::PaletteKey) {
@@ -1279,6 +1477,7 @@ impl PaletteInner {
     /// `D2DERR_RECREATE_TARGET` (device loss), in which case the target is
     /// dropped so the NEXT paint's `ensure_target` call rebuilds it fresh.
     fn try_paint_d2d(&mut self) -> bool {
+        let colors = self.colors;
         let Some(renderer) = &mut self.d2d else {
             return false;
         };
@@ -1299,6 +1498,10 @@ impl PaletteInner {
             .text_format
             .clone()
             .expect("ensure_target just confirmed Some");
+        let summary_format = renderer
+            .summary_format
+            .clone()
+            .unwrap_or_else(|| format.clone());
 
         let pad = PADDING as f32;
         let row_h = ROW_HEIGHT as f32;
@@ -1308,7 +1511,21 @@ impl PaletteInner {
 
         unsafe {
             target.BeginDraw();
-            target.Clear(Some(&colorref_to_d2d(COLORREF(0x0026_2626)) as *const _));
+            target.Clear(Some(
+                &colorref_to_d2d(COLORREF(colors.background)) as *const _
+            ));
+            if let Ok(brush) = target
+                .CreateSolidColorBrush(&colorref_to_d2d(COLORREF(colors.border)) as *const _, None)
+            {
+                let o = QUERY_BORDER_OUTSET as f32;
+                let rect = D2D_RECT_F {
+                    left: pad - o,
+                    top: pad - o,
+                    right: content_w - pad + o,
+                    bottom: pad + EDIT_HEIGHT as f32 + o,
+                };
+                target.DrawRectangle(&rect as *const _, &brush, 1.0, None);
+            }
         }
 
         // #24: the router summary band is always reserved (see
@@ -1321,7 +1538,13 @@ impl PaletteInner {
                 right: content_w - pad,
                 bottom: y + ROUTER_SUMMARY_HEIGHT as f32,
             };
-            draw_text_line_d2d(&target, &format, summary, band_rect, COLORREF(0x0080_B080));
+            draw_text_line_d2d(
+                &target,
+                &summary_format,
+                summary,
+                band_rect,
+                COLORREF(colors.summary),
+            );
         }
         y += ROUTER_SUMMARY_HEIGHT as f32;
 
@@ -1346,21 +1569,41 @@ impl PaletteInner {
             };
             match row {
                 crate::ui::palette_model::Row::Header(name) => {
-                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(0x0090_9090));
+                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(colors.header));
                 }
                 crate::ui::palette_model::Row::Hint(text) => {
-                    draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(0x0080_8080));
+                    draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(colors.hint));
                 }
                 crate::ui::palette_model::Row::Action { name, .. } => {
-                    if i == self.state.selected || self.hover == Some(i) {
+                    // The selected row has the fill and the bar; a row only
+                    // hovered gets an outline in the bar colour (3:1 on the
+                    // background), so the two never look alike.
+                    if i == self.state.selected {
                         if let Ok(hl) = unsafe {
                             target.CreateSolidColorBrush(
-                                &colorref_to_d2d(selected_row_color()) as *const _,
+                                &colorref_to_d2d(COLORREF(colors.selected_fill)) as *const _,
                                 None,
                             )
                         } {
                             unsafe {
                                 target.FillRectangle(&row_rect as *const _, &hl);
+                            }
+                        }
+                    } else if self.hover == Some(i) {
+                        if let Ok(outline) = unsafe {
+                            target.CreateSolidColorBrush(
+                                &colorref_to_d2d(COLORREF(colors.bar)) as *const _,
+                                None,
+                            )
+                        } {
+                            let inset = D2D_RECT_F {
+                                left: row_rect.left + 0.5,
+                                top: row_rect.top + 0.5,
+                                right: row_rect.right - 0.5,
+                                bottom: row_rect.bottom - 0.5,
+                            };
+                            unsafe {
+                                target.DrawRectangle(&inset as *const _, &outline, 1.0, None);
                             }
                         }
                     }
@@ -1374,7 +1617,7 @@ impl PaletteInner {
 
                         if let Ok(accent) = unsafe {
                             target.CreateSolidColorBrush(
-                                &colorref_to_d2d(COLORREF(0x00FF_B080)) as *const _,
+                                &colorref_to_d2d(COLORREF(colors.bar)) as *const _,
                                 None,
                             )
                         } {
@@ -1383,7 +1626,21 @@ impl PaletteInner {
                             }
                         }
                     }
-                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(0x00E6_E6E6));
+                    let text_rect = D2D_RECT_F {
+                        left: row_rect.left + ROW_TEXT_INSET as f32,
+                        ..row_rect
+                    };
+                    draw_text_line_d2d(
+                        &target,
+                        &format,
+                        name,
+                        text_rect,
+                        COLORREF(if i == self.state.selected {
+                            colors.selected_text
+                        } else {
+                            colors.text
+                        }),
+                    );
                 }
             }
         }
@@ -1399,7 +1656,7 @@ impl PaletteInner {
             &format,
             &self.footer_text,
             footer_rect,
-            COLORREF(0x0080_8080),
+            COLORREF(colors.footer),
         );
 
         if let Err(e) = unsafe { target.EndDraw(None, None) } {
@@ -1421,18 +1678,62 @@ impl PaletteInner {
     /// tested as the path it replaces, not a second, thinner
     /// implementation.
     fn paint_gdi(&self, hdc: windows::Win32::Graphics::Gdi::HDC) {
+        let colors = self.colors;
         unsafe {
             let mut rc = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rc);
 
-            let bg = CreateSolidBrush(COLORREF(0x0026_2626));
+            let bg = CreateSolidBrush(COLORREF(colors.background));
             FillRect(hdc, &rc, bg);
             let _ = DeleteObject(bg.into());
 
             SetBkMode(hdc, TRANSPARENT);
-            let old_font = SelectObject(hdc, HGDIOBJ(self.font.0));
+            // Segoe UI at this window's DPI, like the DirectWrite path (the stock
+            // GUI font is neither Segoe nor scaled), freed below.
+            let normal = gdi_font(self.dpi, FW_NORMAL.0 as i32);
+            let old_font = SelectObject(hdc, HGDIOBJ(normal.0));
 
             let pad = scale(PADDING, self.dpi);
+
+            // The query box's hairline: four thin fills round the edit.
+            let line = scale(1, self.dpi).max(1);
+            let o = scale(QUERY_BORDER_OUTSET, self.dpi);
+            let (l, t, r, b) = (
+                pad - o,
+                pad - o,
+                rc.right - pad + o,
+                pad + scale(EDIT_HEIGHT, self.dpi) + o,
+            );
+            let border = CreateSolidBrush(COLORREF(colors.border));
+            for edge in [
+                RECT {
+                    left: l,
+                    top: t,
+                    right: r,
+                    bottom: t + line,
+                },
+                RECT {
+                    left: l,
+                    top: b - line,
+                    right: r,
+                    bottom: b,
+                },
+                RECT {
+                    left: l,
+                    top: t,
+                    right: l + line,
+                    bottom: b,
+                },
+                RECT {
+                    left: r - line,
+                    top: t,
+                    right: r,
+                    bottom: b,
+                },
+            ] {
+                FillRect(hdc, &edge, border);
+            }
+            let _ = DeleteObject(border.into());
             let row_h = scale(ROW_HEIGHT, self.dpi);
             let mut y = pad + scale(EDIT_HEIGHT, self.dpi) + pad;
 
@@ -1446,13 +1747,18 @@ impl PaletteInner {
                     right: rc.right - pad,
                     bottom: y + scale(ROUTER_SUMMARY_HEIGHT, self.dpi),
                 };
-                SetTextColor(hdc, COLORREF(0x0080_B080));
+                SetTextColor(hdc, COLORREF(colors.summary));
+                // Semibold, like the Direct2D path (#361), freed after the line.
+                let bold = gdi_font(self.dpi, FW_SEMIBOLD.0 as i32);
+                SelectObject(hdc, HGDIOBJ(bold.0));
                 draw_text_line(
                     hdc,
                     summary,
                     band_rect,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                 );
+                SelectObject(hdc, HGDIOBJ(normal.0));
+                let _ = DeleteObject(bold.into());
             }
             y += scale(ROUTER_SUMMARY_HEIGHT, self.dpi);
 
@@ -1478,7 +1784,7 @@ impl PaletteInner {
                 };
                 match row {
                     crate::ui::palette_model::Row::Header(name) => {
-                        SetTextColor(hdc, COLORREF(0x0090_9090));
+                        SetTextColor(hdc, COLORREF(colors.header));
                         draw_text_line(
                             hdc,
                             name,
@@ -1487,7 +1793,7 @@ impl PaletteInner {
                         );
                     }
                     crate::ui::palette_model::Row::Hint(text) => {
-                        SetTextColor(hdc, COLORREF(0x0080_8080));
+                        SetTextColor(hdc, COLORREF(colors.hint));
                         draw_text_line(
                             hdc,
                             text,
@@ -1496,13 +1802,37 @@ impl PaletteInner {
                         );
                     }
                     crate::ui::palette_model::Row::Action { name, .. } => {
-                        if i == self.state.selected || self.hover == Some(i) {
-                            let hl = CreateSolidBrush(selected_row_color());
+                        if i == self.state.selected {
+                            let hl = CreateSolidBrush(COLORREF(colors.selected_fill));
                             FillRect(hdc, &row_rect, hl);
                             let _ = DeleteObject(hl.into());
+                        } else if self.hover == Some(i) {
+                            let outline = CreateSolidBrush(COLORREF(colors.bar));
+                            let line = scale(1, self.dpi).max(1);
+                            for edge in [
+                                RECT {
+                                    bottom: row_rect.top + line,
+                                    ..row_rect
+                                },
+                                RECT {
+                                    top: row_rect.bottom - line,
+                                    ..row_rect
+                                },
+                                RECT {
+                                    right: row_rect.left + line,
+                                    ..row_rect
+                                },
+                                RECT {
+                                    left: row_rect.right - line,
+                                    ..row_rect
+                                },
+                            ] {
+                                FillRect(hdc, &edge, outline);
+                            }
+                            let _ = DeleteObject(outline.into());
                         }
                         if i == self.state.selected {
-                            let accent = CreateSolidBrush(COLORREF(0x00FF_B080));
+                            let accent = CreateSolidBrush(COLORREF(colors.bar));
                             let accent_rect = RECT {
                                 left: row_rect.left,
                                 top: row_rect.top,
@@ -1512,11 +1842,22 @@ impl PaletteInner {
                             FillRect(hdc, &accent_rect, accent);
                             let _ = DeleteObject(accent.into());
                         }
-                        SetTextColor(hdc, COLORREF(0x00E6_E6E6));
+                        SetTextColor(
+                            hdc,
+                            COLORREF(if i == self.state.selected {
+                                colors.selected_text
+                            } else {
+                                colors.text
+                            }),
+                        );
+                        let text_rect = RECT {
+                            left: row_rect.left + scale(ROW_TEXT_INSET, self.dpi),
+                            ..row_rect
+                        };
                         draw_text_line(
                             hdc,
                             name,
-                            row_rect,
+                            text_rect,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                         );
                     }
@@ -1529,7 +1870,7 @@ impl PaletteInner {
                 right: rc.right - pad,
                 bottom: rc.bottom,
             };
-            SetTextColor(hdc, COLORREF(0x0080_8080));
+            SetTextColor(hdc, COLORREF(colors.footer));
             draw_text_line(
                 hdc,
                 &self.footer_text,
@@ -1538,6 +1879,7 @@ impl PaletteInner {
             );
 
             SelectObject(hdc, old_font);
+            let _ = DeleteObject(normal.into());
         }
     }
 
@@ -1547,7 +1889,42 @@ impl PaletteInner {
                 self.on_paint();
                 Some(LRESULT(0))
             }
+            // #626: `PrintWindow` and screenshot tools ask for the client
+            // area in their own DC. Direct2D only draws to the window, so
+            // give them the GDI paint, the same picture the fallback makes.
+            WM_PRINTCLIENT => {
+                if wparam.0 != 0 {
+                    self.paint_gdi(windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void));
+                }
+                Some(LRESULT(0))
+            }
             WM_ERASEBKGND => Some(LRESULT(1)), // we paint the whole client area ourselves
+            // #579: without this the query box keeps the stock white
+            // background and black text whatever the theme.
+            WM_CTLCOLOREDIT => {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                unsafe {
+                    SetTextColor(hdc, COLORREF(self.colors.text));
+                    SetBkColor(hdc, COLORREF(self.colors.background));
+                    if self.edit_brush.0.is_null() {
+                        self.edit_brush = CreateSolidBrush(COLORREF(self.colors.background));
+                    }
+                }
+                Some(LRESULT(self.edit_brush.0 as isize))
+            }
+            // #579: the light/dark switch, the high contrast switch and a new
+            // contrast scheme or accent. Windows sends these to every top-level
+            // window, hidden or not, so the palette hears them with no timer.
+            WM_SETTINGCHANGE => {
+                if setting_change_affects_theme(wparam.0, &unsafe { setting_change_name(lparam) }) {
+                    self.refresh_theme();
+                }
+                Some(LRESULT(0))
+            }
+            WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+                self.refresh_theme();
+                Some(LRESULT(0))
+            }
             WM_COMMAND => {
                 let wp = wparam.0 as u32;
                 let notify = (wp >> 16) & 0xFFFF;
@@ -1802,6 +2179,209 @@ mod tests {
     // #357: pure hit-test tests, written before `row_at` exists (RED first).
     // `dpi` is 96 throughout (logical == physical) so the expected pixel
     // values are the raw layout constants.
+    // #476, #579: every colour the palette draws comes from the theme tokens.
+    // The bar carries "this row is selected" (3:1 against what it sits on);
+    // text must stay readable on every surface it is drawn on (4.5:1).
+    mod colour_tests {
+        use super::super::{palette_colors, PaletteColors};
+        use crate::ui::theme::{contrast_ratio, relative_luminance, Theme, HC_BLACK, HC_WHITE};
+
+        fn ratio(a: u32, b: u32) -> f64 {
+            contrast_ratio(relative_luminance(a), relative_luminance(b))
+        }
+
+        /// Every theme, and accents from near-invisible to extreme, so no user
+        /// accent can make the bar or the text unreadable.
+        fn cases() -> Vec<(String, Theme, PaletteColors)> {
+            let accents = [
+                0x00D4_7800, // the Windows default blue
+                0x0000_F0FF, // pale yellow
+                0x0010_0808, // near black
+                0x00FF_FFFF, // white
+                0x0020_20C0, // red
+            ];
+            let mut out = Vec::new();
+            for (name, theme, sys) in [
+                ("light", Theme::Light, HC_BLACK),
+                ("dark", Theme::Dark, HC_BLACK),
+                ("hc-black", Theme::HighContrast, HC_BLACK),
+                ("hc-white", Theme::HighContrast, HC_WHITE),
+            ] {
+                for accent in accents {
+                    out.push((
+                        format!("{name} accent {accent:#08x}"),
+                        theme,
+                        palette_colors(theme, &sys, accent),
+                    ));
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn every_text_colour_has_at_least_4_5_to_1_on_the_background() {
+            let cases = cases();
+            assert_eq!(cases.len(), 20, "the test must look at every case");
+            for (name, _, c) in cases {
+                for (what, fg) in [
+                    ("text", c.text),
+                    ("header", c.header),
+                    ("hint", c.hint),
+                    ("footer", c.footer),
+                    ("summary", c.summary),
+                ] {
+                    let r = ratio(fg, c.background);
+                    assert!(r >= 4.5, "{name}: {what} is {r:.2}:1 on the background");
+                }
+            }
+        }
+
+        #[test]
+        fn row_text_has_at_least_4_5_to_1_on_the_selected_row() {
+            for (name, _, c) in cases() {
+                let r = ratio(c.selected_text, c.selected_fill);
+                assert!(r >= 4.5, "{name}: selected text is {r:.2}:1 on its row");
+            }
+        }
+
+        #[test]
+        fn the_bar_and_the_hover_outline_have_at_least_3_to_1_on_the_background() {
+            // The hover outline is drawn in the bar colour, so this holds both.
+            for (name, theme, c) in cases() {
+                // In high contrast the whole row is the system highlight and
+                // the bar is that colour: the row itself must stand out.
+                let (bar, under) = if theme == Theme::HighContrast {
+                    (c.selected_fill, c.background)
+                } else {
+                    (c.bar, c.background)
+                };
+                let r = ratio(bar, under);
+                assert!(r >= 3.0, "{name}: the selection is {r:.2}:1");
+            }
+        }
+
+        #[test]
+        fn the_selected_row_is_still_distinct_from_the_background() {
+            for (name, _, c) in cases() {
+                assert_ne!(c.selected_fill, c.background, "{name}");
+            }
+        }
+
+        #[test]
+        fn light_and_dark_differ_and_high_contrast_uses_the_system_colours() {
+            let light = palette_colors(Theme::Light, &HC_BLACK, 0x00D4_7800);
+            let dark = palette_colors(Theme::Dark, &HC_BLACK, 0x00D4_7800);
+            assert_ne!(light.background, dark.background);
+            assert!(relative_luminance(light.background) > relative_luminance(dark.background));
+            let hc = palette_colors(Theme::HighContrast, &HC_WHITE, 0x00D4_7800);
+            assert_eq!(hc.background, HC_WHITE.window);
+            assert_eq!(hc.text, HC_WHITE.window_text);
+            assert_eq!(hc.selected_fill, HC_WHITE.highlight);
+            assert_eq!(hc.selected_text, HC_WHITE.highlight_text);
+        }
+    }
+
+    // #579: the palette is a top-level window, so Windows broadcasts every
+    // theme change to it even while it is hidden.
+    mod live_theme_tests {
+        use super::*;
+        use crate::ui::theme::HC_BLACK;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, DeleteDC, GetBkColor, GetDC, GetTextColor, ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{WM_SYSCOLORCHANGE, WM_THEMECHANGED};
+
+        fn live_colors() -> PaletteColors {
+            let (theme, sys) = (detect_theme(), SysColors::read());
+            palette_colors(theme, &sys, live_accent(theme, &sys))
+        }
+
+        #[test]
+        fn a_theme_message_makes_the_palette_read_the_system_again() {
+            for msg in [WM_THEMECHANGED, WM_SYSCOLORCHANGE] {
+                let mut p = Palette::new_for_test(instance()).unwrap();
+                // Stale colours, as if the theme had just changed.
+                p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+                assert_ne!(p.inner.colors, live_colors(), "the setup must differ");
+                unsafe {
+                    SendMessageW(p.hwnd(), msg, Some(WPARAM(0)), Some(LPARAM(0)));
+                }
+                assert_eq!(p.inner.colors, live_colors(), "message {msg:#x}");
+            }
+        }
+
+        #[test]
+        fn a_theme_setting_change_makes_the_palette_read_the_system_again() {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+            let name = wide_z("ImmersiveColorSet");
+            unsafe {
+                SendMessageW(
+                    p.hwnd(),
+                    WM_SETTINGCHANGE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(name.as_ptr() as isize)),
+                );
+            }
+            assert_eq!(p.inner.colors, live_colors());
+            // An unrelated setting leaves it alone.
+            p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+            let other = wide_z("intl");
+            unsafe {
+                SendMessageW(
+                    p.hwnd(),
+                    WM_SETTINGCHANGE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(other.as_ptr() as isize)),
+                );
+            }
+            assert_ne!(p.inner.colors, live_colors());
+        }
+
+        #[test]
+        fn a_forced_theme_ignores_theme_messages() {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.force_theme_for_gallery(Theme::Dark);
+            let forced = p.inner.colors;
+            assert_eq!(
+                forced,
+                palette_colors(Theme::Dark, &HC_BLACK, live_accent(Theme::Dark, &HC_BLACK))
+            );
+            unsafe {
+                SendMessageW(p.hwnd(), WM_THEMECHANGED, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+            assert_eq!(p.inner.colors, forced);
+        }
+
+        /// The query box is a child EDIT: without `WM_CTLCOLOREDIT` it keeps
+        /// the stock white background and black text in a dark palette.
+        #[test]
+        fn the_query_box_gets_the_palette_text_and_background_colours() {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.force_theme_for_gallery(Theme::Dark);
+            let (screen, hdc);
+            let result;
+            unsafe {
+                screen = GetDC(None);
+                hdc = CreateCompatibleDC(Some(screen));
+                result = SendMessageW(
+                    p.hwnd(),
+                    WM_CTLCOLOREDIT,
+                    Some(WPARAM(hdc.0 as usize)),
+                    Some(LPARAM(p.edit_hwnd().0 as isize)),
+                );
+            }
+            let colors = p.inner.colors;
+            let (bk, text) = unsafe { (GetBkColor(hdc), GetTextColor(hdc)) };
+            unsafe {
+                let _ = DeleteDC(hdc);
+                ReleaseDC(None, screen);
+            }
+            assert_ne!(result.0, 0, "WM_CTLCOLOREDIT must return a brush");
+            assert_eq!(bk.0, colors.background);
+            assert_eq!(text.0, colors.text);
+        }
+    }
     mod row_at_tests {
         use super::super::row_at;
 
@@ -1810,43 +2390,6 @@ mod tests {
         //          = 8 + 30 + 8 + 18 = 64
         const LIST_TOP: i32 = 64;
         const ROW_H: i32 = 26;
-
-        #[test]
-        fn selected_row_has_at_least_3_to_1_contrast_with_background() {
-            fn relative_luminance(color: windows::Win32::Foundation::COLORREF) -> f64 {
-                let channels = [
-                    color.0 & 0xFF,
-                    (color.0 >> 8) & 0xFF,
-                    (color.0 >> 16) & 0xFF,
-                ];
-
-                let linear = channels.map(|channel| {
-                    let value = channel as f64 / 255.0;
-                    if value <= 0.03928 {
-                        value / 12.92
-                    } else {
-                        ((value + 0.055) / 1.055).powf(2.4)
-                    }
-                });
-
-                0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
-            }
-
-            let background = windows::Win32::Foundation::COLORREF(0x0026_2626);
-            let selected = crate::ui::palette::selected_row_color();
-
-            let background_luminance = relative_luminance(background);
-            let selected_luminance = relative_luminance(selected);
-
-            let lighter = background_luminance.max(selected_luminance);
-            let darker = background_luminance.min(selected_luminance);
-            let contrast = (lighter + 0.05) / (darker + 0.05);
-
-            assert!(
-                contrast >= 3.0,
-                "selected row contrast must be at least 3:1, got {contrast:.2}:1"
-            );
-        }
 
         #[test]
         fn y_in_the_header_padding_above_the_list_is_none() {
@@ -1893,6 +2436,54 @@ mod tests {
         }
     }
 
+    /// #626: the UI gallery asks the window to paint into ITS device context
+    /// with `WM_PRINT`, which reaches `WM_PRINTCLIENT`. The Direct2D path only
+    /// ever draws to the window itself, and `PrintWindow` reads a surface it
+    /// never reaches, so without an arm the picture is a black page. Sends the
+    /// message into a memory bitmap and reads the pixels back.
+    #[test]
+    fn wm_print_paints_the_rows_into_the_given_dc() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+            SelectObject, HDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let dpi = unsafe { GetDpiForWindow(p.hwnd()) };
+        let (w, h) = (scale(WINDOW_WIDTH, dpi), window_height(dpi));
+        let (screen, mem, bmp);
+        unsafe {
+            screen = GetDC(None);
+            mem = CreateCompatibleDC(Some(screen));
+            bmp = CreateCompatibleBitmap(screen, w, h);
+            SelectObject(mem, bmp.into());
+            // PRF_CHECKVISIBLE | PRF_CHILDREN | PRF_CLIENT | PRF_ERASEBKGND
+            SendMessageW(
+                p.hwnd(),
+                WM_PRINT,
+                Some(WPARAM(mem.0 as usize)),
+                Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
+            );
+        }
+        let pixel = |x: i32, y: i32| unsafe { GetPixel(mem as HDC, x, y) };
+        // Rows start below the edit and the summary band; the first action
+        // row (after the group header) is the selected one.
+        let list_top = scale(PADDING + EDIT_HEIGHT + PADDING + ROUTER_SUMMARY_HEIGHT, dpi);
+        let selected_y = list_top + scale(ROW_HEIGHT, dpi) + scale(ROW_HEIGHT, dpi) / 2;
+        let selected = pixel(w - scale(PADDING, dpi) - 4, selected_y);
+        let empty = pixel(w / 2, h - scale(FOOTER_HEIGHT, dpi) - 4);
+        unsafe {
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+        }
+        assert_eq!(
+            selected.0, p.inner.colors.selected_fill,
+            "the selected row fill"
+        );
+        assert_eq!(empty.0, p.inner.colors.background, "the palette background");
+    }
     #[test]
     fn window_and_edit_control_are_created() {
         let p = Palette::new_for_test(instance()).expect("palette window creation must succeed");
@@ -2376,6 +2967,45 @@ mod tests {
         );
     }
 
+    /// #361: the palette is a `WS_POPUP`, which DWM leaves square unless asked.
+    #[test]
+    fn the_palette_window_asks_for_rounded_corners() {
+        use windows::Win32::Graphics::Dwm::{
+            DwmGetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+            DWM_WINDOW_CORNER_PREFERENCE,
+        };
+        let p = Palette::new_for_test(instance()).unwrap();
+        let mut pref = DWM_WINDOW_CORNER_PREFERENCE(0);
+        unsafe {
+            DwmGetWindowAttribute(
+                p.hwnd(),
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &mut pref as *mut DWM_WINDOW_CORNER_PREFERENCE as *mut c_void,
+                std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+            )
+            .expect("DwmGetWindowAttribute must read the corner preference back");
+        }
+        assert_eq!(pref, DWMWCP_ROUND);
+    }
+
+    /// #361: the router's suggestion is a hint, so it is set in semibold and
+    /// reads as different from the rows and headers around it.
+    #[test]
+    fn the_router_summary_is_semibold_and_the_rows_are_not() {
+        use windows::Win32::Graphics::DirectWrite::{
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        };
+        let p = Palette::new_for_test(instance()).unwrap();
+        let mut renderer = PaletteRenderer::new().expect("Direct2D factories");
+        assert!(renderer.ensure_target(p.hwnd(), 96, 560, 400));
+        let row = renderer.text_format.as_ref().unwrap();
+        let summary = renderer.summary_format.as_ref().unwrap();
+        assert_eq!(unsafe { row.GetFontWeight() }, DWRITE_FONT_WEIGHT_NORMAL);
+        assert_eq!(
+            unsafe { summary.GetFontWeight() },
+            DWRITE_FONT_WEIGHT_SEMI_BOLD
+        );
+    }
     // -- show latency (#25's Done-when: under 100 ms) -----------------------
 
     #[test]

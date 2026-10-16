@@ -422,7 +422,8 @@ Input: the OCR lines of the capture, an `AnchorRef`. Output: `Located`.
    `NotFound` (never "the last one"). `occurrence` 0 or missing is read as 1.
    Models count occurrences badly, so the prompt also asks for enough context
    in the quote to make it unique, and a quote that is unique on screen ignores
-   `occurrence`.
+   `occurrence`. Read together: exactly one match ignores `occurrence`; with two
+   or more, an `occurrence` past the end is `NotFound`.
 6. **Guard rails.** A quote shorter than 2 characters, longer than 400, or
    containing a redaction marker (`[card number 1]`, see Privacy) is
    `NotFound`. No indexing or slicing on untrusted text: char boundaries
@@ -922,12 +923,33 @@ Each ships alone and has an observable.
    CRLF-normalised, candidate set asserted non-empty). The extracted `redact`
    helpers do have a caller from the first commit. Observable: the unit tests,
    and `redact` still passes after the extraction. Nothing user-visible.
+   As built (#808): `anchor.rs`, `layout.rs`, `alpha.rs` and `state.rs` under
+   `src/overlay/`. Decisions taken while building it: (a) a quote with exactly
+   one match ignores `occurrence`; with two or more matches, an `occurrence`
+   past the end is `NotFound`; (b) fuzzy matching folds the OCR confusions
+   `rn`/`m`, `1`/`l` and `0`/`o` first; a quote with a digit in it is
+   exact-only, a quote under 9 characters gets no edits (so `Send` never
+   matches `Sent`, nor `1000` `1900`), and from 9 characters the budget is one
+   edit per 8, rounded up. It is to be tuned from the fixture hit rate;
+   (c) punctuation stuck to either end of a word is ignored on both sides;
+   (d) the matcher trusts OCR word boxes over line text, so it did not need to
+   extract `word_byte_ranges`; the only `redact.rs` addition is
+   `contains_marker`. Left to later slices: the prompt-side line-number hint,
+   `Annotation.action` (slice 7), the `tests/fixtures/overlay/` hit-rate test,
+   and sharing the Esc-claim function with the options card (`state.rs` has an
+   Esc-only claim of its own until that card exists).
 2. **The window, and one real annotation.** `ui/overlay.rs`, the hooks and the
    main-thread decision path, the affinity flag and its fail-closed rule, the
    gallery states, `Action.output` (default `"card"`) and `Action.detector`,
    the generic runner's model-free overlay branch, and a debug-only action that
    marks a word. Observable: Manual checks 1, 3, 6 and 7. Gate: Manual check 1
-   must pass or this design is wrong and is revised.
+   must pass or this design is wrong and is revised. When `state::Overlay::show`
+   returns `Err(Refused)`, the window code must remove every hook and the timer
+   named in `undo` before it shows the summary card alone, and a test covers
+   that path (a failing `SetTimer`, and a failing hook part way through).
+   `Overlay::show` also refuses when no target window is left once Wingman's
+   own windows are removed, and `layout::place_labels` takes the gap already
+   scaled for the monitor's DPI (`GAP_DESIGN_PX` times the scale).
 3. **Units overlay (#325's first user).** `5 km` gets `3.1 mi`, `72 F` gets
    `22 C`, via `calc/units.rs` and `detector = "units"`. No model, works
    offline, reachable from the palette, the tray and the options card's static
@@ -1012,7 +1034,10 @@ is the decision.
    stale overlay is a correctness problem and a stale card line is not.
 7. **Decision: fuzzy matching ships in the first slice, with the
    unique-match rule.** OCR misreads (`l`/`1`, `rn`/`m`) are the common
-   failure. Tune the threshold from the fixture hit rate.
+   failure. Tune the threshold from the fixture hit rate. As built: one edit
+   per 8 characters, rounded up, from 9 characters of quote (shorter quotes
+   get no edits and a quote with a digit is exact-only), after folding
+   `rn`/`m`, `1`/`l`, `0`/`o`.
 8. **Decision: in #332's schema, `steps` comes before `detail`** (see "Domain
    schemas"). The issue text says headline first, which conflicts with the
    code and with rule 3.
