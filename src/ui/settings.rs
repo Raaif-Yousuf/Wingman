@@ -104,6 +104,7 @@ use crate::hotkey::{
     LearnedVerdict, HK_PRIMARY, HK_SECONDARY, WM_APP_LEARNED,
 };
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
+use crate::provider::ollama_gpu_fix;
 use crate::provider::DEFAULT_PROMPT;
 
 // ---------------------------------------------------------------------------
@@ -485,6 +486,8 @@ struct SettingsInner {
     /// #343: where the Ollama group's link button goes, if it has one. Set
     /// when the status probe reports (#527).
     ollama_link_url: Option<&'static str>,
+    /// #382: the button is "Fix it" (the Intel GPU fix) rather than a link.
+    ollama_fix: bool,
     /// #527: the Ollama status probe's result, filled by its worker.
     ollama_status: OllamaStatusSlot,
     /// #183: the pulled-model list the background fetch reports into.
@@ -542,6 +545,7 @@ impl SettingsInner {
             body: HWND(std::ptr::null_mut()),
             body_dpi: 96,
             ollama_link_url: None,
+            ollama_fix: false,
             ollama_status: Default::default(),
             ollama_tags: Default::default(),
             cloud_models: Default::default(),
@@ -745,6 +749,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 let _ = DestroyWindow(inner.hwnd);
             }
         }
+        ID_OLLAMA_LINK if notify == BN_CLICKED && inner.ollama_fix => start_gpu_fix(inner),
         ID_OLLAMA_LINK if notify == BN_CLICKED => {
             if let Some(url) = inner.ollama_link_url {
                 if !open_url(url) {
@@ -2629,12 +2634,13 @@ fn spawn_ollama_status_probe(
     let _ = std::thread::Builder::new()
         .name("settings-ollama-status".into())
         .spawn(move || {
-            let (status, listening, stock_tray) = ollama_status_line(&cfg, ollama_configured);
+            let (status, listening, stock_tray, gpu) = ollama_status_line(&cfg, ollama_configured);
             // Only searched for when nothing listens: it is not needed
             // otherwise.
             let installed = !listening && ollama_installed();
             let section = ollama_section(status, listening, installed, ollama_configured);
             let section = without_link_for_stock_tray(section, stock_tray);
+            let section = with_gpu_fix(section, gpu_fix_offered(listening, stock_tray, gpu));
             if let Ok(mut guard) = slot.lock() {
                 *guard = Some(section);
             }
@@ -2656,11 +2662,14 @@ fn apply_ollama_section(inner: &mut SettingsInner, section: &OllamaSection) {
         set_text(status, &section.text);
     }
     inner.ollama_link_url = section.link.map(|(_, url)| url);
+    inner.ollama_fix = section.fix;
     if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
-        if let Some((label, _)) = section.link {
+        if section.fix {
+            set_text(link, "Fix it");
+        } else if let Some((label, _)) = section.link {
             set_text(link, label);
         }
-        let cmd = if section.link.is_some() {
+        let cmd = if section.link.is_some() || section.fix {
             SW_SHOW
         } else {
             SW_HIDE
@@ -2937,6 +2946,9 @@ struct OllamaSection {
     text: String,
     /// `(button label, url)`.
     link: Option<(&'static str, &'static str)>,
+    /// #382: the button is "Fix it" (Ollama is on the CPU of an Intel GPU
+    /// machine), not a link.
+    fix: bool,
 }
 
 /// Turns the status line into an actionable section (#343). `status` is the
@@ -2959,11 +2971,13 @@ fn ollama_section(
                 text: "Ollama is installed but not running. Start Ollama, then reopen Settings."
                     .to_string(),
                 link: None,
+                fix: false,
             }
         } else {
             OllamaSection {
                 text: "Ollama runs AI models on this PC, free and offline.".to_string(),
                 link: Some(("Get Ollama", OLLAMA_DOWNLOAD_URL)),
+                fix: false,
             }
         };
     }
@@ -2978,6 +2992,7 @@ fn ollama_section(
     OllamaSection {
         text,
         link: Some(("Local models", OLLAMA_DOCS_URL)),
+        fix: false,
     }
 }
 
@@ -2989,6 +3004,107 @@ fn without_link_for_stock_tray(mut section: OllamaSection, stock_tray: bool) -> 
         section.link = None;
     }
     section
+}
+
+/// #382: whether the "Fix it" button is offered: an Intel GPU is present
+/// (DXGI vendor id) and Ollama is on the CPU. Portable mode never writes the
+/// registry (#130), so it never offers it. DXGI is only asked when the other
+/// conditions already hold.
+fn gpu_fix_offered(listening: bool, stock_tray: bool, gpu: Option<GpuStatus>) -> bool {
+    let kind = match (listening, stock_tray) {
+        (false, _) => None,
+        (true, true) => Some(ListenerKind::StockTrayServer),
+        (true, false) => Some(ListenerKind::Other),
+    };
+    // Cheap check first: only enumerate adapters when it could matter.
+    if !ollama_gpu_fix::should_offer_fix(true, kind, gpu) || crate::portable::is_portable() {
+        return false;
+    }
+    ollama_gpu_fix::should_offer_fix(
+        ollama_gpu_fix::has_intel_gpu(&ollama_gpu_fix::adapter_vendor_ids()),
+        kind,
+        gpu,
+    )
+}
+
+/// #382: swaps the section for the fix offer: the text says what the button
+/// will do, and the button is "Fix it" instead of a link.
+fn with_gpu_fix(mut section: OllamaSection, offered: bool) -> OllamaSection {
+    if offered {
+        section.text = ollama_gpu_fix::OFFER_TEXT.to_string();
+        section.link = None;
+        section.fix = true;
+    }
+    section
+}
+
+/// #382: the "Fix it" click. Runs [`ollama_gpu_fix::run_fix`] on a worker
+/// (it stops and starts Ollama and can take a minute), showing each step in
+/// the status text through the same slot and message the probe uses. The
+/// button is hidden while it runs and comes back only if the result says to
+/// try again. Not run in tests: it kills real processes.
+fn start_gpu_fix(inner: &mut SettingsInner) {
+    inner.ollama_fix = false;
+    if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
+        unsafe {
+            let _ = ShowWindow(link, SW_HIDE);
+        }
+    }
+    if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
+        set_text(status, ollama_gpu_fix::RUNNING_TEXT);
+    }
+    let cfg = inner.original.providers.ollama.clone();
+    let slot = inner.ollama_status.clone();
+    let alive = inner.alive.clone();
+    let hwnd_raw = inner.hwnd.0 as isize;
+    let post = move |slot: &OllamaStatusSlot, section: OllamaSection| {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(section);
+        }
+        post_while_open(&alive, || unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd_raw as *mut c_void)),
+                WM_OLLAMA_STATUS,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        });
+    };
+    let spawned = std::thread::Builder::new()
+        .name("settings-ollama-gpu-fix".into())
+        .spawn(move || {
+            let mut sys = ollama_gpu_fix::RealSystem {
+                port: ollama_admin::port_from_base_url(&cfg.base_url).unwrap_or(11434),
+                base_url: cfg.base_url.clone(),
+                model: cfg.model.clone(),
+            };
+            let mut step = |line: &str| {
+                post(
+                    &slot,
+                    OllamaSection {
+                        text: format!("Fixing: {line}"),
+                        link: None,
+                        fix: false,
+                    },
+                )
+            };
+            let outcome =
+                ollama_gpu_fix::run_fix(&mut sys, ollama_gpu_fix::default_exe(), &mut step);
+            post(
+                &slot,
+                OllamaSection {
+                    text: outcome.message(),
+                    link: None,
+                    fix: outcome.retryable(),
+                },
+            );
+        });
+    if spawned.is_err() {
+        // Rule 7: say so inline. Nothing was touched.
+        if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
+            set_text(status, "Could not start the fix. Nothing was changed.");
+        }
+    }
 }
 
 /// Where an Ollama install would be (#343): the default per-user install
@@ -3112,7 +3228,10 @@ fn health_message(health: &OllamaHealth) -> String {
 /// can make (`/api/ps`, `/api/tags`) only run when
 /// [`should_query_ollama_details`] says so (#188), and are bounded by
 /// [`OLLAMA_STATUS_HTTP_BUDGET`] in total when they do.
-fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, bool, bool) {
+fn ollama_status_line(
+    cfg: &OllamaConfig,
+    ollama_configured: bool,
+) -> (String, bool, bool, Option<GpuStatus>) {
     let port = ollama_admin::port_from_base_url(&cfg.base_url).unwrap_or(11434);
     let health = ollama_admin::query_ollama_health(port);
     let health_msg = health_message(&health);
@@ -3127,18 +3246,23 @@ fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, b
     );
 
     if !should_query_ollama_details(ollama_configured, &health) {
-        return (health_msg, listening, stock);
+        return (health_msg, listening, stock, None);
     }
 
     let budget_start = std::time::Instant::now();
-    let gpu_line = match ollama_admin::ps_with_timeout(&cfg.base_url, OLLAMA_STATUS_HTTP_BUDGET) {
-        Ok(entries) => match ollama_admin::gpu_status_for(&entries, &cfg.model) {
-            GpuStatus::Gpu => format!("{} is loaded on GPU.", cfg.model),
-            GpuStatus::Cpu => format!("{} is loaded on CPU.", cfg.model),
-            GpuStatus::NotLoaded => format!("{} is not loaded yet.", cfg.model),
-        },
-        Err(_) => return (health_msg, listening, stock),
-    };
+    let (gpu, gpu_line) =
+        match ollama_admin::ps_with_timeout(&cfg.base_url, OLLAMA_STATUS_HTTP_BUDGET) {
+            Ok(entries) => {
+                let gpu = ollama_admin::gpu_status_for(&entries, &cfg.model);
+                let line = match gpu {
+                    GpuStatus::Gpu => format!("{} is loaded on GPU.", cfg.model),
+                    GpuStatus::Cpu => format!("{} is loaded on CPU.", cfg.model),
+                    GpuStatus::NotLoaded => format!("{} is not loaded yet.", cfg.model),
+                };
+                (gpu, line)
+            }
+            Err(_) => return (health_msg, listening, stock, None),
+        };
 
     // Whatever's left of the budget after `/api/ps`, capped at zero rather
     // than going negative -- a slow first call must not hand the second
@@ -3166,6 +3290,7 @@ fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, b
         join_within(OLLAMA_TEXT_BUDGET, &[&health_msg, &gpu_line, &vision_line]),
         listening,
         stock,
+        Some(gpu),
     )
 }
 
@@ -5406,8 +5531,26 @@ mod tests {
         };
         assert_eq!(
             ollama_status_line(&cfg, true),
-            ("Ollama is not running.".to_string(), false, false)
+            ("Ollama is not running.".to_string(), false, false, None)
         );
+    }
+
+    // -- GPU fix section (#382, pure) ---------------------------------------
+
+    #[test]
+    fn with_gpu_fix_replaces_the_text_and_makes_the_button_a_fix() {
+        let running = ollama_section("Ollama is running.".to_string(), true, true, true);
+        let fixed = with_gpu_fix(running.clone(), true);
+        assert!(fixed.fix);
+        assert_eq!(fixed.link, None);
+        assert_eq!(fixed.text, ollama_gpu_fix::OFFER_TEXT);
+        assert_eq!(with_gpu_fix(running.clone(), false), running);
+    }
+
+    #[test]
+    fn the_gpu_fix_offer_is_never_made_when_nothing_listens() {
+        assert!(!gpu_fix_offered(false, false, None));
+        assert!(!gpu_fix_offered(true, false, Some(GpuStatus::Gpu)));
     }
 
     // -- ollama_section (#343, pure) ---------------------------------------
@@ -6082,7 +6225,7 @@ mod tests {
             effort: "low".to_string(),
         };
 
-        let (status, _, _) = ollama_status_line(&cfg, false);
+        let (status, _, _, _) = ollama_status_line(&cfg, false);
         // The Win32-only health check still runs (it's cheap) and is all
         // this status line shows when not configured -- no GPU/CPU or
         // vision-count sentence appended, which is what the HTTP calls
