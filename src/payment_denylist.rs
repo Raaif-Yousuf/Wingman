@@ -111,6 +111,32 @@ pub fn contains_card_number(text: &str) -> bool {
     false
 }
 
+/// A space-like character that may join the groups of a printed number: the
+/// ASCII space plus the Unicode space separators (no-break space, narrow
+/// no-break space, thin space and the rest of category Zs). Web pages and PDFs
+/// often print `4111&nbsp;1111&nbsp;...`, and copying keeps the no-break space
+/// (#726). Line breaks and tabs are not included, so a run still cannot span
+/// a line.
+fn is_space_separator(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
+}
+
+/// A separator between the digit groups of a card number: any space from
+/// [`is_space_separator`] or a hyphen-like character (ASCII hyphen, U+2010 to
+/// U+2015 including the non-breaking hyphen, minus sign U+2212, small and
+/// full-width hyphen-minus).
+fn is_card_separator(c: char) -> bool {
+    is_space_separator(c)
+        || matches!(
+            c,
+            '-' | '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{FE63}' | '\u{FF0D}'
+        )
+}
+
 /// Extracts maximal runs of `[0-9 -]` from `text`, returning just the
 /// digits of each run (separators stripped), split wherever a character
 /// outside that set appears. A run with fewer than 2 digits is not
@@ -121,7 +147,7 @@ fn digit_runs_with_separators(text: &str) -> Vec<String> {
     for ch in text.chars() {
         if ch.is_ascii_digit() {
             current.push(ch);
-        } else if ch == ' ' || ch == '-' {
+        } else if is_card_separator(ch) {
             // separator inside a run: keep scanning, contributes no digit
         } else {
             if current.len() >= 2 {
@@ -205,7 +231,7 @@ pub fn card_number_spans_with_known_prefix(text: &str) -> Vec<std::ops::Range<us
 
 fn card_spans_where(text: &str, accept: impl Fn(&str) -> bool) -> Vec<std::ops::Range<usize>> {
     let mut spans = Vec::new();
-    for run in runs_of(text, |c| c.is_ascii_digit() || c == ' ' || c == '-') {
+    for run in runs_of(text, |c| c.is_ascii_digit() || is_card_separator(c)) {
         let groups = groups_of(text, run, |c| c.is_ascii_digit());
         spans.extend(passing_windows(text, &groups, 19, |digits| {
             digits.len() >= 12 && luhn_valid(digits) && accept(digits)
@@ -218,7 +244,7 @@ fn card_spans_where(text: &str, accept: impl Fn(&str) -> bool) -> Vec<std::ops::
 /// with positions and merging as in [`card_number_spans`].
 pub fn iban_spans(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut spans = Vec::new();
-    for run in runs_of(text, |c| c.is_ascii_alphanumeric() || c == ' ') {
+    for run in runs_of(text, |c| c.is_ascii_alphanumeric() || is_space_separator(c)) {
         let groups = groups_of(text, run, |c| c.is_ascii_alphanumeric());
         spans.extend(passing_windows(text, &groups, 34, |s| {
             s.len() >= 15 && iban_mod97_valid(s)
@@ -306,7 +332,7 @@ fn alnum_runs_with_spaces(text: &str) -> Vec<String> {
     for ch in text.chars() {
         if ch.is_ascii_alphanumeric() {
             current.push(ch.to_ascii_uppercase());
-        } else if ch == ' ' {
+        } else if is_space_separator(ch) {
             // separator inside a run
         } else {
             if current.len() >= 4 {
@@ -494,6 +520,47 @@ mod tests {
     #[test]
     fn card_number_with_hyphens_is_detected() {
         assert!(contains_card_number("4111-1111-1111-1111"));
+    }
+
+    /// Separators #726 names, placed between the groups of one Visa test number.
+    const CARD_SEPARATORS: [char; 10] = [
+        '\u{A0}', '\u{202F}', '\u{2009}', '\u{3000}', '\u{2010}', '\u{2011}', '\u{2012}',
+        '\u{2013}', '\u{2014}', '\u{2212}',
+    ];
+
+    fn card_with(sep: char) -> String {
+        ["4111", "1111", "1111", "1111"].join(&sep.to_string())
+    }
+
+    #[test]
+    fn card_number_with_unicode_separators_is_found_everywhere() {
+        for sep in CARD_SEPARATORS {
+            let card = card_with(sep);
+            let text = format!("pay {card} now");
+            assert!(contains_card_number(&card), "contains {sep:?}");
+            assert_eq!(card_number_spans(&text).len(), 1, "spans {sep:?}");
+            let known = card_number_spans_with_known_prefix(&text);
+            assert_eq!(known.len(), 1, "known prefix {sep:?}");
+            // The kept text is untouched: the span is exactly the number.
+            assert_eq!(&text[known[0].clone()], card, "range {sep:?}");
+        }
+    }
+
+    #[test]
+    fn iban_with_no_break_spaces_is_found() {
+        for sep in ['\u{A0}', '\u{202F}', '\u{2009}'] {
+            let iban = ["GB29", "NWBK", "6016", "1331", "9268", "19"].join(&sep.to_string());
+            assert!(contains_iban(&iban), "contains {sep:?}");
+            assert_eq!(iban_spans(&iban), vec![0..iban.len()], "spans {sep:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_break_still_ends_a_number() {
+        for br in ['\n', '\r', '\u{2028}', '\t'] {
+            let text = format!("4111 1111{br}1111 1111");
+            assert!(card_number_spans(&text).is_empty(), "break {br:?}");
+        }
     }
 
     #[test]
