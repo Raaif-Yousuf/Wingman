@@ -755,6 +755,7 @@ mod driver {
                     crate::mode::Mode::Auto,
                     &providers,
                     "config.toml",
+                    None,
                 );
                 card.show_settings_needed(&headline, &detail);
             }

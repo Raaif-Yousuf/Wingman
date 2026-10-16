@@ -785,6 +785,31 @@ fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
     mode == Mode::Offline || load_problem.is_none()
 }
 
+/// #892: [`config_problem_card`] with where the file is, for the cards that
+/// replace a setup card: the user must be told which file to open.
+fn broken_file_card(problem: &str, config_path: &str) -> (String, String) {
+    let (headline, detail) = config_problem_card(problem);
+    (
+        headline,
+        format!("{detail}\n\nThe file is here (tray menu, Open config.toml):\n{config_path}"),
+    )
+}
+
+/// #892: [`App::readiness_gate`], except that when config.toml did not parse
+/// the blocked card names the file instead of the mode's setup text.
+fn setup_gate(
+    mode: Mode,
+    providers: &Providers,
+    config_path: &str,
+    load_problem: Option<&str>,
+) -> Option<(String, String)> {
+    let blocked = App::readiness_gate(mode, providers, config_path)?;
+    Some(match load_problem {
+        Some(problem) => broken_file_card(problem, config_path),
+        None => blocked,
+    })
+}
+
 /// #711: config.toml exists but did not parse. Names the line and column
 /// (`problem` already carries them), never file text. No em dash (rule 11).
 fn config_problem_card(problem: &str) -> (String, String) {
@@ -1163,9 +1188,12 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        let Some((headline, mut detail)) =
-            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-        else {
+        let Some((headline, mut detail)) = setup_gate(
+            self.config.mode,
+            &self.config.providers,
+            &path,
+            self.config.load_problem.as_deref(),
+        ) else {
             let pending = matches!(self.card.state(), crate::ui::card::CardState::Pending);
             if should_hide_after_first_run(pending, self.busy) {
                 self.card.hide();
@@ -1313,8 +1341,13 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        let blocked = Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-            .filter(|_| plan.require_provider);
+        let blocked = setup_gate(
+            self.config.mode,
+            &self.config.providers,
+            &path,
+            self.config.load_problem.as_deref(),
+        )
+        .filter(|_| plan.require_provider);
         if let Some((headline, detail)) = blocked {
             // #133: nothing is set up. Look for a local Ollama on a worker
             // (never here: this is the keyboard hook's thread), once per
@@ -3586,7 +3619,12 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        empty_chain_card(self.config.mode, &self.config.providers, &path)
+        empty_chain_card(
+            self.config.mode,
+            &self.config.providers,
+            &path,
+            self.config.load_problem.as_deref(),
+        )
     }
 
     /// #832: for the action result handlers. When the run failed only
@@ -6467,7 +6505,13 @@ pub(crate) fn empty_chain_card(
     mode: Mode,
     providers: &Providers,
     config_path: &str,
+    load_problem: Option<&str>,
 ) -> (String, String) {
+    // #892: the defaults standing in for an unreadable file are not what the
+    // user needs to hear about.
+    if let Some(problem) = load_problem {
+        return broken_file_card(problem, config_path);
+    }
     if mode == Mode::Auto
         && crate::mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
     {
@@ -8198,11 +8242,40 @@ mod tests {
     #[test]
     fn empty_chain_card_says_ollama_is_not_running_when_only_ollama_is_listed() {
         let (headline, detail) =
-            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), "config.toml");
+            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), "config.toml", None);
         assert_eq!(headline, "Ollama is not running");
         assert!(detail.contains("Start Ollama"), "{detail}");
         assert!(detail.contains("Settings"), "{detail}");
         assert!(!detail.contains("Try again"), "{detail}");
+    }
+
+    /// #892: a config.toml that did not parse starts the run on default
+    /// providers; the setup card must name the file, not tell the user to
+    /// edit `providers.order` in the file Wingman could not read.
+    #[test]
+    fn a_file_that_did_not_parse_is_named_by_the_gate_and_the_empty_chain_card() {
+        let problem = Some("config.toml has an error at line 3, column 1");
+        let path = "C:\\Users\\me\\config.toml";
+        let providers = nothing_configured_providers();
+        let cards = [
+            super::setup_gate(Mode::Offline, &providers, path, problem).expect("blocked"),
+            super::empty_chain_card(Mode::Offline, &providers, path, problem),
+            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), path, problem),
+        ];
+        for (headline, detail) in cards {
+            assert_eq!(headline, "Settings file not read");
+            assert!(detail.contains("line 3, column 1"), "{detail}");
+            assert!(detail.contains(path), "{detail}");
+            assert!(detail.contains("Open config.toml"), "{detail}");
+            assert!(!detail.contains("providers.order"), "{detail}");
+            assert!(!detail.contains('\u{2014}'));
+        }
+        // No problem: the old cards, unchanged. A ready provider still passes.
+        assert_eq!(
+            super::setup_gate(Mode::Offline, &providers, path, None),
+            App::readiness_gate(Mode::Offline, &providers, path)
+        );
+        assert!(super::setup_gate(Mode::Cloud, &cloud_ready_providers(), path, problem).is_none());
     }
 
     #[test]
@@ -8212,7 +8285,8 @@ mod tests {
             Some(super::empty_chain_card(
                 Mode::Auto,
                 &providers,
-                "config.toml"
+                "config.toml",
+                None
             )),
             App::readiness_gate(Mode::Auto, &providers, "config.toml")
         );
@@ -8221,7 +8295,8 @@ mod tests {
     #[test]
     fn empty_chain_cards_have_no_em_dash() {
         for providers in [ollama_only_providers(), nothing_configured_providers()] {
-            let (headline, detail) = super::empty_chain_card(Mode::Auto, &providers, "c.toml");
+            let (headline, detail) =
+                super::empty_chain_card(Mode::Auto, &providers, "c.toml", None);
             assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
         }
     }
