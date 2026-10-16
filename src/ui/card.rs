@@ -595,12 +595,13 @@ impl Card {
         self.inner.move_footer_focus(false);
     }
 
-    /// The UI gallery's preview error title: puts `message` where the
-    /// preview's title goes, as a rejected edit does.
+    /// The UI gallery's preview error: shows `message` under the preview's
+    /// title, as a rejected edit does.
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn set_preview_error_for_gallery(&mut self, message: &str) {
         if let Some(preview) = self.inner.preview.as_mut() {
             preview.error = Some(message.to_string());
+            self.inner.relayout_current_state();
             self.inner.invalidate();
         }
     }
@@ -1186,7 +1187,43 @@ fn next_footer_focus(
     Some(links[next])
 }
 
-/// The title line of a preview that rejected an edit. High contrast has one
+/// Draws a solid frame `thickness` px wide just inside `rect`, in `color`.
+unsafe fn frame_rect(hdc: HDC, rect: &RECT, thickness: i32, color: u32) {
+    let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(color));
+    let t = thickness.max(1);
+    let edges = [
+        RECT {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.top + t,
+        },
+        RECT {
+            left: rect.left,
+            top: rect.bottom - t,
+            right: rect.right,
+            bottom: rect.bottom,
+        },
+        RECT {
+            left: rect.left,
+            top: rect.top + t,
+            right: rect.left + t,
+            bottom: rect.bottom - t,
+        },
+        RECT {
+            left: rect.right - t,
+            top: rect.top + t,
+            right: rect.right,
+            bottom: rect.bottom - t,
+        },
+    ];
+    for edge in &edges {
+        FillRect(hdc, edge, brush);
+    }
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+/// The message of a preview that rejected an edit. High contrast has one
 /// ink for everything (#648), so the message says it is an error in words.
 fn preview_error_title(message: &str, theme: Theme) -> String {
     if theme == Theme::HighContrast && !message.starts_with("Error") {
@@ -2774,9 +2811,19 @@ impl CardInner {
         let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
 
         // Dim full ring underneath (also the whole glyph when static).
+        // High contrast has one ink, so the track and the arc would be the
+        // same line: the track goes hairline so the thick arc still shows
+        // progress (#817).
+        let track_stroke = if self.theme == Theme::HighContrast
+            && pending_glyph_should_spin(self.animations_enabled)
+        {
+            1
+        } else {
+            stroke
+        };
         let ring_pen = CreatePen(
             PS_SOLID,
-            stroke,
+            track_stroke,
             windows::Win32::Foundation::COLORREF(palette.border),
         );
         if !ring_pen.0.is_null() {
@@ -3023,17 +3070,25 @@ impl CardInner {
                 );
             }
         }
-        // #606: the system focus rectangle round the link Tab has reached.
-        // It inverts what is under it, so it shows in light, dark and high
-        // contrast alike.
+        // #606, #817: a 2 px solid ring round the link Tab has reached, in the
+        // text ink with a thin ring of the surface inside it, so it shows on
+        // the card in light, dark and high contrast alike.
         if let Some(rect) = self.focus_link.and_then(|l| self.link_rect(l)) {
             let ring = RECT {
-                left: rect.left - 2,
-                top: rect.top - 1,
-                right: rect.right + 2,
-                bottom: rect.bottom + 1,
+                left: rect.left - 3,
+                top: rect.top - 2,
+                right: rect.right + 3,
+                bottom: rect.bottom + 2,
             };
-            let _ = windows::Win32::Graphics::Gdi::DrawFocusRect(hdc, &ring);
+            let thickness = self.scale(2).max(2);
+            frame_rect(hdc, &ring, thickness, palette.headline);
+            let inner = RECT {
+                left: ring.left + thickness,
+                top: ring.top + thickness,
+                right: ring.right - thickness,
+                bottom: ring.bottom - thickness,
+            };
+            frame_rect(hdc, &inner, 1, palette.bg);
         }
     }
 
@@ -3526,6 +3581,8 @@ impl CardInner {
                     let _ = SetFocus(Some(hwnd));
                 }
             }
+            // The message takes a line of its own, so the card grows.
+            self.relayout_current_state();
             unsafe {
                 let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, false);
             }
@@ -3913,6 +3970,27 @@ impl CardInner {
         };
         y += title_h + gap;
 
+        // #817: a rejected edit keeps the title and shows its message on a
+        // line of its own under it, instead of replacing the title.
+        let error_rect = self
+            .preview
+            .as_ref()
+            .and_then(|p| p.error.as_deref())
+            .map(|message| {
+                let text = preview_error_title(message, self.theme);
+                let h = self
+                    .measure_wrapped(self.fonts.body, &text, content_width)
+                    .max(self.line_height(self.fonts.body).max(1));
+                let rect = RECT {
+                    left: content_left,
+                    top: y,
+                    right: content_right,
+                    bottom: y + h,
+                };
+                y += h + gap;
+                rect
+            });
+
         // The row is also an editable field's box: at least the design
         // height, and always the text line plus the padding above and below
         // (a larger text scale must not squeeze the padding away, #811).
@@ -4069,6 +4147,7 @@ impl CardInner {
             width,
             window_h,
             title_rect,
+            error_rect,
             note_rect,
             rows,
             buttons: PreviewButtonMetrics { do_it, edit },
@@ -4146,18 +4225,22 @@ impl CardInner {
         let title_rect = metrics.title_rect;
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-        if preview.error.is_some() {
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.danger));
-        }
         draw_text_line(
             hdc,
-            &preview.error.as_deref().map_or_else(
-                || preview.title.clone(),
-                |e| preview_error_title(e, self.theme),
-            ),
+            &preview.title,
             title_rect,
             DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
+        if let (Some(rect), Some(message)) = (metrics.error_rect, preview.error.as_deref()) {
+            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.danger));
+            draw_text_line(
+                hdc,
+                &preview_error_title(message, self.theme),
+                rect,
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
+            );
+        }
 
         for (field, row) in fields.iter().zip(metrics.rows.iter()) {
             let label_rect = row.label_rect;
@@ -4360,6 +4443,8 @@ struct PreviewLayoutMetrics {
     width: i32,
     window_h: i32,
     title_rect: RECT,
+    /// #817: where a rejected edit's message goes, `None` when there is none.
+    error_rect: Option<RECT>,
     /// #228: where the footer note goes, `None` when there is none.
     note_rect: Option<RECT>,
     /// Same length and order as the `fields` slice `compute_preview_layout`
@@ -5768,6 +5853,34 @@ mod tests {
         assert!(card.inner.focus_link.is_some());
         card.show_model_answer("next", "detail", 0, None);
         assert_eq!(card.inner.focus_link, None);
+    }
+
+    #[test]
+    fn a_rejected_edit_keeps_the_title_and_adds_a_message_line_below_it() {
+        // #817: the message used to replace the title.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let fields = card.inner.preview.as_ref().unwrap().model.fields().to_vec();
+        let plain = card.inner.compute_preview_layout(&fields, false);
+        assert!(plain.error_rect.is_none());
+
+        card.set_preview_error_for_gallery("Start must be a time, like 09:00.");
+        let with_error = card.inner.compute_preview_layout(&fields, false);
+        let err = with_error.error_rect.expect("an error row");
+        assert_eq!(with_error.title_rect.top, plain.title_rect.top);
+        assert!(err.top >= with_error.title_rect.bottom, "under the title");
+        assert!(
+            with_error.rows[0].label_rect.top >= err.bottom,
+            "above the fields"
+        );
+        assert!(with_error.window_h > plain.window_h, "the card grows");
+        assert_eq!(
+            card.inner.preview.as_ref().unwrap().title,
+            "Add to calendar",
+            "the title text is untouched"
+        );
     }
 
     #[test]
