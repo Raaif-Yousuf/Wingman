@@ -89,23 +89,24 @@ use windows::Win32::Graphics::Gdi::{
     Arc, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint,
     EnumDisplayMonitors, ExtCreatePen, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject,
-    GetTextMetricsW, IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect,
-    SelectClipRgn, SelectObject, SetBkColor, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT,
-    DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP,
-    DT_VCENTER, DT_WORDBREAK, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC,
-    PS_JOIN_ROUND, PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
+    GetTextMetricsW, IntersectClipRect, MapWindowPoints, MonitorFromPoint, MonitorFromWindow,
+    RedrawWindow, ReleaseDC, RoundRect, SelectClipRgn, SelectObject, SetBkColor, SetBkMode,
+    SetTextColor, BS_SOLID, DEFAULT_GUI_FONT, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_TOP, DT_VCENTER, DT_WORDBREAK, FW_NORMAL, FW_SEMIBOLD, HBRUSH,
+    HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN,
+    PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, RDW_ALLCHILDREN, RDW_INVALIDATE,
+    SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END, VK_ESCAPE,
-    VK_HOME, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetFocus, GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_HOME, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsChild,
-    IsWindow, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SendMessageW,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    IsChild, IsWindow, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
     HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETCLIENTAREAANIMATION,
@@ -113,9 +114,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
     WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
-    WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE,
+    WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -760,8 +761,49 @@ fn palette_for(theme: Theme, sys: &SysColors) -> Palette {
 /// unit-testable without a real window; the WM_CTLCOLOREDIT handler is the
 /// only caller and does the GDI calls (SetTextColor/SetBkColor/brush) this
 /// function has no business doing.
-fn edit_field_colors(palette: &Palette) -> (u32, u32) {
-    (palette.headline, palette.bg)
+fn edit_field_colors(palette: &Palette, theme: Theme, highlight: u32) -> (u32, u32) {
+    let look = field_look(palette, theme, highlight);
+    (look.text, look.fill)
+}
+
+/// How an editable preview field is drawn (#811): a 1 px outlined, rounded
+/// box on a slightly lifted fill, with an accent underline while it has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FieldLook {
+    fill: u32,
+    border: u32,
+    text: u32,
+    /// The 2 px line along the bottom edge of the focused field.
+    underline: u32,
+}
+
+/// The field colours for `theme`. Light lifts the card colour toward white
+/// (70 %), dark by 6 %, the way Windows 11 text boxes sit on a surface; the
+/// border is half way from the fill to the text colour, which holds 3:1
+/// against the fill (WCAG 1.4.11). High contrast is the system colours only:
+/// window fill, window-text border and underline.
+fn field_look(palette: &Palette, theme: Theme, highlight: u32) -> FieldLook {
+    use crate::ui::card_buttons::blend;
+    match theme {
+        Theme::HighContrast => FieldLook {
+            fill: palette.bg,
+            border: palette.border,
+            text: palette.headline,
+            // A 2 px ring in the system highlight colour, distinct from the
+            // window-text border (see `paint_field_frame`).
+            underline: highlight,
+        },
+        Theme::Light | Theme::Dark => {
+            let lift = if theme == Theme::Light { 70 } else { 6 };
+            let fill = blend(palette.bg, 0x00FF_FFFF, lift);
+            FieldLook {
+                fill,
+                border: blend(fill, palette.headline, 50),
+                text: palette.headline,
+                underline: crate::ui::card_buttons::system_accent(theme, fill),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3013,7 +3055,7 @@ impl CardInner {
             WM_CTLCOLOREDIT => {
                 let hdc = HDC(wparam.0 as *mut _);
                 let palette = self.palette();
-                let (text, bg) = edit_field_colors(&palette);
+                let (text, bg) = edit_field_colors(&palette, self.theme, self.sys.highlight);
                 unsafe {
                     SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text));
                     SetBkColor(hdc, windows::Win32::Foundation::COLORREF(bg));
@@ -3635,11 +3677,13 @@ impl CardInner {
             if !field.editable {
                 continue;
             }
-            let rect = if field.multiline {
-                row.value_rect
-            } else {
-                centered_edit_rect(&row.value_rect, self.line_height(font))
-            };
+            let rect = field_edit_rect(
+                &row.value_rect,
+                self.line_height(font),
+                field.multiline,
+                self.scale(FIELD_PAD_X_DP),
+                self.scale(FIELD_PAD_Y_DP),
+            );
             if let Some(hwnd) = create_preview_edit(parent, instance, font, &field.value, &rect) {
                 subclass_preview_control(hwnd, parent);
                 edits.push((field.name.clone(), hwnd));
@@ -3703,11 +3747,13 @@ impl CardInner {
         for (name, hwnd) in &preview.edits {
             if let Some(idx) = fields.iter().position(|f| &f.name == name) {
                 let cell = metrics.rows[idx].value_rect;
-                let r = &if fields[idx].multiline {
-                    cell
-                } else {
-                    centered_edit_rect(&cell, self.line_height(font))
-                };
+                let r = &field_edit_rect(
+                    &cell,
+                    self.line_height(font),
+                    fields[idx].multiline,
+                    self.scale(FIELD_PAD_X_DP),
+                    self.scale(FIELD_PAD_Y_DP),
+                );
                 unsafe {
                     let _ = SetWindowPos(
                         *hwnd,
@@ -3806,9 +3852,12 @@ impl CardInner {
         };
         y += title_h + gap;
 
+        // The row is also an editable field's box: at least the design
+        // height, and always the text line plus the padding above and below
+        // (a larger text scale must not squeeze the padding away, #811).
         let row_h = self
             .scale(PREVIEW_ROW_H_DP)
-            .max(self.line_height(self.fonts.body));
+            .max(self.line_height(self.fonts.body) + 2 * self.scale(FIELD_PAD_Y_DP));
         let row_gap = self.scale(PREVIEW_ROW_GAP_DP);
         // #355: the label column used to be a fixed 84dp, truncating a long
         // label (e.g. "Date of birth") to "Date of bi..." exactly when the
@@ -3843,7 +3892,14 @@ impl CardInner {
                 // ends in an ellipsis when the text is longer).
                 let line_h = self.line_height(self.fonts.body).max(1);
                 let wrapped_h = self.measure_wrapped(self.fonts.body, &field.value, content_width);
-                let value_h = wrapped_h.clamp(line_h, line_h * PREVIEW_MULTILINE_MAX_LINES);
+                let text_h = wrapped_h.clamp(line_h, line_h * PREVIEW_MULTILINE_MAX_LINES);
+                // An editable field is a framed box, so its text needs room
+                // inside the frame (#811).
+                let value_h = if field.editable {
+                    text_h + 2 * self.scale(FIELD_PAD_Y_DP)
+                } else {
+                    text_h
+                };
                 let label_rect = RECT {
                     left: content_left,
                     top: y,
@@ -3958,6 +4014,64 @@ impl CardInner {
         }
     }
 
+    /// The frame of an editable field (#811): rounded 1 px border on the
+    /// lifted fill, and the accent underline while the field has focus.
+    unsafe fn paint_field_frame(&self, hdc: HDC, frame: &RECT, palette: &Palette, focused: bool) {
+        use windows::Win32::Foundation::COLORREF;
+        let look = field_look(palette, self.theme, self.sys.highlight);
+        let radius = self.scale(CONTROL_RADIUS_DP);
+        let brush = CreateSolidBrush(COLORREF(look.fill));
+        let pen = CreatePen(PS_SOLID, 1, COLORREF(look.border));
+        let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+        let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+        let _ = RoundRect(
+            hdc,
+            frame.left,
+            frame.top,
+            frame.right,
+            frame.bottom,
+            radius * 2,
+            radius * 2,
+        );
+        if focused && self.theme == Theme::HighContrast {
+            // High contrast: a 2 px ring all round in the system highlight
+            // colour, so focus is not the same ink as the border.
+            let ring_pen = CreatePen(
+                PS_SOLID,
+                self.scale(FIELD_UNDERLINE_DP).max(2),
+                COLORREF(look.underline),
+            );
+            let prev = SelectObject(hdc, HGDIOBJ(ring_pen.0));
+            let inset = 1;
+            let _ = RoundRect(
+                hdc,
+                frame.left + inset,
+                frame.top + inset,
+                frame.right - inset,
+                frame.bottom - inset,
+                radius * 2,
+                radius * 2,
+            );
+            SelectObject(hdc, prev);
+            let _ = DeleteObject(HGDIOBJ(ring_pen.0));
+        } else if focused {
+            let thickness = self.scale(FIELD_UNDERLINE_DP).max(2);
+            let line = RECT {
+                left: frame.left + radius,
+                top: frame.bottom - thickness,
+                right: frame.right - radius,
+                bottom: frame.bottom,
+            };
+            let accent = CreateSolidBrush(COLORREF(look.underline));
+            FillRect(hdc, &line, accent);
+            let _ = DeleteObject(HGDIOBJ(accent.0));
+        }
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+
     /// Paints the title line, every field's label, and every *non-editable*
     /// field's value (an editable field's value is shown by its live EDIT
     /// control instead, drawn by Windows on top of this same client area).
@@ -3998,10 +4112,18 @@ impl CardInner {
             };
             draw_text_line(hdc, &field.label, label_rect, label_format);
 
-            if !field.editable {
-                let value_rect = row.value_rect;
+            if field.editable {
+                let focused = preview
+                    .edits
+                    .iter()
+                    .any(|(name, h)| *name == field.name && GetFocus() == *h);
+                self.paint_field_frame(hdc, &row.value_rect, palette, focused);
+            } else {
+                // The text lines up with the text inside the framed fields.
+                let mut value_rect = row.value_rect;
+                value_rect.left += self.scale(FIELD_PAD_X_DP);
                 SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
-                SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
+                SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
                 let value_format = if field.multiline {
                     DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS
                 } else {
@@ -4030,8 +4152,15 @@ impl CardInner {
 // ---------------------------------------------------------------------------
 
 const PREVIEW_WIDTH_DP: i32 = 320;
-const PREVIEW_ROW_H_DP: i32 = 22;
-const PREVIEW_ROW_GAP_DP: i32 = 6;
+/// Height of one preview row, which is also the box of an editable field.
+const PREVIEW_ROW_H_DP: i32 = 28;
+const PREVIEW_ROW_GAP_DP: i32 = 8;
+/// Space between an editable field's border and its text, left and right.
+const FIELD_PAD_X_DP: i32 = 8;
+/// The same, above and below, for a multi-line editable field.
+const FIELD_PAD_Y_DP: i32 = 4;
+/// Thickness of the focus underline on an editable field.
+const FIELD_UNDERLINE_DP: i32 = 2;
 const PREVIEW_LABEL_W_DP: i32 = 84;
 const PREVIEW_BUTTON_H_DP: i32 = 26;
 const PREVIEW_BUTTON_W_DP: i32 = 84;
@@ -4331,7 +4460,44 @@ unsafe extern "system" fn preview_control_subclass(
         set_button_hover(hwnd, false);
         let _ = RemoveWindowSubclass(hwnd, Some(preview_control_subclass), PREVIEW_SUBCLASS_ID);
     }
-    DefSubclassProc(hwnd, msg, wparam, lparam)
+    let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+    // #811: the focus cue is painted by the card, so it must repaint when
+    // focus moves between fields. Each field sends its own message, so only
+    // that field's frame is invalidated (the control is redrawn with it,
+    // since the card's paint covers it).
+    if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS) && !is_owner_drawn_button(hwnd) {
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_ok() {
+            let mut corners = [
+                POINT {
+                    x: r.left,
+                    y: r.top,
+                },
+                POINT {
+                    x: r.right,
+                    y: r.bottom,
+                },
+            ];
+            MapWindowPoints(None, Some(parent), &mut corners);
+            let dpi = GetDpiForWindow(parent).max(96) as i32;
+            let dirty = field_frame_dirty_rect(
+                &RECT {
+                    left: corners[0].x,
+                    top: corners[0].y,
+                    right: corners[1].x,
+                    bottom: corners[1].y,
+                },
+                dpi,
+            );
+            let _ = RedrawWindow(
+                Some(parent),
+                Some(&dirty),
+                None,
+                RDW_INVALIDATE | RDW_ALLCHILDREN,
+            );
+        }
+    }
+    result
 }
 
 fn subclass_preview_control(hwnd: HWND, parent: HWND) {
@@ -4349,6 +4515,39 @@ fn subclass_preview_control(hwnd: HWND, parent: HWND) {
 /// plain value is drawn vertically centred in the cell, but an EDIT draws its
 /// text from the top of its own box, so a full-height box put the text above
 /// the label and the plain values. One text line high, centred, lines up.
+/// The part of the card to repaint when `edit` (client coordinates) gains or
+/// loses focus: its frame, i.e. the edit grown by the field padding, and by
+/// the row's vertical slack above and below (the underline sits on the
+/// frame's bottom edge).
+fn field_frame_dirty_rect(edit: &RECT, dpi: i32) -> RECT {
+    let px = |dp: i32| (dp * dpi + 48) / 96;
+    let (x, y) = (px(FIELD_PAD_X_DP), px(PREVIEW_ROW_H_DP) / 2);
+    RECT {
+        left: edit.left - x,
+        top: edit.top - y,
+        right: edit.right + x,
+        bottom: edit.bottom + y,
+    }
+}
+
+fn field_edit_rect(frame: &RECT, line_h: i32, multiline: bool, pad_x: i32, pad_y: i32) -> RECT {
+    let inner = if multiline {
+        RECT {
+            left: frame.left,
+            top: frame.top + pad_y,
+            right: frame.right,
+            bottom: (frame.bottom - pad_y).max(frame.top + pad_y + 1),
+        }
+    } else {
+        centered_edit_rect(frame, line_h)
+    };
+    RECT {
+        left: inner.left + pad_x,
+        right: (inner.right - pad_x).max(inner.left + pad_x + 1),
+        ..inner
+    }
+}
+
 fn centered_edit_rect(cell: &RECT, line_h: i32) -> RECT {
     let line_h = line_h.clamp(1, (cell.bottom - cell.top).max(1));
     let top = cell.top + ((cell.bottom - cell.top) - line_h) / 2;
@@ -6121,13 +6320,13 @@ mod tests {
         // a hardcoded pair -- otherwise dark mode gets a bright rectangle in
         // the one place the user reads carefully before confirming.
         let dark = palette_for(Theme::Dark, &SysColors::read());
-        let (dark_text, dark_bg) = edit_field_colors(&dark);
-        assert_eq!(dark_bg, dark.bg);
+        let (dark_text, dark_bg) = edit_field_colors(&dark, Theme::Dark, 0);
+        assert_eq!(dark_bg, field_look(&dark, Theme::Dark, 0).fill);
         assert_eq!(dark_text, dark.headline);
 
         let light = palette_for(Theme::Light, &SysColors::read());
-        let (light_text, light_bg) = edit_field_colors(&light);
-        assert_eq!(light_bg, light.bg);
+        let (light_text, light_bg) = edit_field_colors(&light, Theme::Light, 0);
+        assert_eq!(light_bg, field_look(&light, Theme::Light, 0).fill);
         assert_eq!(light_text, light.headline);
 
         // The two themes must not collapse onto the same colors -- that
@@ -6172,6 +6371,139 @@ mod tests {
             let w = card.inner.measure_label(card.inner.fonts.headline, text).0;
             assert!(w <= avail * 2, "{text:?} needs {w}px of {avail}px per line");
         }
+    }
+
+    #[test]
+    fn field_boxes_stand_out_and_keep_their_text_readable_in_every_theme() {
+        // #811: the box must be visible (3:1 border against its fill and
+        // against the card), the text readable on the fill, and the focus
+        // underline visible against the fill.
+        let sys = SysColors::read();
+        let mut checked = 0;
+        for theme in [Theme::Light, Theme::Dark] {
+            let p = palette_for(theme, &sys);
+            let f = field_look(&p, theme, 0);
+            let ratio =
+                |a: u32, b: u32| contrast_ratio(relative_luminance(a), relative_luminance(b));
+            assert!(ratio(f.border, f.fill) >= 3.0, "{theme:?} border");
+            assert!(ratio(f.text, f.fill) >= 4.5, "{theme:?} text");
+            assert!(ratio(f.underline, f.fill) >= 3.0, "{theme:?} underline");
+            assert_ne!(f.fill, p.bg, "{theme:?}: the fill is lifted off the card");
+            checked += 1;
+        }
+        // High contrast: the system colours, no custom fill.
+        let hc = palette_for(Theme::HighContrast, &theme::HC_BLACK);
+        let f = field_look(&hc, Theme::HighContrast, theme::HC_BLACK.highlight);
+        assert_eq!((f.fill, f.border, f.text), (hc.bg, hc.border, hc.headline));
+        assert_ne!(f.border, f.fill);
+        // Focus is its own colour, the system highlight, not the border's ink.
+        assert_eq!(f.underline, theme::HC_BLACK.highlight);
+        assert_ne!(f.underline, f.border);
+        checked += 1;
+        assert_eq!(checked, 3);
+    }
+
+    #[test]
+    fn a_field_edit_sits_inside_its_frame_with_room_for_the_border() {
+        let frame = RECT {
+            left: 100,
+            top: 40,
+            right: 300,
+            bottom: 68,
+        };
+        let r = field_edit_rect(&frame, 20, false, 8, 4);
+        assert_eq!((r.left, r.right), (108, 292), "8 px padding each side");
+        assert!(r.top > frame.top && r.bottom < frame.bottom);
+        assert_eq!(r.bottom - r.top, 20);
+        // A multi-line field is inset on all four sides.
+        let tall = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 108,
+        };
+        let m = field_edit_rect(&tall, 20, true, 8, 4);
+        assert_eq!((m.left, m.top, m.right, m.bottom), (8, 4, 192, 104));
+        // A degenerate frame never inverts the rect.
+        let thin = RECT {
+            left: 0,
+            top: 0,
+            right: 10,
+            bottom: 2,
+        };
+        let t = field_edit_rect(&thin, 20, true, 8, 4);
+        assert!(t.right > t.left && t.bottom > t.top);
+    }
+
+    #[test]
+    fn a_large_text_scale_keeps_the_padding_inside_an_editable_field() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.inner.text_scale = 1.5;
+        card.inner.rebuild_fonts();
+        let field = Field {
+            name: "title".to_string(),
+            label: "Title".to_string(),
+            value: "Standup".to_string(),
+            editable: true,
+            required: false,
+            multiline: false,
+        };
+        let metrics = card.inner.compute_preview_layout(&[field], false);
+        let frame = metrics.rows[0].value_rect;
+        let line_h = card.inner.line_height(card.inner.fonts.body);
+        let pad_y = card.inner.scale(FIELD_PAD_Y_DP);
+        assert!(
+            frame.bottom - frame.top >= line_h + 2 * pad_y,
+            "{} px frame for a {line_h} px line at 150% text",
+            frame.bottom - frame.top
+        );
+    }
+
+    #[test]
+    fn a_focus_change_repaints_only_the_field_frame() {
+        let edit = RECT {
+            left: 108,
+            top: 44,
+            right: 292,
+            bottom: 64,
+        };
+        let r = field_frame_dirty_rect(&edit, 96);
+        assert_eq!((r.left, r.right), (100, 300));
+        assert_eq!((r.top, r.bottom), (30, 78));
+        // Scales with DPI and stays a small region, far from the whole card.
+        let r2 = field_frame_dirty_rect(&edit, 192);
+        assert_eq!(r2.right - r2.left, (edit.right - edit.left) + 32);
+    }
+
+    #[test]
+    fn an_editable_field_is_a_taller_box_than_its_text_line() {
+        let card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let field = |editable: bool| Field {
+            name: "title".to_string(),
+            label: "Title".to_string(),
+            value: "Standup".to_string(),
+            editable,
+            required: false,
+            multiline: false,
+        };
+        let metrics = card
+            .inner
+            .compute_preview_layout(&[field(true), field(false)], false);
+        let line_h = card.inner.line_height(card.inner.fonts.body);
+        let frame = metrics.rows[0].value_rect;
+        assert!(
+            frame.bottom - frame.top >= line_h + 2 * card.inner.scale(FIELD_PAD_Y_DP),
+            "the frame has room above and below the text line"
+        );
+        let edit = field_edit_rect(
+            &frame,
+            line_h,
+            false,
+            card.inner.scale(FIELD_PAD_X_DP),
+            card.inner.scale(FIELD_PAD_Y_DP),
+        );
+        assert_eq!(edit.left - frame.left, card.inner.scale(FIELD_PAD_X_DP));
+        assert!(edit.top - frame.top >= card.inner.scale(FIELD_PAD_Y_DP));
     }
 
     #[test]
@@ -6702,7 +7034,10 @@ mod tests {
         let text_after = unsafe { GetTextColor(hdc) };
         let bg_after = unsafe { GetBkColor(hdc) };
         assert_eq!(text_after.0, dark.headline);
-        assert_eq!(bg_after.0, dark.bg);
+        // #811: the field fill is the card colour lifted a little, not the
+        // card colour itself.
+        assert_eq!(bg_after.0, field_look(&dark, Theme::Dark, 0).fill);
+        assert_ne!(bg_after.0, dark.bg);
         // The bug this closes: stock EDIT white background, unconditionally.
         assert_ne!(bg_after.0, rgb(255, 255, 255));
 

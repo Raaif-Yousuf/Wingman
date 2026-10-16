@@ -87,10 +87,13 @@
 //! left as a TODO: the profile is encrypted in the local store with no
 //! settings page yet (#50) for a user to hand-edit, so pointing at it alone
 //! would be a dead end. [`load_or_import_profile`] additionally looks for a
-//! plain, hand-editable `profile.toml` next to it and imports it once (the
+//! plain, hand-editable `profile.toml` next to it and imports it (the
 //! same `Store::save_profile` -- and therefore the same payment-data denylist
 //! -- every other write already goes through) whenever the encrypted store
-//! is still empty. This was judged "trivial" per the task brief's own
+//! is empty. The file is left in place and is read again if the store's
+//! profile is ever empty again (a fresh database after a damaged-file
+//! recovery); that is the documented way back (#795), at the cost that the
+//! values stay readable on disk until the user deletes the file. This was judged "trivial" per the task brief's own
 //! permission to add it: `Profile` already derives `serde::Deserialize`,
 //! so parsing a TOML document into one is a `toml::from_str` call, no new
 //! type. If neither the encrypted store nor a `profile.toml` has anything,
@@ -961,7 +964,7 @@ pub fn advance(state: FlowState, event: FlowEvent) -> FlowState {
 
 // ---------------------------------------------------------------------------
 // Empty profile: the "point at where to add profile data" card, plus the
-// one-shot profile.toml import -- see this file's module doc comment for
+// profile.toml import -- see this file's module doc comment for
 // the decision this section implements.
 // ---------------------------------------------------------------------------
 
@@ -1004,7 +1007,8 @@ fn import_profile_toml_if_present(toml_path: &Path) -> Result<Option<Profile>> {
     Ok(Some(profile))
 }
 
-/// Loads the profile from `store`; if it is empty, tries a one-shot import
+/// Loads the profile from `store`; if it is empty, tries an import (the file
+/// is not renamed or removed, see the module docs)
 /// from a plain `profile.toml` at `toml_path` and, when that yields anything,
 /// saves it to the store -- through `Store::save_profile`, so it is encrypted
 /// and the payment-data denylist runs over it exactly like any other write (a
@@ -1026,7 +1030,8 @@ pub fn load_or_import_profile_from(store: &Store, toml_path: &Path) -> Result<Pr
     Ok(profile)
 }
 
-/// `%APPDATA%\Wingman\profile.toml`, the hand-edited file imported once.
+/// `%APPDATA%\Wingman\profile.toml`, the hand-edited file imported while the
+/// store's profile is empty.
 pub fn profile_toml_path() -> Result<std::path::PathBuf> {
     Ok(crate::known_folder::roaming_app_data()
         .context("could not determine the platform config directory")?
