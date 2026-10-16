@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::actions;
 use crate::activation::Trigger;
 use crate::capture;
-use crate::config::{Config, Providers};
+use crate::config::{ActiveProvider, Config, Providers};
 use crate::connectors::civil_time::{CivilDate, CivilDateTime};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::executors;
@@ -3181,20 +3181,16 @@ impl App {
     /// Move a provider to the front of `providers.order`, making it the one
     /// that answers. The other stays in the list as the fallback rather than
     /// being dropped, so switching never costs you the second provider.
-    fn set_provider(&mut self, openai: bool) {
-        let want = if openai { "openai" } else { "anthropic" };
-        let order = &mut self.config.providers.order;
-        if order.first().map(String::as_str) == Some(want) {
+    fn set_provider(&mut self, provider: ActiveProvider) {
+        if !provider.move_to_front(&mut self.config.providers.order) {
             return;
         }
-        order.retain(|p| p != want);
-        order.insert(0, want.to_string());
 
         self.chain = Arc::new(self.config.build_chain());
         let saved = self.config.save();
         self.refresh_tray_labels();
 
-        let name = if openai { "ChatGPT" } else { "Claude" };
+        let name = provider.label();
         match saved {
             Ok(()) => self.card.show_answer(name, "", 3, None),
             Err(e) => {
@@ -3247,8 +3243,8 @@ impl App {
             .set_pause_binding(&pause_binding_label(self.config.hotkeys.pause.as_ref()));
 
         let p = &self.config.providers;
-        let openai_first = p.order.first().map(String::as_str) != Some("anthropic");
-        self.tray.set_active_provider(openai_first);
+        self.tray
+            .set_active_provider(ActiveProvider::from_order(&p.order));
         self.tray.set_models(
             &p.openai.models,
             &p.openai.model,
@@ -5214,8 +5210,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
                     MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
                     MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
-                    MenuChoice::Command(cmd::USE_OPENAI) => app.set_provider(true),
-                    MenuChoice::Command(cmd::USE_ANTHROPIC) => app.set_provider(false),
+                    MenuChoice::Command(cmd::USE_OPENAI) => {
+                        app.set_provider(ActiveProvider::OpenAi)
+                    }
+                    MenuChoice::Command(cmd::USE_ANTHROPIC) => {
+                        app.set_provider(ActiveProvider::Anthropic)
+                    }
+                    MenuChoice::Command(cmd::USE_OLLAMA) => {
+                        app.set_provider(ActiveProvider::Ollama)
+                    }
                     MenuChoice::Command(cmd::PAUSE_1H) => app.pause_for(PauseChoice::OneHour),
                     MenuChoice::Command(cmd::PAUSE_UNTIL_TOMORROW) => {
                         app.pause_for(PauseChoice::UntilTomorrow)
