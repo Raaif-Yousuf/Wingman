@@ -517,13 +517,15 @@ pub(crate) fn post_json_with(
     env: &RetryEnv,
     url: &str,
     headers: &[(&str, &str)],
-    body: &Value,
+    body: Value,
     timeout: Duration,
     tag: &str,
 ) -> Result<String> {
     send_preview_guard(url)?;
     offline_guard(url)?;
     budget_guard(url)?;
+    let (body, redactions) = outbound_body(url, body, crate::config::redact_text_enabled());
+    let body = &body;
 
     let policy = env.policy;
     let mut retries = 0u32;
@@ -594,7 +596,7 @@ pub(crate) fn post_json_with(
             }
             Ok(resp) => {
                 if (200..300).contains(&resp.status) {
-                    return Ok(resp.body);
+                    return Ok(redactions.restore_in_json(resp.body));
                 }
 
                 if resp.status == 429 {
@@ -704,7 +706,7 @@ fn log_attempt(
 pub(crate) fn post_json(
     url: &str,
     headers: &[(&str, &str)],
-    body: &Value,
+    body: Value,
     timeout: Duration,
     tag: &str,
 ) -> Result<String> {
@@ -753,6 +755,35 @@ pub(crate) fn offline_guard(url: &str) -> Result<()> {
             "Offline mode blocked a request to a non-local address. Turn off Offline mode, or point every provider at 127.0.0.1, to allow it."
         )),
     }
+}
+
+/// #505: the body that actually leaves, given the request's URL, and the
+/// private details taken out of it. A request that could leave this machine
+/// has the text in its body redacted with the screenshot step's four kinds
+/// (cards, IBANs, key-shaped tokens, emails, in the text-tuned form), each
+/// replaced by a numbered marker (`[email 1]`). No input path (selection,
+/// page text, OCR fallback, UIA fields, ...) can skip it: this is decided at
+/// the one boundary every provider request crosses, like the guards above.
+///
+/// The returned [`crate::redact::Redactions`] is the in-memory list of what
+/// each marker stood for. The send functions use it to put the real values
+/// back into the response, then drop it; it is never logged or stored.
+///
+/// A literal loopback URL stays on this machine and is sent as built,
+/// matching the screenshot rule (`Providers::sends_screenshot_off_machine`);
+/// everything else counts as leaving, including a remote Ollama host and
+/// `localhost` by name. `enabled` is the `capture.redact` setting. The body
+/// is edited in place: nothing is copied, embedded images included.
+pub(crate) fn outbound_body(
+    url: &str,
+    mut body: Value,
+    enabled: bool,
+) -> (Value, crate::redact::Redactions) {
+    let mut redactions = crate::redact::Redactions::default();
+    if enabled && crate::mode::classify_host(url) != crate::mode::HostClass::Loopback {
+        redactions.redact_value(&mut body);
+    }
+    (body, redactions)
 }
 
 /// #101: refuses a request that would be billed once today's spend has
@@ -925,7 +956,7 @@ pub(crate) fn post_json_read_body<T>(
 pub(crate) fn post_json_with_connect_timeout(
     url: &str,
     headers: &[(&str, &str)],
-    body: &Value,
+    body: Value,
     connect_timeout: Duration,
     total_timeout: Duration,
     tag: &str,
@@ -933,6 +964,8 @@ pub(crate) fn post_json_with_connect_timeout(
     send_preview_guard(url)?;
     offline_guard(url)?;
     budget_guard(url)?;
+    let (body, redactions) = outbound_body(url, body, crate::config::redact_text_enabled());
+    let body = &body;
 
     // #191: no retry loop here (Ollama is local/loopback and unbilled), so
     // an attempt logged from this function is never a retry.
@@ -1017,7 +1050,7 @@ pub(crate) fn post_json_with_connect_timeout(
         )
         .with_cost(success_cost(tag, url, body, &body_text)),
     );
-    Ok(body_text)
+    Ok(redactions.restore_in_json(body_text))
 }
 
 /// Base64-encodes each image, in order. Both providers embed the screenshot
@@ -1204,7 +1237,7 @@ mod tests {
             &env,
             "https://example.invalid/",
             &[],
-            &json!({}),
+            json!({}),
             Duration::from_secs(1),
             "anthropic",
         )
@@ -1239,6 +1272,274 @@ mod tests {
         assert_eq!(result, "done");
         assert_eq!(transport.call_count(), 2);
         assert_eq!(sleeper.recorded().len(), 1);
+    }
+
+    // -- #505: text is redacted at the one HTTP boundary --------------------
+
+    const PRIVATE_BODY_TEXT: &str = "card 4111 1111 1111 1111 mail me@example.com";
+
+    fn private_body() -> Value {
+        json!({"model": "m", "messages": [{"role": "user", "content": PRIVATE_BODY_TEXT}]})
+    }
+
+    #[test]
+    fn outbound_body_redacts_for_a_cloud_url() {
+        let (out, r) = outbound_body("https://api.example.com/v1/chat", private_body(), true);
+        let text = out.to_string();
+        assert!(
+            text.contains("[card number 1]") && text.contains("[email 1]"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("4111") && !text.contains("me@example.com"),
+            "{text}"
+        );
+        assert!(!r.is_empty());
+    }
+
+    #[test]
+    fn outbound_body_redacts_for_a_remote_ollama_host() {
+        // A past review found text reaching a remote Ollama unredacted.
+        for url in [
+            "http://192.168.1.50:11434/api/chat",
+            "http://my-box.lan:11434/api/chat",
+            "http://localhost:11434/api/chat",
+            "http://evil.com\\@127.0.0.1:11434/api/chat",
+        ] {
+            let (out, _) = outbound_body(url, private_body(), true);
+            assert!(!out.to_string().contains("4111"), "{url}");
+        }
+    }
+
+    #[test]
+    fn outbound_body_leaves_a_loopback_url_alone() {
+        for url in [
+            "http://127.0.0.1:11434/api/chat",
+            "http://[::1]:11434/api/chat",
+        ] {
+            let (out, r) = outbound_body(url, private_body(), true);
+            assert_eq!(out, private_body(), "{url}");
+            assert!(r.is_empty());
+        }
+    }
+
+    #[test]
+    fn outbound_body_leaves_everything_alone_when_the_setting_is_off() {
+        let (out, r) = outbound_body("https://api.example.com/", private_body(), false);
+        assert_eq!(out, private_body());
+        assert!(r.is_empty());
+    }
+
+    /// Answers each request with `answer(sent_body)`, so a test can have the
+    /// "model" echo the markers it was sent.
+    struct EchoTransport<F: Fn(&Value) -> String> {
+        answer: F,
+        sent: Mutex<Vec<Value>>,
+    }
+
+    impl<F: Fn(&Value) -> String> Transport for EchoTransport<F> {
+        fn post_json(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            body: &Value,
+            _timeout: Duration,
+        ) -> std::result::Result<RawResponse, TransportError> {
+            self.sent.lock().unwrap().push(body.clone());
+            Ok(RawResponse {
+                status: 200,
+                headers: vec![],
+                body: (self.answer)(body),
+            })
+        }
+    }
+
+    fn send_through<F: Fn(&Value) -> String>(url: &str, body: Value, answer: F) -> (String, Value) {
+        let transport = EchoTransport {
+            answer,
+            sent: Mutex::new(Vec::new()),
+        };
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
+        let got = post_json_with(&env, url, &[], body, Duration::from_secs(1), "anthropic")
+            .expect("the scripted request succeeds");
+        let sent = transport.sent.lock().unwrap()[0].clone();
+        (got, sent)
+    }
+
+    #[test]
+    fn post_json_with_sends_the_redacted_body_to_the_transport() {
+        let _g = network_guard();
+        let (_, sent) = send_through("https://example.invalid/", private_body(), |_| {
+            "{}".to_string()
+        });
+        let sent = sent.to_string();
+        assert!(
+            !sent.contains("4111") && !sent.contains("me@example.com"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("[card number 1]") && sent.contains("[email 1]"),
+            "{sent}"
+        );
+    }
+
+    #[test]
+    fn a_replace_text_style_answer_comes_back_with_the_real_value() {
+        let _g = network_guard();
+        // The model sees "[email 1]" and echoes it inside its JSON answer,
+        // which is itself a string inside the vendor's envelope.
+        let body = json!({"model": "m", "messages": [{"role": "user",
+            "content": "Reword: please reply to me@example.com today"}]});
+        let (got, sent) = send_through("https://example.invalid/", body, |sent| {
+            assert!(sent.to_string().contains("[email 1]"));
+            let inner = json!({"replacement": "Kindly reply to [email 1] soon"}).to_string();
+            json!({"content": [{"type": "text", "text": inner}]}).to_string()
+        });
+        assert!(!sent.to_string().contains("me@example.com"));
+        let envelope: Value = serde_json::from_str(&got).unwrap();
+        let inner: Value =
+            serde_json::from_str(envelope["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["replacement"], "Kindly reply to me@example.com soon");
+    }
+
+    #[test]
+    fn a_calendar_style_answer_comes_back_with_the_real_values() {
+        let _g = network_guard();
+        let body = json!({"model": "m", "messages": [{"role": "user",
+            "content": "Lunch with jo@example.org, bring card 4111 1111 1111 1111, jo@example.org again"}]});
+        let (got, _) = send_through("https://example.invalid/", body, |_| {
+            let inner = json!({
+                "title": "Lunch",
+                "start": "2026-10-16T12:00",
+                "end": "2026-10-16T13:00",
+                "location": "",
+                "notes": "[email 1] and [email 1], card [card number 1], also [email 9]"
+            })
+            .to_string();
+            json!({"content": [{"type": "text", "text": inner}]}).to_string()
+        });
+        let envelope: Value = serde_json::from_str(&got).unwrap();
+        let inner: Value =
+            serde_json::from_str(envelope["content"][0]["text"].as_str().unwrap()).unwrap();
+        // The same value shared one marker, and a marker the model made up
+        // (not in this request's list) is left as it is.
+        assert_eq!(
+            inner["notes"],
+            "jo@example.org and jo@example.org, card 4111 1111 1111 1111, also [email 9]"
+        );
+    }
+
+    #[test]
+    fn a_loopback_request_is_neither_redacted_nor_restored() {
+        let _g = network_guard();
+        let (got, sent) = send_through("http://127.0.0.1:11434/api/chat", private_body(), |_| {
+            "[email 1]".to_string()
+        });
+        assert_eq!(sent, private_body());
+        assert_eq!(got, "[email 1]");
+    }
+
+    /// The remote-Ollama path (`post_json_with_connect_timeout`) talks to
+    /// `ureq` directly, so no fake transport can watch it. This scans the
+    /// non-test source instead: every send that carries a body must redact
+    /// it with [`outbound_body`] and restore the answer. `post_json_read_body`
+    /// is the one allowed exception (a model download request, no user text).
+    #[test]
+    fn every_function_that_posts_a_body_redacts_and_restores_it() {
+        let whole = include_str!("common.rs").replace('\r', "");
+        let code = whole.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+
+        // Top-level functions: a line starting at column 0 with `fn`,
+        // `pub fn` or `pub(crate) fn` runs to the next one.
+        let starts: Vec<usize> = code
+            .match_indices('\n')
+            .map(|(i, _)| i + 1)
+            .filter(|&i| {
+                let line = &code[i..];
+                line.starts_with("fn ")
+                    || line.starts_with("pub fn ")
+                    || line.starts_with("pub(crate) fn ")
+            })
+            .collect();
+        assert!(
+            starts.len() > 10,
+            "the scan found no functions: {}",
+            starts.len()
+        );
+        let body_of = |name: &str| -> Option<&str> {
+            let needle = format!("fn {name}(");
+            let at = starts.iter().position(|&i| {
+                code[i..]
+                    .lines()
+                    .next()
+                    .is_some_and(|l| l.contains(&needle) || l.contains(&format!("fn {name}<")))
+            })?;
+            let i = starts[at];
+            let end = code[i..].find("\n}\n").map_or(code.len(), |e| i + e + 3);
+            Some(&code[i..end])
+        };
+
+        // The candidate set must not be empty, or this proves nothing.
+        let posters: Vec<&str> = starts
+            .iter()
+            .filter_map(|&i| {
+                let end = code[i..].find("\n}\n").map_or(code.len(), |e| i + e + 3);
+                let f = &code[i..end];
+                f.contains("ureq::post(").then_some(f)
+            })
+            .collect();
+        assert!(
+            !posters.is_empty(),
+            "no function posting through ureq was found"
+        );
+        for f in posters {
+            let header = f.lines().next().unwrap_or_default();
+            if header.contains("post_json_read_body") {
+                continue;
+            }
+            assert!(
+                f.contains("outbound_body(") && f.contains("restore_in_json("),
+                "this function posts a body without redacting and restoring it: {header}"
+            );
+        }
+
+        for name in ["post_json_with", "post_json_with_connect_timeout"] {
+            let f = body_of(name).unwrap_or_else(|| panic!("{name} not found"));
+            assert!(f.contains("outbound_body("), "{name} must redact its body");
+            assert!(
+                f.contains("restore_in_json("),
+                "{name} must restore the answer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_egress_log_row_describes_the_redacted_body() {
+        // The log sees what was sent, never the original.
+        let (sent, _) = outbound_body("https://api.example.com/", private_body(), true);
+        let entry = egress::build_entry(
+            "anthropic",
+            "https://api.example.com/",
+            &sent,
+            false,
+            0,
+            0,
+            egress::Outcome::Success,
+            None,
+        );
+        let row = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !row.contains("4111") && !row.contains("example.com\""),
+            "{row}"
+        );
     }
 
     #[test]
@@ -1376,7 +1677,7 @@ mod tests {
             &env,
             "https://example.invalid/",
             &[],
-            &json!({}),
+            json!({}),
             Duration::from_secs(1),
             "openai",
         )
@@ -1580,7 +1881,7 @@ mod tests {
             &env,
             "https://example.invalid/",
             &[],
-            &json!({}),
+            json!({}),
             Duration::from_secs(90),
             "anthropic",
         )
@@ -1637,7 +1938,7 @@ mod tests {
             &env,
             "https://example.invalid/",
             &[],
-            &json!({}),
+            json!({}),
             Duration::from_secs(90),
             "openai",
         )
@@ -1811,7 +2112,7 @@ mod tests {
             &env,
             "https://api.openai.com/v1/responses",
             &[],
-            &json!({}),
+            json!({}),
             Duration::from_secs(1),
             "openai",
         )
@@ -1867,7 +2168,7 @@ mod tests {
             &env,
             "http://localhost:11434/api/chat",
             &[],
-            &json!({}),
+            json!({}),
             Duration::from_secs(1),
             "ollama",
         )
@@ -1900,7 +2201,7 @@ mod tests {
             &env,
             "http://127.0.0.1:11434/api/chat",
             &[],
-            &json!({}),
+            json!({}),
             Duration::from_secs(1),
             "ollama",
         );
@@ -1936,7 +2237,7 @@ mod tests {
                 &env,
                 "https://api.openai.com/v1/responses",
                 &[],
-                &json!({}),
+                json!({}),
                 Duration::from_secs(1),
                 "openai",
             );
@@ -2072,7 +2373,7 @@ mod tests {
         let result = post_json_with_connect_timeout(
             "http://127.0.0.1:9/api/chat",
             &[],
-            &json!({}),
+            json!({}),
             Duration::from_millis(200),
             Duration::from_millis(500),
             "ollama",
@@ -2148,7 +2449,7 @@ mod tests {
             &env,
             "https://example.invalid/",
             &[],
-            &json!({ "model": model }),
+            json!({ "model": model }),
             Duration::from_secs(1),
             "anthropic",
         )
@@ -2219,7 +2520,7 @@ mod tests {
             &env,
             "https://example.invalid/",
             &headers,
-            &json!({"model": "claude-opus-5"}),
+            json!({"model": "claude-opus-5"}),
             Duration::from_secs(1),
             "anthropic",
         );
@@ -2520,7 +2821,7 @@ mod tests {
             clock: &clock,
             policy: &policy,
         };
-        post_json_with(&env, url, &[], &json!({}), Duration::from_secs(1), "test")
+        post_json_with(&env, url, &[], json!({}), Duration::from_secs(1), "test")
     }
 
     #[test]
@@ -2621,7 +2922,7 @@ mod tests {
         let err = post_json_with_connect_timeout(
             "https://api.example.invalid/v1/x",
             &[],
-            &json!({}),
+            json!({}),
             Duration::from_millis(50),
             Duration::from_millis(50),
             "test",

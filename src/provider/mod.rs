@@ -319,6 +319,30 @@ pub struct Request {
     pub max_tokens: u32,
 }
 
+/// #602: the request as the send preview should show it for a request that
+/// leaves this machine. With redaction on, `system` and `user` carry the same
+/// markers the HTTP boundary will put in the real body (`[email 1]`), so the
+/// preview matches what is sent. With it off, or when nothing matched, the
+/// request is shown as it is. Images and the schema are carried over.
+fn preview_request(req: &Request, redact: bool) -> std::borrow::Cow<'_, Request> {
+    if !redact {
+        return std::borrow::Cow::Borrowed(req);
+    }
+    let mut redactions = crate::redact::Redactions::default();
+    redactions.note_existing(&req.system);
+    redactions.note_existing(&req.user);
+    let system = redactions.redact_text(&req.system);
+    let user = redactions.redact_text(&req.user);
+    if redactions.is_empty() {
+        return std::borrow::Cow::Borrowed(req);
+    }
+    std::borrow::Cow::Owned(Request {
+        system,
+        user,
+        ..req.clone()
+    })
+}
+
 /// What a provider returns for one [`Request`]. `text` satisfies
 /// `Request::schema` when one was given, and is the plain answer otherwise.
 /// A provider never attempts to interpret `text` itself -- see
@@ -644,7 +668,10 @@ impl Chain {
     ) -> anyhow::Result<T> {
         if let Some(gate) = self.gate() {
             if crate::config::egress_preview_enabled() && provider.sends_off_machine() {
-                let Some(authorized) = gate.confirm(provider.id(), req) else {
+                // #602: show the text as the HTTP boundary will send it, with
+                // private details already swapped for their markers.
+                let shown = preview_request(req, crate::config::redact_text_enabled());
+                let Some(authorized) = gate.confirm(provider.id(), &shown) else {
                     return Err(SendCancelled.into());
                 };
                 return common::with_send_authorized(authorized, || {
@@ -3279,6 +3306,53 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         let ids: Vec<String> = gate.asked().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    // -- #602: the preview shows the text as it will be sent ----------------
+
+    fn request_with_email() -> Request {
+        Request {
+            user: "write to me@example.com, then me@example.com again".to_string(),
+            ..gated_request()
+        }
+    }
+
+    #[test]
+    fn preview_request_swaps_private_details_for_the_markers_that_will_be_sent() {
+        let req = request_with_email();
+        let shown = preview_request(&req, true);
+        assert_eq!(shown.user, "write to [email 1], then [email 1] again");
+        assert_eq!(shown.images, req.images);
+        assert_eq!(shown.system, "sys");
+    }
+
+    #[test]
+    fn preview_request_is_untouched_when_redaction_is_off_or_nothing_matched() {
+        let req = request_with_email();
+        assert_eq!(preview_request(&req, false).user, req.user);
+        let clean = gated_request();
+        assert!(matches!(
+            preview_request(&clean, true),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn the_send_gate_is_shown_redacted_text_for_a_cloud_provider() {
+        let _g = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::config::set_egress_preview_enabled(true);
+        let cloud = std::sync::Arc::new(GuardProbe::new("cloud", true));
+        let gate = FakeGate::new(false);
+        let chain = chain_of(vec![cloud]).with_gate(gate.clone());
+
+        let _ = chain.complete_parsed(&request_with_email(), |c| Ok(c.text.clone()));
+
+        crate::config::set_egress_preview_enabled(false);
+        let asked = gate.asked();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].1, "write to [email 1], then [email 1] again");
     }
 
     #[test]

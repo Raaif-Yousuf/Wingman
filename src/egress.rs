@@ -256,6 +256,18 @@ fn scan_value(v: &Value, images: &mut Vec<Attachment>, text_bytes: &mut usize) {
     }
 }
 
+/// True for a string leaf that is structural metadata (see
+/// [`STRUCTURAL_STRING_KEYS`]) when found under `key`.
+pub(crate) fn is_structural_key(key: &str) -> bool {
+    STRUCTURAL_STRING_KEYS.contains(&key)
+}
+
+/// True for a string that is an embedded PNG: bare base64, or a
+/// `data:image/png;base64,` URL.
+pub(crate) fn is_embedded_png(s: &str) -> bool {
+    is_probable_base64_png(s) || data_url_png_payload(s).is_some()
+}
+
 fn scan_string(key: &str, s: &str, images: &mut Vec<Attachment>, text_bytes: &mut usize) {
     if is_probable_base64_png(s) {
         if let Some(a) = image_attachment(s) {

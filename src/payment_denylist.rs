@@ -183,11 +183,32 @@ pub fn contains_iban(text: &str) -> bool {
 /// when other digits sit in front of it ("123456 4111 1111 1111 1111"): the
 /// leading digits get painted too, which is the safe direction.
 pub fn card_number_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    card_spans_where(text, |_| true)
+}
+
+/// Like [`card_number_spans`], but a number must also start with a digit a
+/// real card network uses (3 to 6: Amex, Visa, Mastercard, Discover, plus Mastercard's 2221 to 2720). Free
+/// text is full of Luhn-valid 16-digit runs that are not cards (timestamps,
+/// tracking and order numbers), so the text path (#505) uses this stricter
+/// rule. A run cannot span a line break: only digits, spaces and hyphens
+/// join groups.
+pub fn card_number_spans_with_known_prefix(text: &str) -> Vec<std::ops::Range<usize>> {
+    card_spans_where(text, |digits| {
+        matches!(digits.as_bytes()[0], b'3'..=b'6')
+            // Mastercard's 2-series: first four digits 2221 to 2720.
+            || digits
+                .get(..4)
+                .and_then(|p| p.parse::<u32>().ok())
+                .is_some_and(|p| (2221..=2720).contains(&p))
+    })
+}
+
+fn card_spans_where(text: &str, accept: impl Fn(&str) -> bool) -> Vec<std::ops::Range<usize>> {
     let mut spans = Vec::new();
     for run in runs_of(text, |c| c.is_ascii_digit() || c == ' ' || c == '-') {
         let groups = groups_of(text, run, |c| c.is_ascii_digit());
         spans.extend(passing_windows(text, &groups, 19, |digits| {
-            digits.len() >= 12 && luhn_valid(digits)
+            digits.len() >= 12 && luhn_valid(digits) && accept(digits)
         }));
     }
     merge_overlapping(spans)

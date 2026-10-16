@@ -334,6 +334,12 @@ fn extract_host(url: &str) -> Option<String> {
     if authority.is_empty() {
         return None;
     }
+    // A backslash ends the authority in a browser (`http://evil.com\@127.0.0.1`
+    // is host `evil.com`) but not in the split above, so the text after it
+    // could be read as the host. Never valid in a host: refuse (#505).
+    if authority.contains('\\') {
+        return None;
+    }
 
     // Userinfo: everything up to and including the LAST '@' is discarded,
     // matching the WHATWG URL host-parsing algorithm's use of the last
@@ -823,6 +829,19 @@ mod tests {
             classify_host("http://evil.com@127.0.0.1/"),
             HostClass::Loopback
         );
+    }
+
+    #[test]
+    fn a_backslash_in_the_authority_is_never_loopback() {
+        // A browser reads `http://evil.com\@127.0.0.1` as host evil.com.
+        for url in [
+            "http://evil.com\\@127.0.0.1/",
+            "http://evil.com\\@127.0.0.1:11434/api/chat",
+            "http://127.0.0.1\\@evil.com/",
+            "http://127.0.0.1\\.evil.com/",
+        ] {
+            assert_eq!(classify_host(url), HostClass::NotLoopback, "{url}");
+        }
     }
 
     // -- classify_host: IPv6 -------------------------------------------------
