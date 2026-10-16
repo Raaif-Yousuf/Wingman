@@ -1,6 +1,6 @@
 # The options card and the Wingman key
 
-Status: **proposed, 2026-10-16** (AGENTS.md rule 12). Covers #305 (epic),
+Status: **accepted, 2026-10-16** (AGENTS.md rule 12). Covers #305 (epic),
 #306, #307, #308, #324, #393, and, as later slices, #42 and #107. Supplements
 the [expansion plan](2026-09-16-expansion-plan-design.md) §6 "The intent
 router" and the [palette spec](2026-09-17-palette-design.md). Where they
@@ -58,8 +58,9 @@ Enter. Wingman never presses Send, Submit, Buy or Pay, whatever the key does.
   written only when the palette opens. The options flow has to set its own.
 - Answer cards already auto-dismiss (`show_answer(.., auto_dismiss_secs, ..)`).
   The options card does not exist yet.
-- Exe size: `perf-budgets.json` records 3,800,576 bytes measured against a gate
-  of 3,900,000, about 99 KB of headroom (AGENTS.md's "about 3.5 MB" is stale).
+- Exe size: `perf-budgets.json` records 3,982,336 bytes measured against a gate
+  of 4,500,000 after the later raises, about 518 KB of headroom (AGENTS.md's
+  "about 3.5 MB" is stale).
   The slices below, and the Settings dark mode, overlay and knowledge specs,
   all draw on that one headroom. See "Size budget".
 
@@ -200,7 +201,7 @@ it to. Resolution:
 - **Decision: the send preview (#105) keeps its focus-loss cancel.** Its worker
   is blocked and `busy` is set, and there is nothing in it to lose, so a
   forgotten one would hold the app busy and the tray looking busy. The cancel
-  stays quiet (no card, #392). Open question 9.
+  stays quiet (no card, #392). Resolved question 9.
 - A setting `options.click_away_dismiss` (default `true`) lets a user who
   wants #324's persistent card turn the dismissal off for answer and options
   cards. Esc, the key and the options card's auto-dismiss still close.
@@ -223,8 +224,9 @@ pub struct RouterResult {
 ```
 
 The old single `intent` and `confidence` are gone. The palette's consumer
-(`palette_model`, `should_apply`) reads `options.first()`, so its behaviour
-is unchanged.
+(`palette_model`, `should_apply`) reads `options.first()`. Separately, see
+"Related decisions": the palette no longer sends a router request when it
+opens.
 
 ### JSON schema
 
@@ -326,10 +328,10 @@ are checked at the press, before the shell shows:
    capture-gate card is shown instead of the options card, and no router call
    is made. The gate runs at the press (a foreground check, no capture) and
    the result is kept for the whole Look, so the action chosen later honours it
-   as the palette's `palette_password_manager` does today.
+   as `palette_password_manager` does for the palette.
 3. Offline: the router runs on the local model or not at all.
 4. Cloud with "confirm before sending" on: the router never shows the send
-   preview (it runs by itself, as it does for the palette), so the send guard
+   preview (it runs by itself, with no preview), so the send guard
    refuses it. The card shows the floor and no request leaves the machine. A
    user who wants cloud routing with that toggle on gets the floor; the action
    they then pick shows its own send preview as always. This keeps one press
@@ -388,7 +390,7 @@ one dispatch; no second one).
 ### Keys 1 to 4 and Esc
 
 The card does not take focus, so a window message to it would never arrive.
-Two choices, with a recommendation:
+Two choices were weighed:
 
 - **Decision: handle 1 to 4 and Esc in the existing low-level hook**, but
   only while the options card is showing. A matching key is swallowed and
@@ -606,7 +608,7 @@ Local versus cloud:
 
 - Cloud: one small vision call per press, the 512 px image leaves the
   machine (through the existing redaction and payment-denylist gates, which
-  run before any capture is sent, same as the palette's router today).
+  run before any capture is sent).
 - Local (Ollama, `127.0.0.1:11434`, `think` explicit, `keep_alive` top
   level): no data leaves, no cost, but the latency of a 4B vision model on the
   dev machine's iGPU is unmeasured (Manual check 4). If it is several seconds,
@@ -813,8 +815,10 @@ at every step.
 
 1. **Router shortlist (#306).** `RouterResult.options`, schema, validation,
    labels, fallbacks, and the `effect` column on the built-in catalogue. The
-   palette reads `options[0]`; nothing else changes. Done when the fixture test
-   passes and the palette still pre-selects its top option (checked by hand).
+   any remaining palette consumer reads `options[0]`. The palette also stops
+   sending a router request when it opens (see "Related decisions"). Done when
+   the fixture test passes and opening the palette makes no request in the
+   egress log (checked by hand).
 2. **Options card (#307).** `CardState::Options`, keys 1 to 4 and Esc (the
    bounded claim, with auto-dismiss), click to pick, hide-before-capture.
    Reachable from a new tray item "What can I do here?", behind no setting,
@@ -848,62 +852,56 @@ hook, `NotifyWinEvent` and the owner-drawn buttons are all in features already
 enabled). Estimates, each THEORY (unverified) until measured: slice 1 about
 4 KB, slice 2 about 15 KB, slice 3 about 6 KB, slice 4 about 6 KB, slice 5
 about 10 KB, about 40 KB in all. The gate is `perf-budgets.json`
-(`exe_size_bytes.max` 3,900,000, last measured 3,800,576), enforced by
-`scripts/perf-budget.ps1`, leaving about 99 KB for this spec and the Settings
+(`exe_size_bytes.max` 4,500,000, last measured 3,982,336), enforced by
+`scripts/perf-budget.ps1`, leaving about 518 KB for this spec and the Settings
 dark mode, overlay and knowledge specs together. Each slice's PR records the
 measured size from CI. A slice that would break the gate raises it in the same
 PR with the measured number and reason, as earlier PRs did, and the
 bookkeeping across specs is the order they merge in.
 
-## Open questions
+## Resolved questions
 
-Each has a recommended answer; the first four affect slice 1 to 4 work.
+Each was an open question with a recommended answer; the recommended answer
+is the decision.
 
-1. **Card inclusion bar.** Should the options card use its own
-   `options.min_confidence` (0.2) rather than `palette.router_threshold`
-   (0.7)? Recommended: yes. #306 says to drop below the palette threshold,
-   but its own example keeps 0.41 and 0.12, and at 0.7 the card would often
-   hold one option. Small-model confidences are poorly calibrated, so treat
-   0.2 as a tunable, not a fact.
-2. **Key runs a low-confidence option 1?** Recommended: yes, but only when
-   option 1 is key-pickable. The earlier reasoning, "every option is read-only
-   or ends in a preview", was wrong: model-free actions such as Copy text from
-   screen and Copy region write the clipboard with no confirm, so a habit press
-   on a low-confidence option 1 would overwrite the clipboard silently. A
-   clipboard-writing option is key-picked only at or above the router
-   threshold, otherwise the key dismisses. Counter-argument: a rule that makes
-   the key sometimes close the card is harder to learn. Mitigation: the hint
-   line shows "Esc to close" and option 1's keycap is drawn without the accent
-   outline when the key will not run it.
-3. **Digits and Esc claimed by the hook while the card is open.** The
-   alternative is to let the card take focus, which steals typing.
-   Recommended: claim them, with the conditions above (no modifiers, only
-   digits that name an option, an auto-dismiss, an expiry that lapses by
-   itself, `options.claim_keys`). Revisit if the digit capture annoys anyone in
-   testing.
-4. **Static card on activation.** Recommended: yes, as above. The cost is that
-   the picker route no longer runs the router; the hotkey route does.
-5. **Double-press default.** 300 ms versus #42's 400 ms. Recommended: ship
-   300 as a placeholder and set it from Manual check 1 before slice 5 merges.
-6. **Should Always pick do anything on an answer card?** Recommended: no, it
-   falls through to nothing, and Esc closes. A key that closes in a mode
-   named "pick" would surprise.
-7. **Auto-dismiss.** Required for the options card (it bounds the digit claim),
-   so it is in scope, default 20 s. For answer cards it stays out of scope:
-   their current timers and `PENDING_SAFETY_TIMEOUT_SECS` are unchanged, and a
-   separate small change after slice 4 can revisit it.
-8. **Router timeout and what shows while waiting.** Recommended: 10 s, shorter
-   than the 30 s the main action gets, since after that the user is better
-   served by the floor. Counter-argument: 10 s is long against "instant", and
-   showing the floor's model-free buttons at once would let the user act while
-   the router thinks. Against that, replacing buttons under the pointer when
-   the router replies is a misclick hazard. Recommended: keep the placeholder,
-   and if Manual check 4 shows a median router latency above 2 s, show the
-   model-free rows at once and let router rows replace them only when no
-   pointer is over the card and no key was pressed. Needs the measurement.
-9. **Does the send preview keep its focus-loss cancel?** Recommended: yes (see
-   "Clicking elsewhere"). Counter-argument: a user who Alt+Tabs to check what
-   is about to be sent loses the preview and the request, and has to press the
-   key again. The cost of the alternative is a worker blocked and the app
-   `busy` until Esc or the key. If this proves annoying, give the send preview
-   a long one-shot expiry instead of removing the cancel.
+1. **Decision: the options card uses its own `options.min_confidence` (0.2),
+   not `palette.router_threshold` (0.7).** At 0.7 the card would often hold
+   one option. Small-model confidences are poorly calibrated, so 0.2 is a
+   tunable, not a fact.
+2. **Decision: the key runs option 1 even at low confidence, but only when
+   option 1 is key-pickable.** A clipboard-writing option (Copy text from
+   screen, Copy region) is key-picked only at or above the router threshold,
+   otherwise the key dismisses, so a habit press never overwrites the
+   clipboard silently. The hint line shows "Esc to close", and option 1's
+   keycap is drawn without the accent outline when the key will not run it.
+3. **Decision: the hook claims digits and Esc while the options card is
+   open**, under the conditions above (no modifiers, only digits that name an
+   option, an auto-dismiss, an expiry that lapses by itself,
+   `options.claim_keys`). Letting the card take focus would steal typing.
+   Revisit if the digit capture annoys anyone in testing.
+4. **Decision: activation shows the static card.** The picker route does not
+   run the router; the hotkey route does.
+5. **Decision: ship `double_press_ms` at 300 as a placeholder** and set it
+   from Manual check 1 before slice 5 merges.
+6. **Decision: Always pick does nothing on an answer card.** Esc closes. A
+   key that closes in a mode named "pick" would surprise.
+7. **Decision: the options card auto-dismisses after 20 s** (this bounds the
+   digit claim). Answer cards keep their current timers and
+   `PENDING_SAFETY_TIMEOUT_SECS`.
+8. **Decision: the router timeout is 10 s, and the card shows the
+   placeholder while it waits.** If Manual check 4 shows a median router
+   latency above 2 s, the model-free rows show at once and router rows
+   replace them only when no pointer is over the card and no key was
+   pressed.
+9. **Decision: the send preview keeps its focus-loss cancel.** If this proves
+   annoying, give it a long one-shot expiry instead of removing the cancel.
+
+## Related decisions
+
+- **Decision: the Quick Ask palette sends no model request when it opens.**
+  It sends one only after the user picks an action or types something. The
+  router call belongs to the key press and the options card, not to opening
+  the palette.
+- **Decision: a remote Ollama `base_url` in Local mode is allowed, with a
+  one-time warning that the screenshot leaves this PC.** The router follows
+  the same rule.
