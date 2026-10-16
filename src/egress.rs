@@ -111,6 +111,13 @@ pub struct EgressEntry {
     pub error: Option<String>,
     /// Always `None` today; see this module's doc comment on cost (#21).
     pub cost: Option<f64>,
+    /// What started the ask this request belongs to (`hotkey`, `activation`,
+    /// `tray`, `palette`, see `activation::Trigger`), so "forty of these were
+    /// activations" can be told apart from key presses (#236). `None` for
+    /// requests not started by an ask, and for rows written before this
+    /// field existed.
+    #[serde(default)]
+    pub trigger: Option<String>,
 }
 
 fn now_unix() -> u64 {
@@ -515,6 +522,7 @@ pub fn build_entry(
         outcome,
         error: error.map(redact_opaque_tokens),
         cost: None,
+        trigger: crate::activation::worker_trigger_label().map(str::to_string),
     }
 }
 
@@ -700,6 +708,9 @@ pub fn render_human(entry: &EgressEntry) -> String {
     let mut parts = Vec::new();
     parts.push(format!("t={}", entry.time_unix));
     parts.push(format!("provider={}", entry.provider));
+    if let Some(trigger) = &entry.trigger {
+        parts.push(format!("trigger={trigger}"));
+    }
     if let Some(model) = &entry.model {
         parts.push(format!("model={model}"));
     }
@@ -1122,6 +1133,49 @@ mod tests {
     fn cap_lines_never_drops_the_newest_line_even_if_it_alone_exceeds_the_cap() {
         let result = cap_lines("", "a very long single line entry", 5);
         assert!(result.contains("a very long single line entry"));
+    }
+
+    // -- trigger (#236) ------------------------------------------------------
+
+    fn sample_entry() -> EgressEntry {
+        build_entry(
+            "openai",
+            "https://api.openai.com/v1/responses",
+            &json!({"model": "gpt-5.5"}),
+            false,
+            10,
+            20,
+            Outcome::Success,
+            None,
+        )
+    }
+
+    #[test]
+    fn an_entry_written_by_a_marked_thread_carries_its_trigger() {
+        let entry = std::thread::spawn(|| {
+            crate::activation::set_worker_trigger(crate::activation::Trigger::Activation);
+            sample_entry()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(entry.trigger.as_deref(), Some("activation"));
+        let line = serde_json::to_string(&entry).unwrap();
+        assert!(line.contains(r#""trigger":"activation""#), "{line}");
+        assert!(render_human(&entry).contains("trigger=activation"));
+        let back: EgressEntry = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn an_unmarked_thread_writes_no_trigger_and_old_rows_still_parse() {
+        let entry = std::thread::spawn(sample_entry).join().unwrap();
+        assert_eq!(entry.trigger, None);
+        assert!(!render_human(&entry).contains("trigger="));
+        // A row written before the field existed has no "trigger" key.
+        let mut v = serde_json::to_value(&entry).unwrap();
+        v.as_object_mut().unwrap().remove("trigger");
+        let back: EgressEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.trigger, None);
     }
 
     // -- render_human --------------------------------------------------------

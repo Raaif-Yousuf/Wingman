@@ -115,6 +115,11 @@ pub struct DiagnosticsInput {
     pub ocr_language: String,
     /// `None` when nothing has failed yet this session. See [`LastError`].
     pub last_error: Option<LastError>,
+    /// #236: activation messages refused by the rate limit this session.
+    pub suppressed_activations: u64,
+    /// #237: this process started without the single-instance lock because
+    /// the name was held by something that is not Wingman.
+    pub lock_squatted: bool,
 }
 
 /// Reduces `config.providers` to the report's provider table, in
@@ -270,6 +275,15 @@ pub fn render_report(input: &DiagnosticsInput) -> String {
     ));
     out.push_str(&format!("Ollama: {}\n", input.ollama_health));
     out.push_str(&format!("OCR language: {}\n", input.ocr_language));
+    out.push_str(&format!(
+        "Suppressed activations: {}\n",
+        input.suppressed_activations
+    ));
+    if input.lock_squatted {
+        out.push_str(
+            "Startup lock: the name was held by a process that is not Wingman, started without it\n",
+        );
+    }
 
     out.push_str("\nEnv overrides present:");
     if input.env_overrides.is_empty() {
@@ -371,6 +385,8 @@ pub fn collect(config: &Config, last_error: Option<LastError>) -> DiagnosticsInp
         ollama_health,
         ocr_language: crate::ocr::language_status(),
         last_error,
+        suppressed_activations: crate::activation::suppressed_count(),
+        lock_squatted: crate::single_instance::lock_squatted(),
     }
 }
 
@@ -508,6 +524,8 @@ mod tests {
             ollama_health: "Ollama is not running.".to_string(),
             ocr_language: "de, used de-DE".to_string(),
             last_error: None,
+            suppressed_activations: 0,
+            lock_squatted: false,
         }
     }
 
@@ -705,6 +723,19 @@ mod tests {
     fn render_report_says_none_when_nothing_has_failed() {
         let text = render_report(&sample_input());
         assert!(text.contains("Last error: none"), "{text}");
+    }
+
+    #[test]
+    fn render_report_shows_suppressed_activations_and_a_squatted_lock() {
+        let mut input = sample_input();
+        input.suppressed_activations = 12;
+        let text = render_report(&input);
+        assert!(text.contains("Suppressed activations: 12\n"), "{text}");
+        assert!(!text.contains("Startup lock"), "{text}");
+        input.lock_squatted = true;
+        let text = render_report(&input);
+        assert!(text.contains("Startup lock: the name was held"), "{text}");
+        assert!(!text.contains('\u{2014}'));
     }
 
     #[test]
