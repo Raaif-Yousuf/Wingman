@@ -27,6 +27,24 @@
 
 use serde_json::{json, Value};
 
+/// Every proposal kind [`schema_for`] answers for, so a test can walk them all.
+#[cfg(test)]
+pub(crate) const PROPOSAL_KINDS: [&str; 13] = [
+    "verdict",
+    "calendar_event",
+    "text_review",
+    "form_fill",
+    "text_answer",
+    "action_items",
+    "table",
+    "error_explanation",
+    "word_definition",
+    "page_summary",
+    "screen_explanation",
+    "time_list",
+    "scam_check",
+];
+
 /// Looks up the JSON Schema for `proposal`. `rate_difficulty` only affects
 /// `"verdict"` (whether its `difficulty` property and rubric-driven enum are
 /// present); it is accepted unconditionally rather than only for the kinds

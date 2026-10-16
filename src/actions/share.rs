@@ -211,6 +211,18 @@ pub fn parse_import(text: &str) -> Result<Import> {
         anyhow::bail!("the action lists more than {MAX_INPUTS} inputs");
     }
 
+    // Only "none" does nothing. Every other executor (the clipboard ones
+    // included, which the app treats as read-only and would auto-run) must
+    // ask first. This runs before validation, which refuses `confirm = false`
+    // on a writing executor (#732): an import turns it on instead.
+    if action.executor != "none" && !action.confirm {
+        action.confirm = true;
+        notes.push(
+            "It acts on your computer (it changes something or uses the clipboard), so it always asks first. Confirm was turned on."
+                .into(),
+        );
+    }
+
     super::validate_action(&action)?;
 
     if action.hotkey.take().is_some() {
@@ -219,16 +231,6 @@ pub fn parse_import(text: &str) -> Result<Import> {
     action.enabled = !imports_turned_off(&action);
     if !action.enabled {
         notes.push(TURNED_OFF_NOTE.to_string());
-    }
-    // Only "none" does nothing. Every other executor (the clipboard ones
-    // included, which the app treats as read-only and would auto-run) must
-    // ask first.
-    if action.executor != "none" && !action.confirm {
-        action.confirm = true;
-        notes.push(
-            "It acts on your computer (it changes something or uses the clipboard), so it always asks first. Confirm was turned on."
-                .into(),
-        );
     }
     Ok(Import { action, notes })
 }
