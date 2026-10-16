@@ -724,6 +724,15 @@ fn startup_card(
     Some((headline, detail))
 }
 
+/// #793: whether `mode` may be switched on while the config file's state is
+/// `load_problem`. A file that did not parse starts the run Offline with
+/// default (looser) settings; anything that sends data out must wait until it
+/// parses, so only Offline is allowed meanwhile. The state is a plain field
+/// read, so the check cannot itself fail open.
+fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
+    mode == Mode::Offline || load_problem.is_none()
+}
+
 /// #711: config.toml exists but did not parse. Names the line and column
 /// (`problem` already carries them), never file text. No em dash (rule 11).
 fn config_problem_card(problem: &str) -> (String, String) {
@@ -3919,6 +3928,11 @@ impl App {
         };
 
         self.config = edited;
+        // #793: the save below is refused while the file does not parse, so
+        // an edited mode must not outlive it in memory (requests read it).
+        if !mode_allowed(self.config.mode, self.config.load_problem.as_deref()) {
+            self.config.mode = Mode::Offline;
+        }
         if let Err(e) = self.config.save() {
             // Rule 7: neither failure may be silently dropped. Every
             // deferred message is delivered for real (its executor runs,
@@ -4231,6 +4245,15 @@ impl App {
     /// writes to disk, same as every other tray setting change.
     fn set_mode(&mut self, mode: Mode) {
         if self.config.mode == mode {
+            return;
+        }
+        // #793: the file did not parse, so the run is Offline until it does.
+        if !mode_allowed(mode, self.config.load_problem.as_deref()) {
+            let (headline, detail) =
+                config_problem_card(self.config.load_problem.as_deref().unwrap_or_default());
+            self.card.show_error(&headline, &detail);
+            self.tray.set_mode(self.config.mode);
+            self.set_watch(true);
             return;
         }
         self.config.mode = mode;
@@ -7150,7 +7173,7 @@ mod tests {
     };
     use super::{final_settings_card, SettingsFinalCard};
     use super::{first_provider_model_label, provider_for_router, router_models_for};
-    use super::{settings_reentrancy_policy, SettingsReentrancy};
+    use super::{mode_allowed, settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
         WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
@@ -8099,6 +8122,17 @@ mod tests {
     /// `WM_DESTROY`, so tests can exercise that branch without depending on
     /// an actual `RegisterWindowMessageW` call.
     const FAKE_TASKBAR_CREATED_MSG: u32 = 0xC123;
+
+    #[test]
+    fn a_config_that_did_not_parse_allows_only_offline() {
+        // #793: one tray click must not switch cloud on with default settings.
+        let problem = Some("config.toml has an error at line 1, column 1");
+        assert!(mode_allowed(Mode::Offline, problem));
+        for m in [Mode::Cloud, Mode::Local, Mode::Auto] {
+            assert!(!mode_allowed(m, problem), "{m:?}");
+            assert!(mode_allowed(m, None), "{m:?}");
+        }
+    }
 
     #[test]
     fn settings_reentrancy_defers_the_worker_result() {
