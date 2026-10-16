@@ -117,9 +117,10 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject, InvalidateRect,
-    SelectObject, SetBkMode, SetTextColor, UpdateWindow, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
+    GetStockObject, InvalidateRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow,
+    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, FW_NORMAL, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -872,7 +873,23 @@ fn row_text_color() -> COLORREF {
     COLORREF(0x00E6_E6E6)
 }
 
-/// D2D/DirectWrite equivalent of `draw_text_line` (imported from
+/// The palette's GDI font: Segoe UI, `D2D_FONT_SIZE_DIP` tall at `dpi`, in
+/// `weight`. The caller frees it with `DeleteObject`.
+fn gdi_font(dpi: u32, weight: i32) -> HFONT {
+    let mut lf = LOGFONTW {
+        lfHeight: -scale(D2D_FONT_SIZE_DIP as i32, dpi),
+        lfWeight: weight,
+        lfCharSet: DEFAULT_CHARSET,
+        lfQuality: CLEARTYPE_QUALITY,
+        ..Default::default()
+    };
+    for (slot, unit) in lf.lfFaceName.iter_mut().zip(D2D_FONT_FAMILY.encode_utf16()) {
+        *slot = unit;
+    }
+    unsafe { CreateFontIndirectW(&lf) }
+}
+
+/// D2D/DirectWrite equivalent of ``draw_text_line`` (imported from
 /// `crate::ui::text` for the GDI fallback path below): draws one line of
 /// `text` in `rect` (logical/DIP coordinates -- see the module doc comment)
 /// with `color`, or does nothing at all when `text` is empty. Unlike the GDI
@@ -1445,7 +1462,10 @@ impl PaletteInner {
             let _ = DeleteObject(bg.into());
 
             SetBkMode(hdc, TRANSPARENT);
-            let old_font = SelectObject(hdc, HGDIOBJ(self.font.0));
+            // Segoe UI at this window's DPI, like the DirectWrite path (the stock
+            // GUI font is neither Segoe nor scaled), freed below.
+            let gdi_font = gdi_font(self.dpi, FW_NORMAL.0 as i32);
+            let old_font = SelectObject(hdc, HGDIOBJ(gdi_font.0));
 
             let pad = scale(PADDING, self.dpi);
             let row_h = scale(ROW_HEIGHT, self.dpi);
@@ -1553,6 +1573,7 @@ impl PaletteInner {
             );
 
             SelectObject(hdc, old_font);
+            let _ = DeleteObject(gdi_font.into());
         }
     }
 
