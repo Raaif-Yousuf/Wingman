@@ -149,6 +149,12 @@ pub struct Config {
     /// without config.toml ever carrying it forward.
     #[serde(skip)]
     pub unreadable_secrets: Vec<String>,
+    /// #711: set when config.toml existed but could not be read or parsed.
+    /// The values here are then defaults, not the user's, so [`Config::save_to`]
+    /// refuses to write them over the file until a reload parses it. Holds
+    /// the file name and the line and column only, never file contents.
+    #[serde(skip)]
+    pub load_problem: Option<String>,
     /// Issue #19: `Cloud | Local | Auto | Offline`. Defaults to `Auto` per
     /// the expansion plan's Modes table. `App::run` publishes this to
     /// `mode::set_current` at startup, and `App::set_mode` keeps the
@@ -751,6 +757,31 @@ thread_local! {
     static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// #711: the modified time of each config file as this process last read or
+/// wrote it. A save compares it with the file now; a difference means someone
+/// edited the file since, and the save is refused rather than overwriting the
+/// edit. Keyed by path so tests on scratch paths never share an entry.
+static SEEN_MTIMES: std::sync::Mutex<Vec<(PathBuf, std::time::SystemTime)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn seen_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    let seen = SEEN_MTIMES.lock().unwrap_or_else(|e| e.into_inner());
+    seen.iter().find(|(p, _)| p == path).map(|(_, t)| *t)
+}
+
+fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
+    let Some(mtime) = mtime else { return };
+    let mut seen = SEEN_MTIMES.lock().unwrap_or_else(|e| e.into_inner());
+    match seen.iter_mut().find(|(p, _)| p == path) {
+        Some(entry) => entry.1 = mtime,
+        None => seen.push((path.to_path_buf(), mtime)),
+    }
+}
+
 impl Config {
     /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {
@@ -872,14 +903,30 @@ impl Config {
     /// create-from-defaults. Never touches env vars or the secret store.
     fn load_from_file(path: &Path) -> Result<Config> {
         if path.exists() {
-            let contents = fs::read_to_string(path).unwrap_or_default();
-            let (cfg, repaired) = Self::parse_reporting_repair(&contents);
-            if repaired {
-                // Best effort: the in-memory value is already correct, so a
-                // failed write here is not worth failing the load over.
-                let _ = cfg.save_to(path);
+            // Taken before the read, so an edit that lands in between reads as
+            // "changed since load" at save time, not as ours.
+            let mtime = file_mtime(path);
+            let contents = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => {
+                    return Ok(Self::not_loaded(
+                        "config.toml could not be read".to_string(),
+                    ));
+                }
+            };
+            match Self::parse_reporting_repair(&contents) {
+                Ok((cfg, repaired)) => {
+                    note_mtime(path, mtime);
+                    if repaired {
+                        // Best effort: the in-memory value is already correct, so a
+                        // failed write here is not worth failing the load over.
+                        let _ = cfg.save_to(path);
+                    }
+                    Ok(cfg)
+                }
+                // #711: keep the file exactly as it is.
+                Err(e) => Ok(Self::not_loaded(Self::describe_parse_error(&contents, &e))),
             }
-            Ok(cfg)
         } else {
             let defaults = Config::default();
             defaults.save_to(path)?;
@@ -1103,10 +1150,37 @@ impl Config {
     /// Like [`Config::parse_or_default`], but also reports whether the parse
     /// had to repair anything -- the caller writes the file back so the
     /// on-disk copy stops disagreeing with what is actually being sent.
-    fn parse_reporting_repair(toml_str: &str) -> (Config, bool) {
-        let mut cfg: Config = toml::from_str(toml_str).unwrap_or_default();
+    fn parse_reporting_repair(toml_str: &str) -> Result<(Config, bool), toml::de::Error> {
+        let mut cfg: Config = toml::from_str(toml_str)?;
         let repaired = cfg.backfill();
-        (cfg, repaired)
+        Ok((cfg, repaired))
+    }
+
+    /// "config.toml has an error at line L, column C", from the parse error's
+    /// byte span. Never includes any file text: a value could be an API key.
+    fn describe_parse_error(contents: &str, err: &toml::de::Error) -> String {
+        let Some(span) = err.span() else {
+            return "config.toml could not be parsed".to_string();
+        };
+        let before = &contents.as_bytes()[..span.start.min(contents.len())];
+        let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+        let line_start = before
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        let column = String::from_utf8_lossy(&before[line_start..])
+            .chars()
+            .count()
+            + 1;
+        format!("config.toml has an error at line {line}, column {column}")
+    }
+
+    /// Defaults, marked "not loaded" so nothing saves them over the file.
+    fn not_loaded(problem: String) -> Config {
+        let mut cfg = Config::default();
+        cfg.backfill();
+        cfg.load_problem = Some(problem);
+        cfg
     }
 
     /// Fills in values a config written by an older build has no key for.
@@ -1278,6 +1352,22 @@ impl Config {
     /// `self` is what gets written. Writes atomically (temp file + rename)
     /// so a reader never observes a half-written file.
     pub fn save_to(&self, path: &Path) -> Result<()> {
+        // #711: defaults standing in for an unreadable file must never replace it.
+        if let Some(problem) = &self.load_problem {
+            anyhow::bail!(
+                "{problem}, so Wingman did not save over it. Fix the file, then choose \
+                 Reload settings from the tray menu"
+            );
+        }
+        // #711: a hand edit made after this config was read is not clobbered.
+        if let (Some(seen), Some(now)) = (seen_mtime(path), file_mtime(path)) {
+            if seen != now {
+                anyhow::bail!(
+                    "config.toml changed on disk since Wingman read it, so it was not saved. \
+                     Choose Reload settings from the tray menu, then try again"
+                );
+            }
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context("failed to create config directory")?;
         }
@@ -1305,7 +1395,33 @@ impl Config {
             );
         }
 
+        // #711: one generation of backup, itself written temp-then-rename and
+        // restricted the same way (it can hold what the file held). Failing to
+        // make it aborts the save: the old file is the only copy.
+        if path.exists() {
+            let mut bak_name = path.as_os_str().to_os_string();
+            bak_name.push(".bak");
+            let bak = PathBuf::from(bak_name);
+            let mut bak_tmp_name = bak.as_os_str().to_os_string();
+            bak_tmp_name.push(".tmp");
+            let bak_tmp = PathBuf::from(bak_tmp_name);
+            let made = fs::copy(path, &bak_tmp)
+                .context("failed to copy the old config to a backup")
+                .and_then(|_| {
+                    #[cfg(windows)]
+                    Self::restrict_acl(&bak_tmp)?;
+                    fs::rename(&bak_tmp, &bak)
+                        .context("failed to move the config backup into place")
+                });
+            if let Err(e) = made {
+                let _ = fs::remove_file(&bak_tmp);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
+
         fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
+        note_mtime(path, file_mtime(path));
 
         Ok(())
     }
@@ -1955,7 +2071,150 @@ win = true
         fs::write(&path, "this is not { valid toml at all [[[").unwrap();
 
         let config = Config::load_from_with(&path, &|_| None).expect("load should still succeed");
-        assert_eq!(config, Config::default());
+        // #711: the in-memory values are defaults, but the config is marked
+        // "not loaded" so nothing saves it over the user's file.
+        assert!(config.load_problem.is_some());
+        assert_eq!(
+            Config {
+                load_problem: None,
+                ..config
+            },
+            Config::default()
+        );
+
+        cleanup(&path);
+    }
+
+    // -- #711: a config.toml that does not parse is never overwritten -----
+
+    fn set_mtime(path: &Path, secs_from_epoch: u64) {
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_from_epoch))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_bad_file_names_its_line_and_column_and_nothing_else() {
+        let path = scratch_path("711-location");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "mode = \"auto\"\napi_key = \"sk-SECRET-VALUE\" oops\n",
+        )
+        .unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        let problem = config.load_problem.expect("a bad file must be reported");
+        assert!(problem.contains("line 2"), "got: {problem}");
+        assert!(problem.contains("column"), "got: {problem}");
+        assert!(!problem.contains("sk-SECRET-VALUE"), "got: {problem}");
+        assert!(problem.contains("config.toml"), "got: {problem}");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn loading_a_bad_file_leaves_its_bytes_alone() {
+        let path = scratch_path("711-load-keeps-bytes");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bad = "[hotkeys\nprimary = nope\n";
+        fs::write(&path, bad).unwrap();
+
+        let _ = Config::load_from_with(&path, &|_| None).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), bad);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_to_refuses_while_the_file_has_not_been_read() {
+        let path = scratch_path("711-save-refused");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bad = "[hotkeys\nprimary = nope\n";
+        fs::write(&path, bad).unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        let err = config.save_to(&path).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("Reload"), "got: {err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), bad);
+
+        // Once the file parses, a reload clears the mark and saving works.
+        fs::write(&path, "mode = \"cloud\"\n").unwrap();
+        let fixed = Config::load_from_with(&path, &|_| None).unwrap();
+        assert!(fixed.load_problem.is_none());
+        fixed.save_to(&path).expect("save after a fix");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_also_not_saved_over() {
+        // Invalid UTF-8 makes read_to_string fail, which used to load as defaults.
+        let path = scratch_path("711-not-utf8");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        assert!(config.load_problem.is_some());
+        assert!(config.save_to(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0xfe, 0x00, 0x80]);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_to_keeps_a_backup_of_the_previous_file() {
+        let path = scratch_path("711-backup");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "mode = \"cloud\"\n# my note\n").unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        config.save_to(&path).unwrap();
+
+        let mut bak = path.as_os_str().to_os_string();
+        bak.push(".bak");
+        assert_eq!(
+            fs::read_to_string(PathBuf::from(bak)).unwrap(),
+            "mode = \"cloud\"\n# my note\n"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_to_refuses_when_the_file_changed_on_disk_since_it_was_read() {
+        let path = scratch_path("711-stale");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "mode = \"cloud\"\n").unwrap();
+        set_mtime(&path, 1_700_000_000);
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        // A hand edit after Wingman started.
+        fs::write(&path, "mode = \"local\"\n").unwrap();
+        set_mtime(&path, 1_700_000_100);
+
+        let err = config.save_to(&path).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("changed"), "got: {err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "mode = \"local\"\n");
+
+        // Reloading picks the edit up and saves work again.
+        let fresh = Config::load_from_with(&path, &|_| None).unwrap();
+        fresh.save_to(&path).expect("save after reload");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn two_saves_in_a_row_are_not_mistaken_for_an_outside_edit() {
+        let path = scratch_path("711-own-writes");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "mode = \"cloud\"\n").unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        config.save_to(&path).unwrap();
+        config
+            .save_to(&path)
+            .expect("our own write is not a conflict");
 
         cleanup(&path);
     }
@@ -3005,7 +3264,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
             "[ui]\nprompt = {}\n",
             toml::Value::String(DEFAULT_PROMPT.to_string())
         );
-        let (_, repaired) = Config::parse_reporting_repair(&doc);
+        let (_, repaired) = Config::parse_reporting_repair(&doc).unwrap();
         assert!(
             !repaired,
             "loading the current shipped default must not be reported as a repair"
