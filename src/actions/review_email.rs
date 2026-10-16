@@ -364,6 +364,8 @@ pub enum CapturedInput {
     Selection {
         text: String,
         target: Option<crate::inputs::selection::SelectionTarget>,
+        /// The selection was longer than the length limit and was cut.
+        cut: bool,
     },
     Screen,
 }
@@ -389,6 +391,10 @@ impl CapturedInput {
     /// (not a reference) since `ComposeBody` and `Selection` carry two
     /// different underlying types -- see [`ReplaceTarget`]'s own doc
     /// comment.
+    pub fn was_cut(&self) -> bool {
+        matches!(self, CapturedInput::Selection { cut: true, .. })
+    }
+
     pub fn target(&self) -> Option<ReplaceTarget> {
         match self {
             CapturedInput::ComposeBody { target, .. } => Some(ReplaceTarget::Whole(target.clone())),
@@ -457,8 +463,14 @@ fn captured_from_selection(selection: crate::inputs::selection::Selection) -> Ca
         } else {
             selection.target
         },
+        cut: selection.truncated,
     }
 }
+
+/// Added to the review card when the selection was longer than the length
+/// limit, so the user knows why there is no "Do it".
+pub const CUT_NOTICE: &str =
+    "The selection was too long to review in full, so nothing can be replaced in place. Select less text to apply the edits.";
 
 // ---------------------------------------------------------------------------
 // Building the "Do it" replace_text proposal, and running it
@@ -483,6 +495,8 @@ pub struct ReviewOutcome {
     /// `Selection` source does not always set `target` -- see
     /// [`CapturedInput::Selection`]'s doc comment).
     pub source: InputSource,
+    /// The selection was cut to the length limit (see [`CUT_NOTICE`]).
+    pub cut: bool,
 }
 
 /// Everything "Do it" needs, stashed by `app.rs` between the preview being
@@ -1167,6 +1181,7 @@ mod tests {
         let c = CapturedInput::Selection {
             text: "hi there".to_string(),
             target: None,
+            cut: false,
         };
         assert_eq!(c.source(), InputSource::Selection);
         assert_eq!(c.text(), Some("hi there"));
@@ -1180,6 +1195,7 @@ mod tests {
         let c = CapturedInput::Selection {
             text: "wnated".to_string(),
             target: Some(sample_selection_target()),
+            cut: false,
         };
         assert_eq!(c.source(), InputSource::Selection);
         assert_eq!(c.text(), Some("wnated"));
@@ -1214,6 +1230,8 @@ mod tests {
         let c = captured_from_selection(uia_selection(true));
         assert_eq!(c.text(), Some("first part"));
         assert_eq!(c.target(), None);
+        assert!(c.was_cut());
+        assert!(!captured_from_selection(uia_selection(false)).was_cut());
     }
 
     #[test]
