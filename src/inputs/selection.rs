@@ -82,7 +82,11 @@
 //! several common copy sources -- Snipping Tool/Snip & Sketch, some browser
 //! image copies -- put on the clipboard, sometimes with no parallel
 //! `CF_DIB` entry), the registered `"HTML Format"` and `"Rich Text Format"`
-//! formats.
+//! formats, and the three privacy markers password managers set beside a
+//! copied secret (#724): `ExcludeClipboardContentFromMonitorProcessing`,
+//! `CanIncludeInClipboardHistory` and `CanUploadToCloudClipboard`. Without
+//! them a restored password would become eligible for Win+V history and
+//! cloud sync.
 //!
 //! **`CF_BITMAP` is NOT byte-copied.** It is a GDI bitmap *handle*, not an
 //! `HGLOBAL` buffer -- there is no byte buffer to snapshot without decoding
@@ -99,7 +103,7 @@
 //! Any other format on the clipboard (a custom app-specific format, a file
 //! contents stream, etc.) is left untouched by `EmptyClipboard` +
 //! `SetClipboardData`'s all-or-nothing semantics: **`EmptyClipboard` clears
-//! every format**, so anything not in the five above is unconditionally lost
+//! every format**, so anything not in the list above is unconditionally lost
 //! across this round trip, not merely "not preserved". This is the honest
 //! limit of a "known formats" snapshot approach; see the filed follow-up
 //! finding for the alternative (a full `IDataObject` capture) this module
@@ -895,8 +899,8 @@ mod win32 {
     };
     use windows::Win32::System::DataExchange::{
         AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-        GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
-        RemoveClipboardFormatListener, SetClipboardData,
+        GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+        RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
@@ -930,9 +934,24 @@ mod win32 {
         *FMT.get_or_init(|| unsafe { RegisterClipboardFormatW(w!("Rich Text Format")) })
     }
 
-    /// The six formats [`super::snapshot`]/[`super::restore`] round-trip.
+    /// The registered names of the clipboard privacy markers (#724). Each
+    /// carries a DWORD, or for the exclusion marker just its presence.
+    pub(super) const MARKER_FORMAT_NAMES: [windows::core::PCWSTR; 3] = [
+        w!("ExcludeClipboardContentFromMonitorProcessing"),
+        w!("CanIncludeInClipboardHistory"),
+        w!("CanUploadToCloudClipboard"),
+    ];
+
+    /// The registered ids of [`MARKER_FORMAT_NAMES`], in the same order.
+    pub(super) fn marker_formats() -> [u32; 3] {
+        static FMTS: OnceLock<[u32; 3]> = OnceLock::new();
+        *FMTS.get_or_init(|| MARKER_FORMAT_NAMES.map(|n| unsafe { RegisterClipboardFormatW(n) }))
+    }
+
+    /// The formats [`super::snapshot`]/[`super::restore`] round-trip.
     /// See the module doc comment's "what is and is not preserved".
-    pub(super) fn preserved_formats() -> [u32; 6] {
+    pub(super) fn preserved_formats() -> [u32; 9] {
+        let [exclude, history, cloud] = marker_formats();
         [
             CF_UNICODETEXT_U32,
             CF_HDROP_U32,
@@ -940,6 +959,9 @@ mod win32 {
             CF_DIBV5_U32,
             html_format(),
             rtf_format(),
+            exclude,
+            history,
+            cloud,
         ]
     }
 
@@ -1029,8 +1051,19 @@ mod win32 {
 
         fn get_format(&self, format: u32) -> Option<Vec<u8>> {
             let _guard = OpenGuard::open().ok()?;
-            let handle = unsafe { GetClipboardData(format) }.ok()?;
-            read_hglobal_bytes(handle)
+            let read = unsafe { GetClipboardData(format) }
+                .ok()
+                .and_then(read_hglobal_bytes);
+            // A privacy marker is meaningful by being there, and some apps
+            // set it with no data. Keep it as a zero DWORD so the restore
+            // still carries it (zero is "do not include / do not upload").
+            if read.is_none()
+                && marker_formats().contains(&format)
+                && unsafe { IsClipboardFormatAvailable(format) }.is_ok()
+            {
+                return Some(vec![0; 4]);
+            }
+            read
         }
 
         fn set_formats(&self, formats: &[(u32, Vec<u8>)]) -> anyhow::Result<()> {
@@ -1790,6 +1823,50 @@ mod tests {
             Some(b"fake-dibv5-bytes".to_vec()),
             "a CF_DIBV5 image must survive a selection-fallback clipboard round trip"
         );
+    }
+
+    #[test]
+    fn a_password_managers_privacy_markers_survive_a_selection_fallback_round_trip() {
+        // #724: the markers keep a copied secret out of Win+V history and
+        // cloud sync. Restoring only the text would strip them.
+        let [exclude, history, cloud] = win32::marker_formats();
+        assert!(
+            exclude != history && history != cloud && exclude != cloud && exclude != 0,
+            "the three markers must be distinct registered formats"
+        );
+        let clipboard = FakeClipboard::seeded(&[
+            (win32::CF_UNICODETEXT_U32, b"s\0e\0c\0r\0e\0t\0\0\0"),
+            (exclude, &[1, 0, 0, 0]),
+            (history, &[0, 0, 0, 0]),
+            (cloud, &[0, 0, 0, 0]),
+        ]);
+
+        let snap = snapshot(&clipboard, &win32::preserved_formats());
+        // The injected Ctrl+C replaces the clipboard with an unmarked copy.
+        clipboard
+            .set_formats(&[(win32::CF_UNICODETEXT_U32, b"x\0\0\0".to_vec())])
+            .unwrap();
+        assert_eq!(clipboard.get_format(exclude), None);
+        restore(&clipboard, &snap).unwrap();
+
+        assert_eq!(clipboard.get_format(exclude), Some(vec![1, 0, 0, 0]));
+        assert_eq!(clipboard.get_format(history), Some(vec![0, 0, 0, 0]));
+        assert_eq!(clipboard.get_format(cloud), Some(vec![0, 0, 0, 0]));
+        assert_eq!(
+            clipboard.get_format(win32::CF_UNICODETEXT_U32),
+            Some(b"s\0e\0c\0r\0e\0t\0\0\0".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_clipboard_without_markers_does_not_gain_any_on_restore() {
+        let clipboard = FakeClipboard::seeded(&[(win32::CF_UNICODETEXT_U32, b"p\0\0\0")]);
+        let snap = snapshot(&clipboard, &win32::preserved_formats());
+        clipboard.set_formats(&[]).unwrap();
+        restore(&clipboard, &snap).unwrap();
+        for marker in win32::marker_formats() {
+            assert_eq!(clipboard.get_format(marker), None);
+        }
     }
 
     #[test]
