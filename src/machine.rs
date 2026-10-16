@@ -318,6 +318,12 @@ fn ollama_state(base_url: &str) -> OllamaState {
     }
 }
 
+/// Hardware DXGI adapters, or None when DXGI could not be read. The one
+/// adapter enumeration in the crate (`ollama_gpu_fix` reuses it).
+pub fn adapters() -> Option<Vec<GpuInfo>> {
+    win::gpus()
+}
+
 mod win {
     use super::{GpuInfo, Power};
     use windows::Win32::Graphics::Dxgi::{
