@@ -129,6 +129,15 @@ jobs:
           Copy-Item '${{ steps.msix.outputs.exe_path }}' dist\wingman.exe -Force
           Copy-Item '${{ steps.msix.outputs.msix_path }}' dist\wingman.msix -Force
           Copy-Item '${{ steps.sbom.outputs.sbom_path }}' dist\wingman.cdx.json -Force
+          # The zip is what the README Download section points to: the exe
+          # plus the files a person unzipping it wants beside it (issue #830).
+          $zipDir = Join-Path $env:RUNNER_TEMP 'wingman-zip'
+          New-Item -ItemType Directory -Force -Path $zipDir | Out-Null
+          Copy-Item dist\wingman.exe $zipDir -Force
+          foreach ($f in 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'PRIVACY.md', 'config.example.toml', 'actions.example.toml') {
+            Copy-Item $f $zipDir -Force
+          }
+          Compress-Archive -Path "$zipDir\*" -DestinationPath 'dist\wingman-${{ inputs.tag }}-windows-x64.zip' -Force
           $hashes = Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$h  $($_.Name)"
@@ -165,9 +174,9 @@ jobs:
           Set-Content -Path $notesPath -Value $notes -Encoding utf8
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS.txt --clobber
+            gh release upload $tag dist\wingman-$tag-windows-x64.zip dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS.txt --clobber
             gh release edit $tag --notes-file $notesPath
           } else {
-            gh release create $tag dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS.txt `
+            gh release create $tag dist\wingman-$tag-windows-x64.zip dist\wingman.exe dist\wingman.msix dist\wingman.cdx.json dist\SHA256SUMS.txt `
               --title $tag --notes-file $notesPath --target $env:GITHUB_SHA
           }
