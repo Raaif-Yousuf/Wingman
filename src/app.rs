@@ -156,8 +156,8 @@ pub const WM_APP_FIRST_RUN: u32 = WM_APP + 20;
 /// `Box::into_raw(Box::new(Result<ExecDone, String>))`; the handler takes
 /// ownership and shows the result card. The executors can take seconds, so
 /// they never run on the message loop, which is also the keyboard hook's
-/// thread. `WM_APP + 21`: `+20` is `WM_APP_FIRST_RUN`.
-pub const WM_APP_EXECUTOR_DONE: u32 = WM_APP + 21;
+/// thread. `WM_APP + 21`: `+21` is taken by the machine check result.
+pub const WM_APP_EXECUTOR_DONE: u32 = WM_APP + 22;
 
 /// #567: what Ollama reported for one base URL, as (name, supports vision).
 type PulledOllamaModels = (String, Vec<(String, bool)>);
@@ -371,6 +371,9 @@ struct App {
     /// a second "Restore" click after a successful restore reports "nothing
     /// to restore" rather than attempting a stale undo twice.
     last_form_undo: Option<executors::Undo>,
+    /// #712: an executor worker is writing into another window. Quit waits
+    /// for it, so a write is never killed half way.
+    exec_in_flight: bool,
     /// Review of #349/#426: the full (redacted) chain behind the most
     /// recent error card, so "use Copy diagnostics for details" points at
     /// something real instead of nothing -- `human_error_detail` on its own
@@ -555,6 +558,7 @@ pub fn run() -> Result<()> {
         first_run_probe: 0,
         fallback_footer: None,
         last_form_undo: None,
+        exec_in_flight: false,
         last_error: None,
     });
     app.refresh_tray_labels();
@@ -2958,6 +2962,11 @@ impl App {
     /// touches the foreground window. The outcome comes back as
     /// `WM_APP_EXECUTOR_DONE` and ends in a card on every path.
     fn spawn_executor(&mut self, work: Box<dyn FnOnce() -> ExecDone + Send + 'static>) {
+        debug_assert!(
+            !self.busy,
+            "an executor must not start over a running action"
+        );
+        self.exec_in_flight = true;
         self.set_busy(true);
         self.card
             .show_pending(crate::ui::card::PendingStage::Working);
@@ -2986,6 +2995,7 @@ impl App {
     /// the executor inline. On the form fill, stashes the `Undo` for
     /// "Restore last form" (#645: only when something can be restored).
     fn on_exec_done(&mut self, result: std::result::Result<ExecDone, String>) {
+        self.exec_in_flight = false;
         self.set_busy(false);
         let done = match result {
             Ok(done) => done,
@@ -5613,6 +5623,12 @@ fn exec_work_restore(undo: executors::Undo) -> ExecDone {
     ExecDone::RestoreForm(undo.undo())
 }
 
+/// #712: why Quit is refused right now, if it is. An executor worker that is
+/// mid-write (typing into a form) is never killed; the user tries again.
+fn quit_refusal(exec_in_flight: bool) -> Option<&'static str> {
+    exec_in_flight.then_some("Wingman is still typing into a form; try again in a moment.")
+}
+
 /// Issue #227: runs a worker's whole computation and turns a panic into the
 /// same packed error a failed run produces, so the result message is always
 /// posted and `busy` is always cleared. Only matters where panics unwind
@@ -6210,9 +6226,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::MODE_AUTO) => app.set_mode(Mode::Auto),
                     MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
                     MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
-                    MenuChoice::Command(cmd::QUIT) => unsafe {
-                        let _ = DestroyWindow(hwnd);
-                    },
+                    MenuChoice::Command(cmd::QUIT) => {
+                        if let Some(text) = quit_refusal(app.exec_in_flight) {
+                            app.card.show_answer("Still working", text, 5, None);
+                            app.set_watch(true);
+                        } else {
+                            unsafe {
+                                let _ = DestroyWindow(hwnd);
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 // Not after Quit: the window (and `app`) may already be gone.
@@ -6858,6 +6881,12 @@ mod tests {
     }
 
     #[test]
+    fn quit_is_refused_only_while_an_executor_is_writing() {
+        assert!(super::quit_refusal(true).is_some_and(|t| !t.contains('\u{2014}')));
+        assert!(super::quit_refusal(false).is_none());
+    }
+
+    #[test]
     fn a_failed_restore_comes_back_as_an_error_message() {
         let undo = executors::Undo::recording("x", || anyhow::bail!("could not put it back"));
         let done = exec_work_restore(undo);
@@ -6877,7 +6906,18 @@ mod tests {
         let mut hits = 0;
         for line in production.lines() {
             let t = line.trim_start();
-            if let Some(rest) = t.strip_prefix("fn ").or_else(|| t.strip_prefix("pub fn ")) {
+            // Any fn header: strip visibility and qualifiers, then `fn `.
+            let mut head = t;
+            for vis in ["pub(crate) ", "pub(super) ", "pub "] {
+                if let Some(r) = head.strip_prefix(vis) {
+                    head = r;
+                    break;
+                }
+            }
+            for q in ["const ", "unsafe ", "async ", "extern \"system\" "] {
+                head = head.strip_prefix(q).unwrap_or(head);
+            }
+            if let Some(rest) = head.strip_prefix("fn ") {
                 current = rest
                     .split(|c: char| !(c.is_alphanumeric() || c == '_'))
                     .next()
@@ -6889,6 +6929,7 @@ mod tests {
             }
             for call in [
                 ".execute(",
+                "Executor::execute(",
                 ".undo()",
                 "replace_or_copy(",
                 "do_review_confirmed(",
