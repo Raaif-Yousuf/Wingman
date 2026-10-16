@@ -426,16 +426,29 @@ mod tests {
         sample_profile()
             .save_to(&path)
             .expect("save_to should succeed");
-        let output = std::process::Command::new("icacls")
-            .arg(&path)
-            .output()
-            .expect("icacls should run");
-        let listing = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            listing.contains("(I)"),
-            "portable mode must not strip inheritance: {listing}"
-        );
+        // A control file made beside it keeps the folder's inherited ACL
+        // whatever the machine's folder settings are (a CI runner's temp
+        // folder shows no "(I)" at all), so the two listings must match.
+        let control = path.with_extension("control");
+        fs::write(&control, b"x").unwrap();
+        let acl_of = |p: &Path| {
+            let out = std::process::Command::new("icacls")
+                .arg(p)
+                .output()
+                .expect("icacls should run");
+            String::from_utf8_lossy(&out.stdout)
+                .replace('\r', "")
+                .replace(p.to_string_lossy().as_ref(), "")
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| l.contains(":("))
+                .collect::<Vec<String>>()
+        };
+        let (saved, plain) = (acl_of(&path), acl_of(&control));
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&control);
+        assert!(!plain.is_empty(), "the control file listed no ACEs");
+        assert_eq!(saved, plain, "portable mode must leave the ACL as it was");
     }
 
     // -- atomic write -----------------------------------------------------
