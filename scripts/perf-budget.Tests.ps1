@@ -31,6 +31,17 @@ Describe 'Get-BudgetResult' {
         $r.Max | Should -Be 100
     }
 
+    It 'checks only the named budgets and ignores the rest' {
+        $b = '{"exe_size_bytes":{"max":100},"startup_ms":{"max":5}}' | ConvertFrom-Json
+        $r = @(Get-BudgetResult -Budgets $b -Measured @{ exe_size_bytes = 99 } -Names 'exe_size_bytes')
+        $r.Count | Should -Be 1
+        $r[0].Name | Should -Be 'exe_size_bytes'
+    }
+
+    It 'throws when a named budget is not in the budgets file' {
+        { Get-BudgetResult -Budgets (Get-TestBudget 100) -Measured @{ startup_ms = 1 } -Names 'startup_ms' } | Should -Throw
+    }
+
     It 'throws when a budget has no measurement' {
         { Get-BudgetResult -Budgets (Get-TestBudget 100) -Measured @{} } | Should -Throw
     }
