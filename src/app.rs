@@ -169,9 +169,6 @@ struct App {
     /// showed. Read only when the palette runs an action, so a stale value
     /// from an earlier session can never apply: every open overwrites it.
     palette_password_manager: bool,
-    /// #620: the last "actions were skipped" notice shown, so the palette does
-    /// not repeat it on every open.
-    last_skipped_notice: Option<String>,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -400,7 +397,6 @@ pub fn run() -> Result<()> {
         watcher: None,
         password_manager_hint: false,
         palette_password_manager: false,
-        last_skipped_notice: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -777,6 +773,7 @@ impl App {
             }
             ModelActionGate::Proceed => {}
         }
+        actions::queue_skipped_from_disk();
 
         // #339: before the card is touched and before anything is read.
         if self.refuse_if_password_manager() {
@@ -905,28 +902,12 @@ impl App {
         Some((raw, foreground_hwnd_isize, extra_value))
     }
 
-    /// #620: tells the user once per distinct problem which actions in
-    /// `actions.toml` were skipped, and forgets the last notice when nothing
-    /// is skipped (so fixing the file and breaking it again tells them again).
+    /// #620: the palette's own card for skipped actions, once per change.
     fn show_skipped_notice(&mut self, report: &actions::LoadReport) {
-        let notice = report.skipped.join(" ");
-        if notice.is_empty() {
-            self.last_skipped_notice = None;
-        } else if self.last_skipped_notice.as_deref() != Some(notice.as_str()) {
+        if let Some(notice) = actions::observe_skipped(&report.skipped) {
             let headline = "Some actions in actions.toml were skipped";
             let detail = self.track_error(headline, &notice);
             self.card.show_error_with_details(headline, &detail);
-            self.last_skipped_notice = Some(notice);
-        }
-    }
-
-    /// The same notice for the hotkey's default ask. A load that fails
-    /// outright is reported by the worker as before; here it only forgets the
-    /// last notice.
-    fn notice_skipped_actions(&mut self) {
-        match actions::load_actions_report() {
-            Ok(report) => self.show_skipped_notice(&report),
-            Err(_) => self.last_skipped_notice = None,
         }
     }
 
@@ -938,7 +919,6 @@ impl App {
         else {
             return;
         };
-        self.notice_skipped_actions();
 
         // Issue #19: the mode-aware chain is built fresh on the WORKER
         // thread (inside `worker`, below), not here on the main thread --
@@ -1024,7 +1004,7 @@ impl App {
                 report.actions
             }
             Err(e) => {
-                self.last_skipped_notice = None;
+                actions::queue_skipped(&[]);
                 let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't load actions.toml", &detail);
@@ -1591,7 +1571,7 @@ impl App {
         let resolved = match actions::load_actions_report() {
             Ok(r) => r,
             Err(e) => {
-                self.last_skipped_notice = None;
+                actions::queue_skipped(&[]);
                 let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't load actions.toml", &detail);
@@ -4066,7 +4046,8 @@ fn append_notices(detail: &str, notices: Vec<String>) -> String {
 }
 
 /// #541: the one place a result card asks for the notices queued for "the
-/// next card": a store failure (#46) and the daily budget warning (#101).
+/// next card": a store failure (#46), the daily budget warning (#101) and
+/// the skipped-actions notice (#620).
 /// Every handler that ends a run on a card calls this on its detail text
 /// (a source-scanning test lists them), so a notice is shown once, on
 /// whichever result card comes first, and never sits unseen.
@@ -4076,6 +4057,7 @@ fn with_pending_notices(detail: &str) -> String {
         [
             crate::store::take_notice(),
             crate::usage::take_budget_notice(),
+            crate::actions::take_skipped_notice(),
         ]
         .into_iter()
         .flatten()
@@ -8202,6 +8184,18 @@ mod tests {
         assert_eq!(append_notices("", n()), "Store failed.\n\nBudget hit.");
         assert_eq!(append_notices("answer", Vec::new()), "answer");
         assert_eq!(append_notices("", Vec::new()), "");
+    }
+
+    /// #620: the skipped-actions notice is one of the sources
+    /// `with_pending_notices` drains, and `begin_action` queues it.
+    #[test]
+    fn the_skipped_actions_notice_rides_on_the_pending_notices() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let start = src.find("fn with_pending_notices(").expect("fn exists");
+        let body = &src[start..start + 400];
+        assert!(body.contains("take_skipped_notice()"));
+        let begin = src.find("fn begin_action<T>").expect("fn exists");
+        assert!(src[begin..begin + 1500].contains("queue_skipped_from_disk()"));
     }
 
     /// #541: every handler that ends a run on a result card must consult the

@@ -574,6 +574,77 @@ fn validate_action(action: &Action) -> Result<()> {
     Ok(())
 }
 
+/// Remembers which skipped-actions notice the user has already been shown, so
+/// the same problem is said once and again only when the set changes (#620).
+#[derive(Debug, Default)]
+pub struct SkipNotice {
+    notified: Option<String>,
+    pending: Option<String>,
+}
+
+impl SkipNotice {
+    /// The notice for this load if it differs from the last one shown. An
+    /// empty list (or a failed load, pass `&[]`) forgets the last notice so a
+    /// later break is reported again.
+    pub fn observe(&mut self, skipped: &[String]) -> Option<String> {
+        let text = skipped.join(" ");
+        if text.is_empty() {
+            self.notified = None;
+            return None;
+        }
+        if self.notified.as_deref() == Some(text.as_str()) {
+            return None;
+        }
+        self.notified = Some(text.clone());
+        Some(text)
+    }
+
+    /// [`Self::observe`], then holds a new notice for the next result card.
+    pub fn queue(&mut self, skipped: &[String]) {
+        if let Some(text) = self.observe(skipped) {
+            self.pending = Some(text);
+        }
+    }
+
+    pub fn take(&mut self) -> Option<String> {
+        self.pending.take()
+    }
+}
+
+static SKIP_NOTICE: std::sync::Mutex<SkipNotice> = std::sync::Mutex::new(SkipNotice {
+    notified: None,
+    pending: None,
+});
+
+fn skip_notice() -> std::sync::MutexGuard<'static, SkipNotice> {
+    SKIP_NOTICE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The notice to show now (the palette's own card), once per change.
+pub fn observe_skipped(skipped: &[String]) -> Option<String> {
+    skip_notice().observe(skipped)
+}
+
+/// Holds the notice for the next result card (`app.rs`'s
+/// `with_pending_notices` takes it).
+pub fn queue_skipped(skipped: &[String]) {
+    skip_notice().queue(skipped);
+}
+
+/// Takes the queued notice, if any.
+pub fn take_skipped_notice() -> Option<String> {
+    skip_notice().take()
+}
+
+/// Loads the report and queues its notice; a failed load forgets the last
+/// notice (the run itself reports the load error).
+pub fn queue_skipped_from_disk() {
+    match load_actions_report() {
+        Ok(report) => queue_skipped(&report.skipped),
+        Err(_) => queue_skipped(&[]),
+    }
+}
+
 /// [`load_actions_from`] against the real `%APPDATA%\Wingman\actions.toml`.
 /// The only entry point `app.rs` calls.
 pub fn load_actions() -> Result<Vec<Resolved>> {
@@ -1199,6 +1270,35 @@ prompt = "Make it loud."
             assert_eq!(report.skipped.len(), 1, "{executor}");
             assert!(!report.skipped[0].contains("  "), "{}", report.skipped[0]);
         }
+    }
+
+    #[test]
+    fn a_skip_notice_is_taken_once_until_the_skipped_set_changes() {
+        let mut n = SkipNotice::default();
+        let a = vec!["action \"a\" is bad.".to_string()];
+        n.queue(&a);
+        assert_eq!(n.take().as_deref(), Some("action \"a\" is bad."));
+        assert_eq!(n.take(), None, "taken once");
+        n.queue(&a);
+        assert_eq!(n.take(), None, "same problem is not repeated");
+        let b = vec![a[0].clone(), "action \"b\" is bad.".to_string()];
+        n.queue(&b);
+        assert!(n.take().unwrap().contains("\"b\""), "a changed set is new");
+        n.queue(&[]);
+        n.queue(&b);
+        assert!(
+            n.take().is_some(),
+            "fixed then broken again is reported again"
+        );
+    }
+
+    #[test]
+    fn observe_and_queue_share_what_was_already_shown() {
+        let mut n = SkipNotice::default();
+        let a = vec!["x".to_string()];
+        assert!(n.observe(&a).is_some());
+        n.queue(&a);
+        assert_eq!(n.take(), None, "the palette already showed it");
     }
 
     #[test]
