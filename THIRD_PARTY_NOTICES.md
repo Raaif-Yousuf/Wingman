@@ -280,7 +280,12 @@ not list it, and it has no license text to reproduce. `rusqlite` and
 
 ## Copied code
 
-None yet. When a snippet is copied from another MIT-licensed project (per
+- `src/actions/read_qr.rs` (`binarize_like_rqrr`, `rqrr_row_hit`): the local-average
+  thresholding and the row test for a finder pattern, re-expressed from `rqrr` 0.11.0
+  (`prepare.rs`, `detect.rs`; MIT OR Apache-2.0, https://github.com/WanzenBug/rqrr).
+  Copied in spirit so the shape counter that guards `rqrr` reads the same pixels it does.
+
+When a further snippet is copied from another MIT-licensed project (per
 AGENTS.md rule 2, e.g. the planned study of PowerToys' Text Extractor overlay
 or Flow Launcher's fuzzy ranking, see the expansion plan §14), it is listed
 here with the source file, the origin project, and its license text.

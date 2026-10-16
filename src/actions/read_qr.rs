@@ -55,58 +55,98 @@ const MAX_SIDE: usize = 1920;
 /// 1920x1080, finder squares scattered at random): 20 squares took 44 ms, 100
 /// took 236 ms, 300 took 2.9 s, 600 took 6.1 s, and 1500 made `rqrr` itself panic
 /// (`geometry.rs`: `x <= i32::MAX`), which aborts a release build. A real
-/// screen holds three per code, plus a few false hits inside the data (a real
-/// code counted 10 here, 30 codes on one screen counted 240), so 150 covers
-/// about 18 codes on one screen.
+/// screen holds three per code, plus a few false hits inside the data. Since
+/// the count was made to match `rqrr`'s own row test (#537) a real code counts
+/// about 10 (MEASURED 2026-10-16: 6 codes on one 1920x1080 screen counted 60),
+/// so 150 covers about 15 codes on one screen.
 const MAX_FINDER_CANDIDATES: usize = 150;
 
-/// Greyscale below this is dark.
-const DARK_BELOW: u8 = 128;
+/// `grey` as `rqrr` sees it: dark or not, decided against a running local
+/// average of the surrounding pixels (a snake scan, a window of one eighth of
+/// the width, 5% under the average), not at a fixed level. This repeats the
+/// thresholding in `rqrr`'s `PreparedImage::prepare` (MIT OR Apache-2.0, see
+/// `THIRD_PARTY_NOTICES.md`) because `rqrr` does not expose its binarised
+/// image, and the shape count below is only safe if it reads the same dark and
+/// light pixels `rqrr` reads (#537). Pure.
+fn binarize_like_rqrr(grey: &Grey) -> Vec<bool> {
+    let (w, h) = (grey.w, grey.h);
+    let mut dark = vec![false; w * h];
+    let mut row_average = vec![0usize; w];
+    let (mut avg_v, mut avg_u) = (0usize, 0usize);
+    let window = (w / 8).max(1);
+    for y in 0..h {
+        let row = &grey.px[y * w..(y + 1) * w];
+        row_average.fill(0);
+        for x in 0..w {
+            let (v, u) = if y % 2 == 0 {
+                (w - 1 - x, x)
+            } else {
+                (x, w - 1 - x)
+            };
+            avg_v = avg_v * (window - 1) / window + usize::from(row[v]);
+            avg_u = avg_u * (window - 1) / window + usize::from(row[u]);
+            row_average[v] += avg_v;
+            row_average[u] += avg_u;
+        }
+        for x in 0..w {
+            dark[y * w + x] = usize::from(row[x]) < row_average[x] * 95 / (200 * window);
+        }
+    }
+    dark
+}
+
+/// Whether five consecutive runs (first one dark) pass `rqrr`'s row test for a
+/// finder pattern: every run within three quarters of the average of the four
+/// outer runs, around 1:1:3:1:1. Deliberately the same arithmetic as `rqrr`'s
+/// `LineScanner::test_for_capstone`, which is much looser than an exact ratio.
+/// Returns the pattern's width.
+fn rqrr_row_hit(win: &[(usize, usize, bool)]) -> Option<usize> {
+    const CHECK: [usize; 5] = [1, 1, 3, 1, 1];
+    let len = |i: usize| win[i].1;
+    let avg = (len(0) + len(1) + len(3) + len(4)) / 4;
+    let err = avg * 3 / 4;
+    (0..5)
+        .all(|i| len(i) + err >= CHECK[i] * avg && len(i) <= CHECK[i] * avg + err)
+        .then(|| win.iter().map(|r| r.1).sum())
+}
 
 /// How many finder-pattern-like shapes `grey` holds, counting up to `cap + 1`
-/// and then stopping. A finder pattern is a row of dark, light, dark, light,
-/// dark runs in the ratio 1:1:3:1:1; hits that line up in consecutive rows
-/// are one shape, and a shape needs at least two rows. This is only a cheap
-/// count to keep `rqrr` away from pathological input, not a detector.
+/// and then stopping. It must never count fewer than `rqrr` will find (#537):
+/// `rqrr` is not safe to run on a frame that holds hundreds. So it reads the
+/// same binarised pixels ([`binarize_like_rqrr`]) with the same row test
+/// ([`rqrr_row_hit`]), and counts every row hit, not only the ones `rqrr` goes
+/// on to confirm. Hits in consecutive rows at about the same place are one
+/// shape, because `rqrr` paints a found shape over so its lower rows do not hit
+/// again. A shape may span a single row. Over-counting only refuses a very
+/// busy frame; under-counting lets `rqrr` panic. Not a detector. `rqrr` scans
+/// rows only, so this does too.
 fn finder_candidates(grey: &Grey, cap: usize) -> usize {
+    let dark = binarize_like_rqrr(grey);
     // (centre x, unit, first row, last row)
     let mut open: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut count = 0usize;
     for y in 0..grey.h {
-        let row = &grey.px[y * grey.w..(y + 1) * grey.w];
+        let row = &dark[y * grey.w..(y + 1) * grey.w];
         // Runs of equal darkness in this row: (start, length, dark).
         let mut runs: Vec<(usize, usize, bool)> = Vec::new();
-        for (x, &v) in row.iter().enumerate() {
-            let dark = v < DARK_BELOW;
+        for (x, &d) in row.iter().enumerate() {
             match runs.last_mut() {
-                Some(r) if r.2 == dark => r.1 += 1,
-                _ => runs.push((x, 1, dark)),
+                Some(r) if r.2 == d => r.1 += 1,
+                _ => runs.push((x, 1, d)),
             }
         }
         for win in runs.windows(5) {
             if !win[0].2 {
                 continue;
             }
-            let total: usize = win.iter().map(|r| r.1).sum();
-            let unit = total / 7;
-            if unit == 0 {
+            let Some(total) = rqrr_row_hit(win) else {
                 continue;
-            }
-            let near = |len: usize, units: usize| {
-                len * 2 >= unit * (units * 2 - 1) && len * 2 <= unit * (units * 2 + 1)
             };
-            let ok = near(win[0].1, 1)
-                && near(win[1].1, 1)
-                && near(win[2].1, 3)
-                && near(win[3].1, 1)
-                && near(win[4].1, 1);
-            if !ok {
-                continue;
-            }
+            let unit = (total / 7).max(1);
             let cx = win[0].0 + total / 2;
             match open
                 .iter_mut()
-                .find(|o| o.0.abs_diff(cx) <= unit.max(o.1) * 2 && y - o.3 <= 1)
+                .find(|o| o.0.abs_diff(cx) <= unit.max(o.1) && y - o.3 <= 1)
             {
                 Some(o) => {
                     o.0 = cx;
@@ -120,20 +160,14 @@ fn finder_candidates(grey: &Grey, cap: usize) -> usize {
             if y - o.3 <= 1 {
                 return true;
             }
-            if o.3 > o.2 {
-                count += 1;
-            }
+            count += 1;
             false
         });
         if count + open.len() > cap {
-            // `open` may hold one-row noise, so confirm before giving up.
-            let tall = open.iter().filter(|o| o.3 > o.2).count();
-            if count + tall > cap {
-                return count + tall;
-            }
+            return count + open.len();
         }
     }
-    count + open.iter().filter(|o| o.3 > o.2).count()
+    count + open.len()
 }
 
 /// A greyscale image: `px.len() == w * h`.
@@ -1071,6 +1105,92 @@ mod tests {
             assert_eq!(found.unreadable, 1);
             assert!(took.as_secs() < 2, "{took:?}");
         }
+    }
+
+    /// `n` finder-like squares on a plain light frame, laid out on a grid so
+    /// none overlap. Each is a dark ring of `ring` pixels, a light gap of
+    /// `gap`, and a dark stone of `stone`, so a row through its middle reads
+    /// `ring, gap, stone, gap, ring`. Grey levels are `dark` and `light`.
+    fn grid_frame(
+        (w, h): (usize, usize),
+        n: usize,
+        (ring, gap, stone): (usize, usize, usize),
+        (dark, light): (u8, u8),
+    ) -> Vec<u8> {
+        let mut rgba = vec![light; w * h * 4];
+        let size = 2 * (ring + gap) + stone;
+        let pitch = size + 12;
+        let cols = (w - 8) / pitch;
+        assert!(cols > 0 && n <= cols * ((h - 8) / pitch), "grid too small");
+        let mut fill = |x0: usize, y0: usize, side: usize, v: u8| {
+            for y in y0..y0 + side {
+                for x in x0..x0 + side {
+                    let i = (y * w + x) * 4;
+                    rgba[i..i + 3].fill(v);
+                }
+            }
+        };
+        for k in 0..n {
+            let (ox, oy) = (4 + (k % cols) * pitch, 4 + (k / cols) * pitch);
+            fill(ox, oy, size, dark);
+            fill(ox + ring, oy + ring, size - 2 * ring, light);
+            fill(ox + ring + gap, oy + ring + gap, stone, dark);
+        }
+        rgba
+    }
+
+    /// #537: the counter must never count fewer shapes than `rqrr` will find.
+    /// `rqrr` accepts a row if each run is within 75% of the average of the
+    /// four outer runs, far looser than an exact 1:1:3:1:1, so a ring that is
+    /// seven times its gap is still a finder to it.
+    #[test]
+    fn loose_ratio_finder_shapes_are_counted_like_rqrr_counts_them() {
+        let rgba = grid_frame((1920, 1080), 400, (7, 1, 12), (0, 255));
+        let g = bounded_grey(&rgba, 1920, 1080, MAX_SIDE);
+        let n = finder_candidates(&g, MAX_FINDER_CANDIDATES);
+        assert!(n > MAX_FINDER_CANDIDATES, "counted only {n}");
+        let started = std::time::Instant::now();
+        let found = scan(&rgba, 1920, 1080);
+        assert_eq!(found.unreadable, 1, "{found:?}");
+        assert!(started.elapsed().as_secs() < 2, "{:?}", started.elapsed());
+    }
+
+    /// #537: `rqrr` thresholds against a running local average, not at a fixed
+    /// 128, so a pale-grey-on-white code is a code to it.
+    #[test]
+    fn low_contrast_finder_shapes_are_counted_like_rqrr_counts_them() {
+        let rgba = grid_frame((1920, 1080), 400, (5, 5, 15), (150, 220));
+        let g = bounded_grey(&rgba, 1920, 1080, MAX_SIDE);
+        let n = finder_candidates(&g, MAX_FINDER_CANDIDATES);
+        assert!(n > MAX_FINDER_CANDIDATES, "counted only {n}");
+        let started = std::time::Instant::now();
+        let found = scan(&rgba, 1920, 1080);
+        assert_eq!(found.unreadable, 1, "{found:?}");
+        assert!(started.elapsed().as_secs() < 2, "{:?}", started.elapsed());
+    }
+
+    /// The count is now conservative, so check it did not tip into refusing a
+    /// screen that really holds a handful of codes (#537).
+    #[test]
+    fn a_screen_with_six_real_codes_is_not_refused() {
+        let codes: Vec<(String, usize, usize)> = (0..6)
+            .map(|i| {
+                (
+                    format!("https://example.com/{i}"),
+                    20 + (i % 3) * 600,
+                    20 + (i / 3) * 400,
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, usize, usize)> =
+            codes.iter().map(|(t, x, y)| (t.as_str(), *x, *y)).collect();
+        let shot = canvas(1920, 1080, &refs);
+        let g = bounded_grey(&shot.rgba, 1920, 1080, MAX_SIDE);
+        let n = finder_candidates(&g, 1000);
+        eprintln!("MEASURED: 6 real codes at 1920x1080 count {n} shapes");
+        assert!(n <= MAX_FINDER_CANDIDATES / 2, "{n}");
+        let found = scan(&shot.rgba, shot.width, shot.height);
+        assert_eq!(found.texts.len(), 6, "{found:?}");
     }
 
     #[test]
