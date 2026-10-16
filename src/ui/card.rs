@@ -237,6 +237,9 @@ impl Card {
             open_settings_on_click: false,
             copy_details_available: false,
             copy_details_rect: None,
+            copy_available: false,
+            copy_rect: None,
+            copied: false,
             read_aloud_available: false,
             read_aloud_rect: None,
             speaker: None,
@@ -351,6 +354,8 @@ impl Card {
             .show_collapsed(headline, detail, auto_dismiss_secs, difficulty);
         // Issue #77: an answer card offers "Read aloud" once expanded.
         self.inner.read_aloud_available = true;
+        // Issue #531: and a "Copy" link.
+        self.inner.copy_available = true;
     }
 
     pub fn show_error(&mut self, headline: &str, detail: &str) {
@@ -1103,6 +1108,56 @@ const TIMER_DISMISS: usize = 2;
 /// that sub-stage -- see `CardInner::set_pending_stage` and
 /// `CardInner::kill_timers` (AGENTS.md rule 5: nothing runs while idle).
 const TIMER_STILL_WORKING: usize = 3;
+/// Issue #531: fires once, `COPIED_FEEDBACK_MS` after a successful "Copy"
+/// click, and puts the footer label back. Armed only while the card is
+/// showing and killed by `kill_timers` (AGENTS.md rule 5).
+const TIMER_COPIED: usize = 4;
+const COPIED_FEEDBACK_MS: u32 = 1500;
+/// Gap between the footer's links, in dp.
+const FOOTER_LINK_GAP_DP: i32 = 16;
+
+/// Issue #531: the text "Copy" puts on the clipboard: the headline, a blank
+/// line, then the detail, exactly what the card shows.
+fn answer_clipboard_text(headline: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        headline.to_string()
+    } else {
+        format!("{headline}\r\n\r\n{detail}")
+    }
+}
+
+/// Issue #531: splits the pinned footer row into the "Read aloud" link (when
+/// the card has one) and the "Copy" link beside it. Each link is as wide as
+/// its measured label; whatever does not fit is clipped to the footer, never
+/// pushed outside it.
+fn footer_links_layout(
+    footer: RECT,
+    read_aloud_w: Option<i32>,
+    copy_w: i32,
+    gap: i32,
+) -> (Option<RECT>, RECT) {
+    let mut left = footer.left;
+    let read_aloud = read_aloud_w.map(|w| {
+        let r = RECT {
+            right: (left + w.max(0)).min(footer.right),
+            left,
+            ..footer
+        };
+        left = (r.right + gap).min(footer.right);
+        r
+    });
+    let copy = RECT {
+        right: (left + copy_w.max(0)).min(footer.right),
+        left,
+        ..footer
+    };
+    (read_aloud, copy)
+}
+
+/// Issue #531: `C` (so also Ctrl+C) copies on an expanded answer card.
+fn is_copy_key(vk: u16) -> bool {
+    vk == 0x43
+}
 /// A rotation needs ~16-33ms/frame to read as smooth; the old text-dot
 /// animation could get away with much slower ticks, but a spinner cannot.
 const ANIM_INTERVAL_MS: u32 = 20;
@@ -1254,6 +1309,15 @@ struct CardInner {
     /// The "Read aloud" footer's hit-test rect while Expanded, same
     /// coordinates and same no-scroll-math reasoning as `copy_details_rect`.
     read_aloud_rect: Option<RECT>,
+    /// Issue #531: `true` while the card is an answer card, i.e. one with a
+    /// "Copy" link in the footer once Expanded.
+    copy_available: bool,
+    /// The "Copy" link's hit-test rect while Expanded, same coordinates as
+    /// `read_aloud_rect`.
+    copy_rect: Option<RECT>,
+    /// Issue #531: `true` for `COPIED_FEEDBACK_MS` after a successful copy;
+    /// the link then reads "Copied".
+    copied: bool,
     /// The system voice, created on the first "Read aloud" click (so a card
     /// that is never read aloud never touches COM or SAPI). Lives on the
     /// main STA thread, like the card.
@@ -1471,6 +1535,11 @@ impl CardInner {
         // on, right after this call returns.
         self.read_aloud_available = false;
         self.read_aloud_rect = None;
+        // Issue #531: same for "Copy"; `reset_activation_and_timers` above
+        // already killed its timer.
+        self.copy_available = false;
+        self.copy_rect = None;
+        self.copied = false;
 
         unsafe {
             if auto_dismiss_secs > 0 {
@@ -1491,6 +1560,7 @@ impl CardInner {
         self.leave_preview_if_active();
         self.stop_reading();
         self.kill_timers();
+        self.copied = false;
         self.set_noactivate(true);
         self.state = CardState::Hidden;
         // Issue #356: no headline is showing any more, so the accessible
@@ -1536,6 +1606,7 @@ impl CardInner {
             // ..." -> "Still working." countdown never outlives the card
             // state it belongs to.
             let _ = KillTimer(Some(self.hwnd), TIMER_STILL_WORKING);
+            let _ = KillTimer(Some(self.hwnd), TIMER_COPIED);
         }
     }
 
@@ -1791,7 +1862,53 @@ impl CardInner {
 
     /// The pinned footer row's rect, whichever footer the card has.
     fn footer_rect(&self) -> Option<RECT> {
-        self.copy_details_rect.or(self.read_aloud_rect)
+        self.copy_details_rect
+            .or(self.read_aloud_rect)
+            .or(self.copy_rect)
+    }
+
+    /// Issue #531: `true` when `(x, y)` lands on the "Copy" link.
+    fn point_hits_copy(&self, x: i32, y: i32) -> bool {
+        let Some(r) = self.copy_rect else {
+            return false;
+        };
+        (r.left..r.right).contains(&x) && (r.top..r.bottom).contains(&y)
+    }
+
+    /// Issue #531: the link's label for the current state.
+    fn copy_label(&self) -> &'static str {
+        if self.copied {
+            "Copied"
+        } else {
+            "Copy"
+        }
+    }
+
+    /// Issue #531: `true` when `vk` should copy: the copy key while an
+    /// answer card is Expanded and showing its "Copy" link.
+    fn copy_key_applies(&self, vk: u16) -> bool {
+        is_copy_key(vk) && self.state == CardState::Expanded && self.copy_rect.is_some()
+    }
+
+    /// Issue #531: shows "Copied" and arms the one-shot timer that puts
+    /// "Copy" back.
+    fn mark_copied(&mut self) {
+        self.copied = true;
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), TIMER_COPIED, COPIED_FEEDBACK_MS, None);
+        }
+        self.invalidate();
+    }
+
+    /// Issue #531: click or the copy key on "Copy". Puts the headline and
+    /// detail on the clipboard. A clipboard that cannot be written ends in
+    /// an error card (AGENTS.md rule 7), never a silent no-op.
+    fn copy_activated(&mut self) {
+        let text = answer_clipboard_text(&self.headline, &self.detail);
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            Ok(()) => self.mark_copied(),
+            Err(e) => self.show_collapsed("Couldn't copy", &format!("{e}"), 0, None),
+        }
     }
 
     // -- layout ------------------------------------------------------------
@@ -1912,11 +2029,12 @@ impl CardInner {
         // needs no scroll_offset math (see `copy_details_rect`'s doc
         // comment). Only an error card (`copy_details_available`) reserves
         // the space at all.
-        let footer_h = if self.copy_details_available || self.read_aloud_available {
-            self.line_height(self.fonts.body).max(1)
-        } else {
-            0
-        };
+        let footer_h =
+            if self.copy_details_available || self.read_aloud_available || self.copy_available {
+                self.line_height(self.fonts.body).max(1)
+            } else {
+                0
+            };
         let footer_gap = if footer_h > 0 { gap } else { 0 };
 
         let work_h = (work.bottom - work.top).max(1);
@@ -1946,7 +2064,27 @@ impl CardInner {
         // Issue #77: the one pinned footer row is "Copy details" on an error
         // card and "Read aloud" on an answer card, never both.
         self.copy_details_rect = footer.filter(|_| self.copy_details_available);
-        self.read_aloud_rect = footer.filter(|_| self.read_aloud_available);
+        // Issue #531: an answer card splits that row between "Read aloud" and
+        // "Copy". Each link is sized for its widest label so the row does not
+        // shift when "Read aloud" becomes "Stop reading" or "Copy" "Copied".
+        self.read_aloud_rect = None;
+        self.copy_rect = None;
+        if let Some(f) = footer.filter(|_| self.copy_available || self.read_aloud_available) {
+            let body = self.fonts.body;
+            let widest = |a: &str, b: &str| {
+                self.measure_label(body, a)
+                    .0
+                    .max(self.measure_label(body, b).0)
+            };
+            let read_w = self
+                .read_aloud_available
+                .then(|| widest("Read aloud", "Stop reading"));
+            let copy_w = widest("Copy", "Copied");
+            let gap = self.scale(FOOTER_LINK_GAP_DP);
+            let (read, copy) = footer_links_layout(f, read_w, copy_w, gap);
+            self.read_aloud_rect = read;
+            self.copy_rect = self.copy_available.then_some(copy);
+        }
 
         self.place_bottom_right(work, width, window_h);
     }
@@ -2476,21 +2614,23 @@ impl CardInner {
         // `IntersectClipRect`, which only ever narrows -- painting here,
         // after that clip has already applied to everything above, still
         // draws within it unless the clip is reset, so reset it first).
-        if let Some(footer_rect) = self.footer_rect() {
-            let label = if self.copy_details_rect.is_some() {
-                "Copy details"
-            } else {
-                self.read_aloud_label()
-            };
-            let _ = SelectClipRgn(hdc, None);
-            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-            draw_text_line(
-                hdc,
-                label,
-                footer_rect,
-                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
-            );
+        let links = [
+            (self.copy_details_rect, "Copy details"),
+            (self.read_aloud_rect, self.read_aloud_label()),
+            (self.copy_rect, self.copy_label()),
+        ];
+        let _ = SelectClipRgn(hdc, None);
+        SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
+        for (rect, label) in links {
+            if let Some(rect) = rect {
+                draw_text_line(
+                    hdc,
+                    label,
+                    rect,
+                    DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
         }
     }
 
@@ -2614,6 +2754,17 @@ impl CardInner {
                     TIMER_STILL_WORKING if self.state == CardState::Pending => {
                         self.set_pending_stage(PendingStage::StillWorking);
                     }
+                    // Issue #531: one-shot; a stale message after the card
+                    // moved on finds `copied` already false.
+                    TIMER_COPIED => {
+                        unsafe {
+                            let _ = KillTimer(Some(self.hwnd), TIMER_COPIED);
+                        }
+                        if self.copied {
+                            self.copied = false;
+                            self.invalidate();
+                        }
+                    }
                     _ => {}
                 }
                 Some(LRESULT(0))
@@ -2647,6 +2798,8 @@ impl CardInner {
                         self.copy_details_activated();
                     } else if self.point_hits_read_aloud(x, y) {
                         self.read_aloud_activated();
+                    } else if self.point_hits_copy(x, y) {
+                        self.copy_activated();
                     }
                 } else {
                     self.try_expand();
@@ -2695,6 +2848,9 @@ impl CardInner {
                         self.scroll_offset = target;
                         self.invalidate();
                     }
+                } else if self.copy_key_applies(wparam.0 as u16) {
+                    // Issue #531: C and Ctrl+C copy the answer.
+                    self.copy_activated();
                 } else if self.state == CardState::Expanded
                     && wparam.0 as u16 == VK_RETURN.0
                     && self.copy_details_rect.is_some()
@@ -4360,6 +4516,139 @@ mod tests {
         card.show_error("Oops", "detail");
         card.inner.try_expand();
         assert!(card.inner.read_aloud_rect.is_none());
+    }
+
+    #[test]
+    fn answer_clipboard_text_is_headline_blank_line_detail() {
+        // Issue #531: what the user sees, nothing else.
+        assert_eq!(
+            answer_clipboard_text("2 + 2 = 4", "You carried."),
+            "2 + 2 = 4\r\n\r\nYou carried."
+        );
+        assert_eq!(answer_clipboard_text("Done", ""), "Done");
+    }
+
+    #[test]
+    fn footer_links_sit_side_by_side_inside_the_footer() {
+        let footer = RECT {
+            left: 10,
+            top: 100,
+            right: 300,
+            bottom: 120,
+        };
+        let (read, copy) = footer_links_layout(footer, Some(80), 50, 16);
+        let read = read.expect("read aloud rect");
+        assert_eq!((read.left, read.right), (10, 90));
+        assert_eq!((copy.left, copy.right), (106, 156));
+        for r in [read, copy] {
+            assert_eq!((r.top, r.bottom), (100, 120));
+        }
+        // Copy only: it takes the left edge.
+        let (read, copy) = footer_links_layout(footer, None, 50, 16);
+        assert!(read.is_none());
+        assert_eq!((copy.left, copy.right), (10, 60));
+        // A narrow footer clips the link instead of overflowing it.
+        let (_, copy) = footer_links_layout(footer, Some(250), 50, 16);
+        assert_eq!(copy.right, 300);
+        assert!(copy.left <= copy.right);
+    }
+
+    #[test]
+    fn expanded_answer_card_has_a_copy_link_beside_read_aloud() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        card.inner.try_expand();
+        let read = card.inner.read_aloud_rect.expect("read aloud");
+        let copy = card.inner.copy_rect.expect("copy");
+        assert!(read.right <= copy.left, "links must not overlap");
+        assert!(card.inner.point_hits_copy(copy.left, copy.top));
+        assert!(!card.inner.point_hits_copy(read.left, read.top));
+        assert!(!card.inner.point_hits_read_aloud(copy.left, copy.top));
+        assert_eq!(card.inner.copy_label(), "Copy");
+    }
+
+    #[test]
+    fn only_answer_cards_get_a_copy_link() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "tracked detail");
+        card.inner.try_expand();
+        assert!(card.inner.copy_rect.is_none());
+        card.show_error("Oops", "detail");
+        card.inner.try_expand();
+        assert!(card.inner.copy_rect.is_none());
+        card.show_answer("Right.", "Details.", 0, None);
+        card.show_error("Oops", "detail");
+        card.inner.try_expand();
+        assert!(card.inner.copy_rect.is_none());
+    }
+
+    #[test]
+    fn copied_label_uses_a_one_shot_timer_that_dies_with_the_card() {
+        // Issue #531, AGENTS.md rule 5.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("Right.", "Details.", 0, None);
+        card.inner.try_expand();
+        assert!(!timer_was_live(&card, TIMER_COPIED), "idle: no timer");
+        card.inner.mark_copied();
+        assert_eq!(card.inner.copy_label(), "Copied");
+        let _ = card.handle_message(WM_TIMER, WPARAM(TIMER_COPIED), LPARAM(0));
+        assert_eq!(card.inner.copy_label(), "Copy");
+        assert!(
+            !timer_was_live(&card, TIMER_COPIED),
+            "fired once, then gone"
+        );
+        // Hiding cancels a pending one and resets the label.
+        card.inner.mark_copied();
+        card.hide();
+        assert!(!timer_was_live(&card, TIMER_COPIED));
+        assert_eq!(card.inner.copy_label(), "Copy");
+        // A replacement card never inherits "Copied".
+        card.show_answer("A", "B", 0, None);
+        card.inner.try_expand();
+        card.inner.mark_copied();
+        card.show_answer("C", "D", 0, None);
+        assert_eq!(card.inner.copy_label(), "Copy");
+        assert!(!timer_was_live(&card, TIMER_COPIED));
+    }
+
+    #[test]
+    fn c_key_is_the_copy_shortcut_only_on_an_expanded_answer_card() {
+        assert!(is_copy_key(0x43));
+        assert!(!is_copy_key(VK_RETURN.0));
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error("Oops", "detail");
+        card.inner.try_expand();
+        // No copy link, so the key must not reach the clipboard path.
+        assert!(!card.inner.copy_key_applies(0x43));
+        card.show_answer("Right.", "Details.", 0, None);
+        assert!(!card.inner.copy_key_applies(0x43), "collapsed: not yet");
+        card.inner.try_expand();
+        assert!(card.inner.copy_key_applies(0x43));
+        assert!(!card.inner.copy_key_applies(VK_RETURN.0));
+    }
+
+    /// Issue #531 live check, run manually (it overwrites the clipboard):
+    /// `cargo test copy_live -- --ignored --nocapture`. A real click on the
+    /// "Copy" link must put the headline and detail on the clipboard.
+    #[test]
+    #[ignore = "writes the real clipboard; run by hand"]
+    fn copy_live_click_puts_the_answer_on_the_clipboard() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("2 + 2 = 4", "You carried.", 0, None);
+        card.inner.try_expand();
+        let r = card.inner.copy_rect.expect("copy link");
+        let lparam = LPARAM(((r.top + 1) << 16 | ((r.left + 1) & 0xFFFF)) as isize);
+        let _ = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), lparam);
+        assert_eq!(card.inner.copy_label(), "Copied");
+        let text = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_text())
+            .expect("clipboard text");
+        assert_eq!(text.replace("\r\n", "\n"), "2 + 2 = 4\n\nYou carried.");
     }
 
     #[test]
