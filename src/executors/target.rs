@@ -327,8 +327,17 @@ pub fn confirm_typed_focus(
     if same_element == Some(true) && in_front {
         return Ok(());
     }
+    let wrong_window = matches!(
+        (foreground_root, target_root),
+        (Some(f), Some(t)) if f != t
+    );
+    if wrong_window {
+        return Err(anyhow!(
+            "the window with this field is not in front, so Wingman typed nothing into it. Click the field and type the value yourself."
+        ));
+    }
     Err(anyhow!(
-        "Wingman could not confirm the cursor is in the field to fill, so it typed nothing. Nothing was written. Click the field and type the value yourself."
+        "Wingman could not confirm the cursor is in this field, so it typed nothing into it. Click the field and type the value yourself."
     ))
 }
 
@@ -808,7 +817,23 @@ pub mod com {
     /// Reads the live focus facts and hands them to the pure
     /// [`confirm_typed_focus`]. Any read that fails becomes `None`, which
     /// refuses.
+    ///
+    /// Focus arrives asynchronously after `SetFocus` (slow apps such as
+    /// browsers), so a failed probe is retried once after a short one-off
+    /// wait before refusing.
     fn probe_typed_focus(
+        automation: &IUIAutomation,
+        element: &IUIAutomationElement,
+        hwnd: HWND,
+    ) -> Result<()> {
+        if probe_typed_focus_once(automation, element, hwnd).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        probe_typed_focus_once(automation, element, hwnd)
+    }
+
+    fn probe_typed_focus_once(
         automation: &IUIAutomation,
         element: &IUIAutomationElement,
         hwnd: HWND,
@@ -1252,7 +1277,11 @@ mod tests {
         let msg = confirm_typed_focus(Some(false), Some(7), Some(7))
             .unwrap_err()
             .to_string();
-        assert!(msg.contains("Nothing was written") && !msg.contains('\u{2014}'));
+        assert!(msg.contains("typed nothing into it") && !msg.contains('\u{2014}'));
+        let front = confirm_typed_focus(Some(true), Some(8), Some(7))
+            .unwrap_err()
+            .to_string();
+        assert!(front.contains("not in front"), "{front}");
     }
 
     #[test]
