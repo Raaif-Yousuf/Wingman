@@ -6792,7 +6792,7 @@ mod tests {
         assert!(matches!(ok, ExecDone::FormFill(Ok(ref u)) if u.summary == "did it"));
         let bad = exec_work_calendar(&FakeExecutor { fail: true }, fake_confirmed());
         assert!(
-            matches!(bad, ExecDone::Calendar(Err(ref e)) if format!("{e:#}").contains("the write failed"))
+            matches!(bad, ExecDone::Calendar(Err(ref e)) if e.root_cause().to_string().contains("the write failed"))
         );
     }
 
@@ -6801,7 +6801,7 @@ mod tests {
         let undo = executors::Undo::recording("x", || anyhow::bail!("could not put it back"));
         let done = exec_work_restore(undo);
         assert!(
-            matches!(done, ExecDone::RestoreForm(Err(ref e)) if format!("{e:#}").contains("put it back"))
+            matches!(done, ExecDone::RestoreForm(Err(ref e)) if e.root_cause().to_string().contains("put it back"))
         );
     }
 
