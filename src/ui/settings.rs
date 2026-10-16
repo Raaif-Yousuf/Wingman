@@ -1754,6 +1754,19 @@ fn create_body(parent: HWND, instance: HINSTANCE, dpi: u32) -> HWND {
     .unwrap_or(HWND(std::ptr::null_mut()))
 }
 
+/// The text colour of the hotkey hint line (#824). Secondary text, never the
+/// disabled grey: `theme::LIGHT.text_dim` on the light button face, and the
+/// system's own button text in high contrast (where grey means disabled).
+/// Settings is drawn on the system face today; the dark-mode work swaps in
+/// the theme's tokens.
+fn hotkey_hint_color(high_contrast: bool, btn_text: u32) -> u32 {
+    if high_contrast {
+        btn_text
+    } else {
+        crate::ui::theme::LIGHT.text_dim
+    }
+}
+
 /// The body forwards what its controls tell their parent (button clicks, the
 /// trackbar) up to the settings window, and runs its own scrollbar.
 unsafe extern "system" fn body_wndproc(
@@ -1766,6 +1779,22 @@ unsafe extern "system" fn body_wndproc(
         WM_COMMAND | WM_HSCROLL => {
             let parent = GetParent(hwnd).unwrap_or_default();
             SendMessageW(parent, msg, Some(wparam), Some(lparam))
+        }
+        // #824: the hotkey hint is secondary text, not the disabled grey.
+        // Every other static keeps the default colours.
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+            if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) == ID_HOTKEY_STATUS =>
+        {
+            use windows::Win32::Graphics::Gdi::{
+                GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor, COLOR_3DFACE,
+                COLOR_BTNTEXT, TRANSPARENT,
+            };
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
+            let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+            let ink = hotkey_hint_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ink));
+            SetBkMode(hdc, TRANSPARENT);
+            LRESULT(GetSysColorBrush(COLOR_3DFACE).0 as isize)
         }
         WM_VSCROLL => {
             let si = body_scroll_info(hwnd);
@@ -4063,7 +4092,7 @@ fn build_ui_recorded(
     ctx.create(
         WC_STATIC,
         "Click Change, then press the new key.",
-        WS_DISABLED.0,
+        0,
         0,
         r.x,
         r.y,
@@ -6374,6 +6403,32 @@ mod tests {
         });
         assert_eq!(enter_command(ID_OPEN_CONFIG), ID_OPEN_CONFIG);
         assert!(!OPEN_CONFIG_FAILED.contains('\u{2014}'));
+    }
+
+    /// #824: the hotkey hint is not the disabled grey. It is an enabled
+    /// control (a disabled static is drawn in the faint disabled colour), and
+    /// the colour chosen for it reads at 4.5:1 on the Settings surface.
+    #[test]
+    fn the_hotkey_hint_is_enabled_and_readable() {
+        use crate::ui::theme::{contrast_ratio, relative_luminance, rgb};
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+
+        with_window(Config::default(), |hwnd, _raw| {
+            let status = get_dlg_item(hwnd, ID_HOTKEY_STATUS).expect("status line");
+            assert!(
+                unsafe { IsWindowEnabled(status) }.as_bool(),
+                "a disabled static is drawn in the disabled grey"
+            );
+        });
+
+        // The classic button-face grey the Settings surface is drawn on.
+        let face = rgb(240, 240, 240);
+        let ink = hotkey_hint_color(false, rgb(0, 0, 0));
+        let ratio = contrast_ratio(relative_luminance(ink), relative_luminance(face));
+        assert!(ratio >= 4.5, "hint contrast {ratio:.2}:1 is under 4.5:1");
+        // High contrast uses the system's own text colour, never a grey.
+        let hc = rgb(255, 255, 255);
+        assert_eq!(hotkey_hint_color(true, hc), hc);
     }
 
     /// Dispatches this thread's queued messages until `done` is true or 10 s
