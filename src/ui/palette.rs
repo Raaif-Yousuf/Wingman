@@ -126,9 +126,10 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
-    GetObjectW, GetStockObject, InvalidateRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-    UpdateWindow, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_SEMIBOLD,
-    HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TRANSPARENT,
+    GetStockObject, InvalidateRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW,
+    PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -823,7 +824,9 @@ impl PaletteRenderer {
         if self.target.is_some() && self.summary_format.is_none() {
             self.summary_format = self.build_text_format(DWRITE_FONT_WEIGHT_SEMI_BOLD);
         }
-        self.target.is_some() && self.text_format.is_some() && self.summary_format.is_some()
+        // The semibold format is a nicety: without it the summary uses the row
+        // format, and the palette stays on Direct2D.
+        self.target.is_some() && self.text_format.is_some()
     }
 
     fn build_text_format(&self, weight: DWRITE_FONT_WEIGHT) -> Option<IDWriteTextFormat> {
@@ -976,6 +979,23 @@ fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
         bar,
     }
 }
+
+/// The palette's GDI font: Segoe UI, `D2D_FONT_SIZE_DIP` tall at `dpi`, in
+/// `weight`. The caller frees it with `DeleteObject`.
+fn gdi_font(dpi: u32, weight: i32) -> HFONT {
+    let mut lf = LOGFONTW {
+        lfHeight: -scale(D2D_FONT_SIZE_DIP as i32, dpi),
+        lfWeight: weight,
+        lfCharSet: DEFAULT_CHARSET,
+        lfQuality: CLEARTYPE_QUALITY,
+        ..Default::default()
+    };
+    for (slot, unit) in lf.lfFaceName.iter_mut().zip(D2D_FONT_FAMILY.encode_utf16()) {
+        *slot = unit;
+    }
+    unsafe { CreateFontIndirectW(&lf) }
+}
+
 /// D2D/DirectWrite equivalent of `draw_text_line` (imported from
 /// `crate::ui::text` for the GDI fallback path below): draws one line of
 /// `text` in `rect` (logical/DIP coordinates -- see the module doc comment)
@@ -1478,7 +1498,7 @@ impl PaletteInner {
         let summary_format = renderer
             .summary_format
             .clone()
-            .expect("ensure_target just confirmed Some");
+            .unwrap_or_else(|| format.clone());
 
         let pad = PADDING as f32;
         let row_h = ROW_HEIGHT as f32;
@@ -1552,7 +1572,10 @@ impl PaletteInner {
                     draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(colors.hint));
                 }
                 crate::ui::palette_model::Row::Action { name, .. } => {
-                    if i == self.state.selected || self.hover == Some(i) {
+                    // The selected row has the fill and the bar; a row only
+                    // hovered gets an outline in the bar colour (3:1 on the
+                    // background), so the two never look alike.
+                    if i == self.state.selected {
                         if let Ok(hl) = unsafe {
                             target.CreateSolidColorBrush(
                                 &colorref_to_d2d(COLORREF(colors.selected_fill)) as *const _,
@@ -1561,6 +1584,23 @@ impl PaletteInner {
                         } {
                             unsafe {
                                 target.FillRectangle(&row_rect as *const _, &hl);
+                            }
+                        }
+                    } else if self.hover == Some(i) {
+                        if let Ok(outline) = unsafe {
+                            target.CreateSolidColorBrush(
+                                &colorref_to_d2d(COLORREF(colors.bar)) as *const _,
+                                None,
+                            )
+                        } {
+                            let inset = D2D_RECT_F {
+                                left: row_rect.left + 0.5,
+                                top: row_rect.top + 0.5,
+                                right: row_rect.right - 0.5,
+                                bottom: row_rect.bottom - 0.5,
+                            };
+                            unsafe {
+                                target.DrawRectangle(&inset as *const _, &outline, 1.0, None);
                             }
                         }
                     }
@@ -1645,7 +1685,10 @@ impl PaletteInner {
             let _ = DeleteObject(bg.into());
 
             SetBkMode(hdc, TRANSPARENT);
-            let old_font = SelectObject(hdc, HGDIOBJ(self.font.0));
+            // Segoe UI at this window's DPI, like the DirectWrite path (the stock
+            // GUI font is neither Segoe nor scaled), freed below.
+            let normal = gdi_font(self.dpi, FW_NORMAL.0 as i32);
+            let old_font = SelectObject(hdc, HGDIOBJ(normal.0));
 
             let pad = scale(PADDING, self.dpi);
 
@@ -1702,33 +1745,17 @@ impl PaletteInner {
                     bottom: y + scale(ROUTER_SUMMARY_HEIGHT, self.dpi),
                 };
                 SetTextColor(hdc, COLORREF(colors.summary));
-                // Semibold, like the Direct2D path (#361): the row font with a
-                // heavier weight, made and freed for this one line.
-                let mut lf = LOGFONTW::default();
-                let have_lf = GetObjectW(
-                    HGDIOBJ(self.font.0),
-                    std::mem::size_of::<LOGFONTW>() as i32,
-                    Some(&mut lf as *mut LOGFONTW as *mut c_void),
-                ) != 0;
-                lf.lfWeight = FW_SEMIBOLD.0 as i32;
-                let bold = if have_lf {
-                    CreateFontIndirectW(&lf)
-                } else {
-                    HFONT::default()
-                };
-                if !bold.is_invalid() {
-                    SelectObject(hdc, HGDIOBJ(bold.0));
-                }
+                // Semibold, like the Direct2D path (#361), freed after the line.
+                let bold = gdi_font(self.dpi, FW_SEMIBOLD.0 as i32);
+                SelectObject(hdc, HGDIOBJ(bold.0));
                 draw_text_line(
                     hdc,
                     summary,
                     band_rect,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                 );
-                SelectObject(hdc, HGDIOBJ(self.font.0));
-                if !bold.is_invalid() {
-                    let _ = DeleteObject(bold.into());
-                }
+                SelectObject(hdc, HGDIOBJ(normal.0));
+                let _ = DeleteObject(bold.into());
             }
             y += scale(ROUTER_SUMMARY_HEIGHT, self.dpi);
 
@@ -1772,10 +1799,34 @@ impl PaletteInner {
                         );
                     }
                     crate::ui::palette_model::Row::Action { name, .. } => {
-                        if i == self.state.selected || self.hover == Some(i) {
+                        if i == self.state.selected {
                             let hl = CreateSolidBrush(COLORREF(colors.selected_fill));
                             FillRect(hdc, &row_rect, hl);
                             let _ = DeleteObject(hl.into());
+                        } else if self.hover == Some(i) {
+                            let outline = CreateSolidBrush(COLORREF(colors.bar));
+                            let line = scale(1, self.dpi).max(1);
+                            for edge in [
+                                RECT {
+                                    bottom: row_rect.top + line,
+                                    ..row_rect
+                                },
+                                RECT {
+                                    top: row_rect.bottom - line,
+                                    ..row_rect
+                                },
+                                RECT {
+                                    right: row_rect.left + line,
+                                    ..row_rect
+                                },
+                                RECT {
+                                    left: row_rect.right - line,
+                                    ..row_rect
+                                },
+                            ] {
+                                FillRect(hdc, &edge, outline);
+                            }
+                            let _ = DeleteObject(outline.into());
                         }
                         if i == self.state.selected {
                             let accent = CreateSolidBrush(COLORREF(colors.bar));
@@ -1825,6 +1876,7 @@ impl PaletteInner {
             );
 
             SelectObject(hdc, old_font);
+            let _ = DeleteObject(normal.into());
         }
     }
 
@@ -2190,7 +2242,8 @@ mod tests {
         }
 
         #[test]
-        fn the_bar_has_at_least_3_to_1_on_what_it_sits_on() {
+        fn the_bar_and_the_hover_outline_have_at_least_3_to_1_on_the_background() {
+            // The hover outline is drawn in the bar colour, so this holds both.
             for (name, theme, c) in cases() {
                 // In high contrast the whole row is the system highlight and
                 // the bar is that colour: the row itself must stand out.
