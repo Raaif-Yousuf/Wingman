@@ -47,6 +47,22 @@ Enter. Wingman never presses Send, Submit, Buy or Pay, whatever the key does.
 - `config.rs`: `Hotkeys { primary, secondary, pause, palette }`,
   `Palette { router_threshold }` (0.7).
 
+- `router_worker` builds its chain with `without_prompt()`: the router never
+  shows the #105 send preview. With "confirm before sending" on, a cloud
+  router call is refused by the send guard and the press gets no suggestion.
+  `maybe_start_router` also returns silently when paused or when a password
+  manager is in front.
+- Every action captures again on the main thread after hiding the card (hide,
+  settle, capture), so no capture is shared between the router and an action.
+- `password_manager_hint` is fed from `palette_password_manager`, which is
+  written only when the palette opens. The options flow has to set its own.
+- Answer cards already auto-dismiss (`show_answer(.., auto_dismiss_secs, ..)`).
+  The options card does not exist yet.
+- Exe size: `perf-budgets.json` records 3,800,576 bytes measured against a gate
+  of 3,900,000, about 99 KB of headroom (AGENTS.md's "about 3.5 MB" is stale).
+  The slices below, and the Settings dark mode, overlay and knowledge specs,
+  all draw on that one headroom. See "Size budget".
+
 ## Decisions
 
 These are the product rules this design is built on.
@@ -62,6 +78,34 @@ These are the product rules this design is built on.
   close as Settings choices.
 - **A bare launch never makes a billed call.** See "Bare launch".
 
+## Shared rules for every surface (this spec and the overlay spec)
+
+The options card and the overlay spec both put things on screen that the key,
+Esc and a click can act on. One rule set, defined here. The overlay spec points
+at this section instead of restating it.
+
+- **Surfaces, highest first:** the Preview card (a write waiting for Enter),
+  the Options card, then Answer, error and info cards. The overlay (marks,
+  labels, ghost text) is not a surface. It belongs to exactly one card (its
+  summary card, or the preview it annotates) and lives as long as that card.
+- **A key press, Esc or a click-away acts on the highest surface only, and
+  whatever it dismisses takes its overlay with it.** With an overlay and a
+  preview card up together (#329), the key dismisses the preview, nothing
+  runs, and the ghost text goes with it.
+- **`Context` carries `overlay: bool`, not a new `CardKind`.** An overlay
+  changes what a dismissal removes, never what the key means.
+- **Click-away dismisses the card and its overlay together, or neither.** With
+  `options.click_away_dismiss = false` a click on the overlay does not dismiss
+  it either; Esc and the key still do. A click that lands on a clickable
+  overlay label (#326) is a pick, not a dismissal: the handler hit-tests the
+  label rectangles before it applies the click-away rule.
+- **Alt+Tab or any foreground change:** a preview card survives with its edits.
+  The overlay hides (the marks no longer line up with the screen) and is not
+  restored when the user comes back. The preview card stays the source of
+  truth.
+- **Screen readers:** a card or summary card appearing raises a system alert
+  event named by its summary. Full UIA support is #119.
+
 ## User-visible behaviour
 
 ### States
@@ -69,9 +113,11 @@ These are the product rules this design is built on.
 | State | What the user sees |
 |---|---|
 | Idle | Nothing. |
-| Options pending | The options card appears at once, in the usual corner, with a summary placeholder ("Looking at your screen") and no buttons yet. |
+| Looking, router not started | The options shell at once: a summary placeholder ("Looking at your screen") and no buttons. The screen was captured at the press. The double-press window is open (when `double_press_ms` is above 0). |
+| Looking, router started | The same shell. The router request is in flight and can be cancelled. |
 | Options ready | Summary line, then 2 to 4 numbered buttons. |
-| Action running | The existing Pending card for that action. |
+| Running, cancellable | The existing Pending card for an action's Look or Propose model call. Nothing has been written. |
+| Running, committed | The Pending card while an executor writes after Enter (fill form, calendar add, replace text), and the short clipboard write of a model-free action. It cannot be cancelled. |
 | Result | The existing answer, error, info or preview card. |
 
 ### What a press does
@@ -81,20 +127,38 @@ card. "Double" means two presses within the double-press window (below).
 
 | State when the key is pressed | Single press | Double press |
 |---|---|---|
-| No card | Look: capture, show the options card, route | Repeat the last action on the current screen (#42 slice) |
-| Options card with options | Run option 1 | Run option 2 (nothing if there is no option 2) |
-| Options pending (router in flight) | Cancel, no card | Cancel, no card |
-| Action running (request in flight) | Cancel, no card (the generation pattern `preview.rs` uses drops the late result) | Same |
-| Answer, error or info card (no options) | Dismiss | Dismiss |
-| Preview card (Do it, Edit; Book anyway) | Dismiss, nothing runs | Dismiss, nothing runs |
+| No card, nothing to repeat | Look: capture, show the shell, the router starts when the window closes | Same as single. The second tap is part of the same gesture and cancels nothing. |
+| No card, a last action exists | Look, as above | Repeat the last action (the shell hides, the action captures again as every action does) |
+| Looking, router not started (window open) | The second press of a double. With a last action: repeat it, the router never starts, the early capture is dropped. Without one: absorbed, the Look carries on. | n/a (a third press is ignored) |
+| Looking, router started | Cancel, no card | Cancel, no card |
+| Options card, option 1 is key-pickable | Run option 1 | Run option 2 if it exists and is key-pickable, otherwise nothing |
+| Options card, option 1 is not key-pickable | Dismiss | Run option 2 if key-pickable, otherwise Dismiss |
+| Running, cancellable | Cancel, no card (the generation pattern `preview.rs` uses drops the late result) | Same |
+| Running, committed | Ignored (swallowed, nothing shown). The result card always appears. | Ignored |
+| Answer, error or info card | Dismiss, and its overlay | Dismiss |
+| Preview card (Do it, Edit; Book anyway; a send preview) | Dismiss, nothing runs (a send preview is cancelled, as today) | Dismiss, nothing runs |
 
-A cancel is not an error: no card, no message.
+A cancel is not an error: no card, no message. The committed state exists
+because the generation pattern can drop a result card but cannot stop a write
+that already started. Cancelling there would leave the user with a write and no
+card telling them it happened (rule 7).
 
 **Decision: a preview card does not count as "has options" for the key.**
 Its option 1 is Do it, which writes. Pressing the key to get rid of a card
 out of habit must never act. Enter (or the button) confirms, as today.
-"Book anyway" (#390) is never reachable from the key. Only the options card
-is key-pickable. This holds in every key mode, including Always pick.
+"Book anyway" (#390) is never reachable from the key. This holds in every key
+mode, including Always pick.
+
+**Decision: an option is key-pickable only if running it cannot change
+anything without a further Enter and cannot overwrite the clipboard.**
+Read-only actions (explain, review) and actions that end in a preview qualify.
+Model-free actions that write the clipboard (Copy text from screen, Copy
+region, Read QR) do not: they are picked by click or by digit, or by the key
+when their confidence is at or above `palette.router_threshold`. The pure
+function `key_pickable(effect, confidence)` decides, and the catalogue table of
+built-ins gains an `effect` column (`none`, `clipboard`, `preview`; a
+user-authored action with a write executor is `preview`, otherwise `none`).
+When option 1 fails the test the key dismisses the card, the safe outcome.
 
 ### Key modes (Settings)
 
@@ -118,20 +182,25 @@ the same in all three.
 it to. Resolution:
 
 - **Decision: a click elsewhere dismisses the options card, answer, error and
-  info cards, and passes through to the app underneath.** The click is never
-  swallowed, so the user still lands in the app they clicked. The `dismiss.rs`
-  watcher stays, and is armed while the options card shows.
-- **Decision: a preview card survives focus loss and click-away.** It can hold
-  edits, and an Alt+Tab to check a date must not discard them (#324's real
-  complaint). It closes on Esc or the key. `preview_focus_left_the_card`'s
-  silent cancel is removed in the same slice that changes the key table (it
-  is the #324 half that still stands).
+  info cards (and their overlay), and passes through to the app underneath.**
+  The click is never swallowed, so the user still lands in the app they
+  clicked. The `dismiss.rs` watcher stays, and is armed while the options card
+  shows.
+- **Decision: a Do it / Edit preview survives focus loss and click-away.** It
+  can hold edits, and an Alt+Tab to check a date must not discard them (#324's
+  real complaint). It closes on Esc or the key. The silent cancel in
+  `preview_focus_left_the_card` is removed for this kind of preview, in the
+  slice that changes the key table.
+- **Decision: the send preview (#105) keeps its focus-loss cancel.** Its worker
+  is blocked and `busy` is set, and there is nothing in it to lose, so a
+  forgotten one would hold the app busy and the tray looking busy. The cancel
+  stays quiet (no card, #392). Open question 9.
 - A setting `options.click_away_dismiss` (default `true`) lets a user who
   wants #324's persistent card turn the dismissal off for answer and options
-  cards. Esc and the key still close.
+  cards. Esc, the key and the options card's auto-dismiss still close.
 - The card never takes focus when shown (`WS_EX_NOACTIVATE`), so typing keeps
   going to the app underneath. Keys 1 to 4 and Esc therefore need a way to
-  reach the card; see "Keys 1 to 4".
+  reach the card; see "Keys 1 to 4 and Esc".
 
 ## The router: a ranked shortlist (#306)
 
@@ -243,6 +312,28 @@ failure reason goes to the diagnostics log, not the card. The router call
 has its own timeout (default 10 s; THEORY, unverified, needs a latency
 measurement on the cheapest target before it is fixed).
 
+The router call is an egress path, so its gates are stated, in the order they
+are checked at the press, before the shell shows:
+
+1. Paused: the key passes through (unchanged).
+2. A password manager, secure desktop or payment page in front: the existing
+   capture-gate card is shown instead of the options card, and no router call
+   is made. The gate runs at the press (a foreground check, no capture) and
+   the result is kept for the whole Look, so the action chosen later honours it
+   as the palette's `palette_password_manager` does today.
+3. Offline: the router runs on the local model or not at all.
+4. Cloud with "confirm before sending" on: the router never shows the send
+   preview (it runs by itself, as it does for the palette), so the send guard
+   refuses it. The card shows the floor and no request leaves the machine. A
+   user who wants cloud routing with that toggle on gets the floor; the action
+   they then pick shows its own send preview as always. This keeps one press
+   from opening two previews.
+5. Otherwise the router runs on the cheapest ready provider through the
+   existing redaction and payment-denylist gates.
+
+The floor's "Copy text from screen" refuses itself over a password manager, so
+it is never a way around gate 2.
+
 ## The options card (#307)
 
 ### Layout
@@ -294,18 +385,41 @@ The card does not take focus, so a window message to it would never arrive.
 Two choices, with a recommendation:
 
 - **Decision: handle 1 to 4 and Esc in the existing low-level hook**, but
-  only while the options card is showing (a lock-free atomic flag, set and
-  cleared by the card, like the paused flag). A matching key is swallowed and
+  only while the options card is showing. A matching key is swallowed and
   posted as a message. Any other key passes through untouched. This keeps
   focus in the user's app and works without a click.
 - The cost is that digits cannot be typed into the app underneath while the
-  options card is open. The card is short-lived and `click_away_dismiss` plus
-  Esc get the user out; the hint line says so. See the open question.
+  options card is open. The claim is therefore narrow and bounded:
+  1. **No modifiers.** A digit or Esc is claimed only with Shift, Ctrl, Alt
+     and both Win keys up, so Ctrl+1 (browser tab), Win+1 (taskbar) and
+     Shift+1 pass through. The hook already tracks modifier state to match
+     chords; the claim reuses it.
+  2. **Only digits that name an option.** With three options, 1 to 3 are
+     claimed and 4 passes through. Main-row and numpad digits both count.
+  3. **Bounded in time.** The options card auto-dismisses after
+     `options.auto_dismiss_secs` (default 20; one `SetTimer` armed when the
+     card shows and killed when it hides, the same one-shot pattern the answer
+     cards use, so nothing runs while idle). The claim is a lock-free atomic
+     holding an expiry tick (auto-dismiss plus 1 s). The hook compares the
+     key event's own timestamp with it, so a flag left set by a bug lapses by
+     itself, with no timer.
+  4. **Cleared on every path.** Hide, pick, cancel, dismiss, card window
+     destroy and `App` drop all clear it. A unit test over the pure "which
+     keys are claimed in which state" function proves nothing is claimed in
+     any other state, with a modifier down, or past the expiry.
+  5. **Switchable.** `options.claim_keys = false` turns the claim off for a
+     user who types digits while the card is up or who runs an IME whose
+     candidate selection uses digits. The options are then picked by click or
+     by the Wingman key.
+  6. **Visible.** The hint line says "1 to 3 or Esc". A digit that is not
+     claimed reaches the app underneath, so a dropped digit cannot happen
+     silently; the one that is claimed visibly runs an option.
+- IME and password fields: the hook cannot see whether the app underneath is
+  mid-composition or has a password box focused. THEORY (unverified): a claim
+  of at most 20 s that needs a deliberate card on screen is acceptable. Manual
+  check 8 covers an IME and a numpad.
 
-Esc closes the card with nothing run. The flag is cleared on every path that
-hides the card (hide, pick, cancel, dismiss), and a unit test over the pure
-"which keys are claimed in which card state" function proves nothing is
-claimed in any other state.
+Esc closes the card with nothing run.
 
 ### Accessibility
 
@@ -315,7 +429,16 @@ the card is a window named by its summary. Full UIA support and keyboard
 navigation inside the card is #119; this slice must not make it harder (real
 child buttons, not a single painted surface). High contrast and the text
 scale setting are honoured as on the existing cards. Contrast of the keycap
-and the default outline is checked in light, dark and high-contrast themes.
+and the default outline is checked in light, dark and high-contrast themes,
+at 4.5:1 for text and 3:1 for the outline and keycap border (WCAG 1.4.11).
+
+The card never takes focus, so Tab and Narrator cannot reach the buttons
+until #119. Until then the keyboard path is the digit and Esc claim and the
+Wingman key itself. To make the card discoverable, showing it raises a system
+alert event named by the summary (see "Shared rules"), and the hint line is
+part of the card's accessible description. A user who cannot rely on either
+can set `options.claim_keys = false` and use the key, or pin an action with
+`primary_action`.
 
 ## The key: single versus double press
 
@@ -329,22 +452,26 @@ message handler on the main thread.
 
 Two things the hook must add, both small and lock-free:
 
-1. **Ignore auto-repeat.** A held key must be one press, not a stream. The
-   hook records that the primary's vk is down (an atomic) on the first
-   matching keydown and clears it on the matching key-up (the hook currently
-   returns early on every non-keydown message; it needs to look at key-up for
-   that one vk). A repeated keydown while the flag is set is swallowed but
-   not posted. If the key-up is missed (a focus change in a secure desktop),
-   the flag would stick, so it also clears on a short deadline (2 s,
-   compared against the keydown's timestamp, no timer).
-2. **Keep the Ctrl tap on every swallowed press, including the second of a
-   double.** The Win-key cancel trick exists because a swallowed Win chord
-   leaves Win logically down and the eventual key-up would open Start. A
-   double press is two swallowed chords in a row; each needs its own tap, and
-   the own-synthetic-input marker (`INJECTED_MARKER`) already stops the hook
-   treating its own taps as presses. MEASURED on the dev machine before this
-   slice ships (Manual check 2): that the second press of a double still does
-   not flicker Start.
+1. **Ignore auto-repeat.** A held key must be one press, not a stream.
+   `KBDLLHOOKSTRUCT` has no repeat bit, so the hook records that the primary's
+   vk is down (an atomic) on the first matching keydown and clears it on the
+   matching key-up (the hook currently returns early on every non-keydown
+   message; it needs to look at key-up for that one vk). A repeated keydown
+   while the flag is set is swallowed but not posted. If the key-up is missed
+   (a focus change on a secure desktop), the flag would stick, so it also
+   clears when no matching keydown has been seen for 2 s. The 2 s is measured
+   from the **last** keydown, not the first: a repeating key refreshes it, so a
+   4 s hold is still one press.
+2. **Keep the Ctrl tap on every distinct swallowed press, including the second
+   of a double, and not on swallowed repeats.** The Win-key cancel trick
+   exists because a swallowed Win chord leaves Win logically down and the
+   eventual key-up would open Start. A double press is two swallowed chords in
+   a row; each distinct press needs its own tap, and the own-synthetic-input
+   marker (`INJECTED_MARKER`) already stops the hook treating its own taps as
+   presses. A swallowed repeat belongs to the press that started the hold and
+   sends no further tap. MEASURED on the dev machine before this ships
+   (Manual check 2): that neither the second press of a double nor a long hold
+   makes Start flicker.
 
 ### The state machine
 
@@ -352,25 +479,36 @@ A pure type in a new module, `keypress.rs`, with no `windows` dependency:
 
 ```rust
 pub enum Press { Single, Double }
-pub struct Context { card: CardKind, in_flight: bool, mode: KeyMode, has_last_action: bool }
+pub enum Phase {
+    Idle,
+    Looking { router_started: bool },
+    Options { count: usize, key_pickable: [bool; 4] },
+    Running { committed: bool },   // committed = the Do phase, cannot be cancelled
+    Answer,                        // answer, error or info
+    Preview,                       // Do it / Edit / Book anyway / send preview
+}
+pub struct Context { phase: Phase, overlay: bool, mode: KeyMode, has_last_action: bool }
 pub enum KeyAction {
-    Dismiss, Cancel, Look, RunOption(usize), RepeatLast, Ignore,
+    Dismiss, Cancel, Look, RunOption(usize), RepeatLast, Absorb, Ignore,
 }
 pub fn on_key(ctx: &Context, press: Press) -> KeyAction;      // the table
 pub fn needs_window(ctx: &Context) -> bool;                    // wait to tell single from double?
 ```
 
 `needs_window` is `true` only where single and double would do different
-things: an options card with at least 2 options (Dynamic or Always pick), and
-no card with a last action to repeat. Everywhere else the first press acts at
-once, so the window costs nothing there.
+things: no card with a last action to repeat, and an options card with at
+least 2 options (Dynamic or Always pick). While `Looking { router_started:
+false }` the window is the thing being waited out. Everywhere else the first
+press acts at once, so the window costs nothing there. `Absorb` is the second
+tap of a double when there is nothing to repeat.
 
 When `needs_window` is true, the first press arms a **one-shot** window timer
 (`SetTimer` on the main window, killed when it fires or a second press
 arrives). It is armed only after a press, never while idle, so rule 5 holds
 (no polling, nothing running between presses). Expiry means Single, a second
 press inside the window means Double, a third press inside the same window is
-ignored (no triple).
+ignored (no triple). Every hide path kills the timer through one function,
+which a unit test covers.
 
 After the key dismisses or cancels something, presses are ignored for one
 window length. Otherwise the second tap of a double on an answer card would
@@ -381,13 +519,16 @@ dismiss it and then immediately start a new Look.
 For "no card", waiting out the window before capturing would add its length
 to every Look. Instead:
 
-- The first press **captures and shows the options card shell immediately**,
-  as it would anyway. The screenshot is taken at the press, so it is the
-  screen the user meant.
+- The first press **captures at once** (the router-size capture, 512 px long
+  edge) and **shows the options shell immediately**. The screenshot is taken
+  before the shell exists, so it is the screen the user meant and never
+  contains the card. The capture is held in memory only, never written, and
+  dropped on cancel, on a double press, and when the router has used it.
 - The router request (the billed part) starts when the window expires with no
   second press. A second press inside the window instead runs the last action
-  on the capture already taken. A double press therefore never costs a router
-  call.
+  by the normal path: the shell hides, the card settles and the action takes
+  its own full capture, as every action does today. A double press therefore
+  never costs a router call, and the early router-size capture is discarded.
 - Delay added to a normal Look: the window length before the router starts.
   Delay added to picking an option by key: the window length (option 1 must
   wait to see whether option 2 was meant). Clicking an option and keys 1 to 4
@@ -474,12 +615,13 @@ menu, the Copilot-key picker, `poke_existing`) arrives as `WM_APP_ACTIVATE`
 and cannot be told apart by argv, so it needs one rule for both:
 
 **Decision: activation opens the options card in its static form: the
-model-free options plus the last used action, with no router call and so no
-network.** The picker route still gives the user a card to act from, and the
-Start menu cannot cost money. The hotkey (the hook) is the only route that
-starts the router. The existing activation rate limit stays. Egress log check
-(Manual check 3): launch the exe from the Start menu with Wingman running and
-confirm no new egress line.
+model-free options only, with no router call and so no network.** (A "last
+used action" row joins it in slice 5, when that memory exists.) The picker
+route still gives the user a card to act from, and the Start menu cannot cost
+money. The hotkey (the hook) is the only route that starts the router. The
+existing activation rate limit stays. Egress log check (Manual check 3):
+launch the exe from the Start menu with Wingman running and confirm no new
+egress line.
 
 This is a deliberate narrowing of #308's "the picker's activation opens the
 card": it does open a card, just without the router.
@@ -487,8 +629,10 @@ card": it does open a card, just without the router.
 ### Pause and Offline
 
 While paused, the key passes through as it does today (the hook returns
-before matching). Offline is covered above. `model_action_gate` still
-decides busy and paused first for anything that would run a model.
+before matching). Offline is covered above and in "Failure" (the router gates).
+`model_action_gate` still decides busy and paused first for anything that
+would run a model. Pause and Offline never leave a claim set: pausing hides
+the options card and clears the digit claim.
 
 ## Config
 
@@ -499,18 +643,23 @@ All fields are optional with defaults, `#[serde(default)]`, so an existing
 [hotkeys]
 key_mode = "dynamic"        # "dynamic" | "pick" | "close"        (#393)
 double_press_ms = 300       # 0 turns double-press off; clamped 150..600
-primary_action = "options"  # "options" | "<action id>"           (#42, slice 5)
+primary_action = "options"  # "options" | "<action id>"           (slice 3, minimal form)
 
 [options]
 max_options = 4             # clamped 2..4
 min_confidence = 0.2        # card inclusion bar; palette.router_threshold unchanged
 click_away_dismiss = true
+auto_dismiss_secs = 20      # options card only; clamped 5..120
+claim_keys = true           # claim 1..N and Esc while the card shows
 ```
 
 - Unknown `key_mode` or `primary_action` values fall back to the default and
   name the bad value in a card (rule 7), they do not stop startup. An id that
   is not in the catalogue is the same failure, shown the first time the key
   is pressed.
+- `primary_action` ships in slice 3 in its minimal form (`"options"` or an
+  action id) so the escape hatch lands with the change it exists for. Per-action
+  chords and the last-action memory are slice 5.
 - `key_mode` and `double_press_ms` appear in Settings next to the key
   settings (#345). `primary_action` is a dropdown of the catalogue plus
   "Show options".
@@ -525,22 +674,21 @@ click_away_dismiss = true
 ### `primary_action` and per-action chords (#42)
 
 - `primary_action = "<action id>"` makes a single press run that action,
-  skipping the router. The options card is then reachable from the palette
-  chord and the tray. With a pinned action, `needs_window` is false for the
-  no-card state only if there is nothing to repeat; a double press still
-  repeats the last action.
-- An action may declare a chord (`Action.hotkey`, already a field the
-  override-merge spec refers to). The hook matches it like the palette chord
-  (a locked snapshot, not the pause chord's atomic) and posts a new message
-  carrying the action id. A per-action chord always runs that action
-  directly: no router, no options card. It does not fire while paused.
-  Conflicts with the primary, secondary, pause, palette and each other are
-  checked at load by `hotkey_conflicts.rs`, and a conflict is a named card,
-  not a silent loss.
+  skipping the router. With it pinned, the options card is reachable from the
+  tray item "What can I do here?" (slice 2) and from a duplicate launch (the
+  static card). The palette chord opens the palette, not the options card.
+  A pinned action still allows a double press to repeat the last action.
+- An action may declare a chord (`Action.hotkey`, a field that exists and is
+  inert today, #535). The hook matches it like the palette chord (a locked
+  snapshot, not the pause chord's atomic) and posts a new message carrying the
+  action id. A per-action chord always runs that action directly: no router, no
+  options card. It does not fire while paused. Conflicts with the primary,
+  secondary, pause, palette and each other are checked at load by
+  `hotkey_conflicts.rs`, and a conflict is a named card, not a silent loss.
 - "Last action" is remembered in memory only (the id of the last action that
   completed or was started by the user, not a router guess). It is not
-  written to disk, so a restart has none, and a double press with none behaves
-  as a single press.
+  written to disk, so a restart has none. A double press with none is
+  absorbed (see the table), it does not become a second Look.
 
 ### Per-app rules (#107)
 
@@ -562,12 +710,15 @@ Every failure ends in a card (rule 7). New ones, plus what is not a failure:
 |---|---|
 | Router error, timeout, refusal, unparseable | Options card with the floor and a plain summary. Reason in the diagnostics log. |
 | Router returns options but all invalid or filtered | Same: the floor. |
+| Cloud router with "confirm before sending" on | The floor, no network. The chosen action shows its own send preview. |
 | No model ready | Static model-free card, no network. |
 | A chosen option fails | That action's own error card. The options card is already gone. |
 | `primary_action` names a missing action | A card naming the setting and the id, once. |
-| Capture fails (secure desktop, password manager, payment page) | The existing capture-gate cards, unchanged, before any router call. |
+| Capture fails (secure desktop, password manager, payment page) | The existing capture-gate card, shown instead of the options card, before any router call. |
 | Press while paused | Passes through, nothing shown. |
-| Key cancels an in-flight request | No card. Not an error. |
+| Key cancels an in-flight Look or Propose request | No card. Not an error. |
+| Key during the committed Do phase | Ignored. The result card appears as usual. |
+| Options card left up | Auto-dismisses after `options.auto_dismiss_secs`, the digit claim lapses with it. |
 | Activation refused by the rate limit | The existing "Too many requests in a row" card. |
 
 ## Testing
@@ -601,6 +752,19 @@ Pure logic is unit-tested (rule 8); each Win32 piece has a named manual check.
 - A test that no `Trigger::Hotkey` or `Trigger::Activation` path reaches a
   provider call without going through the readiness gate.
 
+- `keypress.rs` additions: every `Phase` (including `Looking { router_started }`
+  and `Running { committed }`) against Single and Double, with and without a
+  last action. A committed run never yields `Cancel` or `Dismiss`. A double
+  with nothing to repeat yields `Absorb`, never `Cancel`. `key_pickable`: a
+  clipboard-writing option below the threshold is never key-picked, and a
+  card whose option 1 fails it dismisses.
+- The key-claim function: no modifier, only digits up to the option count,
+  nothing past the expiry tick, nothing in any state but Options.
+- Auto-repeat filter: the 2 s lapse is measured from the last keydown, so a
+  4 s hold stays one press. The Ctrl tap is sent once per distinct press.
+- The options generation: a stale click or digit after the card changed runs
+  nothing.
+
 ### Manual checks (each names the observable that differs if it is wired to nothing)
 
 1. **Double-press timing.** Observable: the measured gaps in a scratch log;
@@ -624,35 +788,66 @@ Pure logic is unit-tested (rule 8); each Win32 piece has a named manual check.
    run; a preview card is dismissed, never confirmed, in every mode.
 7. **Held key.** Holding the key down runs one Look, not several.
 
+8. **Digit claim.** With an IME active and with the numpad: while an options
+   card shows, digits that name an option run it, Ctrl+1 and Win+1 still reach
+   the browser and taskbar, 4 passes through on a 3-option card, and once the
+   card auto-dismisses digits type normally again. Observable: a digit typed
+   into Notepad after the card closes appears.
+9. **Password manager and send guard.** With a password manager in front the
+   key shows the capture-gate card and the egress log gains no line. With
+   "confirm before sending" on and a cloud provider, the key shows the floor
+   and the egress log gains no line.
+10. **Narrator.** The card appearing is announced, and the buttons have their
+    names ("1 of 3").
+
 ## Slices
 
-Each ships alone and leaves the app working.
+Each ships alone and leaves the app working, with the key behaving sensibly
+at every step.
 
 1. **Router shortlist (#306).** `RouterResult.options`, schema, validation,
-   labels, fallbacks. The palette reads `options[0]`; nothing else changes.
-   Done when the fixture test passes and the palette still pre-selects its
-   top option (checked by hand).
-2. **Options card (#307).** `CardState::Options`, keys 1 to 4 and Esc, click
-   to pick, hide-before-capture. Reachable from the palette chord and tray
-   only, behind no setting, since the bare key is unchanged. Done when Manual
-   check 5 passes.
-3. **Bare key opens the options card (#308).** The default flips, the static
-   activation card, `primary_action` read in its minimal form (`"options"` or
-   an action id, so the escape hatch ships with the change it exists for),
-   release note. Done when the Done-when of #308 holds and Manual checks 3 and
-   4 are recorded.
-4. **The key picks (#393, #324).** `keypress.rs` and `on_key`, `key_mode`,
-   the hook's auto-repeat filter and card-open key claim, click-away rules,
-   preview survives focus loss, the Settings choice. Single press only at
-   first (`double_press_ms = 0` behaviour), so Manual checks 6 and 7 can pass
-   before timing is settled.
+   labels, fallbacks, and the `effect` column on the built-in catalogue. The
+   palette reads `options[0]`; nothing else changes. Done when the fixture test
+   passes and the palette still pre-selects its top option (checked by hand).
+2. **Options card (#307).** `CardState::Options`, keys 1 to 4 and Esc (the
+   bounded claim, with auto-dismiss), click to pick, hide-before-capture.
+   Reachable from a new tray item "What can I do here?", behind no setting,
+   since the bare key is unchanged (the key keeps running Check my work, even
+   with the card up). Done when Manual checks 5 and 8 pass.
+3. **Bare key opens the options card (#308).** The default flips. This slice
+   also carries what the flip needs to be safe: the auto-repeat filter, the
+   "Options card" and "Looking" rows of the key table with single-press
+   behaviour only (`keypress.rs` with `double_press_ms = 0` behaviour, so no
+   timer yet), the committed-state rule, the static activation card,
+   `primary_action` in its minimal form, the router gates, a one-line pointer
+   in the expansion plan §6 to this spec, and the release note. Done when the
+   Done-when of #308 holds and Manual checks 3, 4, 7 and 9 are recorded.
+4. **The key picks and click-away (#393, #324).** `key_mode`, the Settings
+   choice, click-away rules, the preview surviving focus loss (send preview
+   excepted), `options.click_away_dismiss`. Done when Manual checks 6 and 10
+   pass.
 5. **Double press and per-action chords (#42).** The window timer, repeat last
-   action, `double_press_ms`, per-action chords and their conflict checks.
-   Gated on Manual checks 1 and 2.
+   action, `double_press_ms`, the last-action row on the static card,
+   per-action chords and their conflict checks. Gated on Manual checks 1 and
+   2.
 6. **Per-app rules (#107).** Its own short spec first.
 
 Slices 1 and 2 are pure additions. Slice 3 is the one user-visible behaviour
 change and should be the last to merge before a release.
+
+### Size budget
+
+No new crate and no new `windows` feature is needed (`SetTimer`, the keyboard
+hook, `NotifyWinEvent` and the owner-drawn buttons are all in features already
+enabled). Estimates, each THEORY (unverified) until measured: slice 1 about
+4 KB, slice 2 about 15 KB, slice 3 about 6 KB, slice 4 about 6 KB, slice 5
+about 10 KB, about 40 KB in all. The gate is `perf-budgets.json`
+(`exe_size_bytes.max` 3,900,000, last measured 3,800,576), enforced by
+`scripts/perf-budget.ps1`, leaving about 99 KB for this spec and the Settings
+dark mode, overlay and knowledge specs together. Each slice's PR records the
+measured size from CI. A slice that would break the gate raises it in the same
+PR with the measured number and reason, as earlier PRs did, and the
+bookkeeping across specs is the order they merge in.
 
 ## Open questions
 
@@ -662,15 +857,24 @@ Each has a recommended answer; the first four affect slice 1 to 4 work.
    `options.min_confidence` (0.2) rather than `palette.router_threshold`
    (0.7)? Recommended: yes. #306 says to drop below the palette threshold,
    but its own example keeps 0.41 and 0.12, and at 0.7 the card would often
-   hold one option.
-2. **Key runs a low-confidence option 1?** Recommended: yes. Every option is
-   read-only or ends in a preview that needs Enter, so a wrong guess costs
-   one call and one dismiss, never an action. The floor guarantees option 1
-   is at least a sane choice.
+   hold one option. Small-model confidences are poorly calibrated, so treat
+   0.2 as a tunable, not a fact.
+2. **Key runs a low-confidence option 1?** Recommended: yes, but only when
+   option 1 is key-pickable. The earlier reasoning, "every option is read-only
+   or ends in a preview", was wrong: model-free actions such as Copy text from
+   screen and Copy region write the clipboard with no confirm, so a habit press
+   on a low-confidence option 1 would overwrite the clipboard silently. A
+   clipboard-writing option is key-picked only at or above the router
+   threshold, otherwise the key dismisses. Counter-argument: a rule that makes
+   the key sometimes close the card is harder to learn. Mitigation: the hint
+   line shows "Esc to close" and option 1's keycap is drawn without the accent
+   outline when the key will not run it.
 3. **Digits and Esc claimed by the hook while the card is open.** The
    alternative is to let the card take focus, which steals typing.
-   Recommended: claim them in the hook while the card shows, and tell the user
-   in the hint line. Revisit if the digit capture annoys anyone in testing.
+   Recommended: claim them, with the conditions above (no modifiers, only
+   digits that name an option, an auto-dismiss, an expiry that lapses by
+   itself, `options.claim_keys`). Revisit if the digit capture annoys anyone in
+   testing.
 4. **Static card on activation.** Recommended: yes, as above. The cost is that
    the picker route no longer runs the router; the hotkey route does.
 5. **Double-press default.** 300 ms versus #42's 400 ms. Recommended: ship
@@ -678,10 +882,22 @@ Each has a recommended answer; the first four affect slice 1 to 4 work.
 6. **Should Always pick do anything on an answer card?** Recommended: no, it
    falls through to nothing, and Esc closes. A key that closes in a mode
    named "pick" would surprise.
-7. **Auto-dismiss timers on answer cards (#324).** Out of scope here; the
-   current timers and `PENDING_SAFETY_TIMEOUT_SECS` are unchanged. Recommended:
-   a separate small change after slice 4, since a persistent card plus
-   click-away dismissal covers most of #324's reason.
-8. **Router timeout.** Recommended: 10 s, shorter than the 30 s the main
-   action gets, since after that the user is better served by the floor.
-   Needs the latency measurement (Manual check 4).
+7. **Auto-dismiss.** Required for the options card (it bounds the digit claim),
+   so it is in scope, default 20 s. For answer cards it stays out of scope:
+   their current timers and `PENDING_SAFETY_TIMEOUT_SECS` are unchanged, and a
+   separate small change after slice 4 can revisit it.
+8. **Router timeout and what shows while waiting.** Recommended: 10 s, shorter
+   than the 30 s the main action gets, since after that the user is better
+   served by the floor. Counter-argument: 10 s is long against "instant", and
+   showing the floor's model-free buttons at once would let the user act while
+   the router thinks. Against that, replacing buttons under the pointer when
+   the router replies is a misclick hazard. Recommended: keep the placeholder,
+   and if Manual check 4 shows a median router latency above 2 s, show the
+   model-free rows at once and let router rows replace them only when no
+   pointer is over the card and no key was pressed. Needs the measurement.
+9. **Does the send preview keep its focus-loss cancel?** Recommended: yes (see
+   "Clicking elsewhere"). Counter-argument: a user who Alt+Tabs to check what
+   is about to be sent loses the preview and the request, and has to press the
+   key again. The cost of the alternative is a worker blocked and the app
+   `busy` until Esc or the key. If this proves annoying, give the send preview
+   a long one-shot expiry instead of removing the cancel.
