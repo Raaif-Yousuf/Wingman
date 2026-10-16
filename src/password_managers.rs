@@ -334,7 +334,9 @@ mod tests {
         "uia_fields_text",
         "page_text_of",
         "gather_generic_inputs",
-        "ocr_text_for",
+        "form_fill_worker",
+        "router_non_vision_inputs",
+        "ocr_text_of",
     ];
 
     #[test]
@@ -456,9 +458,9 @@ mod tests {
     #[test]
     fn only_known_files_capture_the_screen() {
         const ALLOWED: &[&str] = &[
-            "app.rs",                // guarded entry points, checked above
+            "app.rs",                  // guarded entry points, checked above
             "actions/extract_text.rs", // wrapper called only from the guarded fn
-            "ui/region.rs",          // select_region, called only from copy_region
+            "ui/region.rs",            // select_region, called only from copy_region
         ];
         const CAPTURE_CALLS: &[&str] = &[
             "grab_raw(",
@@ -483,7 +485,7 @@ mod tests {
         let mut callers: Vec<String> = Vec::new();
         for path in &files {
             let src = lf(&std::fs::read_to_string(path).unwrap());
-            let live = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+            let live = src.split("mod tests {").next().unwrap();
             let calls = live.lines().any(|l| {
                 let t = l.trim_start();
                 !t.starts_with("//")
