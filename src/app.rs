@@ -3372,6 +3372,22 @@ impl App {
                 return;
             }
         }
+        // #832: an empty chain is a setup problem, not a fault: the setup
+        // card, no failed dot, no "Try again" text.
+        if let Err(packed) = &result {
+            if is_no_providers(packed) {
+                let path = Config::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "config.toml".into());
+                let (headline, detail) =
+                    empty_chain_card(self.config.mode, &self.config.providers, &path);
+                let chain = unpack_error(packed).1.to_string();
+                let _ = self.record_last(Err(pack_error(&headline, &chain)));
+                self.card.show_settings_needed(&headline, &detail);
+                self.set_watch(true);
+                return;
+            }
+        }
         let is_err = result.is_err();
         let mut answer = self.record_last(result);
         // A store failure never fails the request (#46); it rides on the
@@ -6281,6 +6297,35 @@ fn is_send_cancelled(packed: &str) -> bool {
         .contains(crate::provider::SEND_CANCELLED_TEXT)
 }
 
+/// #832: whether a worker's packed error is the empty chain ("no providers
+/// configured"). Looks at the raw chain half.
+fn is_no_providers(packed: &str) -> bool {
+    unpack_error(packed)
+        .1
+        .contains(crate::provider::NO_PROVIDERS_TEXT)
+}
+
+/// #832: the setup card for a run that found no provider to try. The gate
+/// cannot probe Ollama, so it lets an Ollama-only setup through; when the
+/// worker then finds nothing answering, this says what to do. Any other
+/// setup gets the gate's own card.
+fn empty_chain_card(mode: Mode, providers: &Providers, config_path: &str) -> (String, String) {
+    if mode == Mode::Auto
+        && crate::mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+    {
+        return (
+            "Ollama is not running".to_string(),
+            "Start Ollama, or click here to open Settings and paste an API key.".to_string(),
+        );
+    }
+    App::readiness_gate(mode, providers, config_path).unwrap_or_else(|| {
+        (
+            "No AI model set up yet".to_string(),
+            "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
+        )
+    })
+}
+
 /// Issue #225: which action is waiting on the preview currently on screen.
 /// See [`App::pending_preview`] for why this is one slot rather than one
 /// `Option` per kind.
@@ -7830,6 +7875,49 @@ mod tests {
                 App::readiness_gate(mode, &providers, "config.toml").expect("must block");
             assert!(!headline.contains('\u{2014}'), "{headline}");
             assert!(!detail.contains('\u{2014}'), "{detail}");
+        }
+    }
+
+    // -- #832: an empty chain at run time ends in the setup card ----------
+
+    #[test]
+    fn an_empty_chain_error_is_recognised_by_its_text() {
+        let err = anyhow::Error::new(crate::provider::NoProviders);
+        let packed = super::pack_error("x", &format!("{err:#}"));
+        assert!(super::is_no_providers(&packed));
+        let wrapped = anyhow::anyhow!("boom").context("outer");
+        let packed = super::pack_error("x", &format!("{wrapped:#}"));
+        assert!(!super::is_no_providers(&packed));
+    }
+
+    #[test]
+    fn empty_chain_card_says_ollama_is_not_running_when_only_ollama_is_listed() {
+        let (headline, detail) =
+            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), "config.toml");
+        assert_eq!(headline, "Ollama is not running");
+        assert!(detail.contains("Start Ollama"), "{detail}");
+        assert!(detail.contains("Settings"), "{detail}");
+        assert!(!detail.contains("Try again"), "{detail}");
+    }
+
+    #[test]
+    fn empty_chain_card_is_the_gate_card_when_ollama_is_not_listed() {
+        let providers = nothing_configured_providers();
+        assert_eq!(
+            Some(super::empty_chain_card(
+                Mode::Auto,
+                &providers,
+                "config.toml"
+            )),
+            App::readiness_gate(Mode::Auto, &providers, "config.toml")
+        );
+    }
+
+    #[test]
+    fn empty_chain_cards_have_no_em_dash() {
+        for providers in [ollama_only_providers(), nothing_configured_providers()] {
+            let (headline, detail) = super::empty_chain_card(Mode::Auto, &providers, "c.toml");
+            assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
         }
     }
 
