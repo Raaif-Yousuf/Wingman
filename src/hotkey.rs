@@ -91,32 +91,65 @@ pub fn apply_learned(hotkeys: &mut crate::config::Hotkeys, which: usize, chord: 
     }
 }
 
-/// The pause chord is matched before primary/secondary in `hook_proc`, so a
-/// pause chord equal to either would silently take that hotkey over (and a
-/// primary/secondary learned onto the pause chord would never fire). Returns
-/// the name of the other slot that learning `chord` into `which` would
-/// collide with, or `None`. Only collisions that involve the pause slot are
-/// checked; primary and secondary sharing a chord is not this function's job.
-pub fn pause_clash(
+/// What to do with a chord the learn hook captured for a pending Change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LearnedVerdict {
+    /// A bare Esc: the user is backing out.
+    Cancel,
+    /// Not allowed, with the inline text to show. Learning stays armed.
+    Refuse(String),
+    /// A known system shortcut: show the text, and a second press of the
+    /// same chord applies it. Learning stays armed.
+    Warn(String),
+    /// Stage it.
+    Apply,
+}
+
+/// Judges a captured `chord` for slot `which`. Pure, so the flow is tested
+/// without a hook or a window. The conflict warning and its "press it again"
+/// confirmation are `hotkey_conflicts::decide`, the same as the tray's.
+pub fn judge_learned(
     hotkeys: &crate::config::Hotkeys,
+    pending: Option<(usize, Chord)>,
     which: usize,
     chord: Chord,
-) -> Option<&'static str> {
-    if which == HK_PAUSE {
-        if hotkeys.primary == chord {
-            return Some(slot_name(HK_PRIMARY));
+) -> LearnedVerdict {
+    let bare = !(chord.ctrl || chord.shift || chord.alt || chord.win);
+    if bare && chord.vk == windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as u32 {
+        return LearnedVerdict::Cancel;
+    }
+    let anchored = chord.ctrl || chord.alt || chord.win;
+    let name = chord_to_string(&chord);
+    // A plain letter or Enter, or Shift plus a letter, as a global shortcut
+    // would swallow that key in every app. Function keys are fine without.
+    if !anchored && !(0x70..=0x87).contains(&chord.vk) {
+        return LearnedVerdict::Refuse(format!(
+            "{name} needs Ctrl, Alt or Win with it. Press another."
+        ));
+    }
+    let others = [
+        (HK_PRIMARY, Some(hotkeys.primary), slot_name(HK_PRIMARY)),
+        (
+            HK_SECONDARY,
+            Some(hotkeys.secondary),
+            slot_name(HK_SECONDARY),
+        ),
+        (HK_PAUSE, hotkeys.pause, slot_name(HK_PAUSE)),
+        (0, hotkeys.palette, "palette key"),
+    ];
+    for (slot, bound, label) in others {
+        if slot != which && bound == Some(chord) {
+            return LearnedVerdict::Refuse(format!(
+                "{name} is already the {label}. Press another."
+            ));
         }
-        if hotkeys.secondary == chord {
-            return Some(slot_name(HK_SECONDARY));
-        }
-        if hotkeys.palette == Some(chord) {
-            return Some("palette key");
-        }
-        None
-    } else if hotkeys.pause == Some(chord) {
-        Some(slot_name(HK_PAUSE))
-    } else {
-        None
+    }
+    match crate::hotkey_conflicts::decide(pending, which, chord) {
+        crate::hotkey_conflicts::LearnDecision::Apply => LearnedVerdict::Apply,
+        crate::hotkey_conflicts::LearnDecision::Warn(conflict) => LearnedVerdict::Warn(format!(
+            "{name} is already used by {}. Press it again to use it anyway.",
+            conflict.owner
+        )),
     }
 }
 
@@ -1169,43 +1202,42 @@ mod tests {
     }
 
     #[test]
-    fn pause_clash_is_reported_in_both_directions() {
-        let mut h = default_hotkeys();
-        let secondary = h.secondary;
-        // Learning pause onto an existing primary/secondary chord.
-        assert_eq!(pause_clash(&h, HK_PAUSE, secondary), Some("secondary key"));
-        assert_eq!(pause_clash(&h, HK_PAUSE, h.primary), Some("Copilot key"));
-        // Learning primary onto an already-bound pause chord.
-        let p = chord(0x13, false, false, false, false);
-        h.pause = Some(p);
-        assert_eq!(pause_clash(&h, HK_PRIMARY, p), Some("pause key"));
-        assert_eq!(pause_clash(&h, HK_SECONDARY, p), Some("pause key"));
-    }
-
-    #[test]
-    fn pause_clash_ignores_unrelated_chords_and_unset_pause() {
+    fn learned_bare_typing_keys_are_refused_but_function_keys_and_the_copilot_key_pass() {
         let h = default_hotkeys();
-        let free = chord(0x13, false, false, false, false);
-        assert_eq!(pause_clash(&h, HK_PAUSE, free), None);
-        assert_eq!(pause_clash(&h, HK_PRIMARY, free), None);
-        // Re-learning the pause slot onto its own current chord is not a clash.
-        let mut h = default_hotkeys();
-        h.pause = Some(free);
-        assert_eq!(pause_clash(&h, HK_PAUSE, free), None);
-        // primary == secondary is pre-existing behaviour, not this check's job.
-        assert_eq!(pause_clash(&h, HK_PRIMARY, h.secondary), None);
+        for vk in [0x41u32, 0x0D, 0x20] {
+            match judge_learned(&h, None, HK_PRIMARY, chord(vk, false, false, false, false)) {
+                LearnedVerdict::Refuse(text) => assert!(text.contains("needs Ctrl, Alt or Win")),
+                other => panic!("vk {vk:#x}: {other:?}"),
+            }
+        }
+        // F13 (0x7C) bare, and the Copilot key (Win+Shift+F23).
+        assert_eq!(
+            judge_learned(
+                &h,
+                None,
+                HK_SECONDARY,
+                chord(0x7C, false, false, false, false)
+            ),
+            LearnedVerdict::Apply
+        );
+        assert_eq!(
+            judge_learned(&h, None, HK_PRIMARY, chord(0x86, true, false, false, true)),
+            LearnedVerdict::Apply
+        );
     }
 
     #[test]
-    fn pause_clash_includes_the_palette_chord() {
-        let mut h = default_hotkeys();
-        let p = chord(0x20, true, false, false, true);
-        h.palette = Some(p);
-        assert_eq!(pause_clash(&h, HK_PAUSE, p), Some("palette key"));
-        let free = chord(0x13, false, false, false, false);
-        assert_eq!(pause_clash(&h, HK_PAUSE, free), None);
+    fn learned_secondary_equal_to_primary_is_refused_in_both_directions() {
+        let h = default_hotkeys();
+        assert!(matches!(
+            judge_learned(&h, None, HK_SECONDARY, h.primary),
+            LearnedVerdict::Refuse(t) if t.contains("already the Copilot key")
+        ));
+        assert!(matches!(
+            judge_learned(&h, None, HK_PRIMARY, h.secondary),
+            LearnedVerdict::Refuse(t) if t.contains("already the secondary key")
+        ));
     }
-
     #[test]
     fn pause_binding_label_distinguishes_unset_from_set() {
         assert_eq!(pause_binding_label(None), "not set");
