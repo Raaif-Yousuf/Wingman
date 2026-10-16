@@ -4267,6 +4267,12 @@ fn gather_generic_inputs(
             gathered.page_text_truncated = page.truncated;
         }
     }
+    // #500: a text input that comes back empty falls back to the screenshot,
+    // which could show a focused password field. Look before that happens,
+    // and only then (after every text input has been read).
+    if actions::generic_inputs::needs_focus_probe(inputs, &gathered) {
+        gathered.focus_in_password_field = crate::inputs::selection::focused_is_password();
+    }
     Ok(gathered)
 }
 

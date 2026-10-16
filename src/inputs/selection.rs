@@ -649,6 +649,26 @@ mod com {
         probe_from_element(&element)
     }
 
+    /// Password-only probe of the current focus: stops after the
+    /// `CurrentIsPassword` read. The apartment (STA) is torn down when this
+    /// returns, before `ocr::recognize` initialises MTA on this thread
+    /// (the ordering is load-bearing).
+    pub(super) fn focused_is_password() -> anyhow::Result<bool> {
+        let _apartment = ComApartment::enter()?;
+        let automation: IUIAutomation =
+            unsafe { crate::inputs::uia_automation::create_automation() }?;
+        let element = crate::inputs::uia_automation::describe_timeout(
+            unsafe { automation.GetFocusedElement() },
+            "GetFocusedElement",
+        )?;
+        if is_null(&element) {
+            return Ok(false);
+        }
+        Ok(resolve_is_password(
+            unsafe { element.CurrentIsPassword() }.map(|b| b.as_bool()),
+        ))
+    }
+
     /// Probes a specific window's element directly via `ElementFromHandle`,
     /// bypassing real desktop focus entirely -- the integration test's seam
     /// (see the win32 test module's doc comment), the same shape
@@ -1210,6 +1230,17 @@ pub fn get_selection_foreground(
     // which is why that variant is never folded into this `unwrap_or`.
     let probe = com::probe_focused().unwrap_or(UiaProbe::NoFocusedElement);
     resolve(probe, max_chars, clipboard_wait_budget, None)
+}
+
+/// Whether the focused element is a password field (#500). Reads only
+/// `IsPassword`, never the selection or any text. Fails closed on that one
+/// read (`resolve_is_password`: an unreadable `IsPassword` counts as a
+/// password field). Every other error (no automation, a timeout getting the
+/// focused element, no element) counts as "not a password" so a hung or
+/// elevated window does not block the action. Same worker-thread requirement
+/// as [`get_selection_foreground`].
+pub fn focused_is_password() -> bool {
+    com::focused_is_password().unwrap_or(false)
 }
 
 /// Same as [`get_selection_foreground`], plus a [`Selection::target`] when
