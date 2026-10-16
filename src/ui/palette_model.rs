@@ -484,6 +484,9 @@ pub enum DispatchTarget {
     FillForm,
     CalculateSelection,
     CopyRegion,
+    /// "Relative dates to real dates" (#336): finds the phrases locally, no
+    /// model, so it has its own arm like the other model-free built-ins.
+    ResolveDates,
     /// Any other action id (#242): a user-authored `actions.toml` entry,
     /// carried by value so `App::dispatch_palette_action` can look the
     /// action back up by id without a second table.
@@ -511,6 +514,7 @@ pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
         crate::actions::calendar::ACTION_ID => Some(DispatchTarget::AddToCalendar),
         crate::actions::review_email::ACTION_ID => Some(DispatchTarget::ReviewEmail),
         crate::actions::fill_form::ACTION_ID => Some(DispatchTarget::FillForm),
+        crate::actions::relative_dates::ACTION_ID => Some(DispatchTarget::ResolveDates),
         CALCULATE_SELECTION_ACTION_ID => Some(DispatchTarget::CalculateSelection),
         COPY_REGION_ACTION_ID => Some(DispatchTarget::CopyRegion),
         _ => Some(DispatchTarget::Generic(action_id.to_string())),
@@ -534,7 +538,8 @@ fn action_requires_model(action_id: &str) -> bool {
         || action_id == crate::actions::READ_QR_ACTION_ID
         || action_id == CALCULATE_SELECTION_ACTION_ID
         || action_id == COPY_REGION_ACTION_ID
-        || action_id == crate::actions::fill_form::ACTION_ID;
+        || action_id == crate::actions::fill_form::ACTION_ID
+        || action_id == crate::actions::relative_dates::ACTION_ID;
     !model_free
 }
 
@@ -1194,6 +1199,10 @@ mod tests {
             Some(DispatchTarget::ReadQr)
         );
         assert_eq!(
+            dispatch_target_for(crate::actions::relative_dates::ACTION_ID),
+            Some(DispatchTarget::ResolveDates)
+        );
+        assert_eq!(
             dispatch_target_for(CALCULATE_SELECTION_ACTION_ID),
             Some(DispatchTarget::CalculateSelection)
         );
@@ -1284,6 +1293,11 @@ mod tests {
             .find(|a| a.id == crate::actions::fill_form::ACTION_ID)
             .expect("fill-this-form is in the catalogue");
         assert!(!fill.requires_model, "#132: maps locally with no model");
+        let dates = cat
+            .iter()
+            .find(|a| a.id == crate::actions::relative_dates::ACTION_ID)
+            .expect("resolve-relative-dates is in the catalogue");
+        assert!(!dates.requires_model, "#336: resolves locally, no model");
     }
 
     /// #306: the `effect` column. A clipboard writer is never key-picked, a
