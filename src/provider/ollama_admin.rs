@@ -23,6 +23,7 @@
 //! thread, never the UI thread; see its own doc comment.
 
 use std::io::BufRead;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -493,16 +494,7 @@ fn get_body_with_timeout(url: &str, tag: &str, timeout: Duration) -> Result<Stri
     super::common::get_text_with_timeout(url, timeout, tag)
 }
 
-/// Not called from any live path yet: pulling a model needs a worker-thread
-/// caller and a progress UI, neither of which exists (a follow-up issue,
-/// referencing #51's upcoming WebView2 settings window, covers building
-/// that surface). Built and tested now per #14's "typed client functions"
-/// ask -- same "reserved for a consumer that doesn't exist yet" shape as
-/// `ShowCapabilities` above and `Caps`/`Provider::capabilities` in
-/// `provider/mod.rs`.
-///
 /// One line of `/api/pull`'s newline-delimited JSON progress stream.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PullProgress {
     // `#[serde(default)]`: an error line (`{"error": "..."}`) carries no
@@ -522,20 +514,76 @@ pub struct PullProgress {
     pub error: Option<String>,
 }
 
-#[allow(dead_code)]
 impl PullProgress {
     /// 0.0..=1.0, or `None` when the server hasn't reported a total yet
     /// (early statuses like "pulling manifest" carry no completed/total).
+    #[allow(dead_code)]
     pub fn fraction(&self) -> Option<f32> {
         if self.total == 0 {
             None
         } else {
             // #191: clamp -- a malformed/nonsensical line (`completed` >
-            // `total`) must never report a fraction outside 0.0..=1.0, even
-            // though no live UI reads this yet.
+            // `total`) must never report a fraction outside 0.0..=1.0.
             Some((self.completed as f32 / self.total as f32).clamp(0.0, 1.0))
         }
     }
+
+    /// The plain-text progress line Settings shows (#566). A line with a
+    /// total reads "Downloading 31% (1.4 of 4.4 GB)"; the percent is rounded
+    /// down so 100% only appears once the pull is really done. The server's
+    /// status text for the other phases is mapped to short words, and an
+    /// unknown one is shown capped rather than dropped.
+    pub fn describe(&self) -> String {
+        if self.total > 0 {
+            let done = self.completed.min(self.total);
+            let pct = (done as u128 * 100 / self.total as u128) as u32;
+            let (div, unit) = if self.total >= 1 << 30 {
+                ((1u64 << 30) as f64, "GB")
+            } else {
+                ((1u64 << 20) as f64, "MB")
+            };
+            return format!(
+                "Downloading {pct}% ({:.1} of {:.1} {unit})",
+                done as f64 / div,
+                self.total as f64 / div
+            );
+        }
+        let status = self.status.trim();
+        if status == "success" {
+            "Done.".to_string()
+        } else if status == "pulling manifest" {
+            "Pulling manifest...".to_string()
+        } else if status.starts_with("verifying") {
+            "Verifying download...".to_string()
+        } else if status.starts_with("writing") || status.starts_with("removing") {
+            "Finishing...".to_string()
+        } else {
+            let capped: String = status.chars().take(60).collect();
+            format!("Working: {capped}")
+        }
+    }
+}
+
+/// The longest model name `validate_pull_name` accepts. Ollama names are
+/// short (`library/name:tag`); a pasted paragraph is not one.
+const MAX_PULL_NAME_CHARS: usize = 200;
+
+/// Checks the text typed into Settings' Pull box (#566): trimmed, not empty,
+/// no whitespace or control characters inside, at most 200 characters. The
+/// server decides whether the name exists; this only stops input that could
+/// never be a model name.
+pub fn validate_pull_name(input: &str) -> std::result::Result<String, &'static str> {
+    let name = input.trim();
+    if name.is_empty() {
+        return Err("Type a model name to pull, for example llama3.2:3b.");
+    }
+    if name.chars().count() > MAX_PULL_NAME_CHARS {
+        return Err("That model name is too long.");
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("A model name has no spaces. Example: llama3.2:3b.");
+    }
+    Ok(name.to_string())
 }
 
 /// Parses one line from `/api/pull`'s streamed response. `None` for a
@@ -543,7 +591,6 @@ impl PullProgress {
 /// for `PullProgress` -- a single malformed line (e.g. a truncated final
 /// chunk from a dropped connection) degrades to "no update" rather than
 /// aborting the whole pull.
-#[allow(dead_code)]
 pub fn parse_pull_line(line: &str) -> Option<PullProgress> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -556,16 +603,22 @@ pub fn parse_pull_line(line: &str) -> Option<PullProgress> {
 /// and calls `on_progress` for each parsed line. Stops with an `Err` the
 /// moment a line carries `"error"` -- Ollama reports a pull failure inline
 /// in the stream (e.g. an unknown model name), not as an HTTP error status.
+/// Also stops with an `Err` ("pull cancelled") when `cancel` is set, checked
+/// before each line; a blocked read ends at the next line or when the server
+/// closes the connection.
 ///
 /// This is a download-progress stream, not model output -- AGENTS.md's "no
 /// chat, no streaming" rule is about conversational completions, and
 /// nothing here surfaces text the model wrote.
-#[allow(dead_code)]
 pub fn stream_pull_progress<R: BufRead>(
     reader: R,
+    cancel: &AtomicBool,
     mut on_progress: impl FnMut(&PullProgress),
 ) -> Result<()> {
     for line in reader.lines() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(anyhow!("pull cancelled"));
+        }
         let line = line.context("ollama: failed to read /api/pull response")?;
         if let Some(progress) = parse_pull_line(&line) {
             if let Some(err) = &progress.error {
@@ -574,25 +627,34 @@ pub fn stream_pull_progress<R: BufRead>(
             on_progress(&progress);
         }
     }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(anyhow!("pull cancelled"));
+    }
     Ok(())
 }
 
 /// `POST /api/pull` with `stream: true`, feeding progress to `on_progress`
-/// as it arrives.
+/// as it arrives, until the stream ends, errors or `cancel` is set
+/// (dropping the connection also ends the download on the server; a later
+/// pull of the same model resumes).
 ///
 /// **Callers must run this on a worker thread, never the UI thread**: a
 /// real model pull can run for minutes and this function blocks for the
 /// whole download (mirrors the existing worker-thread pattern
 /// `App::ask` uses in `app.rs` for a completion call). Nothing in this
 /// function spawns a thread itself.
-#[allow(dead_code)]
-pub fn pull(base_url: &str, model: &str, on_progress: impl FnMut(&PullProgress)) -> Result<()> {
+pub fn pull(
+    base_url: &str,
+    model: &str,
+    cancel: &AtomicBool,
+    on_progress: impl FnMut(&PullProgress),
+) -> Result<()> {
     let url = format!("{}/api/pull", base_url.trim_end_matches('/'));
     let body = json!({"model": model, "stream": true});
 
     // #189: through `common` so the Offline guard (#19) covers pulls too.
     super::common::post_json_read_body(&url, &body, DISCOVERY_CONNECT_TIMEOUT, "ollama", |r| {
-        stream_pull_progress(std::io::BufReader::new(r), on_progress)
+        stream_pull_progress(std::io::BufReader::new(r), cancel, on_progress)
     })
 }
 
@@ -1032,8 +1094,10 @@ mod tests {
                      {\"status\":\"downloading\",\"completed\":1000,\"total\":1000}\n\
                      {\"status\":\"success\"}\n";
         let mut seen: Vec<String> = Vec::new();
-        stream_pull_progress(body.as_bytes(), |p| seen.push(p.status.clone()))
-            .expect("should succeed");
+        stream_pull_progress(body.as_bytes(), &AtomicBool::new(false), |p| {
+            seen.push(p.status.clone())
+        })
+        .expect("should succeed");
         assert_eq!(
             seen,
             vec!["pulling manifest", "downloading", "downloading", "success"]
@@ -1046,8 +1110,10 @@ mod tests {
                      {\"error\":\"model 'nope' not found\"}\n\
                      {\"status\":\"should never be reached\"}\n";
         let mut seen: Vec<String> = Vec::new();
-        let err =
-            stream_pull_progress(body.as_bytes(), |p| seen.push(p.status.clone())).unwrap_err();
+        let err = stream_pull_progress(body.as_bytes(), &AtomicBool::new(false), |p| {
+            seen.push(p.status.clone())
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("model 'nope' not found"), "{err}");
         // The line after the error must never reach the callback.
         assert_eq!(seen, vec!["pulling manifest"]);
@@ -1057,8 +1123,125 @@ mod tests {
     fn stream_pull_progress_skips_a_blank_line_between_json_lines() {
         let body = "{\"status\":\"a\"}\n\n{\"status\":\"b\"}\n";
         let mut seen: Vec<String> = Vec::new();
-        stream_pull_progress(body.as_bytes(), |p| seen.push(p.status.clone()))
-            .expect("should succeed");
+        stream_pull_progress(body.as_bytes(), &AtomicBool::new(false), |p| {
+            seen.push(p.status.clone())
+        })
+        .expect("should succeed");
         assert_eq!(seen, vec!["a", "b"]);
+    }
+
+    // -- pull from Settings (#566) -----------------------------------------
+
+    #[test]
+    fn pull_name_accepts_a_plain_tag_and_trims() {
+        assert_eq!(
+            validate_pull_name("  llama3.2:3b "),
+            Ok("llama3.2:3b".to_string())
+        );
+        assert_eq!(
+            validate_pull_name("hf.co/user/repo:Q4_K_M"),
+            Ok("hf.co/user/repo:Q4_K_M".to_string())
+        );
+    }
+
+    #[test]
+    fn pull_name_rejects_empty_spaces_and_control_characters() {
+        assert!(validate_pull_name("").is_err());
+        assert!(validate_pull_name("   ").is_err());
+        assert!(validate_pull_name("llama 3").is_err());
+        assert!(validate_pull_name("llama\n3").is_err());
+        assert!(validate_pull_name(&"a".repeat(201)).is_err());
+    }
+
+    #[test]
+    fn pull_text_shows_percent_and_size() {
+        let p = PullProgress {
+            status: "pulling abc".to_string(),
+            completed: 1_500_000_000,
+            total: 4_700_000_000,
+            error: None,
+        };
+        let t = p.describe();
+        assert_eq!(t, "Downloading 31% (1.4 of 4.4 GB)");
+        assert!(!t.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn pull_text_for_the_statuses_without_a_total() {
+        let mk = |s: &str| PullProgress {
+            status: s.to_string(),
+            completed: 0,
+            total: 0,
+            error: None,
+        };
+        assert_eq!(mk("pulling manifest").describe(), "Pulling manifest...");
+        assert_eq!(
+            mk("verifying sha256 digest").describe(),
+            "Verifying download..."
+        );
+        assert_eq!(mk("writing manifest").describe(), "Finishing...");
+        assert_eq!(mk("success").describe(), "Done.");
+        // An unknown status is still shown, never dropped.
+        assert_eq!(mk("something new").describe(), "Working: something new");
+    }
+
+    #[test]
+    fn stream_pull_progress_stops_when_cancelled() {
+        let body = "{\"status\":\"a\"}\n{\"status\":\"b\"}\n{\"status\":\"c\"}\n";
+        let cancel = AtomicBool::new(false);
+        let mut seen: Vec<String> = Vec::new();
+        let err = stream_pull_progress(body.as_bytes(), &cancel, |p| {
+            seen.push(p.status.clone());
+            cancel.store(true, Ordering::SeqCst);
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert_eq!(seen, vec!["a"]);
+    }
+
+    /// A one-shot fake Ollama on loopback: answers one request with `body`
+    /// (newline-delimited JSON) and closes. Returns the base URL.
+    fn fake_pull_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                // Read the whole request (headers and JSON body) first: closing
+                // with unread bytes makes Windows reset the connection and
+                // the client then sees no response at all.
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.ends_with(b"}") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(body.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn pull_streams_progress_from_a_local_server() {
+        let base = fake_pull_server(
+            "{\"status\":\"pulling manifest\"}\n{\"status\":\"pulling x\",\"completed\":5,\"total\":10}\n{\"status\":\"success\"}\n",
+        );
+        let cancel = AtomicBool::new(false);
+        let mut seen: Vec<String> = Vec::new();
+        pull(&base, "tiny:1b", &cancel, |p| seen.push(p.status.clone())).expect("pull");
+        assert_eq!(seen, vec!["pulling manifest", "pulling x", "success"]);
+    }
+
+    #[test]
+    fn pull_reports_an_inline_error_from_a_local_server() {
+        let base = fake_pull_server("{\"error\":\"pull model manifest: file does not exist\"}\n");
+        let cancel = AtomicBool::new(false);
+        let err = pull(&base, "nope", &cancel, |_| {}).unwrap_err();
+        assert!(err.to_string().contains("file does not exist"), "{err}");
     }
 }

@@ -488,6 +488,13 @@ struct SettingsInner {
     ollama_tags: OllamaTags,
     /// #380: the cloud providers' live model lists, filled the same way.
     cloud_models: CloudModels,
+    /// #566: the running pull's progress, filled by its worker. Replaced by a
+    /// fresh slot for every pull, so a stopped pull's worker never writes
+    /// into the next one.
+    pull_slot: PullSlot,
+    /// #566: set while a pull is running; setting it true stops the worker.
+    /// `None` when idle. The only thing alive for a pull is its one thread.
+    pull_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// True while this window is open. Cleared in `WM_DESTROY`; the model
     /// fetch workers check it before posting (#569).
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -526,6 +533,8 @@ impl SettingsInner {
             ollama_status: Default::default(),
             ollama_tags: Default::default(),
             cloud_models: Default::default(),
+            pull_slot: Default::default(),
+            pull_cancel: None,
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             prompt_expanded: false,
             hotkeys: original.hotkeys.clone(),
@@ -593,6 +602,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_OLLAMA_PULL => {
+            apply_pull_update(inner);
+            LRESULT(0)
+        }
         WM_CLOUD_MODELS => {
             let index = wparam.0;
             let fetched = inner
@@ -628,6 +641,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_DESTROY => {
             inner.alive.store(false, Ordering::SeqCst);
+            // #566: closing the window mid-pull stops the download.
+            if let Some(cancel) = inner.pull_cancel.take() {
+                cancel.store(true, Ordering::SeqCst);
+            }
             if inner.learning.take().is_some() {
                 let _ = KillTimer(Some(hwnd), LEARN_TIMER_ID);
                 disarm_learning();
@@ -697,6 +714,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 }
             }
         }
+        ID_PULL_BUTTON if notify == BN_CLICKED => on_pull_button(inner),
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, DEFAULT_PROMPT);
         }
@@ -823,6 +841,11 @@ const ID_CARD_MONITOR: i32 = 137;
 const ID_REDACT: i32 = 138;
 /// #597: the "Card display:" caption, greyed with its combo.
 const ID_CARD_MONITOR_LABEL: i32 = 139;
+/// #566: the Ollama group's Pull row: the model name box, the Pull/Stop
+/// button, and the progress or error line under them. Not form fields.
+const ID_PULL_NAME: i32 = 140;
+const ID_PULL_BUTTON: i32 = 141;
+const ID_PULL_STATUS: i32 = 142;
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
 /// the text sent to a cloud or remote model, and the answer (real values put
@@ -883,6 +906,9 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_CARD_MONITOR", ID_CARD_MONITOR),
     ("ID_REDACT", ID_REDACT),
     ("ID_CARD_MONITOR_LABEL", ID_CARD_MONITOR_LABEL),
+    ("ID_PULL_NAME", ID_PULL_NAME),
+    ("ID_PULL_BUTTON", ID_PULL_BUTTON),
+    ("ID_PULL_STATUS", ID_PULL_STATUS),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1083,9 @@ const MIN_PROMPT_EDIT_H: i32 = ROW_H * 3;
 
 /// Width of the Ollama group's link button (#343), in dp.
 const OLLAMA_LINK_W: i32 = 120;
+
+/// Width of the Pull / Stop button (#566), in dp.
+const OLLAMA_PULL_BTN_W: i32 = 80;
 /// Width of the "Show/Hide Check my work prompt" toggle (#342), in dp.
 const PROMPT_TOGGLE_W: i32 = 210;
 
@@ -2438,6 +2467,217 @@ fn apply_ollama_section(inner: &mut SettingsInner, section: &OllamaSection) {
     }
 }
 
+/// Posted to the Settings window when the pull worker has stored a new
+/// progress line in [`SettingsInner::pull_slot`] (#566).
+const WM_OLLAMA_PULL: u32 = 0x8000 + 44; // WM_APP + 44
+
+/// The pull worker's latest line, shared with the window.
+#[derive(Default, Clone)]
+struct PullUpdate {
+    text: String,
+    /// The worker is done (it posts nothing after this).
+    finished: bool,
+    /// Finished and the model is now pulled.
+    succeeded: bool,
+}
+
+type PullSlot = std::sync::Arc<std::sync::Mutex<PullUpdate>>;
+
+/// The fewest milliseconds between two progress posts from the worker, so a
+/// fast local download does not flood the window with repaints.
+const PULL_POST_INTERVAL_MS: u128 = 100;
+
+/// Caps `s` at `max` characters, ending in "..." when it was cut.
+fn cap_text(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(3)).collect();
+    out.push_str("...");
+    out
+}
+
+/// What Settings says when a pull ends in an error (#566): a plain sentence,
+/// never the raw transport error, capped to fit the status line.
+fn pull_error_text(e: &anyhow::Error) -> String {
+    let msg = e.to_string();
+    let text = if msg.contains("transport error") {
+        "Could not reach Ollama. Start it, then try again.".to_string()
+    } else if let Some(reason) = msg.strip_prefix("ollama: pull failed: ") {
+        format!("Pull failed: {reason}")
+    } else {
+        format!("Pull failed: {msg}")
+    };
+    cap_text(&text.replace('\u{2014}', "-"), OLLAMA_TEXT_BUDGET)
+}
+
+/// The Pull / Stop button (#566). Idle: checks the typed name and starts the
+/// worker. Running: stops it at once; the worker notices at its next line
+/// and exits without posting.
+fn on_pull_button(inner: &mut SettingsInner) {
+    if let Some(cancel) = inner.pull_cancel.take() {
+        cancel.store(true, Ordering::SeqCst);
+        set_pull_idle(
+            inner.hwnd,
+            "Pull stopped. Pulling the same name again resumes.",
+        );
+        return;
+    }
+    let raw = get_dlg_item(inner.hwnd, ID_PULL_NAME)
+        .map(get_text)
+        .unwrap_or_default();
+    let name = match ollama_admin::validate_pull_name(&raw) {
+        Ok(name) => name,
+        Err(message) => {
+            set_pull_status(inner.hwnd, message);
+            return;
+        }
+    };
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    inner.pull_slot = Default::default();
+    if !spawn_ollama_pull(
+        inner.hwnd,
+        inner.original.providers.ollama.base_url.clone(),
+        name,
+        inner.pull_slot.clone(),
+        cancel.clone(),
+        inner.alive.clone(),
+    ) {
+        set_pull_status(inner.hwnd, "Could not start the download.");
+        return;
+    }
+    inner.pull_cancel = Some(cancel);
+    if let Some(button) = get_dlg_item(inner.hwnd, ID_PULL_BUTTON) {
+        set_text(button, "Stop");
+    }
+    if let Some(edit) = get_dlg_item(inner.hwnd, ID_PULL_NAME) {
+        unsafe {
+            let _ = EnableWindow(edit, false);
+        }
+    }
+    set_pull_status(inner.hwnd, "Starting...");
+}
+
+fn set_pull_status(hwnd: HWND, text: &str) {
+    if let Some(status) = get_dlg_item(hwnd, ID_PULL_STATUS) {
+        set_text(status, text);
+    }
+}
+
+/// Back to the resting Pull row: the button says Pull, the name box is
+/// usable, and the status line says `text`.
+fn set_pull_idle(hwnd: HWND, text: &str) {
+    if let Some(button) = get_dlg_item(hwnd, ID_PULL_BUTTON) {
+        set_text(button, "Pull");
+    }
+    if let Some(edit) = get_dlg_item(hwnd, ID_PULL_NAME) {
+        unsafe {
+            let _ = EnableWindow(edit, true);
+        }
+    }
+    set_pull_status(hwnd, text);
+}
+
+/// Shows the worker's latest line. When the pull is over, the row goes back
+/// to idle and, on success, the model list is fetched again so the new model
+/// appears in the combo.
+fn apply_pull_update(inner: &mut SettingsInner) {
+    // A stopped pull has already reset the row; ignore a late post.
+    if inner.pull_cancel.is_none() {
+        return;
+    }
+    let update = inner
+        .pull_slot
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    if !update.finished {
+        set_pull_status(inner.hwnd, &update.text);
+        return;
+    }
+    inner.pull_cancel = None;
+    set_pull_idle(inner.hwnd, &update.text);
+    if update.succeeded {
+        spawn_ollama_models_fetch(
+            inner.hwnd,
+            inner.original.providers.ollama.base_url.clone(),
+            inner.ollama_tags.clone(),
+            inner.alive.clone(),
+        );
+    }
+}
+
+/// Pulls `name` on a worker thread (#566): the thread exists only while the
+/// download runs. Progress goes into `slot` and wakes the window with
+/// [`WM_OLLAMA_PULL`], only while the window is open and the pull has not
+/// been stopped (`alive`, `cancel`). Returns false if the thread could not
+/// start.
+fn spawn_ollama_pull(
+    hwnd: HWND,
+    base_url: String,
+    name: String,
+    slot: PullSlot,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> bool {
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::Builder::new()
+        .name("settings-ollama-pull".into())
+        .spawn(move || {
+            let publish = |update: PullUpdate| {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = update;
+                }
+                if cancel.load(Ordering::SeqCst) {
+                    return;
+                }
+                post_while_open(&alive, || unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(hwnd_raw as *mut c_void)),
+                        WM_OLLAMA_PULL,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                });
+            };
+            let mut last_text = String::new();
+            let mut last_post = std::time::Instant::now() - Duration::from_secs(1);
+            let result = ollama_admin::pull(&base_url, &name, &cancel, |p| {
+                let text = p.describe();
+                if text == last_text || last_post.elapsed().as_millis() < PULL_POST_INTERVAL_MS {
+                    return;
+                }
+                last_text = text.clone();
+                last_post = std::time::Instant::now();
+                publish(PullUpdate {
+                    text,
+                    finished: false,
+                    succeeded: false,
+                });
+            });
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            publish(match result {
+                Ok(()) => PullUpdate {
+                    text: format!(
+                        "Pulled {}. It is now in the model list.",
+                        cap_text(&name, 80)
+                    ),
+                    finished: true,
+                    succeeded: true,
+                },
+                Err(e) => PullUpdate {
+                    text: pull_error_text(&e),
+                    finished: true,
+                    succeeded: false,
+                },
+            });
+        })
+        .is_ok()
+}
+
 /// #188: total budget for the (at most two) optional HTTP calls
 /// `ollama_status_line` can make (`/api/ps` for GPU/CPU, `/api/tags` for
 /// vision counts). Tighter than `ollama_admin`'s general discovery timeout
@@ -3144,6 +3384,57 @@ fn build_ui_recorded(
         }
     }
     y += ROW_H * 2;
+    // #566: pull a model by name. The name box, a Pull/Stop button, and one
+    // line for progress or the reason it failed. No list of suggested
+    // models: the user types the name (see docs/providers.md).
+    let pull_x = content_x + MARGIN;
+    let pull_inner_w = content_w - 2 * MARGIN;
+    ctx.create(
+        WC_STATIC,
+        "Pull model:",
+        0,
+        0,
+        pull_x,
+        y + 3,
+        LABEL_W,
+        ROW_H,
+        0,
+    );
+    ctx.create(
+        WC_EDIT,
+        "",
+        ES_AUTOHSCROLL as u32,
+        WS_EX_BORDER,
+        pull_x + LABEL_W,
+        y,
+        pull_inner_w - LABEL_W - OLLAMA_PULL_BTN_W - 8,
+        ROW_H + 4,
+        ID_PULL_NAME,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Pull",
+        BS_PUSHBUTTON as u32,
+        0,
+        pull_x + pull_inner_w - OLLAMA_PULL_BTN_W,
+        y - 1,
+        OLLAMA_PULL_BTN_W,
+        BTN_H,
+        ID_PULL_BUTTON,
+    );
+    y += BTN_H + 4;
+    ctx.create(
+        WC_STATIC,
+        "",
+        0,
+        0,
+        pull_x,
+        y,
+        pull_inner_w,
+        ROW_H * 2,
+        ID_PULL_STATUS,
+    );
+    y += ROW_H * 2;
     let ollama_bottom = y + 8;
     ctx.create(
         WC_BUTTON,
@@ -3743,6 +4034,8 @@ fn build_ui_recorded(
         ID_CARD_MONITOR,
         ID_REQUIRE_TICK_FOR,
         ID_OLLAMA_LINK,
+        ID_PULL_NAME,
+        ID_PULL_BUTTON,
         ID_PROMPT_TOGGLE,
         ID_PROMPT_EDIT,
         ID_RESET_PROMPT,
@@ -4948,6 +5241,43 @@ mod tests {
         assert!(sec.link.is_some());
     }
 
+    // -- Pull model (#566, pure) -------------------------------------------
+
+    #[test]
+    fn pull_error_text_names_an_unreachable_server_plainly() {
+        let e = anyhow::anyhow!("ollama: transport error: connection refused");
+        assert_eq!(
+            pull_error_text(&e),
+            "Could not reach Ollama. Start it, then try again."
+        );
+    }
+
+    #[test]
+    fn pull_error_text_keeps_the_servers_reason() {
+        let e = anyhow::anyhow!("ollama: pull failed: pull model manifest: file does not exist");
+        assert_eq!(
+            pull_error_text(&e),
+            "Pull failed: pull model manifest: file does not exist"
+        );
+    }
+
+    #[test]
+    fn pull_error_text_is_capped_and_has_no_em_dash() {
+        let e = anyhow::anyhow!("ollama: pull failed: {}\u{2014}", "x".repeat(500));
+        let t = pull_error_text(&e);
+        assert!(t.chars().count() <= OLLAMA_TEXT_BUDGET, "{t}");
+        assert!(!t.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn the_pull_controls_have_unique_ids() {
+        // The three new ids are in ALL_CONTROL_IDS, which the uniqueness test
+        // above iterates; this checks they are really listed there.
+        for name in ["ID_PULL_NAME", "ID_PULL_BUTTON", "ID_PULL_STATUS"] {
+            assert!(ALL_CONTROL_IDS.iter().any(|(n, _)| *n == name), "{name}");
+        }
+    }
+
     #[test]
     fn ollama_section_text_has_no_em_dash() {
         for (l, i, c) in [
@@ -5202,6 +5532,182 @@ mod tests {
         unsafe {
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
+    }
+
+    /// Opens a real (hidden) Settings window whose Ollama base URL is `base`,
+    /// runs `body` with its handle and state, and tears it down.
+    fn with_pull_window(base: &str, body: impl FnOnce(HWND, *mut SettingsInner)) {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+
+        let mut cfg = Config::default();
+        cfg.providers.ollama.base_url = base.to_string();
+        let raw = Box::into_raw(Box::new(SettingsInner::new(cfg.clone())));
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let title = wide_z("Wingman settings (pull test)");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_CAPTION | WS_SYSMENU,
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                Some(raw as *const c_void),
+            )
+        }
+        .expect("CreateWindowExW");
+        let font = build_font(96);
+        let client_h_dp = client_size(hwnd).1;
+        let built = build_ui_recorded(hwnd, instance, 96, font, &cfg, client_h_dp);
+        {
+            let inner = unsafe { &mut *raw };
+            inner.hwnd = hwnd;
+            inner.font = font;
+            inner.adopt(built);
+        }
+        body(hwnd, raw);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+            drop(Box::from_raw(raw));
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+    }
+
+    /// Dispatches this thread's queued messages until `done` is true or 10 s
+    /// pass.
+    fn pump_until(mut done: impl FnMut() -> bool) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() && std::time::Instant::now() < deadline {
+            let mut msg = MSG::default();
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn click_pull_button(hwnd: HWND) {
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_COMMAND,
+                Some(WPARAM(ID_PULL_BUTTON as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+    }
+
+    /// A loopback server that answers one `/api/pull` with `first`, then, if
+    /// `hold` is set, keeps the connection open for 5 s before sending
+    /// `success`. Returns the base URL.
+    fn fake_pull_server(first: &'static str, hold: bool) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.ends_with(b"}") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n",
+                );
+                let _ = s.write_all(first.as_bytes());
+                let _ = s.flush();
+                if hold {
+                    std::thread::sleep(Duration::from_secs(5));
+                    let _ = s.write_all(b"{\"status\":\"success\"}\n");
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// #566 "wired to nothing" check: clicking Pull on the real window starts
+    /// a worker whose progress and result reach the window. If the button had
+    /// no `WM_COMMAND` arm, or the worker's post had no `WM_OLLAMA_PULL` arm,
+    /// the status line would stay empty and the button would still say Pull.
+    #[test]
+    fn clicking_pull_shows_progress_then_done_in_the_window() {
+        let base = fake_pull_server(
+            "{\"status\":\"pulling manifest\"}\n{\"status\":\"success\"}\n",
+            false,
+        );
+        with_pull_window(&base, |hwnd, raw| {
+            set_text(get_dlg_item(hwnd, ID_PULL_NAME).unwrap(), "tiny:1b");
+            click_pull_button(hwnd);
+            let button = get_dlg_item(hwnd, ID_PULL_BUTTON).unwrap();
+            assert_eq!(get_text(button), "Stop", "a running pull offers Stop");
+            let status = get_dlg_item(hwnd, ID_PULL_STATUS).unwrap();
+            pump_until(|| get_text(status).starts_with("Pulled"));
+            assert_eq!(
+                get_text(status),
+                "Pulled tiny:1b. It is now in the model list."
+            );
+            assert_eq!(get_text(button), "Pull", "back to idle when done");
+            assert!(unsafe { &*raw }.pull_cancel.is_none());
+        });
+    }
+
+    #[test]
+    fn a_failed_pull_ends_in_plain_text_in_the_window() {
+        let base = fake_pull_server("{\"error\":\"file does not exist\"}\n", false);
+        with_pull_window(&base, |hwnd, _| {
+            set_text(get_dlg_item(hwnd, ID_PULL_NAME).unwrap(), "nope");
+            click_pull_button(hwnd);
+            let status = get_dlg_item(hwnd, ID_PULL_STATUS).unwrap();
+            pump_until(|| get_text(status).starts_with("Pull failed"));
+            assert_eq!(get_text(status), "Pull failed: file does not exist");
+            let button = get_dlg_item(hwnd, ID_PULL_BUTTON).unwrap();
+            assert_eq!(get_text(button), "Pull");
+        });
+    }
+
+    #[test]
+    fn stop_ends_a_running_pull_at_once_and_a_bad_name_is_refused() {
+        let base = fake_pull_server("{\"status\":\"pulling manifest\"}\n", true);
+        with_pull_window(&base, |hwnd, raw| {
+            let status = get_dlg_item(hwnd, ID_PULL_STATUS).unwrap();
+            let button = get_dlg_item(hwnd, ID_PULL_BUTTON).unwrap();
+            // An empty name starts nothing.
+            click_pull_button(hwnd);
+            assert!(get_text(status).starts_with("Type a model name"));
+            assert!(unsafe { &*raw }.pull_cancel.is_none());
+
+            set_text(get_dlg_item(hwnd, ID_PULL_NAME).unwrap(), "tiny:1b");
+            click_pull_button(hwnd);
+            pump_until(|| get_text(status) == "Pulling manifest...");
+            assert_eq!(get_text(status), "Pulling manifest...");
+            let cancel = unsafe { &*raw }.pull_cancel.clone().expect("running");
+
+            click_pull_button(hwnd);
+            assert!(cancel.load(Ordering::SeqCst), "Stop sets the cancel flag");
+            assert_eq!(get_text(button), "Pull");
+            assert!(get_text(status).starts_with("Pull stopped"));
+            assert!(unsafe { &*raw }.pull_cancel.is_none());
+        });
     }
 
     // -- should_query_ollama_details (#188, pure) -------------------------
