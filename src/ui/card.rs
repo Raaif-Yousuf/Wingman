@@ -5849,7 +5849,10 @@ mod tests {
         assert_eq!(p.bg, sys.window);
         assert_eq!(p.headline, sys.window_text);
         assert_eq!(p.detail, sys.window_text);
-        assert_eq!(p.hint, sys.gray_text);
+        assert_eq!(
+            p.hint, sys.window_text,
+            "live labels are never GrayText (#816)"
+        );
         assert_eq!(p.danger, sys.window_text);
         // Dark ignores the system colours.
         assert_eq!(palette_for(Theme::Dark, &sys).bg, theme::DARK.surface);
