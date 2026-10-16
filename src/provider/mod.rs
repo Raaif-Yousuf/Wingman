@@ -280,21 +280,78 @@ pub struct Usage {
     pub cache_read_tokens: u32,
 }
 
-/// The usage block of a successful response body, by the tag the provider
-/// passes to `common::post_json` (each tag is that provider's `id()`). `None`
-/// for an unknown tag, a body that does not parse, or one with no usage. The
-/// egress log reads this at the HTTP boundary (#487), where the response is
-/// in hand but the provider has not parsed it yet.
+/// The usage block of a response body, by the tag the provider passes to
+/// `common::post_json` (each tag is that provider's `id()`). `None` for an
+/// unknown tag, a body that does not parse, or one with no usage. Read even
+/// when the body is a refusal or a truncated reply, because those were billed
+/// too (#730). The egress log reads this at the HTTP boundary (#487), where
+/// the response is in hand but the provider has not parsed it yet.
 pub(crate) fn usage_from_body(tag: &str, body: &str) -> Option<Usage> {
-    let parsed = match tag {
-        "anthropic" => anthropic::Anthropic::parse_completion(body),
-        "openai" => openai::OpenAi::parse_completion(body),
-        "gemini" => gemini::Gemini::parse_completion(body),
-        "ollama" => ollama::Ollama::parse_completion(body),
-        "openai-compat" => openai_compat::OpenAiCompat::parse_completion(body),
-        _ => return None,
-    };
-    parsed.ok()?.usage
+    match tag {
+        "anthropic" => anthropic::Anthropic::parse_usage(body),
+        "openai" => openai::OpenAi::parse_usage(body),
+        "gemini" => gemini::Gemini::parse_usage(body),
+        "ollama" => ollama::Ollama::parse_usage(body),
+        "openai-compat" => openai_compat::OpenAiCompat::parse_usage(body),
+        _ => None,
+    }
+}
+
+/// The error for a reply the model's own filter blocked (#731): the same
+/// words for every provider, naming the vendor's raw reason.
+pub(crate) fn declined_error(tag: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{tag}: the model declined to answer ({})",
+        safe_reason(reason)
+    )
+}
+
+#[cfg(test)]
+mod safe_reason_tests {
+    use super::safe_reason;
+
+    #[test]
+    fn keeps_a_plain_reason_and_replaces_anything_else_with_unknown() {
+        assert_eq!(safe_reason("SAFETY"), "SAFETY");
+        assert_eq!(safe_reason("content_filter"), "content_filter");
+        assert_eq!(safe_reason("model-context-window"), "model-context-window");
+        for bad in [
+            "",
+            "two words",
+            "dash \u{2014} here",
+            "line\nbreak",
+            "caf\u{e9}",
+            &"x".repeat(41),
+        ] {
+            assert_eq!(safe_reason(bad), "unknown", "{bad:?}");
+        }
+        assert_eq!(safe_reason(&"x".repeat(40)).len(), 40);
+    }
+
+    #[test]
+    fn an_odd_server_reason_never_reaches_the_error_text() {
+        let long = "x".repeat(200);
+        let err = super::declined_error("openai-compat", &long).to_string();
+        assert!(err.contains("(unknown)"), "{err}");
+        assert!(!err.contains("xxxx"), "{err}");
+    }
+}
+
+/// A vendor- or server-supplied reason string, made safe for card text: kept
+/// only when it is 1 to 40 ASCII letters, digits, `_` or `-`, else "unknown".
+/// A compat endpoint is user-configured and could send anything (long text,
+/// control characters, an em dash).
+pub(crate) fn safe_reason(reason: &str) -> &str {
+    let ok = !reason.is_empty()
+        && reason.len() <= 40
+        && reason
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok {
+        reason
+    } else {
+        "unknown"
+    }
 }
 
 /// Why the provider stopped. A refusal, or an empty completion caused by
