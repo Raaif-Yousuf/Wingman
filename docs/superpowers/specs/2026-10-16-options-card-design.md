@@ -94,11 +94,17 @@ at this section instead of restating it.
   runs, and the ghost text goes with it.
 - **`Context` carries `overlay: bool`, not a new `CardKind`.** An overlay
   changes what a dismissal removes, never what the key means.
-- **Click-away dismisses the card and its overlay together, or neither.** With
-  `options.click_away_dismiss = false` a click on the overlay does not dismiss
-  it either; Esc and the key still do. A click that lands on a clickable
+- **Click-away: the overlay always hides, the card follows the setting.** A click
+  that is not on a label changes what is on screen, so a stale overlay would
+  lie and it always hides. The card follows `options.click_away_dismiss`. If the
+  card stays (setting off), its line is rewritten to say the marks are hidden,
+  so it never claims marks that are gone. A click that lands on a clickable
   overlay label (#326) is a pick, not a dismissal: the handler hit-tests the
   label rectangles before it applies the click-away rule.
+- **Esc claim for an overlay.** The summary card never takes focus, so while an
+  overlay shows the hook claims Esc only (no digits), under the same rules as
+  the options card's claim: no modifiers, an expiry tick (the overlay's age cap
+  plus 1 s) that lapses by itself, cleared on every hide path.
 - **Alt+Tab or any foreground change:** a preview card survives with its edits.
   The overlay hides (the marks no longer line up with the screen) and is not
   restored when the user comes back. The preview card stays the source of
