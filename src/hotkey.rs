@@ -164,7 +164,7 @@ pub fn pause_binding_label(pause: Option<&Chord>) -> String {
 
 /// `dwExtraInfo` tag applied to every synthetic input event Wingman itself
 /// injects via `SendInput`, anywhere in the crate -- the ONE constant every
-/// such call site uses: [`ctrl_input`] below,
+/// such call site uses: [`tap_input`] below,
 /// `inputs::selection::win32::inject_events`'s Ctrl+C fallback, and
 /// `executors::target::inject_unicode_events`'s typed-input fallback
 /// (`fill_form` and every other executor that falls back to typing reach
@@ -587,18 +587,19 @@ fn key_down(vk: i32) -> bool {
     (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
 }
 
-/// Build a single Ctrl key-event input (down or up) for [`send_ctrl_tap`].
+/// Build a single key-event input (down or up) for [`send_ctrl_tap`]: Ctrl,
+/// or the unassigned mask key (issue #728).
 /// Tagged with [`INJECTED_MARKER`] (issue #209) like every other synthetic
 /// input this crate injects, so `hook_proc` never treats its own Win-release
 /// workaround as a real keypress -- harmless today only because no
 /// configured chord happens to be shaped like a bare Ctrl tap, exactly the
 /// latent trap #209 was filed about.
-fn ctrl_input(key_up: bool) -> INPUT {
+fn tap_input(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: VK_CONTROL,
+                wVk: vk,
                 wScan: 0,
                 dwFlags: if key_up {
                     KEYEVENTF_KEYUP
@@ -621,33 +622,44 @@ fn ctrl_input(key_up: bool) -> INPUT {
 /// something else to see first, which cancels the pending Start-menu
 /// activation; a lone Ctrl tap has no effect otherwise.
 ///
-/// Issue #728: when the user is already holding Ctrl (a learned `Ctrl+Win+...`
-/// chord), the tap must not send the Ctrl up, which would release a key they
-/// still hold. A lone Ctrl down is what a real held key's auto-repeat looks
-/// like, so the shell still sees a key between the Win down and up.
+/// Issue #728: when the user physically holds a Ctrl (a learned
+/// `Ctrl+Win+...` chord), no Ctrl is injected at all: a generic Ctrl down would
+/// land as Left Ctrl and could stay logically down after a Right Ctrl release,
+/// and a Ctrl up would release a key they still hold. A press of the
+/// unassigned [`MASK_VK`] key is injected instead. THEORY (unverified): the
+/// shell treats it like any other key between the Win down and up and
+/// cancels the Start menu; this is the widely used "menu mask key" trick.
 fn send_ctrl_tap() {
-    let inputs = match ctrl_tap_plan(key_down(VK_CONTROL.0 as i32)) {
-        CtrlTap::DownUp => vec![ctrl_input(false), ctrl_input(true)],
-        CtrlTap::DownOnly => vec![ctrl_input(false)],
+    let ctrl_held = key_down(VK_LCONTROL.0 as i32)
+        || key_down(VK_RCONTROL.0 as i32)
+        || key_down(VK_CONTROL.0 as i32);
+    let vk = match ctrl_tap_plan(ctrl_held) {
+        CtrlTap::DownUp => VK_CONTROL,
+        CtrlTap::MaskKey => MASK_VK,
     };
+    let inputs = [tap_input(vk, false), tap_input(vk, true)];
     unsafe {
         SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
     }
 }
 
-/// What [`send_ctrl_tap`] injects (issue #728).
+/// Unassigned virtual key (`0xE8`) pressed instead of Ctrl while the user
+/// holds a Ctrl. Tagged with [`INJECTED_MARKER`] like all injected input.
+const MASK_VK: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
+
+/// What [`send_ctrl_tap`] injects (issue #728). Both are a down then an up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CtrlTap {
-    /// Ctrl down then up: the user is not holding Ctrl.
+    /// Ctrl: the user is not holding Ctrl (the default chord's path).
     DownUp,
-    /// Ctrl down only: the user physically holds Ctrl, leave it held.
-    DownOnly,
+    /// The mask key: the user holds a Ctrl, so no Ctrl is injected.
+    MaskKey,
 }
 
 /// Pure choice for [`send_ctrl_tap`], from whether Ctrl is physically down.
 fn ctrl_tap_plan(ctrl_held: bool) -> CtrlTap {
     if ctrl_held {
-        CtrlTap::DownOnly
+        CtrlTap::MaskKey
     } else {
         CtrlTap::DownUp
     }
@@ -657,6 +669,8 @@ fn ctrl_tap_plan(ctrl_held: bool) -> CtrlTap {
 /// until its key-up (`0` = none). Windows auto-repeat sends a keydown about
 /// thirty times a second while a key is held; without this, holding a chord
 /// would post `WM_APP_HOTKEY` / pause / palette toggles over and over.
+/// Repeats are swallowed until the chord key itself comes up, even after the
+/// modifiers are released: that is intentional.
 /// Only the hook thread touches it, so `Relaxed` is enough. Kept as one value
 /// with pure helpers below so a double-press detector can extend it later.
 static HELD_VK: AtomicU32 = AtomicU32::new(0);
@@ -1128,7 +1142,7 @@ mod tests {
     #[test]
     fn ctrl_tap_releases_ctrl_only_when_the_user_is_not_holding_it() {
         assert_eq!(ctrl_tap_plan(false), CtrlTap::DownUp);
-        assert_eq!(ctrl_tap_plan(true), CtrlTap::DownOnly);
+        assert_eq!(ctrl_tap_plan(true), CtrlTap::MaskKey);
     }
 
     // -- chord_to_string -------------------------------------------------
