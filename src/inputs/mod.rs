@@ -6,10 +6,12 @@
 //! Today this holds [`uia`] (#27) and [`selection`] (#28). OCR (#30) is
 //! also built, but lives outside this module in `src/ocr.rs`.
 
+pub mod html_text;
 pub mod page_text;
 pub mod selection;
 pub mod uia;
 pub(crate) mod uia_automation;
+pub mod web_page;
 
 /// Serializes every test in this module tree that drives real UIA over COM.
 /// MEASURED 2026-09-17 (#208): UIA integration tests in `uia` and

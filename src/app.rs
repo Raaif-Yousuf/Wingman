@@ -1391,6 +1391,15 @@ impl App {
     /// executor", the case `docs/actions.md` documents as the intended
     /// shape for a new `actions.toml` action.
     fn run_generic_action(&mut self, action_id: &str) {
+        self.run_generic_action_with(action_id, None);
+    }
+
+    /// [`App::run_generic_action`], with the address the user confirmed when
+    /// the action reads a linked page (#127). Such an action runs twice:
+    /// first with `None`, which finds the link and shows the confirmation
+    /// card (nothing is fetched, no model is asked), then, after "Do it",
+    /// with the confirmed address, which fetches the page and summarizes it.
+    fn run_generic_action_with(&mut self, action_id: &str, confirmed_link: Option<String>) {
         let resolved = match actions::load_actions() {
             Ok(r) => r,
             Err(e) => {
@@ -1427,7 +1436,13 @@ impl App {
             return;
         };
 
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        // #127: the fetch step reads no screen, so it takes no screenshot.
+        let link_step = actions::link_summary::step_for(&action, confirmed_link.as_deref());
+        let plan = BeginPlan {
+            capture: !matches!(link_step, actions::link_summary::Step::Fetch(_)),
+            ..BeginPlan::MODEL
+        };
+        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_action(plan, |_| Some(()))
         else {
             return;
         };
@@ -1450,16 +1465,53 @@ impl App {
         // `actions.toml` against a concurrent edit -- must never panic the
         // main thread (rule 7); using exactly what was dispatched makes
         // that whole class of failure unreachable instead of merely rare.
-        let action_for_result = action.clone();
-        let schema_for_result = schema.clone();
+        //
+        // #127: the first step of a linked-page action answers with the
+        // confirmation card's own action and schema instead.
+        let (action_for_result, schema_for_result) =
+            if link_step == actions::link_summary::Step::Confirm {
+                (
+                    actions::link_summary::confirm_action(&action),
+                    actions::link_summary::confirm_schema(),
+                )
+            } else {
+                (action.clone(), schema.clone())
+            };
         std::thread::spawn(move || {
             let result: GenericResult = catch_worker(|| {
                 (|| -> Result<_, GenericFailure> {
-                    // #484: gather what the action's `inputs` list asks for, then
-                    // let the pure `plan` decide the user text and whether the
-                    // screenshot goes along (a selection-only action sends no image).
-                    let gathered =
-                        gather_generic_inputs(&inputs, foreground_hwnd_isize, writes_back)?;
+                    // #127 step 1: find the link, check it, and hand it back for
+                    // confirmation. Nothing is fetched and no model is asked.
+                    if link_step == actions::link_summary::Step::Confirm {
+                        let target = link_to_confirm(&inputs, foreground_hwnd_isize, raw.as_ref())?;
+                        return Ok((actions::link_summary::confirm_proposal(&target), None));
+                    }
+                    // #127 step 2: the user confirmed this address. The page is the
+                    // only input: the selection and the screen are not read again.
+                    let mut redirected_to: Option<(String, String)> = None;
+                    let (gathered, inputs) = match &link_step {
+                        actions::link_summary::Step::Fetch(url) => {
+                            let page = crate::inputs::web_page::fetch_page(url)
+                                .map_err(GenericFailure::UserState)?;
+                            // A redirect to another site is named on the result card.
+                            let confirmed = crate::inputs::web_page::parse_target(url)
+                                .map(|t| t.host)
+                                .unwrap_or_default();
+                            redirected_to = Some((confirmed, page.host.clone()));
+                            (
+                                actions::link_summary::gathered_from(page),
+                                vec![actions::InputKind::LinkedPage],
+                            )
+                        }
+                        _ => (
+                            // #484: gather what the action's `inputs` list asks
+                            // for, then let the pure `plan` decide the user text
+                            // and whether the screenshot goes along (a
+                            // selection-only action sends no image).
+                            gather_generic_inputs(&inputs, foreground_hwnd_isize, writes_back)?,
+                            inputs,
+                        ),
+                    };
                     let planned = plan_generic_inputs(&inputs, &gathered)?;
                     if writes_back && actions::generic_replace::too_long(&gathered) {
                         return Err(GenericFailure::UserState(
@@ -1475,7 +1527,10 @@ impl App {
                         None => prompt.clone(),
                     };
                     let shot = if planned.screen {
-                        Some(encode_for_upload(&mut raw, &providers, mode, redact)?)
+                        let screen = raw
+                            .as_mut()
+                            .context("no screenshot was taken for this request")?;
+                        Some(encode_for_upload(screen, &providers, mode, redact)?)
                     } else {
                         None
                     };
@@ -1490,9 +1545,20 @@ impl App {
                     let proposal =
                         noting_attribution(chain.complete_parsed_with_fallback_attributed(
                             &req,
-                            || non_vision_inputs(&raw, foreground_hwnd_isize),
+                            || match raw.as_ref() {
+                                Some(screen) => non_vision_inputs(screen, foreground_hwnd_isize),
+                                None => {
+                                    Err(anyhow::anyhow!("no screenshot was taken for this request"))
+                                }
+                            },
                             |c| actions::parse_generic_proposal(&c.text),
                         ))?;
+                    let proposal = match redirected_to {
+                        Some((confirmed, read)) => {
+                            actions::link_summary::note_final_host(proposal, &confirmed, &read)
+                        }
+                        None => proposal,
+                    };
                     Ok((proposal, replace))
                 })()
                 .map_err(pack_generic_failure)
@@ -1543,6 +1609,24 @@ impl App {
                 return;
             }
         };
+
+        // #127 step 1 of a linked-page action: the confirmation card. Only
+        // its "Do it" fetches anything (`on_preview_decided`).
+        if action.proposal == actions::link_summary::CONFIRM_PROPOSAL {
+            let host = proposal
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|url| crate::inputs::web_page::parse_target(url).ok())
+                .map_or_else(|| "this link".to_string(), |t| t.host);
+            self.pending_preview = Some(PendingPreview::FetchLink(action.id.clone()));
+            self.pending_preview_generation = self.card.show_preview(
+                &actions::link_summary::confirm_title(&host),
+                &schema,
+                &proposal,
+                false,
+            );
+            return;
+        }
 
         // #314: nothing to list or copy is an answer, not a blank preview.
         if actions::action_items::is_empty_result(&action.proposal, &proposal) {
@@ -1664,6 +1748,27 @@ impl App {
             }
             Some(PendingPreview::GenericReplace(action, plan)) => {
                 self.run_confirmed_generic_replace(&action, plan, confirmed);
+            }
+            Some(PendingPreview::FetchLink(action_id)) => {
+                // #127: the user confirmed the address on the card, so this
+                // is the one place a linked page is fetched.
+                let url = confirmed
+                    .value()
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                match url {
+                    Some(url) => self.run_generic_action_with(&action_id, Some(url)),
+                    None => {
+                        let detail = self.track_error(
+                            "Couldn't fetch the link",
+                            "the confirmed card had no address",
+                        );
+                        self.card
+                            .show_error_with_details("Couldn't fetch the link", &detail);
+                        self.set_watch(true);
+                    }
+                }
             }
             Some(PendingPreview::Send(reply)) => {
                 crate::ui::send_gate::decide(reply, true);
@@ -3903,6 +4008,72 @@ fn pack_generic_failure(f: GenericFailure) -> String {
     }
 }
 
+/// #127 step 1 of a linked-page action: the address to ask the user to
+/// confirm. Looks in the selection and the clipboard (when the action lists
+/// them), then at the screen through OCR (when it lists `screen`), and the
+/// first source with a link decides: one link is offered, several are
+/// refused as ambiguous, and a link the fetch rules refuse ends with the
+/// reason. The model never picks the link. Fails first when the current mode
+/// cannot fetch, so nobody is asked to confirm a fetch that would be refused.
+fn link_to_confirm(
+    inputs: &[actions::InputKind],
+    foreground_hwnd: isize,
+    raw: Option<&capture::RawShot>,
+) -> Result<crate::inputs::web_page::Target, GenericFailure> {
+    use actions::link_summary::{decide, NO_LINK_MESSAGE};
+    if let Some(refusal) = crate::inputs::web_page::network_refusal() {
+        return Err(GenericFailure::UserState(refusal));
+    }
+    let text_inputs: Vec<actions::InputKind> = inputs
+        .iter()
+        .copied()
+        .filter(|k| {
+            matches!(
+                k,
+                actions::InputKind::Selection | actions::InputKind::Clipboard
+            )
+        })
+        .collect();
+    let gathered = gather_generic_inputs(&text_inputs, foreground_hwnd, false)?;
+    if gathered.selection_in_password_field {
+        return Err(GenericFailure::UserState(
+            actions::generic_inputs::PASSWORD_FIELD_MESSAGE.to_string(),
+        ));
+    }
+    for text in [gathered.selection.as_deref(), gathered.clipboard.as_deref()] {
+        if let Some(decision) = decide(text) {
+            return decision.map_err(GenericFailure::UserState);
+        }
+    }
+    if let (true, Some(raw)) = (inputs.contains(&actions::InputKind::Screen), raw) {
+        let screen_text = ocr_text_of(raw)?;
+        if let Some(decision) = decide(Some(&screen_text)) {
+            return decision.map_err(GenericFailure::UserState);
+        }
+    }
+    Err(GenericFailure::UserState(NO_LINK_MESSAGE.to_string()))
+}
+
+/// The text on the screenshot, read by OCR on a thread of its own (OCR and
+/// UIA must not share a thread's COM apartment, see [`non_vision_inputs`]).
+fn ocr_text_of(raw: &capture::RawShot) -> Result<String> {
+    let output = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                crate::ocr::recognize(
+                    &raw.rgba,
+                    raw.width,
+                    raw.height,
+                    crate::ocr::DEFAULT_TIMEOUT,
+                )
+            })
+            .join()
+    })
+    .map_err(|_| anyhow::anyhow!("the OCR thread stopped unexpectedly"))?
+    .context("OCR unavailable")?;
+    Ok(crate::ocr::serialize_lines(&output.lines))
+}
+
 /// #484: reads the text inputs a generic action's `inputs` list names
 /// (selection, clipboard, UIA fields) using the existing readers, only the
 /// ones listed. Runs on the worker thread (the selection and UIA readers
@@ -4709,6 +4880,9 @@ enum PendingPreview {
         actions::Action,
         Option<Box<actions::generic_replace::ReplaceSelection>>,
     ),
+    /// #127: a linked-page action's confirmation card. Carries the action's
+    /// id; "Do it" starts the fetch step with the address on the card.
+    FetchLink(String),
     /// #105: a worker is blocked before a request that leaves the machine,
     /// waiting for this preview's answer. Holds the channel back to it:
     /// "Send" answers it (`ui::send_gate::decide`), and every other way the
@@ -6899,8 +7073,13 @@ mod tests {
         // matches them.
         let upload = ["encode_for", "_upload(&mut raw"].concat();
         let router_upload = ["encode_for", "_upload(raw,"].concat();
+        // The generic worker's screenshot is optional (#127), so it reaches
+        // the helper through a borrowed `screen`.
+        let optional_upload = ["encode_for", "_upload(screen,"].concat();
         let plain = ["capture", "::encode("].concat();
-        let encode_calls = src.matches(&upload).count() + src.matches(&router_upload).count();
+        let encode_calls = src.matches(&upload).count()
+            + src.matches(&router_upload).count()
+            + src.matches(&optional_upload).count();
         assert!(
             encode_calls >= 6,
             "expected the six worker call sites, found {encode_calls}"
