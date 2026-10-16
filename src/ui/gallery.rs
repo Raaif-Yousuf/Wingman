@@ -133,6 +133,7 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
 }
 
 /// One state the gallery can drive `Card` or `Palette` into.
+#[cfg(any(debug_assertions, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GalleryState {
     CardAnswerShort,
@@ -183,6 +184,7 @@ pub enum GalleryState {
 
 /// The full ordered list of states the gallery steps through. Order is the
 /// Right/Left stepping order and the order states are screenshotted in.
+#[cfg(any(debug_assertions, test))]
 pub fn gallery_states() -> Vec<GalleryState> {
     use GalleryState::*;
     vec![
@@ -216,6 +218,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
 /// A stable, filesystem-safe, human-readable name for a state -- used both
 /// for the screenshot filename and for any future debug printing. Lowercase,
 /// hyphen-separated, no spaces or characters Windows forbids in filenames.
+#[cfg(any(debug_assertions, test))]
 pub fn state_name(state: GalleryState) -> &'static str {
     use GalleryState::*;
     match state {
@@ -248,6 +251,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
 
 /// `<state-name>.png`, the file a `--screenshot <dir>` run writes for a
 /// given state.
+#[cfg(any(debug_assertions, test))]
 pub fn screenshot_filename(state_name: &str) -> String {
     format!("{state_name}.png")
 }
