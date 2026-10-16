@@ -69,6 +69,9 @@ pub enum MatchOutcome {
     Found(usize),
     NotFound,
     Ambiguous,
+    /// A single match, but some elements were skipped as unreadable (#590),
+    /// so it cannot be shown to be the only one.
+    Unconfirmed,
 }
 
 /// The single decision point for "which candidate is the target, if any".
@@ -99,6 +102,14 @@ pub fn degraded_control_type<E>(read: Result<String, E>) -> String {
     read.unwrap_or_else(|_| "Other".to_string())
 }
 
+/// #590: whether a resolved control type is the degraded `"Other"` (an
+/// unreadable type, or a type this crate does not map). Writers refuse it: a
+/// proposal that echoes `"Other"` could otherwise match a degraded element and
+/// write into something whose real kind is unknown.
+pub fn is_unknown_control_type(control_type: &str) -> bool {
+    control_type == "Other"
+}
+
 /// #590: an `IsPassword` read that fails is treated as a password field
 /// (fails CLOSED): its value is not read and it is refused for writing.
 /// Same rule as `inputs::uia`'s `resolve_is_password`.
@@ -114,7 +125,7 @@ pub fn resolve_password_read<E>(read: Result<bool, E>) -> bool {
 pub fn guard_skipped(outcome: MatchOutcome, target: &TargetRef, skipped: usize) -> MatchOutcome {
     match outcome {
         MatchOutcome::Found(_) if skipped > 0 && target.runtime_id.is_empty() => {
-            MatchOutcome::Ambiguous
+            MatchOutcome::Unconfirmed
         }
         other => other,
     }
@@ -544,6 +555,9 @@ pub mod com {
             ),
             MatchOutcome::Ambiguous => anyhow::bail!(
                 "more than one element matches the target; refusing to guess which one to write to"
+            ),
+            MatchOutcome::Unconfirmed => anyhow::bail!(
+                "some elements in the window could not be read, so the target cannot be confirmed; nothing was written"
             ),
         }
     }
@@ -1165,6 +1179,13 @@ mod tests {
     }
 
     #[test]
+    fn only_other_is_the_unknown_control_type() {
+        assert!(is_unknown_control_type("Other"));
+        assert!(!is_unknown_control_type("Edit"));
+        assert!(!is_unknown_control_type(""));
+    }
+
+    #[test]
     fn a_degraded_element_never_matches_an_edit_target() {
         let target = sample_target(); // control_type "Edit"
         let degraded = TargetRef {
@@ -1205,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn a_skipped_element_makes_an_identity_only_match_ambiguous() {
+    fn a_skipped_element_makes_an_identity_only_match_unconfirmed() {
         // A skipped element's identity is unknown: with no runtime id to
         // tell it apart, a unique match may only be unique because the twin
         // was skipped, so refuse.
@@ -1215,7 +1236,7 @@ mod tests {
         };
         assert_eq!(
             guard_skipped(MatchOutcome::Found(0), &no_rid, 1),
-            MatchOutcome::Ambiguous
+            MatchOutcome::Unconfirmed
         );
         assert_eq!(
             guard_skipped(MatchOutcome::Found(0), &no_rid, 0),

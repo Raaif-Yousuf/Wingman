@@ -395,6 +395,10 @@ fn do_replace(access: &Arc<dyn TextElementAccess>, proposal: &ReplaceTextProposa
         "replace_text: refusing to write to a password field"
     );
     anyhow::ensure!(
+        !super::target::is_unknown_control_type(&resolved.control_type),
+        "replace_text: refusing to write to an element whose control type could not be confirmed"
+    );
+    anyhow::ensure!(
         !super::uia_guard::is_forbidden_target(&resolved.name, &resolved.automation_id),
         "replace_text: refusing to write to \"{}\"; it reads as a final-action control",
         if resolved.name.is_empty() {

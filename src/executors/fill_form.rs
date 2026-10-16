@@ -163,6 +163,9 @@ pub enum RefuseReason {
     /// The target could not be re-resolved (not found, or ambiguous). Carries
     /// the underlying resolve error's message.
     NotResolved(String),
+    /// The control type is unknown ("Other": unreadable or unmapped), so
+    /// what it is cannot be confirmed (#590).
+    UnknownControlType,
     /// A button (or other invokable control type) or a name/automation id
     /// that reads as a final-action control -- never touched, regardless of
     /// label.
@@ -189,6 +192,9 @@ impl std::fmt::Display for RefuseReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RefuseReason::NotResolved(msg) => write!(f, "its target could not be resolved: {msg}"),
+            RefuseReason::UnknownControlType => {
+                write!(f, "its control type could not be confirmed")
+            }
             RefuseReason::InvokableOrForbiddenTarget => {
                 write!(f, "it is a button or a final-action control")
             }
@@ -252,6 +258,9 @@ pub fn evaluate_resolved_field(
     }
     if field.sensitive && !field.approved {
         return Some(FieldOutcome::Skipped(SkipReason::SensitiveUnapproved));
+    }
+    if target::is_unknown_control_type(&resolved.control_type) {
+        return Some(FieldOutcome::Refused(RefuseReason::UnknownControlType));
     }
     if is_invokable_control_type(&resolved.control_type)
         || is_forbidden_target(&resolved.name, &resolved.automation_id)
@@ -895,6 +904,20 @@ mod tests {
             approved,
             expected_current_text: String::new(),
         }
+    }
+
+    #[test]
+    fn an_unknown_control_type_is_refused() {
+        // #590: a degraded element resolves as "Other"; a proposal that
+        // echoes "Other" must not be written to.
+        let outcome = evaluate_resolved_field(
+            &ordinary_field("Notes", false, false),
+            &resolved("Other", false, "Notes"),
+        );
+        assert_eq!(
+            outcome,
+            Some(FieldOutcome::Refused(RefuseReason::UnknownControlType))
+        );
     }
 
     #[test]
