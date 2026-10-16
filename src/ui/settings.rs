@@ -5388,8 +5388,11 @@ mod tests {
             "the last four characters must still be visible: {shown}"
         );
 
+        // #302: this window has no SettingsInner, so WM_DESTROY never frees
+        // the font; do it here.
         unsafe {
             let _ = DestroyWindow(hwnd);
+            let _ = DeleteObject(HGDIOBJ(font.0));
         }
     }
 
@@ -5441,8 +5444,11 @@ mod tests {
             "the raw marker's control characters must never reach the real control: {shown:?}"
         );
 
+        // #302: this window has no SettingsInner, so WM_DESTROY never frees
+        // the font; do it here.
         unsafe {
             let _ = DestroyWindow(hwnd);
+            let _ = DeleteObject(HGDIOBJ(font.0));
         }
     }
 
