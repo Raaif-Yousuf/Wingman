@@ -49,6 +49,9 @@ pub fn result_card_text(
         if proposal_kind == super::scam_check::PROPOSAL_KIND {
             return super::scam_check::card_text(proposal);
         }
+        if proposal_kind == super::jargon::PROPOSAL_KIND {
+            return super::jargon::card_text(proposal);
+        }
         if let Some(answer) = proposal_answer(proposal) {
             return answer;
         }

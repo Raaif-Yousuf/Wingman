@@ -94,6 +94,8 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "time_list" => Some(time_list_schema()),
         // #312: signs, then a calibrated verdict.
         "scam_check" => Some(scam_check_schema()),
+        // #335: jargon terms with a plain meaning each, shown on the card.
+        "jargon_terms" => Some(jargon_terms_schema()),
         _ => None,
     }
 }
@@ -193,6 +195,34 @@ fn screen_explanation_schema() -> Value {
             "headline": {"type": "string"}
         },
         "required": ["detail", "headline"],
+        "additionalProperties": false
+    })
+}
+
+/// The `jargon_terms` proposal schema (#335): `terms`, each a `term` copied
+/// from the screen and then its `meaning`. Property order is load-bearing
+/// (rule 3): the model names the term before it explains it, so the meaning
+/// is about the term it just copied. The lengths are clamped in code
+/// (`actions::jargon::card_text`), not in the schema. Nothing is editable:
+/// the card is read-only.
+fn jargon_terms_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "terms": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "term": {"type": "string"},
+                        "meaning": {"type": "string"}
+                    },
+                    "required": ["term", "meaning"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["terms"],
         "additionalProperties": false
     })
 }
@@ -703,6 +733,22 @@ mod tests {
         assert_eq!(schema["required"], json!(["detail", "headline"]));
         assert_eq!(schema["additionalProperties"], false);
         assert!(schema["properties"]["headline"].get("editable").is_none());
+    }
+
+    #[test]
+    fn jargon_terms_names_the_term_before_its_meaning() {
+        let schema = schema_for("jargon_terms", false).expect("jargon_terms is registered");
+        let item = &schema["properties"]["terms"]["items"];
+        let order: Vec<&str> = item["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["term", "meaning"]);
+        assert_eq!(item["required"], json!(["term", "meaning"]));
+        assert_eq!(item["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["terms"]));
     }
 
     #[test]
