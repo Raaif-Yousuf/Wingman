@@ -1993,6 +1993,18 @@ impl App {
             return;
         }
 
+        // #69: no table on screen is an answer, not an empty preview.
+        if actions::table::is_empty_result(&action.proposal, &proposal) {
+            self.card.show_answer(
+                actions::table::NO_TABLE_HEADLINE,
+                &with_pending_notices(""),
+                0,
+                None,
+            );
+            self.set_watch(true);
+            return;
+        }
+
         if action.confirm {
             let writes_back = action.executor == "replace_text";
             let title = if writes_back {

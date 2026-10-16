@@ -114,7 +114,9 @@ impl<C: ClipboardAccess + 'static> Executor for ClipboardExecutor<C> {
             .get("text")
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .or_else(|| crate::actions::action_items::checklist_from_value(&value));
+            .or_else(|| crate::actions::action_items::checklist_from_value(&value))
+            // #69: a `columns` and `rows` proposal is copied as CSV.
+            .or_else(|| crate::actions::table::csv_from_value(&value));
         let Some(text) = text else {
             bail!("clipboard executor: proposal has no \"text\" field to copy");
         };
@@ -277,6 +279,36 @@ mod tests {
             executor.clipboard.get_text().unwrap(),
             "- [ ] Dana: send the Q3 numbers (Mon)\n- [ ] Me: book the room"
         );
+    }
+
+    #[test]
+    fn a_table_from_the_preview_card_is_copied_as_csv() {
+        use crate::ui::preview::PreviewModel;
+        let schema = crate::actions::schema::schema_for("table", false).unwrap();
+        let proposal = serde_json::json!({
+            "columns": ["Item", "Note"],
+            "rows": [["Pen", "blue, fine"], ["Ink", "=1+1"]]
+        });
+        let model = PreviewModel::from_schema(&schema, &proposal);
+        // The card shows one line per row, cells joined by " | ".
+        assert_eq!(model.fields()[1].value, "Pen | blue, fine\nInk | =1+1");
+        let executor = ClipboardExecutor::with_clipboard(FakeClipboard::default());
+        executor
+            .execute(confirmed_with(model.to_value(), &executor))
+            .unwrap();
+        assert_eq!(
+            executor.clipboard.get_text().unwrap(),
+            "Item,Note\r\nPen,\"blue, fine\"\r\nInk,'=1+1"
+        );
+    }
+
+    #[test]
+    fn an_empty_table_is_an_error_not_an_empty_clipboard_write() {
+        let executor = ClipboardExecutor::with_clipboard(FakeClipboard::default());
+        let confirmed =
+            confirmed_with(serde_json::json!({"columns": ["A"], "rows": []}), &executor);
+        assert!(executor.execute(confirmed).is_err());
+        assert!(executor.clipboard.text.borrow().is_none());
     }
 
     #[test]

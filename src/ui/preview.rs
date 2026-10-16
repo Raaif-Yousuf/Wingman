@@ -400,10 +400,19 @@ fn display_array_item(v: &Value) -> String {
             };
         }
     }
+    // A list inside a list (a table row, #69) reads as one line, cells joined
+    // by " | ", so the rows of a table stay one per line.
+    if let Some(cells) = v.as_array() {
+        return cells
+            .iter()
+            .map(display_array_item)
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
     display_string(v)
 }
 
-/// `"start"` -> `"Start"`, `"rate_difficulty"` -> `"Rate difficulty"`: a
+/// `"start"` ->`"Start"`, `"rate_difficulty"` -> `"Rate difficulty"`: a
 /// cheap snake_case-to-sentence-case label so a new schema field never needs
 /// a parallel "pretty label" table that can drift from the actual field
 /// name (the same reasoning `actions::schema`'s doc comment gives for
