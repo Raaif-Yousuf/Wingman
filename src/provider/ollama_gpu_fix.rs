@@ -88,6 +88,32 @@ pub fn is_ollama_exe(path: &str) -> bool {
     file_name(path).eq_ignore_ascii_case("ollama.exe")
 }
 
+/// Whether `path` is inside one of `roots` (case-insensitive, whole path
+/// components, `\\` or `/`).
+pub fn under_roots(path: &str, roots: &[String]) -> bool {
+    let norm = |p: &str| p.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let path = norm(path);
+    roots.iter().any(|r| {
+        let r = norm(r);
+        !r.is_empty() && path.starts_with(&format!("{r}\\"))
+    })
+}
+
+/// Where Ollama may be run from: its per-user install folder and Program
+/// Files. Anything else (a Downloads copy) is never executed by the fix.
+pub fn trusted_roots() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(l) = std::env::var("LOCALAPPDATA") {
+        out.push(format!(r"{l}\Programs\Ollama"));
+    }
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(var) {
+            out.push(v);
+        }
+    }
+    out
+}
+
 /// Whether `base_url` points at this machine. The probe reads whatever
 /// server the URL names, but the fix stops local processes, so it must only
 /// act when they are the same server.
@@ -209,23 +235,41 @@ pub trait FixSystem {
 const STOP_WAIT: Duration = Duration::from_secs(10);
 const START_WAIT: Duration = Duration::from_secs(20);
 
-/// Runs the fix. `fallback_exe` is where `ollama.exe` is when nothing is
-/// listening. Only `ollama.exe` is ever stopped or started: a listener with
-/// any other image name stops the fix before anything is touched. `progress`
+/// Runs the fix. `fallback_exe` is the known install's `ollama.exe`; when it
+/// exists it is always the one started. Otherwise the listener's own path is
+/// started only if it is under `roots`. Only `ollama.exe` is ever stopped or
+/// started: a listener with any other image name, or one that could only be
+/// restarted from an untrusted folder, stops the fix before anything is
+/// touched. `progress`
 /// is called with a short line before each step. Never leaves Ollama stopped
 /// without saying so, and says the setting was saved once it has been.
 pub fn run_fix(
     sys: &mut dyn FixSystem,
     fallback_exe: Option<PathBuf>,
+    roots: &[String],
     progress: &mut dyn FnMut(&str),
 ) -> FixOutcome {
     // Look before touching anything, so a missing exe is found while Ollama
     // is still running.
     let before = sys.health();
+    let known = fallback_exe.filter(|p| is_ollama_exe(&p.to_string_lossy()));
     let (exe, listener_kind) = match &before {
         OllamaHealth::Listening {
             image_path, kind, ..
-        } if is_ollama_exe(image_path) => (PathBuf::from(image_path), Some(*kind)),
+        } if is_ollama_exe(image_path) => {
+            let exe =
+                known.or_else(|| under_roots(image_path, roots).then(|| PathBuf::from(image_path)));
+            match exe {
+                Some(exe) => (exe, Some(*kind)),
+                None => {
+                    return FixOutcome::NotChanged(
+                        "This ollama.exe is not in the usual install folder, so it was \
+                         not restarted. Nothing was changed."
+                            .to_string(),
+                    );
+                }
+            }
+        }
         OllamaHealth::Listening { .. } => {
             return FixOutcome::NotChanged(
                 "Another program, not ollama.exe, is using the Ollama port. \
@@ -233,17 +277,14 @@ pub fn run_fix(
                     .to_string(),
             );
         }
-        OllamaHealth::NotListening => {
-            match fallback_exe.filter(|p| is_ollama_exe(&p.to_string_lossy())) {
-                Some(p) => (p, None),
-                None => {
-                    return FixOutcome::NotChanged(
-                        "Could not find ollama.exe to restart it, so nothing was changed."
-                            .to_string(),
-                    );
-                }
+        OllamaHealth::NotListening => match known {
+            Some(p) => (p, None),
+            None => {
+                return FixOutcome::NotChanged(
+                    "Could not find ollama.exe to restart it, so nothing was changed.".to_string(),
+                );
             }
-        }
+        },
     };
 
     progress("Saving the setting...");
@@ -468,14 +509,30 @@ pub fn default_exe() -> Option<PathBuf> {
 fn read_user_value(key_path: &str, name: &str) -> Option<String> {
     use windows::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ};
     let (sub, name_w) = (wide(key_path), wide(name));
-    let mut buf = [0u16; 256];
-    let mut len = std::mem::size_of_val(&buf) as u32;
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+    // First call sizes the buffer, so a long value is still read.
+    let mut len = 0u32;
     unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             PCWSTR(sub.as_ptr()),
             PCWSTR(name_w.as_ptr()),
-            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            flags,
+            None,
+            None,
+            Some(&mut len),
+        )
+        .ok()
+        .ok()?;
+    }
+    let mut buf = vec![0u16; (len as usize).div_ceil(2) + 1];
+    let mut len = (buf.len() * 2) as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name_w.as_ptr()),
+            flags,
             None,
             Some(buf.as_mut_ptr().cast()),
             Some(&mut len),
@@ -545,7 +602,10 @@ impl FixSystem for RealSystem {
             return Ok(());
         };
         match ollama_admin::process_image_path(parent) {
-            Some(img) if file_name(&img).eq_ignore_ascii_case(TRAY_APP_EXE) => {
+            Some(img)
+                if file_name(&img).eq_ignore_ascii_case(TRAY_APP_EXE)
+                    && under_roots(&img, &trusted_roots()) =>
+            {
                 taskkill_pid(parent, false)
             }
             _ => Ok(()),
@@ -780,8 +840,12 @@ mod tests {
         }
     }
 
+    fn roots() -> Vec<String> {
+        vec![r"C:\fake".to_string()]
+    }
+
     fn run(f: &mut Fake) -> FixOutcome {
-        run_fix(f, None, &mut |_| {})
+        run_fix(f, None, &roots(), &mut |_| {})
     }
 
     fn working() -> Fake {
@@ -930,6 +994,7 @@ mod tests {
         let out = run_fix(
             &mut f,
             Some(PathBuf::from(r"C:\fb\ollama.exe")),
+            &roots(),
             &mut |_| {},
         );
         assert_eq!(out, FixOutcome::Fixed);
@@ -991,15 +1056,75 @@ mod tests {
             listen_after_start: true,
             ..Default::default()
         };
-        let out = run_fix(&mut f, Some(PathBuf::from(r"C:\d\ollama.exe")), &mut |_| {});
+        let out = run_fix(
+            &mut f,
+            Some(PathBuf::from(r"C:\d\ollama.exe")),
+            &roots(),
+            &mut |_| {},
+        );
         assert!(matches!(out, FixOutcome::NotChanged(_)), "{out:?}");
         assert_eq!(f.log, ["health"], "not even the setting is written");
     }
 
     #[test]
+    fn an_ollama_exe_in_downloads_is_replaced_by_the_known_install() {
+        let mut f = Fake {
+            health: vec![OllamaHealth::Listening {
+                pid: 7,
+                image_path: r"C:\Users\x\Downloads\ollama.exe".to_string(),
+                kind: ListenerKind::Other,
+            }],
+            listen_after_start: true,
+            ..Default::default()
+        };
+        let out = run_fix(
+            &mut f,
+            Some(PathBuf::from(r"C:\fake\Programs\Ollama\ollama.exe")),
+            &roots(),
+            &mut |_| {},
+        );
+        assert_eq!(out, FixOutcome::Fixed);
+        assert!(f
+            .log
+            .iter()
+            .any(|s| s == r"start C:\fake\Programs\Ollama\ollama.exe"));
+        assert!(!f.log.iter().any(|s| s.contains("Downloads")));
+    }
+
+    #[test]
+    fn an_untrusted_listener_with_no_known_install_changes_nothing() {
+        let mut f = Fake {
+            health: vec![OllamaHealth::Listening {
+                pid: 7,
+                image_path: r"C:\Users\x\Downloads\ollama.exe".to_string(),
+                kind: ListenerKind::Other,
+            }],
+            ..Default::default()
+        };
+        let out = run_fix(&mut f, None, &roots(), &mut |_| {});
+        assert!(matches!(out, FixOutcome::NotChanged(_)));
+        assert_eq!(f.log, ["health"]);
+    }
+
+    #[test]
+    fn roots_match_whole_folders_case_insensitively() {
+        let roots = vec![r"C:\Program Files".to_string()];
+        assert!(under_roots(r"c:\program files\Ollama\ollama.exe", &roots));
+        assert!(under_roots("C:/Program Files/x/ollama.exe", &roots));
+        assert!(!under_roots(r"C:\Program Files Evil\ollama.exe", &roots));
+        assert!(!under_roots(r"C:\Program Files", &roots));
+        assert!(!under_roots(r"C:\x\ollama.exe", &[String::new()]));
+    }
+
+    #[test]
     fn a_non_ollama_fallback_exe_is_refused() {
         let mut f = Fake::default();
-        let out = run_fix(&mut f, Some(PathBuf::from(r"C:\d\other.exe")), &mut |_| {});
+        let out = run_fix(
+            &mut f,
+            Some(PathBuf::from(r"C:\d\other.exe")),
+            &roots(),
+            &mut |_| {},
+        );
         assert!(matches!(out, FixOutcome::NotChanged(_)));
         assert_eq!(f.log, ["health"]);
     }
@@ -1008,7 +1133,7 @@ mod tests {
     fn a_reused_pid_is_not_killed() {
         let mut f = working();
         f.image = Some(r"C:\x\notepad.exe".to_string());
-        let out = run_fix(&mut f, None, &mut |_| {});
+        let out = run_fix(&mut f, None, &roots(), &mut |_| {});
         assert!(matches!(out, FixOutcome::NotChanged(ref m) if m.contains("Setting saved")));
         assert!(!f
             .log
@@ -1020,7 +1145,7 @@ mod tests {
     fn failures_after_the_write_say_the_setting_was_saved() {
         let mut f = working();
         f.kill_err = Some("denied".into());
-        assert!(run_fix(&mut f, None, &mut |_| {})
+        assert!(run_fix(&mut f, None, &roots(), &mut |_| {})
             .message()
             .contains("Setting saved"));
         let mut f = Fake {
@@ -1028,12 +1153,12 @@ mod tests {
             tray_err: Some("denied".into()),
             ..Default::default()
         };
-        assert!(run_fix(&mut f, None, &mut |_| {})
+        assert!(run_fix(&mut f, None, &roots(), &mut |_| {})
             .message()
             .contains("Setting saved"));
         let mut f = working();
         f.stop_waits_out = true;
-        assert!(run_fix(&mut f, None, &mut |_| {})
+        assert!(run_fix(&mut f, None, &roots(), &mut |_| {})
             .message()
             .contains("Setting saved"));
     }
@@ -1094,7 +1219,7 @@ mod tests {
     fn progress_lines_are_reported_in_order() {
         let mut f = working();
         let mut seen = Vec::new();
-        run_fix(&mut f, None, &mut |s| seen.push(s.to_string()));
+        run_fix(&mut f, None, &roots(), &mut |s| seen.push(s.to_string()));
         assert_eq!(
             seen.first().map(String::as_str),
             Some("Saving the setting...")
@@ -1109,6 +1234,9 @@ mod tests {
         use windows::Win32::System::Registry::RegDeleteTreeW;
         let root = r"Software\WingmanTest382GpuFix";
         let sub = format!(r"{root}\Environment");
+        let long = "v".repeat(600);
+        write_user_value(&sub, "WINGMAN_TEST_382_LONG", &long).expect("write long");
+        let read_long = read_user_value(&sub, "WINGMAN_TEST_382_LONG");
         write_user_value(&sub, "WINGMAN_TEST_382", "1").expect("write");
         let read = read_user_value(&sub, "WINGMAN_TEST_382");
         unsafe {
@@ -1116,5 +1244,6 @@ mod tests {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(w.as_ptr()));
         }
         assert_eq!(read.as_deref(), Some("1"));
+        assert_eq!(read_long.as_deref(), Some(long.as_str()));
     }
 }

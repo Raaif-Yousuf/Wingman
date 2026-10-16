@@ -3058,6 +3058,12 @@ fn with_gpu_fix(mut section: OllamaSection, offer: Option<String>) -> OllamaSect
 /// try again. Not run in tests: it kills real processes.
 fn start_gpu_fix(inner: &mut SettingsInner) {
     inner.ollama_fix = false;
+    // Hidden first, so a refusal below never leaves a dead "Fix it".
+    if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
+        unsafe {
+            let _ = ShowWindow(link, SW_HIDE);
+        }
+    }
     let cfg = inner.original.providers.ollama.clone();
     // Refuse before touching anything, and say so inline (rule 7).
     let refusal = if !ollama_gpu_fix::is_loopback_base_url(&cfg.base_url) {
@@ -3120,8 +3126,12 @@ fn start_gpu_fix(inner: &mut SettingsInner) {
                     },
                 )
             };
-            let outcome =
-                ollama_gpu_fix::run_fix(&mut sys, ollama_gpu_fix::default_exe(), &mut step);
+            let outcome = ollama_gpu_fix::run_fix(
+                &mut sys,
+                ollama_gpu_fix::default_exe(),
+                &ollama_gpu_fix::trusted_roots(),
+                &mut step,
+            );
             post(
                 &slot,
                 OllamaSection {
