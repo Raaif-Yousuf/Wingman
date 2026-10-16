@@ -198,7 +198,9 @@ for the verdict, the signs under "Seen in it:" and a fixed next step, never
 "safe", and has no model-written advice because the screen text is untrusted) and `"time_list"` (#315: `times`, each
 with the text, the clock time, the date if shown and the zone as written; the
 model only reads them, and `actions::time_zones` converts them to the local zone
-from Windows' own time zone data).
+from Windows' own time zone data) and `"jargon_terms"` (#335: `terms`, each
+a `term` then its `meaning`; the card shows the terms one per line, at most 12,
+each term once, each meaning cut to 80 characters in code).
 Each schema function returns a `serde_json::json!`
 literal shaped like standard JSON Schema (`"type": "object"`, `"properties"`,
 `"required"`, `"additionalProperties": false`), plus one

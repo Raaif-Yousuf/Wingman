@@ -420,6 +420,10 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `rewrite_tone::builtin_actions`): proposal `text_answer`, executor
 ///   `replace_text`. Rewrite the selection in a fixed tone, confirmed on a
 ///   card, then written over the selection like "Translate selection".
+/// - `"explain-jargon"` (#335, `jargon::builtin_action`): proposal
+///   `jargon_terms`, executor `none`. Lists the technical terms and acronyms in
+///   the selection (else on screen) with a short plain meaning each, on the
+///   card.
 pub fn builtin_actions() -> Vec<Action> {
     let mut actions = vec![
         Action {
