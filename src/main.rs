@@ -26,6 +26,7 @@ mod machine;
 mod mode;
 mod ocr;
 mod options_keys;
+mod overlay;
 mod owner_acl;
 mod password_managers;
 mod pause;

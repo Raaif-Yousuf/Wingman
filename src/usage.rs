@@ -560,6 +560,10 @@ pub(crate) static SPENT_OVERRIDE: Mutex<Option<f64>> = Mutex::new(None);
 /// What this run has spent today, counted in memory by [`record`]. It exists
 /// only for the case where the store is down, and then it is all there is.
 static MEM_SPEND: Mutex<Option<(String, f64)>> = Mutex::new(None);
+/// What this run counted but could not save (a write failed, or the store was
+/// down). Added to the saved total, so a store that reads but does not write
+/// cannot leave the budget stuck at its old value (#794).
+static MEM_UNSAVED: Mutex<Option<(String, f64)>> = Mutex::new(None);
 static APPROX_NOTICED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The last known price of one request, per `provider/model`, for pricing a
 /// later response that came back with no usage block.
@@ -570,6 +574,9 @@ const UNPRICED_GUESS_USD: f64 = 0.01;
 /// Test seam: pretend the store cannot be read or written.
 #[cfg(test)]
 static STORE_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Test seam: the store reads fine but every write fails.
+#[cfg(test)]
+static WRITES_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Adds `usd` to the in-memory total for `date`; a new date starts from zero.
 fn mem_add(mem: &mut Option<(String, f64)>, date: &str, usd: f64) {
@@ -586,11 +593,12 @@ fn mem_total(mem: &Option<(String, f64)>, date: &str) -> f64 {
     }
 }
 
-/// The saved total when there is one, else the in-memory one. The flag says
-/// the number is the fallback, so only this run's spend is in it.
-fn pick_spent(stored: Option<f64>, in_memory: f64) -> (f64, bool) {
+/// The saved total plus what this run counted but could not save; when the
+/// saved total cannot be read, the in-memory total for this run. The flag says
+/// the number is not exact (#713, #794).
+fn pick_spent(stored: Option<f64>, in_memory: f64, unsaved: f64) -> (f64, bool) {
     match stored {
-        Some(s) => (s, false),
+        Some(s) => (s + unsaved, unsaved > 0.0),
         None => (in_memory, true),
     }
 }
@@ -612,10 +620,14 @@ fn spent_today(date: &str) -> (f64, bool) {
             .ok()
             .map(|day| day.map_or(0.0, |d| d.usd))
     };
-    pick_spent(stored, mem_total(&lock(&MEM_SPEND), date))
+    pick_spent(
+        stored,
+        mem_total(&lock(&MEM_SPEND), date),
+        mem_total(&lock(&MEM_UNSAVED), date),
+    )
 }
 
-const APPROXIMATE_NOTICE: &str = "Wingman cannot read today's saved spend, so the daily budget only counts what this run spends. The limit is approximate until the saved data works again.";
+const APPROXIMATE_NOTICE: &str = "Wingman cannot read or save today's spend, so the daily budget is approximate: it counts what this run spends. It is exact again once the saved data works.";
 
 /// Once per run, tell the user the limit is running on the fallback count.
 fn queue_approximate_notice() {
@@ -701,7 +713,9 @@ pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
     };
     mem_add(&mut lock(&MEM_SPEND), &date, counted);
     #[cfg(test)]
-    let saved = if STORE_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+    let saved = if WRITES_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+        Err(crate::store::StoreError::Other("test: writes fail".into()))
+    } else if STORE_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
         Ok(())
     } else {
         crate::store::global()
@@ -713,6 +727,8 @@ pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
     if let Err(e) = saved {
         // Never fails the request; the next card says so, once per run.
         crate::store::report(&e);
+        // The saved total is now short by this response (#794).
+        mem_add(&mut lock(&MEM_UNSAVED), &date, counted);
     }
     queue_budget_notice(&date);
 }
@@ -1156,19 +1172,19 @@ mod tests {
             warn_percent: 80,
         };
         let mut mem = None;
-        let (spent, approx) = pick_spent(None, mem_total(&mem, "2026-10-16"));
+        let (spent, approx) = pick_spent(None, mem_total(&mem, "2026-10-16"), 0.0);
         assert!(approx);
         assert!(check_budget_with(&b, spent).is_ok(), "nothing spent yet");
 
         mem_add(&mut mem, "2026-10-16", 0.03);
-        let (spent, _) = pick_spent(None, mem_total(&mem, "2026-10-16"));
+        let (spent, _) = pick_spent(None, mem_total(&mem, "2026-10-16"), 0.0);
         assert!(
             check_budget_with(&b, spent).is_ok(),
             "first request allowed"
         );
 
         mem_add(&mut mem, "2026-10-16", 0.03);
-        let (spent, _) = pick_spent(None, mem_total(&mem, "2026-10-16"));
+        let (spent, _) = pick_spent(None, mem_total(&mem, "2026-10-16"), 0.0);
         let err = check_budget_with(&b, spent).unwrap_err();
         assert!(err.contains("Daily budget"), "{err}");
     }
@@ -1179,7 +1195,9 @@ mod tests {
         fn drop(&mut self) {
             set_daily_budget(0.0, 80);
             STORE_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+            WRITES_FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
             *lock(&MEM_SPEND) = None;
+            *lock(&MEM_UNSAVED) = None;
             lock(&LAST_COST).clear();
             APPROX_NOTICED.store(false, std::sync::atomic::Ordering::SeqCst);
             *lock(&NOTIFIED) = None;
@@ -1223,6 +1241,35 @@ mod tests {
     }
 
     #[test]
+    fn with_writes_failing_but_reads_fine_the_budget_still_trips() {
+        // #794: the saved total stays put when writes fail; this run's own
+        // spend must still count toward the cap.
+        let (_scope, _guard) = down_scope(0.01);
+        STORE_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+        WRITES_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The path under test needs a store that opens and reads; without
+        // one this would silently exercise the read-failure fallback instead.
+        let date = local_date_today();
+        assert!(
+            crate::store::global()
+                .and_then(|s| s.day_total(&date))
+                .is_ok(),
+            "the test store must open and read"
+        );
+        // About $0.006 each, on top of whatever the test store already holds.
+        let before = spent_today(&date).0;
+        let limit = before + 0.01;
+        set_daily_budget(limit, 80);
+        record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
+        assert!(check_budget().is_ok(), "one request is under the limit");
+        record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
+        let err = check_budget().expect_err("the second request must be refused");
+        assert!(err.contains("Daily budget"), "{err}");
+        let notice = take_budget_notice().unwrap_or_default();
+        assert!(notice.contains("approximate"), "{notice}");
+    }
+
+    #[test]
     fn an_unpriced_cloud_response_still_counts_in_the_fallback_total() {
         let (_scope, _guard) = down_scope(0.015);
         // No usage block: unpriced, counted at the flat guess.
@@ -1243,7 +1290,15 @@ mod tests {
 
     #[test]
     fn the_saved_total_wins_when_the_store_works() {
-        assert_eq!(pick_spent(Some(0.02), 9.0), (0.02, false));
+        assert_eq!(pick_spent(Some(0.02), 9.0, 0.0), (0.02, false));
+    }
+
+    #[test]
+    fn unsaved_spend_is_added_to_the_saved_total_and_marks_it_approximate() {
+        // #794: the store reads fine but a write failed.
+        let (spent, approx) = pick_spent(Some(0.02), 9.0, 0.03);
+        assert!(close(spent, 0.05));
+        assert!(approx);
     }
 
     #[test]

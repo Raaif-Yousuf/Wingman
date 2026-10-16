@@ -659,6 +659,22 @@ pub fn install_send_gate(gate: std::sync::Arc<dyn SendGate>) {
 #[derive(Debug)]
 pub struct SendCancelled;
 
+/// The chain had no provider to try (#832). `App` turns it into the setup
+/// card instead of a generic failure.
+#[derive(Debug)]
+pub struct NoProviders;
+
+/// The text of a [`NoProviders`], which `App` finds in a worker's error chain.
+pub const NO_PROVIDERS_TEXT: &str = "no providers configured";
+
+impl std::fmt::Display for NoProviders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{NO_PROVIDERS_TEXT}")
+    }
+}
+
+impl std::error::Error for NoProviders {}
+
 /// The text of a [`SendCancelled`]. `App` looks for it in a worker's error
 /// chain, which crosses a thread boundary as text, to end a cancel quietly.
 pub const SEND_CANCELLED_TEXT: &str =
@@ -848,7 +864,7 @@ impl Chain {
             }
         }
 
-        Err(first_err.unwrap_or_else(|| anyhow::anyhow!("no providers configured")))
+        Err(first_err.unwrap_or_else(|| anyhow::Error::new(NoProviders)))
     }
 
     /// Issue #18/#206: like [`complete_parsed`](Self::complete_parsed), but
@@ -970,7 +986,7 @@ impl Chain {
             }
         }
 
-        Err(first_err.unwrap_or_else(|| anyhow::anyhow!("no providers configured")))
+        Err(first_err.unwrap_or_else(|| anyhow::Error::new(NoProviders)))
     }
 
     /// Ids of every provider in the chain, in order, regardless of

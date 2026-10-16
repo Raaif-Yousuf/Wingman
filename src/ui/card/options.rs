@@ -97,20 +97,6 @@ pub(super) fn default_row(count: usize, key_runs_first: bool) -> Option<usize> {
     (key_runs_first && count > 0).then_some(0)
 }
 
-/// The colour of the default row's outline: the system accent when it stands
-/// out from the card by the 3:1 that WCAG 1.4.11 asks of a component's
-/// boundary, else the text colour. A user's accent can be nearly the card's own
-/// colour (a deep navy on the dark card), and an outline nobody can see would
-/// leave the default row unmarked.
-pub(super) fn default_outline_color(accent: u32, surface: u32, text: u32) -> u32 {
-    let accent_vs_card = contrast_ratio(relative_luminance(accent), relative_luminance(surface));
-    if accent_vs_card >= 3.0 {
-        accent
-    } else {
-        text
-    }
-}
-
 /// The card's measurements, in pixels.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct LayoutInputs {
@@ -556,7 +542,7 @@ impl CardInner {
             text: palette.headline,
             hint: palette.hint,
         };
-        let accent = btn::system_accent();
+        let accent = btn::system_accent(self.theme, palette.bg);
         let hovered = button_is_hovered(dis.hwndItem);
         let look = btn::look(
             btn::Role::Secondary,
@@ -644,7 +630,7 @@ impl CardInner {
             if default_row(ui.rows.len(), ui.behavior.key_runs_first) == Some(index) {
                 let color = match &high_contrast {
                     Some(hc) => hc.highlight,
-                    None => default_outline_color(accent, palette.bg, palette.headline),
+                    None => accent,
                 };
                 let width = self.scale(2).max(2);
                 let pen = CreatePen(PS_SOLID, width, windows::Win32::Foundation::COLORREF(color));
@@ -921,40 +907,10 @@ mod tests {
 
     #[test]
     fn the_default_row_outline_is_visible_on_the_card_in_light_and_dark() {
-        use crate::ui::theme::{DARK, LIGHT};
-        // The accent Windows reports when it cannot say (the default blue).
-        let accent = crate::ui::card_buttons::accent_from_argb(0xFF00_78D4);
-        for (name, t) in [("light", LIGHT), ("dark", DARK)] {
-            assert!(ratio(accent, t.surface) >= 3.0, "{name}: accent outline");
-        }
-    }
-
-    #[test]
-    fn an_accent_too_close_to_the_card_falls_back_to_the_text_colour() {
-        use crate::ui::theme::{DARK, LIGHT};
-        // A deep navy accent on the dark card is nearly invisible: use the text.
-        let navy = crate::ui::theme::rgb(0x0A, 0x14, 0x3C);
-        assert_eq!(
-            default_outline_color(navy, DARK.surface, DARK.text),
-            DARK.text
-        );
-        // The default blue stands out on both cards, so it stays the accent.
-        let blue = crate::ui::card_buttons::accent_from_argb(0xFF00_78D4);
-        assert_eq!(default_outline_color(blue, LIGHT.surface, LIGHT.text), blue);
-        assert_eq!(default_outline_color(blue, DARK.surface, DARK.text), blue);
-        // Whatever it picks, the outline is visible against the card.
-        for accent in [
-            navy,
-            blue,
-            0x0000_0000,
-            0x00FF_FFFF,
-            DARK.surface,
-            LIGHT.surface,
-        ] {
-            for t in [LIGHT, DARK] {
-                let c = default_outline_color(accent, t.surface, t.text);
-                assert!(ratio(c, t.surface) >= 3.0, "accent {accent:#08x} on {t:?}");
-            }
+        use crate::ui::theme::{Theme, DARK, LIGHT};
+        for (theme, t) in [(Theme::Light, LIGHT), (Theme::Dark, DARK)] {
+            let accent = crate::ui::card_buttons::system_accent(theme, t.surface);
+            assert!(ratio(accent, t.surface) >= 3.0, "{theme:?}: accent outline");
         }
     }
 

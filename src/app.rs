@@ -29,8 +29,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, KillTimer, PeekMessageW, PostQuitMessage, RegisterClassExW, SetTimer,
     SetWindowLongPtrW, TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, MSG, PBT_APMRESUMEAUTOMATIC,
-    PM_REMOVE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST,
-    WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+    PM_REMOVE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_NCCREATE,
+    WM_POWERBROADCAST, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use crate::actions;
@@ -797,6 +797,15 @@ fn startup_card(
         detail = format!("{detail}\n\n{h}. {d}");
     }
     Some((headline, detail))
+}
+
+/// #793: whether `mode` may be switched on while the config file's state is
+/// `load_problem`. A file that did not parse starts the run Offline with
+/// default (looser) settings; anything that sends data out must wait until it
+/// parses, so only Offline is allowed meanwhile. The state is a plain field
+/// read, so the check cannot itself fail open.
+fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
+    mode == Mode::Offline || load_problem.is_none()
 }
 
 /// #711: config.toml exists but did not parse. Names the line and column
@@ -2187,6 +2196,9 @@ impl App {
                 if self.quiet_send_cancel(&packed) {
                     return;
                 }
+                if self.show_empty_chain_failure(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -2539,6 +2551,9 @@ impl App {
             Ok(done) => done,
             Err(packed) => {
                 if self.quiet_send_cancel(&packed) {
+                    return;
+                }
+                if self.show_empty_chain_failure(&packed) {
                     return;
                 }
                 let (human, chain) = unpack_error(&packed);
@@ -3049,6 +3064,9 @@ impl App {
                 if self.quiet_send_cancel(&packed) {
                     return;
                 }
+                if self.show_empty_chain_failure(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -3245,6 +3263,9 @@ impl App {
                 if self.quiet_send_cancel(&packed) {
                     return;
                 }
+                if self.show_empty_chain_failure(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -3395,6 +3416,9 @@ impl App {
         let done = match result {
             Ok(done) => done,
             Err(packed) => {
+                if self.show_empty_chain_failure(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -3568,6 +3592,18 @@ impl App {
                 return;
             }
         }
+        // #832: an empty chain is a setup problem, not a fault: the setup
+        // card, no failed dot, no "Try again" text.
+        if let Err(packed) = &result {
+            if is_no_providers(packed) {
+                let (headline, detail) = self.empty_chain_card_now();
+                let chain = unpack_error(packed).1.to_string();
+                let _ = self.record_last(Err(pack_error(&headline, &chain)));
+                self.card.show_settings_needed(&headline, &detail);
+                self.set_watch(true);
+                return;
+            }
+        }
         let is_err = result.is_err();
         let mut answer = self.record_last(result);
         // A store failure never fails the request (#46); it rides on the
@@ -3697,6 +3733,29 @@ impl App {
     /// if it was a real fault (see [`is_run_fault`]), raises the tray's red
     /// dot. A user-state message ("Nothing is selected") is recorded the same
     /// way but does not raise it.
+    /// #832: the setup card for the current mode and providers.
+    fn empty_chain_card_now(&self) -> (String, String) {
+        let path = Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "config.toml".into());
+        empty_chain_card(self.config.mode, &self.config.providers, &path)
+    }
+
+    /// #832: for the action result handlers. When the run failed only
+    /// because the chain was empty, shows the setup card (not a fault: no
+    /// failed dot, no "Try again") and returns true. The Quick Ask palette's
+    /// router hint already drops any failure quietly.
+    fn show_empty_chain_failure(&mut self, packed: &str) -> bool {
+        if !is_no_providers(packed) {
+            return false;
+        }
+        let (headline, detail) = self.empty_chain_card_now();
+        self.record_run_failure(&headline, &headline, unpack_error(packed).1);
+        self.card.show_settings_needed(&headline, &detail);
+        self.set_watch(true);
+        true
+    }
+
     fn record_run_failure(&mut self, action: &str, human: &str, raw_chain: &str) {
         self.record_last_error(action, raw_chain);
         if is_run_fault(human) {
@@ -4077,6 +4136,14 @@ impl App {
     /// the save-error card is re-shown immediately after so it is still the
     /// one left on screen.
     fn open_settings(&mut self) {
+        self.open_settings_inner();
+        // #673: every modal path ends here, whatever branch it took, so a
+        // completed Save and the deferred messages are handled first and the
+        // close request is honoured last.
+        self.repost_close_if_requested();
+    }
+
+    fn open_settings_inner(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
         self.card.hide();
@@ -4107,6 +4174,11 @@ impl App {
         };
 
         self.config = edited;
+        // #793: the save below is refused while the file does not parse, so
+        // an edited mode must not outlive it in memory (requests read it).
+        if !mode_allowed(self.config.mode, self.config.load_problem.as_deref()) {
+            self.config.mode = Mode::Offline;
+        }
         if let Err(e) = self.config.save() {
             // Rule 7: neither failure may be silently dropped. Every
             // deferred message is delivered for real (its executor runs,
@@ -4136,6 +4208,34 @@ impl App {
             self.deliver_deferred(pending);
         }
         self.show_tray_restore_error(tray_restore_error);
+    }
+
+    /// #712: why Quit (or a `WM_CLOSE`) is refused right now, if it is.
+    fn quit_blocked(&self) -> Option<&'static str> {
+        quit_refusal(
+            self.exec_in_flight,
+            crate::provider::ollama_gpu_fix::is_running(),
+        )
+    }
+
+    /// #673: if the owner window got `WM_CLOSE` while a nested loop (the tray
+    /// menu, Settings or a file dialog) was running, re-post it now that the
+    /// loop is over so it takes the normal path. Every place that clears
+    /// `SETTINGS_OPEN` must call this once its own work is done (a test
+    /// checks the count). Returns whether it did.
+    fn repost_close_if_requested(&self) -> bool {
+        if !take_close_request() {
+            return false;
+        }
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(self.hwnd()),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        true
     }
 
     /// Issue #213: delivers every message `wnd_proc` deferred while Settings
@@ -4180,6 +4280,7 @@ impl App {
         }
         self.deliver_deferred(pending);
         self.show_tray_restore_error(tray_restore_error);
+        self.repost_close_if_requested();
     }
 
     /// Issue #178: shows the tray-restore error card if `error` is `Some`,
@@ -4393,6 +4494,15 @@ impl App {
     /// writes to disk, same as every other tray setting change.
     fn set_mode(&mut self, mode: Mode) {
         if self.config.mode == mode {
+            return;
+        }
+        // #793: the file did not parse, so the run is Offline until it does.
+        if !mode_allowed(mode, self.config.load_problem.as_deref()) {
+            let (headline, detail) =
+                config_problem_card(self.config.load_problem.as_deref().unwrap_or_default());
+            self.card.show_error(&headline, &detail);
+            self.tray.set_mode(self.config.mode);
+            self.set_watch(true);
             return;
         }
         self.config.mode = mode;
@@ -4707,6 +4817,7 @@ impl App {
         }
         self.deliver_deferred(pending);
         self.show_tray_restore_error(tray_restore_error);
+        self.repost_close_if_requested();
         out
     }
 
@@ -6276,9 +6387,17 @@ fn exec_work_restore(undo: executors::Undo) -> ExecDone {
 }
 
 /// #712: why Quit is refused right now, if it is. An executor worker that is
-/// mid-write (typing into a form) is never killed; the user tries again.
-fn quit_refusal(exec_in_flight: bool) -> Option<&'static str> {
-    exec_in_flight.then_some("Wingman is still typing into a form; try again in a moment.")
+/// mid-write (typing into a form) is never killed; the user tries again. The
+/// same for "Fix it" on the Ollama GPU setting: it stops and restarts Ollama,
+/// and quitting between the two would leave Ollama stopped (#795).
+fn quit_refusal(exec_in_flight: bool, gpu_fix_running: bool) -> Option<&'static str> {
+    if exec_in_flight {
+        Some("Wingman is still typing into a form; try again in a moment.")
+    } else if gpu_fix_running {
+        Some("Wingman is still restarting Ollama; try again in a moment.")
+    } else {
+        None
+    }
 }
 
 /// Issue #227: runs a worker's whole computation and turns a panic into the
@@ -6357,6 +6476,9 @@ thread_local! {
     /// `open_settings` are plain, unoptimizable-away side effects through an
     /// opaque TLS accessor call.
     static SETTINGS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #673: the owner window got `WM_CLOSE` while Settings was open. Read
+    /// once by `open_settings` after the modal loop returns.
+    static CLOSE_AFTER_SETTINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
     /// True while the tray menu's loop runs (#722). Always set together with
     /// `SETTINGS_OPEN`, which supplies the reentrancy machinery; this only
@@ -6477,6 +6599,35 @@ fn is_send_cancelled(packed: &str) -> bool {
         .contains(crate::provider::SEND_CANCELLED_TEXT)
 }
 
+/// #832: whether a worker's packed error is the empty chain ("no providers
+/// configured"). Looks at the raw chain half.
+fn is_no_providers(packed: &str) -> bool {
+    unpack_error(packed)
+        .1
+        .contains(crate::provider::NO_PROVIDERS_TEXT)
+}
+
+/// #832: the setup card for a run that found no provider to try. The gate
+/// cannot probe Ollama, so it lets an Ollama-only setup through; when the
+/// worker then finds nothing answering, this says what to do. Any other
+/// setup gets the gate's own card.
+fn empty_chain_card(mode: Mode, providers: &Providers, config_path: &str) -> (String, String) {
+    if mode == Mode::Auto
+        && crate::mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+    {
+        return (
+            "Ollama is not running".to_string(),
+            "Start Ollama, or click here to open Settings and paste an API key.".to_string(),
+        );
+    }
+    App::readiness_gate(mode, providers, config_path).unwrap_or_else(|| {
+        (
+            "No AI model set up yet".to_string(),
+            "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
+        )
+    })
+}
+
 /// Issue #225: which action is waiting on the preview currently on screen.
 /// See [`App::pending_preview`] for why this is one slot rather than one
 /// `Option` per kind.
@@ -6571,6 +6722,14 @@ enum SettingsReentrancy {
     /// itself unreachable while Settings is open: its only path is the
     /// tray's Quit command, and `WM_APP_TRAY` is `Ignore`d above.
     Fallback,
+    /// `WM_CLOSE` on the owner window (#673): a shutdown, a script or a
+    /// smoke test asking Wingman to exit. Falling back to `DefWindowProcW`
+    /// would destroy the owner while Settings is modal-open, and then
+    /// `WM_DESTROY` is also a fallback, so the process would never leave its
+    /// message loop. Instead: remember the request, close Settings (edits are
+    /// discarded, as for its own close box), and let `open_settings` re-post
+    /// `WM_CLOSE` once the modal loop has returned.
+    CloseAfterSettings,
 }
 
 /// #722: the policy while the tray menu is open. Settings hides the card
@@ -6592,6 +6751,7 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         return SettingsReentrancy::DeferTaskbarCreated;
     }
     match msg {
+        WM_CLOSE => SettingsReentrancy::CloseAfterSettings,
         // Issue #213: every WM_APP_* message that carries a worker's result
         // or a preview's Do it/Cancel decision is deferred, never Ignored --
         // see DeferredMessage and the Defer variant's own doc comment. #40:
@@ -6734,6 +6894,16 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
     true
 }
 
+/// #673: remember that the owner got `WM_CLOSE` during a nested loop.
+fn note_close_request() {
+    CLOSE_AFTER_SETTINGS.with(|c| c.set(true));
+}
+
+/// #673: whether a close was asked for during a nested loop; clears it.
+fn take_close_request() -> bool {
+    CLOSE_AFTER_SETTINGS.with(|c| c.replace(false))
+}
+
 /// Issue #302: `DestroyWindow` discards messages still queued for the window,
 /// so a worker result posted just before Quit would never reach `wnd_proc` and
 /// its box would leak. Pull each one out and free it.
@@ -6843,7 +7013,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
         MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
         MenuChoice::Command(cmd::QUIT) => {
-            if let Some(text) = quit_refusal(app.exec_in_flight) {
+            if let Some(text) = app.quit_blocked() {
                 app.card.show_answer("Still working", text, 5, None);
                 app.set_watch(true);
             } else {
@@ -6993,6 +7163,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             SettingsReentrancy::Fallback => {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            SettingsReentrancy::CloseAfterSettings => {
+                // Settings, a file dialog or the tray menu is open. Only
+                // Settings can be closed from here; the others end on their
+                // own and then repost this (`repost_close_if_requested`).
+                note_close_request();
+                settings::request_close();
+                return LRESULT(0);
             }
         }
     }
@@ -7217,6 +7395,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_taskbar_created();
             LRESULT(0)
         }
+        // #673: an owner-window close (a script, a smoke test) takes the same
+        // refusal as tray > Quit while work is in flight. Session end is
+        // WM_ENDSESSION, which never comes through here and is not blocked.
+        WM_CLOSE => {
+            if let Some(text) = app.quit_blocked() {
+                app.card.show_answer("Still working", text, 5, None);
+                app.set_watch(true);
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_DESTROY => {
             // Drop the App (and with it the hook, tray icon and card) before
             // the loop exits, so the tray icon actually disappears.
@@ -7282,7 +7472,7 @@ mod tests {
     };
     use super::{final_settings_card, SettingsFinalCard};
     use super::{first_provider_model_label, provider_for_router, router_models_for};
-    use super::{settings_reentrancy_policy, SettingsReentrancy};
+    use super::{mode_allowed, settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
         WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
@@ -7309,7 +7499,7 @@ mod tests {
     use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
     use serde_json::Value;
-    use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
+    use windows::Win32::UI::WindowsAndMessaging::{WM_CLOSE, WM_DESTROY};
 
     // -- #23: resolve_prompt_and_difficulty (the worker's action-model wiring) --
 
@@ -8000,8 +8190,16 @@ mod tests {
 
     #[test]
     fn quit_is_refused_only_while_an_executor_is_writing() {
-        assert!(super::quit_refusal(true).is_some_and(|t| !t.contains('\u{2014}')));
-        assert!(super::quit_refusal(false).is_none());
+        assert!(super::quit_refusal(true, false).is_some_and(|t| !t.contains('\u{2014}')));
+        assert!(super::quit_refusal(false, false).is_none());
+    }
+
+    #[test]
+    fn quit_is_refused_while_the_ollama_fix_is_running() {
+        // #795: quitting between the stop and the restart leaves Ollama stopped.
+        let text = super::quit_refusal(false, true).expect("must refuse");
+        assert!(!text.contains('\u{2014}'));
+        assert!(super::quit_refusal(true, true).is_some());
     }
 
     #[test]
@@ -8262,6 +8460,71 @@ mod tests {
         }
     }
 
+    // -- #832: an empty chain at run time ends in the setup card ----------
+
+    #[test]
+    fn an_empty_chain_error_is_recognised_by_its_text() {
+        let err = anyhow::Error::new(crate::provider::NoProviders);
+        let packed = super::pack_error("x", &super::worker_error_chain_text(&err));
+        assert!(super::is_no_providers(&packed));
+        let wrapped = anyhow::anyhow!("boom").context("outer");
+        let packed = super::pack_error("x", &super::worker_error_chain_text(&wrapped));
+        assert!(!super::is_no_providers(&packed));
+    }
+
+    #[test]
+    fn every_action_result_handler_checks_for_an_empty_chain() {
+        // CRLF-safe; each handler must offer the packed error to the setup
+        // card before it builds a generic failure card.
+        let src = include_str!("app.rs").replace('\r', "");
+        for name in [
+            "on_calendar_result",
+            "on_generic_action_result",
+            "on_review_result",
+            "on_form_fill_result",
+        ] {
+            let def = format!("    fn {name}(");
+            let start = src.find(&def).expect("handler exists");
+            let body = &src[start..];
+            let end = body.find("unpack_error(&packed)").expect("failure arm");
+            assert!(
+                body[..end].contains("show_empty_chain_failure(&packed)"),
+                "{name} must call show_empty_chain_failure first"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_chain_card_says_ollama_is_not_running_when_only_ollama_is_listed() {
+        let (headline, detail) =
+            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), "config.toml");
+        assert_eq!(headline, "Ollama is not running");
+        assert!(detail.contains("Start Ollama"), "{detail}");
+        assert!(detail.contains("Settings"), "{detail}");
+        assert!(!detail.contains("Try again"), "{detail}");
+    }
+
+    #[test]
+    fn empty_chain_card_is_the_gate_card_when_ollama_is_not_listed() {
+        let providers = nothing_configured_providers();
+        assert_eq!(
+            Some(super::empty_chain_card(
+                Mode::Auto,
+                &providers,
+                "config.toml"
+            )),
+            App::readiness_gate(Mode::Auto, &providers, "config.toml")
+        );
+    }
+
+    #[test]
+    fn empty_chain_cards_have_no_em_dash() {
+        for providers in [ollama_only_providers(), nothing_configured_providers()] {
+            let (headline, detail) = super::empty_chain_card(Mode::Auto, &providers, "c.toml");
+            assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
+        }
+    }
+
     // -- first_provider_model_label / provider_model_label_for (issue #354
     //    follow-up review, finding 4) -------------------------------------
 
@@ -8453,6 +8716,17 @@ mod tests {
     const FAKE_TASKBAR_CREATED_MSG: u32 = 0xC123;
 
     #[test]
+    fn a_config_that_did_not_parse_allows_only_offline() {
+        // #793: one tray click must not switch cloud on with default settings.
+        let problem = Some("config.toml has an error at line 1, column 1");
+        assert!(mode_allowed(Mode::Offline, problem));
+        for m in [Mode::Cloud, Mode::Local, Mode::Auto] {
+            assert!(!mode_allowed(m, problem), "{m:?}");
+            assert!(mode_allowed(m, None), "{m:?}");
+        }
+    }
+
+    #[test]
     fn settings_reentrancy_defers_the_worker_result() {
         // The in-flight answer must still end in a card (rule 7) once
         // Settings closes, so it is deferred rather than dropped or handled
@@ -8575,6 +8849,51 @@ mod tests {
                 "msg {msg:#x} should be Ignore while Settings is open"
             );
         }
+    }
+
+    #[test]
+    fn a_close_request_is_remembered_once_and_then_cleared() {
+        // #673: the flag is set by wnd_proc during a nested loop and must be
+        // consumed exactly once, or a later Settings open+close would quit.
+        let _ = super::take_close_request();
+        assert!(!super::take_close_request());
+        super::note_close_request();
+        assert!(super::take_close_request());
+        assert!(
+            !super::take_close_request(),
+            "consumed, so it cannot fire again"
+        );
+    }
+
+    #[test]
+    fn every_modal_path_that_clears_settings_open_reposts_a_pending_close() {
+        // The tray menu, Settings and file dialogs all set SETTINGS_OPEN, and
+        // wnd_proc swallows WM_CLOSE while it is set. Each of them has to
+        // repost it afterwards. Source scan, CRLF-safe, non-empty.
+        let src = include_str!("app.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let clears = code
+            .matches("SETTINGS_OPEN.with(|c| c.set(false));")
+            .count();
+        assert_eq!(
+            clears, 3,
+            "a modal path was added or removed: update this test"
+        );
+        let reposts = code.matches("self.repost_close_if_requested();").count();
+        assert_eq!(
+            reposts, clears,
+            "each path that clears SETTINGS_OPEN must call repost_close_if_requested"
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_turns_wm_close_into_a_close_after_settings() {
+        // #673: the default path destroyed the owner behind the modal and
+        // the process never left its message loop.
+        assert_eq!(
+            settings_reentrancy_policy(WM_CLOSE, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::CloseAfterSettings
+        );
     }
 
     #[test]

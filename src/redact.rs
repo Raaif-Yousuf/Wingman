@@ -668,6 +668,25 @@ pub fn word_byte_ranges(line_text: &str, words: &[OcrWord]) -> Option<Vec<Range<
     Some(out)
 }
 
+/// Whether `text` holds a redaction marker (`[card number 1]`, `[email 2]`),
+/// in any letter case.
+/// The overlay drops a quote that contains one: the model never saw the real
+/// text, so there is nothing on screen to point at. Slice 2 of the overlay
+/// (#809) is its first non-test caller.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn contains_marker(text: &str) -> bool {
+    // ASCII lowercasing keeps every byte offset, so no char is split.
+    let text = text.to_ascii_lowercase();
+    [CARD, IBAN, KEY, EMAIL].iter().any(|label| {
+        let open = format!("[{} ", label.to_ascii_lowercase());
+        text.match_indices(&open).any(|(at, _)| {
+            let rest = text.as_bytes().get(at + open.len()..).unwrap_or_default();
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            digits > 0 && rest.get(digits) == Some(&b']')
+        })
+    })
+}
+
 /// The pixel regions to paint for `lines`, clipped to a `width` x `height`
 /// image. One region per sensitive span (the union of the words it touches),
 /// or the whole line when its words cannot be matched to its text.
@@ -1511,6 +1530,31 @@ mod tests {
         assert_eq!(&l.text[r[0].clone()], "Card");
         assert_eq!(&l.text[r[3].clone()], "1111");
         assert_eq!(&l.text[r[5].clone()], "ok");
+    }
+
+    #[test]
+    fn contains_marker_matches_only_real_markers() {
+        for yes in ["[card number 1]", "x [email 12] y", "[IBAN 3]", "[key 2]"] {
+            assert!(contains_marker(yes), "{yes}");
+        }
+        for no in [
+            "[email]",
+            "[email x]",
+            "[email 1",
+            "email 1]",
+            "[other 1]",
+            "",
+            "[[email",
+        ] {
+            assert!(!contains_marker(no), "{no}");
+        }
+        // Multibyte text around a marker-like opening must not panic.
+        assert!(contains_marker("\u{4eca}\u{65e5} [key 7] \u{1F600}"));
+        // The label is matched case-insensitively (a model may change case).
+        for yes in ["[EMAIL 1]", "[Card Number 2]", "[iban 3]", "[Key 9]"] {
+            assert!(contains_marker(yes), "{yes}");
+        }
+        assert!(!contains_marker("\u{4eca}[key \u{65e5}"));
     }
 
     #[test]
