@@ -61,6 +61,11 @@ pub struct ResolvedElement {
     /// Empty for a password field -- its real value is never read (see the
     /// module doc comment on both callers' password guard).
     pub current_text: String,
+    /// False when the control exposes no `ValuePattern` (or is a password
+    /// field), so `current_text` is "" whatever the field really holds. A
+    /// write to such a control goes through the typed fallback, and its old
+    /// text is neither known nor restorable (#645).
+    pub value_readable: bool,
 }
 
 /// Result of matching a [`TargetRef`] against a fresh walk of candidates.
@@ -373,6 +378,7 @@ pub mod com {
         control_type: String,
         is_password: bool,
         current_text: String,
+        value_readable: bool,
     }
 
     /// One walked candidate's non-identity extras (password/value), kept
@@ -492,6 +498,7 @@ pub mod com {
                     automation_id: candidates[i].automation_id.clone(),
                     control_type: candidates[i].control_type.clone(),
                     is_password,
+                    value_readable: value.is_some(),
                     current_text: value.unwrap_or_default(),
                 })
             }
@@ -752,6 +759,7 @@ pub mod com {
                 control_type: matched.control_type,
                 is_password: matched.is_password,
                 current_text: matched.current_text,
+                value_readable: matched.value_readable,
             })
         }
 
