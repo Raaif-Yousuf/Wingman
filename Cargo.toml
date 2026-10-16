@@ -89,6 +89,8 @@ features = [
   # type -- without this, activating OcrEngine or DataWriter fails.
   "Win32_System_WinRT",
   "Win32_UI_Controls",
+  # ui/file_dialog.rs (#117): GetOpenFileNameW / GetSaveFileNameW for sharing an action as a file.
+  "Win32_UI_Controls_Dialogs",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",
