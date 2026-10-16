@@ -1247,8 +1247,17 @@ mod tests {
         let (_scope, _guard) = down_scope(0.01);
         STORE_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
         WRITES_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The path under test needs a store that opens and reads; without
+        // one this would silently exercise the read-failure fallback instead.
+        let date = local_date_today();
+        assert!(
+            crate::store::global()
+                .and_then(|s| s.day_total(&date))
+                .is_ok(),
+            "the test store must open and read"
+        );
         // About $0.006 each, on top of whatever the test store already holds.
-        let before = spent_today(&local_date_today()).0;
+        let before = spent_today(&date).0;
         let limit = before + 0.01;
         set_daily_budget(limit, 80);
         record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
