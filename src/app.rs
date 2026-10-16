@@ -4685,6 +4685,7 @@ fn router_worker(
     redact: bool,
     candidates: &[router::RouterCandidate],
 ) -> Result<router::RouterResult> {
+    let started = std::time::Instant::now();
     let ollama_ready = mode == Mode::Auto
         && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
         && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
@@ -4704,7 +4705,9 @@ fn router_worker(
     // #105: the router runs by itself when the palette opens, so it never
     // shows the send preview; with the toggle on, a cloud request is refused
     // by the send guard instead and the press simply gets no suggestion.
-    let chain = Chain::new(vec![provider]).without_prompt();
+    // #792: and it stops starting calls (the repair request included) once
+    // the palette has stopped waiting.
+    let chain = router::router_chain(provider, started);
     let raw: &capture::RawShot = raw;
     router::route(&chain, shot.png, candidates, || {
         router_non_vision_inputs(raw)
