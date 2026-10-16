@@ -531,6 +531,10 @@ struct SettingsInner {
     /// The config this window was opened with -- fields not touched by the
     /// UI (e.g. model lists, hotkeys) are carried through from here.
     original: Config,
+    /// What `config.toml` looked like when this window opened (#851). Save
+    /// refuses to write over a file that changed since, so a hand edit made
+    /// through "Open config file" is never lost.
+    config_stamp: Option<ConfigStamp>,
     /// #345: the hotkeys as edited in this window. Starts as the original's
     /// and only reaches the returned config on Save.
     hotkeys: Hotkeys,
@@ -569,6 +573,7 @@ impl SettingsInner {
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             prompt_expanded: false,
             hotkeys: original.hotkeys.clone(),
+            config_stamp: current_config_stamp(),
             learning: None,
             pending_conflict: None,
             original,
@@ -726,6 +731,15 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             if inner.pull_cancel.is_some() {
                 if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
                     set_text(msg, "A pull is running. Stop it first.");
+                }
+                return;
+            }
+            // #851: the file changed while this window was open (a hand edit
+            // from "Open config file", or the tray). Saving the snapshot taken
+            // at open would silently overwrite it.
+            if config_changed_since(inner.config_stamp, current_config_stamp()) {
+                if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                    set_text(msg, CONFIG_CHANGED_MESSAGE);
                 }
                 return;
             }
@@ -3289,6 +3303,34 @@ fn ollama_installed() -> bool {
 fn secondary_label(chord: &crate::hotkey::Chord) -> String {
     format!("Shortcut for any keyboard: {}", chord_to_string(chord))
 }
+
+/// When `config.toml` was last written and how long it was (#851). Enough to
+/// notice an edit without reading the file, which holds keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfigStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+/// The stamp of the config file now; `None` when it is missing or unreadable.
+fn current_config_stamp() -> Option<ConfigStamp> {
+    let meta = std::fs::metadata(Config::path().ok()?).ok()?;
+    Some(ConfigStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    })
+}
+
+/// Whether the file changed since the window opened. Any difference counts,
+/// including the file appearing or disappearing. If the stamp cannot be read
+/// both times, nothing is known to have changed.
+fn config_changed_since(opened: Option<ConfigStamp>, now: Option<ConfigStamp>) -> bool {
+    opened != now
+}
+
+/// Shown on the validation line when Save is refused for that reason.
+const CONFIG_CHANGED_MESSAGE: &str =
+    "config.toml changed while Settings was open. Close Settings and open it again.";
 
 /// Width of the "Open config file" button, in dp (#823).
 const OPEN_CONFIG_W: i32 = 120;
@@ -6360,6 +6402,56 @@ mod tests {
             assert!(texts
                 .iter()
                 .any(|t| t.starts_with("Shortcut for any keyboard")));
+        });
+    }
+
+    /// #851: the decision on whether the file changed under the window.
+    #[test]
+    fn a_changed_config_file_is_noticed() {
+        let t = std::time::UNIX_EPOCH;
+        let a = Some(ConfigStamp {
+            modified: Some(t),
+            len: 10,
+        });
+        let later = Some(ConfigStamp {
+            modified: Some(t + Duration::from_secs(5)),
+            len: 10,
+        });
+        let longer = Some(ConfigStamp {
+            modified: Some(t),
+            len: 11,
+        });
+        assert!(!config_changed_since(a, a));
+        assert!(!config_changed_since(None, None));
+        assert!(config_changed_since(a, later));
+        assert!(config_changed_since(a, longer));
+        assert!(config_changed_since(a, None), "deleted while open");
+        assert!(config_changed_since(None, a), "created while open");
+        assert!(!CONFIG_CHANGED_MESSAGE.contains('\u{2014}'));
+    }
+
+    /// #851 wired-to-nothing: Save in a real window refuses when the stamp
+    /// taken at open no longer matches, keeps the window open and says why.
+    #[test]
+    fn save_is_refused_when_the_config_file_changed_since_open() {
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe { &mut *raw }.config_stamp = Some(ConfigStamp {
+                modified: None,
+                len: u64::MAX,
+            });
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            let inner = unsafe { &*raw };
+            assert!(inner.result.is_none(), "Save must not produce a config");
+            let msg = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("message line");
+            assert_eq!(get_text(msg), CONFIG_CHANGED_MESSAGE);
         });
     }
 
