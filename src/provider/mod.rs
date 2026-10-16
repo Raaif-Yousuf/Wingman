@@ -6,6 +6,7 @@
 pub mod anthropic;
 pub(crate) mod common;
 pub mod gemini;
+pub mod model_list;
 pub mod ollama;
 pub mod ollama_admin;
 pub mod openai;
