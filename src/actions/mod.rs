@@ -20,6 +20,7 @@ pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
 pub mod review_email;
+pub mod scam_check;
 pub mod schema;
 pub mod translate;
 
@@ -266,6 +267,10 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `page_summary`, executor `none`. Finds the link in the selection (else on
 ///   screen), asks the user to confirm the address, then fetches the page and
 ///   summarizes it.
+/// - `"is-this-a-scam"` (#312, `scam_check::builtin_action`): proposal
+///   `scam_check`, executor `none`. A calibrated verdict (likely a scam,
+///   suspicious, no clear signs) with the signs behind it, for the message or
+///   page on screen.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -321,6 +326,7 @@ pub fn builtin_actions() -> Vec<Action> {
         describe_image::builtin_action(),
         explain_screen::builtin_action(),
         link_summary::builtin_action(),
+        scam_check::builtin_action(),
     ]
 }
 
