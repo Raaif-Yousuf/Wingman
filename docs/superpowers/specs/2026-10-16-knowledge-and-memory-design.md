@@ -75,6 +75,29 @@ the awareness context table (#61, a later migration under the same rules).
   (`perf-budgets.json`, 2026-10-16). About 100 KB of headroom. This is the
   constraint that shapes the parser decision below.
 
+- **`windows` features this track needs and master does not enable.**
+  `Cargo.toml` enables `Win32_Foundation`, `Win32_Security*`,
+  `Win32_Security_Cryptography` and `Win32_System_Threading`, but not
+  `Win32_Storage_FileSystem` (`CreateFileW`, `ReadDirectoryChangesW`, the file
+  attribute constants), `Win32_System_IO` (`OVERLAPPED`), `Win32_System_JobObjects`
+  (the parser's limits) or `Win32_System_Power` (the AC power notification).
+  "No new crate" is true; "no new dependency surface" is not, and features cost
+  size. Each slice lists the ones it adds.
+- **There is no application manifest.** `assets/app.rc` holds the icon and
+  nothing else, and `build.rs` embeds only that. So Settings and any list view
+  run classic (v5) common controls today. The Memory window's list view and the
+  Settings dark-mode spec depend on the same missing manifest; see "Memory page".
+- **`InputKind::Text` is declared and gathered by nothing.** The palette run
+  message (`WM_APP_PALETTE_RUN`) carries only the action id, so a typed line
+  never reaches an action. Ask my documents needs both changed, and K1 owns it.
+- `provider/common.rs` has `post_json` style helpers and a source-scanning test
+  that confines `ureq::post(` to it. Whether an embedding request fits those
+  helpers or needs one more generic helper is checked in K3, and any helper is
+  added inside `common.rs` so the guard stays true.
+- The store spec orders its migrations profile (v3), memory (v4), knowledge
+  (v5). This track puts knowledge first. Numbers are assigned at merge; this
+  K1's PR adds a one-line order note to the store spec's slice table.
+
 ## Architecture in one picture
 
 ```
@@ -91,7 +114,7 @@ the awareness context table (#61, a later migration under the same rules).
                                  --- pdf docx: ----------------------------> wingman-parse.exe
                           chunk -> payment-shape masking -> store (document, chunk, FTS)
                           embed (batched, only if an embedder is allowed)
-                          learn facts (only if allowed, see "What leaves the machine")
+                          learn facts (only on an explicit press, see "What leaves the machine")
                                    |
                                    v
                           SQLite store: document, chunk, chunk_fts, chunk_embedding,
@@ -169,6 +192,17 @@ option, not in K2: render pages with `Windows.Data.Pdf` (built into Windows) and
 send them through Windows OCR. Until then the file is marked `skipped` with the
 reason "no text layer", visible on the Knowledge page.
 
+**Packaging check for the second binary (K2).** It runs without package identity
+(no WinRT, no network, no OCR), launched by path from the directory of
+`wingman.exe`, so the sparse package (AGENTS.md rule 4) needs no manifest entry
+for it. THEORY (unverified): that an unregistered executable in the external
+location starts normally from the identity process; K2's packaging test installs
+the package and runs a real PDF through it. `Build-Msix.ps1` signs both files
+with the one certificate, the installer asserts both are present, and the
+missing-file failure row below covers a half install. It also needs the
+`Win32_System_JobObjects` feature in `wingman.exe`, which is part of K2's size
+line.
+
 ## Data model
 
 Versions are assigned at merge (store spec); the roles below are what matter.
@@ -213,6 +247,23 @@ chunk_fts  -- FTS5 external content over chunk.text, tokenize='unicode61 remove_
 `chunk_fts` with external content needs the triggers; the store spec already
 keeps triggers compiled in for this reason.
 
+### Full-text tokenizer and languages
+
+`unicode61` splits on Unicode word boundaries but **does not segment Chinese,
+Japanese or Korean**: a contiguous run of CJK characters is one token, so a
+query for a word inside a sentence finds nothing. The earlier draft said it
+"works for every language"; it works for scripts that separate words with
+spaces. K1 either records the limit in `docs/knowledge.md` or adds a second FTS
+table with the `trigram` tokenizer for chunks detected as CJK (a trigram index
+is roughly three times larger and needs a query of at least three characters,
+so a two-character CJK word still misses). Vectors (K3) cover some of the gap
+only if the embedding model is multilingual, which `nomic-embed-text` is not
+claimed to be. See open question 13.
+
+The stop-word list used to prune a query is English only. For another language
+it prunes nothing, which costs a little ranking quality and never breaks
+syntax, because every term is quoted.
+
 ### Embeddings migration (K3)
 
 ```
@@ -242,6 +293,7 @@ memory_item (id INTEGER PRIMARY KEY,
              last_used_unix INTEGER,
              uses INTEGER NOT NULL DEFAULT 0,
              pinned INTEGER NOT NULL DEFAULT 0,
+             local_only INTEGER NOT NULL DEFAULT 0,  -- never attached to a cloud request
              reviewed_unix INTEGER,         -- NULL = new, shown by "Learned N things: Review"
              UNIQUE (kind, key, dedupe))
 
@@ -271,9 +323,11 @@ wrapper is one small file tested against published vectors. Near-duplicates (not
 equal after normalization) are #94's job and are found in Rust over decrypted
 text.
 
-The profile slice (store slice 3) keeps `profile_field`; when K4 lands it copies
-each row into `memory_item` with `kind = 'profile_field'`, as the store spec
-says, and the profile becomes a view over those items.
+The profile slice (store slice 3) keeps `profile_field`; when K4 lands, its
+migration copies each row into `memory_item` with `kind = 'profile_field'` and
+drops the old table in the same migration, as the store spec says. From then on
+the profile reads and writes `memory_item`; there is no view and no second copy
+that could diverge. See "Slice plan".
 
 ### Changes to the store spec's reserved tables
 
@@ -345,26 +399,39 @@ which the root shows "too many files" and indexes the first 20,000 by path).
    inside a table row. `span` records page and nearest heading. The text embedded
    and indexed is the chunk text; the heading path is added to the text that is
    embedded.
-4. **Mask payment-shaped text.** Card-number and IBAN spans (the shared
-   `payment_denylist` span functions) in a chunk are replaced with `[card number]`
-   and `[IBAN]` before the chunk is stored. A contract with an IBAN is still
+4. **Mask payment and national-id shaped text.** Card-number and IBAN spans (the
+   shared `payment_denylist` span functions) and national-id spans (the new
+   `payment_denylist` function K4 describes, label-gated except for the SSN
+   shape `ddd-dd-dddd`) in a chunk are replaced with `[card number]`, `[IBAN]` and
+   `[national id]` before the chunk is stored. A contract with an IBAN is still
    searchable; the database never holds one. This is the "no payment data" rule
-   applied to knowledge, not only to memory.
+   applied to knowledge, not only to memory. The national-id function ships in K1
+   (it is a pure string scan), not K4, so a chunk is never stored with an SSN
+   that a cloud snippet could later carry; K4 reuses it for memory writes.
 5. **Diff and store.** In one transaction: chunks whose `text_hash` already exists
    for this document keep their row (and their embeddings); new ones are
    inserted; gone ones are deleted; `document` is updated. FTS rows follow by
    trigger. Search works from this point, before any embedding exists.
-6. **Embed** (K3), **learn** (K5): queued behind the cheap steps, each only if
-   allowed (next section).
+6. **Embed** (K3) is queued behind the cheap steps and runs only if allowed (next
+   section). **Learn** (K5) is not part of the pipeline: it runs only on an
+   explicit press (open question 7).
 
 Throttling: one worker thread, one file at a time, created when the queue gets
 its first entry and ended when it drains (nothing resident). It calls
 `SetThreadPriority(THREAD_MODE_BACKGROUND_BEGIN)` (lowers I/O and memory
 priority too). Writes are one transaction per file and release the store mutex
 between files, so a user's request is never stuck behind an import (store spec,
-threading). Embedding goes in batches of 16 chunks; on battery with Battery
-Saver on, step 6 is deferred until AC power or an explicit "Index now" (cheap
-steps 1 to 5 still run). While Wingman is Paused, nothing in this pipeline makes
+threading). Embedding goes in batches of 16 chunks, and the local model work per
+batch is capped (2,000 chunks, see "Size and performance budgets"), so a folder
+of 200 notes cannot hold the iGPU. On battery, step 6 is deferred until AC power
+or an explicit "Index now" (cheap steps 1 to 5 still run). **How the app learns
+AC power returned without polling:** it registers once for the power-source
+notification (`RegisterPowerSettingNotification` with the AC/DC power source
+GUID, delivered as `WM_POWERBROADCAST` to the main window, which needs the
+`Win32_System_Power` feature), and the handler wakes the ingest worker if the
+queue is non-empty. No timer. If the registration fails, the deferred steps run
+only on "Index now", and the status line says so; the safe outcome is never
+"run on battery". While Wingman is Paused, nothing in this pipeline makes
 a request of any kind, including loopback ones; the queue stays marked `pending`
 and resumes when Pause ends.
 
@@ -429,9 +496,10 @@ embedder cannot bypass the guard is a property of where it lives, not of care.
   the Knowledge page says "2,310 of 2,400 chunks indexed for nomic-embed-text".
   When the re-embed finishes, an explicit "Remove vectors from the old model"
   button deletes the old rows; nothing deletes them automatically.
-- **Cost guard (cloud).** Before the first cloud embedding run the user sees the
-  chunk count and an estimate from the price table `usage.rs` already owns; usage
-  and egress record it like any request.
+- **Cost guard (cloud).** Before the first cloud embedding run for a folder the
+  user sees the chunk count, an estimate from the price table `usage.rs` already
+  owns and the first few file names, and confirms for that folder; usage and
+  egress record it like any request.
 
 ## Vector search and hybrid retrieval
 
@@ -460,11 +528,13 @@ Retrieval for one request:
 5. Merge adjacent chunks of one document into one snippet, then take the highest
    snippets until the **token budget** (default 2,000, setting) is full, at most
    8 snippets.
-6. Memory items are retrieved separately (they are few and encrypted): load
-   non-`correction` items, decrypt in memory, score by term overlap in Rust, take
-   up to 300 tokens; corrections for the running action id are always included.
-   Plaintext is held only for the request and zeroized (the same discipline as
-   `secrets.rs`).
+6. Memory items are retrieved separately (they are few and encrypted), and only
+   when the chip is on: load non-`correction` items that are **reviewed**
+   (`reviewed_unix` not NULL), decrypt in memory, score by term overlap in Rust,
+   take up to 300 tokens; reviewed corrections for the running action id are
+   included. For a cloud provider, items with `local_only` and `contact`
+   corrections are skipped (see "Memory and outbound PII"). Plaintext is held
+   only for the request and zeroized (the same discipline as `secrets.rs`).
 
 Snippets are numbered `[1]..[n]`. The prompt marks them as untrusted data (the
 same convention as page text and linked pages): a document may contain
@@ -503,41 +573,57 @@ defaults follow from it.
 | event | trigger | what is sent, to where | default |
 |---|---|---|---|
 | index a file (hash, parse, chunk, full-text) | file event | nothing | on |
-| embed chunks, local | file event, AC power | chunk text to `127.0.0.1:11434` | on if a local model is present |
-| embed chunks, cloud | only after the user chose a cloud embedder and pressed Index | redacted chunk text to that provider | **off** |
-| learn facts, local | file event, AC power, a local chat model is ready | document text to `127.0.0.1:11434` | on (K5) |
-| learn facts, cloud | only by an explicit "Learn from this file" press, or an explicit setting | redacted document text to the active provider | **off** |
+| embed chunks, local | file event, on AC power or "Index now" | chunk text to `127.0.0.1:11434` | on if a local model is present, capped per batch (see "Throttling") |
+| embed chunks, cloud | only after the user chose a cloud embedder for **that folder** and pressed Index, after the preview | redacted chunk text to that provider | **off** |
+| learn facts, local | an explicit "Learn from this file" or "Learn from this folder" press | document text to `127.0.0.1:11434` | **button only** (open question 7) |
+| learn facts, cloud | an explicit press, per file, after the preview | redacted document text to the active provider | **off** |
 | embed the query | a key press whose action uses knowledge | the question text to the embedder | follows the embedder choice |
-| attach snippets and memory | a key press, action lists `knowledge`, chip on | snippets and items inside the request | per action (chip) |
+| attach snippets and memory | a key press, the request lists store content, chip on | snippets and items inside the request | per action (chip) |
 
 Rules that follow:
 
 - Mode Auto never picks a cloud embedder or cloud extraction for background work.
-  Cloud use for indexing is a separate, explicit, per-provider consent shown in
-  Settings, with the sentence "The text of files in your Knowledge folder will be
-  sent to <provider> to index it." Dropping a file is the user's consent to index
-  and to learn locally; it is not consent to send the file to a vendor.
+  Cloud use for indexing is a separate, explicit, **per-provider and per-folder**
+  consent shown in Settings, with the sentence "The text of files in this folder
+  will be sent to <provider> to index it." Before the first run the user sees a
+  preview: the number of chunks, an estimate from the price table `usage.rs`
+  already owns, and the first few file names. Dropping a file is the user's
+  consent to index locally; it is not consent to send the file to a vendor and
+  not consent to run a model over it.
 - **Redaction before anything is embedded or sent to a cloud provider.**
   Embedding input and extraction input go through `Redactions` (emails, card
-  numbers, IBANs, key-like tokens), and the extraction response is restored with
-  `restore_in_json`, so facts hold real values while the vendor saw markers. The
-  masked-at-ingest payment spans already never reach it. Cost accepted: a query
-  for an email address ranks worse in the cloud embedder than the local one.
+  numbers, IBANs, key-like tokens), **extended with the national-id check** (see
+  "The payment-data denylist at the boundary"), and the extraction response is
+  restored with `restore_in_json`, so facts hold real values while the vendor saw
+  markers. The masked-at-ingest payment and national-id spans never reach it.
+  Cost accepted: a query for an email address ranks worse in the cloud embedder
+  than the local one. Outbound snippets are redacted again on the way out, since
+  a chunk stored before a rule existed could still hold a shape the rule now
+  catches.
 - **Egress log.** Every embedding batch, extraction call and snippet attachment is
   one `egress` row like any request: provider, model, bytes, outcome, cost. New
-  `AttachmentKind` values: `knowledge` (count and bytes) and `embed` (chunk count
-  and bytes). `snippets` carries one short label per item sent, following store
-  decision 5: `resume.pdf#chunk 12:ab12cd34` (file name, chunk id, first 8 hex
-  characters of the chunk hash), and `memory#41:ef56ab78` for a fact. Never the
-  text. The diagnostics bundle and the Egress page show the labels.
+  `AttachmentKind` values: `knowledge` (count and bytes), `memory` (count) and
+  `embed` (chunk count and bytes). `snippets` carries one short label per item
+  sent, following store decision 5: `resume.pdf#chunk 12:ab12cd34` (file name,
+  chunk id, first 8 hex characters of the chunk hash), and `memory#41:ef56ab78`
+  for a fact. Never the text. **File names can themselves be sensitive**
+  ("divorce-settlement.pdf"). The local Egress page shows them, because the user
+  needs to see what was attached, and `PRIVACY.md` says so. The diagnostics bundle
+  (which a user may share) carries `doc#<id>#chunk 12:ab12cd34` instead, with no
+  file name.
 - **Chip off means nothing.** A test fails the build if a request-building path
-  reads the store's knowledge or memory when the chip is off (a source-scanning
-  test with a non-empty candidate set, plus a behavioural test with a fake
-  provider that records the request body).
+  reads the store's knowledge **or memory** when the chip is off or the action
+  lists neither input (a source-scanning test with a non-empty candidate set,
+  plus a behavioural test with a fake provider that records the request body).
+  There is no memory path that bypasses the chip: Reply and Rewrite attach style
+  and corrections only through the same chip (see "Use in actions").
 - **Pause and Offline.** Pause stops the pipeline (above). Offline filters
   embedders to loopback and disables cloud extraction outright.
 - A document cannot make Wingman send more than the user chose: snippets only
   ever go in the one request the user started, and the retrieval output is data.
+- **Memory is data, never instructions.** Everything retrieved from the store is
+  placed in a marked, untrusted block in the prompt. See "Memory and prompt
+  injection".
 
 ## Memory model
 
@@ -567,7 +653,8 @@ adds what the plan names:
 
 - card numbers (Luhn) and IBANs, the CVV label, and bank-account labels, from
   `payment_denylist` unchanged;
-- **national ids**, a new function in `payment_denylist.rs`: a US social security
+- **national ids**, a new function in `payment_denylist.rs` (added in K1 for
+  chunk masking, reused here): a US social security
   shape (`ddd-dd-dddd`, or nine digits next to the words "ssn" or "social
   security"), a UK National Insurance shape, and any six or more digit run
   following "national id", "passport number" or "tax id". Label-gated where a bare
@@ -590,14 +677,64 @@ worker), the write is refused and the item is reported, never stored unchecked.
 
 | source | authorization | detail |
 |---|---|---|
-| a document in a Knowledge root | dropping it is consent to learn **locally** (see above) | facts land with `reviewed_unix NULL`; the review card lets the user edit or delete |
-| **Remember this** on a result card, or a palette line "remember that ..." | explicit | text is what the user sees and edits before saving |
+| a document in a Knowledge root | an explicit "Learn from this file" press (open question 7) | extraction can only produce `fact` items, which land with `reviewed_unix NULL`; the review card lets the user edit or delete |
+| **Remember this** on a result card, or a palette line "remember that ..." | explicit | text is what the user sees and edits before saving; may be `fact` or `preference` |
 | `remember[]` in a proposal response | click | rendered as chips; nothing stored until clicked; each passes the denylist |
-| a proposal edited before Do it | automatic, per action | stored as a `correction`: field, before, after. The next run of that action includes it and the card says so |
+| a proposal edited before Do it | automatic, per action | stored as a `correction`: field, field kind, before, after. The next run of that action includes it (behind the chip) and the card says so |
 | writing samples | explicit "Learn my style" button | a `style` item (K7) |
 
-A correction is stored only for fields the schema marks editable and never for a
-value the denylist refuses; it is capped at the 10 newest per action.
+**Only user-authored sources may create `preference` and `style` items.** Those
+kinds steer how every later request is written, so a document must never be
+able to plant one. Extraction output with any kind other than `fact` is dropped
+and counted. A correction is stored only for fields the schema marks editable
+and never for a value the denylist refuses; it is capped at the 10 newest per
+action.
+
+### Memory and prompt injection
+
+Memory is a persistent channel into every later request, so a poisoned source
+must not be able to use it silently.
+
+- **Unreviewed items are not attached.** An item with `reviewed_unix NULL`
+  (everything extraction just produced) is excluded from retrieval until the
+  user has opened the review or marked it reviewed. The Memory window and the
+  review card list them with their source, so a planted fact is visible before
+  it can act.
+- **Extracted facts are marked untrusted in the prompt**, in the same block as
+  snippets ("Facts from your documents (untrusted)"), and the model is told they
+  are data. Facts the user typed or confirmed go in a separate "Things you told
+  Wingman" block, still data, never instructions.
+- **Deleting the source file does not delete a fact**, by design (the Keep
+  choice), so a fact planted by a document survives it. That is why review
+  comes first, and why the item keeps its label ("resume.pdf, removed") and a
+  "Forget everything from this source" action.
+- A fact that contains something shaped like an instruction ("ignore previous",
+  "always reply with", a URL to send data to) is stored but flagged
+  `reviewed_unix NULL` until a person looks, even if the review was otherwise
+  done in bulk. The check is a short deny-list of phrases, tested; it is a
+  tripwire, not the defence, which is the structure above.
+- A test plants an injected fact through a fixture document and asserts the
+  request body carries it only after review, and only inside the marked block.
+
+### Memory and outbound PII
+
+Corrections store arbitrary before and after values: names, addresses, phone
+numbers. The payment denylist does not cover them and `Redactions` covers only
+emails, cards, IBANs and key-like tokens, so they would reach a cloud model.
+Rules:
+
+- Memory is attached only through the chip, for every action (see "Use in
+  actions"). No action reads it implicitly.
+- A `correction` carries a `field_kind` (`tone`, `salutation`, `signoff`,
+  `wording`, or `contact` for names, addresses, phone numbers, emails and
+  anything else personal). `contact` corrections are attached to **local**
+  providers only; a cloud request leaves them out and says "2 personal
+  corrections kept on this machine" on the preview.
+- Facts and preferences carry the same rule: an item the `Redactions` or
+  national-id check would change is attached to a cloud request only in its
+  redacted form, and a user can mark an item `local only`.
+- Open question 15 asks whether a cloud request may ever carry a `contact`
+  item.
 
 ### Fact extraction (#87)
 
@@ -642,9 +779,13 @@ undecided. This design does not depend on it:
   (`LVS_OWNERDATA`, so ten thousand rows cost nothing), a detail pane with edit,
   Delete, Pin, "Forget everything from this source", Export, Import. The native
   list view comes with keyboard navigation, accessibility and high contrast for
-  free, which the custom-painted card does not. It needs common controls v6 in
-  the manifest; K4 checks that the manifest already requests it and adds it if
-  not.
+  free, which the custom-painted card does not. Theming it (dark mode, owner
+  draw) needs common controls v6, and **master has no application manifest**
+  (`assets/app.rc` is the icon only), so a list view there is a classic v5 one.
+  K4 does not assume v6: it follows the manifest decision in the Settings
+  dark-mode spec (its Slice 0 and 0b), and if that slice is not merged, the
+  window ships as a v5 list view that follows the system colours (correct in
+  high contrast, light in dark mode) rather than a half-themed one.
 - If #44 lands, only the view layer is replaced; the model and the store calls
   stay. If #44 is rejected, nothing is lost. Dependency on #44: none.
 - Export is JSON (the lossless format: kind, key, text, structured, sources with
@@ -664,23 +805,34 @@ Exact duplicates already merge on insert via `dedupe`.
 
 ## Use in actions
 
-- **Input kind.** `knowledge` joins `InputKind`. `generic_inputs::plan` gathers it:
-  retrieval, redaction, numbering, labelled "Knowledge from your documents
-  (untrusted)". An action that does not list `knowledge` never retrieves.
-- **Knowledge chip (#89).** The palette shows `Knowledge: 3 snippets from
-  resume.pdf, notes.md` for the line it is about to run, as a toggle like any
-  chip. Default is on for an action whose `inputs` lists `knowledge` (choosing
-  that action is the consent, and the preview lists what goes), and the chip is
-  absent when the store holds no knowledge or memory. The existing "Knowledge
-  snippets" count in the "show me what you're sending" preview stops being 0 and
-  lists the labels. Off means nothing is read.
+- **Input kinds.** `knowledge` and `memory` join `InputKind`. `generic_inputs::plan`
+  gathers them: retrieval, redaction, numbering, labelled "Knowledge from your
+  documents (untrusted)" and "Memory (untrusted)". **An action that lists neither
+  never reads the store**, and the chip is the single gate for both. The built-in
+  Reply and Rewrite actions list `memory`, so their style and corrections go
+  through it too.
+- **Typed text.** Ask my documents uses `inputs = ["text", "knowledge"]`, and
+  nothing gathers `InputKind::Text` today. K1 adds it: the palette passes its line
+  with the action id (the run message carries a small owned struct instead of just
+  the id) and `generic_inputs::plan` gathers it. Tests cover the line reaching
+  the action and an empty line being refused with a card.
+- **Knowledge and memory chip (#89).** The palette shows `Knowledge: 3 snippets
+  from resume.pdf, notes.md` and `Memory: 2 items` for the line it is about to
+  run, as one toggle like any chip. Default is on for an action whose `inputs`
+  lists `knowledge` or `memory` (choosing that action is the consent, and the
+  preview lists what goes), and the chip is absent when the store holds nothing.
+  The existing "Knowledge snippets" count in the "show me what you're sending"
+  preview stops being 0 and lists the labels. Off means nothing is read.
+  Unreviewed memory is never counted (see "Memory and prompt injection"), and
+  `contact` items are left out of a cloud request and the preview says so.
 - **Fill this form (#90).** Its candidate values gain a second source: memory items
   retrieved for the form's field labels (the compact top 60, not everything). The
   preview model gets an optional per-field `source` ("Profile", "resume.pdf, page
   2"); the preview's "Source" column shows it. Values from the model still pass
   the payment denylist before the fill executor (unchanged).
 - **Reply and Rewrite.** Include the `style` item and the action's `correction`
-  items; the card line says why a choice was made ("using your usual sign-off").
+  items, behind the chip; the card line says why a choice was made ("using your
+  usual sign-off").
 - **Cover letter (#91).** `actions.toml`, `inputs = ["screen", "knowledge"]`,
   output text with insert at cursor through the existing `replace_text` executor,
   whose confirm preview shows the text first. A prompt requirement: cite only
@@ -691,9 +843,12 @@ Exact duplicates already merge on insert via `dedupe`.
   Propose, Confirm, Do: the preview shows the target path; the write creates a
   new file named `YYYY-MM-DD HHmm Title.md` inside a root with `note_target = 1`,
   opened with `CREATE_NEW` so it can never overwrite, after canonicalizing and
-  refusing any path that escapes the root (`..`, a junction, a symlink). The
-  watcher then sees the write: an in-memory own-write ledger (path and hash)
-  suppresses a duplicate ingest and the file indexes through the normal path.
+  refusing any path that escapes the root (`..`, a junction, a symlink). **There is
+  no own-write ledger.** The executor does not ingest; the watcher is the only
+  ingest path, so there is one writer to the index and no race between a ledger
+  entry and the debounce. When the watcher sees the new file it indexes it through
+  the normal path, and the content-hash check makes any second event for it a
+  no-op. A test creates a note and asserts exactly one `document` row.
 
 ## UI surfaces summary
 
@@ -704,6 +859,7 @@ Exact duplicates already merge on insert via `dedupe`.
 | Knowledge status list (file, status, reason): shows `failed` and `skipped` with plain reasons | same window or the Memory window's second tab | K1 |
 | Card: Ask my documents answer with citations | card | K1 |
 | Memory window | own Win32 window | K4 |
+| "Learn from this file" and "Learn from this folder" buttons, with the call count shown first | Knowledge status list, Memory window | K5 |
 | Review notice and card | notice channel, card | K5 |
 | Knowledge chip | palette | K6 |
 | Remember this button, `remember[]` chips | result card | K7 |
@@ -713,6 +869,13 @@ first time the user chooses "Open folder" in the tray (or turns Knowledge on in
 Settings), not at install. A user who never does so has no folder in Documents
 and no watcher thread. (#81 says "created on first run"; see open question 1.)
 
+Accessibility: the tray status line is plain text in the tooltip and menu, the
+status list and the Memory window use native controls (keyboard navigation,
+screen reader names, high contrast), every card this track shows follows the
+card accessibility rules (a system alert event when it appears), and no state is
+conveyed by colour alone (a failed file says "failed" in words). The Memory
+window gets a Narrator and high contrast pass as a named manual check in K4.
+
 Manual-checked Win32 pieces name their observable in each slice, as the store
 spec does.
 
@@ -721,9 +884,33 @@ spec does.
 All figures are targets to be measured by their slice, not measurements; where a
 number came from arithmetic it is marked.
 
+**The exe gate is shared.** `perf-budgets.json` records `exe_size_bytes` measured
+3,800,576 against a gate of 3,900,000, about 99 KB of headroom, and the options
+card, Settings dark mode and overlay specs draw on the same 99 KB. This track
+cannot fit in it. Per-slice estimates for `wingman.exe` (code and any new
+`windows` features, no new crate), each THEORY (unverified) until a CI measurement
+replaces it:
+
+| slice | `wingman.exe` growth | what it is |
+|---|---|---|
+| K1 | about 70 to 90 KB | store tables and queries, watcher, chunker, five in-process parsers, retrieval, the `Text` input and palette change, tray and Settings entries, the status list, the action; plus the `Win32_Storage_FileSystem` and `Win32_System_IO` features |
+| K2 | about 5 KB | parser dispatch, Job object limits (`Win32_System_JobObjects`); the parsers themselves are in `wingman-parse.exe` |
+| K3 | about 15 KB | `Embedder`, `VectorIndex`, fusion, the AC power notification (`Win32_System_Power`) |
+| K4 | about 40 KB | memory store, CNG hashing, the denylist additions, the Memory window and its model |
+| K5 | about 10 KB | extraction, quote verification, the review card |
+| K6 | about 8 KB | chip, labels, the Fill source column |
+| K7 | about 12 KB | Remember this, corrections, style, hygiene |
+| K8 | about 8 KB | vault handling, Save as note |
+
+That is roughly 170 to 190 KB in all. **K1 alone may use most of the headroom, and
+the track needs a gate raise.** The earlier draft's "K1 adds at most 60 KB" was
+optimistic for the list above. The plan: each PR records the CI-measured size and
+raises `exe_size_bytes.max` in the same PR with the measured number and the
+reason, as the QR decoder, the live model lists and the store did; the order the
+four specs merge in decides who raises it first.
+
 | budget | target | slice that measures it |
 |---|---|---|
-| `wingman.exe` | K1 adds at most 60 KB (code only, no crates); K2 adds nothing (the parsers are in `wingman-parse.exe`); K3 and later add code only. Every PR records the size; the gate in `perf-budgets.json` moves only by the measured amount, as it did for QR and the store | each slice |
 | `wingman-parse.exe` | measured and recorded in K2; not gated by the tray's budget, but listed in the release notes | K2 |
 | idle RSS with watcher running and the store open | within 0.5 MB of the same build with Knowledge off (the CI harness already reports idle RSS) | K1 |
 | idle CPU and power | 0% CPU over a 10-minute idle capture with the watcher on; no change in idle watts at the project's existing resolution | K1, manual |
@@ -734,6 +921,7 @@ number came from arithmetic it is marked.
 | disk | about 1.3 times the extracted text for chunks plus full-text; plus 3 KB per chunk for f32 vectors (arithmetic: 768 times 4 bytes), about 30 MB at 10,000 chunks | K1, K3 |
 | background priority | ingest thread in background mode; `wingman-parse` below normal | K1, K2 |
 | caps | 25 MB per file, 2 MB extracted text per file, 20,000 files per root, 8 roots | K1 |
+| local model work per batch | at most 2,000 chunks embedded, and at most 5 files extracted, per AC session or per "Index now"; the rest stays queued | K3, K5 |
 
 ## Failures: every one ends in a card
 
@@ -748,6 +936,10 @@ number came from arithmetic it is marked.
 | Ask my documents finds nothing supported | a card saying so, with the closest sources |
 | memory write refused by the denylist | a card naming the kind of match, not the value |
 | a request fails after attaching snippets | the normal provider failure card; the egress row records the attempt |
+| the AC power notification cannot be registered | deferred embedding runs only on "Index now"; one notice says so; nothing runs on battery |
+| extraction or memory yields an item that looks like an instruction | stored, held as unreviewed and flagged on the review card; never attached before a person reviews it |
+| a cloud request would carry `contact` or `local_only` items | they are left out; the preview says how many; never a silent drop |
+| the national-id check cannot run on a chunk | the chunk is not stored (fail closed) and the file is `failed` with a plain reason |
 
 "Notice" means the store's pending-notice channel: it rides the next result card
 and shows in the tray tooltip. Background work never opens a dialog box (rule 7).
@@ -795,6 +987,20 @@ observable (rule 8). Tests never use production names (rule 9): temp roots and
   tests from the store spec; the memory migration test round-trips a profile row.
 - **Export and import:** round trip equality for every item including sources
   and pins.
+- **Injection and PII:** a fixture document that tries to plant a `preference`
+  yields no `preference` item (extraction may only write `fact`); an unreviewed
+  fact is absent from the request body and present after review, inside the
+  marked block; a `contact` correction never appears in a cloud request body but
+  does in a local one; a chunk with an SSN shape is stored masked and an outbound
+  snippet is redacted again.
+- **Power and caps:** a fake power-notification source wakes the worker with no
+  timer in the code path (source-scanning, non-empty candidate set); a queue of
+  3,000 chunks embeds 2,000 and stays queued; a folder of 20 notes triggers no
+  extraction without a press.
+- **Typed text:** the palette line reaches Ask my documents; an empty line is
+  refused with a card.
+- **Tokenizer:** a Latin fixture finds a word; a CJK fixture documents the limit
+  (or passes, if the trigram table is adopted).
 - **Manual checks (named per slice):** the watcher with a real editor save (the
   atomic-rename save pattern), a OneDrive on-demand file, idle watts and RSS with
   the watcher on, a real PDF resume, the real Ollama embed call with
@@ -811,14 +1017,14 @@ behavior.
 
 | # | slice | issues | useful alone because | caller | observable |
 |---|---|---|---|---|---|
-| K1 | Knowledge root, watcher, reconciliation, md/txt/html/csv/json parsers, chunker, `document`/`chunk`/`chunk_fts`, full-text retrieval, Ask my documents, tray and Settings entries, `docs/knowledge.md` and PRIVACY.md section. No new crate, no network at all | #81, parts of #82, #83, #85, #92, #97 | the user can ask a question of their notes offline, with citations, today | the watcher thread; `generic_inputs::plan` for `knowledge`; the Ask my documents action | Drop `notes.md` into the folder; within 2 s the tray status shows 1 file; ask a question from the file and the card cites `notes.md`; delete the file and `chunk` has no rows for it; idle CPU is 0% |
-| K2 | `wingman-parse` second binary: pdf and docx, Job limits, packaging and CI smoke test; image OCR in process | #82 | resumes and contracts are searchable | the ingest worker's parser dispatch | A two-page PDF resume and a .docx both answer a question; a corrupt PDF becomes a `failed` row and the tray stays up |
-| K3 | `Embedder`, local Ollama first, model pull offer, `chunk_embedding`, `VectorIndex`, RRF, the measurement, cloud embedders behind the explicit setting | #84, #85 | "employer" finds "company"; Offline still works | the ingest worker's embed step; retrieval | With Offline on a packet capture shows only loopback during ingest; the phrase from the resume ranks first; a model switch leaves search working and the page shows the re-embed count |
-| K4 | Memory migration, `store/memory.rs`, denylist at the boundary, national-id check, profile folded in, Memory window (list, search, edit, delete, pin, forget by source), export and import | #86, #88 | the user can see and fix what Wingman knows | the Memory window; Profile read path | A 16-digit number typed in is refused with a card; delete a fact and a retrieval no longer returns it; export then import round-trips |
-| K5 | Fact extraction, quote verification, review notice and card | #87 | a resume becomes facts without typing | the ingest worker's learn step | Drop a resume; the notice names N facts each with a source span; deleting one removes it from retrieval |
-| K6 | `knowledge` chip, egress labels, Fill this form and cover letter use retrieval, preview source column | #89, #90, #91 | the original job-application use | `generic_inputs::plan`, the fill path, the palette | Fill a job application; the Source column names resume.pdf; the egress log names the snippets; chip off sends none |
+| K1 | Knowledge root, watcher, reconciliation, md/txt/html/csv/json parsers, chunker with payment and national-id masking (the national-id scan is a pure function added to `payment_denylist.rs` here), `document`/`chunk`/`chunk_fts`, full-text retrieval, **the `Text` input and the palette passing its line to an action**, Ask my documents, tray and Settings entries, `docs/knowledge.md` and PRIVACY.md section. No new crate, no network at all. Adds the `Win32_Storage_FileSystem` and `Win32_System_IO` features. Records the exe size and raises the gate if it must | #81, parts of #82, #83, #85, #92, #97 | the user can ask a question of their notes offline, with citations, today | the watcher thread; `generic_inputs::plan` for `knowledge` and `text`; the Ask my documents action | Drop `notes.md` into the folder; within 2 s the tray status shows 1 file; type a question in the palette, run Ask my documents, and the card cites `notes.md`; delete the file and `chunk` has no rows for it; idle CPU is 0% |
+| K2 | `wingman-parse` second binary: pdf and docx, Job limits (`Win32_System_JobObjects`), packaging, signing and the install check, CI smoke test; image OCR in process | #82 | resumes and contracts are searchable | the ingest worker's parser dispatch | A two-page PDF resume and a .docx both answer a question; a corrupt PDF becomes a `failed` row and the tray stays up; the installed package contains both signed files |
+| K3 | `Embedder`, local Ollama first, model pull offer, `chunk_embedding`, `VectorIndex`, RRF, the measurement, the AC power notification (`Win32_System_Power`), per-batch caps, cloud embedders behind the per-folder setting and the preview, a generic JSON post helper in `common.rs` if the check needs one | #84, #85 | "employer" finds "company"; Offline still works | the ingest worker's embed step; retrieval | With Offline on a packet capture shows only loopback during ingest; the phrase from the resume ranks first; a model switch leaves search working and the page shows the re-embed count; unplugging and replugging changes when the deferred batch runs, with no timer |
+| K4 | Memory migration, `store/memory.rs`, denylist at the boundary (reusing K1's national-id scan; also applied to outbound snippet redaction), profile folded in (see below), Memory window (list, search, edit, delete, pin, forget by source), export and import; depends on the manifest decision for the list view | #86, #88 | the user can see and fix what Wingman knows | the Memory window; Profile read path | A 16-digit number typed in is refused with a card; delete a fact and a retrieval no longer returns it; export then import round-trips |
+| K5 | Fact extraction behind an explicit button, quote verification, `fact`-only output, unreviewed items not attached, review notice and card | #87 | a resume becomes facts without typing | the Learn button, the ingest worker's learn step | Press Learn on a resume; the notice names N facts each with a source span; none is attached to a request until reviewed; deleting one removes it from retrieval |
+| K6 | Knowledge and memory chip, egress labels, Fill this form and cover letter use retrieval, preview source column | #89, #90, #91 | the original job-application use | `generic_inputs::plan`, the fill path, the palette | Fill a job application; the Source column names resume.pdf; the egress log names the snippets; chip off sends none |
 | K7 | Remember this, `remember[]` chips, corrections, style, hygiene | #93, #94, #95 | Wingman stops repeating itself | result card, confirm step | Edit a salutation once; the next draft uses it and says why |
-| K8 | Vault root, wikilink handling, Save as note executor with the own-write ledger | #96 | notes written back where the user already keeps them | the executor registry | A vault is indexed; Save as note creates a file Obsidian shows at once and the watcher does not index it twice |
+| K8 | Vault root, wikilink handling, Save as note executor (no ledger) | #96 | notes written back where the user already keeps them | the executor registry | A vault is indexed; Save as note creates a file Obsidian shows at once and exactly one `document` row appears |
 
 K1 is the smallest useful slice: it has no dependency on the embedding work, the
 memory model, the parser binary or the Memory window, adds no crate, and makes no
@@ -827,6 +1033,20 @@ reordered after it. K4 needs the store's profile slice. K6 needs the generic
 `knowledge` input from K1 and K4's memory for facts (it works on chunks alone
 before K4).
 
+**Migration order and the store spec.** The store spec's slice table lists
+profile (v3), memory (v4), knowledge (v5). This track lands K1's knowledge tables
+before K4's memory table, so the roles of rows 4 and 5 may swap. Version numbers
+are assigned at merge (store spec). When this spec is accepted, K1's PR adds a
+one-line order note under the store spec's slice table, so the two documents do
+not disagree (not done here, to keep this change to one file).
+
+**The profile in K4.** The store spec's own rule applies: the K4 migration copies
+each `profile_field` row into `memory_item` with `kind = 'profile_field'` and
+**drops the old table in the same migration**, and `Profile::load` and `save`
+read and write `memory_item` from then on. There is no period in which two
+tables hold the profile and no "view" over them; `profile.bin` and the
+`profile_field` table are not written after the copy, so they cannot diverge.
+
 ## Open questions, with a recommended answer each
 
 1. **Create the folder at first run, or on first use?** #81 says first run.
@@ -834,45 +1054,76 @@ before K4).
    folder in Documents and a watcher thread for users who never use the feature is
    a cost with no benefit.
 2. **Cloud embedding and extraction: allowed at all?** Recommended: yes, behind an
-   explicit per-provider setting with the consent sentence, never chosen by Mode
-   Auto, never in Offline, always redacted. It is the only way to index with good
-   quality on a machine with no local model.
+   explicit per-provider **and per-folder** setting with the consent sentence and
+   a preview of chunk count, estimated cost and the first file names, never chosen
+   by Mode Auto, never in Offline, always redacted. It is the only way to index
+   with good quality on a machine with no local model.
 3. **Parsers in a second binary or in the tray?** Recommended: second binary
-   (crash isolation under `panic = "abort"` and the 100 KB size headroom). The
-   cost is packaging and signing one more file; K2 handles it.
+   (crash isolation under `panic = "abort"` and the 99 KB size headroom). The
+   cost is packaging and signing one more file and an install check; K2 handles
+   it.
 4. **sqlite-vec or Rust brute force?** Recommended: Rust brute force behind
    `VectorIndex`; revisit only on K3's measurement, then int8, then `hnsw_rs`,
    then `sqlite-vec` once it has a stable release.
 5. **DPAPI on chunks?** The store spec decided no (full-text search needs
    plaintext and the source file is plaintext anyway). Recommended: keep that, and
    say it in PRIVACY.md and docs/knowledge.md in plain words, including that
-   facts are encrypted and chunks are not.
+   facts are encrypted and the same text in chunks is not, and that file names
+   appear in the local egress log.
 6. **Is dropping a file consent to extract with a cloud model?** Plan section 18
-   says dropping is consent. Recommended: it is consent to index and learn
-   locally only. Cloud extraction is explicit (question 2). Otherwise Wingman
-   would send a resume to a vendor on a file event, which contradicts the
-   no-background-requests promise.
-7. **Automatic local extraction or button only?** Recommended: automatic when a
-   ready local chat model exists and the machine is on AC power, button otherwise.
-   A minutes-long local generation on battery is a power cost the user did not
-   ask for.
-8. **Knowledge chip default.** Recommended: on only for actions whose `inputs`
-   list `knowledge`, absent when the store is empty, off for every other action.
+   says dropping is consent. Recommended: it is consent to index locally only.
+   Cloud extraction is explicit (question 2). Otherwise Wingman would send a
+   resume to a vendor on a file event, which contradicts the no-background-requests
+   promise.
+7. **Automatic local extraction or button only?** Revised recommendation: **button
+   only by default**, with a count and an estimate of local calls shown before it
+   runs ("Learn from 6 files, about 14 model calls"). Earlier draft: automatic on
+   AC power with a ready local chat model. Counter-argument for automatic: a
+   user who drops a resume expects facts without another click, and AC power
+   removes the battery cost. Against: dropping a folder of 200 notes would queue up
+   to 6 local calls per file on the iGPU in the background, and AGENTS.md treats
+   idle drain as a bug measured to the tenth of a watt. Middle option if the
+   button feels like friction: automatic only for a designated `Profile`
+   subfolder, with the per-batch cap (5 files) in "Size and performance budgets".
+8. **Knowledge chip default.** Recommended: one chip for knowledge and memory,
+   on for actions whose `inputs` list `knowledge` or `memory`, absent when the
+   store is empty, off for every other action, which never read the store.
 9. **Scanned PDFs.** Recommended: out of K2; mark `skipped: no text layer`. A later
    slice renders with `Windows.Data.Pdf` and OCRs, with no new crate.
 10. **Memory page: Win32 first or wait for WebView2 (#44)?** Recommended: Win32
-    list view first, on a pure model that the WebView2 page can reuse.
+    list view first, on a pure model that the WebView2 page can reuse. The list
+    view's theming depends on the common-controls manifest question in the
+    Settings dark-mode spec (no manifest exists today), so K4 either adopts that
+    manifest or draws the list itself.
 11. **File hashing: CNG or `sha2`?** Recommended: CNG through the `windows` crate
     already in use (zero added size); `sha2` (MIT OR Apache-2.0) if the wrapper is
     judged not worth owning.
 12. **Chunk size in tokens without a tokenizer.** Recommended: characters divided by
     four, labelled an estimate, since it only sizes chunks and budgets. A real
     tokenizer adds a crate and a vocabulary file for no visible gain.
-13. **Full-text tokenizer.** Recommended: `unicode61 remove_diacritics 2`, no stemming
-    (works for every language; vectors cover word forms).
+13. **Full-text tokenizer.** Earlier recommendation: `unicode61 remove_diacritics 2`,
+    no stemming, "works for every language". That is wrong for Chinese, Japanese
+    and Korean (see "Full-text tokenizer and languages"). Recommended now:
+    `unicode61` in K1 with the CJK limit documented, and a `trigram` table added
+    only if a user needs it. Counter-argument: `trigram` fixes CJK and substring
+    search from the start, at about three times the index size and with a
+    three-character minimum, and adding it later means a re-index. Decide from a
+    measured fixture in K1.
 14. **Retention of removed documents' facts.** Recommended: ask on removal, keep by
     default (the user may have deleted the file for tidiness, and a fact the user
-    edited is authored data).
+    edited is authored data). Kept facts stay marked with their source label.
+15. **May a cloud request ever carry personal memory (`contact` items)?**
+    Recommended: no by default; they go to local providers only, and the preview
+    says how many were left out. Counter-argument: a cover letter or a fill is
+    exactly where the user's name, address and phone matter, and the user has
+    already chosen a cloud provider for that action. Middle option: a per-item
+    "ok to send" the user sets once.
+16. **Unreviewed facts: excluded from requests, or included and marked?**
+    Recommended: excluded until reviewed, so a poisoned document cannot steer
+    anything before a person has seen it. Counter-argument: the point of
+    extraction is to save typing, and an extra review step before first use is
+    friction. Middle option: attach unreviewed facts to the request that triggered
+    the learn, never to later ones.
 
 ## Risks
 
@@ -887,6 +1138,12 @@ before K4).
   them; so they can the original files. Stated plainly in docs.
 - **OneDrive or antivirus interaction.** Reading many files can trigger downloads or
   scans; the on-demand skip, the file cap and background priority limit it.
-- **Exe size.** About 100 KB of headroom; K1 is code only and measured.
-- **Migration order.** K1 and K4 both add migrations; numbers are assigned at merge
-  and the contiguity test catches a race.
+- **Exe size.** About 99 KB of headroom, shared with three other specs, against an
+  estimate of roughly 170 to 190 KB for this track. A gate raise is planned, one
+  measured PR at a time (see "Size and performance budgets").
+- **Memory as an injection channel.** Mitigated by review before attach,
+  fact-only extraction, user-authored-only `preference` and `style`, and the
+  marked block. Residual: a user who reviews in bulk without reading.
+- **Migration order.** K1 and K4 both add migrations; numbers are assigned at merge,
+  the contiguity test catches a race, and K1's PR adds a one-line note to the store
+  spec that the roles of its rows 4 and 5 may swap.
