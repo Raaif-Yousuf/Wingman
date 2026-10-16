@@ -40,3 +40,13 @@ Describe 'the settings window class' {
         $src.Contains('const CLASS_NAME: &str = "' + $SettingsWindowClass + '";') | Should -BeTrue
     }
 }
+
+Describe 'the launched copy' {
+    It 'runs from a scratch folder holding the portable marker' {
+        $text = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'smoke-launch.ps1') -Raw) -replace "`r", ''
+        $text.Contains("'wingman.portable'") | Should -BeTrue
+        $text.Contains('Copy-Item') | Should -BeTrue
+        $src = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\src\portable.rs') -Raw) -replace "`r", ''
+        $src.Contains('pub const MARKER: &str = "wingman.portable";') | Should -BeTrue
+    }
+}

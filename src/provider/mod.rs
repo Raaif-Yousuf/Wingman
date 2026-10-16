@@ -9,6 +9,7 @@ pub mod gemini;
 pub mod model_list;
 pub mod ollama;
 pub mod ollama_admin;
+pub mod ollama_gpu_fix;
 pub mod openai;
 pub mod openai_compat;
 
