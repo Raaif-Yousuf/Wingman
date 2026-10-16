@@ -38,6 +38,8 @@ pub fn builtin_action() -> Action {
         },
         hotkey: None,
         rate_difficulty: false,
+        output: crate::actions::Output::Card,
+        detector: None,
         enabled: true,
     }
 }

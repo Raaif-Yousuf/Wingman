@@ -84,6 +84,13 @@ pub fn set_worker_run(run: u64) {
     WORKER_RUN.with(|c| c.set(run));
 }
 
+/// The run generation [`set_worker_run`] recorded for this thread (`0` if never
+/// set): what a worker that hands a result to the main thread by side channel
+/// keys it with (#809).
+pub fn worker_run() -> u64 {
+    WORKER_RUN.with(|c| c.get())
+}
+
 /// The real gate: posts to the owner window. `hwnd` is carried as an `isize`
 /// because an `HWND` wraps a raw pointer and is not `Send`.
 pub struct WindowSendGate {

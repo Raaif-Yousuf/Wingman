@@ -144,6 +144,8 @@ pub struct Config {
     pub palette: Palette,
     /// #306: the options card's shortlist settings (`[options]`).
     pub options: Options,
+    /// #809: the in-place overlay's settings (`[overlay]`).
+    pub overlay: OverlayConfig,
     /// Provider names (`"openai"`, `"anthropic"`) [`Config::hydrate_secrets`]
     /// could not read a stored credential for (#175). Load-time diagnostic
     /// only -- never persisted (`#[serde(skip)]`), so a caller with access to
@@ -774,6 +776,43 @@ impl Options {
     /// The clamped limits the router validates a shortlist with.
     pub fn router_limits(&self) -> crate::router::RouterLimits {
         crate::router::RouterLimits::new(self.min_confidence, self.max_options)
+    }
+}
+
+/// #809: the in-place overlay (`[overlay]`). No master switch: an action that
+/// does not declare `output = "overlay"` never draws one.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OverlayConfig {
+    /// Most marks one run draws. Clamped to 1..=40 where used.
+    pub max_annotations: usize,
+    /// Seconds after which an overlay hides itself, at most. Clamped to
+    /// 5..=300 where used.
+    pub auto_dismiss_secs: u64,
+    /// `true` leaves the overlay in screenshots and screen shares, to record a
+    /// demo. Config file only, never a Settings toggle: the default keeps the
+    /// labels out of Wingman's own capture and out of a shared screen.
+    pub capturable: bool,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            max_annotations: 20,
+            auto_dismiss_secs: crate::overlay::state::DEFAULT_AGE_MS / 1000,
+            capturable: false,
+        }
+    }
+}
+
+impl OverlayConfig {
+    pub fn max_annotations(&self) -> usize {
+        self.max_annotations.clamp(1, 40)
+    }
+
+    /// The overlay's age cap in milliseconds.
+    pub fn auto_dismiss_ms(&self) -> u64 {
+        self.auto_dismiss_secs.clamp(5, 300) * 1000
     }
 }
 
@@ -2118,6 +2157,37 @@ mod tests {
         let text = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.options, cfg.options);
+    }
+
+    // -- overlay.* (issue #809) ----------------------------------------------
+
+    #[test]
+    fn overlay_defaults_match_the_spec() {
+        let o = Config::default().overlay;
+        assert_eq!(o.max_annotations(), 20);
+        assert_eq!(o.auto_dismiss_ms(), 30_000);
+        assert!(!o.capturable, "labels stay out of captures by default");
+    }
+
+    #[test]
+    fn overlay_table_is_optional_partial_and_clamped() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.overlay, OverlayConfig::default());
+        let cfg: Config =
+            toml::from_str("[overlay]\nauto_dismiss_secs = 1\nmax_annotations = 0\n").unwrap();
+        assert_eq!(cfg.overlay.auto_dismiss_ms(), 5_000);
+        assert_eq!(cfg.overlay.max_annotations(), 1);
+        assert!(!cfg.overlay.capturable);
+        let cfg: Config = toml::from_str(
+            "[overlay]\nauto_dismiss_secs = 99999\nmax_annotations = 999\ncapturable = true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.overlay.auto_dismiss_ms(), 300_000);
+        assert_eq!(cfg.overlay.max_annotations(), 40);
+        assert!(cfg.overlay.capturable);
+        let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.overlay, cfg.overlay);
     }
 
     // -- palette.router_threshold (issue #24) --------------------------------

@@ -193,6 +193,10 @@ pub enum GalleryState {
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
+    /// #809: the in-place overlay over a fixture page: three notes, one of
+    /// them flipped below its text and one spanning a line break. Drawn
+    /// straight to a PNG (no window), so a screenshot run only.
+    OverlayNotes,
 }
 
 /// The full ordered list of states the gallery steps through. Order is the
@@ -225,6 +229,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsAdvancedTop,
         SettingsAdvancedBottom,
         RegionOverlay,
+        OverlayNotes,
     ]
 }
 
@@ -259,6 +264,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsAdvancedTop => "settings-advanced-top",
         SettingsAdvancedBottom => "settings-advanced-bottom",
         RegionOverlay => "region-overlay",
+        OverlayNotes => "overlay-notes",
     }
 }
 
@@ -508,6 +514,14 @@ mod driver {
         path: &std::path::Path,
     ) -> anyhow::Result<HWND> {
         apply_variant(card, variant);
+        if state == GalleryState::OverlayNotes {
+            // No window: the overlay is a layered window, which `PrintWindow`
+            // renders black (#626). Its picture is the frame it would show.
+            card.hide();
+            palette.hide();
+            crate::ui::overlay::gallery_png(variant.theme, variant.dpi.unwrap_or(96), path)?;
+            return Ok(card.hwnd());
+        }
         let hwnd = show_state(card, palette, settings, region, variant, state)?;
         pump_and_wait(Duration::from_millis(120));
         print_window_png(hwnd, path)?;
@@ -777,6 +791,12 @@ mod driver {
                 let theme = variant.theme.unwrap_or_else(crate::ui::theme::detect_theme);
                 let dpi = variant.dpi.unwrap_or(96);
                 *region = Some(Overlay::open_for_gallery(instance, theme, dpi)?);
+            }
+            OverlayNotes => {
+                // Screenshot runs only (see `shoot`): interactively there is
+                // nothing to show, so the card and palette are just cleared.
+                card.hide();
+                palette.hide();
             }
             SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => {
                 card.hide();
@@ -1052,8 +1072,8 @@ mod tests {
         // pending sub-stages (#354) + 3 previews (calendar, long labels,
         // the error title) + the expanded answer, with and without link
         // focus = 15 card states, + 4 palette states + 4 settings states
-        // (#560) + the region overlay (#580) = 24.
-        assert_eq!(states.len(), 24);
+        // (#560) + the region overlay (#580) + the in-place overlay (#809) = 25.
+        assert_eq!(states.len(), 25);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(

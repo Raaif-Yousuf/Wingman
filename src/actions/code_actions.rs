@@ -65,6 +65,8 @@ fn code_action(id: &str, name: &str, executor: &str, confirm: bool, prompt: &str
         prefer: Prefer::default(),
         hotkey: None,
         rate_difficulty: false,
+        output: crate::actions::Output::Card,
+        detector: None,
         enabled: true,
     }
 }

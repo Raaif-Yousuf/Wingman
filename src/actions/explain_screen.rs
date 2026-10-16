@@ -58,6 +58,8 @@ pub fn builtin_action() -> Action {
         prefer: Prefer::default(),
         hotkey: None,
         rate_difficulty: false,
+        output: crate::actions::Output::Card,
+        detector: None,
         enabled: true,
     }
 }

@@ -174,6 +174,10 @@ pub(crate) struct Tokens {
     pub(crate) link: u32,
     /// Error text.
     pub(crate) danger: u32,
+    /// The overlay's note mark and its label's outline: drawn straight on
+    /// the page and on the label pill, so it is held to 3:1 against the
+    /// surface (a graphic, not text).
+    pub(crate) mark_note: u32,
 }
 
 /// Neither pure black nor pure white, per the card spec.
@@ -185,6 +189,7 @@ pub(crate) const LIGHT: Tokens = Tokens {
     text_faint: rgb(112, 112, 112),
     link: rgb(112, 112, 112),
     danger: rgb(200, 50, 50),
+    mark_note: rgb(0, 95, 184),
 };
 
 pub(crate) const DARK: Tokens = Tokens {
@@ -195,6 +200,7 @@ pub(crate) const DARK: Tokens = Tokens {
     text_faint: rgb(140, 140, 140),
     link: rgb(140, 140, 140),
     danger: rgb(240, 100, 100),
+    mark_note: rgb(96, 170, 255),
 };
 
 /// The Windows system colours that matter in high contrast, read again on
@@ -246,6 +252,7 @@ impl Tokens {
                 text_faint: sys.window_text,
                 link: sys.hotlight,
                 danger: sys.window_text,
+                mark_note: sys.highlight,
             },
         }
     }
@@ -453,6 +460,13 @@ pub(crate) fn type_height_px(ramp_px: i32, dpi: u32, text_scale: f32) -> i32 {
     -v.max(1)
 }
 
+/// Converts a 96-DPI design pixel to a physical pixel at `dpi`, rounding to
+/// the nearest pixel: the `(dp * dpi + 48) / 96` rounding the card's own
+/// `Card::dp` uses. Shared by the region overlay and the in-place overlay.
+pub(crate) fn scale_for_dpi(dp: i32, dpi: u32) -> i32 {
+    (dp * dpi as i32 + 48) / 96
+}
+
 /// Spacing on the 4 px grid, in dp (logical pixels at 96 DPI).
 #[allow(dead_code)] // ramp token for surfaces not yet moved onto it
 pub(crate) const SPACE_XS_DP: i32 = 4;
@@ -639,6 +653,37 @@ mod tests {
             }
         }
         assert_eq!(checked, 20, "the test must look at every pair");
+    }
+
+    #[test]
+    fn the_overlay_mark_stands_out_on_the_surface_in_every_theme() {
+        let themes = [
+            (Theme::Light, LIGHT),
+            (Theme::Dark, DARK),
+            (
+                Theme::HighContrast,
+                Tokens::for_theme(Theme::HighContrast, &HC_WHITE),
+            ),
+            (
+                Theme::HighContrast,
+                Tokens::for_theme(Theme::HighContrast, &HC_BLACK),
+            ),
+        ];
+        for (theme, t) in themes {
+            let ratio = contrast_between(t.mark_note, t.surface);
+            assert!(
+                ratio >= AA_LARGE,
+                "{theme:?} mark_note: {ratio:.2}:1 is under {AA_LARGE}:1"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_for_dpi_rounds_to_the_nearest_pixel() {
+        assert_eq!(scale_for_dpi(10, 96), 10);
+        assert_eq!(scale_for_dpi(10, 144), 15);
+        assert_eq!(scale_for_dpi(3, 120), 4);
+        assert_eq!(scale_for_dpi(0, 240), 0);
     }
 
     #[test]

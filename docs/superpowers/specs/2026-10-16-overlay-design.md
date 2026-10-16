@@ -950,6 +950,29 @@ Each ships alone and has an observable.
    `Overlay::show` also refuses when no target window is left once Wingman's
    own windows are removed, and `layout::place_labels` takes the gap already
    scaled for the monitor's DPI (`GAP_DESIGN_PX` times the scale).
+   As built (#809): `ui/overlay.rs` holds the window, the drawing and the
+   Win32 side of the install steps; `overlay/session.rs` runs them through a
+   `Steps` trait, which is what the undo test fakes. Decisions taken while
+   building it: (a) there is one window, on the captured monitor, because one
+   press captures one monitor; the per-monitor split waits for a wider capture;
+   (b) the hook callbacks post one message, `WM_APP_OVERLAY_INPUT`, with a kind
+   in `wparam` (`overlay/wire.rs`), instead of the three ids listed above, and
+   the click-on-label id arrives with #326; (c) the Esc claim is a lock-free
+   expiry in `hotkey.rs`, set and cleared by the Keyboard install step, and any
+   other non-modifier key is reported after the chords have had their say, so
+   the Wingman key itself never counts as a change to the screen; (d) the mouse
+   hook is shared with the card's click-away, and stays installed while either
+   needs it; (e) the detector's result reaches the main thread through
+   `overlay/handoff.rs`, keyed by run, beside the ordinary `WM_APP_RESULT`
+   that carries the summary text; (f) `OcrWord` boxes are in the pixels of the
+   image given to OCR, so the `Space` is built from that same shot's size and
+   scale (`Space::for_image`), including after a `fit_for_model` shrink;
+   (g) the debug action is listed by the loader in debug builds only and is
+   kept out of `builtin_actions()`, so `actions.example.toml` is the same in
+   every build; (h) the gallery's `overlay-notes` picture is composited in
+   software, because `PrintWindow` on a layered window renders black (#626).
+   Left to later slices: the layout still avoids only the marked text, not
+   other text on the page.
 3. **Units overlay (#325's first user).** `5 km` gets `3.1 mi`, `72 F` gets
    `22 C`, via `calc/units.rs` and `detector = "units"`. No model, works
    offline, reachable from the palette, the tray and the options card's static

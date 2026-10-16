@@ -83,7 +83,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::capture::{self, RawShot, RectPx};
-use crate::ui::theme::{relative_luminance, SysColors, Theme, Tokens};
+use crate::ui::theme::{relative_luminance, scale_for_dpi, SysColors, Theme, Tokens};
 
 // ---------------------------------------------------------------------------
 // Pure geometry
@@ -335,13 +335,6 @@ const LABEL_LEFT_DP: i32 = 4;
 const LABEL_HEIGHT_DP: i32 = 20;
 const LABEL_WIDTH_DP: i32 = 240;
 const OUTLINE_WIDTH_DP: i32 = 2;
-
-/// Converts a 96-DPI design pixel to a physical pixel at `dpi`, rounding to
-/// the nearest pixel -- same `(dp * dpi + 48) / 96` rounding `card.rs`'s
-/// `Fonts`/`Card::dp` uses for the same conversion.
-fn scale_for_dpi(dp: i32, dpi: u32) -> i32 {
-    (dp * dpi as i32 + 48) / 96
-}
 
 /// The centered pill [`draw_hint`] paints the instruction text into, given
 /// `monitor` (the monitor under the cursor when the overlay opened,

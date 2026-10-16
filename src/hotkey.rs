@@ -34,8 +34,8 @@ use anyhow::{Context, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
-    VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN,
+    VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
@@ -675,6 +675,85 @@ fn ctrl_tap_plan(ctrl_held: bool) -> CtrlTap {
 /// with pure helpers below so a double-press detector can extend it later.
 static HELD_VK: AtomicU32 = AtomicU32::new(0);
 
+/// #809: the tick at which the overlay's Esc claim lapses by itself, `0` while
+/// no overlay is showing. Written by the main thread through
+/// [`arm_overlay_keys`] and [`disarm_overlay_keys`], read lock-free by
+/// `hook_proc` on every keydown (one atomic load when no overlay shows). The
+/// hook only claims Esc and posts what it saw; the main thread decides.
+static OVERLAY_CLAIM: AtomicU64 = AtomicU64::new(0);
+
+/// Starts watching keys for the overlay: Esc is claimed until `expiry_ms` (see
+/// `overlay::state::claim_expiry`) and any other non-modifier key is reported
+/// with `WM_APP_OVERLAY_INPUT`. `false`, with nothing armed, when the
+/// keyboard hook is not installed: an overlay that cannot hear a key go stale
+/// must not show.
+pub fn arm_overlay_keys(expiry_ms: u64) -> bool {
+    if TARGET_HWND.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    OVERLAY_CLAIM.store(expiry_ms.max(1), Ordering::Relaxed);
+    true
+}
+
+/// Stops the overlay's key handling. Safe to call when nothing is armed.
+pub fn disarm_overlay_keys() {
+    OVERLAY_CLAIM.store(0, Ordering::Relaxed);
+}
+
+/// What the hook does with a keydown while an overlay may be showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayKey {
+    /// Not the overlay's business (no overlay, or a modifier on its own).
+    Pass,
+    /// Esc inside its claim: swallowed, and reported.
+    Esc,
+    /// Any other key: reported, and it still reaches the app.
+    Other,
+}
+
+/// A bare modifier does not change what is on screen.
+fn is_modifier_vk(vk: u32) -> bool {
+    matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0..=0xA5)
+}
+
+/// Pure so the hook callback stays one atomic load and a compare.
+fn overlay_key(expiry: u64, vk: u32, modifiers_down: bool, now_ms: u64) -> OverlayKey {
+    if expiry == 0 {
+        return OverlayKey::Pass;
+    }
+    if vk == u32::from(VK_ESCAPE.0)
+        && crate::overlay::state::esc_claim_open(Some(expiry), modifiers_down, now_ms)
+    {
+        return OverlayKey::Esc;
+    }
+    if is_modifier_vk(vk) {
+        OverlayKey::Pass
+    } else {
+        OverlayKey::Other
+    }
+}
+
+fn any_modifier_down() -> bool {
+    key_down(VK_CONTROL.0 as i32)
+        || key_down(VK_SHIFT.0 as i32)
+        || key_down(VK_MENU.0 as i32)
+        || key_down(VK_LWIN.0 as i32)
+        || key_down(VK_RWIN.0 as i32)
+}
+
+/// Posts one overlay input to the main window. Never blocks, never decides.
+fn post_overlay(kind: crate::overlay::wire::Kind, lparam: isize) {
+    let hwnd = HWND(TARGET_HWND.load(Ordering::Relaxed) as *mut _);
+    let _ = unsafe {
+        PostMessageW(
+            Some(hwnd),
+            crate::ui::overlay::WM_APP_OVERLAY_INPUT,
+            WPARAM(kind as usize),
+            LPARAM(lparam),
+        )
+    };
+}
+
 /// A keydown for `vk`. Returns `true` when it is auto-repeat of the swallowed
 /// key still held (the caller swallows it without acting). Any other key going
 /// down ends the hold: typematic repeat only repeats the last key pressed, so
@@ -796,6 +875,26 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         return LRESULT(1);
     }
 
+    // #809: the overlay's keys. Esc inside the claim is swallowed and
+    // reported; any other non-modifier key is reported at the end, once the
+    // chords below have had their say (a chord is the user's press, not a
+    // change to the screen).
+    let overlay_expiry = OVERLAY_CLAIM.load(Ordering::Relaxed);
+    let overlay_key = if overlay_expiry == 0 {
+        OverlayKey::Pass
+    } else {
+        overlay_key(
+            overlay_expiry,
+            kb.vkCode,
+            any_modifier_down(),
+            crate::ui::overlay::tick_ms(),
+        )
+    };
+    if overlay_key == OverlayKey::Esc {
+        post_overlay(crate::overlay::wire::Kind::Esc, 0);
+        return swallow(kb.vkCode);
+    }
+
     let chord = current_chord(kb.vkCode);
 
     // Pause (issue #20) / pause-toggle chord (issue #181): while paused,
@@ -811,6 +910,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         if pause_hotkey_outcome(&chord, load_pause_chord()) == PauseHotkeyOutcome::Toggle {
             post_pause_toggle(&chord);
             return swallow(kb.vkCode);
+        }
+        if overlay_key == OverlayKey::Other {
+            post_overlay(crate::overlay::wire::Kind::Key, kb.vkCode as isize);
         }
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
@@ -912,6 +1014,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         return swallow(kb.vkCode);
     }
 
+    if overlay_key == OverlayKey::Other {
+        post_overlay(crate::overlay::wire::Kind::Key, kb.vkCode as isize);
+    }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
@@ -927,6 +1032,61 @@ mod tests {
             alt,
             win,
         }
+    }
+
+    // -- #809: the overlay's key handling -----------------------------------
+
+    const NOW: u64 = 5_000;
+    const LIVE: u64 = NOW + 30_000;
+
+    #[test]
+    fn with_no_overlay_every_key_passes() {
+        for vk in [0x1B, 0x41, 0x10, 0x86] {
+            assert_eq!(overlay_key(0, vk, false, NOW), OverlayKey::Pass);
+        }
+    }
+
+    #[test]
+    fn esc_is_claimed_only_bare_and_before_the_expiry() {
+        assert_eq!(overlay_key(LIVE, 0x1B, false, NOW), OverlayKey::Esc);
+        // A modifier down: not ours to swallow, but it is still a key.
+        assert_eq!(overlay_key(LIVE, 0x1B, true, NOW), OverlayKey::Other);
+        // Past the expiry the claim has lapsed by itself.
+        assert_eq!(overlay_key(LIVE, 0x1B, false, LIVE), OverlayKey::Other);
+        assert_eq!(overlay_key(LIVE, 0x1B, false, LIVE + 1), OverlayKey::Other);
+    }
+
+    #[test]
+    fn a_bare_modifier_never_reports_and_any_other_key_does() {
+        for vk in [
+            0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+        ] {
+            assert_eq!(
+                overlay_key(LIVE, vk, true, NOW),
+                OverlayKey::Pass,
+                "{vk:#x}"
+            );
+        }
+        for vk in [0x41, 0x20, 0x0D, 0x25, 0x86, 0x70] {
+            assert_eq!(
+                overlay_key(LIVE, vk, false, NOW),
+                OverlayKey::Other,
+                "{vk:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_claim_is_off_until_armed_and_off_again_after_a_disarm() {
+        // `arm_overlay_keys` needs the installed hook's target; with none,
+        // it must refuse and leave nothing armed.
+        disarm_overlay_keys();
+        if TARGET_HWND.load(Ordering::Relaxed) == 0 {
+            assert!(!arm_overlay_keys(LIVE));
+            assert_eq!(OVERLAY_CLAIM.load(Ordering::Relaxed), 0);
+        }
+        disarm_overlay_keys();
+        assert_eq!(OVERLAY_CLAIM.load(Ordering::Relaxed), 0);
     }
 
     // -- matches() -----------------------------------------------------

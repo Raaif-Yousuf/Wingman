@@ -102,6 +102,11 @@ router_threshold = 0.7
 max_options = 4
 min_confidence = 0.2
 
+[overlay]
+max_annotations = 20
+auto_dismiss_secs = 30
+capturable = false
+
 [forms]
 require_tick_for = "sensitive"
 
