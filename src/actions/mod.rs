@@ -206,7 +206,11 @@ impl ActionOverride {
     /// A complete action from this entry alone: a new id, or `replace = true`.
     fn into_action(self) -> Result<Action> {
         let id = self.id;
-        let need = |what: &str| anyhow::anyhow!("action \"{id}\" is missing the field \"{what}\"");
+        let need = |what: &str| {
+            anyhow::anyhow!(
+                "action \"{id}\" is missing the field \"{what}\".                  If this was meant to change a built-in action, check the id spelling"
+            )
+        };
         Ok(Action {
             name: self.name.ok_or_else(|| need("name"))?,
             group: self.group,
@@ -227,43 +231,60 @@ impl ActionOverride {
     /// origin stays `Builtin` unless a `prompt` was given, so the Settings
     /// prompt keeps applying to an override that never touched it.
     fn apply_to(self, base: &Action) -> (Action, Origin) {
-        let origin = if self.prompt.is_some() {
+        // Exhaustive on purpose: a new field on `ActionOverride` must fail
+        // to compile here until it is merged below.
+        let ActionOverride {
+            id: _,
+            name,
+            group,
+            inputs,
+            proposal,
+            executor,
+            confirm,
+            prompt,
+            prefer,
+            hotkey,
+            rate_difficulty,
+            enabled,
+            replace: _,
+        } = self;
+        let origin = if prompt.is_some() {
             Origin::User
         } else {
             Origin::Builtin
         };
         let mut a = base.clone();
-        if let Some(v) = self.name {
+        if let Some(v) = name {
             a.name = v;
         }
-        if self.group.is_some() {
-            a.group = self.group;
+        if group.is_some() {
+            a.group = group;
         }
-        if let Some(v) = self.inputs {
+        if let Some(v) = inputs {
             a.inputs = v;
         }
-        if let Some(v) = self.proposal {
+        if let Some(v) = proposal {
             a.proposal = v;
         }
-        if let Some(v) = self.executor {
+        if let Some(v) = executor {
             a.executor = v;
         }
-        if let Some(v) = self.confirm {
+        if let Some(v) = confirm {
             a.confirm = v;
         }
-        if let Some(v) = self.prompt {
+        if let Some(v) = prompt {
             a.prompt = v;
         }
-        if let Some(v) = self.prefer {
+        if let Some(v) = prefer {
             a.prefer = v;
         }
-        if self.hotkey.is_some() {
-            a.hotkey = self.hotkey;
+        if hotkey.is_some() {
+            a.hotkey = hotkey;
         }
-        if let Some(v) = self.rate_difficulty {
+        if let Some(v) = rate_difficulty {
             a.rate_difficulty = v;
         }
-        if let Some(v) = self.enabled {
+        if let Some(v) = enabled {
             a.enabled = v;
         }
         (a, origin)
@@ -635,6 +656,17 @@ pub fn load_actions_report_from(user_path: &Path) -> Result<LoadReport> {
     let builtins = builtin_actions();
     let mut report = LoadReport::default();
     let mut entries = Vec::new();
+    let mut seen_ids: Vec<&str> = Vec::new();
+    for entry in &user_file.actions {
+        if seen_ids.contains(&entry.id.as_str()) {
+            anyhow::bail!(
+                "{} is not a valid actions file: the id \"{}\" appears more than once",
+                user_path.display(),
+                entry.id
+            );
+        }
+        seen_ids.push(entry.id.as_str());
+    }
     for entry in user_file.actions {
         let (action, origin) = entry
             .resolve(&builtins)
@@ -1471,6 +1503,54 @@ prompt = "Make it loud."
             &format!("[[actions]]\nid = \"{DEFAULT_ACTION_ID}\"\nrate_dificulty = true\n"),
         );
         assert!(err.contains("rate_dificulty"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicate_id_in_one_file_is_a_named_error() {
+        let text = format!(
+            "[[actions]]
+id = \"{DEFAULT_ACTION_ID}\"
+enabled = true
+
+             [[actions]]
+id = \"{DEFAULT_ACTION_ID}\"
+confirm = false
+"
+        );
+        let err = load_err("dup-id", &text);
+        assert!(err.contains(DEFAULT_ACTION_ID) && err.contains("more than once"));
+    }
+
+    #[test]
+    fn a_missing_field_error_hints_at_the_id_spelling() {
+        let err = load_err(
+            "hint",
+            "[[actions]]
+id = \"check-my-wrok\"
+name = \"X\"
+",
+        );
+        assert!(err.contains("check the id spelling"), "{err}");
+    }
+
+    #[test]
+    fn every_builtin_survives_being_written_out_and_applied_as_an_override() {
+        // Writes each built-in as a full override entry, parses it with the
+        // strict user-file parser and applies it onto itself: a field the
+        // override merge forgets would come back different.
+        let builtins = builtin_actions();
+        assert!(!builtins.is_empty());
+        for builtin in &builtins {
+            let file = ActionsFile {
+                actions: vec![builtin.clone()],
+                disabled_groups: Vec::new(),
+            };
+            let text = toml::to_string(&file).unwrap();
+            let user: UserActionsFile = toml::from_str(&text).unwrap();
+            let entry = user.actions.into_iter().next().unwrap();
+            let (applied, _) = entry.resolve(&builtins).unwrap();
+            assert_eq!(&applied, builtin, "{}", builtin.id);
+        }
     }
 
     #[test]

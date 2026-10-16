@@ -38,6 +38,7 @@ built-in.
   bad combination skips your version, keeps the built-in and shows a notice.
   A new `id` is appended and must carry every required field.
   (`merge_actions`, `src/actions/mod.rs`.)
+- **Built-ins with their own flow ignore some fields.** For `check-my-work`, `review-email`, `fill-form` and the other built-ins that run their own code path, overriding `proposal`, `executor`, `confirm` or `inputs` has no effect; `prompt`, `rate_difficulty`, `enabled` and `group` do apply where the action reads them.
 - **`replace = true` swaps the whole record.** Add it to a block to get the
   old wholesale behaviour: every field comes from your block, so all required
   fields must be there. It is also how to clear `group` or `hotkey` on a
