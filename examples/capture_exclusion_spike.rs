@@ -19,8 +19,8 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, W
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
     DeleteObject, GetDC, GetDIBits, GetMonitorInfoW, MonitorFromPoint, ReleaseDC, SelectObject,
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DIB_RGB_COLORS, HDC, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
+    HDC, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -173,7 +173,10 @@ fn run_case(layered: bool, flag: bool, left: i32, top: i32) -> Outcome {
             }
             let old = SelectObject(mem, dib.into());
             let pos = POINT { x: left, y: top };
-            let size = SIZE { cx: SIZE_PX, cy: SIZE_PX };
+            let size = SIZE {
+                cx: SIZE_PX,
+                cy: SIZE_PX,
+            };
             let src = POINT { x: 0, y: 0 };
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
@@ -208,8 +211,13 @@ fn run_case(layered: bool, flag: bool, left: i32, top: i32) -> Outcome {
             let (w_, h_) = (img.width() as usize, img.height() as usize);
             let mx = m.x().unwrap_or(0);
             let my = m.y().unwrap_or(0);
-            (xcap_hits, xcap_centre) =
-                scan_rgba(img.as_raw(), w_, h_, (left - mx) as usize, (top - my) as usize);
+            (xcap_hits, xcap_centre) = scan_rgba(
+                img.as_raw(),
+                w_,
+                h_,
+                (left - mx) as usize,
+                (top - my) as usize,
+            );
         }
 
         // PrintWindow with PW_RENDERFULLCONTENT (2).
@@ -247,7 +255,14 @@ fn run_case(layered: bool, flag: bool, left: i32, top: i32) -> Outcome {
         pump(30);
         let _ = UnregisterClassW(CLASS, Some(hinst.into()));
         let _ = DeleteObject(brush.into());
-        Outcome { affinity_set, affinity_read: aff, xcap_hits, xcap_centre, pw_hits, pw_centre }
+        Outcome {
+            affinity_set,
+            affinity_read: aff,
+            xcap_hits,
+            xcap_centre,
+            pw_hits,
+            pw_centre,
+        }
     }
 }
 
@@ -255,8 +270,10 @@ fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-        let mut mi =
-            MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
         let _ = GetMonitorInfoW(mon, &mut mi);
         let (left, top) = (mi.rcMonitor.left + 8, mi.rcMonitor.top + 8);
         println!(
@@ -265,7 +282,9 @@ fn main() {
         );
         for (layered, flag) in [(true, false), (true, true), (false, false), (false, true)] {
             let o = run_case(layered, flag, left, top);
-            let pw = o.pw_hits.map_or("PrintWindow failed".to_string(), |h| h.to_string());
+            let pw = o
+                .pw_hits
+                .map_or("PrintWindow failed".to_string(), |h| h.to_string());
             println!(
                 "layered={layered:<5} flag={flag:<5} affinity_call={} (read back {}) xcap_hits={} centre={:?} PrintWindow_hits={pw} centre={:?}",
                 o.affinity_set, o.affinity_read, o.xcap_hits, o.xcap_centre, o.pw_centre
