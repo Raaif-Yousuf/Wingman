@@ -437,22 +437,110 @@ fn page_from(host: &str, hop: &Hop) -> Result<Page, String> {
     })
 }
 
-/// The body as text: Latin-1 when the page says so, UTF-8 (with bad bytes
-/// replaced) otherwise.
+/// The body as text, in the character set the page declares (#552): the
+/// `Content-Type` header first, then a `<meta>` tag near the top. A set this
+/// code does not know, or no declaration, reads as UTF-8 with bad bytes
+/// replaced. Never fails and never panics on malformed bytes.
 fn decode_body(body: &[u8], content_type: &str) -> String {
+    let label = charset_from_header(content_type).or_else(|| charset_from_meta(body));
+    if let Some(code_page) = label.as_deref().and_then(code_page_for) {
+        if let Some(text) = decode_code_page(body, code_page) {
+            return text;
+        }
+    }
+    String::from_utf8_lossy(body).into_owned()
+}
+
+/// The `charset=` value of a `Content-Type` header, lower-cased.
+fn charset_from_header(content_type: &str) -> Option<String> {
     let lower = content_type.to_ascii_lowercase();
-    let charset = lower
-        .split("charset=")
-        .nth(1)
-        .map(|c| c.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch.is_whitespace()))
-        .map(|c| c.split(';').next().unwrap_or(c).trim());
-    if matches!(
-        charset,
-        Some("iso-8859-1" | "latin1" | "windows-1252" | "us-ascii")
-    ) {
-        body.iter().map(|&b| b as char).collect()
-    } else {
-        String::from_utf8_lossy(body).into_owned()
+    let value = lower.split("charset=").nth(1)?;
+    let value = value.split(';').next().unwrap_or(value);
+    let value = value.trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace());
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The charset a `<meta charset=...>` or `<meta http-equiv content="...;
+/// charset=...">` tag names, looking only at the first 1024 bytes the way
+/// browsers do. Lower-cased.
+fn charset_from_meta(body: &[u8]) -> Option<String> {
+    let head: String = body
+        .iter()
+        .take(1024)
+        .map(|&b| b.to_ascii_lowercase() as char)
+        .collect();
+    let at = head.find("charset")? + "charset".len();
+    let rest = head[at..].trim_start().strip_prefix('=')?.trim_start();
+    let rest = rest.trim_start_matches(['"', '\'']);
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')))
+        .unwrap_or(rest.len());
+    let label = &rest[..end];
+    (!label.is_empty()).then(|| label.to_string())
+}
+
+/// The Windows code page for a lower-case charset label, or `None` for UTF-8
+/// and for any label not listed (those read as UTF-8). Latin-1 and ASCII map
+/// to 1252, as browsers treat them.
+fn code_page_for(label: &str) -> Option<u32> {
+    Some(match label {
+        "iso-8859-1" | "latin1" | "latin-1" | "us-ascii" | "ascii" | "windows-1252" | "cp1252" => {
+            1252
+        }
+        "windows-1250" => 1250,
+        "windows-1251" => 1251,
+        "windows-1253" => 1253,
+        "windows-1254" => 1254,
+        "windows-1255" => 1255,
+        "windows-1256" => 1256,
+        "windows-1257" => 1257,
+        "windows-1258" => 1258,
+        "iso-8859-2" => 28592,
+        "iso-8859-3" => 28593,
+        "iso-8859-4" => 28594,
+        "iso-8859-5" => 28595,
+        "iso-8859-6" => 28596,
+        "iso-8859-7" => 28597,
+        "iso-8859-8" => 28598,
+        "iso-8859-9" => 28599,
+        "iso-8859-15" => 28605,
+        "koi8-r" => 20866,
+        "koi8-u" => 21866,
+        "shift_jis" | "shift-jis" | "sjis" | "x-sjis" | "windows-31j" => 932,
+        "euc-jp" => 51932,
+        "gbk" | "gb2312" | "x-gbk" => 936,
+        "gb18030" => 54936,
+        "big5" => 950,
+        "euc-kr" | "ks_c_5601-1987" => 949,
+        _ => return None,
+    })
+}
+
+/// Decodes `body` from `code_page` with the Windows converter (no extra
+/// crate). Bytes that do not fit the set become replacement characters, so
+/// this does not fail on malformed input; `None` only if the API refuses.
+fn decode_code_page(body: &[u8], code_page: u32) -> Option<String> {
+    use windows::Win32::Globalization::{MultiByteToWideChar, MB_PRECOMPOSED};
+    if body.is_empty() {
+        return Some(String::new());
+    }
+    if i32::try_from(body.len()).is_err() {
+        return None;
+    }
+    // SAFETY: both calls read `body` only and write at most `wide.len()`
+    // u16s into `wide`, whose length the first call asked for.
+    unsafe {
+        let needed = MultiByteToWideChar(code_page, MB_PRECOMPOSED, body, None);
+        if needed <= 0 {
+            return None;
+        }
+        let mut wide = vec![0u16; needed as usize];
+        let written = MultiByteToWideChar(code_page, MB_PRECOMPOSED, body, Some(&mut wide));
+        if written <= 0 {
+            return None;
+        }
+        wide.truncate(written as usize);
+        Some(String::from_utf16_lossy(&wide))
     }
 }
 
@@ -1394,6 +1482,85 @@ mod tests {
             fetch(&net, "https://example.com/").unwrap().text,
             "caf\u{E9}"
         );
+    }
+
+    fn page_with(content_type: Option<&str>, body: &[u8]) -> String {
+        let net = FakeNet::new().host("example.com", PUBLIC).page(
+            "https://example.com/",
+            Hop {
+                status: 200,
+                content_type: content_type.map(str::to_string),
+                body: body.to_vec(),
+                ..Hop::default()
+            },
+        );
+        fetch(&net, "https://example.com/").unwrap().text
+    }
+
+    #[test]
+    fn other_declared_charsets_are_decoded() {
+        // Russian "privet" in windows-1251 and in KOI8-R.
+        assert_eq!(
+            page_with(
+                Some("text/html; charset=windows-1251"),
+                b"<p>\xEF\xF0\xE8\xE2\xE5\xF2</p>"
+            ),
+            "\u{43F}\u{440}\u{438}\u{432}\u{435}\u{442}"
+        );
+        assert_eq!(
+            page_with(
+                Some("text/html; charset=koi8-r"),
+                b"<p>\xD0\xD2\xC9\xD7\xC5\xD4</p>"
+            ),
+            "\u{43F}\u{440}\u{438}\u{432}\u{435}\u{442}"
+        );
+        // Japanese "nihon" in Shift_JIS.
+        assert_eq!(
+            page_with(
+                Some("text/html; charset=\"Shift_JIS\""),
+                b"<p>\x93\xFA\x96\x7B</p>"
+            ),
+            "\u{65E5}\u{672C}"
+        );
+    }
+
+    #[test]
+    fn a_meta_tag_names_the_charset_when_the_header_does_not() {
+        assert_eq!(
+            page_with(
+                Some("text/html"),
+                b"<meta charset=\"windows-1251\"><p>\xEF\xF0\xE8</p>"
+            ),
+            "\u{43F}\u{440}\u{438}"
+        );
+        assert_eq!(
+            page_with(
+                Some("text/html"),
+                b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-2\"><p>\xB1</p>"
+            ),
+            "\u{105}"
+        );
+    }
+
+    #[test]
+    fn the_header_wins_over_a_meta_tag() {
+        assert_eq!(
+            page_with(
+                Some("text/html; charset=iso-8859-1"),
+                b"<meta charset=\"windows-1251\"><p>caf\xE9</p>"
+            ),
+            "caf\u{E9}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_charset_and_malformed_bytes_never_fail() {
+        let text = page_with(Some("text/html; charset=x-made-up"), b"<p>a\xFF\xFEb</p>");
+        assert!(text.starts_with('a') && text.ends_with('b'), "{text}");
+        // Truncated multi-byte sequence in a multi-byte set.
+        let text = page_with(Some("text/html; charset=shift_jis"), b"<p>ok\x93</p>");
+        assert!(text.starts_with("ok"), "{text}");
+        assert_eq!(code_page_for("utf-8"), None);
     }
 
     #[test]
