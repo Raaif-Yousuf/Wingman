@@ -3127,10 +3127,7 @@ fn build_ui_recorded(
     combo_add(active_combo, "Claude (Anthropic)");
     combo_add(active_combo, "Ollama (local)");
     combo_add(active_combo, "Gemini (Google)");
-    combo_select_index(
-        active_combo,
-        choice_from_order(&config.providers.order) as i32,
-    );
+    combo_select_index(active_combo, combo_index_for_order(&config.providers.order));
     r.advance();
 
     // OpenAI
@@ -4468,8 +4465,21 @@ fn order_from_choice(choice: usize) -> Vec<String> {
 /// The "Active provider" combo index for `order` (an index into
 /// `ActiveProvider::ALL`: ChatGPT, Claude, Ollama, Gemini). A config led by
 /// anything else shows as ChatGPT.
+#[cfg(test)]
 fn choice_from_order(order: &[String]) -> usize {
     ActiveProvider::from_order(order).index()
+}
+
+/// Issue #302: the combo index to preselect for `order`. An order led by
+/// something the combo does not list (a `compat:` endpoint) selects nothing,
+/// instead of showing ChatGPT as if it were the active provider. An empty
+/// order still reads as ChatGPT, the default.
+fn combo_index_for_order(order: &[String]) -> i32 {
+    match ActiveProvider::leading(order) {
+        Some(p) => p.index() as i32,
+        None if order.is_empty() => 0,
+        None => -1,
+    }
 }
 
 /// #194: `build_config`'s provider-order merge. `choice` (the Settings
@@ -4499,6 +4509,11 @@ fn choice_from_order(order: &[String]) -> usize {
 /// Switching away from an order led by one of them puts the chosen provider
 /// first, since the swap above alone would leave the old leader answering.
 fn merge_provider_order(configured: &[String], choice: usize) -> Vec<String> {
+    // Nothing selected (the combo was left empty because a `compat:` entry
+    // leads, #302): the user chose nothing, so keep the order as it is.
+    if choice >= ActiveProvider::ALL.len() {
+        return configured.to_vec();
+    }
     let chosen = ActiveProvider::from_index(choice);
     if matches!(chosen, ActiveProvider::Ollama | ActiveProvider::Gemini) {
         if configured.is_empty() {
@@ -6093,6 +6108,20 @@ mod tests {
         let order = order_from_choice(1);
         assert_eq!(order, vec!["anthropic".to_string(), "openai".to_string()]);
         assert_eq!(choice_from_order(&order), 1);
+    }
+
+    #[test]
+    fn a_compat_leader_selects_nothing_and_a_save_keeps_the_order() {
+        let order = vec![
+            "compat:groq".to_string(),
+            "anthropic".to_string(),
+            "openai".to_string(),
+        ];
+        assert_eq!(combo_index_for_order(&order), -1);
+        assert_eq!(combo_index_for_order(&[]), 0);
+        assert_eq!(combo_index_for_order(&["gemini".to_string()]), 3);
+        // CB_GETCURSEL returns -1 for "nothing", read as usize.
+        assert_eq!(merge_provider_order(&order, (-1i32) as usize), order);
     }
 
     #[test]

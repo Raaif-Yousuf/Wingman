@@ -501,6 +501,15 @@ impl ActiveProvider {
         }
     }
 
+    /// Which of the four pickers' providers leads `order`, or `None` when the
+    /// first entry is something else (a `compat:` endpoint, a typo) or the
+    /// list is empty. An empty list reads as `None` here; [`Self::from_order`]
+    /// is the one that falls back to ChatGPT.
+    pub fn leading(order: &[String]) -> Option<Self> {
+        let first = order.first()?.as_str();
+        Self::ALL.into_iter().find(|p| p.order_name() == first)
+    }
+
     /// Moves this provider to the front of `order` (adding it if absent).
     /// Everything else keeps its relative order, so the old leader stays in
     /// the list as the fallback. Returns whether `order` changed.
