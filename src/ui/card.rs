@@ -3581,9 +3581,12 @@ impl CardInner {
             if !field.editable {
                 continue;
             }
-            if let Some(hwnd) =
-                create_preview_edit(parent, instance, font, &field.value, &row.value_rect)
-            {
+            let rect = if field.multiline {
+                row.value_rect
+            } else {
+                centered_edit_rect(&row.value_rect, self.line_height(font))
+            };
+            if let Some(hwnd) = create_preview_edit(parent, instance, font, &field.value, &rect) {
                 subclass_preview_control(hwnd, parent);
                 edits.push((field.name.clone(), hwnd));
             }
@@ -3645,7 +3648,12 @@ impl CardInner {
         };
         for (name, hwnd) in &preview.edits {
             if let Some(idx) = fields.iter().position(|f| &f.name == name) {
-                let r = &metrics.rows[idx].value_rect;
+                let cell = metrics.rows[idx].value_rect;
+                let r = &if fields[idx].multiline {
+                    cell
+                } else {
+                    centered_edit_rect(&cell, self.line_height(font))
+                };
                 unsafe {
                     let _ = SetWindowPos(
                         *hwnd,
@@ -4283,6 +4291,36 @@ fn subclass_preview_control(hwnd: HWND, parent: HWND) {
     }
 }
 
+/// #743: where a preview's EDIT control goes inside its row's value cell. A
+/// plain value is drawn vertically centred in the cell, but an EDIT draws its
+/// text from the top of its own box, so a full-height box put the text above
+/// the label and the plain values. One text line high, centred, lines up.
+fn centered_edit_rect(cell: &RECT, line_h: i32) -> RECT {
+    let line_h = line_h.clamp(1, (cell.bottom - cell.top).max(1));
+    let top = cell.top + ((cell.bottom - cell.top) - line_h) / 2;
+    RECT {
+        left: cell.left,
+        top,
+        right: cell.right,
+        bottom: top + line_h,
+    }
+}
+
+/// `EM_SETMARGINS` with `EC_LEFTMARGIN | EC_RIGHTMARGIN` and no margin, so
+/// an edit's text starts where a plain value's does (#743).
+fn clear_edit_margins(edit: HWND) {
+    const EM_SETMARGINS: u32 = 0x00D3;
+    const EC_LEFTMARGIN_AND_RIGHT: usize = 0x0001 | 0x0002;
+    unsafe {
+        SendMessageW(
+            edit,
+            EM_SETMARGINS,
+            Some(WPARAM(EC_LEFTMARGIN_AND_RIGHT)),
+            Some(LPARAM(0)),
+        );
+    }
+}
+
 fn create_preview_edit(
     parent: HWND,
     instance: HINSTANCE,
@@ -4319,6 +4357,7 @@ fn create_preview_edit(
             Some(LPARAM(1)),
         );
     }
+    clear_edit_margins(hwnd);
     Some(hwnd)
 }
 
@@ -5842,6 +5881,42 @@ mod tests {
         assert_eq!(hc.text, theme::HC_BLACK.window_text);
         card.force_theme_for_gallery(Theme::Dark);
         assert!(card.inner.button_high_contrast().is_none());
+    }
+
+    #[test]
+    fn an_edit_is_one_line_high_and_centred_in_its_value_cell() {
+        let cell = RECT {
+            left: 100,
+            top: 40,
+            right: 300,
+            bottom: 70,
+        };
+        let r = centered_edit_rect(&cell, 20);
+        assert_eq!((r.left, r.right), (100, 300));
+        assert_eq!((r.top, r.bottom), (45, 65));
+        // The same gap above and below, like a vertically centred plain value.
+        assert_eq!(r.top - cell.top, cell.bottom - r.bottom);
+        // A line taller than the cell never grows it, and never goes below 1.
+        let tall = centered_edit_rect(&cell, 99);
+        assert_eq!((tall.top, tall.bottom), (40, 70));
+        assert!(centered_edit_rect(&cell, 0).bottom > 40);
+    }
+
+    #[test]
+    fn a_live_preview_edit_sits_inside_its_row_and_one_line_high() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_preview("Add to calendar", &schema, &value, false);
+        let preview = card.inner.preview.as_ref().expect("preview");
+        assert!(!preview.edits.is_empty());
+        let line_h = card.inner.line_height(card.inner.fonts.body);
+        for (_, hwnd) in &preview.edits {
+            let mut r = RECT::default();
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(*hwnd, &mut r);
+            }
+            assert_eq!(r.bottom - r.top, line_h);
+        }
     }
 
     fn card_width(card: &Card) -> i32 {
