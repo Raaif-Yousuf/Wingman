@@ -478,16 +478,28 @@ pub fn load_actions_from(user_path: &Path) -> Result<Vec<Resolved>> {
 
 /// What a load produced: the actions that can run, and one plain sentence for
 /// each action that was left out because its own fields are wrong (#620).
+/// `skipped_ids` holds the ids, in the same order, so a run of a skipped id
+/// can say why it is missing.
 #[derive(Debug, Default)]
 pub struct LoadReport {
     pub actions: Vec<Resolved>,
     pub skipped: Vec<String>,
+    pub skipped_ids: Vec<String>,
+}
+
+impl LoadReport {
+    /// Why the action with this id was skipped, if it was.
+    pub fn skipped_reason(&self, id: &str) -> Option<&str> {
+        let i = self.skipped_ids.iter().position(|s| s == id)?;
+        self.skipped.get(i).map(String::as_str)
+    }
 }
 
 /// [`load_actions_from`] plus the reasons any action was skipped. A file that
 /// cannot be read or parsed is still an `Err` for the whole file; a single
 /// action with a bad executor, proposal or input list is skipped on its own
-/// so one typo never hides the built-ins.
+/// so one typo never hides the built-ins. User entries are checked BEFORE
+/// the merge: a bad override of a built-in is skipped and the built-in stays.
 pub fn load_actions_report_from(user_path: &Path) -> Result<LoadReport> {
     let user_file = if user_path.exists() {
         let contents = fs::read_to_string(user_path)
@@ -498,34 +510,54 @@ pub fn load_actions_report_from(user_path: &Path) -> Result<LoadReport> {
         ActionsFile::default()
     };
 
-    let merged = merge_actions(builtin_actions(), user_file.actions);
+    let builtins = builtin_actions();
     let mut report = LoadReport::default();
-    for resolved in visible(merged, &user_file.disabled_groups) {
-        match validate_action(&resolved.action) {
-            Ok(()) => report.actions.push(resolved),
-            Err(e) => report.skipped.push(format!("{e:#}")),
+    let mut user_actions = Vec::new();
+    for action in user_file.actions {
+        // A hidden action never runs, so it is not checked.
+        let hidden = !action.enabled
+            || action
+                .group
+                .as_ref()
+                .is_some_and(|g| user_file.disabled_groups.contains(g));
+        match validate_action(&action) {
+            Err(e) if !hidden => {
+                let mut message = format!("{e:#}.");
+                if builtins.iter().any(|b| b.id == action.id) {
+                    message.push_str(" Your version was skipped and the built-in was kept.");
+                } else {
+                    message.push_str(" It was skipped.");
+                }
+                report.skipped_ids.push(action.id.clone());
+                report.skipped.push(message);
+            }
+            _ => user_actions.push(action),
         }
     }
+
+    let merged = merge_actions(builtins, user_actions);
+    report.actions = visible(merged, &user_file.disabled_groups);
     Ok(report)
 }
 
 /// Rejects a combination that could only fail (or quietly do something else)
-/// after the user had spent a model call (#536, #620). Only actions that can
-/// run are checked, so a hidden one never blocks the others. A named error,
-/// never a panic (rule 7).
+/// after the user had spent a model call (#536, #620). A named error, never
+/// a panic (rule 7).
 fn validate_action(action: &Action) -> Result<()> {
-    if crate::executors::registry::resolve(&action.executor).is_err() {
-        anyhow::bail!(
+    let executor = match crate::executors::registry::resolve(&action.executor) {
+        Ok(executor) => executor,
+        Err(_) => anyhow::bail!(
             "action \"{}\" names executor \"{}\", which does not exist",
             action.id,
             action.executor
-        );
-    }
-    // An empty prompt means the action never calls a model, so its proposal
-    // name (`"ocr_text"`) is deliberately not a registered schema.
-    if !action.prompt.trim().is_empty()
-        && schema::schema_for(&action.proposal, action.rate_difficulty).is_none()
-    {
+        ),
+    };
+    // No model call (an empty prompt) and nothing written (a read-only
+    // executor): the proposal name (`"ocr_text"`) is deliberately not a
+    // registered schema. Anything else needs a real schema.
+    let no_model =
+        action.prompt.trim().is_empty() && executor.effect() == crate::executors::Effect::ReadOnly;
+    if !no_model && schema::schema_for(&action.proposal, action.rate_difficulty).is_none() {
         anyhow::bail!(
             "action \"{}\" names proposal \"{}\", which does not exist",
             action.id,
@@ -534,8 +566,9 @@ fn validate_action(action: &Action) -> Result<()> {
     }
     if action.executor == "replace_text" && !action.inputs.contains(&InputKind::Selection) {
         anyhow::bail!(
-            "action \"{}\" uses executor \"replace_text\", which writes over the selected text,              so its inputs must include \"selection\"",
-            action.id
+            "action \"{}\" uses executor \"replace_text\", {}",
+            action.id,
+            "which writes over the selected text, so its inputs must include \"selection\""
         );
     }
     Ok(())
@@ -1118,6 +1151,54 @@ prompt = "Make it loud."
             .any(|r| r.action.id == DEFAULT_ACTION_ID));
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(plain.len(), report.actions.len());
+    }
+
+    #[test]
+    fn a_bad_override_of_a_builtin_is_skipped_and_the_builtin_kept() {
+        let path = scratch_path("bad-override");
+        write(
+            &path,
+            &one_action(DEFAULT_ACTION_ID, "verdict", "nope", "Mine."),
+        );
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        let kept = default_action(&report.actions).expect("the built-in default stays");
+        assert_eq!(kept.origin, Origin::Builtin);
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].contains("built-in was kept"));
+        assert!(report.skipped_reason(DEFAULT_ACTION_ID).is_some());
+        assert!(report.skipped_reason("something-else").is_none());
+    }
+
+    #[test]
+    fn an_unregistered_proposal_with_a_writing_executor_is_skipped() {
+        let path = scratch_path("empty-prompt-writes");
+        write(
+            &path,
+            &one_action("quiet", "no_such_schema", "replace_text", ""),
+        );
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        assert!(!report.actions.iter().any(|r| r.action.id == "quiet"));
+        assert_eq!(report.skipped.len(), 1);
+    }
+
+    #[test]
+    fn skip_messages_have_no_double_spaces() {
+        for (executor, proposal, prompt, inputs) in [
+            ("clipbaord", "text_answer", "x", "selection"),
+            ("none", "no_such_schema", "x", "selection"),
+            ("replace_text", "text_answer", "x", "clipboard"),
+        ] {
+            let path = scratch_path("spaces");
+            let text = one_action("m", proposal, executor, prompt)
+                .replace("\"selection\"", &format!("\"{inputs}\""));
+            write(&path, &text);
+            let report = load_actions_report_from(&path).unwrap();
+            cleanup(&path);
+            assert_eq!(report.skipped.len(), 1, "{executor}");
+            assert!(!report.skipped[0].contains("  "), "{}", report.skipped[0]);
+        }
     }
 
     #[test]

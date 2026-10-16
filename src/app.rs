@@ -905,6 +905,31 @@ impl App {
         Some((raw, foreground_hwnd_isize, extra_value))
     }
 
+    /// #620: tells the user once per distinct problem which actions in
+    /// `actions.toml` were skipped, and forgets the last notice when nothing
+    /// is skipped (so fixing the file and breaking it again tells them again).
+    fn show_skipped_notice(&mut self, report: &actions::LoadReport) {
+        let notice = report.skipped.join(" ");
+        if notice.is_empty() {
+            self.last_skipped_notice = None;
+        } else if self.last_skipped_notice.as_deref() != Some(notice.as_str()) {
+            let headline = "Some actions in actions.toml were skipped";
+            let detail = self.track_error(headline, &notice);
+            self.card.show_error_with_details(headline, &detail);
+            self.last_skipped_notice = Some(notice);
+        }
+    }
+
+    /// The same notice for the hotkey's default ask. A load that fails
+    /// outright is reported by the worker as before; here it only forgets the
+    /// last notice.
+    fn notice_skipped_actions(&mut self) {
+        match actions::load_actions_report() {
+            Ok(report) => self.show_skipped_notice(&report),
+            Err(_) => self.last_skipped_notice = None,
+        }
+    }
+
     /// The whole flow: hide any stale card, check a provider is actually
     /// ready, grab the screen, then hand the bytes to a worker so the
     /// message loop stays responsive during the call.
@@ -913,6 +938,7 @@ impl App {
         else {
             return;
         };
+        self.notice_skipped_actions();
 
         // Issue #19: the mode-aware chain is built fresh on the WORKER
         // thread (inside `worker`, below), not here on the main thread --
@@ -994,19 +1020,11 @@ impl App {
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
         let resolved = match actions::load_actions_report() {
             Ok(report) => {
-                // #620: say once per distinct problem, not on every open.
-                let notice = report.skipped.join(" ");
-                if notice.is_empty() {
-                    self.last_skipped_notice = None;
-                } else if self.last_skipped_notice.as_deref() != Some(notice.as_str()) {
-                    let headline = "Some actions in actions.toml were skipped";
-                    let detail = self.track_error(headline, &notice);
-                    self.card.show_error_with_details(headline, &detail);
-                    self.last_skipped_notice = Some(notice);
-                }
+                self.show_skipped_notice(&report);
                 report.actions
             }
             Err(e) => {
+                self.last_skipped_notice = None;
                 let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't load actions.toml", &detail);
@@ -1570,9 +1588,10 @@ impl App {
     /// card (nothing is fetched, no model is asked), then, after "Do it",
     /// with the confirmed address, which fetches the page and summarizes it.
     fn run_generic_action_with(&mut self, action_id: &str, confirmed_link: Option<String>) {
-        let resolved = match actions::load_actions() {
+        let resolved = match actions::load_actions_report() {
             Ok(r) => r,
             Err(e) => {
+                self.last_skipped_notice = None;
                 let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't load actions.toml", &detail);
@@ -1580,14 +1599,16 @@ impl App {
             }
         };
         let Some(action) = resolved
+            .actions
             .iter()
             .find(|r| r.action.id == action_id)
             .map(|r| r.action.clone())
         else {
-            let detail = self.track_error(
-                "Couldn't run that action",
-                &format!("no visible action with id \"{action_id}\""),
+            let reason = resolved.skipped_reason(action_id).map_or_else(
+                || format!("no visible action with id \"{action_id}\""),
+                str::to_string,
             );
+            let detail = self.track_error("Couldn't run that action", &reason);
             self.card
                 .show_error_with_details("Couldn't run that action", &detail);
             return;
