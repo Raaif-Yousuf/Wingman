@@ -95,6 +95,8 @@ parses. `UPDATE_EXAMPLES=1 cargo test actions_example` regenerates it.
 
 ## Merge rule: replace-by-id, not per-field
 
+> Superseded by [2026-10-16-action-override-merge-design.md](2026-10-16-action-override-merge-design.md) (#559): the default is now a field-level merge, and `replace = true` gives the wholesale behaviour described below.
+
 A user `actions.toml` entry whose `id` matches a built-in **replaces it
 wholesale** -- every field, not a per-field overlay. This is deliberately
 the simpler of the two options CONTRIBUTING.md leaves open:
