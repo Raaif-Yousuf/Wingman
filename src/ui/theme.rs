@@ -233,15 +233,17 @@ impl Tokens {
         match theme {
             Theme::Light => LIGHT,
             Theme::Dark => DARK,
-            // Windows promises window text on window is readable, and
-            // greyed text is its own pairing. Everything else is the same
-            // ink: high contrast has no tiers of quiet.
+            // Windows promises window text on window is readable. GrayText
+            // means "unavailable", so it is not used for live labels, the
+            // chevron or the status line: everything is the same ink (high
+            // contrast has no tiers of quiet). Disabled buttons take
+            // `gray_text` from `SysColors` directly.
             Theme::HighContrast => Tokens {
                 surface: sys.window,
                 border: sys.window_text,
                 text: sys.window_text,
                 text_dim: sys.window_text,
-                text_faint: sys.gray_text,
+                text_faint: sys.window_text,
                 link: sys.hotlight,
                 danger: sys.window_text,
             },
@@ -594,7 +596,11 @@ mod tests {
         assert_eq!(t.surface, HC_WHITE.window);
         assert_eq!(t.text, HC_WHITE.window_text);
         assert_eq!(t.text_dim, HC_WHITE.window_text);
-        assert_eq!(t.text_faint, HC_WHITE.gray_text);
+        assert_eq!(t.text_faint, HC_WHITE.window_text);
+        assert_ne!(
+            t.text_faint, HC_WHITE.gray_text,
+            "GrayText means disabled (#816)"
+        );
         // Links are not greyed text: Windows keeps GrayText for disabled
         // items and gives links their own colour.
         assert_eq!(t.link, HC_WHITE.hotlight);

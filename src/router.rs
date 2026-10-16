@@ -182,6 +182,20 @@ pub fn build_request(image_png: Vec<u8>, candidates: &[RouterCandidate]) -> Requ
     }
 }
 
+/// The router's chain: just `provider`, never previewing, and stopping at
+/// [`ROUTER_WALL_CLOCK`] after `started` (#792). It bounds only the chain:
+/// past that point no further provider call and no repair request is
+/// started (and billed). A call already in flight is not interrupted; it
+/// ends on its own HTTP timeout.
+pub fn router_chain(
+    provider: Box<dyn crate::provider::Provider>,
+    started: std::time::Instant,
+) -> Chain {
+    Chain::new(vec![provider])
+        .without_prompt()
+        .with_deadline(started + ROUTER_WALL_CLOCK)
+}
+
 /// Issue #295: runs the router's request through `chain`, the same
 /// vision-aware way every other screen action does. Before this function
 /// existed, `app.rs`'s `router_worker` built its own `Request` via
@@ -398,6 +412,75 @@ mod tests {
             group: None,
             requires_model: true,
         }
+    }
+
+    /// #792: the router's chain sends no repair request once its deadline has
+    /// passed. A slow provider returns an unparseable answer after the cap;
+    /// it must be asked exactly once.
+    #[test]
+    fn router_chain_sends_no_repair_after_the_deadline() {
+        use crate::provider::{Caps, Completion, Provider, StopReason};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        struct SlowBadAnswer(Arc<AtomicU32>);
+        impl Provider for SlowBadAnswer {
+            fn id(&self) -> &'static str {
+                "slow"
+            }
+            fn capabilities(&self, _model: &str) -> Caps {
+                Caps {
+                    vision: true,
+                    ..Caps::default()
+                }
+            }
+            fn own_caps(&self) -> Caps {
+                self.capabilities("")
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                Ok(Completion {
+                    text: "not json".to_string(),
+                    usage: None,
+                    stop: StopReason::Complete,
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        // Started long enough ago that the deadline has passed by the time
+        // the slow answer arrives.
+        let Some(started) = std::time::Instant::now().checked_sub(ROUTER_WALL_CLOCK) else {
+            return; // machine up for under 10 s: no earlier instant exists
+        };
+        let chain = router_chain(Box::new(SlowBadAnswer(calls.clone())), started);
+        let result = route(&chain, vec![1], &[candidate("a", "A")], || {
+            Err(anyhow::anyhow!("no fallback expected"))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "past the deadline: no call at all"
+        );
+
+        let nearly = ROUTER_WALL_CLOCK - std::time::Duration::from_millis(20);
+        let chain = router_chain(
+            Box::new(SlowBadAnswer(calls.clone())),
+            std::time::Instant::now()
+                .checked_sub(nearly)
+                .unwrap_or(started),
+        );
+        let result = route(&chain, vec![1], &[candidate("a", "A")], || {
+            Err(anyhow::anyhow!("no fallback expected"))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "asked once, never repaired"
+        );
     }
 
     // -- candidates_from_catalogue ------------------------------------------
