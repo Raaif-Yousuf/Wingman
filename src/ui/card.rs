@@ -99,7 +99,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END, VK_ESCAPE,
-    VK_HOME, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_UP,
+    VK_HOME, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -242,6 +242,7 @@ impl Card {
             copy_details_available: false,
             copy_details_rect: None,
             copy_available: false,
+            focus_link: None,
             copy_rect: None,
             copy_feedback: CopyFeedback::None,
             read_aloud_available: false,
@@ -575,6 +576,12 @@ impl Card {
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn expand_for_gallery(&mut self) {
         self.inner.try_expand();
+    }
+
+    /// The UI gallery's focus rectangle: what the first Tab does.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn focus_first_link_for_gallery(&mut self) {
+        self.inner.move_footer_focus(false);
     }
 
     /// The UI gallery's preview error title: puts `message` where the
@@ -1139,6 +1146,46 @@ fn scroll_target_for_key(vk: u16, offset: i32, max: i32, line: i32, page: i32) -
     Some(target.clamp(0, max.max(0)))
 }
 
+/// The footer's clickable links, in Tab order (#606).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FooterLink {
+    CopyDetails,
+    ReadAloud,
+    Copy,
+}
+
+/// Where Tab (or Shift+Tab with `backwards`) moves the focus among `links`.
+/// Wraps around; a `current` that is not in `links` starts from the end the
+/// direction came from; no links means no focus.
+fn next_footer_focus(
+    links: &[FooterLink],
+    current: Option<FooterLink>,
+    backwards: bool,
+) -> Option<FooterLink> {
+    if links.is_empty() {
+        return None;
+    }
+    let len = links.len();
+    let at = current.and_then(|c| links.iter().position(|l| *l == c));
+    let next = match (at, backwards) {
+        (None, false) => 0,
+        (None, true) => len - 1,
+        (Some(i), false) => (i + 1) % len,
+        (Some(i), true) => (i + len - 1) % len,
+    };
+    Some(links[next])
+}
+
+/// The title line of a preview that rejected an edit. High contrast has one
+/// ink for everything (#648), so the message says it is an error in words.
+fn preview_error_title(message: &str, theme: Theme) -> String {
+    if theme == Theme::HighContrast {
+        format!("Error: {message}")
+    } else {
+        message.to_string()
+    }
+}
+
 // -- Difficulty badge (Collapsed / Expanded only) -----------------------
 
 /// Distance from the card's outer edge to the badge's outer edge. Smaller
@@ -1391,6 +1438,9 @@ struct CardInner {
     /// Issue #531: `true` while the card is an answer card, i.e. one with a
     /// "Copy" link in the footer once Expanded.
     copy_available: bool,
+    /// #606: the footer link Tab has moved to, drawn with a focus rectangle
+    /// and run by Enter or Space. `None` until Tab is pressed.
+    focus_link: Option<FooterLink>,
     /// The "Copy" link's hit-test rect while Expanded, same coordinates as
     /// `read_aloud_rect`.
     copy_rect: Option<RECT>,
@@ -1619,6 +1669,7 @@ impl CardInner {
         self.copy_available = false;
         self.copy_rect = None;
         self.copy_feedback = CopyFeedback::None;
+        self.focus_link = None;
 
         unsafe {
             if auto_dismiss_secs > 0 {
@@ -1841,6 +1892,7 @@ impl CardInner {
         }
         self.set_noactivate(false);
         self.state = CardState::Expanded;
+        self.focus_link = None;
         self.scroll_offset = 0;
         self.layout_expanded();
         unsafe {
@@ -1966,6 +2018,39 @@ impl CardInner {
             self.reading = false;
             self.invalidate();
         }
+    }
+
+    /// The footer links the card shows now, in Tab order.
+    fn footer_links(&self) -> Vec<FooterLink> {
+        [
+            (FooterLink::CopyDetails, self.copy_details_rect),
+            (FooterLink::ReadAloud, self.read_aloud_rect),
+            (FooterLink::Copy, self.copy_rect),
+        ]
+        .into_iter()
+        .filter_map(|(link, rect)| rect.map(|_| link))
+        .collect()
+    }
+
+    /// #606: Tab or Shift+Tab. The card never takes focus by itself; this
+    /// only runs once Expanded, which already has the keyboard.
+    fn move_footer_focus(&mut self, backwards: bool) {
+        if self.state != CardState::Expanded {
+            return;
+        }
+        self.focus_link = next_footer_focus(&self.footer_links(), self.focus_link, backwards);
+        self.invalidate();
+    }
+
+    /// #606: Enter or Space on the focused link. `false` when none is focused.
+    fn activate_focused_link(&mut self) -> bool {
+        match self.focus_link {
+            Some(FooterLink::CopyDetails) => self.copy_details_activated(),
+            Some(FooterLink::ReadAloud) => self.read_aloud_activated(),
+            Some(FooterLink::Copy) => self.copy_activated(),
+            None => return false,
+        }
+        true
     }
 
     /// The pinned footer row's rect, whichever footer the card has.
@@ -2755,6 +2840,26 @@ impl CardInner {
                 );
             }
         }
+        // #606: the system focus rectangle round the link Tab has reached.
+        // It inverts what is under it, so it shows in light, dark and high
+        // contrast alike.
+        if let Some(rect) = self.focus_link.and_then(|l| self.link_rect(l)) {
+            let ring = RECT {
+                left: rect.left - 2,
+                top: rect.top - 1,
+                right: rect.right + 2,
+                bottom: rect.bottom + 1,
+            };
+            let _ = windows::Win32::Graphics::Gdi::DrawFocusRect(hdc, &ring);
+        }
+    }
+
+    fn link_rect(&self, link: FooterLink) -> Option<RECT> {
+        match link {
+            FooterLink::CopyDetails => self.copy_details_rect,
+            FooterLink::ReadAloud => self.read_aloud_rect,
+            FooterLink::Copy => self.copy_rect,
+        }
     }
 
     /// Draws the difficulty badge in the card's bottom-right corner, if any
@@ -2960,6 +3065,13 @@ impl CardInner {
             WM_KEYDOWN => {
                 if self.state == CardState::Expanded && wparam.0 as u16 == VK_ESCAPE.0 {
                     self.close_expanded();
+                } else if self.state == CardState::Expanded && wparam.0 as u16 == VK_TAB.0 {
+                    self.move_footer_focus(key_is_down(VK_SHIFT.0));
+                } else if self.state == CardState::Expanded
+                    && (wparam.0 as u16 == VK_RETURN.0 || wparam.0 as u16 == VK_SPACE.0)
+                    && self.focus_link.is_some()
+                {
+                    self.activate_focused_link();
                 } else if let Some(target) = self
                     .scroll_key_target(wparam.0 as u16)
                     .filter(|_| self.state == CardState::Expanded)
@@ -3763,7 +3875,10 @@ impl CardInner {
         }
         draw_text_line(
             hdc,
-            preview.error.as_deref().unwrap_or(&preview.title),
+            &preview.error.as_deref().map_or_else(
+                || preview.title.clone(),
+                |e| preview_error_title(e, self.theme),
+            ),
             title_rect,
             DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
@@ -5042,6 +5157,109 @@ mod tests {
         assert!(
             !queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS),
             "an answer card has no Copy details to activate"
+        );
+    }
+
+    // -- footer link focus (#606) --------------------------------------------
+
+    #[test]
+    fn tab_cycles_through_the_links_and_shift_tab_goes_back() {
+        use FooterLink::*;
+        let links = [ReadAloud, Copy];
+        assert_eq!(next_footer_focus(&links, None, false), Some(ReadAloud));
+        assert_eq!(
+            next_footer_focus(&links, Some(ReadAloud), false),
+            Some(Copy)
+        );
+        assert_eq!(
+            next_footer_focus(&links, Some(Copy), false),
+            Some(ReadAloud)
+        );
+        assert_eq!(next_footer_focus(&links, None, true), Some(Copy));
+        assert_eq!(next_footer_focus(&links, Some(ReadAloud), true), Some(Copy));
+        assert_eq!(next_footer_focus(&links, Some(Copy), true), Some(ReadAloud));
+        // A focused link that is gone starts over; no links means no focus.
+        assert_eq!(
+            next_footer_focus(&[Copy], Some(ReadAloud), false),
+            Some(Copy)
+        );
+        assert_eq!(next_footer_focus(&[], Some(Copy), false), None);
+    }
+
+    fn expanded_model_answer() -> Card {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_model_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        card.inner.try_expand();
+        card
+    }
+
+    #[test]
+    fn tab_on_an_expanded_answer_card_moves_focus_between_its_links() {
+        let mut card = expanded_model_answer();
+        assert_eq!(card.inner.focus_link, None);
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_TAB.0 as usize), LPARAM(0));
+        assert_eq!(card.inner.focus_link, Some(FooterLink::ReadAloud));
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_TAB.0 as usize), LPARAM(0));
+        assert_eq!(card.inner.focus_link, Some(FooterLink::Copy));
+        card.inner.move_footer_focus(true);
+        assert_eq!(card.inner.focus_link, Some(FooterLink::ReadAloud));
+    }
+
+    #[test]
+    fn the_focused_link_is_drawn_with_a_focus_rectangle() {
+        // The observable: the card's pixels differ once a link has focus.
+        let mut card = expanded_model_answer();
+        let before = render(&card);
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_TAB.0 as usize), LPARAM(0));
+        let after = render(&card);
+        assert_eq!(before.0, after.0);
+        assert_ne!(before.2, after.2, "no focus rectangle was painted");
+    }
+
+    #[test]
+    fn space_activates_the_focused_link() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_TAB.0 as usize), LPARAM(0));
+        assert_eq!(card.inner.focus_link, Some(FooterLink::CopyDetails));
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(0));
+        // Peek last: peeking can run a WM_KILLFOCUS another test's window
+        // caused, which would close this card.
+        assert!(queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS));
+    }
+
+    #[test]
+    fn space_with_no_focused_link_does_nothing() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        assert!(!card.inner.activate_focused_link());
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(0));
+        assert!(!queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS));
+    }
+
+    #[test]
+    fn a_new_card_starts_with_no_focused_link() {
+        let mut card = expanded_model_answer();
+        card.inner.move_footer_focus(false);
+        assert!(card.inner.focus_link.is_some());
+        card.show_model_answer("next", "detail", 0, None);
+        assert_eq!(card.inner.focus_link, None);
+    }
+
+    #[test]
+    fn a_high_contrast_preview_error_says_error_in_words() {
+        assert_eq!(
+            preview_error_title("Start must be a time.", Theme::HighContrast),
+            "Error: Start must be a time."
+        );
+        assert_eq!(
+            preview_error_title("Start must be a time.", Theme::Dark),
+            "Start must be a time."
         );
     }
 
