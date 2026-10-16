@@ -1234,12 +1234,16 @@ impl PaletteInner {
                 if let Some(owner) = self.owner {
                     let boxed = Box::into_raw(Box::new(action_id));
                     unsafe {
-                        let _ = PostMessageW(
+                        if PostMessageW(
                             Some(owner),
                             WM_APP_PALETTE_RUN,
                             WPARAM(0),
                             LPARAM(boxed as isize),
-                        );
+                        )
+                        .is_err()
+                        {
+                            drop(Box::from_raw(boxed));
+                        }
                     }
                 }
                 self.hide();

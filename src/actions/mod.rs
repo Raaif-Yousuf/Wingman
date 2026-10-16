@@ -22,6 +22,7 @@ pub mod generic_replace;
 pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
+pub mod receipt;
 pub mod review_email;
 pub mod rewrite_tone;
 pub mod scam_check;
@@ -471,6 +472,7 @@ pub fn builtin_actions() -> Vec<Action> {
         action_items::builtin_action(),
         table::builtin_action(),
         chart_table::builtin_action(),
+        receipt::builtin_action(),
         explain_error::builtin_action(),
         define_word::builtin_action(),
         translate::builtin_action(),

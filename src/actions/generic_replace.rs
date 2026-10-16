@@ -227,6 +227,17 @@ pub fn replace_or_copy(
     if blank {
         return ReplaceReport::NothingToReplace;
     }
+    // #694: text the user edited in the preview is matched to the selection's
+    // line endings too, so a copy-instead (no target, or a failed write)
+    // puts the same text on the clipboard that a write would have used. Same
+    // already-confirmed decision, re-wrapped (see `do_review_confirmed`).
+    let confirmed = match plan {
+        Some(p) => crate::ui::confirm::confirm(
+            crate::ui::confirm::Proposal::new(normalize_proposal(p, confirmed.into_value())),
+            crate::ui::confirm::user_confirmed(),
+        ),
+        None => confirmed,
+    };
     let Some(context) = plan.and_then(|p| review_context(p, confirmed.value())) else {
         return copy_report(copy, confirmed, COPIED_INSTEAD_DETAIL.to_string(), None);
     };
@@ -529,6 +540,51 @@ mod tests {
             copy.seen.lock().unwrap().clone(),
             Some(json!({"text": "hello (edited)"})),
             "the clipboard gets exactly what the user confirmed"
+        );
+    }
+
+    #[test]
+    fn a_failed_replace_copies_the_edited_text_with_the_selections_line_endings() {
+        // #694: an edited multi-line value must not land on the clipboard
+        // with LF when the selection was CRLF.
+        let replace = Fake::new("replace_text", Err(anyhow::anyhow!("the text changed")));
+        let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
+        let plan = ReplaceSelection {
+            target: Some(target()),
+            selected_text: "a\r\nb".into(),
+        };
+        let report = replace_or_copy(
+            &replace,
+            &copy,
+            Some(&plan),
+            confirmed(json!({"text": "x\ny\nz"})),
+        );
+        assert!(matches!(report, ReplaceReport::Copied(_)), "{report:?}");
+        assert_eq!(
+            copy.seen.lock().unwrap().clone(),
+            Some(json!({"text": "x\r\ny\r\nz"}))
+        );
+    }
+
+    #[test]
+    fn a_none_target_plan_copies_matched_text_and_never_calls_the_replace_executor() {
+        let replace = Fake::new("replace_text", Ok(Undo::none("wrote it")));
+        let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
+        let plan = ReplaceSelection {
+            target: None,
+            selected_text: "a\r\nb".into(),
+        };
+        let report = replace_or_copy(
+            &replace,
+            &copy,
+            Some(&plan),
+            confirmed(json!({"text": "x\ny"})),
+        );
+        assert_eq!(report, ReplaceReport::Copied(COPIED_INSTEAD_DETAIL.into()));
+        assert!(!replace.ran());
+        assert_eq!(
+            copy.seen.lock().unwrap().clone(),
+            Some(json!({"text": "x\r\ny"}))
         );
     }
 

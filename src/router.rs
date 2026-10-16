@@ -69,7 +69,15 @@ pub const ROUTER_MAX_TOKENS: u32 = 200;
 /// below and change nothing.
 pub const DEFAULT_ROUTER_THRESHOLD: f64 = 0.7;
 
-const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Identify which listed action (if any) the screen suggests, and describe in one short sentence what's on screen. Never explain your reasoning, only report the result. Use plain text only: no markdown and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
+/// MEASURED 2026-10-16 (#223, `app::tests::router_live_recognizes_email_compose`,
+/// local Ollama `qwen3.5:4b`, the expansion plan's router default): with the
+/// earlier one-line prompt, 1 of 4 runs put an action id into `summary` and
+/// picked the wrong action. With the field roles stated below (summary is
+/// plain prose and never an id, intent is copied exactly or "none"), 5 of 5
+/// runs picked `review-this-email` with a prose summary and no echoed id
+/// (~14-17 s each on CPU: `/api/ps` showed `size_vram` 0 on this machine, so
+/// those times are CPU times). `gemma3:4b` was not re-measured.
+const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Fill three fields. \"summary\": one short plain sentence about what is visible on screen, never an action id or action name. \"intent\": the id of the one listed action the screen suggests, copied exactly, or \"none\" if no listed action fits. \"confidence\": a number from 0 to 1. Never explain your reasoning, only report the result. Use plain text only: no markdown and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
 
 /// One candidate action offered to the router: its id and a one-line
 /// description (today: [`PaletteAction::name`] -- the catalogue has no
@@ -419,6 +427,20 @@ mod tests {
         let req = build_request(vec![], &candidates);
         assert!(req.system.contains("check-my-work: Check my work"));
         assert!(req.system.contains("add-to-calendar: Add to calendar"));
+    }
+
+    /// #223: small local models echoed action ids into `summary`. The prompt
+    /// must state each field's role, and the "summary never names an action"
+    /// instruction must come before the candidate list.
+    #[test]
+    fn build_request_states_the_field_roles_before_the_candidate_list() {
+        let req = build_request(vec![], &[candidate("a", "A")]);
+        let list_at = req.system.find("Available actions:").unwrap();
+        let rules = &req.system[..list_at];
+        assert!(rules.contains("summary"), "{rules}");
+        assert!(rules.contains("never an action id"), "{rules}");
+        assert!(rules.contains("intent"), "{rules}");
+        assert!(rules.contains("\"none\""), "{rules}");
     }
 
     #[test]

@@ -49,16 +49,24 @@ pub fn builtin_action() -> Action {
     }
 }
 
+/// What the card and the clipboard get for a chart table: the proposal with
+/// its value headers marked, and the card note with the estimate warning in
+/// front of any note the card would otherwise show.
+pub fn finish(proposal: &Value, note: Option<&str>) -> (Value, String) {
+    (mark_estimates(proposal), card_note(note))
+}
+
 /// The `table` proposal with every value column header (every column but the
-/// first) marked as an estimate. A header that already says "estimate" is
-/// left alone, so a model that obeys a custom prompt is not marked twice.
-/// A reply that does not read as a table comes back unchanged.
+/// first) marked as an estimate. A header that already ends in " (estimate)"
+/// is left alone, so a model that obeys a custom prompt is not marked twice;
+/// a header that merely mentions the word (say "Estimated sales") still gets
+/// the suffix. A reply that does not read as a table comes back unchanged.
 pub fn mark_estimates(proposal: &Value) -> Value {
     let Some(mut table) = Table::from_value(proposal) else {
         return proposal.clone();
     };
     for header in table.columns.iter_mut().skip(1) {
-        if !header.to_lowercase().contains("estimate") {
+        if !header.ends_with(ESTIMATE_SUFFIX) {
             header.push_str(ESTIMATE_SUFFIX);
         }
     }
@@ -138,8 +146,31 @@ mod tests {
 
     #[test]
     fn a_header_that_already_says_estimate_is_not_marked_twice() {
-        let p = json!({"columns": ["X", "Value (estimate)", "Approx. estimate"], "rows": [["a", "1", "2"]]});
+        let p = json!({"columns": ["X", "Value (estimate)"], "rows": [["a", "1"]]});
         assert_eq!(mark_estimates(&p)["columns"], p["columns"]);
+    }
+
+    #[test]
+    fn a_header_that_only_mentions_the_word_is_still_marked() {
+        let p = json!({"columns": ["X", "Estimated sales", "Approx. estimate"], "rows": [["a", "1", "2"]]});
+        assert_eq!(
+            mark_estimates(&p)["columns"],
+            json!([
+                "X",
+                "Estimated sales (estimate)",
+                "Approx. estimate (estimate)"
+            ])
+        );
+    }
+
+    #[test]
+    fn finish_marks_the_table_and_puts_the_warning_first() {
+        let p = json!({"columns": ["L", "V"], "rows": [["a", "1"]]});
+        let (marked, note) = finish(&p, Some("Cut to the first rows."));
+        assert_eq!(marked["columns"], json!(["L", "V (estimate)"]));
+        assert!(note.starts_with(ESTIMATE_NOTE), "{note}");
+        assert!(note.ends_with("Cut to the first rows."), "{note}");
+        assert_eq!(finish(&p, None).1, ESTIMATE_NOTE);
     }
 
     #[test]
@@ -180,9 +211,15 @@ mod tests {
 
     #[test]
     fn the_table_type_is_the_shared_one() {
-        // `mark_estimates` goes through `Table`, so the caps apply too.
-        let cells: Vec<Value> = (0..3).map(|i| json!(i.to_string())).collect();
+        // `mark_estimates` goes through `Table`, so the column cap applies
+        // too: a runaway header list is cut, and the kept value headers are
+        // still marked.
+        let n = crate::actions::table::MAX_COLUMNS + 5;
+        let cells: Vec<Value> = (0..n).map(|i| json!(i.to_string())).collect();
         let p = json!({"columns": cells, "rows": [cells]});
-        assert!(Table::from_value(&mark_estimates(&p)).is_some());
+        let t = Table::from_value(&mark_estimates(&p)).expect("still a table");
+        assert_eq!(t.columns.len(), crate::actions::table::MAX_COLUMNS);
+        assert_eq!(t.columns[0], "0");
+        assert_eq!(t.columns[1], "1 (estimate)");
     }
 }

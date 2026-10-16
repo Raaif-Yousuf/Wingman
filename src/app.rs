@@ -121,9 +121,9 @@ pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
 
 /// #242: posted by `App::run_generic_action`'s worker thread when the
 /// provider chain finishes for a non-built-in `actions.toml` action:
-/// `lparam` is `Box::into_raw(Box::new((String, Result<Value, String>)))`,
+/// `lparam` is `Box::into_raw(Box::new((Action, Value, GenericResult)))`,
 /// the generic-dispatch analogue of [`WM_APP_CALENDAR_RESULT`] -- the
-/// `String` is the action id, carried along because (unlike the calendar
+/// `Action` is carried along because (unlike the calendar
 /// flow) there is no single fixed action this result can belong to.
 /// `WM_APP + 16`: `+15` is already `crate::ui::card::WM_APP_CARD_OPEN_SETTINGS`.
 pub const WM_APP_GENERIC_ACTION_RESULT: u32 = WM_APP + 16;
@@ -396,6 +396,9 @@ fn error_details_clipboard_text(last_error: &LastError) -> &str {
 }
 
 pub fn run() -> Result<()> {
+    // #700: the thread that runs this hosts the keyboard hook, and a `--settings`
+    // launch runs the Settings loop before `pump_messages`, so mark it first.
+    crate::ui_thread::mark_current_thread();
     // Before any window exists, so the card's metrics are right on a mixed-DPI
     // setup (a laptop panel next to an external monitor).
     unsafe {
@@ -509,6 +512,7 @@ pub fn run() -> Result<()> {
     if let Some((headline, detail)) = startup_card(
         &config.unreadable_secrets,
         crate::single_instance::lock_squatted(),
+        config.load_problem.as_deref(),
     ) {
         card.show_error(&headline, &detail);
     }
@@ -649,20 +653,46 @@ fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
 /// unreadable keys, #237 lockless start) end in a card, and one must never
 /// overwrite the other, so when both apply their text is joined. Pure so the
 /// wording is unit-tested without a `Card`. No em dash (rule 11).
-fn startup_card(unreadable: &[String], lock_squatted: bool) -> Option<(String, String)> {
+fn startup_card(
+    unreadable: &[String],
+    lock_squatted: bool,
+    config_problem: Option<&str>,
+) -> Option<(String, String)> {
     let squat = (
         "Another program holds Wingman's startup lock".to_string(),
         "Wingman started anyway. If you see two Wingman tray icons, quit one of them.".to_string(),
     );
-    match (unreadable.is_empty(), lock_squatted) {
-        (true, false) => None,
-        (false, false) => Some(unreadable_secrets_card(unreadable)),
-        (true, true) => Some(squat),
-        (false, true) => {
-            let (headline, detail) = unreadable_secrets_card(unreadable);
-            Some((headline, format!("{detail}\n\n{}. {}", squat.0, squat.1)))
-        }
+    // Every problem that applies, in order; the first one's headline leads
+    // and the rest are joined, so none is dropped.
+    let mut cards = Vec::new();
+    if let Some(problem) = config_problem {
+        cards.push(config_problem_card(problem));
     }
+    if !unreadable.is_empty() {
+        cards.push(unreadable_secrets_card(unreadable));
+    }
+    if lock_squatted {
+        cards.push(squat);
+    }
+    let mut cards = cards.into_iter();
+    let (headline, mut detail) = cards.next()?;
+    for (h, d) in cards {
+        detail = format!("{detail}\n\n{h}. {d}");
+    }
+    Some((headline, detail))
+}
+
+/// #711: config.toml exists but did not parse. Names the line and column
+/// (`problem` already carries them), never file text. No em dash (rule 11).
+fn config_problem_card(problem: &str) -> (String, String) {
+    (
+        "Settings file not read".to_string(),
+        format!(
+            "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
+             computer) and will not save over your file. Fix it, then choose Reload settings \
+             from the tray menu."
+        ),
+    )
 }
 
 fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
@@ -705,6 +735,8 @@ fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
 }
 
 fn pump_messages() {
+    // #700: this thread hosts the keyboard hook, so no blocking network call may run here.
+    crate::ui_thread::mark_current_thread();
     let mut msg = MSG::default();
     // GetMessageW returns -1 on error; treat anything non-positive as "stop".
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -2176,6 +2208,13 @@ impl App {
                 }
             }
         }
+        // #70: a receipt is one row under five fixed headers, whatever the
+        // model sent.
+        let proposal = if action.id == actions::receipt::ACTION_ID {
+            actions::receipt::clamp_receipt(&proposal)
+        } else {
+            proposal
+        };
         // #69: no table on screen, or a reply that is not a table, is an
         // answer, not an empty preview.
         let table_headline = if actions::table::is_unreadable(&action.proposal, &proposal) {
@@ -2202,10 +2241,8 @@ impl App {
         // #114: values read off a chart are estimates. The headers say so (and
         // so does the CSV), and the card says so under the rows.
         let (proposal, note) = if action.id == actions::chart_table::ACTION_ID {
-            (
-                actions::chart_table::mark_estimates(&proposal),
-                Some(actions::chart_table::card_note(note.as_deref())),
-            )
+            let (marked, card_note) = actions::chart_table::finish(&proposal, note.as_deref());
+            (marked, Some(card_note))
         } else {
             (proposal, note)
         };
@@ -2867,7 +2904,7 @@ impl App {
 
     /// Handles the fill_form worker's result (#40). `value` carries one of
     /// three shapes: an empty-profile signal
-    /// (`{"empty_profile": true, "toml_path": ..., "bin_path": ...}` --
+    /// (`{"empty_profile": true, "toml_path": ..., "data_dir": ...}` --
     /// `form_fill_worker` returns this instead of ever building a UIA
     /// snapshot, per `actions::fill_form::load_or_import_profile`'s own
     /// "point at where to add profile data" decision), a proposal with no
@@ -2900,11 +2937,11 @@ impl App {
 
         if value.get("empty_profile").and_then(Value::as_bool) == Some(true) {
             let toml_path = value.get("toml_path").and_then(Value::as_str).unwrap_or("");
-            let bin_path = value.get("bin_path").and_then(Value::as_str).unwrap_or("");
+            let data_dir = value.get("data_dir").and_then(Value::as_str).unwrap_or("");
             self.card.show_answer(
                 actions::fill_form::EMPTY_PROFILE_HEADLINE,
                 &with_pending_notices(&actions::fill_form::empty_profile_detail(
-                    toml_path, bin_path,
+                    toml_path, data_dir,
                 )),
                 0,
                 None,
@@ -3426,6 +3463,13 @@ impl App {
 
     fn reload(&mut self) {
         match Config::load() {
+            // #711: a file that does not parse must not replace the settings
+            // already running; keep them and say what is wrong.
+            Ok(config) if config.load_problem.is_some() => {
+                let (headline, detail) =
+                    config_problem_card(config.load_problem.as_deref().unwrap_or_default());
+                self.card.show_error(&headline, &detail);
+            }
             Ok(config) => {
                 // #175: report before self.config is overwritten, since the
                 // freshly loaded config is the one whose hydrate ran.
@@ -4258,16 +4302,17 @@ fn form_fill_worker(
     require_tick_for: crate::config::RequireTickFor,
     use_model: bool,
 ) -> Result<Value> {
-    let profile = actions::fill_form::load_or_import_profile()
-        .context("failed to load or import the profile")?;
+    // No added context: the store's own messages are the card text (a
+    // profile sealed for another Windows user or PC says so, in plain words).
+    let profile = actions::fill_form::load_or_import_profile()?;
 
     if actions::fill_form::profile_is_empty(&profile) {
-        let bin_path = crate::profile::Profile::path()?;
-        let toml_path = bin_path.with_file_name("profile.toml");
+        let toml_path = actions::fill_form::profile_toml_path()?;
+        let data_dir = crate::store::data_dir().unwrap_or_default();
         return Ok(serde_json::json!({
             "empty_profile": true,
             "toml_path": toml_path.display().to_string(),
-            "bin_path": bin_path.display().to_string(),
+            "data_dir": data_dir.display().to_string(),
         }));
     }
 
@@ -4528,6 +4573,7 @@ fn with_pending_notices(detail: &str) -> String {
         [
             crate::store::take_notice(),
             crate::usage::take_budget_notice(),
+            crate::config::take_backup_warning(),
             crate::actions::take_skipped_notice(),
         ]
         .into_iter()
@@ -7631,16 +7677,35 @@ mod tests {
     #[test]
     fn startup_card_shows_neither_one_or_both_problems() {
         let keys = vec!["openai".to_string()];
-        assert_eq!(super::startup_card(&[], false), None);
-        let only_keys = super::startup_card(&keys, false).unwrap();
+        assert_eq!(super::startup_card(&[], false, None), None);
+        let only_keys = super::startup_card(&keys, false, None).unwrap();
         assert!(only_keys.0.contains("key"), "{only_keys:?}");
-        let only_squat = super::startup_card(&[], true).unwrap();
+        let only_squat = super::startup_card(&[], true, None).unwrap();
         assert!(only_squat.0.contains("startup lock"), "{only_squat:?}");
-        let (headline, detail) = super::startup_card(&keys, true).unwrap();
+        let (headline, detail) = super::startup_card(&keys, true, None).unwrap();
         assert_eq!(headline, only_keys.0);
         assert!(detail.contains(&only_keys.1), "keys text kept: {detail}");
         assert!(detail.contains(&only_squat.0), "squat text added: {detail}");
         assert!(!detail.contains('\u{2014}'));
+    }
+
+    /// #711: a config.toml that did not parse gets its own card, with the
+    /// location, and it is not lost when the other startup problems apply.
+    #[test]
+    fn startup_card_reports_a_config_file_that_did_not_parse() {
+        let problem = "config.toml has an error at line 3, column 7";
+        let (headline, detail) = super::startup_card(&[], false, Some(problem)).unwrap();
+        assert!(headline.contains("Settings file"), "{headline}");
+        assert!(detail.contains(problem), "{detail}");
+        assert!(detail.contains("Reload settings"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
+        let (_, both) = super::startup_card(&["openai".to_string()], true, Some(problem)).unwrap();
+        assert!(
+            both.contains(problem) && both.contains("startup lock"),
+            "{both}"
+        );
+        assert!(both.contains("Stored API key unreadable"), "{both}");
+        assert!(both.contains("Offline"), "{both}");
     }
 
     /// #237: the owner window must exist before the single-instance name is
@@ -8713,14 +8778,14 @@ mod tests {
     /// larger draft downscaled afterward), through the REAL intent router
     /// (`router::build_request`/`router::parse_router_result`, the same
     /// functions `App::router_worker` calls) against local Ollama
-    /// `gemma3:4b`. Run manually (AGENTS.md build rules -- never bare
+    /// `qwen3.5:4b` (or `WINGMAN_ROUTER_LIVE_MODEL`). Run manually (AGENTS.md build rules -- never bare
     /// `cargo test`):
     /// ```text
     /// CARGO_TARGET_DIR=... RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2 \
     ///   cargo test router_live -- --ignored --nocapture
     /// ```
-    /// Requires a local Ollama server on 127.0.0.1:11434 with `gemma3:4b`
-    /// pulled. Expects `intent == Some("review-email")` when that action
+    /// Requires a local Ollama server on 127.0.0.1:11434 with the model
+    /// pulled. Expects `intent == Some("review-this-email")` when that action
     /// exists in `actions::load_actions()`'s catalogue (added by a sibling
     /// agent in parallel, per #24's task description); otherwise only
     /// requires SOME valid id was named, never "none" -- either way the
@@ -8728,7 +8793,7 @@ mod tests {
     /// "0"`), the same convention `provider/mod.rs`'s and `ollama.rs`'s own
     /// live checks already use.
     ///
-    /// MEASURED 2026-09-17 (this crate's dev profile, `gemma3:4b`, catalogue
+    /// MEASURED 2026-09-17 (this crate's dev profile, `gemma3:4b` then, catalogue
     /// of 5 rows -- "review-email" not yet on master at measurement time):
     /// elapsed 45.71s (cold: the model was not already loaded going in --
     /// see `keep_alive`'s doc on why every OTHER live check in this crate
@@ -8748,6 +8813,11 @@ mod tests {
     /// expansion plan's own router default is `qwen3.5:4b`, not
     /// `gemma3:4b` (this test's model choice is fixed by the task that
     /// created it, not a production recommendation).
+    ///
+    /// MEASURED 2026-10-16 (#223, `qwen3.5:4b`, real catalogue with
+    /// `review-this-email`, revised prompt): 5 of 5 runs picked
+    /// `review-this-email` with a prose summary and no echoed id; see
+    /// `router::ROUTER_SYSTEM_PREFIX`.
     ///
     /// Separately: an early draft of this test's GDI renderer crashed
     /// (`STATUS_ACCESS_VIOLATION`) on a blank line in the body text --
@@ -8798,18 +8868,33 @@ mod tests {
 
         let req = router::build_request(shot.png, &candidates);
 
-        let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        // The expansion plan's router default, overridable to compare models
+        // (`WINGMAN_ROUTER_LIVE_MODEL=gemma3:4b`).
+        let model =
+            std::env::var("WINGMAN_ROUTER_LIVE_MODEL").unwrap_or_else(|_| "qwen3.5:4b".to_string());
+        let provider = Ollama::new(DEFAULT_BASE_URL, &model, "low");
         let started = std::time::Instant::now();
         let completion = provider
             .complete(&req)
             .expect("live ollama router request should succeed");
         let elapsed = started.elapsed();
 
+        // GPU oracle (AGENTS.md rule 6): size_vram > 0 on /api/ps, read while
+        // the model is still loaded.
+        let gpu = crate::provider::ollama_admin::ps(DEFAULT_BASE_URL)
+            .map(|e| {
+                format!(
+                    "{:?}",
+                    crate::provider::ollama_admin::gpu_status_for(&e, &model)
+                )
+            })
+            .unwrap_or_else(|e| format!("unknown ({e})"));
+
         // Unload right after the measurement (mirrors `provider/mod.rs`'s /
         // `ollama.rs`'s own live-check convention) -- a trivial follow-up
         // request purely to release VRAM; its own result is not the
         // measurement, so a failure here is not fatal to the test.
-        let mut unload_provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        let mut unload_provider = Ollama::new(DEFAULT_BASE_URL, &model, "low");
         unload_provider.keep_alive = "0".to_string();
         let _ = unload_provider.complete(&router::build_request(vec![], &[]));
 
@@ -8817,29 +8902,29 @@ mod tests {
             .expect("router completion should parse against its own schema");
 
         eprintln!(
-            "MEASURED 2026-09-17: router_live: model=gemma3:4b elapsed={elapsed:?} \
+            "router_live: model={model} gpu={gpu} elapsed={elapsed:?} \
              summary={:?} intent={:?} confidence={}",
             result.summary, result.intent, result.confidence
         );
         if let Some(usage) = completion.usage {
             eprintln!(
-                "MEASURED 2026-09-17: router_live token usage: input={} output={}",
+                "router_live token usage: input={} output={}",
                 usage.input_tokens, usage.output_tokens
             );
         }
 
-        if candidate_ids.iter().any(|id| id == "review-email") {
+        if candidate_ids.iter().any(|id| id == "review-this-email") {
             assert_eq!(
                 result.intent.as_deref(),
-                Some("review-email"),
-                "the \"review-email\" action exists in this catalogue; expected the router \
+                Some("review-this-email"),
+                "the \"review-this-email\" action exists in this catalogue; expected the router \
                  to pick it for an email compose window"
             );
         } else {
             assert!(
                 result.intent.is_some(),
                 "expected the router to name some action id for an unambiguous email compose \
-                 window, got none (\"review-email\" is not in this catalogue yet)"
+                 window, got none (\"review-this-email\" is not in this catalogue yet)"
             );
         }
     }

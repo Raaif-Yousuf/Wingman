@@ -70,7 +70,7 @@
 //!    `replace_text::do_replace` already refused before this fix; a field
 //!    unchanged since Look (empty-to-empty included) proceeds normally.
 //!
-//! Whatever survives all seven checks is [`FieldOutcome::Filled`]: the prior
+//! Whatever survives all of these checks, and the unknown-control-type refusal (#590), is [`FieldOutcome::Filled`]: the prior
 //! value is recorded and the new value is written.
 //!
 //! # Restore
