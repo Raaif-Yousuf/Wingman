@@ -277,19 +277,22 @@ in words.
 
 ## Tray menu
 
-- **Ask now**: trigger without the hotkey
-- **Settings...**: the settings window (left-clicking the tray icon opens
-  this too)
+- **Ask now (same as the key)**: trigger without the hotkey
+- **Actions ▸**: **Quick Ask** (a palette of every action) plus each action
+  directly: copy text, read a QR code, copy a region, calculate, add an
+  event, review an email, fill a form, restore the last form
 - **Copy last answer**: headline and working to the clipboard
-- **Provider ▸**: which service answers (ChatGPT or Claude)
-- **ChatGPT model ▸** / **Claude model ▸**: switch models, saved immediately
-- **Mode ▸**: Cloud / Local / Auto / Offline, radio-checked
 - **Pause ▸**: 1 hour / until tomorrow / until resumed; shown as **Resume**
   instead while already paused
-- **Set Copilot key...** / **Set secondary key...** / **Set pause key...**:
+- **Mode ▸**: Cloud / Local / Auto / Offline, radio-checked
+- **Providers and keys ▸**: **Provider** (which service answers),
+  **ChatGPT model** / **Claude model** (saved immediately), and **Set
+  Copilot key...** / **Set secondary key...** / **Set pause key...** to
   rebind by pressing the key
-- **Edit settings**: opens `config.toml`
-- **Reload settings**: re-read the file without restarting
+- **Settings...**: the settings window (left-clicking the tray icon opens
+  this too)
+- **Help and diagnostics ▸**: open `config.toml`, reload settings, copy
+  diagnostics, copy the egress log
 - **Quit**
 
 ## Settings worth knowing
