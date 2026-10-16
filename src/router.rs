@@ -597,7 +597,7 @@ mod tests {
             vec![
                 "gemini-3.8-flash".to_string(),
                 "gemini-3.1-pro-preview".to_string(),
-                "gemini-3.5-flash".to_string(),
+                "gemini-3.6-flash".to_string(),
                 "gemini-2.5-pro".to_string(),
                 "gemini-2.5-flash".to_string(),
             ]
