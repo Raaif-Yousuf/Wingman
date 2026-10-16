@@ -298,7 +298,7 @@ impl Provider for Ollama {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{parse_answer, physics_request, Shot};
+    use crate::provider::{parse_answer, physics_request_no_note, Shot};
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -310,7 +310,7 @@ mod tests {
     }
 
     fn req(prompt: &str, want_difficulty: bool) -> Request {
-        physics_request(&sample_shot(), prompt, want_difficulty)
+        physics_request_no_note(&sample_shot(), prompt, want_difficulty)
     }
 
     // -- base_url / default -----------------------------------------------
