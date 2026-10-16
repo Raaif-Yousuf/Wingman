@@ -1176,7 +1176,7 @@ const ROW_H: i32 = 22;
 const ROW_GAP: i32 = 8;
 const GROUP_GAP: i32 = 14;
 const GROUP_LABEL_TOP: i32 = 20; // room for the groupbox caption
-const LABEL_W: i32 = 130;
+const LABEL_W: i32 = 140;
 const BTN_W: i32 = 100;
 const BTN_H: i32 = 28;
 
@@ -3529,7 +3529,7 @@ fn build_ui_recorded(
         WC_EDIT,
         &key_field_display(&config.providers.openai.api_key),
         (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         r.x + LABEL_W,
         r.y,
         r.w - LABEL_W - 70,
@@ -3549,16 +3549,15 @@ fn build_ui_recorded(
     );
     r.advance();
 
-    let half = (r.w - 12) / 2;
-    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, 50, ROW_H, 0);
+    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let openai_model = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 50,
+        r.x + LABEL_W,
         r.y,
-        half - 50,
+        r.w - LABEL_W,
         ROW_H * 8,
         ID_OPENAI_MODEL,
     );
@@ -3567,26 +3566,17 @@ fn build_ui_recorded(
         &config.providers.openai.models,
         &config.providers.openai.model,
     );
+    r.advance();
 
-    ctx.create(
-        WC_STATIC,
-        "Thinking:",
-        0,
-        0,
-        r.x + half + 12,
-        r.y,
-        60,
-        ROW_H,
-        0,
-    );
+    ctx.create(WC_STATIC, "Thinking:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let openai_effort = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 60,
+        r.x + LABEL_W,
         r.y,
-        half - 60,
+        r.w - LABEL_W,
         ROW_H * 4,
         ID_OPENAI_EFFORT,
     );
@@ -3616,7 +3606,7 @@ fn build_ui_recorded(
         WC_EDIT,
         &key_field_display(&config.providers.anthropic.api_key),
         (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         r.x + LABEL_W,
         r.y,
         r.w - LABEL_W - 70,
@@ -3636,15 +3626,15 @@ fn build_ui_recorded(
     );
     r.advance();
 
-    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, 50, ROW_H, 0);
+    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let anthropic_model = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 50,
+        r.x + LABEL_W,
         r.y,
-        half - 50,
+        r.w - LABEL_W,
         ROW_H * 8,
         ID_ANTHROPIC_MODEL,
     );
@@ -3653,26 +3643,17 @@ fn build_ui_recorded(
         &config.providers.anthropic.models,
         &config.providers.anthropic.model,
     );
+    r.advance();
 
-    ctx.create(
-        WC_STATIC,
-        "Thinking:",
-        0,
-        0,
-        r.x + half + 12,
-        r.y,
-        60,
-        ROW_H,
-        0,
-    );
+    ctx.create(WC_STATIC, "Thinking:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let anthropic_effort = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 60,
+        r.x + LABEL_W,
         r.y,
-        half - 60,
+        r.w - LABEL_W,
         ROW_H * 4,
         ID_ANTHROPIC_EFFORT,
     );
@@ -3702,7 +3683,7 @@ fn build_ui_recorded(
         WC_EDIT,
         &key_field_display(&config.providers.gemini.api_key),
         (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         r.x + LABEL_W,
         r.y,
         r.w - LABEL_W - 70,
@@ -3722,15 +3703,15 @@ fn build_ui_recorded(
     );
     r.advance();
 
-    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, 50, ROW_H, 0);
+    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let gemini_model = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 50,
+        r.x + LABEL_W,
         r.y,
-        half - 50,
+        r.w - LABEL_W,
         ROW_H * 8,
         ID_GEMINI_MODEL,
     );
@@ -3739,15 +3720,16 @@ fn build_ui_recorded(
         &config.providers.gemini.models,
         &config.providers.gemini.model,
     );
+    r.advance();
 
     ctx.create(
         WC_STATIC,
         "Thinking:",
         0,
         0,
-        r.x + half + 12,
+        r.x,
         r.y,
-        60,
+        LABEL_W,
         ROW_H,
         ID_GEMINI_EFFORT_LABEL,
     );
@@ -3756,9 +3738,9 @@ fn build_ui_recorded(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 60,
+        r.x + LABEL_W,
         r.y,
-        half - 60,
+        r.w - LABEL_W,
         ROW_H * 4,
         ID_GEMINI_EFFORT,
     );
@@ -3911,7 +3893,7 @@ fn build_ui_recorded(
         WC_EDIT,
         "",
         ES_AUTOHSCROLL as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         pull_x + LABEL_W,
         y,
         pull_inner_w - LABEL_W - OLLAMA_PULL_BTN_W - 8,
@@ -4066,8 +4048,6 @@ fn build_ui_recorded(
     let capture_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
-    let half = (r.w - 12) / 2;
-
     ctx.create(
         WC_STATIC,
         "Screenshot detail:",
@@ -4075,7 +4055,7 @@ fn build_ui_recorded(
         0,
         r.x,
         r.y,
-        110,
+        LABEL_W,
         ROW_H,
         0,
     );
@@ -4084,9 +4064,9 @@ fn build_ui_recorded(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 110,
+        r.x + LABEL_W,
         r.y,
-        half - 110,
+        r.w - LABEL_W,
         ROW_H * 6,
         ID_MAX_EDGE,
     );
@@ -4099,25 +4079,17 @@ fn build_ui_recorded(
         &max_edge_display(config.capture.max_edge),
     );
 
-    ctx.create(
-        WC_STATIC,
-        "Screen:",
-        0,
-        0,
-        r.x + half + 12,
-        r.y,
-        60,
-        ROW_H,
-        0,
-    );
+    r.advance();
+
+    ctx.create(WC_STATIC, "Screen:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let monitor = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 60,
+        r.x + LABEL_W,
         r.y,
-        half - 60,
+        r.w - LABEL_W,
         ROW_H * 4,
         ID_MONITOR,
     );
@@ -4208,7 +4180,7 @@ fn build_ui_recorded(
         WC_EDIT,
         &config.ui.card_seconds.to_string(),
         (ES_NUMBER | ES_AUTOHSCROLL) as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         r.x + CARD_SECONDS_LABEL_W + 4,
         r.y,
         50,
@@ -4217,15 +4189,15 @@ fn build_ui_recorded(
     );
     r.advance();
 
-    ctx.create(WC_STATIC, "Text scale:", 0, 0, r.x, r.y, 70, ROW_H, 0);
+    ctx.create(WC_STATIC, "Text scale:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let track = ctx.create(
         TRACKBAR_CLASS_STR,
         "",
         TBS_HORZ as u32,
         0,
-        r.x + 70,
+        r.x + LABEL_W,
         r.y,
-        r.w - 70 - 60,
+        r.w - LABEL_W - 60,
         ROW_H,
         ID_TEXT_SCALE_TRACK,
     );
@@ -4262,15 +4234,25 @@ fn build_ui_recorded(
 
     // #498: where the card appears. The monitor list is read when Settings
     // opens, so a display plugged in afterwards shows up next time.
-    ctx.create(WC_STATIC, "Card position:", 0, 0, r.x, r.y, 110, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "Card position:",
+        0,
+        0,
+        r.x,
+        r.y,
+        LABEL_W,
+        ROW_H,
+        0,
+    );
     let corner = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 110,
+        r.x + LABEL_W,
         r.y,
-        r.w - 110,
+        r.w - LABEL_W,
         ROW_H * 7,
         ID_CARD_CORNER,
     );
@@ -4287,7 +4269,7 @@ fn build_ui_recorded(
         0,
         r.x,
         r.y,
-        110,
+        LABEL_W,
         ROW_H,
         ID_CARD_MONITOR_LABEL,
     );
@@ -4296,9 +4278,9 @@ fn build_ui_recorded(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 110,
+        r.x + LABEL_W,
         r.y,
-        r.w - 110,
+        r.w - LABEL_W,
         ROW_H * 8,
         ID_CARD_MONITOR,
     );
@@ -4341,7 +4323,7 @@ fn build_ui_recorded(
         0,
         r.x,
         r.y,
-        150,
+        LABEL_W,
         ROW_H,
         0,
     );
@@ -4350,9 +4332,9 @@ fn build_ui_recorded(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 150,
+        r.x + LABEL_W,
         r.y,
-        r.w - 150,
+        r.w - LABEL_W,
         ROW_H * 4,
         ID_REQUIRE_TICK_FOR,
     );
@@ -4392,7 +4374,7 @@ fn build_ui_recorded(
         WC_EDIT,
         &prompt_to_edit(&config.ui.prompt),
         (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         content_x + MARGIN,
         y,
         content_w - 2 * MARGIN,
@@ -4586,7 +4568,7 @@ fn add_style(hwnd: HWND, bits: u32) {
 }
 
 const TRACKBAR_CLASS_STR: &str = "msctls_trackbar32";
-const WS_EX_BORDER: u32 = 0x0000_0100;
+const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
 const BM_SETCHECK: u32 = 0x00F1;
 
 // ---------------------------------------------------------------------------
@@ -6245,6 +6227,48 @@ mod tests {
             drop(Box::from_raw(raw));
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
+    }
+
+    /// #822: one field column. Every combo and edit that sits beside a label
+    /// starts at the same x (the label column's right edge), so the boxes do
+    /// not look ragged. The design rect of each child is in dp.
+    #[test]
+    fn settings_field_columns_share_one_left_edge() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let x_of = |id: i32| -> i32 {
+                let child = get_dlg_item(hwnd, id).expect("control exists");
+                inner
+                    .children
+                    .iter()
+                    .find(|c| c.hwnd == child)
+                    .expect("control was recorded")
+                    .x
+            };
+            let ids = [
+                ID_ACTIVE_PROVIDER,
+                ID_OPENAI_KEY,
+                ID_OPENAI_MODEL,
+                ID_OPENAI_EFFORT,
+                ID_ANTHROPIC_KEY,
+                ID_ANTHROPIC_MODEL,
+                ID_ANTHROPIC_EFFORT,
+                ID_GEMINI_KEY,
+                ID_GEMINI_MODEL,
+                ID_GEMINI_EFFORT,
+                ID_OLLAMA_MODEL,
+                ID_PULL_NAME,
+                ID_MAX_EDGE,
+                ID_MONITOR,
+                ID_CARD_CORNER,
+                ID_CARD_MONITOR,
+                ID_REQUIRE_TICK_FOR,
+            ];
+            let first = x_of(ids[0]);
+            for id in ids {
+                assert_eq!(x_of(id), first, "control id {id} is off the field column");
+            }
+        });
     }
 
     /// Dispatches this thread's queued messages until `done` is true or 10 s
