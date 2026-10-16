@@ -4012,6 +4012,82 @@ impl App {
     fn hwnd_isize(&self) -> isize {
         OWNER_HWND.with(|h| h.get())
     }
+
+    /// #117: hands the tray the actions the user wrote, for "Export action".
+    /// Called as the menu opens; a missing or broken actions.toml shows none.
+    fn sync_export_menu(&mut self) {
+        let written = actions::load_actions()
+            .map(|a| actions::share::export_candidates(&a))
+            .unwrap_or_default();
+        self.tray.set_export_actions(&written);
+    }
+
+    /// #117: tray > Import action from file. Pick a file, check it, show what
+    /// it does, and only on Yes append it to actions.toml. Nothing runs.
+    fn import_action(&mut self) {
+        let owner = HWND(self.hwnd_isize() as *mut _);
+        let Some(file) = crate::ui::file_dialog::pick_action_file(owner) else {
+            return;
+        };
+        let outcome = (|| -> anyhow::Result<Option<String>> {
+            let text = actions::share::read_import_file(&file)?;
+            let import = actions::share::parse_import(&text)?;
+            let user_path = actions::path()?;
+            let prepared = actions::share::prepare(&user_path, import)?;
+            if !crate::ui::file_dialog::ask_yes_no(owner, "Add action", &prepared.preview()) {
+                return Ok(None);
+            }
+            prepared.commit(&user_path)?;
+            Ok(Some(prepared.action.name.clone()))
+        })();
+        match outcome {
+            Ok(Some(name)) => self.card.show_answer(
+                "Action added",
+                &format!("{name} is in the Quick Ask list."),
+                4,
+                None,
+            ),
+            Ok(None) => {}
+            Err(e) => {
+                let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't import the action", &detail);
+            }
+        }
+    }
+
+    /// #117: tray > Export action to file > (one of your actions).
+    fn export_action(&mut self, index: usize) {
+        let Some(id) = self.tray.export_action_at(index).map(str::to_owned) else {
+            return;
+        };
+        let owner = HWND(self.hwnd_isize() as *mut _);
+        let outcome = (|| -> anyhow::Result<Option<()>> {
+            let all = actions::load_actions()?;
+            let found = all
+                .iter()
+                .find(|r| r.action.id == id && r.origin == actions::Origin::User)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the action \"{id}\" is no longer in actions.toml")
+                })?;
+            let text = actions::share::export_toml(&found.action)?;
+            let Some(path) = crate::ui::file_dialog::pick_save_path(owner, &id) else {
+                return Ok(None);
+            };
+            std::fs::write(&path, text)
+                .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
+            Ok(Some(()))
+        })();
+        match outcome {
+            Ok(Some(())) => self.card.show_answer("Action saved", "", 3, None),
+            Ok(None) => {}
+            Err(e) => {
+                let detail = self.track_error("Couldn't export the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't export the action", &detail);
+            }
+        }
+    }
 }
 
 /// Issue #19: builds the mode-aware chain HERE, on the worker thread, from
@@ -5876,6 +5952,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // the next one. Never waits on Ollama, so the menu opens at once.
             if Tray::opens_menu(lparam) {
                 app.sync_ollama_menu();
+                app.sync_export_menu();
             }
             if let Some(id) = app.tray.on_tray_message(lparam) {
                 app.password_manager_hint = menu_hint;
@@ -5896,6 +5973,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
                     MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
+                    MenuChoice::ExportAction(i) => app.export_action(i),
+                    MenuChoice::Command(cmd::IMPORT_ACTION) => app.import_action(),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
                     MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
@@ -7210,6 +7289,7 @@ mod tests {
             "OPENAI_MODEL_BASE",
             "ANTHROPIC_MODEL_BASE",
             "OLLAMA_MODEL_BASE",
+            "ACTION_EXPORT_BASE",
         ];
         // Display-only items: added disabled (greyed), so no click can ever
         // produce their WM_COMMAND and they need no wnd_proc arm (#317).
