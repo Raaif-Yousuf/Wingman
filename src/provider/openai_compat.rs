@@ -177,7 +177,7 @@ impl OpenAiCompat {
     /// Parses a successful (2xx) `/chat/completions` body into a
     /// `Completion`. The text is returned as-is -- this provider never
     /// interprets it against a schema (#12).
-    fn parse_completion(body: &str) -> Result<Completion> {
+    pub(crate) fn parse_completion(body: &str) -> Result<Completion> {
         let value: Value =
             serde_json::from_str(body).context("openai-compat: response body is not valid JSON")?;
 

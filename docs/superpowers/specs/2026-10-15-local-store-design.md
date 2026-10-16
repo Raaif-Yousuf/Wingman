@@ -24,7 +24,7 @@ Three ad-hoc files, each with its own read, write, lock and cap logic:
 | data | file | shape | notes |
 |---|---|---|---|
 | spend | `%LOCALAPPDATA%\Wingman\spend.json` | one JSON object keyed by local date: `usd`, `requests`, `unpriced`; newest 60 days kept (`usage.rs`) | read-modify-write behind a process mutex |
-| egress log | `%LOCALAPPDATA%\Wingman\egress.log` | one JSON object per line (`EgressEntry`); capped at 2 MB by dropping the oldest lines (`egress.rs`) | owner-only ACL via `icacls` once per process (#277); `snippets` always empty, `cost` always `None` |
+| egress log | `%LOCALAPPDATA%\Wingman\egress.log` | one JSON object per line (`EgressEntry`); capped at 2 MB by dropping the oldest lines (`egress.rs`) | owner-only ACL via `icacls` once per process (#277); `snippets` always empty, `cost` filled from the usage price table on a successful response (#487) |
 | profile | `%APPDATA%\Wingman\profile.bin` | the whole `Profile` as JSON inside one DPAPI envelope (`dpapi.rs`, magic `WMDP`), plus a one-shot import of a hand-edited `profile.toml` | written atomically; every write passes the payment denylist |
 
 `egress.rs` already says "when #46 lands, this file's rows are exactly the

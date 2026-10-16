@@ -44,11 +44,10 @@
 //!
 //! # Cost (#21)
 //!
-//! [`EgressEntry::cost`] is always `None` today. Token accounting and a
-//! local price table are a separate module, `src/usage.rs`, being built
-//! tonight on issue #21 by another agent. This module does not duplicate
-//! that work; whoever merges both should wire a cost lookup into
-//! [`build_entry`] once `usage.rs` exists.
+//! [`EgressEntry::cost`] is filled on a successful model response by
+//! `provider::common`, which asks `usage::response_cost` (the one price
+//! table, shared with the tooltip and the daily budget). This module has no
+//! price knowledge of its own.
 
 use std::fs;
 use std::path::PathBuf;
@@ -109,7 +108,9 @@ pub struct EgressEntry {
     /// Only set when `outcome == Outcome::Failure`, and always passed
     /// through [`redact_opaque_tokens`] first.
     pub error: Option<String>,
-    /// Always `None` today; see this module's doc comment on cost (#21).
+    /// Dollars for a successful response, from `usage::response_cost`.
+    /// `None` when the model has no price row or the response carried no
+    /// usage (shown as "unknown"), and on failures and non-model requests.
     pub cost: Option<f64>,
     /// What started the ask this request belongs to (`hotkey`, `activation`,
     /// `tray`, `palette`, see `activation::Trigger`), so "forty of these were
@@ -601,6 +602,14 @@ pub fn build_entry(
         error: error.map(redact_opaque_tokens),
         cost: None,
         trigger: crate::activation::worker_trigger_label().map(str::to_string),
+    }
+}
+
+impl EgressEntry {
+    /// The same row with its cost filled in (#487).
+    pub fn with_cost(mut self, cost: Option<f64>) -> Self {
+        self.cost = cost;
+        self
     }
 }
 

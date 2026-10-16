@@ -336,6 +336,21 @@ pub fn request_cost(
     cost_usd(provider, model, date, usage?)
 }
 
+/// The cost of a successful response, read at the HTTP boundary for the
+/// egress log (#487). Same price table and rules as [`record`], so the log
+/// row, the tooltip and the budget cannot disagree. `tag` is the provider's
+/// `id()` and `url` the endpoint (a loopback URL is free).
+pub fn response_cost(tag: &str, url: &str, model: Option<&str>, body: &str) -> Option<f64> {
+    let usage = crate::provider::usage_from_body(tag, body);
+    request_cost(
+        tag,
+        model.unwrap_or(""),
+        &local_date_today(),
+        is_loopback_url(url),
+        usage.as_ref(),
+    )
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct DayTotal {
     pub usd: f64,
@@ -585,6 +600,17 @@ mod tests {
         };
         let c = cost_usd("anthropic", "claude-opus-5", "2026-10-15", &u).unwrap();
         assert!(close(c, 100.0 * 5.0 / 1e6 + 6.25 + 0.50), "{c}");
+    }
+
+    #[test]
+    fn response_cost_is_free_on_loopback_and_unknown_for_an_unknown_tag() {
+        let body = r#"{"choices":[{"finish_reason":"stop","message":{"content":"{}"}}],"usage":{"prompt_tokens":5,"completion_tokens":5}}"#;
+        let local = response_cost("openai-compat", "http://127.0.0.1:1234/v1", Some("m"), body);
+        assert_eq!(local, Some(0.0));
+        assert_eq!(
+            response_cost("elsewhere", "https://x.invalid/", Some("m"), body),
+            None
+        );
     }
 
     #[test]
