@@ -274,7 +274,7 @@ pub struct Tray {
     /// submenu shows a single greyed-out "none configured" entry.
     /// Which provider is first in `providers.order`; radio-checked in the
     /// Provider submenu.
-    active_provider: ActiveProvider,
+    active_provider: Option<ActiveProvider>,
     openai_models: Vec<String>,
     openai_current: Option<usize>,
     anthropic_models: Vec<String>,
@@ -337,7 +337,7 @@ impl Tray {
             primary_label: String::new(),
             secondary_label: String::new(),
             pause_label: String::new(),
-            active_provider: ActiveProvider::OpenAi,
+            active_provider: Some(ActiveProvider::OpenAi),
             openai_models: Vec::new(),
             openai_current: None,
             anthropic_models: Vec::new(),
@@ -509,7 +509,8 @@ impl Tray {
     /// dropped). Does not touch the shell icon; only affects the next menu
     /// built by [`Tray::on_tray_message`].
     /// Marks which provider is active, for the Provider submenu's radio check.
-    pub fn set_active_provider(&mut self, active: ActiveProvider) {
+    /// `None` checks no radio (a `compat:` endpoint leads the order, #677).
+    pub fn set_active_provider(&mut self, active: Option<ActiveProvider>) {
         self.active_provider = active;
     }
 
@@ -958,13 +959,15 @@ fn append_mode_submenu(parent: HMENU, current: crate::mode::Mode) -> Result<()> 
 /// `attach_submenu_or_destroy` itself. Previously this populated first and
 /// attached last, so a failure in the final `append_submenu` call leaked
 /// `sub` -- see #147.
-fn append_provider_submenu(parent: HMENU, active: ActiveProvider) -> Result<()> {
+fn append_provider_submenu(parent: HMENU, active: Option<ActiveProvider>) -> Result<()> {
     let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
     attach_submenu_or_destroy(parent, sub, "Provider")?;
     for provider in ActiveProvider::ALL {
         append_item(sub, provider_cmd(provider), provider_menu_label(provider))?;
     }
-    mark_radio_checked(sub, provider_cmd(active));
+    if let Some(active) = active {
+        mark_radio_checked(sub, provider_cmd(active));
+    }
     Ok(())
 }
 
@@ -1896,13 +1899,34 @@ mod tests {
         }
     }
 
+    /// #677: with a `compat:` endpoint leading the order, no Provider radio is
+    /// checked (it used to check ChatGPT).
+    #[test]
+    fn a_compat_leader_checks_no_provider_radio() {
+        let order = vec!["compat:groq".to_string(), "anthropic".to_string()];
+        let tree = built_menu_tree(|t| {
+            t.set_active_provider(ActiveProvider::shown_for(&order));
+        });
+        for id in [
+            cmd::USE_OPENAI,
+            cmd::USE_ANTHROPIC,
+            cmd::USE_OLLAMA,
+            cmd::USE_GEMINI,
+        ] {
+            match find_item(&tree, id) {
+                Some(Node::Item(_, _, _, c)) => assert!(!*c, "{id} is checked"),
+                _ => panic!("id {id} missing"),
+            }
+        }
+    }
+
     /// Wired-to-nothing guard for dynamic state that now sits inside
     /// submenus: the pause greying, the Mode and Provider radio marks.
     #[test]
     fn dynamic_state_still_shows_inside_the_submenus() {
         let running = built_menu_tree(|t| {
             t.set_mode(crate::mode::Mode::Local);
-            t.set_active_provider(ActiveProvider::Gemini);
+            t.set_active_provider(Some(ActiveProvider::Gemini));
         });
         let grey = |tree: &[Node], id| match find_item(tree, id) {
             Some(Node::Item(_, _, g, _)) => *g,
