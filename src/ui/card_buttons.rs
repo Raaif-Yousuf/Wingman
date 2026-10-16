@@ -9,9 +9,8 @@
 //! Colors are GDI `COLORREF` values (`0x00BBGGRR`), the same as the card's
 //! own palette.
 
-use windows::core::BOOL;
+use crate::ui::theme::{accent_fill, read_accent_shades, Theme};
 use windows::Win32::Foundation::{COLORREF, RECT};
-use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, GetSysColor,
     RoundRect, SelectObject, SetBkMode, SetTextColor, COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT,
@@ -33,9 +32,6 @@ const ODS_SELECTED: u32 = 0x0001;
 const ODS_DISABLED: u32 = 0x0004;
 const ODS_FOCUS: u32 = 0x0010;
 const ODS_NOFOCUSRECT: u32 = 0x0200;
-
-/// The Windows default accent blue, used when the system will not say.
-const FALLBACK_ACCENT: u32 = 0x00D4_7800;
 
 /// Whether a button's window style marks it owner-drawn.
 pub(crate) fn is_owner_drawn(style: u32) -> bool {
@@ -219,24 +215,12 @@ fn high_contrast_look(role: Role, state: State, hc: &HighContrast) -> Look {
     }
 }
 
-/// The user's Windows accent color as a `COLORREF`, or the default blue when
-/// the system cannot say. Read per paint: it is one cheap call, and it keeps
-/// the button right after the user changes the accent.
-pub(crate) fn system_accent() -> u32 {
-    let mut argb = 0u32;
-    let mut opaque = BOOL(0);
-    match unsafe { DwmGetColorizationColor(&mut argb, &mut opaque) } {
-        Ok(()) => accent_from_argb(argb),
-        Err(_) => FALLBACK_ACCENT,
-    }
-}
-
-/// DWM reports `0xAARRGGBB`; GDI wants `0x00BBGGRR`.
-pub(crate) fn accent_from_argb(argb: u32) -> u32 {
-    let r = (argb >> 16) & 0xFF;
-    let g = (argb >> 8) & 0xFF;
-    let b = argb & 0xFF;
-    r | (g << 8) | (b << 16)
+/// The fill of the primary button for `theme` on a card of colour
+/// `surface_bg`: the user's accent shade for that theme, kept at 3:1 against
+/// the card (see `theme::accent_fill`). Not `DwmGetColorizationColor`: that is
+/// the window colourisation (often graphite), not the accent buttons use.
+pub(crate) fn system_accent(theme: Theme, surface_bg: u32) -> u32 {
+    accent_fill(theme, read_accent_shades(), surface_bg)
 }
 
 /// The system colors when high contrast mode is on, else `None`.
@@ -415,11 +399,6 @@ mod tests {
 
     fn rgb(r: u32, g: u32, b: u32) -> u32 {
         r | (g << 8) | (b << 16)
-    }
-
-    #[test]
-    fn dwm_argb_becomes_a_gdi_colorref() {
-        assert_eq!(accent_from_argb(0xC40078D4), 0x00D4_7800);
     }
 
     #[test]
