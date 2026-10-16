@@ -234,7 +234,8 @@ impl Provider for Anthropic {
 /// wrong "no" is the model's default effort, the cost of a wrong "yes" is a
 /// 400 card on every press.
 ///
-/// Minimum versions: Opus 4.5, Sonnet 4.6, Haiku 5, any Fable.
+/// Minimum versions: Opus 4.5, Sonnet 4.6, Haiku 5, any Fable. A `-latest`
+/// alias carries no version, so it gets no effort (the model's own default).
 ///
 /// Also used as this provider's `thinking` capability: on this API, effort
 /// support and extended-thinking support are the same models.
@@ -297,6 +298,11 @@ fn parse_claude_id(model: &str) -> Option<(Family, (u32, u32))> {
 /// By version number (4.7 or later), not by effort support: Opus 4.5/4.6 and
 /// Sonnet 4.6 accept effort but sit on the standard tier. An id that cannot be
 /// placed gets the standard tier, the smaller images (the safe side).
+///
+/// THEORY (unverified, not probed): that the Haiku 5.x and Fable lines are on
+/// the high-resolution tier is inferred from "4.7 and later" in the vision
+/// docs, by version number alone. A `-latest` alias has no version, so it is
+/// "cannot be placed": no effort and the standard tier.
 fn supports_high_res_tier(model: &str) -> bool {
     parse_claude_id(model).is_some_and(|(_, v)| v >= (4, 7))
 }
