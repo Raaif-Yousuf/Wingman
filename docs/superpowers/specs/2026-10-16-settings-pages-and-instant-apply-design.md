@@ -367,10 +367,14 @@ that ships slice 5.
 
 **Size.** No new `windows` feature is expected (`NotifyWinEvent` is
 `Win32_UI_Accessibility`, to confirm in slice 7). `toml_edit` (MIT or Apache-2.0)
-is the one possible dependency: THEORY (unverified) 100 to 150 KB in release.
-The exe gate has about 518 KB shared with the options card, overlay and
-knowledge work; slice 0 records the measured size and raises the gate in its PR
-if needed. `settings.rs` should shrink (modal loop, group boxes go).
+is the one possible dependency. MEASURED 2026-10-16 (slice 0, #870, same
+machine, release profile): 4,055,040 bytes on master, 4,143,104 with
+`toml_edit` and the writer, a delta of 88,064 bytes (about 86 KB), less than the
+100 to 150 KB guessed. `toml_edit` shares `toml_parser`, `toml_datetime` and
+`winnow` with `toml`, so it adds no second parser. The gate (4,500,000) is not
+raised: master measured 3,982,336 on CI, so the writer lands near 4,070,000. That
+leaves about 430 KB for the options card, overlay and knowledge work.
+`settings.rs` should shrink (modal loop, group boxes go).
 
 ## Adversarial review: the five strongest objections
 
