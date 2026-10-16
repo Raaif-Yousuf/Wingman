@@ -80,6 +80,19 @@ pub fn follows_variants(state: GalleryState) -> bool {
     )
 }
 
+/// Whether a state is captured with `PW_RENDERFULLCONTENT`. The palette draws
+/// with a Direct2D window render target, which presents straight to the
+/// compositor, so a plain `PrintWindow` gets a black page (#626). The card and
+/// Settings paint with GDI and a plain `PrintWindow` is exact for them.
+#[cfg(any(test, debug_assertions))]
+pub fn needs_full_content(state: GalleryState) -> bool {
+    use GalleryState::*;
+    matches!(
+        state,
+        PaletteDefault | PaletteRouterSuggestion | PaletteNoMatches | PaletteNoModel
+    )
+}
+
 /// Whether a state follows `--dpi` but not `--theme`: Settings can be laid out
 /// at a simulated scale, but it has no forced theme yet (issue #662), so
 /// `--matrix` draws it once per scale as `<state>--system--<percent>.png`.
@@ -300,7 +313,10 @@ mod driver {
         CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC,
         SelectObject, HBITMAP, HDC,
     };
-    use windows::Win32::Storage::Xps::{PrintWindow, PW_CLIENTONLY};
+    /// `PrintWindow` flag, absent from the `windows` crate: ask DWM for the
+    /// composed content, which is the only way to read a Direct2D window.
+    const PW_RENDERFULLCONTENT: u32 = 2;
+    use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS, PW_CLIENTONLY};
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RIGHT};
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetClientRect, GetMessageW, PeekMessageW, TranslateMessage, MSG,
@@ -510,7 +526,7 @@ mod driver {
         apply_variant(card, variant);
         let hwnd = show_state(card, palette, settings, region, variant, state)?;
         pump_and_wait(Duration::from_millis(120));
-        print_window_png(hwnd, path)?;
+        capture_png(hwnd, path, needs_full_content(state))?;
         Ok(hwnd)
     }
 
@@ -800,11 +816,12 @@ mod driver {
         })
     }
 
-    /// Captures `hwnd`'s client area via `PrintWindow` and saves it as a PNG
-    /// at `path`. A specific application window, never the monitor (rule:
-    /// this must never call anything from `capture.rs`, which grabs the
-    /// screen for the real ask flow).
-    fn print_window_png(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<()> {
+    /// Captures `hwnd`'s client area and saves it as a PNG at `path`. A
+    /// specific application window, never the monitor (rule: this must never
+    /// call anything from `capture.rs`, which grabs the screen for the real
+    /// ask flow). `full_content` adds `PW_RENDERFULLCONTENT`: see
+    /// [`needs_full_content`].
+    fn capture_png(hwnd: HWND, path: &std::path::Path, full_content: bool) -> anyhow::Result<()> {
         unsafe {
             let mut rect = windows::Win32::Foundation::RECT::default();
             GetClientRect(hwnd, &mut rect)?;
@@ -816,7 +833,12 @@ mod driver {
             let bitmap: HBITMAP = CreateCompatibleBitmap(screen_dc, width, height);
             let old = SelectObject(mem_dc, bitmap.into());
 
-            let ok = PrintWindow(hwnd, mem_dc, PW_CLIENTONLY);
+            let flags = if full_content {
+                PRINT_WINDOW_FLAGS(PW_CLIENTONLY.0 | PW_RENDERFULLCONTENT)
+            } else {
+                PW_CLIENTONLY
+            };
+            let ok = PrintWindow(hwnd, mem_dc, flags);
 
             let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
             let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
@@ -968,6 +990,17 @@ mod tests {
                 "{n}"
             );
         }
+    }
+
+    #[test]
+    fn only_the_palette_states_need_full_content_capture() {
+        let mut palette_states = 0;
+        for state in gallery_states() {
+            let n = state_name(state);
+            assert_eq!(needs_full_content(state), n.starts_with("palette-"), "{n}");
+            palette_states += usize::from(n.starts_with("palette-"));
+        }
+        assert_eq!(palette_states, 4, "the test must see every palette state");
     }
 
     #[test]
