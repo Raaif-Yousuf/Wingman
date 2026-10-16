@@ -4947,10 +4947,10 @@ enum SettingsReentrancy {
     /// menu does not pop up, and none of its commands can fire, over the
     /// modal), a dismiss click (the card is already hidden and its watcher
     /// disarmed before `show_modal` runs, so there is nothing to do),
-    /// `WM_APP_LEARNED` (unreachable here in practice: every path that opens
-    /// Settings cancels learn mode first, see `open_settings`'s call sites --
-    /// but the boxed `Chord` payload is still freed rather than leaked, in
-    /// case that invariant ever changes), `WM_APP_PAUSE_TOGGLE` (#181: same
+    /// `WM_APP_LEARNED` (a key captured for a Change inside Settings (#345)
+    /// never gets here: Settings' own message loop takes it off the queue
+    /// first. Any other one is stale, and its boxed `Chord` payload is freed
+    /// rather than leaked), `WM_APP_PAUSE_TOGGLE` (#181: same
     /// treatment as the hotkey -- a chord press while Settings is open is
     /// dropped, not queued), and the two palette messages (#25: the palette
     /// cannot be shown while Settings is modal-open anyway; `WM_APP_PALETTE_RUN`'s

@@ -49,9 +49,13 @@
 //!   editable as a list -- adding/removing model names stays a
 //!   `config.toml` / tray-submenu-driven thing. Only the *active* model
 //!   (one entry from that list) is set here.
-//! - `hotkeys.primary` / `hotkeys.secondary` are shown read-only (via
-//!   `chord_to_string`); rebinding stays in the tray's existing learn mode
-//!   per the spec for this module.
+//! - `hotkeys.primary` / `hotkeys.secondary` are shown with a Change button
+//!   each (#345). Change arms the tray's own learn mode (`hotkey::arm_learning`),
+//!   and the captured chord comes back as `WM_APP_LEARNED`, posted to the main
+//!   window. This module's message loop takes that message off the queue
+//!   itself (`take_learned`) while a Change is pending, because the main
+//!   window's proc ignores it whenever Settings is open. The new chord is
+//!   only staged in the window and saved with everything else on Save.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -78,15 +82,15 @@ use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgCtrlID, GetDlgItem,
     GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild,
-    IsDialogMessageW, LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
+    IsDialogMessageW, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
     TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
     HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE,
-    WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_DISABLED,
-    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
+    WS_DISABLED, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetParent, GetScrollInfo, GetWindow, GW_CHILD, GW_HWNDNEXT, SB_VERT, SCROLLINFO,
@@ -94,8 +98,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_VSCROLL,
 };
 
-use crate::config::{ActiveProvider, Config, OllamaConfig, RequireTickFor};
-use crate::hotkey::chord_to_string;
+use crate::config::{ActiveProvider, Config, Hotkeys, OllamaConfig, RequireTickFor};
+use crate::hotkey::{
+    apply_learned, arm_learning, chord_to_string, disarm_learning, slot_name, Chord, HK_PAUSE,
+    HK_PRIMARY, HK_SECONDARY, WM_APP_LEARNED,
+};
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::DEFAULT_PROMPT;
 
@@ -266,7 +273,8 @@ static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 /// prompt toggle toggles); anywhere else Enter saves.
 fn enter_command(ctrl_id: i32) -> i32 {
     match ctrl_id {
-        ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK => ctrl_id,
+        ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK | ID_CHANGE_PRIMARY
+        | ID_CHANGE_SECONDARY => ctrl_id,
         _ => ID_SAVE,
     }
 }
@@ -293,11 +301,23 @@ fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
             break;
         }
 
+        // #345: the hook posts a captured key to the MAIN window, so it is
+        // not addressed to us. While a Change is pending it is ours.
+        if msg.message == WM_APP_LEARNED && unsafe { take_learned(hwnd, &msg) } {
+            continue;
+        }
+
         let belongs_to_us = msg.hwnd == hwnd || unsafe { IsChild(hwnd, msg.hwnd) }.as_bool();
 
         if belongs_to_us && msg.message == WM_KEYDOWN {
             let vk = msg.wParam.0 as u32;
             if vk == VK_ESCAPE.0 as u32 {
+                // #345: while a Change is pending, Esc cancels that, not the
+                // whole window. (The hook normally swallows this Esc and
+                // reports it as a captured key instead; see `judge_learned`.)
+                if unsafe { cancel_learning_if_active(hwnd) } {
+                    continue;
+                }
                 unsafe {
                     let _ = PostMessageW(
                         Some(hwnd),
@@ -447,6 +467,14 @@ struct SettingsInner {
     /// The config this window was opened with -- fields not touched by the
     /// UI (e.g. model lists, hotkeys) are carried through from here.
     original: Config,
+    /// #345: the hotkeys as edited in this window. Starts as the original's
+    /// and only reaches the returned config on Save.
+    hotkeys: Hotkeys,
+    /// #345: the slot a pending Change is waiting on a key for.
+    learning: Option<usize>,
+    /// #345: the `(slot, chord)` last warned about, so pressing the same
+    /// conflicting chord again confirms it (same flow as the tray's).
+    pending_conflict: Option<(usize, Chord)>,
     /// Set on Save; left `None` on Cancel/close.
     result: Option<Config>,
     should_close: bool,
@@ -467,6 +495,9 @@ impl SettingsInner {
             ollama_link_url: None,
             ollama_tags: Default::default(),
             prompt_expanded: false,
+            hotkeys: original.hotkeys.clone(),
+            learning: None,
+            pending_conflict: None,
             original,
             result: None,
             should_close: false,
@@ -527,7 +558,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             on_dpi_changed(inner, wparam, lparam);
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == LEARN_TIMER_ID => {
+            learn_timed_out(inner);
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            if inner.learning.take().is_some() {
+                let _ = KillTimer(Some(hwnd), LEARN_TIMER_ID);
+                disarm_learning();
+            }
             if !inner.font.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(inner.font.0));
                 inner.font = HFONT(std::ptr::null_mut());
@@ -572,7 +611,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             if want != crate::autostart::is_enabled() {
                 let _ = crate::autostart::set_enabled(want);
             }
-            inner.result = Some(build_config(&inner.original, &raw));
+            inner.result = Some(finalize_config(inner, &raw));
             unsafe {
                 let _ = DestroyWindow(inner.hwnd);
             }
@@ -596,6 +635,8 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, DEFAULT_PROMPT);
         }
+        ID_CHANGE_PRIMARY if notify == BN_CLICKED => start_change(inner, HK_PRIMARY),
+        ID_CHANGE_SECONDARY if notify == BN_CLICKED => start_change(inner, HK_SECONDARY),
         ID_PROMPT_TOGGLE if notify == BN_CLICKED => {
             inner.prompt_expanded = !inner.prompt_expanded;
             unsafe { show_prompt_state(inner) };
@@ -702,6 +743,18 @@ const ID_GEMINI_KEY: i32 = 127;
 const ID_GEMINI_SHOW_KEY: i32 = 128;
 const ID_GEMINI_MODEL: i32 = 129;
 const ID_GEMINI_EFFORT: i32 = 130;
+/// #345: the Change buttons beside the two shortcuts, the labels that show
+/// them, and the one status line the learn flow writes into.
+const ID_CHANGE_PRIMARY: i32 = 131;
+const ID_CHANGE_SECONDARY: i32 = 132;
+const ID_HOTKEY_STATUS: i32 = 133;
+const ID_PRIMARY_LABEL: i32 = 134;
+const ID_SECONDARY_LABEL: i32 = 135;
+/// #345: the one-shot timer that ends a pending Change that nobody pressed a
+/// key for. Only ever set while a Change is pending, so nothing ticks idle.
+const LEARN_TIMER_ID: usize = 0x345;
+/// A little over the hook's own 10 second learn window.
+const LEARN_TIMER_MS: u32 = 10_500;
 
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
@@ -742,6 +795,11 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_GEMINI_SHOW_KEY", ID_GEMINI_SHOW_KEY),
     ("ID_GEMINI_MODEL", ID_GEMINI_MODEL),
     ("ID_GEMINI_EFFORT", ID_GEMINI_EFFORT),
+    ("ID_CHANGE_PRIMARY", ID_CHANGE_PRIMARY),
+    ("ID_CHANGE_SECONDARY", ID_CHANGE_SECONDARY),
+    ("ID_HOTKEY_STATUS", ID_HOTKEY_STATUS),
+    ("ID_PRIMARY_LABEL", ID_PRIMARY_LABEL),
+    ("ID_SECONDARY_LABEL", ID_SECONDARY_LABEL),
 ];
 
 // ---------------------------------------------------------------------------
@@ -2711,6 +2769,8 @@ fn build_ui_recorded(
     let hotkeys_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
+    let change_w = 90;
+    let label_w = r.w - change_w - 12;
     ctx.create(
         WC_STATIC,
         &format!("Copilot key: {}", chord_to_string(&config.hotkeys.primary)),
@@ -2718,9 +2778,20 @@ fn build_ui_recorded(
         0,
         r.x,
         r.y,
-        r.w,
+        label_w,
         ROW_H,
+        ID_PRIMARY_LABEL,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Change...",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
         0,
+        r.x + r.w - change_w,
+        r.y,
+        change_w,
+        ROW_H,
+        ID_CHANGE_PRIMARY,
     );
     r.advance();
     ctx.create(
@@ -2733,21 +2804,34 @@ fn build_ui_recorded(
         0,
         r.x,
         r.y,
-        r.w,
+        label_w,
         ROW_H,
+        ID_SECONDARY_LABEL,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Change...",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
         0,
+        r.x + r.w - change_w,
+        r.y,
+        change_w,
+        ROW_H,
+        ID_CHANGE_SECONDARY,
     );
     r.advance();
+    // The learn flow's whole conversation happens on this one line, inline:
+    // never a dialog and never a card (rule 7).
     ctx.create(
         WC_STATIC,
-        "Rebind from the tray menu (right-click the tray icon).",
+        "Click Change, then press the new key.",
         WS_DISABLED.0,
         0,
         r.x,
         r.y,
         r.w,
         ROW_H,
-        0,
+        ID_HOTKEY_STATUS,
     );
     r.advance();
 
@@ -3310,6 +3394,217 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
 fn read_form(inner: &SettingsInner) -> Config {
     let raw = read_raw_form(inner);
     build_config(&inner.original, &raw)
+}
+
+// ---------------------------------------------------------------------------
+// #345: changing the two shortcuts from here
+// ---------------------------------------------------------------------------
+
+/// What to do with a chord the learn hook captured for a pending Change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LearnedVerdict {
+    /// A bare Esc: the user is backing out.
+    Cancel,
+    /// Not allowed, with the inline text to show. Learning stays armed.
+    Refuse(String),
+    /// A known system shortcut: show the text, and a second press of the
+    /// same chord applies it. Learning stays armed.
+    Warn(String),
+    /// Stage it.
+    Apply,
+}
+
+/// Judges a captured `chord` for slot `which`. Pure, so the flow is tested
+/// without a hook or a window. The conflict warning and its "press it again"
+/// confirmation are `hotkey_conflicts::decide`, the same as the tray's.
+fn judge_learned(
+    hotkeys: &Hotkeys,
+    pending: Option<(usize, Chord)>,
+    which: usize,
+    chord: Chord,
+) -> LearnedVerdict {
+    let bare = !(chord.ctrl || chord.shift || chord.alt || chord.win);
+    if bare && chord.vk == VK_ESCAPE.0 as u32 {
+        return LearnedVerdict::Cancel;
+    }
+    let name = chord_to_string(&chord);
+    // A plain letter or Enter as a global shortcut would swallow that key in
+    // every app. Function keys are fine on their own.
+    if bare && !(0x70..=0x87).contains(&chord.vk) {
+        return LearnedVerdict::Refuse(format!(
+            "{name} needs Ctrl, Alt, Shift or Win with it. Press another."
+        ));
+    }
+    let others = [
+        (HK_PRIMARY, Some(hotkeys.primary), slot_name(HK_PRIMARY)),
+        (
+            HK_SECONDARY,
+            Some(hotkeys.secondary),
+            slot_name(HK_SECONDARY),
+        ),
+        (HK_PAUSE, hotkeys.pause, slot_name(HK_PAUSE)),
+        (0, hotkeys.palette, "palette key"),
+    ];
+    for (slot, bound, label) in others {
+        if slot != which && bound == Some(chord) {
+            return LearnedVerdict::Refuse(format!(
+                "{name} is already the {label}. Press another."
+            ));
+        }
+    }
+    match crate::hotkey_conflicts::decide(pending, which, chord) {
+        crate::hotkey_conflicts::LearnDecision::Apply => LearnedVerdict::Apply,
+        crate::hotkey_conflicts::LearnDecision::Warn(conflict) => LearnedVerdict::Warn(format!(
+            "{name} is already used by {}. Press it again to use it anyway.",
+            conflict.owner
+        )),
+    }
+}
+
+/// Why a Change cannot work right now, or `None`. While paused the hook
+/// passes every key through untouched, so nothing would ever be captured.
+fn learn_unavailable_reason(paused: bool, hook_ready: bool) -> Option<&'static str> {
+    if paused {
+        Some("Wingman is paused. Resume it, then try again.")
+    } else if !hook_ready {
+        Some("The keyboard hook is not installed, so keys cannot be changed here.")
+    } else {
+        None
+    }
+}
+
+/// The config Save returns: the form folded in, plus the hotkeys staged in
+/// this window.
+fn finalize_config(inner: &SettingsInner, raw: &RawForm) -> Config {
+    let mut cfg = build_config(&inner.original, raw);
+    cfg.hotkeys = inner.hotkeys.clone();
+    cfg
+}
+
+fn set_hotkey_status(hwnd: HWND, text: &str) {
+    if let Some(status) = get_dlg_item(hwnd, ID_HOTKEY_STATUS) {
+        set_text(status, text);
+    }
+}
+
+/// Points the two shortcut labels at `hotkeys`.
+fn set_hotkey_labels(hwnd: HWND, hotkeys: &Hotkeys) {
+    if let Some(l) = get_dlg_item(hwnd, ID_PRIMARY_LABEL) {
+        set_text(
+            l,
+            &format!("Copilot key: {}", chord_to_string(&hotkeys.primary)),
+        );
+    }
+    if let Some(l) = get_dlg_item(hwnd, ID_SECONDARY_LABEL) {
+        set_text(
+            l,
+            &format!("Other shortcut: {}", chord_to_string(&hotkeys.secondary)),
+        );
+    }
+}
+
+/// Arms learn mode (and its end-of-window timer) for `which`.
+fn arm_change(inner: &mut SettingsInner, which: usize) -> bool {
+    if let Some(reason) = learn_unavailable_reason(crate::pause::is_paused_now(), true) {
+        set_hotkey_status(inner.hwnd, reason);
+        return false;
+    }
+    if !arm_learning(which) {
+        let reason = learn_unavailable_reason(false, false).unwrap_or_default();
+        set_hotkey_status(inner.hwnd, reason);
+        return false;
+    }
+    inner.learning = Some(which);
+    unsafe {
+        SetTimer(Some(inner.hwnd), LEARN_TIMER_ID, LEARN_TIMER_MS, None);
+    }
+    true
+}
+
+fn stop_learning(inner: &mut SettingsInner) {
+    inner.learning = None;
+    inner.pending_conflict = None;
+    unsafe {
+        let _ = KillTimer(Some(inner.hwnd), LEARN_TIMER_ID);
+    }
+    disarm_learning();
+}
+
+/// A Change button was pressed.
+fn start_change(inner: &mut SettingsInner, which: usize) {
+    if inner.learning != Some(which) {
+        inner.pending_conflict = None;
+    }
+    if arm_change(inner, which) {
+        set_hotkey_status(inner.hwnd, "Press the new key now. Esc cancels.");
+    } else {
+        inner.learning = None;
+    }
+}
+
+/// The learn window ran out with no key.
+fn learn_timed_out(inner: &mut SettingsInner) {
+    if inner.learning.is_some() {
+        stop_learning(inner);
+        set_hotkey_status(inner.hwnd, "No key pressed. The shortcut is unchanged.");
+    } else {
+        unsafe {
+            let _ = KillTimer(Some(inner.hwnd), LEARN_TIMER_ID);
+        }
+    }
+}
+
+/// A captured chord for the pending Change.
+fn handle_learned(inner: &mut SettingsInner, which: usize, chord: Chord) {
+    match judge_learned(&inner.hotkeys, inner.pending_conflict, which, chord) {
+        LearnedVerdict::Cancel => {
+            stop_learning(inner);
+            set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+        }
+        LearnedVerdict::Refuse(text) => {
+            set_hotkey_status(inner.hwnd, &text);
+            arm_change(inner, which);
+        }
+        LearnedVerdict::Warn(text) => {
+            inner.pending_conflict = Some((which, chord));
+            set_hotkey_status(inner.hwnd, &text);
+            arm_change(inner, which);
+        }
+        LearnedVerdict::Apply => {
+            stop_learning(inner);
+            apply_learned(&mut inner.hotkeys, which, chord);
+            set_hotkey_labels(inner.hwnd, &inner.hotkeys);
+            set_hotkey_status(
+                inner.hwnd,
+                &format!("Set to {}. Press Save to keep it.", chord_to_string(&chord)),
+            );
+        }
+    }
+}
+
+/// Takes a `WM_APP_LEARNED` off the loop if a Change is pending, handling it
+/// and freeing its boxed chord. Returns `false` (leaving the message to be
+/// dispatched, where the main window frees it) when none is.
+unsafe fn take_learned(hwnd: HWND, msg: &MSG) -> bool {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner;
+    if ptr.is_null() || (*ptr).learning.is_none() || msg.lParam.0 == 0 {
+        return false;
+    }
+    let chord = *Box::from_raw(msg.lParam.0 as *mut Chord);
+    handle_learned(&mut *ptr, msg.wParam.0, chord);
+    true
+}
+
+/// Esc while a Change is pending: cancels that Change. `false` if none was.
+unsafe fn cancel_learning_if_active(hwnd: HWND) -> bool {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner;
+    if ptr.is_null() || (*ptr).learning.is_none() {
+        return false;
+    }
+    let inner = &mut *ptr;
+    stop_learning(inner);
+    set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+    true
 }
 
 #[allow(dead_code)] // exercised by tests; #194 replaced its build_config call site with merge_provider_order
@@ -6026,5 +6321,221 @@ mod tests {
         let result = show_modal(instance, &Config::default());
         assert!(result.is_none());
         OPEN_HWND.store(prev, Ordering::SeqCst);
+    }
+
+    // -- #345: Change buttons for the two shortcuts ------------------------
+
+    fn chord(vk: u32, ctrl: bool, shift: bool, alt: bool, win: bool) -> Chord {
+        Chord {
+            vk,
+            ctrl,
+            shift,
+            alt,
+            win,
+        }
+    }
+
+    #[test]
+    fn learned_free_chord_applies() {
+        let h = Hotkeys::default();
+        let c = chord(b'W' as u32, true, false, true, false);
+        assert_eq!(
+            judge_learned(&h, None, HK_PRIMARY, c),
+            LearnedVerdict::Apply
+        );
+    }
+
+    #[test]
+    fn learned_bare_escape_cancels() {
+        let h = Hotkeys::default();
+        let esc = chord(0x1B, false, false, false, false);
+        assert_eq!(
+            judge_learned(&h, None, HK_PRIMARY, esc),
+            LearnedVerdict::Cancel
+        );
+        // Escape with a modifier is an ordinary chord, not a cancel.
+        let ctrl_esc = chord(0x1B, true, false, false, false);
+        assert_ne!(
+            judge_learned(&h, None, HK_PRIMARY, ctrl_esc),
+            LearnedVerdict::Cancel
+        );
+    }
+
+    #[test]
+    fn learned_bare_typing_key_is_refused_but_a_bare_function_key_is_fine() {
+        let h = Hotkeys::default();
+        for vk in [b'A' as u32, 0x0D, 0x20] {
+            assert!(
+                matches!(
+                    judge_learned(&h, None, HK_PRIMARY, chord(vk, false, false, false, false)),
+                    LearnedVerdict::Refuse(_)
+                ),
+                "vk {vk:#x}"
+            );
+        }
+        assert_eq!(
+            judge_learned(
+                &h,
+                None,
+                HK_PRIMARY,
+                chord(0x7A, false, false, false, false)
+            ),
+            LearnedVerdict::Apply
+        );
+    }
+
+    #[test]
+    fn learned_chord_already_on_the_other_slot_is_refused_inline() {
+        let h = Hotkeys::default();
+        match judge_learned(&h, None, HK_PRIMARY, h.secondary) {
+            LearnedVerdict::Refuse(text) => {
+                assert!(text.contains("secondary key"), "{text}");
+                assert!(!text.contains('\u{2014}'), "no em dash: {text}");
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+        match judge_learned(&h, None, HK_SECONDARY, h.primary) {
+            LearnedVerdict::Refuse(text) => assert!(text.contains("Copilot key"), "{text}"),
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn learned_chord_on_the_pause_or_palette_slot_is_refused() {
+        let mut h = Hotkeys::default();
+        let p = chord(0x13, true, false, false, false);
+        let q = chord(b'Q' as u32, true, false, true, false);
+        h.pause = Some(p);
+        h.palette = Some(q);
+        assert!(matches!(
+            judge_learned(&h, None, HK_PRIMARY, p),
+            LearnedVerdict::Refuse(t) if t.contains("pause key")
+        ));
+        assert!(matches!(
+            judge_learned(&h, None, HK_SECONDARY, q),
+            LearnedVerdict::Refuse(t) if t.contains("palette key")
+        ));
+    }
+
+    #[test]
+    fn learning_a_slots_own_current_chord_is_not_a_clash() {
+        let h = Hotkeys::default();
+        assert_eq!(
+            judge_learned(&h, None, HK_PRIMARY, h.primary),
+            LearnedVerdict::Apply
+        );
+    }
+
+    #[test]
+    fn learned_system_chord_warns_first_and_applies_on_the_second_press() {
+        let h = Hotkeys::default();
+        let win_d = chord(b'D' as u32, false, false, false, true);
+        let first = judge_learned(&h, None, HK_PRIMARY, win_d);
+        match first {
+            LearnedVerdict::Warn(ref text) => {
+                assert!(text.contains("Show desktop"), "{text}");
+                assert!(!text.contains('\u{2014}'), "no em dash: {text}");
+            }
+            ref other => panic!("expected Warn, got {other:?}"),
+        }
+        assert_eq!(
+            judge_learned(&h, Some((HK_PRIMARY, win_d)), HK_PRIMARY, win_d),
+            LearnedVerdict::Apply
+        );
+        // A different slot's warning does not confirm this one.
+        assert!(matches!(
+            judge_learned(&h, Some((HK_SECONDARY, win_d)), HK_PRIMARY, win_d),
+            LearnedVerdict::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn learning_is_refused_with_a_reason_when_it_cannot_work() {
+        assert!(learn_unavailable_reason(false, true).is_none());
+        assert!(learn_unavailable_reason(true, true)
+            .unwrap()
+            .contains("paused"));
+        assert!(learn_unavailable_reason(false, false)
+            .unwrap()
+            .contains("keyboard hook"));
+    }
+
+    #[test]
+    fn save_carries_the_staged_hotkeys_and_a_fresh_window_stages_the_originals() {
+        let original = Config::default();
+        let mut inner = SettingsInner::new(original.clone());
+        assert_eq!(inner.hotkeys, original.hotkeys);
+        let new = chord(b'W' as u32, true, false, true, false);
+        apply_learned(&mut inner.hotkeys, HK_PRIMARY, new);
+        let raw = raw_from(&original);
+        let saved = finalize_config(&inner, &raw);
+        assert_eq!(saved.hotkeys.primary, new);
+        assert_eq!(saved.hotkeys.secondary, original.hotkeys.secondary);
+    }
+
+    /// The real controls: a Change button per shortcut, the labels show the
+    /// chords, the old "rebind from the tray" hint is gone, and updating the
+    /// labels from a staged change reaches the label controls.
+    #[test]
+    fn build_ui_has_change_buttons_and_labels_follow_the_staged_hotkeys() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+
+        let config = Config::default();
+        let title = wide_z("Wingman settings (hotkey buttons test)");
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        let font = build_font(dpi);
+        build_ui(hwnd, instance, dpi, font, &config, WIN_H_DP);
+
+        for id in [ID_CHANGE_PRIMARY, ID_CHANGE_SECONDARY] {
+            assert!(get_dlg_item(hwnd, id).is_some(), "Change button {id}");
+        }
+        let primary = get_dlg_item(hwnd, ID_PRIMARY_LABEL).expect("primary label");
+        assert!(get_text(primary).starts_with("Copilot key: "));
+        let status = get_dlg_item(hwnd, ID_HOTKEY_STATUS).expect("status line");
+        assert!(
+            !get_text(status).contains("tray menu"),
+            "the old hint must be gone"
+        );
+
+        let mut staged = config.hotkeys.clone();
+        apply_learned(
+            &mut staged,
+            HK_PRIMARY,
+            chord(b'W' as u32, true, false, true, false),
+        );
+        set_hotkey_labels(hwnd, &staged);
+        assert_eq!(
+            get_text(primary),
+            format!("Copilot key: {}", chord_to_string(&staged.primary))
+        );
+        assert!(get_text(primary).contains("W"));
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
     }
 }
