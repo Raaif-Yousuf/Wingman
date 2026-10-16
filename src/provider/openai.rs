@@ -108,7 +108,7 @@ impl OpenAi {
     /// The `output` array may contain a `reasoning` entry before the
     /// `message` entry on reasoning models, so non-`message` entries are
     /// skipped rather than assumed absent.
-    fn parse_completion(body: &str) -> Result<Completion> {
+    pub(crate) fn parse_completion(body: &str) -> Result<Completion> {
         let value: Value =
             serde_json::from_str(body).context("openai: response body is not valid JSON")?;
 
@@ -474,6 +474,13 @@ mod tests {
         let body = r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{}"}]}],"usage":{"input_tokens":1000,"output_tokens":5,"prompt_tokens_details":{"cached_tokens":250}}}"#;
         let u = OpenAi::parse_completion(body).unwrap().usage.unwrap();
         assert_eq!((u.input_tokens, u.cache_read_tokens), (750, 250));
+    }
+
+    #[test]
+    fn parse_completion_clamps_cached_tokens_to_the_input_count() {
+        let body = r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{}"}]}],"usage":{"input_tokens":10,"output_tokens":5,"input_tokens_details":{"cached_tokens":50}}}"#;
+        let u = OpenAi::parse_completion(body).unwrap().usage.unwrap();
+        assert_eq!((u.input_tokens, u.cache_read_tokens), (0, 10));
     }
 
     #[test]

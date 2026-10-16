@@ -631,6 +631,12 @@ pub(crate) fn post_json_with(
     }
 }
 
+/// #487: what a successful response cost, for its egress row.
+fn success_cost(tag: &str, url: &str, request: &Value, response: &str) -> Option<f64> {
+    let model = egress::model_from(url, request);
+    crate::usage::response_cost(tag, url, model.as_deref(), response)
+}
+
 /// #106: logs one HTTP attempt (success or failure) to the local egress
 /// log, from exactly the values `post_json_with`'s loop already has on
 /// hand -- see `egress.rs`'s module doc comment for what is and is not
@@ -655,7 +661,8 @@ fn log_attempt(
             resp.body.len(),
             egress::Outcome::Success,
             None,
-        ),
+        )
+        .with_cost(success_cost(tag, url, body, &resp.body)),
         Ok(resp) => egress::build_entry(
             tag,
             url,
@@ -920,16 +927,19 @@ pub(crate) fn post_json_with_connect_timeout(
         return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
     }
 
-    egress::record(&egress::build_entry(
-        tag,
-        url,
-        body,
-        false,
-        bytes_sent,
-        body_text.len(),
-        egress::Outcome::Success,
-        None,
-    ));
+    egress::record(
+        &egress::build_entry(
+            tag,
+            url,
+            body,
+            false,
+            bytes_sent,
+            body_text.len(),
+            egress::Outcome::Success,
+            None,
+        )
+        .with_cost(success_cost(tag, url, body, &body_text)),
+    );
     Ok(body_text)
 }
 
@@ -2023,6 +2033,51 @@ mod tests {
         let log = crate::egress::read_all();
         assert!(log.contains("\"provider\":\"anthropic\""), "{log}");
         assert!(log.contains("\"outcome\":\"success\""), "{log}");
+    }
+
+    /// #487: the success row carries what the response cost, from the same
+    /// price table the tooltip uses.
+    fn cost_in_last_egress_row(model: &str) -> serde_json::Value {
+        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        let body = include_str!("../../tests/fixtures/anthropic_response.json");
+        let transport = ScriptedTransport::new(vec![ok(body)]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
+        post_json_with(
+            &env,
+            "https://example.invalid/",
+            &[],
+            &json!({ "model": model }),
+            Duration::from_secs(1),
+            "anthropic",
+        )
+        .unwrap();
+        let log = crate::egress::read_all();
+        let line = log.lines().last().expect("one row");
+        serde_json::from_str::<serde_json::Value>(line).unwrap()["cost"].clone()
+    }
+
+    #[test]
+    fn a_priced_success_row_carries_its_cost() {
+        let _g = network_guard();
+        // The fixture is 900 in, 60 out: 0.0045 + 0.0015 at claude-opus-5.
+        let cost = cost_in_last_egress_row("claude-opus-5")
+            .as_f64()
+            .expect("a number");
+        assert!((cost - 0.006).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn an_unpriced_success_row_has_no_cost_not_zero() {
+        let _g = network_guard();
+        assert!(cost_in_last_egress_row("claude-unlisted-9").is_null());
     }
 
     #[test]

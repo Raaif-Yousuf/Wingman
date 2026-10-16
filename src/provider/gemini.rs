@@ -143,7 +143,7 @@ impl Gemini {
     /// `RECITATION`, `PROHIBITED_CONTENT`) or a prompt-level block
     /// (`promptFeedback.blockReason` with no candidates at all) rather than
     /// treating either as a malformed response.
-    fn parse_completion(body: &str) -> Result<Completion> {
+    pub(crate) fn parse_completion(body: &str) -> Result<Completion> {
         let value: Value =
             serde_json::from_str(body).context("gemini: response body is not valid JSON")?;
 
@@ -629,6 +629,13 @@ mod tests {
         let body = r#"{"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1000,"cachedContentTokenCount":700,"candidatesTokenCount":5}}"#;
         let usage = Gemini::parse_completion(body).unwrap().usage.unwrap();
         assert_eq!((usage.input_tokens, usage.cache_read_tokens), (300, 700));
+    }
+
+    #[test]
+    fn parse_completion_clamps_cached_content_to_the_prompt_count() {
+        let body = r#"{"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":50,"candidatesTokenCount":5}}"#;
+        let usage = Gemini::parse_completion(body).unwrap().usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.cache_read_tokens), (0, 10));
     }
 
     #[test]

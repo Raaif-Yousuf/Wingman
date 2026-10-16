@@ -226,6 +226,10 @@ const PRICES: &[PriceRow] = &[
         p(2.0, 8.0, 2.0, 0.50),
         OPENAI_SRC,
     ),
+    // Gemini context-caching rates (the last number in each row) are the
+    // "Context caching" column of the pricing page, MEASURED 2026-10-15:
+    // 3.8 Flash $0.075 (then $0.15 from 2027-01-01), 3.1 Pro $0.20, 2.5 Pro
+    // $0.125, 2.5 Flash $0.03. Storage fees are not counted.
     // Gemini (output includes thinking tokens). The 3.8 Flash page lists an
     // introductory rate through 2026-12-31 and double from 2027-01-01
     // (MEASURED 2026-10-15: the page says "$0.75 through December 31, 2026"
@@ -335,6 +339,21 @@ pub fn request_cost(
         return Some(0.0);
     }
     cost_usd(provider, model, date, usage?)
+}
+
+/// The cost of a successful response, read at the HTTP boundary for the
+/// egress log (#487). Same price table and rules as [`record`], so the log
+/// row, the tooltip and the budget cannot disagree. `tag` is the provider's
+/// `id()` and `url` the endpoint (a loopback URL is free).
+pub fn response_cost(tag: &str, url: &str, model: Option<&str>, body: &str) -> Option<f64> {
+    let usage = crate::provider::usage_from_body(tag, body);
+    request_cost(
+        tag,
+        model.unwrap_or(""),
+        &local_date_today(),
+        is_loopback_url(url),
+        usage.as_ref(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -604,6 +623,17 @@ mod tests {
         assert!(close(c("gemini", "gemini-3.8-flash"), 0.075));
         let later = cost_usd("gemini", "gemini-3.8-flash", "2027-01-01", &u).unwrap();
         assert!(close(later, 0.15), "{later}");
+    }
+
+    #[test]
+    fn response_cost_is_free_on_loopback_and_unknown_for_an_unknown_tag() {
+        let body = r#"{"choices":[{"finish_reason":"stop","message":{"content":"{}"}}],"usage":{"prompt_tokens":5,"completion_tokens":5}}"#;
+        let local = response_cost("openai-compat", "http://127.0.0.1:1234/v1", Some("m"), body);
+        assert_eq!(local, Some(0.0));
+        assert_eq!(
+            response_cost("elsewhere", "https://x.invalid/", Some("m"), body),
+            None
+        );
     }
 
     #[test]

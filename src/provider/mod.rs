@@ -259,6 +259,23 @@ pub struct Usage {
     pub cache_read_tokens: u32,
 }
 
+/// The usage block of a successful response body, by the tag the provider
+/// passes to `common::post_json` (each tag is that provider's `id()`). `None`
+/// for an unknown tag, a body that does not parse, or one with no usage. The
+/// egress log reads this at the HTTP boundary (#487), where the response is
+/// in hand but the provider has not parsed it yet.
+pub(crate) fn usage_from_body(tag: &str, body: &str) -> Option<Usage> {
+    let parsed = match tag {
+        "anthropic" => anthropic::Anthropic::parse_completion(body),
+        "openai" => openai::OpenAi::parse_completion(body),
+        "gemini" => gemini::Gemini::parse_completion(body),
+        "ollama" => ollama::Ollama::parse_completion(body),
+        "openai-compat" => openai_compat::OpenAiCompat::parse_completion(body),
+        _ => return None,
+    };
+    parsed.ok()?.usage
+}
+
 /// Why the provider stopped. A refusal, or an empty completion caused by
 /// running out of budget, is surfaced as `Err` before a `Completion` ever
 /// exists (see each provider's response parsing), so in practice this only

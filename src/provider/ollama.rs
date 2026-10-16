@@ -151,7 +151,7 @@ impl Ollama {
     /// `message.thinking` (present when `think: true` on a thinking-capable
     /// model) is discarded -- only `message.content` is ever returned as
     /// `Completion::text`.
-    fn parse_completion(body: &str) -> Result<Completion> {
+    pub(crate) fn parse_completion(body: &str) -> Result<Completion> {
         let value: Value =
             serde_json::from_str(body).context("ollama: response body is not valid JSON")?;
 
