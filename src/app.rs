@@ -840,6 +840,10 @@ fn first_run_detail(found: &FirstRun) -> Option<String> {
             "Ollama is running, but none of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
                 .to_string(),
         ),
+        FirstRun::VisionUnknown => Some(
+            "Ollama is running, but Wingman could not tell which of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
+                .to_string(),
+        ),
         FirstRun::NotRunning | FirstRun::Found { .. } => None,
     }
 }
@@ -926,7 +930,10 @@ impl App {
         let base_url = self.config.providers.ollama.base_url.clone();
         let preferred = self.config.providers.ollama.model.clone();
         std::thread::spawn(move || {
-            let found = ollama_admin::probe_first_run(&base_url, &preferred);
+            // A panic must still post a result, or the Working card never
+            // goes away (dev builds; release aborts). Read as "not found".
+            let found = catch_worker(|| Ok(ollama_admin::probe_first_run(&base_url, &preferred)))
+                .unwrap_or(FirstRun::NotRunning);
             let payload = Box::into_raw(Box::new(found));
             unsafe {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -6676,6 +6683,13 @@ mod tests {
             !detail.contains('\u{2014}') && !detail.contains('\u{2013}'),
             "{detail}"
         );
+        // An older Ollama that lists no capabilities: say so, do not claim
+        // that no model can read the screen.
+        let unknown = super::first_run_detail(&FirstRun::VisionUnknown).expect("a detail");
+        assert!(unknown.contains("could not tell"), "{unknown}");
+        assert!(!unknown.contains("none of its models"), "{unknown}");
+        assert!(unknown.contains("Settings"), "{unknown}");
+        assert!(!unknown.contains('\u{2014}') && !unknown.contains('\u{2013}'));
     }
 
     #[test]

@@ -721,6 +721,10 @@ pub enum FirstRun {
     NotRunning,
     /// Ollama answers but has no model that can read an image.
     NoVisionModel,
+    /// Ollama answers with models, but none of them reports a `capabilities`
+    /// array (an older server), so Wingman cannot tell which can read an
+    /// image and adopts none by name.
+    VisionUnknown,
     /// Ollama answers and `model` can read an image. `kind` says whether it
     /// is the stock tray server (which may be running on the CPU only).
     Found { model: String, kind: ListenerKind },
@@ -774,6 +778,9 @@ pub fn first_run_outcome(
         Err(_) => FirstRun::NotRunning,
         Ok(models) => match pick_first_run_model(&models, preferred) {
             Some(model) => FirstRun::Found { model, kind: *kind },
+            None if !models.is_empty() && models.iter().all(|m| m.capabilities.is_empty()) => {
+                FirstRun::VisionUnknown
+            }
             None => FirstRun::NoVisionModel,
         },
     }
@@ -1591,6 +1598,24 @@ mod tests {
         );
         assert_eq!(
             first_run_outcome(&h, || Ok(vec![]), "gemma3:4b"),
+            FirstRun::NoVisionModel
+        );
+        // An older server sends no capabilities at all: Wingman cannot tell.
+        assert_eq!(
+            first_run_outcome(
+                &h,
+                || Ok(vec![tag("llama3.1:8b", &[]), tag("gemma3:12b", &[])]),
+                "gemma3:4b"
+            ),
+            FirstRun::VisionUnknown
+        );
+        // One entry that does list capabilities means the server reports them.
+        assert_eq!(
+            first_run_outcome(
+                &h,
+                || Ok(vec![tag("llama3.1:8b", &["completion"]), tag("x:1b", &[])]),
+                "gemma3:4b"
+            ),
             FirstRun::NoVisionModel
         );
         let stock = listening(ListenerKind::StockTrayServer);
