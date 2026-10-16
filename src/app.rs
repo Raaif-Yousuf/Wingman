@@ -785,6 +785,37 @@ fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
     mode == Mode::Offline || load_problem.is_none()
 }
 
+/// #890: applies a Settings save all or nothing. `save` runs on the edited
+/// copy first; only when it succeeds does the edit replace `current`, so a
+/// refused save leaves the running config exactly as it was.
+fn commit_edited_config(
+    current: &mut Config,
+    mut edited: Config,
+    save: impl FnOnce(&Config) -> Result<()>,
+) -> Result<()> {
+    // #793: the save is refused while the file does not parse, so an edited
+    // mode must not outlive it in memory (requests read it).
+    let problem = edited
+        .load_problem
+        .clone()
+        .or_else(|| current.load_problem.clone());
+    if !mode_allowed(edited.mode, problem.as_deref()) {
+        edited.mode = Mode::Offline;
+    }
+    save(&edited)?;
+    *current = edited;
+    Ok(())
+}
+
+/// #890: the card text for a Settings save that was refused. The edits are
+/// dropped (a key typed there is not stored either), and it says so.
+fn refused_save_detail(human: &str) -> String {
+    format!(
+        "{human}\n\nYour changes were not applied and Wingman is still using its previous \
+         settings. A key you typed was not stored, so enter it again after fixing this."
+    )
+}
+
 /// #711: config.toml exists but did not parse. Names the line and column
 /// (`problem` already carries them), never file text. No em dash (rule 11).
 fn config_problem_card(problem: &str) -> (String, String) {
@@ -4021,13 +4052,7 @@ impl App {
             return;
         };
 
-        self.config = edited;
-        // #793: the save below is refused while the file does not parse, so
-        // an edited mode must not outlive it in memory (requests read it).
-        if !mode_allowed(self.config.mode, self.config.load_problem.as_deref()) {
-            self.config.mode = Mode::Offline;
-        }
-        if let Err(e) = self.config.save() {
+        if let Err(e) = commit_edited_config(&mut self.config, edited, Config::save) {
             // Rule 7: neither failure may be silently dropped. Every
             // deferred message is delivered for real (its executor runs,
             // its own card shows) even though the unrelated config save
@@ -4036,7 +4061,8 @@ impl App {
             // the single card slot's final content (`final_settings_card`'s
             // `SaveError` case, unchanged by #213).
             let had_pending = !pending.is_empty();
-            let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
+            let human = self.track_error("Couldn't save settings", &format!("{e:#}"));
+            let detail = refused_save_detail(&human);
             self.card
                 .show_error_with_details("Couldn't save settings", &detail);
             self.deliver_deferred(pending);
@@ -8425,6 +8451,56 @@ mod tests {
             assert!(!mode_allowed(m, problem), "{m:?}");
             assert!(mode_allowed(m, None), "{m:?}");
         }
+    }
+
+    /// #890: a refused Settings save leaves the running config exactly as it
+    /// was; a saved one replaces it.
+    #[test]
+    fn a_refused_settings_save_leaves_the_running_config_untouched() {
+        let mut current = crate::config::Config {
+            mode: Mode::Cloud,
+            ..Default::default()
+        };
+        let before = current.clone();
+        let mut edited = current.clone();
+        edited.mode = Mode::Local;
+        edited.ui.card_seconds += 5;
+        let refused = super::commit_edited_config(&mut current, edited, |_| {
+            Err(anyhow::anyhow!("config.toml changed on disk"))
+        });
+        assert!(refused.is_err());
+        assert_eq!(current, before);
+
+        let mut edited = before.clone();
+        edited.ui.card_seconds += 5;
+        let want = edited.clone();
+        super::commit_edited_config(&mut current, edited, |_| Ok(())).expect("saved");
+        assert_eq!(current, want);
+    }
+
+    #[test]
+    fn an_edited_mode_is_held_to_offline_while_the_file_does_not_parse() {
+        let mut current = crate::config::Config {
+            load_problem: Some("config.toml has an error at line 1, column 1".into()),
+            ..Default::default()
+        };
+        let mut edited = current.clone();
+        edited.mode = Mode::Cloud;
+        super::commit_edited_config(&mut current, edited, |saved| {
+            assert_eq!(saved.mode, Mode::Offline);
+            Ok(())
+        })
+        .expect("saved");
+        assert_eq!(current.mode, Mode::Offline);
+    }
+
+    #[test]
+    fn a_refused_save_card_says_nothing_was_applied() {
+        let detail = super::refused_save_detail("config.toml changed on disk");
+        assert!(detail.starts_with("config.toml changed on disk"));
+        assert!(detail.contains("not applied"), "{detail}");
+        assert!(detail.contains("key"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
     }
 
     #[test]
