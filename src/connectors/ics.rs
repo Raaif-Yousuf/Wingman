@@ -11,7 +11,9 @@
 //! best-effort [`cleanup_stale_ics_files`] sweep of its own temp directory
 //! before writing the new file -- see that function's doc comment for why
 //! stale means "older than [`MAX_ICS_FILE_AGE`]", not "every other file",
-//! and why a cleanup failure is always ignored.
+//! and why a cleanup failure is always ignored. #769: the same sweep also runs
+//! once at startup ([`IcsConnector::sweep_stale`]), so a lone event's file is
+//! not kept until the next "Add to calendar".
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -299,6 +301,16 @@ impl<O: Opener> IcsConnector<O> {
             opener,
             local_time_converter,
         }
+    }
+}
+
+impl<O: Opener> IcsConnector<O> {
+    /// Deletes this connector's `.ics` files that are older than
+    /// [`MAX_ICS_FILE_AGE`], without writing anything (#769). Called once at
+    /// startup, so a lone event's file does not wait for the next "Add to
+    /// calendar" to be swept. Best effort, never fails.
+    pub fn sweep_stale(&self) {
+        cleanup_stale_ics_files(&self.temp_dir);
     }
 }
 
@@ -1671,6 +1683,30 @@ END:VCALENDAR\r\n";
 
         assert!(!stale.exists(), "a stale .ics file must be deleted");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_startup_sweep_deletes_an_old_file_with_no_calendar_action() {
+        let dir = test_temp_dir("startup-sweep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = write_file_with_age(&dir, "old.ics", MAX_ICS_FILE_AGE.as_secs() + 60);
+        let fresh = write_file_with_age(&dir, "fresh.ics", 60);
+        let connector =
+            IcsConnector::with_temp_dir_and_opener(dir.clone(), RecordingOpener::default());
+
+        connector.sweep_stale();
+
+        assert!(!stale.exists(), "an old file must go at startup");
+        assert!(fresh.exists(), "a recent file must stay");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_startup_sweep_on_a_missing_directory_does_nothing() {
+        let dir = test_temp_dir("startup-sweep-missing");
+        IcsConnector::with_temp_dir_and_opener(dir.clone(), RecordingOpener::default())
+            .sweep_stale();
+        assert!(!dir.exists(), "the sweep must not create the directory");
     }
 
     #[test]
