@@ -9,3 +9,6 @@
 # src/redact.rs: a fake mixed-case id in a URL, in the test proving text redaction
 # leaves links alone (#505). The test now builds the string at run time.
 b52fbb2a735670004173bea910c499ed205670b0:src/redact.rs:generic-api-key:657
+#
+# src/redact.rs: a fake PEM header in an earlier commit's test of the cut-off key block rule (#734). The tests now build the header at run time.
+33da6200f5d6276a3eb8d3e4ae1b3ae95ae830d5:src/redact.rs:private-key:1120
