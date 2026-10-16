@@ -4260,17 +4260,18 @@ fn gather_generic_inputs(
     if actions::generic_inputs::wants_uia(inputs) {
         gathered.uia = Some(uia_fields_text(foreground_hwnd));
     }
-    // #500: a text input that comes back empty falls back to the screenshot,
-    // which could show a focused password field. Look before that happens.
-    if actions::generic_inputs::needs_focus_probe(inputs) {
-        gathered.focus_in_password_field = crate::inputs::selection::focused_is_password();
-    }
     // #104: the page is read after the selection, because a selection wins.
     if actions::generic_inputs::needs_page_text(inputs, &gathered) {
         if let Some(page) = page_text_of(foreground_hwnd) {
             gathered.page_text = Some(page.text);
             gathered.page_text_truncated = page.truncated;
         }
+    }
+    // #500: a text input that comes back empty falls back to the screenshot,
+    // which could show a focused password field. Look before that happens,
+    // and only then (after every text input has been read).
+    if actions::generic_inputs::needs_focus_probe(inputs, &gathered) {
+        gathered.focus_in_password_field = crate::inputs::selection::focused_is_password();
     }
     Ok(gathered)
 }

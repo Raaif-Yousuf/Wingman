@@ -137,11 +137,14 @@ fn wants_screen(inputs: &[InputKind]) -> bool {
 }
 
 /// Whether the worker should check for a focused password field: a text input
-/// is listed next to the screen, so an empty text could fall back to the
-/// screenshot, and the selection reader (which checks it itself) is not
-/// listed (#500).
-pub fn needs_focus_probe(inputs: &[InputKind]) -> bool {
-    wants_any_text(inputs) && wants_screen(inputs) && !wants_selection(inputs)
+/// is listed next to the screen, the selection reader (which checks it itself)
+/// is not listed, and nothing was gathered, so `plan` would fall back to the
+/// screenshot (#500). Call it after every text input has been read.
+pub fn needs_focus_probe(inputs: &[InputKind], gathered: &Gathered) -> bool {
+    wants_any_text(inputs)
+        && wants_screen(inputs)
+        && !wants_selection(inputs)
+        && plan(inputs, gathered).is_ok_and(|r| r.screen)
 }
 
 /// Whether the request could carry the screenshot, decided from the `inputs`
@@ -408,12 +411,13 @@ mod tests {
 
     #[test]
     fn the_focus_probe_runs_only_for_text_plus_screen_without_a_selection() {
+        let none = Gathered::default();
         for inputs in [
             vec![Clipboard, Screen],
             vec![Uia, Window],
             vec![PageText, Region],
         ] {
-            assert!(needs_focus_probe(&inputs), "{inputs:?}");
+            assert!(needs_focus_probe(&inputs, &none), "{inputs:?}");
         }
         for inputs in [
             vec![],
@@ -422,8 +426,19 @@ mod tests {
             vec![Selection, Screen],
             vec![Selection, Clipboard, Screen],
         ] {
-            assert!(!needs_focus_probe(&inputs), "{inputs:?}");
+            assert!(!needs_focus_probe(&inputs, &none), "{inputs:?}");
         }
+    }
+
+    #[test]
+    fn no_focus_probe_is_needed_when_text_was_gathered() {
+        let clip = g(None, Some("copied"), None);
+        let uia = g(None, None, Some("fields"));
+        assert!(!needs_focus_probe(&[Clipboard, Screen], &clip));
+        assert!(!needs_focus_probe(&[Uia, Screen], &uia));
+        // Blank text counts as nothing gathered.
+        let blank = g(None, Some("  "), None);
+        assert!(needs_focus_probe(&[Clipboard, Screen], &blank));
     }
 
     #[test]
