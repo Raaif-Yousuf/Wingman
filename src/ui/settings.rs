@@ -2475,6 +2475,19 @@ fn key_to_fetch(original: &str, form_text: &str, last_fetched: &str) -> Option<S
     Some(key.to_string())
 }
 
+/// Whether a typed `key` has the shape of vendor `index`'s keys (#678), so a
+/// key pasted into the wrong vendor's field is not sent to that vendor.
+/// OpenAI keys start `sk-` (Anthropic's `sk-ant-` do not count), Anthropic's
+/// `sk-ant-`, Gemini's `AIza`.
+fn key_fits_vendor(index: usize, key: &str) -> bool {
+    let key = key.trim();
+    match index {
+        0 => key.starts_with("sk-") && !key.starts_with("sk-ant-"),
+        1 => key.starts_with("sk-ant-"),
+        _ => key.starts_with("AIza"),
+    }
+}
+
 /// #585: the user left a key field. Fetch that vendor's list with what is
 /// typed now, saved or not. Nothing runs in Offline mode.
 fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
@@ -2499,6 +2512,14 @@ fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
         return;
     };
     if !cloud_list_allowed(crate::mode::current()) {
+        return;
+    }
+    if !key_fits_vendor(index, &key) {
+        // No key text: the report is pasted into public issues.
+        crate::diagnostics::note_warning(&format!(
+            "Live model list skipped for {}: the typed key has an unrecognised format",
+            CLOUD_VENDORS[index].tag()
+        ));
         return;
     }
     spawn_one_cloud_fetch(
@@ -2539,16 +2560,22 @@ fn spawn_one_cloud_fetch(
                 }
             };
             // A newer fetch for this vendor started while this one ran: its
-            // result wins, so this one is dropped.
+            // result wins, so this one is dropped. The check and the store
+            // happen under one lock, so an older worker cannot pass the check
+            // and then store after a newer one finished (#678).
+            let Ok(mut guard) = slots.lock() else {
+                return;
+            };
             if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
                 return;
             }
-            if let Ok(mut guard) = slots.lock() {
-                guard[index] = Some(ids);
-            }
+            guard[index] = Some(ids);
+            // The fetched-key record is written under the same slots lock
+            // (always slots first, then keys), so it cannot go stale.
             if let Ok(mut keys) = sync.fetched_keys.lock() {
                 keys[index] = key.trim().to_string();
             }
+            drop(guard);
             post_while_open(&alive, || unsafe {
                 let _ = PostMessageW(
                     Some(HWND(hwnd_raw as *mut c_void)),
@@ -6335,6 +6362,22 @@ mod tests {
             key_to_fetch("", "sk-first", "").as_deref(),
             Some("sk-first")
         );
+    }
+
+    /// #678: a key typed into the wrong vendor's field is not fetched with.
+    #[test]
+    fn a_typed_key_is_fetched_only_for_its_own_vendor() {
+        let anthropic = "sk-ant-api03-xyz";
+        let openai = "sk-proj-abc";
+        let gemini = "AIzaSyABC";
+        assert!(key_fits_vendor(0, openai));
+        assert!(!key_fits_vendor(0, anthropic));
+        assert!(!key_fits_vendor(0, gemini));
+        assert!(key_fits_vendor(1, anthropic));
+        assert!(!key_fits_vendor(1, openai));
+        assert!(key_fits_vendor(2, &format!(" {gemini} ")));
+        assert!(!key_fits_vendor(2, openai));
+        assert!(!key_fits_vendor(0, ""));
     }
 
     #[test]
