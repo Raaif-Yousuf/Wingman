@@ -127,7 +127,8 @@ built; see "What works today" above. Track what remains in
 Try Wingman in under two minutes, no Rust and no build step:
 
 1. Download the `.zip` from the [latest release](https://github.com/Raaif-Yousuf/Wingman/releases/latest)
-   (currently `wingman-v0.1.0-windows-x64.zip`).
+   (named `wingman-<version>-windows-x64.zip`). Its `SHA256SUMS.txt` has the
+   checksum to compare against.
 2. Unzip it anywhere and run `wingman.exe`. It is a standalone build: no
    installer, no admin rights. This build is not code-signed yet, so Windows
    SmartScreen will likely say it protected your PC; click **More info ▸ Run
@@ -139,10 +140,9 @@ Try Wingman in under two minutes, no Rust and no build step:
 That is the whole path: the hotkey is a system-wide keyboard hook that works
 the moment `wingman.exe` is running, with nothing to register first. What
 this download does not do is add Wingman to Start, to the Copilot key picker
-in **Settings**, or to start-with-Windows, and `install.ps1` in this zip
-cannot do that either on its own: it needs the `packaging\` folder, which
-this zip does not include. For that OS-level integration, see **Install**
-below, which builds from source.
+in **Settings**, or to start-with-Windows. For that OS-level integration, see
+**Install** below, which builds from source: `install.ps1` needs the
+`packaging\` folder, which this zip does not include.
 
 ## Install
 
