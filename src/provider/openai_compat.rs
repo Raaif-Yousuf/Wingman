@@ -215,12 +215,26 @@ impl OpenAiCompat {
             ));
         }
 
+        // The server's own filter blocked the reply (#731): a decline, not a
+        // missing field.
+        if finish_reason == Some("content_filter") {
+            return Err(super::declined_error("openai-compat", "content_filter"));
+        }
+
         let text = message
             .and_then(|m| m.get("content"))
             .and_then(Value::as_str);
         let text = match text {
             Some(t) if !t.is_empty() => t,
-            _ => return Err(anyhow!("openai-compat: response has no message.content")),
+            _ => {
+                return Err(match finish_reason {
+                    Some(r) => anyhow!(
+                        "openai-compat: response has no message.content (finish_reason: {})",
+                        super::safe_reason(r)
+                    ),
+                    None => anyhow!("openai-compat: response has no message.content"),
+                })
+            }
         };
 
         let stop = match finish_reason {
@@ -229,7 +243,22 @@ impl OpenAiCompat {
             _ => StopReason::Other,
         };
 
-        let usage = match (
+        let usage = Self::usage_of(&value);
+
+        Ok(Completion {
+            text: text.to_string(),
+            usage,
+            stop,
+        })
+    }
+
+    /// The usage counts of a body, whether or not it holds an answer (#730).
+    pub(crate) fn parse_usage(body: &str) -> Option<Usage> {
+        Self::usage_of(&serde_json::from_str::<Value>(body).ok()?)
+    }
+
+    fn usage_of(value: &Value) -> Option<Usage> {
+        match (
             value
                 .get("usage")
                 .and_then(|u| u.get("prompt_tokens"))
@@ -245,13 +274,7 @@ impl OpenAiCompat {
                 ..Default::default()
             }),
             _ => None,
-        };
-
-        Ok(Completion {
-            text: text.to_string(),
-            usage,
-            stop,
-        })
+        }
     }
 }
 
@@ -349,6 +372,7 @@ impl Provider for OpenAiCompat {
             &self.model,
             crate::usage::is_loopback_url(&self.base_url),
             Self::parse_completion(&body_text),
+            || Self::parse_usage(&body_text),
         )
     }
 }
@@ -814,6 +838,30 @@ mod tests {
         let usage = completion.usage.expect("usage should be present");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
+    }
+
+    /// #731: a content filter is a decline, and an unknown reason is named.
+    #[test]
+    fn parse_completion_names_content_filter_and_unknown_finish_reasons() {
+        let filtered = r#"{"choices": [{"finish_reason": "content_filter", "message": {"role": "assistant", "content": null}}]}"#;
+        let msg = OpenAiCompat::parse_completion(filtered)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("declined"), "{msg}");
+        assert!(msg.contains("content_filter"), "{msg}");
+        let odd =
+            r#"{"choices": [{"finish_reason": "tool_calls", "message": {"role": "assistant"}}]}"#;
+        let msg = OpenAiCompat::parse_completion(odd).unwrap_err().to_string();
+        assert!(msg.contains("tool_calls"), "{msg}");
+    }
+
+    /// #730: usage is readable from a truncated body that is an error.
+    #[test]
+    fn parse_usage_reads_a_length_body_that_is_an_error() {
+        let body = r#"{"choices": [{"finish_reason": "length", "message": {"content": ""}}], "usage": {"prompt_tokens": 70, "completion_tokens": 200}}"#;
+        assert!(OpenAiCompat::parse_completion(body).is_err());
+        let u = OpenAiCompat::parse_usage(body).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (70, 200));
     }
 
     #[test]
