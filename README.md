@@ -302,7 +302,7 @@ which one.
 - **Settings...**: the settings window (left-clicking the tray icon opens
   this too)
 - **Help and diagnostics ▸**: open `config.toml`, reload settings, copy
-  diagnostics, copy the egress log
+  diagnostics, copy the egress log, check this PC for local models
 - **Quit**
 
 ## Settings worth knowing

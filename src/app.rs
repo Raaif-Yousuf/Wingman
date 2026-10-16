@@ -3074,6 +3074,17 @@ impl App {
         }
     }
 
+    /// Issue #328: "Check this PC for local models". One on-demand read of
+    /// RAM, GPU, battery and Ollama's GPU use (a few quick local calls, the
+    /// same kind `copy_diagnostics` already makes on the message thread),
+    /// then a card with the verdict. Nothing is kept and nothing polls.
+    fn check_machine(&mut self) {
+        let facts = crate::machine::gather(&self.config.providers.ollama.base_url);
+        let verdict = crate::machine::verdict(&facts);
+        self.card
+            .show_answer(&verdict.headline, &verdict.detail(), 20, None);
+    }
+
     /// Issue #115: "Calculate selection" tray item. Model-free: reads the
     /// current selection (UIA, falling back to a clipboard-safe Ctrl+C --
     /// see `inputs::selection`) and evaluates it locally via `calc`, with no
@@ -5756,6 +5767,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
                     MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
                     MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
+                    MenuChoice::Command(cmd::CHECK_MACHINE) => app.check_machine(),
                     MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
                     MenuChoice::Command(cmd::USE_OPENAI) => {
                         app.set_provider(ActiveProvider::OpenAi)

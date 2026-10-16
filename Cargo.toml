@@ -52,6 +52,10 @@ features = [
   "Win32_Graphics_DirectWrite",
   # D2D1_PIXEL_FORMAT's DXGI_FORMAT (issue #216).
   "Win32_Graphics_Dxgi_Common",
+  # machine.rs (#328): DXGI adapter names and memory, on demand.
+  "Win32_Graphics_Dxgi",
+  # machine.rs (#328): GetSystemPowerStatus, on demand.
+  "Win32_System_Power",
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Dwm",
   "Win32_NetworkManagement_IpHelper",
