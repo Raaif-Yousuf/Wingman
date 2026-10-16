@@ -143,8 +143,17 @@ pub const WM_APP_SEND_PREVIEW: u32 = WM_APP + 18;
 /// is dropped. `WM_APP + 19`: `+18` is `WM_APP_SEND_PREVIEW`.
 pub const WM_APP_PENDING_STAGE: u32 = WM_APP + 19;
 
-/// #567: a base URL and the (name, supports vision) pairs it reported.
+/// #567: what Ollama reported for one base URL, as (name, supports vision).
 type PulledOllamaModels = (String, Vec<(String, bool)>);
+
+/// #567: whether the tray should ask Ollama for its models at all. Only when
+/// Ollama is in `providers.order` or the base URL is a loopback address, so a
+/// config that points at some other host never gets a request from a menu
+/// open.
+fn ollama_menu_refresh_wanted(order: &[String], base_url: &str) -> bool {
+    mode::should_probe_ollama(order, base_url)
+        || matches!(mode::classify_host(base_url), mode::HostClass::Loopback)
+}
 
 /// #567: the models Ollama has pulled, for the tray's Ollama submenu. The
 /// tray menu is built on the UI thread the moment it is right-clicked, so it
@@ -153,31 +162,25 @@ type PulledOllamaModels = (String, Vec<(String, bool)>);
 /// Event-driven (a menu open, a reload, startup), never a timer.
 #[derive(Default)]
 struct OllamaModelCache {
-    /// The base URL asked and what it said, as (name, supports vision).
-    /// An unreachable server stores an empty list, so the menu falls back to
-    /// the configured model only.
-    result: Arc<std::sync::Mutex<Option<PulledOllamaModels>>>,
-    in_flight: Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<std::sync::Mutex<CacheState>>,
+}
+
+#[derive(Default)]
+struct CacheState {
+    /// The base URL a fetch is running for, if any.
+    in_flight: Option<String>,
+    /// The last finished answer. An unreachable server stores an empty list,
+    /// so the menu falls back to the configured model only.
+    result: Option<PulledOllamaModels>,
 }
 
 impl OllamaModelCache {
-    /// Starts a background fetch unless one is already running.
+    /// Starts a background fetch from Ollama's `/api/tags`. The whole request,
+    /// body included, is capped at 3 seconds (a global timeout, not just the
+    /// connect).
     fn refresh(&self, base_url: &str) {
-        use std::sync::atomic::Ordering;
-        if self.in_flight.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let base_url = base_url.to_string();
-        let result = Arc::clone(&self.result);
-        let in_flight = Arc::clone(&self.in_flight);
-        let worker_flag = Arc::clone(&in_flight);
-        let spawned = std::thread::Builder::new()
-            .name("tray-ollama-models".into())
-            .spawn(move || {
-                let pulled = crate::provider::ollama_admin::list_tags_with_timeout(
-                    &base_url,
-                    Duration::from_secs(3),
-                )
+        let _ = self.refresh_with(base_url, |url| {
+            crate::provider::ollama_admin::list_tags_with_timeout(url, Duration::from_secs(3))
                 .map(|models| {
                     models
                         .iter()
@@ -189,21 +192,62 @@ impl OllamaModelCache {
                         })
                         .collect()
                 })
-                .unwrap_or_default();
-                if let Ok(mut slot) = result.lock() {
-                    *slot = Some((base_url, pulled));
+                .unwrap_or_default()
+        });
+    }
+
+    /// [`OllamaModelCache::refresh`] with the fetch passed in, so tests need
+    /// no network. Does nothing while a fetch for the same URL is running; a
+    /// different URL starts its own fetch, and only the one for the URL most
+    /// recently asked for may store its answer.
+    fn refresh_with(
+        &self,
+        base_url: &str,
+        fetch: impl FnOnce(&str) -> Vec<(String, bool)> + Send + 'static,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        {
+            let Ok(mut state) = self.state.lock() else {
+                return None;
+            };
+            if state.in_flight.as_deref() == Some(base_url) {
+                return None;
+            }
+            state.in_flight = Some(base_url.to_string());
+        }
+        let url = base_url.to_string();
+        let state = Arc::clone(&self.state);
+        let spawned = std::thread::Builder::new()
+            .name("tray-ollama-models".into())
+            .spawn({
+                let state = Arc::clone(&state);
+                let url = url.clone();
+                move || {
+                    let pulled = fetch(&url);
+                    if let Ok(mut state) = state.lock() {
+                        if state.in_flight.as_deref() == Some(url.as_str()) {
+                            state.in_flight = None;
+                            state.result = Some((url, pulled));
+                        }
+                    }
                 }
-                worker_flag.store(false, Ordering::Release);
             });
-        if spawned.is_err() {
-            in_flight.store(false, Ordering::Release);
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                if let Ok(mut state) = state.lock() {
+                    if state.in_flight.as_deref() == Some(url.as_str()) {
+                        state.in_flight = None;
+                    }
+                }
+                None
+            }
         }
     }
 
     /// The finished list, if there is one for `base_url` (a list fetched for
     /// an address the config has since left is dropped).
     fn take_for(&self, base_url: &str) -> Option<Vec<(String, bool)>> {
-        let taken = self.result.lock().ok()?.take()?;
+        let taken = self.state.lock().ok()?.result.take()?;
         (taken.0 == base_url).then_some(taken.1)
     }
 }
@@ -3514,7 +3558,9 @@ impl App {
         if let Some(pulled) = self.ollama_models.take_for(&ollama.base_url) {
             self.tray.set_ollama_models(&pulled, &ollama.model);
         }
-        self.ollama_models.refresh(&ollama.base_url);
+        if ollama_menu_refresh_wanted(&self.config.providers.order, &ollama.base_url) {
+            self.ollama_models.refresh(&ollama.base_url);
+        }
     }
 
     fn refresh_tray_labels(&mut self) {
@@ -3537,7 +3583,9 @@ impl App {
         // checked model follows the config. A fresh list is fetched in the
         // background (never here), see `OllamaModelCache`.
         self.tray.set_ollama_current(&p.ollama.model);
-        self.ollama_models.refresh(&p.ollama.base_url);
+        if ollama_menu_refresh_wanted(&p.order, &p.ollama.base_url) {
+            self.ollama_models.refresh(&p.ollama.base_url);
+        }
 
         self.update_tooltip();
     }
@@ -6611,6 +6659,73 @@ mod tests {
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
     ];
+
+    // -- #567: the tray's Ollama model cache --------------------------------
+
+    fn names(list: &[(&str, bool)]) -> Vec<(String, bool)> {
+        list.iter().map(|(n, v)| (n.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn ollama_cache_hands_over_a_finished_list_once_and_resets_in_flight() {
+        let cache = super::OllamaModelCache::default();
+        let url = "http://127.0.0.1:11434";
+        let h = cache
+            .refresh_with(url, |_| names(&[("gemma3:4b", true)]))
+            .expect("a fetch starts");
+        h.join().unwrap();
+        assert!(cache.state.lock().unwrap().in_flight.is_none());
+        assert_eq!(cache.take_for(url), Some(names(&[("gemma3:4b", true)])));
+        assert_eq!(cache.take_for(url), None, "taken once");
+        // in_flight was reset, so another fetch can start.
+        assert!(cache.refresh_with(url, |_| Vec::new()).is_some());
+    }
+
+    #[test]
+    fn ollama_cache_drops_a_list_for_another_url() {
+        let cache = super::OllamaModelCache::default();
+        cache
+            .refresh_with("http://127.0.0.1:11434", |_| names(&[("a", false)]))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(cache.take_for("http://127.0.0.1:9999"), None);
+    }
+
+    #[test]
+    fn ollama_cache_respawns_for_a_new_url_and_ignores_the_stale_answer() {
+        use std::sync::mpsc;
+        let cache = super::OllamaModelCache::default();
+        let (release_old, wait_old) = mpsc::channel::<()>();
+        let old = cache
+            .refresh_with("http://old", move |_| {
+                let _ = wait_old.recv();
+                names(&[("old", false)])
+            })
+            .unwrap();
+        // Same URL while running: no second fetch.
+        assert!(cache.refresh_with("http://old", |_| Vec::new()).is_none());
+        // New URL: its own fetch, and it finishes first.
+        cache
+            .refresh_with("http://new", |_| names(&[("new", false)]))
+            .expect("a changed URL respawns")
+            .join()
+            .unwrap();
+        release_old.send(()).unwrap();
+        old.join().unwrap();
+        assert_eq!(cache.take_for("http://new"), Some(names(&[("new", false)])));
+        assert_eq!(cache.take_for("http://old"), None);
+    }
+
+    #[test]
+    fn ollama_menu_refresh_is_wanted_only_for_ollama_in_the_chain_or_loopback() {
+        use super::ollama_menu_refresh_wanted as wanted;
+        let order = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(wanted(&order(&["openai"]), "http://127.0.0.1:11434"));
+        assert!(wanted(&order(&["ollama"]), "http://192.168.1.5:11434"));
+        assert!(!wanted(&order(&["openai"]), "http://192.168.1.5:11434"));
+        assert!(!wanted(&order(&["openai"]), "http://localhost:11434"));
+    }
 
     #[test]
     fn wm_app_ids_are_pairwise_unique() {

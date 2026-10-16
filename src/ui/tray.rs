@@ -247,6 +247,14 @@ pub fn decode(id: u32) -> MenuChoice {
     }
 }
 
+/// See [`Tray::shown`].
+#[derive(Default)]
+struct ShownModels {
+    openai: Vec<String>,
+    anthropic: Vec<String>,
+    ollama: Vec<String>,
+}
+
 pub struct Tray {
     hwnd: HWND,
     /// Kept so [`Tray::readd`] can reload the icon exactly as [`Tray::new`]
@@ -277,6 +285,11 @@ pub struct Tray {
     /// [`ollama_entries`].
     ollama_pulled: Vec<(String, bool)>,
     ollama_models: Vec<String>,
+    /// The model names the open menu was built from. A pick is resolved
+    /// against this, not the live lists above, because a reload can replace
+    /// those while the popup is still on screen. Taken by
+    /// [`Tray::snapshot_models`] when the menu opens.
+    shown: ShownModels,
     ollama_labels: Vec<String>,
     ollama_current: Option<usize>,
     /// The icon loaded by [`add_icon`] (embedded resource or the
@@ -330,6 +343,7 @@ impl Tray {
             anthropic_models: Vec::new(),
             ollama_pulled: Vec::new(),
             ollama_models: Vec::new(),
+            shown: ShownModels::default(),
             ollama_labels: Vec::new(),
             ollama_current: None,
             anthropic_current: None,
@@ -536,7 +550,7 @@ impl Tray {
     /// Resolve a [`MenuChoice::OllamaModel`] index back to a bare model name
     /// (no vision badge).
     pub fn ollama_model_at(&self, index: usize) -> Option<&str> {
-        self.ollama_models.get(index).map(String::as_str)
+        self.shown.ollama.get(index).map(String::as_str)
     }
 
     /// Handle the `WM_APP_TRAY` message. Returns `Some(cmd::OPEN_SETTINGS)` on
@@ -551,13 +565,24 @@ impl Tray {
     /// from the list gets appended), so callers must resolve through here
     /// rather than re-indexing their own copy.
     pub fn openai_model_at(&self, index: usize) -> Option<&str> {
-        self.openai_models.get(index).map(String::as_str)
+        self.shown.openai.get(index).map(String::as_str)
     }
 
     /// Resolve a [`MenuChoice::AnthropicModel`] index back to a model id.
     /// See [`Tray::openai_model_at`].
     pub fn anthropic_model_at(&self, index: usize) -> Option<&str> {
-        self.anthropic_models.get(index).map(String::as_str)
+        self.shown.anthropic.get(index).map(String::as_str)
+    }
+
+    /// Remembers the model names the menu about to open is built from, so a
+    /// pick resolves to the entry the user clicked even if the lists change
+    /// while the popup is open (a reload, a finished refresh).
+    fn snapshot_models(&mut self) {
+        self.shown = ShownModels {
+            openai: self.openai_models.clone(),
+            anthropic: self.anthropic_models.clone(),
+            ollama: self.ollama_models.clone(),
+        };
     }
 
     /// Whether this tray message opens the menu, which takes the foreground
@@ -572,7 +597,10 @@ impl Tray {
         let event = (lparam.0 as u32) & 0xFFFF;
         match event {
             e if e == WM_LBUTTONUP || e == NIN_SELECT => Some(cmd::OPEN_SETTINGS),
-            e if e == WM_CONTEXTMENU || e == WM_RBUTTONUP => self.show_menu(),
+            e if e == WM_CONTEXTMENU || e == WM_RBUTTONUP => {
+                self.snapshot_models();
+                self.show_menu()
+            }
             _ => None,
         }
     }
@@ -672,7 +700,11 @@ impl Tray {
             "ChatGPT model",
             cmd::OPENAI_MODEL_BASE,
             &self.openai_models,
-            &self.openai_models,
+            &self
+                .openai_models
+                .iter()
+                .map(|m| menu_label(m))
+                .collect::<Vec<_>>(),
             self.openai_current,
         )?;
         append_model_submenu(
@@ -680,7 +712,11 @@ impl Tray {
             "Claude model",
             cmd::ANTHROPIC_MODEL_BASE,
             &self.anthropic_models,
-            &self.anthropic_models,
+            &self
+                .anthropic_models
+                .iter()
+                .map(|m| menu_label(m))
+                .collect::<Vec<_>>(),
             self.anthropic_current,
         )?;
         append_model_submenu(
@@ -995,7 +1031,10 @@ fn append_model_submenu(
     // with the other submenu or the fixed cmd::* ids.
     for (i, model) in models.iter().enumerate() {
         let id = base_id + i as u32;
-        append_item(submenu, id, labels.get(i).unwrap_or(model))?;
+        match labels.get(i) {
+            Some(label) => append_item(submenu, id, label)?,
+            None => append_item(submenu, id, &menu_label(model))?,
+        }
         if current == Some(i) {
             mark_radio_checked(submenu, id);
         }
@@ -1018,11 +1057,34 @@ fn ollama_entries(
     let labels = names
         .iter()
         .map(|n| match pulled.iter().find(|(p, _)| p == n) {
-            Some((_, true)) => format!("{n} (vision)"),
-            _ => n.clone(),
+            Some((_, true)) => format!("{} (vision)", menu_label(n)),
+            _ => menu_label(n),
         })
         .collect();
     (names, labels, idx)
+}
+
+/// Longest model name shown in a menu item, in characters.
+const MENU_LABEL_MAX: usize = 60;
+
+/// A model name made safe to show as menu text: control characters dropped,
+/// cut to [`MENU_LABEL_MAX`] characters, and `&` doubled so Windows shows an
+/// ampersand instead of underlining the next letter. Display only: the name
+/// that gets saved is always the original.
+fn menu_label(name: &str) -> String {
+    let clean: String = name.chars().filter(|c| !c.is_control()).collect();
+    let mut out = String::new();
+    for (i, c) in clean.chars().enumerate() {
+        if i == MENU_LABEL_MAX {
+            out.push_str("...");
+            break;
+        }
+        if c == '&' {
+            out.push('&');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Clamp `list` to at most `cmd::MODEL_RANGE` entries and make sure
@@ -2501,12 +2563,34 @@ mod tests {
         let mut seen = None;
         built_menu_tree(|t| {
             t.set_ollama_models(&pulled(&[("gemma3:4b", true)]), "gemma3:4b");
+            t.snapshot_models();
+            // A reload while the popup is open replaces the live list; the
+            // pick still resolves against what was on screen.
+            t.set_ollama_models(&pulled(&[("other:1b", false)]), "other:1b");
             seen = Some((
                 t.ollama_model_at(0).map(str::to_owned),
                 t.ollama_model_at(1).map(str::to_owned),
             ));
         });
         assert_eq!(seen, Some((Some("gemma3:4b".to_string()), None)));
+    }
+
+    #[test]
+    fn menu_label_escapes_ampersands_strips_controls_and_truncates() {
+        assert_eq!(menu_label("a&b"), "a&&b");
+        assert_eq!(menu_label("a\u{7}b\nc"), "abc");
+        assert_eq!(
+            menu_label(&"x".repeat(100)),
+            format!("{}...", "x".repeat(60))
+        );
+        assert_eq!(menu_label(&"x".repeat(60)), "x".repeat(60));
+    }
+
+    #[test]
+    fn ollama_entries_escape_the_label_but_keep_the_stored_name() {
+        let (names, labels, _) = ollama_entries(&pulled(&[("a&b", true)]), "a&b");
+        assert_eq!(names, ["a&b"]);
+        assert_eq!(labels, ["a&&b (vision)"]);
     }
 
     // -- grey_pixel (issue #20's paused icon) -------------------------------
