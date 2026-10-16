@@ -473,6 +473,34 @@ pub fn path() -> Result<PathBuf> {
 /// against a scratch directory. Only [`load_actions`] touches the real
 /// `%APPDATA%`.
 pub fn load_actions_from(user_path: &Path) -> Result<Vec<Resolved>> {
+    load_actions_report_from(user_path).map(|report| report.actions)
+}
+
+/// What a load produced: the actions that can run, and one plain sentence for
+/// each action that was left out because its own fields are wrong (#620).
+/// `skipped_ids` holds the ids, in the same order, so a run of a skipped id
+/// can say why it is missing.
+#[derive(Debug, Default)]
+pub struct LoadReport {
+    pub actions: Vec<Resolved>,
+    pub skipped: Vec<String>,
+    pub skipped_ids: Vec<String>,
+}
+
+impl LoadReport {
+    /// Why the action with this id was skipped, if it was.
+    pub fn skipped_reason(&self, id: &str) -> Option<&str> {
+        let i = self.skipped_ids.iter().position(|s| s == id)?;
+        self.skipped.get(i).map(String::as_str)
+    }
+}
+
+/// [`load_actions_from`] plus the reasons any action was skipped. A file that
+/// cannot be read or parsed is still an `Err` for the whole file; a single
+/// action with a bad executor, proposal or input list is skipped on its own
+/// so one typo never hides the built-ins. User entries are checked BEFORE
+/// the merge: a bad override of a built-in is skipped and the built-in stays.
+pub fn load_actions_report_from(user_path: &Path) -> Result<LoadReport> {
     let user_file = if user_path.exists() {
         let contents = fs::read_to_string(user_path)
             .with_context(|| format!("failed to read {}", user_path.display()))?;
@@ -482,33 +510,151 @@ pub fn load_actions_from(user_path: &Path) -> Result<Vec<Resolved>> {
         ActionsFile::default()
     };
 
-    let merged = merge_actions(builtin_actions(), user_file.actions);
-    let visible = visible(merged, &user_file.disabled_groups);
-    for resolved in &visible {
-        validate_action(&resolved.action)?;
+    let builtins = builtin_actions();
+    let mut report = LoadReport::default();
+    let mut user_actions = Vec::new();
+    for action in user_file.actions {
+        // A hidden action never runs, so it is not checked.
+        let hidden = !action.enabled
+            || action
+                .group
+                .as_ref()
+                .is_some_and(|g| user_file.disabled_groups.contains(g));
+        match validate_action(&action) {
+            Err(e) if !hidden => {
+                let mut message = format!("{e:#}.");
+                if builtins.iter().any(|b| b.id == action.id) {
+                    message.push_str(" Your version was skipped and the built-in was kept.");
+                } else {
+                    message.push_str(" It was skipped.");
+                }
+                report.skipped_ids.push(action.id.clone());
+                report.skipped.push(message);
+            }
+            _ => user_actions.push(action),
+        }
     }
-    Ok(visible)
+
+    let merged = merge_actions(builtins, user_actions);
+    report.actions = visible(merged, &user_file.disabled_groups);
+    Ok(report)
 }
 
 /// Rejects a combination that could only fail (or quietly do something else)
-/// after the user had spent a model call (#536). Only actions that can run
-/// are checked, so a hidden one never blocks the others. A named error, never
+/// after the user had spent a model call (#536, #620). A named error, never
 /// a panic (rule 7).
 fn validate_action(action: &Action) -> Result<()> {
+    let executor = match crate::executors::registry::resolve(&action.executor) {
+        Ok(executor) => executor,
+        Err(_) => anyhow::bail!(
+            "action \"{}\" names executor \"{}\", which does not exist",
+            action.id,
+            action.executor
+        ),
+    };
+    // No model call (an empty prompt) and nothing written (a read-only
+    // executor): the proposal name (`"ocr_text"`) is deliberately not a
+    // registered schema. Anything else needs a real schema.
+    let no_model =
+        action.prompt.trim().is_empty() && executor.effect() == crate::executors::Effect::ReadOnly;
+    if !no_model && schema::schema_for(&action.proposal, action.rate_difficulty).is_none() {
+        anyhow::bail!(
+            "action \"{}\" names proposal \"{}\", which does not exist",
+            action.id,
+            action.proposal
+        );
+    }
     if action.executor == "replace_text" && !action.inputs.contains(&InputKind::Selection) {
         anyhow::bail!(
-            "action \"{}\" uses executor \"replace_text\", which writes over the selected text, \
-             so its inputs must include \"selection\"",
-            action.id
+            "action \"{}\" uses executor \"replace_text\", {}",
+            action.id,
+            "which writes over the selected text, so its inputs must include \"selection\""
         );
     }
     Ok(())
+}
+
+/// Remembers which skipped-actions notice the user has already been shown, so
+/// the same problem is said once and again only when the set changes (#620).
+#[derive(Debug, Default)]
+pub struct SkipNotice {
+    notified: Option<String>,
+    pending: Option<String>,
+}
+
+impl SkipNotice {
+    /// The notice for this load if it differs from the last one shown. An
+    /// empty list (or a failed load, pass `&[]`) forgets the last notice so a
+    /// later break is reported again.
+    pub fn observe(&mut self, skipped: &[String]) -> Option<String> {
+        let text = skipped.join(" ");
+        if text.is_empty() {
+            self.notified = None;
+            return None;
+        }
+        if self.notified.as_deref() == Some(text.as_str()) {
+            return None;
+        }
+        self.notified = Some(text.clone());
+        Some(text)
+    }
+
+    /// [`Self::observe`], then holds a new notice for the next result card.
+    pub fn queue(&mut self, skipped: &[String]) {
+        if let Some(text) = self.observe(skipped) {
+            self.pending = Some(text);
+        }
+    }
+
+    pub fn take(&mut self) -> Option<String> {
+        self.pending.take()
+    }
+}
+
+static SKIP_NOTICE: std::sync::Mutex<SkipNotice> = std::sync::Mutex::new(SkipNotice {
+    notified: None,
+    pending: None,
+});
+
+fn skip_notice() -> std::sync::MutexGuard<'static, SkipNotice> {
+    SKIP_NOTICE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The notice to show now (the palette's own card), once per change.
+pub fn observe_skipped(skipped: &[String]) -> Option<String> {
+    skip_notice().observe(skipped)
+}
+
+/// Holds the notice for the next result card (`app.rs`'s
+/// `with_pending_notices` takes it).
+pub fn queue_skipped(skipped: &[String]) {
+    skip_notice().queue(skipped);
+}
+
+/// Takes the queued notice, if any.
+pub fn take_skipped_notice() -> Option<String> {
+    skip_notice().take()
+}
+
+/// Loads the report and queues its notice; a failed load forgets the last
+/// notice (the run itself reports the load error).
+pub fn queue_skipped_from_disk() {
+    match load_actions_report() {
+        Ok(report) => queue_skipped(&report.skipped),
+        Err(_) => queue_skipped(&[]),
+    }
 }
 
 /// [`load_actions_from`] against the real `%APPDATA%\Wingman\actions.toml`.
 /// The only entry point `app.rs` calls.
 pub fn load_actions() -> Result<Vec<Resolved>> {
     load_actions_from(&path()?)
+}
+
+/// [`load_actions_report_from`] against the real `actions.toml`. The palette
+/// uses it so it can tell the user about a skipped action.
+pub fn load_actions_report() -> Result<LoadReport> {
+    load_actions_report_from(&path()?)
 }
 
 #[cfg(test)]
@@ -992,16 +1138,185 @@ prompt = "Make it loud."
 "#;
 
     #[test]
-    fn replace_text_without_a_selection_input_is_a_named_load_error() {
+    fn replace_text_without_a_selection_input_is_skipped_with_a_named_reason() {
         let path = scratch_path("replace-no-selection");
         write(&path, REPLACE_NO_SELECTION);
-        let err = load_actions_from(&path).unwrap_err();
+        let report = load_actions_report_from(&path).unwrap();
         cleanup(&path);
-        let msg = format!("{err:#}");
+        assert!(!report.actions.iter().any(|r| r.action.id == "shout"));
+        assert_eq!(report.skipped.len(), 1);
+        let msg = &report.skipped[0];
         assert!(msg.contains("shout"), "names the action: {msg}");
         assert!(msg.contains("replace_text"), "names the executor: {msg}");
         assert!(msg.contains("selection"), "names the fix: {msg}");
         assert!(!msg.contains('\u{2014}'), "no em dash: {msg}");
+    }
+
+    // -- unknown executor / proposal and skip-not-fail (#620) -----------------
+
+    fn one_action(id: &str, proposal: &str, executor: &str, prompt: &str) -> String {
+        format!(
+            "[[actions]]\nid = \"{id}\"\nname = \"{id}\"\ninputs = [\"selection\"]\n\
+             proposal = \"{proposal}\"\nexecutor = \"{executor}\"\nconfirm = false\n\
+             prompt = \"{prompt}\"\n"
+        )
+    }
+
+    #[test]
+    fn an_unknown_executor_is_skipped_and_named() {
+        let path = scratch_path("unknown-executor");
+        write(
+            &path,
+            &one_action("typo", "text_answer", "clipbaord", "Do it."),
+        );
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        assert!(!report.actions.iter().any(|r| r.action.id == "typo"));
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].contains("typo"));
+        assert!(report.skipped[0].contains("clipbaord"));
+    }
+
+    #[test]
+    fn an_unknown_proposal_is_skipped_and_named() {
+        let path = scratch_path("unknown-proposal");
+        write(
+            &path,
+            &one_action("odd", "no_such_schema", "none", "Answer."),
+        );
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        assert!(!report.actions.iter().any(|r| r.action.id == "odd"));
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].contains("odd"));
+        assert!(report.skipped[0].contains("no_such_schema"));
+    }
+
+    #[test]
+    fn an_unregistered_proposal_is_fine_when_the_action_never_calls_a_model() {
+        let path = scratch_path("no-model");
+        write(&path, &one_action("ocr-copy", "ocr_text", "clipboard", ""));
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert!(report.actions.iter().any(|r| r.action.id == "ocr-copy"));
+    }
+
+    #[test]
+    fn a_bad_action_does_not_hide_the_good_ones_or_the_builtins() {
+        let path = scratch_path("mixed");
+        let text = format!(
+            "{}\n{}",
+            one_action("good", "text_answer", "clipboard", "Fine."),
+            one_action("bad", "text_answer", "nope", "Broken.")
+        );
+        write(&path, &text);
+        let report = load_actions_report_from(&path).unwrap();
+        let plain = load_actions_from(&path).unwrap();
+        cleanup(&path);
+        assert!(report.actions.iter().any(|r| r.action.id == "good"));
+        assert!(!report.actions.iter().any(|r| r.action.id == "bad"));
+        assert!(report
+            .actions
+            .iter()
+            .any(|r| r.action.id == DEFAULT_ACTION_ID));
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(plain.len(), report.actions.len());
+    }
+
+    #[test]
+    fn a_bad_override_of_a_builtin_is_skipped_and_the_builtin_kept() {
+        let path = scratch_path("bad-override");
+        write(
+            &path,
+            &one_action(DEFAULT_ACTION_ID, "verdict", "nope", "Mine."),
+        );
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        let kept = default_action(&report.actions).expect("the built-in default stays");
+        assert_eq!(kept.origin, Origin::Builtin);
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].contains("built-in was kept"));
+        assert!(report.skipped_reason(DEFAULT_ACTION_ID).is_some());
+        assert!(report.skipped_reason("something-else").is_none());
+    }
+
+    #[test]
+    fn an_unregistered_proposal_with_a_writing_executor_is_skipped() {
+        let path = scratch_path("empty-prompt-writes");
+        write(
+            &path,
+            &one_action("quiet", "no_such_schema", "replace_text", ""),
+        );
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        assert!(!report.actions.iter().any(|r| r.action.id == "quiet"));
+        assert_eq!(report.skipped.len(), 1);
+    }
+
+    #[test]
+    fn skip_messages_have_no_double_spaces() {
+        for (executor, proposal, prompt, inputs) in [
+            ("clipbaord", "text_answer", "x", "selection"),
+            ("none", "no_such_schema", "x", "selection"),
+            ("replace_text", "text_answer", "x", "clipboard"),
+        ] {
+            let path = scratch_path("spaces");
+            let text = one_action("m", proposal, executor, prompt)
+                .replace("\"selection\"", &format!("\"{inputs}\""));
+            write(&path, &text);
+            let report = load_actions_report_from(&path).unwrap();
+            cleanup(&path);
+            assert_eq!(report.skipped.len(), 1, "{executor}");
+            assert!(!report.skipped[0].contains("  "), "{}", report.skipped[0]);
+        }
+    }
+
+    #[test]
+    fn a_skip_notice_is_taken_once_until_the_skipped_set_changes() {
+        let mut n = SkipNotice::default();
+        let a = vec!["action \"a\" is bad.".to_string()];
+        n.queue(&a);
+        assert_eq!(n.take().as_deref(), Some("action \"a\" is bad."));
+        assert_eq!(n.take(), None, "taken once");
+        n.queue(&a);
+        assert_eq!(n.take(), None, "same problem is not repeated");
+        let b = vec![a[0].clone(), "action \"b\" is bad.".to_string()];
+        n.queue(&b);
+        assert!(n.take().unwrap().contains("\"b\""), "a changed set is new");
+        n.queue(&[]);
+        n.queue(&b);
+        assert!(
+            n.take().is_some(),
+            "fixed then broken again is reported again"
+        );
+    }
+
+    #[test]
+    fn observe_and_queue_share_what_was_already_shown() {
+        let mut n = SkipNotice::default();
+        let a = vec!["x".to_string()];
+        assert!(n.observe(&a).is_some());
+        n.queue(&a);
+        assert_eq!(n.take(), None, "the palette already showed it");
+    }
+
+    #[test]
+    fn a_toml_syntax_error_is_still_a_whole_file_error() {
+        let path = scratch_path("syntax");
+        write(&path, "[[actions]\nid = ");
+        let result = load_actions_report_from(&path);
+        cleanup(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn every_builtin_passes_validation() {
+        let builtins = builtin_actions();
+        assert!(!builtins.is_empty());
+        for a in builtins {
+            validate_action(&a).unwrap_or_else(|e| panic!("{}: {e:#}", a.id));
+        }
     }
 
     #[test]
@@ -1020,9 +1335,9 @@ prompt = "Make it loud."
     fn a_disabled_replace_text_action_without_a_selection_still_loads() {
         let path = scratch_path("replace-disabled");
         write(&path, &format!("{REPLACE_NO_SELECTION}enabled = false\n"));
-        let resolved = load_actions_from(&path);
+        let report = load_actions_report_from(&path).unwrap();
         cleanup(&path);
-        assert!(resolved.is_ok(), "a hidden action never runs");
+        assert!(report.skipped.is_empty(), "a hidden action is not checked");
     }
 
     #[test]
