@@ -27,6 +27,7 @@ pub mod review_email;
 pub mod rewrite_tone;
 pub mod scam_check;
 pub mod schema;
+pub mod share;
 pub mod table;
 pub mod time_zones;
 pub mod translate;
