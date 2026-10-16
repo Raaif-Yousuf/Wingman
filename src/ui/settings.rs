@@ -286,6 +286,23 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     inner.result
 }
 
+/// Asks the open Settings window to close without saving (#673), as its own
+/// close box does. A no-op when none is open. Posted, not sent, so it is safe
+/// to call from inside the owner window's procedure.
+pub fn request_close() {
+    let existing = OPEN_HWND.load(Ordering::SeqCst);
+    if existing != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(existing as *mut c_void)),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
 /// Process-wide guard: 0 when no settings window is open, else the open
 /// window's `HWND` value. `isize` rather than a `Mutex<HWND>` because `HWND`
 /// is just a pointer-sized value and this only ever needs a single atomic
