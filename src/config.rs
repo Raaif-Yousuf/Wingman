@@ -432,6 +432,60 @@ impl Default for OllamaConfig {
     }
 }
 
+/// The provider the tray's Provider submenu and Settings' "Active provider"
+/// control can pick (#183): whichever name leads `providers.order`. Gemini and
+/// the compat endpoints are reached by editing `providers.order` for now, so
+/// a config that leads with one of them reads as [`ActiveProvider::OpenAi`],
+/// the same fallback the two-way picker always had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveProvider {
+    OpenAi,
+    Anthropic,
+    Ollama,
+}
+
+impl ActiveProvider {
+    /// The `providers.order` name.
+    pub fn order_name(self) -> &'static str {
+        match self {
+            ActiveProvider::OpenAi => "openai",
+            ActiveProvider::Anthropic => "anthropic",
+            ActiveProvider::Ollama => "ollama",
+        }
+    }
+
+    /// What the tray card and menu call it.
+    pub fn label(self) -> &'static str {
+        match self {
+            ActiveProvider::OpenAi => "ChatGPT",
+            ActiveProvider::Anthropic => "Claude",
+            ActiveProvider::Ollama => "Ollama",
+        }
+    }
+
+    /// Which provider leads `order`.
+    pub fn from_order(order: &[String]) -> Self {
+        match order.first().map(String::as_str) {
+            Some("anthropic") => ActiveProvider::Anthropic,
+            Some("ollama") => ActiveProvider::Ollama,
+            _ => ActiveProvider::OpenAi,
+        }
+    }
+
+    /// Moves this provider to the front of `order` (adding it if absent).
+    /// Everything else keeps its relative order, so the old leader stays in
+    /// the list as the fallback. Returns whether `order` changed.
+    pub fn move_to_front(self, order: &mut Vec<String>) -> bool {
+        let want = self.order_name();
+        if order.first().map(String::as_str) == Some(want) {
+            return false;
+        }
+        order.retain(|p| p != want);
+        order.insert(0, want.to_string());
+        true
+    }
+}
+
 /// #16: one `[[providers.compat]]` entry -- an OpenAI-compatible
 /// `/chat/completions` endpoint (OpenRouter, Groq, Mistral, DeepSeek, xAI,
 /// Together, LM Studio, llama.cpp, vLLM, Azure, ...). `Debug` is hand-rolled
@@ -4425,5 +4479,57 @@ mod egress_preview_tests {
         // before asserting it.
         set_egress_preview_enabled(false);
         assert!(!egress_preview_enabled());
+    }
+
+    // -- #183: ActiveProvider -------------------------------------------------
+
+    fn order(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn active_provider_reads_the_front_of_the_order() {
+        assert_eq!(
+            ActiveProvider::from_order(&order(&["ollama", "openai"])),
+            ActiveProvider::Ollama
+        );
+        assert_eq!(
+            ActiveProvider::from_order(&order(&["anthropic", "openai"])),
+            ActiveProvider::Anthropic
+        );
+        assert_eq!(
+            ActiveProvider::from_order(&order(&["openai", "ollama"])),
+            ActiveProvider::OpenAi
+        );
+    }
+
+    #[test]
+    fn active_provider_falls_back_to_openai_for_other_leaders() {
+        assert_eq!(ActiveProvider::from_order(&[]), ActiveProvider::OpenAi);
+        assert_eq!(
+            ActiveProvider::from_order(&order(&["gemini", "anthropic"])),
+            ActiveProvider::OpenAi
+        );
+    }
+
+    #[test]
+    fn move_to_front_adds_a_missing_provider_and_keeps_the_rest() {
+        let mut o = order(&["openai", "anthropic"]);
+        assert!(ActiveProvider::Ollama.move_to_front(&mut o));
+        assert_eq!(o, order(&["ollama", "openai", "anthropic"]));
+    }
+
+    #[test]
+    fn move_to_front_moves_an_existing_entry_without_duplicating_it() {
+        let mut o = order(&["openai", "gemini", "ollama"]);
+        assert!(ActiveProvider::Ollama.move_to_front(&mut o));
+        assert_eq!(o, order(&["ollama", "openai", "gemini"]));
+    }
+
+    #[test]
+    fn move_to_front_is_a_no_op_when_already_first() {
+        let mut o = order(&["ollama", "openai"]);
+        assert!(!ActiveProvider::Ollama.move_to_front(&mut o));
+        assert_eq!(o, order(&["ollama", "openai"]));
     }
 }

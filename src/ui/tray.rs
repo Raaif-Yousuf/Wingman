@@ -44,6 +44,8 @@
 //! is required.
 
 use anyhow::{anyhow, Context, Result};
+
+use crate::config::ActiveProvider;
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT};
 use windows::Win32::Graphics::Gdi::{
@@ -105,6 +107,8 @@ pub mod cmd {
     pub const USE_OPENAI: u32 = 1009;
     /// Make Claude the active provider.
     pub const USE_ANTHROPIC: u32 = 1010;
+    /// Make Ollama (the local model server) the active provider (#183).
+    pub const USE_OLLAMA: u32 = 1032;
 
     /// Pause (issue #20): 1 hour / until tomorrow / until resumed. Shown as
     /// a "Pause" submenu while running; see [`super::cmd::RESUME`] for the
@@ -254,7 +258,7 @@ pub struct Tray {
     /// submenu shows a single greyed-out "none configured" entry.
     /// Which provider is first in `providers.order`; radio-checked in the
     /// Provider submenu.
-    active_provider_openai: bool,
+    active_provider: ActiveProvider,
     openai_models: Vec<String>,
     openai_current: Option<usize>,
     anthropic_models: Vec<String>,
@@ -304,7 +308,7 @@ impl Tray {
             primary_label: String::new(),
             secondary_label: String::new(),
             pause_label: String::new(),
-            active_provider_openai: true,
+            active_provider: ActiveProvider::OpenAi,
             openai_models: Vec::new(),
             openai_current: None,
             anthropic_models: Vec::new(),
@@ -470,9 +474,9 @@ impl Tray {
     /// keeping room to append `*_current` if it would otherwise be
     /// dropped). Does not touch the shell icon; only affects the next menu
     /// built by [`Tray::on_tray_message`].
-    /// Marks which provider is active. `true` = ChatGPT, `false` = Claude.
-    pub fn set_active_provider(&mut self, openai: bool) {
-        self.active_provider_openai = openai;
+    /// Marks which provider is active, for the Provider submenu's radio check.
+    pub fn set_active_provider(&mut self, active: ActiveProvider) {
+        self.active_provider = active;
     }
 
     pub fn set_models(
@@ -599,7 +603,7 @@ impl Tray {
         append_separator(hmenu)?;
         append_mode_submenu(hmenu, self.mode)?;
         append_separator(hmenu)?;
-        append_provider_submenu(hmenu, self.active_provider_openai)?;
+        append_provider_submenu(hmenu, self.active_provider)?;
         append_model_submenu(
             hmenu,
             "ChatGPT model",
@@ -832,20 +836,40 @@ fn append_mode_submenu(parent: HMENU, current: crate::mode::Mode) -> Result<()> 
 /// `attach_submenu_or_destroy` itself. Previously this populated first and
 /// attached last, so a failure in the final `append_submenu` call leaked
 /// `sub` -- see #147.
-fn append_provider_submenu(parent: HMENU, openai_active: bool) -> Result<()> {
+fn append_provider_submenu(parent: HMENU, active: ActiveProvider) -> Result<()> {
     let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
     attach_submenu_or_destroy(parent, sub, "Provider")?;
-    append_item(sub, cmd::USE_OPENAI, "ChatGPT")?;
-    append_item(sub, cmd::USE_ANTHROPIC, "Claude")?;
-    mark_radio_checked(
-        sub,
-        if openai_active {
-            cmd::USE_OPENAI
-        } else {
-            cmd::USE_ANTHROPIC
-        },
-    );
+    for provider in PROVIDER_MENU {
+        append_item(sub, provider_cmd(provider), provider_menu_label(provider))?;
+    }
+    mark_radio_checked(sub, provider_cmd(active));
     Ok(())
+}
+
+/// The Provider submenu's entries, in menu order.
+const PROVIDER_MENU: [ActiveProvider; 3] = [
+    ActiveProvider::OpenAi,
+    ActiveProvider::Anthropic,
+    ActiveProvider::Ollama,
+];
+
+/// The menu command each Provider entry sends.
+fn provider_cmd(provider: ActiveProvider) -> u32 {
+    match provider {
+        ActiveProvider::OpenAi => cmd::USE_OPENAI,
+        ActiveProvider::Anthropic => cmd::USE_ANTHROPIC,
+        ActiveProvider::Ollama => cmd::USE_OLLAMA,
+    }
+}
+
+/// Menu text. Ollama says "(local)" so it reads as the on-device choice next
+/// to the two cloud ones.
+fn provider_menu_label(provider: ActiveProvider) -> &'static str {
+    match provider {
+        ActiveProvider::OpenAi => "ChatGPT",
+        ActiveProvider::Anthropic => "Claude",
+        ActiveProvider::Ollama => "Ollama (local)",
+    }
 }
 
 /// Build one model submenu (`CreatePopupMenu`, populate, attach to
@@ -1806,6 +1830,7 @@ mod tests {
         ("OPEN_SETTINGS", cmd::OPEN_SETTINGS),
         ("USE_OPENAI", cmd::USE_OPENAI),
         ("USE_ANTHROPIC", cmd::USE_ANTHROPIC),
+        ("USE_OLLAMA", cmd::USE_OLLAMA),
         ("PAUSE_1H", cmd::PAUSE_1H),
         ("PAUSE_UNTIL_TOMORROW", cmd::PAUSE_UNTIL_TOMORROW),
         ("PAUSE_UNTIL_RESUMED", cmd::PAUSE_UNTIL_RESUMED),
@@ -1965,6 +1990,23 @@ mod tests {
                 !openai_range.contains(id) && !anthropic_range.contains(id),
                 "{name} ({id}) falls inside a model submenu's dynamic id range"
             );
+        }
+    }
+
+    #[test]
+    fn provider_menu_offers_ollama_with_its_own_command() {
+        assert!(PROVIDER_MENU.contains(&ActiveProvider::Ollama));
+        assert_eq!(provider_cmd(ActiveProvider::Ollama), cmd::USE_OLLAMA);
+        assert_eq!(
+            provider_menu_label(ActiveProvider::Ollama),
+            "Ollama (local)"
+        );
+        let mut ids: Vec<u32> = PROVIDER_MENU.iter().map(|p| provider_cmd(*p)).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), PROVIDER_MENU.len(), "one command per entry");
+        for p in PROVIDER_MENU {
+            assert!(!provider_menu_label(p).contains('\u{2014}'));
         }
     }
 
