@@ -70,7 +70,7 @@ pub enum GalleryState {
     CardAnswerDifficultyMid,
     CardAnswerDifficultyHigh,
     CardAnswerDifficultyUltra,
-    /// An answer opened up, so its footer links (Read aloud, Copy) show.
+    /// A model answer opened up, so both footer links (Read aloud, Copy) show.
     CardAnswerExpanded,
     CardError,
     /// Issue #354. Replaces the old single glyph-only `CardPending` state:
@@ -422,7 +422,7 @@ mod driver {
             CardAnswerExpanded => {
                 card.hide();
                 palette.hide();
-                card.show_answer(
+                card.show_model_answer(
                     "The limit is 1/2",
                     "Apply L'Hopital's rule once and simplify.",
                     0,
