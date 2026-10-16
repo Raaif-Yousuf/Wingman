@@ -80,12 +80,12 @@ pub fn follows_variants(state: GalleryState) -> bool {
     )
 }
 
-/// Whether a state is captured with `PW_RENDERFULLCONTENT`. The palette draws
-/// with a Direct2D window render target, which presents straight to the
-/// compositor, so a plain `PrintWindow` gets a black page (#626). The card and
-/// Settings paint with GDI and a plain `PrintWindow` is exact for them.
+/// Whether a state is captured by sending `WM_PRINT` instead of calling
+/// `PrintWindow`. The palette draws with a Direct2D window render target,
+/// which `PrintWindow` cannot read, so its pictures were a black page (#626).
+/// The card and Settings paint with GDI and `PrintWindow` is exact for them.
 #[cfg(any(test, debug_assertions))]
-pub fn needs_full_content(state: GalleryState) -> bool {
+pub fn prints_with_wm_print(state: GalleryState) -> bool {
     use GalleryState::*;
     matches!(
         state,
@@ -308,19 +308,16 @@ mod driver {
     use crate::ui::region::Overlay;
     use crate::ui::settings::GalleryWindow;
     use std::time::Duration;
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC,
         SelectObject, HBITMAP, HDC,
     };
-    /// `PrintWindow` flag, absent from the `windows` crate: ask DWM for the
-    /// composed content, which is the only way to read a Direct2D window.
-    const PW_RENDERFULLCONTENT: u32 = 2;
-    use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS, PW_CLIENTONLY};
+    use windows::Win32::Storage::Xps::{PrintWindow, PW_CLIENTONLY};
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RIGHT};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetClientRect, GetMessageW, PeekMessageW, TranslateMessage, MSG,
-        PM_REMOVE, WM_KEYDOWN,
+        DispatchMessageW, GetClientRect, GetMessageW, PeekMessageW, SendMessageW, TranslateMessage,
+        MSG, PM_REMOVE, WM_KEYDOWN, WM_PRINT,
     };
 
     /// Runs the gallery. With `args.screenshot_dir` set, drives every state
@@ -526,7 +523,7 @@ mod driver {
         apply_variant(card, variant);
         let hwnd = show_state(card, palette, settings, region, variant, state)?;
         pump_and_wait(Duration::from_millis(120));
-        capture_png(hwnd, path, needs_full_content(state))?;
+        print_window_png(hwnd, path, prints_with_wm_print(state))?;
         Ok(hwnd)
     }
 
@@ -816,12 +813,12 @@ mod driver {
         })
     }
 
-    /// Captures `hwnd`'s client area and saves it as a PNG at `path`. A
-    /// specific application window, never the monitor (rule: this must never
-    /// call anything from `capture.rs`, which grabs the screen for the real
-    /// ask flow). `full_content` adds `PW_RENDERFULLCONTENT`: see
-    /// [`needs_full_content`].
-    fn capture_png(hwnd: HWND, path: &std::path::Path, full_content: bool) -> anyhow::Result<()> {
+    /// Captures `hwnd`'s client area and saves it as a PNG at `path`, with
+    /// `PrintWindow` or, for `wm_print`, by sending `WM_PRINT` (see
+    /// [`prints_with_wm_print`]). A specific application window, never the
+    /// monitor (rule: this must never call anything from `capture.rs`, which
+    /// grabs the screen for the real ask flow).
+    fn print_window_png(hwnd: HWND, path: &std::path::Path, wm_print: bool) -> anyhow::Result<()> {
         unsafe {
             let mut rect = windows::Win32::Foundation::RECT::default();
             GetClientRect(hwnd, &mut rect)?;
@@ -833,12 +830,18 @@ mod driver {
             let bitmap: HBITMAP = CreateCompatibleBitmap(screen_dc, width, height);
             let old = SelectObject(mem_dc, bitmap.into());
 
-            let flags = if full_content {
-                PRINT_WINDOW_FLAGS(PW_CLIENTONLY.0 | PW_RENDERFULLCONTENT)
+            let ok = if wm_print {
+                // PRF_CHECKVISIBLE | PRF_CHILDREN | PRF_CLIENT | PRF_ERASEBKGND
+                SendMessageW(
+                    hwnd,
+                    WM_PRINT,
+                    Some(WPARAM(mem_dc.0 as usize)),
+                    Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
+                );
+                windows::core::BOOL(1)
             } else {
-                PW_CLIENTONLY
+                PrintWindow(hwnd, mem_dc, PW_CLIENTONLY)
             };
-            let ok = PrintWindow(hwnd, mem_dc, flags);
 
             let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
             let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
@@ -993,11 +996,15 @@ mod tests {
     }
 
     #[test]
-    fn only_the_palette_states_need_full_content_capture() {
+    fn only_the_palette_states_are_printed_with_wm_print() {
         let mut palette_states = 0;
         for state in gallery_states() {
             let n = state_name(state);
-            assert_eq!(needs_full_content(state), n.starts_with("palette-"), "{n}");
+            assert_eq!(
+                prints_with_wm_print(state),
+                n.starts_with("palette-"),
+                "{n}"
+            );
             palette_states += usize::from(n.starts_with("palette-"));
         }
         assert_eq!(palette_states, 4, "the test must see every palette state");

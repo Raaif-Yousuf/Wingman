@@ -134,8 +134,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE,
     WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
-    WS_VISIBLE,
+    WM_PRINTCLIENT, WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 /// `WM_MOUSELEAVE`'s stable, documented value (winuser.h) -- not re-exported
@@ -1548,6 +1548,15 @@ impl PaletteInner {
                 self.on_paint();
                 Some(LRESULT(0))
             }
+            // #626: `PrintWindow` and screenshot tools ask for the client
+            // area in their own DC. Direct2D only draws to the window, so
+            // give them the GDI paint, the same picture the fallback makes.
+            WM_PRINTCLIENT => {
+                if wparam.0 != 0 {
+                    self.paint_gdi(windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void));
+                }
+                Some(LRESULT(0))
+            }
             WM_ERASEBKGND => Some(LRESULT(1)), // we paint the whole client area ourselves
             WM_COMMAND => {
                 let wp = wparam.0 as u32;
@@ -1892,6 +1901,51 @@ mod tests {
         }
     }
 
+    /// #626: the UI gallery asks the window to paint into ITS device context
+    /// with `WM_PRINT`, which reaches `WM_PRINTCLIENT`. The Direct2D path only
+    /// ever draws to the window itself, and `PrintWindow` reads a surface it
+    /// never reaches, so without an arm the picture is a black page. Sends the
+    /// message into a memory bitmap and reads the pixels back.
+    #[test]
+    fn wm_print_paints_the_rows_into_the_given_dc() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+            SelectObject, HDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let dpi = unsafe { GetDpiForWindow(p.hwnd()) };
+        let (w, h) = (scale(WINDOW_WIDTH, dpi), window_height(dpi));
+        let (screen, mem, bmp);
+        unsafe {
+            screen = GetDC(None);
+            mem = CreateCompatibleDC(Some(screen));
+            bmp = CreateCompatibleBitmap(screen, w, h);
+            SelectObject(mem, bmp.into());
+            // PRF_CHECKVISIBLE | PRF_CHILDREN | PRF_CLIENT | PRF_ERASEBKGND
+            SendMessageW(
+                p.hwnd(),
+                WM_PRINT,
+                Some(WPARAM(mem.0 as usize)),
+                Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
+            );
+        }
+        let pixel = |x: i32, y: i32| unsafe { GetPixel(mem as HDC, x, y) };
+        // Rows start below the edit and the summary band; the first action
+        // row (after the group header) is the selected one.
+        let list_top = scale(PADDING + EDIT_HEIGHT + PADDING + ROUTER_SUMMARY_HEIGHT, dpi);
+        let selected_y = list_top + scale(ROW_HEIGHT, dpi) + scale(ROW_HEIGHT, dpi) / 2;
+        let selected = pixel(w - scale(PADDING, dpi) - 4, selected_y);
+        let empty = pixel(w / 2, h - scale(FOOTER_HEIGHT, dpi) - 4);
+        unsafe {
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+        }
+        assert_eq!(selected, selected_row_color(), "the selected row fill");
+        assert_eq!(empty, COLORREF(0x0026_2626), "the palette background");
+    }
     #[test]
     fn window_and_edit_control_are_created() {
         let p = Palette::new_for_test(instance()).expect("palette window creation must succeed");
