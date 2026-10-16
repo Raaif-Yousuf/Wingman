@@ -7,8 +7,11 @@ OpenAI-compatible endpoint (`openai-compat`, issue #16, closed).
 Every provider implements the same `Provider` trait
 (`src/provider/mod.rs`): `id`, `ready`, `capabilities`, `complete`. A
 `Chain` (`src/provider/mod.rs`) tries each ready provider in
-`providers.order` in turn and falls through to the next on any failure,
+`providers.order` in turn and falls through to the next on a failure,
 including a 200 response that fails to parse against the action's schema.
+The exception is a decline (a safety refusal, content filter or blocked
+prompt): the chain stops and the card shows the reason, so the screenshot is
+never sent to a second vendor (#767).
 
 ## Where a key lives
 

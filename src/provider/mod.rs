@@ -300,11 +300,32 @@ pub(crate) fn usage_from_body(tag: &str, body: &str) -> Option<Usage> {
 /// The error for a reply the model's own filter blocked (#731): the same
 /// words for every provider, naming the vendor's raw reason.
 pub(crate) fn declined_error(tag: &str, reason: &str) -> anyhow::Error {
-    anyhow::anyhow!(
+    anyhow::Error::new(Declined(format!(
         "{tag}: the model declined to answer ({})",
         safe_reason(reason)
-    )
+    )))
 }
+
+/// The error for a model that refused to answer (#767), with the same
+/// stop-the-chain meaning as [`declined_error`].
+pub(crate) fn refused_error(tag: &str) -> anyhow::Error {
+    anyhow::Error::new(Declined(format!("{tag}: model refused to answer")))
+}
+
+/// A vendor's own decline (safety refusal, content filter, blocked prompt)
+/// (#767). Stops the whole chain: the content itself is the reason, so
+/// sending the same screenshot to the next vendor would show it to a second
+/// company and bill a second call. The card shows this text.
+#[derive(Debug)]
+pub struct Declined(String);
+
+impl std::fmt::Display for Declined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Declined {}
 
 #[cfg(test)]
 mod safe_reason_tests {
@@ -659,6 +680,13 @@ pub fn install_send_gate(gate: std::sync::Arc<dyn SendGate>) {
 #[derive(Debug)]
 pub struct SendCancelled;
 
+/// Whether this error ends the whole chain instead of moving to the next
+/// provider: the user cancelled the preview, or a vendor declined the content
+/// (#767). Anything else is a failure of that one provider.
+fn stops_chain(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<SendCancelled>().is_some() || e.downcast_ref::<Declined>().is_some()
+}
+
 /// The chain had no provider to try (#832). `App` turns it into the setup
 /// card instead of a generic failure.
 #[derive(Debug)]
@@ -688,8 +716,9 @@ impl std::fmt::Display for SendCancelled {
 
 impl std::error::Error for SendCancelled {}
 
-/// Runs a list of providers in order, falling through to the next on any
-/// failure (transport error, non-2xx, or unparseable body). A provider that
+/// Runs a list of providers in order, falling through to the next on a
+/// failure (transport error, non-2xx, or unparseable body), except a
+/// vendor's decline of the content, which ends the chain (#767). A provider that
 /// is not `ready()` (e.g. its API key is empty) is skipped entirely, rather
 /// than being tried and failing. If every provider fails or is skipped, the
 /// *first* encountered error is surfaced.
@@ -857,7 +886,7 @@ impl Chain {
             }
             match self.attempt(provider.as_ref(), req, &mut parse) {
                 Ok(value) => return Ok(value),
-                Err(e) if e.downcast_ref::<SendCancelled>().is_some() => return Err(e),
+                Err(e) if stops_chain(&e) => return Err(e),
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -980,7 +1009,7 @@ impl Chain {
                     };
                     return Ok((value, answered));
                 }
-                Err(e) if e.downcast_ref::<SendCancelled>().is_some() => return Err(e),
+                Err(e) if stops_chain(&e) => return Err(e),
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -2092,10 +2121,67 @@ mod tests {
         // `stop_reason: "refusal"` handling). Only one result scripted:
         // `SequencedProvider` panics on a second call, so a passing test
         // here proves no repair (retry) was attempted on the error path.
-        let a = SequencedProvider::new(
-            "a",
-            vec![|| Err(anyhow::anyhow!("anthropic: model refused to answer"))],
+        let a = SequencedProvider::new("a", vec![|| Err(refused_error("anthropic"))]);
+        let chain = Chain::new(vec![Box::new(a)]);
+        let err = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap_err();
+        assert!(err.to_string().contains("refused"), "{err:#}");
+    }
+
+    /// #767: a vendor decline stops the chain. The screenshot must never go
+    /// to the next vendor, so the second provider is never called.
+    #[test]
+    fn a_decline_stops_the_chain_and_the_next_provider_is_never_called() {
+        let declines: [ScriptedResult; 2] = [
+            || Err(refused_error("anthropic")),
+            || Err(declined_error("gemini", "SAFETY")),
+        ];
+        for decline in declines {
+            let a = SequencedProvider::new("a", vec![decline]);
+            let (b, b_calls) = SequencedProvider::new_counted("b", vec![ok_completion]);
+            let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+            let err = chain
+                .complete_parsed(&req(), |c| parse_answer(&c.text))
+                .unwrap_err();
+            assert!(err.downcast_ref::<Declined>().is_some(), "{err:#}");
+            assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// #767: the same stop through the entry point the app uses, and the
+    /// decline's own reason is what the card gets, even after an earlier
+    /// provider failed for another reason.
+    #[test]
+    fn a_decline_stops_the_attributed_chain_too_and_keeps_its_reason() {
+        let a = SequencedProvider::new("a", vec![|| Err(anyhow::anyhow!("a: transport error"))]);
+        let b = SequencedProvider::new("b", vec![|| Err(declined_error("gemini", "SAFETY"))]);
+        let (c, c_calls) = SequencedProvider::new_counted("c", vec![ok_completion]);
+        let chain = Chain::new(vec![Box::new(a), Box::new(b), Box::new(c)]);
+        let err = chain
+            .complete_parsed_with_fallback_attributed(
+                &req(),
+                || {
+                    Ok(NonVisionInputs {
+                        ocr_text: String::new(),
+                        uia_fields: String::new(),
+                    })
+                },
+                |c| parse_answer(&c.text),
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("declined to answer (SAFETY)"),
+            "{err:#}"
         );
+        assert_eq!(c_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Contrast: a plain failure (not a decline) still falls through.
+    #[test]
+    fn a_transport_failure_still_falls_through_to_the_next_provider() {
+        let a = SequencedProvider::new("a", vec![|| Err(anyhow::anyhow!("a: transport error"))]);
         let b = MockProvider {
             id: "b",
             ready: true,
