@@ -942,7 +942,8 @@ impl App {
     /// the stuck timer already gave up on is abandoned here, so the press
     /// starts over; its late result is dropped as stale.
     fn busy_now(&mut self) -> bool {
-        if busy_after_press(self.busy, BUSY_STUCK.with(|c| c.get())) != self.busy {
+        let stuck = BUSY_STUCK.with(|c| c.get()) && !self.exec_in_flight;
+        if busy_after_press(self.busy, stuck) != self.busy {
             self.set_busy(false);
             // Advance now, not only when the next run starts: if this press
             // returns early (paused, a readiness card, ...) the abandoned
@@ -960,7 +961,9 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(hwnd), STUCK_TIMER_ID);
         }
-        if !self.busy {
+        // An executor is a confirmed write that is really happening: it is
+        // never called stuck, and its done message is never treated as stale.
+        if !self.busy || self.exec_in_flight {
             return;
         }
         BUSY_STUCK.with(|c| c.set(true));
@@ -7159,6 +7162,8 @@ mod tests {
         // A send preview from an abandoned run is stale too.
         assert!(super::is_run_result(WM_APP_SEND_PREVIEW));
         assert!(!super::is_run_result(WM_APP_HOTKEY));
+        // An executor's done message is a real write: never dropped as stale.
+        assert!(!super::is_run_result(WM_APP_EXECUTOR_DONE));
         let src = lf(include_str!("app.rs"));
         let tagged = src.matches("send_gate::set_worker_run(run);").count();
         assert!(tagged >= 7, "workers that tag their run: {tagged}");
