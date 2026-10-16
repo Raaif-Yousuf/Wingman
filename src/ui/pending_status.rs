@@ -46,6 +46,10 @@ pub enum PendingStage {
     /// the window and matches them to the profile on this PC. No screenshot,
     /// no model, nothing sent.
     ReadingForm,
+    /// #551: "Summarize a link" is downloading the page the user confirmed.
+    /// Carries the site name (the host being fetched), shown until the
+    /// model is asked.
+    ReadingPage { host: String },
     /// A generic, always-true placeholder for a pending flow that has no
     /// more specific honest text yet (e.g. `extract_text`'s OCR pass).
     Working,
@@ -63,6 +67,9 @@ pub enum PendingStage {
 /// untrusted-length input the same way).
 const MAX_MODEL_NAME_CHARS: usize = 28;
 
+/// Same idea for the site name in the "Reading ..." line (#551).
+const MAX_HOST_CHARS: usize = 40;
+
 /// Caps `s` at `max_chars` `char`s. Returns the untouched string when it
 /// already fits; otherwise the kept prefix, with no trailing marker of its
 /// own -- the single "in progress" `"..."` the caller appends afterwards
@@ -75,6 +82,19 @@ fn truncate(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// Like `truncate` but keeps the END and cuts the front, with a leading
+/// "...". A host's registrable domain is at the end, so a long
+/// `login.bank.com.evil.example` must still show `evil.example`.
+fn truncate_front(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let tail: String = s.chars().skip(n - keep).collect();
+    format!("...{tail}")
+}
+
 /// The status line shown on the pending card (and set as the window's
 /// accessible text via `SetWindowTextW`) for a given stage. Pure: no I/O, no
 /// Win32.
@@ -85,6 +105,9 @@ pub fn pending_status_text(stage: &PendingStage) -> String {
         }
         PendingStage::ReadingSelection => "Reading your selection...".to_string(),
         PendingStage::ReadingForm => "Reading the form...".to_string(),
+        PendingStage::ReadingPage { host } => {
+            format!("Reading {}...", truncate_front(host, MAX_HOST_CHARS))
+        }
         PendingStage::Working => "Working...".to_string(),
         PendingStage::StillWorking => "Still working.".to_string(),
     }
@@ -98,9 +121,47 @@ pub fn pending_glyph_should_spin(animations_enabled: bool) -> bool {
     animations_enabled
 }
 
+/// #551: a stage message posted by a worker is only applied while the run
+/// that posted it is still the current one. A run that ended (or was
+/// replaced by a newer press) must not relabel the card of the run on
+/// screen now. Pure so it is unit tested; the card's own `Pending` guard
+/// covers the other half (a result card already showing).
+pub fn stage_is_current(posted_for_run: u64, current_run: u64) -> bool {
+    posted_for_run == current_run
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_page_text_names_the_site_and_no_model() {
+        let text = pending_status_text(&PendingStage::ReadingPage {
+            host: "example.com".to_string(),
+        });
+        assert_eq!(text, "Reading example.com...");
+        assert!(!text.to_lowercase().contains("asking"));
+        assert!(!text.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn reading_page_text_truncates_a_very_long_host() {
+        let text = pending_status_text(&PendingStage::ReadingPage {
+            host: format!("{}.evil.example", "a".repeat(47)),
+        });
+        // 60 chars in: the front is cut, the registrable domain stays.
+        assert_eq!(
+            text,
+            format!("Reading ...{}.evil.example...", "a".repeat(24))
+        );
+    }
+
+    #[test]
+    fn a_stage_from_an_older_run_is_not_current() {
+        assert!(stage_is_current(7, 7));
+        assert!(!stage_is_current(6, 7));
+        assert!(!stage_is_current(8, 7));
+    }
 
     #[test]
     fn reading_selection_text_is_exact_and_does_not_mention_a_screenshot() {
