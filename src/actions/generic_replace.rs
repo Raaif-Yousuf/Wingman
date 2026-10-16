@@ -62,8 +62,56 @@ pub fn review_context(plan: &ReplaceSelection, confirmed: &Value) -> Option<Revi
     Some(ReviewContext {
         target: ReplaceTarget::Selection(plan.target.clone()),
         original_text: plan.selected_text.clone(),
-        new_text: new_text.to_string(),
+        new_text: match_line_endings(&plan.selected_text, new_text),
     })
+}
+
+/// The model's text with the selection's own line endings: a model returns
+/// `\n`, and writing that into a CRLF document leaves a mix. The dominant
+/// line ending of `original` (CRLF, LF or CR; a tie goes to CRLF) is applied
+/// to every line break in `new`, and a trailing line break is kept or dropped
+/// to match whether `original` had one. An `original` with no line break at
+/// all leaves `new`'s line breaks alone (nothing to match), but still drops
+/// a trailing one the selection did not have.
+pub fn match_line_endings(original: &str, new: &str) -> String {
+    let (mut crlf, mut lf, mut cr) = (0usize, 0usize, 0usize);
+    let mut chars = original.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' if chars.peek() == Some(&'\n') => {
+                crlf += 1;
+                chars.next();
+            }
+            '\r' => cr += 1,
+            '\n' => lf += 1,
+            _ => {}
+        }
+    }
+    // Normalise the model's breaks to LF first, then pick the target.
+    let mut text = new.replace("\r\n", "\n").replace('\r', "\n");
+    let original_ends_with_break = original.ends_with(['\n', '\r']);
+    if !original_ends_with_break {
+        if let Some(stripped) = text.strip_suffix('\n') {
+            text = stripped.to_string();
+        }
+    }
+    let eol = if crlf + lf + cr == 0 {
+        return text;
+    } else if crlf >= lf && crlf >= cr {
+        "\r\n"
+    } else if lf >= cr {
+        "\n"
+    } else {
+        "\r"
+    };
+    if original_ends_with_break && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if eol == "\n" {
+        text
+    } else {
+        text.replace('\n', eol)
+    }
 }
 
 /// Shown instead of calling the model when the selection was cut to the
@@ -176,6 +224,54 @@ mod tests {
             selection_target: Some(target()),
             ..Gathered::default()
         }
+    }
+
+    #[test]
+    fn model_line_breaks_take_the_selections_line_endings() {
+        // A CRLF document gets CRLF, not a mix.
+        assert_eq!(match_line_endings("a\r\nb\r\nc", "x\ny\nz"), "x\r\ny\r\nz");
+        // An LF document stays LF, even if the model sent CRLF.
+        assert_eq!(match_line_endings("a\nb", "x\r\ny"), "x\ny");
+        // A CR-only selection (old Mac text) gets CR.
+        assert_eq!(match_line_endings("a\rb\rc", "x\ny"), "x\ry");
+        // Mixed: the dominant ending wins.
+        assert_eq!(
+            match_line_endings("a\r\nb\r\nc\nd", "x\ny\nz"),
+            "x\r\ny\r\nz"
+        );
+        assert_eq!(match_line_endings("a\nb\nc\r\nd", "x\r\ny"), "x\ny");
+        // A model that already used CRLF is not doubled.
+        assert_eq!(match_line_endings("a\r\nb", "x\r\ny"), "x\r\ny");
+    }
+
+    #[test]
+    fn a_trailing_line_break_is_kept_or_dropped_to_match_the_selection() {
+        // The model adds a final newline the selection did not have.
+        assert_eq!(match_line_endings("a\r\nb", "x\ny\n"), "x\r\ny");
+        assert_eq!(match_line_endings("one line", "fixed\n"), "fixed");
+        // The selection ended with one and the model dropped it.
+        assert_eq!(match_line_endings("a\r\nb\r\n", "x\ny"), "x\r\ny\r\n");
+        assert_eq!(match_line_endings("a\n", "x"), "x\n");
+        // Both have one: unchanged apart from the ending style.
+        assert_eq!(match_line_endings("a\r\nb\r\n", "x\ny\n"), "x\r\ny\r\n");
+    }
+
+    #[test]
+    fn text_with_no_line_breaks_to_match_is_left_alone() {
+        assert_eq!(match_line_endings("one line", "x\ny"), "x\ny");
+        assert_eq!(match_line_endings("", "x"), "x");
+        assert_eq!(match_line_endings("a\r\nb", ""), "");
+    }
+
+    #[test]
+    fn the_replace_context_carries_the_matched_line_endings() {
+        let plan = ReplaceSelection {
+            target: target(),
+            selected_text: "a\r\nb".into(),
+        };
+        let ctx = review_context(&plan, &json!({"text": "x\ny\n"})).unwrap();
+        assert_eq!(ctx.new_text, "x\r\ny");
+        assert_eq!(ctx.original_text, "a\r\nb");
     }
 
     #[test]
