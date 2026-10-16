@@ -591,24 +591,28 @@ mod driver {
                 name: "Check my work".to_string(),
                 group: Some("Answer".to_string()),
                 requires_model: true,
+                effect: crate::ui::palette_model::Effect::None,
             },
             PaletteAction {
                 id: "summarize".to_string(),
                 name: "Summarize this".to_string(),
                 group: Some("Answer".to_string()),
                 requires_model: true,
+                effect: crate::ui::palette_model::Effect::None,
             },
             PaletteAction {
                 id: crate::ui::palette_model::CALCULATE_SELECTION_ACTION_ID.to_string(),
                 name: "Calculate selection".to_string(),
                 group: Some("Utilities".to_string()),
                 requires_model: false,
+                effect: crate::ui::palette_model::Effect::None,
             },
             PaletteAction {
                 id: crate::ui::palette_model::COPY_REGION_ACTION_ID.to_string(),
                 name: "Copy region to clipboard".to_string(),
                 group: Some("Utilities".to_string()),
                 requires_model: false,
+                effect: crate::ui::palette_model::Effect::None,
             },
         ]
     }
@@ -759,8 +763,11 @@ mod driver {
                 let generation = palette.router_generation();
                 let result = crate::router::RouterResult {
                     summary: "Check my work".to_string(),
-                    intent: Some("check-work".to_string()),
-                    confidence: 0.92,
+                    options: vec![crate::router::RouterOption {
+                        intent: "check-work".to_string(),
+                        label: "Check my work".to_string(),
+                        confidence: 0.92,
+                    }],
                 };
                 palette.apply_router_suggestion(generation, &result, 0.5);
             }

@@ -1075,17 +1075,16 @@ impl PaletteInner {
         // placeholder this session's request started with must not survive
         // the result -- either it becomes the real summary below, or this
         // clears it back to None.
-        let Some(intent_id) = result.intent.as_deref() else {
+        // #306: the palette pre-selects the top of the ranked shortlist; the
+        // alternatives are for the options card.
+        let Some(top) = result.options.first() else {
             self.router_summary = None;
             self.invalidate();
             return;
         };
-        if !crate::router::should_apply(
-            Some(intent_id),
-            result.confidence,
-            threshold,
-            self.interacted,
-        ) {
+        let intent_id = top.intent.as_str();
+        if !crate::router::should_apply(Some(intent_id), top.confidence, threshold, self.interacted)
+        {
             self.router_summary = None;
             self.invalidate();
             return;
@@ -1800,12 +1799,14 @@ mod tests {
                 name: "Check my work".to_string(),
                 group: Some("Study".to_string()),
                 requires_model: true,
+                effect: crate::ui::palette_model::Effect::None,
             },
             PaletteAction {
                 id: "extract-text-to-clipboard".to_string(),
                 name: "Copy text from screen".to_string(),
                 group: Some("Work".to_string()),
                 requires_model: false,
+                effect: crate::ui::palette_model::Effect::None,
             },
         ]
     }
@@ -2226,6 +2227,7 @@ mod tests {
                 name: format!("Action {i}"),
                 group: None,
                 requires_model: false,
+                effect: crate::ui::palette_model::Effect::None,
             })
             .collect()
     }
@@ -2470,8 +2472,14 @@ mod tests {
     fn router_result(intent: Option<&str>, confidence: f64) -> crate::router::RouterResult {
         crate::router::RouterResult {
             summary: "Check my work".to_string(),
-            intent: intent.map(|s| s.to_string()),
-            confidence,
+            options: intent
+                .map(|id| crate::router::RouterOption {
+                    intent: id.to_string(),
+                    label: "Check my work".to_string(),
+                    confidence,
+                })
+                .into_iter()
+                .collect(),
         }
     }
 
