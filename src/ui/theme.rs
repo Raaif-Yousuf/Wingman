@@ -98,6 +98,7 @@ pub(crate) unsafe fn setting_change_name(lparam: LPARAM) -> String {
 }
 
 const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+const RRF_RT_REG_BINARY: u32 = 0x0000_0008;
 
 fn hkey_current_user() -> *mut c_void {
     // HKEY_CURRENT_USER is defined by the Windows headers as
@@ -301,6 +302,99 @@ fn srgb_channel_to_linear(channel: u8) -> f64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The system accent
+// ---------------------------------------------------------------------------
+
+/// The two shades of the user's accent colour that Windows 11 fills accent
+/// buttons with: `AccentDark1` in light mode, `AccentLight2` in dark mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AccentShades {
+    pub light2: u32,
+    pub dark1: u32,
+}
+
+/// The default Windows blue's shades, used when the palette cannot be read.
+pub(crate) const DEFAULT_ACCENT: AccentShades = AccentShades {
+    light2: rgb(0x4C, 0xC2, 0xFF),
+    dark1: rgb(0x00, 0x67, 0xC0),
+};
+
+/// Parses `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent\AccentPalette`:
+/// eight RGBA entries, lightest first (Light3, Light2, Light1, Accent, Dark1,
+/// Dark2, Dark3, and a neutral). MEASURED 2026-10-16 on the dev machine: entry
+/// 3 was the accent blue 0078D4 while `DwmGetColorizationColor` returned
+/// graphite 3A3A3A, which is why the card's button was grey. `None` if the
+/// blob is too short.
+pub(crate) fn parse_accent_palette(bytes: &[u8]) -> Option<AccentShades> {
+    let entry = |i: usize| -> Option<u32> {
+        let e = bytes.get(i * 4..i * 4 + 3)?;
+        Some(rgb(e[0], e[1], e[2]))
+    };
+    Some(AccentShades {
+        light2: entry(1)?,
+        dark1: entry(4)?,
+    })
+}
+
+/// `fill`, moved toward black (on a light surface) or white (on a dark one)
+/// in 5% steps until it reaches `min` contrast against `surface`.
+pub(crate) fn ensure_contrast(fill: u32, surface: u32, min: f64) -> u32 {
+    use crate::ui::card_buttons::blend;
+    let toward = if relative_luminance(surface) > 0.5 {
+        0x0000_0000
+    } else {
+        0x00FF_FFFF
+    };
+    for pct in (0..=100).step_by(5) {
+        let c = blend(fill, toward, pct);
+        if contrast_ratio(relative_luminance(c), relative_luminance(surface)) >= min {
+            return c;
+        }
+    }
+    toward
+}
+
+/// The resting fill of an accent (primary) button in `theme` on `surface`:
+/// the theme's shade of the user's accent, pushed apart from the surface if
+/// the accent is so pale or so dark that the button would not stand out
+/// (WCAG 1.4.11: 3:1 for the boundary of a control).
+pub(crate) fn accent_fill(theme: Theme, shades: AccentShades, surface: u32) -> u32 {
+    let shade = match theme {
+        Theme::Dark => shades.light2,
+        Theme::Light | Theme::HighContrast => shades.dark1,
+    };
+    ensure_contrast(shade, surface, 3.0)
+}
+
+/// The user's accent shades. Read from the registry rather than
+/// `UISettings`: that is WinRT and needs an apartment on this thread, and
+/// the UI thread owns the keyboard hook and must not change its COM mode.
+/// Read per paint (one small registry read) so an accent change shows at once.
+pub(crate) fn read_accent_shades() -> AccentShades {
+    let subkey = wide_z(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent");
+    let value = wide_z("AccentPalette");
+    // The real value is 32 bytes; the buffer is larger, and bounded, so a
+    // longer value is parsed instead of failing with ERROR_MORE_DATA.
+    let mut data = [0u8; 256];
+    let mut size = data.len() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            hkey_current_user(),
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_BINARY,
+            std::ptr::null_mut(),
+            data.as_mut_ptr() as *mut c_void,
+            &mut size,
+        )
+    };
+    if status != 0 {
+        return DEFAULT_ACCENT;
+    }
+    parse_accent_palette(&data[..(size as usize).min(data.len())]).unwrap_or(DEFAULT_ACCENT)
+}
+
 /// WCAG 2 relative luminance of a packed `0x00BBGGRR` colour.
 pub(crate) fn relative_luminance(color: u32) -> f64 {
     let r = (color & 0xFF) as u8;
@@ -329,25 +423,57 @@ fn contrast_between(a: u32, b: u32) -> f64 {
 // Type, radius and spacing
 // ---------------------------------------------------------------------------
 
-/// Headline size relative to the system message font. Deliberately below
-/// 1.0: the headline should read smaller than a stock notification.
-pub(crate) const HEADLINE_FONT_SCALE: f32 = 0.85;
-/// Just under the headline, so the two stay distinguishable by size as a
-/// second cue after colour. Neither is bold.
-pub(crate) const DETAIL_FONT_SCALE: f32 = 0.8;
-/// The smallest text: at-a-glance annotations such as the badge label.
-pub(crate) const SMALL_FONT_SCALE: f32 = 0.7;
+/// The Windows 11 type ramp, in px at 96 DPI (scaled per window by
+/// `type_height_px`). Sentence case, no ALL CAPS.
+///
+/// Subtitle: titles on larger surfaces, semibold.
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const TYPE_SUBTITLE_PX: i32 = 20;
+/// Body: field labels and values, button text. The card headline is this
+/// size in semibold ("body strong").
+pub(crate) const TYPE_BODY_PX: i32 = 14;
+/// Caption: detail text, footer links, the status line and the badge.
+pub(crate) const TYPE_CAPTION_PX: i32 = 12;
+/// Line height for body text, in px at 96 DPI.
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const TYPE_BODY_LINE_PX: i32 = 20;
+/// Line height for caption text, in px at 96 DPI.
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const TYPE_CAPTION_LINE_PX: i32 = 16;
+/// The preferred face, installed on Windows 11. Surfaces fall back to the
+/// system message font's face when it is missing.
+pub(crate) const PREFERRED_FONT_FACE: &str = "Segoe UI Variable Text";
 /// The face used when the system message font cannot be read.
 pub(crate) const FALLBACK_FONT_FACE: &str = "Segoe UI";
 
-/// Outer margin around a surface, in dp (logical pixels at 96 DPI).
-pub(crate) const MARGIN_DP: i32 = 14;
+/// A `LOGFONTW::lfHeight` for a ramp size: negative (character height, not
+/// cell height), scaled for `dpi` and the user's `text_scale`, never zero.
+pub(crate) fn type_height_px(ramp_px: i32, dpi: u32, text_scale: f32) -> i32 {
+    let v = (ramp_px as f32 * dpi as f32 / 96.0 * text_scale).round() as i32;
+    -v.max(1)
+}
+
+/// Spacing on the 4 px grid, in dp (logical pixels at 96 DPI).
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const SPACE_XS_DP: i32 = 4;
+pub(crate) const SPACE_SM_DP: i32 = 8;
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const SPACE_MD_DP: i32 = 12;
+pub(crate) const SPACE_LG_DP: i32 = 16;
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const SPACE_XL_DP: i32 = 24;
+
+/// Outer margin around a surface, in dp.
+pub(crate) const MARGIN_DP: i32 = SPACE_LG_DP;
 /// Inner padding of a surface, in dp.
-pub(crate) const PADDING_DP: i32 = 14;
+pub(crate) const PADDING_DP: i32 = SPACE_LG_DP;
 /// The gap between stacked elements, in dp.
-pub(crate) const GAP_DP: i32 = 6;
+pub(crate) const GAP_DP: i32 = SPACE_SM_DP;
 /// Corner radius of owner-drawn controls, in dp.
-pub(crate) const CONTROL_RADIUS_DP: i32 = 6;
+pub(crate) const CONTROL_RADIUS_DP: i32 = 4;
+/// Corner radius of a top-level window, in dp (what `DWMWCP_ROUND` draws).
+#[allow(dead_code)] // ramp token for surfaces not yet moved onto it
+pub(crate) const WINDOW_RADIUS_DP: i32 = 8;
 
 #[cfg(test)]
 mod tests {
@@ -375,6 +501,94 @@ mod tests {
         assert_eq!(DARK.text_dim, rgb(190, 190, 190));
         assert_eq!(DARK.text_faint, rgb(140, 140, 140));
         assert_eq!(DARK.danger, rgb(240, 100, 100));
+    }
+
+    #[test]
+    fn the_accent_palette_gives_light2_and_dark1() {
+        // The dev machine's real AccentPalette: RGBA, Light3 first.
+        let blob: [u8; 32] = [
+            0x99, 0xEB, 0xFF, 0x00, 0x4C, 0xC2, 0xFF, 0x00, 0x00, 0x91, 0xF8, 0x00, 0x00, 0x78,
+            0xD4, 0x00, 0x00, 0x67, 0xC0, 0x00, 0x00, 0x3E, 0x92, 0x00, 0x00, 0x1A, 0x68, 0x00,
+            0x88, 0x17, 0x98, 0x00,
+        ];
+        assert_eq!(parse_accent_palette(&blob), Some(DEFAULT_ACCENT));
+        assert_eq!(parse_accent_palette(&blob[..18]), None);
+        assert_eq!(parse_accent_palette(&[]), None);
+    }
+
+    #[test]
+    fn accent_buttons_stand_out_and_stay_readable_for_any_accent() {
+        use crate::ui::card_buttons::readable_on;
+        // Windows' own accent choices plus the extremes: graphite, black,
+        // white and a pale yellow, in both themes.
+        let accents = [
+            rgb(0x00, 0x78, 0xD4),
+            rgb(0xFF, 0xB9, 0x00),
+            rgb(0xF7, 0x63, 0x0C),
+            rgb(0xE7, 0x48, 0x56),
+            rgb(0x00, 0xCC, 0x6A),
+            rgb(0x3A, 0x3A, 0x3A),
+            rgb(0x00, 0x00, 0x00),
+            rgb(0xFF, 0xFF, 0xFF),
+            rgb(0xFF, 0xF1, 0x00),
+        ];
+        let mut checked = 0;
+        for (theme, surface) in [(Theme::Light, LIGHT.surface), (Theme::Dark, DARK.surface)] {
+            for a in accents {
+                let shades = AccentShades {
+                    light2: a,
+                    dark1: a,
+                };
+                let fill = accent_fill(theme, shades, surface);
+                let vs_surface = contrast_between(fill, surface);
+                assert!(vs_surface >= 3.0, "{theme:?} {a:#08x}: {vs_surface:.2}:1");
+                let label = contrast_between(fill, readable_on(fill));
+                assert!(label >= AA_TEXT, "{theme:?} {a:#08x}: label {label:.2}:1");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 18, "the test must look at every pair");
+    }
+
+    #[test]
+    fn the_default_blue_is_used_unchanged_when_it_already_stands_out() {
+        assert_eq!(
+            accent_fill(Theme::Light, DEFAULT_ACCENT, LIGHT.surface),
+            DEFAULT_ACCENT.dark1
+        );
+        assert_eq!(
+            accent_fill(Theme::Dark, DEFAULT_ACCENT, DARK.surface),
+            DEFAULT_ACCENT.light2
+        );
+    }
+
+    #[test]
+    fn type_ramp_scales_with_dpi_and_text_scale() {
+        assert_eq!(type_height_px(TYPE_BODY_PX, 96, 1.0), -14);
+        assert_eq!(type_height_px(TYPE_CAPTION_PX, 96, 1.0), -12);
+        assert_eq!(type_height_px(TYPE_SUBTITLE_PX, 96, 1.0), -20);
+        assert_eq!(type_height_px(TYPE_BODY_PX, 144, 1.0), -21);
+        assert_eq!(type_height_px(TYPE_BODY_PX, 96, 1.5), -21);
+        assert_eq!(type_height_px(TYPE_CAPTION_PX, 192, 1.0), -24);
+        // Never zero, whatever the inputs.
+        assert_eq!(type_height_px(TYPE_CAPTION_PX, 96, 0.0), -1);
+    }
+
+    #[test]
+    fn type_ramp_orders_and_spacing_sits_on_the_grid() {
+        const { assert!(TYPE_SUBTITLE_PX > TYPE_BODY_PX && TYPE_BODY_PX > TYPE_CAPTION_PX) };
+        const { assert!(TYPE_BODY_LINE_PX > TYPE_BODY_PX && TYPE_CAPTION_LINE_PX > TYPE_CAPTION_PX) };
+        for s in [
+            SPACE_XS_DP,
+            SPACE_SM_DP,
+            SPACE_MD_DP,
+            SPACE_LG_DP,
+            SPACE_XL_DP,
+        ] {
+            assert_eq!(s % 4, 0);
+        }
+        assert_eq!((MARGIN_DP, PADDING_DP, GAP_DP), (16, 16, 8));
+        assert_eq!((CONTROL_RADIUS_DP, WINDOW_RADIUS_DP), (4, 8));
     }
 
     #[test]
