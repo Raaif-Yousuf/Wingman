@@ -439,13 +439,24 @@ pub fn capture_input(foreground_hwnd: isize) -> CapturedInput {
             CapturedInput::ComposeBody { target, text }
         }
         InputSource::Selection => {
-            let selection = selection.expect("just matched Some above");
-            CapturedInput::Selection {
-                text: selection.text,
-                target: selection.target,
-            }
+            captured_from_selection(selection.expect("just matched Some above"))
         }
         InputSource::Screen => CapturedInput::Screen,
+    }
+}
+
+/// The captured selection as an input. Keeps the write-back target only when
+/// the whole selection was read: a selection cut to the length limit has a
+/// target that spans all of it, so writing the reviewed (cut) text through it
+/// would delete everything past the limit.
+fn captured_from_selection(selection: crate::inputs::selection::Selection) -> CapturedInput {
+    CapturedInput::Selection {
+        text: selection.text,
+        target: if selection.truncated {
+            None
+        } else {
+            selection.target
+        },
     }
 }
 
@@ -1176,6 +1187,33 @@ mod tests {
             c.target(),
             Some(ReplaceTarget::Selection(sample_selection_target()))
         );
+    }
+
+    fn uia_selection(truncated: bool) -> crate::inputs::selection::Selection {
+        crate::inputs::selection::Selection {
+            text: "first part".to_string(),
+            truncated,
+            source: crate::inputs::selection::SelectionSource::Uia,
+            target: Some(sample_selection_target()),
+        }
+    }
+
+    #[test]
+    fn captured_from_selection_keeps_the_target_when_the_whole_selection_was_read() {
+        let c = captured_from_selection(uia_selection(false));
+        assert_eq!(
+            c.target(),
+            Some(ReplaceTarget::Selection(sample_selection_target()))
+        );
+    }
+
+    #[test]
+    fn captured_from_selection_drops_the_target_when_the_selection_was_cut() {
+        // #534: writing the cut text through the whole-selection target
+        // would delete everything past the limit.
+        let c = captured_from_selection(uia_selection(true));
+        assert_eq!(c.text(), Some("first part"));
+        assert_eq!(c.target(), None);
     }
 
     #[test]
