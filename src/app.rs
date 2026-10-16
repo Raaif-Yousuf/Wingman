@@ -2208,6 +2208,13 @@ impl App {
                 }
             }
         }
+        // #70: a receipt is one row under five fixed headers, whatever the
+        // model sent.
+        let proposal = if action.id == actions::receipt::ACTION_ID {
+            actions::receipt::clamp_receipt(&proposal)
+        } else {
+            proposal
+        };
         // #69: no table on screen, or a reply that is not a table, is an
         // answer, not an empty preview.
         let table_headline = if actions::table::is_unreadable(&action.proposal, &proposal) {
