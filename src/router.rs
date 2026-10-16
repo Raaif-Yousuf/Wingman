@@ -21,7 +21,6 @@
 //! even called (see [`cheapest_router_target`]'s doc for how Mode already
 //! folds in via the caller's `ready_provider_names`).
 
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::provider::{Chain, Effort, NonVisionInputs, Request};
@@ -99,7 +98,13 @@ pub const DEFAULT_ROUTER_THRESHOLD: f64 = 0.7;
 /// runs picked `review-this-email` with a prose summary and no echoed id
 /// (~14-17 s each on CPU: `/api/ps` showed `size_vram` 0 on this machine, so
 /// those times are CPU times). `gemma3:4b` was not re-measured.
-const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Fill three fields. \"summary\": one short plain sentence about what is visible on screen, never an action id or action name. \"intent\": the id of the one listed action the screen suggests, copied exactly, or \"none\" if no listed action fits. \"confidence\": a number from 0 to 1. Never explain your reasoning, only report the result. Use plain text only: no markdown and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
+///
+/// That measurement was of the earlier three-field prompt. The shortlist prompt
+/// below is MEASURED 2026-10-16 on one run only (#306, same test, `qwen3.5:4b`,
+/// CPU, ~35 s): `review-this-email` first with the label "Review this email to
+/// Dana" and a prose summary. THEORY (unverified): it holds 5 of 5 like the old
+/// prompt did; it has not been repeated.
+const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Fill two fields. \"summary\": one short plain sentence about what is visible on screen, never an action id or action name. \"options\": up to four of the listed actions that suit this screen, best first, an empty list if none fits. Each option has \"intent\": the id of the listed action, copied exactly; \"label\": a short button label of at most six words that names the thing on screen, for example \"Review this email to Dana\"; \"confidence\": a number from 0 to 1. Never explain your reasoning, only report the result. Use plain text only: no markdown and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
 
 /// One candidate action offered to the router: its id and a one-line
 /// description (today: [`PaletteAction::name`] -- the catalogue has no
@@ -126,25 +131,42 @@ pub fn candidates_from_catalogue(catalogue: &[PaletteAction]) -> Vec<RouterCandi
 
 /// The router's JSON-schema, `additionalProperties: false`. Property order
 /// is load-bearing (AGENTS.md rule 3): `summary` FIRST, so the model
-/// describes what it actually sees before it commits to an intent id or a
-/// confidence number -- the same reasoning `provider::common::answer_schema`
-/// already applies to `detail` before `headline`.
+/// describes what it actually sees before it commits to any option, and
+/// inside an option `intent` before `label` before `confidence`, so it names
+/// the action before it writes a label for it.
 ///
-/// `intent`'s `enum` is built from `candidate_ids` plus the literal
-/// `"none"`, so a schema-conformant response can only ever name a real
-/// catalogue id or explicitly opt out -- never a hallucinated id
-/// [`parse_router_result`] would have to filter out after the fact.
+/// `intent`'s `enum` is built from `candidate_ids` alone. There is no
+/// `"none"` entry: an empty `options` array is how the model says nothing
+/// fits. The schema deliberately has no `minItems`/`maxItems` -- providers
+/// differ on which array keywords structured output accepts, and a
+/// prompt-only limit is not trusted either, so [`parse_router_result`]
+/// enforces the cap in code.
 pub fn router_schema(candidate_ids: &[String]) -> Value {
-    let mut intent_values: Vec<Value> = candidate_ids.iter().map(|id| json!(id)).collect();
-    intent_values.push(json!("none"));
+    let mut intent = json!({"type": "string"});
+    // An empty `enum` is invalid JSON Schema and some providers reject the
+    // whole request, so with no candidates the keyword is left out.
+    if !candidate_ids.is_empty() {
+        intent["enum"] = Value::Array(candidate_ids.iter().map(|id| json!(id)).collect());
+    }
     json!({
         "type": "object",
         "properties": {
             "summary": {"type": "string"},
-            "intent": {"type": "string", "enum": intent_values},
-            "confidence": {"type": "number"}
+            "options": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "intent": intent,
+                        "label": {"type": "string"},
+                        "confidence": {"type": "number"}
+                    },
+                    "required": ["intent", "label", "confidence"],
+                    "additionalProperties": false
+                }
+            }
         },
-        "required": ["summary", "intent", "confidence"],
+        "required": ["summary", "options"],
         "additionalProperties": false
     })
 }
@@ -182,6 +204,20 @@ pub fn build_request(image_png: Vec<u8>, candidates: &[RouterCandidate]) -> Requ
     }
 }
 
+/// The router's chain: just `provider`, never previewing, and stopping at
+/// [`ROUTER_WALL_CLOCK`] after `started` (#792). It bounds only the chain:
+/// past that point no further provider call and no repair request is
+/// started (and billed). A call already in flight is not interrupted; it
+/// ends on its own HTTP timeout.
+pub fn router_chain(
+    provider: Box<dyn crate::provider::Provider>,
+    started: std::time::Instant,
+) -> Chain {
+    Chain::new(vec![provider])
+        .without_prompt()
+        .with_deadline(started + ROUTER_WALL_CLOCK)
+}
+
 /// Issue #295: runs the router's request through `chain`, the same
 /// vision-aware way every other screen action does. Before this function
 /// existed, `app.rs`'s `router_worker` built its own `Request` via
@@ -199,62 +235,261 @@ pub fn route(
     chain: &Chain,
     image_png: Vec<u8>,
     candidates: &[RouterCandidate],
+    limits: RouterLimits,
     fallback: impl FnMut() -> anyhow::Result<NonVisionInputs>,
 ) -> anyhow::Result<RouterResult> {
-    let candidate_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
     let req = build_request(image_png, candidates);
     chain.complete_parsed_with_fallback(&req, fallback, |c| {
-        parse_router_result(&c.text, &candidate_ids)
+        parse_router_result(&c.text, candidates, limits)
     })
 }
 
-/// The wire shape of the router's completion, before `intent` is validated
-/// against the real candidate list. Kept separate from [`RouterResult`] for
-/// the same reason `provider::RawAnswer` is separate from `Answer`: the raw
-/// field needs validation ([`parse_router_result`]) before it becomes the
-/// public type's `Option<String>`.
-#[derive(Deserialize)]
-struct RawRouterResult {
-    summary: String,
-    intent: String,
-    confidence: f64,
+/// Longest label, in characters, an option may carry. The card button is a
+/// fixed width, and the label came from a model.
+pub const MAX_LABEL_CHARS: usize = 40;
+
+/// Longest summary line, in characters. Clamped like a label.
+pub const MAX_SUMMARY_CHARS: usize = 120;
+
+/// The card's inclusion bar (`options.min_confidence`). Lower than
+/// [`DEFAULT_ROUTER_THRESHOLD`] on purpose: the card exists to show
+/// alternatives, so at 0.7 it would often hold one option. Small-model
+/// confidences are poorly calibrated, so this is a tunable, not a fact.
+pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.2;
+
+/// How many options the card shows by default.
+pub const DEFAULT_MAX_OPTIONS: usize = 4;
+
+/// The hard cap on options, whatever `options.max_options` says.
+pub const MAX_OPTIONS_CAP: usize = 4;
+
+/// The fewest options `options.max_options` may be set to.
+pub const MIN_OPTIONS_FLOOR: usize = 2;
+
+/// The two tunables of the shortlist validation, already clamped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RouterLimits {
+    min_confidence: f64,
+    max_options: usize,
 }
 
-/// The router's parsed, validated answer. `intent` is `None` for the
-/// literal `"none"` OR for any id [`parse_router_result`] doesn't recognize
-/// (defensive -- the schema's `enum` should already rule this out, but a
-/// provider is never trusted to actually honor a schema, same posture
-/// `provider::parse_answer` takes toward `difficulty`).
+impl RouterLimits {
+    /// Clamps a hand-edited config pair: `max_options` to 2..=4, and a
+    /// `min_confidence` that is not a number back to the default, one outside
+    /// 0..=1 to the nearer end (a safe degradation, never a crash).
+    pub fn new(min_confidence: f64, max_options: usize) -> Self {
+        let min_confidence = if min_confidence.is_finite() {
+            min_confidence.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_MIN_CONFIDENCE
+        };
+        Self {
+            min_confidence,
+            max_options: max_options.clamp(MIN_OPTIONS_FLOOR, MAX_OPTIONS_CAP),
+        }
+    }
+}
+
+impl Default for RouterLimits {
+    fn default() -> Self {
+        Self::new(DEFAULT_MIN_CONFIDENCE, DEFAULT_MAX_OPTIONS)
+    }
+}
+
+/// One ranked suggestion: a real catalogue action id, a label written for
+/// the screen, and the model's confidence clamped to `0.0..=1.0`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RouterResult {
-    pub summary: String,
-    pub intent: Option<String>,
-    /// Clamped to `0.0..=1.0` -- a provider returning `1.4` or `-0.2` must
-    /// never let a caller's `>= threshold` comparison misbehave.
+pub struct RouterOption {
+    pub intent: String,
+    pub label: String,
     pub confidence: f64,
 }
 
-/// Parses a completion produced from [`build_request`]'s schema.
-/// `candidate_ids` is the SAME list [`router_schema`] was built from for
-/// this request -- an `intent` that doesn't match any of them (or is
-/// literally `"none"`) becomes `None`, never an error: a router result is
-/// advisory, so an odd answer degrades to "no suggestion", not a failure the
-/// palette would have to show (rule 7's "every failure ends in a card" does
-/// not apply here because the router never surfaces failures to the user at
-/// all -- see `app.rs`'s router hook doc comment).
-pub fn parse_router_result(text: &str, candidate_ids: &[String]) -> anyhow::Result<RouterResult> {
-    let raw: RawRouterResult = serde_json::from_str(text)
+/// The router's parsed, validated answer: a summary of the screen and a
+/// ranked shortlist, best first. `options` has 0 to 4 entries and every
+/// `intent` is a real candidate id ([`parse_router_result`] drops the rest).
+/// Empty means nothing fit; the caller decides what a card shows then
+/// ([`with_fallbacks`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterResult {
+    pub summary: String,
+    pub options: Vec<RouterOption>,
+}
+
+/// Strips what a button label must not carry: markdown markers, an em dash
+/// (rule 11: a colon and a space instead), runs of whitespace, then clamps to
+/// `max_chars` characters (never a byte slice: the text came from a model).
+///
+/// `*` and backticks are dropped anywhere. `_ [ ] | ~` are trimmed only from
+/// the ends of a word and `# >` only from its start, so `_email_` and `#1`
+/// lose their markers while `snake_case` and `C#` keep theirs.
+fn clean_model_line(text: &str, max_chars: usize) -> String {
+    let words: Vec<String> = text
+        .replace('\u{2014}', ": ")
+        .replace(['*', '`'], "")
+        .split_whitespace()
+        .map(|w| {
+            w.trim_start_matches(['#', '>'])
+                .trim_matches(['_', '[', ']', '|', '~'])
+                .to_string()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    crate::provider::sanitize_model_text(&words.join(" "), max_chars)
+}
+
+/// Reads one `options` entry, `None` for anything malformed. One bad entry
+/// costs only itself, never the whole shortlist.
+fn read_option(v: &Value) -> Option<(String, String, f64)> {
+    let obj = v.as_object()?;
+    let intent = obj.get("intent")?.as_str()?.to_string();
+    let label = obj
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let confidence = obj.get("confidence")?.as_f64()?;
+    Some((intent, label, confidence))
+}
+
+/// Parses a completion produced from [`build_request`]'s schema into a
+/// validated shortlist. `candidates` is the SAME list [`router_schema`] was
+/// built from, in catalogue order. A router result is advisory, so an odd
+/// answer degrades to fewer (or no) options, never an error; only text that
+/// is not a JSON object is an error, and the caller turns that into the floor.
+///
+/// Applied in this order (the spec's "Validation"): drop ids that are not a
+/// candidate; drop duplicates keeping the higher confidence; clamp
+/// confidence; drop below `limits.min_confidence`; sort by confidence
+/// descending (ties keep catalogue order); keep at most `limits.max_options`;
+/// clean every label (an empty one becomes the action's catalogue name).
+///
+/// Lenient input: a reply in the old `{summary, intent, confidence}` shape,
+/// which small local models drift to (#223), is read as a one-option list
+/// whose label is the action name, with `"none"` meaning no options.
+pub fn parse_router_result(
+    text: &str,
+    candidates: &[RouterCandidate],
+    limits: RouterLimits,
+) -> anyhow::Result<RouterResult> {
+    let value: Value = serde_json::from_str(text)
         .map_err(|e| anyhow::anyhow!("router: completion text is not a valid RouterResult: {e}"))?;
-    let intent = if raw.intent == "none" || !candidate_ids.iter().any(|id| id == &raw.intent) {
-        None
-    } else {
-        Some(raw.intent)
+    let Some(obj) = value.as_object() else {
+        anyhow::bail!("router: completion text is not a valid RouterResult: not an object");
     };
-    Ok(RouterResult {
-        summary: raw.summary,
-        intent,
-        confidence: raw.confidence.clamp(0.0, 1.0),
-    })
+    let summary = clean_model_line(
+        obj.get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        MAX_SUMMARY_CHARS,
+    );
+
+    let raw: Vec<(String, String, f64)> = match obj.get("options").and_then(Value::as_array) {
+        Some(items) => items.iter().filter_map(read_option).collect(),
+        None => match (
+            obj.get("intent").and_then(Value::as_str),
+            obj.get("confidence").and_then(Value::as_f64),
+        ) {
+            (Some(intent), Some(confidence)) => {
+                vec![(intent.to_string(), String::new(), confidence)]
+            }
+            _ => Vec::new(),
+        },
+    };
+
+    // Steps 1 to 3: real ids only, one entry per id (higher confidence wins),
+    // confidence clamped. Slots follow catalogue order so the stable sort
+    // below breaks ties by catalogue position.
+    let mut best: Vec<Option<RouterOption>> = vec![None; candidates.len()];
+    for (intent, label, confidence) in raw {
+        let Some(at) = candidates.iter().position(|c| c.id == intent) else {
+            continue;
+        };
+        let confidence = if confidence.is_finite() {
+            confidence.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let better = match &best[at] {
+            Some(kept) => confidence > kept.confidence,
+            None => true,
+        };
+        if better {
+            best[at] = Some(RouterOption {
+                intent,
+                label,
+                confidence,
+            });
+        }
+    }
+
+    let mut options: Vec<RouterOption> = best.into_iter().flatten().collect();
+    // Steps 4 to 6.
+    options.retain(|o| o.confidence >= limits.min_confidence);
+    options.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    options.truncate(limits.max_options);
+    // Step 7.
+    for option in &mut options {
+        let label = clean_model_line(&option.label, MAX_LABEL_CHARS);
+        option.label = if label.is_empty() {
+            candidates
+                .iter()
+                .find(|c| c.id == option.intent)
+                .map(|c| clean_model_line(&c.description, MAX_LABEL_CHARS))
+                .unwrap_or_default()
+        } else {
+            label
+        };
+    }
+
+    Ok(RouterResult { summary, options })
+}
+
+/// Builds a fallback option: the catalogue name as its label, no confidence.
+#[allow(dead_code)] // used by `with_fallbacks`, which the options card (#307) calls
+fn catalogue_option(action: &PaletteAction) -> RouterOption {
+    RouterOption {
+        intent: action.id.clone(),
+        label: clean_model_line(&action.name, MAX_LABEL_CHARS),
+        confidence: 0.0,
+    }
+}
+
+/// The floor: after validation the options card must never be empty or a
+/// single dead end. With no model ready the router never ran, so the answer
+/// is the static list (the catalogue's model-free actions, in catalogue
+/// order, capped at [`MAX_OPTIONS_CAP`]). With a model ready and fewer than
+/// two options, "Explain this screen" then "Copy text from screen" are
+/// appended, skipping any already present or absent from the catalogue
+/// (the user may have disabled one). Labels are the catalogue names.
+#[allow(dead_code)] // the options card (#307) is its caller; unit tested until then
+pub fn with_fallbacks(
+    mut options: Vec<RouterOption>,
+    catalogue: &[PaletteAction],
+    model_ready: bool,
+) -> Vec<RouterOption> {
+    if !model_ready {
+        return catalogue
+            .iter()
+            .filter(|a| !a.requires_model)
+            .take(MAX_OPTIONS_CAP)
+            .map(catalogue_option)
+            .collect();
+    }
+    if options.len() < 2 {
+        for id in [
+            crate::actions::explain_screen::ACTION_ID,
+            crate::actions::EXTRACT_TEXT_ACTION_ID,
+        ] {
+            if options.iter().any(|o| o.intent == id) {
+                continue;
+            }
+            if let Some(action) = catalogue.iter().find(|a| a.id == id) {
+                options.push(catalogue_option(action));
+            }
+        }
+    }
+    options
 }
 
 /// Whether the palette should act on a router result: an `intent` was
@@ -397,7 +632,118 @@ mod tests {
             name: name.to_string(),
             group: None,
             requires_model: true,
+            effect: crate::ui::palette_model::Effect::None,
         }
+    }
+
+    fn free_action(id: &str, name: &str) -> PaletteAction {
+        PaletteAction {
+            requires_model: false,
+            ..palette_action(id, name)
+        }
+    }
+
+    fn ids(list: &[RouterCandidate]) -> Vec<String> {
+        list.iter().map(|c| c.id.clone()).collect()
+    }
+
+    fn option(intent: &str, label: &str, confidence: f64) -> RouterOption {
+        RouterOption {
+            intent: intent.to_string(),
+            label: label.to_string(),
+            confidence,
+        }
+    }
+
+    fn five() -> Vec<RouterCandidate> {
+        vec![
+            candidate("a", "Action A"),
+            candidate("b", "Action B"),
+            candidate("c", "Action C"),
+            candidate("d", "Action D"),
+            candidate("e", "Action E"),
+        ]
+    }
+
+    fn parse(text: &str, candidates: &[RouterCandidate]) -> RouterResult {
+        parse_router_result(text, candidates, RouterLimits::default()).unwrap()
+    }
+
+    /// #792: the router's chain sends no repair request once its deadline has
+    /// passed. A slow provider returns an unparseable answer after the cap;
+    /// it must be asked exactly once.
+    #[test]
+    fn router_chain_sends_no_repair_after_the_deadline() {
+        use crate::provider::{Caps, Completion, Provider, StopReason};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        struct SlowBadAnswer(Arc<AtomicU32>);
+        impl Provider for SlowBadAnswer {
+            fn id(&self) -> &'static str {
+                "slow"
+            }
+            fn capabilities(&self, _model: &str) -> Caps {
+                Caps {
+                    vision: true,
+                    ..Caps::default()
+                }
+            }
+            fn own_caps(&self) -> Caps {
+                self.capabilities("")
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                Ok(Completion {
+                    text: "not json".to_string(),
+                    usage: None,
+                    stop: StopReason::Complete,
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        // Started long enough ago that the deadline has passed by the time
+        // the slow answer arrives.
+        let Some(started) = std::time::Instant::now().checked_sub(ROUTER_WALL_CLOCK) else {
+            return; // machine up for under 10 s: no earlier instant exists
+        };
+        let chain = router_chain(Box::new(SlowBadAnswer(calls.clone())), started);
+        let result = route(
+            &chain,
+            vec![1],
+            &[candidate("a", "A")],
+            RouterLimits::default(),
+            || Err(anyhow::anyhow!("no fallback expected")),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "past the deadline: no call at all"
+        );
+
+        let nearly = ROUTER_WALL_CLOCK - std::time::Duration::from_millis(20);
+        let chain = router_chain(
+            Box::new(SlowBadAnswer(calls.clone())),
+            std::time::Instant::now()
+                .checked_sub(nearly)
+                .unwrap_or(started),
+        );
+        let result = route(
+            &chain,
+            vec![1],
+            &[candidate("a", "A")],
+            RouterLimits::default(),
+            || Err(anyhow::anyhow!("no fallback expected")),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "asked once, never repaired"
+        );
     }
 
     // -- candidates_from_catalogue ------------------------------------------
@@ -420,43 +766,54 @@ mod tests {
 
     // -- router_schema: property order is load-bearing (rule 3) ------------
 
+    fn keys(v: &Value) -> Vec<&str> {
+        v.as_object().unwrap().keys().map(|k| k.as_str()).collect()
+    }
+
     #[test]
-    fn router_schema_orders_summary_before_intent_before_confidence() {
+    fn router_schema_orders_summary_before_options() {
         let schema = router_schema(&["check-my-work".to_string()]);
-        let serialized = serde_json::to_string(&schema["properties"]).unwrap();
-        let summary_pos = serialized.find("\"summary\"").unwrap();
-        let intent_pos = serialized.find("\"intent\"").unwrap();
-        let confidence_pos = serialized.find("\"confidence\"").unwrap();
-        assert!(
-            summary_pos < intent_pos && intent_pos < confidence_pos,
-            "schema property order must be summary, intent, confidence: {serialized}"
+        assert_eq!(keys(&schema["properties"]), ["summary", "options"]);
+    }
+
+    #[test]
+    fn router_schema_orders_intent_before_label_before_confidence() {
+        let schema = router_schema(&["check-my-work".to_string()]);
+        let item = &schema["properties"]["options"]["items"];
+        assert_eq!(
+            keys(&item["properties"]),
+            ["intent", "label", "confidence"],
+            "the model names the action before it writes a label for it"
         );
     }
 
     #[test]
-    fn router_schema_intent_enum_covers_every_candidate_plus_none() {
+    fn router_schema_intent_enum_equals_the_candidate_ids_with_no_none() {
         let ids = vec!["a".to_string(), "b".to_string()];
         let schema = router_schema(&ids);
-        let enum_values: Vec<String> = schema["properties"]["intent"]["enum"]
+        let enum_values: Vec<String> = schema["properties"]["options"]["items"]["properties"]
+            ["intent"]["enum"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(
-            enum_values,
-            vec!["a".to_string(), "b".to_string(), "none".to_string()]
-        );
+        assert_eq!(enum_values, ids);
     }
 
     #[test]
-    fn router_schema_forbids_additional_properties() {
+    fn router_schema_forbids_additional_properties_and_has_no_array_limits() {
         let schema = router_schema(&[]);
         assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(schema["required"], json!(["summary", "options"]));
+        let options = &schema["properties"]["options"];
+        assert_eq!(options["items"]["additionalProperties"], json!(false));
         assert_eq!(
-            schema["required"],
-            json!(["summary", "intent", "confidence"])
+            options["items"]["required"],
+            json!(["intent", "label", "confidence"])
         );
+        // Providers differ on array keywords (#301): the cap lives in code.
+        assert!(options.get("minItems").is_none() && options.get("maxItems").is_none());
     }
 
     // -- build_request -------------------------------------------------------
@@ -489,7 +846,8 @@ mod tests {
         assert!(rules.contains("summary"), "{rules}");
         assert!(rules.contains("never an action id"), "{rules}");
         assert!(rules.contains("intent"), "{rules}");
-        assert!(rules.contains("\"none\""), "{rules}");
+        assert!(rules.contains("label"), "{rules}");
+        assert!(rules.contains("up to four"), "{rules}");
     }
 
     /// #768: the screenshot is data, never instructions, for the router too.
@@ -505,7 +863,7 @@ mod tests {
             .keys()
             .map(|k| k.as_str())
             .collect();
-        assert_eq!(keys, ["summary", "intent", "confidence"]);
+        assert_eq!(keys, ["summary", "options"]);
     }
 
     #[test]
@@ -555,55 +913,344 @@ mod tests {
         assert_eq!(req.schema, Some(router_schema(&["a".to_string()])));
     }
 
-    // -- parse_router_result --------------------------------------------------
+    // -- parse_router_result: the validation pipeline (#306) -------------------
+
+    /// The #306 fixture: five options, one unknown id, one duplicate, one
+    /// below the bar, becomes exactly the expected ranked list.
+    #[test]
+    fn the_306_fixture_becomes_the_expected_ranked_shortlist() {
+        let text = r#"{"summary":"An email to Dana","options":[
+            {"intent":"c","label":"Third","confidence":0.41},
+            {"intent":"a","label":"First","confidence":0.92},
+            {"intent":"nope","label":"Invented","confidence":0.99},
+            {"intent":"a","label":"First again","confidence":0.30},
+            {"intent":"d","label":"Too low","confidence":0.12},
+            {"intent":"b","label":"Second","confidence":0.65}
+        ]}"#;
+        let result = parse(text, &five());
+        assert_eq!(result.summary, "An email to Dana");
+        assert_eq!(
+            result.options,
+            vec![
+                option("a", "First", 0.92),
+                option("b", "Second", 0.65),
+                option("c", "Third", 0.41),
+            ]
+        );
+    }
 
     #[test]
-    fn parse_router_result_recognizes_a_listed_intent() {
-        let ids = vec!["check-my-work".to_string()];
-        let text = r#"{"summary":"A physics problem","intent":"check-my-work","confidence":0.9}"#;
-        let result = parse_router_result(text, &ids).unwrap();
-        assert_eq!(result.intent.as_deref(), Some("check-my-work"));
+    fn an_id_that_is_not_a_candidate_is_dropped_never_invented() {
+        let text = r#"{"summary":"s","options":[{"intent":"hallucinated","label":"x","confidence":0.95}]}"#;
+        assert!(parse(text, &five()).options.is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_keeps_the_higher_confidence_and_its_label() {
+        let text = r#"{"summary":"s","options":[
+            {"intent":"a","label":"Low","confidence":0.4},
+            {"intent":"a","label":"High","confidence":0.8}]}"#;
+        assert_eq!(parse(text, &five()).options, vec![option("a", "High", 0.8)]);
+        let reversed = r#"{"summary":"s","options":[
+            {"intent":"a","label":"High","confidence":0.8},
+            {"intent":"a","label":"Low","confidence":0.4}]}"#;
+        assert_eq!(
+            parse(reversed, &five()).options,
+            vec![option("a", "High", 0.8)]
+        );
+    }
+
+    #[test]
+    fn confidence_is_clamped_to_zero_one() {
+        let text = r#"{"summary":"s","options":[
+            {"intent":"a","label":"A","confidence":1.4},
+            {"intent":"b","label":"B","confidence":-0.2}]}"#;
+        let limits = RouterLimits::new(0.0, 4);
+        let result = parse_router_result(text, &five(), limits).unwrap();
+        assert_eq!(result.options[0].confidence, 1.0);
+        assert_eq!(result.options[1].confidence, 0.0);
+    }
+
+    #[test]
+    fn options_below_min_confidence_are_dropped_and_the_bar_is_inclusive() {
+        let text = r#"{"summary":"s","options":[
+            {"intent":"a","label":"A","confidence":0.2},
+            {"intent":"b","label":"B","confidence":0.19}]}"#;
+        let ids: Vec<_> = parse(text, &five())
+            .options
+            .into_iter()
+            .map(|o| o.intent)
+            .collect();
+        assert_eq!(ids, ["a"]);
+    }
+
+    #[test]
+    fn ties_keep_catalogue_order_not_reply_order() {
+        let text = r#"{"summary":"s","options":[
+            {"intent":"c","label":"C","confidence":0.5},
+            {"intent":"a","label":"A","confidence":0.5},
+            {"intent":"b","label":"B","confidence":0.5}]}"#;
+        let got: Vec<_> = parse(text, &five())
+            .options
+            .into_iter()
+            .map(|o| o.intent)
+            .collect();
+        assert_eq!(got, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn the_shortlist_is_capped_at_max_options_and_the_cap_is_clamped() {
+        let text = r#"{"summary":"s","options":[
+            {"intent":"a","label":"A","confidence":0.9},
+            {"intent":"b","label":"B","confidence":0.8},
+            {"intent":"c","label":"C","confidence":0.7},
+            {"intent":"d","label":"D","confidence":0.6},
+            {"intent":"e","label":"E","confidence":0.5}]}"#;
+        assert_eq!(parse(text, &five()).options.len(), 4);
+        let two = parse_router_result(text, &five(), RouterLimits::new(0.2, 2)).unwrap();
+        assert_eq!(two.options.len(), 2);
+        // 1 is clamped up to 2, 99 down to 4.
+        let one = parse_router_result(text, &five(), RouterLimits::new(0.2, 1)).unwrap();
+        assert_eq!(one.options.len(), 2);
+        let many = parse_router_result(text, &five(), RouterLimits::new(0.2, 99)).unwrap();
+        assert_eq!(many.options.len(), 4);
+    }
+
+    #[test]
+    fn router_limits_new_degrades_a_bad_min_confidence_safely() {
+        assert_eq!(
+            RouterLimits::new(f64::NAN, 4),
+            RouterLimits::new(DEFAULT_MIN_CONFIDENCE, 4)
+        );
+        assert_eq!(RouterLimits::new(7.0, 4), RouterLimits::new(1.0, 4));
+        assert_eq!(RouterLimits::new(-1.0, 4), RouterLimits::new(0.0, 4));
+        assert_eq!(RouterLimits::default(), RouterLimits::new(0.2, 4));
+    }
+
+    #[test]
+    fn labels_lose_markdown_and_collapse_whitespace() {
+        let text = r#"{"summary":"**Bold** `code`","options":[
+            {"intent":"a","label":"  **Review**   this\n_email_ #1 ","confidence":0.9}]}"#;
+        let result = parse(text, &five());
+        assert_eq!(result.options[0].label, "Review this email 1");
+        assert_eq!(result.summary, "Bold code");
+    }
+
+    #[test]
+    fn inner_underscores_and_hashes_survive_label_cleaning() {
+        let text = r#"{"summary":"s","options":[
+            {"intent":"a","label":"Fix snake_case names in C#","confidence":0.9}]}"#;
+        assert_eq!(
+            parse(text, &five()).options[0].label,
+            "Fix snake_case names in C#"
+        );
+    }
+
+    #[test]
+    fn router_schema_with_no_candidates_has_no_empty_enum() {
+        let schema = router_schema(&[]);
+        let intent = &schema["properties"]["options"]["items"]["properties"]["intent"];
+        assert_eq!(intent, &json!({"type": "string"}));
+    }
+
+    #[test]
+    fn an_em_dash_in_a_label_becomes_a_colon_and_a_space() {
+        let text = format!(
+            r#"{{"summary":"s","options":[{{"intent":"a","label":"Reply{}short","confidence":0.9}}]}}"#,
+            '\u{2014}'
+        );
+        let label = parse(&text, &five()).options[0].label.clone();
+        assert_eq!(label, "Reply: short");
+        assert!(!label.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn an_empty_or_markdown_only_label_falls_back_to_the_action_name() {
+        let text = r#"{"summary":"s","options":[
+            {"intent":"a","label":"","confidence":0.9},
+            {"intent":"b","label":"***","confidence":0.8},
+            {"intent":"c","confidence":0.7}]}"#;
+        let labels: Vec<_> = parse(text, &five())
+            .options
+            .into_iter()
+            .map(|o| o.label)
+            .collect();
+        assert_eq!(labels, ["Action A", "Action B", "Action C"]);
+    }
+
+    #[test]
+    fn a_multibyte_label_is_clamped_on_a_char_boundary_and_never_panics() {
+        let long = "\u{1F600}\u{00E9}".repeat(60);
+        let text = format!(
+            r#"{{"summary":"{long}","options":[{{"intent":"a","label":"{long}","confidence":0.9}}]}}"#
+        );
+        let result = parse(&text, &five());
+        assert!(result.options[0].label.chars().count() <= MAX_LABEL_CHARS);
+        assert!(result.options[0].label.ends_with('\u{2026}'));
+        assert!(result.summary.chars().count() <= MAX_SUMMARY_CHARS);
+    }
+
+    #[test]
+    fn the_old_single_intent_shape_reads_as_one_option_labelled_with_the_name() {
+        let text = r#"{"summary":"A physics problem","intent":"b","confidence":0.9}"#;
+        let result = parse(text, &five());
         assert_eq!(result.summary, "A physics problem");
-        assert_eq!(result.confidence, 0.9);
+        assert_eq!(result.options, vec![option("b", "Action B", 0.9)]);
     }
 
     #[test]
-    fn parse_router_result_maps_literal_none_to_none() {
-        let ids = vec!["check-my-work".to_string()];
-        let text = r#"{"summary":"A blank desktop","intent":"none","confidence":0.1}"#;
-        let result = parse_router_result(text, &ids).unwrap();
-        assert_eq!(result.intent, None);
+    fn the_old_shape_with_none_or_an_unknown_id_is_an_empty_shortlist() {
+        let none = r#"{"summary":"blank","intent":"none","confidence":0.1}"#;
+        assert!(parse(none, &five()).options.is_empty());
+        let unknown = r#"{"summary":"?","intent":"hallucinated-id","confidence":0.95}"#;
+        assert!(parse(unknown, &five()).options.is_empty());
     }
 
     #[test]
-    fn parse_router_result_maps_an_unrecognized_intent_to_none_not_an_error() {
-        let ids = vec!["check-my-work".to_string()];
-        let text = r#"{"summary":"?","intent":"hallucinated-id","confidence":0.95}"#;
-        let result = parse_router_result(text, &ids).unwrap();
-        assert_eq!(result.intent, None);
+    fn an_empty_options_array_is_an_empty_shortlist_not_an_error() {
+        let result = parse(r#"{"summary":"nothing fits","options":[]}"#, &five());
+        assert_eq!(result.summary, "nothing fits");
+        assert!(result.options.is_empty());
     }
 
     #[test]
-    fn parse_router_result_clamps_out_of_range_confidence() {
-        let ids = vec!["check-my-work".to_string()];
-        let too_high = parse_router_result(
-            r#"{"summary":"s","intent":"check-my-work","confidence":1.4}"#,
-            &ids,
-        )
-        .unwrap();
-        assert_eq!(too_high.confidence, 1.0);
-        let too_low = parse_router_result(
-            r#"{"summary":"s","intent":"check-my-work","confidence":-0.2}"#,
-            &ids,
-        )
-        .unwrap();
-        assert_eq!(too_low.confidence, 0.0);
+    fn a_malformed_entry_costs_only_itself() {
+        let text = r#"{"summary":"s","options":[
+            42, "a", {"intent":7,"label":"x","confidence":0.9},
+            {"intent":"a","label":"x"},
+            {"intent":"b","label":"Good","confidence":0.9}]}"#;
+        assert_eq!(parse(text, &five()).options, vec![option("b", "Good", 0.9)]);
     }
 
     #[test]
-    fn parse_router_result_rejects_malformed_json() {
-        let err = parse_router_result("not json", &[]).unwrap_err();
-        assert!(err.to_string().contains("not a valid RouterResult"));
+    fn a_missing_summary_is_empty_and_no_candidates_means_no_options() {
+        let text = r#"{"options":[{"intent":"a","label":"A","confidence":0.9}]}"#;
+        assert_eq!(parse(text, &five()).summary, "");
+        assert!(parse(text, &[]).options.is_empty());
+    }
+
+    #[test]
+    fn parse_router_result_rejects_malformed_json_and_non_objects() {
+        for bad in ["not json", "[]", "\"text\"", "7", ""] {
+            let err = parse_router_result(bad, &five(), RouterLimits::default()).unwrap_err();
+            assert!(
+                err.to_string().contains("not a valid RouterResult"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_schema_enum_and_the_parser_use_the_same_candidate_list() {
+        let c = five();
+        let schema = router_schema(&ids(&c));
+        let enum_len = schema["properties"]["options"]["items"]["properties"]["intent"]["enum"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(enum_len, c.len());
+    }
+
+    // -- with_fallbacks: the floor ------------------------------------------
+
+    fn catalogue() -> Vec<PaletteAction> {
+        vec![
+            palette_action("check-my-work", "Check my work"),
+            palette_action(
+                crate::actions::explain_screen::ACTION_ID,
+                "Explain this screen",
+            ),
+            free_action(
+                crate::actions::EXTRACT_TEXT_ACTION_ID,
+                "Copy text from screen",
+            ),
+            free_action("calculate-selection", "Calculate selection"),
+            free_action("copy-region", "Copy region to clipboard"),
+            free_action("f1", "Free one"),
+            free_action("f2", "Free two"),
+        ]
+    }
+
+    fn intents(options: &[RouterOption]) -> Vec<&str> {
+        options.iter().map(|o| o.intent.as_str()).collect()
+    }
+
+    #[test]
+    fn an_empty_shortlist_gets_explain_then_copy_text() {
+        let out = with_fallbacks(vec![], &catalogue(), true);
+        assert_eq!(
+            intents(&out),
+            [
+                crate::actions::explain_screen::ACTION_ID,
+                crate::actions::EXTRACT_TEXT_ACTION_ID
+            ]
+        );
+        assert_eq!(out[0].label, "Explain this screen");
+    }
+
+    #[test]
+    fn one_option_gets_both_fallbacks_appended_after_it() {
+        let out = with_fallbacks(
+            vec![option("check-my-work", "Mine", 0.5)],
+            &catalogue(),
+            true,
+        );
+        assert_eq!(
+            intents(&out),
+            [
+                "check-my-work",
+                crate::actions::explain_screen::ACTION_ID,
+                crate::actions::EXTRACT_TEXT_ACTION_ID
+            ]
+        );
+        assert_eq!(out[0].label, "Mine", "model labels are untouched");
+    }
+
+    #[test]
+    fn fallbacks_skip_what_is_already_present() {
+        let have = vec![option(
+            crate::actions::explain_screen::ACTION_ID,
+            "Explain",
+            0.5,
+        )];
+        let out = with_fallbacks(have, &catalogue(), true);
+        assert_eq!(
+            intents(&out),
+            [
+                crate::actions::explain_screen::ACTION_ID,
+                crate::actions::EXTRACT_TEXT_ACTION_ID
+            ]
+        );
+    }
+
+    #[test]
+    fn fallbacks_skip_an_action_the_user_removed_from_the_catalogue() {
+        let mut cat = catalogue();
+        cat.retain(|a| a.id != crate::actions::explain_screen::ACTION_ID);
+        let out = with_fallbacks(vec![], &cat, true);
+        assert_eq!(intents(&out), [crate::actions::EXTRACT_TEXT_ACTION_ID]);
+        assert!(with_fallbacks(vec![], &[], true).is_empty());
+    }
+
+    #[test]
+    fn two_or_more_options_are_left_alone() {
+        let have = vec![option("x", "X", 0.9), option("y", "Y", 0.8)];
+        assert_eq!(with_fallbacks(have.clone(), &catalogue(), true), have);
+    }
+
+    #[test]
+    fn with_no_model_the_answer_is_the_static_model_free_list_capped_at_four() {
+        let out = with_fallbacks(vec![option("x", "X", 0.9)], &catalogue(), false);
+        assert_eq!(
+            intents(&out),
+            [
+                crate::actions::EXTRACT_TEXT_ACTION_ID,
+                "calculate-selection",
+                "copy-region",
+                "f1"
+            ]
+        );
+        assert!(out.iter().all(|o| !o.label.is_empty()));
     }
 
     // -- should_apply: threshold and "user already chose" (#24) --------------
