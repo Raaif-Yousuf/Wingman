@@ -337,6 +337,17 @@ fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
 
         if belongs_to_us && msg.message == WM_KEYDOWN {
             let vk = msg.wParam.0 as u32;
+            // #776: with a combo list open, Enter and Esc belong to the list
+            // (pick or close); they must not save or cancel the window.
+            if (vk == VK_ESCAPE.0 as u32 || vk == VK_RETURN.0 as u32)
+                && unsafe { wheel_over_open_combo(msg.hwnd) }
+            {
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                continue;
+            }
             if vk == VK_ESCAPE.0 as u32 {
                 // #345: while a Change is pending, Esc cancels that, not the
                 // whole window. (The hook normally swallows this Esc and
@@ -736,7 +747,17 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             // Run key on every Save.
             let want = checkbox_checked(inner.hwnd, ID_AUTOSTART);
             if want != crate::autostart::is_enabled() {
-                let _ = crate::autostart::set_enabled(want);
+                // Rule 7: a failed registry write must not end in "Settings
+                // saved". Say so here, show the real state, keep the window.
+                if crate::autostart::set_enabled(want).is_err() {
+                    if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                        set_text(msg, autostart_failure_message(want));
+                    }
+                    if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+                        set_checkbox(box_, crate::autostart::is_enabled());
+                    }
+                    return;
+                }
             }
             inner.result = Some(finalize_config(inner, &raw));
             unsafe {
@@ -762,7 +783,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         }
         ID_PULL_BUTTON if notify == BN_CLICKED => on_pull_button(inner),
         ID_RESET_PROMPT => {
-            set_text(inner.prompt_edit, DEFAULT_PROMPT);
+            set_text(inner.prompt_edit, &prompt_to_edit(DEFAULT_PROMPT));
         }
         ID_CARD_CORNER if notify == CBN_SELCHANGE => sync_card_display_enabled(inner.hwnd),
         ID_GEMINI_MODEL if notify == CBN_SELCHANGE => sync_gemini_thinking_enabled(inner.hwnd),
@@ -2255,9 +2276,11 @@ fn fill_model_combo(hwnd: HWND, models: &[String], active: &str) {
     for m in &list {
         combo_add(hwnd, m);
     }
-    combo_select(hwnd, active);
-    if unsafe { SendMessageW(hwnd, CB_GETCURSEL, None, None).0 } < 0 && !list.is_empty() {
-        combo_select_index(hwnd, 0);
+    // Exact match by position: CB_SELECTSTRING matches a prefix, which opened
+    // "gpt-5" as "gpt-5.5" (#775). `active` is always in `list` unless empty.
+    let index = list.iter().position(|m| *m == active).unwrap_or(0);
+    if !list.is_empty() {
+        combo_select_index(hwnd, index as i32);
     }
 }
 
@@ -4343,7 +4366,7 @@ fn build_ui_recorded(
     let content_top_dp = footer.prompt_top;
     let prompt_edit = ctx.create(
         WC_EDIT,
-        &config.ui.prompt,
+        &prompt_to_edit(&config.ui.prompt),
         (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) as u32,
         WS_EX_BORDER,
         content_x + MARGIN,
@@ -4432,6 +4455,8 @@ fn build_ui_recorded(
         ID_VALIDATION_MESSAGE,
     );
     ctx.set_anchor(validation, Anchor::Footer);
+    // #778: a key an environment variable overrides cannot be edited here.
+    lock_env_key_fields(hwnd);
     let cancel = ctx.create(
         WC_BUTTON,
         "Cancel",
@@ -4622,7 +4647,7 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
             .map(|h| unsafe { SendMessageW(h, TBM_GETPOS, None, None).0 as f32 / 100.0 })
             .unwrap_or(inner.original.ui.text_scale),
         prompt: get_dlg_item(hwnd, ID_PROMPT_EDIT)
-            .map(get_text)
+            .map(|h| prompt_from_edit(&get_text(h)))
             .unwrap_or_default(),
         require_tick_for: combo_selected_text(hwnd, ID_REQUIRE_TICK_FOR),
         card_corner: combo_selected_text(hwnd, ID_CARD_CORNER),
@@ -5312,6 +5337,91 @@ fn resolve_key_field(original: &str, form_text: &str) -> String {
     }
 }
 
+// Test seam: the env var names to treat as set, instead of the process
+// environment (which is shared by every test thread).
+#[cfg(test)]
+thread_local! {
+    static ENV_KEYS_SET: std::cell::RefCell<Option<Vec<&'static str>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn env_var_is_set(var: &str) -> bool {
+    #[cfg(test)]
+    if let Some(set) = ENV_KEYS_SET.with(|c| c.borrow().clone()) {
+        return set.contains(&var);
+    }
+    std::env::var(var).is_ok()
+}
+
+/// The key fields whose environment variable is set (#778): the variable wins
+/// over the stored key, so a key typed here would never be used or saved.
+/// Pairs the field's control id with the variable name.
+fn env_locked_key_fields() -> Vec<(i32, &'static str)> {
+    let fields = [
+        ("openai", ID_OPENAI_KEY),
+        ("anthropic", ID_ANTHROPIC_KEY),
+        ("gemini", ID_GEMINI_KEY),
+    ];
+    crate::config::ENV_OVERRIDE_VARS
+        .iter()
+        .filter(|(_, var)| env_var_is_set(var))
+        .filter_map(|(provider, var)| {
+            fields
+                .iter()
+                .find(|(p, _)| p == provider)
+                .map(|(_, id)| (*id, *var))
+        })
+        .collect()
+}
+
+/// The line Settings shows while `vars` are set in the environment. Short:
+/// it shares the footer row with the buttons.
+fn env_key_hint(vars: &[&str]) -> String {
+    match vars {
+        [] => String::new(),
+        [one] => format!("{one} is set and wins over this field."),
+        _ => "Environment API keys are set and win over these fields.".to_string(),
+    }
+}
+
+/// Greys out the key fields an environment variable overrides and says why
+/// in the footer message (#778).
+fn lock_env_key_fields(hwnd: HWND) {
+    let locked = env_locked_key_fields();
+    for (id, _) in &locked {
+        if let Some(edit) = get_dlg_item(hwnd, *id) {
+            unsafe {
+                let _ = EnableWindow(edit, false);
+            }
+        }
+    }
+    let vars: Vec<&str> = locked.iter().map(|(_, var)| *var).collect();
+    if let Some(msg) = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE) {
+        set_text(msg, &env_key_hint(&vars));
+    }
+}
+
+/// What Save says when the start-with-Windows switch could not be changed
+/// (#777). The window stays open so nothing is lost.
+fn autostart_failure_message(wanted_on: bool) -> &'static str {
+    if wanted_on {
+        "Could not turn on Start with Windows. Save again to keep the rest."
+    } else {
+        "Could not turn off Start with Windows. Save again to keep the rest."
+    }
+}
+
+/// The prompt as the multiline edit wants it: CRLF line breaks (#779). The
+/// edit shows a bare LF as a box and does not break the line.
+fn prompt_to_edit(prompt: &str) -> String {
+    prompt.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+/// The prompt as saved: LF line breaks only (#779).
+fn prompt_from_edit(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 /// Merges parsed form values onto a clone of `original`. Any field the form
 /// could not produce a sane value for (a blank combo selection, unparsable
 /// numeric text) falls back to the value already in `original` rather than
@@ -5319,7 +5429,11 @@ fn resolve_key_field(original: &str, form_text: &str) -> String {
 fn build_config(original: &Config, raw: &RawForm) -> Config {
     let mut cfg = original.clone();
 
-    cfg.providers.order = merge_provider_order(&original.providers.order, raw.provider_choice);
+    // Only a changed selection touches the order: an untouched Save must not
+    // add a vendor the user left out on purpose (#780).
+    if raw.provider_choice as i32 != combo_index_for_order(&original.providers.order) {
+        cfg.providers.order = merge_provider_order(&original.providers.order, raw.provider_choice);
+    }
 
     let ollama_model = strip_vision_badge(raw.ollama_model.trim());
     if !ollama_model.is_empty() {
@@ -6991,6 +7105,109 @@ mod tests {
         assert_eq!(cfg.providers.order, original.providers.order);
     }
 
+    // -- untouched Save is a no-op (#775, #779, #780) ----------------------
+
+    /// A config that exercises the fields an untouched Save used to change.
+    fn round_trip_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.providers.order = names(&["openai", "gemini"]);
+        cfg.providers.openai.model = "gpt-5".to_string();
+        cfg.ui.prompt = "line one\nline two\n\nline four".to_string();
+        cfg.ui.card_seconds = 9;
+        cfg.ui.text_scale = 1.25;
+        cfg
+    }
+
+    #[test]
+    fn an_untouched_save_never_adds_a_vendor_to_the_order() {
+        for order in [
+            vec!["openai"],
+            vec!["anthropic"],
+            vec!["openai", "gemini"],
+            vec!["ollama"],
+            vec!["gemini", "anthropic"],
+        ] {
+            let mut original = Config::default();
+            original.providers.order = names(&order);
+            let cfg = build_config(&original, &raw_from(&original));
+            assert_eq!(cfg.providers.order, original.providers.order, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn choosing_a_provider_still_changes_the_order() {
+        let mut original = Config::default();
+        original.providers.order = names(&["openai"]);
+        let mut raw = raw_from(&original);
+        raw.provider_choice = 1;
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.order, names(&["anthropic", "openai"]));
+    }
+
+    #[test]
+    fn the_prompt_box_text_uses_crlf_and_the_saved_prompt_uses_lf() {
+        assert_eq!(prompt_to_edit("a\nb\n\nc"), "a\r\nb\r\n\r\nc");
+        assert_eq!(prompt_to_edit("a\r\nb"), "a\r\nb");
+        assert_eq!(prompt_from_edit("a\r\nb\r\n\r\nc"), "a\nb\n\nc");
+        assert_eq!(prompt_from_edit(&prompt_to_edit("x\ny")), "x\ny");
+    }
+
+    #[test]
+    fn the_env_hint_names_the_variable_and_has_no_dash() {
+        assert_eq!(env_key_hint(&[]), "");
+        let one = env_key_hint(&["OPENAI_API_KEY"]);
+        assert!(one.contains("OPENAI_API_KEY"), "{one}");
+        let many = env_key_hint(&["OPENAI_API_KEY", "GEMINI_API_KEY"]);
+        assert!(!many.is_empty());
+        assert!(!one.contains('\u{2014}') && !many.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn an_autostart_failure_message_is_plain_and_has_no_dash() {
+        for on in [true, false] {
+            let m = autostart_failure_message(on);
+            assert!(!m.is_empty() && !m.contains('\u{2014}'), "{m}");
+        }
+    }
+
+    #[test]
+    fn a_model_that_prefixes_a_listed_one_opens_as_itself() {
+        let cfg = round_trip_config();
+        assert!(cfg.providers.openai.models.iter().any(|m| m == "gpt-5"));
+        assert!(cfg.providers.openai.models.iter().any(|m| m == "gpt-5.5"));
+        with_window(cfg, |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            assert_eq!(read_form(inner).providers.openai.model, "gpt-5");
+        });
+    }
+
+    #[test]
+    fn opening_settings_and_saving_with_no_edits_changes_nothing() {
+        let original = round_trip_config();
+        with_window(original.clone(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            assert_eq!(read_form(inner), original);
+            // The multiline prompt shows real line breaks.
+            let shown = get_text(get_dlg_item(hwnd, ID_PROMPT_EDIT).unwrap());
+            assert_eq!(shown, "line one\r\nline two\r\n\r\nline four");
+        });
+    }
+
+    #[test]
+    fn an_env_set_key_field_is_disabled_and_the_window_says_why() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+        ENV_KEYS_SET.with(|c| *c.borrow_mut() = Some(vec!["OPENAI_API_KEY"]));
+        with_window(Config::default(), |hwnd, _raw| {
+            let key = get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap();
+            let other = get_dlg_item(hwnd, ID_ANTHROPIC_KEY).unwrap();
+            assert!(!unsafe { IsWindowEnabled(key) }.as_bool());
+            assert!(unsafe { IsWindowEnabled(other) }.as_bool());
+            let msg = get_text(get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).unwrap());
+            assert!(msg.contains("OPENAI_API_KEY"), "{msg}");
+        });
+        ENV_KEYS_SET.with(|c| *c.borrow_mut() = None);
+    }
+
     #[test]
     fn build_config_applies_an_edited_gemini_model_and_effort() {
         let original = Config::default();
@@ -7972,7 +8189,7 @@ mod tests {
 
         let prompt_edit = build_ui(hwnd, instance, dpi, inner_ref.font, &config, WIN_H_DP);
         assert!(!prompt_edit.0.is_null());
-        assert_eq!(get_text(prompt_edit), config.ui.prompt);
+        assert_eq!(get_text(prompt_edit), prompt_to_edit(&config.ui.prompt));
 
         // Exercise a value round trip through the real controls.
         set_text(prompt_edit, "hello from a test");
@@ -8672,7 +8889,10 @@ mod tests {
         // a short screen; the scrolling content is what grows.
         assert!(top_in_parent_px(hwnd, save) >= collapsed_save_y);
         assert!(content() > collapsed_content, "the body did not grow");
-        assert_eq!(get_text(prompt), Config::default().ui.prompt);
+        assert_eq!(
+            get_text(prompt),
+            prompt_to_edit(&Config::default().ui.prompt)
+        );
 
         click();
         assert!(!visible(prompt) && !visible(reset));
@@ -8680,7 +8900,10 @@ mod tests {
         assert_eq!(top_in_parent_px(hwnd, save), collapsed_save_y);
         assert_eq!(content(), collapsed_content);
         // Hidden text is still readable, so Save keeps it.
-        assert_eq!(get_text(prompt), Config::default().ui.prompt);
+        assert_eq!(
+            get_text(prompt),
+            prompt_to_edit(&Config::default().ui.prompt)
+        );
     }
 
     /// #481: the window's direct children are the pinned footer controls and
