@@ -301,6 +301,11 @@ pub fn plan_typed_fallback(control_type: &str, new_text: &str) -> Result<TypedRe
             "Wingman cannot safely type into this field ({control_type}): the app does not let it set the text directly, and typing could overwrite the wrong thing. Nothing was written. Click the field and type the value yourself."
         ));
     }
+    if new_text.contains(['\n', '\r', '\t']) {
+        return Err(anyhow!(
+            "the value has a line break or tab, which Wingman cannot type into this field without changing it. Nothing was written. Click the field and type the value yourself."
+        ));
+    }
     let text = plan_typed_input(new_text);
     Ok(TypedReplacePlan {
         select_all: true,
@@ -1250,10 +1255,16 @@ mod tests {
     }
 
     #[test]
-    fn fallback_keeps_the_never_enter_or_tab_rule() {
-        let plan = plan_typed_fallback("Edit", "a\nb\tc").unwrap();
-        let units: Vec<u16> = plan.text.iter().map(|e| e.code_unit).collect();
-        assert!(!units.contains(&0x0A) && !units.contains(&0x09));
+    fn fallback_refuses_a_value_with_a_line_break_or_tab_instead_of_flattening_it() {
+        // Decision (#678): typing would have to drop Enter and Tab, so a
+        // multi-line value would be filled as one run and still reported as
+        // filled. Refuse it with a clear message instead.
+        for v in ["a\nb", "a\r\nb", "a\rb", "a\tb"] {
+            let msg = plan_typed_fallback("Edit", v).unwrap_err().to_string();
+            assert!(msg.contains("line break or tab"), "{v:?}: {msg}");
+            assert!(!msg.contains('\u{2014}'));
+        }
+        assert!(plan_typed_fallback("Edit", "a b").is_ok());
     }
 
     // -- #590: one unreadable element costs only itself ---------------------

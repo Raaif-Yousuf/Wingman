@@ -137,7 +137,7 @@ impl OpenAiCompat {
         let mut system_text = req.system.clone();
         if let Some(schema) = &req.schema {
             if !matches!(self.structured, Structured::JsonSchema) {
-                system_text.push_str(&Self::schema_instruction(schema));
+                system_text.push_str(&Self::schema_instruction(&common::wire_schema(schema)));
             }
         }
 
@@ -161,7 +161,7 @@ impl OpenAiCompat {
                 Structured::JsonSchema => {
                     body["response_format"] = json!({
                         "type": "json_schema",
-                        "json_schema": {"name": "answer", "schema": schema, "strict": true}
+                        "json_schema": {"name": "answer", "schema": common::wire_schema(schema), "strict": true}
                     });
                 }
                 Structured::JsonObject => {
@@ -215,12 +215,26 @@ impl OpenAiCompat {
             ));
         }
 
+        // The server's own filter blocked the reply (#731): a decline, not a
+        // missing field.
+        if finish_reason == Some("content_filter") {
+            return Err(super::declined_error("openai-compat", "content_filter"));
+        }
+
         let text = message
             .and_then(|m| m.get("content"))
             .and_then(Value::as_str);
         let text = match text {
             Some(t) if !t.is_empty() => t,
-            _ => return Err(anyhow!("openai-compat: response has no message.content")),
+            _ => {
+                return Err(match finish_reason {
+                    Some(r) => anyhow!(
+                        "openai-compat: response has no message.content (finish_reason: {})",
+                        super::safe_reason(r)
+                    ),
+                    None => anyhow!("openai-compat: response has no message.content"),
+                })
+            }
         };
 
         let stop = match finish_reason {
@@ -229,7 +243,22 @@ impl OpenAiCompat {
             _ => StopReason::Other,
         };
 
-        let usage = match (
+        let usage = Self::usage_of(&value);
+
+        Ok(Completion {
+            text: text.to_string(),
+            usage,
+            stop,
+        })
+    }
+
+    /// The usage counts of a body, whether or not it holds an answer (#730).
+    pub(crate) fn parse_usage(body: &str) -> Option<Usage> {
+        Self::usage_of(&serde_json::from_str::<Value>(body).ok()?)
+    }
+
+    fn usage_of(value: &Value) -> Option<Usage> {
+        match (
             value
                 .get("usage")
                 .and_then(|u| u.get("prompt_tokens"))
@@ -245,13 +274,7 @@ impl OpenAiCompat {
                 ..Default::default()
             }),
             _ => None,
-        };
-
-        Ok(Completion {
-            text: text.to_string(),
-            usage,
-            stop,
-        })
+        }
     }
 }
 
@@ -349,6 +372,7 @@ impl Provider for OpenAiCompat {
             &self.model,
             crate::usage::is_loopback_url(&self.base_url),
             Self::parse_completion(&body_text),
+            || Self::parse_usage(&body_text),
         )
     }
 }
@@ -512,6 +536,25 @@ mod tests {
         assert_eq!(schema["required"], json!(["detail", "headline"]));
         // No textual schema instruction appended -- the server enforces it.
         assert_eq!(body["messages"][0]["content"], "system prompt text");
+    }
+
+    /// #719: in every structured mode, the schema text that goes out (as a
+    /// `response_format` or inside the prompt) has no `editable` keyword.
+    #[test]
+    fn no_registered_schema_sends_the_editable_keyword_in_any_mode() {
+        for structured in [
+            Structured::JsonSchema,
+            Structured::JsonObject,
+            Structured::Prompt,
+        ] {
+            let p = provider(CompatAuth::Bearer, structured);
+            for kind in crate::actions::schema::PROPOSAL_KINDS {
+                let mut r = req("sys", false);
+                r.schema = crate::actions::schema::schema_for(kind, false);
+                let body = serde_json::to_string(&p.build_body(&r)).unwrap();
+                assert!(!body.contains("editable"), "{kind}: {body}");
+            }
+        }
     }
 
     #[test]
@@ -795,6 +838,30 @@ mod tests {
         let usage = completion.usage.expect("usage should be present");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
+    }
+
+    /// #731: a content filter is a decline, and an unknown reason is named.
+    #[test]
+    fn parse_completion_names_content_filter_and_unknown_finish_reasons() {
+        let filtered = r#"{"choices": [{"finish_reason": "content_filter", "message": {"role": "assistant", "content": null}}]}"#;
+        let msg = OpenAiCompat::parse_completion(filtered)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("declined"), "{msg}");
+        assert!(msg.contains("content_filter"), "{msg}");
+        let odd =
+            r#"{"choices": [{"finish_reason": "tool_calls", "message": {"role": "assistant"}}]}"#;
+        let msg = OpenAiCompat::parse_completion(odd).unwrap_err().to_string();
+        assert!(msg.contains("tool_calls"), "{msg}");
+    }
+
+    /// #730: usage is readable from a truncated body that is an error.
+    #[test]
+    fn parse_usage_reads_a_length_body_that_is_an_error() {
+        let body = r#"{"choices": [{"finish_reason": "length", "message": {"content": ""}}], "usage": {"prompt_tokens": 70, "completion_tokens": 200}}"#;
+        assert!(OpenAiCompat::parse_completion(body).is_err());
+        let u = OpenAiCompat::parse_usage(body).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (70, 200));
     }
 
     #[test]

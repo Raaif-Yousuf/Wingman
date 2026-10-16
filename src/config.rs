@@ -149,6 +149,12 @@ pub struct Config {
     /// without config.toml ever carrying it forward.
     #[serde(skip)]
     pub unreadable_secrets: Vec<String>,
+    /// #711: set when config.toml existed but could not be read or parsed.
+    /// The values here are then defaults, not the user's, so [`Config::save_to`]
+    /// refuses to write them over the file until a reload parses it. Holds
+    /// the file name and the line and column only, never file contents.
+    #[serde(skip)]
+    pub load_problem: Option<String>,
     /// Issue #19: `Cloud | Local | Auto | Offline`. Defaults to `Auto` per
     /// the expansion plan's Modes table. `App::run` publishes this to
     /// `mode::set_current` at startup, and `App::set_mode` keeps the
@@ -751,6 +757,130 @@ thread_local! {
     static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// #711: the modified time of each config file as this process last read or
+/// wrote it. A save compares it with the file now; a difference means someone
+/// edited the file since, and the save is refused rather than overwriting the
+/// edit. Keyed by path so tests on scratch paths never share an entry.
+static SEEN_MTIMES: std::sync::Mutex<Vec<(PathBuf, std::time::SystemTime)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn seen_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    let seen = SEEN_MTIMES.lock().unwrap_or_else(|e| e.into_inner());
+    seen.iter().find(|(p, _)| p == path).map(|(_, t)| *t)
+}
+
+fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
+    let Some(mtime) = mtime else { return };
+    let mut seen = SEEN_MTIMES.lock().unwrap_or_else(|e| e.into_inner());
+    match seen.iter_mut().find(|(p, _)| p == path) {
+        Some(entry) => entry.1 = mtime,
+        None => seen.push((path.to_path_buf(), mtime)),
+    }
+}
+
+/// #711: paths already backed up since their last load, so one load that
+/// rewrites the file twice (repair, then key import) keeps the first, original
+/// copy rather than an intermediate one.
+static BACKED_UP: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// A backup that could not be made, for the next card. See [`take_backup_warning`].
+static BACKUP_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// True the first time it is called for `path` since [`forget_backed_up`].
+fn mark_backed_up(path: &Path) -> bool {
+    let mut done = lock_ignoring_poison(&BACKED_UP);
+    if done.iter().any(|p| p == path) {
+        return false;
+    }
+    done.push(path.to_path_buf());
+    true
+}
+
+fn forget_backed_up(path: &Path) {
+    lock_ignoring_poison(&BACKED_UP).retain(|p| p != path);
+}
+
+/// Takes the pending "could not keep a backup" warning, if any. `app.rs` adds
+/// it to the next card.
+pub fn take_backup_warning() -> Option<String> {
+    lock_ignoring_poison(&BACKUP_WARNING).take()
+}
+
+/// `text` with every `api_key` value emptied, comments and layout kept. Both
+/// the usual `api_key = "..."` line and any other place a parsed key value
+/// appears quoted are blanked, so a backup never holds a key.
+fn blank_api_keys(text: &str) -> String {
+    fn collect(v: &toml::Value, out: &mut Vec<String>) {
+        match v {
+            toml::Value::Table(t) => {
+                for (k, v) in t {
+                    match v {
+                        toml::Value::String(s) if k == "api_key" && !s.is_empty() => {
+                            out.push(s.clone())
+                        }
+                        _ => collect(v, out),
+                    }
+                }
+            }
+            toml::Value::Array(a) => a.iter().for_each(|v| collect(v, out)),
+            _ => {}
+        }
+    }
+    let mut keys = Vec::new();
+    if let Ok(v) = text.parse::<toml::Value>() {
+        collect(&v, &mut keys);
+    }
+    let mut out: String = text
+        .split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_start();
+            let rest = body.strip_prefix("api_key").map(str::trim_start);
+            if rest.is_some_and(|r| r.starts_with('=')) {
+                let indent = &line[..line.len() - body.len()];
+                let eol = &line[line.trim_end_matches(['\r', '\n']).len()..];
+                format!("{indent}api_key = \"\"{eol}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    for k in keys {
+        out = out.replace(&format!("\"{k}\""), "\"\"");
+        out = out.replace(&format!("'{k}'"), "''");
+    }
+    out
+}
+
+/// Writes `<path>.bak` (temp, restrict, rename) from the current file with
+/// its API keys blanked.
+fn backup_without_keys(path: &Path) -> Result<()> {
+    let text = fs::read_to_string(path).context("could not read the old config")?;
+    let mut bak_name = path.as_os_str().to_os_string();
+    bak_name.push(".bak");
+    let bak = PathBuf::from(bak_name);
+    let mut tmp_name = bak.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    let made = fs::write(&tmp, blank_api_keys(&text))
+        .context("could not write the backup")
+        .and_then(|_| {
+            #[cfg(windows)]
+            Config::restrict_acl(&tmp)?;
+            fs::rename(&tmp, &bak).context("could not move the backup into place")
+        });
+    if made.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    made
+}
+
 impl Config {
     /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {
@@ -872,14 +1002,32 @@ impl Config {
     /// create-from-defaults. Never touches env vars or the secret store.
     fn load_from_file(path: &Path) -> Result<Config> {
         if path.exists() {
-            let contents = fs::read_to_string(path).unwrap_or_default();
-            let (cfg, repaired) = Self::parse_reporting_repair(&contents);
-            if repaired {
-                // Best effort: the in-memory value is already correct, so a
-                // failed write here is not worth failing the load over.
-                let _ = cfg.save_to(path);
+            // Taken before the read, so an edit that lands in between reads as
+            // "changed since load" at save time, not as ours.
+            let mtime = file_mtime(path);
+            let contents = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => {
+                    return Ok(Self::not_loaded(
+                        "config.toml could not be read".to_string(),
+                    ));
+                }
+            };
+            match Self::parse_reporting_repair(&contents) {
+                Ok((cfg, repaired)) => {
+                    note_mtime(path, mtime);
+                    // A fresh load: the next save takes a fresh backup.
+                    forget_backed_up(path);
+                    if repaired {
+                        // Best effort: the in-memory value is already correct, so a
+                        // failed write here is not worth failing the load over.
+                        let _ = cfg.save_to(path);
+                    }
+                    Ok(cfg)
+                }
+                // #711: keep the file exactly as it is.
+                Err(e) => Ok(Self::not_loaded(Self::describe_parse_error(&contents, &e))),
             }
-            Ok(cfg)
         } else {
             let defaults = Config::default();
             defaults.save_to(path)?;
@@ -1103,10 +1251,40 @@ impl Config {
     /// Like [`Config::parse_or_default`], but also reports whether the parse
     /// had to repair anything -- the caller writes the file back so the
     /// on-disk copy stops disagreeing with what is actually being sent.
-    fn parse_reporting_repair(toml_str: &str) -> (Config, bool) {
-        let mut cfg: Config = toml::from_str(toml_str).unwrap_or_default();
+    fn parse_reporting_repair(toml_str: &str) -> Result<(Config, bool), toml::de::Error> {
+        let mut cfg: Config = toml::from_str(toml_str)?;
         let repaired = cfg.backfill();
-        (cfg, repaired)
+        Ok((cfg, repaired))
+    }
+
+    /// "config.toml has an error at line L, column C", from the parse error's
+    /// byte span. Never includes any file text: a value could be an API key.
+    fn describe_parse_error(contents: &str, err: &toml::de::Error) -> String {
+        let Some(span) = err.span() else {
+            return "config.toml could not be parsed".to_string();
+        };
+        let before = &contents.as_bytes()[..span.start.min(contents.len())];
+        let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+        let line_start = before
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        let column = String::from_utf8_lossy(&before[line_start..])
+            .chars()
+            .count()
+            + 1;
+        format!("config.toml has an error at line {line}, column {column}")
+    }
+
+    /// Defaults, marked "not loaded" so nothing saves them over the file.
+    fn not_loaded(problem: String) -> Config {
+        let mut cfg = Config::default();
+        cfg.backfill();
+        // Fail safe: the file may have said Offline or set a budget, and
+        // defaults would be looser. Nothing leaves the machine until it parses.
+        cfg.mode = Mode::Offline;
+        cfg.load_problem = Some(problem);
+        cfg
     }
 
     /// Fills in values a config written by an older build has no key for.
@@ -1268,9 +1446,33 @@ impl Config {
     /// [`Config::load_from`] does (rule 9).
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
+        // #711: checked before the secret store is touched, so a refused save
+        // writes nothing anywhere.
+        self.check_save_allowed(&path)?;
         let mut on_disk = self.clone();
         on_disk.push_secrets_to_store(&CredManagerStore, &|name| std::env::var(name).is_ok())?;
         on_disk.save_to(&path)
+    }
+
+    /// #711: refuses a save that would clobber the user's file.
+    fn check_save_allowed(&self, path: &Path) -> Result<()> {
+        // Defaults standing in for an unreadable file must never replace it.
+        if let Some(problem) = &self.load_problem {
+            anyhow::bail!(
+                "{problem}, so Wingman did not save over it. Fix the file, then choose \
+                 Reload settings from the tray menu"
+            );
+        }
+        // A hand edit made after this config was read is not clobbered.
+        if let (Some(seen), Some(now)) = (seen_mtime(path), file_mtime(path)) {
+            if seen != now {
+                anyhow::bail!(
+                    "config.toml changed on disk since Wingman read it, so it was not saved. \
+                     Choose Reload settings from the tray menu, then try again"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Same as [`Config::save`] but against an arbitrary path, and without
@@ -1278,6 +1480,7 @@ impl Config {
     /// `self` is what gets written. Writes atomically (temp file + rename)
     /// so a reader never observes a half-written file.
     pub fn save_to(&self, path: &Path) -> Result<()> {
+        self.check_save_allowed(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context("failed to create config directory")?;
         }
@@ -1305,7 +1508,20 @@ impl Config {
             );
         }
 
+        // #711: one generation of backup, taken on the first save after each
+        // load (so the hand-edited original survives the load's own repair or
+        // key-import rewrites). It never holds an API key. A backup that cannot
+        // be made only warns: the atomic write below still goes ahead.
+        if path.exists() && mark_backed_up(path) {
+            if let Err(e) = backup_without_keys(path) {
+                *lock_ignoring_poison(&BACKUP_WARNING) = Some(format!(
+                    "Wingman could not keep a backup copy of config.toml ({e:#}). Your settings were saved."
+                ));
+            }
+        }
+
         fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
+        note_mtime(path, file_mtime(path));
 
         Ok(())
     }
@@ -1330,26 +1546,19 @@ impl Config {
             return Ok(());
         }
 
-        let username = std::env::var("USERNAME")
-            .ok()
-            .filter(|u| !u.is_empty())
-            .context(
-                "the USERNAME environment variable is not set; cannot restrict \
-                 the config file to the current user",
-            )?;
-        // CREATE_NO_WINDOW (0x0800_0000): Wingman is a windows-subsystem GUI
-        // app with no console of its own, so spawning `icacls` without this
-        // flag allocates and briefly flashes a new console window on every
-        // call -- every `save()`/`save_to()`, i.e. potentially on every
-        // settings change, not just once at startup.
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let output = std::process::Command::new("icacls")
+        // #736: the grant names the current user by SID (the USERNAME
+        // variable is inherited and not a SID), and `icacls` is the one in
+        // the system folder. `icacls_command` also sets CREATE_NO_WINDOW:
+        // Wingman has no console, so without it every `save()` would flash
+        // one.
+        let account = crate::owner_acl::grant_account()
+            .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?;
+        let output = crate::owner_acl::icacls_command()
+            .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
-            .arg(format!("{username}:F"))
-            .creation_flags(CREATE_NO_WINDOW)
+            .arg(format!("{account}:F"))
             .output()
             .context("failed to run icacls to restrict the config file's permissions")?;
         if !output.status.success() {
@@ -1955,7 +2164,237 @@ win = true
         fs::write(&path, "this is not { valid toml at all [[[").unwrap();
 
         let config = Config::load_from_with(&path, &|_| None).expect("load should still succeed");
-        assert_eq!(config, Config::default());
+        // #711: the in-memory values are defaults, but the config is marked
+        // "not loaded" so nothing saves it over the user's file.
+        assert!(config.load_problem.is_some());
+        assert_eq!(
+            Config {
+                load_problem: None,
+                mode: Mode::default(),
+                ..config
+            },
+            Config::default()
+        );
+
+        cleanup(&path);
+    }
+
+    // -- #711: a config.toml that does not parse is never overwritten -----
+
+    fn set_mtime(path: &Path, secs_from_epoch: u64) {
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_from_epoch))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_file_that_did_not_parse_runs_offline() {
+        let path = scratch_path("711-offline");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "mode = \"offline\"\n[budget\n").unwrap();
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        assert_eq!(config.mode, Mode::Offline);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_backup_never_holds_an_api_key_but_keeps_comments() {
+        let path = scratch_path("711-bak-no-key");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# my note\n[providers.openai]\napi_key = \"x\"\n[providers.anthropic]\n  api_key='y'\n";
+        fs::write(&path, original).unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        config.save_to(&path).unwrap();
+
+        let mut bak = path.as_os_str().to_os_string();
+        bak.push(".bak");
+        let bak_text = fs::read_to_string(PathBuf::from(bak)).unwrap();
+        assert!(bak_text.contains("# my note"), "{bak_text}");
+        assert!(
+            !bak_text.contains("\"x\"") && !bak_text.contains("'y'"),
+            "{bak_text}"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn one_load_that_rewrites_twice_keeps_the_original_as_the_backup() {
+        let path = scratch_path("711-bak-first-only");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# hand written\nmode = \"cloud\"\n";
+        fs::write(&path, original).unwrap();
+
+        // The load repairs (first save), then a second save follows.
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        config.save_to(&path).unwrap();
+        config.save_to(&path).unwrap();
+
+        let mut bak = path.as_os_str().to_os_string();
+        bak.push(".bak");
+        assert_eq!(fs::read_to_string(PathBuf::from(bak)).unwrap(), original);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_refused_save_writes_nothing_before_the_gate() {
+        // Config::save checks the gate before the secret store; the check is
+        // shared, so prove it refuses with no path touched.
+        let path = scratch_path("711-gate-first");
+        let config = Config {
+            load_problem: Some("config.toml has an error at line 1, column 1".into()),
+            ..Config::default()
+        };
+        assert!(config.check_save_allowed(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_made_does_not_block_the_save() {
+        let path = scratch_path("711-bak-fails");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "mode = \"cloud\"\n").unwrap();
+        // A directory where the .bak file goes makes the rename fail.
+        let mut bak = path.as_os_str().to_os_string();
+        bak.push(".bak");
+        fs::create_dir_all(PathBuf::from(&bak)).unwrap();
+
+        let config = Config {
+            mode: Mode::Local,
+            ..Config::default()
+        };
+        let _ = take_backup_warning();
+        config.save_to(&path).expect("the save still goes ahead");
+        assert!(fs::read_to_string(&path).unwrap().contains("local"));
+        assert!(take_backup_warning().is_some());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_bad_file_names_its_line_and_column_and_nothing_else() {
+        let path = scratch_path("711-location");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "mode = \"auto\"\napi_key = \"sk-SECRET-VALUE\" oops\n",
+        )
+        .unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        let problem = config.load_problem.expect("a bad file must be reported");
+        assert!(problem.contains("line 2"), "got: {problem}");
+        assert!(problem.contains("column"), "got: {problem}");
+        assert!(!problem.contains("sk-SECRET-VALUE"), "got: {problem}");
+        assert!(problem.contains("config.toml"), "got: {problem}");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn loading_a_bad_file_leaves_its_bytes_alone() {
+        let path = scratch_path("711-load-keeps-bytes");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bad = "[hotkeys\nprimary = nope\n";
+        fs::write(&path, bad).unwrap();
+
+        let _ = Config::load_from_with(&path, &|_| None).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), bad);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_to_refuses_while_the_file_has_not_been_read() {
+        let path = scratch_path("711-save-refused");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bad = "[hotkeys\nprimary = nope\n";
+        fs::write(&path, bad).unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        let err = config.save_to(&path).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("Reload"), "got: {err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), bad);
+
+        // Once the file parses, a reload clears the mark and saving works.
+        fs::write(&path, "mode = \"cloud\"\n").unwrap();
+        let fixed = Config::load_from_with(&path, &|_| None).unwrap();
+        assert!(fixed.load_problem.is_none());
+        fixed.save_to(&path).expect("save after a fix");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_also_not_saved_over() {
+        // Invalid UTF-8 makes read_to_string fail, which used to load as defaults.
+        let path = scratch_path("711-not-utf8");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        assert!(config.load_problem.is_some());
+        assert!(config.save_to(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0xfe, 0x00, 0x80]);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_to_keeps_a_backup_of_the_previous_file() {
+        let path = scratch_path("711-backup");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "mode = \"cloud\"\n# my note\n").unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        config.save_to(&path).unwrap();
+
+        let mut bak = path.as_os_str().to_os_string();
+        bak.push(".bak");
+        assert_eq!(
+            fs::read_to_string(PathBuf::from(bak)).unwrap(),
+            "mode = \"cloud\"\n# my note\n"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_to_refuses_when_the_file_changed_on_disk_since_it_was_read() {
+        let path = scratch_path("711-stale");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "mode = \"cloud\"\n").unwrap();
+        set_mtime(&path, 1_700_000_000);
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        // A hand edit after Wingman started.
+        fs::write(&path, "mode = \"local\"\n").unwrap();
+        set_mtime(&path, 1_700_000_100);
+
+        let err = config.save_to(&path).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("changed"), "got: {err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "mode = \"local\"\n");
+
+        // Reloading picks the edit up and saves work again.
+        let fresh = Config::load_from_with(&path, &|_| None).unwrap();
+        fresh.save_to(&path).expect("save after reload");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn two_saves_in_a_row_are_not_mistaken_for_an_outside_edit() {
+        let path = scratch_path("711-own-writes");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "mode = \"cloud\"\n").unwrap();
+
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        config.save_to(&path).unwrap();
+        config
+            .save_to(&path)
+            .expect("our own write is not a conflict");
 
         cleanup(&path);
     }
@@ -3005,7 +3444,7 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
             "[ui]\nprompt = {}\n",
             toml::Value::String(DEFAULT_PROMPT.to_string())
         );
-        let (_, repaired) = Config::parse_reporting_repair(&doc);
+        let (_, repaired) = Config::parse_reporting_repair(&doc).unwrap();
         assert!(
             !repaired,
             "loading the current shipped default must not be reported as a repair"

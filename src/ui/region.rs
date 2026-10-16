@@ -651,9 +651,14 @@ impl Overlay {
 
     /// The UI gallery's seam (#580): a small overlay over a synthetic
     /// backdrop with a selection already staged, drawn in `theme` whatever
-    /// the system is set to. High contrast uses Windows' black palette.
+    /// the system is set to. High contrast uses Windows' black palette. The
+    /// hint pill is laid out at `dpi` (the gallery's `--dpi`; 96 for none).
     #[cfg(debug_assertions)]
-    pub(crate) fn open_for_gallery(instance: HINSTANCE, theme: Theme) -> anyhow::Result<Self> {
+    pub(crate) fn open_for_gallery(
+        instance: HINSTANCE,
+        theme: Theme,
+        dpi: u32,
+    ) -> anyhow::Result<Self> {
         let desktop = Rect {
             left: 80,
             top: 80,
@@ -685,7 +690,7 @@ impl Overlay {
         // The hint goes at the top of this small window, not of whatever
         // monitor the cursor is on.
         overlay.inner.hint_monitor = overlay.inner.local_bounds();
-        overlay.inner.hint_dpi = 96;
+        overlay.inner.hint_dpi = dpi.max(1);
         overlay.inner.theme = theme;
         overlay.inner.sys = crate::ui::theme::HC_BLACK;
         overlay.inner.theme_forced = true;
@@ -2685,6 +2690,91 @@ mod tests {
         }
     }
 
+    /// A sentinel the real system colours can never equal, so "re-read" is
+    /// visible in the field.
+    fn stale_sys_colors() -> SysColors {
+        SysColors {
+            window: 1,
+            window_text: 2,
+            gray_text: 3,
+            hotlight: 6,
+            highlight: 4,
+            highlight_text: 5,
+        }
+    }
+
+    fn opposite_theme(theme: Theme) -> Theme {
+        match theme {
+            Theme::Light => Theme::Dark,
+            Theme::Dark | Theme::HighContrast => Theme::Light,
+        }
+    }
+
+    #[test]
+    fn theme_messages_sent_to_a_live_overlay_make_it_re_read_the_theme() {
+        // Through the window procedure of a live window of the test class
+        // (#658): an overlay whose class never routed the message, or whose
+        // arm did nothing, would keep the stale values.
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+        let desktop = Rect {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 150,
+        };
+        let name = wide_z("ImmersiveColorSet");
+        for msg in [WM_SETTINGCHANGE, WM_THEMECHANGED, WM_SYSCOLORCHANGE] {
+            let mut overlay =
+                Overlay::open_for_test(test_instance(), desktop).expect("Overlay::open_for_test");
+            let detected = crate::ui::theme::detect_theme();
+            overlay.inner.theme = opposite_theme(detected);
+            overlay.inner.sys = stale_sys_colors();
+            let hwnd = overlay.hwnd();
+            let lparam = if msg == WM_SETTINGCHANGE {
+                LPARAM(name.as_ptr() as isize)
+            } else {
+                LPARAM(0)
+            };
+
+            unsafe {
+                SendMessageW(hwnd, msg, Some(WPARAM(0)), Some(lparam));
+            }
+
+            assert_eq!(overlay.inner.theme, detected, "message {msg:#x}");
+            assert_eq!(overlay.inner.sys, SysColors::read(), "message {msg:#x}");
+        }
+    }
+
+    #[test]
+    fn an_unrelated_setting_change_sent_to_a_live_overlay_leaves_the_theme_alone() {
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+        let desktop = Rect {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 150,
+        };
+        let mut overlay =
+            Overlay::open_for_test(test_instance(), desktop).expect("Overlay::open_for_test");
+        let forced = opposite_theme(crate::ui::theme::detect_theme());
+        overlay.inner.theme = forced;
+        overlay.inner.sys = stale_sys_colors();
+        let name = wide_z("intl");
+
+        unsafe {
+            SendMessageW(
+                overlay.hwnd(),
+                WM_SETTINGCHANGE,
+                Some(WPARAM(0)),
+                Some(LPARAM(name.as_ptr() as isize)),
+            );
+        }
+
+        assert_eq!(overlay.inner.theme, forced);
+        assert_eq!(overlay.inner.sys, stale_sys_colors());
+    }
     #[test]
     fn a_theme_message_is_dispatched_to_the_overlay() {
         let src = include_str!("region.rs").replace('\r', "");

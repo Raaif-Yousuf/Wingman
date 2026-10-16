@@ -121,9 +121,9 @@ pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
 
 /// #242: posted by `App::run_generic_action`'s worker thread when the
 /// provider chain finishes for a non-built-in `actions.toml` action:
-/// `lparam` is `Box::into_raw(Box::new((String, Result<Value, String>)))`,
+/// `lparam` is `Box::into_raw(Box::new((Action, Value, GenericResult)))`,
 /// the generic-dispatch analogue of [`WM_APP_CALENDAR_RESULT`] -- the
-/// `String` is the action id, carried along because (unlike the calendar
+/// `Action` is carried along because (unlike the calendar
 /// flow) there is no single fixed action this result can belong to.
 /// `WM_APP + 16`: `+15` is already `crate::ui::card::WM_APP_CARD_OPEN_SETTINGS`.
 pub const WM_APP_GENERIC_ACTION_RESULT: u32 = WM_APP + 16;
@@ -150,6 +150,29 @@ pub const WM_APP_PENDING_STAGE: u32 = WM_APP + 19;
 /// on the message loop (which is also the keyboard hook's thread).
 /// `WM_APP + 20`: `+19` is `WM_APP_PENDING_STAGE`.
 pub const WM_APP_FIRST_RUN: u32 = WM_APP + 20;
+
+/// #712: posted by the worker that ran a confirmed action's executor (UIA
+/// walk and write, typed input, clipboard, calendar file). `lparam` is
+/// `Box::into_raw(Box::new(Result<ExecDone, String>))`; the handler takes
+/// ownership and shows the result card. The executors can take seconds, so
+/// they never run on the message loop, which is also the keyboard hook's
+/// thread. `WM_APP + 22`: `+21` is `WM_APP_MACHINE_CHECK_RESULT`.
+pub const WM_APP_EXECUTOR_DONE: u32 = WM_APP + 22;
+
+/// #328: posted by the "Check this PC for local models" worker thread when
+/// its reads finish. `lparam` is
+/// `Box::into_raw(Box::new(machine::MachineFacts))`; the receiver takes
+/// ownership. The reads (including a loopback `/api/ps` call) run off the
+/// message thread because that thread also hosts the low-level keyboard
+/// hook, which Windows drops if it stalls. `WM_APP + 21`: `+20` is
+/// `WM_APP_FIRST_RUN`.
+pub const WM_APP_MACHINE_CHECK_RESULT: u32 = WM_APP + 21;
+
+/// Set while a machine check is gathering, so a second click does not start
+/// a second worker. Cleared by the worker just before it posts, so an
+/// ignored (Settings open) or dropped result can never leave it stuck.
+static MACHINE_CHECK_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// #567: what Ollama reported for one base URL, as (name, supports vision).
 type PulledOllamaModels = (String, Vec<(String, bool)>);
@@ -363,6 +386,9 @@ struct App {
     /// a second "Restore" click after a successful restore reports "nothing
     /// to restore" rather than attempting a stale undo twice.
     last_form_undo: Option<executors::Undo>,
+    /// #712: an executor worker is writing into another window. Quit waits
+    /// for it, so a write is never killed half way.
+    exec_in_flight: bool,
     /// Review of #349/#426: the full (redacted) chain behind the most
     /// recent error card, so "use Copy diagnostics for details" points at
     /// something real instead of nothing -- `human_error_detail` on its own
@@ -396,6 +422,9 @@ fn error_details_clipboard_text(last_error: &LastError) -> &str {
 }
 
 pub fn run() -> Result<()> {
+    // #700: the thread that runs this hosts the keyboard hook, and a `--settings`
+    // launch runs the Settings loop before `pump_messages`, so mark it first.
+    crate::ui_thread::mark_current_thread();
     // Before any window exists, so the card's metrics are right on a mixed-DPI
     // setup (a laptop panel next to an external monitor).
     unsafe {
@@ -509,6 +538,7 @@ pub fn run() -> Result<()> {
     if let Some((headline, detail)) = startup_card(
         &config.unreadable_secrets,
         crate::single_instance::lock_squatted(),
+        config.load_problem.as_deref(),
     ) {
         card.show_error(&headline, &detail);
     }
@@ -543,6 +573,7 @@ pub fn run() -> Result<()> {
         first_run_probe: 0,
         fallback_footer: None,
         last_form_undo: None,
+        exec_in_flight: false,
         last_error: None,
     });
     app.refresh_tray_labels();
@@ -649,20 +680,46 @@ fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
 /// unreadable keys, #237 lockless start) end in a card, and one must never
 /// overwrite the other, so when both apply their text is joined. Pure so the
 /// wording is unit-tested without a `Card`. No em dash (rule 11).
-fn startup_card(unreadable: &[String], lock_squatted: bool) -> Option<(String, String)> {
+fn startup_card(
+    unreadable: &[String],
+    lock_squatted: bool,
+    config_problem: Option<&str>,
+) -> Option<(String, String)> {
     let squat = (
         "Another program holds Wingman's startup lock".to_string(),
         "Wingman started anyway. If you see two Wingman tray icons, quit one of them.".to_string(),
     );
-    match (unreadable.is_empty(), lock_squatted) {
-        (true, false) => None,
-        (false, false) => Some(unreadable_secrets_card(unreadable)),
-        (true, true) => Some(squat),
-        (false, true) => {
-            let (headline, detail) = unreadable_secrets_card(unreadable);
-            Some((headline, format!("{detail}\n\n{}. {}", squat.0, squat.1)))
-        }
+    // Every problem that applies, in order; the first one's headline leads
+    // and the rest are joined, so none is dropped.
+    let mut cards = Vec::new();
+    if let Some(problem) = config_problem {
+        cards.push(config_problem_card(problem));
     }
+    if !unreadable.is_empty() {
+        cards.push(unreadable_secrets_card(unreadable));
+    }
+    if lock_squatted {
+        cards.push(squat);
+    }
+    let mut cards = cards.into_iter();
+    let (headline, mut detail) = cards.next()?;
+    for (h, d) in cards {
+        detail = format!("{detail}\n\n{h}. {d}");
+    }
+    Some((headline, detail))
+}
+
+/// #711: config.toml exists but did not parse. Names the line and column
+/// (`problem` already carries them), never file text. No em dash (rule 11).
+fn config_problem_card(problem: &str) -> (String, String) {
+    (
+        "Settings file not read".to_string(),
+        format!(
+            "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
+             computer) and will not save over your file. Fix it, then choose Reload settings \
+             from the tray menu."
+        ),
+    )
 }
 
 fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
@@ -705,6 +762,8 @@ fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
 }
 
 fn pump_messages() {
+    // #700: this thread hosts the keyboard hook, so no blocking network call may run here.
+    crate::ui_thread::mark_current_thread();
     let mut msg = MSG::default();
     // GetMessageW returns -1 on error; treat anything non-positive as "stop".
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -808,6 +867,10 @@ fn first_run_detail(found: &FirstRun) -> Option<String> {
             "Ollama is running, but none of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
                 .to_string(),
         ),
+        FirstRun::VisionUnknown => Some(
+            "Ollama is running, but Wingman could not tell which of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
+                .to_string(),
+        ),
         FirstRun::NotRunning | FirstRun::Found { .. } => None,
     }
 }
@@ -894,7 +957,10 @@ impl App {
         let base_url = self.config.providers.ollama.base_url.clone();
         let preferred = self.config.providers.ollama.model.clone();
         std::thread::spawn(move || {
-            let found = ollama_admin::probe_first_run(&base_url, &preferred);
+            // A panic must still post a result, or the Working card never
+            // goes away (dev builds; release aborts). Read as "not found".
+            let found = catch_worker(|| Ok(ollama_admin::probe_first_run(&base_url, &preferred)))
+                .unwrap_or(FirstRun::NotRunning);
             let payload = Box::into_raw(Box::new(found));
             unsafe {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1852,7 +1918,7 @@ impl App {
                     executor.as_ref(),
                     confirm::Proposal::new(proposal),
                 ) {
-                    Ok(confirmed) => self.run_calendar_executor(executor.as_ref(), confirmed),
+                    Ok(confirmed) => self.run_calendar_executor(executor, confirmed),
                     Err(e) => {
                         let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
                         self.card
@@ -2201,6 +2267,13 @@ impl App {
                 }
             }
         }
+        // #70: a receipt is one row under five fixed headers, whatever the
+        // model sent.
+        let proposal = if action.id == actions::receipt::ACTION_ID {
+            actions::receipt::clamp_receipt(&proposal)
+        } else {
+            proposal
+        };
         // #69: no table on screen, or a reply that is not a table, is an
         // answer, not an empty preview.
         let table_headline = if actions::table::is_unreadable(&action.proposal, &proposal) {
@@ -2223,6 +2296,14 @@ impl App {
                 (t.to_value(), Some(actions::table::CAPPED_NOTE.to_string()))
             }
             _ => (proposal, self.fallback_footer.clone()),
+        };
+        // #114: values read off a chart are estimates. The headers say so (and
+        // so does the CSV), and the card says so under the rows.
+        let (proposal, note) = if action.id == actions::chart_table::ACTION_ID {
+            let (marked, card_note) = actions::chart_table::finish(&proposal, note.as_deref());
+            (marked, Some(card_note))
+        } else {
+            (proposal, note)
         };
 
         if action.confirm {
@@ -2371,6 +2452,7 @@ impl App {
                     .show_pending(crate::ui::card::PendingStage::AskingModel { model_name });
             }
             Some(PendingPreview::Calendar) => self.run_confirmed_calendar_add(confirmed),
+            Some(PendingPreview::ImportAction(prepared)) => self.commit_import(&prepared),
             // Nothing is waiting on this decision, so nothing runs.
             None => {}
         }
@@ -2429,35 +2511,10 @@ impl App {
     ) {
         match actions::resolve_executor(action) {
             Ok(executor) => {
-                // #441: `execute` consumes `confirmed`, so keep the value the
-                // card text may need (a read-only `"none"` action's answer).
-                let proposal = confirmed.value().clone();
-                match executor.execute(confirmed) {
-                    Ok(undo) => {
-                        let text = actions::generic_answer::result_card_text(
-                            &action.name,
-                            executor.name(),
-                            &action.proposal,
-                            &undo.summary,
-                            &proposal,
-                        );
-                        let detail = with_pending_notices(&text.detail);
-
-                        let detail = with_fallback_footer(&detail, self.fallback_footer.as_deref());
-                        self.card
-                            .show_model_answer(&text.headline, &detail, 0, None);
-                    }
-                    Err(e) => {
-                        let detail = self.track_error(
-                            &format!("Couldn't run \"{}\"", action.name),
-                            &format!("{e:#}"),
-                        );
-                        self.card.show_error_with_details(
-                            &format!("Couldn't run \"{}\"", action.name),
-                            &detail,
-                        );
-                    }
-                }
+                let action = action.clone();
+                self.spawn_executor(Box::new(move || {
+                    exec_work_generic(executor, action, confirmed)
+                }));
             }
             Err(e) => {
                 let detail = self.track_error(
@@ -2466,11 +2523,10 @@ impl App {
                 );
                 self.card
                     .show_error_with_details(&format!("Couldn't run \"{}\"", action.name), &detail);
+                self.set_watch(true);
             }
         }
-        self.set_watch(true);
     }
-
     /// #68's half of [`App::on_preview_decided`]: writes the confirmed text
     /// over the selection through the action's `replace_text` executor (the
     /// same `do_review_confirmed` path "Review this email" uses, so the
@@ -2484,56 +2540,23 @@ impl App {
         plan: Option<Box<actions::generic_replace::ReplaceSelection>>,
         confirmed: confirm::Confirmed<Value>,
     ) {
-        use actions::generic_replace::ReplaceReport;
-        let title = format!("Couldn't run \"{}\"", action.name);
         let executors = actions::resolve_executor(action)
             .and_then(|replace| Ok((replace, executors::registry::resolve("clipboard")?)));
         match executors {
             Ok((replace, copy)) => {
-                match actions::generic_replace::replace_or_copy(
-                    replace.as_ref(),
-                    copy.as_ref(),
-                    plan.as_deref(),
-                    confirmed,
-                ) {
-                    ReplaceReport::Replaced(summary) => {
-                        self.card.show_answer(
-                            "Selection replaced",
-                            &with_pending_notices(&summary),
-                            0,
-                            None,
-                        );
-                    }
-                    ReplaceReport::Copied(detail) => {
-                        self.card.show_answer(
-                            "Copied to the clipboard",
-                            &with_pending_notices(&detail),
-                            0,
-                            None,
-                        );
-                    }
-                    ReplaceReport::NothingToReplace => {
-                        self.card.show_answer(
-                            "Nothing to replace",
-                            &with_pending_notices(""),
-                            0,
-                            None,
-                        );
-                    }
-                    ReplaceReport::Failed(reason) => {
-                        let detail = self.track_error(&title, &reason);
-                        self.card.show_error_with_details(&title, &detail);
-                    }
-                }
+                let action_name = action.name.clone();
+                self.spawn_executor(Box::new(move || {
+                    exec_work_replace(action_name, replace, copy, plan, confirmed)
+                }));
             }
             Err(e) => {
+                let title = format!("Couldn't run \"{}\"", action.name);
                 let detail = self.track_error(&title, &format!("{e:#}"));
                 self.card.show_error_with_details(&title, &detail);
+                self.set_watch(true);
             }
         }
-        self.set_watch(true);
     }
-
     /// #40's half of [`App::on_preview_decided`], split out so that handler
     /// is a flat match over [`PendingPreview`] with one arm per kind.
     fn run_confirmed_form_fill(&mut self, original: &Value, confirmed: confirm::Confirmed<Value>) {
@@ -2542,7 +2565,7 @@ impl App {
             let token = confirm::user_confirmed();
             let final_confirmed = confirm::confirm(confirm::Proposal::new(rebuilt), token);
             match executors::registry::resolve("fill_form") {
-                Ok(executor) => self.run_form_fill_executor(executor.as_ref(), final_confirmed),
+                Ok(executor) => self.run_form_fill_executor(executor, final_confirmed),
                 Err(e) => {
                     let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
                     self.card
@@ -2557,7 +2580,7 @@ impl App {
     /// means the calendar flow.
     fn run_confirmed_calendar_add(&mut self, confirmed: confirm::Confirmed<Value>) {
         match executors::registry::resolve("calendar_add") {
-            Ok(executor) => self.run_calendar_executor(executor.as_ref(), confirmed),
+            Ok(executor) => self.run_calendar_executor(executor, confirmed),
             Err(e) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
                 self.card
@@ -2593,24 +2616,13 @@ impl App {
     /// event was opened (see [`Self::calendar_headline`]).
     fn run_calendar_executor(
         &mut self,
-        executor: &dyn executors::Executor,
+        executor: Box<dyn executors::Executor>,
         confirmed: confirm::Confirmed<Value>,
     ) {
-        match executor.execute(confirmed) {
-            Ok(undo) => {
-                let headline = Self::calendar_headline(&undo.summary);
-                self.card
-                    .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
-            }
-            Err(e) => {
-                let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't add the event", &detail);
-            }
-        }
-        self.set_watch(true);
+        self.spawn_executor(Box::new(move || {
+            exec_work_calendar(executor.as_ref(), confirmed)
+        }));
     }
-
     /// #38: "Review this email", the second action to run the full
     /// Look/Propose/Confirm/Do loop -- the tray's third one-shot action,
     /// parallel to `ask()`/`add_event_from_screen()` (neither of which this
@@ -2779,32 +2791,16 @@ impl App {
     fn run_review_executor(&mut self, ctx: actions::review_email::ReviewContext) {
         match executors::registry::resolve("replace_text") {
             Ok(executor) => {
-                match actions::review_email::do_review_confirmed(executor.as_ref(), &ctx) {
-                    Ok(undo) => {
-                        self.card.show_answer(
-                            "Email updated",
-                            &with_pending_notices(&undo.summary),
-                            0,
-                            None,
-                        );
-                    }
-                    Err(e) => {
-                        let detail =
-                            self.track_error("Couldn't update the email", &format!("{e:#}"));
-                        self.card
-                            .show_error_with_details("Couldn't update the email", &detail);
-                    }
-                }
+                self.spawn_executor(Box::new(move || exec_work_review(executor.as_ref(), &ctx)));
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't update the email", &detail);
+                self.set_watch(true);
             }
         }
-        self.set_watch(true);
     }
-
     /// #40: "Fill this form", the tray's fourth one-shot Look/Propose/Confirm/Do
     /// action. Shares `add_event_from_screen`/`review_this_email`'s pause/
     /// busy/readiness/capture steps via `begin_action` (#214), with a
@@ -2882,7 +2878,7 @@ impl App {
 
     /// Handles the fill_form worker's result (#40). `value` carries one of
     /// three shapes: an empty-profile signal
-    /// (`{"empty_profile": true, "toml_path": ..., "bin_path": ...}` --
+    /// (`{"empty_profile": true, "toml_path": ..., "data_dir": ...}` --
     /// `form_fill_worker` returns this instead of ever building a UIA
     /// snapshot, per `actions::fill_form::load_or_import_profile`'s own
     /// "point at where to add profile data" decision), a proposal with no
@@ -2915,11 +2911,11 @@ impl App {
 
         if value.get("empty_profile").and_then(Value::as_bool) == Some(true) {
             let toml_path = value.get("toml_path").and_then(Value::as_str).unwrap_or("");
-            let bin_path = value.get("bin_path").and_then(Value::as_str).unwrap_or("");
+            let data_dir = value.get("data_dir").and_then(Value::as_str).unwrap_or("");
             self.card.show_answer(
                 actions::fill_form::EMPTY_PROFILE_HEADLINE,
                 &with_pending_notices(&actions::fill_form::empty_profile_detail(
-                    toml_path, bin_path,
+                    toml_path, data_dir,
                 )),
                 0,
                 None,
@@ -2997,26 +2993,188 @@ impl App {
     /// the `Undo` for "Restore last form" (tray, `restore_last_form`).
     fn run_form_fill_executor(
         &mut self,
-        executor: &dyn executors::Executor,
+        executor: Box<dyn executors::Executor>,
         confirmed: confirm::Confirmed<Value>,
     ) {
-        match executor.execute(confirmed) {
-            Ok(undo) => {
+        self.spawn_executor(Box::new(move || {
+            exec_work_form_fill(executor.as_ref(), confirmed)
+        }));
+    }
+
+    /// #712: runs `work` (an `exec_work_*` function: a UIA walk and write,
+    /// typed input, a clipboard or file write) on its own thread and shows
+    /// the working card meanwhile. These can take seconds, and the message
+    /// loop is also the keyboard hook's thread, so a slow one on it makes
+    /// every keystroke on the machine lag (or the hook time out). The
+    /// card's own foreground restore has already happened on the UI thread,
+    /// from the user's click, before this is called; the worker never
+    /// touches the foreground window. The outcome comes back as
+    /// `WM_APP_EXECUTOR_DONE` and ends in a card on every path.
+    fn spawn_executor(&mut self, work: Box<dyn FnOnce() -> ExecDone + Send + 'static>) {
+        debug_assert!(
+            !self.busy,
+            "an executor must not start over a running action"
+        );
+        self.exec_in_flight = true;
+        self.set_busy(true);
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        let target = self.hwnd_isize();
+        std::thread::spawn(move || {
+            let result: std::result::Result<ExecDone, String> = catch_worker(|| Ok(work()));
+            let payload = Box::into_raw(Box::new(result));
+            unsafe {
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_EXECUTOR_DONE,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_EXECUTOR_DONE, LPARAM(payload as isize));
+                }
+            }
+        });
+    }
+
+    /// #712: shows the card for a finished executor run, whichever action
+    /// it was. Each arm is what that action's own handler showed when it ran
+    /// the executor inline. On the form fill, stashes the `Undo` for
+    /// "Restore last form" (#645: only when something can be restored).
+    fn on_exec_done(&mut self, result: std::result::Result<ExecDone, String>) {
+        self.exec_in_flight = false;
+        self.set_busy(false);
+        let done = match result {
+            Ok(done) => done,
+            Err(packed) => {
+                let (human, chain) = unpack_error(&packed);
+                let headline = first_line(human, 88);
+                self.record_run_failure(&headline, human, chain);
+                self.card
+                    .show_error_with_details(&headline, &with_pending_notices(human));
+                self.set_watch(true);
+                return;
+            }
+        };
+        match done {
+            ExecDone::Calendar(Ok(undo)) => {
+                let headline = Self::calendar_headline(&undo.summary);
+                self.card
+                    .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
+            }
+            ExecDone::Calendar(Err(e)) => {
+                let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't add the event", &detail);
+            }
+            ExecDone::Review(Ok(undo)) => {
+                self.card.show_answer(
+                    "Email updated",
+                    &with_pending_notices(&undo.summary),
+                    0,
+                    None,
+                );
+            }
+            ExecDone::Review(Err(e)) => {
+                let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't update the email", &detail);
+            }
+            ExecDone::FormFill(Ok(undo)) => {
                 let headline = Self::form_fill_headline(&undo.summary);
                 self.card
                     .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
-                // #645: a fill with nothing restorable offers no Restore.
                 self.last_form_undo = undo.is_restorable().then_some(undo);
             }
-            Err(e) => {
+            ExecDone::FormFill(Err(e)) => {
                 let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't fill the form", &detail);
             }
+            ExecDone::Generic {
+                action,
+                executor_name,
+                proposal,
+                result: Ok(undo),
+            } => {
+                // #441: a read-only `"none"` action's answer comes from the
+                // proposal the card confirmed.
+                let text = actions::generic_answer::result_card_text(
+                    &action.name,
+                    &executor_name,
+                    &action.proposal,
+                    &undo.summary,
+                    &proposal,
+                );
+                let detail = with_pending_notices(&text.detail);
+                let detail = with_fallback_footer(&detail, self.fallback_footer.as_deref());
+                self.card
+                    .show_model_answer(&text.headline, &detail, 0, None);
+            }
+            ExecDone::Generic {
+                action,
+                result: Err(e),
+                ..
+            } => {
+                let title = format!("Couldn't run \"{}\"", action.name);
+                let detail = self.track_error(&title, &format!("{e:#}"));
+                self.card.show_error_with_details(&title, &detail);
+            }
+            ExecDone::Replace {
+                action_name,
+                report,
+            } => {
+                use actions::generic_replace::ReplaceReport;
+                match report {
+                    ReplaceReport::Replaced(summary) => {
+                        self.card.show_answer(
+                            "Selection replaced",
+                            &with_pending_notices(&summary),
+                            0,
+                            None,
+                        );
+                    }
+                    ReplaceReport::Copied(detail) => {
+                        self.card.show_answer(
+                            "Copied to the clipboard",
+                            &with_pending_notices(&detail),
+                            0,
+                            None,
+                        );
+                    }
+                    ReplaceReport::NothingToReplace => {
+                        self.card.show_answer(
+                            "Nothing to replace",
+                            &with_pending_notices(""),
+                            0,
+                            None,
+                        );
+                    }
+                    ReplaceReport::Failed(reason) => {
+                        let title = format!("Couldn't run \"{action_name}\"");
+                        let detail = self.track_error(&title, &reason);
+                        self.card.show_error_with_details(&title, &detail);
+                    }
+                }
+            }
+            ExecDone::RestoreForm(Ok(())) => {
+                self.card.show_answer(
+                    "Form restored",
+                    "The fields this filled have been put back.",
+                    5,
+                    None,
+                );
+            }
+            ExecDone::RestoreForm(Err(e)) => {
+                let detail = self.track_error("Couldn't fully restore the form", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't fully restore the form", &detail);
+            }
         }
         self.set_watch(true);
     }
-
     /// Tray "Restore last form" (#40's Undo requirement). Takes
     /// `self.last_form_undo` (an `Undo::undo` is `FnOnce`, consumed on use)
     /// so a second click after a successful restore reports "nothing to
@@ -3025,6 +3183,18 @@ impl App {
     /// nothing to restore is a plain informational card, never a dialog
     /// box (rule 7).
     fn restore_last_form(&mut self) {
+        // #712: the restore runs off the UI thread, so it needs the same
+        // "one thing at a time" as every other run. Keep the undo for later.
+        if self.busy {
+            self.card.show_answer(
+                "Still working",
+                "Try Restore last form again once the current action has finished.",
+                5,
+                None,
+            );
+            self.set_watch(true);
+            return;
+        }
         let Some(undo) = self.last_form_undo.take() else {
             self.card.show_answer(
                 "Nothing to restore",
@@ -3035,24 +3205,8 @@ impl App {
             self.set_watch(true);
             return;
         };
-        match undo.undo() {
-            Ok(()) => {
-                self.card.show_answer(
-                    "Form restored",
-                    "The fields this filled have been put back.",
-                    5,
-                    None,
-                );
-            }
-            Err(e) => {
-                let detail = self.track_error("Couldn't fully restore the form", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't fully restore the form", &detail);
-            }
-        }
-        self.set_watch(true);
+        self.spawn_executor(Box::new(move || exec_work_restore(undo)));
     }
-
     /// #228: takes the worker's attribution into [`App::fallback_footer`].
     /// Called first in every action result handler, so a run that never
     /// reached a model (or failed) cannot show the previous run's footer.
@@ -3285,6 +3439,46 @@ impl App {
         }
     }
 
+    /// Issue #328: "Check this PC for local models". Reads RAM, GPU, battery
+    /// and Ollama's GPU use once, on click, on a worker thread (the message
+    /// thread also hosts the keyboard hook and must never wait on a
+    /// socket), then `on_machine_check_result` shows the verdict. Nothing is
+    /// kept and nothing polls.
+    fn check_machine(&mut self) {
+        use std::sync::atomic::Ordering;
+        if MACHINE_CHECK_RUNNING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        let target = self.hwnd_isize();
+        let base_url = self.config.providers.ollama.base_url.clone();
+        std::thread::spawn(move || {
+            let facts = crate::machine::gather(&base_url);
+            MACHINE_CHECK_RUNNING.store(false, Ordering::SeqCst);
+            let payload = Box::into_raw(Box::new(facts));
+            unsafe {
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_MACHINE_CHECK_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_MACHINE_CHECK_RESULT, LPARAM(payload as isize));
+                }
+            }
+        });
+    }
+
+    fn on_machine_check_result(&mut self, facts: &crate::machine::MachineFacts) {
+        let verdict = crate::machine::verdict(facts);
+        self.card
+            .show_answer(&verdict.headline, &verdict.detail(), 20, None);
+    }
+
     /// Issue #115: "Calculate selection" tray item. Model-free: reads the
     /// current selection (UIA, falling back to a clipboard-safe Ctrl+C --
     /// see `inputs::selection`) and evaluates it locally via `calc`, with no
@@ -3441,6 +3635,13 @@ impl App {
 
     fn reload(&mut self) {
         match Config::load() {
+            // #711: a file that does not parse must not replace the settings
+            // already running; keep them and say what is wrong.
+            Ok(config) if config.load_problem.is_some() => {
+                let (headline, detail) =
+                    config_problem_card(config.load_problem.as_deref().unwrap_or_default());
+                self.card.show_error(&headline, &detail);
+            }
             Ok(config) => {
                 // #175: report before self.config is overwritten, since the
                 // freshly loaded config is the one whose hydrate ran.
@@ -3588,6 +3789,7 @@ impl App {
                 DeferredMessage::GenericActionResult(action, schema, result) => {
                     self.on_generic_action_result(action, schema, result)
                 }
+                DeferredMessage::ExecutorDone(result) => self.on_exec_done(result),
             }
         }
     }
@@ -4033,11 +4235,22 @@ impl App {
         }
     }
 
-    fn set_watch(&self, on: bool) {
+    fn set_watch(&mut self, on: bool) {
+        let failed = match &self.watcher {
+            Some(w) if on => !w.arm(),
+            _ => false,
+        };
+        // Never overwrite a real earlier error: the card being shown may be it.
+        if failed && self.last_error.is_none() {
+            // Issue #729: no click-away for this card. Record it for
+            // "Copy diagnostics" rather than failing the card itself.
+            self.record_last_error(
+                "Click-away dismissal unavailable",
+                "SetWindowsHookExW(WH_MOUSE_LL) failed",
+            );
+        }
         if let Some(w) = &self.watcher {
-            if on {
-                w.arm();
-            } else {
+            if !on {
                 w.disarm();
             }
         }
@@ -4069,6 +4282,139 @@ impl App {
 
     fn hwnd_isize(&self) -> isize {
         OWNER_HWND.with(|h| h.get())
+    }
+
+    /// #117: hands the tray the actions the user wrote, for "Export action".
+    /// Called as the menu opens; a missing or broken actions.toml shows none.
+    fn sync_export_menu(&mut self) {
+        let written = actions::load_actions()
+            .map(|a| actions::share::export_candidates(&a))
+            .unwrap_or_default();
+        self.tray.set_export_actions(&written);
+    }
+
+    /// #117: runs an OS file dialog without `&mut App` being reachable from it.
+    /// The dialog pumps this thread's messages, so `wnd_proc` can be entered
+    /// while it is open; `SETTINGS_OPEN` makes that entry defer or ignore
+    /// everything instead of forming a second `&mut App` (see its doc
+    /// comment). What was deferred is delivered afterwards, as
+    /// `open_settings` does. The closure must not touch `self`.
+    fn run_os_dialog<T>(&mut self, dialog: impl FnOnce() -> T) -> T {
+        // Like `open_settings`: no card timers or click watcher while the
+        // nested loop runs.
+        self.card.hide();
+        self.set_watch(false);
+        SETTINGS_OPEN.with(|c| c.set(true));
+        let out = dialog();
+        SETTINGS_OPEN.with(|c| c.set(false));
+        let pending: VecDeque<DeferredMessage> =
+            PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
+            self.try_restore_tray_icon()
+        } else {
+            None
+        };
+        if PAUSE_REEVALUATE_PENDING.with(|c| c.replace(false)) {
+            self.reevaluate_pause(self.hwnd());
+        }
+        self.deliver_deferred(pending);
+        self.show_tray_restore_error(tray_restore_error);
+        out
+    }
+
+    /// #117: tray > Import action from file. Pick a file, check it, and show
+    /// what it does on a preview card. Only "Do it" adds it to actions.toml
+    /// (`on_preview_decided`); Esc or a click away adds nothing. Nothing runs.
+    fn import_action(&mut self) {
+        let owner = HWND(self.hwnd_isize() as *mut _);
+        let Some(file) = self.run_os_dialog(|| crate::ui::file_dialog::pick_action_file(owner))
+        else {
+            return;
+        };
+        let prepared = (|| -> anyhow::Result<actions::share::Prepared> {
+            let text = actions::share::read_import_file(&file)?;
+            let import = actions::share::parse_import(&text)?;
+            actions::share::prepare(&actions::path()?, import)
+        })();
+        match prepared {
+            Ok(prepared) => {
+                let value = prepared.preview_value();
+                self.pending_preview = Some(PendingPreview::ImportAction(Box::new(prepared)));
+                self.pending_preview_generation = self.card.show_preview(
+                    "Add this action?",
+                    &actions::share::preview_schema(),
+                    &value,
+                    false,
+                );
+            }
+            Err(e) => {
+                let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't import the action", &detail);
+            }
+        }
+    }
+
+    /// #117: the user said "Do it" on an import preview. Re-checks that
+    /// actions.toml is still the file the preview was made against.
+    fn commit_import(&mut self, prepared: &actions::share::Prepared) {
+        let result = actions::path().and_then(|path| prepared.commit(&path));
+        match result {
+            Ok(()) => self.card.show_answer(
+                "Action added",
+                &format!("{} is in the Quick Ask list.", prepared.action.name),
+                4,
+                None,
+            ),
+            Err(e) => {
+                let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't import the action", &detail);
+            }
+        }
+    }
+
+    /// #117: tray > Export action to file > (one of your actions).
+    fn export_action(&mut self, index: usize) {
+        let Some(id) = self.tray.export_action_at(index).map(str::to_owned) else {
+            return;
+        };
+        let owner = HWND(self.hwnd_isize() as *mut _);
+        let mut turned_off = false;
+        let text = actions::load_actions().and_then(|all| {
+            let found = all
+                .iter()
+                .find(|r| r.action.id == id && r.origin == actions::Origin::User)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the action \"{id}\" is no longer in actions.toml")
+                })?;
+            turned_off = actions::share::imports_turned_off(&found.action);
+            actions::share::export_toml(&found.action)
+        });
+        let outcome = text.and_then(|text| {
+            let picked = self.run_os_dialog(|| crate::ui::file_dialog::pick_save_path(owner, &id));
+            let Some(path) = picked else {
+                return Ok(None);
+            };
+            std::fs::write(&path, text)
+                .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
+            Ok(Some(()))
+        });
+        match outcome {
+            Ok(Some(())) if turned_off => self.card.show_answer(
+                "Action saved",
+                "Its prompt is long, so it will be added turned off. Whoever imports it must read the prompt in actions.toml, then turn it on.",
+                8,
+                None,
+            ),
+            Ok(Some(())) => self.card.show_answer("Action saved", "", 3, None),
+            Ok(None) => {}
+            Err(e) => {
+                let detail = self.track_error("Couldn't export the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't export the action", &detail);
+            }
+        }
     }
 }
 
@@ -4273,16 +4619,17 @@ fn form_fill_worker(
     require_tick_for: crate::config::RequireTickFor,
     use_model: bool,
 ) -> Result<Value> {
-    let profile = actions::fill_form::load_or_import_profile()
-        .context("failed to load or import the profile")?;
+    // No added context: the store's own messages are the card text (a
+    // profile sealed for another Windows user or PC says so, in plain words).
+    let profile = actions::fill_form::load_or_import_profile()?;
 
     if actions::fill_form::profile_is_empty(&profile) {
-        let bin_path = crate::profile::Profile::path()?;
-        let toml_path = bin_path.with_file_name("profile.toml");
+        let toml_path = actions::fill_form::profile_toml_path()?;
+        let data_dir = crate::store::data_dir().unwrap_or_default();
         return Ok(serde_json::json!({
             "empty_profile": true,
             "toml_path": toml_path.display().to_string(),
-            "bin_path": bin_path.display().to_string(),
+            "data_dir": data_dir.display().to_string(),
         }));
     }
 
@@ -4543,6 +4890,7 @@ fn with_pending_notices(detail: &str) -> String {
         [
             crate::store::take_notice(),
             crate::usage::take_budget_notice(),
+            crate::config::take_backup_warning(),
             crate::actions::take_skipped_notice(),
         ]
         .into_iter()
@@ -5436,6 +5784,111 @@ fn unpack_error(packed: &str) -> (&str, &str) {
         .unwrap_or((packed, packed))
 }
 
+/// #712: what a confirmed action's executor produced, built on the worker
+/// thread and handed to the UI thread as `WM_APP_EXECUTOR_DONE`. An error
+/// stays an `anyhow::Error` until the card code, which records its full
+/// chain through `track_error`.
+enum ExecDone {
+    Calendar(anyhow::Result<executors::Undo>),
+    Review(anyhow::Result<executors::Undo>),
+    FormFill(anyhow::Result<executors::Undo>),
+    /// A non-built-in action's executor. Carries the action and the
+    /// confirmed proposal because the card text is built from both.
+    Generic {
+        action: Box<actions::Action>,
+        executor_name: String,
+        proposal: Value,
+        result: anyhow::Result<executors::Undo>,
+    },
+    Replace {
+        action_name: String,
+        report: actions::generic_replace::ReplaceReport,
+    },
+    RestoreForm(anyhow::Result<()>),
+}
+
+impl std::fmt::Debug for ExecDone {
+    // `Undo` holds a closure and has no `Debug`; the variant is all a log
+    // or an assertion needs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ExecDone::Calendar(_) => "ExecDone::Calendar",
+            ExecDone::Review(_) => "ExecDone::Review",
+            ExecDone::FormFill(_) => "ExecDone::FormFill",
+            ExecDone::Generic { .. } => "ExecDone::Generic",
+            ExecDone::Replace { .. } => "ExecDone::Replace",
+            ExecDone::RestoreForm(_) => "ExecDone::RestoreForm",
+        })
+    }
+}
+
+fn exec_work_calendar(
+    executor: &dyn executors::Executor,
+    confirmed: confirm::Confirmed<Value>,
+) -> ExecDone {
+    ExecDone::Calendar(executor.execute(confirmed))
+}
+
+fn exec_work_form_fill(
+    executor: &dyn executors::Executor,
+    confirmed: confirm::Confirmed<Value>,
+) -> ExecDone {
+    ExecDone::FormFill(executor.execute(confirmed))
+}
+
+fn exec_work_review(
+    executor: &dyn executors::Executor,
+    ctx: &actions::review_email::ReviewContext,
+) -> ExecDone {
+    ExecDone::Review(actions::review_email::do_review_confirmed(executor, ctx))
+}
+
+fn exec_work_generic(
+    executor: Box<dyn executors::Executor>,
+    action: actions::Action,
+    confirmed: confirm::Confirmed<Value>,
+) -> ExecDone {
+    // #441: `execute` consumes `confirmed`, so keep the value the card text
+    // may need (a read-only `"none"` action's answer).
+    let proposal = confirmed.value().clone();
+    let result = executor.execute(confirmed);
+    ExecDone::Generic {
+        action: Box::new(action),
+        executor_name: executor.name().to_string(),
+        proposal,
+        result,
+    }
+}
+
+fn exec_work_replace(
+    action_name: String,
+    replace: Box<dyn executors::Executor>,
+    copy: Box<dyn executors::Executor>,
+    plan: Option<Box<actions::generic_replace::ReplaceSelection>>,
+    confirmed: confirm::Confirmed<Value>,
+) -> ExecDone {
+    let report = actions::generic_replace::replace_or_copy(
+        replace.as_ref(),
+        copy.as_ref(),
+        plan.as_deref(),
+        confirmed,
+    );
+    ExecDone::Replace {
+        action_name,
+        report,
+    }
+}
+
+fn exec_work_restore(undo: executors::Undo) -> ExecDone {
+    ExecDone::RestoreForm(undo.undo())
+}
+
+/// #712: why Quit is refused right now, if it is. An executor worker that is
+/// mid-write (typing into a form) is never killed; the user tries again.
+fn quit_refusal(exec_in_flight: bool) -> Option<&'static str> {
+    exec_in_flight.then_some("Wingman is still typing into a form; try again in a moment.")
+}
+
 /// Issue #227: runs a worker's whole computation and turns a panic into the
 /// same packed error a failed run produces, so the result message is always
 /// posted and `busy` is always cleared. Only matters where panics unwind
@@ -5581,6 +6034,8 @@ enum DeferredMessage {
     /// and schema `run_generic_action` dispatched with, not just the id --
     /// see `on_generic_action_result`'s doc comment for why.
     GenericActionResult(actions::Action, Value, GenericResult),
+    /// `WM_APP_EXECUTOR_DONE` (#712).
+    ExecutorDone(std::result::Result<ExecDone, String>),
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -5645,6 +6100,9 @@ enum PendingPreview {
     /// "Send" answers it (`ui::send_gate::decide`), and every other way the
     /// preview ends drops it, which cancels the send.
     Send(std::sync::mpsc::Sender<confirm::SendAuthorized>),
+    /// #117: an action file waiting for "Do it" before it is added to
+    /// actions.toml.
+    ImportAction(Box<actions::share::Prepared>),
 }
 
 /// What `wnd_proc` should do with a message addressed to the owner window
@@ -5722,7 +6180,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_REVIEW_RESULT
         | WM_APP_PREVIEW_DECIDED
         | WM_APP_FORM_FILL_RESULT
-        | WM_APP_GENERIC_ACTION_RESULT => SettingsReentrancy::Defer,
+        | WM_APP_GENERIC_ACTION_RESULT
+        | WM_APP_EXECUTOR_DONE => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
@@ -5761,6 +6220,10 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
+        // #328: an on-demand card; Settings hides every card when it
+        // opens, so a result arriving then has nothing to show on. The
+        // boxed facts are freed below.
+        | WM_APP_MACHINE_CHECK_RESULT
         // #105: a send preview cannot be answered while Settings is
         // modal-open, so it is dropped, which cancels the send (the worker
         // sees the reply channel close and the request ends in a card).
@@ -5814,6 +6277,9 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_PALETTE_RUN => drop(Box::from_raw(p as *mut String)),
             WM_APP_SEND_PREVIEW => drop(Box::from_raw(p as *mut crate::ui::send_gate::SendRequest)),
             WM_APP_PENDING_STAGE => drop(Box::from_raw(p as *mut crate::ui::card::PendingStage)),
+            WM_APP_MACHINE_CHECK_RESULT => {
+                drop(Box::from_raw(p as *mut crate::machine::MachineFacts))
+            }
             WM_APP_FIRST_RUN => drop(Box::from_raw(p as *mut FirstRun)),
             WM_APP_ROUTER_RESULT => drop(Box::from_raw(
                 p as *mut (u64, std::result::Result<router::RouterResult, String>),
@@ -5827,6 +6293,9 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             )),
             WM_APP_GENERIC_ACTION_RESULT => drop(Box::from_raw(
                 p as *mut (actions::Action, Value, GenericResult),
+            )),
+            WM_APP_EXECUTOR_DONE => drop(Box::from_raw(
+                p as *mut std::result::Result<ExecDone, String>,
             )),
             _ => return false,
         }
@@ -5928,8 +6397,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         };
                         DeferredMessage::GenericActionResult(action, schema, result)
                     }
+                    WM_APP_EXECUTOR_DONE => DeferredMessage::ExecutorDone(unsafe {
+                        *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>)
+                    }),
                     _ => unreachable!(
-                        "settings_reentrancy_policy only returns Defer for the six ids above"
+                        "settings_reentrancy_policy only returns Defer for the seven ids above"
                     ),
                 };
                 PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
@@ -5961,6 +6433,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // the next one. Never waits on Ollama, so the menu opens at once.
             if Tray::opens_menu(lparam) {
                 app.sync_ollama_menu();
+                app.sync_export_menu();
             }
             if let Some(id) = app.tray.on_tray_message(lparam) {
                 app.password_manager_hint = menu_hint;
@@ -5981,6 +6454,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
                     MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
+                    MenuChoice::ExportAction(i) => app.export_action(i),
+                    MenuChoice::Command(cmd::IMPORT_ACTION) => app.import_action(),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
                     MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
@@ -5998,6 +6473,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
                     MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
                     MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
+                    MenuChoice::Command(cmd::CHECK_MACHINE) => app.check_machine(),
                     MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
                     MenuChoice::Command(cmd::USE_OPENAI) => {
                         app.set_provider(ActiveProvider::OpenAi)
@@ -6024,9 +6500,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::MODE_AUTO) => app.set_mode(Mode::Auto),
                     MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
                     MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
-                    MenuChoice::Command(cmd::QUIT) => unsafe {
-                        let _ = DestroyWindow(hwnd);
-                    },
+                    MenuChoice::Command(cmd::QUIT) => {
+                        if let Some(text) = quit_refusal(app.exec_in_flight) {
+                            app.card.show_answer("Still working", text, 5, None);
+                            app.set_watch(true);
+                        } else {
+                            unsafe {
+                                let _ = DestroyWindow(hwnd);
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 // Not after Quit: the window (and `app`) may already be gone.
@@ -6111,6 +6594,17 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let (action, schema, result) =
                 unsafe { *Box::from_raw(lparam.0 as *mut (actions::Action, Value, GenericResult)) };
             app.on_generic_action_result(action, schema, result);
+            LRESULT(0)
+        }
+        WM_APP_EXECUTOR_DONE => {
+            let result =
+                unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>) };
+            app.on_exec_done(result);
+            LRESULT(0)
+        }
+        WM_APP_MACHINE_CHECK_RESULT => {
+            let facts = unsafe { *Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts) };
+            app.on_machine_check_result(&facts);
             LRESULT(0)
         }
         WM_APP_PENDING_STAGE => {
@@ -6285,18 +6779,22 @@ mod tests {
     use super::App;
     use super::BeginPlan;
     use super::WM_APP_FIRST_RUN;
+    use super::{
+        exec_work_calendar, exec_work_form_fill, exec_work_restore, ExecDone, WM_APP_EXECUTOR_DONE,
+    };
     use super::{final_settings_card, SettingsFinalCard};
     use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
-        WM_APP_GENERIC_ACTION_RESULT, WM_APP_PENDING_STAGE, WM_APP_RESULT, WM_APP_REVIEW_RESULT,
-        WM_APP_ROUTER_RESULT, WM_APP_SEND_PREVIEW,
+        WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
+        WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT, WM_APP_SEND_PREVIEW,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
     use crate::config::Providers;
     use crate::dismiss::WM_APP_DISMISS;
+    use crate::executors;
     use crate::hotkey::{
         WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
     };
@@ -6307,9 +6805,11 @@ mod tests {
     use crate::ui::card::{
         WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
     };
+    use crate::ui::confirm;
     use crate::ui::palette::WM_APP_PALETTE_RUN;
     use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
+    use serde_json::Value;
     use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
 
     // -- #23: resolve_prompt_and_difficulty (the worker's action-model wiring) --
@@ -6548,6 +7048,22 @@ mod tests {
         }
     }
 
+    /// #328: a machine-check result dropped unhandled (Settings open, window
+    /// closing, post failure) must free its boxed facts, not leak them.
+    #[test]
+    fn free_boxed_payload_frees_a_machine_check_result() {
+        let facts = Box::into_raw(Box::new(crate::machine::MachineFacts {
+            ram_bytes: None,
+            gpus: None,
+            ollama: crate::machine::OllamaState::NotRunning,
+            power: crate::machine::Power::Unknown,
+        }));
+        assert!(super::free_boxed_payload(
+            super::WM_APP_MACHINE_CHECK_RESULT,
+            windows::Win32::Foundation::LPARAM(facts as isize)
+        ));
+    }
+
     #[test]
     fn choosing_a_keyed_provider_with_no_key_needs_a_key() {
         use crate::config::{ActiveProvider as P, Providers};
@@ -6602,6 +7118,129 @@ mod tests {
         assert!(!super::free_boxed_payload(WM_APP_TRAY, LPARAM(0)));
         assert!(!super::free_boxed_payload(WM_APP_TRAY, LPARAM(8)));
         assert!(!super::free_boxed_payload(WM_APP_PALETTE_RUN, LPARAM(0)));
+    }
+
+    /// #712: the executor result box is freed when its message is dropped
+    /// unhandled (Settings open, window gone), so none leaks.
+    #[test]
+    fn an_executor_result_box_is_freed_when_dropped_unhandled() {
+        use windows::Win32::Foundation::LPARAM;
+        let done: std::result::Result<ExecDone, String> =
+            Ok(ExecDone::RestoreForm(Err(anyhow::anyhow!("x"))));
+        let boxed = Box::into_raw(Box::new(done));
+        assert!(super::free_boxed_payload(
+            WM_APP_EXECUTOR_DONE,
+            LPARAM(boxed as isize)
+        ));
+    }
+
+    struct FakeExecutor {
+        fail: bool,
+    }
+
+    impl executors::Executor for FakeExecutor {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn effect(&self) -> executors::Effect {
+            executors::Effect::Writes
+        }
+        fn execute(
+            &self,
+            _confirmed: confirm::Confirmed<Value>,
+        ) -> anyhow::Result<executors::Undo> {
+            if self.fail {
+                anyhow::bail!("the write failed")
+            }
+            Ok(executors::Undo::none("did it"))
+        }
+    }
+
+    fn fake_confirmed() -> confirm::Confirmed<Value> {
+        confirm::confirm(
+            confirm::Proposal::new(serde_json::json!({})),
+            confirm::user_confirmed(),
+        )
+    }
+
+    /// #712: the worker half turns the executor's outcome into a plain
+    /// message for the UI thread, and an error keeps its full chain text.
+    #[test]
+    fn the_executor_worker_half_reports_success_and_failure() {
+        let ok = exec_work_form_fill(&FakeExecutor { fail: false }, fake_confirmed());
+        assert!(matches!(ok, ExecDone::FormFill(Ok(ref u)) if u.summary == "did it"));
+        let bad = exec_work_calendar(&FakeExecutor { fail: true }, fake_confirmed());
+        assert!(
+            matches!(bad, ExecDone::Calendar(Err(ref e)) if e.root_cause().to_string().contains("the write failed"))
+        );
+    }
+
+    #[test]
+    fn quit_is_refused_only_while_an_executor_is_writing() {
+        assert!(super::quit_refusal(true).is_some_and(|t| !t.contains('\u{2014}')));
+        assert!(super::quit_refusal(false).is_none());
+    }
+
+    #[test]
+    fn a_failed_restore_comes_back_as_an_error_message() {
+        let undo = executors::Undo::recording("x", || anyhow::bail!("could not put it back"));
+        let done = exec_work_restore(undo);
+        assert!(
+            matches!(done, ExecDone::RestoreForm(Err(ref e)) if e.root_cause().to_string().contains("put it back"))
+        );
+    }
+
+    /// #712: no executor or undo runs on the UI thread, which is also the
+    /// keyboard hook's thread. Every call to one in this file must sit in an
+    /// `exec_work_*` function, which only the spawned worker runs.
+    #[test]
+    fn executors_are_only_called_from_the_worker_half() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = src.split("\nmod tests {").next().expect("production part");
+        let mut current = String::new();
+        let mut hits = 0;
+        for line in production.lines() {
+            let t = line.trim_start();
+            // Any fn header: strip visibility and qualifiers, then `fn `.
+            let mut head = t;
+            for vis in ["pub(crate) ", "pub(super) ", "pub "] {
+                if let Some(r) = head.strip_prefix(vis) {
+                    head = r;
+                    break;
+                }
+            }
+            for q in ["const ", "unsafe ", "async ", "extern \"system\" "] {
+                head = head.strip_prefix(q).unwrap_or(head);
+            }
+            if let Some(rest) = head.strip_prefix("fn ") {
+                current = rest
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+            }
+            if t.starts_with("//") {
+                continue;
+            }
+            for call in [
+                ".execute(",
+                "Executor::execute(",
+                ".undo()",
+                "replace_or_copy(",
+                "do_review_confirmed(",
+            ] {
+                if t.contains(call) {
+                    hits += 1;
+                    // `copy_region` only puts an image on the clipboard: no UIA,
+                    // no typed input, nothing slow.
+                    assert!(
+                        current.starts_with("exec_work_") || current == "copy_region",
+                        "{call} is called from `{current}`, not an exec_work_ function"
+                    );
+                }
+            }
+        }
+        assert!(hits >= 5, "the scan found only {hits} calls");
     }
 
     #[test]
@@ -6680,6 +7319,13 @@ mod tests {
             !detail.contains('\u{2014}') && !detail.contains('\u{2013}'),
             "{detail}"
         );
+        // An older Ollama that lists no capabilities: say so, do not claim
+        // that no model can read the screen.
+        let unknown = super::first_run_detail(&FirstRun::VisionUnknown).expect("a detail");
+        assert!(unknown.contains("could not tell"), "{unknown}");
+        assert!(!unknown.contains("none of its models"), "{unknown}");
+        assert!(unknown.contains("Settings"), "{unknown}");
+        assert!(!unknown.contains('\u{2014}') && !unknown.contains('\u{2013}'));
     }
 
     #[test]
@@ -7154,7 +7800,9 @@ mod tests {
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
+        ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
         ("WM_APP_FIRST_RUN", WM_APP_FIRST_RUN),
+        ("WM_APP_EXECUTOR_DONE", WM_APP_EXECUTOR_DONE),
     ];
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -7295,6 +7943,7 @@ mod tests {
             "OPENAI_MODEL_BASE",
             "ANTHROPIC_MODEL_BASE",
             "OLLAMA_MODEL_BASE",
+            "ACTION_EXPORT_BASE",
         ];
         // Display-only items: added disabled (greyed), so no click can ever
         // produce their WM_COMMAND and they need no wnd_proc arm (#317).
@@ -7673,16 +8322,35 @@ mod tests {
     #[test]
     fn startup_card_shows_neither_one_or_both_problems() {
         let keys = vec!["openai".to_string()];
-        assert_eq!(super::startup_card(&[], false), None);
-        let only_keys = super::startup_card(&keys, false).unwrap();
+        assert_eq!(super::startup_card(&[], false, None), None);
+        let only_keys = super::startup_card(&keys, false, None).unwrap();
         assert!(only_keys.0.contains("key"), "{only_keys:?}");
-        let only_squat = super::startup_card(&[], true).unwrap();
+        let only_squat = super::startup_card(&[], true, None).unwrap();
         assert!(only_squat.0.contains("startup lock"), "{only_squat:?}");
-        let (headline, detail) = super::startup_card(&keys, true).unwrap();
+        let (headline, detail) = super::startup_card(&keys, true, None).unwrap();
         assert_eq!(headline, only_keys.0);
         assert!(detail.contains(&only_keys.1), "keys text kept: {detail}");
         assert!(detail.contains(&only_squat.0), "squat text added: {detail}");
         assert!(!detail.contains('\u{2014}'));
+    }
+
+    /// #711: a config.toml that did not parse gets its own card, with the
+    /// location, and it is not lost when the other startup problems apply.
+    #[test]
+    fn startup_card_reports_a_config_file_that_did_not_parse() {
+        let problem = "config.toml has an error at line 3, column 7";
+        let (headline, detail) = super::startup_card(&[], false, Some(problem)).unwrap();
+        assert!(headline.contains("Settings file"), "{headline}");
+        assert!(detail.contains(problem), "{detail}");
+        assert!(detail.contains("Reload settings"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
+        let (_, both) = super::startup_card(&["openai".to_string()], true, Some(problem)).unwrap();
+        assert!(
+            both.contains(problem) && both.contains("startup lock"),
+            "{both}"
+        );
+        assert!(both.contains("Stored API key unreadable"), "{both}");
+        assert!(both.contains("Offline"), "{both}");
     }
 
     /// #237: the owner window must exist before the single-instance name is
@@ -7817,9 +8485,19 @@ mod tests {
             SettingsReentrancy::Ignore,
         ),
         (
+            "WM_APP_MACHINE_CHECK_RESULT",
+            WM_APP_MACHINE_CHECK_RESULT,
+            SettingsReentrancy::Ignore,
+        ),
+        (
             "WM_APP_FIRST_RUN",
             WM_APP_FIRST_RUN,
             SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_EXECUTOR_DONE",
+            WM_APP_EXECUTOR_DONE,
+            SettingsReentrancy::Defer,
         ),
     ];
 
@@ -8755,14 +9433,14 @@ mod tests {
     /// larger draft downscaled afterward), through the REAL intent router
     /// (`router::build_request`/`router::parse_router_result`, the same
     /// functions `App::router_worker` calls) against local Ollama
-    /// `gemma3:4b`. Run manually (AGENTS.md build rules -- never bare
+    /// `qwen3.5:4b` (or `WINGMAN_ROUTER_LIVE_MODEL`). Run manually (AGENTS.md build rules -- never bare
     /// `cargo test`):
     /// ```text
     /// CARGO_TARGET_DIR=... RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=2 \
     ///   cargo test router_live -- --ignored --nocapture
     /// ```
-    /// Requires a local Ollama server on 127.0.0.1:11434 with `gemma3:4b`
-    /// pulled. Expects `intent == Some("review-email")` when that action
+    /// Requires a local Ollama server on 127.0.0.1:11434 with the model
+    /// pulled. Expects `intent == Some("review-this-email")` when that action
     /// exists in `actions::load_actions()`'s catalogue (added by a sibling
     /// agent in parallel, per #24's task description); otherwise only
     /// requires SOME valid id was named, never "none" -- either way the
@@ -8770,7 +9448,7 @@ mod tests {
     /// "0"`), the same convention `provider/mod.rs`'s and `ollama.rs`'s own
     /// live checks already use.
     ///
-    /// MEASURED 2026-09-17 (this crate's dev profile, `gemma3:4b`, catalogue
+    /// MEASURED 2026-09-17 (this crate's dev profile, `gemma3:4b` then, catalogue
     /// of 5 rows -- "review-email" not yet on master at measurement time):
     /// elapsed 45.71s (cold: the model was not already loaded going in --
     /// see `keep_alive`'s doc on why every OTHER live check in this crate
@@ -8790,6 +9468,11 @@ mod tests {
     /// expansion plan's own router default is `qwen3.5:4b`, not
     /// `gemma3:4b` (this test's model choice is fixed by the task that
     /// created it, not a production recommendation).
+    ///
+    /// MEASURED 2026-10-16 (#223, `qwen3.5:4b`, real catalogue with
+    /// `review-this-email`, revised prompt): 5 of 5 runs picked
+    /// `review-this-email` with a prose summary and no echoed id; see
+    /// `router::ROUTER_SYSTEM_PREFIX`.
     ///
     /// Separately: an early draft of this test's GDI renderer crashed
     /// (`STATUS_ACCESS_VIOLATION`) on a blank line in the body text --
@@ -8840,18 +9523,33 @@ mod tests {
 
         let req = router::build_request(shot.png, &candidates);
 
-        let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        // The expansion plan's router default, overridable to compare models
+        // (`WINGMAN_ROUTER_LIVE_MODEL=gemma3:4b`).
+        let model =
+            std::env::var("WINGMAN_ROUTER_LIVE_MODEL").unwrap_or_else(|_| "qwen3.5:4b".to_string());
+        let provider = Ollama::new(DEFAULT_BASE_URL, &model, "low");
         let started = std::time::Instant::now();
         let completion = provider
             .complete(&req)
             .expect("live ollama router request should succeed");
         let elapsed = started.elapsed();
 
+        // GPU oracle (AGENTS.md rule 6): size_vram > 0 on /api/ps, read while
+        // the model is still loaded.
+        let gpu = crate::provider::ollama_admin::ps(DEFAULT_BASE_URL)
+            .map(|e| {
+                format!(
+                    "{:?}",
+                    crate::provider::ollama_admin::gpu_status_for(&e, &model)
+                )
+            })
+            .unwrap_or_else(|e| format!("unknown ({e})"));
+
         // Unload right after the measurement (mirrors `provider/mod.rs`'s /
         // `ollama.rs`'s own live-check convention) -- a trivial follow-up
         // request purely to release VRAM; its own result is not the
         // measurement, so a failure here is not fatal to the test.
-        let mut unload_provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        let mut unload_provider = Ollama::new(DEFAULT_BASE_URL, &model, "low");
         unload_provider.keep_alive = "0".to_string();
         let _ = unload_provider.complete(&router::build_request(vec![], &[]));
 
@@ -8859,29 +9557,29 @@ mod tests {
             .expect("router completion should parse against its own schema");
 
         eprintln!(
-            "MEASURED 2026-09-17: router_live: model=gemma3:4b elapsed={elapsed:?} \
+            "router_live: model={model} gpu={gpu} elapsed={elapsed:?} \
              summary={:?} intent={:?} confidence={}",
             result.summary, result.intent, result.confidence
         );
         if let Some(usage) = completion.usage {
             eprintln!(
-                "MEASURED 2026-09-17: router_live token usage: input={} output={}",
+                "router_live token usage: input={} output={}",
                 usage.input_tokens, usage.output_tokens
             );
         }
 
-        if candidate_ids.iter().any(|id| id == "review-email") {
+        if candidate_ids.iter().any(|id| id == "review-this-email") {
             assert_eq!(
                 result.intent.as_deref(),
-                Some("review-email"),
-                "the \"review-email\" action exists in this catalogue; expected the router \
+                Some("review-this-email"),
+                "the \"review-this-email\" action exists in this catalogue; expected the router \
                  to pick it for an email compose window"
             );
         } else {
             assert!(
                 result.intent.is_some(),
                 "expected the router to name some action id for an unambiguous email compose \
-                 window, got none (\"review-email\" is not in this catalogue yet)"
+                 window, got none (\"review-this-email\" is not in this catalogue yet)"
             );
         }
     }
@@ -9017,11 +9715,7 @@ mod tests {
             "on_generic_action_result",
             "on_review_result",
             "on_form_fill_result",
-            "run_confirmed_generic_action",
-            "run_confirmed_generic_replace",
-            "run_calendar_executor",
-            "run_review_executor",
-            "run_form_fill_executor",
+            "on_exec_done",
         ];
         for name in paths {
             let start = src

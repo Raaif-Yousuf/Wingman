@@ -46,6 +46,9 @@ Where each provider's request goes:
 | Ollama | `{providers.ollama.base_url}/api/chat`, default `http://127.0.0.1:11434/api/chat` | none; local server, no key |
 | OpenAI-compatible (`compat:<name>`) | `{base_url}/chat/completions`, where `base_url` is whatever you configured per endpoint (OpenRouter, Groq, LM Studio, a local server, ...) | your saved `Wingman/compat:<name>` credential, a caller-named header, or none, depending on that endpoint's `auth` setting |
 
+The OpenAI request sets `store: false`, so OpenAI is asked not to keep the
+response or the screenshot for later retrieval.
+
 The three cloud requests go to whichever provider you configured with your
 own API key. Ollama's request never leaves your machine: it is a loopback
 HTTP call to a local Ollama server, only ever `127.0.0.1` (never
@@ -116,6 +119,10 @@ packet capture, is in [`docs/offline.md`](docs/offline.md).
   ACL. Never read by any Wingman code path except the settings window and the
   request-building code; never uploaded anywhere as a file, only the
   individual fields the request needs.
+- `%TEMP%\Wingman\*.ics`: the calendar file "Add to calendar" hands to your
+  calendar app, with the event title, place and notes (in portable mode, in
+  the Wingman folder instead). Wingman deletes files at least an hour old the
+  next time you add an event, and the undo button deletes it at once.
 - Nothing else. No screenshot is written to disk. No history, log or cache of
   past answers persists across a restart.
 
@@ -189,11 +196,14 @@ Remove-Item "$env:LOCALAPPDATA\Wingman" -Recurse -Force
 ```
 
 - `%APPDATA%\Wingman` holds `config.toml` (your settings, and a key if one is
-  still sitting in the file rather than Credential Manager) and, if you used
-  Fill this form, your encrypted profile (`profile.bin`).
+  still sitting in the file rather than Credential Manager). After an upgrade it
+  may also hold the old `profile.bin.migrated` (your profile before it moved
+  into the store).
 - `%LOCALAPPDATA%\Wingman` holds the local store (`store\wingman.db`): the
-  daily spend totals behind the tray tooltip and the egress log, one row per
-  request with sizes and kinds, never content. Rows are kept for 90 days, at
+  daily spend totals behind the tray tooltip, the egress log, one row per
+  request with sizes and kinds, never content, and, if you used Fill this form,
+  your profile. Each profile value is encrypted with Windows DPAPI, so it can
+  only be opened by your Windows account on this PC. Rows are kept for 90 days, at
   most 10 000. After an upgrade it also holds the old `spend.json.migrated`
   and `egress.log.migrated`. The `store` folder is readable only by your
   Windows account.

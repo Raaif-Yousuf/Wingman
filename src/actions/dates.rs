@@ -41,7 +41,13 @@ pub struct Found {
     /// The phrase as written (original letter case, spaces collapsed).
     pub phrase: String,
     pub resolution: Resolution,
+    /// True when the day was cut back to the last day of a shorter month
+    /// ("in 1 month" from 31 Jan is 28 Feb). The card says so.
+    pub clamped: bool,
 }
+
+/// Said on the card after a clamped date.
+pub const CLAMPED_NOTE: &str = "last day of a shorter month";
 
 /// The most text [`find`] reads, in characters. Anything past it is ignored.
 pub const MAX_SCAN_CHARS: usize = 50_000;
@@ -194,6 +200,9 @@ struct Parsed {
     consumed: usize,
     resolution: Resolution,
     weekday_phrase: bool,
+    /// A month or year step that landed on a shorter month, so the day was
+    /// cut back to that month's last day.
+    clamped: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -303,6 +312,7 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
             consumed,
             resolution: Resolution::One(date),
             weekday_phrase: false,
+            clamped: false,
         })
     };
     let weekday_phrase = |consumed: usize, resolution: Resolution| {
@@ -310,6 +320,18 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
             consumed,
             resolution,
             weekday_phrase: true,
+            clamped: false,
+        })
+    };
+    // A counted offset. When a month or year step lands on a shorter month
+    // the day is cut back to its last day, and `clamped` says so.
+    let counted = |consumed: usize, n: i64, unit: Unit, sign: i64| {
+        let date = shifted(today, n, unit, sign);
+        Some(Parsed {
+            consumed,
+            resolution: Resolution::One(date),
+            weekday_phrase: false,
+            clamped: matches!(unit, Unit::Month | Unit::Year) && date.day != td.day,
         })
     };
     let first = *w.first()?;
@@ -343,7 +365,7 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
         "in" => {
             let n = count_of(second)?;
             let unit = unit_of(third)?;
-            one(3, shifted(today, n, unit, 1))
+            counted(3, n, unit, 1)
         }
         "end" if second == "of" => {
             // "end of [the|this|next] month|year|week".
@@ -369,6 +391,7 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
                         consumed,
                         resolution: Resolution::Either(friday, from_days(start + 6)),
                         weekday_phrase: false,
+                        clamped: false,
                     })
                 }
                 _ => None,
@@ -381,15 +404,16 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
                         return weekday_phrase(3, Resolution::One(date));
                     }
                 }
-                // A bare weekday is the next one; on that very day it could
-                // be today or a week on.
+                // A bare weekday has no tense: "met him Friday" is the one
+                // just gone, "see you Friday" the one coming. Both are shown,
+                // earlier first. On that very day it is today or a week on.
                 let ahead = (target - weekday_of(today)).rem_euclid(7);
                 return weekday_phrase(
                     1,
                     if ahead == 0 {
                         Resolution::Either(td, from_days(today + 7))
                     } else {
-                        Resolution::One(from_days(today + ahead))
+                        Resolution::Either(from_days(today + ahead - 7), from_days(today + ahead))
                     },
                 );
             }
@@ -397,8 +421,8 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
             let n = count_of(first)?;
             let unit = unit_of(second)?;
             match (third, w.get(3).copied().unwrap_or("")) {
-                ("ago", _) => one(3, shifted(today, n, unit, -1)),
-                ("from", "now" | "today") => one(4, shifted(today, n, unit, 1)),
+                ("ago", _) => counted(3, n, unit, -1),
+                ("from", "now" | "today") => counted(4, n, unit, 1),
                 _ => None,
             }
         }
@@ -460,9 +484,10 @@ pub fn resolve(phrase: &str, today: CivilDate, week: WeekStart) -> Option<Resolu
 /// What each form means: "next Tuesday" is next week's Tuesday when this
 /// week's has passed, and both readings when it is still ahead ("next Friday"
 /// said on a Thursday). "this Friday" is this week's Friday, or both readings
-/// when it has passed. "last Friday" mirrors "next". A bare weekday is the next
-/// one, or today and a week on when it is today. "in 1 month" keeps the day, or
-/// the month's last day when it is shorter (31 Jan is 28 Feb). "end of the
+/// when it has passed. "last Friday" mirrors "next". A bare weekday has no tense,
+/// so it gives the one just gone and the one coming (today and a week on when it
+/// is today). "in 1 month" keeps the day, or the month's last day when it is
+/// shorter (31 Jan is 28 Feb); [`Found::clamped`] says when that happened. "end of the
 /// week" is Friday or the last day of the week.
 pub fn find(text: &str, today: CivilDate, week: WeekStart) -> Vec<Found> {
     if !valid(today) {
@@ -501,6 +526,7 @@ pub fn find(text: &str, today: CivilDate, week: WeekStart) -> Vec<Found> {
                     found.push(Found {
                         phrase,
                         resolution: p.resolution,
+                        clamped: p.clamped,
                     });
                 }
                 i = last + 1;
@@ -700,6 +726,23 @@ mod tests {
     }
 
     #[test]
+    fn a_clamped_month_is_flagged_and_an_exact_one_is_not() {
+        let wk = WeekStart::Monday;
+        let jan31 = d(2027, 1, 31);
+        let f = find("in 1 month", jan31, wk);
+        assert_eq!(f[0].resolution, Resolution::One(d(2027, 2, 28)));
+        assert!(f[0].clamped);
+        assert!(find("1 month ago", d(2026, 3, 31), wk)[0].clamped);
+        assert!(find("in 1 year", d(2028, 2, 29), wk)[0].clamped);
+        assert!(!find("in 1 month", WED, wk)[0].clamped);
+        assert!(!find("in 1 month", d(2026, 12, 31), wk)[0].clamped);
+        assert!(
+            !find("in 31 days", jan31, wk)[0].clamped,
+            "days never clamp"
+        );
+    }
+
+    #[test]
     fn counted_offsets_back_and_from_now() {
         assert_eq!(r("5 days ago", WED), one(2026, 9, 18));
         assert_eq!(r("a week ago", WED), one(2026, 9, 16));
@@ -753,10 +796,10 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_weekday_is_the_next_one() {
-        assert_eq!(r("Friday", WED), one(2026, 9, 25));
-        assert_eq!(r("Tuesday", WED), one(2026, 9, 29));
-        assert_eq!(r("Sunday", WED), one(2026, 9, 27));
+    fn a_bare_weekday_shows_the_one_just_gone_and_the_one_coming() {
+        assert_eq!(r("Friday", WED), either((2026, 9, 18), (2026, 9, 25)));
+        assert_eq!(r("Tuesday", WED), either((2026, 9, 22), (2026, 9, 29)));
+        assert_eq!(r("Sunday", WED), either((2026, 9, 20), (2026, 9, 27)));
         // On that very day it could mean today or a week on.
         assert_eq!(r("Wednesday", WED), either((2026, 9, 23), (2026, 9, 30)));
     }
@@ -1056,7 +1099,7 @@ mod tests {
             ),
             ["tomorrow"]
         );
-        assert!(phrases("\u{130}\u{130} in 3 days", WED).len() <= 1);
+        assert_eq!(phrases("\u{130}\u{130} in 3 days", WED), ["in 3 days"]);
         assert!(phrases("\u{1f600}\u{1f600}", WED).is_empty());
     }
 
@@ -1070,9 +1113,12 @@ mod tests {
 
     #[test]
     fn a_huge_text_is_cut_and_still_fast() {
-        let text = "tomorrow ".repeat(200_000);
-        let found = find(&text, WED, WeekStart::Monday);
-        assert_eq!(found.len(), 1);
+        // A phrase right at the start is found; a different one placed after
+        // the scan limit is not, so the scan really stopped.
+        let text = format!("tomorrow {}yesterday", "x ".repeat(MAX_SCAN_CHARS));
+        assert_eq!(phrases(&text, WED), ["tomorrow"]);
+        let repeated = "tomorrow ".repeat(200_000);
+        assert_eq!(find(&repeated, WED, WeekStart::Monday).len(), 1);
         let late = format!("{} tomorrow", "x ".repeat(MAX_SCAN_CHARS));
         assert!(
             find(&late, WED, WeekStart::Monday).is_empty(),

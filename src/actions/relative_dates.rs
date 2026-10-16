@@ -75,8 +75,18 @@ pub fn answer_for_text(text: &str, today: CivilDate, week: WeekStart) -> Answer 
             difficulty: None,
         };
     };
-    let line =
-        |f: &dates::Found| format!("{}: {}", f.phrase, dates::describe(&f.resolution, today));
+    let line = |f: &dates::Found| {
+        let note = if f.clamped {
+            format!(" ({})", dates::CLAMPED_NOTE)
+        } else {
+            String::new()
+        };
+        format!(
+            "{}: {}{note}",
+            f.phrase,
+            dates::describe(&f.resolution, today)
+        )
+    };
     let more = found.len() - 1;
     let suffix = match more {
         0 => String::new(),
@@ -226,6 +236,28 @@ mod tests {
     fn two_readings_are_both_shown() {
         let a = answer_for_text("Review next Friday", WED, MON);
         assert_eq!(a.headline, "next Friday: Fri Sep 25 or Fri Oct 2");
+    }
+
+    #[test]
+    fn a_bare_weekday_shows_both_readings_on_the_card() {
+        let a = answer_for_text("met him Friday", WED, MON);
+        assert_eq!(a.headline, "Friday: Fri Sep 18 or Fri Sep 25");
+    }
+
+    #[test]
+    fn a_month_cut_back_to_a_shorter_one_says_so() {
+        let jan31 = CivilDate {
+            year: 2027,
+            month: 1,
+            day: 31,
+        };
+        let a = answer_for_text("in 1 month", jan31, MON);
+        assert_eq!(
+            a.headline,
+            "in 1 month: Sun Feb 28 (last day of a shorter month)"
+        );
+        let plain = answer_for_text("in 1 month", WED, MON);
+        assert!(!plain.headline.contains("shorter"), "{}", plain.headline);
     }
 
     #[test]

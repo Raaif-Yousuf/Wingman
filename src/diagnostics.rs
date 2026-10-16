@@ -401,7 +401,11 @@ pub fn egress_report() -> String {
 pub fn collect(config: &Config, last_error: Option<LastError>) -> DiagnosticsInput {
     let ollama_port =
         ollama_admin::port_from_base_url(&config.providers.ollama.base_url).unwrap_or(11434);
-    let ollama_health = ollama_admin::query_ollama_health(ollama_port).message();
+    let mut ollama_health = ollama_admin::query_ollama_health(ollama_port).message();
+    // #382: Wingman exited in the middle of the Intel GPU fix.
+    if crate::provider::ollama_gpu_fix::interrupted() {
+        ollama_health.push_str(" The last Fix it did not finish, so Ollama may be stopped.");
+    }
 
     // Issue #270: redact the account name out of the two fields it can
     // leak from before it ever reaches `DiagnosticsInput`. Best-effort, same
