@@ -2437,6 +2437,12 @@ impl App {
             }
             _ => (proposal, self.fallback_footer.clone()),
         };
+        // #710: a receipt cell that could not be checked is named on the card.
+        let note = if action.id == actions::receipt::ACTION_ID {
+            actions::receipt::card_note(&proposal, note.as_deref())
+        } else {
+            note
+        };
         // #114: values read off a chart are estimates. The headers say so (and
         // so does the CSV), and the card says so under the rows.
         let (proposal, note) = if action.id == actions::chart_table::ACTION_ID {
