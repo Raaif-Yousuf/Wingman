@@ -152,16 +152,27 @@ pub fn profile_bin(conn: &mut Connection, path: &Path) -> Result<Option<String>,
     if flag_is_set(conn, PROFILE_FLAG)? {
         return Ok(None);
     }
-    match std::fs::metadata(path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            // Nothing to import, now or later.
-            set_flag_named(conn, PROFILE_FLAG)?;
-            return Ok(None);
-        }
+    // A fresh database after a damaged one was moved aside has lost the
+    // profile, and the old file was already renamed. Read that copy again.
+    let migrated = path.with_extension("bin.migrated");
+    let source = match std::fs::metadata(path) {
+        Ok(_) => path.to_path_buf(),
+        Err(e) if e.kind() == ErrorKind::NotFound => match std::fs::metadata(&migrated) {
+            Ok(_) => migrated.clone(),
+            Err(m) if m.kind() == ErrorKind::NotFound => {
+                // Nothing to import. Only settle that for good when the
+                // folder is there: a folder that is briefly unavailable
+                // (a synced or removable drive) must not look like "no file".
+                if path.parent().is_some_and(Path::is_dir) {
+                    set_flag_named(conn, PROFILE_FLAG)?;
+                }
+                return Ok(None);
+            }
+            Err(_) => return Ok(Some(profile_unreadable())),
+        },
         Err(_) => return Ok(Some(profile_unreadable())),
-    }
-    let Ok(profile) = crate::profile::Profile::load_from(path) else {
+    };
+    let Ok(profile) = crate::profile::Profile::load_from(&source) else {
         return Ok(Some(profile_unreadable()));
     };
     let rows = match profile_field::encrypt_rows(&profile) {
@@ -176,7 +187,9 @@ pub fn profile_bin(conn: &mut Connection, path: &Path) -> Result<Option<String>,
     )?;
     tx.commit()?;
     // Harmless if it fails: the flag is set, so the file is not read again.
-    let _ = std::fs::rename(path, path.with_extension("bin.migrated"));
+    if source == path {
+        let _ = std::fs::rename(path, &migrated);
+    }
     Ok(None)
 }
 
@@ -599,6 +612,35 @@ mod tests {
         assert!(!dir.join("profile.bin.migrated").exists());
         assert_eq!(profile_flag(&conn), None);
         assert_eq!(profile_count(&conn), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_database_re_imports_the_migrated_copy() {
+        // Import, lose the database (moved aside as damaged), reopen: the
+        // profile comes back from profile.bin.migrated.
+        let dir = scratch("pf-recover");
+        let path = write_legacy(&dir);
+        let mut first = db();
+        assert_eq!(profile_bin(&mut first, &path).unwrap(), None);
+        drop(first);
+
+        let mut fresh = db();
+        assert_eq!(profile_bin(&mut fresh, &path).unwrap(), None);
+
+        assert_eq!(profile_flag(&fresh).as_deref(), Some("1"));
+        assert_eq!(store_over(fresh).load_profile().unwrap(), sample());
+        assert!(dir.join("profile.bin.migrated").exists(), "kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_folder_does_not_settle_the_import_for_good() {
+        let dir = scratch("pf-nofolder");
+        let path = dir.join("gone").join("profile.bin");
+        let mut conn = db();
+        assert_eq!(profile_bin(&mut conn, &path).unwrap(), None);
+        assert_eq!(profile_flag(&conn), None, "retried on a later launch");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

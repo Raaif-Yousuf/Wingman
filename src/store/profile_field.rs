@@ -115,19 +115,22 @@ impl Store {
             }
             let plain = dpapi::unprotect(&sealed, Some(dpapi::PROFILE_FIELD_ENTROPY))
                 .map_err(|e| StoreError::Undecryptable(format!("{e:#}")))?;
-            let member: Value = serde_json::from_slice(&plain)
-                .map_err(|e| StoreError::Profile(format!("a saved value is damaged: {e}")))?;
+            // Fixed text only: a serde message can quote the decrypted value.
+            let member: Value = serde_json::from_slice(&plain).map_err(|_| {
+                StoreError::Profile(format!("the saved value for {key} is damaged"))
+            })?;
             members.insert(key, member);
         }
         if members.is_empty() {
             return Ok(Profile::default());
         }
         let mut profile: Profile = serde_json::from_value(Value::Object(members))
-            .map_err(|e| StoreError::Profile(format!("a saved value is damaged: {e}")))?;
+            .map_err(|_| StoreError::Profile("the saved profile is damaged".to_string()))?;
         profile.normalize_sensitivity();
         profile.validate().map_err(|e| {
+            // `e` names the field (for example "notes"), never its value.
             StoreError::Profile(format!(
-                "a saved value failed the payment data check: {e:#}"
+                "{e:#}: that saved value looks like payment data, so Wingman will not use it. Until the profile page exists, close Wingman, delete wingman.db in the store folder (this also clears usage history), and add your profile again with a profile.toml"
             ))
         })?;
         Ok(profile)

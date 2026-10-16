@@ -774,6 +774,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_damaged_database_does_not_lose_the_profile() {
+        let dir = scratch("profile-recover");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let profile = dir.join("profile.bin");
+        crate::profile::Profile {
+            full_name: crate::profile::Field::new("Ada Lovelace".to_string(), false),
+            ..Default::default()
+        }
+        .write_legacy_file(&profile)
+        .unwrap();
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &profile,
+        };
+        drop(open_in(&path, &legacy, |_: &Path| Ok(())).unwrap());
+        assert!(dir.join("profile.bin.migrated").exists());
+        std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+
+        assert_eq!(s.load_profile().unwrap().full_name.value, "Ada Lovelace");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn sample_row(provider: &str) -> crate::egress::EgressEntry {
         crate::egress::build_entry(
             provider,
