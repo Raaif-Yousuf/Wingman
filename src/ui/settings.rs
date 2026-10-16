@@ -4633,11 +4633,7 @@ fn choice_from_order(order: &[String]) -> usize {
 /// instead of showing ChatGPT as if it were the active provider. An empty
 /// order still reads as ChatGPT, the default.
 fn combo_index_for_order(order: &[String]) -> i32 {
-    match ActiveProvider::leading(order) {
-        Some(p) => p.index() as i32,
-        None if order.is_empty() => 0,
-        None => -1,
-    }
+    ActiveProvider::shown_for(order).map_or(-1, |p| p.index() as i32)
 }
 
 /// #194: `build_config`'s provider-order merge. `choice` (the Settings

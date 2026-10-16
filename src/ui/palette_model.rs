@@ -1104,9 +1104,13 @@ mod tests {
         // nothing a plain `actions.toml` entry lacks.
         let generic_on_purpose = [
             crate::actions::action_items::ACTION_ID,
+            crate::actions::table::ACTION_ID,
             crate::actions::explain_error::ACTION_ID,
             crate::actions::define_word::ACTION_ID,
             crate::actions::translate::ACTION_ID,
+            crate::actions::rewrite_tone::SHORTER_ID,
+            crate::actions::rewrite_tone::FRIENDLIER_ID,
+            crate::actions::rewrite_tone::FORMAL_ID,
             crate::actions::page_summary::ACTION_ID,
             crate::actions::describe_image::ACTION_ID,
             crate::actions::explain_screen::ACTION_ID,
