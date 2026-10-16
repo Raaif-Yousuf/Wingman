@@ -45,12 +45,14 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.9.1
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: coverage
+          # cargo-llvm-cov builds into target/llvm-cov-target, so point the cache at it.
+          workspaces: ". -> target/llvm-cov-target"
 
       # Same test run as the CI job: the tests already use their own mutex,
       # window-class and file names (AGENTS.md rule 9), so nothing here touches
