@@ -63,6 +63,8 @@ mod tests {
         .expect("an unmarked thread must pass the check");
     }
 
+    /// Only debug builds panic; release builds leave a diagnostics line.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_marked_thread_fires_the_check() {
         let result = std::thread::spawn(|| {
@@ -77,25 +79,83 @@ mod tests {
         );
     }
 
-    /// Every blocking entry point named in #700 carries the check. Scans the
-    /// source (CRLF normalised) and requires a non-empty set of sites.
+    /// The text of each `fn` whose signature starts with `sig`, up to the next
+    /// item. Source is CRLF normalised.
+    fn bodies<'a>(text: &'a str, sig: &str) -> Vec<&'a str> {
+        let ends = [
+            "\n    fn ",
+            "\nfn ",
+            "\npub fn ",
+            "\npub(crate) fn ",
+            "\n    pub fn ",
+            "\nimpl ",
+            "\n    #[test]",
+        ];
+        text.match_indices(sig)
+            .map(|(at, _)| {
+                let rest = &text[at + sig.len()..];
+                let end = ends.iter().filter_map(|e| rest.find(e)).min();
+                &rest[..end.unwrap_or(rest.len())]
+            })
+            .collect()
+    }
+
+    /// Every blocking entry point named in #700 carries the check inside its
+    /// own function body (not just somewhere in the file).
     #[test]
     fn every_blocking_entry_point_calls_the_check() {
-        let sources = [
-            ("src/provider/common.rs", include_str!("provider/common.rs")),
+        let common = include_str!("provider/common.rs").replace('\r', "");
+        let oauth = include_str!("connectors/oauth.rs").replace('\r', "");
+        let page = include_str!("inputs/web_page.rs").replace('\r', "");
+        let app = include_str!("app.rs").replace('\r', "");
+        let entry_points: [(&str, &str, &str); 9] = [
+            ("common", "fn post_json(", "UreqTransport"),
+            ("common", "pub(crate) fn get_text_with_timeout(", ""),
+            ("common", "fn get_with_headers_raw(", ""),
+            ("common", "pub(crate) fn post_json_read_body<", ""),
             (
-                "src/connectors/oauth.rs",
-                include_str!("connectors/oauth.rs"),
+                "common",
+                "pub(crate) fn post_json_with_connect_timeout(",
+                "",
             ),
-            ("src/inputs/web_page.rs", include_str!("inputs/web_page.rs")),
+            ("oauth", "fn send_form(", ""),
+            ("oauth", "pub fn authorize(", ""),
+            (
+                "page",
+                "fn resolve(&self, host: &str, timeout: Duration)",
+                "",
+            ),
+            ("page", "let pinned = PinnedResolver(pinned);", ""),
         ];
-        let mut found = 0;
-        for (name, text) in sources {
-            let text = text.replace('\r', "");
-            let n = text.matches("ui_thread::blocking_call(").count();
-            assert!(n > 0, "{name} has no ui_thread::blocking_call");
-            found += n;
+        let mut checked = 0;
+        for (file, sig, _) in entry_points {
+            let text = match file {
+                "common" => &common,
+                "oauth" => &oauth,
+                _ => &page,
+            };
+            let hit = if sig.starts_with("let ") {
+                // Inside the page fetch: the check sits right above this line.
+                let at = text.find(sig).expect(sig);
+                text[..at]
+                    .rsplit('\n')
+                    .take(3)
+                    .any(|l| l.contains("ui_thread::blocking_call("))
+            } else {
+                bodies(text, sig)
+                    .iter()
+                    .any(|b| b.contains("ui_thread::blocking_call("))
+            };
+            assert!(hit, "{sig} has no ui_thread::blocking_call in its body");
+            checked += 1;
         }
-        assert!(found >= 8, "expected the known entry points, found {found}");
+        assert_eq!(checked, 9);
+        // The thread is marked before the first window exists.
+        let run = bodies(&app, "pub fn run() -> Result<()> {");
+        assert!(
+            run.iter()
+                .any(|b| b.find("mark_current_thread()") < b.find("create_owner_window(")),
+            "run() must mark the UI thread before it creates the owner window"
+        );
     }
 }

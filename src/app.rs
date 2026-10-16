@@ -396,6 +396,9 @@ fn error_details_clipboard_text(last_error: &LastError) -> &str {
 }
 
 pub fn run() -> Result<()> {
+    // #700: the thread that runs this hosts the keyboard hook, and a `--settings`
+    // launch runs the Settings loop before `pump_messages`, so mark it first.
+    crate::ui_thread::mark_current_thread();
     // Before any window exists, so the card's metrics are right on a mixed-DPI
     // setup (a laptop panel next to an external monitor).
     unsafe {
