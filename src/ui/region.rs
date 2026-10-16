@@ -2383,9 +2383,12 @@ mod tests {
         // lands on the last of the two, which is `OverlayInner`'s own. Its
         // body ends at the first column-4 closing brace, since it is a
         // method rather than a free function.
-        let at = src.rfind("fn handle_message").expect(
-            "region.rs no longer has a `fn handle_message`; this guard is checking nothing",
-        );
+        // Spelled with `concat!` so this test's own text is not a match.
+        let at = src
+            .find(concat!("fn handle_", "message(&mut self, msg: u32"))
+            .expect(
+                "region.rs no longer has OverlayInner's handler; this guard is checking nothing",
+            );
         let handler = &src[at..];
         let body = &handler[..handler.find("\n    }\n").unwrap_or(handler.len())];
         assert!(
@@ -2589,15 +2592,16 @@ mod tests {
 
     // -- theme (#580) ----------------------------------------------------
 
-    use crate::ui::theme::{contrast_ratio, rgb, HC_BLACK};
+    use crate::ui::theme::{contrast_ratio, rgb, HC_BLACK, HC_WHITE};
 
-    /// The three themes the overlay is drawn in, with a system palette for
+    /// The themes the overlay is drawn in, with a system palette for
     /// high contrast.
-    fn all_overlay_themes() -> [(Theme, SysColors); 3] {
+    fn all_overlay_themes() -> [(Theme, SysColors); 4] {
         [
             (Theme::Light, HC_BLACK),
             (Theme::Dark, HC_BLACK),
             (Theme::HighContrast, HC_BLACK),
+            (Theme::HighContrast, HC_WHITE),
         ]
     }
 
@@ -2619,7 +2623,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 6);
+        assert_eq!(checked, 8);
     }
 
     #[test]
@@ -2661,10 +2665,24 @@ mod tests {
             body.contains("SetTextColor"),
             "the candidate set must not be empty"
         );
+        let no_null = body.replace("NULL_BRUSH", "");
         assert!(
-            !body.contains("COLORREF(0x"),
+            !body.contains("rgb("),
             "a literal colour is back in the drawing code"
         );
+        assert!(
+            !no_null.contains("_BRUSH") && !no_null.contains("_PEN"),
+            "a stock brush or pen is back in the drawing code"
+        );
+        let mut rest = body;
+        while let Some(i) = rest.find("COLORREF(") {
+            let next = rest[i + "COLORREF(".len()..].chars().next();
+            assert!(
+                !next.is_some_and(|c| c.is_ascii_digit()),
+                "a literal COLORREF is back in the drawing code"
+            );
+            rest = &rest[i + 1..];
+        }
     }
 
     #[test]
