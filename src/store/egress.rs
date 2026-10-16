@@ -1,0 +1,488 @@
+//! The `egress` table: one row per outbound request attempt, replacing the
+//! old `egress.log`. Rows hold kinds, sizes and counts, never content (see
+//! `crate::egress`).
+//!
+//! Retention (spec, decision 6): 90 days and at most 10 000 rows, whichever
+//! is reached first. Pruning runs inside the insert, never on a timer, and
+//! never removes the row just written.
+
+use rusqlite::{params, Row};
+
+use super::{Store, StoreError};
+use crate::egress::{Attachment, EgressEntry, Outcome};
+
+/// Rows older than this are pruned by the next insert.
+pub const KEEP_SECS: u64 = 90 * 24 * 60 * 60;
+/// Newest rows kept.
+pub const KEEP_ROWS: usize = 10_000;
+
+impl Store {
+    /// Appends one request attempt, then prunes past the retention limits, in
+    /// one transaction.
+    pub fn record_egress(&self, entry: &EgressEntry) -> Result<(), StoreError> {
+        self.record_egress_at(entry, now_unix(), KEEP_ROWS)
+    }
+
+    /// [`Store::record_egress`] with the clock and the row limit passed in,
+    /// so retention can be tested without ten thousand rows.
+    pub(super) fn record_egress_at(
+        &self,
+        entry: &EgressEntry,
+        now: u64,
+        keep_rows: usize,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        insert(&tx, entry)?;
+        prune(&tx, now, keep_rows, true)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Test builds only: every kept row, oldest first.
+    #[cfg(test)]
+    pub fn egress_rows(&self) -> Result<Vec<EgressEntry>, StoreError> {
+        Ok(self.egress_rows_counted()?.0)
+    }
+
+    /// Every readable row, oldest first, and how many rows could not be
+    /// read. One damaged row must not make the whole history unreadable.
+    pub fn egress_rows_counted(&self) -> Result<(Vec<EgressEntry>, usize), StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT time_unix, provider, model, retried, trigger_label, attachments,
+                    snippets, redactions, bytes_sent, bytes_received, outcome, error, cost
+             FROM egress ORDER BY id",
+        )?;
+        let mut rows = Vec::new();
+        let mut skipped = 0;
+        for row in stmt.query_map([], entry_from_row)? {
+            match row {
+                Ok(e) => rows.push(e),
+                Err(_) => skipped += 1,
+            }
+        }
+        Ok((rows, skipped))
+    }
+
+    /// Test builds only: forgets every row.
+    #[cfg(test)]
+    pub fn clear_egress(&self) {
+        self.lock().execute("DELETE FROM egress", []).unwrap();
+    }
+}
+
+/// Inserts one row. Shared with the one-time import of the old log.
+pub(super) fn insert(
+    tx: &rusqlite::Transaction<'_>,
+    entry: &EgressEntry,
+) -> Result<(), StoreError> {
+    let json = |e: serde_json::Error| StoreError::Other(e.to_string());
+    let attachments = serde_json::to_string(&entry.attachments).map_err(json)?;
+    let snippets = serde_json::to_string(&entry.snippets).map_err(json)?;
+    let redactions = serde_json::to_string(&entry.redactions).map_err(json)?;
+    let outcome = match entry.outcome {
+        Outcome::Success => "success",
+        Outcome::Failure => "failure",
+    };
+    tx.execute(
+        "INSERT INTO egress
+           (time_unix, provider, model, retried, trigger_label, attachments,
+            snippets, redactions, bytes_sent, bytes_received, outcome, error, cost)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            i64::try_from(entry.time_unix).unwrap_or(i64::MAX),
+            entry.provider,
+            entry.model,
+            i64::from(entry.retried),
+            entry.trigger,
+            attachments,
+            snippets,
+            redactions,
+            i64::try_from(entry.bytes_sent).unwrap_or(i64::MAX),
+            i64::try_from(entry.bytes_received).unwrap_or(i64::MAX),
+            outcome,
+            entry.error,
+            entry.cost,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Drops rows past the retention limits. With `exempt_newest`, the row
+/// inserted last is exempt from the age rule, so a bad clock cannot make the
+/// request just made the first thing deleted. An import passes `false`: its
+/// last row is only as new as its own timestamp says.
+pub(super) fn prune(
+    tx: &rusqlite::Transaction<'_>,
+    now: u64,
+    keep_rows: usize,
+    exempt_newest: bool,
+) -> Result<(), StoreError> {
+    let cutoff = i64::try_from(now.saturating_sub(KEEP_SECS)).unwrap_or(i64::MAX);
+    let age_sql = if exempt_newest {
+        "DELETE FROM egress WHERE time_unix < ?1 AND id != last_insert_rowid()"
+    } else {
+        "DELETE FROM egress WHERE time_unix < ?1"
+    };
+    tx.execute(age_sql, [cutoff])?;
+    tx.execute(
+        "DELETE FROM egress WHERE id <=
+           (SELECT id FROM egress ORDER BY id DESC LIMIT 1 OFFSET ?1)",
+        [i64::try_from(keep_rows).unwrap_or(i64::MAX)],
+    )?;
+    Ok(())
+}
+
+/// Where rows wait when the store cannot open: `egress-pending.log` next to
+/// the database folder, one JSON row per line. The store imports and removes
+/// it on the next open that works (`import::egress_pending`).
+pub fn append_pending(entry: &EgressEntry) -> Result<(), StoreError> {
+    append_pending_at(&super::pending_egress_path()?, entry)
+}
+
+/// The pending file stops growing here, like the old 2 MB log; further rows
+/// are refused, so the caller counts them as dropped and the report says so.
+pub const PENDING_CAP_BYTES: u64 = 2_000_000;
+
+/// 0 = not tried, 1 = restricted, 2 = failed once (one retry left), 3 = gave up.
+static PENDING_ACL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn append_pending_at(
+    path: &std::path::Path,
+    entry: &EgressEntry,
+) -> Result<(), StoreError> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let io = |e: std::io::Error| StoreError::Other(e.to_string());
+    let line = serde_json::to_string(entry).map_err(|e| StoreError::Other(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io)?;
+    }
+    // `create_new` tells a file this call made from one that was already
+    // there, with no gap between the check and the create.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true);
+    let (mut f, is_new) = match opts.clone().create_new(true).open(path) {
+        Ok(f) => (f, true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            (opts.open(path).map_err(io)?, false)
+        }
+        Err(e) => return Err(io(e)),
+    };
+    let len = f.metadata().map_err(io)?.len();
+    if len >= PENDING_CAP_BYTES {
+        return Err(StoreError::Other(
+            "the pending request log is full".to_string(),
+        ));
+    }
+    // A crash in the middle of an earlier append can leave a row without its
+    // newline; start on a fresh line so two rows are never glued together.
+    let mut buf = String::with_capacity(line.len() + 2);
+    if len > 0 {
+        let mut last = [0u8; 1];
+        let mut r = std::fs::File::open(path).map_err(io)?;
+        r.seek(SeekFrom::End(-1)).map_err(io)?;
+        r.read_exact(&mut last).map_err(io)?;
+        if last[0] != b'\n' {
+            buf.push('\n');
+        }
+    }
+    buf.push_str(&line);
+    buf.push('\n');
+    f.write_all(buf.as_bytes()).map_err(io)?;
+    drop(f);
+    restrict_pending_acl(path, is_new);
+    Ok(())
+}
+
+/// Same owner-only rule the old log had. Tried when the file is new, and once
+/// more later in the run if the first try failed; best effort, the row is
+/// already safe on disk.
+fn restrict_pending_acl(path: &std::path::Path, is_new: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let state = PENDING_ACL.load(SeqCst);
+    if !(is_new || state == 0 || state == 2) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        match crate::config::Config::restrict_acl(path) {
+            Ok(()) => PENDING_ACL.store(1, SeqCst),
+            Err(e) => {
+                eprintln!("wingman: failed to restrict {}: {e:#}", path.display());
+                PENDING_ACL.store(if state == 2 { 3 } else { 2 }, SeqCst);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        PENDING_ACL.store(1, SeqCst);
+    }
+}
+
+pub(super) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Reads one row back. JSON columns that do not parse come back empty: a
+/// damaged detail must not hide the rest of the history.
+fn entry_from_row(r: &Row<'_>) -> rusqlite::Result<EgressEntry> {
+    let attachments: String = r.get(5)?;
+    let snippets: String = r.get(6)?;
+    let redactions: String = r.get(7)?;
+    let outcome: String = r.get(10)?;
+    Ok(EgressEntry {
+        time_unix: u64::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
+        provider: r.get(1)?,
+        model: r.get(2)?,
+        retried: r.get::<_, i64>(3)? != 0,
+        trigger: r.get(4)?,
+        attachments: serde_json::from_str::<Vec<Attachment>>(&attachments).unwrap_or_default(),
+        snippets: serde_json::from_str(&snippets).unwrap_or_default(),
+        redactions: serde_json::from_str(&redactions).unwrap_or_default(),
+        bytes_sent: usize::try_from(r.get::<_, i64>(8)?).unwrap_or(0),
+        bytes_received: usize::try_from(r.get::<_, i64>(9)?).unwrap_or(0),
+        outcome: if outcome == "success" {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        },
+        error: r.get(11)?,
+        cost: r.get(12)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::egress::{build_entry, AttachmentKind};
+    use serde_json::json;
+
+    fn entry(provider: &str, time_unix: u64) -> EgressEntry {
+        let mut e = build_entry(
+            provider,
+            "https://api.example.com/",
+            &json!({"model": "m", "messages": [{"role": "user", "content": "hello"}]}),
+            false,
+            10,
+            20,
+            Outcome::Success,
+            None,
+        );
+        e.time_unix = time_unix;
+        e
+    }
+
+    fn count(s: &Store) -> i64 {
+        s.lock()
+            .query_row("SELECT count(*) FROM egress", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_row_round_trips_every_field() {
+        let s = Store::in_memory();
+        let mut e = entry("anthropic", 1_000);
+        e.model = Some("claude-opus-5".into());
+        e.retried = true;
+        e.attachments = vec![Attachment {
+            kind: AttachmentKind::Image,
+            size_bytes: 1234,
+            width: Some(340),
+            height: Some(200),
+        }];
+        e.snippets = vec!["resume.pdf#3".into()];
+        e.outcome = Outcome::Failure;
+        e.error = Some("HTTP 500".into());
+        e.cost = Some(0.0123);
+        e.trigger = Some("hotkey".into());
+        e.redactions.insert("email".into(), 2);
+
+        s.record_egress_at(&e, 1_000, KEEP_ROWS).unwrap();
+
+        assert_eq!(s.egress_rows().unwrap(), vec![e]);
+    }
+
+    #[test]
+    fn absent_optionals_come_back_absent_not_zero() {
+        let s = Store::in_memory();
+        let mut e = entry("p", 5);
+        e.model = None;
+        e.cost = None;
+        e.trigger = None;
+        s.record_egress_at(&e, 5, KEEP_ROWS).unwrap();
+        let back = &s.egress_rows().unwrap()[0];
+        assert_eq!(
+            (back.model.clone(), back.cost, back.trigger.clone()),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn rows_come_back_oldest_first() {
+        let s = Store::in_memory();
+        for (i, p) in ["a", "b", "c"].iter().enumerate() {
+            s.record_egress_at(&entry(p, 100 + i as u64), 200, KEEP_ROWS)
+                .unwrap();
+        }
+        let got: Vec<String> = s
+            .egress_rows()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        assert_eq!(got, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn rows_past_the_row_limit_are_pruned_oldest_first() {
+        let s = Store::in_memory();
+        for i in 0..7u64 {
+            s.record_egress_at(&entry(&format!("p{i}"), 1_000 + i), 2_000, 5)
+                .unwrap();
+        }
+        let got: Vec<String> = s
+            .egress_rows()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        assert_eq!(got, ["p2", "p3", "p4", "p5", "p6"]);
+    }
+
+    #[test]
+    fn rows_older_than_ninety_days_are_pruned_by_the_next_insert() {
+        let s = Store::in_memory();
+        let now = 10_000_000u64;
+        s.record_egress_at(&entry("old", now - KEEP_SECS - 1), now, KEEP_ROWS)
+            .unwrap();
+        s.record_egress_at(&entry("edge", now - KEEP_SECS), now, KEEP_ROWS)
+            .unwrap();
+        s.record_egress_at(&entry("new", now), now, KEEP_ROWS)
+            .unwrap();
+        let got: Vec<String> = s
+            .egress_rows()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        assert_eq!(got, ["edge", "new"]);
+    }
+
+    #[test]
+    fn the_row_just_written_is_never_pruned_even_with_a_bad_clock() {
+        // time_unix 0 is what the entry builder falls back to when the clock
+        // is unreadable; it must not be the first thing deleted.
+        let s = Store::in_memory();
+        s.record_egress_at(&entry("zero", 0), 10_000_000, KEEP_ROWS)
+            .unwrap();
+        assert_eq!(count(&s), 1);
+    }
+
+    #[test]
+    fn a_damaged_json_column_does_not_hide_the_row() {
+        let s = Store::in_memory();
+        s.record_egress_at(&entry("p", 1), 1, KEEP_ROWS).unwrap();
+        s.lock()
+            .execute(
+                "UPDATE egress SET attachments = 'nope', snippets = '{', redactions = '['",
+                [],
+            )
+            .unwrap();
+        let back = &s.egress_rows().unwrap()[0];
+        assert!(back.attachments.is_empty() && back.snippets.is_empty());
+        assert!(back.redactions.is_empty());
+        assert_eq!(back.provider, "p");
+    }
+
+    #[test]
+    fn one_unreadable_row_is_skipped_and_counted_not_fatal() {
+        let s = Store::in_memory();
+        s.record_egress_at(&entry("good", 1), 1, KEEP_ROWS).unwrap();
+        s.record_egress_at(&entry("bad", 2), 2, KEEP_ROWS).unwrap();
+        s.lock()
+            .execute(
+                "UPDATE egress SET time_unix = 'abc' WHERE provider = 'bad'",
+                [],
+            )
+            .unwrap();
+        let (rows, skipped) = s.egress_rows_counted().unwrap();
+        assert_eq!(skipped, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "good");
+    }
+
+    #[test]
+    fn the_pending_file_stops_growing_at_its_cap_and_says_so() {
+        let dir =
+            std::env::temp_dir().join(format!("wingman-test-pending-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.log");
+        std::fs::write(&path, vec![b'x'; PENDING_CAP_BYTES as usize]).unwrap();
+
+        let err = append_pending_at(&path, &entry("over", 1)).unwrap_err();
+
+        assert!(err.to_string().contains("full"), "{err}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), PENDING_CAP_BYTES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_threads_recording_both_land() {
+        let s = std::sync::Arc::new(Store::in_memory());
+        let handles: Vec<_> = (0..2)
+            .map(|t| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        s.record_egress(&entry(&format!("t{t}-{i}"), now_unix()))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(count(&s), 50);
+    }
+
+    #[test]
+    fn a_locked_database_reports_failure_and_loses_nothing_already_saved() {
+        let dir =
+            std::env::temp_dir().join(format!("wingman-test-egress-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("wingman.db");
+        let s = Store::open_at(&path).unwrap();
+        s.record_egress(&entry("before", now_unix())).unwrap();
+        // Fail fast instead of waiting out the 5 s production timeout.
+        s.lock()
+            .busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+
+        // Another connection holds the write lock.
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let err = s.record_egress(&entry("blocked", now_unix())).unwrap_err();
+        assert!(matches!(err, StoreError::Other(_)), "{err:?}");
+        other.execute_batch("ROLLBACK").unwrap();
+
+        // The store still works and still has the earlier row.
+        s.record_egress(&entry("after", now_unix())).unwrap();
+        let got: Vec<String> = s
+            .egress_rows()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        assert_eq!(got, ["before", "after"]);
+        drop(other);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
