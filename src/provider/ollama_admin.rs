@@ -22,7 +22,7 @@
 //! real download can run for minutes, so it must be called from a worker
 //! thread, never the UI thread; see its own doc comment.
 
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -529,8 +529,10 @@ impl PullProgress {
     }
 
     /// The plain-text progress line Settings shows (#566). A line with a
-    /// total reads "Downloading 31% (1.4 of 4.4 GB)"; the percent is rounded
-    /// down so 100% only appears once the pull is really done. The server's
+    /// total reads "Downloading 31% (1.4 of 4.4 GB)". The numbers are for the
+    /// piece (layer) being downloaded, so they start over for each piece of a
+    /// model; the percent is rounded down so a piece shows 100% only when it
+    /// is complete. The server's
     /// status text for the other phases is mapped to short words, and an
     /// unknown one is shown capped rather than dropped.
     pub fn describe(&self) -> String {
@@ -563,6 +565,10 @@ impl PullProgress {
         }
     }
 }
+
+/// The longest single `/api/pull` progress line read (64 KB). Real lines are
+/// a few hundred bytes.
+const MAX_PULL_LINE_BYTES: usize = 64 * 1024;
 
 /// The longest model name `validate_pull_name` accepts. Ollama names are
 /// short (`library/name:tag`); a pasted paragraph is not one.
@@ -611,15 +617,29 @@ pub fn parse_pull_line(line: &str) -> Option<PullProgress> {
 /// chat, no streaming" rule is about conversational completions, and
 /// nothing here surfaces text the model wrote.
 pub fn stream_pull_progress<R: BufRead>(
-    reader: R,
+    mut reader: R,
     cancel: &AtomicBool,
     mut on_progress: impl FnMut(&PullProgress),
 ) -> Result<()> {
-    for line in reader.lines() {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
         if cancel.load(Ordering::SeqCst) {
             return Err(anyhow!("pull cancelled"));
         }
-        let line = line.context("ollama: failed to read /api/pull response")?;
+        buf.clear();
+        // A line is read through a `Take`, so a server that never sends a
+        // newline cannot grow the buffer past the cap.
+        let n = (&mut reader)
+            .take(MAX_PULL_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .context("ollama: failed to read /api/pull response")?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() > MAX_PULL_LINE_BYTES && !buf.ends_with(b"\n") {
+            return Err(anyhow!("ollama: /api/pull sent a line that is too long"));
+        }
+        let line = String::from_utf8_lossy(&buf);
         if let Some(progress) = parse_pull_line(&line) {
             if let Some(err) = &progress.error {
                 return Err(anyhow!("ollama: pull failed: {err}"));
@@ -1183,6 +1203,26 @@ mod tests {
         assert_eq!(mk("success").describe(), "Done.");
         // An unknown status is still shown, never dropped.
         assert_eq!(mk("something new").describe(), "Working: something new");
+    }
+
+    #[test]
+    fn stream_pull_progress_refuses_an_endless_line() {
+        // 10 MB with no newline must end in an error, not a 10 MB buffer.
+        let body = vec![b'a'; 10 * 1024 * 1024];
+        let err = stream_pull_progress(&body[..], &AtomicBool::new(false), |_| {}).unwrap_err();
+        assert!(err.to_string().contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn stream_pull_progress_handles_a_last_line_without_a_newline() {
+        let mut seen = Vec::new();
+        stream_pull_progress(
+            "{\"status\":\"a\"}\n{\"status\":\"b\"}".as_bytes(),
+            &AtomicBool::new(false),
+            |p| seen.push(p.status.clone()),
+        )
+        .unwrap();
+        assert_eq!(seen, vec!["a", "b"]);
     }
 
     #[test]

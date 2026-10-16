@@ -495,6 +495,9 @@ struct SettingsInner {
     /// #566: set while a pull is running; setting it true stops the worker.
     /// `None` when idle. The only thing alive for a pull is its one thread.
     pull_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// #566: which pull is current. Each pull's posts carry its number in
+    /// `wparam`; a post from an older pull is ignored.
+    pull_gen: usize,
     /// True while this window is open. Cleared in `WM_DESTROY`; the model
     /// fetch workers check it before posting (#569).
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -535,6 +538,7 @@ impl SettingsInner {
             cloud_models: Default::default(),
             pull_slot: Default::default(),
             pull_cancel: None,
+            pull_gen: 0,
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             prompt_expanded: false,
             hotkeys: original.hotkeys.clone(),
@@ -603,7 +607,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_OLLAMA_PULL => {
-            apply_pull_update(inner);
+            if wparam.0 == inner.pull_gen {
+                apply_pull_update(inner);
+            }
             LRESULT(0)
         }
         WM_CLOUD_MODELS => {
@@ -669,6 +675,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
     match id {
         ID_SAVE => {
+            // #566: Save would close the window and silently stop the pull.
+            if inner.pull_cancel.is_some() {
+                if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                    set_text(msg, "A pull is running. Stop it first.");
+                }
+                return;
+            }
             let raw = read_raw_form(inner);
             // #344: an invalid numeric field must not be silently kept at
             // its old value -- reject the Save, keep the window open, focus
@@ -2535,8 +2548,10 @@ fn on_pull_button(inner: &mut SettingsInner) {
     };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     inner.pull_slot = Default::default();
+    inner.pull_gen = inner.pull_gen.wrapping_add(1);
     if !spawn_ollama_pull(
         inner.hwnd,
+        inner.pull_gen,
         inner.original.providers.ollama.base_url.clone(),
         name,
         inner.pull_slot.clone(),
@@ -2615,6 +2630,7 @@ fn apply_pull_update(inner: &mut SettingsInner) {
 /// start.
 fn spawn_ollama_pull(
     hwnd: HWND,
+    generation: usize,
     base_url: String,
     name: String,
     slot: PullSlot,
@@ -2636,7 +2652,7 @@ fn spawn_ollama_pull(
                     let _ = PostMessageW(
                         Some(HWND(hwnd_raw as *mut c_void)),
                         WM_OLLAMA_PULL,
-                        WPARAM(0),
+                        WPARAM(generation),
                         LPARAM(0),
                     );
                 });
@@ -5668,6 +5684,51 @@ mod tests {
             );
             assert_eq!(get_text(button), "Pull", "back to idle when done");
             assert!(unsafe { &*raw }.pull_cancel.is_none());
+        });
+    }
+
+    #[test]
+    fn save_is_refused_while_a_pull_runs_and_a_stale_post_is_ignored() {
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+        let base = fake_pull_server("{\"status\":\"pulling manifest\"}\n", true);
+        with_pull_window(&base, |hwnd, raw| {
+            let status = get_dlg_item(hwnd, ID_PULL_STATUS).unwrap();
+            set_text(get_dlg_item(hwnd, ID_PULL_NAME).unwrap(), "tiny:1b");
+            click_pull_button(hwnd);
+            pump_until(|| get_text(status) == "Pulling manifest...");
+            let cancel = unsafe { &*raw }.pull_cancel.clone().expect("running");
+
+            // A post from an older pull changes nothing.
+            let current = unsafe { &*raw }.pull_gen;
+            *unsafe { &*raw }.pull_slot.lock().unwrap() = PullUpdate {
+                text: "stale".into(),
+                finished: true,
+                succeeded: true,
+            };
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_OLLAMA_PULL,
+                    Some(WPARAM(current.wrapping_sub(1))),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert_eq!(get_text(status), "Pulling manifest...");
+            assert!(unsafe { &*raw }.pull_cancel.is_some());
+
+            // Save does not cancel the pull; it says why.
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            let msg = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).unwrap();
+            assert_eq!(get_text(msg), "A pull is running. Stop it first.");
+            assert!(!cancel.load(Ordering::SeqCst));
+            assert!(unsafe { &*raw }.result.is_none());
         });
     }
 
