@@ -283,6 +283,27 @@ fn is_dotted_vendor_key(run: &str) -> bool {
 /// kilobytes; the bound keeps the scan linear on hostile text.
 const PEM_WINDOW: usize = 16 * 1024;
 
+/// Where the key body starts in the text after a private key header: past
+/// blank lines and `Key: value` armor header lines. PGP armor puts a blank
+/// line straight after the header, so the first blank line is not the end.
+fn armor_body_start(window: &str) -> usize {
+    let mut pos = 0;
+    loop {
+        let rest = &window[pos..];
+        let trimmed = rest.trim_start_matches(['\r', '\n']);
+        pos += rest.len() - trimmed.len();
+        let line_len = trimmed.find('\n').unwrap_or(trimmed.len());
+        let line = trimmed[..line_len].trim_end_matches('\r');
+        let is_header = line
+            .split_once(": ")
+            .is_some_and(|(k, _)| !k.is_empty() && !k.contains(char::is_whitespace));
+        if !is_header {
+            return pos;
+        }
+        pos += line_len;
+    }
+}
+
 /// Private key blocks: from a `-----BEGIN <label>-----` header whose label
 /// ends in `PRIVATE KEY` (or is `PGP PRIVATE KEY BLOCK`) through the matching
 /// `-----END <label>-----` line. Certificates and public keys are not secrets
@@ -326,11 +347,13 @@ fn pem_private_key_spans(text: &str) -> Vec<Range<usize>> {
         let end = match window.find(&end_line) {
             Some(e) => header_end + e + end_line.len(),
             None => {
+                let body = armor_body_start(window);
+                let rest = &window[body..];
                 let blank = ["\n\n", "\r\n\r\n"]
                     .iter()
-                    .filter_map(|b| window.find(b))
+                    .filter_map(|b| rest.find(b))
                     .min();
-                header_end + blank.unwrap_or(window.len())
+                header_end + body + blank.unwrap_or(rest.len())
             }
         };
         spans.push(start..end);
@@ -371,8 +394,15 @@ pub(crate) fn shared_key_spans(text: &str) -> Vec<Range<usize>> {
             (false, Some(b)) => {
                 dot_start = None;
                 let run = text[b..i].trim_end_matches('.');
-                if is_jwt(run) || is_dotted_vendor_key(run) {
-                    spans.push(b..b + run.len());
+                // Each dot-separated suffix is tried, so `bearer.eyJ...` is
+                // caught from the `eyJ`.
+                let starts = std::iter::once(0).chain(run.match_indices('.').map(|(d, _)| d + 1));
+                for off in starts {
+                    let sub = &run[off..];
+                    if is_jwt(sub) || is_dotted_vendor_key(sub) {
+                        spans.push(b + off..b + run.len());
+                        break;
+                    }
                 }
             }
             _ => {}
@@ -1135,7 +1165,25 @@ mod tests {
         assert_eq!(red(&pgp), "[key 1]\nok");
         // An END line of another label does not end the block.
         let mixed = format!("{BEGIN}PRIVATE KEY-----\nabc\n-----END CERTIFICATE-----\nmore");
-        assert!(red(&mixed).contains("[key 1]"), "{}", red(&mixed));
+        assert_eq!(red(&mixed), "[key 1]");
+        // PGP armor has a blank line right after the header, and may carry
+        // `Key: value` header lines; neither ends a cut-off block.
+        for t in [
+            format!("{BEGIN}PGP PRIVATE KEY BLOCK-----\n\nlQdGBF+x/Ab12=\nmore"),
+            format!("{BEGIN}PGP PRIVATE KEY BLOCK-----\nVersion: GnuPG v2\nComment: x y\n\nlQdGBF+x/Ab12=\nmore"),
+            format!("{BEGIN}PGP PRIVATE KEY BLOCK-----\r\n\r\nlQdGBF+x/Ab12=\r\nmore"),
+        ] {
+            assert!(!red(&t).contains("lQdGBF"), "{}", red(&t));
+        }
+    }
+
+    #[test]
+    fn a_token_after_a_dotted_prefix_is_still_found() {
+        let j = jwt();
+        let t = format!("Authorization: bearer.{j} end");
+        assert!(!red(&t).contains(&j), "{}", red(&t));
+        let sg = format!("SG.aB3dE6gH9jK2mN5pQ8sT1v.{}", "x".repeat(43));
+        assert!(!red(&format!("x.{sg}")).contains(&sg));
     }
 
     #[test]
