@@ -82,15 +82,15 @@ use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgCtrlID, GetDlgItem,
     GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild,
-    IsDialogMessageW, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
-    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
-    HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE,
-    WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
-    WS_DISABLED, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    IsDialogMessageW, KillTimer, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassExW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW, PM_REMOVE, SPI_GETNONCLIENTMETRICS,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW,
+    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_CONTROLPARENT,
+    WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetParent, GetScrollInfo, GetWindow, GW_CHILD, GW_HWNDNEXT, SB_VERT, SCROLLINFO,
@@ -252,6 +252,10 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     }
 
     run_message_loop(hwnd, inner_ref.prompt_edit);
+
+    // #345: a key captured while Save was being pressed may still be queued
+    // for the main window, which would take it as a rebind. Free it unused.
+    drain_learned_messages();
 
     // `inner_ref` is only valid up to WM_NCDESTROY, which has already run by
     // the time DestroyWindow (called from our WM_CLOSE/command handling)
@@ -557,6 +561,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_DPICHANGED => {
             on_dpi_changed(inner, wparam, lparam);
             LRESULT(0)
+        }
+        WM_ACTIVATE if (wparam.0 & 0xFFFF) == 0 && inner.learning.is_some() => {
+            // Alt-tabbing away mid-Change: the hook is global, so a key typed
+            // in another app would otherwise be captured as the new shortcut.
+            stop_learning(inner);
+            set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_TIMER if wparam.0 == LEARN_TIMER_ID => {
             learn_timed_out(inner);
@@ -3427,12 +3438,13 @@ fn judge_learned(
     if bare && chord.vk == VK_ESCAPE.0 as u32 {
         return LearnedVerdict::Cancel;
     }
+    let anchored = chord.ctrl || chord.alt || chord.win;
     let name = chord_to_string(&chord);
-    // A plain letter or Enter as a global shortcut would swallow that key in
-    // every app. Function keys are fine on their own.
-    if bare && !(0x70..=0x87).contains(&chord.vk) {
+    // A plain letter or Enter, or Shift plus a letter, as a global shortcut
+    // would swallow that key in every app. Function keys are fine without.
+    if !anchored && !(0x70..=0x87).contains(&chord.vk) {
         return LearnedVerdict::Refuse(format!(
-            "{name} needs Ctrl, Alt, Shift or Win with it. Press another."
+            "{name} needs Ctrl, Alt or Win with it. Press another."
         ));
     }
     let others = [
@@ -3530,6 +3542,18 @@ fn stop_learning(inner: &mut SettingsInner) {
     disarm_learning();
 }
 
+/// Removes and frees every queued `WM_APP_LEARNED` on this thread.
+fn drain_learned_messages() {
+    let mut msg = MSG::default();
+    while unsafe { PeekMessageW(&mut msg, None, WM_APP_LEARNED, WM_APP_LEARNED, PM_REMOVE) }
+        .as_bool()
+    {
+        if msg.lParam.0 != 0 {
+            drop(unsafe { Box::from_raw(msg.lParam.0 as *mut Chord) });
+        }
+    }
+}
+
 /// A Change button was pressed.
 fn start_change(inner: &mut SettingsInner, which: usize) {
     if inner.learning != Some(which) {
@@ -3538,7 +3562,9 @@ fn start_change(inner: &mut SettingsInner, which: usize) {
     if arm_change(inner, which) {
         set_hotkey_status(inner.hwnd, "Press the new key now. Esc cancels.");
     } else {
-        inner.learning = None;
+        // A Change armed earlier must not stay armed after a failed re-arm.
+        // The reason `arm_change` put on the status line is left as it is.
+        stop_learning(inner);
     }
 }
 
@@ -6373,6 +6399,16 @@ mod tests {
                 "vk {vk:#x}"
             );
         }
+        // Shift alone with a letter would swallow capitals everywhere.
+        assert!(matches!(
+            judge_learned(
+                &h,
+                None,
+                HK_PRIMARY,
+                chord(b'A' as u32, false, true, false, false)
+            ),
+            LearnedVerdict::Refuse(_)
+        ));
         assert_eq!(
             judge_learned(
                 &h,
