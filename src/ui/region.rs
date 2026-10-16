@@ -66,8 +66,8 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, GetMonitorInfoW, GetStockObject,
     MonitorFromPoint, Rectangle, RoundRect, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    DT_WORDBREAK, HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, LOGFONTW, MONITORINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DT_WORDBREAK, HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, LOGFONTW, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -354,13 +354,13 @@ pub fn hint_rect(monitor: Rect, dpi: u32) -> Rect {
     hint_rect_for_lines(monitor, dpi, 1)
 }
 
-/// How many lines the hint text needs: one when it fits in `available`
-/// pixels, else as many as it takes, at most three (#744).
-pub fn hint_line_count(text_width: i32, available: i32) -> i32 {
-    if available <= 0 || text_width <= available {
+/// How many lines the word-wrapped hint takes, from its measured wrapped
+/// height and one line's height: at least one, at most three (#744).
+pub fn hint_lines_from_height(wrapped_height: i32, line_height: i32) -> i32 {
+    if line_height <= 0 || wrapped_height <= 0 {
         return 1;
     }
-    ((text_width + available - 1) / available).clamp(1, 3)
+    ((wrapped_height + line_height - 1) / line_height).clamp(1, 3)
 }
 
 /// [`hint_rect`] for a hint that wraps onto `lines` lines: the same pill,
@@ -1187,13 +1187,14 @@ impl OverlayInner {
             if !hdc.0.is_null() && w > 0 && h > 0 && !self.background_dc.0.is_null() {
                 let _ = BitBlt(hdc, 0, 0, w, h, Some(self.background_dc), 0, 0, SRCCOPY);
             }
-            if let Some(rect) = self.visible_rect() {
-                draw_selection(hdc, rect, self.hint_dpi, &colors);
-            }
             // #360: hidden once dragging starts -- the size label next to
             // the live selection already tells the user what they're doing.
+            // Drawn first, so the selection and its size label stay on top.
             if !self.dragging {
                 draw_hint(hdc, self.hint_monitor, self.hint_dpi, &colors);
+            }
+            if let Some(rect) = self.visible_rect() {
+                draw_selection(hdc, rect, self.hint_dpi, &colors);
             }
 
             let _ = EndPaint(self.hwnd, &ps);
@@ -1317,15 +1318,26 @@ unsafe fn draw_hint(hdc: HDC, monitor: Rect, dpi: u32, colors: &OverlayColors) {
     // (a taller pill) when it does not fit, instead of cutting it off.
     let font = hint_font(dpi);
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
-    let text: Vec<u16> = HINT_TEXT.encode_utf16().collect();
-    let mut extent = windows::Win32::Foundation::SIZE::default();
-    let measured = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &text, &mut extent);
-    let lines = if measured.as_bool() {
-        let available = one_line.width() - 2 * scale_for_dpi(HINT_TEXT_INSET_DP, dpi);
-        hint_line_count(extent.cx, available)
-    } else {
-        1
+    // DT_CALCRECT with word wrap gives the real wrapped height, which can need
+    // more lines than text width / pill width suggests.
+    let mut text: Vec<u16> = HINT_TEXT.encode_utf16().collect();
+    let available = one_line.width() - 2 * scale_for_dpi(HINT_TEXT_INSET_DP, dpi);
+    let mut calc = RECT {
+        left: 0,
+        top: 0,
+        right: available.max(1),
+        bottom: 0,
     };
+    windows::Win32::Graphics::Gdi::DrawTextW(
+        hdc,
+        &mut text,
+        &mut calc,
+        DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+    );
+    let mut one = windows::Win32::Foundation::SIZE::default();
+    let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &text, &mut one);
+    let text_h = calc.bottom - calc.top;
+    let lines = hint_lines_from_height(text_h, one.cy);
     let rect = hint_rect_for_lines(monitor, dpi, lines);
 
     let brush = CreateSolidBrush(COLORREF(colors.hint_fill));
@@ -1350,14 +1362,17 @@ unsafe fn draw_hint(hdc: HDC, monitor: Rect, dpi: u32, colors: &OverlayColors) {
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, COLORREF(colors.hint_text));
     let inset = scale_for_dpi(HINT_TEXT_INSET_DP, dpi);
-    let text_rc = RECT {
+    let mut text_rc = RECT {
         left: rect.left + inset,
         top: rect.top,
         right: rect.right - inset,
         bottom: rect.bottom,
     };
     let format = if lines > 1 {
-        DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX
+        // DT_VCENTER only works with DT_SINGLELINE, so centre the wrapped
+        // block by hand.
+        text_rc.top = rect.top + ((rect.bottom - rect.top) - text_h).max(0) / 2;
+        DT_CENTER | DT_WORDBREAK | DT_NOPREFIX
     } else {
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
     };
@@ -2599,15 +2614,16 @@ mod tests {
 
     #[test]
     fn a_hint_that_does_not_fit_wraps_to_more_lines_and_a_taller_pill() {
-        assert_eq!(hint_line_count(500, 600), 1);
-        assert_eq!(hint_line_count(600, 600), 1);
-        assert_eq!(hint_line_count(601, 600), 2);
-        assert_eq!(hint_line_count(5000, 600), 3, "capped at three lines");
+        assert_eq!(hint_lines_from_height(24, 24), 1);
+        assert_eq!(hint_lines_from_height(48, 24), 2);
+        assert_eq!(hint_lines_from_height(49, 24), 3);
+        assert_eq!(hint_lines_from_height(240, 24), 3, "capped at three lines");
         assert_eq!(
-            hint_line_count(500, 0),
+            hint_lines_from_height(48, 0),
             1,
-            "no room is not a divide by zero"
+            "no line height is not a divide by zero"
         );
+        assert_eq!(hint_lines_from_height(0, 24), 1);
         let m = monitor_rect(0, 0, 960, 600);
         let one = hint_rect_for_lines(m, 240, 1);
         let two = hint_rect_for_lines(m, 240, 2);
