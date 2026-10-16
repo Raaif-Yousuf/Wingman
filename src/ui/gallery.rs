@@ -21,6 +21,7 @@ pub struct GalleryArgs {
 
 /// The theme a `--theme` value names: `light`, `dark` or `high-contrast`
 /// (Windows' high contrast black). `None` for anything else.
+#[cfg(any(test, debug_assertions))]
 pub fn theme_from_arg(name: &str) -> Option<crate::ui::theme::Theme> {
     use crate::ui::theme::Theme;
     match name {
@@ -69,6 +70,8 @@ pub enum GalleryState {
     CardAnswerDifficultyMid,
     CardAnswerDifficultyHigh,
     CardAnswerDifficultyUltra,
+    /// An answer opened up, so its footer links (Read aloud, Copy) show.
+    CardAnswerExpanded,
     CardError,
     /// Issue #354. Replaces the old single glyph-only `CardPending` state:
     /// the pending card now always carries a status line, so each sub-stage
@@ -113,6 +116,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardAnswerDifficultyMid,
         CardAnswerDifficultyHigh,
         CardAnswerDifficultyUltra,
+        CardAnswerExpanded,
         CardError,
         CardPendingReadingSelection,
         CardPendingAskingModelShort,
@@ -143,6 +147,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardAnswerDifficultyMid => "card-answer-difficulty-mid",
         CardAnswerDifficultyHigh => "card-answer-difficulty-high",
         CardAnswerDifficultyUltra => "card-answer-difficulty-ultra",
+        CardAnswerExpanded => "card-answer-expanded",
         CardError => "card-error",
         CardPendingReadingSelection => "card-pending-reading-selection",
         CardPendingAskingModelShort => "card-pending-asking-model-short",
@@ -413,6 +418,17 @@ mod driver {
                     0,
                     Some(Difficulty::Ultra),
                 );
+            }
+            CardAnswerExpanded => {
+                card.hide();
+                palette.hide();
+                card.show_answer(
+                    "The limit is 1/2",
+                    "Apply L'Hopital's rule once and simplify.",
+                    0,
+                    Some(Difficulty::Level(5)),
+                );
+                card.expand_for_gallery();
             }
             CardError => {
                 card.hide();
@@ -694,9 +710,9 @@ mod tests {
         let states = gallery_states();
         // 5 card-answer variants (short + 4 difficulty badges) + error + 4
         // pending sub-stages (#354) + 3 previews (calendar, long labels,
-        // the error title) = 13 card states, + 4 palette states + 4 settings
-        // states (#560) = 21.
-        assert_eq!(states.len(), 21);
+        // the error title) + the expanded answer = 14 card states, + 4
+        // palette states + 4 settings states (#560) = 22.
+        assert_eq!(states.len(), 22);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(

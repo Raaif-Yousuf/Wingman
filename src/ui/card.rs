@@ -73,9 +73,9 @@ use crate::ui::card_placement::{
 };
 use crate::ui::text::draw_text_line;
 use crate::ui::theme::{
-    self, contrast_ratio, relative_luminance, rgb, SysColors, Theme, Tokens, BADGE_HIGH,
-    BADGE_INK_DARK, BADGE_INK_LIGHT, BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP,
-    DETAIL_FONT_SCALE, FALLBACK_FONT_FACE, GAP_DP, HEADLINE_FONT_SCALE, MARGIN_DP, PADDING_DP,
+    contrast_ratio, relative_luminance, rgb, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK,
+    BADGE_INK_LIGHT, BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, DETAIL_FONT_SCALE,
+    FALLBACK_FONT_FACE, GAP_DP, HEADLINE_FONT_SCALE, MARGIN_DP, PADDING_DP,
     SMALL_FONT_SCALE as BADGE_FONT_SCALE,
 };
 use serde_json::Value;
@@ -564,11 +564,17 @@ impl Card {
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn force_theme_for_gallery(&mut self, theme: Theme) {
         self.inner.theme = theme;
-        self.inner.sys = theme::HC_BLACK;
+        self.inner.sys = crate::ui::theme::HC_BLACK;
         self.inner.theme_forced = true;
         if !self.inner.hwnd.0.is_null() {
             self.inner.repaint_for_theme();
         }
+    }
+
+    /// The UI gallery's expanded answer: what a click on the card does.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn expand_for_gallery(&mut self) {
+        self.inner.try_expand();
     }
 
     /// The UI gallery's preview error title: puts `message` where the
@@ -712,6 +718,7 @@ struct Palette {
     headline: u32,
     detail: u32,
     hint: u32,
+    link: u32,
     danger: u32,
 }
 
@@ -725,6 +732,7 @@ fn palette_for(theme: Theme, sys: &SysColors) -> Palette {
         headline: tokens.text,
         detail: tokens.text_dim,
         hint: tokens.text_faint,
+        link: tokens.link,
         danger: tokens.danger,
     }
 }
@@ -764,6 +772,17 @@ fn difficulty_color(difficulty: Difficulty) -> u32 {
         lerp_u8(from.1, to.1, t),
         lerp_u8(from.2, to.2, t),
     )
+}
+
+/// The badge's `(fill, label ink)`. High contrast drops the rank gradient
+/// for the system highlight pair (the label still carries the rank); every
+/// other theme uses the gradient with whichever ink reads better on it.
+fn badge_colors(difficulty: Difficulty, theme: Theme, sys: &SysColors) -> (u32, u32) {
+    if theme == Theme::HighContrast {
+        return (sys.highlight, sys.highlight_text);
+    }
+    let fill = difficulty_color(difficulty);
+    (fill, badge_text_color(fill))
 }
 
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
@@ -1726,13 +1745,11 @@ impl CardInner {
         palette_for(self.theme, &self.sys)
     }
 
-    /// The system colours for the preview buttons while high contrast is on.
-    /// A forced (gallery) theme answers from its simulated colours instead of
-    /// the live system.
+    /// The colours for the preview buttons while high contrast is on, from
+    /// the same system colours the card paints with (window and window text,
+    /// not button face and text, so a custom scheme cannot split the two).
+    /// The live card and the gallery's forced theme share this path.
     fn button_high_contrast(&self) -> Option<crate::ui::card_buttons::HighContrast> {
-        if !self.theme_forced {
-            return crate::ui::card_buttons::system_high_contrast();
-        }
         (self.theme == Theme::HighContrast).then_some(crate::ui::card_buttons::HighContrast {
             face: self.sys.window,
             text: self.sys.window_text,
@@ -2727,7 +2744,7 @@ impl CardInner {
         ];
         let _ = SelectClipRgn(hdc, None);
         SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
-        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.link));
         for (rect, label) in links {
             if let Some(rect) = rect {
                 draw_text_line(
@@ -2765,8 +2782,7 @@ impl CardInner {
         let left = (right - w).max(rc.left);
         let top = (bottom - h).max(rc.top);
 
-        let fill = difficulty_color(difficulty);
-        let text_color = badge_text_color(fill);
+        let (fill, text_color) = badge_colors(difficulty, self.theme, &self.sys);
         // Equal-radius rounding on both axes: when w == h (short labels like
         // "1") this comes out as a circle; when w > h ("10", "U") it comes
         // out as a pill.
@@ -4309,6 +4325,7 @@ fn utf16(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::theme;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
     fn instance() -> HINSTANCE {
@@ -5360,6 +5377,7 @@ mod tests {
                 window: 1,
                 window_text: 2,
                 gray_text: 3,
+                hotlight: 6,
                 highlight: 4,
                 highlight_text: 5,
             };
@@ -5381,6 +5399,7 @@ mod tests {
             window: 1,
             window_text: 2,
             gray_text: 3,
+            hotlight: 6,
             highlight: 4,
             highlight_text: 5,
         };
@@ -5444,18 +5463,60 @@ mod tests {
     }
 
     #[test]
+    fn live_high_contrast_buttons_use_the_same_colours_as_the_card() {
+        // The card paints with window/window text; the buttons must not read
+        // button face/text, or a custom scheme splits the two.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.inner.theme = Theme::HighContrast;
+        card.inner.sys = theme::HC_BLACK;
+        let hc = card.inner.button_high_contrast().expect("high contrast");
+        assert_eq!(
+            (hc.face, hc.text),
+            (card.inner.palette().bg, card.inner.palette().headline)
+        );
+    }
+
+    #[test]
+    fn high_contrast_badges_use_the_highlight_colours() {
+        let sys = theme::HC_BLACK;
+        for d in [
+            Difficulty::Level(1),
+            Difficulty::Level(10),
+            Difficulty::Ultra,
+        ] {
+            assert_eq!(
+                badge_colors(d, Theme::HighContrast, &sys),
+                (sys.highlight, sys.highlight_text)
+            );
+        }
+        let (fill, ink) = badge_colors(Difficulty::Level(5), Theme::Dark, &sys);
+        assert_eq!(fill, difficulty_color(Difficulty::Level(5)));
+        assert_eq!(ink, badge_text_color(fill));
+    }
+
+    #[test]
+    fn footer_links_use_the_link_colour_not_the_hint() {
+        let p = palette_for(Theme::HighContrast, &theme::HC_BLACK);
+        assert_eq!(p.link, theme::HC_BLACK.hotlight);
+        assert_ne!(p.link, p.hint);
+        let l = palette_for(Theme::Light, &theme::HC_BLACK);
+        assert_eq!(l.link, l.hint);
+    }
+
+    #[test]
     fn a_forced_high_contrast_card_paints_its_buttons_from_the_simulated_colours() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.force_theme_for_gallery(Theme::HighContrast);
         let hc = card.inner.button_high_contrast().expect("high contrast");
         assert_eq!(hc.face, theme::HC_BLACK.window);
         assert_eq!(hc.highlight, theme::HC_BLACK.highlight);
+        assert_eq!(hc.text, theme::HC_BLACK.window_text);
         card.force_theme_for_gallery(Theme::Dark);
         assert!(card.inner.button_high_contrast().is_none());
     }
 
     #[test]
-    fn a_preview_error_replaces_the_title_and_asks_for_a_repaint() {
+    fn a_preview_error_replaces_the_title() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
         let _ = card.show_preview("Add to calendar", &schema, &value, false);
