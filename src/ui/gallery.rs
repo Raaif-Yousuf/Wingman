@@ -837,6 +837,12 @@ mod driver {
             let bitmap: HBITMAP = CreateCompatibleBitmap(screen_dc, width, height);
             let old = SelectObject(mem_dc, bitmap.into());
 
+            if wm_print && !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool()
+            {
+                // A palette that hid itself (it hides when focus leaves it)
+                // would print as a black page: fail loudly instead.
+                anyhow::bail!("the window is hidden, so {path:?} would be a black page");
+            }
             let ok = if wm_print {
                 // PRF_CHECKVISIBLE | PRF_CHILDREN | PRF_CLIENT | PRF_ERASEBKGND
                 SendMessageW(
