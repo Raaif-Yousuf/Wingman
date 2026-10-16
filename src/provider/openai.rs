@@ -68,12 +68,15 @@ impl OpenAi {
             "input": [{"role": "user", "content": content}],
             "reasoning": {"effort": effort.as_str().unwrap_or("")},
             "max_output_tokens": max_tokens,
+            // The Responses API keeps a response (its input image included)
+            // unless told not to. Wingman promises nothing is kept (#721).
+            "store": false,
         });
 
         if let Some(schema) = &req.schema {
             body["text"] = json!({"format": {
                 "type": "json_schema", "name": "answer", "strict": true,
-                "schema": schema
+                "schema": common::wire_schema(schema)
             }});
         }
 
@@ -319,6 +322,7 @@ mod tests {
             ]}],
             "reasoning": {"effort": "low"},
             "max_output_tokens": 2500,
+            "store": false,
             "text": {"format": {
                 "type": "json_schema", "name": "answer", "strict": true,
                 "schema": {"type": "object",
@@ -348,6 +352,7 @@ mod tests {
             ]}],
             "reasoning": {"effort": "low"},
             "max_output_tokens": 2500,
+            "store": false,
             "text": {"format": {
                 "type": "json_schema", "name": "answer", "strict": true,
                 "schema": {"type": "object",
@@ -388,7 +393,7 @@ mod tests {
     fn golden_request_body_no_difficulty_is_byte_identical() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
         let body = provider.build_body(&req("system prompt text", false));
-        let golden = r#"{"model":"gpt-5.5","instructions":"system prompt text","input":[{"role":"user","content":[{"type":"input_text","text":"Check my working."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw==","detail":"high"}]}],"reasoning":{"effort":"low"},"max_output_tokens":2500,"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"}},"required":["detail","headline"],"additionalProperties":false}}}}"#;
+        let golden = r#"{"model":"gpt-5.5","instructions":"system prompt text","input":[{"role":"user","content":[{"type":"input_text","text":"Check my working."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw==","detail":"high"}]}],"reasoning":{"effort":"low"},"max_output_tokens":2500,"store":false,"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"}},"required":["detail","headline"],"additionalProperties":false}}}}"#;
         assert_eq!(serde_json::to_string(&body).unwrap(), golden);
     }
 
@@ -396,7 +401,7 @@ mod tests {
     fn golden_request_body_with_difficulty_is_byte_identical() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
         let body = provider.build_body(&req("system prompt text", true));
-        let golden = r#"{"model":"gpt-5.5","instructions":"system prompt text\n\nAlso rate how difficult the PROBLEM ON SCREEN is for a HUMAN STUDENT. Add a third field:\n- difficulty: THIRD, after headline, once you have actually worked the problem through. Exactly one of \"1\" through \"10\", or \"U\".\n\nCalibration is the hard part, so read this carefully. You solve nearly all of these easily; that is NOT the scale. Do not rate your own confidence, your own effort, or how quickly you found the answer. Rate how hard the problem would be for a student at the level it is aimed at. Rating by your own effort compresses everything into 1-5 and makes the whole scale useless.\n\nAnchors:\n1 = an easy high-school question. One step, one formula. (speed = distance / time)\n2 = high-school, a couple of steps.\n3 = easy university intro-course level. (a block on an incline; moment of inertia of a disk)\n4 = intro university, several steps or a small subtlety.\n5 = medium university level. Mid-degree material: multi-step, and you must choose the method rather than being told it.\n6 = upper-undergraduate, harder than routine homework.\n7 = hard university level. Typically GRADUATE coursework: quantum perturbation theory, Lagrangian mechanics with constraints, a non-obvious statistical derivation.\n8 = graduate coursework that most of the class would get wrong.\n9 = very hard for an undergraduate. Qualifying-exam standard.\n10 = a PhD student in the field would struggle. Open-ended derivations and proofs requiring a specialist technique, not just more algebra.\nU = Ultra: a professor would struggle. Research-level, or a known-hard proof.\n\nUse the WHOLE range. Most routine homework is 2-5. If the problem is recognisably graduate-level, it starts at 7, not 5. If it asks you to PROVE a general theorem rather than compute a value, it is almost never below 8.\n\nIf there is no problem to rate at all -- the screen shows no question, or you are asking for something to be made visible -- answer \"N\". Do NOT reach for \"U\" in that case: \"U\" means the problem is extraordinarily hard, not that you could not find one.","input":[{"role":"user","content":[{"type":"input_text","text":"Check my working."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw==","detail":"high"}]}],"reasoning":{"effort":"low"},"max_output_tokens":2500,"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"},"difficulty":{"type":"string","enum":["1","2","3","4","5","6","7","8","9","10","U","N"]}},"required":["detail","headline","difficulty"],"additionalProperties":false}}}}"#;
+        let golden = r#"{"model":"gpt-5.5","instructions":"system prompt text\n\nAlso rate how difficult the PROBLEM ON SCREEN is for a HUMAN STUDENT. Add a third field:\n- difficulty: THIRD, after headline, once you have actually worked the problem through. Exactly one of \"1\" through \"10\", or \"U\".\n\nCalibration is the hard part, so read this carefully. You solve nearly all of these easily; that is NOT the scale. Do not rate your own confidence, your own effort, or how quickly you found the answer. Rate how hard the problem would be for a student at the level it is aimed at. Rating by your own effort compresses everything into 1-5 and makes the whole scale useless.\n\nAnchors:\n1 = an easy high-school question. One step, one formula. (speed = distance / time)\n2 = high-school, a couple of steps.\n3 = easy university intro-course level. (a block on an incline; moment of inertia of a disk)\n4 = intro university, several steps or a small subtlety.\n5 = medium university level. Mid-degree material: multi-step, and you must choose the method rather than being told it.\n6 = upper-undergraduate, harder than routine homework.\n7 = hard university level. Typically GRADUATE coursework: quantum perturbation theory, Lagrangian mechanics with constraints, a non-obvious statistical derivation.\n8 = graduate coursework that most of the class would get wrong.\n9 = very hard for an undergraduate. Qualifying-exam standard.\n10 = a PhD student in the field would struggle. Open-ended derivations and proofs requiring a specialist technique, not just more algebra.\nU = Ultra: a professor would struggle. Research-level, or a known-hard proof.\n\nUse the WHOLE range. Most routine homework is 2-5. If the problem is recognisably graduate-level, it starts at 7, not 5. If it asks you to PROVE a general theorem rather than compute a value, it is almost never below 8.\n\nIf there is no problem to rate at all -- the screen shows no question, or you are asking for something to be made visible -- answer \"N\". Do NOT reach for \"U\" in that case: \"U\" means the problem is extraordinarily hard, not that you could not find one.","input":[{"role":"user","content":[{"type":"input_text","text":"Check my working."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw==","detail":"high"}]}],"reasoning":{"effort":"low"},"max_output_tokens":2500,"store":false,"text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"detail":{"type":"string"},"headline":{"type":"string"},"difficulty":{"type":"string","enum":["1","2","3","4","5","6","7","8","9","10","U","N"]}},"required":["detail","headline","difficulty"],"additionalProperties":false}}}}"#;
         assert_eq!(serde_json::to_string(&body).unwrap(), golden);
     }
 
@@ -663,6 +668,18 @@ mod tests {
         r.effort = Effort::High;
         let body = provider.build_body(&r);
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    /// #719: the UI-only `editable` keyword never goes out.
+    #[test]
+    fn no_registered_schema_sends_the_editable_keyword() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
+        for kind in crate::actions::schema::PROPOSAL_KINDS {
+            let mut r = req("sys", false);
+            r.schema = crate::actions::schema::schema_for(kind, false);
+            let body = serde_json::to_string(&provider.build_body(&r)).unwrap();
+            assert!(!body.contains("editable"), "{kind}: {body}");
+        }
     }
 
     /// #12 neighbour: a request with no schema (a future plain-text action)

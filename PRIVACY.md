@@ -46,6 +46,9 @@ Where each provider's request goes:
 | Ollama | `{providers.ollama.base_url}/api/chat`, default `http://127.0.0.1:11434/api/chat` | none; local server, no key |
 | OpenAI-compatible (`compat:<name>`) | `{base_url}/chat/completions`, where `base_url` is whatever you configured per endpoint (OpenRouter, Groq, LM Studio, a local server, ...) | your saved `Wingman/compat:<name>` credential, a caller-named header, or none, depending on that endpoint's `auth` setting |
 
+The OpenAI request sets `store: false`, so OpenAI is asked not to keep the
+response or the screenshot for later retrieval.
+
 The three cloud requests go to whichever provider you configured with your
 own API key. Ollama's request never leaves your machine: it is a loopback
 HTTP call to a local Ollama server, only ever `127.0.0.1` (never
