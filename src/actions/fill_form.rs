@@ -84,11 +84,11 @@
 //! Expansion plan §15/`OWNER_TODO.md` item 3 leaves the sensitivity default
 //! to the owner, but a genuinely EMPTY profile (issue #40's task brief) is
 //! a product decision this file does make, documented here rather than
-//! left as a TODO: `profile.bin` is a DPAPI-encrypted binary with no
+//! left as a TODO: the profile is encrypted in the local store with no
 //! settings page yet (#50) for a user to hand-edit, so pointing at it alone
 //! would be a dead end. [`load_or_import_profile`] additionally looks for a
 //! plain, hand-editable `profile.toml` next to it and imports it once (the
-//! same `Profile::save_to` -- and therefore the same payment-data denylist
+//! same `Store::save_profile` -- and therefore the same payment-data denylist
 //! -- every other write already goes through) whenever the encrypted store
 //! is still empty. This was judged "trivial" per the task brief's own
 //! permission to add it: `Profile` already derives `serde::Deserialize`,
@@ -100,6 +100,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+
+use crate::store::Store;
 use serde_json::{json, Map, Value};
 
 use crate::config::RequireTickFor;
@@ -975,12 +977,13 @@ pub const EMPTY_PROFILE_HEADLINE: &str = "No profile data yet";
 /// import. Names both real paths (rule 1 never applies here: this is only
 /// the PATH, never the file's contents) so the user knows exactly what to
 /// create and where the encrypted result ends up.
-pub fn empty_profile_detail(toml_path: &str, bin_path: &str) -> String {
+pub fn empty_profile_detail(toml_path: &str, data_dir: &str) -> String {
     format!(
         "Fill this form has nothing to offer yet because your profile is empty. \
          Create a plain text file at:\n{toml_path}\n\
          with fields like full_name, emails, phones and address, and Wingman will import it \
-         the next time you press this. The encrypted profile it becomes lives at:\n{bin_path}\n\
+         the next time you press this. The encrypted profile it becomes is kept in Wingman's \
+         private data folder:\n{data_dir}\n\
          A profile settings page is planned (#50) but not built yet."
     )
 }
@@ -1001,20 +1004,21 @@ fn import_profile_toml_if_present(toml_path: &Path) -> Result<Option<Profile>> {
     Ok(Some(profile))
 }
 
-/// Loads the encrypted profile from `bin_path`; if it is empty, tries a
-/// one-shot import from a plain `profile.toml` at `toml_path` and, when
-/// that yields anything, saves it back to `bin_path` -- through
-/// `Profile::save_to`, so it is encrypted and the payment-data denylist
-/// runs over it exactly like any other write (a `profile.toml` with a
-/// payment-shaped value in it is rejected here, surfaced as an `Err`,
-/// never silently imported). Path-injectable (rule 9); [`load_or_import`]
-/// is the only caller that touches the real `%APPDATA%` paths.
-pub fn load_or_import_profile_from(bin_path: &Path, toml_path: &Path) -> Result<Profile> {
-    let mut profile = Profile::load_from(bin_path)?;
+/// Loads the profile from `store`; if it is empty, tries a one-shot import
+/// from a plain `profile.toml` at `toml_path` and, when that yields anything,
+/// saves it to the store -- through `Store::save_profile`, so it is encrypted
+/// and the payment-data denylist runs over it exactly like any other write (a
+/// `profile.toml` with a payment-shaped value in it is rejected here,
+/// surfaced as an `Err`, never silently imported). A profile that cannot be
+/// decrypted is an `Err` before any import is tried, so nothing is ever
+/// written over it. [`load_or_import_profile`] is the only caller that
+/// touches the real store and `%APPDATA%` path.
+pub fn load_or_import_profile_from(store: &Store, toml_path: &Path) -> Result<Profile> {
+    let mut profile = store.load_profile()?;
     if profile_is_empty(&profile) {
         if let Some(imported) = import_profile_toml_if_present(toml_path)? {
             if !profile_is_empty(&imported) {
-                imported.save_to(bin_path)?;
+                store.save_profile(&imported)?;
                 profile = imported;
             }
         }
@@ -1022,12 +1026,19 @@ pub fn load_or_import_profile_from(bin_path: &Path, toml_path: &Path) -> Result<
     Ok(profile)
 }
 
-/// [`load_or_import_profile_from`] against the real
-/// `%APPDATA%\Wingman\profile.bin` and `%APPDATA%\Wingman\profile.toml`.
+/// `%APPDATA%\Wingman\profile.toml`, the hand-edited file imported once.
+pub fn profile_toml_path() -> Result<std::path::PathBuf> {
+    Ok(crate::known_folder::roaming_app_data()
+        .context("could not determine the platform config directory")?
+        .join("Wingman")
+        .join("profile.toml"))
+}
+
+/// [`load_or_import_profile_from`] against the real store and
+/// `%APPDATA%\Wingman\profile.toml`.
 pub fn load_or_import_profile() -> Result<Profile> {
-    let bin_path = Profile::path()?;
-    let toml_path = bin_path.with_file_name("profile.toml");
-    load_or_import_profile_from(&bin_path, &toml_path)
+    let store = crate::store::global()?;
+    load_or_import_profile_from(&store, &profile_toml_path()?)
 }
 
 #[cfg(test)]
@@ -2042,38 +2053,41 @@ mod tests {
 
     #[test]
     fn empty_profile_detail_names_both_paths_and_has_no_em_dash() {
-        let text = empty_profile_detail("C:\\x\\profile.toml", "C:\\x\\profile.bin");
+        let text = empty_profile_detail("C:\\x\\profile.toml", "C:\\x\\store");
         assert!(text.contains("profile.toml"));
-        assert!(text.contains("profile.bin"));
+        assert!(text.contains("C:\\x\\store"));
         assert!(!text.contains('\u{2014}'));
     }
 
-    fn scratch_paths(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "wingman-fill-form-test-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        (dir.join("profile.bin"), dir.join("profile.toml"))
+    fn scratch_toml(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "wingman-fill-form-test-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .join("profile.toml")
     }
 
     #[test]
-    fn load_or_import_profile_from_with_no_bin_and_no_toml_yields_an_empty_profile() {
-        let (bin_path, toml_path) = scratch_paths("neither");
-        let profile = load_or_import_profile_from(&bin_path, &toml_path).unwrap();
+    fn load_or_import_profile_from_with_no_store_rows_and_no_toml_yields_an_empty_profile() {
+        let store = Store::in_memory();
+        let profile = load_or_import_profile_from(&store, &scratch_toml("neither")).unwrap();
         assert!(profile_is_empty(&profile));
-        assert!(
-            !bin_path.exists(),
+        assert_eq!(
+            store.load_profile().unwrap(),
+            Profile::default(),
             "must never create a profile out of nothing"
         );
     }
 
     #[test]
     fn load_or_import_profile_from_imports_a_plain_toml_and_saves_it_encrypted() {
-        let (bin_path, toml_path) = scratch_paths("import");
+        let store = Store::in_memory();
+        let toml_path = scratch_toml("import");
         std::fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
         std::fs::write(
             &toml_path,
@@ -2081,44 +2095,72 @@ mod tests {
         )
         .unwrap();
 
-        let profile = load_or_import_profile_from(&bin_path, &toml_path).unwrap();
+        let profile = load_or_import_profile_from(&store, &toml_path).unwrap();
         assert_eq!(profile.full_name.value, "Ada Lovelace");
-        assert!(
-            bin_path.exists(),
-            "the import must be saved to the encrypted store"
-        );
 
         // A second load (no more profile.toml needed) reads the saved copy.
-        let reloaded = Profile::load_from(&bin_path).unwrap();
+        let reloaded = store.load_profile().unwrap();
         assert_eq!(reloaded.full_name.value, "Ada Lovelace");
 
-        let _ = std::fs::remove_dir_all(bin_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(toml_path.parent().unwrap());
     }
 
     #[test]
     fn load_or_import_profile_from_never_imports_over_an_already_populated_profile() {
-        let (bin_path, toml_path) = scratch_paths("no-overwrite");
-        std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
-        let existing = sample_profile();
-        existing.save_to(&bin_path).unwrap();
+        let store = Store::in_memory();
+        let toml_path = scratch_toml("no-overwrite");
+        std::fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
+        store.save_profile(&sample_profile()).unwrap();
         std::fs::write(
             &toml_path,
             "[full_name]\nvalue = \"Someone Else\"\nsensitive = false\n",
         )
         .unwrap();
 
-        let profile = load_or_import_profile_from(&bin_path, &toml_path).unwrap();
+        let profile = load_or_import_profile_from(&store, &toml_path).unwrap();
         assert_eq!(
             profile.full_name.value, "Ada Lovelace",
             "the existing profile must win"
         );
 
-        let _ = std::fs::remove_dir_all(bin_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(toml_path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_undecryptable_profile_is_an_error_and_the_toml_is_not_imported_over_it() {
+        // Another PC or Windows user: the stored value is sealed for someone
+        // else. The result is an error (a card), never an empty profile that
+        // a profile.toml import could then overwrite.
+        let store = Store::in_memory();
+        store.save_profile(&sample_profile()).unwrap();
+        let foreign = crate::dpapi::protect(b"{}".to_vec(), Some(b"someone else")).unwrap();
+        store
+            .corrupt_profile_row_for_test("full_name", &foreign)
+            .unwrap();
+        let toml_path = scratch_toml("undecryptable");
+        std::fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &toml_path,
+            "[full_name]\nvalue = \"Someone Else\"\nsensitive = false\n",
+        )
+        .unwrap();
+
+        let err = load_or_import_profile_from(&store, &toml_path).unwrap_err();
+
+        assert!(err.to_string().contains("could not unlock"), "{err:#}");
+        assert!(!err.to_string().contains('\u{2014}'));
+        assert_eq!(
+            store.stored_profile_value_for_test("full_name").unwrap(),
+            foreign,
+            "the stored row is untouched"
+        );
+        let _ = std::fs::remove_dir_all(toml_path.parent().unwrap());
     }
 
     #[test]
     fn load_or_import_profile_from_rejects_a_payment_shaped_toml_and_saves_nothing() {
-        let (bin_path, toml_path) = scratch_paths("denylist");
+        let store = Store::in_memory();
+        let toml_path = scratch_toml("denylist");
         std::fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
         std::fs::write(
             &toml_path,
@@ -2126,9 +2168,9 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_or_import_profile_from(&bin_path, &toml_path).unwrap_err();
+        let err = load_or_import_profile_from(&store, &toml_path).unwrap_err();
         assert!(!err.to_string().contains("4111"));
-        assert!(!bin_path.exists());
+        assert_eq!(store.load_profile().unwrap(), Profile::default());
 
         let _ = std::fs::remove_dir_all(toml_path.parent().unwrap());
     }
@@ -2419,7 +2461,9 @@ mod tests {
                 phones: vec![Field::new("+1 555-123-4567".to_string(), false)],
                 ..Profile::default()
             };
-            profile.save_to(&bin_path).expect("save_to");
+            profile
+                .write_legacy_file(&bin_path)
+                .expect("write_legacy_file");
 
             // -- snapshot, filter, map locally --------------------------------
             let snapshot = crate::inputs::uia::snapshot_hwnd(

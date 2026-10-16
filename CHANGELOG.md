@@ -9,6 +9,10 @@ tagged release.
 
 ### Added
 
+- Share an action as a file: tray, Help and diagnostics, "Export action to file"
+  saves one of your actions as a `.toml`; "Import action from file" checks a
+  file, shows what it does, and adds it to your `actions.toml` only if you say
+  yes. Part of issue #117 (export and import of all settings is still open).
 - "Convert times to my time zone" action: reads each time and zone on
   screen and lists it in your local time, day included. Ambiguous zones
   (CST, IST, BST) show every reading (issue #315).

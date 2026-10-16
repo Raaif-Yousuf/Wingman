@@ -137,7 +137,7 @@ impl OpenAiCompat {
         let mut system_text = req.system.clone();
         if let Some(schema) = &req.schema {
             if !matches!(self.structured, Structured::JsonSchema) {
-                system_text.push_str(&Self::schema_instruction(schema));
+                system_text.push_str(&Self::schema_instruction(&common::wire_schema(schema)));
             }
         }
 
@@ -161,7 +161,7 @@ impl OpenAiCompat {
                 Structured::JsonSchema => {
                     body["response_format"] = json!({
                         "type": "json_schema",
-                        "json_schema": {"name": "answer", "schema": schema, "strict": true}
+                        "json_schema": {"name": "answer", "schema": common::wire_schema(schema), "strict": true}
                     });
                 }
                 Structured::JsonObject => {
@@ -512,6 +512,25 @@ mod tests {
         assert_eq!(schema["required"], json!(["detail", "headline"]));
         // No textual schema instruction appended -- the server enforces it.
         assert_eq!(body["messages"][0]["content"], "system prompt text");
+    }
+
+    /// #719: in every structured mode, the schema text that goes out (as a
+    /// `response_format` or inside the prompt) has no `editable` keyword.
+    #[test]
+    fn no_registered_schema_sends_the_editable_keyword_in_any_mode() {
+        for structured in [
+            Structured::JsonSchema,
+            Structured::JsonObject,
+            Structured::Prompt,
+        ] {
+            let p = provider(CompatAuth::Bearer, structured);
+            for kind in crate::actions::schema::PROPOSAL_KINDS {
+                let mut r = req("sys", false);
+                r.schema = crate::actions::schema::schema_for(kind, false);
+                let body = serde_json::to_string(&p.build_body(&r)).unwrap();
+                assert!(!body.contains("editable"), "{kind}: {body}");
+            }
+        }
     }
 
     #[test]
