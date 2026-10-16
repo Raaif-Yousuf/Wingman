@@ -651,9 +651,14 @@ impl Overlay {
 
     /// The UI gallery's seam (#580): a small overlay over a synthetic
     /// backdrop with a selection already staged, drawn in `theme` whatever
-    /// the system is set to. High contrast uses Windows' black palette.
+    /// the system is set to. High contrast uses Windows' black palette. The
+    /// hint pill is laid out at `dpi` (the gallery's `--dpi`; 96 for none).
     #[cfg(debug_assertions)]
-    pub(crate) fn open_for_gallery(instance: HINSTANCE, theme: Theme) -> anyhow::Result<Self> {
+    pub(crate) fn open_for_gallery(
+        instance: HINSTANCE,
+        theme: Theme,
+        dpi: u32,
+    ) -> anyhow::Result<Self> {
         let desktop = Rect {
             left: 80,
             top: 80,
@@ -685,7 +690,7 @@ impl Overlay {
         // The hint goes at the top of this small window, not of whatever
         // monitor the cursor is on.
         overlay.inner.hint_monitor = overlay.inner.local_bounds();
-        overlay.inner.hint_dpi = 96;
+        overlay.inner.hint_dpi = dpi.max(1);
         overlay.inner.theme = theme;
         overlay.inner.sys = crate::ui::theme::HC_BLACK;
         overlay.inner.theme_forced = true;
