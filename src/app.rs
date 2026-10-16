@@ -2000,6 +2000,9 @@ impl App {
                 if self.quiet_send_cancel(&packed) {
                     return;
                 }
+                if self.show_empty_chain_failure(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -2352,6 +2355,9 @@ impl App {
             Ok(done) => done,
             Err(packed) => {
                 if self.quiet_send_cancel(&packed) {
+                    return;
+                }
+                if self.show_empty_chain_failure(&packed) {
                     return;
                 }
                 let (human, chain) = unpack_error(&packed);
@@ -2862,6 +2868,9 @@ impl App {
                 if self.quiet_send_cancel(&packed) {
                     return;
                 }
+                if self.show_empty_chain_failure(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -3058,6 +3067,9 @@ impl App {
                 if self.quiet_send_cancel(&packed) {
                     return;
                 }
+                if self.show_empty_chain_failure(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -3208,6 +3220,9 @@ impl App {
         let done = match result {
             Ok(done) => done,
             Err(packed) => {
+                if self.show_empty_chain_failure(&packed) {
+                    return;
+                }
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
@@ -3385,11 +3400,7 @@ impl App {
         // card, no failed dot, no "Try again" text.
         if let Err(packed) = &result {
             if is_no_providers(packed) {
-                let path = Config::path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "config.toml".into());
-                let (headline, detail) =
-                    empty_chain_card(self.config.mode, &self.config.providers, &path);
+                let (headline, detail) = self.empty_chain_card_now();
                 let chain = unpack_error(packed).1.to_string();
                 let _ = self.record_last(Err(pack_error(&headline, &chain)));
                 self.card.show_settings_needed(&headline, &detail);
@@ -3526,6 +3537,29 @@ impl App {
     /// if it was a real fault (see [`is_run_fault`]), raises the tray's red
     /// dot. A user-state message ("Nothing is selected") is recorded the same
     /// way but does not raise it.
+    /// #832: the setup card for the current mode and providers.
+    fn empty_chain_card_now(&self) -> (String, String) {
+        let path = Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "config.toml".into());
+        empty_chain_card(self.config.mode, &self.config.providers, &path)
+    }
+
+    /// #832: for the action result handlers. When the run failed only
+    /// because the chain was empty, shows the setup card (not a fault: no
+    /// failed dot, no "Try again") and returns true. The Quick Ask palette's
+    /// router hint already drops any failure quietly.
+    fn show_empty_chain_failure(&mut self, packed: &str) -> bool {
+        if !is_no_providers(packed) {
+            return false;
+        }
+        let (headline, detail) = self.empty_chain_card_now();
+        self.record_run_failure(&headline, &headline, unpack_error(packed).1);
+        self.card.show_settings_needed(&headline, &detail);
+        self.set_watch(true);
+        true
+    }
+
     fn record_run_failure(&mut self, action: &str, human: &str, raw_chain: &str) {
         self.record_last_error(action, raw_chain);
         if is_run_fault(human) {
@@ -8007,6 +8041,28 @@ mod tests {
         let wrapped = anyhow::anyhow!("boom").context("outer");
         let packed = super::pack_error("x", &super::worker_error_chain_text(&wrapped));
         assert!(!super::is_no_providers(&packed));
+    }
+
+    #[test]
+    fn every_action_result_handler_checks_for_an_empty_chain() {
+        // CRLF-safe; each handler must offer the packed error to the setup
+        // card before it builds a generic failure card.
+        let src = include_str!("app.rs").replace('\r', "");
+        for name in [
+            "on_calendar_result",
+            "on_generic_action_result",
+            "on_review_result",
+            "on_form_fill_result",
+        ] {
+            let def = format!("    fn {name}(");
+            let start = src.find(&def).expect("handler exists");
+            let body = &src[start..];
+            let end = body.find("unpack_error(&packed)").expect("failure arm");
+            assert!(
+                body[..end].contains("show_empty_chain_failure(&packed)"),
+                "{name} must call show_empty_chain_failure first"
+            );
+        }
     }
 
     #[test]
