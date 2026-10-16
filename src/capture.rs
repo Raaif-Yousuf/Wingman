@@ -192,6 +192,7 @@ pub fn encode_for_chain(
     mode: crate::mode::Mode,
     redact_setting: bool,
 ) -> Result<Shot> {
+    crate::redact::reset_image_counts();
     if redact_setting && providers.sends_screenshot_off_machine(mode) {
         crate::redact::apply(raw)?;
     }

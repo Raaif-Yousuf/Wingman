@@ -90,12 +90,25 @@ pub fn email_spans(text: &str) -> Vec<Range<usize>> {
 /// numbers, IBANs, key-shaped tokens, emails. Ranges may overlap (a key-shaped
 /// run can contain digits that also pass Luhn); callers paint each one. This
 /// is the screenshot rule set; text uses [`text_spans`], which is narrower.
+#[cfg(test)]
 pub fn sensitive_spans(text: &str) -> Vec<Range<usize>> {
-    let mut spans = crate::payment_denylist::card_number_spans(text);
-    spans.extend(crate::payment_denylist::iban_spans(text));
-    spans.extend(crate::egress::find_opaque_tokens(text));
-    spans.extend(email_spans(text));
-    spans.sort_by_key(|r| (r.start, r.end));
+    sensitive_spans_labeled(text)
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect()
+}
+
+/// [`sensitive_spans`] with the kind of each range, for the egress log count.
+fn sensitive_spans_labeled(text: &str) -> Vec<(Range<usize>, &'static str)> {
+    let mut spans: Vec<(Range<usize>, &'static str)> = Vec::new();
+    let mut add = |found: Vec<Range<usize>>, label| {
+        spans.extend(found.into_iter().map(|r| (r, label)));
+    };
+    add(crate::payment_denylist::card_number_spans(text), CARD);
+    add(crate::payment_denylist::iban_spans(text), IBAN);
+    add(crate::egress::find_opaque_tokens(text), KEY);
+    add(email_spans(text), EMAIL);
+    spans.sort_by_key(|(r, _)| (r.start, r.end));
     spans
 }
 
@@ -262,6 +275,8 @@ pub struct Redactions {
     /// issued here and any `[label N]` already written in the input, so a new
     /// marker can never be confused with text that was there already.
     last: std::collections::HashMap<&'static str, u32>,
+    /// How many different values were replaced, per kind (#508).
+    counted: std::collections::BTreeMap<&'static str, usize>,
 }
 
 impl std::fmt::Debug for Redactions {
@@ -273,6 +288,15 @@ impl std::fmt::Debug for Redactions {
 impl Redactions {
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
+    }
+
+    /// How many different values were replaced, by kind: what the egress log
+    /// shows. Counts only, never the values.
+    pub fn counts(&self) -> std::collections::BTreeMap<String, usize> {
+        self.counted
+            .iter()
+            .map(|(k, n)| (log_kind(k), *n))
+            .collect()
     }
 
     /// Notes every `[label N]` already written in `text`, so numbering
@@ -303,6 +327,7 @@ impl Redactions {
         }
         let n = self.last.get(label).copied().unwrap_or(0) + 1;
         self.last.insert(label, n);
+        *self.counted.entry(label).or_insert(0) += 1;
         let marker = format!("[{label} {n}]");
         self.pairs.push((marker.clone(), original.to_string()));
         marker
@@ -432,10 +457,23 @@ pub fn word_byte_ranges(line_text: &str, words: &[OcrWord]) -> Option<Vec<Range<
 /// The pixel regions to paint for `lines`, clipped to a `width` x `height`
 /// image. One region per sensitive span (the union of the words it touches),
 /// or the whole line when its words cannot be matched to its text.
+#[cfg(test)]
 pub fn regions_for_lines(lines: &[OcrLine], width: u32, height: u32) -> Vec<PixelRect> {
+    regions_with_kinds(lines, width, height)
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect()
+}
+
+/// [`regions_for_lines`] with the kind of each region.
+fn regions_with_kinds(
+    lines: &[OcrLine],
+    width: u32,
+    height: u32,
+) -> Vec<(PixelRect, &'static str)> {
     let mut out = Vec::new();
     for line in lines {
-        let spans = sensitive_spans(&line.text);
+        let spans = sensitive_spans_labeled(&line.text);
         if spans.is_empty() {
             continue;
         }
@@ -444,14 +482,14 @@ pub fn regions_for_lines(lines: &[OcrLine], width: u32, height: u32) -> Vec<Pixe
         } else {
             word_byte_ranges(&line.text, &line.words)
         };
-        for span in spans {
+        for (span, label) in spans {
             let rect = match &ranges {
                 Some(ranges) => union_of_overlapping(&line.words, ranges, &span),
                 None => None,
             }
             .unwrap_or((line.x, line.y, line.x + line.width, line.y + line.height));
             if let Some(r) = clip(rect, width, height) {
-                out.push(r);
+                out.push((r, label));
             }
         }
     }
@@ -506,9 +544,44 @@ pub fn paint(raw: &mut RawShot, rects: &[PixelRect]) {
 /// Paints `lines`' sensitive regions into `raw` and returns how many regions
 /// were painted. The pure half of [`apply`].
 pub fn apply_lines(raw: &mut RawShot, lines: &[OcrLine]) -> usize {
-    let rects = regions_for_lines(lines, raw.width, raw.height);
+    let found = regions_with_kinds(lines, raw.width, raw.height);
+    let rects: Vec<PixelRect> = found.iter().map(|(r, _)| *r).collect();
     paint(raw, &rects);
+    for (_, label) in &found {
+        note_image_redactions(&log_kind(label), 1);
+    }
     rects.len()
+}
+
+/// The name of a kind in the egress log: `card number`, `iban`, `key`, `email`.
+fn log_kind(label: &str) -> String {
+    label.to_lowercase()
+}
+
+thread_local! {
+    /// What was painted into the screenshot this worker thread is sending, by
+    /// kind (#508). A thread-local like the egress trigger label: the encode
+    /// and the HTTP call run on the same worker thread, and other threads
+    /// start with nothing.
+    static IMAGE_COUNTS: std::cell::RefCell<std::collections::BTreeMap<String, usize>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Forgets the painted counts, at the start of each screenshot encode.
+pub fn reset_image_counts() {
+    IMAGE_COUNTS.with(|c| c.borrow_mut().clear());
+}
+
+/// Adds `n` painted regions of `kind` to this thread's screenshot count.
+pub fn note_image_redactions(kind: &str, n: usize) {
+    if n > 0 {
+        IMAGE_COUNTS.with(|c| *c.borrow_mut().entry(kind.to_string()).or_insert(0) += n);
+    }
+}
+
+/// What was painted into this thread's screenshot, by kind.
+pub fn image_counts() -> std::collections::BTreeMap<String, usize> {
+    IMAGE_COUNTS.with(|c| c.borrow().clone())
 }
 
 /// Runs OCR over `raw` and paints over everything sensitive it reads. Returns
@@ -1114,6 +1187,55 @@ mod tests {
         l.words.clear();
         assert_eq!(apply_lines(&mut raw, &[l]), 0);
         assert_eq!(raw.rgba, before);
+    }
+
+    // -- counts for the egress log (#508) ---------------------------------
+
+    fn counts_of(m: std::collections::BTreeMap<String, usize>) -> Vec<(String, usize)> {
+        m.into_iter().collect()
+    }
+
+    #[test]
+    fn text_redactions_are_counted_by_kind_not_by_value() {
+        let mut r = Redactions::default();
+        r.redact_text("a@example.com b@example.com a@example.com paid with 4111 1111 1111 1111");
+        assert_eq!(
+            counts_of(r.counts()),
+            vec![("card number".to_string(), 1), ("email".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn nothing_redacted_counts_nothing() {
+        let mut r = Redactions::default();
+        r.redact_text("plain words only");
+        assert!(r.counts().is_empty());
+    }
+
+    #[test]
+    fn painted_regions_are_counted_by_kind() {
+        reset_image_counts();
+        let mut raw = white(1000, 200);
+        apply_lines(&mut raw, &[card_line()]);
+        assert_eq!(
+            counts_of(image_counts()),
+            vec![("card number".to_string(), 1)]
+        );
+        reset_image_counts();
+        assert!(image_counts().is_empty());
+    }
+
+    #[test]
+    fn image_counts_add_up_across_notes() {
+        reset_image_counts();
+        note_image_redactions("password field", 2);
+        note_image_redactions("password field", 1);
+        note_image_redactions("email", 0);
+        assert_eq!(
+            counts_of(image_counts()),
+            vec![("password field".to_string(), 3)]
+        );
+        reset_image_counts();
     }
 
     // -- live (needs the real OCR engine) ---------------------------------

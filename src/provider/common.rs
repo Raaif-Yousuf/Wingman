@@ -563,7 +563,7 @@ pub(crate) fn post_json_with(
         let is_retry = retries > 0 || retried_429;
 
         let attempt = env.transport.post_json(url, headers, body, attempt_timeout);
-        log_attempt(tag, url, body, is_retry, bytes_sent, &attempt);
+        log_attempt(tag, url, body, is_retry, bytes_sent, &attempt, &redactions);
 
         match attempt {
             // #187: a status was already received -- the request almost
@@ -652,6 +652,7 @@ fn log_attempt(
     is_retry: bool,
     bytes_sent: usize,
     attempt: &std::result::Result<RawResponse, TransportError>,
+    redactions: &crate::redact::Redactions,
 ) {
     let entry = match attempt {
         Ok(resp) if (200..300).contains(&resp.status) => egress::build_entry(
@@ -696,7 +697,7 @@ fn log_attempt(
             Some(&format!("HTTP {status} then body read failed: {error}")),
         ),
     };
-    egress::record(&entry);
+    egress::record(&entry.with_text_redactions(redactions.counts()));
 }
 
 /// POSTs `body` as JSON to `url` with `headers`, waits up to `timeout`,
@@ -1540,6 +1541,37 @@ mod tests {
             !row.contains("4111") && !row.contains("example.com\""),
             "{row}"
         );
+    }
+
+    #[test]
+    fn the_egress_row_counts_what_the_text_step_replaced() {
+        let _g = network_guard();
+        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
+        post_json_with(
+            &env,
+            "https://api.example.com/v1/chat",
+            &[],
+            private_body(),
+            Duration::from_secs(1),
+            "anthropic",
+        )
+        .unwrap();
+        let log = crate::egress::read_all();
+        let row = log.lines().last().expect("one row");
+        let v: serde_json::Value = serde_json::from_str(row).unwrap();
+        assert_eq!(v["redactions"]["card number"], 1, "{row}");
+        assert_eq!(v["redactions"]["email"], 1, "{row}");
+        assert!(!row.contains("4111"), "{row}");
     }
 
     #[test]
