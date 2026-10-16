@@ -14,8 +14,25 @@ use super::{Action, InputKind, Prefer};
 pub const ACTION_ID: &str = "receipt-to-expense-row";
 
 /// The header the prompt asks for. The row below it has one cell per column.
-#[cfg(test)]
 const COLUMNS: [&str; 5] = ["Date", "Merchant", "Amount", "Currency", "Category"];
+
+/// Forces a `table` proposal for this action into the shape the prompt asks
+/// for: the five fixed headers and at most one row of five cells (extra cells
+/// dropped, missing ones empty). The model is asked for this, but nothing else
+/// enforces it, and what the card shows is what is copied. A proposal with no
+/// rows, or one that is not a table, is returned unchanged so the empty and
+/// unreadable answers still apply.
+pub fn clamp_receipt(proposal: &serde_json::Value) -> serde_json::Value {
+    let Some(table) = super::table::Table::from_value(proposal) else {
+        return proposal.clone();
+    };
+    let Some(first) = table.rows.into_iter().next() else {
+        return proposal.clone();
+    };
+    let mut row: Vec<String> = first.into_iter().take(COLUMNS.len()).collect();
+    row.resize(COLUMNS.len(), String::new());
+    serde_json::json!({ "columns": COLUMNS, "rows": [row] })
+}
 
 /// The action's prompt. The total is copied, never added up: a model that
 /// does its own arithmetic on a receipt gets the amount wrong silently.
@@ -89,7 +106,7 @@ mod tests {
             "rows": [["2026-10-03", "Cafe Nero, Main St", "12.50", "GBP", "Meals"]]
         });
         assert_eq!(
-            crate::actions::table::csv_from_value(&p).unwrap(),
+            crate::actions::table::csv_from_value(&clamp_receipt(&p)).unwrap(),
             "Date,Merchant,Amount,Currency,Category\r\n\
              2026-10-03,\"Cafe Nero, Main St\",12.50,GBP,Meals"
         );
@@ -101,14 +118,44 @@ mod tests {
             "columns": COLUMNS,
             "rows": [["2026-10-03", "=HYPERLINK(\"http://x\")", "5.00", "USD", "Other"]]
         });
-        let csv = crate::actions::table::csv_from_value(&p).unwrap();
+        let csv = crate::actions::table::csv_from_value(&clamp_receipt(&p)).unwrap();
         assert!(csv.contains("\"'=HYPERLINK("), "{csv}");
     }
 
     #[test]
     fn no_receipt_is_an_empty_table() {
-        let p = json!({"columns": [], "rows": []});
+        let p = clamp_receipt(&json!({"columns": [], "rows": []}));
         assert!(crate::actions::table::is_empty_result("table", &p));
         assert!(crate::actions::table::csv_from_value(&p).is_none());
+        let headers_only = clamp_receipt(&json!({"columns": COLUMNS, "rows": []}));
+        assert!(crate::actions::table::is_empty_result(
+            "table",
+            &headers_only
+        ));
+    }
+
+    #[test]
+    fn two_rows_and_wrong_columns_become_one_row_with_fixed_headers() {
+        let p = json!({
+            "columns": ["A", "B", "C", "D", "E", "F", "G"],
+            "rows": [
+                ["2026-10-03", "Cafe", "1.00", "USD", "Meals", "x", "y"],
+                ["2026-10-04", "Other", "2.00", "USD", "Meals", "x", "y"]
+            ]
+        });
+        let out = clamp_receipt(&p);
+        assert_eq!(out["columns"], json!(COLUMNS));
+        assert_eq!(
+            out["rows"],
+            json!([["2026-10-03", "Cafe", "1.00", "USD", "Meals"]])
+        );
+    }
+
+    #[test]
+    fn a_short_row_is_padded_and_a_non_table_is_left_alone() {
+        let out = clamp_receipt(&json!({"columns": ["x"], "rows": [["2026-10-03", "Cafe"]]}));
+        assert_eq!(out["rows"], json!([["2026-10-03", "Cafe", "", "", ""]]));
+        let junk = json!({"verdict": "hello"});
+        assert_eq!(clamp_receipt(&junk), junk);
     }
 }
