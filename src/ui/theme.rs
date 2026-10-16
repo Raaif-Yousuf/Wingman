@@ -5,14 +5,12 @@
 //! palettes and their contrast can be unit-tested. Colours are GDI
 //! `COLORREF` values (`0x00BBGGRR`), the same layout `rgb` builds.
 //!
-//! Slice 1 holds what the card paints today, with the same values. The
-//! palette and region overlay move onto it in later slices, and the card
-//! learns to follow high contrast then too; until then the high-contrast
-//! pieces are only exercised by the tests.
+//! The card paints from these tokens in light, dark and high contrast. The
+//! palette and region overlay move onto them in later slices.
 
 use windows::Win32::Graphics::Gdi::{
-    GetSysColor, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
-    COLOR_WINDOWTEXT,
+    GetSysColor, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_HOTLIGHT,
+    COLOR_WINDOW, COLOR_WINDOWTEXT,
 };
 
 /// Packs 8-bit channels into a GDI `COLORREF` (`0x00BBGGRR`).
@@ -35,7 +33,6 @@ pub(crate) enum Theme {
 impl Theme {
     /// High contrast wins over the light/dark app mode, the way Windows
     /// itself treats it.
-    #[allow(dead_code)] // wired in by the palette and region slices
     pub(crate) fn resolve(apps_use_light_theme: bool, high_contrast: bool) -> Theme {
         if high_contrast {
             Theme::HighContrast
@@ -65,6 +62,9 @@ pub(crate) struct Tokens {
     pub(crate) text_dim: u32,
     /// The quietest text: hints and footers.
     pub(crate) text_faint: u32,
+    /// Clickable text (the card's footer links). Not greyed in high
+    /// contrast, where grey text means disabled.
+    pub(crate) link: u32,
     /// Error text.
     pub(crate) danger: u32,
 }
@@ -76,6 +76,7 @@ pub(crate) const LIGHT: Tokens = Tokens {
     text: rgb(23, 23, 23),
     text_dim: rgb(90, 90, 90),
     text_faint: rgb(112, 112, 112),
+    link: rgb(112, 112, 112),
     danger: rgb(200, 50, 50),
 };
 
@@ -85,23 +86,23 @@ pub(crate) const DARK: Tokens = Tokens {
     text: rgb(245, 245, 245),
     text_dim: rgb(190, 190, 190),
     text_faint: rgb(140, 140, 140),
+    link: rgb(140, 140, 140),
     danger: rgb(240, 100, 100),
 };
 
-/// The Windows system colours that matter in high contrast, read once per
-/// theme change by [`SysColors::read`] and passed in so the mapping stays
-/// pure.
+/// The Windows system colours that matter in high contrast, read again on
+/// every theme change by [`SysColors::read`] and passed in so the mapping
+/// stays pure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // wired in by the palette and region slices
 pub(crate) struct SysColors {
     pub(crate) window: u32,
     pub(crate) window_text: u32,
     pub(crate) gray_text: u32,
+    pub(crate) hotlight: u32,
     pub(crate) highlight: u32,
     pub(crate) highlight_text: u32,
 }
 
-#[allow(dead_code)] // wired in by the palette and region slices
 impl SysColors {
     /// The current system colours (`GetSysColor`).
     pub(crate) fn read() -> SysColors {
@@ -111,6 +112,7 @@ impl SysColors {
                 window: GetSysColor(COLOR_WINDOW),
                 window_text: GetSysColor(COLOR_WINDOWTEXT),
                 gray_text: GetSysColor(COLOR_GRAYTEXT),
+                hotlight: GetSysColor(COLOR_HOTLIGHT),
                 highlight: GetSysColor(COLOR_HIGHLIGHT),
                 highlight_text: GetSysColor(COLOR_HIGHLIGHTTEXT),
             }
@@ -120,7 +122,6 @@ impl SysColors {
 
 impl Tokens {
     /// The tokens for `theme`. Only high contrast looks at `sys`.
-    #[allow(dead_code)] // wired in by the palette and region slices
     pub(crate) fn for_theme(theme: Theme, sys: &SysColors) -> Tokens {
         match theme {
             Theme::Light => LIGHT,
@@ -134,11 +135,35 @@ impl Tokens {
                 text: sys.window_text,
                 text_dim: sys.window_text,
                 text_faint: sys.gray_text,
+                link: sys.hotlight,
                 danger: sys.window_text,
             },
         }
     }
 }
+
+/// Windows' high-contrast black and high-contrast white themes. The tests
+/// hold them to the contrast bar; the UI gallery's `--theme high-contrast`
+/// draws with the black one, so a screenshot needs no change to the
+/// machine's real settings.
+#[cfg(any(test, debug_assertions))]
+pub(crate) const HC_BLACK: SysColors = SysColors {
+    window: 0x0000_0000,
+    window_text: 0x00FF_FFFF,
+    gray_text: rgb(0x3F, 0xF2, 0x3F),
+    hotlight: rgb(0xFF, 0xFF, 0x00),
+    highlight: 0x00FF_FF00,
+    highlight_text: 0x0000_0000,
+};
+#[cfg(test)]
+const HC_WHITE: SysColors = SysColors {
+    window: 0x00FF_FFFF,
+    window_text: 0x0000_0000,
+    gray_text: rgb(0, 0x60, 0),
+    hotlight: rgb(0, 0, 0x80),
+    highlight: rgb(0x37, 0x00, 0x6E),
+    highlight_text: 0x00FF_FFFF,
+};
 
 /// Difficulty badge fill: green, amber, red stops at ranks 1, 5 and 10.
 /// Three stops (not a straight green to red blend) so the middle reads as
@@ -224,22 +249,6 @@ mod tests {
     const AA_TEXT: f64 = 4.5;
     const AA_LARGE: f64 = 3.0;
 
-    /// Windows' high-contrast black and high-contrast white themes.
-    const HC_BLACK: SysColors = SysColors {
-        window: 0x0000_0000,
-        window_text: 0x00FF_FFFF,
-        gray_text: rgb(0x3F, 0xF2, 0x3F),
-        highlight: 0x00FF_FF00,
-        highlight_text: 0x0000_0000,
-    };
-    const HC_WHITE: SysColors = SysColors {
-        window: 0x00FF_FFFF,
-        window_text: 0x0000_0000,
-        gray_text: rgb(0, 0x60, 0),
-        highlight: rgb(0x37, 0x00, 0x6E),
-        highlight_text: 0x00FF_FFFF,
-    };
-
     #[test]
     fn light_and_dark_values_are_the_ones_the_card_always_painted() {
         // Pinned: changing any of these is a visible change. The hint and
@@ -250,6 +259,8 @@ mod tests {
         assert_eq!(LIGHT.text_dim, rgb(90, 90, 90));
         assert_eq!(LIGHT.text_faint, rgb(112, 112, 112));
         assert_eq!(LIGHT.danger, rgb(200, 50, 50));
+        assert_eq!(LIGHT.link, LIGHT.text_faint);
+        assert_eq!(DARK.link, DARK.text_faint);
         assert_eq!(DARK.surface, rgb(32, 32, 32));
         assert_eq!(DARK.border, rgb(64, 64, 64));
         assert_eq!(DARK.text, rgb(245, 245, 245));
@@ -270,11 +281,12 @@ mod tests {
     }
 
     /// Every (foreground, background) text pair a theme defines.
-    fn text_pairs(t: &Tokens) -> [(&'static str, u32, u32); 4] {
+    fn text_pairs(t: &Tokens) -> [(&'static str, u32, u32); 5] {
         [
             ("text", t.text, t.surface),
             ("text_dim", t.text_dim, t.surface),
             ("text_faint", t.text_faint, t.surface),
+            ("link", t.link, t.surface),
             ("danger", t.danger, t.surface),
         ]
     }
@@ -304,7 +316,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 16, "the test must look at every pair");
+        assert_eq!(checked, 20, "the test must look at every pair");
     }
 
     #[test]
@@ -326,6 +338,10 @@ mod tests {
         assert_eq!(t.text, HC_WHITE.window_text);
         assert_eq!(t.text_dim, HC_WHITE.window_text);
         assert_eq!(t.text_faint, HC_WHITE.gray_text);
+        // Links are not greyed text: Windows keeps GrayText for disabled
+        // items and gives links their own colour.
+        assert_eq!(t.link, HC_WHITE.hotlight);
+        assert_ne!(t.link, t.text_faint);
         // Light and dark ignore the system colours entirely.
         assert_eq!(Tokens::for_theme(Theme::Light, &HC_WHITE), LIGHT);
         assert_eq!(Tokens::for_theme(Theme::Dark, &HC_BLACK), DARK);

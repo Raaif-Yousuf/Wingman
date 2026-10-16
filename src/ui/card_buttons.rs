@@ -156,6 +156,8 @@ pub(crate) fn look(
                 State::Pressed => blend(accent, 0x0000_0000, 18),
                 State::Disabled => blend(surface.bg, surface.hint, 30),
             };
+            // The disabled label is about 3.2:1 on its fill: WCAG 1.4.3 exempts
+            // text on inactive controls from the 4.5:1 bar.
             let text = if state == State::Disabled {
                 surface.hint
             } else {

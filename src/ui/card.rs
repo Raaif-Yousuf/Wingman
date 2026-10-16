@@ -73,9 +73,10 @@ use crate::ui::card_placement::{
 };
 use crate::ui::text::draw_text_line;
 use crate::ui::theme::{
-    self, contrast_ratio, relative_luminance, rgb, BADGE_HIGH, BADGE_INK_DARK, BADGE_INK_LIGHT,
-    BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, DETAIL_FONT_SCALE, FALLBACK_FONT_FACE,
-    GAP_DP, HEADLINE_FONT_SCALE, MARGIN_DP, PADDING_DP, SMALL_FONT_SCALE as BADGE_FONT_SCALE,
+    contrast_ratio, relative_luminance, rgb, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK,
+    BADGE_INK_LIGHT, BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, DETAIL_FONT_SCALE,
+    FALLBACK_FONT_FACE, GAP_DP, HEADLINE_FONT_SCALE, MARGIN_DP, PADDING_DP,
+    SMALL_FONT_SCALE as BADGE_FONT_SCALE,
 };
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -108,13 +109,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
     HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETCLIENTAREAANIMATION,
-    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETTINGCHANGE, WM_TIMER, WM_USER,
-    WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SPI_SETHIGHCONTRAST, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
+    WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFONT,
+    WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD,
+    WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -220,6 +222,8 @@ impl Card {
             difficulty: None,
             dpi: 96,
             theme,
+            sys: SysColors::read(),
+            theme_forced: false,
             fonts: Fonts::null(),
             text_scale: 1.0,
             corner: CardCorner::default(),
@@ -554,6 +558,35 @@ impl Card {
         self.inner.last_confirmed.take()
     }
 
+    /// The UI gallery's `--theme`: draws in `theme` whatever the system is
+    /// set to, and ignores later theme messages. High contrast uses Windows'
+    /// high contrast black colours. Never touches the registry.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn force_theme_for_gallery(&mut self, theme: Theme) {
+        self.inner.theme = theme;
+        self.inner.sys = crate::ui::theme::HC_BLACK;
+        self.inner.theme_forced = true;
+        if !self.inner.hwnd.0.is_null() {
+            self.inner.repaint_for_theme();
+        }
+    }
+
+    /// The UI gallery's expanded answer: what a click on the card does.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn expand_for_gallery(&mut self) {
+        self.inner.try_expand();
+    }
+
+    /// The UI gallery's preview error title: puts `message` where the
+    /// preview's title goes, as a rejected edit does.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn set_preview_error_for_gallery(&mut self, message: &str) {
+        if let Some(preview) = self.inner.preview.as_mut() {
+            preview.error = Some(message.to_string());
+            self.inner.invalidate();
+        }
+    }
+
     /// The card's own window proc dispatches internally; this is the seam
     /// tests use to feed synthetic messages.
     #[allow(dead_code)]
@@ -679,37 +712,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 // Theme
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Theme {
-    Light,
-    Dark,
-}
-
 struct Palette {
     bg: u32,
     border: u32,
     headline: u32,
     detail: u32,
     hint: u32,
+    link: u32,
     danger: u32,
 }
 
-impl Theme {
-    /// The card's colours, from the shared tokens (#362). The card follows
-    /// light and dark only for now; high contrast comes with a later slice.
-    fn palette(self) -> Palette {
-        let tokens = match self {
-            Theme::Dark => theme::DARK,
-            Theme::Light => theme::LIGHT,
-        };
-        Palette {
-            bg: tokens.surface,
-            border: tokens.border,
-            headline: tokens.text,
-            detail: tokens.text_dim,
-            hint: tokens.text_faint,
-            danger: tokens.danger,
-        }
+/// The card's colours for `theme`, from the shared tokens (#362). Light and
+/// dark are fixed; high contrast takes the system colours in `sys`.
+fn palette_for(theme: Theme, sys: &SysColors) -> Palette {
+    let tokens = Tokens::for_theme(theme, sys);
+    Palette {
+        bg: tokens.surface,
+        border: tokens.border,
+        headline: tokens.text,
+        detail: tokens.text_dim,
+        hint: tokens.text_faint,
+        link: tokens.link,
+        danger: tokens.danger,
     }
 }
 
@@ -750,6 +774,17 @@ fn difficulty_color(difficulty: Difficulty) -> u32 {
     )
 }
 
+/// The badge's `(fill, label ink)`. High contrast drops the rank gradient
+/// for the system highlight pair (the label still carries the rank); every
+/// other theme uses the gradient with whichever ink reads better on it.
+fn badge_colors(difficulty: Difficulty, theme: Theme, sys: &SysColors) -> (u32, u32) {
+    if theme == Theme::HighContrast {
+        return (sys.highlight, sys.highlight_text);
+    }
+    let fill = difficulty_color(difficulty);
+    (fill, badge_text_color(fill))
+}
+
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     let t = t.clamp(0.0, 1.0);
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
@@ -783,11 +818,10 @@ fn badge_text_color(fill: u32) -> u32 {
 /// directly against `advapi32.dll` (a standard system import library, not a
 /// new crate dependency).
 fn detect_theme() -> Theme {
-    if registry_apps_use_light_theme() {
-        Theme::Light
-    } else {
-        Theme::Dark
-    }
+    Theme::resolve(
+        registry_apps_use_light_theme(),
+        crate::ui::card_buttons::system_high_contrast().is_some(),
+    )
 }
 
 /// Whether a `WM_SETTINGCHANGE` names the light/dark switch. Windows sends
@@ -795,6 +829,13 @@ fn detect_theme() -> Theme {
 /// accent color.
 fn setting_change_is_theme(name: &str) -> bool {
     name == "ImmersiveColorSet"
+}
+
+/// Whether a `WM_SETTINGCHANGE` is one the card's theme depends on: the
+/// light/dark switch, or the high contrast flag (`wparam` is
+/// `SPI_SETHIGHCONTRAST`; its `lparam` carries no name).
+fn setting_change_affects_theme(wparam: usize, name: &str) -> bool {
+    wparam == SPI_SETHIGHCONTRAST.0 as usize || setting_change_is_theme(name)
 }
 
 /// The text of a `WM_SETTINGCHANGE` `lparam` (a null-terminated UTF-16
@@ -1254,6 +1295,12 @@ struct CardInner {
     difficulty: Option<Difficulty>,
     dpi: u32,
     theme: Theme,
+    /// The system colours high contrast paints with, read together with
+    /// `theme` (and again on every theme message).
+    sys: SysColors,
+    /// Set by the UI gallery's `--theme`: `theme` and `sys` are simulated
+    /// and no theme message may replace them.
+    theme_forced: bool,
     fonts: Fonts,
     /// User-tunable multiplier applied to every font size. Set via
     /// [`Card::set_text_scale`]; defaults to 1.0.
@@ -1658,7 +1705,8 @@ impl CardInner {
             return;
         }
         let dis = unsafe { &*dis };
-        let palette = self.theme.palette();
+        let palette = self.palette();
+        let high_contrast = self.button_high_contrast();
         let surface = btn::Surface {
             bg: palette.bg,
             border: palette.border,
@@ -1676,7 +1724,7 @@ impl CardInner {
             btn::state_of(dis, hovered),
             &surface,
             btn::system_accent(),
-            btn::system_high_contrast().as_ref(),
+            high_contrast.as_ref(),
         );
         let text = window_text(dis.hwndItem);
         unsafe {
@@ -1692,14 +1740,42 @@ impl CardInner {
         }
     }
 
-    /// Switches to `theme`: drops the cached EDIT brush (it holds the old
-    /// theme's color; `WM_CTLCOLOREDIT` rebuilds it) and repaints the card
-    /// and its preview fields.
-    fn apply_theme(&mut self, theme: Theme) {
-        if theme == self.theme {
+    /// The card's colours in its current theme.
+    fn palette(&self) -> Palette {
+        palette_for(self.theme, &self.sys)
+    }
+
+    /// The colours for the preview buttons while high contrast is on, from
+    /// the same system colours the card paints with (window and window text,
+    /// not button face and text, so a custom scheme cannot split the two).
+    /// The live card and the gallery's forced theme share this path.
+    fn button_high_contrast(&self) -> Option<crate::ui::card_buttons::HighContrast> {
+        (self.theme == Theme::HighContrast).then_some(crate::ui::card_buttons::HighContrast {
+            face: self.sys.window,
+            text: self.sys.window_text,
+            highlight: self.sys.highlight,
+            highlight_text: self.sys.highlight_text,
+            gray_text: self.sys.gray_text,
+        })
+    }
+
+    /// Re-reads the theme and the system colours, then repaints. Runs on
+    /// every message that can change them. It repaints even when the theme
+    /// is the same: switching between two high contrast schemes changes the
+    /// colours and not the theme.
+    fn refresh_theme(&mut self) {
+        if self.theme_forced {
             return;
         }
-        self.theme = theme;
+        self.theme = detect_theme();
+        self.sys = SysColors::read();
+        self.repaint_for_theme();
+    }
+
+    /// Drops the cached EDIT brush (it holds the old theme's color;
+    /// `WM_CTLCOLOREDIT` rebuilds it) and repaints the card and its preview
+    /// fields.
+    fn repaint_for_theme(&mut self) {
         if !self.edit_bg_brush.0.is_null() {
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(self.edit_bg_brush.0));
@@ -2353,7 +2429,7 @@ impl CardInner {
     }
 
     fn paint_into(&self, hdc: HDC, rc: RECT) {
-        let palette = self.theme.palette();
+        let palette = self.palette();
         let padding = self.scale(PADDING_DP);
         let gap = self.scale(GAP_DP);
 
@@ -2668,7 +2744,7 @@ impl CardInner {
         ];
         let _ = SelectClipRgn(hdc, None);
         SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
-        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.link));
         for (rect, label) in links {
             if let Some(rect) = rect {
                 draw_text_line(
@@ -2706,8 +2782,7 @@ impl CardInner {
         let left = (right - w).max(rc.left);
         let top = (bottom - h).max(rc.top);
 
-        let fill = difficulty_color(difficulty);
-        let text_color = badge_text_color(fill);
+        let (fill, text_color) = badge_colors(difficulty, self.theme, &self.sys);
         // Equal-radius rounding on both axes: when w == h (short labels like
         // "1") this comes out as a circle; when w > h ("10", "U") it comes
         // out as a pill.
@@ -2752,7 +2827,7 @@ impl CardInner {
             // a handler for it would be dead code.
             WM_CTLCOLOREDIT => {
                 let hdc = HDC(wparam.0 as *mut _);
-                let palette = self.theme.palette();
+                let palette = self.palette();
                 let (text, bg) = edit_field_colors(&palette);
                 unsafe {
                     SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text));
@@ -2952,9 +3027,15 @@ impl CardInner {
             // Windows broadcasts this to every top-level window, so the card
             // hears it even while hidden.
             WM_SETTINGCHANGE => {
-                if setting_change_is_theme(&unsafe { setting_change_name(lparam) }) {
-                    self.apply_theme(detect_theme());
+                if setting_change_affects_theme(wparam.0, &unsafe { setting_change_name(lparam) }) {
+                    self.refresh_theme();
                 }
+                Some(LRESULT(0))
+            }
+            // The high contrast switch and a new contrast scheme: Windows
+            // sends these to every top-level window as well.
+            WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+                self.refresh_theme();
                 Some(LRESULT(0))
             }
             WM_DPICHANGED => {
@@ -4244,6 +4325,7 @@ fn utf16(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::theme;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
     fn instance() -> HINSTANCE {
@@ -5029,7 +5111,7 @@ mod tests {
             let edit_px = drawn_pixel(&mut card, edit, ID_PREVIEW_EDIT, 0, 8, 12);
             assert_eq!(
                 edit_px,
-                theme.palette().bg,
+                palette_for(theme, &SysColors::read()).bg,
                 "Edit is an outline on the card background"
             );
         }
@@ -5224,7 +5306,7 @@ mod tests {
         let (w, h, above) = render(&card);
         card.handle_message(WM_KEYDOWN, WPARAM(VK_END.0 as usize), LPARAM(0));
         let (_, _, at_end) = render(&card);
-        let palette = card.inner.theme.palette();
+        let palette = card.inner.palette();
         let padding = card.inner.scale(PADDING_DP);
         // The short text lines leave the right side of the scroll area
         // empty, so the only thing that can be there is the cue.
@@ -5251,7 +5333,7 @@ mod tests {
         let gap = card.inner.scale(GAP_DP);
         let line = card.inner.line_height(card.inner.fonts.body).max(1);
         let fade_h = line + card.inner.scale(FADE_EXTRA_DP);
-        let ink = card.inner.theme.palette().detail;
+        let ink = card.inner.palette().detail;
         // Pixels in the fade band, left half (the chevron is on the right),
         // that are full-strength text colour: a fade blends every one of them.
         let solid_ink = |card: &Card| {
@@ -5279,8 +5361,168 @@ mod tests {
     fn opposite(theme: Theme) -> Theme {
         match theme {
             Theme::Light => Theme::Dark,
-            Theme::Dark => Theme::Light,
+            Theme::Dark | Theme::HighContrast => Theme::Light,
         }
+    }
+
+    #[test]
+    fn a_theme_change_message_makes_the_card_re_read_the_theme() {
+        // The high contrast switch (Win+Left Alt+PrtScn) and a new contrast
+        // scheme both send WM_THEMECHANGED and WM_SYSCOLORCHANGE.
+        for msg in [WM_THEMECHANGED, WM_SYSCOLORCHANGE] {
+            let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+            let detected = detect_theme();
+            card.inner.theme = opposite(detected);
+            card.inner.sys = SysColors {
+                window: 1,
+                window_text: 2,
+                gray_text: 3,
+                hotlight: 6,
+                highlight: 4,
+                highlight_text: 5,
+            };
+
+            let handled = card.handle_message(msg, WPARAM(0), LPARAM(0));
+
+            assert!(handled.is_some());
+            assert_eq!(card.inner.theme, detected, "message {msg:#x}");
+            assert_eq!(card.inner.sys, SysColors::read(), "message {msg:#x}");
+        }
+    }
+
+    #[test]
+    fn a_theme_message_sent_to_the_real_window_reaches_the_card() {
+        // Through the window procedure, not `handle_message`: a card whose
+        // class never routed the message would pass the tests above.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.inner.sys = SysColors {
+            window: 1,
+            window_text: 2,
+            gray_text: 3,
+            hotlight: 6,
+            highlight: 4,
+            highlight_text: 5,
+        };
+        let hwnd = card.inner.hwnd;
+        unsafe {
+            SendMessageW(hwnd, WM_SYSCOLORCHANGE, None, None);
+        }
+        assert_eq!(card.inner.sys, SysColors::read());
+    }
+
+    #[test]
+    fn the_high_contrast_setting_change_makes_the_card_re_read_the_theme() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let detected = detect_theme();
+        card.inner.theme = opposite(detected);
+        let empty = wide_z("");
+
+        card.handle_message(
+            WM_SETTINGCHANGE,
+            WPARAM(SPI_SETHIGHCONTRAST.0 as usize),
+            LPARAM(empty.as_ptr() as isize),
+        );
+
+        assert_eq!(card.inner.theme, detected);
+    }
+
+    #[test]
+    fn only_theme_names_and_the_high_contrast_flag_are_theme_changes() {
+        let hc = SPI_SETHIGHCONTRAST.0 as usize;
+        assert!(setting_change_affects_theme(0, "ImmersiveColorSet"));
+        assert!(setting_change_affects_theme(hc, ""));
+        assert!(!setting_change_affects_theme(0, "intl"));
+        assert!(!setting_change_affects_theme(0, ""));
+    }
+
+    #[test]
+    fn a_forced_theme_ignores_every_theme_message() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.force_theme_for_gallery(Theme::HighContrast);
+        let name = wide_z("ImmersiveColorSet");
+
+        card.handle_message(WM_SETTINGCHANGE, WPARAM(0), LPARAM(name.as_ptr() as isize));
+        card.handle_message(WM_THEMECHANGED, WPARAM(0), LPARAM(0));
+        card.handle_message(WM_SYSCOLORCHANGE, WPARAM(0), LPARAM(0));
+
+        assert_eq!(card.inner.theme, Theme::HighContrast);
+        assert_eq!(card.inner.sys, theme::HC_BLACK);
+    }
+
+    #[test]
+    fn the_high_contrast_palette_is_the_system_colours() {
+        let sys = theme::HC_BLACK;
+        let p = palette_for(Theme::HighContrast, &sys);
+        assert_eq!(p.bg, sys.window);
+        assert_eq!(p.headline, sys.window_text);
+        assert_eq!(p.detail, sys.window_text);
+        assert_eq!(p.hint, sys.gray_text);
+        assert_eq!(p.danger, sys.window_text);
+        // Dark ignores the system colours.
+        assert_eq!(palette_for(Theme::Dark, &sys).bg, theme::DARK.surface);
+    }
+
+    #[test]
+    fn live_high_contrast_buttons_use_the_same_colours_as_the_card() {
+        // The card paints with window/window text; the buttons must not read
+        // button face/text, or a custom scheme splits the two.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.inner.theme = Theme::HighContrast;
+        card.inner.sys = theme::HC_BLACK;
+        let hc = card.inner.button_high_contrast().expect("high contrast");
+        assert_eq!(
+            (hc.face, hc.text),
+            (card.inner.palette().bg, card.inner.palette().headline)
+        );
+    }
+
+    #[test]
+    fn high_contrast_badges_use_the_highlight_colours() {
+        let sys = theme::HC_BLACK;
+        for d in [
+            Difficulty::Level(1),
+            Difficulty::Level(10),
+            Difficulty::Ultra,
+        ] {
+            assert_eq!(
+                badge_colors(d, Theme::HighContrast, &sys),
+                (sys.highlight, sys.highlight_text)
+            );
+        }
+        let (fill, ink) = badge_colors(Difficulty::Level(5), Theme::Dark, &sys);
+        assert_eq!(fill, difficulty_color(Difficulty::Level(5)));
+        assert_eq!(ink, badge_text_color(fill));
+    }
+
+    #[test]
+    fn footer_links_use_the_link_colour_not_the_hint() {
+        let p = palette_for(Theme::HighContrast, &theme::HC_BLACK);
+        assert_eq!(p.link, theme::HC_BLACK.hotlight);
+        assert_ne!(p.link, p.hint);
+        let l = palette_for(Theme::Light, &theme::HC_BLACK);
+        assert_eq!(l.link, l.hint);
+    }
+
+    #[test]
+    fn a_forced_high_contrast_card_paints_its_buttons_from_the_simulated_colours() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.force_theme_for_gallery(Theme::HighContrast);
+        let hc = card.inner.button_high_contrast().expect("high contrast");
+        assert_eq!(hc.face, theme::HC_BLACK.window);
+        assert_eq!(hc.highlight, theme::HC_BLACK.highlight);
+        assert_eq!(hc.text, theme::HC_BLACK.window_text);
+        card.force_theme_for_gallery(Theme::Dark);
+        assert!(card.inner.button_high_contrast().is_none());
+    }
+
+    #[test]
+    fn a_preview_error_replaces_the_title() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        let _ = card.show_preview("Add to calendar", &schema, &value, false);
+        card.set_preview_error_for_gallery("Start must be a time.");
+        let preview = card.inner.preview.as_ref().unwrap();
+        assert_eq!(preview.error.as_deref(), Some("Start must be a time."));
     }
 
     #[test]
@@ -5338,7 +5580,7 @@ mod tests {
     fn card_palettes_keep_the_colours_they_always_had() {
         // #362 slice 1 moved the values into `theme`; the card must paint
         // exactly what it painted before. Literal numbers on purpose.
-        let d = Theme::Dark.palette();
+        let d = palette_for(Theme::Dark, &SysColors::read());
         assert_eq!(
             (d.bg, d.border, d.headline, d.detail, d.hint),
             (
@@ -5349,7 +5591,7 @@ mod tests {
                 0x008C_8C8C
             )
         );
-        let l = Theme::Light.palette();
+        let l = palette_for(Theme::Light, &SysColors::read());
         assert_eq!(
             (l.bg, l.border, l.headline, l.detail, l.hint),
             (
@@ -5373,12 +5615,12 @@ mod tests {
         // come from the same Palette the rest of the card paints with, not
         // a hardcoded pair -- otherwise dark mode gets a bright rectangle in
         // the one place the user reads carefully before confirming.
-        let dark = Theme::Dark.palette();
+        let dark = palette_for(Theme::Dark, &SysColors::read());
         let (dark_text, dark_bg) = edit_field_colors(&dark);
         assert_eq!(dark_bg, dark.bg);
         assert_eq!(dark_text, dark.headline);
 
-        let light = Theme::Light.palette();
+        let light = palette_for(Theme::Light, &SysColors::read());
         let (light_text, light_bg) = edit_field_colors(&light);
         assert_eq!(light_bg, light.bg);
         assert_eq!(light_text, light.headline);
@@ -5883,7 +6125,7 @@ mod tests {
         let brush = result.expect("WM_CTLCOLOREDIT must be handled, not fall through to Def*");
         assert_ne!(brush.0, 0, "must return a real brush, not NULL");
 
-        let dark = Theme::Dark.palette();
+        let dark = palette_for(Theme::Dark, &SysColors::read());
         let text_after = unsafe { GetTextColor(hdc) };
         let bg_after = unsafe { GetBkColor(hdc) };
         assert_eq!(text_after.0, dark.headline);
