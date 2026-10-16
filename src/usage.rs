@@ -269,9 +269,22 @@ const PRICES: &[PriceRow] = &[
         p(0.30, 2.5, 0.30, 0.03),
         GEMINI_SRC,
     ),
-    // THEORY (unverified): "gemini-3.5-flash" is in the default model list
-    // but the Gemini pricing page lists no such model on 2026-10-15 (it
-    // lists 3.6 Flash). Left unpriced on purpose, so it shows as unpriced.
+    // 3.6 Flash is priced the same as 3.8 Flash, intro rate then doubling
+    // (MEASURED 2026-10-15: the pricing page says "Same as Gemini 3.8 Flash").
+    row(
+        "gemini",
+        "gemini-3.6-flash",
+        ALWAYS,
+        p(0.75, 3.75, 0.75, 0.075),
+        GEMINI_SRC,
+    ),
+    row(
+        "gemini",
+        "gemini-3.6-flash",
+        "2027-01-01",
+        p(1.50, 7.50, 1.50, 0.15),
+        GEMINI_SRC,
+    ),
 ];
 
 /// `rest` is a dated snapshot suffix such as `-20251001`.
@@ -682,6 +695,7 @@ mod tests {
         assert!(close(c("gemini", "gemini-2.5-flash"), 0.03));
         assert!(close(c("gemini", "gemini-3.1-pro-preview"), 0.20));
         assert!(close(c("gemini", "gemini-3.8-flash"), 0.075));
+        assert!(close(c("gemini", "gemini-3.6-flash"), 0.075));
         let later = cost_usd("gemini", "gemini-3.8-flash", "2027-01-01", &u).unwrap();
         assert!(close(later, 0.15), "{later}");
     }
@@ -906,7 +920,7 @@ mod tests {
     }
 
     /// Default model ids that are priced on purpose as "unknown".
-    const UNPRICED_ON_PURPOSE: &[(&str, &str)] = &[("gemini", "gemini-3.5-flash")];
+    const UNPRICED_ON_PURPOSE: &[(&str, &str)] = &[];
 
     #[test]
     fn every_default_model_has_a_price_or_is_listed_as_exempt() {

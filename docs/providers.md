@@ -104,7 +104,7 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   `endpoint_url_never_contains_the_api_key`.
 - **Models:** `providers.gemini.models`, active model
   `providers.gemini.model`. Ships with `gemini-3.8-flash`,
-  `gemini-3.1-pro-preview`, `gemini-3.5-flash`, `gemini-2.5-pro`,
+  `gemini-3.1-pro-preview`, `gemini-3.6-flash`, `gemini-2.5-pro`,
   `gemini-2.5-flash`.
 - **Effort/thinking:** `generationConfig.thinkingConfig.thinkingLevel`
   (`"low"`/`"medium"`/`"high"`), sent only to the Gemini 3.x line
