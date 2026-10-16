@@ -44,7 +44,7 @@ fn known_folder(id: &GUID) -> Result<PathBuf> {
 /// `%APPDATA%` (roaming), e.g. `C:\Users\<user>\AppData\Roaming`. Same
 /// folder `dirs::config_dir()` resolved to on Windows.
 pub fn roaming_app_data() -> Result<PathBuf> {
-    resolve(crate::portable::root(), || {
+    resolve(crate::portable::root().as_deref(), || {
         known_folder(&FOLDERID_RoamingAppData)
     })
 }
@@ -70,7 +70,7 @@ fn resolve(
 /// machines the way `config.toml` (in [`roaming_app_data`]) intentionally
 /// does.
 pub fn local_app_data() -> Result<PathBuf> {
-    resolve(crate::portable::root(), || {
+    resolve(crate::portable::root().as_deref(), || {
         known_folder(&FOLDERID_LocalAppData)
     })
 }
@@ -86,6 +86,16 @@ pub fn user_profile() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Removing the `portable::root()` call from either public function
+    /// makes this fail (the real wiring, not just the `resolve` helper).
+    #[test]
+    fn both_public_folders_follow_the_portable_root() {
+        let root = PathBuf::from(r"E:\usb\Wingman-test-root");
+        let _forced = crate::portable::ForcedRoot::new(&root);
+        assert_eq!(roaming_app_data().unwrap(), root);
+        assert_eq!(local_app_data().unwrap(), root);
+    }
 
     #[test]
     fn portable_root_wins_and_the_system_is_not_asked() {

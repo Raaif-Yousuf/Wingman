@@ -1310,12 +1310,12 @@ impl Config {
             anyhow::bail!("ACL restriction forced to fail for a test");
         }
 
-        // Portable mode (#130) on a FAT/exFAT drive: the volume has no ACLs,
-        // so icacls could only fail and the start would break. Skipped only
-        // when the volume is known to have none; an unknown answer still
-        // runs icacls. The config file holds no API key (those live in
-        // Credential Manager), so nothing secret is left unprotected.
-        if crate::portable::skip_acl(path) {
+        // Portable mode (#130): the drive moves between PCs and users, and
+        // FAT/exFAT has no ACLs, so the restriction is skipped there. The
+        // file keeps the drive's permissions. Keys normally live in
+        // Credential Manager, but one can still be in this file (a failed
+        // store write, or typed by hand), so keep the drive private.
+        if crate::portable::skip_acl() {
             return Ok(());
         }
 
