@@ -29,8 +29,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, KillTimer, PeekMessageW, PostQuitMessage, RegisterClassExW, SetTimer,
     SetWindowLongPtrW, TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, MSG, PBT_APMRESUMEAUTOMATIC,
-    PM_REMOVE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST,
-    WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+    PM_REMOVE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_NCCREATE,
+    WM_POWERBROADCAST, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use crate::actions;
@@ -722,6 +722,15 @@ fn startup_card(
         detail = format!("{detail}\n\n{h}. {d}");
     }
     Some((headline, detail))
+}
+
+/// #793: whether `mode` may be switched on while the config file's state is
+/// `load_problem`. A file that did not parse starts the run Offline with
+/// default (looser) settings; anything that sends data out must wait until it
+/// parses, so only Offline is allowed meanwhile. The state is a plain field
+/// read, so the check cannot itself fail open.
+fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
+    mode == Mode::Offline || load_problem.is_none()
 }
 
 /// #711: config.toml exists but did not parse. Names the line and column
@@ -3881,6 +3890,14 @@ impl App {
     /// the save-error card is re-shown immediately after so it is still the
     /// one left on screen.
     fn open_settings(&mut self) {
+        self.open_settings_inner();
+        // #673: every modal path ends here, whatever branch it took, so a
+        // completed Save and the deferred messages are handled first and the
+        // close request is honoured last.
+        self.repost_close_if_requested();
+    }
+
+    fn open_settings_inner(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
         self.card.hide();
@@ -3911,6 +3928,11 @@ impl App {
         };
 
         self.config = edited;
+        // #793: the save below is refused while the file does not parse, so
+        // an edited mode must not outlive it in memory (requests read it).
+        if !mode_allowed(self.config.mode, self.config.load_problem.as_deref()) {
+            self.config.mode = Mode::Offline;
+        }
         if let Err(e) = self.config.save() {
             // Rule 7: neither failure may be silently dropped. Every
             // deferred message is delivered for real (its executor runs,
@@ -3948,6 +3970,26 @@ impl App {
             self.exec_in_flight,
             crate::provider::ollama_gpu_fix::is_running(),
         )
+    }
+
+    /// #673: if the owner window got `WM_CLOSE` while a nested loop (the tray
+    /// menu, Settings or a file dialog) was running, re-post it now that the
+    /// loop is over so it takes the normal path. Every place that clears
+    /// `SETTINGS_OPEN` must call this once its own work is done (a test
+    /// checks the count). Returns whether it did.
+    fn repost_close_if_requested(&self) -> bool {
+        if !take_close_request() {
+            return false;
+        }
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(self.hwnd()),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        true
     }
 
     /// Issue #213: delivers every message `wnd_proc` deferred while Settings
@@ -3992,6 +4034,7 @@ impl App {
         }
         self.deliver_deferred(pending);
         self.show_tray_restore_error(tray_restore_error);
+        self.repost_close_if_requested();
     }
 
     /// Issue #178: shows the tray-restore error card if `error` is `Some`,
@@ -4205,6 +4248,15 @@ impl App {
     /// writes to disk, same as every other tray setting change.
     fn set_mode(&mut self, mode: Mode) {
         if self.config.mode == mode {
+            return;
+        }
+        // #793: the file did not parse, so the run is Offline until it does.
+        if !mode_allowed(mode, self.config.load_problem.as_deref()) {
+            let (headline, detail) =
+                config_problem_card(self.config.load_problem.as_deref().unwrap_or_default());
+            self.card.show_error(&headline, &detail);
+            self.tray.set_mode(self.config.mode);
+            self.set_watch(true);
             return;
         }
         self.config.mode = mode;
@@ -4519,6 +4571,7 @@ impl App {
         }
         self.deliver_deferred(pending);
         self.show_tray_restore_error(tray_restore_error);
+        self.repost_close_if_requested();
         out
     }
 
@@ -6177,6 +6230,9 @@ thread_local! {
     /// `open_settings` are plain, unoptimizable-away side effects through an
     /// opaque TLS accessor call.
     static SETTINGS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #673: the owner window got `WM_CLOSE` while Settings was open. Read
+    /// once by `open_settings` after the modal loop returns.
+    static CLOSE_AFTER_SETTINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
     /// True while the tray menu's loop runs (#722). Always set together with
     /// `SETTINGS_OPEN`, which supplies the reentrancy machinery; this only
@@ -6391,6 +6447,14 @@ enum SettingsReentrancy {
     /// itself unreachable while Settings is open: its only path is the
     /// tray's Quit command, and `WM_APP_TRAY` is `Ignore`d above.
     Fallback,
+    /// `WM_CLOSE` on the owner window (#673): a shutdown, a script or a
+    /// smoke test asking Wingman to exit. Falling back to `DefWindowProcW`
+    /// would destroy the owner while Settings is modal-open, and then
+    /// `WM_DESTROY` is also a fallback, so the process would never leave its
+    /// message loop. Instead: remember the request, close Settings (edits are
+    /// discarded, as for its own close box), and let `open_settings` re-post
+    /// `WM_CLOSE` once the modal loop has returned.
+    CloseAfterSettings,
 }
 
 /// #722: the policy while the tray menu is open. Settings hides the card
@@ -6412,6 +6476,7 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         return SettingsReentrancy::DeferTaskbarCreated;
     }
     match msg {
+        WM_CLOSE => SettingsReentrancy::CloseAfterSettings,
         // Issue #213: every WM_APP_* message that carries a worker's result
         // or a preview's Do it/Cancel decision is deferred, never Ignored --
         // see DeferredMessage and the Defer variant's own doc comment. #40:
@@ -6548,6 +6613,16 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
         }
     }
     true
+}
+
+/// #673: remember that the owner got `WM_CLOSE` during a nested loop.
+fn note_close_request() {
+    CLOSE_AFTER_SETTINGS.with(|c| c.set(true));
+}
+
+/// #673: whether a close was asked for during a nested loop; clears it.
+fn take_close_request() -> bool {
+    CLOSE_AFTER_SETTINGS.with(|c| c.replace(false))
 }
 
 /// Issue #302: `DestroyWindow` discards messages still queued for the window,
@@ -6807,6 +6882,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             SettingsReentrancy::Fallback => {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
+            SettingsReentrancy::CloseAfterSettings => {
+                // Settings, a file dialog or the tray menu is open. Only
+                // Settings can be closed from here; the others end on their
+                // own and then repost this (`repost_close_if_requested`).
+                note_close_request();
+                settings::request_close();
+                return LRESULT(0);
+            }
         }
     }
 
@@ -7024,6 +7107,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_taskbar_created();
             LRESULT(0)
         }
+        // #673: an owner-window close (a script, a smoke test) takes the same
+        // refusal as tray > Quit while work is in flight. Session end is
+        // WM_ENDSESSION, which never comes through here and is not blocked.
+        WM_CLOSE => {
+            if let Some(text) = app.quit_blocked() {
+                app.card.show_answer("Still working", text, 5, None);
+                app.set_watch(true);
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_DESTROY => {
             // Drop the App (and with it the hook, tray icon and card) before
             // the loop exits, so the tray icon actually disappears.
@@ -7089,7 +7184,7 @@ mod tests {
     };
     use super::{final_settings_card, SettingsFinalCard};
     use super::{first_provider_model_label, provider_for_router, router_models_for};
-    use super::{settings_reentrancy_policy, SettingsReentrancy};
+    use super::{mode_allowed, settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
         WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
@@ -7115,7 +7210,7 @@ mod tests {
     use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
     use serde_json::Value;
-    use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
+    use windows::Win32::UI::WindowsAndMessaging::{WM_CLOSE, WM_DESTROY};
 
     // -- #23: resolve_prompt_and_difficulty (the worker's action-model wiring) --
 
@@ -8048,6 +8143,17 @@ mod tests {
     const FAKE_TASKBAR_CREATED_MSG: u32 = 0xC123;
 
     #[test]
+    fn a_config_that_did_not_parse_allows_only_offline() {
+        // #793: one tray click must not switch cloud on with default settings.
+        let problem = Some("config.toml has an error at line 1, column 1");
+        assert!(mode_allowed(Mode::Offline, problem));
+        for m in [Mode::Cloud, Mode::Local, Mode::Auto] {
+            assert!(!mode_allowed(m, problem), "{m:?}");
+            assert!(mode_allowed(m, None), "{m:?}");
+        }
+    }
+
+    #[test]
     fn settings_reentrancy_defers_the_worker_result() {
         // The in-flight answer must still end in a card (rule 7) once
         // Settings closes, so it is deferred rather than dropped or handled
@@ -8170,6 +8276,51 @@ mod tests {
                 "msg {msg:#x} should be Ignore while Settings is open"
             );
         }
+    }
+
+    #[test]
+    fn a_close_request_is_remembered_once_and_then_cleared() {
+        // #673: the flag is set by wnd_proc during a nested loop and must be
+        // consumed exactly once, or a later Settings open+close would quit.
+        let _ = super::take_close_request();
+        assert!(!super::take_close_request());
+        super::note_close_request();
+        assert!(super::take_close_request());
+        assert!(
+            !super::take_close_request(),
+            "consumed, so it cannot fire again"
+        );
+    }
+
+    #[test]
+    fn every_modal_path_that_clears_settings_open_reposts_a_pending_close() {
+        // The tray menu, Settings and file dialogs all set SETTINGS_OPEN, and
+        // wnd_proc swallows WM_CLOSE while it is set. Each of them has to
+        // repost it afterwards. Source scan, CRLF-safe, non-empty.
+        let src = include_str!("app.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let clears = code
+            .matches("SETTINGS_OPEN.with(|c| c.set(false));")
+            .count();
+        assert_eq!(
+            clears, 3,
+            "a modal path was added or removed: update this test"
+        );
+        let reposts = code.matches("self.repost_close_if_requested();").count();
+        assert_eq!(
+            reposts, clears,
+            "each path that clears SETTINGS_OPEN must call repost_close_if_requested"
+        );
+    }
+
+    #[test]
+    fn settings_reentrancy_turns_wm_close_into_a_close_after_settings() {
+        // #673: the default path destroyed the owner behind the modal and
+        // the process never left its message loop.
+        assert_eq!(
+            settings_reentrancy_policy(WM_CLOSE, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::CloseAfterSettings
+        );
     }
 
     #[test]
