@@ -89,8 +89,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
     WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW,
-    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_CONTROLPARENT,
-    WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME,
+    WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetParent, GetScrollInfo, GetWindow, CBN_SELCHANGE, GW_CHILD, GW_HWNDNEXT,
@@ -286,6 +286,23 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     inner.result
 }
 
+/// Asks the open Settings window to close without saving (#673), as its own
+/// close box does. A no-op when none is open. Posted, not sent, so it is safe
+/// to call from inside the owner window's procedure.
+pub fn request_close() {
+    let existing = OPEN_HWND.load(Ordering::SeqCst);
+    if existing != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(existing as *mut c_void)),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
 /// Process-wide guard: 0 when no settings window is open, else the open
 /// window's `HWND` value. `isize` rather than a `Mutex<HWND>` because `HWND`
 /// is just a pointer-sized value and this only ever needs a single atomic
@@ -298,7 +315,7 @@ static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 fn enter_command(ctrl_id: i32) -> i32 {
     match ctrl_id {
         ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK | ID_CHANGE_PRIMARY
-        | ID_CHANGE_SECONDARY | ID_PULL_BUTTON => ctrl_id,
+        | ID_CHANGE_SECONDARY | ID_PULL_BUTTON | ID_OPEN_CONFIG => ctrl_id,
         // #635: Enter in the Pull model box starts the pull.
         ID_PULL_NAME => ID_PULL_BUTTON,
         _ => ID_SAVE,
@@ -531,6 +548,10 @@ struct SettingsInner {
     /// The config this window was opened with -- fields not touched by the
     /// UI (e.g. model lists, hotkeys) are carried through from here.
     original: Config,
+    /// What `config.toml` looked like when this window opened (#851). Save
+    /// refuses to write over a file that changed since, so a hand edit made
+    /// through "Open config file" is never lost.
+    config_stamp: Option<ConfigStamp>,
     /// #345: the hotkeys as edited in this window. Starts as the original's
     /// and only reaches the returned config on Save.
     hotkeys: Hotkeys,
@@ -569,6 +590,7 @@ impl SettingsInner {
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             prompt_expanded: false,
             hotkeys: original.hotkeys.clone(),
+            config_stamp: current_config_stamp(),
             learning: None,
             pending_conflict: None,
             original,
@@ -729,6 +751,15 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 }
                 return;
             }
+            // #851: the file changed while this window was open (a hand edit
+            // from "Open config file", or the tray). Saving the snapshot taken
+            // at open would silently overwrite it.
+            if config_changed_since(inner.config_stamp, current_config_stamp()) {
+                if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                    set_text(msg, CONFIG_CHANGED_MESSAGE);
+                }
+                return;
+            }
             let raw = read_raw_form(inner);
             // #344: an invalid numeric field must not be silently kept at
             // its old value -- reject the Save, keep the window open, focus
@@ -786,6 +817,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 }
             }
         }
+        ID_OPEN_CONFIG if notify == BN_CLICKED => open_config_file(inner),
         ID_PULL_BUTTON if notify == BN_CLICKED => on_pull_button(inner),
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, &prompt_to_edit(DEFAULT_PROMPT));
@@ -926,6 +958,8 @@ const ID_PULL_STATUS: i32 = 142;
 /// that ignores the setting.
 const ID_GEMINI_EFFORT_LABEL: i32 = 143;
 const ID_MODEL_LIST_HINT: i32 = 144;
+/// The "Open config file" button beside the model hint (#823).
+const ID_OPEN_CONFIG: i32 = 145;
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
 /// the text sent to a cloud or remote model, and the answer (real values put
@@ -991,6 +1025,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_PULL_STATUS", ID_PULL_STATUS),
     ("ID_GEMINI_EFFORT_LABEL", ID_GEMINI_EFFORT_LABEL),
     ("ID_MODEL_LIST_HINT", ID_MODEL_LIST_HINT),
+    ("ID_OPEN_CONFIG", ID_OPEN_CONFIG),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1127,11 +1162,13 @@ const WIN_W_DP: i32 = 620;
 /// back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout` itself
 /// never overlaps regardless of this constant, but a taller default is nicer
 /// than always squeezing. #427 added one more row (the hint under the cloud
-/// model dropdowns), so it is raised by another `ROW_H + ROW_GAP`.
-const WIN_H_DP: i32 = 918 + 4 * (ROW_H + ROW_GAP);
+/// model dropdowns), so it is raised by another `ROW_H + ROW_GAP`. #822 gave
+/// each Thinking dropdown (three) and the Capture Screen dropdown their own
+/// row, four more.
+const WIN_H_DP: i32 = 918 + 8 * (ROW_H + ROW_GAP);
 
 /// The one-line hint under the model dropdowns (#427). Plain words, no dash.
-const MODEL_LIST_HINT: &str = "Missing a cloud model? Add its name to models in config.toml.";
+const MODEL_LIST_HINT: &str = "Missing a model? Add it in the config file.";
 
 /// #674: shown instead of [`MODEL_LIST_HINT`] when the mode keeps every
 /// request on this computer, so the user knows why no live cloud list loads.
@@ -1176,7 +1213,7 @@ const ROW_H: i32 = 22;
 const ROW_GAP: i32 = 8;
 const GROUP_GAP: i32 = 14;
 const GROUP_LABEL_TOP: i32 = 20; // room for the groupbox caption
-const LABEL_W: i32 = 130;
+const LABEL_W: i32 = 140;
 const BTN_W: i32 = 100;
 const BTN_H: i32 = 28;
 
@@ -1646,7 +1683,11 @@ fn nc_width_px(hwnd: HWND) -> i32 {
 
 /// #624: the width of the Card group's first label. Its text is about 262px
 /// at 96 dpi; at 260dp it wrapped and the second line was clipped.
-const CARD_SECONDS_LABEL_W: i32 = 300;
+const CARD_SECONDS_EDIT_W: i32 = 50;
+/// The Card group's first row (#823): a short title, the number box, then
+/// what the number means. 0 is explained in words, not as a code.
+const CARD_SECONDS_LABEL: &str = "Hide the card after:";
+const CARD_SECONDS_UNIT: &str = "seconds (0 keeps it open)";
 
 /// #597: whether the Card display choice has any effect for this Card
 /// position label. "Next to the mouse" follows the pointer's own monitor, so
@@ -1744,6 +1785,19 @@ fn create_body(parent: HWND, instance: HINSTANCE, dpi: u32) -> HWND {
     .unwrap_or(HWND(std::ptr::null_mut()))
 }
 
+/// The text colour of the hotkey hint line (#824). Secondary text, never the
+/// disabled grey: `theme::LIGHT.text_dim` on the light button face, and the
+/// system's own button text in high contrast (where grey means disabled).
+/// Settings is drawn on the system face today; the dark-mode work swaps in
+/// the theme's tokens.
+fn hotkey_hint_color(high_contrast: bool, btn_text: u32) -> u32 {
+    if high_contrast {
+        btn_text
+    } else {
+        crate::ui::theme::LIGHT.text_dim
+    }
+}
+
 /// The body forwards what its controls tell their parent (button clicks, the
 /// trackbar) up to the settings window, and runs its own scrollbar.
 unsafe extern "system" fn body_wndproc(
@@ -1756,6 +1810,22 @@ unsafe extern "system" fn body_wndproc(
         WM_COMMAND | WM_HSCROLL => {
             let parent = GetParent(hwnd).unwrap_or_default();
             SendMessageW(parent, msg, Some(wparam), Some(lparam))
+        }
+        // #824: the hotkey hint is secondary text, not the disabled grey.
+        // Every other static keeps the default colours.
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+            if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) == ID_HOTKEY_STATUS =>
+        {
+            use windows::Win32::Graphics::Gdi::{
+                GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor, COLOR_3DFACE,
+                COLOR_BTNTEXT, TRANSPARENT,
+            };
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
+            let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+            let ink = hotkey_hint_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ink));
+            SetBkMode(hdc, TRANSPARENT);
+            LRESULT(GetSysColorBrush(COLOR_3DFACE).0 as isize)
         }
         WM_VSCROLL => {
             let si = body_scroll_info(hwnd);
@@ -3274,6 +3344,61 @@ fn ollama_installed() -> bool {
         .any(|p| p.is_file())
 }
 
+/// The second shortcut's line (#823): named by what it is for, since the
+/// Copilot key line above it already says which key is the first.
+fn secondary_label(chord: &crate::hotkey::Chord) -> String {
+    format!("Shortcut for any keyboard: {}", chord_to_string(chord))
+}
+
+/// When `config.toml` was last written and how long it was (#851). Enough to
+/// notice an edit without reading the file, which holds keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfigStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+/// The stamp of the config file now; `None` when it is missing or unreadable.
+fn current_config_stamp() -> Option<ConfigStamp> {
+    let meta = std::fs::metadata(Config::path().ok()?).ok()?;
+    Some(ConfigStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    })
+}
+
+/// Whether the file changed since the window opened. Any difference counts,
+/// including the file appearing or disappearing. If the stamp cannot be read
+/// both times, nothing is known to have changed.
+fn config_changed_since(opened: Option<ConfigStamp>, now: Option<ConfigStamp>) -> bool {
+    opened != now
+}
+
+/// Shown on the validation line when Save is refused for that reason.
+const CONFIG_CHANGED_MESSAGE: &str =
+    "config.toml changed while Settings was open. Close Settings and open it again.";
+
+/// Width of the "Open config file" button, in dp (#823).
+const OPEN_CONFIG_W: i32 = 120;
+
+/// Shown on the validation line when the config file cannot be opened (rule 7:
+/// never a silent no-op, never a dialog).
+const OPEN_CONFIG_FAILED: &str = "Could not open the config file. Save once to create it.";
+
+/// Opens the config file in the user's default editor. A missing file or a
+/// refusal from the shell is said on the validation line.
+fn open_config_file(inner: &SettingsInner) {
+    let opened = match Config::path() {
+        Ok(path) if path.exists() => open_url(&path.to_string_lossy()),
+        _ => false,
+    };
+    if !opened {
+        if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+            set_text(msg, OPEN_CONFIG_FAILED);
+        }
+    }
+}
+
 /// Opens `url` in the default browser. `false` when the shell refused
 /// (`ShellExecuteW` returns a value above 32 on success).
 fn open_url(url: &str) -> bool {
@@ -3529,7 +3654,7 @@ fn build_ui_recorded(
         WC_EDIT,
         &key_field_display(&config.providers.openai.api_key),
         (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         r.x + LABEL_W,
         r.y,
         r.w - LABEL_W - 70,
@@ -3549,16 +3674,15 @@ fn build_ui_recorded(
     );
     r.advance();
 
-    let half = (r.w - 12) / 2;
-    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, 50, ROW_H, 0);
+    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let openai_model = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 50,
+        r.x + LABEL_W,
         r.y,
-        half - 50,
+        r.w - LABEL_W,
         ROW_H * 8,
         ID_OPENAI_MODEL,
     );
@@ -3567,15 +3691,16 @@ fn build_ui_recorded(
         &config.providers.openai.models,
         &config.providers.openai.model,
     );
+    r.advance();
 
     ctx.create(
         WC_STATIC,
-        "Thinking:",
+        "Thinking time:",
         0,
         0,
-        r.x + half + 12,
+        r.x,
         r.y,
-        60,
+        LABEL_W,
         ROW_H,
         0,
     );
@@ -3584,9 +3709,9 @@ fn build_ui_recorded(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 60,
+        r.x + LABEL_W,
         r.y,
-        half - 60,
+        r.w - LABEL_W,
         ROW_H * 4,
         ID_OPENAI_EFFORT,
     );
@@ -3616,7 +3741,7 @@ fn build_ui_recorded(
         WC_EDIT,
         &key_field_display(&config.providers.anthropic.api_key),
         (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         r.x + LABEL_W,
         r.y,
         r.w - LABEL_W - 70,
@@ -3636,15 +3761,15 @@ fn build_ui_recorded(
     );
     r.advance();
 
-    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, 50, ROW_H, 0);
+    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let anthropic_model = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 50,
+        r.x + LABEL_W,
         r.y,
-        half - 50,
+        r.w - LABEL_W,
         ROW_H * 8,
         ID_ANTHROPIC_MODEL,
     );
@@ -3653,15 +3778,16 @@ fn build_ui_recorded(
         &config.providers.anthropic.models,
         &config.providers.anthropic.model,
     );
+    r.advance();
 
     ctx.create(
         WC_STATIC,
-        "Thinking:",
+        "Thinking time:",
         0,
         0,
-        r.x + half + 12,
+        r.x,
         r.y,
-        60,
+        LABEL_W,
         ROW_H,
         0,
     );
@@ -3670,9 +3796,9 @@ fn build_ui_recorded(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 60,
+        r.x + LABEL_W,
         r.y,
-        half - 60,
+        r.w - LABEL_W,
         ROW_H * 4,
         ID_ANTHROPIC_EFFORT,
     );
@@ -3702,7 +3828,7 @@ fn build_ui_recorded(
         WC_EDIT,
         &key_field_display(&config.providers.gemini.api_key),
         (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         r.x + LABEL_W,
         r.y,
         r.w - LABEL_W - 70,
@@ -3722,15 +3848,15 @@ fn build_ui_recorded(
     );
     r.advance();
 
-    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, 50, ROW_H, 0);
+    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let gemini_model = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 50,
+        r.x + LABEL_W,
         r.y,
-        half - 50,
+        r.w - LABEL_W,
         ROW_H * 8,
         ID_GEMINI_MODEL,
     );
@@ -3739,15 +3865,16 @@ fn build_ui_recorded(
         &config.providers.gemini.models,
         &config.providers.gemini.model,
     );
+    r.advance();
 
     ctx.create(
         WC_STATIC,
-        "Thinking:",
+        "Thinking time:",
         0,
         0,
-        r.x + half + 12,
+        r.x,
         r.y,
-        60,
+        LABEL_W,
         ROW_H,
         ID_GEMINI_EFFORT_LABEL,
     );
@@ -3756,9 +3883,9 @@ fn build_ui_recorded(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 60,
+        r.x + LABEL_W,
         r.y,
-        half - 60,
+        r.w - LABEL_W,
         ROW_H * 4,
         ID_GEMINI_EFFORT,
     );
@@ -3786,9 +3913,20 @@ fn build_ui_recorded(
         0,
         r.x,
         r.y,
-        r.w,
+        r.w - OPEN_CONFIG_W - 8,
         ROW_H,
         ID_MODEL_LIST_HINT,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Open config file",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + r.w - OPEN_CONFIG_W,
+        r.y,
+        OPEN_CONFIG_W,
+        ROW_H,
+        ID_OPEN_CONFIG,
     );
     r.advance();
 
@@ -3911,7 +4049,7 @@ fn build_ui_recorded(
         WC_EDIT,
         "",
         ES_AUTOHSCROLL as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         pull_x + LABEL_W,
         y,
         pull_inner_w - LABEL_W - OLLAMA_PULL_BTN_W - 8,
@@ -3987,10 +4125,7 @@ fn build_ui_recorded(
     r.advance();
     ctx.create(
         WC_STATIC,
-        &format!(
-            "Other shortcut: {}",
-            chord_to_string(&config.hotkeys.secondary)
-        ),
+        &secondary_label(&config.hotkeys.secondary),
         0,
         0,
         r.x,
@@ -4016,7 +4151,7 @@ fn build_ui_recorded(
     ctx.create(
         WC_STATIC,
         "Click Change, then press the new key.",
-        WS_DISABLED.0,
+        0,
         0,
         r.x,
         r.y,
@@ -4066,8 +4201,6 @@ fn build_ui_recorded(
     let capture_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
-    let half = (r.w - 12) / 2;
-
     ctx.create(
         WC_STATIC,
         "Screenshot detail:",
@@ -4075,7 +4208,7 @@ fn build_ui_recorded(
         0,
         r.x,
         r.y,
-        110,
+        LABEL_W,
         ROW_H,
         0,
     );
@@ -4084,9 +4217,9 @@ fn build_ui_recorded(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 110,
+        r.x + LABEL_W,
         r.y,
-        half - 110,
+        r.w - LABEL_W,
         ROW_H * 6,
         ID_MAX_EDGE,
     );
@@ -4099,25 +4232,17 @@ fn build_ui_recorded(
         &max_edge_display(config.capture.max_edge),
     );
 
-    ctx.create(
-        WC_STATIC,
-        "Screen:",
-        0,
-        0,
-        r.x + half + 12,
-        r.y,
-        60,
-        ROW_H,
-        0,
-    );
+    r.advance();
+
+    ctx.create(WC_STATIC, "Screen:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let monitor = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + half + 12 + 60,
+        r.x + LABEL_W,
         r.y,
-        half - 60,
+        r.w - LABEL_W,
         ROW_H * 4,
         ID_MONITOR,
     );
@@ -4195,12 +4320,12 @@ fn build_ui_recorded(
 
     ctx.create(
         WC_STATIC,
-        "Hide the card after this many seconds (0 = never):",
+        CARD_SECONDS_LABEL,
         0,
         0,
         r.x,
         r.y,
-        CARD_SECONDS_LABEL_W,
+        LABEL_W,
         ROW_H,
         0,
     );
@@ -4208,24 +4333,35 @@ fn build_ui_recorded(
         WC_EDIT,
         &config.ui.card_seconds.to_string(),
         (ES_NUMBER | ES_AUTOHSCROLL) as u32,
-        WS_EX_BORDER,
-        r.x + CARD_SECONDS_LABEL_W + 4,
+        WS_EX_CLIENTEDGE,
+        r.x + LABEL_W,
         r.y,
-        50,
+        CARD_SECONDS_EDIT_W,
         ROW_H,
         ID_CARD_SECONDS,
     );
+    ctx.create(
+        WC_STATIC,
+        CARD_SECONDS_UNIT,
+        0,
+        0,
+        r.x + LABEL_W + CARD_SECONDS_EDIT_W + 8,
+        r.y,
+        r.w - LABEL_W - CARD_SECONDS_EDIT_W - 8,
+        ROW_H,
+        0,
+    );
     r.advance();
 
-    ctx.create(WC_STATIC, "Text scale:", 0, 0, r.x, r.y, 70, ROW_H, 0);
+    ctx.create(WC_STATIC, "Text scale:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let track = ctx.create(
         TRACKBAR_CLASS_STR,
         "",
         TBS_HORZ as u32,
         0,
-        r.x + 70,
+        r.x + LABEL_W,
         r.y,
-        r.w - 70 - 60,
+        r.w - LABEL_W - 60,
         ROW_H,
         ID_TEXT_SCALE_TRACK,
     );
@@ -4262,15 +4398,15 @@ fn build_ui_recorded(
 
     // #498: where the card appears. The monitor list is read when Settings
     // opens, so a display plugged in afterwards shows up next time.
-    ctx.create(WC_STATIC, "Card position:", 0, 0, r.x, r.y, 110, ROW_H, 0);
+    ctx.create(WC_STATIC, "Card corner:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
     let corner = ctx.create(
         WC_COMBOBOX,
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 110,
+        r.x + LABEL_W,
         r.y,
-        r.w - 110,
+        r.w - LABEL_W,
         ROW_H * 7,
         ID_CARD_CORNER,
     );
@@ -4282,12 +4418,12 @@ fn build_ui_recorded(
 
     ctx.create(
         WC_STATIC,
-        "Card display:",
+        "Card monitor:",
         0,
         0,
         r.x,
         r.y,
-        110,
+        LABEL_W,
         ROW_H,
         ID_CARD_MONITOR_LABEL,
     );
@@ -4296,9 +4432,9 @@ fn build_ui_recorded(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 110,
+        r.x + LABEL_W,
         r.y,
-        r.w - 110,
+        r.w - LABEL_W,
         ROW_H * 8,
         ID_CARD_MONITOR,
     );
@@ -4336,12 +4472,12 @@ fn build_ui_recorded(
 
     ctx.create(
         WC_STATIC,
-        "Require a tick to fill:",
+        "Review before filling:",
         0,
         0,
         r.x,
         r.y,
-        150,
+        LABEL_W,
         ROW_H,
         0,
     );
@@ -4350,9 +4486,9 @@ fn build_ui_recorded(
         "",
         (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
         0,
-        r.x + 150,
+        r.x + LABEL_W,
         r.y,
-        r.w - 150,
+        r.w - LABEL_W,
         ROW_H * 4,
         ID_REQUIRE_TICK_FOR,
     );
@@ -4392,7 +4528,7 @@ fn build_ui_recorded(
         WC_EDIT,
         &prompt_to_edit(&config.ui.prompt),
         (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) as u32,
-        WS_EX_BORDER,
+        WS_EX_CLIENTEDGE,
         content_x + MARGIN,
         y,
         content_w - 2 * MARGIN,
@@ -4586,7 +4722,7 @@ fn add_style(hwnd: HWND, bits: u32) {
 }
 
 const TRACKBAR_CLASS_STR: &str = "msctls_trackbar32";
-const WS_EX_BORDER: u32 = 0x0000_0100;
+const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
 const BM_SETCHECK: u32 = 0x00F1;
 
 // ---------------------------------------------------------------------------
@@ -4735,10 +4871,7 @@ fn set_hotkey_labels(hwnd: HWND, hotkeys: &Hotkeys) {
         );
     }
     if let Some(l) = get_dlg_item(hwnd, ID_SECONDARY_LABEL) {
-        set_text(
-            l,
-            &format!("Other shortcut: {}", chord_to_string(&hotkeys.secondary)),
-        );
+        set_text(l, &secondary_label(&hotkeys.secondary));
     }
 }
 
@@ -6245,6 +6378,175 @@ mod tests {
             drop(Box::from_raw(raw));
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
+    }
+
+    /// #822: one field column. Every combo and edit that sits beside a label
+    /// starts at the same x (the label column's right edge), so the boxes do
+    /// not look ragged. The design rect of each child is in dp.
+    #[test]
+    fn settings_field_columns_share_one_left_edge() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let x_of = |id: i32| -> i32 {
+                let child = get_dlg_item(hwnd, id).expect("control exists");
+                inner
+                    .children
+                    .iter()
+                    .find(|c| c.hwnd == child)
+                    .expect("control was recorded")
+                    .x
+            };
+            let ids = [
+                ID_ACTIVE_PROVIDER,
+                ID_OPENAI_KEY,
+                ID_OPENAI_MODEL,
+                ID_OPENAI_EFFORT,
+                ID_ANTHROPIC_KEY,
+                ID_ANTHROPIC_MODEL,
+                ID_ANTHROPIC_EFFORT,
+                ID_GEMINI_KEY,
+                ID_GEMINI_MODEL,
+                ID_GEMINI_EFFORT,
+                ID_OLLAMA_MODEL,
+                ID_PULL_NAME,
+                ID_MAX_EDGE,
+                ID_MONITOR,
+                ID_CARD_CORNER,
+                ID_TEXT_SCALE_TRACK,
+                ID_CARD_SECONDS,
+                ID_CARD_MONITOR,
+                ID_REQUIRE_TICK_FOR,
+            ];
+            let first = x_of(ids[0]);
+            for id in ids {
+                assert_eq!(x_of(id), first, "control id {id} is off the field column");
+            }
+        });
+    }
+
+    /// #823: Settings speaks in plain words. No control text carries a config
+    /// term (a "(0 =" magic value, or a tell to edit config.toml), and the
+    /// second shortcut and the form tick are named by what they do.
+    #[test]
+    fn settings_labels_are_plain_words_not_config_terms() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let texts: Vec<String> = inner.children.iter().map(|c| get_text(c.hwnd)).collect();
+            assert!(texts.len() > 40, "the window was built: {}", texts.len());
+            for t in &texts {
+                assert!(!t.contains("(0 ="), "magic zero in a label: {t}");
+                assert!(
+                    !t.contains("config.toml"),
+                    "tells the user to edit a file: {t}"
+                );
+                assert!(!t.starts_with("Other shortcut"), "unnamed shortcut: {t}");
+                assert!(!t.starts_with("Require a tick"), "unclear label: {t}");
+                assert!(
+                    t != "Card display:" && t != "Card position:",
+                    "two names for one thing: {t}"
+                );
+            }
+            assert!(texts.iter().any(|t| t.starts_with("Hide the card after")));
+            assert!(texts
+                .iter()
+                .any(|t| t.starts_with("Shortcut for any keyboard")));
+        });
+    }
+
+    /// #851: the decision on whether the file changed under the window.
+    #[test]
+    fn a_changed_config_file_is_noticed() {
+        let t = std::time::UNIX_EPOCH;
+        let a = Some(ConfigStamp {
+            modified: Some(t),
+            len: 10,
+        });
+        let later = Some(ConfigStamp {
+            modified: Some(t + Duration::from_secs(5)),
+            len: 10,
+        });
+        let longer = Some(ConfigStamp {
+            modified: Some(t),
+            len: 11,
+        });
+        assert!(!config_changed_since(a, a));
+        assert!(!config_changed_since(None, None));
+        assert!(config_changed_since(a, later));
+        assert!(config_changed_since(a, longer));
+        assert!(config_changed_since(a, None), "deleted while open");
+        assert!(config_changed_since(None, a), "created while open");
+        assert!(!CONFIG_CHANGED_MESSAGE.contains('\u{2014}'));
+    }
+
+    /// #851 wired-to-nothing: Save in a real window refuses when the stamp
+    /// taken at open no longer matches, keeps the window open and says why.
+    #[test]
+    fn save_is_refused_when_the_config_file_changed_since_open() {
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe { &mut *raw }.config_stamp = Some(ConfigStamp {
+                modified: None,
+                len: u64::MAX,
+            });
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            let inner = unsafe { &*raw };
+            assert!(inner.result.is_none(), "Save must not produce a config");
+            let msg = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("message line");
+            assert_eq!(get_text(msg), CONFIG_CHANGED_MESSAGE);
+        });
+    }
+
+    /// #823 wired-to-nothing: the "Open config file" button is a real control
+    /// in the built window, Enter on it presses it, and its failure line is
+    /// plain words.
+    #[test]
+    fn the_open_config_button_exists_and_takes_enter() {
+        with_window(Config::default(), |hwnd, _raw| {
+            let button = get_dlg_item(hwnd, ID_OPEN_CONFIG).expect("button exists");
+            assert_eq!(get_text(button), "Open config file");
+        });
+        assert_eq!(enter_command(ID_OPEN_CONFIG), ID_OPEN_CONFIG);
+        assert!(!OPEN_CONFIG_FAILED.contains('\u{2014}'));
+    }
+
+    /// #824: the hotkey hint is not the disabled grey. It is an enabled
+    /// control (a disabled static is drawn in the faint disabled colour), and
+    /// the colour chosen for it reads at 4.5:1 on the Settings surface.
+    #[test]
+    fn the_hotkey_hint_is_enabled_and_readable() {
+        use crate::ui::theme::{contrast_ratio, relative_luminance, rgb};
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+
+        with_window(Config::default(), |hwnd, _raw| {
+            let status = get_dlg_item(hwnd, ID_HOTKEY_STATUS).expect("status line");
+            assert!(
+                unsafe { IsWindowEnabled(status) }.as_bool(),
+                "a disabled static is drawn in the disabled grey"
+            );
+        });
+
+        // The surface Settings is drawn on, read from the system. In a real
+        // high contrast session the grey path is not used, so skip it there.
+        if crate::ui::card_buttons::system_high_contrast().is_none() {
+            let face = unsafe {
+                windows::Win32::Graphics::Gdi::GetSysColor(
+                    windows::Win32::Graphics::Gdi::COLOR_3DFACE,
+                )
+            };
+            let ink = hotkey_hint_color(false, rgb(0, 0, 0));
+            let ratio = contrast_ratio(relative_luminance(ink), relative_luminance(face));
+            assert!(ratio >= 4.5, "hint contrast {ratio:.2}:1 is under 4.5:1");
+        }
+        // High contrast uses the system's own text colour, never a grey.
+        let hc = rgb(255, 255, 255);
+        assert_eq!(hotkey_hint_color(true, hc), hc);
     }
 
     /// Dispatches this thread's queued messages until `done` is true or 10 s
@@ -9221,7 +9523,7 @@ mod tests {
             unsafe { GetClientRect(label, &mut r) }.expect("label rect");
             r.right - r.left
         };
-        let text = "Hide the card after this many seconds (0 = never):";
+        let text = CARD_SECONDS_LABEL;
         let wide: Vec<u16> = text.encode_utf16().collect();
         let dc = unsafe { GetDC(Some(body)) };
         let old = unsafe { SelectObject(dc, HGDIOBJ((&*win.1).font.0)) };

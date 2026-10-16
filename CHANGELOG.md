@@ -7,6 +7,10 @@ tagged release.
 
 ## [Unreleased]
 
+### Changed
+
+- Settings now uses the modern Windows 11 controls (rounded combo boxes and buttons, themed checkboxes and slider) instead of the classic look. The app now carries a manifest that asks for them (issues #807, #820).
+
 ### Added
 
 - Share an action as a file: tray, Help and diagnostics, "Export action to file"
