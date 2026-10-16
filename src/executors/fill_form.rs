@@ -499,7 +499,11 @@ fn do_fill(access: &Arc<dyn TextElementAccess>, form: &FormFill) -> Result<Undo>
             continue;
         }
 
-        match access.write_with_fallback(&field.target, &field.value) {
+        // #432: the write re-verifies the expected text on the very element
+        // it writes to, so text typed after `evaluate_resolved_field`'s
+        // check is refused as stale too, never overwritten.
+        match access.write_with_fallback(&field.target, &field.expected_current_text, &field.value)
+        {
             Ok(()) => {
                 filled.push(FilledField {
                     target: field.target.clone(),
@@ -513,9 +517,14 @@ fn do_fill(access: &Arc<dyn TextElementAccess>, form: &FormFill) -> Result<Undo>
                 });
             }
             Err(e) => {
+                let reason = if target::is_stale_target_error(&e) {
+                    RefuseReason::Stale
+                } else {
+                    RefuseReason::WriteFailed(e.to_string())
+                };
                 results.push(FieldResult {
                     label: field.label.clone(),
-                    outcome: FieldOutcome::Refused(RefuseReason::WriteFailed(e.to_string())),
+                    outcome: FieldOutcome::Refused(reason),
                 });
             }
         }
@@ -547,8 +556,19 @@ fn restore_fields(access: &Arc<dyn TextElementAccess>, filled: &[FilledField]) -
         );
         match action {
             RestoreAction::Restore => {
-                access.write(&field.target, &field.prior_value)?;
-                restored += 1;
+                // #432: same-walk re-check; a field typed into after the
+                // check above is reported as skipped, never overwritten.
+                match access.write(
+                    &field.target,
+                    &field.expected_after_write,
+                    &field.prior_value,
+                ) {
+                    Ok(()) => restored += 1,
+                    Err(e) if target::is_stale_target_error(&e) => {
+                        skipped.push(format!("\"{}\" (edited since the fill)", field.label));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             RestoreAction::SkipStale => {
                 skipped.push(format!("\"{}\" (edited since the fill)", field.label));
@@ -592,6 +612,10 @@ mod tests {
         fields: HashMap<TargetRef, FakeField>,
         write_calls: RefCell<Vec<TargetRef>>,
         unresolvable: Vec<TargetRef>,
+        /// Simulates the user typing into a field right after a `resolve`
+        /// read it (#432): that `resolve` returns the old text, then the
+        /// live text becomes this value.
+        typed_after_resolve: RefCell<HashMap<TargetRef, String>>,
     }
 
     // `RefCell` isn't `Sync`; this fake is never touched from more than one
@@ -609,21 +633,31 @@ mod tests {
                 .fields
                 .get(target)
                 .ok_or_else(|| anyhow!("fake: unknown target"))?;
-            Ok(target::ResolvedElement {
+            let resolved = target::ResolvedElement {
                 name: field.name.clone(),
                 automation_id: field.automation_id.clone(),
                 control_type: field.control_type.clone(),
                 is_password: field.is_password,
                 current_text: field.text.borrow().clone(),
-            })
+            };
+            if let Some(typed) = self.typed_after_resolve.borrow_mut().remove(target) {
+                *field.text.borrow_mut() = typed;
+            }
+            Ok(resolved)
         }
 
-        fn write(&self, target: &TargetRef, new_text: &str) -> Result<()> {
+        fn write(
+            &self,
+            target: &TargetRef,
+            expected_current_text: &str,
+            new_text: &str,
+        ) -> Result<()> {
             self.write_calls.borrow_mut().push(target.clone());
             let field = self
                 .fields
                 .get(target)
                 .ok_or_else(|| anyhow!("fake: unknown target"))?;
+            target::ensure_unchanged(expected_current_text, &field.text.borrow())?;
             *field.text.borrow_mut() = new_text.to_string();
             Ok(())
         }
@@ -657,6 +691,7 @@ mod tests {
                 .collect(),
             write_calls: RefCell::new(Vec::new()),
             unresolvable: Vec::new(),
+            typed_after_resolve: RefCell::new(HashMap::new()),
         })
     }
 
@@ -1255,6 +1290,7 @@ mod tests {
             .collect(),
             write_calls: RefCell::new(Vec::new()),
             unresolvable: vec![target_for("missing")],
+            typed_after_resolve: RefCell::new(HashMap::new()),
         });
         let executor = FillFormExecutor::with_access(access.clone());
         let form = form_json(vec![
@@ -1317,6 +1353,90 @@ mod tests {
             !undo.summary.contains('\u{2014}'),
             "no em dashes: {}",
             undo.summary
+        );
+    }
+
+    /// #432: text typed AFTER the staleness check read the field and BEFORE
+    /// the write lands. The write must refuse that one field (reported as
+    /// changed), leave the user's text alone, and still fill the others.
+    #[test]
+    fn a_field_typed_into_between_the_check_and_the_write_is_refused_not_overwritten() {
+        let access = access(vec![
+            (
+                "name",
+                field("name", "Edit", false, "Full name", "old name"),
+            ),
+            (
+                "email",
+                field("email", "Edit", false, "Email", "old@example.com"),
+            ),
+        ]);
+        access
+            .typed_after_resolve
+            .borrow_mut()
+            .insert(target_for("name"), "typed in the gap".to_string());
+        let executor = FillFormExecutor::with_access(access.clone());
+        let form = form_json(vec![
+            field_json("name", "Full name", "Ada", false, false, "old name"),
+            field_json(
+                "email",
+                "Email",
+                "ada@example.com",
+                false,
+                false,
+                "old@example.com",
+            ),
+        ]);
+
+        let undo = executor
+            .execute(confirmed(form))
+            .expect("execute must succeed (fill_form never aborts the whole run)");
+
+        assert_eq!(
+            *access.fields[&target_for("name")].text.borrow(),
+            "typed in the gap",
+            "text typed in the gap must not be overwritten"
+        );
+        assert!(
+            undo.summary.contains("changed"),
+            "must read as a stale refusal, not a generic write failure: {}",
+            undo.summary
+        );
+        assert!(undo.summary.contains("Filled 1 of 2 fields"));
+        assert_eq!(
+            *access.fields[&target_for("email")].text.borrow(),
+            "ada@example.com"
+        );
+    }
+
+    /// Restore has the same check-then-write shape.
+    #[test]
+    fn restore_does_not_overwrite_text_typed_between_its_check_and_its_write() {
+        let access = access(vec![(
+            "name",
+            field("name", "Edit", false, "Full name", "old name"),
+        )]);
+        let executor = FillFormExecutor::with_access(access.clone());
+        let form = form_json(vec![field_json(
+            "name",
+            "Full name",
+            "Ada",
+            false,
+            false,
+            "old name",
+        )]);
+        let undo = executor.execute(confirmed(form)).unwrap();
+
+        access
+            .typed_after_resolve
+            .borrow_mut()
+            .insert(target_for("name"), "typed in the gap".to_string());
+        undo.undo()
+            .expect_err("a change between restore's check and its write must be reported");
+
+        assert_eq!(
+            *access.fields[&target_for("name")].text.borrow(),
+            "typed in the gap"
         );
     }
 
@@ -1764,7 +1884,7 @@ mod tests {
             // between "Look" (both controls still blank, "current": ""
             // captured for each) and "Do".
             real_access
-                .write(&edit_a, "typed after look")
+                .write(&edit_a, "", "typed after look")
                 .expect("simulate a live edit before Do runs");
 
             let access: Arc<dyn TextElementAccess> = Arc::new(target::com::UiaTextElementAccess);

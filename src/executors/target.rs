@@ -97,6 +97,40 @@ pub fn is_stale(expected_current_text: &str, actual_current_text: &str) -> bool 
     expected_current_text != actual_current_text
 }
 
+/// The error a [`TextElementAccess::write`] returns when the element's text no
+/// longer equals the text the caller expected (#432). A distinct type so a
+/// caller can tell "someone typed in between" from any other write failure
+/// (`anyhow::Error::downcast_ref::<StaleTarget>`) and word its own card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleTarget;
+
+impl std::fmt::Display for StaleTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the text has changed since the preview was shown; refusing to overwrite it"
+        )
+    }
+}
+
+impl std::error::Error for StaleTarget {}
+
+/// Whether `err` (at any depth of its context chain) is a [`StaleTarget`].
+pub fn is_stale_target_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<StaleTarget>().is_some()
+}
+
+/// `Ok` when `actual_current_text` still equals what the caller expected,
+/// otherwise a [`StaleTarget`] error. The one compare every
+/// [`TextElementAccess::write`] implementation runs on the SAME element it is
+/// about to write (#432).
+pub fn ensure_unchanged(expected_current_text: &str, actual_current_text: &str) -> Result<()> {
+    if is_stale(expected_current_text, actual_current_text) {
+        return Err(StaleTarget.into());
+    }
+    Ok(())
+}
+
 /// Parses one `TargetRef` out of a proposal's `"target"` object. Shared by
 /// `replace_text::parse_replace_text` and `fill_form::parse_field_fill` --
 /// every proposal that names a UIA element uses this exact shape (`hwnd`,
@@ -223,10 +257,14 @@ pub trait TextElementAccess: Send + Sync {
 
     /// Re-resolves `target` again (independently of any earlier `resolve`
     /// call -- each call is self-contained, see `com::UiaTextElementAccess`'s
-    /// doc comment) and writes `new_text` via `ValuePattern.SetValue`. Errs
-    /// if the element cannot be found, is a password field, or does not
-    /// support `ValuePattern`.
-    fn write(&self, target: &TargetRef, new_text: &str) -> Result<()>;
+    /// doc comment) and writes `new_text` via `ValuePattern.SetValue`, but
+    /// only if THAT walk's element still reads `expected_current_text`: the
+    /// staleness check and the write use the same element, so text typed
+    /// between a caller's earlier `resolve` and this call is caught (#432).
+    /// Errs with a [`StaleTarget`] when the text differs; also errs if the
+    /// element cannot be found, is a password field, or does not support
+    /// `ValuePattern`. Nothing is written on any error.
+    fn write(&self, target: &TargetRef, expected_current_text: &str, new_text: &str) -> Result<()>;
 
     /// Same as [`write`](Self::write), but for `fill_form` (#33) only: when
     /// the real implementation finds no `ValuePattern` and the control is
@@ -234,8 +272,13 @@ pub trait TextElementAccess: Send + Sync {
     /// refusing outright. The default implementation is plain `write` --
     /// every fake gets this for free, and `replace_text` never calls this
     /// method at all (see the module doc comment).
-    fn write_with_fallback(&self, target: &TargetRef, new_text: &str) -> Result<()> {
-        self.write(target, new_text)
+    fn write_with_fallback(
+        &self,
+        target: &TargetRef,
+        expected_current_text: &str,
+        new_text: &str,
+    ) -> Result<()> {
+        self.write(target, expected_current_text, new_text)
     }
 }
 
@@ -247,8 +290,8 @@ pub mod com {
     #![allow(dead_code)]
 
     use super::{
-        is_editable_control_type, plan_typed_input, resolve_index, MatchOutcome, ResolvedElement,
-        TargetRef, TextElementAccess, UnicodeKeyEvent,
+        ensure_unchanged, is_editable_control_type, plan_typed_input, resolve_index, MatchOutcome,
+        ResolvedElement, TargetRef, TextElementAccess, UnicodeKeyEvent,
     };
     use anyhow::Result;
     use windows::core::{Interface, BSTR};
@@ -516,6 +559,22 @@ pub mod com {
         Ok(unknown.cast()?)
     }
 
+    /// One more compare right before `SetValue`, against the control's LIVE
+    /// value rather than the walk's cached one (#432): the walk's cache was
+    /// filled before the pattern lookup, so this shrinks the remaining gap to
+    /// the two adjacent COM calls. A failed live read is not a refusal: the
+    /// cached compare in the caller already passed, and a provider that
+    /// cannot report a current value would otherwise never be writable.
+    fn recheck_live_value(
+        pattern: &IUIAutomationValuePattern,
+        expected_current_text: &str,
+    ) -> Result<()> {
+        if let Ok(live) = unsafe { pattern.CurrentValue() } {
+            ensure_unchanged(expected_current_text, &live.to_string())?;
+        }
+        Ok(())
+    }
+
     /// `BSTR::from("")` allocates nothing and yields a raw NULL pointer
     /// (`windows-strings`' own optimization for the empty case -- it never
     /// calls the OS allocator at all when the input slice is empty).
@@ -600,7 +659,12 @@ pub mod com {
             })
         }
 
-        fn write(&self, target: &TargetRef, new_text: &str) -> Result<()> {
+        fn write(
+            &self,
+            target: &TargetRef,
+            expected_current_text: &str,
+            new_text: &str,
+        ) -> Result<()> {
             let _apartment = ComApartment::enter()?;
             let automation: IUIAutomation =
                 unsafe { crate::inputs::uia_automation::create_automation() }?;
@@ -611,12 +675,19 @@ pub mod com {
                 !matched.is_password,
                 "refusing to write to a password field"
             );
+            ensure_unchanged(expected_current_text, &matched.current_text)?;
             let pattern = value_pattern_of(&matched.element)?;
+            recheck_live_value(&pattern, expected_current_text)?;
             unsafe { pattern.SetValue(&bstr_for_value(new_text)) }?;
             Ok(())
         }
 
-        fn write_with_fallback(&self, target: &TargetRef, new_text: &str) -> Result<()> {
+        fn write_with_fallback(
+            &self,
+            target: &TargetRef,
+            expected_current_text: &str,
+            new_text: &str,
+        ) -> Result<()> {
             let _apartment = ComApartment::enter()?;
             let automation: IUIAutomation =
                 unsafe { crate::inputs::uia_automation::create_automation() }?;
@@ -627,9 +698,11 @@ pub mod com {
                 !matched.is_password,
                 "refusing to write to a password field"
             );
+            ensure_unchanged(expected_current_text, &matched.current_text)?;
 
             match value_pattern_of(&matched.element) {
                 Ok(pattern) => {
+                    recheck_live_value(&pattern, expected_current_text)?;
                     unsafe { pattern.SetValue(&bstr_for_value(new_text)) }?;
                     Ok(())
                 }
@@ -707,6 +780,32 @@ mod tests {
         let target = sample_target();
         let candidates = vec![target.clone(), target.clone()];
         assert_eq!(resolve_index(&candidates, &target), MatchOutcome::Ambiguous);
+    }
+
+    // -- ensure_unchanged / StaleTarget (#432) --------------------------
+
+    #[test]
+    fn ensure_unchanged_accepts_equal_text() {
+        assert!(ensure_unchanged("same", "same").is_ok());
+        assert!(ensure_unchanged("", "").is_ok());
+    }
+
+    #[test]
+    fn ensure_unchanged_refuses_changed_text_with_a_typed_error() {
+        let err = ensure_unchanged("before", "after").expect_err("must refuse");
+        assert!(is_stale_target_error(&err));
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert!(!err.to_string().contains('\u{2014}'), "no em dashes: {err}");
+    }
+
+    #[test]
+    fn a_stale_target_error_is_still_recognised_through_added_context() {
+        use anyhow::Context;
+        let err = ensure_unchanged("a", "b")
+            .context("outer")
+            .expect_err("must refuse");
+        assert!(is_stale_target_error(&err));
+        assert!(!is_stale_target_error(&anyhow!("some other failure")));
     }
 
     // -- is_stale -------------------------------------------------------

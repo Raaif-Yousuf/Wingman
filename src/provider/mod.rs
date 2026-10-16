@@ -257,6 +257,23 @@ pub struct Usage {
     pub cache_read_tokens: u32,
 }
 
+/// The usage block of a successful response body, by the tag the provider
+/// passes to `common::post_json` (each tag is that provider's `id()`). `None`
+/// for an unknown tag, a body that does not parse, or one with no usage. The
+/// egress log reads this at the HTTP boundary (#487), where the response is
+/// in hand but the provider has not parsed it yet.
+pub(crate) fn usage_from_body(tag: &str, body: &str) -> Option<Usage> {
+    let parsed = match tag {
+        "anthropic" => anthropic::Anthropic::parse_completion(body),
+        "openai" => openai::OpenAi::parse_completion(body),
+        "gemini" => gemini::Gemini::parse_completion(body),
+        "ollama" => ollama::Ollama::parse_completion(body),
+        "openai-compat" => openai_compat::OpenAiCompat::parse_completion(body),
+        _ => return None,
+    };
+    parsed.ok()?.usage
+}
+
 /// Why the provider stopped. A refusal, or an empty completion caused by
 /// running out of budget, is surfaced as `Err` before a `Completion` ever
 /// exists (see each provider's response parsing), so in practice this only
@@ -750,8 +767,6 @@ impl Chain {
         mut fallback: impl FnMut() -> anyhow::Result<NonVisionInputs>,
         mut parse: impl FnMut(&Completion) -> anyhow::Result<T>,
     ) -> anyhow::Result<(T, Attribution)> {
-        // #486: the cost on the card is this run's, and only this run's.
-        crate::usage::begin_run();
         let mut first_err: Option<anyhow::Error> = None;
         let mut first_choice: Option<String> = None;
         // Cached as a `String` error (not `anyhow::Error`) purely so this
@@ -3443,10 +3458,14 @@ mod tests {
     }
 
     #[test]
-    fn an_earlier_run_cost_does_not_leak_into_the_next_answer() {
-        crate::usage::note_run_cost(Some(9.0));
-        let chain = Chain::new(vec![labelled("ollama", "ollama:gemma3:4b", true, true)]);
-        assert_eq!(attributed(&chain).unwrap().cost_usd, None);
+    fn a_run_with_two_chain_calls_reports_the_sum() {
+        // One worker thread is one run: the second call's attribution (the
+        // one the card ends up with) carries both calls' cost.
+        let first = Chain::new(vec![Box::new(Billed(Some(0.002)))]);
+        let second = Chain::new(vec![Box::new(Billed(Some(0.003)))]);
+        attributed(&first).unwrap();
+        let cost = attributed(&second).unwrap().cost_usd;
+        assert!(cost.is_some_and(|c| (c - 0.005).abs() < 1e-9), "{cost:?}");
     }
 
     #[test]

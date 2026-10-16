@@ -108,7 +108,7 @@ impl OpenAi {
     /// The `output` array may contain a `reasoning` entry before the
     /// `message` entry on reasoning models, so non-`message` entries are
     /// skipped rather than assumed absent.
-    fn parse_completion(body: &str) -> Result<Completion> {
+    pub(crate) fn parse_completion(body: &str) -> Result<Completion> {
         let value: Value =
             serde_json::from_str(body).context("openai: response body is not valid JSON")?;
 

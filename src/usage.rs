@@ -336,10 +336,12 @@ pub fn request_cost(
     cost_usd(provider, model, date, usage?)
 }
 
-/// What one answer cost so far, for the card (#486). A run is one `Chain`
-/// call on the worker thread, and every provider request in it reports here
-/// from [`record`] on that same thread, so a thread-local needs no lock and
-/// cannot bleed into another run.
+/// What one answer cost so far, for the card (#486). A run is one action
+/// worker, and every action starts a fresh worker thread, so this thread-local
+/// is that run's total: every provider request on the thread reports here
+/// from [`record`], and a run with several chain calls (each one hands over
+/// the total so far) ends with the sum. It needs no lock and cannot bleed
+/// into another run.
 #[derive(Clone, Copy, Default)]
 struct RunCost {
     usd: f64,
@@ -352,7 +354,9 @@ thread_local! {
     static RUN_COST: std::cell::Cell<RunCost> = std::cell::Cell::new(RunCost::default());
 }
 
-/// Starts counting a new run, forgetting the last one.
+/// Starts counting a new run. Production needs no call (a new run is a new
+/// thread); tests share a thread-local per test thread and reset explicitly.
+#[cfg(test)]
 pub fn begin_run() {
     RUN_COST.with(|c| c.set(RunCost::default()));
 }
@@ -390,6 +394,21 @@ pub fn format_cost(usd: f64) -> Option<String> {
     } else {
         format!("About ${usd:.2}")
     })
+}
+
+/// The cost of a successful response, read at the HTTP boundary for the
+/// egress log (#487). Same price table and rules as [`record`], so the log
+/// row, the tooltip and the budget cannot disagree. `tag` is the provider's
+/// `id()` and `url` the endpoint (a loopback URL is free).
+pub fn response_cost(tag: &str, url: &str, model: Option<&str>, body: &str) -> Option<f64> {
+    let usage = crate::provider::usage_from_body(tag, body);
+    request_cost(
+        tag,
+        model.unwrap_or(""),
+        &local_date_today(),
+        is_loopback_url(url),
+        usage.as_ref(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -689,6 +708,17 @@ mod tests {
         begin_run();
         note_run_cost(Some(0.0));
         assert_eq!(run_cost(), None);
+    }
+
+    #[test]
+    fn response_cost_is_free_on_loopback_and_unknown_for_an_unknown_tag() {
+        let body = r#"{"choices":[{"finish_reason":"stop","message":{"content":"{}"}}],"usage":{"prompt_tokens":5,"completion_tokens":5}}"#;
+        let local = response_cost("openai-compat", "http://127.0.0.1:1234/v1", Some("m"), body);
+        assert_eq!(local, Some(0.0));
+        assert_eq!(
+            response_cost("elsewhere", "https://x.invalid/", Some("m"), body),
+            None
+        );
     }
 
     #[test]

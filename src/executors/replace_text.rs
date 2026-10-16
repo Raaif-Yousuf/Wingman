@@ -430,9 +430,21 @@ fn do_replace(access: &Arc<dyn TextElementAccess>, proposal: &ReplaceTextProposa
         "replace_text: refusing to write a value that reads as a payment card number or IBAN"
     );
 
+    // #432: the write re-verifies `expected_current_text` on the very element
+    // it writes to, so text typed after the check above is refused here too.
     access
-        .write(&proposal.target, &new_full_text)
-        .context("replace_text: could not write the new text")?;
+        .write(
+            &proposal.target,
+            &proposal.expected_current_text,
+            &new_full_text,
+        )
+        .map_err(|e| {
+            if target::is_stale_target_error(&e) {
+                anyhow!("replace_text: {e}")
+            } else {
+                e.context("replace_text: could not write the new text")
+            }
+        })?;
 
     let summary = format!(
         "Replaced text in \"{}\".",
@@ -456,7 +468,15 @@ fn do_replace(access: &Arc<dyn TextElementAccess>, proposal: &ReplaceTextProposa
             !is_stale(&expected_after_write, &resolved.current_text),
             "replace_text undo: the text has changed since this executor wrote it; refusing to overwrite it"
         );
-        undo_access.write(&target, &prior_text)
+        undo_access
+            .write(&target, &expected_after_write, &prior_text)
+            .map_err(|e| {
+                if target::is_stale_target_error(&e) {
+                    anyhow!("replace_text undo: {e}")
+                } else {
+                    e
+                }
+            })
     }))
 }
 
@@ -485,6 +505,10 @@ mod tests {
         resolve_calls: RefCell<u32>,
         write_calls: RefCell<u32>,
         resolve_should_fail: bool,
+        /// Simulates the user typing into the control right after a
+        /// `resolve` read it (#432): that `resolve` returns the old text,
+        /// then the live text becomes this value.
+        typed_after_resolve: RefCell<Option<String>>,
     }
 
     // `RefCell` isn't `Sync`; this fake is never touched from more than one
@@ -500,18 +524,28 @@ mod tests {
                 "fake: could not resolve the target"
             );
             anyhow::ensure!(*target == self.target, "fake: unexpected target");
-            Ok(ResolvedElement {
+            let resolved = ResolvedElement {
                 name: self.element.name.clone(),
                 automation_id: self.element.automation_id.clone(),
                 control_type: self.element.control_type.clone(),
                 is_password: self.element.is_password,
                 current_text: self.element.text.borrow().clone(),
-            })
+            };
+            if let Some(typed) = self.typed_after_resolve.borrow_mut().take() {
+                *self.element.text.borrow_mut() = typed;
+            }
+            Ok(resolved)
         }
 
-        fn write(&self, target: &TargetRef, new_text: &str) -> Result<()> {
+        fn write(
+            &self,
+            target: &TargetRef,
+            expected_current_text: &str,
+            new_text: &str,
+        ) -> Result<()> {
             *self.write_calls.borrow_mut() += 1;
             anyhow::ensure!(*target == self.target, "fake: unexpected target");
+            target::ensure_unchanged(expected_current_text, &self.element.text.borrow())?;
             *self.element.text.borrow_mut() = new_text.to_string();
             Ok(())
         }
@@ -540,6 +574,7 @@ mod tests {
             resolve_calls: RefCell::new(0),
             write_calls: RefCell::new(0),
             resolve_should_fail: false,
+            typed_after_resolve: RefCell::new(None),
         })
     }
 
@@ -869,6 +904,63 @@ mod tests {
         assert_eq!(*access.element.text.borrow(), "someone typed this");
     }
 
+    /// #432: the user types into the field AFTER the staleness check read
+    /// it and BEFORE the write lands. The write must notice and refuse; the
+    /// user's newer text must survive.
+    #[test]
+    fn text_typed_between_the_check_and_the_write_is_refused_not_overwritten() {
+        let access = fake_access("original text");
+        *access.typed_after_resolve.borrow_mut() = Some("typed in the gap".to_string());
+        let executor = ReplaceTextExecutor::with_access(access.clone());
+        let proposal = replace_all_proposal(&sample_target(), "new text", "original text");
+
+        let err = executor
+            .execute(confirmed(proposal))
+            .err()
+            .expect("a change between the check and the write must be refused");
+
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert!(!err.to_string().contains('\u{2014}'), "no em dashes: {err}");
+        assert_eq!(
+            *access.element.text.borrow(),
+            "typed in the gap",
+            "the user's newer text must not be overwritten"
+        );
+    }
+
+    /// Same race in replace_selection mode: the spliced result must not be
+    /// written over text the user changed in the gap.
+    #[test]
+    fn replace_selection_text_typed_in_the_gap_is_refused_not_overwritten() {
+        let access = fake_access("Hello world");
+        *access.typed_after_resolve.borrow_mut() = Some("Hello there, friend".to_string());
+        let executor = ReplaceTextExecutor::with_access(access.clone());
+        let proposal = replace_selection_proposal(&sample_target(), "Rust", "Hello world", 6, 11);
+
+        executor
+            .execute(confirmed(proposal))
+            .err()
+            .expect("a change between the check and the write must be refused");
+
+        assert_eq!(*access.element.text.borrow(), "Hello there, friend");
+    }
+
+    /// Undo has the same check-then-write shape: text typed after its own
+    /// re-resolve must survive.
+    #[test]
+    fn undo_text_typed_between_its_check_and_its_write_is_not_overwritten() {
+        let access = fake_access("original text");
+        let executor = ReplaceTextExecutor::with_access(access.clone());
+        let proposal = replace_all_proposal(&sample_target(), "new text", "original text");
+        let undo = executor.execute(confirmed(proposal)).unwrap();
+
+        *access.typed_after_resolve.borrow_mut() = Some("typed in the gap".to_string());
+        undo.undo()
+            .expect_err("a change between undo's check and its write must be refused");
+
+        assert_eq!(*access.element.text.borrow(), "typed in the gap");
+    }
+
     #[test]
     fn password_field_is_refused_and_never_written() {
         let access = fake_access_named("secret", true, "Password");
@@ -972,6 +1064,7 @@ mod tests {
             resolve_calls: RefCell::new(0),
             write_calls: RefCell::new(0),
             resolve_should_fail: true,
+            typed_after_resolve: RefCell::new(None),
         };
         let executor = ReplaceTextExecutor::with_access(Arc::new(unresolvable));
         let proposal = replace_all_proposal(&sample_target(), "new text", "text");
