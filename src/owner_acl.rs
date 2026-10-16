@@ -109,9 +109,14 @@ fn read_current_user_sid() -> Result<String, String> {
 }
 
 /// The current user's SID string (`S-1-5-21-...`), read once per process.
+/// Only a success is cached: a failed read is tried again next time.
 pub fn current_user_sid() -> Result<String, String> {
-    static SID: OnceLock<Result<String, String>> = OnceLock::new();
-    SID.get_or_init(read_current_user_sid).clone()
+    static SID: OnceLock<String> = OnceLock::new();
+    if let Some(sid) = SID.get() {
+        return Ok(sid.clone());
+    }
+    let sid = read_current_user_sid()?;
+    Ok(SID.get_or_init(|| sid).clone())
 }
 
 /// The account part of an `icacls` grant: `*` and the SID, which `icacls`

@@ -87,13 +87,23 @@ mod tests {
             .output()
             .expect("icacls should run");
         let listing = String::from_utf8_lossy(&out.stdout).to_string();
-        let user = std::env::var("USERNAME").unwrap();
+        // The grant names the current user by SID, so ask icacls whether
+        // that SID has an ACE on the file (it prints "SID Found" if so).
+        let sid = crate::owner_acl::grant_account().unwrap();
+        let found = crate::owner_acl::icacls_command()
+            .unwrap()
+            .arg(&child)
+            .arg("/findsid")
+            .arg(&sid)
+            .output()
+            .expect("icacls should run");
+        let found = String::from_utf8_lossy(&found.stdout).to_string();
         let _ = std::fs::remove_dir_all(&dir);
-        // The ACE itself: the user, inherited, full control. (The user name
-        // alone is not enough: the temp path contains it.)
+        assert!(found.contains("SID Found"), "no ACE for {sid}: {found}");
+        // That ACE is inherited full control.
         assert!(
-            listing.contains(&format!("{user}:(I)(F)")),
-            "no inherited full-control ACE for {user}: {listing}"
+            listing.contains(":(I)(F)"),
+            "no inherited full-control ACE: {listing}"
         );
         for other in ["Everyone", "BUILTIN\\Users", "Authenticated Users"] {
             assert!(

@@ -117,9 +117,9 @@ packet capture, is in [`docs/offline.md`](docs/offline.md).
   request-building code; never uploaded anywhere as a file, only the
   individual fields the request needs.
 - `%TEMP%\Wingman\*.ics`: the calendar file "Add to calendar" hands to your
-  calendar app, with the event title, place and notes. Wingman deletes
-  files older than an hour the next time you add an event, and the undo
-  button deletes it at once.
+  calendar app, with the event title, place and notes (in portable mode, in
+  the Wingman folder instead). Wingman deletes files at least an hour old the
+  next time you add an event, and the undo button deletes it at once.
 - Nothing else. No screenshot is written to disk. No history, log or cache of
   past answers persists across a restart.
 
