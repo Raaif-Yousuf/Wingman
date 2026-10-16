@@ -380,7 +380,7 @@ impl Provider for OpenAiCompat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{parse_answer, physics_request, Effort, Shot};
+    use crate::provider::{parse_answer, physics_request_no_note, Effort, Shot};
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -392,7 +392,7 @@ mod tests {
     }
 
     fn req(prompt: &str, want_difficulty: bool) -> Request {
-        physics_request(&sample_shot(), prompt, want_difficulty)
+        physics_request_no_note(&sample_shot(), prompt, want_difficulty)
     }
 
     fn provider(auth: CompatAuth, structured: Structured) -> OpenAiCompat {
