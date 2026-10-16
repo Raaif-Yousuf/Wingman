@@ -1101,6 +1101,26 @@ const WIN_H_DP: i32 = 918 + 4 * (ROW_H + ROW_GAP);
 
 /// The one-line hint under the model dropdowns (#427). Plain words, no dash.
 const MODEL_LIST_HINT: &str = "Missing a cloud model? Add its name to models in config.toml.";
+
+/// #674: shown instead of [`MODEL_LIST_HINT`] when the mode keeps every
+/// request on this computer, so the user knows why no live cloud list loads.
+const MODEL_LIST_HINT_LOCAL: &str = "Local mode: live cloud model lists are not fetched.";
+const MODEL_LIST_HINT_OFFLINE: &str = "Offline mode: live cloud model lists are not fetched.";
+
+/// Whether the mode allows asking a cloud vendor for its model list. Both
+/// Local and Offline are loopback only (#674); the saved key rides along.
+fn cloud_list_allowed(mode: crate::mode::Mode) -> bool {
+    !matches!(mode, crate::mode::Mode::Local | crate::mode::Mode::Offline)
+}
+
+/// The hint line under the cloud model dropdowns for `mode`.
+fn model_list_hint_for(mode: crate::mode::Mode) -> &'static str {
+    match mode {
+        crate::mode::Mode::Local => MODEL_LIST_HINT_LOCAL,
+        crate::mode::Mode::Offline => MODEL_LIST_HINT_OFFLINE,
+        _ => MODEL_LIST_HINT,
+    }
+}
 /// The shortest the window is ever made, in dp: the pinned footer and a sliver
 /// of body. It is only a floor against a failed or absurd monitor query (see
 /// `fitted_height_for_work_px`); a real work area is always taller, and a
@@ -2389,7 +2409,7 @@ fn spawn_cloud_models_fetch(
     sync: std::sync::Arc<CloudSync>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    if crate::mode::is_offline_now() {
+    if !cloud_list_allowed(crate::mode::current()) {
         return;
     }
     let keys = [
@@ -2478,7 +2498,7 @@ fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
     let Some(key) = key_to_fetch(original, &get_text(edit), &last) else {
         return;
     };
-    if crate::mode::is_offline_now() {
+    if !cloud_list_allowed(crate::mode::current()) {
         return;
     }
     spawn_one_cloud_fetch(
@@ -3520,7 +3540,7 @@ fn build_ui_recorded(
     // Ollama's list comes from what is pulled, so this sits above its row.
     ctx.create(
         WC_STATIC,
-        MODEL_LIST_HINT,
+        model_list_hint_for(config.mode),
         0,
         0,
         r.x,
@@ -6319,8 +6339,29 @@ mod tests {
 
     #[test]
     fn the_model_list_hint_is_one_short_line_without_a_dash() {
-        assert!(MODEL_LIST_HINT.len() <= 64, "it must fit one row");
-        assert!(!MODEL_LIST_HINT.contains('\u{2014}'));
+        for h in [
+            MODEL_LIST_HINT,
+            MODEL_LIST_HINT_LOCAL,
+            MODEL_LIST_HINT_OFFLINE,
+        ] {
+            assert!(h.len() <= 64, "it must fit one row: {h}");
+            assert!(!h.contains('\u{2014}'));
+        }
+    }
+
+    /// #674: only Auto and Cloud may ask a cloud vendor for its model list,
+    /// and Local and Offline say why they do not.
+    #[test]
+    fn cloud_lists_are_skipped_in_local_and_offline_with_a_reason() {
+        use crate::mode::Mode;
+        assert!(cloud_list_allowed(Mode::Auto));
+        assert!(cloud_list_allowed(Mode::Cloud));
+        assert!(!cloud_list_allowed(Mode::Local));
+        assert!(!cloud_list_allowed(Mode::Offline));
+        assert_eq!(model_list_hint_for(Mode::Auto), MODEL_LIST_HINT);
+        assert_eq!(model_list_hint_for(Mode::Cloud), MODEL_LIST_HINT);
+        assert!(model_list_hint_for(Mode::Local).starts_with("Local"));
+        assert!(model_list_hint_for(Mode::Offline).starts_with("Offline"));
     }
 
     /// #427 wired-to-nothing: the hint is a real control in the built window,
