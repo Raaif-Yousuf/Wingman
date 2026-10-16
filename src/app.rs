@@ -6415,7 +6415,11 @@ fn is_no_providers(packed: &str) -> bool {
 /// cannot probe Ollama, so it lets an Ollama-only setup through; when the
 /// worker then finds nothing answering, this says what to do. Any other
 /// setup gets the gate's own card.
-fn empty_chain_card(mode: Mode, providers: &Providers, config_path: &str) -> (String, String) {
+pub(crate) fn empty_chain_card(
+    mode: Mode,
+    providers: &Providers,
+    config_path: &str,
+) -> (String, String) {
     if mode == Mode::Auto
         && crate::mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
     {
