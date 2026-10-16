@@ -74,9 +74,9 @@ use crate::ui::card_placement::{
 use crate::ui::text::draw_text_line;
 use crate::ui::theme::{
     contrast_ratio, detect_theme, relative_luminance, rgb, setting_change_affects_theme,
-    setting_change_name, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK, BADGE_INK_LIGHT,
-    BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, DETAIL_FONT_SCALE, FALLBACK_FONT_FACE,
-    GAP_DP, HEADLINE_FONT_SCALE, MARGIN_DP, PADDING_DP, SMALL_FONT_SCALE as BADGE_FONT_SCALE,
+    setting_change_name, type_height_px, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK,
+    BADGE_INK_LIGHT, BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, FALLBACK_FONT_FACE,
+    GAP_DP, MARGIN_DP, PADDING_DP, PREFERRED_FONT_FACE, TYPE_BODY_PX, TYPE_CAPTION_PX,
 };
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -92,9 +92,9 @@ use windows::Win32::Graphics::Gdi::{
     GetTextMetricsW, IntersectClipRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect,
     SelectClipRgn, SelectObject, SetBkColor, SetBkMode, SetTextColor, BS_SOLID, DEFAULT_GUI_FONT,
     DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP,
-    DT_VCENTER, DT_WORDBREAK, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND,
-    PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
+    DT_VCENTER, DT_WORDBREAK, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, LOGBRUSH,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PS_ENDCAP_ROUND, PS_GEOMETRIC,
+    PS_JOIN_ROUND, PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -833,8 +833,8 @@ fn badge_text_color(fill: u32) -> u32 {
 struct Fonts {
     headline: HFONT,
     body: HFONT,
-    /// Small font used only for the difficulty badge's label.
-    badge: HFONT,
+    /// Caption font: detail text, footer links, the status line and the badge.
+    caption: HFONT,
 }
 
 impl Fonts {
@@ -842,7 +842,7 @@ impl Fonts {
         Fonts {
             headline: HFONT(std::ptr::null_mut()),
             body: HFONT(std::ptr::null_mut()),
-            badge: HFONT(std::ptr::null_mut()),
+            caption: HFONT(std::ptr::null_mut()),
         }
     }
 
@@ -854,8 +854,8 @@ impl Fonts {
             if !self.body.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(self.body.0));
             }
-            if !self.badge.0.is_null() {
-                let _ = DeleteObject(HGDIOBJ(self.badge.0));
+            if !self.caption.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.caption.0));
             }
         }
     }
@@ -907,30 +907,78 @@ fn build_fonts(dpi: u32, text_scale: f32) -> Fonts {
             lf
         };
 
-        let scale = text_scale;
+        // Face: Segoe UI Variable Text where installed, else the system
+        // message font's own face. Sizes come from the type ramp in
+        // `theme.rs`, in px at 96 DPI and scaled for this monitor and the
+        // user's text scale (the DPI is applied once, in `type_height_px`).
+        let mut face_lf = base;
+        if preferred_face_installed() {
+            set_face_name(&mut face_lf, PREFERRED_FONT_FACE);
+        }
+        let ramp = |px: i32, weight: i32| {
+            let mut lf = face_lf;
+            lf.lfWeight = weight;
+            lf.lfHeight = type_height_px(px, dpi, text_scale);
+            lf
+        };
 
-        let mut headline_lf = base;
-        // Normal weight and sub-message size, per user feedback: the
-        // headline should read smaller than a regular Windows notification,
-        // not bolder/larger than one. Headline vs. detail is distinguished
-        // by colour now (see Palette), not by weight.
-        headline_lf.lfWeight = FW_NORMAL.0 as i32;
-        headline_lf.lfHeight = scaled_height(base.lfHeight, scale * HEADLINE_FONT_SCALE);
-
-        let mut body_lf = base;
-        body_lf.lfWeight = FW_NORMAL.0 as i32;
-        body_lf.lfHeight = scaled_height(base.lfHeight, scale * DETAIL_FONT_SCALE);
-
-        let mut badge_lf = base;
-        badge_lf.lfWeight = FW_NORMAL.0 as i32;
-        badge_lf.lfHeight = scaled_height(base.lfHeight, scale * BADGE_FONT_SCALE);
+        // Headline: body strong (14 px semibold). Detail, links, status line
+        // and badge: caption (12 px). Fields and buttons: body (14 px).
+        let headline_lf = ramp(TYPE_BODY_PX, FW_SEMIBOLD.0 as i32);
+        let body_lf = ramp(TYPE_BODY_PX, FW_NORMAL.0 as i32);
+        let caption_lf = ramp(TYPE_CAPTION_PX, FW_NORMAL.0 as i32);
 
         Fonts {
             headline: font_or_stock(&headline_lf),
             body: font_or_stock(&body_lf),
-            badge: font_or_stock(&badge_lf),
+            caption: font_or_stock(&caption_lf),
         }
     }
+}
+
+fn set_face_name(lf: &mut windows::Win32::Graphics::Gdi::LOGFONTW, face: &str) {
+    lf.lfFaceName = [0; 32];
+    // Leave the last unit as the NUL terminator.
+    for (i, u) in face.encode_utf16().take(31).enumerate() {
+        lf.lfFaceName[i] = u;
+    }
+}
+
+/// Whether the preferred font family is installed. Asked once per process:
+/// the answer does not change while the card is running.
+fn preferred_face_installed() -> bool {
+    use std::sync::OnceLock;
+    static PREFERRED: OnceLock<bool> = OnceLock::new();
+    *PREFERRED.get_or_init(|| unsafe {
+        use windows::Win32::Graphics::Gdi::{
+            EnumFontFamiliesExW, GetDC, ReleaseDC, DEFAULT_CHARSET, LOGFONTW, TEXTMETRICW,
+        };
+        unsafe extern "system" fn found(
+            _lf: *const LOGFONTW,
+            _tm: *const TEXTMETRICW,
+            _font_type: u32,
+            lparam: LPARAM,
+        ) -> i32 {
+            *(lparam.0 as *mut bool) = true;
+            0 // stop at the first match
+        }
+        let mut lf = LOGFONTW {
+            lfCharSet: DEFAULT_CHARSET,
+            ..Default::default()
+        };
+        set_face_name(&mut lf, PREFERRED_FONT_FACE);
+        let hdc = GetDC(None);
+        let mut hit = false;
+        EnumFontFamiliesExW(
+            hdc,
+            &lf,
+            Some(found),
+            LPARAM(&mut hit as *mut bool as isize),
+            0,
+        );
+        ReleaseDC(None, hdc);
+        hit
+    })
 }
 
 fn scaled_height(base_height: i32, factor: f32) -> i32 {
@@ -972,21 +1020,23 @@ fn fallback_logfont() -> windows::Win32::Graphics::Gdi::LOGFONTW {
 // Layout constants (logical pixels at 96 DPI; scaled per-window via `scale`)
 // ---------------------------------------------------------------------------
 
-const CARD_WIDTH_DP: i32 = 280;
+const CARD_WIDTH_DP: i32 = 384;
 /// Collapsed headline cap. The prompt budgets a 90-character headline.
-/// Content width is `CARD_WIDTH_DP - 2*PADDING_DP` = 280 - 28 = 252dp.
-/// Segoe UI's average character width is roughly half its em size; the
-/// headline font's `lfHeight` at 96 DPI/1.0 text scale is
-/// `round(-12 * HEADLINE_FONT_SCALE)` = `round(-12 * 0.85)` = -10, i.e. a
-/// ~10dp em, so average glyph width is ~5dp -- call it 4.5dp once
-/// `DT_WORDBREAK`'s end-of-line slack is priced in. That's 252 / 4.5 ~= 56
-/// characters per line, so two lines already covers a 90-character
-/// headline; three lines leaves real headroom for wider glyphs/short words
-/// that push wrapping earlier, so a full 90-character headline is never
-/// silently `DT_END_ELLIPSIS`'d.
+/// Content width is `CARD_WIDTH_DP - 2*PADDING_DP` = 384 - 32 = 352dp.
+/// The headline is 14 px semibold Segoe UI: from the gallery renders an
+/// average glyph is ~6.6dp once `DT_WORDBREAK`'s end-of-line slack is
+/// priced in. With the chevron's 24dp reserved that is 328 / 6.6 ~= 50
+/// characters per line (THEORY, unverified for wide text: MEASURED 2026-10-16
+/// a news-style 50-character line fits one line but a wide one needs 371 px
+/// of the 352 available and wraps, see
+/// `a_fifty_character_headline_fits_one_collapsed_line`), so two lines already cover a 90-character
+/// headline; three lines leave real headroom for wider glyphs and short
+/// words that push wrapping earlier, so a full 90-character headline is
+/// never silently `DT_END_ELLIPSIS`'d. (The card is as wide as it is so
+/// the larger type keeps the 50-character budget the prompts promise.)
 pub(crate) const HEADLINE_MAX_LINES: i32 = 3;
 /// Characters that fit on one collapsed headline line once the chevron's
-/// width is reserved: (252dp content - 24dp chevron) / 4.5dp per glyph = 50.
+/// width is reserved: (352dp content - 24dp chevron) / 6.6dp per glyph = 50.
 /// A budget for callers that must fit text in `HEADLINE_MAX_LINES`
 /// (`actions::page_summary`), not a measurement.
 pub(crate) const HEADLINE_CHARS_PER_LINE: usize = 50;
@@ -997,7 +1047,7 @@ const PENDING_SIZE_DP: i32 = 40;
 /// Full width of the pending card, once it carries status text -- matches
 /// the Collapsed/Expanded card width so the pending card no longer looks
 /// like a different surface from the states that immediately replace it.
-const PENDING_WIDTH_DP: i32 = CARD_WIDTH_DP;
+const PENDING_WIDTH_DP: i32 = 280;
 /// Vertical gap between the glyph and the status line beneath it.
 const PENDING_TEXT_GAP_DP: i32 = 8;
 const WHEEL_SCROLL_DP: i32 = 48;
@@ -1682,7 +1732,7 @@ impl CardInner {
     }
 
     fn scroll_key_target(&self, vk: u16) -> Option<i32> {
-        let line = self.line_height(self.fonts.body).max(1);
+        let line = self.line_height(self.fonts.caption).max(1);
         let page = (self.scroll_page - line).max(line);
         scroll_target_for_key(vk, self.scroll_offset, self.scroll_max, line, page)
     }
@@ -2210,7 +2260,7 @@ impl CardInner {
         let width = self.scale(PENDING_WIDTH_DP);
         let glyph_size = self.scale(PENDING_SIZE_DP);
         let gap = self.scale(PENDING_TEXT_GAP_DP);
-        let text_line_h = self.line_height(self.fonts.body).max(1);
+        let text_line_h = self.line_height(self.fonts.caption).max(1);
         let height = padding * 2 + glyph_size + gap + text_line_h;
         self.place_bottom_right(work, width, height);
     }
@@ -2248,7 +2298,7 @@ impl CardInner {
         let detail_h = if self.detail.is_empty() {
             0
         } else {
-            self.measure_wrapped(self.fonts.body, &self.detail, content_width)
+            self.measure_wrapped(self.fonts.caption, &self.detail, content_width)
         };
         let content_h = headline_h + if detail_h > 0 { gap + detail_h } else { 0 };
 
@@ -2260,7 +2310,7 @@ impl CardInner {
         // the space at all.
         let footer_h =
             if self.copy_details_available || self.read_aloud_available || self.copy_available {
-                self.line_height(self.fonts.body).max(1)
+                self.line_height(self.fonts.caption).max(1)
             } else {
                 0
             };
@@ -2299,7 +2349,7 @@ impl CardInner {
         self.read_aloud_rect = None;
         self.copy_rect = None;
         if let Some(f) = footer.filter(|_| self.copy_available || self.read_aloud_available) {
-            let body = self.fonts.body;
+            let body = self.fonts.caption;
             let widest = |labels: &[&str]| {
                 labels
                     .iter()
@@ -2435,7 +2485,7 @@ impl CardInner {
     /// this card's DPI and text scale. A short label (e.g. "1") floors out at
     /// a circle; a wider one ("10", "U") grows into a pill.
     fn badge_size(&self, difficulty: Difficulty) -> (i32, i32) {
-        let (tw, th) = self.measure_label(self.fonts.badge, difficulty.label());
+        let (tw, th) = self.measure_label(self.fonts.caption, difficulty.label());
         let pad_x = self.scale(BADGE_PAD_X_DP);
         let pad_y = self.scale(BADGE_PAD_Y_DP);
         let min_d = self.scale(BADGE_MIN_DIAMETER_DP);
@@ -2603,7 +2653,7 @@ impl CardInner {
             right: rc.right - padding,
             bottom: rc.bottom - padding,
         };
-        SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+        SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
         let text = pending_status_text(&self.pending_stage);
         draw_text_line(
@@ -2797,7 +2847,7 @@ impl CardInner {
         );
 
         if !self.detail.is_empty() {
-            let detail_h = self.measure_wrapped(self.fonts.body, &self.detail, content_w);
+            let detail_h = self.measure_wrapped(self.fonts.caption, &self.detail, content_w);
             let y1 = y0 + headline_h + gap;
             let detail_rect = RECT {
                 left: content_left,
@@ -2805,7 +2855,7 @@ impl CardInner {
                 right: content_left + content_w,
                 bottom: y1 + detail_h,
             };
-            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+            SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
             draw_text_line(
                 hdc,
@@ -2820,7 +2870,7 @@ impl CardInner {
         // edge fades into the card colour and a chevron points down (#353),
         // so it reads as "scroll" rather than as a finished card.
         if self.scroll_offset < self.scroll_max {
-            let line_h = self.line_height(self.fonts.body).max(1);
+            let line_h = self.line_height(self.fonts.caption).max(1);
             let fade_h = line_h + self.scale(FADE_EXTRA_DP);
             let top = (content_bottom - fade_h).max(content_top);
             let rows = content_bottom - top;
@@ -2858,7 +2908,7 @@ impl CardInner {
             (self.copy_rect, self.copy_label()),
         ];
         let _ = SelectClipRgn(hdc, None);
-        SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+        SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.link));
         for (rect, label) in links {
             if let Some(rect) = rect {
@@ -2937,7 +2987,7 @@ impl CardInner {
             right,
             bottom,
         };
-        SelectObject(hdc, HGDIOBJ(self.fonts.badge.0));
+        SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_color));
         draw_text_line(
             hdc,
@@ -5727,7 +5777,7 @@ mod tests {
         assert!(card.inner.scroll_max > 0);
         let padding = card.inner.scale(PADDING_DP);
         let gap = card.inner.scale(GAP_DP);
-        let line = card.inner.line_height(card.inner.fonts.body).max(1);
+        let line = card.inner.line_height(card.inner.fonts.caption).max(1);
         let fade_h = line + card.inner.scale(FADE_EXTRA_DP);
         let ink = card.inner.palette().detail;
         // Pixels in the fade band, left half (the chevron is on the right),
@@ -6088,6 +6138,42 @@ mod tests {
         assert_ne!(dark_text, light_text);
     }
 
+    /// MEASURED in the card's own headline font: a 50-character first line
+    /// (`HEADLINE_CHARS_PER_LINE`, what the prompts promise) fits one
+    /// collapsed headline line, with the chevron's room reserved.
+    #[test]
+    fn a_fifty_character_headline_fits_one_collapsed_line() {
+        let card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let content_w = card.inner.scale(CARD_WIDTH_DP) - 2 * card.inner.scale(PADDING_DP);
+        let avail = card.inner.headline_content_width(content_w);
+        let samples = [
+            "Fed holds rates at 5.25%, signals 2 or 3 cuts now.",
+            "Summary of the quarterly results and what changed.",
+            "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+            "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii",
+        ];
+        for text in samples {
+            assert_eq!(text.chars().count(), HEADLINE_CHARS_PER_LINE, "{text}");
+        }
+        // MEASURED 2026-10-16: a news-style line of 50 characters fits one
+        // line; a wide one needs 371 px of the 352 px available, so it
+        // wraps to a second line. Wrapping is fine (the card allows
+        // `HEADLINE_MAX_LINES`), clipping is not: both must stay within it.
+        let fits = card
+            .inner
+            .measure_label(card.inner.fonts.headline, samples[0])
+            .0;
+        assert!(
+            fits <= avail,
+            "{:?} needs {fits}px of {avail}px",
+            samples[0]
+        );
+        for text in &samples[1..3] {
+            let w = card.inner.measure_label(card.inner.fonts.headline, text).0;
+            assert!(w <= avail * 2, "{text:?} needs {w}px of {avail}px per line");
+        }
+    }
+
     #[test]
     fn set_text_scale_clamps_and_rebuilds() {
         let mut card = Card::new(instance()).expect("Card::new");
@@ -6109,11 +6195,43 @@ mod tests {
         // whatever state is active must still not panic afterwards.
         assert!(!card.inner.fonts.headline.0.is_null());
         assert!(!card.inner.fonts.body.0.is_null());
-        assert!(!card.inner.fonts.badge.0.is_null());
+        assert!(!card.inner.fonts.caption.0.is_null());
 
         card.show_answer("headline text", "detail text", 0, Some(Difficulty::Ultra));
         card.set_text_scale(0.75);
         assert_eq!(card.state(), CardState::Collapsed);
+    }
+
+    /// The pixel height and weight GDI actually gave a font.
+    fn font_metrics(font: HFONT) -> (i32, i32) {
+        use windows::Win32::Graphics::Gdi::{GetObjectW, LOGFONTW};
+        let mut lf = LOGFONTW::default();
+        let got = unsafe {
+            GetObjectW(
+                HGDIOBJ(font.0),
+                std::mem::size_of::<LOGFONTW>() as i32,
+                Some(&mut lf as *mut _ as *mut c_void),
+            )
+        };
+        assert!(got > 0, "GetObjectW failed");
+        (lf.lfHeight, lf.lfWeight)
+    }
+
+    #[test]
+    fn the_card_text_sits_on_the_type_ramp() {
+        // Headline is body strong (14 px semibold), fields are body (14 px),
+        // detail/links/badge are caption (12 px), all at 96 DPI.
+        let f = build_fonts(96, 1.0);
+        assert_eq!(font_metrics(f.headline), (-14, FW_SEMIBOLD.0 as i32));
+        assert_eq!(font_metrics(f.body), (-14, FW_NORMAL.0 as i32));
+        assert_eq!(font_metrics(f.caption), (-12, FW_NORMAL.0 as i32));
+        f.delete();
+
+        // The DPI is applied once: 150% is 1.5x, not 2.25x.
+        let f = build_fonts(144, 1.0);
+        assert_eq!(font_metrics(f.headline).0, -21);
+        assert_eq!(font_metrics(f.caption).0, -18);
+        f.delete();
     }
 
     #[test]

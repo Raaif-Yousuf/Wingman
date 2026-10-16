@@ -1565,6 +1565,7 @@ impl App {
         let generation = self.palette.router_generation();
         let target = self.hwnd_isize();
         let redact = self.config.capture.redact;
+        let limits = self.config.options.router_limits();
 
         // #359: a request is actually starting now (every earlier bail-out
         // above -- Paused, no ready provider, capture failure -- must never
@@ -1580,15 +1581,14 @@ impl App {
             std::thread::spawn(move || {
                 let result: std::result::Result<router::RouterResult, String> =
                     catch_worker(|| {
-                        router_worker(&providers, mode, &mut raw, redact, &candidates).map_err(
-                            |e| {
+                        router_worker(&providers, mode, &mut raw, redact, &candidates, limits)
+                            .map_err(|e| {
                                 let chain_text = worker_error_chain_text(&e);
                                 pack_error(
                                     &human_error_detail(&chain_text),
                                     &crate::egress::redact_opaque_tokens(&chain_text),
                                 )
-                            },
-                        )
+                            })
                     });
                 let _ = tx.send(result);
             });
@@ -4901,6 +4901,7 @@ fn router_worker(
     raw: &mut capture::RawShot,
     redact: bool,
     candidates: &[router::RouterCandidate],
+    limits: router::RouterLimits,
 ) -> Result<router::RouterResult> {
     let started = std::time::Instant::now();
     let ollama_ready = mode == Mode::Auto
@@ -4926,7 +4927,7 @@ fn router_worker(
     // the palette has stopped waiting.
     let chain = router::router_chain(provider, started);
     let raw: &capture::RawShot = raw;
-    router::route(&chain, shot.png, candidates, || {
+    router::route(&chain, shot.png, candidates, limits, || {
         router_non_vision_inputs(raw)
     })
 }
@@ -10013,13 +10014,17 @@ mod tests {
         unload_provider.keep_alive = "0".to_string();
         let _ = unload_provider.complete(&router::build_request(vec![], &[]));
 
-        let result = router::parse_router_result(&completion.text, &candidate_ids)
-            .expect("router completion should parse against its own schema");
+        let result = router::parse_router_result(
+            &completion.text,
+            &candidates,
+            router::RouterLimits::default(),
+        )
+        .expect("router completion should parse against its own schema");
 
         eprintln!(
             "router_live: model={model} gpu={gpu} elapsed={elapsed:?} \
-             summary={:?} intent={:?} confidence={}",
-            result.summary, result.intent, result.confidence
+             summary={:?} options={:?}",
+            result.summary, result.options
         );
         if let Some(usage) = completion.usage {
             eprintln!(
@@ -10030,14 +10035,14 @@ mod tests {
 
         if candidate_ids.iter().any(|id| id == "review-this-email") {
             assert_eq!(
-                result.intent.as_deref(),
+                result.options.first().map(|o| o.intent.as_str()),
                 Some("review-this-email"),
                 "the \"review-this-email\" action exists in this catalogue; expected the router \
                  to pick it for an email compose window"
             );
         } else {
             assert!(
-                result.intent.is_some(),
+                !result.options.is_empty(),
                 "expected the router to name some action id for an unambiguous email compose \
                  window, got none (\"review-this-email\" is not in this catalogue yet)"
             );
