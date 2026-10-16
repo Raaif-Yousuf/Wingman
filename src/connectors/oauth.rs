@@ -213,6 +213,7 @@ impl TokenTransport for UreqTransport {
 }
 
 fn send_form(url: &str, form: &[(&str, &str)]) -> Result<(u16, String)> {
+    crate::ui_thread::blocking_call("oauth send_form");
     let mut response = ureq::post(url)
         .config()
         .http_status_as_error(false)
@@ -664,6 +665,7 @@ pub fn authorize(
     store: &dyn SecretStore,
     timeout: Duration,
 ) -> Result<AccessToken> {
+    crate::ui_thread::blocking_call("oauth authorize");
     // Before anything is opened or bound: Offline and Local mode mean no sign-in (connectors are cloud services).
     crate::provider::common::loopback_only_guard(&provider.auth_url)?;
     let pkce = Pkce::generate()?;
@@ -748,7 +750,7 @@ pub fn access_token(
 
 /// Revokes the stored token at the provider (when it has a revocation
 /// endpoint) and always forgets it locally, even if the remote call fails or
-/// Offline mode blocks it (the call then returns that error).
+/// Offline or Local mode blocks it (the call then returns that error).
 #[allow(dead_code)]
 pub fn revoke(
     provider: &OAuthProvider,
@@ -1274,6 +1276,8 @@ mod tests {
 
         assert!(revoke(&provider, &transport, &store).is_err());
         assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The remote revoke is skipped, but the local token is still deleted.
+        assert!(!is_connected(&provider, &store).unwrap());
     }
 
     #[test]

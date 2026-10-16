@@ -396,6 +396,9 @@ fn error_details_clipboard_text(last_error: &LastError) -> &str {
 }
 
 pub fn run() -> Result<()> {
+    // #700: the thread that runs this hosts the keyboard hook, and a `--settings`
+    // launch runs the Settings loop before `pump_messages`, so mark it first.
+    crate::ui_thread::mark_current_thread();
     // Before any window exists, so the card's metrics are right on a mixed-DPI
     // setup (a laptop panel next to an external monitor).
     unsafe {
@@ -705,6 +708,8 @@ fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
 }
 
 fn pump_messages() {
+    // #700: this thread hosts the keyboard hook, so no blocking network call may run here.
+    crate::ui_thread::mark_current_thread();
     let mut msg = MSG::default();
     // GetMessageW returns -1 on error; treat anything non-positive as "stop".
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
