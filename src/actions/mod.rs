@@ -163,11 +163,121 @@ fn default_enabled() -> bool {
 /// The root of `actions.toml` (built-in or user). `disabled_groups` (#199)
 /// lives at this level, not per-action, because it names *groups*, which
 /// span actions and are meaningless attached to any single one.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ActionsFile {
     pub actions: Vec<Action>,
     pub disabled_groups: Vec<String>,
+}
+
+/// One `[[actions]]` entry of a USER `actions.toml`, as written: every field
+/// but `id` is optional so the loader can tell "left out" from "set to the
+/// default" (#559). An entry whose `id` is a built-in overrides only the
+/// fields it carries, unless `replace = true`; any other entry must carry
+/// every required field. `replace` exists only here, never on [`Action`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionOverride {
+    id: String,
+    name: Option<String>,
+    group: Option<String>,
+    inputs: Option<Vec<InputKind>>,
+    proposal: Option<String>,
+    executor: Option<String>,
+    confirm: Option<bool>,
+    prompt: Option<String>,
+    prefer: Option<Prefer>,
+    hotkey: Option<ActionHotkey>,
+    rate_difficulty: Option<bool>,
+    enabled: Option<bool>,
+    replace: Option<bool>,
+}
+
+/// The root of a user `actions.toml` as the loader reads it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct UserActionsFile {
+    actions: Vec<ActionOverride>,
+    disabled_groups: Vec<String>,
+}
+
+impl ActionOverride {
+    /// A complete action from this entry alone: a new id, or `replace = true`.
+    fn into_action(self) -> Result<Action> {
+        let id = self.id;
+        let need = |what: &str| anyhow::anyhow!("action \"{id}\" is missing the field \"{what}\"");
+        Ok(Action {
+            name: self.name.ok_or_else(|| need("name"))?,
+            group: self.group,
+            inputs: self.inputs.ok_or_else(|| need("inputs"))?,
+            proposal: self.proposal.ok_or_else(|| need("proposal"))?,
+            executor: self.executor.ok_or_else(|| need("executor"))?,
+            confirm: self.confirm.ok_or_else(|| need("confirm"))?,
+            prompt: self.prompt.ok_or_else(|| need("prompt"))?,
+            prefer: self.prefer.unwrap_or_default(),
+            hotkey: self.hotkey,
+            rate_difficulty: self.rate_difficulty.unwrap_or(false),
+            enabled: self.enabled.unwrap_or(true),
+            id,
+        })
+    }
+
+    /// The built-in with only this entry's present fields laid over it. The
+    /// origin stays `Builtin` unless a `prompt` was given, so the Settings
+    /// prompt keeps applying to an override that never touched it.
+    fn apply_to(self, base: &Action) -> (Action, Origin) {
+        let origin = if self.prompt.is_some() {
+            Origin::User
+        } else {
+            Origin::Builtin
+        };
+        let mut a = base.clone();
+        if let Some(v) = self.name {
+            a.name = v;
+        }
+        if self.group.is_some() {
+            a.group = self.group;
+        }
+        if let Some(v) = self.inputs {
+            a.inputs = v;
+        }
+        if let Some(v) = self.proposal {
+            a.proposal = v;
+        }
+        if let Some(v) = self.executor {
+            a.executor = v;
+        }
+        if let Some(v) = self.confirm {
+            a.confirm = v;
+        }
+        if let Some(v) = self.prompt {
+            a.prompt = v;
+        }
+        if let Some(v) = self.prefer {
+            a.prefer = v;
+        }
+        if self.hotkey.is_some() {
+            a.hotkey = self.hotkey;
+        }
+        if let Some(v) = self.rate_difficulty {
+            a.rate_difficulty = v;
+        }
+        if let Some(v) = self.enabled {
+            a.enabled = v;
+        }
+        (a, origin)
+    }
+
+    /// Resolves this entry against the built-ins: field by field over a
+    /// built-in with the same id, wholesale for `replace = true` or a new id.
+    fn resolve(self, builtins: &[Action]) -> Result<(Action, Origin)> {
+        let base = builtins.iter().find(|b| b.id == self.id);
+        match base {
+            Some(base) if self.replace != Some(true) => Ok(self.apply_to(base)),
+            _ => Ok((self.into_action()?, Origin::User)),
+        }
+    }
 }
 
 /// Whether a resolved action's fields came from the built-in default or
@@ -337,13 +447,26 @@ pub fn builtin_actions() -> Vec<Action> {
     ]
 }
 
-/// Replaces each built-in whose `id` a user action matches (wholesale, not
-/// per-field -- see the design spec's "Merge rule"), appends any user
-/// action with a new `id`, and records which is which via `Origin`. Pure:
-/// no filesystem, no filtering by `enabled`/`disabled_groups` (that is
-/// [`visible`]'s job) -- kept separate so a future actions-editor UI can
-/// merge without also deciding visibility.
+/// Replaces each built-in whose `id` a user action matches (wholesale -- the
+/// field-by-field override is resolved earlier, by the loader, see #559),
+/// appends any user action with a new `id`, and records which is which via
+/// `Origin`. Pure: no filesystem, no filtering by `enabled`/`disabled_groups`
+/// (that is [`visible`]'s job) -- kept separate so a future actions-editor UI
+/// can merge without also deciding visibility.
+#[cfg(test)]
 pub fn merge_actions(builtins: Vec<Action>, user_actions: Vec<Action>) -> Vec<Resolved> {
+    merge_with_origins(
+        builtins,
+        user_actions
+            .into_iter()
+            .map(|a| (a, Origin::User))
+            .collect(),
+    )
+}
+
+/// [`merge_actions`] where each entry brings its own origin: a field-level
+/// override that left `prompt` alone stays `Builtin` (#559).
+fn merge_with_origins(builtins: Vec<Action>, entries: Vec<(Action, Origin)>) -> Vec<Resolved> {
     let mut merged: Vec<Resolved> = builtins
         .into_iter()
         .map(|action| Resolved {
@@ -352,15 +475,12 @@ pub fn merge_actions(builtins: Vec<Action>, user_actions: Vec<Action>) -> Vec<Re
         })
         .collect();
 
-    for user_action in user_actions {
-        if let Some(existing) = merged.iter_mut().find(|r| r.action.id == user_action.id) {
-            existing.action = user_action;
-            existing.origin = Origin::User;
+    for (action, origin) in entries {
+        if let Some(existing) = merged.iter_mut().find(|r| r.action.id == action.id) {
+            existing.action = action;
+            existing.origin = origin;
         } else {
-            merged.push(Resolved {
-                action: user_action,
-                origin: Origin::User,
-            });
+            merged.push(Resolved { action, origin });
         }
     }
 
@@ -450,6 +570,7 @@ pub fn default_action(actions: &[Resolved]) -> Option<&Resolved> {
 /// struct in this module) is what makes a typo'd key surface here as a
 /// named `Err` rather than being silently dropped by `toml`'s default
 /// "ignore what you don't recognise" behaviour.
+#[cfg(test)]
 pub fn parse_actions_file(toml_str: &str) -> Result<ActionsFile> {
     toml::from_str(toml_str).context("actions.toml did not parse")
 }
@@ -504,16 +625,20 @@ pub fn load_actions_report_from(user_path: &Path) -> Result<LoadReport> {
     let user_file = if user_path.exists() {
         let contents = fs::read_to_string(user_path)
             .with_context(|| format!("failed to read {}", user_path.display()))?;
-        parse_actions_file(&contents)
+        toml::from_str::<UserActionsFile>(&contents)
+            .context("actions.toml did not parse")
             .with_context(|| format!("{} is not a valid actions file", user_path.display()))?
     } else {
-        ActionsFile::default()
+        UserActionsFile::default()
     };
 
     let builtins = builtin_actions();
     let mut report = LoadReport::default();
-    let mut user_actions = Vec::new();
-    for action in user_file.actions {
+    let mut entries = Vec::new();
+    for entry in user_file.actions {
+        let (action, origin) = entry
+            .resolve(&builtins)
+            .with_context(|| format!("{} is not a valid actions file", user_path.display()))?;
         // A hidden action never runs, so it is not checked.
         let hidden = !action.enabled
             || action
@@ -531,11 +656,11 @@ pub fn load_actions_report_from(user_path: &Path) -> Result<LoadReport> {
                 report.skipped_ids.push(action.id.clone());
                 report.skipped.push(message);
             }
-            _ => user_actions.push(action),
+            _ => entries.push((action, origin)),
         }
     }
 
-    let merged = merge_actions(builtins, user_actions);
+    let merged = merge_with_origins(builtins, entries);
     report.actions = visible(merged, &user_file.disabled_groups);
     Ok(report)
 }
@@ -1239,6 +1364,113 @@ prompt = "Make it loud."
         assert!(report.skipped[0].contains("built-in was kept"));
         assert!(report.skipped_reason(DEFAULT_ACTION_ID).is_some());
         assert!(report.skipped_reason("something-else").is_none());
+    }
+
+    // -- field-level override of a built-in (#559) --------------------------
+
+    fn load_one(tag: &str, toml_text: &str) -> LoadReport {
+        let path = scratch_path(tag);
+        write(&path, toml_text);
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        report
+    }
+
+    fn load_err(tag: &str, toml_text: &str) -> String {
+        let path = scratch_path(tag);
+        write(&path, toml_text);
+        let err = load_actions_report_from(&path).unwrap_err();
+        cleanup(&path);
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn flipping_one_option_keeps_the_builtin_prompt() {
+        let report = load_one(
+            "flip-one",
+            &format!("[[actions]]\nid = \"{DEFAULT_ACTION_ID}\"\nrate_difficulty = true\n"),
+        );
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let r = default_action(&report.actions).unwrap();
+        let builtin = &builtin_actions()[0];
+        assert!(r.action.rate_difficulty);
+        assert_eq!(r.action.prompt, builtin.prompt);
+        assert_eq!(r.action.name, builtin.name);
+        assert_eq!(r.action.group, builtin.group);
+        assert_eq!(r.action.inputs, builtin.inputs);
+        assert_eq!(
+            r.origin,
+            Origin::Builtin,
+            "config.ui.prompt must still apply"
+        );
+    }
+
+    #[test]
+    fn an_explicit_prompt_override_still_replaces_the_builtin_prompt() {
+        let report = load_one(
+            "explicit-prompt",
+            &format!("[[actions]]\nid = \"{DEFAULT_ACTION_ID}\"\nprompt = \"Mine.\"\n"),
+        );
+        let r = default_action(&report.actions).unwrap();
+        assert_eq!(r.action.prompt, "Mine.");
+        assert_eq!(r.action.name, builtin_actions()[0].name);
+        assert_eq!(r.origin, Origin::User);
+    }
+
+    #[test]
+    fn an_invalid_merged_result_keeps_the_builtin_with_a_notice() {
+        let report = load_one(
+            "bad-merge",
+            &format!("[[actions]]\nid = \"{DEFAULT_ACTION_ID}\"\nexecutor = \"nope\"\n"),
+        );
+        let r = default_action(&report.actions).unwrap();
+        assert_eq!(r.action, builtin_actions()[0]);
+        assert_eq!(r.origin, Origin::Builtin);
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].contains("built-in was kept"));
+    }
+
+    #[test]
+    fn a_new_id_still_needs_every_required_field() {
+        let err = load_err(
+            "new-id-partial",
+            "[[actions]]\nid = \"brand-new\"\nname = \"New\"\n",
+        );
+        assert!(err.contains("inputs"), "{err}");
+    }
+
+    #[test]
+    fn replace_true_restores_wholesale_replacement() {
+        let text = format!(
+            "{}replace = true\n",
+            one_action(DEFAULT_ACTION_ID, "verdict", "none", "Mine.")
+        );
+        let report = load_one("replace", &text);
+        let r = default_action(&report.actions).unwrap();
+        assert_eq!(r.action.prompt, "Mine.");
+        assert!(
+            r.action.group.is_none(),
+            "replace must drop the built-in group"
+        );
+        assert_eq!(r.origin, Origin::User);
+    }
+
+    #[test]
+    fn replace_true_still_needs_every_required_field() {
+        let err = load_err(
+            "replace-partial",
+            &format!("[[actions]]\nid = \"{DEFAULT_ACTION_ID}\"\nreplace = true\n"),
+        );
+        assert!(err.contains("name"), "{err}");
+    }
+
+    #[test]
+    fn a_typo_in_a_partial_override_is_still_a_named_error() {
+        let err = load_err(
+            "partial-typo",
+            &format!("[[actions]]\nid = \"{DEFAULT_ACTION_ID}\"\nrate_dificulty = true\n"),
+        );
+        assert!(err.contains("rate_dificulty"), "{err}");
     }
 
     #[test]

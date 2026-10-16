@@ -26,12 +26,23 @@ built-in.
 
 ## Merge and visibility rules
 
-- **Merge is by `id`, wholesale, not per-field.** A user `[[actions]]` block
-  whose `id` matches a built-in replaces that built-in's entire record --
-  every field comes from the user's block, not a mix of old and new. A new
-  `id` is appended. (`merge_actions`, `src/actions/mod.rs`.) For example, a
-  user action with the id `translate-selection` replaces the built-in
-  "Translate selection".
+- **Merge is by `id`, field by field (#559).** A user `[[actions]]` block
+  whose `id` matches a built-in overrides only the fields it contains; every
+  field it leaves out keeps the built-in's value. So `id = "check-my-work"`
+  plus `rate_difficulty = true` is a complete override that turns the badge
+  on and changes nothing else. "Present" means written in the file, so an
+  explicit `enabled = true` or `confirm = false` still counts. If the block
+  has no `prompt`, the action stays a built-in and the Settings prompt keeps
+  applying to it; a `prompt` in the block replaces the built-in's prompt and
+  makes the action a user action. The merged result is checked as a whole: a
+  bad combination skips your version, keeps the built-in and shows a notice.
+  A new `id` is appended and must carry every required field.
+  (`merge_actions`, `src/actions/mod.rs`.)
+- **`replace = true` swaps the whole record.** Add it to a block to get the
+  old wholesale behaviour: every field comes from your block, so all required
+  fields must be there. It is also how to clear `group` or `hotkey` on a
+  built-in, since leaving them out means "keep". `replace` is read by the
+  loader only; it is not an action field.
 - **`enabled = false` hides an action**, and so does listing its `group` in
   the top-level `disabled_groups = [...]` array. Both checks run after
   merge, so a disabled built-in whose group is later re-enabled still
@@ -42,6 +53,8 @@ built-in.
   of being ignored.
 
 ## The `actions.toml` schema, field by field
+
+Required means required for a new `id` or a `replace = true` block. A block that overrides a built-in field by field needs only `id`.
 
 ```toml
 disabled_groups = ["Study"]        # top level, applies across all actions
@@ -76,6 +89,7 @@ mode = "auto"                      # only field Prefer has today
 | `hotkey` | table, optional | no | `{ vk, ctrl, shift, alt, win }`. Parsed and round-tripped, but **inert**: nothing reads `Action::hotkey` yet (per-action hotkeys are a later phase). Do not rely on setting this doing anything today. |
 | `rate_difficulty` | bool | no, default `false` | Only affects the `"verdict"` proposal kind's schema (adds a `difficulty` property and its rubric-driven enum). Accepted unconditionally on every action so a caller never has to know which proposal kinds care about it; ignored by every other schema. |
 | `enabled` | bool | no, default `true` | See "Merge and visibility rules". |
+| `replace` | bool | no, default `false` | Only for a block whose `id` is a built-in: `true` replaces the whole built-in instead of overriding field by field (needs every required field). See "Merge and visibility rules". |
 
 Top level, alongside `[[actions]]`:
 
