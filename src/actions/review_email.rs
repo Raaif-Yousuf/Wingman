@@ -364,6 +364,8 @@ pub enum CapturedInput {
     Selection {
         text: String,
         target: Option<crate::inputs::selection::SelectionTarget>,
+        /// The selection was longer than the length limit and was cut.
+        cut: bool,
     },
     Screen,
 }
@@ -389,6 +391,10 @@ impl CapturedInput {
     /// (not a reference) since `ComposeBody` and `Selection` carry two
     /// different underlying types -- see [`ReplaceTarget`]'s own doc
     /// comment.
+    pub fn was_cut(&self) -> bool {
+        matches!(self, CapturedInput::Selection { cut: true, .. })
+    }
+
     pub fn target(&self) -> Option<ReplaceTarget> {
         match self {
             CapturedInput::ComposeBody { target, .. } => Some(ReplaceTarget::Whole(target.clone())),
@@ -439,15 +445,32 @@ pub fn capture_input(foreground_hwnd: isize) -> CapturedInput {
             CapturedInput::ComposeBody { target, text }
         }
         InputSource::Selection => {
-            let selection = selection.expect("just matched Some above");
-            CapturedInput::Selection {
-                text: selection.text,
-                target: selection.target,
-            }
+            captured_from_selection(selection.expect("just matched Some above"))
         }
         InputSource::Screen => CapturedInput::Screen,
     }
 }
+
+/// The captured selection as an input. Keeps the write-back target only when
+/// the whole selection was read: a selection cut to the length limit has a
+/// target that spans all of it, so writing the reviewed (cut) text through it
+/// would delete everything past the limit.
+fn captured_from_selection(selection: crate::inputs::selection::Selection) -> CapturedInput {
+    CapturedInput::Selection {
+        text: selection.text,
+        target: if selection.truncated {
+            None
+        } else {
+            selection.target
+        },
+        cut: selection.truncated,
+    }
+}
+
+/// Added to the review card when the selection was longer than the length
+/// limit, so the user knows why there is no "Do it".
+pub const CUT_NOTICE: &str =
+    "The selection was too long to review in full, so nothing can be replaced in place. Select less text to apply the edits.";
 
 // ---------------------------------------------------------------------------
 // Building the "Do it" replace_text proposal, and running it
@@ -472,6 +495,8 @@ pub struct ReviewOutcome {
     /// `Selection` source does not always set `target` -- see
     /// [`CapturedInput::Selection`]'s doc comment).
     pub source: InputSource,
+    /// The selection was cut to the length limit (see [`CUT_NOTICE`]).
+    pub cut: bool,
 }
 
 /// Everything "Do it" needs, stashed by `app.rs` between the preview being
@@ -1156,6 +1181,7 @@ mod tests {
         let c = CapturedInput::Selection {
             text: "hi there".to_string(),
             target: None,
+            cut: false,
         };
         assert_eq!(c.source(), InputSource::Selection);
         assert_eq!(c.text(), Some("hi there"));
@@ -1169,6 +1195,7 @@ mod tests {
         let c = CapturedInput::Selection {
             text: "wnated".to_string(),
             target: Some(sample_selection_target()),
+            cut: false,
         };
         assert_eq!(c.source(), InputSource::Selection);
         assert_eq!(c.text(), Some("wnated"));
@@ -1176,6 +1203,35 @@ mod tests {
             c.target(),
             Some(ReplaceTarget::Selection(sample_selection_target()))
         );
+    }
+
+    fn uia_selection(truncated: bool) -> crate::inputs::selection::Selection {
+        crate::inputs::selection::Selection {
+            text: "first part".to_string(),
+            truncated,
+            source: crate::inputs::selection::SelectionSource::Uia,
+            target: Some(sample_selection_target()),
+        }
+    }
+
+    #[test]
+    fn captured_from_selection_keeps_the_target_when_the_whole_selection_was_read() {
+        let c = captured_from_selection(uia_selection(false));
+        assert_eq!(
+            c.target(),
+            Some(ReplaceTarget::Selection(sample_selection_target()))
+        );
+    }
+
+    #[test]
+    fn captured_from_selection_drops_the_target_when_the_selection_was_cut() {
+        // #534: writing the cut text through the whole-selection target
+        // would delete everything past the limit.
+        let c = captured_from_selection(uia_selection(true));
+        assert_eq!(c.text(), Some("first part"));
+        assert_eq!(c.target(), None);
+        assert!(c.was_cut());
+        assert!(!captured_from_selection(uia_selection(false)).was_cut());
     }
 
     #[test]
