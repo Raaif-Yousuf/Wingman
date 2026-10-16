@@ -512,6 +512,7 @@ pub fn run() -> Result<()> {
     if let Some((headline, detail)) = startup_card(
         &config.unreadable_secrets,
         crate::single_instance::lock_squatted(),
+        config.load_problem.as_deref(),
     ) {
         card.show_error(&headline, &detail);
     }
@@ -652,20 +653,46 @@ fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
 /// unreadable keys, #237 lockless start) end in a card, and one must never
 /// overwrite the other, so when both apply their text is joined. Pure so the
 /// wording is unit-tested without a `Card`. No em dash (rule 11).
-fn startup_card(unreadable: &[String], lock_squatted: bool) -> Option<(String, String)> {
+fn startup_card(
+    unreadable: &[String],
+    lock_squatted: bool,
+    config_problem: Option<&str>,
+) -> Option<(String, String)> {
     let squat = (
         "Another program holds Wingman's startup lock".to_string(),
         "Wingman started anyway. If you see two Wingman tray icons, quit one of them.".to_string(),
     );
-    match (unreadable.is_empty(), lock_squatted) {
-        (true, false) => None,
-        (false, false) => Some(unreadable_secrets_card(unreadable)),
-        (true, true) => Some(squat),
-        (false, true) => {
-            let (headline, detail) = unreadable_secrets_card(unreadable);
-            Some((headline, format!("{detail}\n\n{}. {}", squat.0, squat.1)))
-        }
+    // Every problem that applies, in order; the first one's headline leads
+    // and the rest are joined, so none is dropped.
+    let mut cards = Vec::new();
+    if let Some(problem) = config_problem {
+        cards.push(config_problem_card(problem));
     }
+    if !unreadable.is_empty() {
+        cards.push(unreadable_secrets_card(unreadable));
+    }
+    if lock_squatted {
+        cards.push(squat);
+    }
+    let mut cards = cards.into_iter();
+    let (headline, mut detail) = cards.next()?;
+    for (h, d) in cards {
+        detail = format!("{detail}\n\n{h}. {d}");
+    }
+    Some((headline, detail))
+}
+
+/// #711: config.toml exists but did not parse. Names the line and column
+/// (`problem` already carries them), never file text. No em dash (rule 11).
+fn config_problem_card(problem: &str) -> (String, String) {
+    (
+        "Settings file not read".to_string(),
+        format!(
+            "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
+             computer) and will not save over your file. Fix it, then choose Reload settings \
+             from the tray menu."
+        ),
+    )
 }
 
 fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
@@ -813,6 +840,10 @@ fn first_run_detail(found: &FirstRun) -> Option<String> {
             "Ollama is running, but none of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
                 .to_string(),
         ),
+        FirstRun::VisionUnknown => Some(
+            "Ollama is running, but Wingman could not tell which of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
+                .to_string(),
+        ),
         FirstRun::NotRunning | FirstRun::Found { .. } => None,
     }
 }
@@ -899,7 +930,10 @@ impl App {
         let base_url = self.config.providers.ollama.base_url.clone();
         let preferred = self.config.providers.ollama.model.clone();
         std::thread::spawn(move || {
-            let found = ollama_admin::probe_first_run(&base_url, &preferred);
+            // A panic must still post a result, or the Working card never
+            // goes away (dev builds; release aborts). Read as "not found".
+            let found = catch_worker(|| Ok(ollama_admin::probe_first_run(&base_url, &preferred)))
+                .unwrap_or(FirstRun::NotRunning);
             let payload = Box::into_raw(Box::new(found));
             unsafe {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -2181,6 +2215,13 @@ impl App {
                 }
             }
         }
+        // #70: a receipt is one row under five fixed headers, whatever the
+        // model sent.
+        let proposal = if action.id == actions::receipt::ACTION_ID {
+            actions::receipt::clamp_receipt(&proposal)
+        } else {
+            proposal
+        };
         // #69: no table on screen, or a reply that is not a table, is an
         // answer, not an empty preview.
         let table_headline = if actions::table::is_unreadable(&action.proposal, &proposal) {
@@ -3421,6 +3462,13 @@ impl App {
 
     fn reload(&mut self) {
         match Config::load() {
+            // #711: a file that does not parse must not replace the settings
+            // already running; keep them and say what is wrong.
+            Ok(config) if config.load_problem.is_some() => {
+                let (headline, detail) =
+                    config_problem_card(config.load_problem.as_deref().unwrap_or_default());
+                self.card.show_error(&headline, &detail);
+            }
             Ok(config) => {
                 // #175: report before self.config is overwritten, since the
                 // freshly loaded config is the one whose hydrate ran.
@@ -4013,11 +4061,22 @@ impl App {
         }
     }
 
-    fn set_watch(&self, on: bool) {
+    fn set_watch(&mut self, on: bool) {
+        let failed = match &self.watcher {
+            Some(w) if on => !w.arm(),
+            _ => false,
+        };
+        // Never overwrite a real earlier error: the card being shown may be it.
+        if failed && self.last_error.is_none() {
+            // Issue #729: no click-away for this card. Record it for
+            // "Copy diagnostics" rather than failing the card itself.
+            self.record_last_error(
+                "Click-away dismissal unavailable",
+                "SetWindowsHookExW(WH_MOUSE_LL) failed",
+            );
+        }
         if let Some(w) = &self.watcher {
-            if on {
-                w.arm();
-            } else {
+            if !on {
                 w.disarm();
             }
         }
@@ -4524,6 +4583,7 @@ fn with_pending_notices(detail: &str) -> String {
         [
             crate::store::take_notice(),
             crate::usage::take_budget_notice(),
+            crate::config::take_backup_warning(),
             crate::actions::take_skipped_notice(),
         ]
         .into_iter()
@@ -6634,6 +6694,13 @@ mod tests {
             !detail.contains('\u{2014}') && !detail.contains('\u{2013}'),
             "{detail}"
         );
+        // An older Ollama that lists no capabilities: say so, do not claim
+        // that no model can read the screen.
+        let unknown = super::first_run_detail(&FirstRun::VisionUnknown).expect("a detail");
+        assert!(unknown.contains("could not tell"), "{unknown}");
+        assert!(!unknown.contains("none of its models"), "{unknown}");
+        assert!(unknown.contains("Settings"), "{unknown}");
+        assert!(!unknown.contains('\u{2014}') && !unknown.contains('\u{2013}'));
     }
 
     #[test]
@@ -7627,16 +7694,35 @@ mod tests {
     #[test]
     fn startup_card_shows_neither_one_or_both_problems() {
         let keys = vec!["openai".to_string()];
-        assert_eq!(super::startup_card(&[], false), None);
-        let only_keys = super::startup_card(&keys, false).unwrap();
+        assert_eq!(super::startup_card(&[], false, None), None);
+        let only_keys = super::startup_card(&keys, false, None).unwrap();
         assert!(only_keys.0.contains("key"), "{only_keys:?}");
-        let only_squat = super::startup_card(&[], true).unwrap();
+        let only_squat = super::startup_card(&[], true, None).unwrap();
         assert!(only_squat.0.contains("startup lock"), "{only_squat:?}");
-        let (headline, detail) = super::startup_card(&keys, true).unwrap();
+        let (headline, detail) = super::startup_card(&keys, true, None).unwrap();
         assert_eq!(headline, only_keys.0);
         assert!(detail.contains(&only_keys.1), "keys text kept: {detail}");
         assert!(detail.contains(&only_squat.0), "squat text added: {detail}");
         assert!(!detail.contains('\u{2014}'));
+    }
+
+    /// #711: a config.toml that did not parse gets its own card, with the
+    /// location, and it is not lost when the other startup problems apply.
+    #[test]
+    fn startup_card_reports_a_config_file_that_did_not_parse() {
+        let problem = "config.toml has an error at line 3, column 7";
+        let (headline, detail) = super::startup_card(&[], false, Some(problem)).unwrap();
+        assert!(headline.contains("Settings file"), "{headline}");
+        assert!(detail.contains(problem), "{detail}");
+        assert!(detail.contains("Reload settings"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
+        let (_, both) = super::startup_card(&["openai".to_string()], true, Some(problem)).unwrap();
+        assert!(
+            both.contains(problem) && both.contains("startup lock"),
+            "{both}"
+        );
+        assert!(both.contains("Stored API key unreadable"), "{both}");
+        assert!(both.contains("Offline"), "{both}");
     }
 
     /// #237: the owner window must exist before the single-instance name is

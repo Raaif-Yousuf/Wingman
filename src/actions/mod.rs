@@ -21,6 +21,7 @@ pub mod generic_replace;
 pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
+pub mod receipt;
 pub mod review_email;
 pub mod rewrite_tone;
 pub mod scam_check;
@@ -469,6 +470,7 @@ pub fn builtin_actions() -> Vec<Action> {
         fill_form::builtin_action(),
         action_items::builtin_action(),
         table::builtin_action(),
+        receipt::builtin_action(),
         explain_error::builtin_action(),
         define_word::builtin_action(),
         translate::builtin_action(),
@@ -741,6 +743,15 @@ fn validate_action(action: &Action) -> Result<()> {
             "action \"{}\" uses executor \"replace_text\", {}",
             action.id,
             "which writes over the selected text, so its inputs must include \"selection\""
+        );
+    }
+    // `confirm = false` on a writing executor is refused by
+    // `auto_confirm_read_only` only after the model has answered (#732).
+    if !action.confirm && executor.effect() == crate::executors::Effect::Writes {
+        anyhow::bail!(
+            "action \"{}\" uses executor \"{}\", which writes, so it needs confirm = true",
+            action.id,
+            action.executor
         );
     }
     Ok(())
@@ -1322,6 +1333,48 @@ prompt = "Make it loud."
         assert!(msg.contains("replace_text"), "names the executor: {msg}");
         assert!(msg.contains("selection"), "names the fix: {msg}");
         assert!(!msg.contains('\u{2014}'), "no em dash: {msg}");
+    }
+
+    // -- confirm = false on a writing executor (#732) -------------------------
+
+    #[test]
+    fn confirm_false_on_a_writing_executor_is_skipped_at_load_naming_the_field() {
+        for executor in ["replace_text", "calendar_add", "fill_form"] {
+            let path = scratch_path("confirm-false-writes");
+            write(
+                &path,
+                &one_action("shout", "text_answer", executor, "Make it loud."),
+            );
+            let report = load_actions_report_from(&path).unwrap();
+            cleanup(&path);
+            assert!(
+                !report.actions.iter().any(|r| r.action.id == "shout"),
+                "{executor}"
+            );
+            assert_eq!(report.skipped.len(), 1, "{executor}");
+            let msg = &report.skipped[0];
+            assert!(msg.contains("shout"), "names the action: {msg}");
+            assert!(msg.contains("confirm"), "names the field: {msg}");
+            assert!(msg.contains(executor), "names the executor: {msg}");
+            assert!(!msg.contains('\u{2014}'), "no em dash: {msg}");
+        }
+    }
+
+    #[test]
+    fn confirm_true_on_a_writing_executor_and_confirm_false_on_a_read_only_one_load() {
+        let path = scratch_path("confirm-ok");
+        let text = format!(
+            "{}{}",
+            one_action("w", "text_answer", "replace_text", "Go.")
+                .replace("confirm = false", "confirm = true"),
+            one_action("r", "text_answer", "clipboard", "Go.")
+        );
+        write(&path, &text);
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert!(report.actions.iter().any(|r| r.action.id == "w"));
+        assert!(report.actions.iter().any(|r| r.action.id == "r"));
     }
 
     // -- unknown executor / proposal and skip-not-fail (#620) -----------------
