@@ -314,6 +314,47 @@ fn center_in_work(work: &windows::Win32::Foundation::RECT, w: i32, h: i32) -> (i
     (x.max(work.left), y.max(work.top))
 }
 
+/// Enter and Esc for the Settings window. Returns true when the key was used
+/// and must not be dispatched further.
+unsafe fn handle_key(hwnd: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
+    let vk = msg.wParam.0 as u32;
+    // #776: with a combo list open, Enter and Esc belong to the list (pick or
+    // close); they must not save or cancel the window.
+    if (vk == VK_ESCAPE.0 as u32 || vk == VK_RETURN.0 as u32) && wheel_over_open_combo(msg.hwnd) {
+        let _ = TranslateMessage(msg);
+        DispatchMessageW(msg);
+        return true;
+    }
+    if vk == VK_ESCAPE.0 as u32 {
+        // #345: while a Change is pending, Esc cancels that, not the whole
+        // window. (The hook normally swallows this Esc and reports it as a
+        // captured key instead; see `judge_learned`.)
+        if !cancel_learning_if_active(hwnd) {
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_COMMAND,
+                WPARAM(ID_CANCEL as usize),
+                LPARAM(0),
+            );
+        }
+        return true;
+    }
+    // Enter submits, except inside the multiline prompt box, where
+    // ES_WANTRETURN means Enter should insert a newline instead, and on a
+    // focused push button, where it presses that button (#342).
+    if vk == VK_RETURN.0 as u32 && msg.hwnd != prompt_edit {
+        let ctrl_id = GetDlgCtrlID(msg.hwnd);
+        let _ = PostMessageW(
+            Some(hwnd),
+            WM_COMMAND,
+            WPARAM(enter_command(ctrl_id) as usize),
+            LPARAM(0),
+        );
+        return true;
+    }
+    false
+}
+
 fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
     // #481: the focused window as of the last message, to scroll a newly
     // focused control into view without a timer.
@@ -335,51 +376,11 @@ fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
 
         let belongs_to_us = msg.hwnd == hwnd || unsafe { IsChild(hwnd, msg.hwnd) }.as_bool();
 
-        if belongs_to_us && msg.message == WM_KEYDOWN {
-            let vk = msg.wParam.0 as u32;
-            // #776: with a combo list open, Enter and Esc belong to the list
-            // (pick or close); they must not save or cancel the window.
-            if (vk == VK_ESCAPE.0 as u32 || vk == VK_RETURN.0 as u32)
-                && unsafe { wheel_over_open_combo(msg.hwnd) }
-            {
-                unsafe {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-                continue;
-            }
-            if vk == VK_ESCAPE.0 as u32 {
-                // #345: while a Change is pending, Esc cancels that, not the
-                // whole window. (The hook normally swallows this Esc and
-                // reports it as a captured key instead; see `judge_learned`.)
-                if unsafe { cancel_learning_if_active(hwnd) } {
-                    continue;
-                }
-                unsafe {
-                    let _ = PostMessageW(
-                        Some(hwnd),
-                        WM_COMMAND,
-                        WPARAM(ID_CANCEL as usize),
-                        LPARAM(0),
-                    );
-                }
-                continue;
-            }
-            // Enter submits, except inside the multiline prompt box, where
-            // ES_WANTRETURN means Enter should insert a newline instead, and
-            // on a focused push button, where it presses that button (#342).
-            if vk == VK_RETURN.0 as u32 && msg.hwnd != prompt_edit {
-                let ctrl_id = unsafe { GetDlgCtrlID(msg.hwnd) };
-                unsafe {
-                    let _ = PostMessageW(
-                        Some(hwnd),
-                        WM_COMMAND,
-                        WPARAM(enter_command(ctrl_id) as usize),
-                        LPARAM(0),
-                    );
-                }
-                continue;
-            }
+        if belongs_to_us
+            && msg.message == WM_KEYDOWN
+            && unsafe { handle_key(hwnd, &msg, prompt_edit) }
+        {
+            continue;
         }
 
         // #481: the wheel scrolls the body wherever the pointer is in the
@@ -738,7 +739,8 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 return;
             }
             if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-                set_text(msg, "");
+                // Back to the standing hint (#778), not blank.
+                set_text(msg, &env_key_hint(&env_hint_vars()));
             }
 
             // Autostart is registry state rather than a Config field, so it is
@@ -751,7 +753,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 // saved". Say so here, show the real state, keep the window.
                 if crate::autostart::set_enabled(want).is_err() {
                     if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-                        set_text(msg, autostart_failure_message(want));
+                        set_text(msg, autostart_failure_message());
                     }
                     if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
                         set_checkbox(box_, crate::autostart::is_enabled());
@@ -4446,7 +4448,7 @@ fn build_ui_recorded(
     let validation = ctx.create(
         WC_STATIC,
         "",
-        0,
+        0x4000, // SS_ENDELLIPSIS
         0,
         content_x + MARGIN,
         buttons_y + (BTN_H - ROW_H) / 2,
@@ -5395,20 +5397,23 @@ fn lock_env_key_fields(hwnd: HWND) {
             }
         }
     }
-    let vars: Vec<&str> = locked.iter().map(|(_, var)| *var).collect();
     if let Some(msg) = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE) {
-        set_text(msg, &env_key_hint(&vars));
+        set_text(msg, &env_key_hint(&env_hint_vars()));
     }
+}
+
+/// The names of the set key variables, for [`env_key_hint`].
+fn env_hint_vars() -> Vec<&'static str> {
+    env_locked_key_fields()
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect()
 }
 
 /// What Save says when the start-with-Windows switch could not be changed
 /// (#777). The window stays open so nothing is lost.
-fn autostart_failure_message(wanted_on: bool) -> &'static str {
-    if wanted_on {
-        "Could not turn on Start with Windows. Save again to keep the rest."
-    } else {
-        "Could not turn off Start with Windows. Save again to keep the rest."
-    }
+fn autostart_failure_message() -> &'static str {
+    "Could not change Start with Windows."
 }
 
 /// The prompt as the multiline edit wants it: CRLF line breaks (#779). The
@@ -5474,12 +5479,21 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     }
 
     cfg.ui.card_seconds = parse_u32_or(&raw.card_seconds_text, original.ui.card_seconds);
-    cfg.ui.text_scale = clamp_text_scale(raw.text_scale_raw);
-    cfg.ui.prompt = if raw.prompt.trim().is_empty() {
-        original.ui.prompt.clone()
+    // The slider works in whole percent, so an untouched slider keeps a
+    // hand-edited value it cannot show (2.5, 0.4, 1.255).
+    let pct = |v: f32| (clamp_text_scale(v) * 100.0).round() as i32;
+    cfg.ui.text_scale = if pct(raw.text_scale_raw) == pct(original.ui.text_scale) {
+        original.ui.text_scale
     } else {
-        raw.prompt.clone()
+        clamp_text_scale(raw.text_scale_raw)
     };
+    // An unchanged box keeps the stored prompt byte for byte, CRLF or LF.
+    cfg.ui.prompt =
+        if raw.prompt.trim().is_empty() || raw.prompt == prompt_from_edit(&original.ui.prompt) {
+            original.ui.prompt.clone()
+        } else {
+            raw.prompt.clone()
+        };
 
     cfg.ui.card_corner = label_to_card_corner(&raw.card_corner).unwrap_or(original.ui.card_corner);
     if let Some(v) = label_to_card_monitor(&raw.card_monitor) {
@@ -7145,6 +7159,80 @@ mod tests {
     }
 
     #[test]
+    fn an_untouched_save_keeps_a_hand_edited_text_scale_and_a_crlf_prompt() {
+        for scale in [2.5_f32, 0.4, 1.255] {
+            let mut original = Config::default();
+            original.ui.text_scale = scale;
+            original.ui.prompt = "one\r\ntwo".to_string();
+            // What the form reads back: the slider in whole percent.
+            let mut raw = raw_from(&original);
+            raw.text_scale_raw = (clamp_text_scale(scale) * 100.0).round() / 100.0;
+            raw.prompt = prompt_from_edit(&prompt_to_edit(&original.ui.prompt));
+            let cfg = build_config(&original, &raw);
+            assert_eq!(cfg.ui.text_scale, scale);
+            assert_eq!(cfg.ui.prompt, "one\r\ntwo");
+            // Moving the slider still changes it.
+            raw.text_scale_raw = 1.0;
+            assert_eq!(build_config(&original, &raw).ui.text_scale, 1.0);
+        }
+    }
+
+    #[test]
+    fn enter_and_esc_with_a_dropdown_open_do_not_save_or_cancel_the_window() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IsWindow, PeekMessageW, PM_REMOVE, SW_SHOWNA, WM_KEYDOWN,
+        };
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let combo = get_dlg_item(hwnd, ID_OPENAI_MODEL).unwrap();
+            for key in [VK_ESCAPE, VK_RETURN] {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOWNA);
+                    SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(1)), None);
+                }
+                assert!(unsafe { wheel_over_open_combo(combo) }, "list did not open");
+                let msg = MSG {
+                    hwnd: combo,
+                    message: WM_KEYDOWN,
+                    wParam: WPARAM(key.0 as usize),
+                    ..Default::default()
+                };
+                assert!(unsafe { handle_key(hwnd, &msg, inner.prompt_edit) });
+                // No Save or Cancel was queued, and the window is alive.
+                let mut queued = MSG::default();
+                let posted = unsafe {
+                    PeekMessageW(&mut queued, Some(hwnd), WM_COMMAND, WM_COMMAND, PM_REMOVE)
+                };
+                assert!(!posted.as_bool(), "a command was posted for {key:?}");
+                assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
+                assert!(inner.result.is_none());
+                unsafe {
+                    SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(0)), None);
+                }
+            }
+            // With the list closed, Esc still cancels the window.
+            let msg = MSG {
+                hwnd: combo,
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_ESCAPE.0 as usize),
+                ..Default::default()
+            };
+            assert!(unsafe { handle_key(hwnd, &msg, inner.prompt_edit) });
+            let mut queued = MSG::default();
+            let posted =
+                unsafe { PeekMessageW(&mut queued, Some(hwnd), WM_COMMAND, WM_COMMAND, PM_REMOVE) };
+            assert!(posted.as_bool());
+        });
+    }
+
+    #[test]
+    fn the_env_hint_survives_a_save_that_clears_other_messages() {
+        ENV_KEYS_SET.with(|c| *c.borrow_mut() = Some(vec!["GEMINI_API_KEY"]));
+        assert_eq!(env_hint_vars(), vec!["GEMINI_API_KEY"]);
+        ENV_KEYS_SET.with(|c| *c.borrow_mut() = None);
+    }
+
+    #[test]
     fn the_prompt_box_text_uses_crlf_and_the_saved_prompt_uses_lf() {
         assert_eq!(prompt_to_edit("a\nb\n\nc"), "a\r\nb\r\n\r\nc");
         assert_eq!(prompt_to_edit("a\r\nb"), "a\r\nb");
@@ -7164,10 +7252,11 @@ mod tests {
 
     #[test]
     fn an_autostart_failure_message_is_plain_and_has_no_dash() {
-        for on in [true, false] {
-            let m = autostart_failure_message(on);
-            assert!(!m.is_empty() && !m.contains('\u{2014}'), "{m}");
-        }
+        let m = autostart_failure_message();
+        assert!(
+            !m.is_empty() && m.len() <= 45 && !m.contains('\u{2014}'),
+            "{m}"
+        );
     }
 
     #[test]
