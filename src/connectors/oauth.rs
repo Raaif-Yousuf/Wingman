@@ -204,7 +204,7 @@ impl TokenTransport for UreqTransport {
         if !loopback && !url.starts_with("https://") {
             bail!("refusing to send credentials over plain http");
         }
-        crate::provider::common::offline_guard(url)?;
+        crate::provider::common::loopback_only_guard(url)?;
         let bytes_sent: usize = form.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
         let result = send_form(url, form);
         log_egress(url, bytes_sent, &result);
@@ -664,8 +664,8 @@ pub fn authorize(
     store: &dyn SecretStore,
     timeout: Duration,
 ) -> Result<AccessToken> {
-    // Before anything is opened or bound: Offline mode means no sign-in.
-    crate::provider::common::offline_guard(&provider.auth_url)?;
+    // Before anything is opened or bound: Offline and Local mode mean no sign-in (connectors are cloud services).
+    crate::provider::common::loopback_only_guard(&provider.auth_url)?;
     let pkce = Pkce::generate()?;
     let state = random_state()?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("could not open a loopback port")?;
@@ -712,7 +712,7 @@ pub fn access_token(
     transport: &dyn TokenTransport,
     store: &dyn SecretStore,
 ) -> Result<AccessToken> {
-    crate::provider::common::offline_guard(&provider.token_url)?;
+    crate::provider::common::loopback_only_guard(&provider.token_url)?;
     let target = provider.credential_target();
     let refresh = store
         .get(&target)?
@@ -760,7 +760,7 @@ pub fn revoke(
         return Ok(());
     };
     let remote = match &provider.revoke_url {
-        Some(url) => crate::provider::common::offline_guard(url)
+        Some(url) => crate::provider::common::loopback_only_guard(url)
             .and_then(|()| transport.post_form(url, &[("token", &refresh)]))
             .and_then(|(status, _)| {
                 if (200..300).contains(&status) {
@@ -1234,6 +1234,46 @@ mod tests {
         crate::mode::set_current(crate::mode::Mode::Auto);
         assert!(result.unwrap_err().to_string().contains("Offline"));
         assert_eq!(browser.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// #686: Local mode keeps everything on this computer, so the sign-in,
+    /// refresh and revoke requests to a cloud host are refused there too.
+    #[test]
+    fn local_mode_blocks_sign_in_refresh_and_revoke_before_any_request() {
+        struct RestoreMode;
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                crate::mode::set_current(crate::mode::Mode::Auto);
+            }
+        }
+        let _lock = online();
+        let _restore = RestoreMode;
+        crate::mode::set_current(crate::mode::Mode::Local);
+        let provider = OAuthProvider::google();
+        let store = InMemoryStore::default();
+        store.set(&provider.credential_target(), "KEEP").unwrap();
+
+        let browser = CountingBrowser(Default::default());
+        let err = authorize(
+            &provider,
+            &test_client(),
+            &browser,
+            &UreqTransport,
+            &store,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Local"), "{err}");
+        assert_eq!(browser.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let transport = CountingTransport(Default::default());
+        let err = access_token(&provider, &test_client(), &transport, &store).unwrap_err();
+        assert!(err.to_string().contains("Local"), "{err}");
+        assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(is_connected(&provider, &store).unwrap());
+
+        assert!(revoke(&provider, &transport, &store).is_err());
+        assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
