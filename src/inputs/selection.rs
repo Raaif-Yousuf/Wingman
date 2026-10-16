@@ -467,6 +467,20 @@ pub trait RawClipboard {
     fn set_formats(&self, formats: &[(u32, Vec<u8>)]) -> anyhow::Result<()>;
 }
 
+/// `formats` with the ones in `markers` first, otherwise in the same order.
+/// The privacy markers are written before the data they protect, so a restore
+/// that fails part way can never leave a secret on the clipboard without them
+/// (#724).
+fn markers_first<'a>(formats: &'a [(u32, Vec<u8>)], markers: &[u32]) -> Vec<&'a (u32, Vec<u8>)> {
+    let (first, rest): (Vec<_>, Vec<_>) = formats.iter().partition(|(f, _)| markers.contains(f));
+    first.into_iter().chain(rest).collect()
+}
+
+/// What stands in for a privacy marker that could not be read: a zero DWORD,
+/// which means "do not include in history / do not upload", and for the
+/// exclusion marker is simply present. Restoring it is the safe direction.
+const UNREADABLE_MARKER: [u8; 4] = [0; 4];
+
 /// One point-in-time capture of every format in `formats_of_interest` that
 /// was actually present.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1050,18 +1064,21 @@ mod win32 {
         }
 
         fn get_format(&self, format: u32) -> Option<Vec<u8>> {
-            let _guard = OpenGuard::open().ok()?;
+            let is_marker = marker_formats().contains(&format);
+            // A busy clipboard must not drop a privacy marker: if it cannot
+            // be opened, a marker is assumed present (fail closed).
+            let Ok(_guard) = OpenGuard::open() else {
+                return is_marker.then(|| super::UNREADABLE_MARKER.to_vec());
+            };
             let read = unsafe { GetClipboardData(format) }
                 .ok()
                 .and_then(read_hglobal_bytes);
             // A privacy marker is meaningful by being there, and some apps
             // set it with no data. Keep it as a zero DWORD so the restore
             // still carries it (zero is "do not include / do not upload").
-            if read.is_none()
-                && marker_formats().contains(&format)
-                && unsafe { IsClipboardFormatAvailable(format) }.is_ok()
+            if read.is_none() && is_marker && unsafe { IsClipboardFormatAvailable(format) }.is_ok()
             {
-                return Some(vec![0; 4]);
+                return Some(super::UNREADABLE_MARKER.to_vec());
             }
             read
         }
@@ -1069,7 +1086,7 @@ mod win32 {
         fn set_formats(&self, formats: &[(u32, Vec<u8>)]) -> anyhow::Result<()> {
             let _guard = OpenGuard::open()?;
             unsafe { EmptyClipboard() }?;
-            for (format, bytes) in formats {
+            for (format, bytes) in super::markers_first(formats, &marker_formats()) {
                 let hglobal = alloc_hglobal_bytes(bytes)?;
                 // Ownership of hglobal transfers to the clipboard on
                 // success; it must NOT be freed here either way -- on
@@ -1856,6 +1873,39 @@ mod tests {
             clipboard.get_format(win32::CF_UNICODETEXT_U32),
             Some(b"s\0e\0c\0r\0e\0t\0\0\0".to_vec())
         );
+    }
+
+    #[test]
+    fn markers_are_written_before_the_data_they_protect() {
+        let [exclude, history, _] = win32::marker_formats();
+        let formats = vec![
+            (win32::CF_UNICODETEXT_U32, b"t".to_vec()),
+            (exclude, vec![1, 0, 0, 0]),
+            (win32::CF_DIB_U32, b"d".to_vec()),
+            (history, vec![0, 0, 0, 0]),
+        ];
+        let order: Vec<u32> = markers_first(&formats, &win32::marker_formats())
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        assert_eq!(
+            order,
+            [
+                exclude,
+                history,
+                win32::CF_UNICODETEXT_U32,
+                win32::CF_DIB_U32
+            ]
+        );
+        // No markers: the order is untouched.
+        let plain = vec![(1, vec![]), (2, vec![])];
+        assert_eq!(markers_first(&plain, &[]).len(), 2);
+        assert_eq!(markers_first(&plain, &[])[0].0, 1);
+    }
+
+    #[test]
+    fn an_unreadable_marker_stands_in_as_a_zero_dword() {
+        assert_eq!(UNREADABLE_MARKER, [0, 0, 0, 0]);
     }
 
     #[test]
