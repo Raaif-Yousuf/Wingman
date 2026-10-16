@@ -81,10 +81,10 @@ text that ends up on an error card. `actions::resolve_executor(&action)` is
 the one call site that turns `Action::executor` (a plain, unvalidated-until-now
 string) into this lookup.
 
-One pairing is checked earlier, when `actions.toml` loads: an action with
-`executor = "replace_text"` must list `selection` in `inputs` (#536), or the
-load fails with an error naming the action. Without a selection there is
-nothing to write over.
+The name is also checked when `actions.toml` loads (#620), as is one pairing:
+`executor = "replace_text"` must list `selection` in `inputs` (#536), because
+without a selection there is nothing to write over. An action that fails a
+check is skipped and named in a notice; the other actions still load.
 
 ## The `Confirmed<P>` boundary, and why an executor cannot fabricate one
 
