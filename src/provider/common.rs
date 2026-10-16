@@ -161,6 +161,7 @@ impl Transport for UreqTransport {
         body: &Value,
         timeout: Duration,
     ) -> std::result::Result<RawResponse, TransportError> {
+        crate::ui_thread::blocking_call("post_json");
         let mut builder = ureq::post(url);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
@@ -765,6 +766,24 @@ pub(crate) fn offline_guard(url: &str) -> Result<()> {
     }
 }
 
+/// #674: Local mode is loopback only too (the Modes table), but its provider
+/// selection already keeps cloud requests from being built, so
+/// `offline_guard` does not need to refuse in Local. A request that is not a
+/// provider call (a cloud model-list lookup carries the saved API key) has no
+/// such selection in front of it, so it gets this stricter check at the send
+/// itself. It fails closed: a non-loopback host is allowed only when the mode
+/// is positively Auto or Cloud; any other mode refuses it.
+pub(crate) fn loopback_only_guard(url: &str) -> Result<()> {
+    offline_guard(url)?;
+    match crate::mode::current() {
+        crate::mode::Mode::Auto | crate::mode::Mode::Cloud => Ok(()),
+        _ if crate::mode::classify_host(url) == crate::mode::HostClass::Loopback => Ok(()),
+        _ => Err(anyhow!(
+            "Local mode blocked a request to a non-local address. Switch to Auto or Cloud to allow it."
+        )),
+    }
+}
+
 /// #505: the body that actually leaves, given the request's URL, and the
 /// private details taken out of it. A request that could leave this machine
 /// has the text in its body redacted with the screenshot step's four kinds
@@ -813,6 +832,7 @@ fn budget_guard(url: &str) -> Result<()> {
 /// requires add none of when Ollama is not configured. Goes through
 /// [`offline_guard`] like every other entry point in this file.
 pub(crate) fn get_text_with_timeout(url: &str, timeout: Duration, tag: &str) -> Result<String> {
+    crate::ui_thread::blocking_call(tag);
     offline_guard(url)?;
 
     let response = ureq::get(url)
@@ -851,7 +871,7 @@ pub(crate) fn get_json_with_headers(
     timeout: Duration,
     tag: &str,
 ) -> Result<String> {
-    offline_guard(url)?;
+    loopback_only_guard(url)?;
 
     let result = get_with_headers_raw(url, headers, timeout);
     let (outcome, received, error) = match &result {
@@ -892,6 +912,7 @@ fn get_with_headers_raw(
     headers: &[(&str, &str)],
     timeout: Duration,
 ) -> std::result::Result<RawResponse, String> {
+    crate::ui_thread::blocking_call("get_with_headers");
     let mut builder = ureq::get(url);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
@@ -940,6 +961,7 @@ pub(crate) fn post_json_read_body<T>(
 ) -> Result<T> {
     use std::io::{BufRead, BufReader, Read, Write};
 
+    crate::ui_thread::blocking_call(tag);
     offline_guard(url)?;
     budget_guard(url)?;
 
@@ -1218,6 +1240,7 @@ pub(crate) fn post_json_with_connect_timeout(
     total_timeout: Duration,
     tag: &str,
 ) -> Result<String> {
+    crate::ui_thread::blocking_call(tag);
     send_preview_guard(url)?;
     offline_guard(url)?;
     budget_guard(url)?;
@@ -1329,6 +1352,50 @@ pub(crate) fn encode_images_base64(images: &[Vec<u8>]) -> Vec<String> {
         .collect()
 }
 
+/// The schema as it goes to a vendor: the UI-only `"editable"` keyword
+/// (`actions::schema`: the confirm card reads it, a model never needs it) is
+/// removed everywhere. OpenAI strict mode and Gemini accept only a documented
+/// subset of JSON Schema, so an unknown keyword risks a 400 on every calendar,
+/// rewrite and list action (#719). The local copy in the registry keeps it.
+///
+/// MEASURED 2026-10-16: Anthropic (haiku-5-5) accepts the keyword and ignores it.
+/// THEORY (unverified, no key here): OpenAI strict mode and Gemini reject or
+/// ignore it; stripping is safe either way.
+///
+/// Key order is kept (rule 3): the map is rebuilt in order rather than using
+/// `Map::remove`, which swaps the last key into the hole under
+/// `preserve_order`. A property that is itself NAMED `editable` is left alone.
+///
+/// The walk is by structure, not by meaning: it also descends into `enum`,
+/// `const`, `default` and `examples` values, so a literal object there that
+/// has an `editable` key would lose it. No registered schema has one (the
+/// all-kinds test checks the output byte for byte).
+pub(crate) fn wire_schema(schema: &Value) -> Value {
+    fn strip(node: &mut Value, is_property_map: bool) {
+        match node {
+            Value::Object(map) => {
+                let old = std::mem::take(map);
+                for (key, mut child) in old {
+                    if !is_property_map && key == "editable" {
+                        continue;
+                    }
+                    strip(&mut child, !is_property_map && key == "properties");
+                    map.insert(key, child);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    strip(item, false);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = schema.clone();
+    strip(&mut out, false);
+    out
+}
+
 /// The JSON Schema for the physics-check `Answer`: `detail` is listed (and
 /// required) before `headline` deliberately -- with `headline` first the
 /// model committed to a verdict before doing the arithmetic and then
@@ -1371,6 +1438,53 @@ pub(crate) fn augmented_system_prompt(prompt: &str, want_difficulty: bool) -> St
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    // -- wire_schema (#719) ----------------------------------------------
+
+    /// A walk over a JSON value: does any schema node carry `editable`?
+    pub(crate) fn mentions_editable_keyword(v: &Value) -> bool {
+        match v {
+            Value::Object(m) => {
+                m.contains_key("editable") || m.values().any(mentions_editable_keyword)
+            }
+            Value::Array(a) => a.iter().any(mentions_editable_keyword),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn wire_schema_removes_editable_everywhere_and_keeps_every_other_key_in_order() {
+        let kinds = crate::actions::schema::PROPOSAL_KINDS;
+        let mut with_editable = 0;
+        for kind in kinds {
+            let schema = crate::actions::schema::schema_for(kind, true).unwrap();
+            if mentions_editable_keyword(&schema) {
+                with_editable += 1;
+            }
+            let wire = wire_schema(&schema);
+            assert!(!mentions_editable_keyword(&wire), "{kind}: {wire}");
+            // The same schema minus the keyword, byte for byte, in order.
+            let expected = serde_json::to_string(&schema)
+                .unwrap()
+                .replace(r#","editable":true"#, "");
+            assert_eq!(serde_json::to_string(&wire).unwrap(), expected, "{kind}");
+        }
+        assert!(with_editable >= 3, "the candidate set must not be empty");
+    }
+
+    #[test]
+    fn wire_schema_leaves_a_property_named_editable_alone() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"editable": {"type": "boolean", "editable": true}, "a": {"type": "string"}},
+            "required": ["editable", "a"]
+        });
+        let wire = wire_schema(&schema);
+        assert_eq!(
+            serde_json::to_string(&wire).unwrap(),
+            r#"{"type":"object","properties":{"editable":{"type":"boolean"},"a":{"type":"string"}},"required":["editable","a"]}"#
+        );
+    }
 
     // -- test doubles ----------------------------------------------------
 
@@ -1832,7 +1946,7 @@ mod tests {
     #[test]
     fn the_egress_row_counts_what_the_text_step_replaced() {
         let _g = network_guard();
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
         let transport = ScriptedTransport::new(vec![ok("done")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
@@ -1863,7 +1977,7 @@ mod tests {
     #[test]
     fn the_connect_timeout_path_logs_text_counts_too() {
         let _g = network_guard();
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
         // `.invalid` never resolves, so this fails fast and still logs a row.
         let r = post_json_with_connect_timeout(
             "https://example.invalid/v1/chat",
@@ -2488,6 +2602,38 @@ mod tests {
         assert!(!msg.contains("sk-test"), "{msg}");
     }
 
+    /// #674: Local mode keeps saved API keys off the cloud vendors' model
+    /// list endpoints, and a loopback list (a local server) still works.
+    #[test]
+    fn the_model_list_get_is_refused_in_local_mode_for_a_cloud_host() {
+        /// Puts the mode back to Auto even when an assert fails.
+        struct RestoreMode;
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                crate::mode::set_current(crate::mode::Mode::Auto);
+            }
+        }
+        let _g = network_guard();
+        let _restore = RestoreMode;
+        crate::mode::set_current(crate::mode::Mode::Local);
+        let err = get_json_with_headers(
+            "https://api.anthropic.com/v1/models",
+            &[("x-api-key", "sk-test")],
+            Duration::from_secs(1),
+            "anthropic models",
+        )
+        .unwrap_err();
+        let loopback = loopback_only_guard("http://127.0.0.1:9/v1/models");
+        crate::mode::set_current(crate::mode::Mode::Cloud);
+        let cloud = loopback_only_guard("https://api.openai.com/v1/models");
+        let msg = err.to_string();
+        assert!(msg.contains("Local"), "{msg}");
+        assert!(!msg.contains("sk-test"), "{msg}");
+        assert!(!msg.contains('\u{2014}'), "rule 11: {msg}");
+        assert!(loopback.is_ok());
+        assert!(cloud.is_ok(), "Cloud and Auto still list models");
+    }
+
     #[test]
     fn offline_guard_names_localhost_with_guidance() {
         let _g = network_guard();
@@ -2758,7 +2904,7 @@ mod tests {
     #[test]
     fn post_json_with_logs_a_successful_attempt_to_the_egress_log() {
         let _g = network_guard();
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
 
         let transport = ScriptedTransport::new(vec![ok("done")]);
         let sleeper = RecordingSleeper::new();
@@ -2773,7 +2919,7 @@ mod tests {
     /// #487: the success row carries what the response cost, from the same
     /// price table the tooltip uses.
     fn cost_in_last_egress_row(model: &str) -> serde_json::Value {
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
         let body = include_str!("../../tests/fixtures/anthropic_response.json");
         let transport = ScriptedTransport::new(vec![ok(body)]);
         let sleeper = RecordingSleeper::new();
@@ -2818,7 +2964,7 @@ mod tests {
     #[test]
     fn post_json_with_logs_the_retry_attempt_as_retried() {
         let _g = network_guard();
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
 
         let transport = ScriptedTransport::new(vec![no_response("connection refused"), ok("done")]);
         let sleeper = RecordingSleeper::new();
@@ -2838,7 +2984,7 @@ mod tests {
     #[test]
     fn post_json_with_never_logs_a_fake_key_from_headers_or_a_failing_response_body() {
         let _g = network_guard();
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
 
         let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
         let body_text = format!("{{\"error\": \"invalid api key {fake_key}\"}}");
@@ -3357,13 +3503,18 @@ mod tests {
 
     #[test]
     fn a_cancel_ends_a_read_the_server_never_answers_within_a_poll_or_two() {
-        // The server sends the headers and then goes quiet for 5 s.
+        // Independent of machine speed (#670): the server stays quiet for 60 s
+        // and the stall limit is 300 s, so neither the server nor a stall can
+        // end the read. Only the cancel can, and that is what the error kind
+        // proves. The elapsed bound (30 s) is half the server's silence: it
+        // only has to show the read did not wait for the server, and no
+        // scheduler delay on a loaded machine gets near it.
         let url = raw_server(
             vec![
                 b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec(),
                 b"late".to_vec(),
             ],
-            5000,
+            60_000,
         );
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c = cancel.clone();
@@ -3371,11 +3522,33 @@ mod tests {
             std::thread::sleep(Duration::from_millis(400));
             c.store(true, std::sync::atomic::Ordering::SeqCst);
         });
+        let _g = network_guard();
         let start = std::time::Instant::now();
-        let result = read_all_body(&url, &cancel);
-        assert!(result.is_err());
+        let err = post_json_read_body(
+            &url,
+            &json!({"model": "m"}),
+            Duration::from_secs(2),
+            "test",
+            &cancel,
+            Duration::from_secs(300),
+            |r| {
+                let mut s = String::new();
+                r.read_to_string(&mut s)?;
+                Ok(s)
+            },
+        )
+        .unwrap_err();
+        // A cancel that lands while the headers are still being read comes
+        // back as ureq's "connection aborted" transport error instead of the
+        // raw io error, so accept both spellings of it.
+        let io_kind = err.downcast_ref::<std::io::Error>().map(|e| e.kind());
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            io_kind == Some(std::io::ErrorKind::ConnectionAborted)
+                || format!("{err:#}").contains("connection aborted"),
+            "{err:#}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
             "took {:?}",
             start.elapsed()
         );

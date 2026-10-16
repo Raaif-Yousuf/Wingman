@@ -69,7 +69,15 @@ pub const ROUTER_MAX_TOKENS: u32 = 200;
 /// below and change nothing.
 pub const DEFAULT_ROUTER_THRESHOLD: f64 = 0.7;
 
-const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Identify which listed action (if any) the screen suggests, and describe in one short sentence what's on screen. Never explain your reasoning, only report the result. Use plain text only: no markdown and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
+/// MEASURED 2026-10-16 (#223, `app::tests::router_live_recognizes_email_compose`,
+/// local Ollama `qwen3.5:4b`, the expansion plan's router default): with the
+/// earlier one-line prompt, 1 of 4 runs put an action id into `summary` and
+/// picked the wrong action. With the field roles stated below (summary is
+/// plain prose and never an id, intent is copied exactly or "none"), 5 of 5
+/// runs picked `review-this-email` with a prose summary and no echoed id
+/// (~14-17 s each on CPU: `/api/ps` showed `size_vram` 0 on this machine, so
+/// those times are CPU times). `gemma3:4b` was not re-measured.
+const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Fill three fields. \"summary\": one short plain sentence about what is visible on screen, never an action id or action name. \"intent\": the id of the one listed action the screen suggests, copied exactly, or \"none\" if no listed action fits. \"confidence\": a number from 0 to 1. Never explain your reasoning, only report the result. Use plain text only: no markdown and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
 
 /// One candidate action offered to the router: its id and a one-line
 /// description (today: [`PaletteAction::name`] -- the catalogue has no
@@ -136,7 +144,12 @@ pub fn build_request(image_png: Vec<u8>, candidates: &[RouterCandidate]) -> Requ
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let system = format!("{ROUTER_SYSTEM_PREFIX}\n\nAvailable actions:\n{list}");
+    // #768: the screenshot is data, never instructions. MEASURED 2026-10-16
+    // (Anthropic claude-haiku-5-5, low effort, one tiny image): this request
+    // and the default screen-check request both came back as a normal
+    // completed answer, not a "refusal", with the note in place.
+    let note = crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE;
+    let system = format!("{ROUTER_SYSTEM_PREFIX}\n\nAvailable actions:\n{list}\n\n{note}");
     Request {
         system,
         user: "What does this screen suggest?".to_string(),
@@ -314,9 +327,29 @@ pub fn cheapest_router_target(
 /// follow, and it degrades safely (falls back to SOME configured model,
 /// never `None`, unless the list itself is empty).
 fn smallest_model(models: &[String]) -> Option<String> {
-    const CHEAP_MARKERS: [&str; 6] = ["nano", "mini", "haiku", "flash-lite", "flash", "lite"];
+    // Markers are matched as whole name segments, not substrings: "mini" is
+    // inside every "gemini" id. `flash-lite` needs both segments, so it ranks
+    // above plain `flash`.
+    const CHEAP_MARKERS: [&[&str]; 6] = [
+        &["nano"],
+        &["mini"],
+        &["haiku"],
+        &["flash", "lite"],
+        &["flash"],
+        &["lite"],
+    ];
+    let segments = |m: &str| -> Vec<String> {
+        m.to_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .map(str::to_string)
+            .collect()
+    };
     for marker in CHEAP_MARKERS {
-        if let Some(m) = models.iter().find(|m| m.to_lowercase().contains(marker)) {
+        let found = models.iter().find(|m| {
+            let segs = segments(m);
+            marker.iter().all(|w| segs.iter().any(|s| s == w))
+        });
+        if let Some(m) = found {
             return Some(m.clone());
         }
     }
@@ -419,6 +452,36 @@ mod tests {
         let req = build_request(vec![], &candidates);
         assert!(req.system.contains("check-my-work: Check my work"));
         assert!(req.system.contains("add-to-calendar: Add to calendar"));
+    }
+
+    /// #223: small local models echoed action ids into `summary`. The prompt
+    /// must state each field's role, and the "summary never names an action"
+    /// instruction must come before the candidate list.
+    #[test]
+    fn build_request_states_the_field_roles_before_the_candidate_list() {
+        let req = build_request(vec![], &[candidate("a", "A")]);
+        let list_at = req.system.find("Available actions:").unwrap();
+        let rules = &req.system[..list_at];
+        assert!(rules.contains("summary"), "{rules}");
+        assert!(rules.contains("never an action id"), "{rules}");
+        assert!(rules.contains("intent"), "{rules}");
+        assert!(rules.contains("\"none\""), "{rules}");
+    }
+
+    /// #768: the screenshot is data, never instructions, for the router too.
+    /// The note sits after the candidate list and the schema is untouched.
+    #[test]
+    fn build_request_carries_the_screen_note_and_keeps_the_schema_order() {
+        let req = build_request(vec![], &[candidate("a", "A")]);
+        let note = crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE;
+        assert!(req.system.ends_with(note), "{}", req.system);
+        let keys: Vec<&str> = req.schema.as_ref().unwrap()["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(keys, ["summary", "intent", "confidence"]);
     }
 
     #[test]
@@ -606,6 +669,29 @@ mod tests {
             cheapest_router_target(&ready, models).unwrap().model,
             "gemini-3.8-flash"
         );
+    }
+
+    #[test]
+    fn smallest_model_does_not_match_mini_inside_gemini_ids() {
+        // A pro model listed first must not win through the "mini" in "gemini".
+        let models = vec![
+            "gemini-3.1-pro-preview".to_string(),
+            "gemini-2.5-pro".to_string(),
+            "gemini-2.5-flash".to_string(),
+        ];
+        assert_eq!(smallest_model(&models).unwrap(), "gemini-2.5-flash");
+        let lite_first = vec![
+            "gemini-3.1-pro-preview".to_string(),
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.5-flash-lite".to_string(),
+        ];
+        assert_eq!(
+            smallest_model(&lite_first).unwrap(),
+            "gemini-2.5-flash-lite"
+        );
+        // Real "mini" and "nano" segments still match.
+        let openai = vec!["gpt-5.4".to_string(), "gpt-5.4-mini".to_string()];
+        assert_eq!(smallest_model(&openai).unwrap(), "gpt-5.4-mini");
     }
 
     #[test]

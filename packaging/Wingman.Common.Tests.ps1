@@ -1116,3 +1116,33 @@ function Remove-Item { process { Write-Output "REMOVED:$($_.Thumbprint)" } }
         ($out -join "`n") | Should -BeExactly 'REMOVED:BBBB'
     }
 }
+
+Describe 'Registration stays sparse (issue #251)' {
+    It 'registers the package with -ExternalLocation' {
+        # Parsed, not text-matched, so comments, `&` calls, one-line blocks and
+        # continuation lines cannot fool it.
+        $files = @(Get-ChildItem -Path $PSScriptRoot -Include *.ps1, *.psm1 -Recurse -File |
+                Where-Object { $_.Name -notlike '*.Tests.ps1' })
+        $files.Count | Should -BeGreaterThan 0
+        $calls = @(foreach ($f in $files) {
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+                $ast.FindAll({
+                        param($n)
+                        $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-AppxPackage'
+                    }, $true)
+            })
+        $calls.Count | Should -BeGreaterThan 0
+        foreach ($c in $calls) {
+            $names = @($c.CommandElements |
+                    Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } |
+                    ForEach-Object { $_.ParameterName })
+            $names | Should -Contain 'ExternalLocation'
+        }
+    }
+
+    It 'tells release readers to install with install.ps1, not the msix' {
+        $yml = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\.github\workflows\release.yml') -Raw) -replace "`r", ''
+        $yml | Should -Match 'never by double-clicking wingman\.msix'
+        $yml | Should -Match '\$notes = "\$signedNote`n`n\$installNote'
+    }
+}

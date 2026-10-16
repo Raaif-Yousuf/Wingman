@@ -18,9 +18,15 @@
 //! * **Only this module names `rusqlite`.** Callers get typed methods.
 
 mod acl;
+mod egress;
 mod import;
 mod migrate;
+mod profile_field;
 mod usage_day;
+
+pub use egress::append_pending;
+#[cfg(test)]
+pub(crate) use egress::append_pending_at;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +48,12 @@ pub enum StoreError {
     Acl(String),
     /// A migration step failed and was rolled back.
     Migration(i64, String),
+    /// The saved profile could not be read or written.
+    Profile(String),
+    /// A saved profile value is sealed for another Windows user or PC.
+    Undecryptable(String),
+    /// A profile value looked like payment data and was not saved.
+    Refused(String),
     Other(String),
 }
 
@@ -61,6 +73,17 @@ impl std::fmt::Display for StoreError {
             StoreError::Migration(v, why) => write!(
                 f,
                 "Wingman could not update its saved data (step {v}: {why})."
+            ),
+            StoreError::Profile(why) => {
+                write!(f, "Wingman could not read or save your profile ({why}).")
+            }
+            StoreError::Undecryptable(why) => write!(
+                f,
+                "Wingman could not unlock your saved profile ({why}). It was probably saved by another Windows user or on another PC, and only that user on that PC can open it. Your saved profile was left as it is."
+            ),
+            StoreError::Refused(why) => write!(
+                f,
+                "Wingman did not save your profile: {why}. Remove that text and try again."
             ),
             StoreError::Other(why) => write!(f, "Wingman could not save its history ({why})."),
         }
@@ -124,7 +147,7 @@ impl Store {
     }
 
     #[cfg(test)]
-    fn in_memory() -> Store {
+    pub(crate) fn in_memory() -> Store {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate::run(&mut conn, migrate::MIGRATIONS, None).unwrap();
         Store {
@@ -215,42 +238,174 @@ fn legacy_spend_path() -> Result<PathBuf, StoreError> {
     }
 }
 
+/// `%LOCALAPPDATA%\Wingman\egress.log`, the file the `egress` table
+/// replaced. Under `#[cfg(test)]` a per-process file in `%TEMP%` (rule 9).
+fn legacy_egress_path() -> Result<PathBuf, StoreError> {
+    #[cfg(test)]
+    {
+        Ok(std::env::temp_dir().join(format!("wingman-test-egress-{}.log", std::process::id())))
+    }
+    #[cfg(not(test))]
+    {
+        let base = crate::known_folder::local_app_data()
+            .map_err(|e| StoreError::Other(format!("no local app data folder: {e}")))?;
+        Ok(base.join("Wingman").join("egress.log"))
+    }
+}
+
+/// `%LOCALAPPDATA%\Wingman\egress-pending.log`: where request log rows wait
+/// while the store cannot open (`egress::record`). Under `#[cfg(test)]` a
+/// per-process file in `%TEMP%` (rule 9).
+fn pending_egress_path() -> Result<PathBuf, StoreError> {
+    #[cfg(test)]
+    {
+        Ok(std::env::temp_dir().join(format!(
+            "wingman-test-egress-pending-{}.log",
+            std::process::id()
+        )))
+    }
+    #[cfg(not(test))]
+    {
+        let base = crate::known_folder::local_app_data()
+            .map_err(|e| StoreError::Other(format!("no local app data folder: {e}")))?;
+        Ok(base.join("Wingman").join("egress-pending.log"))
+    }
+}
+
+/// `profile.bin` in the roaming folder, the file the `profile_field` table
+/// replaced. Under `#[cfg(test)]` a per-process file in `%TEMP%` (rule 9).
+fn legacy_profile_path() -> Result<PathBuf, StoreError> {
+    #[cfg(test)]
+    {
+        Ok(std::env::temp_dir().join(format!("wingman-test-profile-{}.bin", std::process::id())))
+    }
+    #[cfg(not(test))]
+    {
+        let base = crate::known_folder::roaming_app_data()
+            .map_err(|e| StoreError::Other(format!("no app data folder: {e}")))?;
+        Ok(base.join("Wingman").join("profile.bin"))
+    }
+}
+
+/// The folder the database lives in, for cards that say where data is kept.
+pub fn data_dir() -> Option<PathBuf> {
+    db_path().ok()?.parent().map(Path::to_path_buf)
+}
+
+/// The old files that are imported once, then renamed `.migrated`, and the
+/// pending file that is imported on every open that finds it.
+struct Legacy<'a> {
+    spend: &'a Path,
+    egress: &'a Path,
+    pending: &'a Path,
+    profile: &'a Path,
+}
+
 /// The real open, at the real paths.
 fn open_default() -> Result<Store, StoreError> {
     sweep_stale_test_dirs();
-    open_in(&db_path()?, &legacy_spend_path()?, acl::restrict_dir)
+    let (spend, egress, pending, profile) = (
+        legacy_spend_path()?,
+        legacy_egress_path()?,
+        pending_egress_path()?,
+        legacy_profile_path()?,
+    );
+    open_in(
+        &db_path()?,
+        &Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &profile,
+        },
+        acl::restrict_dir,
+    )
 }
+
+/// Written into the store folder once its owner-only restriction succeeded.
+const ACL_MARKER: &str = ".owner-only";
 
 /// Owner-only directory, recovery, migrations, imports.
 ///
-/// The directory is restricted when it is created, not on every launch:
-/// spawning `icacls` costs tens of milliseconds on the UI thread at startup
-/// (MEASURED 2026-10-15, see the PR for the numbers). If the restriction
-/// fails, the directory is removed again so the next launch retries it
-/// instead of trusting an unrestricted folder.
+/// The directory is restricted once, not on every launch: spawning `icacls`
+/// costs tens of milliseconds on the UI thread at startup (MEASURED
+/// 2026-10-15, see the PR for the numbers). "Once" means until the marker
+/// file exists, so a launch cut short after the folder was made, or a folder
+/// first made in portable mode, is restricted on the next normal launch. If
+/// the restriction fails on a folder made this run, the folder is removed
+/// again so the next launch retries instead of trusting an unrestricted one.
+/// Limit: the marker records only that the step ran once, so an ACL reset by
+/// someone later is not detected.
 fn open_in(
     path: &Path,
-    legacy_spend: &Path,
+    legacy: &Legacy<'_>,
     restrict: impl FnOnce(&Path) -> Result<(), StoreError>,
 ) -> Result<Store, StoreError> {
     let dir = path
         .parent()
         .ok_or_else(|| StoreError::Other("the store path has no folder".to_string()))?;
-    if !dir.exists() {
-        std::fs::create_dir_all(dir).map_err(|e| StoreError::Other(e.to_string()))?;
+    // A marker file records that the restriction finished. A folder with no
+    // marker was either interrupted between create and restrict, or made in
+    // portable mode (no ACL by design) and now opened in normal mode, so it
+    // is restricted now. One `icacls` call, once.
+    let marker = dir.join(ACL_MARKER);
+    if !dir.exists() || !marker.exists() {
+        let created = !dir.exists();
+        if created {
+            std::fs::create_dir_all(dir).map_err(|e| StoreError::Other(e.to_string()))?;
+        }
         if let Err(e) = restrict(dir) {
-            let _ = std::fs::remove_dir(dir);
+            if created {
+                let _ = std::fs::remove_dir(dir);
+            }
             return Err(e);
+        }
+        // Portable mode skips the restriction, so it must not claim it ran.
+        if !crate::portable::skip_acl() {
+            // Best effort: a missing marker only means one more restrict.
+            let _ = std::fs::write(&marker, b"");
         }
     }
     let (store, recovered) = Store::open_recovering(path)?;
     if let Some(n) = recovered {
         note(n);
     }
-    if let Some(n) = import::spend_json(&mut store.lock(), legacy_spend)? {
+    if let Some(n) = import::spend_json(&mut store.lock(), legacy.spend)? {
+        note(n);
+    }
+    for n in request_log_notices(&store, legacy) {
+        note(n);
+    }
+    if let Some(n) = profile_notice(&store, legacy) {
         note(n);
     }
     Ok(store)
+}
+
+/// Runs the request log imports. They are not allowed to take the store
+/// down: a failure is a notice, and the store still opens (rows would
+/// otherwise have nowhere to go for the whole run). Each import takes the
+/// lock on its own; guards held across both would deadlock the second.
+fn request_log_notices(store: &Store, legacy: &Legacy<'_>) -> Vec<String> {
+    let old_log = import::egress_log(&mut store.lock(), legacy.egress);
+    let pending = import::egress_pending(&mut store.lock(), legacy.pending);
+    [old_log, pending]
+        .into_iter()
+        .filter_map(|r| match r {
+            Ok(n) => n,
+            Err(e) => Some(e.to_string()),
+        })
+        .collect()
+}
+
+/// Imports the old `profile.bin`. Like the request logs it is not allowed to
+/// take the store down: any failure is a notice, the old file is left where
+/// it is, and the next launch tries again.
+fn profile_notice(store: &Store, legacy: &Legacy<'_>) -> Option<String> {
+    match import::profile_bin(&mut store.lock(), legacy.profile) {
+        Ok(n) => n,
+        Err(e) => Some(e.to_string()),
+    }
 }
 
 /// Test builds only: removes `wingman-test-store-<pid>` directories left in
@@ -347,7 +502,7 @@ mod tests {
             migrate::current_version(&conn).unwrap(),
             migrate::MIGRATIONS.last().unwrap().version
         );
-        for table in ["meta", "usage_day"] {
+        for table in ["meta", "usage_day", "egress", "profile_field"] {
             let n: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE name = ?1",
@@ -427,6 +582,9 @@ mod tests {
             StoreError::Corrupt("x".into()),
             StoreError::Acl("x".into()),
             StoreError::Migration(2, "x".into()),
+            StoreError::Profile("x".into()),
+            StoreError::Undecryptable("x".into()),
+            StoreError::Refused("x".into()),
             StoreError::Other("x".into()),
         ];
         for e in all {
@@ -492,7 +650,14 @@ mod tests {
     fn the_acl_step_runs_only_when_the_directory_is_created() {
         let dir = scratch("acl-once");
         let path = dir.join("store").join("wingman.db");
-        let legacy = dir.join("spend.json");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
         let calls = std::cell::Cell::new(0);
         let count = |_: &Path| {
             calls.set(calls.get() + 1);
@@ -512,10 +677,72 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_without_the_marker_is_restricted_on_open_and_kept() {
+        // A folder left behind by a launch cut short (or made in portable
+        // mode) has no marker, so the next open restricts it.
+        let dir = scratch("acl-marker");
+        let store_dir = dir.join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let path = store_dir.join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
+        let calls = std::cell::Cell::new(0);
+        let count = |_: &Path| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        drop(open_in(&path, &legacy, count).unwrap());
+        assert_eq!(calls.get(), 1, "an unmarked folder is restricted");
+        assert!(store_dir.join(ACL_MARKER).exists());
+        // A failure on a folder that was not made this run keeps the folder.
+        std::fs::remove_file(store_dir.join(ACL_MARKER)).unwrap();
+        let err = open_in(&path, &legacy, |_: &Path| {
+            Err(StoreError::Acl("nope".to_string()))
+        })
+        .err()
+        .expect("must fail");
+        assert!(matches!(err, StoreError::Acl(_)));
+        assert!(store_dir.exists(), "an existing folder is never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn portable_mode_does_not_write_the_marker() {
+        let dir = scratch("acl-marker-portable");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
+        let _forced = crate::portable::ForcedRoot::new(&dir);
+        drop(open_in(&path, &legacy, |_: &Path| Ok(())).unwrap());
+        assert!(!dir.join("store").join(ACL_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_failed_acl_step_removes_the_directory_so_the_next_launch_retries() {
         let dir = scratch("acl-fail");
         let path = dir.join("store").join("wingman.db");
-        let err = open_in(&path, &dir.join("spend.json"), |_: &Path| {
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
+        let err = open_in(&path, &legacy, |_: &Path| {
             Err(StoreError::Acl("nope".to_string()))
         })
         .err()
@@ -532,13 +759,244 @@ mod tests {
         // (directory, ACL step, migrations) and every later launch.
         let dir = scratch("timing");
         let path = dir.join("store").join("wingman.db");
-        let legacy = dir.join("spend.json");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
         let t = std::time::Instant::now();
         drop(open_in(&path, &legacy, acl::restrict_dir).unwrap());
         println!("first-ever launch: {:?}", t.elapsed());
         let t = std::time::Instant::now();
         drop(open_in(&path, &legacy, acl::restrict_dir).unwrap());
         println!("later launch: {:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_open_imports_a_waiting_egress_log_and_renames_it() {
+        // The wiring check for the import: through the real open path, not
+        // the import function alone.
+        let dir = scratch("egress-import");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let row = crate::egress::build_entry(
+            "legacy",
+            "https://api.example.com/",
+            &serde_json::json!({"model": "m"}),
+            false,
+            1,
+            2,
+            crate::egress::Outcome::Success,
+            None,
+        );
+        std::fs::write(&egress, serde_json::to_string(&row).unwrap() + "\n").unwrap();
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+
+        assert_eq!(s.egress_rows().unwrap().len(), 1);
+        assert!(!egress.exists());
+        assert!(dir.join("egress.log.migrated").exists());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_open_imports_a_waiting_profile_file_and_a_bad_one_does_not_stop_it() {
+        // The wiring check for the profile import, through the real open path.
+        let dir = scratch("profile-import");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let profile = dir.join("profile.bin");
+        crate::profile::Profile {
+            full_name: crate::profile::Field::new("Ada Lovelace".to_string(), false),
+            ..Default::default()
+        }
+        .write_legacy_file(&profile)
+        .unwrap();
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &profile,
+        };
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+
+        assert_eq!(s.load_profile().unwrap().full_name.value, "Ada Lovelace");
+        assert!(!profile.exists());
+        assert!(dir.join("profile.bin.migrated").exists());
+        drop(s);
+
+        // A file nobody on this account can open: the store still opens.
+        let path2 = dir.join("store2").join("wingman.db");
+        std::fs::write(&profile, b"not a profile").unwrap();
+        let s = open_in(&path2, &legacy, |_: &Path| Ok(()))
+            .expect("a bad profile file must not fail the open");
+        assert!(profile.exists(), "left where it is");
+        assert!(profile_notice(&s, &legacy).is_some());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_database_does_not_lose_the_profile() {
+        let dir = scratch("profile-recover");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let profile = dir.join("profile.bin");
+        crate::profile::Profile {
+            full_name: crate::profile::Field::new("Ada Lovelace".to_string(), false),
+            ..Default::default()
+        }
+        .write_legacy_file(&profile)
+        .unwrap();
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &profile,
+        };
+        drop(open_in(&path, &legacy, |_: &Path| Ok(())).unwrap());
+        assert!(dir.join("profile.bin.migrated").exists());
+        std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+
+        assert_eq!(s.load_profile().unwrap().full_name.value, "Ada Lovelace");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_row(provider: &str) -> crate::egress::EgressEntry {
+        crate::egress::build_entry(
+            provider,
+            "https://api.example.com/",
+            &serde_json::json!({"model": "m"}),
+            false,
+            1,
+            2,
+            crate::egress::Outcome::Success,
+            None,
+        )
+    }
+
+    #[test]
+    fn rows_written_while_the_store_was_down_are_imported_by_the_next_open() {
+        let dir = scratch("pending");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        egress::append_pending_at(&pending, &sample_row("down-1")).unwrap();
+        egress::append_pending_at(&pending, &sample_row("down-2")).unwrap();
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+
+        let got: Vec<String> = s
+            .egress_rows()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        assert_eq!(got, ["down-1", "down-2"]);
+        assert!(!pending.exists(), "imported rows are not imported twice");
+        drop(s);
+        // A later run that finds the store down again appends again, and the
+        // import runs again even though the old log was imported long ago.
+        egress::append_pending_at(&pending, &sample_row("down-3")).unwrap();
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+        assert_eq!(s.egress_rows().unwrap().len(), 3);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_cut_off_by_a_crash_does_not_swallow_the_next_one() {
+        let dir = scratch("pending-cut");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        std::fs::write(&pending, "{\"a\":1").unwrap();
+        egress::append_pending_at(&pending, &sample_row("after-crash")).unwrap();
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+
+        let got: Vec<String> = s
+            .egress_rows()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        assert_eq!(got, ["after-crash"]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_request_log_import_does_not_stop_the_store_opening() {
+        let dir = scratch("import-fails");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
+        drop(open_in(&path, &legacy, |_: &Path| Ok(())).unwrap());
+        {
+            // Make every egress insert fail, then leave rows waiting.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "DELETE FROM meta WHERE key = 'imported_egress';
+                 CREATE TRIGGER boom BEFORE INSERT ON egress
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            &egress,
+            serde_json::to_string(&sample_row("old")).unwrap() + "\n",
+        )
+        .unwrap();
+        egress::append_pending_at(&pending, &sample_row("waiting")).unwrap();
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(()))
+            .expect("an import failure must not fail the open");
+
+        assert!(egress.exists() && pending.exists(), "both stay for a retry");
+        let notices = request_log_notices(&s, &legacy);
+        assert_eq!(
+            notices.len(),
+            2,
+            "each failed import raises a notice: {notices:?}"
+        );
+        drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

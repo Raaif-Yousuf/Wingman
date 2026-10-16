@@ -1,0 +1,96 @@
+name: Coverage
+
+# Informational only. This is a separate workflow so it runs in parallel with
+# the required CI job and never delays it. The job cannot fail a pull request:
+# continue-on-error keeps a coverage problem (a tool install, a flaky run)
+# from turning the PR red, and this check should not be marked required in the
+# branch protection rules.
+#
+# Output: a totals table in the job summary (all code, pure logic, and
+# Win32-heavy code apart) and the lcov file plus an HTML report as an artifact.
+# Codecov upload is optional: it only runs when the CODECOV_TOKEN secret exists.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: cargo-llvm-cov (informational)
+    runs-on: windows-latest
+    continue-on-error: true
+    env:
+      # Only whether the secret exists, never the token itself: the token is
+      # given to the upload step alone, so the test code never sees it.
+      # False when the secret is not set (and always on fork PRs).
+      HAS_CODECOV: ${{ secrets.CODECOV_TOKEN != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Add the llvm-tools component
+        run: rustup component add llvm-tools-preview
+
+      # cargo-llvm-cov is Apache-2.0 OR MIT. It is a build tool, not a
+      # dependency of the crate, so it never ships.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+          # cargo-llvm-cov builds into target/llvm-cov-target, so point the cache at it.
+          workspaces: ". -> target/llvm-cov-target"
+
+      # Same test run as the CI job: the tests already use their own mutex,
+      # window-class and file names (AGENTS.md rule 9), so nothing here touches
+      # production names.
+      - name: Run tests with coverage
+        run: cargo llvm-cov --all-targets --no-report
+        env:
+          WINGMAN_FULL_SUITE: '1'
+
+      - name: Write reports
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force coverage | Out-Null
+          cargo llvm-cov report --lcov --output-path coverage/lcov.info
+          cargo llvm-cov report --json --summary-only --output-path coverage/summary.json
+          cargo llvm-cov report --html --output-dir coverage/html
+
+      - name: Job summary
+        shell: pwsh
+        run: |
+          $md = ./scripts/coverage-summary.ps1 -SummaryJson coverage/summary.json
+          $md
+          "## Test coverage (informational)`n`n$md`n`nWin32-heavy code is checked by hand; see scripts/coverage-summary.ps1 for the split." |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: error
+
+      - name: Upload to Codecov (only when the token secret exists)
+        if: ${{ env.HAS_CODECOV == 'true' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage/lcov.info
+          fail_ci_if_error: false

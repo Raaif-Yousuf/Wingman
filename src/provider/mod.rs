@@ -9,6 +9,7 @@ pub mod gemini;
 pub mod model_list;
 pub mod ollama;
 pub mod ollama_admin;
+pub mod ollama_gpu_fix;
 pub mod openai;
 pub mod openai_compat;
 
@@ -260,21 +261,78 @@ pub struct Usage {
     pub cache_read_tokens: u32,
 }
 
-/// The usage block of a successful response body, by the tag the provider
-/// passes to `common::post_json` (each tag is that provider's `id()`). `None`
-/// for an unknown tag, a body that does not parse, or one with no usage. The
-/// egress log reads this at the HTTP boundary (#487), where the response is
-/// in hand but the provider has not parsed it yet.
+/// The usage block of a response body, by the tag the provider passes to
+/// `common::post_json` (each tag is that provider's `id()`). `None` for an
+/// unknown tag, a body that does not parse, or one with no usage. Read even
+/// when the body is a refusal or a truncated reply, because those were billed
+/// too (#730). The egress log reads this at the HTTP boundary (#487), where
+/// the response is in hand but the provider has not parsed it yet.
 pub(crate) fn usage_from_body(tag: &str, body: &str) -> Option<Usage> {
-    let parsed = match tag {
-        "anthropic" => anthropic::Anthropic::parse_completion(body),
-        "openai" => openai::OpenAi::parse_completion(body),
-        "gemini" => gemini::Gemini::parse_completion(body),
-        "ollama" => ollama::Ollama::parse_completion(body),
-        "openai-compat" => openai_compat::OpenAiCompat::parse_completion(body),
-        _ => return None,
-    };
-    parsed.ok()?.usage
+    match tag {
+        "anthropic" => anthropic::Anthropic::parse_usage(body),
+        "openai" => openai::OpenAi::parse_usage(body),
+        "gemini" => gemini::Gemini::parse_usage(body),
+        "ollama" => ollama::Ollama::parse_usage(body),
+        "openai-compat" => openai_compat::OpenAiCompat::parse_usage(body),
+        _ => None,
+    }
+}
+
+/// The error for a reply the model's own filter blocked (#731): the same
+/// words for every provider, naming the vendor's raw reason.
+pub(crate) fn declined_error(tag: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{tag}: the model declined to answer ({})",
+        safe_reason(reason)
+    )
+}
+
+#[cfg(test)]
+mod safe_reason_tests {
+    use super::safe_reason;
+
+    #[test]
+    fn keeps_a_plain_reason_and_replaces_anything_else_with_unknown() {
+        assert_eq!(safe_reason("SAFETY"), "SAFETY");
+        assert_eq!(safe_reason("content_filter"), "content_filter");
+        assert_eq!(safe_reason("model-context-window"), "model-context-window");
+        for bad in [
+            "",
+            "two words",
+            "dash \u{2014} here",
+            "line\nbreak",
+            "caf\u{e9}",
+            &"x".repeat(41),
+        ] {
+            assert_eq!(safe_reason(bad), "unknown", "{bad:?}");
+        }
+        assert_eq!(safe_reason(&"x".repeat(40)).len(), 40);
+    }
+
+    #[test]
+    fn an_odd_server_reason_never_reaches_the_error_text() {
+        let long = "x".repeat(200);
+        let err = super::declined_error("openai-compat", &long).to_string();
+        assert!(err.contains("(unknown)"), "{err}");
+        assert!(!err.contains("xxxx"), "{err}");
+    }
+}
+
+/// A vendor- or server-supplied reason string, made safe for card text: kept
+/// only when it is 1 to 40 ASCII letters, digits, `_` or `-`, else "unknown".
+/// A compat endpoint is user-configured and could send anything (long text,
+/// control characters, an em dash).
+pub(crate) fn safe_reason(reason: &str) -> &str {
+    let ok = !reason.is_empty()
+        && reason.len() <= 40
+        && reason
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok {
+        reason
+    } else {
+        "unknown"
+    }
 }
 
 /// Why the provider stopped. A refusal, or an empty completion caused by
@@ -909,7 +967,13 @@ impl Chain {
 /// `Anthropic`/`OpenAi`/future providers without another trait change.
 pub fn physics_request(shot: &Shot, prompt: &str, want_difficulty: bool) -> Request {
     Request {
-        system: common::augmented_system_prompt(prompt, want_difficulty),
+        // #768: the screenshot is data, never instructions (the note goes
+        // last, after the user's own prompt and the rubric).
+        system: format!(
+            "{}\n\n{}",
+            common::augmented_system_prompt(prompt, want_difficulty),
+            crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE
+        ),
         user: "Check my working.".to_string(),
         images: vec![shot.png.clone()],
         // #23: routed through the proposal schema registry instead of
@@ -924,6 +988,15 @@ pub fn physics_request(shot: &Shot, prompt: &str, want_difficulty: bool) -> Requ
         effort: Effort::Unset,
         max_tokens: 0,
     }
+}
+
+/// Test fixture for the per-provider body tests: [`physics_request`] without
+/// the #768 screen note, so those tests keep pinning the body shape alone.
+#[cfg(test)]
+pub(crate) fn physics_request_no_note(shot: &Shot, prompt: &str, want_difficulty: bool) -> Request {
+    let mut req = physics_request(shot, prompt, want_difficulty);
+    req.system = common::augmented_system_prompt(prompt, want_difficulty);
+    req
 }
 
 /// Builds the `Request` for #39's "Add event from screen" action: the
@@ -1917,7 +1990,13 @@ mod tests {
     fn physics_request_carries_the_screenshot_and_prompt_unmodified_without_difficulty() {
         let s = shot();
         let req = physics_request(&s, "system prompt text", false);
-        assert_eq!(req.system, "system prompt text");
+        assert_eq!(
+            req.system,
+            format!(
+                "system prompt text\n\n{}",
+                crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE
+            )
+        );
         assert_eq!(req.user, "Check my working.");
         assert_eq!(req.images, vec![s.png]);
         assert_eq!(req.effort, Effort::Unset);
@@ -1926,6 +2005,24 @@ mod tests {
             .schema
             .expect("schema is always present for the physics check");
         assert!(schema["properties"].get("difficulty").is_none());
+    }
+
+    /// #768: the default screen check carries the note with the rubric too,
+    /// and the schema property order stays detail, headline, difficulty.
+    #[test]
+    fn physics_request_always_carries_the_screen_note() {
+        let note = crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE;
+        for want in [false, true] {
+            let req = physics_request(&shot(), "p", want);
+            assert!(req.system.contains(note), "{}", req.system);
+            let keys: Vec<String> = req.schema.unwrap()["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(keys[..2], ["detail", "headline"]);
+        }
     }
 
     #[test]

@@ -185,7 +185,9 @@ completion must satisfy. These kinds are registered today: `"verdict"` (today's
 `"form_fill"` (#40), `"text_answer"` (#242), `"page_summary"` (#67: `bullets`,
 then two summary lines, shown on the card only; the first line is cut to 50 characters, the second to 90 so both fit the collapsed card, and bullets are
 clamped in code), `"action_items"` (#314: a list of
-lines the `clipboard` executor copies as a Markdown checklist),
+lines the `clipboard` executor copies as a Markdown checklist), `"table"` (#69:
+`columns`, then `rows`, a list of cell lists; the `clipboard` executor copies them
+as tab-separated text (so they paste into spreadsheet columns), with spreadsheet formulas made safe; "Chart to data table" (#114) reuses it, marks each value column "(estimate)" and says so on the card; "Receipt to expense row" (#70) reuses it with a fixed five-column header and one row),
 `"error_explanation"` (#66: `meaning`, `cause`, `fix`, a read-only answer for
 the card), `"word_definition"` (#75: `definition`, `example`, a read-only answer for
 the card) and `"screen_explanation"` (#131: `detail`, then a one-sentence
@@ -196,7 +198,9 @@ for the verdict, the signs under "Seen in it:" and a fixed next step, never
 "safe", and has no model-written advice because the screen text is untrusted) and `"time_list"` (#315: `times`, each
 with the text, the clock time, the date if shown and the zone as written; the
 model only reads them, and `actions::time_zones` converts them to the local zone
-from Windows' own time zone data).
+from Windows' own time zone data) and `"jargon_terms"` (#335: `terms`, each
+a `term` then its `meaning`; the card shows the terms one per line, at most 12,
+each term once, each meaning cut to 80 characters in code).
 Each schema function returns a `serde_json::json!`
 literal shaped like standard JSON Schema (`"type": "object"`, `"properties"`,
 `"required"`, `"additionalProperties": false`), plus one

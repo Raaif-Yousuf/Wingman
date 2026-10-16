@@ -27,7 +27,11 @@ anyhow = "1.0"
 # checked, through ureq's `unversioned::resolver::Resolver`, which ureq says is
 # outside semver. The test `the_real_transport_connects_to_the_pinned_address_
 # not_to_a_lookup` fails if a newer ureq stops using the hook; bump on purpose.
-ureq = { version = "=3.4.2", features = ["json"] }
+# No `gzip` feature (#771): it only adds ureq's decompression glue and asks
+# servers for compressed bodies, about 18 KB (MEASURED 2026-10-16: 3,983,872 to
+# 3,965,440 bytes). flate2 and miniz_oxide stay, png needs them. web_page.rs
+# refuses a compressed reply. Do not turn default features back on.
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "json"] }
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = "3.6"
@@ -52,6 +56,11 @@ features = [
   "Win32_Graphics_DirectWrite",
   # D2D1_PIXEL_FORMAT's DXGI_FORMAT (issue #216).
   "Win32_Graphics_Dxgi_Common",
+  # machine.rs (#328) and ollama_gpu_fix.rs (#382): enumerate DXGI adapters
+  # (names, memory, vendor).
+  "Win32_Graphics_Dxgi",
+  # machine.rs (#328): GetSystemPowerStatus, on demand.
+  "Win32_System_Power",
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Dwm",
   "Win32_NetworkManagement_IpHelper",
@@ -84,6 +93,8 @@ features = [
   # type -- without this, activating OcrEngine or DataWriter fails.
   "Win32_System_WinRT",
   "Win32_UI_Controls",
+  # ui/file_dialog.rs (#117): GetOpenFileNameW / GetSaveFileNameW for sharing an action as a file.
+  "Win32_UI_Controls_Dialogs",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",

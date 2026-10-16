@@ -28,13 +28,23 @@
 //!
 //! # Storage and retention
 //!
-//! Issue #46 plans a real SQLite store; it does not exist yet. Until then
-//! this is the simplest thing that survives a restart: one JSON object per
-//! line, appended to `%LOCALAPPDATA%\Wingman\egress.log`. Every append caps
-//! the file at [`MAX_LOG_BYTES`] by dropping the OLDEST lines first (see
-//! [`cap_lines`]) -- an unbounded append-only log on the request path is a
-//! disk-filling bug on its own, independent of any privacy concern. When
-//! #46 lands, this file's rows are exactly the columns that table needs.
+//! Rows live in the local store's `egress` table (`store/egress.rs`, #46).
+//! Retention is 90 days and 10 000 rows, pruned inside the insert. The old
+//! `%LOCALAPPDATA%\Wingman\egress.log` is imported once and renamed
+//! `egress.log.migrated`.
+//!
+//! **A store failure never fails the request and never loses a row
+//! silently.** When the store cannot open or a write fails (locked, full,
+//! damaged, newer than this build, a failed ACL step), the failure is
+//! reported once per run on the next card (`store::report`) and the row is
+//! appended to `egress-pending.log` next to the store folder. The store
+//! imports and removes that file on the next open that works, so the row
+//! reaches the table and nothing reads two sources for long. Only when even
+//! that append fails is the row kept in a bounded in-memory list
+//! ([`UNSAVED_CAP`] rows, oldest dropped first and counted); the next
+//! successful save writes the kept rows first, in order. [`read_all_human`]
+//! shows the kept rows, the count waiting in the pending file, and the reason,
+//! so "Copy egress log" still answers "what left this machine" meanwhile.
 //!
 //! # Knowledge snippets (#85+)
 //!
@@ -49,20 +59,14 @@
 //! table, shared with the tooltip and the daily budget). This module has no
 //! price knowledge of its own.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Hard cap on `egress.log`'s size. Chosen to comfortably hold thousands of
-/// rows (each is well under 1 KB) while staying far short of anything that
-/// could meaningfully fill a disk. See [`cap_lines`] for the trimming
-/// policy once a write would exceed it.
-const MAX_LOG_BYTES: usize = 2_000_000;
+use crate::store::{Store, StoreError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -649,178 +653,139 @@ impl EgressEntry {
     }
 }
 
-/// Appends `new_line` to `existing`, then drops the OLDEST lines (never the
-/// newest -- a log that silently lost the request just made must not exist)
-/// until the result fits in `max_bytes`, or exactly one line remains. Pure,
-/// so the trimming policy is unit-tested without touching a real file.
-pub(crate) fn cap_lines(existing: &str, new_line: &str, max_bytes: usize) -> String {
-    let trimmed_new = new_line.trim_end();
-    let mut lines: Vec<&str> = existing.lines().collect();
-    lines.push(trimmed_new);
+/// Most rows kept in memory while the store cannot save them. A broken store
+/// must not turn every request into unbounded memory growth; the oldest rows
+/// go first and are counted, never dropped without a trace.
+const UNSAVED_CAP: usize = 500;
 
-    let mut total: usize = lines.iter().map(|l| l.len() + 1).sum();
-    while total > max_bytes && lines.len() > 1 {
-        let removed = lines.remove(0);
-        total -= removed.len() + 1;
-    }
-
-    let mut out = lines.join("\n");
-    out.push('\n');
-    out
+/// Rows the store has not accepted yet, oldest first.
+#[derive(Default)]
+struct Unsaved {
+    rows: VecDeque<EgressEntry>,
+    /// Rows pushed out of `rows` by the cap.
+    dropped: usize,
+    /// Rows written to the pending file this run (not in `rows`).
+    parked: usize,
 }
 
-/// `%LOCALAPPDATA%\Wingman\egress.log`. Local-only, machine-scoped storage
-/// (`known_folder::local_app_data`, the same folder the expansion plan
-/// names for the eventual `store.rs` SQLite database, #46) -- never
-/// `%APPDATA%` (roaming), since this file is deliberately not something
-/// that should follow a roaming profile between machines.
-///
-/// AGENTS.md rule 9 ("tests never touch production names"): under
-/// `#[cfg(test)]` this resolves to a process-scoped file in `%TEMP%`
-/// instead, never the real `%LOCALAPPDATA%\Wingman\egress.log` -- so
-/// `provider::common`'s tests, which call the real `post_json_with` (and so
-/// really do call [`record`] as a side effect), never write to, or race
-/// each other over, the production path. The process id keeps this from
-/// colliding with a `cargo test` run in another worktree on the same
-/// shared machine.
-pub fn log_path() -> Result<PathBuf> {
-    #[cfg(test)]
-    {
-        Ok(std::env::temp_dir().join(format!("wingman-test-egress-{}.log", std::process::id())))
-    }
-    #[cfg(not(test))]
-    {
-        let base = crate::known_folder::local_app_data()?;
-        Ok(base.join("Wingman").join("egress.log"))
-    }
+static UNSAVED: Mutex<Unsaved> = Mutex::new(Unsaved {
+    rows: VecDeque::new(),
+    dropped: 0,
+    parked: 0,
+});
+
+static SAVE_GATE: Mutex<()> = Mutex::new(());
+
+fn lock_unsaved(unsaved: &Mutex<Unsaved>) -> std::sync::MutexGuard<'_, Unsaved> {
+    // A panic elsewhere must not take the history with it.
+    unsaved.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Appends one row to the log, capped per [`cap_lines`]. Never panics and
-/// never surfaces an error to its caller (rule 7: a logging failure must
-/// never be why the request itself fails or shows an error card) --
-/// `provider::common`'s callers already treat the actual HTTP result as the
-/// thing that can fail; whether it got logged is a best-effort side effect.
+/// Saves one row to the store. Never panics and never surfaces an error to
+/// its caller (rule 7: a logging failure must never be why the request
+/// itself fails or shows an error card). A failure keeps the row in memory
+/// and is reported once per run; see this module's doc comment.
 pub fn record(entry: &EgressEntry) {
-    let _ = try_record(entry);
+    save(
+        &crate::store::global,
+        crate::store::append_pending,
+        &UNSAVED,
+        entry,
+    );
 }
 
-/// Tracks, within one process, whether an attempt has been made yet to
-/// restrict `egress.log`'s ACL (#277). Pure state machine, deliberately
-/// separate from any real filesystem or `icacls` call, so the "once" policy
-/// itself can be unit-tested against a fresh instance instead of process-wide
-/// state -- the same isolation rationale as `config.rs`'s
-/// `FORCE_ACL_FAILURE_FOR_TEST` thread_local, applied to a plain struct
-/// instead since this needs a *value*, not a boolean toggle, that a test can
-/// own independently of the real process-wide static.
-struct AclRestrictOnce(std::sync::atomic::AtomicBool);
-
-impl AclRestrictOnce {
-    const fn new() -> Self {
-        Self(std::sync::atomic::AtomicBool::new(false))
-    }
-
-    /// `true` the first time this is called; `false` on every call after,
-    /// regardless of whether the first attempt's caller went on to succeed
-    /// or fail -- egress.log is appended on every provider request, so
-    /// re-shelling to `icacls` per request is both a per-request cost and a
-    /// console-window flash risk (AGENTS.md). One attempt per process is the
-    /// budget; a failed attempt is not retried within the same run.
-    fn take_first_attempt(&self) -> bool {
-        !self.0.swap(true, std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-/// Process-wide: real callers all share one `egress.log`, so one attempt
-/// covers every caller in the process, whether the file was just created or
-/// already existed from an older Wingman version that never restricted it.
-static EGRESS_LOG_ACL_RESTRICTED: AclRestrictOnce = AclRestrictOnce::new();
-
-/// Restricts `path`'s ACL to the current user via [`crate::config`]'s
-/// `restrict_acl`, at most once for the lifetime of `flag`. A failure is
-/// logged to stderr and otherwise swallowed (never propagated, never a
-/// panic): rule 7 says a logging failure must never be why the request
-/// itself fails, and the same posture extends to failing to lock the log
-/// down -- the entry the caller is about to write still matters more than a
-/// missed ACL attempt, and the next process launch gets another attempt.
-fn restrict_log_acl_once_with(flag: &AclRestrictOnce, path: &std::path::Path) {
-    restrict_log_acl_once_using(flag, path, |p| {
-        #[cfg(windows)]
-        {
-            crate::config::Config::restrict_acl(p)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = p;
-            Ok(())
-        }
-    });
-}
-
-/// The real body of [`restrict_log_acl_once_with`], taking the restrict call
-/// itself as a parameter. This is what lets a test observe "the restrict
-/// action ran exactly once" (the actual "once per process" contract) via a
-/// counting closure, instead of asserting on real `icacls` ACL output --
-/// MEASURED 2026-09-25 on a GitHub Actions Windows runner: a freshly created
-/// file under the runner's own `%TEMP%` already carries explicit,
-/// non-inherited ACEs (SYSTEM, Administrators, `runneradmin`: `(F)`, no
-/// `(I)` flag at all) before `restrict_acl` ever runs, so a test asserting
-/// `(I)` IS present on an unrestricted file is asserting something about the
-/// host's temp-directory inheritance, not about this code, and is not
-/// portable across machines. Asserting `(I)` is ABSENT after a real
-/// `restrict_acl` call (the positive direction; see
-/// `restrict_log_acl_once_with_restricts_a_freshly_written_file` and
-/// `try_record_restricts_the_real_log_path_acl` below) has no such
-/// assumption and stays real-`icacls` based.
-fn restrict_log_acl_once_using(
-    flag: &AclRestrictOnce,
-    path: &std::path::Path,
-    restrict: impl FnOnce(&std::path::Path) -> Result<()>,
+/// The body of [`record`], with the store and the kept-rows list passed in so
+/// the failure paths can be tested without touching process-wide state.
+fn save(
+    open: &dyn Fn() -> Result<Arc<Store>, StoreError>,
+    fallback: impl FnMut(&EgressEntry) -> Result<(), StoreError>,
+    unsaved: &Mutex<Unsaved>,
+    entry: &EgressEntry,
 ) {
-    if !flag.take_first_attempt() {
+    // One save at a time, so rows kept by a failed save cannot be reordered
+    // behind a newer row from another thread.
+    let _gate = SAVE_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    // Anything kept from earlier failures goes first, then this row.
+    let mut pending: Vec<EgressEntry> = lock_unsaved(unsaved).rows.drain(..).collect();
+    pending.push(entry.clone());
+    let Err(e) = open().and_then(|store| write_pending(&mut pending, |r| store.record_egress(r)))
+    else {
         return;
+    };
+    crate::store::report(&e);
+    // The store is down: park what is left in the pending file, which the
+    // store imports on the next open that works. Only a row that cannot be
+    // parked either stays in memory.
+    let before = pending.len();
+    let _ = write_pending(&mut pending, fallback);
+    lock_unsaved(unsaved).parked += before - pending.len();
+    keep(unsaved, pending);
+}
+
+/// Writes `pending` oldest first and removes each row as it is saved, so on a
+/// failure `pending` holds exactly the rows that are still unsaved.
+fn write_pending(
+    pending: &mut Vec<EgressEntry>,
+    mut write: impl FnMut(&EgressEntry) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let mut saved = 0;
+    let mut result = Ok(());
+    for row in pending.iter() {
+        match write(row) {
+            Ok(()) => saved += 1,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
     }
-    if let Err(e) = restrict(path) {
-        eprintln!("wingman: failed to restrict egress.log permissions: {e:#}");
+    pending.drain(..saved);
+    result
+}
+
+/// Puts rows back at the front of the kept list (anything that arrived from
+/// another thread meanwhile is newer) and applies the cap.
+fn keep(unsaved: &Mutex<Unsaved>, rows: Vec<EgressEntry>) {
+    let mut u = lock_unsaved(unsaved);
+    for row in rows.into_iter().rev() {
+        u.rows.push_front(row);
+    }
+    while u.rows.len() > UNSAVED_CAP {
+        u.rows.pop_front();
+        u.dropped += 1;
     }
 }
 
-fn try_record(entry: &EgressEntry) -> Result<()> {
-    try_record_with(&EGRESS_LOG_ACL_RESTRICTED, entry)
+/// Test builds only: every saved row, oldest first.
+#[cfg(test)]
+pub fn rows() -> Result<Vec<EgressEntry>, StoreError> {
+    crate::store::global()?.egress_rows()
 }
 
-/// The real body of [`try_record`], taking its ACL-once flag as a parameter
-/// rather than reaching for [`EGRESS_LOG_ACL_RESTRICTED`] directly. This is
-/// what lets a test exercise the write-then-restrict wiring against a flag
-/// nobody else can have spent, instead of racing every other test in the
-/// process that can also reach [`record`] (`provider::common`'s tests do,
-/// for real, as a side effect of the HTTP path they exercise) for the one
-/// shared process-wide attempt.
-fn try_record_with(flag: &AclRestrictOnce, entry: &EgressEntry) -> Result<()> {
-    let path = log_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let line = serde_json::to_string(entry)?;
-    let capped = cap_lines(&existing, &line, MAX_LOG_BYTES);
-    fs::write(&path, capped)?;
-    // #277: restrict the ACL once per process, after the file is known to
-    // exist on disk (icacls needs a real file to target). Covers both a
-    // freshly created file and one left behind by an older Wingman version
-    // that never restricted it -- either way this process restricts it
-    // exactly once, not on every append.
-    restrict_log_acl_once_with(flag, &path);
-    Ok(())
+/// [`rows`] and how many stored rows were unreadable and left out.
+fn rows_counted() -> Result<(Vec<EgressEntry>, usize), StoreError> {
+    crate::store::global()?.egress_rows_counted()
 }
 
-/// Raw JSON-lines file contents, or an empty string if the log does not
-/// exist yet (nothing has been sent, or logging never succeeded even
-/// once) -- never an error the caller has to handle specially.
+/// Test builds only: every saved row as JSON lines, the shape the old log
+/// had, so tests can look at what a request logged.
+#[cfg(test)]
 pub fn read_all() -> String {
-    log_path()
-        .ok()
-        .and_then(|p| fs::read_to_string(p).ok())
+    rows()
         .unwrap_or_default()
+        .iter()
+        .filter_map(|e| serde_json::to_string(e).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Test builds only: forgets every saved row (the store is shared by every
+/// test in the process, so tests that read "the last row" start clean).
+#[cfg(test)]
+pub fn clear_for_test() {
+    if let Ok(store) = crate::store::global() {
+        store.clear_egress();
+    }
 }
 
 /// Renders one entry as a human-readable line for the "Copy egress log"
@@ -896,21 +861,48 @@ fn human_bytes(n: usize) -> String {
     }
 }
 
-/// Every row in the log, oldest first, rendered per [`render_human`] -- what
-/// `diagnostics::egress_report` puts on the clipboard. Malformed lines
-/// (should never happen, since [`record`] is the only writer, but a hand
-/// edit or a future format change is possible) are skipped rather than
-/// failing the whole read.
+/// Every saved row, oldest first, rendered per [`render_human`], then any
+/// rows the store has not accepted yet and why -- what
+/// `diagnostics::egress_report` puts on the clipboard. Never blank: a store
+/// that cannot be read says so instead of looking like an empty log.
 pub fn read_all_human() -> String {
-    let raw = read_all();
-    if raw.trim().is_empty() {
+    human_report(rows_counted(), &lock_unsaved(&UNSAVED))
+}
+
+fn human_report(saved: Result<(Vec<EgressEntry>, usize), StoreError>, unsaved: &Unsaved) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    match saved {
+        Ok((rows, skipped)) => {
+            lines.extend(rows.iter().map(render_human));
+            if skipped > 0 {
+                lines.push(format!("{skipped} saved requests could not be read."));
+            }
+        }
+        Err(e) => lines.push(format!("The saved request log could not be read. {e}")),
+    }
+    if unsaved.parked > 0 {
+        lines.push(format!(
+            "{} requests are waiting in egress-pending.log and will be listed after the next start.",
+            unsaved.parked
+        ));
+    }
+    if !unsaved.rows.is_empty() || unsaved.dropped > 0 {
+        lines.push(format!(
+            "Not saved yet ({} requests, kept in memory until a save works):",
+            unsaved.rows.len()
+        ));
+        lines.extend(unsaved.rows.iter().map(render_human));
+        if unsaved.dropped > 0 {
+            lines.push(format!(
+                "{} older requests that could not be saved were dropped.",
+                unsaved.dropped
+            ));
+        }
+    }
+    if lines.is_empty() {
         return "No requests logged yet.".to_string();
     }
-    raw.lines()
-        .filter_map(|line| serde_json::from_str::<EgressEntry>(line).ok())
-        .map(|e| render_human(&e))
-        .collect::<Vec<_>>()
-        .join("\n")
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -1333,31 +1325,6 @@ mod tests {
         assert!(!human.contains(fake_key), "{human}");
     }
 
-    // -- cap_lines ----------------------------------------------------------
-
-    #[test]
-    fn cap_lines_keeps_everything_under_the_cap() {
-        let existing = "line one\nline two\n";
-        let result = cap_lines(existing, "line three", 1000);
-        assert_eq!(result, "line one\nline two\nline three\n");
-    }
-
-    #[test]
-    fn cap_lines_drops_the_oldest_line_first_once_over_the_cap() {
-        let existing = "aaaaaaaaaa\nbbbbbbbbbb\n";
-        // Cap tight enough that all three ten-char lines cannot fit.
-        let result = cap_lines(existing, "cccccccccc", 24);
-        assert!(!result.contains("aaaaaaaaaa"), "{result}");
-        assert!(result.contains("bbbbbbbbbb"), "{result}");
-        assert!(result.contains("cccccccccc"), "{result}");
-    }
-
-    #[test]
-    fn cap_lines_never_drops_the_newest_line_even_if_it_alone_exceeds_the_cap() {
-        let result = cap_lines("", "a very long single line entry", 5);
-        assert!(result.contains("a very long single line entry"));
-    }
-
     // -- trigger (#236) ------------------------------------------------------
 
     fn sample_entry() -> EgressEntry {
@@ -1456,219 +1423,191 @@ mod tests {
         assert!(!render_human(&entry).contains('\u{2014}'));
     }
 
-    // -- read_all_human with nothing logged ----------------------------------
-
-    // -- #277: egress.log gets an owner-only ACL, same as config.toml -------
+    // -- saving, and what happens when the store cannot save -----------------
     //
-    // `try_record` used to create/write `egress.log` with plain `fs::write`,
-    // with nothing analogous to `config.rs`'s `restrict_acl` call --
-    // https://github.com/Raaif-Yousuf/Wingman/issues/277. Every append must
-    // not shell out to `icacls` (cost per request, console-flash risk), so
-    // the restriction happens at most once per process: `AclRestrictOnce`
-    // is the pure "have I attempted this yet" decision, tested here against
-    // a fresh instance per test rather than the process-wide static so
-    // these tests cannot see each other's state (mirrors config.rs's
-    // `FORCE_ACL_FAILURE_FOR_TEST` thread_local isolation rationale).
+    // `provider::common`'s tests reach `record` for real, so the shared test
+    // store holds rows from other tests: these use their own provider names
+    // and their own kept-rows list.
 
-    #[test]
-    fn acl_restrict_once_returns_true_on_the_first_attempt_only() {
-        let flag = AclRestrictOnce::new();
-        assert!(
-            flag.take_first_attempt(),
-            "the first attempt in a process must be allowed to run"
-        );
-        assert!(
-            !flag.take_first_attempt(),
-            "a second attempt in the same process must be suppressed"
-        );
-        assert!(
-            !flag.take_first_attempt(),
-            "a third attempt must still be suppressed"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn restrict_log_acl_once_with_restricts_a_freshly_written_file() {
-        // The wired-to-nothing observable: after the seam runs once against
-        // a real scratch file, `icacls` shows inheritance disabled, exactly
-        // the same check `config.rs`'s own `save_to_restricts_the_acl_on_a_
-        // normal_successful_save` uses for config.toml.
-        let path = std::env::temp_dir().join(format!(
-            "wingman-test-egress-acl-{}-{}.log",
-            std::process::id(),
-            line!()
-        ));
-        fs::write(&path, "{}\n").expect("scratch file should write");
-
-        let flag = AclRestrictOnce::new();
-        restrict_log_acl_once_with(&flag, &path);
-
-        let output = std::process::Command::new("icacls")
-            .arg(&path)
-            .output()
-            .expect("icacls should run");
-        let listing = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            !listing.contains("(I)"),
-            "inheritance must be disabled after the ACL seam runs: {listing}"
-        );
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn restrict_log_acl_once_with_only_shells_out_on_the_first_call() {
-        // Second call against the same flag must not invoke the restrict
-        // call at all -- this is the "never icacls on every write"
-        // guarantee. Observed through `restrict_log_acl_once_using`'s
-        // injected closure, counting how many times it actually runs,
-        // rather than through real `icacls` ACL output: MEASURED
-        // 2026-09-25, a GitHub Actions Windows runner's own `%TEMP%` gives a
-        // freshly created file explicit, non-inherited ACEs before any
-        // `restrict_acl` call ever runs, so an assertion that expects the
-        // `(I)` inheritance flag to still be PRESENT on an unrestricted file
-        // is really asserting something about the host, not this code, and
-        // is not portable across machines. Counting calls has no such
-        // assumption.
-        let path = std::env::temp_dir().join(format!(
-            "wingman-test-egress-acl-once-{}-{}.log",
-            std::process::id(),
-            line!()
-        ));
-        let flag = AclRestrictOnce::new();
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-
-        restrict_log_acl_once_using(&flag, &path, |_| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        });
-        restrict_log_acl_once_using(&flag, &path, |_| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        });
-        restrict_log_acl_once_using(&flag, &path, |_| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        });
-
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst),
+    fn tagged(provider: &str) -> EgressEntry {
+        build_entry(
+            provider,
+            "https://api.example.com/",
+            &json!({"model": "m"}),
+            false,
             1,
-            "the restrict call must run exactly once per flag, however many \
-             times restrict_log_acl_once_using is called"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn try_record_still_writes_the_entry_when_acl_restriction_fails() {
-        // Rule 7: an ACL failure must never lose the log entry or crash the
-        // request path. Force `config::restrict_acl` to fail via its
-        // existing #257 test seam and confirm the row still lands.
-        //
-        // `log_path()` under `#[cfg(test)]` is one file per PROCESS (shared
-        // by every test in this binary, including `provider::common`'s
-        // egress-log tests), so this takes the same
-        // `EGRESS_PREVIEW_TEST_LOCK` those tests use to serialize the file
-        // content, and restores it afterwards. The ACL-ONCE flag is a
-        // freshly constructed `AclRestrictOnce` passed straight to
-        // `try_record_with`, never `EGRESS_LOG_ACL_RESTRICTED` -- otherwise
-        // this test's outcome would depend on whether some other test
-        // (including `provider::common`'s, which really does call
-        // `record()`) already spent the process-wide attempt before this
-        // one runs, which is exactly the "leftover state and libtest
-        // ordering" failure mode a fresh flag rules out.
-        let _guard = crate::config::EGRESS_PREVIEW_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let path = log_path().unwrap();
-        let saved = fs::read_to_string(&path).unwrap_or_default();
-
-        let entry = build_entry(
-            "openai",
-            "https://api.openai.com/v1/responses",
-            &json!({"model": "gpt-5.5"}),
-            false,
-            10,
-            20,
+            1,
             Outcome::Success,
             None,
-        );
-
-        crate::config::force_acl_failure_for_test(true);
-        let result = try_record_with(&AclRestrictOnce::new(), &entry);
-        crate::config::force_acl_failure_for_test(false);
-
-        assert!(
-            result.is_ok(),
-            "an ACL restriction failure must not fail the write: {result:?}"
-        );
-        let contents = fs::read_to_string(&path).unwrap_or_default();
-        assert!(
-            contents.contains("\"provider\":\"openai\""),
-            "the entry must still be written even when the ACL call fails: {contents}"
-        );
-
-        fs::write(&path, saved).expect("restoring the shared test log should succeed");
+        )
     }
 
-    #[test]
-    #[cfg(windows)]
-    fn try_record_restricts_the_real_log_path_acl() {
-        // The wiring check itself, separate from the pure `AclRestrictOnce`
-        // logic above: proves `try_record`'s inner `try_record_with`
-        // actually calls the ACL seam against the file `log_path()`
-        // returns, not just that the seam works in isolation.
-        //
-        // Same shared-file content serialization as the test above, but a
-        // freshly constructed `AclRestrictOnce` for the ACL-once gate, for
-        // the same reason: this test must observe ITS OWN call restricting
-        // the file, not ride on some earlier test (in any thread, in any
-        // order) having already spent the process-wide static.
-        let _guard = crate::config::EGRESS_PREVIEW_TEST_LOCK
+    fn providers_like(prefix: &str) -> Vec<String> {
+        rows()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .filter(|p| p.starts_with(prefix))
+            .collect()
+    }
+
+    fn refuse() -> Result<Arc<Store>, StoreError> {
+        Err(StoreError::Other("disk full".to_string()))
+    }
+
+    fn no_fallback(_: &EgressEntry) -> Result<(), StoreError> {
+        Err(StoreError::Other("no pending file".to_string()))
+    }
+
+    /// The shared test store is also cleared by `provider::common`'s tests,
+    /// which hold this lock; so must anything that reads it back.
+    fn store_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::config::EGRESS_PREVIEW_TEST_LOCK
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let path = log_path().unwrap();
-        let saved = fs::read_to_string(&path).unwrap_or_default();
-
-        let entry = build_entry(
-            "anthropic",
-            "https://api.anthropic.com/v1/messages",
-            &json!({"model": "claude-opus-5"}),
-            false,
-            5,
-            5,
-            Outcome::Success,
-            None,
-        );
-        try_record_with(&AclRestrictOnce::new(), &entry).expect("try_record should succeed");
-
-        let output = std::process::Command::new("icacls")
-            .arg(&path)
-            .output()
-            .expect("icacls should run");
-        let listing = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            !listing.contains("(I)"),
-            "try_record must leave egress.log ACL-restricted: {listing}"
-        );
-
-        fs::write(&path, saved).expect("restoring the shared test log should succeed");
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
-    fn read_all_human_of_empty_input_says_so() {
-        // Exercises the pure formatting branch directly (no file I/O):
-        // an empty log must say something readable, never blank text or a
-        // panic.
-        let raw = "";
-        let rendered = if raw.trim().is_empty() {
-            "No requests logged yet.".to_string()
-        } else {
-            unreachable!()
-        };
-        assert_eq!(rendered, "No requests logged yet.");
+    fn record_saves_a_row_the_diagnostics_report_lists() {
+        // The wired-to-nothing check: the public entry point, through the
+        // real store, to the text "Copy egress log" puts on the clipboard.
+        let _lock = store_lock();
+        record(&tagged("wired-check"));
+        assert_eq!(providers_like("wired-check"), ["wired-check"]);
+        assert!(
+            read_all_human().contains("provider=wired-check"),
+            "the report must list a request saved a moment ago"
+        );
+    }
+
+    #[test]
+    fn a_failing_store_keeps_the_row_in_memory_and_does_not_panic() {
+        let unsaved = Mutex::new(Unsaved::default());
+        save(&refuse, no_fallback, &unsaved, &tagged("kept-1"));
+        let u = lock_unsaved(&unsaved);
+        assert_eq!(u.rows.len(), 1);
+        assert_eq!(u.rows[0].provider, "kept-1");
+    }
+
+    #[test]
+    fn a_store_that_cannot_open_parks_the_row_in_the_pending_file() {
+        // The regression the old ACL test guarded: a store failure for the
+        // whole run must not turn into rows lost on exit.
+        let path = std::env::temp_dir().join(format!(
+            "wingman-test-egress-park-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let unsaved = Mutex::new(Unsaved::default());
+
+        save(
+            &refuse,
+            |r| crate::store::append_pending_at(&path, r),
+            &unsaved,
+            &tagged("parked-1"),
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("\"provider\":\"parked-1\""), "{text}");
+        let u = lock_unsaved(&unsaved);
+        assert!(u.rows.is_empty(), "a parked row is not also kept");
+        assert_eq!(u.parked, 1);
+        let report = human_report(Ok((Vec::new(), 0)), &u);
+        assert!(report.contains("1 requests are waiting"), "{report}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_next_good_save_writes_the_kept_rows_first_in_order() {
+        let _lock = store_lock();
+        let unsaved = Mutex::new(Unsaved::default());
+        save(&refuse, no_fallback, &unsaved, &tagged("flush-a"));
+        save(&refuse, no_fallback, &unsaved, &tagged("flush-b"));
+        assert_eq!(lock_unsaved(&unsaved).rows.len(), 2);
+
+        save(
+            &crate::store::global,
+            no_fallback,
+            &unsaved,
+            &tagged("flush-c"),
+        );
+
+        assert!(lock_unsaved(&unsaved).rows.is_empty());
+        assert_eq!(providers_like("flush-"), ["flush-a", "flush-b", "flush-c"]);
+    }
+
+    #[test]
+    fn a_write_that_fails_part_way_keeps_only_the_unsaved_rows() {
+        // The first row saves, the second fails: only the second and later
+        // rows may stay pending, or the first would be written twice.
+        let mut pending = vec![tagged("half-a"), tagged("half-b"), tagged("half-c")];
+        let mut calls = 0;
+        let r = write_pending(&mut pending, |_| {
+            calls += 1;
+            if calls == 2 {
+                Err(StoreError::Other("locked".to_string()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(r.is_err());
+        let left: Vec<&str> = pending.iter().map(|e| e.provider.as_str()).collect();
+        assert_eq!(left, ["half-b", "half-c"]);
+    }
+
+    #[test]
+    fn the_kept_list_is_bounded_and_counts_what_it_drops() {
+        let unsaved = Mutex::new(Unsaved::default());
+        for i in 0..UNSAVED_CAP + 3 {
+            save(&refuse, no_fallback, &unsaved, &tagged(&format!("cap-{i}")));
+        }
+        let u = lock_unsaved(&unsaved);
+        assert_eq!(u.rows.len(), UNSAVED_CAP);
+        assert_eq!(u.dropped, 3);
+        assert_eq!(u.rows.front().unwrap().provider, "cap-3", "oldest go first");
+        assert_eq!(
+            u.rows.back().unwrap().provider,
+            format!("cap-{}", UNSAVED_CAP + 2),
+            "the newest is never the one dropped"
+        );
+    }
+
+    #[test]
+    fn the_report_shows_kept_rows_and_the_reason_when_the_store_is_down() {
+        let mut unsaved = Unsaved::default();
+        unsaved.rows.push_back(tagged("report-kept"));
+        unsaved.dropped = 2;
+        let text = human_report(Err(StoreError::Other("locked".to_string())), &unsaved);
+        assert!(text.contains("could not be read"), "{text}");
+        assert!(text.contains("locked"), "{text}");
+        assert!(text.contains("provider=report-kept"), "{text}");
+        assert!(text.contains("2 older requests"), "{text}");
+        assert!(!text.contains('\u{2014}'), "{text}");
+    }
+
+    #[test]
+    fn the_report_lists_saved_rows_then_kept_rows() {
+        let mut unsaved = Unsaved::default();
+        unsaved.rows.push_back(tagged("second"));
+        let text = human_report(Ok((vec![tagged("first")], 1)), &unsaved);
+        assert!(
+            text.contains("1 saved requests could not be read"),
+            "{text}"
+        );
+        let (first, second) = (
+            text.find("provider=first").unwrap(),
+            text.find("provider=second").unwrap(),
+        );
+        assert!(first < second, "{text}");
+    }
+
+    #[test]
+    fn an_empty_log_says_so() {
+        assert_eq!(
+            human_report(Ok((Vec::new(), 0)), &Unsaved::default()),
+            "No requests logged yet."
+        );
     }
 
     // -- redaction counts (#508) -------------------------------------------

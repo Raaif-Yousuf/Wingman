@@ -11,7 +11,9 @@
 //! best-effort [`cleanup_stale_ics_files`] sweep of its own temp directory
 //! before writing the new file -- see that function's doc comment for why
 //! stale means "older than [`MAX_ICS_FILE_AGE`]", not "every other file",
-//! and why a cleanup failure is always ignored.
+//! and why a cleanup failure is always ignored. #769: the same sweep also runs
+//! once at startup ([`IcsConnector::sweep_stale`]), so a lone event's file is
+//! not kept until the next "Add to calendar".
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -245,10 +247,19 @@ impl IcsConnector<ShellOpener> {
     /// real Win32 timezone converter.
     pub fn new() -> Self {
         Self {
-            temp_dir: std::env::temp_dir().join("Wingman"),
+            temp_dir: temp_dir_for(crate::portable::root().as_deref(), std::env::temp_dir()),
             opener: ShellOpener,
             local_time_converter: Box::new(Win32LocalTimeConverter),
         }
+    }
+}
+
+/// `%TEMP%\Wingman`, or `Wingman\tmp` under the portable root (#130) so
+/// portable mode leaves nothing on the host PC.
+fn temp_dir_for(portable_root: Option<&Path>, system_temp: PathBuf) -> PathBuf {
+    match portable_root {
+        Some(root) => root.join("Wingman").join("tmp"),
+        None => system_temp.join("Wingman"),
     }
 }
 
@@ -290,6 +301,16 @@ impl<O: Opener> IcsConnector<O> {
             opener,
             local_time_converter,
         }
+    }
+}
+
+impl<O: Opener> IcsConnector<O> {
+    /// Deletes this connector's `.ics` files that are older than
+    /// [`MAX_ICS_FILE_AGE`], without writing anything (#769). Called once at
+    /// startup, so a lone event's file does not wait for the next "Add to
+    /// calendar" to be swept. Best effort, never fails.
+    pub fn sweep_stale(&self) {
+        cleanup_stale_ics_files(&self.temp_dir);
     }
 }
 
@@ -370,9 +391,12 @@ fn sanitize_filename(uid: &str) -> String {
 /// (`ShellExecuteW("open", ...)`) can still be reading it asynchronously
 /// for a short while after that call returns, so removing it too eagerly
 /// risks deleting a file the calendar app has not finished opening yet. One
-/// day is long enough for any such read to have finished, short enough that
-/// `%TEMP%\Wingman` does not accumulate indefinitely.
-const MAX_ICS_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// hour is long enough for any such read to have finished (it was a day until
+/// #736: the file holds the event title, place and notes taken from the
+/// screen, in a folder with the default temp ACL, so it should not sit there
+/// longer than it has to), short enough that `%TEMP%\Wingman` does not
+/// accumulate indefinitely.
+const MAX_ICS_FILE_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Pure: whether a file last modified at `modified` counts as stale at
 /// `now`, given `max_age`. A `now` that is not strictly after `modified` by
@@ -749,6 +773,19 @@ fn parse_offset(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn portable_mode_keeps_the_calendar_temp_files_under_the_root() {
+        let root = std::path::Path::new(r"E:\usb");
+        assert_eq!(
+            temp_dir_for(Some(root), PathBuf::from(r"C:\T")),
+            PathBuf::from(r"E:\usb\Wingman\tmp")
+        );
+        assert_eq!(
+            temp_dir_for(None, PathBuf::from(r"C:\T")),
+            PathBuf::from(r"C:\T\Wingman")
+        );
+    }
+
     use super::*;
     use std::cell::RefCell;
     use std::path::PathBuf;
@@ -1574,6 +1611,13 @@ END:VCALENDAR\r\n";
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn a_calendar_file_is_swept_after_at_most_an_hour() {
+        // #736: the file holds screen text; it must not stay for a day.
+        assert!(MAX_ICS_FILE_AGE <= Duration::from_secs(60 * 60));
+        assert!(MAX_ICS_FILE_AGE >= Duration::from_secs(10 * 60));
+    }
+
     // -- is_stale (#238, pure) ----------------------------------------------
 
     #[test]
@@ -1639,6 +1683,30 @@ END:VCALENDAR\r\n";
 
         assert!(!stale.exists(), "a stale .ics file must be deleted");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_startup_sweep_deletes_an_old_file_with_no_calendar_action() {
+        let dir = test_temp_dir("startup-sweep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = write_file_with_age(&dir, "old.ics", MAX_ICS_FILE_AGE.as_secs() + 60);
+        let fresh = write_file_with_age(&dir, "fresh.ics", 60);
+        let connector =
+            IcsConnector::with_temp_dir_and_opener(dir.clone(), RecordingOpener::default());
+
+        connector.sweep_stale();
+
+        assert!(!stale.exists(), "an old file must go at startup");
+        assert!(fresh.exists(), "a recent file must stay");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_startup_sweep_on_a_missing_directory_does_nothing() {
+        let dir = test_temp_dir("startup-sweep-missing");
+        IcsConnector::with_temp_dir_and_opener(dir.clone(), RecordingOpener::default())
+            .sweep_stale();
+        assert!(!dir.exists(), "the sweep must not create the directory");
     }
 
     #[test]

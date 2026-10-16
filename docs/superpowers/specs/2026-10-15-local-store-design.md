@@ -296,7 +296,7 @@ as a hand rollback, then a later slice deletes it.
 - **`egress.log`**: each JSON line becomes an `egress` row. A line that does not
   parse is counted and skipped, not fatal; the count goes in the same card.
   Retention is applied after the import.
-- **`profile.bin`**: loaded with the existing `Profile::load_from` (so the
+- **`profile.bin`**: (as built in slice 3, see below) loaded with the existing `Profile::load_from` (so the
   payment denylist runs over it like any other read), each field written to
   `profile_field` as its own DPAPI value. The `profile.toml` hand-edit import
   stays in `fill_form.rs` and writes through the store instead of the file. The
@@ -403,6 +403,18 @@ wired to nothing (AGENTS.md rule 8).
 | 4 | v4 = `memory_item`, the boundary denylist, export and import functions (with #86) | the Remember button, the review card (#87), the Memory page (#88) | A 16-digit number typed into Remember is refused with a card; export then import round-trips |
 | 5 | v5 = `document`, `chunk`, `chunk_fts`, the `VectorIndex` trait and chosen implementation (with #83 and #85) | the ingest pipeline and retrieval | A phrase from a dropped resume comes back as the first hit; deleting the file leaves no chunk rows |
 | 6 | delete-after-release: remove the `.migrated` files; context table with #61 | the same startup path | the files are gone |
+
+Slice 2 as built: v2 adds `trigger_label` and `redactions` to the `egress`
+table (fields added to `EgressEntry` after this spec, #236 and #508). When the
+store cannot save a row, the failure is reported once per run and the row is
+appended to `egress-pending.log` beside the store folder, which the next open
+that works imports and removes (every open, no flag, since a later run can
+park rows again). Only if that append fails too is the row kept in a bounded
+in-memory list (500 rows, oldest dropped and counted) and written first by the
+next successful save. The diagnostics report lists kept rows, the number
+parked, and the reason. The request log imports cannot fail the open.
+
+Slice 3 as built: v3 is `profile_field (key, value, updated_unix)` with one row per `Profile` member (`full_name`, `emails`, `address` and so on) rather than per `FieldKind`, because the label matcher's vocabulary has no entry for `notes` and the member is the unit that is read and written. Each value is that member's JSON in its own DPAPI envelope, with its own entropy (`Wingman/store/profile_field/v1`). The payment denylist runs inside `Store::save_profile` and `Store::load_profile`. The `profile.bin` import runs on every open until it succeeds and never fails the open. If the file cannot be decrypted or read (another Windows user or PC, a damaged file, a payment-shaped value), it is left where it is, the flag stays unset, and the notice says so; once it imports, the rows are written and the flag set in one transaction and only then is the file renamed `profile.bin.migrated`. Rows already in the store win over the file. A fresh database (the old one was moved aside as damaged) has no flag, so when `profile.bin` is gone the import reads `profile.bin.migrated` again; a missing file only sets the flag when its folder exists, so a briefly unavailable folder is retried. A saved value that looks like payment data blocks the profile and the card names the field; until the profile page (#50) exists the recovery is to close Wingman, delete `wingman.db` in the store folder (usage history goes too) and add the profile again with `profile.toml`. At run time a value that cannot be decrypted is an error with a plain message and nothing is deleted or overwritten; `Fill this form` shows it as a card and does not fall through to the `profile.toml` import. Portable mode (#130) needs nothing extra: the old file path goes through `known_folder` like the rest. Issue #688 asked whether a profile from another PC fails gracefully: it did, but as a raw `failed to decrypt` chain; it now reads as above.
 
 Slices 1 to 3 do not depend on the knowledge track and can land in order as soon
 as this design is accepted. Slices 5 and 6 are listed so their tables have a
