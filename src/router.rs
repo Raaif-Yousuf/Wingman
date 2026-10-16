@@ -56,10 +56,19 @@ pub const ROUTER_IMAGE_MAX_PIXELS: u64 =
     (ROUTER_IMAGE_LONG_EDGE as u64) * (ROUTER_IMAGE_LONG_EDGE as u64);
 
 /// Token budget for the router's completion. `{summary, intent, confidence}`
-/// is a handful of short fields -- generous headroom over the ~40-60 tokens
-/// a typical answer needs, while still bounding worst-case latency and cost
-/// far below the main action's `max_tokens: 0` (provider default).
-pub const ROUTER_MAX_TOKENS: u32 = 200;
+/// is a handful of short fields, about 40-60 tokens of answer.
+///
+/// The cap also has to cover reasoning: OpenAI `max_output_tokens`, Gemini
+/// `maxOutputTokens` and Anthropic `max_tokens` all count thinking tokens, and
+/// a reply cut off with no text is the "ran out of room" error (#155). THEORY
+/// (unverified, no OpenAI or Gemini key to measure): at `Effort::Low` a small
+/// reasoning model can spend more than the old 200 on thinking and return
+/// nothing, so the palette hint would silently never appear and the chain
+/// would bill a second provider. MEASURED 2026-10-16 (Anthropic
+/// `claude-haiku-5-5`, low effort, a structured calendar reply): 39 to 42
+/// output tokens, no thinking. Raising the cap costs nothing when the model
+/// does not think, since only generated tokens are billed.
+pub const ROUTER_MAX_TOKENS: u32 = 1000;
 
 /// `palette.router_threshold`'s default (`config.rs`'s `Palette::default`
 /// must match this exactly -- `router_threshold_config_default_matches_router_module`
@@ -448,6 +457,14 @@ mod tests {
         let req = build_request(vec![], &[]);
         assert!(req.system.contains("no actions available"));
         assert!(req.schema.is_some());
+    }
+
+    /// #725: the cap covers thinking tokens, so it must stay well above the
+    /// ~60 tokens of answer (200 was too tight for a reasoning model).
+    #[test]
+    fn the_router_token_budget_leaves_room_for_reasoning() {
+        let req = build_request(vec![], &[candidate("a", "A")]);
+        assert!(req.max_tokens >= 1000, "{}", req.max_tokens);
     }
 
     #[test]
