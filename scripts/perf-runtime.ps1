@@ -85,7 +85,7 @@ function Measure-Launch {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $proc = [System.Diagnostics.Process]::Start($psi)
     try {
-        while ([Perf.Win]::FindWindowW($OwnerWindowClass, $null) -eq [IntPtr]::Zero) {
+        while ([Perf.Win]::FindWindowW($OwnerWindowClass, [NullString]::Value) -eq [IntPtr]::Zero) {
             if ($proc.HasExited) { throw "wingman exited with code $($proc.ExitCode) before its window appeared" }
             if ($sw.Elapsed.TotalSeconds -gt 30) { throw 'no owner window within 30 s' }
             Start-Sleep -Milliseconds 5
