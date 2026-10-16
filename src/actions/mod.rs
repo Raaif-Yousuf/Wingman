@@ -65,7 +65,8 @@ pub enum InputKind {
     Context,
 }
 
-/// `prefer = { mode = "auto" }` in an action's TOML block. Only `mode`
+/// `prefer = { mode = "auto" }` in an action's TOML block. Inert today:
+/// nothing reads it (#535), the same status as `Action::hotkey`. Only `mode`
 /// exists today (expansion plan §6's worked examples); kept as its own
 /// struct (not folded into `Action`) because the plan already shows it as a
 /// nested table, and a second `prefer.*` field (a preferred model, say) is
