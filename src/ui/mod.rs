@@ -11,4 +11,5 @@ pub mod region;
 pub(crate) mod send_gate;
 pub mod settings;
 pub(crate) mod text;
+pub(crate) mod theme;
 pub mod tray;

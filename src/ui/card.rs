@@ -72,6 +72,11 @@ use crate::ui::card_placement::{
     card_origin, dpi_to_apply, resolve_monitor, sort_left_to_right, MonitorChoice,
 };
 use crate::ui::text::draw_text_line;
+use crate::ui::theme::{
+    self, contrast_ratio, relative_luminance, rgb, BADGE_HIGH, BADGE_INK_DARK, BADGE_INK_LIGHT,
+    BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, DETAIL_FONT_SCALE, FALLBACK_FONT_FACE,
+    GAP_DP, HEADLINE_FONT_SCALE, MARGIN_DP, PADDING_DP, SMALL_FONT_SCALE as BADGE_FONT_SCALE,
+};
 use serde_json::Value;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -669,32 +674,26 @@ struct Palette {
     headline: u32,
     detail: u32,
     hint: u32,
+    danger: u32,
 }
 
 impl Theme {
+    /// The card's colours, from the shared tokens (#362). The card follows
+    /// light and dark only for now; high contrast comes with a later slice.
     fn palette(self) -> Palette {
-        match self {
-            // Neither pure black nor pure white, per spec.
-            Theme::Dark => Palette {
-                bg: rgb(32, 32, 32),
-                border: rgb(64, 64, 64),
-                headline: rgb(245, 245, 245),
-                detail: rgb(190, 190, 190),
-                hint: rgb(140, 140, 140),
-            },
-            Theme::Light => Palette {
-                bg: rgb(250, 250, 250),
-                border: rgb(214, 214, 214),
-                headline: rgb(23, 23, 23),
-                detail: rgb(90, 90, 90),
-                hint: rgb(122, 122, 122),
-            },
+        let tokens = match self {
+            Theme::Dark => theme::DARK,
+            Theme::Light => theme::LIGHT,
+        };
+        Palette {
+            bg: tokens.surface,
+            border: tokens.border,
+            headline: tokens.text,
+            detail: tokens.text_dim,
+            hint: tokens.text_faint,
+            danger: tokens.danger,
         }
     }
-}
-
-const fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
 /// Issue #350: the `(text, background)` colors a preview EDIT field is
@@ -711,16 +710,6 @@ fn edit_field_colors(palette: &Palette) -> (u32, u32) {
 // Difficulty badge colour
 // ---------------------------------------------------------------------------
 
-/// Green -> amber -> red gradient stops for `Difficulty::Level`, at ranks 1,
-/// 5 and 10 respectively. Three stops (not a straight two-stop green->red
-/// lerp) so the midpoint reads as amber/yellow rather than a muddy brown.
-const GRADIENT_LOW: (u8, u8, u8) = (0x2e, 0xa0, 0x43); // green, rank 1
-const GRADIENT_MID: (u8, u8, u8) = (0xf2, 0xa9, 0x00); // amber, rank 5
-const GRADIENT_HIGH: (u8, u8, u8) = (0xd6, 0x2c, 0x2c); // red, rank 10
-/// Deliberately outside the 1-10 gradient: Ultra is its own thing, not
-/// "worse than 10".
-const ULTRA_COLOR: (u8, u8, u8) = (0x8e, 0x24, 0xaa); // purple
-
 /// Maps a difficulty to the badge's fill colour, via `Difficulty::rank()`
 /// (1..=11, Ultra == 11) rather than matching on the variant, per that
 /// method's own doc comment. Ranks outside 1..=10 are clamped rather than
@@ -729,13 +718,13 @@ const ULTRA_COLOR: (u8, u8, u8) = (0x8e, 0x24, 0xaa); // purple
 fn difficulty_color(difficulty: Difficulty) -> u32 {
     let rank = difficulty.rank();
     if rank >= 11 {
-        return rgb(ULTRA_COLOR.0, ULTRA_COLOR.1, ULTRA_COLOR.2);
+        return rgb(BADGE_ULTRA.0, BADGE_ULTRA.1, BADGE_ULTRA.2);
     }
     let level = rank.clamp(1, 10) as f32;
     let (from, to, t) = if level <= 5.0 {
-        (GRADIENT_LOW, GRADIENT_MID, (level - 1.0) / 4.0)
+        (BADGE_LOW, BADGE_MID, (level - 1.0) / 4.0)
     } else {
-        (GRADIENT_MID, GRADIENT_HIGH, (level - 5.0) / 5.0)
+        (BADGE_MID, BADGE_HIGH, (level - 5.0) / 5.0)
     };
     rgb(
         lerp_u8(from.0, to.0, t),
@@ -748,45 +737,6 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     let t = t.clamp(0.0, 1.0);
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
-
-/// One sRGB channel (0..=255), gamma-expanded to linear light per the WCAG 2
-/// relative luminance formula (https://www.w3.org/TR/WCAG21/#dfn-relative-luminance).
-fn srgb_channel_to_linear(channel: u8) -> f64 {
-    let c = channel as f64 / 255.0;
-    if c <= 0.03928 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-/// WCAG 2 relative luminance of a packed `0x00BBGGRR` colour (the same
-/// layout [`rgb`] builds): linearize each channel, then combine with the
-/// standard luma weights.
-pub(crate) fn relative_luminance(color: u32) -> f64 {
-    let r = (color & 0xFF) as u8;
-    let g = ((color >> 8) & 0xFF) as u8;
-    let b = ((color >> 16) & 0xFF) as u8;
-    0.2126 * srgb_channel_to_linear(r)
-        + 0.7152 * srgb_channel_to_linear(g)
-        + 0.0722 * srgb_channel_to_linear(b)
-}
-
-/// WCAG 2 contrast ratio between two relative luminances
-/// (https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio): the lighter one over
-/// the darker, each padded by 0.05 so black-on-black still gives a defined
-/// 1:1 rather than dividing by zero.
-pub(crate) fn contrast_ratio(l1: f64, l2: f64) -> f64 {
-    let (lighter, darker) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
-    (lighter + 0.05) / (darker + 0.05)
-}
-
-/// The near-black ink used for badges whose fill reads as light, and the
-/// white used for badges whose fill reads as dark. Kept as the exact colours
-/// `badge_text_color` returns (not pure `#000000`/`#ffffff`) so the contrast
-/// math below matches what is actually painted.
-const BADGE_INK_DARK: u32 = rgb(0x20, 0x20, 0x20);
-const BADGE_INK_LIGHT: u32 = rgb(0xff, 0xff, 0xff);
 
 /// Picks whichever of near-black or white text gives the higher WCAG 2
 /// contrast ratio (https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio) against
@@ -931,21 +881,6 @@ impl Fonts {
     }
 }
 
-/// Headline size relative to the system message font. Deliberately below
-/// 1.0: a stock Windows notification uses roughly the message-font size,
-/// and the user wants the card's headline clearly smaller than that (see
-/// `HEADLINE_MAX_LINES` for the character-budget arithmetic this feeds).
-const HEADLINE_FONT_SCALE: f32 = 0.85;
-/// Sits just under the headline so the two remain distinguishable by size
-/// as a secondary cue, even though colour (`Palette::headline` vs.
-/// `Palette::detail`) is now the primary way to tell them apart -- neither
-/// font is bold any more.
-const DETAIL_FONT_SCALE: f32 = 0.8;
-/// The difficulty badge's label is the smallest text on the card -- it is an
-/// at-a-glance annotation, not a headline, and the whole point is that it not
-/// compete with the (already small, non-bold) answer text for attention.
-const BADGE_FONT_SCALE: f32 = 0.7;
-
 /// Builds the headline/body fonts for `dpi` and `text_scale`, deriving from
 /// the shell's message font (`SPI_GETNONCLIENTMETRICS`) so the card matches
 /// the system. Infallible: any Win32 failure degrades to a stock GUI font
@@ -1045,7 +980,7 @@ fn fallback_logfont() -> windows::Win32::Graphics::Gdi::LOGFONTW {
         lfHeight: -12,
         ..Default::default()
     };
-    for (i, u) in "Segoe UI".encode_utf16().enumerate() {
+    for (i, u) in FALLBACK_FONT_FACE.encode_utf16().enumerate() {
         if i < lf.lfFaceName.len() {
             lf.lfFaceName[i] = u;
         }
@@ -1057,8 +992,6 @@ fn fallback_logfont() -> windows::Win32::Graphics::Gdi::LOGFONTW {
 // Layout constants (logical pixels at 96 DPI; scaled per-window via `scale`)
 // ---------------------------------------------------------------------------
 
-const MARGIN_DP: i32 = 14;
-const PADDING_DP: i32 = 14;
 const CARD_WIDTH_DP: i32 = 280;
 /// Collapsed headline cap. The prompt budgets a 90-character headline.
 /// Content width is `CARD_WIDTH_DP - 2*PADDING_DP` = 280 - 28 = 252dp.
@@ -1087,7 +1020,6 @@ const PENDING_SIZE_DP: i32 = 40;
 const PENDING_WIDTH_DP: i32 = CARD_WIDTH_DP;
 /// Vertical gap between the glyph and the status line beneath it.
 const PENDING_TEXT_GAP_DP: i32 = 8;
-const GAP_DP: i32 = 6;
 const WHEEL_SCROLL_DP: i32 = 48;
 
 // -- "there is more" cues (#353) ----------------------------------------
@@ -1651,7 +1583,7 @@ impl CardInner {
                 self.fonts.body,
                 &look,
                 palette.bg,
-                self.scale(BUTTON_CORNER_DP),
+                self.scale(CONTROL_RADIUS_DP),
                 self.scale(1),
             );
         }
@@ -3538,7 +3470,7 @@ impl CardInner {
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
         if preview.error.is_some() {
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(rgb(224, 82, 82)));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.danger));
         }
         draw_text_line(
             hdc,
@@ -3627,9 +3559,6 @@ const ID_PREVIEW_CANCEL: i32 = 3902;
 /// subclass procedure, so nothing here ever needs to tell two subclasses on
 /// the same control apart.
 const PREVIEW_SUBCLASS_ID: usize = 1;
-
-/// Corner radius of the owner-drawn preview buttons, in dp.
-const BUTTON_CORNER_DP: i32 = 6;
 
 fn button_is_hovered(hwnd: HWND) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::GetPropW;
@@ -5008,6 +4937,37 @@ mod tests {
         assert!(setting_change_is_theme("ImmersiveColorSet"));
         assert!(!setting_change_is_theme("intl"));
         assert!(!setting_change_is_theme(""));
+    }
+
+    #[test]
+    fn card_palettes_keep_the_colours_they_always_had() {
+        // #362 slice 1 moved the values into `theme`; the card must paint
+        // exactly what it painted before. Literal numbers on purpose.
+        let d = Theme::Dark.palette();
+        assert_eq!(
+            (d.bg, d.border, d.headline, d.detail, d.hint),
+            (
+                0x0020_2020,
+                0x0040_4040,
+                0x00F5_F5F5,
+                0x00BE_BEBE,
+                0x008C_8C8C
+            )
+        );
+        let l = Theme::Light.palette();
+        assert_eq!(
+            (l.bg, l.border, l.headline, l.detail, l.hint),
+            (
+                0x00FA_FAFA,
+                0x00D6_D6D6,
+                0x0017_1717,
+                0x005A_5A5A,
+                0x007A_7A7A
+            )
+        );
+        // The preview error colour was rgb(224, 82, 82) in both themes.
+        assert_eq!(d.danger, 0x0052_52E0);
+        assert_eq!(l.danger, 0x0052_52E0);
     }
 
     #[test]

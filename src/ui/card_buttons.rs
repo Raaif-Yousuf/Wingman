@@ -112,7 +112,7 @@ pub(crate) fn blend(from: u32, to: u32, pct: u32) -> u32 {
 /// Black or white text for `fill`, whichever has the higher WCAG contrast
 /// ratio against it.
 pub(crate) fn readable_on(fill: u32) -> u32 {
-    use crate::ui::card::{contrast_ratio, relative_luminance};
+    use crate::ui::theme::{contrast_ratio, relative_luminance};
     let l = relative_luminance(fill);
     let against_black = contrast_ratio(l, 0.0);
     let against_white = contrast_ratio(l, 1.0);
@@ -401,7 +401,7 @@ mod tests {
         assert_eq!(readable_on(rgb(0, 40, 120)), 0x00FF_FFFF);
         // Mid accents (the default blue, an orange) get whichever of black
         // and white has the higher contrast, never the weaker one.
-        use crate::ui::card::{contrast_ratio, relative_luminance};
+        use crate::ui::theme::{contrast_ratio, relative_luminance};
         for accent in [ACCENT, rgb(0xF7, 0x63, 0x0C)] {
             let l = relative_luminance(accent);
             let chosen = relative_luminance(readable_on(accent));
