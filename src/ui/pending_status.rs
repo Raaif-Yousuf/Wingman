@@ -82,6 +82,19 @@ fn truncate(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// Like `truncate` but keeps the END and cuts the front, with a leading
+/// "...". A host's registrable domain is at the end, so a long
+/// `login.bank.com.evil.example` must still show `evil.example`.
+fn truncate_front(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let tail: String = s.chars().skip(n - keep).collect();
+    format!("...{tail}")
+}
+
 /// The status line shown on the pending card (and set as the window's
 /// accessible text via `SetWindowTextW`) for a given stage. Pure: no I/O, no
 /// Win32.
@@ -93,7 +106,7 @@ pub fn pending_status_text(stage: &PendingStage) -> String {
         PendingStage::ReadingSelection => "Reading your selection...".to_string(),
         PendingStage::ReadingForm => "Reading the form...".to_string(),
         PendingStage::ReadingPage { host } => {
-            format!("Reading {}...", truncate(host, MAX_HOST_CHARS))
+            format!("Reading {}...", truncate_front(host, MAX_HOST_CHARS))
         }
         PendingStage::Working => "Working...".to_string(),
         PendingStage::StillWorking => "Still working.".to_string(),
@@ -134,9 +147,13 @@ mod tests {
     #[test]
     fn reading_page_text_truncates_a_very_long_host() {
         let text = pending_status_text(&PendingStage::ReadingPage {
-            host: "a".repeat(200),
+            host: format!("{}.evil.example", "a".repeat(47)),
         });
-        assert_eq!(text, format!("Reading {}...", "a".repeat(MAX_HOST_CHARS)));
+        // 60 chars in: the front is cut, the registrable domain stays.
+        assert_eq!(
+            text,
+            format!("Reading ...{}.evil.example...", "a".repeat(24))
+        );
     }
 
     #[test]

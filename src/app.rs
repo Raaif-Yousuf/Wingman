@@ -4013,19 +4013,6 @@ fn provider_for_router(
     providers.provider_for_named_model(name, Some(model))
 }
 
-/// #243: `App::first_provider_model_label`'s implementation, pulled out to a
-/// free function over `&Providers` (same split as `router_models_for`/
-/// `provider_for_router` above) so it is testable without constructing a
-/// whole `App`. Used to keep its own hand-mirrored match over
-/// "openai"/"anthropic"/"gemini"/"ollama"/"compat:<name>" -- the same five
-/// arms issue #222 already consolidated for the router and #201 for
-/// diagnostics. Now a thin call into `Providers::describe`, the single
-/// source of truth those two already read, so a provider kind missing an
-/// arm here is no longer possible: there is no arm here to miss.
-///
-/// #354 follow-up: reads the first entry `mode` would actually try
-/// (`Providers::selected_order_for_mode`, shared with `build_chain_for_mode`)
-/// rather than `providers.order.first()` unfiltered.
 /// #551: posts a pending-card stage from a worker thread. `run` is the
 /// `App::run_generation` the worker was started under. If the post fails the
 /// box is freed here, so nothing leaks.
@@ -4044,6 +4031,19 @@ fn post_pending_stage(target: isize, run: u64, stage: crate::ui::card::PendingSt
     }
 }
 
+/// #243: `App::first_provider_model_label`'s implementation, pulled out to a
+/// free function over `&Providers` (same split as `router_models_for`/
+/// `provider_for_router` above) so it is testable without constructing a
+/// whole `App`. Used to keep its own hand-mirrored match over
+/// "openai"/"anthropic"/"gemini"/"ollama"/"compat:<name>" -- the same five
+/// arms issue #222 already consolidated for the router and #201 for
+/// diagnostics. Now a thin call into `Providers::describe`, the single
+/// source of truth those two already read, so a provider kind missing an
+/// arm here is no longer possible: there is no arm here to miss.
+///
+/// #354 follow-up: reads the first entry `mode` would actually try
+/// (`Providers::selected_order_for_mode`, shared with `build_chain_for_mode`)
+/// rather than `providers.order.first()` unfiltered.
 fn first_provider_model_label(mode: Mode, providers: &Providers) -> Option<String> {
     let selected = providers.selected_order_for_mode(mode, true);
     let name = selected.first()?;
