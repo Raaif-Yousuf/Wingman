@@ -192,16 +192,6 @@ pub fn is_invokable_control_type(control_type: &str) -> bool {
     )
 }
 
-/// Whether a UIA control type is the kind of thing typed text can go into --
-/// used only to decide whether [`TextElementAccess::write_with_fallback`]'s
-/// typed-input fallback is even worth attempting for a control with no
-/// `ValuePattern`. Deliberately narrow (the three control types this crate's
-/// `control_type_to_string` maps to something text-editable); a control type
-/// not in this list refuses rather than guessing.
-pub fn is_editable_control_type(control_type: &str) -> bool {
-    matches!(control_type, "Edit" | "Document" | "ComboBox")
-}
-
 /// One `SendInput` Unicode key event: a UTF-16 code unit plus whether this is
 /// the key-down or key-up half. Deliberately not a `windows::Win32::...`
 /// type -- this stays plain data so [`plan_typed_input`] is testable with no
@@ -254,13 +244,15 @@ pub struct TypedReplacePlan {
 /// reads `current_text` only from a `ValuePattern`, so the expected text is
 /// always empty here even when the field holds text. So this never looks at
 /// it: select-all is unconditional (harmless on an empty field).
-/// Only `Edit` and `ComboBox` are allowed. Ctrl+A in a `Document` (a browser
-/// page, a Word body) selects the whole document and typing would wipe it, so
-/// that is refused, as is any other control type.
+/// Only `Edit` is allowed. Ctrl+A in a `Document` (a browser page, a Word
+/// body) selects the whole document and typing would wipe it. A `ComboBox`
+/// with no `ValuePattern` cannot be told apart from a drop-down list, where
+/// Ctrl+A does nothing and typing is only type-ahead, so the card would say
+/// Filled when nothing was filled. Both refuse, as does any other type.
 pub fn plan_typed_fallback(control_type: &str, new_text: &str) -> Result<TypedReplacePlan> {
-    if !is_editable_control_type(control_type) || control_type == "Document" {
+    if control_type != "Edit" {
         return Err(anyhow!(
-            "the target element does not support ValuePattern and typing into a {control_type} control is not safe, so nothing was written"
+            "Wingman cannot safely type into this field ({control_type}): the app does not let it set the text directly, and typing could overwrite the wrong thing. Nothing was written. Click the field and type the value yourself."
         ));
     }
     let text = plan_typed_input(new_text);
@@ -649,20 +641,20 @@ pub mod com {
         }
     }
 
-    /// `SendInput`s the typed-input fallback plan. Never called by this
-    /// module's own automated tests -- see the module doc comment's "The
-    /// typed-input fallback" section and `fill_form.rs`'s tests, none of
-    /// which target a control lacking `ValuePattern`, so this function is
-    /// only ever reached in production. Covered by [`plan_typed_input`]'s
-    /// own pure tests plus the manual check filed to #166. `dwExtraInfo` is
-    /// tagged with `crate::hotkey::INJECTED_MARKER` (issue #209: the single
-    /// constant every `SendInput` call site in the crate now shares) so
-    /// `hook_proc` never treats this typed fallback's own keystrokes as a
-    /// real hotkey press.
+    /// The one real `SendInput` call, returning how many events were
+    /// accepted. Never called by this module's own automated tests (tests use
+    /// a fake sender): it would type into whatever window has focus.
     fn real_sender(inputs: &[INPUT]) -> usize {
         unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) as usize }
     }
 
+    /// Types the planned Unicode events through the real sender. Never called
+    /// by this module's own automated tests -- see the module doc comment's
+    /// "The typed-input fallback" section; covered by [`plan_typed_input`]'s
+    /// pure tests plus the manual check filed to #166. `dwExtraInfo` is tagged
+    /// with `crate::hotkey::INJECTED_MARKER` (issue #209: the one constant
+    /// every `SendInput` call site shares) so `hook_proc` never treats these
+    /// keystrokes as a real hotkey press.
     fn inject_unicode_events(events: &[UnicodeKeyEvent]) -> Result<()> {
         let inputs: Vec<INPUT> = events.iter().map(to_unicode_input).collect();
         send_all(&inputs, &real_sender).map_err(|e| {
@@ -686,8 +678,8 @@ pub mod com {
         Ok(())
     }
 
-    /// Ctrl+A. On a short count Ctrl may be left down, so a Ctrl key-up is
-    /// sent best-effort before reporting the error.
+    /// Ctrl+A. On a short count A or Ctrl may be left down, so key-ups for
+    /// both are sent best-effort before reporting the error.
     fn send_select_all(sender: &dyn Fn(&[INPUT]) -> usize) -> Result<()> {
         let r = send_all(
             &[
@@ -699,7 +691,7 @@ pub mod com {
             sender,
         );
         if r.is_err() {
-            sender(&[vk_input(VK_CONTROL, true)]);
+            sender(&[vk_input(VK_A, true), vk_input(VK_CONTROL, true)]);
         }
         r
     }
@@ -846,12 +838,13 @@ pub mod com {
         fn run(accept: usize) -> (Result<()>, Vec<(usize, bool)>) {
             let calls = RefCell::new(Vec::new());
             let sender = |inputs: &[INPUT]| {
-                let up = unsafe {
-                    inputs.len() == 1
-                        && inputs[0].Anonymous.ki.wVk == VK_CONTROL
-                        && inputs[0].Anonymous.ki.dwFlags == KEYEVENTF_KEYUP
-                        && inputs[0].Anonymous.ki.dwExtraInfo == INJECTED_MARKER
+                let is_up = |i: &INPUT, vk: VIRTUAL_KEY| unsafe {
+                    i.Anonymous.ki.wVk == vk
+                        && i.Anonymous.ki.dwFlags == KEYEVENTF_KEYUP
+                        && i.Anonymous.ki.dwExtraInfo == INJECTED_MARKER
                 };
+                let up =
+                    inputs.len() == 2 && is_up(&inputs[0], VK_A) && is_up(&inputs[1], VK_CONTROL);
                 calls.borrow_mut().push((inputs.len(), up));
                 accept.min(inputs.len())
             };
@@ -1003,22 +996,6 @@ mod tests {
         }
     }
 
-    // -- is_editable_control_type --------------------------------------
-
-    #[test]
-    fn edit_document_combobox_are_editable() {
-        for ct in ["Edit", "Document", "ComboBox"] {
-            assert!(is_editable_control_type(ct), "{ct} should be editable");
-        }
-    }
-
-    #[test]
-    fn button_and_other_are_not_editable() {
-        for ct in ["Button", "CheckBox", "Text", "Other", ""] {
-            assert!(!is_editable_control_type(ct), "{ct} should not be editable");
-        }
-    }
-
     // -- plan_typed_input (SendInput fallback planning, purely) -------------
 
     #[test]
@@ -1100,12 +1077,10 @@ mod tests {
     fn fallback_always_selects_all_because_expected_is_empty_without_a_value_pattern() {
         // The real path: no ValuePattern means the walk reads "" for a field
         // that may still hold text, so the plan cannot depend on that text.
-        for ct in ["Edit", "ComboBox"] {
-            let plan = plan_typed_fallback(ct, "new").unwrap();
-            assert!(plan.select_all, "{ct}: must select existing text first");
-            assert!(!plan.delete_selection);
-            assert_eq!(plan.text, plan_typed_input("new"));
-        }
+        let plan = plan_typed_fallback("Edit", "new").unwrap();
+        assert!(plan.select_all, "must select existing text first");
+        assert!(!plan.delete_selection);
+        assert_eq!(plan.text, plan_typed_input("new"));
     }
 
     #[test]
@@ -1116,8 +1091,10 @@ mod tests {
 
     #[test]
     fn fallback_refuses_document_and_other_control_types() {
-        for ct in ["Document", "Button", "Pane", ""] {
-            assert!(plan_typed_fallback(ct, "x").is_err(), "{ct} must refuse");
+        for ct in ["Document", "ComboBox", "Button", "Pane", ""] {
+            let err = plan_typed_fallback(ct, "x").unwrap_err().to_string();
+            assert!(err.contains("type the value yourself"), "{ct}: {err}");
+            assert!(!err.contains('\u{2014}'), "no em dash in a card string");
         }
     }
 
@@ -1137,8 +1114,8 @@ mod send_tests {
     fn short_select_all_batch_releases_ctrl_and_errs() {
         let (r, calls) = select_all_with_short_count();
         assert!(r.is_err());
-        // The 4-event batch, then a lone Ctrl key-up.
-        assert_eq!(calls, vec![(4, false), (1, true)]);
+        // The 4-event batch, then key-ups for A and Ctrl.
+        assert_eq!(calls, vec![(4, false), (2, true)]);
     }
 
     #[test]
