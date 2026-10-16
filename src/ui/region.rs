@@ -768,7 +768,7 @@ impl Overlay {
         // Keep the screen position (#506) so a password field inside the
         // selection is still found. `crop_rgba` clamps the origin of `rect`
         // to the image, so do the same here to stay in step with it.
-        cropped.screen = original.screen.map(|m| {
+        cropped.screen = original.screen.as_ref().map(|m| {
             m.cropped(capture::RectPx {
                 x: rect.x.min(original.width.saturating_sub(1)),
                 y: rect.y.min(original.height.saturating_sub(1)),

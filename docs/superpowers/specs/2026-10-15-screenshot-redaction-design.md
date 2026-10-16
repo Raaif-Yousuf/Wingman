@@ -203,16 +203,27 @@ Slices 1 and 2 land together (rule 8: no pipeline stage nobody calls).
 ## As built (slice 3, #506)
 
 - `RawShot.screen` is a `ScreenMap`: the screen position of pixel (0, 0), the
-  screen pixels per image pixel (above 1 after the downscale) and the
-  foreground window at capture time. `grab_raw` and `grab_virtual_desktop_raw`
-  set it; the region tool carries it through a crop with `ScreenMap::cropped`.
-  A shot without one (a test canvas) has no password lookup.
-- `inputs::uia::password_rects` does one `FindAllBuildCache` with an
-  `IsPassword = true` condition on the foreground window and caches only the
-  bounding rectangle, so no text is read. It runs on a thread of its own and is
-  given up after 1.5 s; at most 64 rectangles come back.
-  `redact::apply` paints them (padded and clipped like OCR regions) before the
-  OCR regions. A lookup that fails or times out fails closed, like OCR.
+  screen pixels per image pixel (above 1 after the downscale) and the password
+  lookup. `grab_raw` and `grab_virtual_desktop_raw` set it; the region tool
+  carries it through a crop with `ScreenMap::cropped`. A shot without one (a
+  test canvas) has no password lookup.
+- The lookup starts on its own thread at capture time, right after the window
+  is read, so it describes what the user saw and runs alongside the capture and
+  encode. `inputs::uia::password_rects` does one `FindAllBuildCache` with an
+  `IsPassword = true` condition and caches only the bounding rectangle, so no
+  text is read. `redact::apply` collects the result and only waits for what is
+  left of a 1.5 s budget counted from the start; at most 64 rectangles come
+  back. The boxes are padded and clipped like OCR regions.
+- Failure policy: a timeout, a thread that cannot start and an unexpected UIA
+  error fail closed with the generic card. A window that no longer exists has
+  no fields. An access denied answer (an app running as administrator) fails
+  closed with its own card: "Wingman can't check an app running as
+  administrator for password fields, so nothing was sent." THEORY (unverified):
+  that UIA answers E_ACCESSDENIED for an elevated window; it was not run
+  against one.
+- The router's capture runs while Wingman's palette is in front, so it asks
+  about the window that was in front before the palette opened (none: no
+  fields).
 - Only the foreground window is asked. A password field in another window on the
   same monitor is not painted. A revealed password (the field is no longer
   `IsPassword`) is not found by UIA; OCR and the span rules still apply to it.

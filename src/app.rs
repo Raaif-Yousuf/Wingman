@@ -967,6 +967,11 @@ impl App {
             return;
         }
 
+        // #506: the window under the palette, read before the palette takes
+        // the foreground. The router's capture looks for password fields
+        // there, not in Wingman's own palette.
+        let underlying =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
         let resolved = match actions::load_actions() {
             Ok(r) => r,
             Err(e) => {
@@ -1001,7 +1006,7 @@ impl App {
         let password_manager_in_front = self.password_manager_now();
         self.palette_password_manager = password_manager_in_front;
         self.palette.show(catalogue, model_configured, footer);
-        self.maybe_start_router(candidates, password_manager_in_front);
+        self.maybe_start_router(candidates, password_manager_in_front, underlying);
     }
 
     /// #24: the intent router's hook, called right after
@@ -1025,6 +1030,7 @@ impl App {
         &mut self,
         candidates: Vec<router::RouterCandidate>,
         password_manager_in_front: bool,
+        underlying_window: isize,
     ) {
         if pause::is_paused_now() || password_manager_in_front {
             return;
@@ -1046,10 +1052,11 @@ impl App {
         // worker thread, same constraint `ask` documents at its own capture
         // call site); encoding to PNG happens below, on the worker thread,
         // exactly like `ask` defers its own (more expensive) encode.
-        let mut raw = match capture::grab_raw(
+        let mut raw = match capture::grab_raw_for(
             &self.config.capture.monitor,
             router::ROUTER_IMAGE_LONG_EDGE,
             router::ROUTER_IMAGE_MAX_PIXELS,
+            capture::LookupWindow::Window(underlying_window),
         ) {
             Ok(r) => r,
             Err(_) => return,
@@ -4514,6 +4521,10 @@ const KNOWN_TECHNICAL_DETAILS: &[(&str, &str)] = &[
         crate::redact::FAILURE_SENTENCE,
     ),
     (
+        crate::redact::ADMIN_APP_SENTENCE,
+        crate::redact::ADMIN_APP_SENTENCE,
+    ),
+    (
         "TzSpecificLocalTimeToSystemTime",
         "Couldn't read your clock settings.",
     ),
@@ -7342,6 +7353,22 @@ mod tests {
         assert_eq!(
             crate::redact::FAILURE_SENTENCE,
             "Could not check the screenshot for private details, so nothing was sent."
+        );
+    }
+
+    /// #506: an app running as administrator gets its own plain sentence, not
+    /// the generic one and not "Something went wrong."
+    #[test]
+    fn an_administrator_app_shows_its_own_sentence() {
+        let err = anyhow::anyhow!("access denied").context(crate::redact::ADMIN_APP_SENTENCE);
+        let chain = worker_error_chain_text(&err);
+        assert_eq!(
+            humanize_error_chain(&chain),
+            crate::redact::ADMIN_APP_SENTENCE
+        );
+        assert_eq!(
+            crate::redact::ADMIN_APP_SENTENCE,
+            "Wingman can't check an app running as administrator for password fields, so nothing was sent."
         );
     }
 

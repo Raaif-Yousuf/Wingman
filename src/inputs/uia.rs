@@ -399,40 +399,165 @@ pub fn snapshot_hwnd(
 /// with more masked fields than this is not a login form; the rest are left.
 pub const MAX_PASSWORD_RECTS: usize = 64;
 
-/// How long the password lookup may take before it is given up (#506). The
-/// `FindAll` is one blocking COM call against another process, and UIA's own
-/// transaction timeout is five seconds, too long to hold a request for.
+/// How long the password lookup may take, counted from the moment it starts
+/// (the capture), before it is given up (#506). The `FindAll` is one blocking
+/// COM call against another process, and UIA's own transaction timeout is
+/// five seconds, too long to hold a request for.
 pub const PASSWORD_LOOKUP_BUDGET: Duration = Duration::from_millis(1500);
 
-/// The on-screen rectangles of every password field (`IsPassword`) under the
-/// window `hwnd` (a raw `HWND` value), in virtual-screen pixels, with no text
-/// read (#506). One `FindAll` with a property condition, on a thread of its
-/// own so a hung provider can only cost `budget`: after that this returns an
-/// error and the thread is left to finish by itself. At most
-/// [`MAX_PASSWORD_RECTS`] come back. An `hwnd` of 0 has no window to ask and
-/// returns none.
-pub fn password_rects(
-    hwnd: isize,
-    budget: Duration,
-) -> anyhow::Result<Vec<crate::capture::ScreenRect>> {
-    if hwnd == 0 {
+/// Why a password lookup gave no answer (#506). Every one fails closed except
+/// a window that has gone, which is not an error at all (no fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupError {
+    /// The lookup did not finish within its budget.
+    TimedOut,
+    /// Windows refused (E_ACCESSDENIED): an app running as administrator.
+    AccessDenied,
+    /// The thread could not start, or UIA failed in an unexpected way.
+    Failed,
+}
+
+type LookupSlot = std::sync::Arc<(
+    std::sync::Mutex<Option<Result<Vec<crate::capture::ScreenRect>, LookupError>>>,
+    std::sync::Condvar,
+)>;
+
+/// A password-field lookup running on a thread of its own, started at capture
+/// time (#506). Cloning shares the one lookup (a region crop keeps it). The
+/// thread is never waited for here: [`PasswordLookup::collect`] waits only
+/// for what is left of the budget, and a thread that outlives it finishes by
+/// itself.
+#[derive(Clone)]
+pub struct PasswordLookup {
+    started: std::time::Instant,
+    slot: LookupSlot,
+}
+
+impl std::fmt::Debug for PasswordLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordLookup").finish_non_exhaustive()
+    }
+}
+
+/// How a lookup error should be treated, from the error alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// The window or its root element no longer exists: no fields.
+    Gone,
+    Denied,
+    Timeout,
+    Other,
+}
+
+/// `E_ACCESSDENIED`.
+const E_ACCESSDENIED_HRESULT: i32 = 0x8007_0005u32 as i32;
+/// `UIA_E_ELEMENTNOTAVAILABLE`.
+const UIA_E_ELEMENTNOTAVAILABLE_HRESULT: i32 = 0x8004_0201u32 as i32;
+
+/// Sorts an error from the COM half. Pure so every branch is tested.
+pub fn classify_error(err: &anyhow::Error) -> ErrorClass {
+    if let Some(e) = err.downcast_ref::<windows::core::Error>() {
+        match e.code().0 {
+            E_ACCESSDENIED_HRESULT => return ErrorClass::Denied,
+            UIA_E_ELEMENTNOTAVAILABLE_HRESULT => return ErrorClass::Gone,
+            _ => {}
+        }
+    }
+    if format!("{err:#}").contains(crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT) {
+        return ErrorClass::Timeout;
+    }
+    ErrorClass::Other
+}
+
+/// The blocking lookup, run on the lookup thread: a window that no longer
+/// exists has no fields, anything else follows [`classify_error`].
+fn lookup_blocking(hwnd: isize) -> Result<Vec<crate::capture::ScreenRect>, LookupError> {
+    let handle = windows::Win32::Foundation::HWND(hwnd as *mut _);
+    let alive = |h| unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(h)) }.as_bool();
+    if hwnd == 0 || !alive(handle) {
         return Ok(Vec::new());
     }
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("password-rects".into())
-        .spawn(move || {
-            let _ = tx.send(com::password_rects(
-                windows::Win32::Foundation::HWND(hwnd as *mut _),
-                MAX_PASSWORD_RECTS,
-            ));
-        })?;
-    match rx.recv_timeout(budget) {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "{} (password fields)",
-            crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT
-        )),
+    match com::password_rects(handle, MAX_PASSWORD_RECTS) {
+        Ok(rects) => Ok(rects),
+        // A window closed while the lookup ran is not a failure.
+        Err(_) if !alive(handle) => Ok(Vec::new()),
+        Err(e) => match classify_error(&e) {
+            ErrorClass::Gone => Ok(Vec::new()),
+            ErrorClass::Denied => Err(LookupError::AccessDenied),
+            ErrorClass::Timeout => Err(LookupError::TimedOut),
+            ErrorClass::Other => Err(LookupError::Failed),
+        },
+    }
+}
+
+impl PasswordLookup {
+    /// Starts the lookup for the window `hwnd` (a raw `HWND` value; 0 means
+    /// no window and finds nothing). Returns at once. If the thread cannot be
+    /// spawned the lookup is already finished with [`LookupError::Failed`].
+    pub fn start(hwnd: isize) -> Self {
+        let slot: LookupSlot = Default::default();
+        let for_thread = slot.clone();
+        let spawned = std::thread::Builder::new()
+            .name("password-rects".into())
+            .spawn(move || Self::finish(&for_thread, lookup_blocking(hwnd)));
+        let this = Self {
+            started: std::time::Instant::now(),
+            slot,
+        };
+        if spawned.is_err() {
+            Self::finish(&this.slot, Err(LookupError::Failed));
+        }
+        this
+    }
+
+    fn finish(slot: &LookupSlot, result: Result<Vec<crate::capture::ScreenRect>, LookupError>) {
+        let (lock, cv) = &**slot;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        cv.notify_all();
+    }
+
+    /// The rectangles, waiting at most until `budget` after the lookup
+    /// started. Safe to call more than once. A lookup still running at the
+    /// deadline is [`LookupError::TimedOut`].
+    pub fn collect(
+        &self,
+        budget: Duration,
+    ) -> Result<Vec<crate::capture::ScreenRect>, LookupError> {
+        let (lock, cv) = &*self.slot;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(result) = guard.as_ref() {
+                return result.clone();
+            }
+            let left = budget.saturating_sub(self.started.elapsed());
+            if left.is_zero() {
+                return Err(LookupError::TimedOut);
+            }
+            guard = cv
+                .wait_timeout(guard, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// A lookup that has already finished with `result` (tests).
+    #[cfg(test)]
+    pub fn finished(result: Result<Vec<crate::capture::ScreenRect>, LookupError>) -> Self {
+        let this = Self {
+            started: std::time::Instant::now(),
+            slot: Default::default(),
+        };
+        Self::finish(&this.slot, result);
+        this
+    }
+
+    /// A lookup that never finishes, started `ago` ago (tests).
+    #[cfg(test)]
+    pub fn never_finishing(ago: Duration) -> Self {
+        Self {
+            started: std::time::Instant::now() - ago,
+            slot: Default::default(),
+        }
     }
 }
 
@@ -1147,6 +1272,85 @@ mod tests {
     }
 
     // -- real Win32 window: label resolution and password redaction, for
+    // -- password lookup (#506) --------------------------------------------
+
+    fn rect(l: i32) -> crate::capture::ScreenRect {
+        crate::capture::ScreenRect {
+            left: l,
+            top: 0,
+            right: l + 10,
+            bottom: 10,
+        }
+    }
+
+    #[test]
+    fn classify_error_sorts_access_denied_gone_timeout_and_the_rest() {
+        use super::{classify_error, ErrorClass::*};
+        let win = |code: i32| {
+            anyhow::Error::from(windows::core::Error::from_hresult(windows::core::HRESULT(
+                code,
+            )))
+        };
+        assert_eq!(classify_error(&win(0x8007_0005u32 as i32)), Denied);
+        assert_eq!(classify_error(&win(0x8004_0201u32 as i32)), Gone);
+        assert_eq!(classify_error(&win(0x8000_4005u32 as i32)), Other);
+        let timeout = anyhow::anyhow!(
+            "{} (FindAllBuildCache)",
+            crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT
+        );
+        assert_eq!(classify_error(&timeout), Timeout);
+        assert_eq!(classify_error(&anyhow::anyhow!("boom")), Other);
+    }
+
+    #[test]
+    fn a_finished_lookup_returns_its_result_every_time() {
+        use super::{LookupError, PasswordLookup};
+        let ok = PasswordLookup::finished(Ok(vec![rect(1)]));
+        assert_eq!(ok.collect(Duration::ZERO).unwrap(), vec![rect(1)]);
+        assert_eq!(ok.clone().collect(Duration::ZERO).unwrap(), vec![rect(1)]);
+        let denied = PasswordLookup::finished(Err(LookupError::AccessDenied));
+        assert_eq!(
+            denied.collect(Duration::ZERO),
+            Err(LookupError::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn a_lookup_still_running_at_the_deadline_times_out_and_the_elapsed_time_counts() {
+        use super::{LookupError, PasswordLookup};
+        // Started 10 s ago with a 1.5 s budget: already over, returns at once.
+        let late = PasswordLookup::never_finishing(Duration::from_secs(10));
+        let t = std::time::Instant::now();
+        assert_eq!(
+            late.collect(crate::inputs::uia::PASSWORD_LOOKUP_BUDGET),
+            Err(LookupError::TimedOut)
+        );
+        assert!(t.elapsed() < Duration::from_millis(500));
+        // Only the rest of the budget is waited for.
+        let soon = PasswordLookup::never_finishing(Duration::ZERO);
+        let t = std::time::Instant::now();
+        assert_eq!(
+            soon.collect(Duration::from_millis(60)),
+            Err(LookupError::TimedOut)
+        );
+        assert!(t.elapsed() >= Duration::from_millis(40));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn no_window_or_a_closed_window_has_no_password_fields() {
+        use super::PasswordLookup;
+        assert!(PasswordLookup::start(0)
+            .collect(Duration::from_secs(5))
+            .unwrap()
+            .is_empty());
+        // 0x7777 is not a window handle in this process.
+        assert!(PasswordLookup::start(0x7777)
+            .collect(Duration::from_secs(5))
+            .unwrap()
+            .is_empty());
+    }
+
     // real, via snapshot_hwnd -----------------------------------------------
     //
     // A test-only window class (AGENTS.md rule 9): two labelled EDIT
@@ -1398,15 +1602,13 @@ mod tests {
                 as isize;
             for run in 0..3 {
                 let start = std::time::Instant::now();
-                let r = crate::inputs::uia::password_rects(
-                    hwnd,
-                    crate::inputs::uia::PASSWORD_LOOKUP_BUDGET,
-                );
+                let r = crate::inputs::uia::PasswordLookup::start(hwnd)
+                    .collect(crate::inputs::uia::PASSWORD_LOOKUP_BUDGET);
                 eprintln!(
-                    "run {run}: {:?}, {} rect(s), ok={}",
+                    "run {run}: {:?}, {} rect(s), result={:?}",
                     start.elapsed(),
                     r.as_ref().map(|v| v.len()).unwrap_or(0),
-                    r.is_ok()
+                    r.as_ref().map(|_| ()).map_err(|e| *e)
                 );
             }
         }
@@ -1463,7 +1665,10 @@ mod tests {
                 .expect("CreateWindowExW (edit)")
             };
 
-            // Calls the COM half directly (see below).
+            // Calls the COM half directly: `PasswordLookup` waits on another
+            // thread, and this thread owns the window, so it would have to
+            // pump messages for UIA to answer. In the app the window belongs
+            // to another process.
             // No password field yet: nothing comes back.
             let plain = edit(10, ES_AUTOHSCROLL as u32);
             pump_pending_messages();
@@ -1499,13 +1704,6 @@ mod tests {
                 "UIA rect {got:?} must overlap the password edit at {want:?}"
             );
             assert!(got.bottom - got.top < 60, "{got:?}");
-
-            // No window to ask: nothing, not an error.
-            assert!(
-                crate::inputs::uia::password_rects(0, std::time::Duration::from_millis(10))
-                    .expect("hwnd 0")
-                    .is_empty()
-            );
 
             unsafe {
                 let _ = DestroyWindow(frame);

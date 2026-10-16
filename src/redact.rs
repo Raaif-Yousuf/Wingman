@@ -28,6 +28,12 @@ const OCR_TIMEOUT: Duration = Duration::from_secs(5);
 /// Prefix of the error [`apply`] returns when the check cannot run.
 pub const FAILURE_NEEDLE: &str = "Could not check the screenshot for private details";
 
+/// What the card says when the foreground app runs as administrator and
+/// Windows refuses to list its password fields (#506). Used as the error text
+/// itself; `app::humanize_error_chain` maps it to this same sentence.
+pub const ADMIN_APP_SENTENCE: &str =
+    "Wingman can't check an app running as administrator for password fields, so nothing was sent.";
+
 /// What the card says when [`apply`] fails, whatever the underlying cause.
 /// `app::humanize_error_chain` maps any error chain containing
 /// [`FAILURE_NEEDLE`] to this sentence, so a Win32-looking cause cannot turn
@@ -210,18 +216,27 @@ pub fn password_regions(
 /// Paints the password fields of the window `raw` was captured against.
 /// Returns how many regions were painted. A shot with no screen map (not a
 /// capture) has nothing to map and is left alone. The pure half is
-/// [`password_regions`]; this is the UIA lookup plus [`paint`]. Blocks for the
-/// lookup (at most [`crate::inputs::uia::PASSWORD_LOOKUP_BUDGET`]): worker
-/// thread only.
+/// [`password_regions`]; this collects the lookup that started at capture time
+/// and paints. Blocks only for what is left of
+/// [`crate::inputs::uia::PASSWORD_LOOKUP_BUDGET`]: worker thread only. A
+/// timeout, a failed start or an unexpected error fails closed; a window that
+/// has gone has no fields; an administrator app has its own sentence.
 fn apply_password_fields(raw: &mut RawShot) -> Result<usize> {
-    let Some(map) = raw.screen else {
+    use crate::inputs::uia::LookupError;
+    let Some(map) = raw.screen.clone() else {
         return Ok(0);
     };
-    let rects = crate::inputs::uia::password_rects(
-        map.foreground,
-        crate::inputs::uia::PASSWORD_LOOKUP_BUDGET,
-    )
-    .context(FAILURE_NEEDLE)?;
+    let Some(lookup) = &map.lookup else {
+        return Ok(0);
+    };
+    // The lookup started when the capture was taken; only what is left of its
+    // budget is waited for here.
+    let rects = lookup
+        .collect(crate::inputs::uia::PASSWORD_LOOKUP_BUDGET)
+        .map_err(|e| match e {
+            LookupError::AccessDenied => anyhow::anyhow!(ADMIN_APP_SENTENCE),
+            other => anyhow::anyhow!("password field lookup: {other:?}").context(FAILURE_NEEDLE),
+        })?;
     let regions = password_regions(&rects, &map, raw.width, raw.height);
     paint(raw, &regions);
     Ok(regions.len())
@@ -490,7 +505,7 @@ mod tests {
 
     #[test]
     fn a_password_rect_becomes_a_padded_image_region() {
-        let map = ScreenMap::for_capture(100, 0, 200, 100, 200, 100, 0);
+        let map = ScreenMap::for_capture(100, 0, 200, 100, 200, 100, None);
         let r = password_regions(&[sr(150, 40, 180, 50)], &map, 200, 100);
         assert_eq!(
             r,
@@ -506,7 +521,7 @@ mod tests {
     #[test]
     fn a_password_rect_on_a_downscaled_shot_lands_where_the_pixels_are() {
         // 400x200 monitor shown at 200x100.
-        let map = ScreenMap::for_capture(0, 0, 400, 200, 200, 100, 0);
+        let map = ScreenMap::for_capture(0, 0, 400, 200, 200, 100, None);
         let r = password_regions(&[sr(100, 100, 200, 120)], &map, 200, 100);
         assert_eq!(r.len(), 1);
         assert!(r[0].x0 <= 50 && r[0].x1 >= 100 && r[0].y0 <= 50 && r[0].y1 >= 60);
@@ -515,7 +530,7 @@ mod tests {
 
     #[test]
     fn password_rects_off_the_image_or_empty_paint_nothing_and_never_panic() {
-        let map = ScreenMap::for_capture(0, 0, 100, 100, 100, 100, 0);
+        let map = ScreenMap::for_capture(0, 0, 100, 100, 100, 100, None);
         let rects = [
             sr(500, 500, 600, 600),
             sr(-500, -500, -400, -400),
@@ -543,7 +558,7 @@ mod tests {
 
     #[test]
     fn a_password_rect_overlapping_one_edge_is_clipped_to_the_image() {
-        let map = ScreenMap::for_capture(0, 0, 100, 100, 100, 100, 0);
+        let map = ScreenMap::for_capture(0, 0, 100, 100, 100, 100, None);
         let r = password_regions(&[sr(80, 80, 140, 120)], &map, 100, 100);
         assert_eq!(
             r,
@@ -559,7 +574,7 @@ mod tests {
     #[test]
     fn painting_a_password_region_boxes_it_and_leaves_the_rest() {
         let mut raw = white(100, 100);
-        let map = ScreenMap::for_capture(0, 0, 100, 100, 100, 100, 0);
+        let map = ScreenMap::for_capture(0, 0, 100, 100, 100, 100, None);
         let regions = password_regions(&[sr(40, 40, 60, 50)], &map, 100, 100);
         paint(&mut raw, &regions);
         let px = |x: usize, y: usize| raw.rgba[(y * 100 + x) * 4..(y * 100 + x) * 4 + 4].to_vec();
@@ -581,11 +596,66 @@ mod tests {
         );
 
         let capture = norm(include_str!("capture.rs"));
-        for f in ["pub fn grab_raw(", "pub fn grab_virtual_desktop_raw("] {
+        for f in ["pub fn grab_raw_for(", "pub fn grab_virtual_desktop_raw("] {
             let at = capture.find(f).unwrap_or_else(|| panic!("{f} exists"));
             let body = &capture[at..at + capture[at..].find("\n}\n").unwrap()];
             assert!(body.contains("screen: Some(ScreenMap::for_capture("), "{f}");
+            assert!(body.contains("PasswordLookup::start("), "{f}");
         }
+        // The router's capture names the window under the palette.
+        let app = norm(include_str!("app.rs"));
+        let at = app.find("fn maybe_start_router(").expect("router fn");
+        let body = &app[at..at + app[at..].find("\n    }\n").unwrap()];
+        assert!(
+            body.contains("LookupWindow::Window(underlying_window)"),
+            "{body}"
+        );
+    }
+
+    fn shot_with(lookup: Option<crate::inputs::uia::PasswordLookup>) -> RawShot {
+        let mut raw = white(100, 100);
+        raw.screen = Some(ScreenMap::for_capture(0, 0, 100, 100, 100, 100, lookup));
+        raw
+    }
+
+    #[test]
+    fn a_finished_lookup_is_painted_without_waiting() {
+        use crate::inputs::uia::PasswordLookup;
+        let mut raw = shot_with(Some(PasswordLookup::finished(Ok(vec![sr(40, 40, 60, 50)]))));
+        assert_eq!(apply_password_fields(&mut raw).unwrap(), 1);
+        assert_eq!(&raw.rgba[(45 * 100 + 50) * 4..][..4], &FILL);
+        assert_eq!(&raw.rgba[..4], &[255; 4]);
+    }
+
+    #[test]
+    fn timeouts_failures_and_a_missing_thread_fail_closed_with_the_generic_card() {
+        use crate::inputs::uia::{LookupError, PasswordLookup};
+        for lookup in [
+            PasswordLookup::never_finishing(Duration::from_secs(10)),
+            PasswordLookup::finished(Err(LookupError::TimedOut)),
+            PasswordLookup::finished(Err(LookupError::Failed)),
+        ] {
+            let mut raw = shot_with(Some(lookup));
+            let err = apply_password_fields(&mut raw).unwrap_err();
+            assert!(format!("{err:#}").contains(FAILURE_NEEDLE), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn an_administrator_app_fails_closed_with_its_own_sentence() {
+        use crate::inputs::uia::{LookupError, PasswordLookup};
+        let mut raw = shot_with(Some(PasswordLookup::finished(Err(
+            LookupError::AccessDenied,
+        ))));
+        let err = apply_password_fields(&mut raw).unwrap_err();
+        assert_eq!(format!("{err:#}"), ADMIN_APP_SENTENCE);
+        assert!(!ADMIN_APP_SENTENCE.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn a_map_with_no_lookup_paints_nothing() {
+        let mut raw = shot_with(None);
+        assert_eq!(apply_password_fields(&mut raw).unwrap(), 0);
     }
 
     #[test]

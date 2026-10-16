@@ -113,17 +113,39 @@ pub struct ScreenRect {
 /// How a [`RawShot`]'s pixels relate to the virtual screen: the screen
 /// position of pixel (0, 0) and how many screen pixels one image pixel
 /// covers (above 1.0 once `fit_for_model` has shrunk the capture). Carries
-/// the foreground window the capture was taken against, so the password
-/// lookup asks the window the user was looking at, not whatever is in front
-/// when the worker runs.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// the password-field lookup that was started when the capture was taken, so
+/// it describes the window as the user saw it, not as it is when the worker
+/// runs, and runs while the capture and encode do.
+#[derive(Debug, Clone)]
 pub struct ScreenMap {
     pub origin_x: f64,
     pub origin_y: f64,
     pub scale_x: f64,
     pub scale_y: f64,
-    /// Raw `HWND` of the foreground window at capture time, 0 if none.
-    pub foreground: isize,
+    /// The password-field lookup started at capture time. `None` for a map
+    /// built without one (a test).
+    pub lookup: Option<crate::inputs::uia::PasswordLookup>,
+}
+
+/// Which window's password fields a capture asks about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupWindow {
+    /// Whatever is in front when the capture is taken.
+    Foreground,
+    /// A window remembered earlier (the router capture runs while Wingman's
+    /// own palette is in front). 0 means there is none: no fields.
+    Window(isize),
+}
+
+impl LookupWindow {
+    /// The raw `HWND` value to ask about. Reads the foreground window when
+    /// this is [`LookupWindow::Foreground`], so call it at capture time.
+    fn resolve(self) -> isize {
+        match self {
+            Self::Foreground => unsafe { GetForegroundWindow() }.0 as isize,
+            Self::Window(h) => h,
+        }
+    }
 }
 
 impl ScreenMap {
@@ -137,14 +159,14 @@ impl ScreenMap {
         native_h: u32,
         width: u32,
         height: u32,
-        foreground: isize,
+        lookup: Option<crate::inputs::uia::PasswordLookup>,
     ) -> Self {
         Self {
             origin_x: f64::from(left),
             origin_y: f64::from(top),
             scale_x: f64::from(native_w.max(1)) / f64::from(width.max(1)),
             scale_y: f64::from(native_h.max(1)) / f64::from(height.max(1)),
-            foreground,
+            lookup,
         }
     }
 
@@ -153,14 +175,14 @@ impl ScreenMap {
         Self {
             origin_x: self.origin_x + f64::from(rect.x) * self.scale_x,
             origin_y: self.origin_y + f64::from(rect.y) * self.scale_y,
-            ..*self
+            ..self.clone()
         }
     }
 
     /// `rect` as float image pixels `(x0, y0, x1, y1)`, not clipped. `None`
     /// for a map that cannot be inverted (a scale that is zero or not
     /// finite) or a rect that is empty or reversed.
-    pub fn to_image(self, rect: ScreenRect) -> Option<(f32, f32, f32, f32)> {
+    pub fn to_image(&self, rect: ScreenRect) -> Option<(f32, f32, f32, f32)> {
         let ok = |s: f64| s.is_finite() && s > 0.0;
         if !(ok(self.scale_x) && ok(self.scale_y))
             || rect.right <= rect.left
@@ -212,6 +234,24 @@ pub fn resolve_limits(
 /// `"primary"` (always the system's primary monitor). Anything else is
 /// treated as `"active"`.
 pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Result<RawShot> {
+    grab_raw_for(
+        monitor_mode,
+        max_long_edge,
+        max_pixels,
+        LookupWindow::Foreground,
+    )
+}
+
+/// [`grab_raw`], with the window whose password fields are looked up named.
+/// The lookup thread starts here, before the monitor is grabbed, so it runs
+/// alongside the capture, the resize and the encode (#506).
+pub fn grab_raw_for(
+    monitor_mode: &str,
+    max_long_edge: u32,
+    max_pixels: u64,
+    lookup_window: LookupWindow,
+) -> Result<RawShot> {
+    let lookup = crate::inputs::uia::PasswordLookup::start(lookup_window.resolve());
     let rect = match monitor_mode {
         "primary" => primary_monitor_rect()?,
         _ => active_monitor_rect()?,
@@ -238,7 +278,6 @@ pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Resu
         target.x().unwrap_or(rect.left),
         target.y().unwrap_or(rect.top),
     );
-    let foreground = unsafe { GetForegroundWindow() }.0 as isize;
 
     let (w, h) = (image.width(), image.height());
     let (nw, nh) = fit_for_model(w, h, max_long_edge, max_pixels);
@@ -255,7 +294,13 @@ pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Resu
         width: final_w,
         height: final_h,
         screen: Some(ScreenMap::for_capture(
-            origin_x, origin_y, w, h, final_w, final_h, foreground,
+            origin_x,
+            origin_y,
+            w,
+            h,
+            final_w,
+            final_h,
+            Some(lookup),
         )),
     })
 }
@@ -522,6 +567,7 @@ pub fn virtual_desktop_rect() -> Result<RECT> {
 /// is clamped to the real desktop bounds first, so a gap pixel is never
 /// actually selectable.
 pub fn grab_virtual_desktop_raw() -> Result<RawShot> {
+    let lookup = crate::inputs::uia::PasswordLookup::start(LookupWindow::Foreground.resolve());
     let desktop = virtual_desktop_rect()?;
     let width = (desktop.right - desktop.left).max(1) as u32;
     let height = (desktop.bottom - desktop.top).max(1) as u32;
@@ -563,7 +609,7 @@ pub fn grab_virtual_desktop_raw() -> Result<RawShot> {
             height,
             width,
             height,
-            unsafe { GetForegroundWindow() }.0 as isize,
+            Some(lookup),
         )),
     })
 }
@@ -1234,7 +1280,7 @@ mod tests {
 
     #[test]
     fn screen_map_full_size_capture_subtracts_the_monitor_origin() {
-        let m = super::ScreenMap::for_capture(100, 50, 800, 600, 800, 600, 0);
+        let m = super::ScreenMap::for_capture(100, 50, 800, 600, 800, 600, None);
         assert_eq!(
             m.to_image(sr(110, 60, 210, 80)),
             Some((10.0, 10.0, 110.0, 30.0))
@@ -1244,7 +1290,7 @@ mod tests {
     #[test]
     fn screen_map_follows_a_downscale() {
         // 2000x1000 monitor shrunk to 1000x500: one image pixel is two screen pixels.
-        let m = super::ScreenMap::for_capture(0, 0, 2000, 1000, 1000, 500, 0);
+        let m = super::ScreenMap::for_capture(0, 0, 2000, 1000, 1000, 500, None);
         assert_eq!(
             m.to_image(sr(200, 100, 600, 300)),
             Some((100.0, 50.0, 300.0, 150.0))
@@ -1253,7 +1299,7 @@ mod tests {
 
     #[test]
     fn screen_map_handles_a_monitor_left_of_and_above_the_primary() {
-        let m = super::ScreenMap::for_capture(-1920, -200, 1920, 1080, 1920, 1080, 0);
+        let m = super::ScreenMap::for_capture(-1920, -200, 1920, 1080, 1920, 1080, None);
         assert_eq!(
             m.to_image(sr(-1900, -190, -1800, -170)),
             Some((20.0, 10.0, 120.0, 30.0))
@@ -1262,7 +1308,7 @@ mod tests {
 
     #[test]
     fn screen_map_of_a_crop_moves_the_origin_by_the_crop_offset() {
-        let whole = super::ScreenMap::for_capture(0, 0, 2000, 1000, 1000, 500, 0);
+        let whole = super::ScreenMap::for_capture(0, 0, 2000, 1000, 1000, 500, None);
         let crop = whole.cropped(RectPx {
             x: 100,
             y: 50,
@@ -1278,18 +1324,21 @@ mod tests {
 
     #[test]
     fn screen_map_refuses_what_it_cannot_map_instead_of_panicking() {
-        let m = super::ScreenMap::for_capture(0, 0, 100, 100, 100, 100, 0);
+        let m = super::ScreenMap::for_capture(0, 0, 100, 100, 100, 100, None);
         assert_eq!(m.to_image(sr(10, 10, 10, 20)), None, "empty");
         assert_eq!(m.to_image(sr(30, 10, 10, 20)), None, "reversed");
-        let bad = super::ScreenMap { scale_x: 0.0, ..m };
+        let bad = super::ScreenMap {
+            scale_x: 0.0,
+            ..m.clone()
+        };
         assert_eq!(bad.to_image(sr(0, 0, 5, 5)), None);
         let nan = super::ScreenMap {
             scale_y: f64::NAN,
-            ..m
+            ..m.clone()
         };
         assert_eq!(nan.to_image(sr(0, 0, 5, 5)), None);
         // A zero-sized capture still builds a usable (non-zero) scale.
-        let z = super::ScreenMap::for_capture(0, 0, 0, 0, 0, 0, 0);
+        let z = super::ScreenMap::for_capture(0, 0, 0, 0, 0, 0, None);
         assert!(z.scale_x > 0.0 && z.scale_y > 0.0);
         assert!(m
             .to_image(sr(i32::MIN, i32::MIN, i32::MAX, i32::MAX))
