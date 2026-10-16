@@ -75,8 +75,8 @@ pub(crate) const LIGHT: Tokens = Tokens {
     border: rgb(214, 214, 214),
     text: rgb(23, 23, 23),
     text_dim: rgb(90, 90, 90),
-    text_faint: rgb(122, 122, 122),
-    danger: rgb(224, 82, 82),
+    text_faint: rgb(112, 112, 112),
+    danger: rgb(200, 50, 50),
 };
 
 pub(crate) const DARK: Tokens = Tokens {
@@ -85,7 +85,7 @@ pub(crate) const DARK: Tokens = Tokens {
     text: rgb(245, 245, 245),
     text_dim: rgb(190, 190, 190),
     text_faint: rgb(140, 140, 140),
-    danger: rgb(224, 82, 82),
+    danger: rgb(240, 100, 100),
 };
 
 /// The Windows system colours that matter in high contrast, read once per
@@ -242,20 +242,20 @@ mod tests {
 
     #[test]
     fn light_and_dark_values_are_the_ones_the_card_always_painted() {
-        // Pinned from the card before the move (#362 slice 1): changing
-        // any of these is a visible change and needs its own decision.
+        // Pinned: changing any of these is a visible change. The hint and
+        // error colours were darkened or lightened for 4.5:1 in #578.
         assert_eq!(LIGHT.surface, rgb(250, 250, 250));
         assert_eq!(LIGHT.border, rgb(214, 214, 214));
         assert_eq!(LIGHT.text, rgb(23, 23, 23));
         assert_eq!(LIGHT.text_dim, rgb(90, 90, 90));
-        assert_eq!(LIGHT.text_faint, rgb(122, 122, 122));
-        assert_eq!(LIGHT.danger, rgb(224, 82, 82));
+        assert_eq!(LIGHT.text_faint, rgb(112, 112, 112));
+        assert_eq!(LIGHT.danger, rgb(200, 50, 50));
         assert_eq!(DARK.surface, rgb(32, 32, 32));
         assert_eq!(DARK.border, rgb(64, 64, 64));
         assert_eq!(DARK.text, rgb(245, 245, 245));
         assert_eq!(DARK.text_dim, rgb(190, 190, 190));
         assert_eq!(DARK.text_faint, rgb(140, 140, 140));
-        assert_eq!(DARK.danger, rgb(224, 82, 82));
+        assert_eq!(DARK.danger, rgb(240, 100, 100));
     }
 
     #[test]
@@ -279,17 +279,6 @@ mod tests {
         ]
     }
 
-    /// Pairs that sit below their target today, with the floor they must
-    /// not drop under. Fixing one is a visible change, so it is tracked as
-    /// its own issue (#578), not hidden in this move. Delete the entry when
-    /// the colour is fixed.
-    const KNOWN_BELOW_TARGET: &[(Theme, &str, f64)] = &[
-        (Theme::Light, "text_faint", 4.0),
-        // Error text is only held to the large-text ratio.
-        (Theme::Light, "danger", AA_LARGE),
-        (Theme::Dark, "danger", AA_LARGE),
-    ];
-
     #[test]
     fn every_text_pair_in_every_theme_meets_aa() {
         let themes = [
@@ -308,37 +297,14 @@ mod tests {
         for (theme, tokens) in themes {
             for (name, fg, bg) in text_pairs(&tokens) {
                 let ratio = contrast_between(fg, bg);
-                let floor = KNOWN_BELOW_TARGET
-                    .iter()
-                    .find(|(t, n, _)| *t == theme && *n == name)
-                    .map_or(AA_TEXT, |(_, _, f)| *f);
                 assert!(
-                    ratio >= floor,
-                    "{theme:?} {name}: {ratio:.2}:1 is under {floor}:1"
+                    ratio >= AA_TEXT,
+                    "{theme:?} {name}: {ratio:.2}:1 is under {AA_TEXT}:1"
                 );
                 checked += 1;
             }
         }
         assert_eq!(checked, 16, "the test must look at every pair");
-    }
-
-    #[test]
-    fn the_known_exceptions_still_need_the_exception() {
-        // An exception that now passes 4.5 is stale and must be deleted.
-        for (theme, name, _) in KNOWN_BELOW_TARGET {
-            let tokens = match theme {
-                Theme::Light => LIGHT,
-                _ => DARK,
-            };
-            let (_, fg, bg) = text_pairs(&tokens)
-                .into_iter()
-                .find(|(n, _, _)| n == name)
-                .expect("exception names a real token");
-            assert!(
-                contrast_between(fg, bg) < AA_TEXT,
-                "{theme:?} {name} now passes 4.5:1, remove it from the list"
-            );
-        }
     }
 
     #[test]
