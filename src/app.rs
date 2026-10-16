@@ -768,7 +768,7 @@ fn should_show_welcome(
 /// opens Settings. No em dash (rule 11).
 pub(crate) fn welcome_card(secondary: &str) -> (String, String) {
     (
-        "Wingman is running. Press the Copilot key. The icon is in the tray (^).".to_string(),
+        "Wingman is running".to_string(),
         format!(
             "Press the Copilot key or {secondary}. The icon may be under the ^ arrow in the tray; \
              drag it out to keep it in view. Click here to open Settings."
@@ -6463,7 +6463,11 @@ fn is_no_providers(packed: &str) -> bool {
 /// cannot probe Ollama, so it lets an Ollama-only setup through; when the
 /// worker then finds nothing answering, this says what to do. Any other
 /// setup gets the gate's own card.
-fn empty_chain_card(mode: Mode, providers: &Providers, config_path: &str) -> (String, String) {
+pub(crate) fn empty_chain_card(
+    mode: Mode,
+    providers: &Providers,
+    config_path: &str,
+) -> (String, String) {
     if mode == Mode::Auto
         && crate::mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
     {

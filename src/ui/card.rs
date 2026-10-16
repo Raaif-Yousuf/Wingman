@@ -425,8 +425,8 @@ impl Card {
     /// up yet", "Local mode needs Ollama configured") -- the actionable next
     /// step for those is Settings, not more text to read.
     pub fn show_settings_needed(&mut self, headline: &str, detail: &str) {
-        self.inner.show_collapsed(headline, detail, 0, None);
-        self.inner.open_settings_on_click = true;
+        self.inner
+            .show_collapsed_with(headline, detail, 0, None, true);
     }
 
     pub fn hide(&mut self) {
@@ -1077,6 +1077,9 @@ const CARD_WIDTH_DP: i32 = 384;
 /// never silently `DT_END_ELLIPSIS`'d. (The card is as wide as it is so
 /// the larger type keeps the 50-character budget the prompts promise.)
 pub(crate) const HEADLINE_MAX_LINES: i32 = 3;
+/// #885: the most lines of detail a setup card shows; the rest ends in an
+/// ellipsis, so a long config path cannot make the card taller than the screen.
+const SETUP_DETAIL_MAX_LINES: i32 = 6;
 /// Characters that fit on one collapsed headline line once the chevron's
 /// width is reserved: (352dp content - 24dp chevron) / 6.6dp per glyph = 50.
 /// A budget for callers that must fit text in `HEADLINE_MAX_LINES`
@@ -1667,6 +1670,19 @@ impl CardInner {
         auto_dismiss_secs: u32,
         difficulty: Option<Difficulty>,
     ) {
+        self.show_collapsed_with(headline, detail, auto_dismiss_secs, difficulty, false);
+    }
+
+    /// `open_settings` must be known before the layout runs: a setup card
+    /// shows its detail line (#885), so its height depends on it.
+    fn show_collapsed_with(
+        &mut self,
+        headline: &str,
+        detail: &str,
+        auto_dismiss_secs: u32,
+        difficulty: Option<Difficulty>,
+        open_settings: bool,
+    ) {
         self.leave_preview_if_active();
         self.reset_activation_and_timers();
         self.headline = headline.to_string();
@@ -1679,12 +1695,17 @@ impl CardInner {
         // reasoning as `set_window_text_for_pending_stage` (#354) -- covers
         // show_answer, show_error, show_error_with_details and
         // show_settings_needed, every one of which funnels through here.
-        self.set_window_text(headline);
+        // #885: a setup card's detail is on screen, so Narrator reads it too.
+        if open_settings && !detail.is_empty() {
+            self.set_window_text(&format!("{headline}. {detail}"));
+        } else {
+            self.set_window_text(headline);
+        }
         // Issue #347: every ordinary show_answer/show_error call starts a
         // plain card, not a "click to open Settings" prompt -- only
         // `Card::show_settings_needed` sets this, right after this call
-        // returns.
-        self.open_settings_on_click = false;
+        // returns (through `show_collapsed_with`).
+        self.open_settings_on_click = open_settings;
         // Issue #425: same reasoning -- only `Card::show_error` sets this,
         // right after this call returns, so an answer card never inherits a
         // "Copy details" affordance for an error it isn't.
@@ -2321,7 +2342,13 @@ impl CardInner {
 
         // No affordance line: the card is just the headline. Clicking it
         // still expands when there is detail to show.
-        let height = padding * 2 + headline_h;
+        let mut height = padding * 2 + headline_h;
+        // #885: a setup card also shows its detail, measured the same way
+        // `paint_collapsed` draws it.
+        if self.shows_setup_detail() {
+            let gap = self.scale(GAP_DP);
+            height += gap + self.setup_detail_height(content_width);
+        }
 
         self.place_bottom_right(work, width, height);
     }
@@ -2567,10 +2594,26 @@ impl CardInner {
         (content_w - self.badge_reserve(self.difficulty) - self.chevron_reserve()).max(1)
     }
 
+    /// #885: a collapsed click-to-open-Settings card draws its detail line
+    /// under the headline, because a click opens Settings, not the detail.
+    fn shows_setup_detail(&self) -> bool {
+        self.state == CardState::Collapsed && self.open_settings_on_click && !self.detail.is_empty()
+    }
+
+    /// Height of the setup card's detail: measured, capped at
+    /// [`SETUP_DETAIL_MAX_LINES`] lines. Layout and paint both use it.
+    fn setup_detail_height(&self, content_w: i32) -> i32 {
+        let cap = self.line_height(self.fonts.caption).max(1) * SETUP_DETAIL_MAX_LINES;
+        self.measure_wrapped(self.fonts.caption, &self.detail, content_w)
+            .min(cap)
+    }
+
     /// Space kept free at the right of a collapsed headline for the "click
     /// for more" chevron (#353); zero when there is nothing more to show.
     fn chevron_reserve(&self) -> i32 {
-        if card_has_more_to_show(self.state, self.detail.is_empty()) {
+        // A setup card shows its detail itself and a click opens Settings,
+        // so a "click for more" chevron would promise the wrong thing (#885).
+        if card_has_more_to_show(self.state, self.detail.is_empty()) && !self.shows_setup_detail() {
             self.scale(CHEVRON_RESERVE_DP)
         } else {
             0
@@ -2836,6 +2879,24 @@ impl CardInner {
             let cx = headline_rect.right + self.chevron_reserve() / 2;
             let cy = headline_rect.top + headline_line_h / 2;
             self.draw_chevron(hdc, cx, cy, palette.hint);
+        }
+
+        if self.shows_setup_detail() {
+            let top = headline_rect.bottom + self.scale(GAP_DP);
+            let detail_rect = RECT {
+                left: rc.left + padding,
+                top,
+                right: rc.left + padding + content_w,
+                bottom: top + self.setup_detail_height(content_w),
+            };
+            SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
+            draw_text_line(
+                hdc,
+                &self.detail,
+                detail_rect,
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
         }
 
         self.paint_difficulty_badge(hdc, rc);
@@ -4882,6 +4943,50 @@ mod tests {
         card.set_pending_stage(PendingStage::StillWorking);
         assert!(!timer_was_live(&card, TIMER_STILL_WORKING));
         card.hide();
+    }
+
+    #[test]
+    fn a_settings_needed_card_is_taller_for_its_detail_and_has_no_chevron() {
+        // #885: the detail of a click-to-open-Settings card is drawn on the
+        // collapsed card, so the window must have room for it.
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let height = |card: &Card| {
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(card.hwnd(), &mut r);
+            }
+            r.bottom - r.top
+        };
+        let detail = "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.";
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_settings_needed("No AI model set up yet", "");
+        let headline_only = height(&card);
+        assert_eq!(card.inner.chevron_reserve(), 0);
+        card.show_settings_needed("No AI model set up yet", detail);
+        assert!(height(&card) > headline_only, "detail must add height");
+        assert!(card.inner.shows_setup_detail());
+        assert_eq!(
+            card.inner.chevron_reserve(),
+            0,
+            "a click opens Settings, so no expand chevron"
+        );
+        // Narrator reads the detail too (the window text is the accessible name).
+        assert!(window_text(card.hwnd()).contains("paste an API key"));
+        // A very long detail is capped, not taller than a few lines.
+        let normal = height(&card);
+        card.show_settings_needed("No AI model set up yet", &"word ".repeat(200));
+        let long = height(&card);
+        let line = card.inner.line_height(card.inner.fonts.caption);
+        assert!(long > normal);
+        assert!(
+            long <= normal + line * SETUP_DETAIL_MAX_LINES,
+            "{long} vs {normal}"
+        );
+        // An ordinary answer card with the same text is unchanged: it keeps
+        // the chevron and shows no detail until expanded.
+        card.show_answer("No AI model set up yet", detail, 0, None);
+        assert!(!card.inner.shows_setup_detail());
+        assert!(card.inner.chevron_reserve() > 0);
     }
 
     #[test]
