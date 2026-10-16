@@ -44,51 +44,137 @@ impl Vendor {
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 const OPENAI_URL: &str = "https://api.openai.com/v1/models";
-/// `limit=1000` is the documented maximum, so the whole list is one page.
+/// `limit=1000` is the documented maximum, so one page is normally the whole
+/// list; [`next_page_url`] follows `has_more` if it ever is not.
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/models?limit=1000";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// `pageSize=1000` is the documented maximum, so the whole list is one page.
+/// `pageSize=1000` is the documented maximum; `nextPageToken` is followed.
 const GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000";
+/// A vendor that keeps saying "more" stops here: a runaway list is a bug on
+/// their side, and the pages read so far are still a usable list.
+const MAX_PAGES: usize = 10;
+/// Stop following pages once this many bytes have been read in all.
+const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+/// The page to read next, or `None` to stop: there is no next page, the
+/// vendor sent the URL just read again (a loop), or enough has been read.
+fn follow(current: &str, next: Option<String>, total_bytes: usize) -> Option<String> {
+    let next = next?;
+    (next != current && total_bytes < MAX_TOTAL_BYTES).then_some(next)
+}
 
 /// Asks the vendor for its model list. An empty result counts as a failure,
 /// so the caller keeps its built-in list instead of showing an empty
 /// dropdown. The key goes in a header, never the URL.
 pub fn fetch(vendor: Vendor, api_key: &str) -> Result<Vec<String>> {
-    let body = match vendor {
-        Vendor::OpenAi => {
-            let auth = format!("Bearer {api_key}");
-            common::get_json_with_headers(
-                OPENAI_URL,
+    let mut url = match vendor {
+        Vendor::OpenAi => OPENAI_URL.to_string(),
+        Vendor::Anthropic => ANTHROPIC_URL.to_string(),
+        Vendor::Gemini => GEMINI_URL.to_string(),
+    };
+    let auth = format!("Bearer {api_key}");
+    let mut bodies: Vec<String> = Vec::new();
+    let mut total_bytes = 0usize;
+    for _ in 0..MAX_PAGES {
+        let body = match vendor {
+            Vendor::OpenAi => common::get_json_with_headers(
+                &url,
                 &[("Authorization", auth.as_str())],
                 LIST_TIMEOUT,
                 vendor.tag(),
-            )?
+            ),
+            Vendor::Anthropic => common::get_json_with_headers(
+                &url,
+                &[
+                    ("x-api-key", api_key),
+                    ("anthropic-version", ANTHROPIC_VERSION),
+                ],
+                LIST_TIMEOUT,
+                vendor.tag(),
+            ),
+            Vendor::Gemini => common::get_json_with_headers(
+                &url,
+                &[("x-goog-api-key", api_key)],
+                LIST_TIMEOUT,
+                vendor.tag(),
+            ),
+        };
+        let body = match body {
+            Ok(b) => b,
+            // A later page failing keeps what was read; the first failing is
+            // a failure.
+            Err(e) if bodies.is_empty() => return Err(e),
+            Err(_) => break,
+        };
+        let next = next_page_url(vendor, &body);
+        total_bytes += body.len();
+        bodies.push(body);
+        match follow(&url, next, total_bytes) {
+            Some(n) => url = n,
+            None => break,
         }
-        Vendor::Anthropic => common::get_json_with_headers(
-            ANTHROPIC_URL,
-            &[
-                ("x-api-key", api_key),
-                ("anthropic-version", ANTHROPIC_VERSION),
-            ],
-            LIST_TIMEOUT,
-            vendor.tag(),
-        )?,
-        Vendor::Gemini => common::get_json_with_headers(
-            GEMINI_URL,
-            &[("x-goog-api-key", api_key)],
-            LIST_TIMEOUT,
-            vendor.tag(),
-        )?,
-    };
-    let ids = match vendor {
-        Vendor::OpenAi => parse_openai(&body)?,
-        Vendor::Anthropic => parse_anthropic(&body)?,
-        Vendor::Gemini => parse_gemini(&body)?,
-    };
+    }
+    let ids = parse_pages(vendor, &bodies)?;
     if ids.is_empty() {
         return Err(anyhow!("{}: the list had no usable models", vendor.tag()));
     }
     Ok(ids)
+}
+
+/// The URL of the page after the one that returned `body`, if the vendor says
+/// there is one. OpenAI's list is a single page.
+pub fn next_page_url(vendor: Vendor, body: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    match vendor {
+        Vendor::OpenAi => None,
+        Vendor::Anthropic => {
+            if v.get("has_more").and_then(Value::as_bool) != Some(true) {
+                return None;
+            }
+            let last = v.get("last_id").and_then(Value::as_str)?;
+            (!last.is_empty()).then(|| format!("{ANTHROPIC_URL}&after_id={}", percent_encode(last)))
+        }
+        Vendor::Gemini => {
+            let token = v.get("nextPageToken").and_then(Value::as_str)?;
+            (!token.is_empty()).then(|| format!("{GEMINI_URL}&pageToken={}", percent_encode(token)))
+        }
+    }
+}
+
+/// Percent-encodes everything but RFC 3986 unreserved characters.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Parses every page as one list, so the newest-first sort and the
+/// dated-snapshot filter see all the models together. A page that is not
+/// valid is an error only if it is the first.
+pub fn parse_pages(vendor: Vendor, bodies: &[String]) -> Result<Vec<String>> {
+    type Parser = fn(&str) -> Result<Vec<String>>;
+    let (key, parse): (&str, Parser) = match vendor {
+        Vendor::OpenAi => ("data", parse_openai),
+        Vendor::Anthropic => ("data", parse_anthropic),
+        Vendor::Gemini => ("models", parse_gemini),
+    };
+    let mut all: Vec<Value> = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        match data_array(body, key) {
+            Ok(items) => all.extend(items),
+            Err(e) if i == 0 => return Err(e),
+            Err(_) => {}
+        }
+    }
+    let mut combined = serde_json::Map::new();
+    combined.insert(key.to_string(), Value::Array(all));
+    parse(&Value::Object(combined).to_string())
 }
 
 /// `GET /v1/models`: `{"data": [{"id", "created", ...}]}`. Ids only, no
@@ -344,6 +430,63 @@ mod tests {
         let ids = fetch(Vendor::Anthropic, &key).expect("live fetch");
         println!("live anthropic ids ({}): {ids:?}", ids.len());
         assert!(ids.iter().any(|i| i.starts_with("claude-")));
+    }
+
+    #[test]
+    fn anthropic_follows_has_more_with_the_last_id() {
+        let body = r#"{"data":[],"has_more":true,"last_id":"claude-x"}"#;
+        let url = next_page_url(Vendor::Anthropic, body).unwrap();
+        assert!(url.ends_with("&after_id=claude-x"), "{url}");
+        let done = r#"{"data":[],"has_more":false,"last_id":"claude-x"}"#;
+        assert_eq!(next_page_url(Vendor::Anthropic, done), None);
+        assert_eq!(next_page_url(Vendor::Anthropic, "not json"), None);
+    }
+
+    #[test]
+    fn gemini_follows_a_next_page_token_and_encodes_it() {
+        let body = r#"{"models":[],"nextPageToken":"a+b/c=="}"#;
+        let url = next_page_url(Vendor::Gemini, body).unwrap();
+        assert!(url.ends_with("&pageToken=a%2Bb%2Fc%3D%3D"), "{url}");
+        assert_eq!(
+            next_page_url(Vendor::Gemini, r#"{"models":[],"nextPageToken":""}"#),
+            None
+        );
+        assert_eq!(next_page_url(Vendor::Gemini, r#"{"models":[]}"#), None);
+    }
+
+    #[test]
+    fn paging_stops_on_a_repeated_url_and_on_too_many_bytes() {
+        let a = "https://x/models?p=1".to_string();
+        let b = "https://x/models?p=2".to_string();
+        assert_eq!(follow(&a, Some(b.clone()), 10), Some(b.clone()));
+        // The vendor repeats the token it just gave: stop.
+        assert_eq!(follow(&b, Some(b.clone()), 10), None);
+        assert_eq!(follow(&a, None, 10), None);
+        assert_eq!(follow(&a, Some(b), MAX_TOTAL_BYTES), None);
+    }
+
+    #[test]
+    fn openai_has_no_second_page() {
+        assert_eq!(
+            next_page_url(Vendor::OpenAi, r#"{"data":[],"has_more":true}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn pages_are_sorted_together() {
+        let p1 = r#"{"data":[{"id":"claude-a","created_at":"2025-01-01T00:00:00Z"}]}"#.to_string();
+        let p2 = r#"{"data":[{"id":"claude-b","created_at":"2026-01-01T00:00:00Z"}]}"#.to_string();
+        assert_eq!(
+            parse_pages(Vendor::Anthropic, &[p1.clone(), p2]).unwrap(),
+            ["claude-b", "claude-a"]
+        );
+        // A broken later page keeps the earlier ones; a broken first is an error.
+        assert_eq!(
+            parse_pages(Vendor::Anthropic, &[p1, "oops".to_string()]).unwrap(),
+            ["claude-a"]
+        );
+        assert!(parse_pages(Vendor::Anthropic, &["oops".to_string()]).is_err());
     }
 
     #[test]

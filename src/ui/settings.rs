@@ -232,6 +232,7 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
         hwnd,
         config,
         inner_ref.cloud_models.clone(),
+        inner_ref.cloud_sync.clone(),
         inner_ref.alive.clone(),
     );
     // #342: the prompt starts hidden, so shrink the window to match.
@@ -490,6 +491,9 @@ struct SettingsInner {
     ollama_tags: OllamaTags,
     /// #380: the cloud providers' live model lists, filled the same way.
     cloud_models: CloudModels,
+    /// #585: per-vendor fetch generation and the key each list was last
+    /// fetched with successfully.
+    cloud_sync: std::sync::Arc<CloudSync>,
     /// #566: the running pull's progress, filled by its worker. Replaced by a
     /// fresh slot for every pull, so a stopped pull's worker never writes
     /// into the next one.
@@ -541,6 +545,7 @@ impl SettingsInner {
             ollama_status: Default::default(),
             ollama_tags: Default::default(),
             cloud_models: Default::default(),
+            cloud_sync: Default::default(),
             pull_slot: Default::default(),
             pull_cancel: None,
             pull_gen: 0,
@@ -690,6 +695,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
+    // #585: a key typed but not saved yet still fetches its model list once
+    // the user leaves the field.
+    if let Some(index) = typed_key_vendor(id, notify) {
+        fetch_for_typed_key(inner, index);
+        return;
+    }
     match id {
         ID_SAVE => {
             // #566: Save would close the window and silently stop the pull.
@@ -970,6 +981,7 @@ const CB_ADDSTRING: u32 = 0x0143;
 const CB_RESETCONTENT: u32 = 0x014B;
 const CB_SETCURSEL: u32 = 0x014E;
 const CB_GETCURSEL: u32 = 0x0147;
+const EN_KILLFOCUS: u32 = 0x0200;
 const CB_GETDROPPEDSTATE: u32 = 0x0157;
 #[cfg(test)]
 const CB_SHOWDROPDOWN: u32 = 0x014F;
@@ -2374,6 +2386,7 @@ fn spawn_cloud_models_fetch(
     hwnd: HWND,
     config: &Config,
     slots: CloudModels,
+    sync: std::sync::Arc<CloudSync>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     if crate::mode::is_offline_now() {
@@ -2388,40 +2401,143 @@ fn spawn_cloud_models_fetch(
         if key.trim().is_empty() || key == crate::config::UNREADABLE_KEY_MARKER {
             continue;
         }
-        let key = key.clone();
-        let vendor = CLOUD_VENDORS[index];
-        let slots = slots.clone();
-        let alive = alive.clone();
-        let hwnd_raw = hwnd.0 as isize;
-        let _ = std::thread::Builder::new()
-            .name("settings-cloud-models".into())
-            .spawn(move || {
-                let ids = match crate::provider::model_list::fetch(vendor, &key) {
-                    Ok(ids) => ids,
-                    Err(_) => {
-                        // No error text: it can carry a vendor body, and the
-                        // report is pasted into public issues. The egress
-                        // log has the failure.
-                        crate::diagnostics::note_warning(&format!(
-                            "Live model list unavailable for {}: using the built-in list",
-                            vendor.tag()
-                        ));
-                        return;
-                    }
-                };
-                if let Ok(mut guard) = slots.lock() {
-                    guard[index] = Some(ids);
-                }
-                post_while_open(&alive, || unsafe {
-                    let _ = PostMessageW(
-                        Some(HWND(hwnd_raw as *mut c_void)),
-                        WM_CLOUD_MODELS,
-                        WPARAM(index),
-                        LPARAM(0),
-                    );
-                });
-            });
+        spawn_one_cloud_fetch(
+            hwnd,
+            index,
+            key.clone(),
+            slots.clone(),
+            sync.clone(),
+            alive.clone(),
+        );
     }
+}
+
+/// #585: state shared between Settings and its model-list workers.
+#[derive(Default)]
+struct CloudSync {
+    /// The newest fetch started for each vendor. A worker whose number is no
+    /// longer current has been replaced and drops its result.
+    generation: [std::sync::atomic::AtomicU64; 3],
+    /// The key each list was last fetched with successfully, so leaving a
+    /// key field with the same key does not fetch again, and a failed fetch
+    /// is retried on the next focus-out.
+    fetched_keys: std::sync::Mutex<[String; 3]>,
+}
+
+/// Whether a worker holding `mine` is still the newest for its vendor.
+fn is_current_generation(newest: u64, mine: u64) -> bool {
+    newest == mine
+}
+
+/// Which vendor index a command is a key field losing focus for (#585).
+fn typed_key_vendor(id: i32, notify: u32) -> Option<usize> {
+    if notify != EN_KILLFOCUS {
+        return None;
+    }
+    match id {
+        ID_OPENAI_KEY => Some(0),
+        ID_ANTHROPIC_KEY => Some(1),
+        ID_GEMINI_KEY => Some(2),
+        _ => None,
+    }
+}
+
+/// The key to fetch a model list with after the user leaves a key field, or
+/// `None` when there is nothing to do: the field is empty, still shows the
+/// mask of the saved key, shows the unreadable-key placeholder, or holds the
+/// key the list was already fetched with (#585).
+fn key_to_fetch(original: &str, form_text: &str, last_fetched: &str) -> Option<String> {
+    let key = resolve_key_field(original, form_text);
+    let key = key.trim();
+    if key.is_empty() || key == crate::config::UNREADABLE_KEY_MARKER || key == last_fetched.trim() {
+        return None;
+    }
+    Some(key.to_string())
+}
+
+/// #585: the user left a key field. Fetch that vendor's list with what is
+/// typed now, saved or not. Nothing runs in Offline mode.
+fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
+    let (edit_id, original) = {
+        let p = &inner.original.providers;
+        match index {
+            0 => (ID_OPENAI_KEY, p.openai.api_key.as_str()),
+            1 => (ID_ANTHROPIC_KEY, p.anthropic.api_key.as_str()),
+            _ => (ID_GEMINI_KEY, p.gemini.api_key.as_str()),
+        }
+    };
+    let Some(edit) = get_dlg_item(inner.hwnd, edit_id) else {
+        return;
+    };
+    let last = inner
+        .cloud_sync
+        .fetched_keys
+        .lock()
+        .map(|g| g[index].clone())
+        .unwrap_or_default();
+    let Some(key) = key_to_fetch(original, &get_text(edit), &last) else {
+        return;
+    };
+    if crate::mode::is_offline_now() {
+        return;
+    }
+    spawn_one_cloud_fetch(
+        inner.hwnd,
+        index,
+        key,
+        inner.cloud_models.clone(),
+        inner.cloud_sync.clone(),
+        inner.alive.clone(),
+    );
+}
+
+fn spawn_one_cloud_fetch(
+    hwnd: HWND,
+    index: usize,
+    key: String,
+    slots: CloudModels,
+    sync: std::sync::Arc<CloudSync>,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let vendor = CLOUD_VENDORS[index];
+    let mine = sync.generation[index].fetch_add(1, Ordering::SeqCst) + 1;
+    let hwnd_raw = hwnd.0 as isize;
+    let _ = std::thread::Builder::new()
+        .name("settings-cloud-models".into())
+        .spawn(move || {
+            let ids = match crate::provider::model_list::fetch(vendor, &key) {
+                Ok(ids) => ids,
+                Err(_) => {
+                    // No error text: it can carry a vendor body, and the
+                    // report is pasted into public issues. The egress
+                    // log has the failure.
+                    crate::diagnostics::note_warning(&format!(
+                        "Live model list unavailable for {}: using the built-in list",
+                        vendor.tag()
+                    ));
+                    return;
+                }
+            };
+            // A newer fetch for this vendor started while this one ran: its
+            // result wins, so this one is dropped.
+            if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
+                return;
+            }
+            if let Ok(mut guard) = slots.lock() {
+                guard[index] = Some(ids);
+            }
+            if let Ok(mut keys) = sync.fetched_keys.lock() {
+                keys[index] = key.trim().to_string();
+            }
+            post_while_open(&alive, || unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd_raw as *mut c_void)),
+                    WM_CLOUD_MODELS,
+                    WPARAM(index),
+                    LPARAM(0),
+                );
+            });
+        });
 }
 
 /// Runs `post` only while the Settings window is still open (#569). `alive`
@@ -6144,6 +6260,59 @@ mod tests {
         assert_eq!(combo_index_for_order(&["gemini".to_string()]), 3);
         // CB_GETCURSEL returns -1 for "nothing", read as usize.
         assert_eq!(merge_provider_order(&order, (-1i32) as usize), order);
+    }
+
+    #[test]
+    fn only_the_newest_fetch_for_a_vendor_is_kept() {
+        let sync = CloudSync::default();
+        let first = sync.generation[0].fetch_add(1, Ordering::SeqCst) + 1;
+        let second = sync.generation[0].fetch_add(1, Ordering::SeqCst) + 1;
+        let newest = sync.generation[0].load(Ordering::SeqCst);
+        assert!(!is_current_generation(newest, first));
+        assert!(is_current_generation(newest, second));
+        // Another vendor's counter is independent.
+        assert!(is_current_generation(
+            sync.generation[1].load(Ordering::SeqCst),
+            0
+        ));
+    }
+
+    #[test]
+    fn only_a_key_field_losing_focus_triggers_a_typed_key_fetch() {
+        assert_eq!(typed_key_vendor(ID_OPENAI_KEY, EN_KILLFOCUS), Some(0));
+        assert_eq!(typed_key_vendor(ID_ANTHROPIC_KEY, EN_KILLFOCUS), Some(1));
+        assert_eq!(typed_key_vendor(ID_GEMINI_KEY, EN_KILLFOCUS), Some(2));
+        assert_eq!(typed_key_vendor(ID_OPENAI_KEY, 0x0300), None); // EN_CHANGE
+        assert_eq!(typed_key_vendor(ID_OLLAMA_MODEL, EN_KILLFOCUS), None);
+    }
+
+    #[test]
+    fn a_typed_key_is_fetched_once_and_a_masked_or_empty_one_never() {
+        let saved = "sk-saved-1234";
+        let masked = mask_key(saved);
+        // Untouched mask, empty and the unreadable placeholder: nothing.
+        assert_eq!(key_to_fetch(saved, &masked, saved), None);
+        assert_eq!(key_to_fetch(saved, "", saved), None);
+        assert_eq!(key_to_fetch(saved, "   ", saved), None);
+        assert_eq!(
+            key_to_fetch(
+                crate::config::UNREADABLE_KEY_MARKER,
+                UNREADABLE_KEY_PLACEHOLDER_TEXT,
+                ""
+            ),
+            None
+        );
+        // A newly typed key is fetched, trimmed, and not fetched twice.
+        assert_eq!(
+            key_to_fetch(saved, " sk-new-9999 ", saved).as_deref(),
+            Some("sk-new-9999")
+        );
+        assert_eq!(key_to_fetch(saved, "sk-new-9999", "sk-new-9999"), None);
+        // First key typed where none was saved.
+        assert_eq!(
+            key_to_fetch("", "sk-first", "").as_deref(),
+            Some("sk-first")
+        );
     }
 
     #[test]
