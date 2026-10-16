@@ -163,7 +163,10 @@ impl Gemini {
                     .and_then(|f| f.get("blockReason"))
                     .and_then(Value::as_str)
                 {
-                    return Err(anyhow!("gemini: the prompt was blocked ({reason})"));
+                    return Err(anyhow!(
+                        "gemini: the prompt was blocked ({})",
+                        super::safe_reason(reason)
+                    ));
                 }
                 return Err(anyhow!("gemini: response has no candidates[]"));
             }
@@ -172,14 +175,17 @@ impl Gemini {
         let candidate = &candidates[0];
         let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
 
-        if matches!(
-            finish_reason,
-            Some("SAFETY") | Some("RECITATION") | Some("PROHIBITED_CONTENT")
-        ) {
-            return Err(anyhow!(
-                "gemini: the model declined to answer ({})",
-                finish_reason.unwrap_or("unknown reason")
-            ));
+        if let Some(
+            reason @ ("SAFETY"
+            | "RECITATION"
+            | "PROHIBITED_CONTENT"
+            | "BLOCKLIST"
+            | "SPII"
+            | "IMAGE_SAFETY"
+            | "IMAGE_PROHIBITED_CONTENT"),
+        ) = finish_reason
+        {
+            return Err(super::declined_error("gemini", reason));
         }
 
         let mut text = String::new();
@@ -205,7 +211,19 @@ impl Gemini {
                     "gemini: The model ran out of room before answering. Lower the effort setting or raise the token limit."
                 ));
             }
-            return Err(anyhow!("gemini: no text part found in candidate content"));
+            return Err(match finish_reason {
+                Some("LANGUAGE") => anyhow!(
+                    "gemini: the model would not answer in the language of this request (LANGUAGE)"
+                ),
+                Some("MALFORMED_RESPONSE") => {
+                    anyhow!("gemini: the model returned a malformed reply (MALFORMED_RESPONSE)")
+                }
+                Some(other) => anyhow!(
+                    "gemini: no text part found in candidate content (finishReason: {})",
+                    super::safe_reason(other)
+                ),
+                None => anyhow!("gemini: no text part found in candidate content"),
+            });
         }
 
         let stop = match finish_reason {
@@ -216,7 +234,19 @@ impl Gemini {
 
         // `thoughtsTokenCount` is separate from `candidatesTokenCount` on a
         // thinking response and is billed as output, so it is added in.
-        let usage = value.get("usageMetadata").map(|u| {
+        let usage = Self::usage_of(&value);
+
+        Ok(Completion { text, usage, stop })
+    }
+
+    /// The usage block of a body, whether or not it holds an answer: a
+    /// declined reply or a blocked prompt was billed too (#730).
+    pub(crate) fn parse_usage(body: &str) -> Option<Usage> {
+        Self::usage_of(&serde_json::from_str::<Value>(body).ok()?)
+    }
+
+    fn usage_of(value: &Value) -> Option<Usage> {
+        value.get("usageMetadata").map(|u| {
             let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
             // `promptTokenCount` includes the cached part: split it out.
             let prompt = count("promptTokenCount");
@@ -228,9 +258,7 @@ impl Gemini {
                 cache_read_tokens: cached,
                 ..Default::default()
             }
-        });
-
-        Ok(Completion { text, usage, stop })
+        })
     }
 }
 
@@ -311,6 +339,7 @@ impl Provider for Gemini {
             &self.model,
             false,
             Self::parse_completion(&body_text),
+            || Self::parse_usage(&body_text),
         )
     }
 }
@@ -318,7 +347,7 @@ impl Provider for Gemini {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{parse_answer, physics_request, Difficulty, Shot};
+    use crate::provider::{parse_answer, physics_request_no_note, Difficulty, Shot};
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -330,7 +359,7 @@ mod tests {
     }
 
     fn req(prompt: &str, want_difficulty: bool) -> Request {
-        physics_request(&sample_shot(), prompt, want_difficulty)
+        physics_request_no_note(&sample_shot(), prompt, want_difficulty)
     }
 
     // -- endpoint_url: the key must never reach the URL --------------------
@@ -777,6 +806,51 @@ mod tests {
         let err = Gemini::parse_completion(body).unwrap_err();
         assert!(err.to_string().contains("declined to answer"), "{err}");
         assert!(err.to_string().contains("PROHIBITED_CONTENT"), "{err}");
+    }
+
+    /// #731: every filter reason is a decline, and the two odd ones name
+    /// what really happened instead of "no text part found".
+    #[test]
+    fn parse_completion_names_the_other_finish_reasons() {
+        for reason in [
+            "BLOCKLIST",
+            "SPII",
+            "IMAGE_SAFETY",
+            "IMAGE_PROHIBITED_CONTENT",
+        ] {
+            let body = format!(
+                r#"{{"candidates": [{{"finishReason": "{reason}", "content": {{"parts": []}}}}]}}"#
+            );
+            let msg = Gemini::parse_completion(&body).unwrap_err().to_string();
+            assert!(msg.contains("declined to answer"), "{msg}");
+            assert!(msg.contains(reason), "{msg}");
+        }
+        for (reason, words) in [
+            ("LANGUAGE", "language"),
+            ("MALFORMED_RESPONSE", "malformed"),
+            ("SOMETHING_NEW", "SOMETHING_NEW"),
+        ] {
+            let body = format!(
+                r#"{{"candidates": [{{"finishReason": "{reason}", "content": {{"parts": []}}}}]}}"#
+            );
+            let msg = Gemini::parse_completion(&body).unwrap_err().to_string();
+            assert!(msg.contains(reason), "{msg}");
+            assert!(msg.contains(words), "{msg}");
+            assert!(!msg.contains("ran out of room"), "{msg}");
+            assert!(!msg.contains('\u{2014}'), "{msg}");
+        }
+    }
+
+    /// #730: usage is readable from declined and prompt-blocked bodies.
+    #[test]
+    fn parse_usage_reads_blocked_and_declined_bodies() {
+        let declined = r#"{"candidates": [{"finishReason": "SAFETY"}], "usageMetadata": {"promptTokenCount": 500, "candidatesTokenCount": 0, "thoughtsTokenCount": 700}}"#;
+        assert!(Gemini::parse_completion(declined).is_err());
+        let u = Gemini::parse_usage(declined).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (500, 700));
+        let blocked = r#"{"promptFeedback": {"blockReason": "SAFETY"}, "usageMetadata": {"promptTokenCount": 40}}"#;
+        assert_eq!(Gemini::parse_usage(blocked).unwrap().input_tokens, 40);
+        assert!(Gemini::parse_usage("{}").is_none());
     }
 
     // -- parse_completion: prompt-level block (no candidates at all) --------

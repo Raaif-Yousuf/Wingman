@@ -124,7 +124,19 @@ impl Anthropic {
                         "anthropic: The model ran out of room before answering. Lower the effort setting or raise the token limit."
                     ));
                 }
-                return Err(anyhow!("anthropic: no text block found in content[]"));
+                return Err(match stop_reason {
+                    Some("pause_turn") => anyhow!(
+                        "anthropic: the reply was paused before it finished (pause_turn)"
+                    ),
+                    Some("model_context_window_exceeded") => anyhow!(
+                        "anthropic: the request was too long for the model's context window (model_context_window_exceeded)"
+                    ),
+                    Some(other) => anyhow!(
+                        "anthropic: no text block found in content[] (stop_reason: {})",
+                        super::safe_reason(other)
+                    ),
+                    None => anyhow!("anthropic: no text block found in content[]"),
+                });
             }
         };
 
@@ -136,7 +148,23 @@ impl Anthropic {
 
         // `input_tokens` excludes the two cache fields; each is priced at its
         // own rate (see `usage.rs`). Absent today (no `cache_control`, #180).
-        let usage = value.get("usage").map(|u| {
+        let usage = Self::usage_of(&value);
+
+        Ok(Completion {
+            text: text.to_string(),
+            usage,
+            stop,
+        })
+    }
+
+    /// The usage block of a body, whether or not it holds an answer: a
+    /// refusal or a truncated reply was billed too (#730).
+    pub(crate) fn parse_usage(body: &str) -> Option<Usage> {
+        Self::usage_of(&serde_json::from_str::<Value>(body).ok()?)
+    }
+
+    fn usage_of(value: &Value) -> Option<Usage> {
+        value.get("usage").map(|u| {
             let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
             Usage {
                 input_tokens: count("input_tokens"),
@@ -144,12 +172,6 @@ impl Anthropic {
                 cache_write_tokens: count("cache_creation_input_tokens"),
                 cache_read_tokens: count("cache_read_input_tokens"),
             }
-        });
-
-        Ok(Completion {
-            text: text.to_string(),
-            usage,
-            stop,
         })
     }
 }
@@ -217,6 +239,7 @@ impl Provider for Anthropic {
             &self.model,
             false,
             Self::parse_completion(&body_text),
+            || Self::parse_usage(&body_text),
         )
     }
 }
@@ -311,7 +334,7 @@ fn supports_high_res_tier(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{parse_answer, physics_request, Difficulty, Shot};
+    use crate::provider::{parse_answer, physics_request_no_note, Difficulty, Shot};
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -323,7 +346,7 @@ mod tests {
     }
 
     fn req(prompt: &str, want_difficulty: bool) -> Request {
-        physics_request(&sample_shot(), prompt, want_difficulty)
+        physics_request_no_note(&sample_shot(), prompt, want_difficulty)
     }
 
     #[test]
@@ -623,6 +646,35 @@ mod tests {
         let body = r#"{"stop_reason": "end_turn", "content": []}"#;
         let err = Anthropic::parse_completion(body).unwrap_err();
         assert!(err.to_string().contains("no text block found"));
+    }
+
+    /// #731: stop reasons with no text block name themselves instead of
+    /// blaming a missing block or the effort setting.
+    #[test]
+    fn parse_completion_names_other_stop_reasons_with_no_text() {
+        for (reason, words) in [
+            ("pause_turn", "paused"),
+            ("model_context_window_exceeded", "too long"),
+            ("some_new_reason", "some_new_reason"),
+        ] {
+            let body = format!(r#"{{"stop_reason":"{reason}","content":[]}}"#);
+            let msg = Anthropic::parse_completion(&body).unwrap_err().to_string();
+            assert!(msg.contains(reason), "{msg}");
+            assert!(msg.contains(words), "{msg}");
+            assert!(!msg.contains("ran out of room"), "{msg}");
+            assert!(!msg.contains('\u{2014}'), "{msg}");
+        }
+    }
+
+    /// #730: the usage block is readable from a reply that is not an answer.
+    #[test]
+    fn parse_usage_reads_a_max_tokens_body_with_no_text_block() {
+        let body = r#"{"stop_reason":"max_tokens","content":[{"type":"thinking","thinking":"..."}],"usage":{"input_tokens":120,"output_tokens":4000}}"#;
+        assert!(Anthropic::parse_completion(body).is_err());
+        let u = Anthropic::parse_usage(body).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (120, 4000));
+        assert!(Anthropic::parse_usage("not json").is_none());
+        assert!(Anthropic::parse_usage(r#"{"content":[]}"#).is_none());
     }
 
     #[test]

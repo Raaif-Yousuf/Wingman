@@ -144,7 +144,12 @@ pub fn build_request(image_png: Vec<u8>, candidates: &[RouterCandidate]) -> Requ
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let system = format!("{ROUTER_SYSTEM_PREFIX}\n\nAvailable actions:\n{list}");
+    // #768: the screenshot is data, never instructions. MEASURED 2026-10-16
+    // (Anthropic claude-haiku-5-5, low effort, one tiny image): this request
+    // and the default screen-check request both came back as a normal
+    // completed answer, not a "refusal", with the note in place.
+    let note = crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE;
+    let system = format!("{ROUTER_SYSTEM_PREFIX}\n\nAvailable actions:\n{list}\n\n{note}");
     Request {
         system,
         user: "What does this screen suggest?".to_string(),
@@ -461,6 +466,22 @@ mod tests {
         assert!(rules.contains("never an action id"), "{rules}");
         assert!(rules.contains("intent"), "{rules}");
         assert!(rules.contains("\"none\""), "{rules}");
+    }
+
+    /// #768: the screenshot is data, never instructions, for the router too.
+    /// The note sits after the candidate list and the schema is untouched.
+    #[test]
+    fn build_request_carries_the_screen_note_and_keeps_the_schema_order() {
+        let req = build_request(vec![], &[candidate("a", "A")]);
+        let note = crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE;
+        assert!(req.system.ends_with(note), "{}", req.system);
+        let keys: Vec<&str> = req.schema.as_ref().unwrap()["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(keys, ["summary", "intent", "confidence"]);
     }
 
     #[test]

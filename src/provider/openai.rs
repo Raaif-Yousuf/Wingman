@@ -157,11 +157,26 @@ impl OpenAi {
             // (see `tests/fixtures/openai_response_no_message.json`), not
             // a generic malformed response (#155).
             if status == Some("incomplete") {
+                // Incomplete because of the content filter is a decline, not
+                // a budget problem (#731).
+                let reason = value
+                    .get("incomplete_details")
+                    .and_then(|d| d.get("reason"))
+                    .and_then(Value::as_str);
+                if reason == Some("content_filter") {
+                    return Err(super::declined_error("openai", "content_filter"));
+                }
                 return Err(anyhow!(
                     "openai: The model ran out of room before answering. Lower the effort setting or raise the token limit."
                 ));
             }
-            return Err(anyhow!("openai: no message text found in output[]"));
+            return Err(match status {
+                Some(s) => anyhow!(
+                    "openai: no message text found in output[] (status: {})",
+                    super::safe_reason(s)
+                ),
+                None => anyhow!("openai: no message text found in output[]"),
+            });
         }
 
         let stop = match status {
@@ -174,7 +189,19 @@ impl OpenAi {
         // includes the cached part, so the cached count is split out and
         // billed at the cached rate. The Responses API reports it under
         // `input_tokens_details`; the chat-style name is read as a fallback.
-        let usage = value.get("usage").map(|u| {
+        let usage = Self::usage_of(&value);
+
+        Ok(Completion { text, usage, stop })
+    }
+
+    /// The usage block of a body, whether or not it holds an answer: a
+    /// refusal or a truncated reply was billed too (#730).
+    pub(crate) fn parse_usage(body: &str) -> Option<Usage> {
+        Self::usage_of(&serde_json::from_str::<Value>(body).ok()?)
+    }
+
+    fn usage_of(value: &Value) -> Option<Usage> {
+        value.get("usage").map(|u| {
             let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
             let cached = ["input_tokens_details", "prompt_tokens_details"]
                 .iter()
@@ -192,9 +219,7 @@ impl OpenAi {
                 cache_read_tokens: cached,
                 ..Default::default()
             }
-        });
-
-        Ok(Completion { text, usage, stop })
+        })
     }
 }
 
@@ -278,6 +303,7 @@ impl Provider for OpenAi {
             &self.model,
             false,
             Self::parse_completion(&body_text),
+            || Self::parse_usage(&body_text),
         )
     }
 }
@@ -285,7 +311,7 @@ impl Provider for OpenAi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{parse_answer, physics_request, Shot};
+    use crate::provider::{parse_answer, physics_request_no_note, Shot};
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -297,7 +323,7 @@ mod tests {
     }
 
     fn req(prompt: &str, want_difficulty: bool) -> Request {
-        physics_request(&sample_shot(), prompt, want_difficulty)
+        physics_request_no_note(&sample_shot(), prompt, want_difficulty)
     }
 
     #[test]
@@ -562,6 +588,30 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("ran out of room"), "{msg}");
         assert!(!msg.contains("no message text"), "{msg}");
+    }
+
+    /// #731: `incomplete` because of the content filter is a decline, not a
+    /// budget problem, so it must not tell the user to lower the effort.
+    #[test]
+    fn parse_completion_reports_a_content_filter_as_a_decline() {
+        let body = r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}"#;
+        let msg = OpenAi::parse_completion(body).unwrap_err().to_string();
+        assert!(msg.contains("declined"), "{msg}");
+        assert!(msg.contains("content_filter"), "{msg}");
+        assert!(!msg.contains("ran out of room"), "{msg}");
+        let other = r#"{"status":"failed","output":[]}"#;
+        let msg = OpenAi::parse_completion(other).unwrap_err().to_string();
+        assert!(msg.contains("failed"), "{msg}");
+    }
+
+    /// #730: usage is readable from an incomplete body with no message.
+    #[test]
+    fn parse_usage_reads_an_incomplete_body_with_no_message() {
+        let body = r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":300,"output_tokens":2500}}"#;
+        assert!(OpenAi::parse_completion(body).is_err());
+        let u = OpenAi::parse_usage(body).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (300, 2500));
+        assert!(OpenAi::parse_usage("nope").is_none());
     }
 
     /// Neighbour of the above: a body with no message and no `status:

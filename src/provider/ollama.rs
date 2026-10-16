@@ -183,17 +183,7 @@ impl Ollama {
             return Err(anyhow!("ollama: response has no message.content"));
         }
 
-        let usage = match (
-            value.get("prompt_eval_count").and_then(Value::as_u64),
-            value.get("eval_count").and_then(Value::as_u64),
-        ) {
-            (Some(input), Some(output)) => Some(super::Usage {
-                input_tokens: input as u32,
-                output_tokens: output as u32,
-                ..Default::default()
-            }),
-            _ => None,
-        };
+        let usage = Self::usage_of(&value);
 
         let stop = match done_reason {
             Some("stop") => StopReason::Complete,
@@ -206,6 +196,25 @@ impl Ollama {
             usage,
             stop,
         })
+    }
+
+    /// The usage counts of a body, whether or not it holds an answer (#730).
+    pub(crate) fn parse_usage(body: &str) -> Option<super::Usage> {
+        Self::usage_of(&serde_json::from_str::<Value>(body).ok()?)
+    }
+
+    fn usage_of(value: &Value) -> Option<super::Usage> {
+        match (
+            value.get("prompt_eval_count").and_then(Value::as_u64),
+            value.get("eval_count").and_then(Value::as_u64),
+        ) {
+            (Some(input), Some(output)) => Some(super::Usage {
+                input_tokens: input as u32,
+                output_tokens: output as u32,
+                ..Default::default()
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -281,6 +290,7 @@ impl Provider for Ollama {
             &self.model,
             true,
             Self::parse_completion(&body_text),
+            || Self::parse_usage(&body_text),
         )
     }
 }
@@ -288,7 +298,7 @@ impl Provider for Ollama {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{parse_answer, physics_request, Shot};
+    use crate::provider::{parse_answer, physics_request_no_note, Shot};
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -300,7 +310,7 @@ mod tests {
     }
 
     fn req(prompt: &str, want_difficulty: bool) -> Request {
-        physics_request(&sample_shot(), prompt, want_difficulty)
+        physics_request_no_note(&sample_shot(), prompt, want_difficulty)
     }
 
     // -- base_url / default -----------------------------------------------
@@ -513,6 +523,16 @@ mod tests {
         let body = r#"{"done": true, "done_reason": "stop"}"#;
         let err = Ollama::parse_completion(body).unwrap_err();
         assert!(err.to_string().contains("no message.content"));
+    }
+
+    /// #730: usage is readable from a `length` body that is an error.
+    #[test]
+    fn parse_usage_reads_a_length_body_that_is_an_error() {
+        let body = r#"{"message": {"role": "assistant", "content": ""}, "done": true, "done_reason": "length", "prompt_eval_count": 33, "eval_count": 64}"#;
+        assert!(Ollama::parse_completion(body).is_err());
+        let u = Ollama::parse_usage(body).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (33, 64));
+        assert!(Ollama::parse_usage("not json").is_none());
     }
 
     #[test]

@@ -379,9 +379,12 @@ fn sanitize_filename(uid: &str) -> String {
 /// (`ShellExecuteW("open", ...)`) can still be reading it asynchronously
 /// for a short while after that call returns, so removing it too eagerly
 /// risks deleting a file the calendar app has not finished opening yet. One
-/// day is long enough for any such read to have finished, short enough that
-/// `%TEMP%\Wingman` does not accumulate indefinitely.
-const MAX_ICS_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// hour is long enough for any such read to have finished (it was a day until
+/// #736: the file holds the event title, place and notes taken from the
+/// screen, in a folder with the default temp ACL, so it should not sit there
+/// longer than it has to), short enough that `%TEMP%\Wingman` does not
+/// accumulate indefinitely.
+const MAX_ICS_FILE_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Pure: whether a file last modified at `modified` counts as stale at
 /// `now`, given `max_age`. A `now` that is not strictly after `modified` by
@@ -1594,6 +1597,13 @@ END:VCALENDAR\r\n";
         let connector = IcsConnector::with_temp_dir_and_opener(dir.clone(), opener);
         connector.create_calendar_event(&sample_event()).unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_calendar_file_is_swept_after_at_most_an_hour() {
+        // #736: the file holds screen text; it must not stay for a day.
+        assert!(MAX_ICS_FILE_AGE <= Duration::from_secs(60 * 60));
+        assert!(MAX_ICS_FILE_AGE >= Duration::from_secs(10 * 60));
     }
 
     // -- is_stale (#238, pure) ----------------------------------------------
