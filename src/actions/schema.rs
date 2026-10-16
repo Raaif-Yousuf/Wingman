@@ -69,8 +69,38 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "page_summary" => Some(page_summary_schema()),
         // #131: a short explanation of whatever is on screen, shown on the card.
         "screen_explanation" => Some(screen_explanation_schema()),
+        // #315: times read off the screen as written; Rust converts them.
+        "time_list" => Some(time_list_schema()),
         _ => None,
     }
+}
+
+/// The `time_list` proposal schema (#315): `times`, each with the text as
+/// shown, the clock time, the date if shown and the zone as written. The
+/// model finds and copies; the conversion is `actions::time_zones`. Nothing
+/// is editable: the card is read-only.
+fn time_list_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "times": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "time": {"type": "string"},
+                        "date": {"type": "string"},
+                        "zone": {"type": "string"}
+                    },
+                    "required": ["text", "time", "date", "zone"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["times"],
+        "additionalProperties": false
+    })
 }
 
 /// The `error_explanation` proposal schema (#66): `meaning`, `cause`, `fix`,

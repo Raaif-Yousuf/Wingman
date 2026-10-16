@@ -175,7 +175,10 @@ lines the `clipboard` executor copies as a Markdown checklist),
 the card), `"word_definition"` (#75: `definition`, `example`, a read-only answer for
 the card) and `"screen_explanation"` (#131: `detail`, then a one-sentence
 `headline`; the headline is cut to fit the collapsed card and the detail shows
-on expand). Each schema function returns a `serde_json::json!`
+on expand) and `"time_list"` (#315: `times`, each with the text, the clock time, the
+date if shown and the zone as written; the model only reads them, and
+`actions::time_zones` converts them to the local zone from Windows' own time zone
+data). Each schema function returns a `serde_json::json!`
 literal shaped like standard JSON Schema (`"type": "object"`, `"properties"`,
 `"required"`, `"additionalProperties": false`), plus one
 non-standard keyword:

@@ -40,6 +40,9 @@ pub fn result_card_text(
         if proposal_kind == super::page_summary::PROPOSAL_KIND {
             return super::page_summary::card_text(proposal);
         }
+        if proposal_kind == super::convert_times::PROPOSAL_KIND {
+            return super::convert_times::card_text(proposal);
+        }
         if proposal_kind == super::explain_screen::PROPOSAL_KIND {
             return super::explain_screen::card_text(proposal);
         }

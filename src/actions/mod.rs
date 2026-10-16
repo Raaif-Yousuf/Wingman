@@ -7,6 +7,7 @@
 
 pub mod action_items;
 pub mod calendar;
+pub mod convert_times;
 pub mod define_word;
 pub mod describe_image;
 pub mod explain_error;
@@ -21,6 +22,7 @@ pub mod page_summary;
 pub mod read_qr;
 pub mod review_email;
 pub mod schema;
+pub mod time_zones;
 pub mod translate;
 
 use std::fs;
@@ -265,6 +267,10 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `page_summary`, executor `none`. Finds the link in the selection (else on
 ///   screen), asks the user to confirm the address, then fetches the page and
 ///   summarizes it.
+/// - `"convert-times-to-my-zone"` (#315, `convert_times::builtin_action`):
+///   proposal `time_list`, executor `none`. The model reads each time and its
+///   zone as written; Rust converts them to the local zone (`time_zones`).
+///   Ambiguous zones list every reading.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -320,6 +326,7 @@ pub fn builtin_actions() -> Vec<Action> {
         describe_image::builtin_action(),
         explain_screen::builtin_action(),
         link_summary::builtin_action(),
+        convert_times::builtin_action(),
     ]
 }
 
