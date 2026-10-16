@@ -2857,7 +2857,7 @@ impl App {
 
     /// Handles the fill_form worker's result (#40). `value` carries one of
     /// three shapes: an empty-profile signal
-    /// (`{"empty_profile": true, "toml_path": ..., "bin_path": ...}` --
+    /// (`{"empty_profile": true, "toml_path": ..., "data_dir": ...}` --
     /// `form_fill_worker` returns this instead of ever building a UIA
     /// snapshot, per `actions::fill_form::load_or_import_profile`'s own
     /// "point at where to add profile data" decision), a proposal with no
@@ -2890,11 +2890,11 @@ impl App {
 
         if value.get("empty_profile").and_then(Value::as_bool) == Some(true) {
             let toml_path = value.get("toml_path").and_then(Value::as_str).unwrap_or("");
-            let bin_path = value.get("bin_path").and_then(Value::as_str).unwrap_or("");
+            let data_dir = value.get("data_dir").and_then(Value::as_str).unwrap_or("");
             self.card.show_answer(
                 actions::fill_form::EMPTY_PROFILE_HEADLINE,
                 &with_pending_notices(&actions::fill_form::empty_profile_detail(
-                    toml_path, bin_path,
+                    toml_path, data_dir,
                 )),
                 0,
                 None,
@@ -4248,16 +4248,17 @@ fn form_fill_worker(
     require_tick_for: crate::config::RequireTickFor,
     use_model: bool,
 ) -> Result<Value> {
-    let profile = actions::fill_form::load_or_import_profile()
-        .context("failed to load or import the profile")?;
+    // No added context: the store's own messages are the card text (a
+    // profile sealed for another Windows user or PC says so, in plain words).
+    let profile = actions::fill_form::load_or_import_profile()?;
 
     if actions::fill_form::profile_is_empty(&profile) {
-        let bin_path = crate::profile::Profile::path()?;
-        let toml_path = bin_path.with_file_name("profile.toml");
+        let toml_path = actions::fill_form::profile_toml_path()?;
+        let data_dir = crate::store::data_dir().unwrap_or_default();
         return Ok(serde_json::json!({
             "empty_profile": true,
             "toml_path": toml_path.display().to_string(),
-            "bin_path": bin_path.display().to_string(),
+            "data_dir": data_dir.display().to_string(),
         }));
     }
 

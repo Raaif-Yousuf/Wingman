@@ -21,6 +21,7 @@ mod acl;
 mod egress;
 mod import;
 mod migrate;
+mod profile_field;
 mod usage_day;
 
 pub use egress::append_pending;
@@ -47,6 +48,12 @@ pub enum StoreError {
     Acl(String),
     /// A migration step failed and was rolled back.
     Migration(i64, String),
+    /// The saved profile could not be read or written.
+    Profile(String),
+    /// A saved profile value is sealed for another Windows user or PC.
+    Undecryptable(String),
+    /// A profile value looked like payment data and was not saved.
+    Refused(String),
     Other(String),
 }
 
@@ -66,6 +73,17 @@ impl std::fmt::Display for StoreError {
             StoreError::Migration(v, why) => write!(
                 f,
                 "Wingman could not update its saved data (step {v}: {why})."
+            ),
+            StoreError::Profile(why) => {
+                write!(f, "Wingman could not read or save your profile ({why}).")
+            }
+            StoreError::Undecryptable(why) => write!(
+                f,
+                "Wingman could not unlock your saved profile ({why}). It was probably saved by another Windows user or on another PC, and only that user on that PC can open it. Your saved profile was left as it is."
+            ),
+            StoreError::Refused(why) => write!(
+                f,
+                "Wingman did not save your profile: {why}. Remove that text and try again."
             ),
             StoreError::Other(why) => write!(f, "Wingman could not save its history ({why})."),
         }
@@ -129,7 +147,7 @@ impl Store {
     }
 
     #[cfg(test)]
-    fn in_memory() -> Store {
+    pub(crate) fn in_memory() -> Store {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate::run(&mut conn, migrate::MIGRATIONS, None).unwrap();
         Store {
@@ -254,21 +272,43 @@ fn pending_egress_path() -> Result<PathBuf, StoreError> {
     }
 }
 
+/// `profile.bin` in the roaming folder, the file the `profile_field` table
+/// replaced. Under `#[cfg(test)]` a per-process file in `%TEMP%` (rule 9).
+fn legacy_profile_path() -> Result<PathBuf, StoreError> {
+    #[cfg(test)]
+    {
+        Ok(std::env::temp_dir().join(format!("wingman-test-profile-{}.bin", std::process::id())))
+    }
+    #[cfg(not(test))]
+    {
+        let base = crate::known_folder::roaming_app_data()
+            .map_err(|e| StoreError::Other(format!("no app data folder: {e}")))?;
+        Ok(base.join("Wingman").join("profile.bin"))
+    }
+}
+
+/// The folder the database lives in, for cards that say where data is kept.
+pub fn data_dir() -> Option<PathBuf> {
+    db_path().ok()?.parent().map(Path::to_path_buf)
+}
+
 /// The old files that are imported once, then renamed `.migrated`, and the
 /// pending file that is imported on every open that finds it.
 struct Legacy<'a> {
     spend: &'a Path,
     egress: &'a Path,
     pending: &'a Path,
+    profile: &'a Path,
 }
 
 /// The real open, at the real paths.
 fn open_default() -> Result<Store, StoreError> {
     sweep_stale_test_dirs();
-    let (spend, egress, pending) = (
+    let (spend, egress, pending, profile) = (
         legacy_spend_path()?,
         legacy_egress_path()?,
         pending_egress_path()?,
+        legacy_profile_path()?,
     );
     open_in(
         &db_path()?,
@@ -276,6 +316,7 @@ fn open_default() -> Result<Store, StoreError> {
             spend: &spend,
             egress: &egress,
             pending: &pending,
+            profile: &profile,
         },
         acl::restrict_dir,
     )
@@ -313,6 +354,9 @@ fn open_in(
     for n in request_log_notices(&store, legacy) {
         note(n);
     }
+    if let Some(n) = profile_notice(&store, legacy) {
+        note(n);
+    }
     Ok(store)
 }
 
@@ -330,6 +374,16 @@ fn request_log_notices(store: &Store, legacy: &Legacy<'_>) -> Vec<String> {
             Err(e) => Some(e.to_string()),
         })
         .collect()
+}
+
+/// Imports the old `profile.bin`. Like the request logs it is not allowed to
+/// take the store down: any failure is a notice, the old file is left where
+/// it is, and the next launch tries again.
+fn profile_notice(store: &Store, legacy: &Legacy<'_>) -> Option<String> {
+    match import::profile_bin(&mut store.lock(), legacy.profile) {
+        Ok(n) => n,
+        Err(e) => Some(e.to_string()),
+    }
 }
 
 /// Test builds only: removes `wingman-test-store-<pid>` directories left in
@@ -426,7 +480,7 @@ mod tests {
             migrate::current_version(&conn).unwrap(),
             migrate::MIGRATIONS.last().unwrap().version
         );
-        for table in ["meta", "usage_day", "egress"] {
+        for table in ["meta", "usage_day", "egress", "profile_field"] {
             let n: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE name = ?1",
@@ -506,6 +560,9 @@ mod tests {
             StoreError::Corrupt("x".into()),
             StoreError::Acl("x".into()),
             StoreError::Migration(2, "x".into()),
+            StoreError::Profile("x".into()),
+            StoreError::Undecryptable("x".into()),
+            StoreError::Refused("x".into()),
             StoreError::Other("x".into()),
         ];
         for e in all {
@@ -577,6 +634,7 @@ mod tests {
             spend: &spend,
             egress: &egress,
             pending: &pending,
+            profile: &dir.join("profile.bin"),
         };
         let calls = std::cell::Cell::new(0);
         let count = |_: &Path| {
@@ -606,6 +664,7 @@ mod tests {
             spend: &spend,
             egress: &egress,
             pending: &pending,
+            profile: &dir.join("profile.bin"),
         };
         let err = open_in(&path, &legacy, |_: &Path| {
             Err(StoreError::Acl("nope".to_string()))
@@ -630,6 +689,7 @@ mod tests {
             spend: &spend,
             egress: &egress,
             pending: &pending,
+            profile: &dir.join("profile.bin"),
         };
         let t = std::time::Instant::now();
         drop(open_in(&path, &legacy, acl::restrict_dir).unwrap());
@@ -663,6 +723,7 @@ mod tests {
             spend: &spend,
             egress: &egress,
             pending: &pending,
+            profile: &dir.join("profile.bin"),
         };
 
         let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
@@ -670,6 +731,45 @@ mod tests {
         assert_eq!(s.egress_rows().unwrap().len(), 1);
         assert!(!egress.exists());
         assert!(dir.join("egress.log.migrated").exists());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_open_imports_a_waiting_profile_file_and_a_bad_one_does_not_stop_it() {
+        // The wiring check for the profile import, through the real open path.
+        let dir = scratch("profile-import");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let profile = dir.join("profile.bin");
+        crate::profile::Profile {
+            full_name: crate::profile::Field::new("Ada Lovelace".to_string(), false),
+            ..Default::default()
+        }
+        .write_legacy_file(&profile)
+        .unwrap();
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &profile,
+        };
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+
+        assert_eq!(s.load_profile().unwrap().full_name.value, "Ada Lovelace");
+        assert!(!profile.exists());
+        assert!(dir.join("profile.bin.migrated").exists());
+        drop(s);
+
+        // A file nobody on this account can open: the store still opens.
+        let path2 = dir.join("store2").join("wingman.db");
+        std::fs::write(&profile, b"not a profile").unwrap();
+        let s = open_in(&path2, &legacy, |_: &Path| Ok(()))
+            .expect("a bad profile file must not fail the open");
+        assert!(profile.exists(), "left where it is");
+        assert!(profile_notice(&s, &legacy).is_some());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -699,6 +799,7 @@ mod tests {
             spend: &spend,
             egress: &egress,
             pending: &pending,
+            profile: &dir.join("profile.bin"),
         };
 
         let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
@@ -733,6 +834,7 @@ mod tests {
             spend: &spend,
             egress: &egress,
             pending: &pending,
+            profile: &dir.join("profile.bin"),
         };
 
         let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
@@ -758,6 +860,7 @@ mod tests {
             spend: &spend,
             egress: &egress,
             pending: &pending,
+            profile: &dir.join("profile.bin"),
         };
         drop(open_in(&path, &legacy, |_: &Path| Ok(())).unwrap());
         {

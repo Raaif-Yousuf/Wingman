@@ -11,7 +11,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::{egress, StoreError};
+use super::{egress, profile_field, StoreError};
 use crate::egress::EgressEntry;
 use crate::usage::DayTotal;
 
@@ -133,6 +133,55 @@ fn import_rows(
     egress::prune(&tx, egress::now_unix(), egress::KEEP_ROWS, false)?;
     tx.commit()?;
     Ok(skipped)
+}
+
+const PROFILE_FLAG: &str = "imported_profile";
+
+/// Imports the old `profile.bin` once. The file is read with the same loader
+/// as before (so the payment denylist runs over it), each member is sealed
+/// on its own into `profile_field`, and the rows and the flag are written in
+/// one transaction. Only after the commit is the file renamed
+/// `profile.bin.migrated`; it is never deleted.
+///
+/// A file that cannot be used (sealed for another Windows user or PC,
+/// damaged, or failing the payment check) comes back as a notice with the
+/// file left exactly where it is and the flag unset, so a later launch on the
+/// right account can still import it. Rows already in the store win over the
+/// file's, so a profile entered since is never overwritten.
+pub fn profile_bin(conn: &mut Connection, path: &Path) -> Result<Option<String>, StoreError> {
+    if flag_is_set(conn, PROFILE_FLAG)? {
+        return Ok(None);
+    }
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // Nothing to import, now or later.
+            set_flag_named(conn, PROFILE_FLAG)?;
+            return Ok(None);
+        }
+        Err(_) => return Ok(Some(profile_unreadable())),
+    }
+    let Ok(profile) = crate::profile::Profile::load_from(path) else {
+        return Ok(Some(profile_unreadable()));
+    };
+    let rows = match profile_field::encrypt_rows(&profile) {
+        Ok(r) => r,
+        Err(_) => return Ok(Some(profile_unreadable())),
+    };
+    let tx = conn.transaction()?;
+    profile_field::insert_rows(&tx, &rows, false)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, '1')",
+        [PROFILE_FLAG],
+    )?;
+    tx.commit()?;
+    // Harmless if it fails: the flag is set, so the file is not read again.
+    let _ = std::fs::rename(path, path.with_extension("bin.migrated"));
+    Ok(None)
+}
+
+fn profile_unreadable() -> String {
+    "Wingman could not open your old profile file, so it was left where it is. A profile saved by another Windows user or on another PC cannot be opened here.".to_string()
 }
 
 fn flag_is_set(conn: &Connection, flag: &str) -> Result<bool, StoreError> {
@@ -458,6 +507,191 @@ mod tests {
     fn the_egress_notices_have_no_em_dash() {
         assert!(!bad_lines_notice(3).contains('\u{2014}'));
         assert!(!egress_unreadable().contains('\u{2014}'));
+    }
+
+    // -- profile.bin ----------------------------------------------------------
+
+    fn sample() -> crate::profile::Profile {
+        profile_field::sample_profile()
+    }
+
+    fn profile_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM profile_field", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn profile_flag(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'imported_profile'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn write_legacy(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("profile.bin");
+        sample().write_legacy_file(&path).unwrap();
+        path
+    }
+
+    /// The store the connection belongs to, for reading the profile back.
+    fn store_over(conn: Connection) -> crate::store::Store {
+        crate::store::Store {
+            conn: std::sync::Mutex::new(conn),
+        }
+    }
+
+    #[test]
+    fn profile_bin_is_imported_once_and_renamed_after_the_commit() {
+        let dir = scratch("pf-ok");
+        let path = write_legacy(&dir);
+        let mut conn = db();
+
+        assert_eq!(profile_bin(&mut conn, &path).unwrap(), None);
+
+        assert_eq!(profile_flag(&conn).as_deref(), Some("1"));
+        assert!(!path.exists());
+        assert!(dir.join("profile.bin.migrated").exists());
+        let s = store_over(conn);
+        assert_eq!(s.load_profile().unwrap(), sample());
+
+        // A second run, even with a file back in place, imports nothing.
+        let path = dir.join("profile.bin");
+        let mut other = sample();
+        other.full_name.value = "Someone Else".to_string();
+        other.write_legacy_file(&path).unwrap();
+        assert_eq!(profile_bin(&mut s.lock(), &path).unwrap(), None);
+        assert_eq!(s.load_profile().unwrap().full_name.value, "Ada Lovelace");
+        assert!(path.exists(), "an imported-once store never reads it again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_profile_file_sets_the_flag_and_imports_nothing() {
+        let dir = scratch("pf-missing");
+        let mut conn = db();
+        assert_eq!(
+            profile_bin(&mut conn, &dir.join("profile.bin")).unwrap(),
+            None
+        );
+        assert_eq!(profile_flag(&conn).as_deref(), Some("1"));
+        assert_eq!(profile_count(&conn), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_profile_file_that_cannot_be_decrypted_is_kept_with_a_notice_and_no_flag() {
+        // What another PC or Windows user looks like: DPAPI refuses it. Here
+        // the envelope is sealed under entropy this build does not use.
+        let dir = scratch("pf-foreign");
+        let path = dir.join("profile.bin");
+        let foreign = crate::dpapi::protect(b"{}".to_vec(), Some(b"someone else")).unwrap();
+        std::fs::write(&path, &foreign).unwrap();
+        let mut conn = db();
+
+        let notice = profile_bin(&mut conn, &path).unwrap().expect("a notice");
+
+        assert!(notice.contains("another"), "{notice}");
+        assert!(!notice.contains('\u{2014}'), "{notice}");
+        assert_eq!(std::fs::read(&path).unwrap(), foreign, "left untouched");
+        assert!(!dir.join("profile.bin.migrated").exists());
+        assert_eq!(profile_flag(&conn), None);
+        assert_eq!(profile_count(&conn), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_garbage_profile_file_is_kept_with_a_notice() {
+        let dir = scratch("pf-garbage");
+        let path = dir.join("profile.bin");
+        std::fs::write(&path, b"this is not a DPAPI envelope").unwrap();
+        let mut conn = db();
+
+        assert!(profile_bin(&mut conn, &path).unwrap().is_some());
+
+        assert!(path.exists());
+        assert_eq!(profile_flag(&conn), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_payment_shaped_profile_file_is_not_imported() {
+        let dir = scratch("pf-payment");
+        let path = dir.join("profile.bin");
+        let mut p = sample();
+        p.notes.value = "card: 4111 1111 1111 1111".to_string();
+        let sealed = crate::dpapi::protect(
+            serde_json::to_vec(&p).unwrap(),
+            Some(crate::dpapi::PROFILE_ENTROPY),
+        )
+        .unwrap();
+        std::fs::write(&path, sealed).unwrap();
+        let mut conn = db();
+
+        let notice = profile_bin(&mut conn, &path).unwrap().expect("a notice");
+
+        assert!(!notice.contains("4111"));
+        assert!(path.exists());
+        assert_eq!(profile_count(&conn), 0);
+        assert_eq!(profile_flag(&conn), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_profile_path_is_left_in_place_with_a_notice_and_no_flag() {
+        // A directory where the file should be.
+        let dir = scratch("pf-dir");
+        let path = dir.join("profile.bin");
+        std::fs::create_dir(&path).unwrap();
+        let mut conn = db();
+
+        assert!(profile_bin(&mut conn, &path).unwrap().is_some());
+
+        assert!(path.exists());
+        assert_eq!(profile_flag(&conn), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failure_before_commit_leaves_no_profile_rows_no_flag_and_the_file() {
+        let dir = scratch("pf-crash");
+        let path = write_legacy(&dir);
+        let mut conn = db();
+        conn.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON profile_field WHEN NEW.key = 'notes'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+
+        assert!(profile_bin(&mut conn, &path).is_err());
+
+        assert_eq!(profile_count(&conn), 0);
+        assert_eq!(profile_flag(&conn), None);
+        assert!(path.exists(), "the old file stays for a retry");
+        assert!(!dir.join("profile.bin.migrated").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_already_saved_profile_wins_over_the_old_file() {
+        let dir = scratch("pf-wins");
+        let path = write_legacy(&dir);
+        let s = store_over(db());
+        let mut mine = sample();
+        mine.full_name.value = "Entered Since".to_string();
+        s.save_profile(&mine).unwrap();
+
+        assert_eq!(profile_bin(&mut s.lock(), &path).unwrap(), None);
+
+        assert_eq!(s.load_profile().unwrap().full_name.value, "Entered Since");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_profile_notice_has_no_em_dash() {
+        assert!(!profile_unreadable().contains('\u{2014}'));
     }
 
     #[test]
