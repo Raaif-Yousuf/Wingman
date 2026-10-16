@@ -41,10 +41,19 @@ pub const MAX_FILE_BYTES: u64 = 16 * 1024;
 const MAX_ID_CHARS: usize = 64;
 const MAX_NAME_CHARS: usize = 80;
 const MAX_GROUP_CHARS: usize = 40;
-/// Decision: an imported prompt must fit on the confirmation card in full
+const MAX_PROMPT_CHARS: usize = 8000;
+/// Decision: a prompt up to this long fits on the confirmation card in full
 /// (the card is narrow and shows at most ten wrapped lines per field), so the
-/// user always reads all of it before saying yes. A longer prompt is refused.
-const MAX_PROMPT_CHARS: usize = 300;
+/// user reads all of it before saying yes. A longer one (up to
+/// [`MAX_PROMPT_CHARS`]) is still imported, but turned off, and the user is
+/// told to read it in actions.toml and turn it on. The count is conservative.
+pub const MAX_SHOWN_PROMPT_CHARS: usize = 300;
+const TURNED_OFF_NOTE: &str = "Added turned off. Read the prompt in actions.toml, then turn it on.";
+
+/// Whether an action with this prompt would import turned off.
+pub fn imports_turned_off(action: &Action) -> bool {
+    action.prompt.chars().count() > MAX_SHOWN_PROMPT_CHARS
+}
 const MAX_INPUTS: usize = 12;
 /// The highest suffix tried when an id is taken.
 const MAX_RENAME_SUFFIX: u32 = 99;
@@ -207,8 +216,9 @@ pub fn parse_import(text: &str) -> Result<Import> {
     if action.hotkey.take().is_some() {
         notes.push("Its hotkey was left out.".to_string());
     }
+    action.enabled = !imports_turned_off(&action);
     if !action.enabled {
-        action.enabled = true;
+        notes.push(TURNED_OFF_NOTE.to_string());
     }
     // Only "none" does nothing. Every other executor (the clipboard ones
     // included, which the app treats as read-only and would auto-run) must
@@ -672,11 +682,26 @@ prompt = "Tidy these notes."
     }
 
     #[test]
-    fn a_prompt_too_long_to_show_whole_is_refused() {
-        let ok = "x".repeat(MAX_PROMPT_CHARS);
-        assert!(parse_import(&GOOD.replace("Tidy these notes.", &ok)).is_ok());
-        let long = "x".repeat(MAX_PROMPT_CHARS + 1);
-        assert!(parse_import(&GOOD.replace("Tidy these notes.", &long)).is_err());
+    fn a_prompt_too_long_to_show_whole_imports_turned_off() {
+        let fits = "x".repeat(MAX_SHOWN_PROMPT_CHARS);
+        let i = parse_import(&GOOD.replace("Tidy these notes.", &fits)).unwrap();
+        assert!(i.action.enabled && !imports_turned_off(&i.action));
+        let long = "x".repeat(MAX_SHOWN_PROMPT_CHARS + 1);
+        let i = parse_import(&GOOD.replace("Tidy these notes.", &long)).unwrap();
+        assert!(!i.action.enabled && imports_turned_off(&i.action));
+        assert!(i.notes.iter().any(|n| n.contains("Added turned off")));
+        let path = scratch("off");
+        let p = prepare(&path, i).unwrap();
+        assert!(p.preview_value()["notes"]
+            .as_str()
+            .unwrap()
+            .contains("Added turned off. Read the prompt in actions.toml, then turn it on."));
+        p.commit(&path).unwrap();
+        let report = crate::actions::load_actions_report_from(&path).unwrap();
+        assert!(!report.actions.iter().any(|r| r.action.id == "tidy-notes"));
+        let too_long = "x".repeat(MAX_PROMPT_CHARS + 1);
+        assert!(parse_import(&GOOD.replace("Tidy these notes.", &too_long)).is_err());
+        cleanup(&path);
     }
 
     #[test]

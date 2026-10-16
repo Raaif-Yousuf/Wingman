@@ -4030,6 +4030,10 @@ impl App {
     /// comment). What was deferred is delivered afterwards, as
     /// `open_settings` does. The closure must not touch `self`.
     fn run_os_dialog<T>(&mut self, dialog: impl FnOnce() -> T) -> T {
+        // Like `open_settings`: no card timers or click watcher while the
+        // nested loop runs.
+        self.card.hide();
+        self.set_watch(false);
         SETTINGS_OPEN.with(|c| c.set(true));
         let out = dialog();
         SETTINGS_OPEN.with(|c| c.set(false));
@@ -4106,6 +4110,7 @@ impl App {
             return;
         };
         let owner = HWND(self.hwnd_isize() as *mut _);
+        let mut turned_off = false;
         let text = actions::load_actions().and_then(|all| {
             let found = all
                 .iter()
@@ -4113,6 +4118,7 @@ impl App {
                 .ok_or_else(|| {
                     anyhow::anyhow!("the action \"{id}\" is no longer in actions.toml")
                 })?;
+            turned_off = actions::share::imports_turned_off(&found.action);
             actions::share::export_toml(&found.action)
         });
         let outcome = text.and_then(|text| {
@@ -4125,6 +4131,12 @@ impl App {
             Ok(Some(()))
         });
         match outcome {
+            Ok(Some(())) if turned_off => self.card.show_answer(
+                "Action saved",
+                "Its prompt is long, so it will be added turned off. Whoever imports it must read the prompt in actions.toml, then turn it on.",
+                8,
+                None,
+            ),
             Ok(Some(())) => self.card.show_answer("Action saved", "", 3, None),
             Ok(None) => {}
             Err(e) => {
