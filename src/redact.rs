@@ -32,7 +32,7 @@ pub const FAILURE_NEEDLE: &str = "Could not check the screenshot for private det
 /// Windows refuses to list its password fields (#506). Used as the error text
 /// itself; `app::humanize_error_chain` maps it to this same sentence.
 pub const ADMIN_APP_SENTENCE: &str =
-    "Wingman can't check an app running as administrator for password fields, so nothing was sent.";
+    "Wingman can't check this app for password fields (it may be running as administrator), so nothing was sent.";
 
 /// What the card says when [`apply`] fails, whatever the underlying cause.
 /// `app::humanize_error_chain` maps any error chain containing
