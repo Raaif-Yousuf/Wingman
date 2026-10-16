@@ -37,6 +37,7 @@ mod single_instance;
 mod speech;
 mod store;
 mod ui;
+mod ui_thread;
 mod usage;
 
 fn main() {

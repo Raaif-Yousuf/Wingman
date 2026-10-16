@@ -213,6 +213,7 @@ impl TokenTransport for UreqTransport {
 }
 
 fn send_form(url: &str, form: &[(&str, &str)]) -> Result<(u16, String)> {
+    crate::ui_thread::blocking_call("oauth send_form");
     let mut response = ureq::post(url)
         .config()
         .http_status_as_error(false)
@@ -664,6 +665,7 @@ pub fn authorize(
     store: &dyn SecretStore,
     timeout: Duration,
 ) -> Result<AccessToken> {
+    crate::ui_thread::blocking_call("oauth authorize");
     // Before anything is opened or bound: Offline mode means no sign-in.
     crate::provider::common::offline_guard(&provider.auth_url)?;
     let pkce = Pkce::generate()?;

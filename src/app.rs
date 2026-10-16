@@ -705,6 +705,8 @@ fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
 }
 
 fn pump_messages() {
+    // #700: this thread hosts the keyboard hook, so no blocking network call may run here.
+    crate::ui_thread::mark_current_thread();
     let mut msg = MSG::default();
     // GetMessageW returns -1 on error; treat anything non-positive as "stop".
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
