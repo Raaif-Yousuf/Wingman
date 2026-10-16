@@ -1352,6 +1352,45 @@ pub(crate) fn encode_images_base64(images: &[Vec<u8>]) -> Vec<String> {
         .collect()
 }
 
+/// The schema as it goes to a vendor: the UI-only `"editable"` keyword
+/// (`actions::schema`: the confirm card reads it, a model never needs it) is
+/// removed everywhere. OpenAI strict mode and Gemini accept only a documented
+/// subset of JSON Schema, so an unknown keyword risks a 400 on every calendar,
+/// rewrite and list action (#719). The local copy in the registry keeps it.
+///
+/// MEASURED 2026-10-16: Anthropic (haiku-5-5) accepts the keyword and ignores it.
+/// THEORY (unverified, no key here): OpenAI strict mode and Gemini reject or
+/// ignore it; stripping is safe either way.
+///
+/// Key order is kept (rule 3): the map is rebuilt in order rather than using
+/// `Map::remove`, which swaps the last key into the hole under
+/// `preserve_order`. A property that is itself NAMED `editable` is left alone.
+pub(crate) fn wire_schema(schema: &Value) -> Value {
+    fn strip(node: &mut Value, is_property_map: bool) {
+        match node {
+            Value::Object(map) => {
+                let old = std::mem::take(map);
+                for (key, mut child) in old {
+                    if !is_property_map && key == "editable" {
+                        continue;
+                    }
+                    strip(&mut child, !is_property_map && key == "properties");
+                    map.insert(key, child);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    strip(item, false);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = schema.clone();
+    strip(&mut out, false);
+    out
+}
+
 /// The JSON Schema for the physics-check `Answer`: `detail` is listed (and
 /// required) before `headline` deliberately -- with `headline` first the
 /// model committed to a verdict before doing the arithmetic and then
@@ -1394,6 +1433,53 @@ pub(crate) fn augmented_system_prompt(prompt: &str, want_difficulty: bool) -> St
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    // -- wire_schema (#719) ----------------------------------------------
+
+    /// A walk over a JSON value: does any schema node carry `editable`?
+    pub(crate) fn mentions_editable_keyword(v: &Value) -> bool {
+        match v {
+            Value::Object(m) => {
+                m.contains_key("editable") || m.values().any(mentions_editable_keyword)
+            }
+            Value::Array(a) => a.iter().any(mentions_editable_keyword),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn wire_schema_removes_editable_everywhere_and_keeps_every_other_key_in_order() {
+        let kinds = crate::actions::schema::PROPOSAL_KINDS;
+        let mut with_editable = 0;
+        for kind in kinds {
+            let schema = crate::actions::schema::schema_for(kind, true).unwrap();
+            if mentions_editable_keyword(&schema) {
+                with_editable += 1;
+            }
+            let wire = wire_schema(&schema);
+            assert!(!mentions_editable_keyword(&wire), "{kind}: {wire}");
+            // The same schema minus the keyword, byte for byte, in order.
+            let expected = serde_json::to_string(&schema)
+                .unwrap()
+                .replace(r#","editable":true"#, "");
+            assert_eq!(serde_json::to_string(&wire).unwrap(), expected, "{kind}");
+        }
+        assert!(with_editable >= 3, "the candidate set must not be empty");
+    }
+
+    #[test]
+    fn wire_schema_leaves_a_property_named_editable_alone() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"editable": {"type": "boolean", "editable": true}, "a": {"type": "string"}},
+            "required": ["editable", "a"]
+        });
+        let wire = wire_schema(&schema);
+        assert_eq!(
+            serde_json::to_string(&wire).unwrap(),
+            r#"{"type":"object","properties":{"editable":{"type":"boolean"},"a":{"type":"string"}},"required":["editable","a"]}"#
+        );
+    }
 
     // -- test doubles ----------------------------------------------------
 

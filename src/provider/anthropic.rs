@@ -58,7 +58,8 @@ impl Anthropic {
 
         let mut output_config = serde_json::json!({});
         if let Some(schema) = &req.schema {
-            output_config["format"] = serde_json::json!({"type": "json_schema", "schema": schema});
+            output_config["format"] =
+                serde_json::json!({"type": "json_schema", "schema": common::wire_schema(schema)});
         }
         let effort = if req.effort != Effort::Unset {
             req.effort
@@ -599,6 +600,18 @@ mod tests {
             );
             // The schema must still be there — only effort is dropped.
             assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        }
+    }
+
+    /// #719: the UI-only `editable` keyword never goes to the vendor.
+    #[test]
+    fn no_registered_schema_sends_the_editable_keyword() {
+        let p = Anthropic::new("k", "claude-opus-5", "low");
+        for kind in crate::actions::schema::PROPOSAL_KINDS {
+            let mut r = req("sys", false);
+            r.schema = crate::actions::schema::schema_for(kind, false);
+            let body = serde_json::to_string(&p.build_body(&r)).unwrap();
+            assert!(!body.contains("editable"), "{kind}: {body}");
         }
     }
 

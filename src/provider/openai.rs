@@ -73,7 +73,7 @@ impl OpenAi {
         if let Some(schema) = &req.schema {
             body["text"] = json!({"format": {
                 "type": "json_schema", "name": "answer", "strict": true,
-                "schema": schema
+                "schema": common::wire_schema(schema)
             }});
         }
 
@@ -667,6 +667,18 @@ mod tests {
 
     /// #12 neighbour: a request with no schema (a future plain-text action)
     /// must not fabricate a `text` key.
+    /// #719: the UI-only `editable` keyword never goes out.
+    #[test]
+    fn no_registered_schema_sends_the_editable_keyword() {
+        let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
+        for kind in crate::actions::schema::PROPOSAL_KINDS {
+            let mut r = req("sys", false);
+            r.schema = crate::actions::schema::schema_for(kind, false);
+            let body = serde_json::to_string(&provider.build_body(&r)).unwrap();
+            assert!(!body.contains("editable"), "{kind}: {body}");
+        }
+    }
+
     #[test]
     fn no_schema_request_omits_text_format() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
