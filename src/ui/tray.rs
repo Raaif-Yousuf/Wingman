@@ -573,83 +573,97 @@ impl Tray {
         // clickable (see `append_item_state`'s doc comment on #185).
         append_item_state(hmenu, cmd::VERSION_LABEL, &version_label(), false)?;
         append_separator(hmenu)?;
-        append_item(hmenu, cmd::ASK_NOW, "Ask now")?;
-        // #25: honors Pause the same way "Calculate selection" does just
-        // below -- opening the palette to run an action defeats the point
-        // of pausing.
-        append_item_state(hmenu, cmd::QUICK_ASK, "Quick Ask", !self.paused)?;
-        append_item(hmenu, cmd::EXTRACT_TEXT, "Copy text from screen")?;
-        append_item(hmenu, cmd::READ_QR, "Read QR code from screen")?;
-        append_item(hmenu, cmd::COPY_REGION, "Copy region to clipboard")?;
-        append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
+        append_item(hmenu, cmd::ASK_NOW, "Ask now (same as the key)")?;
+
+        // #348: every action lives in one submenu. Quick Ask is first
+        // because it is the palette that lists the rest.
+        let actions = append_group(hmenu, "Actions")?;
+        // #25: honors Pause the same way "Calculate selection" does below --
+        // opening the palette to run an action defeats the point of pausing.
+        append_item_state(
+            actions,
+            cmd::QUICK_ASK,
+            "Quick Ask (pick an action)",
+            !self.paused,
+        )?;
+        append_separator(actions)?;
+        append_item(actions, cmd::EXTRACT_TEXT, "Copy text from screen")?;
+        append_item(actions, cmd::READ_QR, "Read QR code from screen")?;
+        append_item(actions, cmd::COPY_REGION, "Copy region to clipboard")?;
         // #115: works with no provider at all, but still honors Pause
         // (issue #20's rule: nothing Wingman does runs while paused, even
         // the model-free actions), same greyed-while-paused treatment as
-        // the "Set ... key" items just below.
+        // the "Set ... key" items below.
         append_item_state(
-            hmenu,
+            actions,
             cmd::CALCULATE_SELECTION,
             "Calculate selection",
             !self.paused,
         )?;
-        append_item(hmenu, cmd::ADD_TO_CALENDAR, "Add event from screen")?;
-        append_item(hmenu, cmd::REVIEW_EMAIL, "Review this email")?;
-        append_item(hmenu, cmd::FILL_FORM, "Fill this form")?;
-        append_item(hmenu, cmd::RESTORE_LAST_FORM, "Restore last form")?;
+        append_item(actions, cmd::ADD_TO_CALENDAR, "Add event from screen")?;
+        append_item(actions, cmd::REVIEW_EMAIL, "Review this email")?;
+        append_item(actions, cmd::FILL_FORM, "Fill this form")?;
+        append_item(actions, cmd::RESTORE_LAST_FORM, "Restore last form")?;
+
+        append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
         append_separator(hmenu)?;
         if self.paused {
             append_item(hmenu, cmd::RESUME, "Resume")?;
         } else {
             append_pause_submenu(hmenu)?;
         }
-        append_separator(hmenu)?;
         append_mode_submenu(hmenu, self.mode)?;
-        append_separator(hmenu)?;
-        append_provider_submenu(hmenu, self.active_provider)?;
+
+        // #348: providers, models and the key-learning items in one place.
+        let setup = append_group(hmenu, "Providers and keys")?;
+        append_provider_submenu(setup, self.active_provider)?;
         append_model_submenu(
-            hmenu,
+            setup,
             "ChatGPT model",
             cmd::OPENAI_MODEL_BASE,
             &self.openai_models,
             self.openai_current,
         )?;
         append_model_submenu(
-            hmenu,
+            setup,
             "Claude model",
             cmd::ANTHROPIC_MODEL_BASE,
             &self.anthropic_models,
             self.anthropic_current,
         )?;
-        append_separator(hmenu)?;
+        append_separator(setup)?;
         // #185: greyed out while paused. Arming learn mode can never
         // capture while paused (the WH_KEYBOARD_LL hook passes every
         // keydown straight through, per hotkey.rs's pause bypass), so
         // offering it would show a "press now" prompt that can never
         // succeed and leaves a stale armed deadline behind. Mirrors the
-        // Pause/Resume item swap just above.
+        // Pause/Resume item swap above.
         append_item_state(
-            hmenu,
+            setup,
             cmd::SET_PRIMARY,
             &key_label("Set Copilot key", &self.primary_label),
             !self.paused,
         )?;
         append_item_state(
-            hmenu,
+            setup,
             cmd::SET_SECONDARY,
             &key_label("Set secondary key", &self.secondary_label),
             !self.paused,
         )?;
         append_item_state(
-            hmenu,
+            setup,
             cmd::SET_PAUSE,
             &key_label("Set pause key", &self.pause_label),
             !self.paused,
         )?;
+
+        append_separator(hmenu)?;
         append_item(hmenu, cmd::OPEN_SETTINGS, "Settings...")?;
-        append_item(hmenu, cmd::EDIT_SETTINGS, "Open config.toml")?;
-        append_item(hmenu, cmd::RELOAD, "Reload settings")?;
-        append_item(hmenu, cmd::COPY_DIAGNOSTICS, "Copy diagnostics")?;
-        append_item(hmenu, cmd::COPY_EGRESS_LOG, "Copy egress log")?;
+        let help = append_group(hmenu, "Help and diagnostics")?;
+        append_item(help, cmd::EDIT_SETTINGS, "Open config.toml")?;
+        append_item(help, cmd::RELOAD, "Reload settings")?;
+        append_item(help, cmd::COPY_DIAGNOSTICS, "Copy diagnostics")?;
+        append_item(help, cmd::COPY_EGRESS_LOG, "Copy egress log")?;
         append_separator(hmenu)?;
         append_item(hmenu, cmd::QUIT, "Quit")?;
         Ok(())
@@ -761,6 +775,16 @@ fn append_submenu(parent: HMENU, submenu: HMENU, text: &str) -> Result<()> {
         )
     }
     .context("AppendMenuW(popup) failed")
+}
+
+/// Create an empty submenu labeled `text`, attached to `parent` before it is
+/// populated (same ownership rule as [`attach_submenu_or_destroy`]), and
+/// return its handle so the caller can fill it. Used by [`Tray::build_menu`]
+/// for the #348 groups.
+fn append_group(parent: HMENU, text: &str) -> Result<HMENU> {
+    let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
+    attach_submenu_or_destroy(parent, sub, text)?;
+    Ok(sub)
 }
 
 /// Mark the item identified by command id `id` in `hmenu` as the checked
@@ -1475,6 +1499,296 @@ mod tests {
 
         drop(tray);
         let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    // -- #348: the menu tree --------------------------------------------------
+
+    /// One node of a built menu, read back from the real `HMENU`.
+    #[derive(Debug)]
+    enum Node {
+        Sep,
+        /// `(command id, label, greyed, radio-checked)`
+        Item(u32, String, bool, bool),
+        Sub(String, Vec<Node>),
+    }
+
+    impl Node {
+        fn label(&self) -> Option<&str> {
+            match self {
+                Node::Sep => None,
+                Node::Item(_, t, ..) | Node::Sub(t, _) => Some(t),
+            }
+        }
+    }
+
+    fn read_menu(hmenu: HMENU) -> Vec<Node> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetMenuItemCount, GetMenuItemInfoW, MFS_GRAYED, MIIM_ID, MIIM_STRING, MIIM_SUBMENU,
+        };
+        let n = unsafe { GetMenuItemCount(Some(hmenu)) };
+        assert!(n >= 0, "GetMenuItemCount failed");
+        let mut out = Vec::new();
+        for pos in 0..n as u32 {
+            let mut buf = [0u16; 128];
+            let mut info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_ID | MIIM_FTYPE | MIIM_STATE | MIIM_STRING | MIIM_SUBMENU,
+                dwTypeData: windows::core::PWSTR(buf.as_mut_ptr()),
+                cch: buf.len() as u32 - 1,
+                ..Default::default()
+            };
+            unsafe { GetMenuItemInfoW(hmenu, pos, true, &mut info) }.expect("GetMenuItemInfoW");
+            if info.fType.0 & MF_SEPARATOR.0 != 0 {
+                out.push(Node::Sep);
+                continue;
+            }
+            let text = String::from_utf16_lossy(&buf[..info.cch as usize]);
+            if info.hSubMenu.0.is_null() {
+                out.push(Node::Item(
+                    info.wID,
+                    text,
+                    info.fState.0 & MFS_GRAYED.0 != 0,
+                    info.fState.0 & MFS_CHECKED.0 != 0,
+                ));
+            } else {
+                out.push(Node::Sub(text, read_menu(info.hSubMenu)));
+            }
+        }
+        out
+    }
+
+    /// Build the real menu for a throwaway tray window and read it back.
+    fn built_menu_tree(configure: impl FnOnce(&mut Tray)) -> Vec<Node> {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, CW_USEDEFAULT, WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray menu tree test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+        let mut tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+        configure(&mut tray);
+        let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu).expect("build_menu");
+        let tree = read_menu(hmenu);
+        let _ = unsafe { DestroyMenu(hmenu) };
+        drop(tray);
+        let _ = unsafe { DestroyWindow(hwnd) };
+        tree
+    }
+
+    fn ids_under(nodes: &[Node], out: &mut Vec<u32>) {
+        for n in nodes {
+            match n {
+                Node::Item(id, ..) => out.push(*id),
+                Node::Sub(_, kids) => ids_under(kids, out),
+                Node::Sep => {}
+            }
+        }
+    }
+
+    fn find_sub<'a>(nodes: &'a [Node], label: &str) -> &'a [Node] {
+        nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Sub(t, kids) if t == label => Some(kids.as_slice()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no submenu {label:?}"))
+    }
+
+    fn direct_ids(nodes: &[Node]) -> Vec<u32> {
+        nodes
+            .iter()
+            .filter_map(|n| match n {
+                Node::Item(id, ..) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn find_item(nodes: &[Node], want: u32) -> Option<&Node> {
+        for n in nodes {
+            match n {
+                Node::Item(id, ..) if *id == want => return Some(n),
+                Node::Sub(_, kids) => {
+                    if let Some(found) = find_item(kids, want) {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn menu_top_level_is_ten_entries_or_fewer_and_grouped() {
+        let tree = built_menu_tree(|_| {});
+        let top: Vec<&str> = tree.iter().filter_map(Node::label).collect();
+        assert!(
+            top.len() <= 10,
+            "top level has {} entries: {top:?}",
+            top.len()
+        );
+        let expect = [
+            format!("Wingman {}", env!("CARGO_PKG_VERSION")),
+            "Ask now (same as the key)".to_string(),
+            "Actions".to_string(),
+            "Copy last answer".to_string(),
+            "Pause".to_string(),
+            "Mode".to_string(),
+            "Providers and keys".to_string(),
+            "Settings...".to_string(),
+            "Help and diagnostics".to_string(),
+            "Quit".to_string(),
+        ];
+        assert_eq!(top, expect.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn menu_groups_hold_the_expected_commands() {
+        let tree = built_menu_tree(|_| {});
+
+        assert_eq!(
+            direct_ids(&tree),
+            [
+                cmd::VERSION_LABEL,
+                cmd::ASK_NOW,
+                cmd::COPY_LAST,
+                cmd::OPEN_SETTINGS,
+                cmd::QUIT
+            ]
+        );
+
+        let mut actions = direct_ids(find_sub(&tree, "Actions"));
+        actions.sort_unstable();
+        let mut want = vec![
+            cmd::QUICK_ASK,
+            cmd::EXTRACT_TEXT,
+            cmd::READ_QR,
+            cmd::COPY_REGION,
+            cmd::CALCULATE_SELECTION,
+            cmd::ADD_TO_CALENDAR,
+            cmd::REVIEW_EMAIL,
+            cmd::FILL_FORM,
+            cmd::RESTORE_LAST_FORM,
+        ];
+        want.sort_unstable();
+        assert_eq!(actions, want);
+
+        let mut help = direct_ids(find_sub(&tree, "Help and diagnostics"));
+        help.sort_unstable();
+        let mut want = vec![
+            cmd::EDIT_SETTINGS,
+            cmd::RELOAD,
+            cmd::COPY_DIAGNOSTICS,
+            cmd::COPY_EGRESS_LOG,
+        ];
+        want.sort_unstable();
+        assert_eq!(help, want);
+
+        let setup = find_sub(&tree, "Providers and keys");
+        assert_eq!(
+            direct_ids(setup),
+            [cmd::SET_PRIMARY, cmd::SET_SECONDARY, cmd::SET_PAUSE]
+        );
+        let mut providers = Vec::new();
+        ids_under(find_sub(setup, "Provider"), &mut providers);
+        assert_eq!(providers.len(), ActiveProvider::ALL.len());
+        find_sub(setup, "ChatGPT model");
+        find_sub(setup, "Claude model");
+
+        assert_eq!(
+            direct_ids(find_sub(&tree, "Pause")),
+            [
+                cmd::PAUSE_1H,
+                cmd::PAUSE_UNTIL_TOMORROW,
+                cmd::PAUSE_UNTIL_RESUMED
+            ]
+        );
+        assert_eq!(find_sub(&tree, "Mode").len(), 4);
+    }
+
+    #[test]
+    fn menu_tree_has_no_em_dashes_and_every_fixed_id_is_reachable() {
+        let mut all = Vec::new();
+        for paused in [false, true] {
+            let tree = built_menu_tree(|t| t.set_paused(paused));
+            fn labels(nodes: &[Node], out: &mut Vec<String>) {
+                for n in nodes {
+                    if let Some(l) = n.label() {
+                        out.push(l.to_string());
+                    }
+                    if let Node::Sub(_, k) = n {
+                        labels(k, out);
+                    }
+                }
+            }
+            let mut ls = Vec::new();
+            labels(&tree, &mut ls);
+            assert!(ls.len() > 20, "walker saw only {} labels", ls.len());
+            assert!(ls.iter().all(|l| !l.contains('\u{2014}')), "{ls:?}");
+            ids_under(&tree, &mut all);
+        }
+        for (name, id) in ALL_FIXED_CMD_IDS {
+            assert!(all.contains(id), "{name} is in no menu");
+        }
+    }
+
+    /// Wired-to-nothing guard for dynamic state that now sits inside
+    /// submenus: the pause greying, the Mode and Provider radio marks.
+    #[test]
+    fn dynamic_state_still_shows_inside_the_submenus() {
+        let running = built_menu_tree(|t| {
+            t.set_mode(crate::mode::Mode::Local);
+            t.set_active_provider(ActiveProvider::Gemini);
+        });
+        let grey = |tree: &[Node], id| match find_item(tree, id) {
+            Some(Node::Item(_, _, g, _)) => *g,
+            _ => panic!("id {id} missing"),
+        };
+        let checked = |tree: &[Node], id| match find_item(tree, id) {
+            Some(Node::Item(_, _, _, c)) => *c,
+            _ => panic!("id {id} missing"),
+        };
+        assert!(checked(&running, cmd::MODE_LOCAL));
+        assert!(!checked(&running, cmd::MODE_CLOUD));
+        assert!(checked(&running, cmd::USE_GEMINI));
+        assert!(!checked(&running, cmd::USE_OPENAI));
+        assert!(!grey(&running, cmd::SET_PAUSE));
+        assert!(!grey(&running, cmd::QUICK_ASK));
+
+        let paused = built_menu_tree(|t| t.set_paused(true));
+        for id in [
+            cmd::SET_PRIMARY,
+            cmd::SET_SECONDARY,
+            cmd::SET_PAUSE,
+            cmd::QUICK_ASK,
+            cmd::CALCULATE_SELECTION,
+        ] {
+            assert!(grey(&paused, id), "{id} must be greyed while paused");
+        }
+        let top: Vec<&str> = paused.iter().filter_map(Node::label).collect();
+        assert!(top.contains(&"Resume"), "{top:?}");
+        assert!(!top.contains(&"Pause"));
+        assert!(top.len() <= 10);
     }
 
     // -- #25: "Quick Ask" is reachable from the menu -------------------------
