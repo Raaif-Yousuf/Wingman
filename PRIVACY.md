@@ -28,8 +28,9 @@ provider answers, the request carries:
    pixels on the long edge (1568 by default) and PNG-encoded. Before a cloud
    request, card numbers, IBANs, key-like tokens and email addresses that
    Windows OCR can read on the screenshot are painted over with solid boxes
-   (`capture.redact`, on by default). This covers the image only: text sent
-   to a text-only model is not yet scrubbed the same way. A number that
+   (`capture.redact`, on by default, also a checkbox in Settings). The same
+   switch masks those details in text sent along (selected text, page text,
+   field values) and puts the real values back into the answer. A number that
    Windows OCR splits across two lines, or does not read at all, may not be
    painted over.
 2. The system prompt from `ui.prompt` in your config, sent alongside the

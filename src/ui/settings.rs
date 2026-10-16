@@ -817,6 +817,14 @@ const ID_SECONDARY_LABEL: i32 = 135;
 /// #498: the card-corner and card-monitor combos in the Card group.
 const ID_CARD_CORNER: i32 = 136;
 const ID_CARD_MONITOR: i32 = 137;
+/// #509: the capture.redact checkbox in the Capture group.
+const ID_REDACT: i32 = 138;
+/// #509: what capture.redact covers, in plain words. Three things: the
+/// screenshot (card numbers, keys, emails and password fields painted over),
+/// the text sent to a cloud or remote model, and the answer (real values put
+/// back). Local models skip it.
+const REDACT_LABEL: &str = "Hide card numbers, keys, emails and passwords before sending";
+const REDACT_HINT: &str = "Painted over in screenshots and masked in text sent to cloud or remote models. The answer shows the real values. Local models skip it.";
 /// #345: the one-shot timer that ends a pending Change that nobody pressed a
 /// key for. Only ever set while a Change is pending, so nothing ticks idle.
 const LEARN_TIMER_ID: usize = 0x345;
@@ -869,6 +877,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_SECONDARY_LABEL", ID_SECONDARY_LABEL),
     ("ID_CARD_CORNER", ID_CARD_CORNER),
     ("ID_CARD_MONITOR", ID_CARD_MONITOR),
+    ("ID_REDACT", ID_REDACT),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1004,7 +1013,7 @@ const WIN_W_DP: i32 = 620;
 /// back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout` itself
 /// never overlaps regardless of this constant, but a taller default is nicer
 /// than always squeezing.
-const WIN_H_DP: i32 = 918;
+const WIN_H_DP: i32 = 918 + 3 * (ROW_H + ROW_GAP);
 /// The shortest the window is ever made, in dp: the pinned footer and a sliver
 /// of body. It is only a floor against a failed or absurd monitor query (see
 /// `fitted_height_for_work_px`); a real work area is always taller, and a
@@ -3291,6 +3300,35 @@ fn build_ui_recorded(
         0,
     );
     r.advance();
+
+    // #509: capture.redact. The hint is two rows tall so it wraps in words
+    // rather than running off the group.
+    let redact = ctx.create(
+        WC_BUTTON,
+        REDACT_LABEL,
+        BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
+        0,
+        r.x,
+        r.y,
+        r.w,
+        ROW_H,
+        ID_REDACT,
+    );
+    set_checkbox(redact, config.capture.redact);
+    r.advance();
+    ctx.create(
+        WC_STATIC,
+        REDACT_HINT,
+        0,
+        0,
+        r.x + 20,
+        r.y,
+        r.w - 20,
+        ROW_H * 2,
+        0,
+    );
+    r.advance();
+    r.advance();
     let capture_bottom = r.y + 4;
     ctx.create(
         WC_BUTTON,
@@ -3647,6 +3685,7 @@ fn build_ui_recorded(
         ID_OLLAMA_MODEL,
         ID_MAX_EDGE,
         ID_MONITOR,
+        ID_REDACT,
         ID_CARD_SECONDS,
         ID_TEXT_SCALE_TRACK,
         ID_CARD_CORNER,
@@ -3722,6 +3761,8 @@ struct RawForm {
     /// #498: the card-corner and card-monitor combos' text.
     card_corner: String,
     card_monitor: String,
+    /// #509: the redaction checkbox (capture.redact).
+    redact: bool,
 }
 
 /// Reads every control into a [`RawForm`], without yet folding it into a
@@ -3776,6 +3817,12 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
         require_tick_for: combo_selected_text(hwnd, ID_REQUIRE_TICK_FOR),
         card_corner: combo_selected_text(hwnd, ID_CARD_CORNER),
         card_monitor: combo_selected_text(hwnd, ID_CARD_MONITOR),
+        // A missing control keeps the stored value, never flips it.
+        redact: if get_dlg_item(hwnd, ID_REDACT).is_some() {
+            checkbox_checked(hwnd, ID_REDACT)
+        } else {
+            inner.original.capture.redact
+        },
     }
 }
 
@@ -4545,6 +4592,7 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     }
 
     cfg.capture.max_edge = parse_max_edge_or(&raw.max_edge_text, original.capture.max_edge);
+    cfg.capture.redact = raw.redact;
     if let Some(v) = label_to_monitor(raw.monitor.trim()) {
         cfg.capture.monitor = v;
     }
@@ -5687,6 +5735,7 @@ mod tests {
             require_tick_for: require_tick_for_label(original.forms.require_tick_for).to_string(),
             card_corner: card_corner_label(original.ui.card_corner).to_string(),
             card_monitor: card_monitor_display(&original.ui.card_monitor, 2),
+            redact: original.capture.redact,
         }
     }
 
@@ -5857,6 +5906,44 @@ mod tests {
         assert_eq!(cfg.providers.openai.effort, "high");
         assert_eq!(cfg.capture.max_edge, 2048);
         assert_eq!(cfg.capture.monitor, "primary");
+    }
+
+    // -- capture.redact checkbox (#509) -------------------------------------
+
+    #[test]
+    fn build_config_applies_the_redact_checkbox_both_ways() {
+        let mut original = Config::default();
+        assert!(original.capture.redact);
+        let mut raw = raw_from(&original);
+        raw.redact = false;
+        assert!(!build_config(&original, &raw).capture.redact);
+        original.capture.redact = false;
+        let mut raw = raw_from(&original);
+        raw.redact = true;
+        assert!(build_config(&original, &raw).capture.redact);
+    }
+
+    #[test]
+    fn build_config_round_trips_redact_and_leaves_hand_edited_capture_values() {
+        for on in [true, false] {
+            let mut original = Config::default();
+            original.capture.redact = on;
+            original.capture.ocr_language = "de".to_string();
+            original.capture.extra_password_managers = vec!["vault.exe".to_string()];
+            let cfg = build_config(&original, &raw_from(&original));
+            assert_eq!(cfg.capture.redact, on);
+            assert_eq!(cfg.capture.ocr_language, "de");
+            assert_eq!(cfg.capture.extra_password_managers, vec!["vault.exe"]);
+        }
+    }
+
+    #[test]
+    fn redact_labels_say_the_three_things_without_em_dashes() {
+        let all = format!("{REDACT_LABEL} {REDACT_HINT}").to_lowercase();
+        assert!(!all.contains('\u{2014}') && !all.contains('\u{2013}'));
+        for word in ["screenshot", "text", "password", "answer"] {
+            assert!(all.contains(word), "missing {word}: {all}");
+        }
     }
 
     // -- card corner and monitor (#498) -------------------------------------
