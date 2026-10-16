@@ -1546,26 +1546,19 @@ impl Config {
             return Ok(());
         }
 
-        let username = std::env::var("USERNAME")
-            .ok()
-            .filter(|u| !u.is_empty())
-            .context(
-                "the USERNAME environment variable is not set; cannot restrict \
-                 the config file to the current user",
-            )?;
-        // CREATE_NO_WINDOW (0x0800_0000): Wingman is a windows-subsystem GUI
-        // app with no console of its own, so spawning `icacls` without this
-        // flag allocates and briefly flashes a new console window on every
-        // call -- every `save()`/`save_to()`, i.e. potentially on every
-        // settings change, not just once at startup.
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let output = std::process::Command::new("icacls")
+        // #736: the grant names the current user by SID (the USERNAME
+        // variable is inherited and not a SID), and `icacls` is the one in
+        // the system folder. `icacls_command` also sets CREATE_NO_WINDOW:
+        // Wingman has no console, so without it every `save()` would flash
+        // one.
+        let account = crate::owner_acl::grant_account()
+            .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?;
+        let output = crate::owner_acl::icacls_command()
+            .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
-            .arg(format!("{username}:F"))
-            .creation_flags(CREATE_NO_WINDOW)
+            .arg(format!("{account}:F"))
             .output()
             .context("failed to run icacls to restrict the config file's permissions")?;
         if !output.status.success() {

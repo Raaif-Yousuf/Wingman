@@ -96,14 +96,15 @@ states in that theme without changing your Windows settings. The palette and
 Settings states still follow the system theme.
 
 Add `--dpi 100`, `--dpi 150`, `--dpi 250` (any scale from 100 to 500 percent) to
-lay the card and the region overlay out at that display scale, again without
+lay the card, the region overlay and Settings out at that display scale, again without
 touching your display settings. Add `--matrix` with `--screenshot out\` to
 write every state under every theme and scale (100, 150, 200 and 250 percent)
 as `<state>--<theme>--<percent>.png`, for example `card-error--dark--150.png`,
-so two runs can be compared file by file. The palette and Settings cannot be
-simulated yet: the matrix writes them once as `<state>--system--<percent>.png`
-at your real display scale. The palette pictures are black for now (issue
-#626).
+so two runs can be compared file by file. Settings follows `--dpi` but not
+`--theme` yet, so the matrix writes it once per scale as
+`<state>--system--<percent>.png`. The palette cannot be simulated yet: the
+matrix writes it once at your real display scale. The palette pictures are
+black for now (issue #626).
 
 ## Checking the size of the exe
 

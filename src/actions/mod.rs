@@ -19,6 +19,7 @@ pub mod fill_form;
 pub mod generic_answer;
 pub mod generic_inputs;
 pub mod generic_replace;
+pub mod jargon;
 pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
@@ -422,6 +423,10 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `rewrite_tone::builtin_actions`): proposal `text_answer`, executor
 ///   `replace_text`. Rewrite the selection in a fixed tone, confirmed on a
 ///   card, then written over the selection like "Translate selection".
+/// - `"explain-jargon"` (#335, `jargon::builtin_action`): proposal
+///   `jargon_terms`, executor `none`. Lists the technical terms and acronyms in
+///   the selection (else on screen) with a short plain meaning each, on the
+///   card.
 pub fn builtin_actions() -> Vec<Action> {
     let mut actions = vec![
         Action {
@@ -482,6 +487,7 @@ pub fn builtin_actions() -> Vec<Action> {
         link_summary::builtin_action(),
         convert_times::builtin_action(),
         scam_check::builtin_action(),
+        jargon::builtin_action(),
     ];
     actions.extend(code_actions::builtin_actions());
     actions.extend(rewrite_tone::builtin_actions());

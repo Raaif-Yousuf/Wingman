@@ -175,7 +175,7 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     let inner_ref = unsafe { &mut *raw };
     inner_ref.hwnd = hwnd;
 
-    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+    let dpi = dpi_for(hwnd);
     inner_ref.font = build_font(dpi);
     let fitted_h = fitted_height_dp(hwnd, dpi);
 
@@ -656,6 +656,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        // The gallery's simulated DPI stays whatever monitor this is.
+        #[cfg(any(test, debug_assertions))]
+        WM_DPICHANGED if forced_dpi().is_some() => LRESULT(0),
         WM_DPICHANGED => {
             on_dpi_changed(inner, wparam, lparam);
             LRESULT(0)
@@ -1153,6 +1156,28 @@ const GROUP_LABEL_TOP: i32 = 20; // room for the groupbox caption
 const LABEL_W: i32 = 130;
 const BTN_W: i32 = 100;
 const BTN_H: i32 = 28;
+
+/// The DPI the Settings window lays out at: the window's real one, floored
+/// at 1. Every layout call goes through here so the UI gallery can simulate
+/// another display scale (`--dpi`, issue #745); debug and test builds only.
+fn dpi_for(hwnd: HWND) -> u32 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(dpi) = forced_dpi() {
+        return dpi;
+    }
+    unsafe { GetDpiForWindow(hwnd) }.max(1)
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The gallery's simulated DPI for this thread's Settings window, if any.
+    static FORCED_DPI: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, debug_assertions))]
+fn forced_dpi() -> Option<u32> {
+    FORCED_DPI.with(std::cell::Cell::get)
+}
 
 fn to_px(dp: i32, dpi: u32) -> i32 {
     ((dp as i64 * dpi as i64 + 48) / 96) as i32
@@ -1712,7 +1737,7 @@ unsafe extern "system" fn body_wndproc(
         WM_VSCROLL => {
             let si = body_scroll_info(hwnd);
             if si.nPage != 0 {
-                let dpi = GetDpiForWindow(hwnd).max(1);
+                let dpi = dpi_for(hwnd);
                 let max = max_scroll(si.nMax + 1, si.nPage as i32);
                 let target = scroll_request_target(
                     (wparam.0 & 0xFFFF) as u32,
@@ -1849,7 +1874,7 @@ unsafe fn ensure_visible(body: HWND, ctrl: HWND) {
     }
     // Room above for the group's caption (and the window's top margin for the
     // first group), a little below.
-    let dpi = GetDpiForWindow(body).max(1);
+    let dpi = dpi_for(body);
     let pad_top = to_px(GROUP_LABEL_TOP + MARGIN, dpi);
     let pad_bottom = to_px(ROW_GAP, dpi);
     let new = scroll_into_view(
@@ -1913,10 +1938,7 @@ unsafe fn scroll_with_wheel(main: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
         return false;
     }
     let delta = ((msg.wParam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-    scroll_body_to(
-        body,
-        si.nPos + wheel_scroll_px(delta, GetDpiForWindow(main).max(1)),
-    );
+    scroll_body_to(body, si.nPos + wheel_scroll_px(delta, dpi_for(main)));
     true
 }
 
@@ -5436,8 +5458,10 @@ pub struct GalleryWindow {
 
 #[cfg(debug_assertions)]
 impl GalleryWindow {
-    /// Opens the window and shows it without taking focus.
-    pub fn open(instance: HINSTANCE) -> Option<GalleryWindow> {
+    /// Opens the window and shows it without taking focus. `dpi` lays it out
+    /// at that DPI whatever the monitor says (the gallery's `--dpi`); `None`
+    /// uses the window's own.
+    pub fn open(instance: HINSTANCE, dpi: Option<u32>) -> Option<GalleryWindow> {
         static ONCE: std::sync::Once = std::sync::Once::new();
         static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         ONCE.call_once(|| {
@@ -5447,6 +5471,7 @@ impl GalleryWindow {
             return None;
         }
         ensure_common_controls();
+        FORCED_DPI.with(|f| f.set(dpi.map(|d| d.max(1))));
 
         let config = Config::default();
         let raw = Box::into_raw(Box::new(SettingsInner::new(config.clone())));
@@ -5469,6 +5494,7 @@ impl GalleryWindow {
             )
         };
         let Ok(hwnd) = created else {
+            FORCED_DPI.with(|f| f.set(None));
             unsafe { drop(Box::from_raw(raw)) };
             return None;
         };
@@ -5476,7 +5502,7 @@ impl GalleryWindow {
         let gallery = GalleryWindow { raw };
         let inner = unsafe { &mut *raw };
         inner.hwnd = hwnd;
-        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        let dpi = dpi_for(hwnd);
         inner.font = build_font(dpi);
         let fitted_h = fitted_height_dp(hwnd, dpi);
         unsafe {
@@ -5547,6 +5573,7 @@ impl GalleryWindow {
 impl Drop for GalleryWindow {
     fn drop(&mut self) {
         // WM_DESTROY frees the font and flags the close; the Box is ours.
+        FORCED_DPI.with(|f| f.set(None));
         unsafe {
             let _ = DestroyWindow((*self.raw).hwnd);
             drop(Box::from_raw(self.raw));
@@ -8205,6 +8232,43 @@ mod tests {
             let _ = DestroyWindow(hwnd);
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
+    }
+
+    // -- gallery DPI seam (#745) -------------------------------------------
+
+    /// #745 wired check: a gallery Settings window opened at 240 DPI lays
+    /// out at 240 (inner.dpi, `dpi_for`, the Save button's width), is
+    /// bigger than one at 96, and a `WM_DPICHANGED` cannot replace it. If the
+    /// override were wired to nothing, both buttons would be the same size.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_forced_gallery_dpi_lays_settings_out_at_that_dpi() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let save_w = |w: &GalleryWindow| {
+            let save = get_dlg_item(w.hwnd(), ID_SAVE).expect("Save button");
+            client_size(save).0
+        };
+        let small = GalleryWindow::open(instance, Some(96)).expect("open at 96");
+        let small_w = save_w(&small);
+        drop(small);
+        let big = GalleryWindow::open(instance, Some(240)).expect("open at 240");
+        assert_eq!(dpi_for(big.hwnd()), 240);
+        assert_eq!(unsafe { &*big.raw }.dpi, 240);
+        let big_w = save_w(&big);
+        assert!(big_w * 100 / small_w >= 235, "{small_w} -> {big_w}");
+        unsafe {
+            SendMessageW(
+                big.hwnd(),
+                WM_DPICHANGED,
+                Some(WPARAM(96 | (96 << 16))),
+                Some(LPARAM(0)),
+            );
+        }
+        assert_eq!(unsafe { &*big.raw }.dpi, 240, "a DPI message must not win");
+        drop(big);
+        assert_eq!(forced_dpi(), None, "closing the window clears the override");
     }
 
     // -- WM_DPICHANGED (#233) ---------------------------------------------
