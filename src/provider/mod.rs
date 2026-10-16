@@ -338,7 +338,7 @@ pub struct Completion {
 
 /// #228: which provider answered a [`Chain`] request. Labels are
 /// `"<id>:<model>"` ([`Provider::model_label`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Attribution {
     /// The model that actually answered.
     pub answered: String,
@@ -346,6 +346,8 @@ pub struct Attribution {
     /// that answered (it failed, was refused, or could not be given the
     /// input). `None` means the first choice answered.
     pub first_choice: Option<String>,
+    /// What the run cost, when it was billed and every request was priced.
+    pub cost_usd: Option<f64>,
 }
 
 impl Attribution {
@@ -821,6 +823,7 @@ impl Chain {
                         } else {
                             first_choice.clone()
                         },
+                        cost_usd: crate::usage::run_cost(),
                     };
                     return Ok((value, answered));
                 }
@@ -3425,6 +3428,53 @@ mod tests {
                 |c| parse_answer(&c.text),
             )
             .map(|(_, attribution)| attribution)
+    }
+
+    /// A first-choice provider that reports a cost the way `usage::record`
+    /// does after a real response.
+    struct Billed(Option<f64>);
+
+    impl Provider for Billed {
+        fn id(&self) -> &'static str {
+            "billed"
+        }
+        fn capabilities(&self, _model: &str) -> Caps {
+            Caps {
+                vision: true,
+                ..Caps::default()
+            }
+        }
+        fn own_caps(&self) -> Caps {
+            self.capabilities("")
+        }
+        fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+            crate::usage::note_run_cost(self.0);
+            ok_completion()
+        }
+    }
+
+    #[test]
+    fn the_attribution_carries_what_the_run_cost() {
+        let chain = Chain::new(vec![Box::new(Billed(Some(0.002)))]);
+        let cost = attributed(&chain).unwrap().cost_usd;
+        assert!(cost.is_some_and(|c| (c - 0.002).abs() < 1e-9), "{cost:?}");
+    }
+
+    #[test]
+    fn a_run_with_two_chain_calls_reports_the_sum() {
+        // One worker thread is one run: the second call's attribution (the
+        // one the card ends up with) carries both calls' cost.
+        let first = Chain::new(vec![Box::new(Billed(Some(0.002)))]);
+        let second = Chain::new(vec![Box::new(Billed(Some(0.003)))]);
+        attributed(&first).unwrap();
+        let cost = attributed(&second).unwrap().cost_usd;
+        assert!(cost.is_some_and(|c| (c - 0.005).abs() < 1e-9), "{cost:?}");
+    }
+
+    #[test]
+    fn an_unpriced_answer_carries_no_cost_not_zero() {
+        let chain = Chain::new(vec![Box::new(Billed(None))]);
+        assert_eq!(attributed(&chain).unwrap().cost_usd, None);
     }
 
     #[test]

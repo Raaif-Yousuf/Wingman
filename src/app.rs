@@ -2658,6 +2658,7 @@ impl App {
     fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
         if busy {
+            forget_last_attribution();
             self.tray.set_failed(false);
         }
         self.tray.set_busy(busy);
@@ -3939,12 +3940,27 @@ fn noting_attribution<T>(result: Result<(T, crate::provider::Attribution)>) -> R
     })
 }
 
-/// #228: the card footer for `attribution`: a line only when a fallback
-/// answered, `None` for a first-choice answer or no model at all.
+/// #486: the attribution (and its cost) is one global slot that the result
+/// handler takes. A run whose result was dropped before the take would leave
+/// its line for the next run, so every run starts by clearing it.
+fn forget_last_attribution() {
+    crate::provider::record_attribution(None);
+}
+
+/// #228, #486: the card footer for `attribution`, one line. It names the
+/// answering model when a fallback answered, and says what the answer cost
+/// when it was billed and priced. `None` for a free first-choice answer, an
+/// unpriced one, or no model at all.
 fn fallback_footer_for(attribution: Option<&crate::provider::Attribution>) -> Option<String> {
-    attribution?
+    let a = attribution?;
+    let fallback = a
         .fallback()
-        .map(|(answered, first)| palette_model::fallback_footer(answered, first))
+        .map(|(answered, first)| palette_model::fallback_footer(answered, first));
+    let cost = a.cost_usd.and_then(crate::usage::format_cost);
+    match (fallback, cost) {
+        (Some(f), Some(c)) => Some(format!("{f}. {c}")),
+        (f, c) => f.or(c),
+    }
 }
 
 /// #228: `detail` with the footer as its last paragraph, or `detail`
@@ -7941,7 +7957,65 @@ mod tests {
         crate::provider::Attribution {
             answered: answered.to_string(),
             first_choice: first.map(str::to_string),
+            cost_usd: None,
         }
+    }
+
+    #[test]
+    fn footer_shows_the_cost_of_a_billed_first_choice_answer() {
+        let mut a = attribution("openai:gpt-5.5", None);
+        a.cost_usd = Some(0.002);
+        assert_eq!(
+            fallback_footer_for(Some(&a)).as_deref(),
+            Some("About $0.002")
+        );
+    }
+
+    #[test]
+    fn footer_joins_the_fallback_note_and_the_cost_into_one_line() {
+        let mut a = attribution("anthropic:claude-opus-5", Some("openai:gpt-5.5"));
+        a.cost_usd = Some(0.002);
+        assert_eq!(
+            fallback_footer_for(Some(&a)).as_deref(),
+            Some("Answered by Claude Opus 5 (GPT-5.5 was unavailable). About $0.002")
+        );
+    }
+
+    #[test]
+    fn footer_has_no_cost_for_a_free_or_unpriced_answer() {
+        let mut a = attribution("ollama:gemma3:4b", None);
+        a.cost_usd = Some(0.0);
+        assert_eq!(fallback_footer_for(Some(&a)), None);
+        a.cost_usd = None;
+        assert_eq!(fallback_footer_for(Some(&a)), None);
+    }
+
+    /// The attribution is one global slot shared by every run, so the tests
+    /// that write or take it must not interleave.
+    static ATTRIBUTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_new_run_does_not_inherit_a_dropped_runs_cost() {
+        let _g = ATTRIBUTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Run A answered and its result was dropped before anyone took it.
+        let mut a = attribution("openai:gpt-5.5", None);
+        a.cost_usd = Some(0.002);
+        crate::provider::record_attribution(Some(a));
+        // Run B starts (the tray goes busy) and fails before any model call.
+        crate::app::forget_last_attribution();
+        let taken = crate::provider::take_attribution();
+        assert_eq!(fallback_footer_for(taken.as_ref()), None);
+    }
+
+    #[test]
+    fn going_busy_clears_the_last_attribution() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let start = src.find("fn set_busy(").expect("set_busy exists");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").expect("end of set_busy")];
+        assert!(body.contains("forget_last_attribution()"), "{body}");
     }
 
     #[test]
@@ -7973,6 +8047,9 @@ mod tests {
 
     #[test]
     fn a_worker_result_hands_its_attribution_to_the_main_thread_once() {
+        let _g = ATTRIBUTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ = crate::provider::take_attribution();
         let value = noting_attribution(Ok((
             7,

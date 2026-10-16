@@ -341,6 +341,66 @@ pub fn request_cost(
     cost_usd(provider, model, date, usage?)
 }
 
+/// What one answer cost so far, for the card (#486). A run is one action
+/// worker, and every action starts a fresh worker thread, so this thread-local
+/// is that run's total: every provider request on the thread reports here
+/// from [`record`], and a run with several chain calls (each one hands over
+/// the total so far) ends with the sum. It needs no lock and cannot bleed
+/// into another run.
+#[derive(Clone, Copy, Default)]
+struct RunCost {
+    usd: f64,
+    /// A request in this run had no price: the sum would be a floor, so the
+    /// card shows nothing rather than a number that might be wrong.
+    unpriced: bool,
+}
+
+thread_local! {
+    static RUN_COST: std::cell::Cell<RunCost> = std::cell::Cell::new(RunCost::default());
+}
+
+/// Starts counting a new run. Production needs no call (a new run is a new
+/// thread); tests share a thread-local per test thread and reset explicitly.
+#[cfg(test)]
+pub fn begin_run() {
+    RUN_COST.with(|c| c.set(RunCost::default()));
+}
+
+/// Adds one request's cost (`None`: unpriced) to the run in flight.
+pub fn note_run_cost(cost: Option<f64>) {
+    RUN_COST.with(|c| {
+        let mut run = c.get();
+        match cost {
+            Some(usd) => run.usd += usd,
+            None => run.unpriced = true,
+        }
+        c.set(run);
+    });
+}
+
+/// What the run in flight cost, or `None` when nothing was billed (all
+/// local) or any request was unpriced. Never `Some(0.0)`.
+pub fn run_cost() -> Option<f64> {
+    let run = RUN_COST.with(std::cell::Cell::get);
+    (!run.unpriced && run.usd > 0.0).then_some(run.usd)
+}
+
+/// The card's cost text: `About $0.002`, or `Under $0.001` for a fraction
+/// of a tenth of a cent. `None` for a free or nonsense amount. No em dash
+/// (AGENTS.md rule 11).
+pub fn format_cost(usd: f64) -> Option<String> {
+    if !usd.is_finite() || usd <= 0.0 {
+        return None;
+    }
+    Some(if usd < 0.0005 {
+        "Under $0.001".to_string()
+    } else if usd < 0.1 {
+        format!("About ${usd:.3}")
+    } else {
+        format!("About ${usd:.2}")
+    })
+}
+
 /// The cost of a successful response, read at the HTTP boundary for the
 /// egress log (#487). Same price table and rules as [`record`], so the log
 /// row, the tooltip and the budget cannot disagree. `tag` is the provider's
@@ -533,6 +593,7 @@ fn queue_budget_notice(date: &str) {
 pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
     let date = local_date_today();
     let cost = request_cost(provider, model, &date, local, usage.as_ref());
+    note_run_cost(cost);
     let saved = crate::store::global()
         .and_then(|s| s.record_usage(&date, provider, model, cost, usage.as_ref()));
     if let Err(e) = saved {
@@ -623,6 +684,53 @@ mod tests {
         assert!(close(c("gemini", "gemini-3.8-flash"), 0.075));
         let later = cost_usd("gemini", "gemini-3.8-flash", "2027-01-01", &u).unwrap();
         assert!(close(later, 0.15), "{later}");
+    }
+
+    #[test]
+    fn card_cost_text_rounds_to_a_readable_amount() {
+        assert_eq!(format_cost(0.002).as_deref(), Some("About $0.002"));
+        assert_eq!(format_cost(0.0123).as_deref(), Some("About $0.012"));
+        assert_eq!(format_cost(0.0004).as_deref(), Some("Under $0.001"));
+        assert_eq!(format_cost(0.5).as_deref(), Some("About $0.50"));
+        assert_eq!(format_cost(1.234).as_deref(), Some("About $1.23"));
+    }
+
+    #[test]
+    fn card_cost_text_is_absent_for_free_or_nonsense_amounts() {
+        assert_eq!(format_cost(0.0), None);
+        assert_eq!(format_cost(-1.0), None);
+        assert_eq!(format_cost(f64::NAN), None);
+    }
+
+    #[test]
+    fn a_run_sums_its_priced_requests() {
+        begin_run();
+        note_run_cost(Some(0.002));
+        note_run_cost(Some(0.003));
+        assert!(close(run_cost().unwrap(), 0.005));
+    }
+
+    #[test]
+    fn one_unpriced_request_makes_the_run_cost_unknown() {
+        begin_run();
+        note_run_cost(Some(0.002));
+        note_run_cost(None);
+        assert_eq!(run_cost(), None);
+    }
+
+    #[test]
+    fn a_new_run_forgets_the_last_one() {
+        begin_run();
+        note_run_cost(Some(0.002));
+        begin_run();
+        assert_eq!(run_cost(), None);
+    }
+
+    #[test]
+    fn a_run_that_only_ran_locally_has_no_cost_to_show() {
+        begin_run();
+        note_run_cost(Some(0.0));
+        assert_eq!(run_cost(), None);
     }
 
     #[test]
