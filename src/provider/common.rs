@@ -917,20 +917,184 @@ fn get_with_headers_raw(
 
 /// POST whose response body is consumed incrementally by `read` (Ollama's
 /// `/api/pull` NDJSON download progress; not model output, so the
-/// no-streaming rule does not apply). Single attempt, only the connect phase
-/// is timed out: a model download can legitimately run for minutes. Goes
+/// no-streaming rule does not apply). Single attempt; a model download can
+/// legitimately run for minutes, so there is no overall time limit. Goes
 /// through [`offline_guard`] like every other entry point in this file
 /// (#189).
+///
+/// #635: this speaks plain HTTP over its own socket rather than `ureq`,
+/// because `ureq` has no per-read timeout: a stalled server would keep the
+/// reading thread blocked after the caller cancelled. Here every read waits at
+/// most [`STREAM_POLL`], and between waits the call returns an error as soon
+/// as `cancel` is set, or when nothing has arrived for `stall`. An `https://`
+/// address falls back to `ureq` ([`post_json_read_body_ureq`]), where a Stop
+/// is NOT prompt: the cancel is only seen when the next line arrives.
 pub(crate) fn post_json_read_body<T>(
+    url: &str,
+    body: &Value,
+    connect_timeout: Duration,
+    tag: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    stall: Duration,
+    read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
+) -> Result<T> {
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    offline_guard(url)?;
+    budget_guard(url)?;
+
+    if has_scheme(url, "https://") {
+        return post_json_read_body_ureq(url, body, connect_timeout, tag, read);
+    }
+    let rest = url
+        .get(7..)
+        .filter(|_| has_scheme(url, "http://"))
+        .ok_or_else(|| anyhow!("{tag}: only http and https addresses are supported here"))?;
+    let (authority, path) = split_authority_path(rest);
+    let host_port = with_default_port(authority);
+    // Try every address the name resolves to; keep the first that connects.
+    let mut last_kind = None;
+    let mut connected = None;
+    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&host_port) {
+        for addr in addrs {
+            match std::net::TcpStream::connect_timeout(&addr, connect_timeout) {
+                Ok(s) => {
+                    connected = Some(s);
+                    break;
+                }
+                Err(e) => last_kind = Some(e.kind()),
+            }
+        }
+    }
+    let mut stream = connected.ok_or_else(|| match last_kind {
+        Some(kind) => anyhow!("{tag}: transport error: {kind}"),
+        None => anyhow!("{tag}: transport error: could not resolve the address"),
+    })?;
+    let payload = body.to_string();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .and_then(|()| stream.set_read_timeout(Some(STREAM_POLL)))
+        .and_then(|()| stream.write_all(request.as_bytes()))
+        .map_err(|e| anyhow!("{tag}: transport error: {}", e.kind()))?;
+
+    let mut reader = BufReader::new(WatchedStream {
+        inner: stream,
+        cancel,
+        stall,
+        last_data: std::time::Instant::now(),
+    });
+
+    // Status line, then headers up to the blank line. Each line is read
+    // through a `Take`, so a server cannot make this buffer grow.
+    let mut line = String::new();
+    let read_line = |reader: &mut BufReader<WatchedStream>, line: &mut String| -> Result<()> {
+        line.clear();
+        let n = (&mut *reader)
+            .take(8 * 1024)
+            .read_line(line)
+            .map_err(|e| anyhow!("{tag}: transport error: {}", e.kind()))?;
+        if n == 0 {
+            return Err(anyhow!("{tag}: transport error: connection closed"));
+        }
+        Ok(())
+    };
+    read_line(&mut reader, &mut line)?;
+    let status: u16 = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow!("{tag}: transport error: not an HTTP response"))?;
+    let mut chunked = false;
+    let mut headers_ended = false;
+    for _ in 0..MAX_RESPONSE_HEADERS {
+        read_line(&mut reader, &mut line)?;
+        let header = line.trim_end().to_ascii_lowercase();
+        if header.is_empty() {
+            headers_ended = true;
+            break;
+        }
+        if header.starts_with("transfer-encoding:") && header.contains("chunked") {
+            chunked = true;
+        }
+    }
+    if !headers_ended {
+        return Err(anyhow!("{tag}: transport error: too many response headers"));
+    }
+
+    let mut body_reader: Box<dyn Read + '_> = if chunked {
+        Box::new(ChunkedReader {
+            inner: reader,
+            remaining: 0,
+            done: false,
+        })
+    } else {
+        Box::new(reader)
+    };
+
+    if !(200..300).contains(&status) {
+        let mut text = Vec::new();
+        let _ = (&mut body_reader).take(4096).read_to_end(&mut text);
+        let truncated = redact_and_truncate(&String::from_utf8_lossy(&text));
+        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+    }
+    read(&mut body_reader)
+}
+
+/// The most response header lines [`post_json_read_body`] reads before it
+/// gives up (#635), so a server cannot make it treat a header as the body.
+const MAX_RESPONSE_HEADERS: usize = 100;
+
+/// Whether `url` starts with `scheme` (e.g. `"http://"`), ignoring case.
+fn has_scheme(url: &str, scheme: &str) -> bool {
+    url.get(..scheme.len())
+        .is_some_and(|s| s.eq_ignore_ascii_case(scheme))
+}
+
+/// Splits what follows `http://` into the host and port as the `Host` header
+/// should carry them (any `user:password@` removed: credentials never go in
+/// `Host`) and the request path.
+fn split_authority_path(rest: &str) -> (&str, &str) {
+    let (authority, path) = match rest.find(['/', '?', '#']) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], &rest[i..]),
+        Some(i) => (&rest[..i], "/"),
+        None => (rest, "/"),
+    };
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    (host, path)
+}
+
+/// `host_port` with `:80` added when it names no port. An IPv6 literal's
+/// colons do not count: the port is whatever follows the closing `]`.
+fn with_default_port(host_port: &str) -> String {
+    let has_port = match host_port.strip_prefix('[') {
+        Some(inner) => inner
+            .split_once(']')
+            .is_some_and(|(_, after)| after.starts_with(':')),
+        None => host_port.contains(':'),
+    };
+    if has_port {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    }
+}
+
+/// The `https://` fallback of [`post_json_read_body`]: `ureq`, whose reads
+/// have no timeout, so a Stop is only noticed when the next progress line
+/// arrives (or the connection closes). Ollama is loopback http, so this is
+/// for a hand-edited https address. Single attempt, only the connect phase
+/// is timed out.
+fn post_json_read_body_ureq<T>(
     url: &str,
     body: &Value,
     connect_timeout: Duration,
     tag: &str,
     read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
 ) -> Result<T> {
-    offline_guard(url)?;
-    budget_guard(url)?;
-
     let mut response = ureq::post(url)
         .config()
         .http_status_as_error(false)
@@ -948,6 +1112,91 @@ pub(crate) fn post_json_read_body<T>(
 
     let mut reader = response.body_mut().as_reader();
     read(&mut reader)
+}
+
+/// How long one read on a streamed response waits before the cancel flag and
+/// the stall limit are looked at again (#635).
+const STREAM_POLL: Duration = Duration::from_millis(250);
+
+/// A socket whose reads give up early for a cancel or a stall (#635); see
+/// [`post_json_read_body`]. A stall is a `TimedOut` error, a cancel an
+/// `ConnectionAborted` one (not `Interrupted`, which std readers retry forever).
+struct WatchedStream<'a> {
+    inner: std::net::TcpStream,
+    cancel: &'a std::sync::atomic::AtomicBool,
+    stall: Duration,
+    last_data: std::time::Instant,
+}
+
+impl std::io::Read for WatchedStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::ErrorKind;
+        loop {
+            if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    ErrorKind::ConnectionAborted,
+                    "cancelled",
+                ));
+            }
+            match self.inner.read(buf) {
+                Ok(n) => {
+                    self.last_data = std::time::Instant::now();
+                    return Ok(n);
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if self.last_data.elapsed() >= self.stall {
+                        return Err(std::io::Error::new(ErrorKind::TimedOut, "stalled"));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// Decodes an HTTP/1.1 `Transfer-Encoding: chunked` body.
+struct ChunkedReader<R> {
+    inner: R,
+    /// Bytes left in the current chunk.
+    remaining: usize,
+    done: bool,
+}
+
+impl<R: std::io::BufRead> std::io::Read for ChunkedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{BufRead, Error, ErrorKind};
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut size_line = String::new();
+            let n = std::io::Read::take(&mut self.inner, 64).read_line(&mut size_line)?;
+            if n == 0 {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "chunk size missing"));
+            }
+            let hex = size_line.split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(hex, 16)
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "bad chunk size"))?;
+            if size == 0 {
+                self.done = true;
+                return Ok(0);
+            }
+            self.remaining = size;
+        }
+        let want = buf.len().min(self.remaining);
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "chunk cut short"));
+        }
+        self.remaining -= n;
+        if self.remaining == 0 {
+            // The CRLF that ends every chunk.
+            let mut crlf = [0u8; 2];
+            self.inner.read_exact(&mut crlf)?;
+        }
+        Ok(n)
+    }
 }
 
 /// Same as [`post_json`] but with the connect phase timed out separately
@@ -1469,7 +1718,9 @@ mod tests {
     /// `ureq` directly, so no fake transport can watch it. This scans the
     /// non-test source instead: every send that carries a body must redact
     /// it with [`outbound_body`] and restore the answer. `post_json_read_body`
-    /// is the one allowed exception (a model download request, no user text).
+    /// and its https fallback are the only allowed exceptions, by name (a
+    /// model download request, no user text). Raw-socket senders are scanned
+    /// too, not only `ureq::post`.
     #[test]
     fn every_function_that_posts_a_body_redacts_and_restores_it() {
         let whole = include_str!("common.rs").replace('\r', "");
@@ -1511,16 +1762,34 @@ mod tests {
             .filter_map(|&i| {
                 let end = code[i..].find("\n}\n").map_or(code.len(), |e| i + e + 3);
                 let f = &code[i..end];
-                f.contains("ureq::post(").then_some(f)
+                (f.contains("ureq::post(") || f.contains("TcpStream::connect")).then_some(f)
             })
             .collect();
         assert!(
             !posters.is_empty(),
-            "no function posting through ureq was found"
+            "no function posting through ureq or a raw socket was found"
+        );
+        // The model-download request carries a model name, no user text, so
+        // its two senders (raw socket, and the https `ureq` fallback) are
+        // allowed by name. Any other sender must redact and restore.
+        const ALLOWED: [&str; 2] = [
+            "fn post_json_read_body<T>(",
+            "fn post_json_read_body_ureq<T>(",
+        ];
+        let allowed_seen = posters
+            .iter()
+            .filter(|f| {
+                let header = f.lines().next().unwrap_or_default();
+                ALLOWED.iter().any(|a| header.contains(a))
+            })
+            .count();
+        assert_eq!(
+            allowed_seen, 2,
+            "both model-download senders should be found by this scan"
         );
         for f in posters {
             let header = f.lines().next().unwrap_or_default();
-            if header.contains("post_json_read_body") {
+            if ALLOWED.iter().any(|a| header.contains(a)) {
                 continue;
             }
             assert!(
@@ -3005,9 +3274,218 @@ mod tests {
             &json!({}),
             Duration::from_millis(50),
             "test",
+            &std::sync::atomic::AtomicBool::new(false),
+            Duration::from_secs(1),
             |_| Ok(()),
         )
         .unwrap_err();
         assert!(err.to_string().contains("Daily budget"), "{err}");
+    }
+
+    // -- post_json_read_body over its own socket (#635) --------------------
+
+    /// A loopback server that reads the request, then writes each of `parts`
+    /// in turn with `pause_ms` between them, then closes.
+    fn raw_server(parts: Vec<Vec<u8>>, pause_ms: u64) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.ends_with(b"}") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                for p in parts {
+                    if s.write_all(&p).is_err() {
+                        return;
+                    }
+                    let _ = s.flush();
+                    std::thread::sleep(Duration::from_millis(pause_ms));
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}/api/pull")
+    }
+
+    fn read_all_body(url: &str, cancel: &std::sync::atomic::AtomicBool) -> Result<String> {
+        let _g = network_guard();
+        post_json_read_body(
+            url,
+            &json!({"model": "m"}),
+            Duration::from_secs(2),
+            "test",
+            cancel,
+            Duration::from_secs(5),
+            |r| {
+                let mut s = String::new();
+                r.read_to_string(&mut s)?;
+                Ok(s)
+            },
+        )
+    }
+
+    #[test]
+    fn a_chunked_response_is_decoded_across_chunk_boundaries() {
+        let url = raw_server(
+            vec![
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+                b"6\r\nhello \r\n".to_vec(),
+                b"5\r\nworld\r\n0\r\n\r\n".to_vec(),
+            ],
+            20,
+        );
+        let got = read_all_body(&url, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        assert_eq!(got, "hello world");
+    }
+
+    #[test]
+    fn an_error_status_returns_its_body_text() {
+        let url = raw_server(
+            vec![b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nno such model".to_vec()],
+            0,
+        );
+        let err = read_all_body(&url, &std::sync::atomic::AtomicBool::new(false)).unwrap_err();
+        assert!(err.to_string().contains("HTTP 404"), "{err}");
+        assert!(err.to_string().contains("no such model"), "{err}");
+    }
+
+    #[test]
+    fn a_cancel_ends_a_read_the_server_never_answers_within_a_poll_or_two() {
+        // The server sends the headers and then goes quiet for 5 s.
+        let url = raw_server(
+            vec![
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec(),
+                b"late".to_vec(),
+            ],
+            5000,
+        );
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            c.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        let result = read_all_body(&url, &cancel);
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_silent_server_times_out_at_the_stall_limit() {
+        let _g = network_guard();
+        let url = raw_server(
+            vec![
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec(),
+                b"late".to_vec(),
+            ],
+            5000,
+        );
+        let start = std::time::Instant::now();
+        let err = post_json_read_body(
+            &url,
+            &json!({"model": "m"}),
+            Duration::from_secs(2),
+            "test",
+            &std::sync::atomic::AtomicBool::new(false),
+            Duration::from_millis(600),
+            |r| {
+                let mut s = String::new();
+                r.read_to_string(&mut s)?;
+                Ok(s)
+            },
+        )
+        .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let io = err.downcast_ref::<std::io::Error>().expect("an io error");
+        assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_non_http_address_is_refused() {
+        let err = read_all_body(
+            "ftp://127.0.0.1:1/api/pull",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("only http"), "{err}");
+    }
+
+    #[test]
+    fn the_scheme_is_matched_without_regard_to_case() {
+        let url = raw_server(
+            vec![b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nok".to_vec()],
+            0,
+        )
+        .replacen("http://", "HTTP://", 1);
+        let got = read_all_body(&url, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        assert_eq!(got, "ok");
+        assert!(has_scheme("HtTpS://x", "https://"));
+        assert!(!has_scheme("htt", "http://"));
+    }
+
+    #[test]
+    fn an_https_address_takes_the_ureq_path() {
+        // Nothing listens on port 1; the point is that the error is ureq's
+        // transport error, not the "only http" refusal.
+        let err = read_all_body(
+            "https://127.0.0.1:1/api/pull",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("transport error"), "{err}");
+        assert!(!err.to_string().contains("only http"), "{err}");
+    }
+
+    #[test]
+    fn userinfo_is_never_put_in_the_host_and_ipv6_ports_are_found() {
+        assert_eq!(
+            split_authority_path("user:pw@127.0.0.1:11434/api/pull"),
+            ("127.0.0.1:11434", "/api/pull")
+        );
+        assert_eq!(split_authority_path("host"), ("host", "/"));
+        assert_eq!(with_default_port("host"), "host:80");
+        assert_eq!(with_default_port("host:11434"), "host:11434");
+        // The colons inside the brackets are not a port.
+        assert_eq!(with_default_port("[::1]"), "[::1]:80");
+        assert_eq!(with_default_port("[::1]:11434"), "[::1]:11434");
+    }
+
+    #[test]
+    fn more_than_a_hundred_headers_is_an_error_not_a_body() {
+        let mut head = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for i in 0..150 {
+            head.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+        }
+        head.extend_from_slice(b"\r\nbody");
+        let url = raw_server(vec![head], 0);
+        let err = read_all_body(&url, &std::sync::atomic::AtomicBool::new(false)).unwrap_err();
+        assert!(
+            err.to_string().contains("too many response headers"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_resolved_address_is_tried() {
+        // `localhost` resolves to ::1 first on many machines while the server
+        // listens on 127.0.0.1 only; the second address must still connect.
+        let url = raw_server(
+            vec![b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nok".to_vec()],
+            0,
+        )
+        .replacen("127.0.0.1", "localhost", 1);
+        let got = read_all_body(&url, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        assert_eq!(got, "ok");
     }
 }

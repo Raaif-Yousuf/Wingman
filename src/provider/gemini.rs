@@ -245,8 +245,12 @@ impl Gemini {
 /// (scope cut, not a bug -- #17 does not ask for it).
 ///
 /// Also used as this provider's `thinking` capability.
-fn supports_thinking(model: &str) -> bool {
-    model.starts_with("gemini-3")
+pub(crate) fn supports_thinking(model: &str) -> bool {
+    // "gemini-3" must end the name or be followed by '.' or '-', so a future
+    // "gemini-30" or "gemini-3x" is not taken for the 3.x line.
+    model
+        .strip_prefix("gemini-3")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '-']))
 }
 
 impl Provider for Gemini {
@@ -517,6 +521,16 @@ mod tests {
     }
 
     // -- effort / thinkingConfig --------------------------------------------
+
+    #[test]
+    fn only_the_3_line_supports_thinking() {
+        for ok in ["gemini-3", "gemini-3.8-flash", "gemini-3-pro"] {
+            assert!(supports_thinking(ok), "{ok}");
+        }
+        for no in ["gemini-30", "gemini-3x", "gemini-2.5-pro", "gemini-"] {
+            assert!(!supports_thinking(no), "{no}");
+        }
+    }
 
     #[test]
     fn empty_effort_is_never_sent() {
