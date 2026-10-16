@@ -19,7 +19,7 @@
 
   Shared runners are noisy, so the budgets in perf-budgets.json are set far
   above what CI measures, and the gate uses the median of several runs. It
-  catches a change that doubles startup or memory, not a small drift.
+  catches a large regression, not a small drift.
 
   Usage: pwsh scripts/perf-runtime.ps1 [-ExePath target\release\wingman.exe]
                                        [-BudgetsPath perf-budgets.json]
