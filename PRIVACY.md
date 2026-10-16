@@ -63,6 +63,20 @@ This probe is skipped entirely unless you have already added `"ollama"` to
 `providers.order` yourself (`mode::should_probe_ollama`); a user who never
 configured Ollama sees no extra network activity from this at all.
 
+One action reads a web page for you: **Summarize a link**. It finds a link
+in your selection (or, failing that, on your screen), shows you the site and
+the exact address on a confirmation card, and fetches nothing until you press
+"Do it". The fetch is a plain `GET` over `https` (port 443 only) with no
+cookies, no sign-in and no proxy, sent from your computer, so the site sees
+your IP address and the address you asked for. Wingman refuses any link that
+points at a private, loopback or link-local address (checked after the name
+is looked up, and again on every redirect), follows at most 4 redirects,
+reads at most 1 MB and gives up after 20 seconds. The page text is then sent
+to your model like any other text, marked as untrusted data. The fetch is
+refused in Offline and Local mode, is one row in the egress log (the site
+name and the bytes received, never the path, the query or the page), and
+lives in `src/inputs/web_page.rs`.
+
 ## Modes and the Offline guard
 
 The tray's **Mode** submenu is Cloud / Local / Auto (default) / Offline.
@@ -155,7 +169,8 @@ in the same change, per issue #58.
 
 Wingman is open source under the MIT license. `src/provider/openai.rs`,
 `src/provider/anthropic.rs`, `src/provider/gemini.rs`,
-`src/provider/ollama.rs` and `src/provider/openai_compat.rs` are the only
+`src/provider/ollama.rs` and `src/provider/openai_compat.rs`, plus
+`src/inputs/web_page.rs` (the confirmed link fetch above), are the only
 files that open a network connection;
 everything above can be checked by reading them and `src/provider/common.rs`
 (the shared, guarded send path and the Offline guard), or by running the app

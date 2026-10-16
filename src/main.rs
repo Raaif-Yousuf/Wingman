@@ -12,6 +12,7 @@ mod config;
 #[cfg(test)]
 mod config_example;
 mod connectors;
+mod crash_note;
 mod diagnostics;
 mod dismiss;
 mod dpapi;
@@ -37,6 +38,9 @@ mod ui;
 mod usage;
 
 fn main() {
+    // Issue #227: first, so a panic anywhere after this leaves a crash note.
+    crash_note::install_hook();
+
     // Checked before any production init (hotkeys, tray icon, single
     // instance mutex): issue #363, debug builds only. In a release build
     // `run_gallery` does not exist, so `--ui-gallery` is a silent no-op and

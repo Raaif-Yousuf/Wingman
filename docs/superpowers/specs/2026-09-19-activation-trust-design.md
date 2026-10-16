@@ -188,3 +188,16 @@ Each is one observable, per AGENTS.md rule 8.
 3. Confirm that authentication is being dropped as a goal (§ 2), so that #236
    is not later reopened asking for a named pipe.
 4. Say whether #101 should be pulled forward as the backstop § 4.4 assumes.
+
+### Decisions as built
+
+- The 3 s interval and the 20 per hour cap are fixed constants in
+  `src/activation.rs`, not settings. The spec said configurable; a Settings
+  surface for two numbers was not worth it yet.
+- An owner window only counts as "the running instance" once it carries the
+  `Wingman.Ready` window property, set after its `App` is installed. A
+  duplicate's own window, or one still starting, is never a target.
+- During the 2 s wait a duplicate also retries the mutex each round, so an
+  instance that is exiting ends in a normal locked start, not a lockless one.
+- A refused activation shows one short card per interval ("Too many requests
+  in a row"), and only counts against the limit when an ask would really run.

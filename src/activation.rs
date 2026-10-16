@@ -51,17 +51,29 @@ pub const MIN_INTERVAL: Duration = Duration::from_secs(3);
 pub const MAX_PER_HOUR: usize = 20;
 const HOUR: Duration = Duration::from_secs(3600);
 
+/// What the limiter says about one activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Go ahead and ask.
+    Allowed,
+    /// Too soon. `notify` is true for at most one refusal per
+    /// [`MIN_INTERVAL`], so the user gets one short card instead of silence
+    /// (AGENTS.md rule 7) without a flood being able to spam cards.
+    Refused { notify: bool },
+}
+
 /// Pure rate limiter for activation asks; time is passed in.
 #[derive(Debug, Default)]
 pub struct ActivationLimiter {
     allowed: VecDeque<Instant>,
+    last_notice: Option<Instant>,
 }
 
 impl ActivationLimiter {
-    /// Whether an activation at `now` may ask. Records it when it may. A
-    /// refusal changes nothing, so a flood cannot push the next allowed
-    /// time further away.
-    pub fn allow(&mut self, now: Instant) -> bool {
+    /// The verdict for an activation at `now`. An allowed one is recorded; a
+    /// refusal changes nothing about the wait, so a flood cannot push the
+    /// next allowed time further away.
+    pub fn check(&mut self, now: Instant) -> Verdict {
         while let Some(&oldest) = self.allowed.front() {
             if now.saturating_duration_since(oldest) >= HOUR {
                 self.allowed.pop_front();
@@ -69,37 +81,43 @@ impl ActivationLimiter {
                 break;
             }
         }
-        if let Some(&last) = self.allowed.back() {
-            if now.saturating_duration_since(last) < MIN_INTERVAL {
-                return false;
-            }
+        let too_soon = self
+            .allowed
+            .back()
+            .is_some_and(|&last| now.saturating_duration_since(last) < MIN_INTERVAL);
+        if !too_soon && self.allowed.len() < MAX_PER_HOUR {
+            self.allowed.push_back(now);
+            return Verdict::Allowed;
         }
-        if self.allowed.len() >= MAX_PER_HOUR {
-            return false;
+        let notify = self
+            .last_notice
+            .map_or(true, |n| now.saturating_duration_since(n) >= MIN_INTERVAL);
+        if notify {
+            self.last_notice = Some(now);
         }
-        self.allowed.push_back(now);
-        true
+        Verdict::Refused { notify }
     }
 }
 
 static LIMITER: Mutex<Option<ActivationLimiter>> = Mutex::new(None);
 static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
-/// Called by the `WM_APP_ACTIVATE` handler: true when this activation may
-/// ask. A refusal is counted, never silent.
-pub fn allow_activation_now() -> bool {
-    let allowed = match LIMITER.lock() {
+/// Called by the `WM_APP_ACTIVATE` handler, only once an ask would really
+/// run (not busy, not paused), so a refused ask never costs the user an
+/// allowance. A refusal is counted, never silent.
+pub fn check_activation_now() -> Verdict {
+    let verdict = match LIMITER.lock() {
         Ok(mut guard) => guard
             .get_or_insert_with(ActivationLimiter::default)
-            .allow(Instant::now()),
+            .check(Instant::now()),
         // A poisoned lock cannot happen (nothing panics while holding it);
         // if it ever did, failing open keeps the Copilot key working.
-        Err(_) => true,
+        Err(_) => Verdict::Allowed,
     };
-    if !allowed {
+    if matches!(verdict, Verdict::Refused { .. }) {
         SUPPRESSED.fetch_add(1, Ordering::Relaxed);
     }
-    allowed
+    verdict
 }
 
 /// How many activations have been refused since the process started.
@@ -128,29 +146,40 @@ pub fn worker_trigger_label() -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    const REFUSED: Verdict = Verdict::Refused { notify: false };
+
     #[test]
     fn the_first_activation_is_allowed() {
         let mut l = ActivationLimiter::default();
-        assert!(l.allow(Instant::now()));
+        assert_eq!(l.check(Instant::now()), Verdict::Allowed);
     }
 
     #[test]
     fn a_second_activation_inside_the_interval_is_refused() {
         let mut l = ActivationLimiter::default();
         let t0 = Instant::now();
-        assert!(l.allow(t0));
-        assert!(!l.allow(t0 + Duration::from_millis(500)));
-        assert!(!l.allow(t0 + MIN_INTERVAL - Duration::from_millis(1)));
+        assert_eq!(l.check(t0), Verdict::Allowed);
+        assert!(matches!(
+            l.check(t0 + Duration::from_millis(500)),
+            Verdict::Refused { .. }
+        ));
+        assert!(matches!(
+            l.check(t0 + MIN_INTERVAL - Duration::from_millis(1)),
+            Verdict::Refused { .. }
+        ));
     }
 
     #[test]
     fn a_refused_activation_does_not_extend_the_wait() {
         let mut l = ActivationLimiter::default();
         let t0 = Instant::now();
-        assert!(l.allow(t0));
-        assert!(!l.allow(t0 + Duration::from_secs(2)));
+        assert_eq!(l.check(t0), Verdict::Allowed);
+        assert!(matches!(
+            l.check(t0 + Duration::from_secs(2)),
+            Verdict::Refused { .. }
+        ));
         // 3 s after the allowed one, not 3 s after the refused one.
-        assert!(l.allow(t0 + MIN_INTERVAL));
+        assert_eq!(l.check(t0 + MIN_INTERVAL), Verdict::Allowed);
     }
 
     #[test]
@@ -158,12 +187,45 @@ mod tests {
         let mut l = ActivationLimiter::default();
         let t0 = Instant::now();
         for i in 0..MAX_PER_HOUR {
-            assert!(l.allow(t0 + MIN_INTERVAL * i as u32), "ask {i}");
+            assert_eq!(
+                l.check(t0 + MIN_INTERVAL * i as u32),
+                Verdict::Allowed,
+                "ask {i}"
+            );
         }
         let next = t0 + MIN_INTERVAL * MAX_PER_HOUR as u32;
-        assert!(!l.allow(next), "the cap must refuse ask {MAX_PER_HOUR}");
+        assert!(
+            matches!(l.check(next), Verdict::Refused { .. }),
+            "the cap must refuse ask {MAX_PER_HOUR}"
+        );
         // An hour after the first one it frees up.
-        assert!(l.allow(t0 + HOUR));
+        assert_eq!(l.check(t0 + HOUR), Verdict::Allowed);
+    }
+
+    #[test]
+    fn a_refusal_asks_for_a_card_at_most_once_per_interval() {
+        let mut l = ActivationLimiter::default();
+        let t0 = Instant::now();
+        assert_eq!(l.check(t0), Verdict::Allowed);
+        // First refusal notifies, the flood after it does not.
+        assert_eq!(
+            l.check(t0 + Duration::from_millis(100)),
+            Verdict::Refused { notify: true }
+        );
+        assert_eq!(l.check(t0 + Duration::from_millis(200)), REFUSED);
+        assert_eq!(l.check(t0 + Duration::from_millis(900)), REFUSED);
+        // A new interval, and the cap is what refuses now: notify again.
+        let mut l = ActivationLimiter::default();
+        for i in 0..MAX_PER_HOUR {
+            l.check(t0 + MIN_INTERVAL * i as u32);
+        }
+        let t1 = t0 + MIN_INTERVAL * MAX_PER_HOUR as u32;
+        assert_eq!(l.check(t1), Verdict::Refused { notify: true });
+        assert_eq!(l.check(t1 + Duration::from_secs(1)), REFUSED);
+        assert_eq!(
+            l.check(t1 + MIN_INTERVAL),
+            Verdict::Refused { notify: true }
+        );
     }
 
     #[test]
@@ -195,7 +257,9 @@ mod tests {
         // The global limiter is shared by the process, so only assert the
         // direction: hammering it must refuse something and count it.
         let before = suppressed_count();
-        let allowed = (0..5).filter(|_| allow_activation_now()).count();
+        let allowed = (0..5)
+            .filter(|_| check_activation_now() == Verdict::Allowed)
+            .count();
         assert!(allowed <= 1, "five instant activations, at most one asks");
         assert!(suppressed_count() >= before + 4);
     }

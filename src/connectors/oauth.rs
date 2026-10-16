@@ -1252,9 +1252,9 @@ mod tests {
         users.sort();
         assert_eq!(
             users,
-            ["common.rs", "oauth.rs"],
-            "ureq may only be used in provider/common.rs and connectors/oauth.rs, \
-             which carry the Offline guard"
+            ["common.rs", "oauth.rs", "web_page.rs"],
+            "ureq may only be used in provider/common.rs, connectors/oauth.rs and \
+             inputs/web_page.rs, which carry the Offline guard"
         );
     }
     #[test]
