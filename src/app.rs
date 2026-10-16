@@ -724,8 +724,6 @@ fn startup_card(
     Some((headline, detail))
 }
 
-/// #711: config.toml exists but did not parse. Names the line and column
-/// (`problem` already carries them), never file text. No em dash (rule 11).
 /// #793: whether `mode` may be switched on while the config file's state is
 /// `load_problem`. A file that did not parse starts the run Offline with
 /// default (looser) settings; anything that sends data out must wait until it
@@ -735,6 +733,8 @@ fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
     mode == Mode::Offline || load_problem.is_none()
 }
 
+/// #711: config.toml exists but did not parse. Names the line and column
+/// (`problem` already carries them), never file text. No em dash (rule 11).
 fn config_problem_card(problem: &str) -> (String, String) {
     (
         "Settings file not read".to_string(),
