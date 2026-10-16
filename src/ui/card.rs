@@ -3985,6 +3985,12 @@ fn sorted_monitors() -> Vec<(RECT, windows::Win32::Graphics::Gdi::HMONITOR)> {
     out
 }
 
+/// Issue #498: how many monitors are connected, for the Settings list of
+/// numbered displays. Counted the same way `sorted_monitors` numbers them.
+pub(crate) fn monitor_count() -> usize {
+    sorted_monitors().len()
+}
+
 fn work_area_for_monitor(hmon: windows::Win32::Graphics::Gdi::HMONITOR) -> RECT {
     unsafe {
         let mut mi = MONITORINFO {

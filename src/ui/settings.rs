@@ -98,7 +98,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_VSCROLL,
 };
 
-use crate::config::{ActiveProvider, Config, Hotkeys, OllamaConfig, RequireTickFor};
+use crate::config::{ActiveProvider, CardCorner, Config, Hotkeys, OllamaConfig, RequireTickFor};
 use crate::hotkey::{
     apply_learned, arm_learning, chord_to_string, disarm_learning, slot_name, Chord, HK_PAUSE,
     HK_PRIMARY, HK_SECONDARY, WM_APP_LEARNED,
@@ -795,6 +795,9 @@ const ID_CHANGE_SECONDARY: i32 = 132;
 const ID_HOTKEY_STATUS: i32 = 133;
 const ID_PRIMARY_LABEL: i32 = 134;
 const ID_SECONDARY_LABEL: i32 = 135;
+/// #498: the card-corner and card-monitor combos in the Card group.
+const ID_CARD_CORNER: i32 = 136;
+const ID_CARD_MONITOR: i32 = 137;
 /// #345: the one-shot timer that ends a pending Change that nobody pressed a
 /// key for. Only ever set while a Change is pending, so nothing ticks idle.
 const LEARN_TIMER_ID: usize = 0x345;
@@ -845,6 +848,8 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_HOTKEY_STATUS", ID_HOTKEY_STATUS),
     ("ID_PRIMARY_LABEL", ID_PRIMARY_LABEL),
     ("ID_SECONDARY_LABEL", ID_SECONDARY_LABEL),
+    ("ID_CARD_CORNER", ID_CARD_CORNER),
+    ("ID_CARD_MONITOR", ID_CARD_MONITOR),
 ];
 
 // ---------------------------------------------------------------------------
@@ -3215,6 +3220,51 @@ fn build_ui_recorded(
     let _ = scale_label;
     r.advance();
 
+    // #498: where the card appears. The monitor list is read when Settings
+    // opens, so a display plugged in afterwards shows up next time.
+    ctx.create(WC_STATIC, "Card position:", 0, 0, r.x, r.y, 110, ROW_H, 0);
+    let corner = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + 110,
+        r.y,
+        r.w - 110,
+        ROW_H * 7,
+        ID_CARD_CORNER,
+    );
+    for label in CARD_CORNER_LABELS {
+        combo_add(corner, label);
+    }
+    combo_select(corner, card_corner_label(config.ui.card_corner));
+    r.advance();
+
+    ctx.create(WC_STATIC, "Card display:", 0, 0, r.x, r.y, 110, ROW_H, 0);
+    let card_monitor = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + 110,
+        r.y,
+        r.w - 110,
+        ROW_H * 8,
+        ID_CARD_MONITOR,
+    );
+    let monitors = crate::ui::card::monitor_count();
+    let monitor_options = card_monitor_options(monitors);
+    for (label, _) in &monitor_options {
+        combo_add(card_monitor, label);
+    }
+    let monitor_presets: Vec<&str> = monitor_options.iter().map(|(l, _)| l.as_str()).collect();
+    combo_select_with_custom(
+        card_monitor,
+        &monitor_presets,
+        &card_monitor_display(&config.ui.card_monitor, monitors),
+    );
+    r.advance();
+
     let card_bottom = r.y + 4;
     ctx.create(
         WC_BUTTON,
@@ -3442,6 +3492,8 @@ fn build_ui_recorded(
         ID_MONITOR,
         ID_CARD_SECONDS,
         ID_TEXT_SCALE_TRACK,
+        ID_CARD_CORNER,
+        ID_CARD_MONITOR,
         ID_REQUIRE_TICK_FOR,
         ID_OLLAMA_LINK,
         ID_PROMPT_TOGGLE,
@@ -3511,6 +3563,9 @@ struct RawForm {
     text_scale_raw: f32,
     prompt: String,
     require_tick_for: String,
+    /// #498: the card-corner and card-monitor combos' text.
+    card_corner: String,
+    card_monitor: String,
 }
 
 /// Reads every control into a [`RawForm`], without yet folding it into a
@@ -3563,6 +3618,8 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
             .map(get_text)
             .unwrap_or_default(),
         require_tick_for: combo_selected_text(hwnd, ID_REQUIRE_TICK_FOR),
+        card_corner: combo_selected_text(hwnd, ID_CARD_CORNER),
+        card_monitor: combo_selected_text(hwnd, ID_CARD_MONITOR),
     }
 }
 
@@ -4060,6 +4117,99 @@ fn label_to_require_tick_for(label: &str) -> Option<RequireTickFor> {
     }
 }
 
+/// #498: the five [`CardCorner`] labels in the Settings combo, in display
+/// order. Plain words, not the config's `bottom_right` tokens.
+const CARD_CORNER_LABELS: [&str; 5] = [
+    "Bottom right",
+    "Bottom left",
+    "Top right",
+    "Top left",
+    "Next to the mouse",
+];
+
+/// The label shown for a given [`CardCorner`]. Inverse of
+/// [`label_to_card_corner`].
+fn card_corner_label(value: CardCorner) -> &'static str {
+    match value {
+        CardCorner::BottomRight => CARD_CORNER_LABELS[0],
+        CardCorner::BottomLeft => CARD_CORNER_LABELS[1],
+        CardCorner::TopRight => CARD_CORNER_LABELS[2],
+        CardCorner::TopLeft => CARD_CORNER_LABELS[3],
+        CardCorner::FollowMouse => CARD_CORNER_LABELS[4],
+    }
+}
+
+/// Parses a combo selection back into a [`CardCorner`]. `None` for a blank
+/// or unrecognized selection, so callers keep the original config value.
+fn label_to_card_corner(label: &str) -> Option<CardCorner> {
+    [
+        CardCorner::BottomRight,
+        CardCorner::BottomLeft,
+        CardCorner::TopRight,
+        CardCorner::TopLeft,
+        CardCorner::FollowMouse,
+    ]
+    .into_iter()
+    .find(|&c| card_corner_label(c) == label)
+}
+
+const CARD_MONITOR_CURSOR_LABEL: &str = "Where the mouse is";
+const CARD_MONITOR_PRIMARY_LABEL: &str = "The main display";
+
+fn card_monitor_numbered_label(n: usize) -> String {
+    format!("Display {n} from the left")
+}
+
+/// #498: the card-monitor choices as `(label, config value)` pairs, for a
+/// machine with `count` monitors. "Display n" entries only appear with two
+/// or more monitors, and only up to `count`, so a choice never points at a
+/// monitor that is not there.
+fn card_monitor_options(count: usize) -> Vec<(String, String)> {
+    let mut out = vec![
+        (CARD_MONITOR_CURSOR_LABEL.to_string(), "cursor".to_string()),
+        (
+            CARD_MONITOR_PRIMARY_LABEL.to_string(),
+            "primary".to_string(),
+        ),
+    ];
+    if count >= 2 {
+        out.extend((1..=count).map(|n| (card_monitor_numbered_label(n), n.to_string())));
+    }
+    out
+}
+
+/// The label for a stored `ui.card_monitor` value: the matching entry of
+/// [`card_monitor_options`], or `"Custom (<value>)"` for anything else (a
+/// hand-edited `"Primary"`, or `"3"` after a monitor was unplugged), so an
+/// untouched Save writes the exact original text back.
+fn card_monitor_display(value: &str, count: usize) -> String {
+    card_monitor_options(count)
+        .into_iter()
+        .find(|(_, v)| v == value)
+        .map(|(label, _)| label)
+        .unwrap_or_else(|| custom_label(value))
+}
+
+/// Parses a combo selection back into a `ui.card_monitor` value. `None` for
+/// a blank or unrecognized selection, so callers keep the original value.
+/// Needs no monitor count: a numbered label carries its own number.
+fn label_to_card_monitor(label: &str) -> Option<String> {
+    match label {
+        CARD_MONITOR_CURSOR_LABEL => return Some("cursor".to_string()),
+        CARD_MONITOR_PRIMARY_LABEL => return Some("primary".to_string()),
+        _ => {}
+    }
+    if let Some(n) = label
+        .strip_prefix("Display ")
+        .and_then(|s| s.strip_suffix(" from the left"))
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| card_monitor_numbered_label(n) == label)
+    {
+        return Some(n.to_string());
+    }
+    parse_custom_label(label).map(str::to_string)
+}
+
 /// #344: a numeric Settings field whose text does not parse to a value
 /// `build_config` would actually accept, found by [`find_invalid_numeric_field`].
 /// Distinct from "blank", which `build_config` already treats as "leave the
@@ -4250,6 +4400,11 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     } else {
         raw.prompt.clone()
     };
+
+    cfg.ui.card_corner = label_to_card_corner(&raw.card_corner).unwrap_or(original.ui.card_corner);
+    if let Some(v) = label_to_card_monitor(&raw.card_monitor) {
+        cfg.ui.card_monitor = v;
+    }
 
     cfg.forms.require_tick_for =
         label_to_require_tick_for(&raw.require_tick_for).unwrap_or(original.forms.require_tick_for);
@@ -5149,6 +5304,8 @@ mod tests {
             text_scale_raw: original.ui.text_scale,
             prompt: original.ui.prompt.clone(),
             require_tick_for: require_tick_for_label(original.forms.require_tick_for).to_string(),
+            card_corner: card_corner_label(original.ui.card_corner).to_string(),
+            card_monitor: card_monitor_display(&original.ui.card_monitor, 2),
         }
     }
 
@@ -5319,6 +5476,116 @@ mod tests {
         assert_eq!(cfg.providers.openai.effort, "high");
         assert_eq!(cfg.capture.max_edge, 2048);
         assert_eq!(cfg.capture.monitor, "primary");
+    }
+
+    // -- card corner and monitor (#498) -------------------------------------
+
+    const ALL_CORNERS: [CardCorner; 5] = [
+        CardCorner::BottomRight,
+        CardCorner::BottomLeft,
+        CardCorner::TopRight,
+        CardCorner::TopLeft,
+        CardCorner::FollowMouse,
+    ];
+
+    #[test]
+    fn card_corner_label_round_trips_for_all_variants() {
+        for value in ALL_CORNERS {
+            assert_eq!(label_to_card_corner(card_corner_label(value)), Some(value));
+        }
+        let labels: std::collections::HashSet<_> =
+            ALL_CORNERS.iter().map(|&c| card_corner_label(c)).collect();
+        assert_eq!(labels.len(), 5, "every corner needs its own label");
+    }
+
+    #[test]
+    fn label_to_card_corner_rejects_unknown_text() {
+        assert_eq!(label_to_card_corner(""), None);
+        assert_eq!(label_to_card_corner("garbage"), None);
+    }
+
+    #[test]
+    fn card_monitor_options_depend_on_the_monitor_count() {
+        let values = |n| {
+            card_monitor_options(n)
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(0), ["cursor", "primary"]);
+        assert_eq!(values(1), ["cursor", "primary"]);
+        assert_eq!(values(3), ["cursor", "primary", "1", "2", "3"]);
+        let labels: std::collections::HashSet<_> = card_monitor_options(3)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+        assert_eq!(labels.len(), 5, "labels must be distinct");
+    }
+
+    #[test]
+    fn card_monitor_display_round_trips_every_option() {
+        for count in [1, 2, 4] {
+            for (label, value) in card_monitor_options(count) {
+                assert_eq!(card_monitor_display(&value, count), label);
+                assert_eq!(label_to_card_monitor(&label), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn card_monitor_display_keeps_a_hand_edited_value_honest() {
+        // Not an exact preset, or a monitor that is not connected: shown as
+        // Custom, and parsed back to the very same text.
+        for odd in ["Primary", " 2", "7", "0", "typo", ""] {
+            let label = card_monitor_display(odd, 2);
+            assert_eq!(label, format!("Custom ({odd})"));
+            assert_eq!(label_to_card_monitor(&label), Some(odd.to_string()));
+        }
+    }
+
+    #[test]
+    fn label_to_card_monitor_rejects_unknown_text() {
+        assert_eq!(label_to_card_monitor(""), None);
+        assert_eq!(label_to_card_monitor("garbage"), None);
+    }
+
+    #[test]
+    fn build_config_round_trips_card_corner_and_monitor_choices() {
+        for corner in ALL_CORNERS {
+            let mut raw = raw_from(&Config::default());
+            raw.card_corner = card_corner_label(corner).to_string();
+            let cfg = build_config(&Config::default(), &raw);
+            assert_eq!(cfg.ui.card_corner, corner);
+        }
+        let mut raw = raw_from(&Config::default());
+        raw.card_monitor = card_monitor_display("primary", 2);
+        assert_eq!(
+            build_config(&Config::default(), &raw).ui.card_monitor,
+            "primary"
+        );
+    }
+
+    #[test]
+    fn untouched_save_keeps_a_hand_edited_card_monitor_and_corner() {
+        let mut original = Config::default();
+        original.ui.card_monitor = "Primary".to_string();
+        original.ui.card_corner = CardCorner::TopLeft;
+        let cfg = build_config(&original, &raw_from(&original));
+        assert_eq!(cfg.ui.card_monitor, "Primary");
+        assert_eq!(cfg.ui.card_corner, CardCorner::TopLeft);
+    }
+
+    #[test]
+    fn blank_card_selections_fall_back_to_the_original() {
+        let mut original = Config::default();
+        original.ui.card_monitor = "2".to_string();
+        original.ui.card_corner = CardCorner::TopRight;
+        let mut raw = raw_from(&original);
+        raw.card_corner = String::new();
+        raw.card_monitor = String::new();
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.ui.card_monitor, "2");
+        assert_eq!(cfg.ui.card_corner, CardCorner::TopRight);
     }
 
     // -- require_tick_for (#403) ------------------------------------------
@@ -5921,6 +6188,58 @@ mod tests {
 
         // #302: this window has no SettingsInner, so WM_DESTROY never frees
         // the font; do it here.
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+    }
+
+    /// #498's "wired to nothing" check: the two card combos exist in a real
+    /// window, show the stored values (a hand-edited one as Custom), and
+    /// read back through `combo_selected_text`.
+    #[test]
+    fn build_ui_shows_the_card_corner_and_display_from_the_config() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+
+        let mut config = Config::default();
+        config.ui.card_corner = CardCorner::TopLeft;
+        config.ui.card_monitor = "Primary".to_string();
+
+        let title = wide_z("Wingman settings (card position test)");
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        let font = build_font(dpi);
+        build_ui(hwnd, instance, dpi, font, &config, WIN_H_DP);
+
+        assert_eq!(combo_selected_text(hwnd, ID_CARD_CORNER), "Top left");
+        assert_eq!(
+            combo_selected_text(hwnd, ID_CARD_MONITOR),
+            "Custom (Primary)"
+        );
+
         unsafe {
             let _ = DestroyWindow(hwnd);
             let _ = DeleteObject(HGDIOBJ(font.0));
