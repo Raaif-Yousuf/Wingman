@@ -1,14 +1,14 @@
 //! Intent router (#24): one cheap classification call, started on a worker
-//! thread the moment the Quick Ask palette opens, that guesses which
-//! catalogue action the screen in front of the user is probably about.
+//! thread when the options card (#307) opens, that ranks which catalogue
+//! actions the screen in front of the user is probably about.
 //!
 //! Pure module (AGENTS.md rule 8): no `windows` dependency anywhere in this
 //! file. `app.rs` owns every piece of Win32/network wiring this needs --
 //! capturing the downscaled screenshot on the main thread (mirroring
 //! `App::ask`'s own capture-before-spawn ordering), picking and constructing
 //! the actual `Provider` to call, spawning the worker thread, and posting the
-//! result back to the palette. `ui::palette`/`ui::palette_model` own the
-//! palette-side half: pre-selecting a row and rendering the summary line.
+//! result back to the options card (#307). `ui::card` owns the card-side half:
+//! showing the summary and the buttons.
 //!
 //! See the 2026-09-16 expansion plan §6 "The intent router",
 //! `docs/superpowers/specs/2026-09-17-palette-design.md`, and `gh issue view 24`.
@@ -16,7 +16,7 @@
 //! # What this module does NOT do
 //!
 //! It never runs an action -- [`RouterResult`] is read-only advice the
-//! palette may or may not act on (see [`should_apply`]). It never decides
+//! options card offers and the user picks from. It never decides
 //! Mode or Pause; those are `app.rs`'s job before this module's functions are
 //! even called (see [`cheapest_router_target`]'s doc for how Mode already
 //! folds in via the caller's `ready_provider_names`).
@@ -446,7 +446,6 @@ pub fn parse_router_result(
 }
 
 /// Builds a fallback option: the catalogue name as its label, no confidence.
-#[allow(dead_code)] // used by `with_fallbacks`, which the options card (#307) calls
 fn catalogue_option(action: &PaletteAction) -> RouterOption {
     RouterOption {
         intent: action.id.clone(),
@@ -462,7 +461,6 @@ fn catalogue_option(action: &PaletteAction) -> RouterOption {
 /// two options, "Explain this screen" then "Copy text from screen" are
 /// appended, skipping any already present or absent from the catalogue
 /// (the user may have disabled one). Labels are the catalogue names.
-#[allow(dead_code)] // the options card (#307) is its caller; unit tested until then
 pub fn with_fallbacks(
     mut options: Vec<RouterOption>,
     catalogue: &[PaletteAction],
@@ -492,31 +490,55 @@ pub fn with_fallbacks(
     options
 }
 
-/// Whether the palette should act on a router result: an `intent` was
-/// actually named, its `confidence` clears `threshold`, AND the user has not
-/// already typed into the query box or moved the selection since the
-/// palette opened (`user_interacted`). All three, in order -- a confident
-/// suggestion arriving after the user already started choosing something
-/// else must never yank the selection out from under them.
-pub fn should_apply(
-    intent: Option<&str>,
-    confidence: f64,
-    threshold: f64,
-    user_interacted: bool,
-) -> bool {
-    intent.is_some() && confidence >= threshold && !user_interacted
+/// The summary shown while the router works (the options card's shell).
+pub const LOOKING_SUMMARY: &str = "Looking at your screen";
+/// The summary when the model gave none.
+pub const PICK_SUMMARY: &str = "What would you like to do?";
+/// The summary when the router failed for any reason. The reason goes to the
+/// diagnostics log, never the card (the router is advisory).
+pub const FAILED_SUMMARY: &str = "Could not read the screen, here are a few options";
+/// The summary when no model is set up: these options work without one.
+pub const NO_MODEL_SUMMARY: &str = "No AI model is set up. These work without one.";
+
+/// What the options card shows: a summary line and the ranked options.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OptionsContent {
+    pub summary: String,
+    pub options: Vec<RouterOption>,
 }
 
-/// Whether a router result belongs to a palette session that has since
-/// moved on. `result_generation` is the generation number captured at the
-/// moment the request was built (right after the palette that triggered it
-/// was shown); `current_generation` is read fresh at delivery time
-/// (`ui::palette`'s `PaletteInner::router_generation`, bumped on every show
-/// AND every hide -- see that field's doc comment). A mismatch means the
-/// palette was hidden and/or reshown since this request started, so the
-/// result is dropped silently, never applied to whatever is on screen now.
-pub fn is_stale(result_generation: u64, current_generation: u64) -> bool {
-    result_generation != current_generation
+/// Decides the options card's content from the router's outcome. `result` is
+/// `None` when the router failed (an error, a timeout, a refusal, an unreadable
+/// reply). With no model ready the router never ran and the card is the static
+/// model-free list. Otherwise the shortlist is topped up by
+/// [`with_fallbacks`], so the card is never empty or a single dead end, and
+/// capped at [`MAX_OPTIONS_CAP`] whatever came in. Never an error: the router
+/// is advisory, and its failure is the card's floor.
+pub fn options_content(
+    result: Option<&RouterResult>,
+    catalogue: &[PaletteAction],
+    model_ready: bool,
+) -> OptionsContent {
+    if !model_ready {
+        return OptionsContent {
+            summary: NO_MODEL_SUMMARY.to_string(),
+            options: with_fallbacks(Vec::new(), catalogue, false),
+        };
+    }
+    let Some(result) = result else {
+        return OptionsContent {
+            summary: FAILED_SUMMARY.to_string(),
+            options: with_fallbacks(Vec::new(), catalogue, true),
+        };
+    };
+    let summary = if result.summary.trim().is_empty() {
+        PICK_SUMMARY.to_string()
+    } else {
+        result.summary.clone()
+    };
+    let mut options = with_fallbacks(result.options.clone(), catalogue, true);
+    options.truncate(MAX_OPTIONS_CAP);
+    OptionsContent { summary, options }
 }
 
 /// The provider name and model the router should call -- deliberately not
@@ -1253,44 +1275,108 @@ mod tests {
         assert!(out.iter().all(|o| !o.label.is_empty()));
     }
 
-    // -- should_apply: threshold and "user already chose" (#24) --------------
+    // -- options_content: what the options card shows (#307) -----------------
 
-    #[test]
-    fn should_apply_true_when_confident_and_untouched() {
-        assert!(should_apply(Some("check-my-work"), 0.9, 0.7, false));
+    fn routed(summary: &str, options: Vec<RouterOption>) -> RouterResult {
+        RouterResult {
+            summary: summary.to_string(),
+            options,
+        }
     }
 
     #[test]
-    fn should_apply_false_when_below_threshold() {
-        assert!(!should_apply(Some("check-my-work"), 0.5, 0.7, false));
+    fn a_good_shortlist_is_shown_as_the_model_wrote_it() {
+        let result = routed(
+            "Compose window to Dana",
+            vec![
+                option("check-my-work", "Review", 0.9),
+                option("f1", "Free", 0.5),
+            ],
+        );
+        let c = options_content(Some(&result), &catalogue(), true);
+        assert_eq!(c.summary, "Compose window to Dana");
+        assert_eq!(intents(&c.options), ["check-my-work", "f1"]);
+        assert_eq!(c.options[0].label, "Review");
     }
 
     #[test]
-    fn should_apply_true_at_exactly_the_threshold() {
-        assert!(should_apply(Some("check-my-work"), 0.7, 0.7, false));
+    fn a_thin_shortlist_is_topped_up_with_the_floor_and_keeps_the_summary() {
+        let result = routed("A spreadsheet", vec![option("check-my-work", "Check", 0.4)]);
+        let c = options_content(Some(&result), &catalogue(), true);
+        assert_eq!(c.summary, "A spreadsheet");
+        assert_eq!(
+            intents(&c.options),
+            [
+                "check-my-work",
+                crate::actions::explain_screen::ACTION_ID,
+                crate::actions::EXTRACT_TEXT_ACTION_ID
+            ]
+        );
     }
 
     #[test]
-    fn should_apply_false_when_no_intent_was_named() {
-        assert!(!should_apply(None, 0.99, 0.7, false));
+    fn an_empty_shortlist_still_gives_a_card_with_a_useful_summary() {
+        let result = routed("", vec![]);
+        let c = options_content(Some(&result), &catalogue(), true);
+        assert_eq!(c.summary, PICK_SUMMARY, "no model words: a plain prompt");
+        assert_eq!(c.options.len(), 2);
     }
 
     #[test]
-    fn should_apply_false_when_the_user_already_interacted() {
-        assert!(!should_apply(Some("check-my-work"), 0.99, 0.7, true));
+    fn a_failed_router_shows_the_floor_with_the_failure_summary() {
+        let c = options_content(None, &catalogue(), true);
+        assert_eq!(c.summary, FAILED_SUMMARY);
+        assert_eq!(
+            intents(&c.options),
+            [
+                crate::actions::explain_screen::ACTION_ID,
+                crate::actions::EXTRACT_TEXT_ACTION_ID
+            ]
+        );
     }
 
-    // -- is_stale: generation-counter staleness (#24) -------------------------
-
     #[test]
-    fn is_stale_false_when_generations_match() {
-        assert!(!is_stale(3, 3));
+    fn with_no_model_the_card_is_the_static_list_whatever_the_router_said() {
+        let result = routed("ignored", vec![option("check-my-work", "Check", 0.9)]);
+        for r in [Some(&result), None] {
+            let c = options_content(r, &catalogue(), false);
+            assert_eq!(c.summary, NO_MODEL_SUMMARY);
+            assert_eq!(
+                intents(&c.options),
+                [
+                    crate::actions::EXTRACT_TEXT_ACTION_ID,
+                    "calculate-selection",
+                    "copy-region",
+                    "f1"
+                ]
+            );
+        }
     }
 
     #[test]
-    fn is_stale_true_when_the_palette_was_hidden_or_reshown_since() {
-        assert!(is_stale(3, 4));
-        assert!(is_stale(4, 3));
+    fn the_card_never_has_more_than_four_options_or_an_empty_label() {
+        let many = (0..9)
+            .map(|n| option(&format!("a{n}"), &format!("Label {n}"), 0.9))
+            .collect::<Vec<_>>();
+        let c = options_content(Some(&routed("S", many)), &catalogue(), true);
+        assert!(c.options.len() <= crate::options_keys::MAX_OPTIONS);
+        for model in [true, false] {
+            let c = options_content(None, &catalogue(), model);
+            assert!(c.options.iter().all(|o| !o.label.trim().is_empty()));
+        }
+    }
+
+    #[test]
+    fn card_summaries_have_no_em_dash_and_fit_the_summary_cap() {
+        for text in [
+            LOOKING_SUMMARY,
+            PICK_SUMMARY,
+            FAILED_SUMMARY,
+            NO_MODEL_SUMMARY,
+        ] {
+            assert!(!text.contains('\u{2014}'), "{text}");
+            assert!(text.chars().count() <= MAX_SUMMARY_CHARS, "{text}");
+        }
     }
 
     // -- cheapest_router_target -----------------------------------------------

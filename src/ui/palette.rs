@@ -193,24 +193,12 @@ const PADDING: i32 = 8;
 /// than being truncated -- that constant is the single source of truth for
 /// both the window's fixed height here and the palette-side viewport math in
 /// `palette_model.rs`.
-/// #24: height of the router's suggestion summary line, always reserved
-/// (never grows/shrinks the window -- rule 5's "pre-created, never
-/// re-created" applies to size too) between the query box and the row list;
-/// blank when [`PaletteInner::router_summary`] is `None`.
-const ROUTER_SUMMARY_HEIGHT: i32 = 18;
-
-/// #359: shown in the router summary band from the moment
-/// `App::maybe_start_router` actually starts a background request until the
-/// result (or a failure) replaces or clears it. No em dash (rule 11).
-const ROUTER_LOOKING_TEXT: &str = "Looking at your screen...";
-
 fn scale(v: i32, dpi: u32) -> i32 {
     v * dpi as i32 / 96
 }
 
 fn window_height(dpi: u32) -> i32 {
     scale(PADDING * 2 + EDIT_HEIGHT, dpi)
-        + scale(ROUTER_SUMMARY_HEIGHT, dpi)
         + scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32
         + scale(FOOTER_HEIGHT, dpi)
 }
@@ -220,14 +208,14 @@ fn window_height(dpi: u32) -> i32 {
 /// and the real row count, returns the real row index (into
 /// `PaletteState::rows`, the same space `PaletteState::selected` lives in)
 /// under that `y`, or `None` when `y` is above the list (still over the
-/// query box/padding/router-summary band), below the last real row, or below
+/// query box/padding), below the last real row, or below
 /// the whole painted viewport. Mirrors `on_paint`'s row-geometry math
 /// exactly (same constants, same order of additions) so a click always lands
 /// on the row it visually looks like it landed on -- see that function's `y`
 /// math, which this must never drift from.
 fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
     let pad = scale(PADDING, dpi);
-    let list_top = pad + scale(EDIT_HEIGHT, dpi) + pad + scale(ROUTER_SUMMARY_HEIGHT, dpi);
+    let list_top = pad + scale(EDIT_HEIGHT, dpi) + pad;
     let row_h = scale(ROW_HEIGHT, dpi);
     if row_h <= 0 || y < list_top {
         return None;
@@ -294,9 +282,6 @@ impl Palette {
             footer_text: String::new(),
             state: crate::ui::palette_model::PaletteState::new(Vec::new()),
             visible: false,
-            router_generation: 0,
-            interacted: false,
-            router_summary: None,
             hover: None,
             tracking_leave: false,
             suppress_en_change: false,
@@ -410,45 +395,6 @@ impl Palette {
 
     pub fn hide(&mut self) {
         self.inner.hide();
-    }
-
-    /// #24: the generation number stamped on THIS showing of the palette --
-    /// `app.rs`'s router hook reads this right after [`Palette::show`]
-    /// returns and carries it across the worker thread, so the eventual
-    /// result can be checked against whatever this returns AT DELIVERY time
-    /// (`crate::router::is_stale`). Bumped on every [`Palette::show`] and
-    /// every hide (Esc, lost focus, a dispatched Enter, or a second
-    /// `toggle_palette`), so a result from any earlier showing is always
-    /// stale by the time it arrives.
-    pub fn router_generation(&self) -> u64 {
-        self.inner.router_generation
-    }
-
-    /// #24: applies (or silently drops) a router result against the
-    /// showing identified by `generation`. See
-    /// [`PaletteInner::apply_router_suggestion`] for the full decision
-    /// chain (staleness, visibility, confidence vs. `threshold`, and
-    /// whether the user already typed or moved the selection) -- this is
-    /// pure Win32 glue over `crate::router`'s pure decisions and
-    /// `palette_model::preselect_action`'s pure state mutation.
-    pub fn apply_router_suggestion(
-        &mut self,
-        generation: u64,
-        result: &crate::router::RouterResult,
-        threshold: f64,
-    ) {
-        self.inner
-            .apply_router_suggestion(generation, result, threshold);
-    }
-
-    /// #359: see [`PaletteInner::set_router_pending`].
-    pub fn set_router_pending(&mut self, generation: u64) {
-        self.inner.set_router_pending(generation);
-    }
-
-    /// #359: see [`PaletteInner::clear_router_pending`].
-    pub fn clear_router_pending(&mut self, generation: u64) {
-        self.inner.clear_router_pending(generation);
     }
 
     /// The palette's own window proc dispatches internally; this is the
@@ -916,24 +862,6 @@ struct PaletteInner {
     footer_text: String,
     state: crate::ui::palette_model::PaletteState,
     visible: bool,
-    /// #24: bumped on every [`PaletteInner::show`] AND every
-    /// [`PaletteInner::hide`] -- see [`Palette::router_generation`]'s doc
-    /// comment for the full staleness story. `u64::wrapping_add` because
-    /// this is a long-running tray app's counter, not a value that should
-    /// ever panic on overflow (which would take longer than the app's
-    /// uptime to reach in practice regardless).
-    router_generation: u64,
-    /// #24: whether the user has typed into the query box or moved the
-    /// selection (Up/Down/PageUp/PageDown) since THIS showing -- reset by
-    /// [`PaletteInner::show`], set by the `EN_CHANGE`/movement handlers
-    /// below. `crate::router::should_apply` reads this to decide whether a
-    /// late-arriving suggestion may still take the selection.
-    interacted: bool,
-    /// #24: the router's one-line summary, shown as a subtle line between
-    /// the query box and the row list once a suggestion is applied (see
-    /// `on_paint`). `None` most of the time -- no router result yet, the
-    /// result didn't clear the threshold, or the user already interacted.
-    router_summary: Option<String>,
     /// #357: the row currently under the mouse cursor (real index into
     /// `state.rows`, same space as `state.selected`), or `None` when the
     /// mouse isn't over the list, isn't over an `Action` row, or hasn't
@@ -954,10 +882,9 @@ struct PaletteInner {
     /// a real-window test -- fires a real, synchronous `EN_CHANGE` for this
     /// edit control, not just user typing or `EM_REPLACESEL` as the old
     /// comment here assumed. While armed, `handle_message`'s `EN_CHANGE` arm
-    /// treats the notification as the programmatic clear it is: it skips
-    /// marking `interacted`/clearing `router_summary` (both already just set
-    /// by `show`) and skips the redundant `rebuild_state` (`show` already
-    /// calls it with the real, empty query right after).
+    /// treats the notification as the programmatic clear it is and skips the
+    /// redundant `rebuild_state` (`show` already calls it with the real,
+    /// empty query right after).
     suppress_en_change: bool,
 }
 
@@ -971,20 +898,12 @@ impl PaletteInner {
         self.catalogue = catalogue;
         self.model_configured = model_configured;
         self.footer_text = footer_text;
-        // #24: a fresh showing starts a fresh router session -- any result
-        // still in flight for the PREVIOUS showing (this bump changes what
-        // `router_generation()` returns) is now stale, and the user hasn't
-        // interacted with this one yet.
-        self.router_generation = self.router_generation.wrapping_add(1);
-        self.interacted = false;
-        self.router_summary = None;
         self.hover = None;
         self.tracking_leave = false;
         // #414: SetWindowTextW below fires a real, synchronous EN_CHANGE for
         // this edit control -- see `suppress_en_change`'s doc comment. Armed
-        // only around this one call, so a genuine keystroke that lands
-        // between `show` calls (impossible: this is all synchronous) or any
-        // later real typing still sets `interacted` normally.
+        // only around this one call, so any later real typing still
+        // rebuilds the rows normally.
         self.suppress_en_change = true;
         unsafe {
             let _ = SetWindowTextW(self.edit_hwnd, PCWSTR(wide_z("").as_ptr()));
@@ -1030,95 +949,8 @@ impl PaletteInner {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.visible = false;
-        // #24: invalidates any router request still in flight for this
-        // showing -- see `router_generation`'s doc comment. Cheap and always
-        // safe to do even when nothing was in flight.
-        self.router_generation = self.router_generation.wrapping_add(1);
-        self.router_summary = None;
         self.hover = None;
         self.tracking_leave = false;
-    }
-
-    /// #24: see [`Palette::apply_router_suggestion`]'s doc comment for the
-    /// public entry point. Order matters: staleness and visibility are
-    /// checked before touching `crate::router::should_apply` at all, since
-    /// neither needs the confidence/threshold/interacted comparison to
-    /// already say no.
-    fn apply_router_suggestion(
-        &mut self,
-        generation: u64,
-        result: &crate::router::RouterResult,
-        threshold: f64,
-    ) {
-        if crate::router::is_stale(generation, self.router_generation) {
-            return;
-        }
-        if !self.visible {
-            return;
-        }
-        // #359: whatever happens from here, the "Looking at your screen..."
-        // placeholder this session's request started with must not survive
-        // the result -- either it becomes the real summary below, or this
-        // clears it back to None.
-        // #306: the palette pre-selects the top of the ranked shortlist; the
-        // alternatives are for the options card.
-        let Some(top) = result.options.first() else {
-            self.router_summary = None;
-            self.invalidate();
-            return;
-        };
-        let intent_id = top.intent.as_str();
-        if !crate::router::should_apply(Some(intent_id), top.confidence, threshold, self.interacted)
-        {
-            self.router_summary = None;
-            self.invalidate();
-            return;
-        }
-        if crate::ui::palette_model::preselect_action(&mut self.state, intent_id) {
-            self.router_summary = Some(result.summary.clone());
-        } else {
-            self.router_summary = None;
-        }
-        self.invalidate();
-    }
-
-    /// #359: called right when [`App::maybe_start_router`] actually starts a
-    /// background request (after the Paused/no-provider/capture-failure
-    /// checks all pass), so the reserved summary band shows something is
-    /// happening instead of sitting blank until the result arrives. Cleared
-    /// the same way a real summary is: by
-    /// [`PaletteInner::apply_router_suggestion`] on arrival,
-    /// [`PaletteInner::clear_router_pending`] on failure, or any of the
-    /// existing "user already interacted" paths above (`show`, `hide`,
-    /// `on_palette_key_command`'s Up/Down/PageUp/PageDown arm, `EN_CHANGE`).
-    /// No timer involved (rule 5): this only ever changes on those events.
-    fn set_router_pending(&mut self, generation: u64) {
-        if crate::router::is_stale(generation, self.router_generation) {
-            return;
-        }
-        if !self.visible {
-            return;
-        }
-        self.router_summary = Some(ROUTER_LOOKING_TEXT.to_string());
-        self.invalidate();
-    }
-
-    /// #359: the router's background request failed (or no provider ended up
-    /// ready by the time the worker thread ran) -- clears whatever
-    /// [`PaletteInner::set_router_pending`] showed rather than leaving it
-    /// stuck. A no-op if the user already interacted or hid the palette,
-    /// both of which already cleared it.
-    fn clear_router_pending(&mut self, generation: u64) {
-        if crate::router::is_stale(generation, self.router_generation) {
-            return;
-        }
-        if !self.visible {
-            return;
-        }
-        if self.router_summary.is_some() {
-            self.router_summary = None;
-            self.invalidate();
-        }
     }
 
     fn reposition_centered(&mut self) {
@@ -1212,20 +1044,6 @@ impl PaletteInner {
     /// Takes the key-forwarded `WM_COMMAND` id, runs it through the pure
     /// state machine, and acts on the outcome: repaint, dispatch, or hide.
     fn on_palette_key_command(&mut self, key: crate::ui::palette_model::PaletteKey) {
-        // #24: moving the selection counts as "the user already chose" --
-        // `crate::router::should_apply` must never yank the selection back
-        // to a router suggestion after this. Also drops any summary line
-        // already shown, since it describes a selection the user just left.
-        if matches!(
-            key,
-            crate::ui::palette_model::PaletteKey::Up
-                | crate::ui::palette_model::PaletteKey::Down
-                | crate::ui::palette_model::PaletteKey::PageUp
-                | crate::ui::palette_model::PaletteKey::PageDown
-        ) {
-            self.interacted = true;
-            self.router_summary = None;
-        }
         match crate::ui::palette_model::handle_key(&mut self.state, key) {
             crate::ui::palette_model::PaletteOutcome::None => self.invalidate(),
             crate::ui::palette_model::PaletteOutcome::Hide => self.hide(),
@@ -1304,26 +1122,12 @@ impl PaletteInner {
         let row_h = ROW_HEIGHT as f32;
         let content_w = WINDOW_WIDTH as f32;
         let content_h = window_height(96) as f32; // logical/DIP total height -- see the module doc comment
-        let mut y = pad + EDIT_HEIGHT as f32 + pad;
+        let y = pad + EDIT_HEIGHT as f32 + pad;
 
         unsafe {
             target.BeginDraw();
             target.Clear(Some(&colorref_to_d2d(COLORREF(0x0026_2626)) as *const _));
         }
-
-        // #24: the router summary band is always reserved (see
-        // ROUTER_SUMMARY_HEIGHT's doc comment) so the window never
-        // resizes; only its text is conditional.
-        if let Some(summary) = &self.router_summary {
-            let band_rect = D2D_RECT_F {
-                left: pad,
-                top: y,
-                right: content_w - pad,
-                bottom: y + ROUTER_SUMMARY_HEIGHT as f32,
-            };
-            draw_text_line_d2d(&target, &format, summary, band_rect, COLORREF(0x0080_B080));
-        }
-        y += ROUTER_SUMMARY_HEIGHT as f32;
 
         // #217: only the rows inside [offset, offset + MAX_VISIBLE_ROWS) are
         // painted; `i` stays the row's real index into `state.rows` (what
@@ -1434,27 +1238,7 @@ impl PaletteInner {
 
             let pad = scale(PADDING, self.dpi);
             let row_h = scale(ROW_HEIGHT, self.dpi);
-            let mut y = pad + scale(EDIT_HEIGHT, self.dpi) + pad;
-
-            // #24: the router summary band is always reserved (see
-            // ROUTER_SUMMARY_HEIGHT's doc comment) so the window never
-            // resizes; only its text is conditional.
-            if let Some(summary) = &self.router_summary {
-                let band_rect = RECT {
-                    left: pad,
-                    top: y,
-                    right: rc.right - pad,
-                    bottom: y + scale(ROUTER_SUMMARY_HEIGHT, self.dpi),
-                };
-                SetTextColor(hdc, COLORREF(0x0080_B080));
-                draw_text_line(
-                    hdc,
-                    summary,
-                    band_rect,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                );
-            }
-            y += scale(ROUTER_SUMMARY_HEIGHT, self.dpi);
+            let y = pad + scale(EDIT_HEIGHT, self.dpi) + pad;
 
             // #217: only the rows inside [offset, offset + MAX_VISIBLE_ROWS)
             // are painted; `i` stays the row's real index into `state.rows`
@@ -1555,16 +1339,10 @@ impl PaletteInner {
                 if notify == EN_CHANGE && ctrl_id == QUERY_EDIT_ID && lparam.0 != 0 {
                     if self.suppress_en_change {
                         // #414: this is `show`'s own programmatic clear, not
-                        // real user typing -- `show` already reset
-                        // `interacted`/`router_summary` and will call
+                        // real user typing -- `show` will call
                         // `rebuild_state` itself right after.
                         return Some(LRESULT(0));
                     }
-                    // #24: real user typing -- the router's suggestion must
-                    // not steal the selection back from here on for this
-                    // showing.
-                    self.interacted = true;
-                    self.router_summary = None;
                     let query = self.current_query();
                     self.rebuild_state(&query);
                     self.invalidate();
@@ -1746,9 +1524,8 @@ fn utf16(s: &str) -> Vec<u16> {
 // identical to `crate::ui::text::draw_text_line` (issue #221) -- see that
 // module's doc comment for the MEASURED empty-string crash and the guard's
 // reasoning, which applies unchanged to every row's text painted below
-// (`router_summary` from a live model's JSON response, `Row::Action`'s
-// `name`/`Row::Header`'s group name from a hand-editable `actions.toml`,
-// none of it validated non-empty at the source). Now imported instead of
+// (`Row::Action`'s `name`/`Row::Header`'s group name from a hand-editable
+// `actions.toml`, none of it validated non-empty at the source). Now imported instead of
 // duplicated; the regression coverage for the empty-string guard itself
 // lives in `ui::text`'s own tests.
 use crate::ui::text::draw_text_line;
@@ -1806,9 +1583,8 @@ mod tests {
         use super::super::row_at;
 
         const DPI: u32 = 96;
-        // list_top = PADDING + EDIT_HEIGHT + PADDING + ROUTER_SUMMARY_HEIGHT
-        //          = 8 + 30 + 8 + 18 = 64
-        const LIST_TOP: i32 = 64;
+        // list_top = PADDING + EDIT_HEIGHT + PADDING = 8 + 30 + 8 = 46
+        const LIST_TOP: i32 = 46;
         const ROW_H: i32 = 26;
 
         #[test]
@@ -2046,11 +1822,11 @@ mod tests {
         p.show(free_actions(), true, "mode: Auto".to_string());
         pump_pending(p.hwnd());
 
-        // list_top (96 DPI) = PADDING + EDIT_HEIGHT + PADDING +
-        // ROUTER_SUMMARY_HEIGHT = 8 + 30 + 8 + 18 = 64; row 1's midpoint is
-        // list_top + ROW_HEIGHT + ROW_HEIGHT/2 = 64 + 26 + 13 = 103.
+        // list_top (96 DPI) = PADDING + EDIT_HEIGHT + PADDING = 8 + 30 + 8 =
+        // 46; row 1's midpoint is list_top + ROW_HEIGHT + ROW_HEIGHT/2 =
+        // 46 + 26 + 13 = 85.
         let x: i16 = 50;
-        let y: i16 = 103;
+        let y: i16 = 85;
         let lparam = LPARAM(((y as u16 as u32) << 16 | (x as u16 as u32)) as isize);
 
         unsafe {
@@ -2141,22 +1917,19 @@ mod tests {
     /// #414: the fix for `show`'s programmatic clear must not also swallow
     /// genuine user typing -- a real `EN_CHANGE` from `set_query_for_test`
     /// (which drives the query through the real edit control, not by poking
-    /// `PaletteState` directly) must still mark `interacted`.
+    /// `PaletteState` directly) must still rebuild the rows.
     #[test]
-    fn real_typing_after_show_still_marks_interacted() {
+    fn real_typing_after_show_still_filters_the_rows() {
         let inst = instance();
         let mut p = Palette::new_for_test(inst).unwrap();
         p.show(free_actions(), true, "mode: Auto".to_string());
         pump_pending(p.hwnd());
-        assert!(
-            !p.inner.interacted,
-            "show() itself must not mark interacted"
-        );
+        let before = p.inner.state.rows.len();
         p.set_query_for_test("copy");
         pump_pending(p.hwnd());
         assert!(
-            p.inner.interacted,
-            "a real EN_CHANGE from user typing must mark interacted"
+            p.inner.state.rows.len() < before,
+            "a real EN_CHANGE from user typing must rebuild the rows"
         );
     }
 
@@ -2405,120 +2178,5 @@ mod tests {
             avg < 100.0,
             "#25's Done-when is under 100 ms; measured avg {avg:.2} ms"
         );
-    }
-
-    // -- #359: "Looking at your screen..." while the router works ----------
-
-    fn router_result(intent: Option<&str>, confidence: f64) -> crate::router::RouterResult {
-        crate::router::RouterResult {
-            summary: "Check my work".to_string(),
-            options: intent
-                .map(|id| crate::router::RouterOption {
-                    intent: id.to_string(),
-                    label: "Check my work".to_string(),
-                    confidence,
-                })
-                .into_iter()
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn set_router_pending_shows_the_looking_text() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        assert_eq!(p.inner.router_summary, None);
-        p.set_router_pending(generation);
-        assert_eq!(p.inner.router_summary.as_deref(), Some(ROUTER_LOOKING_TEXT));
-    }
-
-    #[test]
-    fn set_router_pending_is_a_noop_for_a_stale_generation() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let stale_generation = p.router_generation().wrapping_sub(1);
-        p.set_router_pending(stale_generation);
-        assert_eq!(p.inner.router_summary, None);
-    }
-
-    /// #414: `show()`'s own programmatic `SetWindowTextW(edit_hwnd, "")`
-    /// clear must never look like real user input -- if it does, `interacted`
-    /// is `true` immediately after every `show()`, and
-    /// `crate::router::should_apply` (which refuses once `interacted`) means
-    /// the router's preselect (#24) can never apply in the real app. This
-    /// calls only `show()` then `apply_router_suggestion`, with no manual
-    /// `interacted` reset, unlike the tests below.
-    #[test]
-    fn show_does_not_mark_interacted_so_a_router_suggestion_still_applies() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.9), 0.5);
-        assert_eq!(
-            p.inner.router_summary.as_deref(),
-            Some("Check my work"),
-            "show()'s own programmatic text clear must not mark interacted, \
-             or a genuine above-threshold router suggestion can never apply"
-        );
-    }
-
-    #[test]
-    fn apply_router_suggestion_replaces_pending_text_with_the_real_summary() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.set_router_pending(generation);
-        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.9), 0.5);
-        assert_eq!(
-            p.inner.router_summary.as_deref(),
-            Some("Check my work"),
-            "a successful, above-threshold result must replace the placeholder"
-        );
-    }
-
-    #[test]
-    fn apply_router_suggestion_below_threshold_clears_the_pending_text() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.set_router_pending(generation);
-        // Confidence below the threshold: should_apply is false, so the
-        // placeholder must be cleared rather than left stuck.
-        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.1), 0.5);
-        assert_eq!(p.inner.router_summary, None);
-    }
-
-    #[test]
-    fn apply_router_suggestion_with_no_intent_clears_the_pending_text() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.set_router_pending(generation);
-        p.apply_router_suggestion(generation, &router_result(None, 0.9), 0.5);
-        assert_eq!(p.inner.router_summary, None);
-    }
-
-    #[test]
-    fn clear_router_pending_clears_the_looking_text_on_failure() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.set_router_pending(generation);
-        p.clear_router_pending(generation);
-        assert_eq!(p.inner.router_summary, None);
-    }
-
-    #[test]
-    fn clear_router_pending_is_a_noop_for_a_stale_generation() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.set_router_pending(generation);
-        // A new showing bumps the generation; the old request's eventual
-        // failure must not clear the NEW showing's (currently empty) band.
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        p.clear_router_pending(generation);
-        assert_eq!(p.inner.router_summary, None);
     }
 }

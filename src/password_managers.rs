@@ -642,19 +642,14 @@ mod tests {
         "run_model_free_screen_action",
         "copy_region",
         "calculate_selection",
-        "maybe_start_router",
+        // #307: captures a small image for the router before it shows the
+        // options card.
+        "show_options_card",
     ];
 
-    /// What each guarded fn must contain before it reads. The router runs
-    /// after the palette has taken the foreground, so `toggle_palette`
-    /// asks first and hands the answer down.
-    fn guard_marker(name: &str) -> &'static str {
-        match name {
-            // The parameter name alone also matches the signature, so the
-            // marker is the use: the early return.
-            "maybe_start_router" => "|| password_manager_in_front",
-            _ => "refuse_if_password_manager(",
-        }
+    /// What each guarded fn must contain before it reads.
+    fn guard_marker(_name: &str) -> &'static str {
+        "refuse_if_password_manager("
     }
 
     /// Calls that put pixels or a selection in Wingman's hands from a
@@ -728,7 +723,7 @@ mod tests {
         // The palette sets the hint for its dispatch, then clears it.
         let dispatch = body_of("dispatch_palette_action");
         let set = dispatch
-            .find("self.password_manager_hint = self.palette_password_manager;")
+            .find("self.password_manager_hint = self.picker_password_manager;")
             .expect("the palette dispatch never sets the hint");
         let run = dispatch
             .find("self.dispatch_palette_target(")
@@ -763,11 +758,12 @@ mod tests {
             .find("self.palette.show(")
             .expect("no palette.show call");
         assert!(ask < show, "the palette steals the foreground when shown");
+        // #805: the palette reads nothing when it opens, so there is no
+        // capture to hand the answer to. It keeps the answer for the action
+        // the user runs from it.
         assert!(
-            body.contains(
-                "self.maybe_start_router(candidates, password_manager_in_front, underlying)"
-            ),
-            "toggle_palette must hand its answer to the router"
+            body.contains("self.picker_password_manager = self.password_manager_now()"),
+            "toggle_palette must keep its answer for the dispatch"
         );
     }
 

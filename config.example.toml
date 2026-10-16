@@ -101,6 +101,8 @@ router_threshold = 0.7
 [options]
 max_options = 4
 min_confidence = 0.2
+auto_dismiss_secs = 20
+claim_keys = true
 
 [forms]
 require_tick_for = "sensitive"

@@ -39,7 +39,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
-    WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    LLKHF_INJECTED, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 /// Posted to the target `HWND` when a bound chord fires. `wparam` is
@@ -732,6 +732,48 @@ fn is_own_synthetic_input(dw_extra_info: usize) -> bool {
     dw_extra_info == INJECTED_MARKER
 }
 
+/// #307: the modifier keys of a chord, in the shape the options card's key
+/// claim wants. The claim passes a key through when any of them is down.
+fn options_modifiers(chord: &Chord) -> crate::options_keys::Modifiers {
+    crate::options_keys::Modifiers {
+        shift: chord.shift,
+        ctrl: chord.ctrl,
+        alt: chord.alt,
+        win: chord.win,
+    }
+}
+
+/// #307: whether the options card claims this key-down, and posts its choice
+/// if so. The card never takes focus, so keys 1 to 4 and Esc can only reach it
+/// through the hook. Costs one atomic load per key-down while no card shows.
+/// Returns `true` when the key was claimed (the caller swallows it).
+///
+/// Bounded by `options_keys::claimed_choice`: no modifier down, only digits
+/// that name an option, real (not injected) input, and a claim that lapses by
+/// itself at its expiry tick. The claim is spent here, so a second digit
+/// before the main thread has handled the first reaches the app.
+fn claim_for_options_card(kb: &KBDLLHOOKSTRUCT, chord: &Chord) -> bool {
+    if crate::options_keys::current().is_none() {
+        return false;
+    }
+    let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0;
+    let Some((choice, generation)) =
+        crate::options_keys::take_for_key(kb.vkCode, kb.time, options_modifiers(chord), injected)
+    else {
+        return false;
+    };
+    let hwnd = HWND(TARGET_HWND.load(Ordering::Relaxed) as *mut _);
+    let _ = unsafe {
+        PostMessageW(
+            Some(hwnd),
+            crate::options_keys::WM_APP_OPTIONS_CHOICE,
+            WPARAM(choice.to_wparam()),
+            LPARAM(generation as isize),
+        )
+    };
+    true
+}
+
 /// Reads [`PAUSE_CHORD`] and unpacks it, lock-free. `None` if no pause
 /// chord is configured (the packed sentinel `0`).
 fn load_pause_chord() -> Option<Chord> {
@@ -813,6 +855,13 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             return swallow(kb.vkCode);
         }
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
+    // #307: the options card claims keys 1 to 4 and Esc while it shows. After
+    // the paused return above (a paused app claims nothing) and before learn
+    // mode and the chord match.
+    if claim_for_options_card(kb, &chord) {
+        return swallow(kb.vkCode);
     }
 
     let Some(state) = STATE.get() else {
@@ -950,6 +999,79 @@ mod tests {
         let c = chord(0xBF, true, true, false, false);
         let b = chord(0x86, true, true, false, false);
         assert!(!matches(&c, &b));
+    }
+
+    // -- #307: the options card's key claim ------------------------------
+
+    #[test]
+    fn the_claim_reads_the_same_modifiers_the_chord_does() {
+        let m = options_modifiers(&chord(0x31, true, false, true, false));
+        assert!(m.ctrl && m.alt && !m.shift && !m.win);
+        let none = options_modifiers(&chord(0x31, false, false, false, false));
+        assert_eq!(none, crate::options_keys::Modifiers::default());
+        let win = options_modifiers(&chord(0x31, false, false, false, true));
+        assert!(win.win && !win.ctrl);
+    }
+
+    /// The hook source, CRLF-normalised, up to its tests.
+    fn hook_source() -> String {
+        let src = include_str!("hotkey.rs").replace('\r', "");
+        let end = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("hotkey.rs lost its tests marker; this scanner is blind");
+        src[..end].to_string()
+    }
+
+    /// Wired-to-nothing guard: the claim exists only if `hook_proc` calls it,
+    /// after the paused early return (a paused app claims nothing) and before
+    /// the chord match, and swallows what it claims.
+    #[test]
+    fn the_hook_asks_the_options_claim_after_pause_and_before_the_chord_match() {
+        let src = hook_source();
+        let proc_start = src
+            .find("unsafe extern \"system\" fn hook_proc(")
+            .expect("no hook_proc");
+        let body = &src[proc_start..];
+        let paused = body.find("is_paused_now()").expect("no pause check");
+        let claim = body
+            .find("claim_for_options_card(kb, &chord)")
+            .expect("hook_proc never asks the options claim");
+        let matched = body.find("STATE.get()").expect("no chord match");
+        assert!(
+            paused < claim && claim < matched,
+            "wrong order in hook_proc"
+        );
+        let after = &body[claim..matched];
+        assert!(
+            after.contains("return swallow(kb.vkCode)"),
+            "a claimed key must be swallowed"
+        );
+    }
+
+    /// The claim posts the options message with the claim's own generation,
+    /// and the hot path stays a single atomic load while no card shows.
+    #[test]
+    fn the_claim_posts_its_message_and_costs_one_load_when_idle() {
+        let src = hook_source();
+        let start = src
+            .find("fn claim_for_options_card(")
+            .expect("no claim_for_options_card");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("fn has no end")];
+        let idle = body
+            .find("options_keys::current().is_none()")
+            .expect("no idle check");
+        let take = body.find("take_for_key(").expect("never takes the claim");
+        assert!(idle < take, "the cheap check must come first");
+        assert!(body.contains("WM_APP_OPTIONS_CHOICE"));
+        assert!(
+            body.contains("LLKHF_INJECTED"),
+            "injected input is never claimed"
+        );
+        assert!(
+            !body.contains("lock()"),
+            "the hook must not take a lock here"
+        );
     }
 
     // -- learn-mode state machine --------------------------------------
