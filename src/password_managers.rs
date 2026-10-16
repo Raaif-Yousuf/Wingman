@@ -18,8 +18,9 @@
 //! Only the FOREGROUND window is REFUSED. A password manager visible beside
 //! it (#575) is painted out of a cloud-bound screenshot instead: see
 //! [`manager_window_rects`]. Store/UWP builds run under
-//! `ApplicationFrameHost.exe`, so their process name says nothing and they
-//! are not covered either way. The tray menu and the palette take the foreground
+//! `ApplicationFrameHost.exe`, so their process name says nothing: for such
+//! a frame the image of the app's own `Windows.UI.Core.CoreWindow` child is
+//! matched instead (#636, [`window_image_path`]). The tray menu and the palette take the foreground
 //! before an action runs, so `App` remembers who was in front when they
 //! opened (see `password_manager_hint` in `app.rs`).
 
@@ -126,6 +127,77 @@ pub fn is_password_manager(image_path: Option<&str>, title: &str, extra: &[Strin
     title_is_password_screen(title)
 }
 
+/// The window class of a Store app's content window inside its frame.
+const CORE_WINDOW_CLASS: &str = "Windows.UI.Core.CoreWindow";
+
+/// Whether `path` is `ApplicationFrameHost.exe`, which owns the top-level
+/// frame of every UWP/Store window while the app runs in its own process.
+fn is_frame_host(path: &str) -> bool {
+    normalized_exe_name(path) == "applicationframehost.exe"
+}
+
+/// The image path to match for window `hwnd` of process `pid` (#636): the
+/// process's own, except that a frame owned by `ApplicationFrameHost.exe`
+/// gives the image of its core-window child (a different process), so a
+/// Store build of a password manager is matched by name like any other. When
+/// the child cannot be found the frame host's own path is returned, which
+/// matches nothing: the same as before this existed. Bounded: one pass over
+/// the frame's few children.
+pub fn window_image_path(hwnd: windows::Win32::Foundation::HWND, pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumChildWindows, GetClassNameW, GetWindowThreadProcessId,
+    };
+    let own = crate::provider::ollama_admin::process_image_path(pid)?;
+    if !is_frame_host(&own) {
+        return Some(own);
+    }
+    struct Found {
+        frame_pid: u32,
+        pid: u32,
+        left: u32,
+    }
+    unsafe extern "system" fn visit(child: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        // SAFETY: `lparam` is the `&mut Found` passed below, which outlives
+        // the synchronous `EnumChildWindows` call.
+        let f = unsafe { &mut *(lparam.0 as *mut Found) };
+        if f.left == 0 {
+            return false.into();
+        }
+        f.left -= 1;
+        let mut class = [0u16; 64];
+        let len = unsafe { GetClassNameW(child, &mut class) }.max(0) as usize;
+        if String::from_utf16_lossy(&class[..len.min(class.len())]) != CORE_WINDOW_CLASS {
+            return true.into();
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(child, Some(&mut pid)) };
+        if pid != 0 && pid != f.frame_pid {
+            f.pid = pid;
+            return false.into();
+        }
+        true.into()
+    }
+    let mut found = Found {
+        frame_pid: pid,
+        pid: 0,
+        left: 64,
+    };
+    // SAFETY: `found` outlives the call; the callback is the only user. The
+    // result only says whether the walk was stopped early.
+    let _ = unsafe {
+        EnumChildWindows(
+            Some(hwnd),
+            Some(visit),
+            LPARAM(&mut found as *mut Found as isize),
+        )
+    };
+    if found.pid == 0 {
+        return Some(own);
+    }
+    crate::provider::ollama_admin::process_image_path(found.pid).or(Some(own))
+}
+
 /// The Win32 half: reads the foreground window's process image and title and
 /// asks [`is_password_manager`]. Main thread, no capture, no network. No
 /// foreground window (or an unreadable one) is not a refusal: nothing is
@@ -140,9 +212,7 @@ pub fn foreground_is_password_manager(extra: &[String]) -> bool {
     }
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    let image = (pid != 0)
-        .then(|| crate::provider::ollama_admin::process_image_path(pid))
-        .flatten();
+    let image = (pid != 0).then(|| window_image_path(hwnd, pid)).flatten();
     let mut buf = [0u16; 512];
     let len = unsafe { GetWindowTextW(hwnd, &mut buf) }.max(0) as usize;
     let title = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
@@ -255,6 +325,51 @@ mod tests {
 
     fn none() -> Vec<String> {
         Vec::new()
+    }
+
+    #[test]
+    fn only_the_frame_host_is_a_frame_host() {
+        assert!(is_frame_host(
+            r"C:\Windows\System32\ApplicationFrameHost.exe"
+        ));
+        assert!(is_frame_host("applicationframehost"));
+        assert!(!is_frame_host(r"C:\Windows\explorer.exe"));
+        assert!(!is_frame_host(""));
+        // The frame host itself is not a password manager, so a frame with
+        // no resolvable child stays unmatched.
+        assert!(!is_password_manager(
+            Some(r"C:\Windows\System32\ApplicationFrameHost.exe"),
+            "Settings",
+            &none()
+        ));
+    }
+
+    #[test]
+    fn a_store_manager_is_matched_by_its_real_process_not_the_frame() {
+        // What `window_image_path` hands the matcher for a hosted app.
+        assert!(is_password_manager(
+            Some(r"C:\Program Files\WindowsApps\x\Bitwarden.exe"),
+            "Bitwarden",
+            &none()
+        ));
+    }
+
+    #[test]
+    fn foreground_and_beside_checks_both_resolve_the_hosted_app() {
+        // Wiring (#636): a resolver nobody calls leaves Store managers
+        // unmatched while every pure test passes.
+        let norm = |s: &str| s.replace('\r', "");
+        let pm = norm(include_str!("password_managers.rs"));
+        let at = pm.find("pub fn foreground_is_password_manager(").unwrap();
+        let body = &pm[at..at + pm[at..].find("\n}\n").unwrap()];
+        assert!(body.contains("window_image_path(hwnd, pid)"), "{body}");
+        let capture = norm(include_str!("capture.rs"));
+        let at = capture.find("fn manager_windows_on(").unwrap();
+        let body = &capture[at..at + capture[at..].find("\n}\n").unwrap()];
+        assert!(
+            body.contains("crate::password_managers::window_image_path(hwnd, pid)"),
+            "{body}"
+        );
     }
 
     // -- beside the front window (#575) ------------------------------------

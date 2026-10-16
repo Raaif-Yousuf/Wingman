@@ -330,7 +330,7 @@ fn manager_windows_on(monitor: ScreenRect, extra: &[String]) -> Result<Vec<Scree
             let mut buf = [0u16; 256];
             let len = unsafe { GetWindowTextW(hwnd, &mut buf) }.max(0) as usize;
             WindowFacts {
-                image_path: crate::provider::ollama_admin::process_image_path(pid),
+                image_path: crate::password_managers::window_image_path(hwnd, pid),
                 title: String::from_utf16_lossy(&buf[..len.min(buf.len())]),
                 rect: ScreenRect {
                     left: r.left,
