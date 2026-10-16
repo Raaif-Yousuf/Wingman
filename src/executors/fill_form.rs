@@ -545,7 +545,7 @@ fn do_fill(access: &Arc<dyn TextElementAccess>, form: &FormFill) -> Result<Undo>
     }
     if filled.is_empty() {
         // Nothing can be put back, so do not offer an Undo that "succeeds".
-        return Ok(Undo::not_undoable(summary));
+        return Ok(Undo::none(summary));
     }
     let undo_access = Arc::clone(access);
     Ok(Undo::recording(summary, move || {
@@ -1597,8 +1597,8 @@ mod tests {
             undo.summary
         );
         assert!(
-            undo.undo().is_err(),
-            "nothing was recorded, so Undo must not report success"
+            !undo.is_restorable(),
+            "nothing was recorded, so no Restore is offered"
         );
         assert_eq!(access.write_calls.borrow().len(), 1);
     }

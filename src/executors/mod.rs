@@ -74,6 +74,7 @@ pub enum Effect {
 pub struct Undo {
     pub summary: String,
     restore: Box<dyn FnOnce() -> anyhow::Result<()> + Send>,
+    restorable: bool,
 }
 
 impl Undo {
@@ -83,20 +84,7 @@ impl Undo {
         Self {
             summary: summary.into(),
             restore: Box::new(|| Ok(())),
-        }
-    }
-
-    /// For an executor that changed something it cannot put back (#645).
-    /// Unlike [`Undo::none`], calling `undo` is an error, so it never reports
-    /// success for a change it did not reverse.
-    pub fn not_undoable(summary: impl Into<String>) -> Self {
-        Self {
-            summary: summary.into(),
-            restore: Box::new(|| {
-                anyhow::bail!(
-                    "Undo is not available: the old text could not be read before it was replaced"
-                )
-            }),
+            restorable: false,
         }
     }
 
@@ -108,7 +96,14 @@ impl Undo {
         Self {
             summary: summary.into(),
             restore: Box::new(restore),
+            restorable: true,
         }
+    }
+
+    /// Whether `undo` can put anything back. False for [`Undo::none`], so a
+    /// caller that offers a Restore keeps nothing to offer (#645).
+    pub fn is_restorable(&self) -> bool {
+        self.restorable
     }
 
     pub fn undo(self) -> anyhow::Result<()> {
