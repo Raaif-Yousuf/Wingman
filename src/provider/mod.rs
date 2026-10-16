@@ -991,7 +991,13 @@ impl Chain {
 /// `Anthropic`/`OpenAi`/future providers without another trait change.
 pub fn physics_request(shot: &Shot, prompt: &str, want_difficulty: bool) -> Request {
     Request {
-        system: common::augmented_system_prompt(prompt, want_difficulty),
+        // #768: the screenshot is data, never instructions (the note goes
+        // last, after the user's own prompt and the rubric).
+        system: format!(
+            "{}\n\n{}",
+            common::augmented_system_prompt(prompt, want_difficulty),
+            crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE
+        ),
         user: "Check my working.".to_string(),
         images: vec![shot.png.clone()],
         // #23: routed through the proposal schema registry instead of
@@ -1006,6 +1012,15 @@ pub fn physics_request(shot: &Shot, prompt: &str, want_difficulty: bool) -> Requ
         effort: Effort::Unset,
         max_tokens: 0,
     }
+}
+
+/// Test fixture for the per-provider body tests: [`physics_request`] without
+/// the #768 screen note, so those tests keep pinning the body shape alone.
+#[cfg(test)]
+pub(crate) fn physics_request_no_note(shot: &Shot, prompt: &str, want_difficulty: bool) -> Request {
+    let mut req = physics_request(shot, prompt, want_difficulty);
+    req.system = common::augmented_system_prompt(prompt, want_difficulty);
+    req
 }
 
 /// Builds the `Request` for #39's "Add event from screen" action: the
@@ -1999,7 +2014,13 @@ mod tests {
     fn physics_request_carries_the_screenshot_and_prompt_unmodified_without_difficulty() {
         let s = shot();
         let req = physics_request(&s, "system prompt text", false);
-        assert_eq!(req.system, "system prompt text");
+        assert_eq!(
+            req.system,
+            format!(
+                "system prompt text\n\n{}",
+                crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE
+            )
+        );
         assert_eq!(req.user, "Check my working.");
         assert_eq!(req.images, vec![s.png]);
         assert_eq!(req.effort, Effort::Unset);
@@ -2008,6 +2029,24 @@ mod tests {
             .schema
             .expect("schema is always present for the physics check");
         assert!(schema["properties"].get("difficulty").is_none());
+    }
+
+    /// #768: the default screen check carries the note with the rubric too,
+    /// and the schema property order stays detail, headline, difficulty.
+    #[test]
+    fn physics_request_always_carries_the_screen_note() {
+        let note = crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE;
+        for want in [false, true] {
+            let req = physics_request(&shot(), "p", want);
+            assert!(req.system.contains(note), "{}", req.system);
+            let keys: Vec<String> = req.schema.unwrap()["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(keys[..2], ["detail", "headline"]);
+        }
     }
 
     #[test]
