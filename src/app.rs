@@ -2954,7 +2954,7 @@ impl App {
                     .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
             }
             ExecDone::Calendar(Err(e)) => {
-                let detail = self.track_error("Couldn't add the event", &e);
+                let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't add the event", &detail);
             }
@@ -2967,7 +2967,7 @@ impl App {
                 );
             }
             ExecDone::Review(Err(e)) => {
-                let detail = self.track_error("Couldn't update the email", &e);
+                let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't update the email", &detail);
             }
@@ -2978,7 +2978,7 @@ impl App {
                 self.last_form_undo = undo.is_restorable().then_some(undo);
             }
             ExecDone::FormFill(Err(e)) => {
-                let detail = self.track_error("Couldn't fill the form", &e);
+                let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't fill the form", &detail);
             }
@@ -3008,7 +3008,7 @@ impl App {
                 ..
             } => {
                 let title = format!("Couldn't run \"{}\"", action.name);
-                let detail = self.track_error(&title, &e);
+                let detail = self.track_error(&title, &format!("{e:#}"));
                 self.card.show_error_with_details(&title, &detail);
             }
             ExecDone::Replace {
@@ -3057,7 +3057,7 @@ impl App {
                 );
             }
             ExecDone::RestoreForm(Err(e)) => {
-                let detail = self.track_error("Couldn't fully restore the form", &e);
+                let detail = self.track_error("Couldn't fully restore the form", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't fully restore the form", &detail);
             }
@@ -5454,26 +5454,26 @@ fn unpack_error(packed: &str) -> (&str, &str) {
 }
 
 /// #712: what a confirmed action's executor produced, built on the worker
-/// thread and handed to the UI thread as `WM_APP_EXECUTOR_DONE`. Errors are
-/// already flattened to their full `{:#}` chain text, which is what the card
-/// code recorded before the executors moved off the UI thread.
+/// thread and handed to the UI thread as `WM_APP_EXECUTOR_DONE`. An error
+/// stays an `anyhow::Error` until the card code, which records its full
+/// chain through `track_error`.
 enum ExecDone {
-    Calendar(std::result::Result<executors::Undo, String>),
-    Review(std::result::Result<executors::Undo, String>),
-    FormFill(std::result::Result<executors::Undo, String>),
+    Calendar(anyhow::Result<executors::Undo>),
+    Review(anyhow::Result<executors::Undo>),
+    FormFill(anyhow::Result<executors::Undo>),
     /// A non-built-in action's executor. Carries the action and the
     /// confirmed proposal because the card text is built from both.
     Generic {
         action: Box<actions::Action>,
         executor_name: String,
         proposal: Value,
-        result: std::result::Result<executors::Undo, String>,
+        result: anyhow::Result<executors::Undo>,
     },
     Replace {
         action_name: String,
         report: actions::generic_replace::ReplaceReport,
     },
-    RestoreForm(std::result::Result<(), String>),
+    RestoreForm(anyhow::Result<()>),
 }
 
 impl std::fmt::Debug for ExecDone {
@@ -5495,23 +5495,21 @@ fn exec_work_calendar(
     executor: &dyn executors::Executor,
     confirmed: confirm::Confirmed<Value>,
 ) -> ExecDone {
-    ExecDone::Calendar(executor.execute(confirmed).map_err(|e| format!("{e:#}")))
+    ExecDone::Calendar(executor.execute(confirmed))
 }
 
 fn exec_work_form_fill(
     executor: &dyn executors::Executor,
     confirmed: confirm::Confirmed<Value>,
 ) -> ExecDone {
-    ExecDone::FormFill(executor.execute(confirmed).map_err(|e| format!("{e:#}")))
+    ExecDone::FormFill(executor.execute(confirmed))
 }
 
 fn exec_work_review(
     executor: &dyn executors::Executor,
     ctx: &actions::review_email::ReviewContext,
 ) -> ExecDone {
-    ExecDone::Review(
-        actions::review_email::do_review_confirmed(executor, ctx).map_err(|e| format!("{e:#}")),
-    )
+    ExecDone::Review(actions::review_email::do_review_confirmed(executor, ctx))
 }
 
 fn exec_work_generic(
@@ -5522,7 +5520,7 @@ fn exec_work_generic(
     // #441: `execute` consumes `confirmed`, so keep the value the card text
     // may need (a read-only `"none"` action's answer).
     let proposal = confirmed.value().clone();
-    let result = executor.execute(confirmed).map_err(|e| format!("{e:#}"));
+    let result = executor.execute(confirmed);
     ExecDone::Generic {
         action: Box::new(action),
         executor_name: executor.name().to_string(),
@@ -5551,7 +5549,7 @@ fn exec_work_replace(
 }
 
 fn exec_work_restore(undo: executors::Undo) -> ExecDone {
-    ExecDone::RestoreForm(undo.undo().map_err(|e| format!("{e:#}")))
+    ExecDone::RestoreForm(undo.undo())
 }
 
 /// Issue #227: runs a worker's whole computation and turns a panic into the
@@ -6749,7 +6747,7 @@ mod tests {
     fn an_executor_result_box_is_freed_when_dropped_unhandled() {
         use windows::Win32::Foundation::LPARAM;
         let done: std::result::Result<ExecDone, String> =
-            Ok(ExecDone::RestoreForm(Err("x".to_string())));
+            Ok(ExecDone::RestoreForm(Err(anyhow::anyhow!("x"))));
         let boxed = Box::into_raw(Box::new(done));
         assert!(super::free_boxed_payload(
             WM_APP_EXECUTOR_DONE,
@@ -6793,14 +6791,18 @@ mod tests {
         let ok = exec_work_form_fill(&FakeExecutor { fail: false }, fake_confirmed());
         assert!(matches!(ok, ExecDone::FormFill(Ok(ref u)) if u.summary == "did it"));
         let bad = exec_work_calendar(&FakeExecutor { fail: true }, fake_confirmed());
-        assert!(matches!(bad, ExecDone::Calendar(Err(ref e)) if e.contains("the write failed")));
+        assert!(
+            matches!(bad, ExecDone::Calendar(Err(ref e)) if format!("{e:#}").contains("the write failed"))
+        );
     }
 
     #[test]
     fn a_failed_restore_comes_back_as_an_error_message() {
         let undo = executors::Undo::recording("x", || anyhow::bail!("could not put it back"));
         let done = exec_work_restore(undo);
-        assert!(matches!(done, ExecDone::RestoreForm(Err(ref e)) if e.contains("put it back")));
+        assert!(
+            matches!(done, ExecDone::RestoreForm(Err(ref e)) if format!("{e:#}").contains("put it back"))
+        );
     }
 
     /// #712: no executor or undo runs on the UI thread, which is also the
