@@ -1445,15 +1445,32 @@ impl App {
         self.palette.set_router_pending(generation);
 
         std::thread::spawn(move || {
-            let result: std::result::Result<router::RouterResult, String> = catch_worker(|| {
-                router_worker(&providers, mode, &mut raw, redact, &candidates).map_err(|e| {
-                    let chain_text = worker_error_chain_text(&e);
-                    pack_error(
-                        &human_error_detail(&chain_text),
-                        &crate::egress::redact_opaque_tokens(&chain_text),
-                    )
-                })
+            // The call runs on its own thread so the wait can be capped: past
+            // `ROUTER_WALL_CLOCK` the placeholder is cleared and the late
+            // answer, if any, is dropped with the channel.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result: std::result::Result<router::RouterResult, String> =
+                    catch_worker(|| {
+                        router_worker(&providers, mode, &mut raw, redact, &candidates).map_err(
+                            |e| {
+                                let chain_text = worker_error_chain_text(&e);
+                                pack_error(
+                                    &human_error_detail(&chain_text),
+                                    &crate::egress::redact_opaque_tokens(&chain_text),
+                                )
+                            },
+                        )
+                    });
+                let _ = tx.send(result);
             });
+            let result =
+                router::await_result(&rx, router::ROUTER_WALL_CLOCK).unwrap_or_else(|| {
+                    Err(pack_error(
+                        "The router took too long.",
+                        "router: no answer within the wall-clock cap",
+                    ))
+                });
             let payload = Box::into_raw(Box::new((generation, result)));
             unsafe {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(

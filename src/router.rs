@@ -70,6 +70,19 @@ pub const ROUTER_IMAGE_MAX_PIXELS: u64 =
 /// does not think, since only generated tokens are billed.
 pub const ROUTER_MAX_TOKENS: u32 = 1000;
 
+/// How long the palette waits for the router before it gives up and clears
+/// its "Looking at your screen..." line. The hint is a bonus, so a slow
+/// local model that talks on for the whole token budget must not keep the
+/// line up for minutes. The call itself still ends on its own HTTP timeout;
+/// only the wait is capped.
+pub const ROUTER_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits at most `cap` for the router's result. `None` means the cap passed
+/// (or the worker died without answering), and the caller shows no hint.
+pub fn await_result<T>(rx: &std::sync::mpsc::Receiver<T>, cap: std::time::Duration) -> Option<T> {
+    rx.recv_timeout(cap).ok()
+}
+
 /// `palette.router_threshold`'s default (`config.rs`'s `Palette::default`
 /// must match this exactly -- `router_threshold_config_default_matches_router_module`
 /// below proves it). #24's Done-when doesn't name a number; 0.7 mirrors the
@@ -317,8 +330,10 @@ pub fn cheapest_router_target(
 /// list (`ProviderConfig::models`, authored newest/flagship-first -- see
 /// `config.rs`'s `Providers::default` comment on `openai.models`).
 ///
-/// Checks, in priority order, for a name containing a small/fast market
-/// marker (`nano`, `mini`, `haiku`, `flash-lite`, `flash`, `lite`) -- this
+/// Checks, in priority order, for a name with a small/fast market marker as
+/// a whole `-`/`.` separated segment (`nano`, `mini`, `haiku`, `flash` with
+/// `lite`, `flash`, `lite`; never a substring, since "mini" is inside
+/// "gemini") -- this
 /// matches every provider's OWN naming convention for its cheapest tier as
 /// configured by `Providers::default` today (`gpt-5.4-nano`,
 /// `claude-haiku-4-5`, `gemini-3.8-flash`). Falls back to the LAST list
@@ -477,6 +492,24 @@ mod tests {
         let req = build_request(vec![], &[]);
         assert!(req.system.contains("no actions available"));
         assert!(req.schema.is_some());
+    }
+
+    #[test]
+    fn await_result_returns_a_prompt_answer_and_none_after_the_cap() {
+        use std::time::Duration;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(7).unwrap();
+        assert_eq!(await_result(&rx, Duration::from_secs(5)), Some(7));
+        // Nothing arrives: the sender is alive but silent (a slow model).
+        let (_tx2, rx2) = std::sync::mpsc::channel::<i32>();
+        let start = std::time::Instant::now();
+        assert_eq!(await_result(&rx2, Duration::from_millis(40)), None);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // The worker died without sending.
+        let (tx3, rx3) = std::sync::mpsc::channel::<i32>();
+        drop(tx3);
+        assert_eq!(await_result(&rx3, Duration::from_secs(5)), None);
+        assert!(ROUTER_WALL_CLOCK <= Duration::from_secs(15));
     }
 
     /// #725: the cap covers thinking tokens, so it must stay well above the
