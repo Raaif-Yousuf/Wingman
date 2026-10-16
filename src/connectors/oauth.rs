@@ -458,9 +458,18 @@ fn read_request_head(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// How long past the deadline the caller waits for the watchdog's wake-up
+/// connect before it gives up on the blocked accept and reports the timeout
+/// itself.
+const WAKE_GRACE: Duration = Duration::from_secs(2);
+
 /// Waits for the redirect and returns the authorization code. The accept is
 /// blocking, so nothing runs while the user is in the browser; a watchdog
-/// thread wakes it by connecting to the port when `timeout` passes. Requests
+/// thread wakes it by connecting to the port when `timeout` passes. If that
+/// connect fails (security software dropping loopback, a full backlog) the
+/// accept stays blocked, so it runs on its own thread and this function stops
+/// waiting for it after [`WAKE_GRACE`]: the timeout still ends in a card. The
+/// abandoned thread ends with the process or the next connection. Requests
 /// that are not the real redirect (wrong path, wrong or missing `state`,
 /// including an `error` with the wrong `state`) are answered and ignored, so
 /// another page on this PC cannot abort or complete a sign-in it did not
@@ -470,15 +479,44 @@ fn wait_for_code(
     expected_state: &str,
     timeout: Duration,
 ) -> Result<String> {
+    wait_for_code_with(listener, expected_state, timeout, wake_listener)
+}
+
+/// Connects to the listener's own port so a blocked `accept` returns.
+/// False when the connect failed.
+fn wake_listener(addr: std::net::SocketAddr) -> bool {
+    TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
+}
+
+fn wait_for_code_with(
+    listener: &TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+    wake: fn(std::net::SocketAddr) -> bool,
+) -> Result<String> {
     let deadline = Instant::now() + timeout;
     let addr = listener.local_addr()?;
+    let accepting = listener.try_clone().context("loopback listener failed")?;
+    let state = expected_state.to_string();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<String>>();
+    std::thread::spawn(move || {
+        let _ = result_tx.send(accept_until_redirect(&accepting, &state, deadline));
+    });
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
         if done_rx.recv_timeout(timeout) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-            let _ = TcpStream::connect_timeout(&addr, Duration::from_secs(1));
+            let _ = wake(addr);
         }
     });
-    let result = accept_until_redirect(listener, expected_state, deadline);
+    let result = match result_rx.recv_timeout(timeout + WAKE_GRACE) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
+            "timed out waiting for sign-in to finish in the browser"
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("loopback listener failed"))
+        }
+    };
     drop(done_tx);
     let _ = watchdog.join();
     result
@@ -746,12 +784,22 @@ mod tests {
     /// Every test that reaches the Offline guard takes the shared mode lock
     /// and pins the mode, so a test in another module that sets Offline
     /// cannot leak into it.
-    fn online() -> std::sync::MutexGuard<'static, ()> {
+    ///
+    /// The egress-log lock comes first (the order `provider::common` uses):
+    /// the real transport appends a row to the shared test log, which other
+    /// tests save and restore.
+    fn online() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let egress = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let guard = crate::mode::MODE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::mode::set_current(crate::mode::Mode::Auto);
-        guard
+        (egress, guard)
     }
 
     // -- PKCE ------------------------------------------------------------
@@ -1162,7 +1210,10 @@ mod tests {
         }
     }
 
-    fn offline_google() -> std::sync::MutexGuard<'static, ()> {
+    fn offline_google() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
         let guard = online();
         crate::mode::set_current(crate::mode::Mode::Offline);
         guard
@@ -1329,6 +1380,87 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn authorize_ends_in_a_timeout_when_the_watchdog_cannot_wake_the_accept() {
+        // The wake-up connect failing (security software dropping loopback)
+        // used to leave `accept` blocked past the deadline for good.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let started = Instant::now();
+        let err = wait_for_code_with(&listener, "state", Duration::from_millis(200), |_| false)
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "gave up too late: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_working_wake_up_still_ends_the_wait_at_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let started = Instant::now();
+        let err = wait_for_code_with(
+            &listener,
+            "state",
+            Duration::from_millis(200),
+            wake_listener,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < WAKE_GRACE, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn the_egress_row_for_sign_in_traffic_holds_no_query_form_or_reply_secret() {
+        let _mode = online();
+        let reply = token_json("ACCESSLEAK", Some("REFRESHLEAK"));
+        let ep = fake_endpoint(vec![(200, reply), (400, "BODYLEAK".to_string())]);
+        let log = crate::egress::log_path().unwrap();
+        let saved = std::fs::read_to_string(&log).unwrap_or_default();
+        let url = format!("{}/token?client_secret=QUERYLEAK#FRAGLEAK", ep.base);
+        let form = [
+            ("code", "CODELEAK"),
+            ("code_verifier", "VERIFIERLEAK"),
+            ("refresh_token", "FORMTOKENLEAK"),
+        ];
+        UreqTransport.post_form(&url, &form).unwrap();
+        UreqTransport.post_form(&url, &form).unwrap();
+        let after = std::fs::read_to_string(&log).unwrap_or_default();
+        std::fs::write(&log, &saved).unwrap();
+
+        let before_rows = saved.replace('\r', "").lines().count();
+        let rows: Vec<String> = after
+            .replace('\r', "")
+            .lines()
+            .skip(before_rows)
+            .map(str::to_string)
+            .collect();
+        let host = ep.base.trim_start_matches("http://").to_string();
+        let mine: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains(&format!("oauth {host}/token")))
+            .collect();
+        assert_eq!(mine.len(), 2, "one row per request: {rows:?}");
+        for row in &mine {
+            for secret in [
+                "QUERYLEAK",
+                "FRAGLEAK",
+                "CODELEAK",
+                "VERIFIERLEAK",
+                "FORMTOKENLEAK",
+                "ACCESSLEAK",
+                "REFRESHLEAK",
+                "BODYLEAK",
+                "client_secret",
+            ] {
+                assert!(!row.contains(secret), "{secret} reached the log: {row}");
+            }
+        }
+        assert!(mine[0].contains("\"outcome\":\"success\""), "{}", mine[0]);
+        assert!(mine[1].contains("HTTP 400"), "{}", mine[1]);
     }
 
     #[test]
