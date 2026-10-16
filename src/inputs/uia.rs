@@ -121,7 +121,11 @@ pub enum FieldValue {
     /// `IsPassword` was true. The real value was never read into this
     /// process for this element -- see [`com::extract`]'s doc comment.
     Redacted,
+    /// The control has a `ValuePattern` and it reads as empty.
     Empty,
+    /// The control has no `ValuePattern`, so its text could not be read. It
+    /// may hold text, so this is NOT the same as `Empty` (#675).
+    Unreadable,
 }
 
 #[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
@@ -273,7 +277,8 @@ fn build_snapshot(elements: &[RawElement]) -> Vec<FieldSnapshot> {
         } else {
             match &el.value {
                 Some(v) if !v.is_empty() => FieldValue::Text(v.clone()),
-                _ => FieldValue::Empty,
+                Some(_) => FieldValue::Empty,
+                None => FieldValue::Unreadable,
             }
         };
 
@@ -375,7 +380,7 @@ fn format_line(field: &FieldSnapshot) -> String {
             line.push_str(v);
         }
         FieldValue::Redacted => line.push_str(": [redacted]"),
-        FieldValue::Text(_) | FieldValue::Empty => {}
+        FieldValue::Text(_) | FieldValue::Empty | FieldValue::Unreadable => {}
     }
 
     if !field.enabled {
@@ -1356,7 +1361,7 @@ mod tests {
             },
         ];
         let fields = build_snapshot(&elements);
-        assert_eq!(fields[0].value, FieldValue::Empty);
+        assert_eq!(fields[0].value, FieldValue::Unreadable);
         assert_eq!(fields[1].value, FieldValue::Empty);
     }
 

@@ -765,6 +765,24 @@ pub(crate) fn offline_guard(url: &str) -> Result<()> {
     }
 }
 
+/// #674: Local mode is loopback only too (the Modes table), but its provider
+/// selection already keeps cloud requests from being built, so
+/// `offline_guard` does not need to refuse in Local. A request that is not a
+/// provider call (a cloud model-list lookup carries the saved API key) has no
+/// such selection in front of it, so it gets this stricter check at the send
+/// itself. It fails closed: a non-loopback host is allowed only when the mode
+/// is positively Auto or Cloud; any other mode refuses it.
+pub(crate) fn loopback_only_guard(url: &str) -> Result<()> {
+    offline_guard(url)?;
+    match crate::mode::current() {
+        crate::mode::Mode::Auto | crate::mode::Mode::Cloud => Ok(()),
+        _ if crate::mode::classify_host(url) == crate::mode::HostClass::Loopback => Ok(()),
+        _ => Err(anyhow!(
+            "Local mode blocked a request to a non-local address. Switch to Auto or Cloud to allow it."
+        )),
+    }
+}
+
 /// #505: the body that actually leaves, given the request's URL, and the
 /// private details taken out of it. A request that could leave this machine
 /// has the text in its body redacted with the screenshot step's four kinds
@@ -851,7 +869,7 @@ pub(crate) fn get_json_with_headers(
     timeout: Duration,
     tag: &str,
 ) -> Result<String> {
-    offline_guard(url)?;
+    loopback_only_guard(url)?;
 
     let result = get_with_headers_raw(url, headers, timeout);
     let (outcome, received, error) = match &result {
@@ -2486,6 +2504,38 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Offline"), "{msg}");
         assert!(!msg.contains("sk-test"), "{msg}");
+    }
+
+    /// #674: Local mode keeps saved API keys off the cloud vendors' model
+    /// list endpoints, and a loopback list (a local server) still works.
+    #[test]
+    fn the_model_list_get_is_refused_in_local_mode_for_a_cloud_host() {
+        /// Puts the mode back to Auto even when an assert fails.
+        struct RestoreMode;
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                crate::mode::set_current(crate::mode::Mode::Auto);
+            }
+        }
+        let _g = network_guard();
+        let _restore = RestoreMode;
+        crate::mode::set_current(crate::mode::Mode::Local);
+        let err = get_json_with_headers(
+            "https://api.anthropic.com/v1/models",
+            &[("x-api-key", "sk-test")],
+            Duration::from_secs(1),
+            "anthropic models",
+        )
+        .unwrap_err();
+        let loopback = loopback_only_guard("http://127.0.0.1:9/v1/models");
+        crate::mode::set_current(crate::mode::Mode::Cloud);
+        let cloud = loopback_only_guard("https://api.openai.com/v1/models");
+        let msg = err.to_string();
+        assert!(msg.contains("Local"), "{msg}");
+        assert!(!msg.contains("sk-test"), "{msg}");
+        assert!(!msg.contains('\u{2014}'), "rule 11: {msg}");
+        assert!(loopback.is_ok());
+        assert!(cloud.is_ok(), "Cloud and Auto still list models");
     }
 
     #[test]

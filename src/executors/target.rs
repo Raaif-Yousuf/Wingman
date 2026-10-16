@@ -17,7 +17,7 @@
 //! support it. `fill_form` (#33) calls `write_with_fallback`, whose real
 //! (`com::UiaTextElementAccess`) implementation additionally falls back to
 //! focus plus typed Unicode input ([`plan_typed_input`]) for a control that
-//! exposes no `ValuePattern` and is an `Edit` or `ComboBox` ([`plan_typed_fallback`]).
+//! exposes no `ValuePattern` and is an `Edit` ([`plan_typed_fallback`]).
 //! The default trait implementation is just `write` -- only the real,
 //! UIA-backed implementation overrides it, so every fake used by this
 //! file's and `fill_form.rs`'s tests gets plain `write` semantics with no
@@ -308,6 +308,39 @@ pub fn plan_typed_fallback(control_type: &str, new_text: &str) -> Result<TypedRe
         text,
     })
 }
+/// The go/no-go for sending keystrokes into a field (#676). Select-all plus
+/// typed text is the most destructive thing Wingman sends, and it goes to
+/// whatever has keyboard focus, so it is sent only when every check ran and
+/// agrees: the focused UIA element is the target (`same_element`), and the
+/// foreground window's top-level window is the target's (`foreground_root`
+/// equals `target_root`, neither null). A check that could not run is `None`,
+/// and that refuses too: when in doubt, nothing is typed.
+pub fn confirm_typed_focus(
+    same_element: Option<bool>,
+    foreground_root: Option<isize>,
+    target_root: Option<isize>,
+) -> Result<()> {
+    let in_front = matches!(
+        (foreground_root, target_root),
+        (Some(f), Some(t)) if f != 0 && f == t
+    );
+    if same_element == Some(true) && in_front {
+        return Ok(());
+    }
+    let wrong_window = matches!(
+        (foreground_root, target_root),
+        (Some(f), Some(t)) if f != t
+    );
+    if wrong_window {
+        return Err(anyhow!(
+            "the window with this field is not in front, so Wingman typed nothing into it. Click the field and type the value yourself."
+        ));
+    }
+    Err(anyhow!(
+        "Wingman could not confirm the cursor is in this field, so it typed nothing into it. Click the field and type the value yourself."
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // The injectable seam (mirrors executors::clipboard::ClipboardAccess)
 // ---------------------------------------------------------------------------
@@ -359,9 +392,9 @@ pub mod com {
     #![allow(dead_code)]
 
     use super::{
-        degraded_control_type, ensure_unchanged, guard_skipped, plan_typed_fallback, resolve_index,
-        resolve_password_read, MatchOutcome, ResolvedElement, TargetRef, TextElementAccess,
-        TypedReplacePlan, UnicodeKeyEvent,
+        confirm_typed_focus, degraded_control_type, ensure_unchanged, guard_skipped,
+        plan_typed_fallback, resolve_index, resolve_password_read, MatchOutcome, ResolvedElement,
+        TargetRef, TextElementAccess, TypedReplacePlan, UnicodeKeyEvent,
     };
     use anyhow::Result;
     use windows::core::{Interface, BSTR};
@@ -384,6 +417,8 @@ pub mod com {
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
         VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL,
     };
+
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
 
     use crate::hotkey::INJECTED_MARKER;
 
@@ -779,14 +814,60 @@ pub mod com {
         }
     }
 
+    /// Reads the live focus facts and hands them to the pure
+    /// [`confirm_typed_focus`]. Any read that fails becomes `None`, which
+    /// refuses.
+    ///
+    /// Focus arrives asynchronously after `SetFocus` (slow apps such as
+    /// browsers), so a failed probe is retried once after a short one-off
+    /// wait before refusing.
+    fn probe_typed_focus(
+        automation: &IUIAutomation,
+        element: &IUIAutomationElement,
+        hwnd: HWND,
+    ) -> Result<()> {
+        if probe_typed_focus_once(automation, element, hwnd).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        probe_typed_focus_once(automation, element, hwnd)
+    }
+
+    fn probe_typed_focus_once(
+        automation: &IUIAutomation,
+        element: &IUIAutomationElement,
+        hwnd: HWND,
+    ) -> Result<()> {
+        let same = unsafe { automation.GetFocusedElement() }
+            .ok()
+            .and_then(|focused| unsafe { automation.CompareElements(&focused, element) }.ok())
+            .map(|b| b.as_bool());
+        let root_of = |w: HWND| -> Option<isize> {
+            if w.0.is_null() {
+                return None;
+            }
+            let root = unsafe { GetAncestor(w, GA_ROOT) };
+            (!root.0.is_null()).then_some(root.0 as isize)
+        };
+        let foreground = root_of(unsafe { GetForegroundWindow() });
+        confirm_typed_focus(same, foreground, root_of(hwnd))
+    }
+
     /// Runs a [`TypedReplacePlan`]. Select-all (and delete) is sent first and
     /// on its own: if it cannot be sent, nothing is typed and this errs, so a
     /// failed clear never turns into an append (#592).
-    fn inject_typed_replace(plan: &TypedReplacePlan) -> Result<()> {
+    ///
+    /// `still_focused` is checked again after the select-all and before
+    /// anything is deleted or typed (#676): focus can move in between.
+    fn inject_typed_replace(
+        plan: &TypedReplacePlan,
+        still_focused: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
         if plan.select_all {
             send_select_all(&real_sender).map_err(|e| {
                 anyhow::anyhow!("could not select the existing text, so nothing was typed: {e}")
             })?;
+            still_focused()?;
         }
         if plan.delete_selection {
             send_all(
@@ -874,7 +955,11 @@ pub mod com {
                     // plan_typed_input never emits Enter/Tab, so this can
                     // never submit or focus-advance out of the field.
                     unsafe { matched.element.SetFocus() }.map_err(|_| e)?;
-                    inject_typed_replace(&plan)
+                    // #676: SetFocus returning Ok does not mean the keyboard
+                    // is in this field or that its window is in front.
+                    let focused = || probe_typed_focus(&automation, &matched.element, hwnd);
+                    focused()?;
+                    inject_typed_replace(&plan, &focused)
                 }
             }
         }
@@ -1172,6 +1257,32 @@ mod tests {
     }
 
     // -- #590: one unreadable element costs only itself ---------------------
+
+    #[test]
+    fn focus_is_confirmed_only_when_every_check_ran_and_agrees() {
+        assert!(confirm_typed_focus(Some(true), Some(7), Some(7)).is_ok());
+        // The focused element is not the target.
+        assert!(confirm_typed_focus(Some(false), Some(7), Some(7)).is_err());
+        // Another window is in front.
+        assert!(confirm_typed_focus(Some(true), Some(8), Some(7)).is_err());
+        // No foreground window at all (0 is the null handle).
+        assert!(confirm_typed_focus(Some(true), Some(0), Some(0)).is_err());
+    }
+
+    #[test]
+    fn focus_check_that_could_not_run_fails_closed() {
+        assert!(confirm_typed_focus(None, Some(7), Some(7)).is_err());
+        assert!(confirm_typed_focus(Some(true), None, Some(7)).is_err());
+        assert!(confirm_typed_focus(Some(true), Some(7), None).is_err());
+        let msg = confirm_typed_focus(Some(false), Some(7), Some(7))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("typed nothing into it") && !msg.contains('\u{2014}'));
+        let front = confirm_typed_focus(Some(true), Some(8), Some(7))
+            .unwrap_err()
+            .to_string();
+        assert!(front.contains("not in front"), "{front}");
+    }
 
     #[test]
     fn an_unreadable_control_type_degrades_to_other() {
