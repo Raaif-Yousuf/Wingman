@@ -805,7 +805,6 @@ impl App {
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
         let prompt = self.config.ui.prompt.clone();
-        let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
         let redact = self.config.capture.redact;
 
@@ -823,7 +822,6 @@ impl App {
                         &raw,
                         foreground_hwnd_isize,
                         &prompt,
-                        want_difficulty,
                     )
                 })()
                 .map_err(|e| {
@@ -3423,13 +3421,11 @@ impl App {
 /// `%APPDATA%\Wingman\actions.toml`) and runs the hotkey's one default
 /// action (`actions::DEFAULT_ACTION_ID`, "Check my work") through it,
 /// instead of building the physics request straight from config. `ui_prompt`
-/// and `ui_show_difficulty` are `config.ui.prompt` /
-/// `config.ui.show_difficulty` exactly as before -- see the design spec's
-/// "Origin tracking" section for why they are only the FALLBACK now, not
-/// the only source: an `actions.toml` override of the default action's
-/// `prompt` wins outright (Origin::User), while `ui_show_difficulty` and
-/// the action's own `rate_difficulty` OR together, so the existing global
-/// toggle keeps working as an override for existing users (#197 part 2).
+/// is `config.ui.prompt` exactly as before -- see the design spec's
+/// "Origin tracking" section for why it is only the FALLBACK now, not the
+/// only source: an `actions.toml` override of the default action's `prompt`
+/// wins outright (Origin::User). The difficulty rating comes only from the
+/// action's own `rate_difficulty` (#197).
 ///
 /// A malformed `actions.toml`, or the default action being disabled/missing,
 /// surfaces as `Err` here exactly like any other worker failure -- `ask()`'s
@@ -3442,7 +3438,6 @@ fn worker(
     raw: &capture::RawShot,
     foreground_hwnd: isize,
     ui_prompt: &str,
-    ui_show_difficulty: bool,
 ) -> Result<Answer> {
     let resolved = actions::load_actions().context("failed to load actions")?;
     let default = actions::default_action(&resolved).with_context(|| {
@@ -3452,8 +3447,7 @@ fn worker(
         )
     })?;
 
-    let (prompt, want_difficulty) =
-        resolve_prompt_and_difficulty(default, ui_prompt, ui_show_difficulty);
+    let (prompt, want_difficulty) = resolve_prompt_and_difficulty(default, ui_prompt);
 
     let ollama_ready = mode == Mode::Auto
         && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
@@ -4141,21 +4135,17 @@ fn gather_generic_inputs(
 /// - The prompt: an `actions.toml` override (`Origin::User`) wins outright;
 ///   otherwise `ui_prompt` (today's only source, `config.ui.prompt`)
 ///   applies unchanged.
-/// - The difficulty flag: `ui_show_difficulty` (the existing global
-///   override, #197 part 1) and the resolved action's own
-///   `rate_difficulty` (#197 part 2) OR together -- either one being on is
-///   enough.
+/// - The difficulty flag: only the resolved action's own `rate_difficulty`.
+///   The old global `ui.show_difficulty` setting is gone (#197).
 fn resolve_prompt_and_difficulty<'a>(
     default: &'a actions::Resolved,
     ui_prompt: &'a str,
-    ui_show_difficulty: bool,
 ) -> (&'a str, bool) {
     let prompt = match default.origin {
         actions::Origin::User => default.action.prompt.as_str(),
         actions::Origin::Builtin => ui_prompt,
     };
-    let want_difficulty = ui_show_difficulty || default.action.rate_difficulty;
-    (prompt, want_difficulty)
+    (prompt, default.action.rate_difficulty)
 }
 
 /// Issue #181: which action a pause-toggle-chord press should take. Pure
@@ -5439,7 +5429,7 @@ mod tests {
         // config.ui.prompt says, regardless of the built-in's own prompt
         // text.
         let r = resolved(Origin::Builtin, "builtin default text", false);
-        let (prompt, _) = resolve_prompt_and_difficulty(&r, "config.toml prompt", false);
+        let (prompt, _) = resolve_prompt_and_difficulty(&r, "config.toml prompt");
         assert_eq!(prompt, "config.toml prompt");
     }
 
@@ -5448,35 +5438,26 @@ mod tests {
         // #23's Done-when: a user action overriding a built-in's prompt is
         // what runs.
         let r = resolved(Origin::User, "overridden prompt", false);
-        let (prompt, _) = resolve_prompt_and_difficulty(&r, "config.toml prompt", false);
+        let (prompt, _) = resolve_prompt_and_difficulty(&r, "config.toml prompt");
         assert_eq!(prompt, "overridden prompt");
     }
 
     #[test]
-    fn difficulty_flags_or_together() {
-        for (ui_flag, action_flag, expected) in [
-            (false, false, false),
-            (true, false, true),
-            (false, true, true),
-            (true, true, true),
-        ] {
+    fn difficulty_follows_only_the_actions_own_flag() {
+        for action_flag in [false, true] {
             let r = resolved(Origin::Builtin, "p", action_flag);
-            let (_, want_difficulty) = resolve_prompt_and_difficulty(&r, "p", ui_flag);
-            assert_eq!(
-                want_difficulty, expected,
-                "ui_flag={ui_flag} action_flag={action_flag}"
-            );
+            let (_, want_difficulty) = resolve_prompt_and_difficulty(&r, "p");
+            assert_eq!(want_difficulty, action_flag);
         }
     }
 
     #[test]
     fn fresh_install_defaults_send_no_difficulty_rubric() {
-        // Both #197 part 1 (ui.show_difficulty default false) and #197 part
-        // 2 (rate_difficulty default false) must combine to "off", matching
-        // today's already-shipped default (commit d88f78b).
+        // `rate_difficulty` defaults to false, so a fresh install sends no
+        // rubric (#197).
         let r = resolved(Origin::Builtin, crate::provider::DEFAULT_PROMPT, false);
         let (prompt, want_difficulty) =
-            resolve_prompt_and_difficulty(&r, crate::provider::DEFAULT_PROMPT, false);
+            resolve_prompt_and_difficulty(&r, crate::provider::DEFAULT_PROMPT);
         assert_eq!(prompt, crate::provider::DEFAULT_PROMPT);
         assert!(!want_difficulty);
     }

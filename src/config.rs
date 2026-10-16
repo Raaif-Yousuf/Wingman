@@ -562,18 +562,6 @@ pub struct Ui {
     /// number with no such monitor falls back to the cursor's. Anything
     /// else also means `"cursor"`.
     pub card_monitor: String,
-    /// Show the 1-10/Ultra difficulty badge in the card's bottom-right
-    /// corner. When off, the rating is not requested from the model at all,
-    /// so the rubric costs nothing on every call. Defaults to `false`
-    /// (issue #197, owner decision 2026-09-17): the rating is being moved
-    /// out of the core app and into the "Check my work" action (#37) as an
-    /// opt-in, student-oriented option, so no user should pay its ~500
-    /// system-prompt tokens per press unless they turn it on. `#[serde(default)]`
-    /// only fills this in when the key is *absent* from config.toml, so an
-    /// existing user who already has `show_difficulty = true` on disk keeps
-    /// seeing the badge; only a fresh config (or one where the user never set
-    /// the key) picks up the new `false` default.
-    pub show_difficulty: bool,
     /// System prompt, editable by the user in the TOML file.
     pub prompt: String,
 }
@@ -585,7 +573,6 @@ impl Default for Ui {
             text_scale: 1.0,
             card_corner: CardCorner::default(),
             card_monitor: "cursor".to_string(),
-            show_difficulty: false,
             prompt: DEFAULT_PROMPT.to_string(),
         }
     }
@@ -1811,7 +1798,6 @@ win = true
         assert_eq!(config.capture.max_edge, 1568);
         assert_eq!(config.capture.ocr_language, "auto");
         assert_eq!(config.ui.card_seconds, 12);
-        assert!(!config.ui.show_difficulty);
         // The file should now exist, created from defaults.
         assert!(path.exists());
 
@@ -2820,32 +2806,22 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         );
     }
 
-    // -- #197: show_difficulty default flipped to false ---------------------
+    // -- #197: the global show_difficulty setting is retired ----------------
 
     #[test]
-    fn default_show_difficulty_is_false() {
-        // Owner decision 2026-09-17: the difficulty rating is being moved
-        // out of the core app, so a fresh config must not request or pay
-        // for the rubric unless the user opts in.
-        assert!(!Config::default().ui.show_difficulty);
-    }
-
-    #[test]
-    fn an_existing_config_with_show_difficulty_true_keeps_it_on_load() {
-        // #[serde(default)] only fills a field in when the key is absent
-        // from the TOML text. A config.toml written by an older build (or
-        // hand-edited) with `show_difficulty = true` must not be silently
-        // flipped off just because the shipped default changed.
-        let toml_str = "[ui]\nshow_difficulty = true\n";
+    fn an_old_config_with_show_difficulty_still_loads_and_the_key_is_dropped_on_save() {
+        // Decision: the difficulty rating lives only on the Check my work
+        // action (`rate_difficulty`). Older config.toml files still carry
+        // `ui.show_difficulty`; it must not break the load, must not evict
+        // the neighbouring values, and is not written back.
+        let toml_str = "[ui]\ncard_seconds = 33\nshow_difficulty = true\n";
         let cfg = Config::parse_or_default(toml_str);
-        assert!(cfg.ui.show_difficulty);
-    }
-
-    #[test]
-    fn an_older_config_missing_show_difficulty_backfills_to_the_new_default() {
-        let toml_str = "[capture]\nmax_edge = 999\n";
-        let cfg = Config::parse_or_default(toml_str);
-        assert!(!cfg.ui.show_difficulty);
+        assert_eq!(cfg.ui.card_seconds, 33);
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(
+            !text.contains("show_difficulty"),
+            "a retired key must not be written back"
+        );
     }
 
     // -- copilot-ask -> Wingman config migration -----------------------------
@@ -3908,7 +3884,6 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         assert_eq!(cfg.capture.monitor, "primary");
         assert_eq!(cfg.ui.card_seconds, 45);
         assert_eq!(cfg.ui.text_scale, 1.25);
-        assert!(!cfg.ui.show_difficulty);
         assert_eq!(
             cfg.ui.prompt,
             "Pre-rename custom prompt: check only the arithmetic."
@@ -3971,7 +3946,6 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         assert_eq!(cfg.capture.monitor, "active");
         assert_eq!(cfg.ui.card_seconds, 8);
         assert_eq!(cfg.ui.text_scale, 1.5);
-        assert!(!cfg.ui.show_difficulty);
         assert_eq!(cfg.ui.prompt, "Post-rename, pre-expansion custom prompt.");
         assert_eq!(cfg.providers.order, vec!["openai", "anthropic"]);
         assert_eq!(cfg.providers.openai.model, "gpt-5.1");
@@ -4029,7 +4003,6 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         assert_eq!(cfg.capture.monitor, "primary");
         assert_eq!(cfg.ui.card_seconds, 30);
         assert_eq!(cfg.ui.text_scale, 0.9);
-        assert!(cfg.ui.show_difficulty);
         assert_eq!(cfg.ui.prompt, "Before-Modes custom prompt: focus on units.");
         assert_eq!(cfg.providers.order, vec!["ollama", "anthropic", "openai"]);
         assert_eq!(cfg.providers.openai.model, "gpt-5.2");

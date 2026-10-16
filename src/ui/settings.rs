@@ -620,7 +620,6 @@ const ID_ANTHROPIC_EFFORT: i32 = 108;
 const ID_MAX_EDGE: i32 = 109;
 const ID_MONITOR: i32 = 110;
 const ID_CARD_SECONDS: i32 = 111;
-const ID_SHOW_DIFFICULTY: i32 = 112;
 const ID_TEXT_SCALE_TRACK: i32 = 113;
 const ID_TEXT_SCALE_LABEL: i32 = 114;
 const ID_PROMPT_EDIT: i32 = 115;
@@ -664,7 +663,6 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_MAX_EDGE", ID_MAX_EDGE),
     ("ID_MONITOR", ID_MONITOR),
     ("ID_CARD_SECONDS", ID_CARD_SECONDS),
-    ("ID_SHOW_DIFFICULTY", ID_SHOW_DIFFICULTY),
     ("ID_TEXT_SCALE_TRACK", ID_TEXT_SCALE_TRACK),
     ("ID_TEXT_SCALE_LABEL", ID_TEXT_SCALE_LABEL),
     ("ID_PROMPT_EDIT", ID_PROMPT_EDIT),
@@ -2189,18 +2187,6 @@ fn build_ui_recorded(
         ROW_H,
         ID_CARD_SECONDS,
     );
-    let show_diff = ctx.create(
-        WC_BUTTON,
-        "Show difficulty rating",
-        BS_AUTOCHECKBOX as u32,
-        0,
-        r.x + 260 + 50 + 12,
-        r.y,
-        r.w - (260 + 50 + 12),
-        ROW_H,
-        ID_SHOW_DIFFICULTY,
-    );
-    set_checkbox(show_diff, config.ui.show_difficulty);
     r.advance();
 
     ctx.create(WC_STATIC, "Text scale:", 0, 0, r.x, r.y, 70, ROW_H, 0);
@@ -2465,7 +2451,6 @@ fn build_ui_recorded(
         ID_MAX_EDGE,
         ID_MONITOR,
         ID_CARD_SECONDS,
-        ID_SHOW_DIFFICULTY,
         ID_TEXT_SCALE_TRACK,
         ID_REQUIRE_TICK_FOR,
         ID_OLLAMA_LINK,
@@ -2527,7 +2512,6 @@ struct RawForm {
     max_edge_text: String,
     monitor: String,
     card_seconds_text: String,
-    show_difficulty: bool,
     text_scale_raw: f32,
     prompt: String,
     require_tick_for: String,
@@ -2570,7 +2554,6 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
         card_seconds_text: get_dlg_item(hwnd, ID_CARD_SECONDS)
             .map(get_text)
             .unwrap_or_default(),
-        show_difficulty: checkbox_checked(hwnd, ID_SHOW_DIFFICULTY),
         text_scale_raw: get_dlg_item(hwnd, ID_TEXT_SCALE_TRACK)
             .map(|h| unsafe { SendMessageW(h, TBM_GETPOS, None, None).0 as f32 / 100.0 })
             .unwrap_or(inner.original.ui.text_scale),
@@ -2989,7 +2972,6 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     }
 
     cfg.ui.card_seconds = parse_u32_or(&raw.card_seconds_text, original.ui.card_seconds);
-    cfg.ui.show_difficulty = raw.show_difficulty;
     cfg.ui.text_scale = clamp_text_scale(raw.text_scale_raw);
     cfg.ui.prompt = if raw.prompt.trim().is_empty() {
         original.ui.prompt.clone()
@@ -3660,7 +3642,6 @@ mod tests {
             max_edge_text: original.capture.max_edge.to_string(),
             monitor: monitor_display(&original.capture.monitor),
             card_seconds_text: original.ui.card_seconds.to_string(),
-            show_difficulty: original.ui.show_difficulty,
             text_scale_raw: original.ui.text_scale,
             prompt: original.ui.prompt.clone(),
             require_tick_for: require_tick_for_label(original.forms.require_tick_for).to_string(),
@@ -3889,7 +3870,6 @@ mod tests {
         raw.openai_key = "sk-new".to_string();
         raw.max_edge_text = "2048".to_string();
         raw.card_seconds_text = "30".to_string();
-        raw.show_difficulty = false;
         raw.text_scale_raw = 1.5;
         raw.prompt = "custom prompt".to_string();
 
@@ -3901,7 +3881,6 @@ mod tests {
         assert_eq!(cfg.providers.openai.api_key, "sk-new");
         assert_eq!(cfg.capture.max_edge, 2048);
         assert_eq!(cfg.ui.card_seconds, 30);
-        assert!(!cfg.ui.show_difficulty);
         assert!((cfg.ui.text_scale - 1.5).abs() < f32::EPSILON);
         assert_eq!(cfg.ui.prompt, "custom prompt");
     }
