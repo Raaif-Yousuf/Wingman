@@ -211,11 +211,67 @@ fn env_overrides_present() -> Vec<String> {
 /// account name that happens to start with the same letters). An empty
 /// `profile` (the known-folder lookup failed) leaves `text` untouched
 /// rather than matching everything.
+///
+/// The profile is also looked for in the other forms it takes in error text
+/// (#770): with forward slashes (`C:/Users/name`) and with doubled backslashes
+/// (`C:\\Users\\name`, what a Debug-printed path looks like). A `\\?\` prefix
+/// needs nothing extra, the path after it is matched as usual. The 8.3 short
+/// form (`NAMEUS~1`) is not resolved: that needs another Win32 feature for a
+/// rare case.
 pub fn redact_user_profile(text: &str, profile: &str) -> String {
     let profile = profile.trim_end_matches(['\\', '/']);
     if profile.is_empty() {
         return text.to_string();
     }
+    let mut out = replace_profile_form(text, profile);
+    for form in [profile.replace('\\', "/"), profile.replace('\\', "\\\\")] {
+        if form != profile {
+            out = replace_profile_form(&out, &form);
+        }
+    }
+    out
+}
+
+/// The account name: the last component of the profile folder.
+fn account_name(profile: &str) -> &str {
+    profile
+        .trim_end_matches(['\\', '/'])
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+}
+
+/// Replaces the bare account name where it stands as a whole word, case
+/// insensitively (`name` in "user name failed", not in "named"). A name under
+/// three characters is left alone: it would hit ordinary words.
+pub fn redact_account_name(text: &str, name: &str) -> String {
+    if name.chars().count() < 3 {
+        return text.to_string();
+    }
+    let lower = text.to_ascii_lowercase();
+    let needle = name.to_ascii_lowercase();
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    let mut search = 0;
+    while let Some(rel) = lower[search..].find(&needle) {
+        let start = search + rel;
+        let end = start + needle.len();
+        let before_ok = !text[..start].chars().next_back().is_some_and(word);
+        let after_ok = !text[end..].chars().next().is_some_and(word);
+        if before_ok && after_ok {
+            out.push_str(&text[at..start]);
+            out.push_str("%USERNAME%");
+            at = end;
+        }
+        search = end;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+fn replace_profile_form(text: &str, profile: &str) -> String {
+    let profile = profile.trim_end_matches(['\\', '/']);
 
     let needle_lower = profile.to_ascii_lowercase();
     let mut result = String::with_capacity(text.len());
@@ -261,7 +317,21 @@ pub fn redact_user_profile(text: &str, profile: &str) -> String {
 pub fn scrub_error_chain(raw: &str, profile: &str) -> String {
     let no_tokens = crate::egress::redact_opaque_tokens(raw);
     let redacted = crate::redact::Redactions::default().redact_text(&no_tokens);
-    redact_user_profile(&redacted, profile)
+    let no_paths = redact_user_profile(&redacted, profile);
+    redact_account_name(&no_paths, account_name(profile))
+}
+
+/// [`scrub_error_chain`] for the account this process runs as. The profile
+/// folder is looked up once.
+pub fn scrub_error_chain_here(raw: &str) -> String {
+    static PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let profile = PROFILE.get_or_init(|| {
+        crate::known_folder::user_profile()
+            .ok()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    });
+    scrub_error_chain(raw, profile)
 }
 
 /// Renders `input` as a plain-text report, ready for the clipboard and for
@@ -885,6 +955,50 @@ mod tests {
         assert!(!text.contains("ana@example.com"), "{text}");
         assert!(text.contains("%USERPROFILE%"), "{text}");
         assert!(text.contains("could not create"), "{text}");
+    }
+
+    #[test]
+    fn the_profile_is_found_in_slash_doubled_and_prefixed_forms() {
+        let p = r"C:\Users\test";
+        for (raw, kept) in [
+            (
+                r"open C:/Users/test/AppData/x failed",
+                "open %USERPROFILE%/AppData/x failed",
+            ),
+            (
+                r"open C:\\Users\\test\\AppData failed",
+                r"open %USERPROFILE%\\AppData failed",
+            ),
+            (
+                r"open \\?\C:\Users\test\x failed",
+                r"open \\?\%USERPROFILE%\x failed",
+            ),
+            (
+                r"open c:\users\TEST\x failed",
+                r"open %USERPROFILE%\x failed",
+            ),
+        ] {
+            let got = redact_user_profile(raw, p);
+            assert_eq!(got, kept, "{raw}");
+            assert!(!got.to_lowercase().contains("test"), "{got}");
+        }
+    }
+
+    #[test]
+    fn the_bare_account_name_goes_at_word_boundaries_only() {
+        assert_eq!(
+            redact_account_name(
+                "user Raaif failed; raaif's file; Raaifs and xraaif stay",
+                "raaif"
+            ),
+            "user %USERNAME% failed; %USERNAME%'s file; Raaifs and xraaif stay"
+        );
+        // Names under three characters are left alone.
+        assert_eq!(redact_account_name("al went to al", "al"), "al went to al");
+        assert_eq!(redact_account_name("anything", ""), "anything");
+        // The scrub applies it after the path step.
+        let got = scrub_error_chain(r"C:\Users\Raaif\x for Raaif", r"C:\Users\Raaif");
+        assert_eq!(got, r"%USERPROFILE%\x for %USERNAME%");
     }
 
     #[test]
