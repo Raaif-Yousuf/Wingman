@@ -183,7 +183,10 @@ fn is_signed_number(cell: &str) -> bool {
         None => (rest, None),
     };
     let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-    let exponent_ok = exponent.is_none_or(|e| digits(e.strip_prefix(['+', '-']).unwrap_or(e)));
+    let exponent_ok = match exponent {
+        None => true,
+        Some(e) => digits(e.strip_prefix(['+', '-']).unwrap_or(e)),
+    };
     mantissa.chars().any(|c| c.is_ascii_digit())
         && mantissa
             .chars()
