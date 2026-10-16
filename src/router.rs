@@ -182,21 +182,18 @@ pub fn build_request(image_png: Vec<u8>, candidates: &[RouterCandidate]) -> Requ
     }
 }
 
-/// How long the router's chain may keep starting calls after it began (#792).
-/// Same length as the palette's wait for the hint: once that wait is over
-/// nobody sees an answer, so no further provider call or repair request is
-/// started (and billed). A call already in flight cannot be interrupted.
-pub const ROUTER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// The router's chain: just `provider`, never previewing, and stopping at
-/// [`ROUTER_DEADLINE`] after `started` (#792).
+/// [`ROUTER_WALL_CLOCK`] after `started` (#792). It bounds only the chain:
+/// past that point no further provider call and no repair request is
+/// started (and billed). A call already in flight is not interrupted; it
+/// ends on its own HTTP timeout.
 pub fn router_chain(
     provider: Box<dyn crate::provider::Provider>,
     started: std::time::Instant,
 ) -> Chain {
     Chain::new(vec![provider])
         .without_prompt()
-        .with_deadline(started + ROUTER_DEADLINE)
+        .with_deadline(started + ROUTER_WALL_CLOCK)
 }
 
 /// Issue #295: runs the router's request through `chain`, the same
@@ -454,7 +451,9 @@ mod tests {
         let calls = Arc::new(AtomicU32::new(0));
         // Started long enough ago that the deadline has passed by the time
         // the slow answer arrives.
-        let started = std::time::Instant::now() - ROUTER_DEADLINE;
+        let Some(started) = std::time::Instant::now().checked_sub(ROUTER_WALL_CLOCK) else {
+            return; // machine up for under 10 s: no earlier instant exists
+        };
         let chain = router_chain(Box::new(SlowBadAnswer(calls.clone())), started);
         let result = route(&chain, vec![1], &[candidate("a", "A")], || {
             Err(anyhow::anyhow!("no fallback expected"))
@@ -466,9 +465,12 @@ mod tests {
             "past the deadline: no call at all"
         );
 
+        let nearly = ROUTER_WALL_CLOCK - std::time::Duration::from_millis(20);
         let chain = router_chain(
             Box::new(SlowBadAnswer(calls.clone())),
-            std::time::Instant::now() - ROUTER_DEADLINE + std::time::Duration::from_millis(20),
+            std::time::Instant::now()
+                .checked_sub(nearly)
+                .unwrap_or(started),
         );
         let result = route(&chain, vec![1], &[candidate("a", "A")], || {
             Err(anyhow::anyhow!("no fallback expected"))
