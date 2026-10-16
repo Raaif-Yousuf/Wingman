@@ -122,3 +122,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Patched copy of rqrr 0.11.0 (#537, #616): the upstream decoder asserts and
+# can run for minutes on crafted frames, and a panic aborts the release exe.
+# See vendor/rqrr/WINGMAN_PATCHES.md.
+[patch.crates-io]
+rqrr = { path = "vendor/rqrr" }

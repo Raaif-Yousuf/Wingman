@@ -1105,4 +1105,168 @@ mod tests {
             let _ = scan(&rgba, w, h);
         }
     }
+
+    // -- the patched decoder (#537, #616) ---------------------------------------
+
+    /// A finder-like square: dark ring of `ring` pixels, light gap of `gap`,
+    /// dark stone of `stone`, drawn at (`ox`, `oy`) on an RGBA canvas.
+    fn draw_finder(
+        rgba: &mut [u8],
+        w: usize,
+        (ox, oy): (usize, usize),
+        (ring, gap, stone): (usize, usize, usize),
+        (dark, light): (u8, u8),
+    ) {
+        let size = 2 * (ring + gap) + stone;
+        let h = rgba.len() / 4 / w;
+        let mut fill = |x0: usize, y0: usize, side: usize, v: u8| {
+            for y in y0..(y0 + side).min(h) {
+                for x in x0..(x0 + side).min(w) {
+                    let i = (y * w + x) * 4;
+                    rgba[i..i + 3].fill(v);
+                }
+            }
+        };
+        fill(ox, oy, size, dark);
+        fill(ox + ring, oy + ring, size - 2 * ring, light);
+        fill(ox + ring + gap, oy + ring + gap, stone, dark);
+    }
+
+    /// `n` finder-like squares on a grid so none overlap.
+    fn grid_frame(
+        (w, h): (usize, usize),
+        n: usize,
+        shape: (usize, usize, usize),
+        levels: (u8, u8),
+    ) -> Vec<u8> {
+        let mut rgba = vec![levels.1; w * h * 4];
+        let pitch = 2 * (shape.0 + shape.1) + shape.2 + 12;
+        let cols = (w - 8) / pitch;
+        assert!(cols > 0 && n <= cols * ((h - 8) / pitch), "grid too small");
+        for k in 0..n {
+            let at = (4 + (k % cols) * pitch, 4 + (k / cols) * pitch);
+            draw_finder(&mut rgba, w, at, shape, levels);
+        }
+        rgba
+    }
+
+    /// Runs `scan` on `rgba` and checks it comes back, as a card, in time.
+    fn assert_scans_to_a_card(rgba: &[u8], w: usize, h: usize, what: &str) {
+        let started = std::time::Instant::now();
+        let found = scan(rgba, w as u32, h as u32);
+        let took = started.elapsed();
+        eprintln!("MEASURED: {what}: {took:?}, {found:?}");
+        assert!(!card_for(&found).headline.is_empty());
+        assert!(took.as_secs() < 30, "{what}: {took:?}");
+    }
+
+    #[test]
+    fn many_thin_gap_finder_shapes_come_back_as_a_card() {
+        // A ring seven times its gap: rqrr's row test accepts it, a strict
+        // 1:1:3:1:1 count does not.
+        let rgba = grid_frame((1920, 1080), 400, (7, 1, 12), (0, 255));
+        assert_scans_to_a_card(&rgba, 1920, 1080, "400 thin-gap shapes");
+    }
+
+    #[test]
+    fn many_pale_finder_shapes_come_back_as_a_card() {
+        // Pale grey on white: rqrr thresholds locally, a fixed 128 does not.
+        let rgba = grid_frame((1920, 1080), 400, (5, 5, 15), (150, 220));
+        assert_scans_to_a_card(&rgba, 1920, 1080, "400 pale shapes");
+    }
+
+    #[test]
+    fn a_diagonal_staircase_of_rings_comes_back_as_a_card() {
+        // Corner-touching rings merge into one dark region, the case a merged
+        // shape count undercounts.
+        let (w, h) = (1920usize, 1080usize);
+        let mut rgba = vec![255u8; w * h * 4];
+        let shape = (4, 4, 12);
+        let size = 2 * (shape.0 + shape.1) + shape.2;
+        for k in 0..(h / size).min(w / size) {
+            draw_finder(&mut rgba, w, (k * size, k * size), shape, (0, 255));
+            draw_finder(
+                &mut rgba,
+                w,
+                (w - size - k * size, k * size),
+                shape,
+                (0, 255),
+            );
+        }
+        assert_scans_to_a_card(&rgba, w, h, "staircase of rings");
+    }
+
+    #[test]
+    fn crowded_overlapping_finder_shapes_never_panic() {
+        // #616: a few finder-like shapes of random size, overlapping at random
+        // on a small frame, 300 frames. Whatever geometry that makes, the
+        // decoder must come back.
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move |m: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % m as u64) as usize
+        };
+        for _ in 0..300 {
+            let (w, h) = (120 + next(120), 120 + next(120));
+            let mut rgba = vec![255u8; w * h * 4];
+            for _ in 0..3 + next(4) {
+                let shape = (1 + next(6), 1 + next(4), 1 + next(14));
+                let size = 2 * (shape.0 + shape.1) + shape.2;
+                if size + 2 >= w.min(h) {
+                    continue;
+                }
+                let at = (next(w - size), next(h - size));
+                draw_finder(
+                    &mut rgba,
+                    w,
+                    at,
+                    shape,
+                    (next(120) as u8, 200 + next(55) as u8),
+                );
+            }
+            let _ = scan(&rgba, w as u32, h as u32);
+        }
+    }
+}
+
+#[cfg(test)]
+mod unguarded_rqrr {
+    /// The real decoder with no shape-count guard in front of it (#537, #616):
+    /// upstream rqrr panics in `Perspective::map` on this frame (MEASURED
+    /// 2026-10-16, debug), which aborts a release build. The vendored copy
+    /// must come back.
+    // (see vendor/rqrr/WINGMAN_PATCHES.md)
+    #[test]
+    fn patched_rqrr_survives_1500_finder_squares_unguarded() {
+        let (w, h) = (1920usize, 1080usize);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut g = vec![255u8; w * h];
+        for p in g.iter_mut() {
+            if next() % 1000 < 5 {
+                *p = 0;
+            }
+        }
+        for _ in 0..1500 {
+            let (ox, oy) = (next() as usize % (w - 40), next() as usize % (h - 40));
+            for y in 0..35usize {
+                for x in 0..35usize {
+                    let (mx, my) = (x / 5, y / 5);
+                    let dark = mx.min(6 - mx).min(my.min(6 - my)) != 1;
+                    g[(oy + y) * w + ox + x] = if dark { 0 } else { 255 };
+                }
+            }
+        }
+        let t = std::time::Instant::now();
+        let mut img = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| g[y * w + x]);
+        let n = img.detect_grids().len();
+        eprintln!("raw rqrr: {n} grids in {:?}", t.elapsed());
+    }
 }
