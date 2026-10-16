@@ -26,7 +26,7 @@
 //! in the crate also means adding it to `app.rs`'s `tests::ALL_WM_APP_IDS`
 //! (issue #163), which is enforced by `wm_app_ids_registry_is_exhaustive`.
 
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
-    WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_SYSKEYDOWN,
+    WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 /// Posted to the target `HWND` when a bound chord fires. `wparam` is
@@ -620,11 +620,77 @@ fn ctrl_input(key_up: bool) -> INPUT {
 /// Start menu. Injecting a harmless Ctrl down+up in between gives the shell
 /// something else to see first, which cancels the pending Start-menu
 /// activation; a lone Ctrl tap has no effect otherwise.
+///
+/// Issue #728: when the user is already holding Ctrl (a learned `Ctrl+Win+...`
+/// chord), the tap must not send the Ctrl up, which would release a key they
+/// still hold. A lone Ctrl down is what a real held key's auto-repeat looks
+/// like, so the shell still sees a key between the Win down and up.
 fn send_ctrl_tap() {
-    let inputs = [ctrl_input(false), ctrl_input(true)];
+    let inputs = match ctrl_tap_plan(key_down(VK_CONTROL.0 as i32)) {
+        CtrlTap::DownUp => vec![ctrl_input(false), ctrl_input(true)],
+        CtrlTap::DownOnly => vec![ctrl_input(false)],
+    };
     unsafe {
         SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
     }
+}
+
+/// What [`send_ctrl_tap`] injects (issue #728).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlTap {
+    /// Ctrl down then up: the user is not holding Ctrl.
+    DownUp,
+    /// Ctrl down only: the user physically holds Ctrl, leave it held.
+    DownOnly,
+}
+
+/// Pure choice for [`send_ctrl_tap`], from whether Ctrl is physically down.
+fn ctrl_tap_plan(ctrl_held: bool) -> CtrlTap {
+    if ctrl_held {
+        CtrlTap::DownOnly
+    } else {
+        CtrlTap::DownUp
+    }
+}
+
+/// Issue #728: the virtual-key of the last chord key `hook_proc` swallowed,
+/// until its key-up (`0` = none). Windows auto-repeat sends a keydown about
+/// thirty times a second while a key is held; without this, holding a chord
+/// would post `WM_APP_HOTKEY` / pause / palette toggles over and over.
+/// Only the hook thread touches it, so `Relaxed` is enough. Kept as one value
+/// with pure helpers below so a double-press detector can extend it later.
+static HELD_VK: AtomicU32 = AtomicU32::new(0);
+
+/// A keydown for `vk`. Returns `true` when it is auto-repeat of the swallowed
+/// key still held (the caller swallows it without acting). Any other key going
+/// down ends the hold: typematic repeat only repeats the last key pressed, so
+/// this also recovers from a key-up the hook never saw.
+fn note_keydown(held: &mut u32, vk: u32) -> bool {
+    if *held != 0 && *held == vk {
+        return true;
+    }
+    *held = 0;
+    false
+}
+
+/// The hook swallowed the keydown for `vk`: remember it until its key-up.
+fn note_swallowed(held: &mut u32, vk: u32) {
+    *held = vk;
+}
+
+/// A key-up for `vk`: ends the hold if it is the held key.
+fn note_keyup(held: &mut u32, vk: u32) {
+    if *held == vk {
+        *held = 0;
+    }
+}
+
+/// Marks `vk` as swallowed in [`HELD_VK`] and returns the hook's swallow value.
+fn swallow(vk: u32) -> LRESULT {
+    let mut held = HELD_VK.load(Ordering::Relaxed);
+    note_swallowed(&mut held, vk);
+    HELD_VK.store(held, Ordering::Relaxed);
+    LRESULT(1)
 }
 
 /// Whether swallowing this chord's keydown (returning 1 from the hook, as
@@ -682,6 +748,16 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     }
 
     let msg = wparam.0 as u32;
+    if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+        // #728: the key-up ends a hold. Key-ups always pass through.
+        let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        let mut held = HELD_VK.load(Ordering::Relaxed);
+        if held != 0 {
+            note_keyup(&mut held, kb.vkCode);
+            HELD_VK.store(held, Ordering::Relaxed);
+        }
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
     if msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
@@ -695,6 +771,15 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     // it can never accidentally toggle Pause or match a hotkey either.
     if is_own_synthetic_input(kb.dwExtraInfo) {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
+    // #728: auto-repeat of a swallowed chord key is swallowed too, with no
+    // second action, until the key-up arrives.
+    let mut held = HELD_VK.load(Ordering::Relaxed);
+    let is_repeat = note_keydown(&mut held, kb.vkCode);
+    HELD_VK.store(held, Ordering::Relaxed);
+    if is_repeat {
+        return LRESULT(1);
     }
 
     let chord = current_chord(kb.vkCode);
@@ -711,7 +796,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     if crate::pause::is_paused_now() {
         if pause_hotkey_outcome(&chord, load_pause_chord()) == PauseHotkeyOutcome::Toggle {
             post_pause_toggle(&chord);
-            return LRESULT(1);
+            return swallow(kb.vkCode);
         }
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
@@ -758,7 +843,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 send_ctrl_tap();
             }
 
-            return LRESULT(1);
+            return swallow(kb.vkCode);
         }
         // #185: `LearnOutcome::PassThrough` here means either a bare
         // modifier kept armed, or the deadline just expired -- neither
@@ -775,7 +860,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     // lock-free atomic the paused branch above reads.
     if pause_hotkey_outcome(&chord, load_pause_chord()) == PauseHotkeyOutcome::Toggle {
         post_pause_toggle(&chord);
-        return LRESULT(1);
+        return swallow(kb.vkCode);
     }
 
     // #25: the palette chord, checked alongside primary/secondary (not
@@ -790,7 +875,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             if needs_win_release_workaround(&pc) {
                 send_ctrl_tap();
             }
-            return LRESULT(1);
+            return swallow(kb.vkCode);
         }
     }
 
@@ -810,7 +895,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             send_ctrl_tap();
         }
 
-        return LRESULT(1);
+        return swallow(kb.vkCode);
     }
 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -992,6 +1077,58 @@ mod tests {
         assert!(!needs_win_release_workaround(&chord(
             0xBF, true, true, false, false
         )));
+    }
+
+    // -- held-key tracking (issue #728, pure) -------------------------------
+
+    #[test]
+    fn first_press_is_fresh_and_held_key_repeat_is_ignored() {
+        let mut held = 0;
+        assert!(!note_keydown(&mut held, 0x86)); // fresh press
+        note_swallowed(&mut held, 0x86);
+        assert!(note_keydown(&mut held, 0x86)); // auto-repeat
+        assert!(note_keydown(&mut held, 0x86)); // and again
+    }
+
+    #[test]
+    fn key_up_ends_the_hold_so_the_next_press_fires() {
+        let mut held = 0;
+        note_swallowed(&mut held, 0x86);
+        note_keyup(&mut held, 0x86);
+        assert!(!note_keydown(&mut held, 0x86));
+    }
+
+    #[test]
+    fn key_up_of_another_key_keeps_the_hold() {
+        let mut held = 0;
+        note_swallowed(&mut held, 0x86);
+        note_keyup(&mut held, 0x5B); // the Win key coming up
+        assert!(note_keydown(&mut held, 0x86));
+    }
+
+    #[test]
+    fn a_different_keydown_clears_a_hold_whose_key_up_was_missed() {
+        // Typematic repeat only ever repeats the last key pressed, so any
+        // other keydown proves the old hold is over, even with no key-up seen.
+        let mut held = 0;
+        note_swallowed(&mut held, 0x86);
+        assert!(!note_keydown(&mut held, 0x41));
+        assert!(!note_keydown(&mut held, 0x86));
+    }
+
+    #[test]
+    fn an_unswallowed_key_is_never_a_repeat() {
+        let mut held = 0;
+        assert!(!note_keydown(&mut held, 0x41));
+        assert!(!note_keydown(&mut held, 0x41));
+    }
+
+    // -- Ctrl tap plan (issue #728, pure) -----------------------------------
+
+    #[test]
+    fn ctrl_tap_releases_ctrl_only_when_the_user_is_not_holding_it() {
+        assert_eq!(ctrl_tap_plan(false), CtrlTap::DownUp);
+        assert_eq!(ctrl_tap_plan(true), CtrlTap::DownOnly);
     }
 
     // -- chord_to_string -------------------------------------------------
