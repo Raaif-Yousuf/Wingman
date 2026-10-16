@@ -2413,7 +2413,9 @@ impl App {
         match actions::resolve_executor(action) {
             Ok(executor) => {
                 let action = action.clone();
-                self.spawn_executor(move || exec_work_generic(executor, action, confirmed));
+                self.spawn_executor(Box::new(move || {
+                    exec_work_generic(executor, action, confirmed)
+                }));
             }
             Err(e) => {
                 let detail = self.track_error(
@@ -2444,9 +2446,9 @@ impl App {
         match executors {
             Ok((replace, copy)) => {
                 let action_name = action.name.clone();
-                self.spawn_executor(move || {
+                self.spawn_executor(Box::new(move || {
                     exec_work_replace(action_name, replace, copy, plan, confirmed)
-                });
+                }));
             }
             Err(e) => {
                 let title = format!("Couldn't run \"{}\"", action.name);
@@ -2518,7 +2520,9 @@ impl App {
         executor: Box<dyn executors::Executor>,
         confirmed: confirm::Confirmed<Value>,
     ) {
-        self.spawn_executor(move || exec_work_calendar(executor.as_ref(), confirmed));
+        self.spawn_executor(Box::new(move || {
+            exec_work_calendar(executor.as_ref(), confirmed)
+        }));
     }
     /// #38: "Review this email", the second action to run the full
     /// Look/Propose/Confirm/Do loop -- the tray's third one-shot action,
@@ -2688,7 +2692,7 @@ impl App {
     fn run_review_executor(&mut self, ctx: actions::review_email::ReviewContext) {
         match executors::registry::resolve("replace_text") {
             Ok(executor) => {
-                self.spawn_executor(move || exec_work_review(executor.as_ref(), &ctx));
+                self.spawn_executor(Box::new(move || exec_work_review(executor.as_ref(), &ctx)));
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
@@ -2893,7 +2897,9 @@ impl App {
         executor: Box<dyn executors::Executor>,
         confirmed: confirm::Confirmed<Value>,
     ) {
-        self.spawn_executor(move || exec_work_form_fill(executor.as_ref(), confirmed));
+        self.spawn_executor(Box::new(move || {
+            exec_work_form_fill(executor.as_ref(), confirmed)
+        }));
     }
 
     /// #712: runs `work` (an `exec_work_*` function: a UIA walk and write,
@@ -2905,7 +2911,7 @@ impl App {
     /// from the user's click, before this is called; the worker never
     /// touches the foreground window. The outcome comes back as
     /// `WM_APP_EXECUTOR_DONE` and ends in a card on every path.
-    fn spawn_executor(&mut self, work: impl FnOnce() -> ExecDone + Send + 'static) {
+    fn spawn_executor(&mut self, work: Box<dyn FnOnce() -> ExecDone + Send + 'static>) {
         self.set_busy(true);
         self.card
             .show_pending(crate::ui::card::PendingStage::Working);
@@ -3094,7 +3100,7 @@ impl App {
             self.set_watch(true);
             return;
         };
-        self.spawn_executor(move || exec_work_restore(undo));
+        self.spawn_executor(Box::new(move || exec_work_restore(undo)));
     }
     /// #228: takes the worker's attribution into [`App::fallback_footer`].
     /// Called first in every action result handler, so a run that never
