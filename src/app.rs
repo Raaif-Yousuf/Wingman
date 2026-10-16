@@ -817,6 +817,27 @@ fn first_run_detail(found: &FirstRun) -> Option<String> {
     }
 }
 
+/// #723: what a press that arrives while a request is still running does to
+/// the card (rule 7: it must never end in nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyPress {
+    /// A card already explains the wait, or is waiting on the user (a send
+    /// preview): leave it.
+    Leave,
+    /// Nothing explains the wait: show the working card again.
+    ShowStillWorking,
+}
+
+fn busy_press_card(card: crate::ui::card::CardState) -> BusyPress {
+    use crate::ui::card::CardState;
+    match card {
+        CardState::Pending | CardState::Preview => BusyPress::Leave,
+        CardState::Hidden | CardState::Collapsed | CardState::Expanded => {
+            BusyPress::ShowStillWorking
+        }
+    }
+}
+
 fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
     if busy {
         ModelActionGate::Busy
@@ -828,6 +849,15 @@ fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
 }
 
 impl App {
+    /// #723: a press while a request is running. Puts the working card back
+    /// if the user cannot see one, so the key never seems dead.
+    fn show_busy_card(&mut self) {
+        if busy_press_card(self.card.state()) == BusyPress::ShowStillWorking {
+            self.card
+                .show_pending(crate::ui::card::PendingStage::StillWorking);
+        }
+    }
+
     /// Issue #192: the card `App::ask`'s pre-flight gate should show, or
     /// `None` when at least one provider the current `Mode` would actually
     /// try is ready. Decided entirely from `config` -- no network call, so
@@ -1046,7 +1076,10 @@ impl App {
         extra: impl FnOnce(&mut Self) -> Option<T>,
     ) -> Option<(Option<capture::RawShot>, isize, T)> {
         match model_action_gate(self.busy, pause::is_paused_now()) {
-            ModelActionGate::Busy => return None,
+            ModelActionGate::Busy => {
+                self.show_busy_card();
+                return None;
+            }
             ModelActionGate::Paused => {
                 self.card
                     .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
@@ -1544,6 +1577,7 @@ impl App {
         work: fn(&crate::capture::RawShot) -> anyhow::Result<Answer>,
     ) {
         if self.busy {
+            self.show_busy_card();
             return;
         }
 
@@ -1619,6 +1653,7 @@ impl App {
     /// else in this crate (e.g. a declined confirm-card proposal).
     fn copy_region(&mut self) {
         if self.busy {
+            self.show_busy_card();
             return;
         }
 
@@ -3276,6 +3311,7 @@ impl App {
     /// message loop must stay responsive regardless.
     fn calculate_selection(&mut self) {
         if self.busy {
+            self.show_busy_card();
             return;
         }
         if pause::is_paused_now() {
@@ -6467,6 +6503,43 @@ mod tests {
             super::model_action_gate(false, true),
             super::ModelActionGate::Paused
         );
+    }
+
+    /// #723: a press while busy must leave a card on screen, but must not
+    /// cover a card that already says so or one waiting on the user.
+    #[test]
+    fn busy_press_card_shows_only_when_nothing_explains_the_wait() {
+        use crate::ui::card::CardState;
+        for (state, expected) in [
+            (CardState::Pending, super::BusyPress::Leave),
+            (CardState::Preview, super::BusyPress::Leave),
+            (CardState::Hidden, super::BusyPress::ShowStillWorking),
+            (CardState::Collapsed, super::BusyPress::ShowStillWorking),
+            (CardState::Expanded, super::BusyPress::ShowStillWorking),
+        ] {
+            assert_eq!(super::busy_press_card(state), expected, "{state:?}");
+        }
+    }
+
+    /// #723: no busy gate may return without a card. Scans every
+    /// early return on the busy flag in app.rs.
+    #[test]
+    fn busy_gates_never_return_silently() {
+        let src = lf(include_str!("app.rs"));
+        let mut seen = 0;
+        for (i, _) in src.match_indices(&("if self.".to_owned() + "busy {")) {
+            let after = &src[i..i + 120.min(src.len() - i)];
+            assert!(
+                after.contains("self.show_busy_card()"),
+                "a busy gate returns without a card: {after}"
+            );
+            seen += 1;
+        }
+        assert!(seen >= 3, "expected the busy gates, found {seen}");
+        let gate = src
+            .find("ModelActionGate::Busy => {")
+            .expect("begin_action has no Busy arm");
+        assert!(src[gate..gate + 120].contains("self.show_busy_card()"));
     }
 
     #[test]
