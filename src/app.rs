@@ -8413,7 +8413,7 @@ mod tests {
     ///   cargo test router_live -- --ignored --nocapture
     /// ```
     /// Requires a local Ollama server on 127.0.0.1:11434 with `gemma3:4b`
-    /// pulled. Expects `intent == Some("review-email")` when that action
+    /// pulled. Expects `intent == Some("review-this-email")` when that action
     /// exists in `actions::load_actions()`'s catalogue (added by a sibling
     /// agent in parallel, per #24's task description); otherwise only
     /// requires SOME valid id was named, never "none" -- either way the
@@ -8491,18 +8491,33 @@ mod tests {
 
         let req = router::build_request(shot.png, &candidates);
 
-        let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        // The expansion plan's router default, overridable to compare models
+        // (`WINGMAN_ROUTER_LIVE_MODEL=gemma3:4b`).
+        let model =
+            std::env::var("WINGMAN_ROUTER_LIVE_MODEL").unwrap_or_else(|_| "qwen3.5:4b".to_string());
+        let provider = Ollama::new(DEFAULT_BASE_URL, &model, "low");
         let started = std::time::Instant::now();
         let completion = provider
             .complete(&req)
             .expect("live ollama router request should succeed");
         let elapsed = started.elapsed();
 
+        // GPU oracle (AGENTS.md rule 6): size_vram > 0 on /api/ps, read while
+        // the model is still loaded.
+        let gpu = crate::provider::ollama_admin::ps(DEFAULT_BASE_URL)
+            .map(|e| {
+                format!(
+                    "{:?}",
+                    crate::provider::ollama_admin::gpu_status_for(&e, &model)
+                )
+            })
+            .unwrap_or_else(|e| format!("unknown ({e})"));
+
         // Unload right after the measurement (mirrors `provider/mod.rs`'s /
         // `ollama.rs`'s own live-check convention) -- a trivial follow-up
         // request purely to release VRAM; its own result is not the
         // measurement, so a failure here is not fatal to the test.
-        let mut unload_provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
+        let mut unload_provider = Ollama::new(DEFAULT_BASE_URL, &model, "low");
         unload_provider.keep_alive = "0".to_string();
         let _ = unload_provider.complete(&router::build_request(vec![], &[]));
 
@@ -8510,29 +8525,29 @@ mod tests {
             .expect("router completion should parse against its own schema");
 
         eprintln!(
-            "MEASURED 2026-09-17: router_live: model=gemma3:4b elapsed={elapsed:?} \
+            "router_live: model={model} gpu={gpu} elapsed={elapsed:?} \
              summary={:?} intent={:?} confidence={}",
             result.summary, result.intent, result.confidence
         );
         if let Some(usage) = completion.usage {
             eprintln!(
-                "MEASURED 2026-09-17: router_live token usage: input={} output={}",
+                "router_live token usage: input={} output={}",
                 usage.input_tokens, usage.output_tokens
             );
         }
 
-        if candidate_ids.iter().any(|id| id == "review-email") {
+        if candidate_ids.iter().any(|id| id == "review-this-email") {
             assert_eq!(
                 result.intent.as_deref(),
-                Some("review-email"),
-                "the \"review-email\" action exists in this catalogue; expected the router \
+                Some("review-this-email"),
+                "the \"review-this-email\" action exists in this catalogue; expected the router \
                  to pick it for an email compose window"
             );
         } else {
             assert!(
                 result.intent.is_some(),
                 "expected the router to name some action id for an unambiguous email compose \
-                 window, got none (\"review-email\" is not in this catalogue yet)"
+                 window, got none (\"review-this-email\" is not in this catalogue yet)"
             );
         }
     }
