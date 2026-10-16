@@ -34,6 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::actions;
+use crate::activation::Trigger;
 use crate::capture;
 use crate::config::{Config, Providers};
 use crate::connectors::civil_time::{CivilDate, CivilDateTime};
@@ -256,20 +257,46 @@ pub fn run() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    // #237: the owner window comes BEFORE the single-instance name. Then
+    // "the name is held" implies "a window of our class exists", because
+    // whoever holds the name created its window first, and a duplicate that
+    // finds no window knows the holder is not Wingman.
+    let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
+    let mut hwnd = create_owner_window(instance)?;
+
     // Claim the single-instance name before anything else is created. A
     // duplicate must not register a tray icon or install a keyboard hook,
     // because both would double every keypress -- and the second API call is
     // billed just like the first.
     let _instance = match crate::single_instance::acquire() {
-        crate::single_instance::Instance::First(lock) => lock,
+        crate::single_instance::Instance::First(lock) => Some(lock),
         crate::single_instance::Instance::Already => {
+            // A duplicate's own window has no App behind it, so it goes
+            // before anyone looks for "the" owner window.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
             // The shell launches this app by AUMID with no way to pass
             // arguments, so the Copilot key always arrives here bare; only a
             // launch explicitly carrying `--settings` should open Settings
             // instead of asking.
             let activation = crate::single_instance::activation_from_args(std::env::args());
-            crate::single_instance::poke_existing(activation);
-            return Ok(());
+            match crate::single_instance::settle_duplicate(activation) {
+                crate::single_instance::Startup::Delivered => return Ok(()),
+                // The old holder exited while we waited: a normal start.
+                crate::single_instance::Startup::Locked(lock) => {
+                    hwnd = create_owner_window(instance)?;
+                    Some(lock)
+                }
+                // Decision: a process squatting the name must not stop the
+                // app from starting. No instance answered, so start without
+                // the lock and say so (shown on a card below).
+                crate::single_instance::Startup::Squatted => {
+                    crate::single_instance::mark_lock_squatted();
+                    hwnd = create_owner_window(instance)?;
+                    None
+                }
+            }
         }
     };
 
@@ -286,7 +313,6 @@ pub fn run() -> Result<()> {
     }
     let _ = crate::autostart::remove_old_run_value();
 
-    let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let config = Config::load().unwrap_or_default();
     // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
     // anything below can start a request (the hotkey hook isn't installed
@@ -306,7 +332,6 @@ pub fn run() -> Result<()> {
     crate::ocr::set_preferred_language(&config.capture.ocr_language);
     let chain = Arc::new(config.build_chain());
 
-    let hwnd = create_owner_window(instance)?;
     // #105: every `Chain` built from here on asks the owner window to show
     // the send preview before a request leaves the machine (when the toggle
     // is on). Installed before anything can build a chain.
@@ -332,8 +357,11 @@ pub fn run() -> Result<()> {
     card.set_owner(hwnd);
     // #175: a stored key that could not be read is never silently dropped
     // (rule 7) -- the card is the first thing to exist that can show it.
-    if !config.unreadable_secrets.is_empty() {
-        let (headline, detail) = unreadable_secrets_card(&config.unreadable_secrets);
+    // #237 shares the card: a lockless start must be visible too (rule 7).
+    if let Some((headline, detail)) = startup_card(
+        &config.unreadable_secrets,
+        crate::single_instance::lock_squatted(),
+    ) {
         card.show_error(&headline, &detail);
     }
     let tray = Tray::new(hwnd, instance).context("creating the tray icon")?;
@@ -441,6 +469,9 @@ pub fn run() -> Result<()> {
 
     // Hand the App to the window proc. It stays alive until WM_DESTROY.
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize) };
+    // Only now can this window act on an activation; a duplicate looking for
+    // "the running instance" ignores any window without this mark (#237).
+    crate::single_instance::mark_ready(hwnd);
 
     pump_messages();
     Ok(())
@@ -461,6 +492,26 @@ fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
     )
 }
 
+/// The one card shown at startup, or `None`. Both startup problems (#175
+/// unreadable keys, #237 lockless start) end in a card, and one must never
+/// overwrite the other, so when both apply their text is joined. Pure so the
+/// wording is unit-tested without a `Card`. No em dash (rule 11).
+fn startup_card(unreadable: &[String], lock_squatted: bool) -> Option<(String, String)> {
+    let squat = (
+        "Another program holds Wingman's startup lock".to_string(),
+        "Wingman started anyway. If you see two Wingman tray icons, quit one of them.".to_string(),
+    );
+    match (unreadable.is_empty(), lock_squatted) {
+        (true, false) => None,
+        (false, false) => Some(unreadable_secrets_card(unreadable)),
+        (true, true) => Some(squat),
+        (false, true) => {
+            let (headline, detail) = unreadable_secrets_card(unreadable);
+            Some((headline, format!("{detail}\n\n{}. {}", squat.0, squat.1)))
+        }
+    }
+}
+
 fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -469,7 +520,12 @@ fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
         lpszClassName: WINDOW_CLASS,
         ..Default::default()
     };
-    if unsafe { RegisterClassExW(&class) } == 0 {
+    // A duplicate that destroyed its window and starts anyway registers the
+    // class a second time in the same process; that is not a failure.
+    if unsafe { RegisterClassExW(&class) } == 0
+        && unsafe { windows::Win32::Foundation::GetLastError() }
+            != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS
+    {
         anyhow::bail!("RegisterClassExW failed for the owner window");
     }
 
@@ -788,7 +844,7 @@ impl App {
     /// The whole flow: hide any stale card, check a provider is actually
     /// ready, grab the screen, then hand the bytes to a worker so the
     /// message loop stays responsive during the call.
-    fn ask(&mut self) {
+    fn ask(&mut self, trigger: Trigger) {
         let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
@@ -805,7 +861,6 @@ impl App {
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
         let prompt = self.config.ui.prompt.clone();
-        let want_difficulty = self.config.ui.show_difficulty;
         let target = self.hwnd_isize();
         let redact = self.config.capture.redact;
 
@@ -813,6 +868,8 @@ impl App {
         // `AskingModel` inside `begin_model_action` (findings 1 and 2), so
         // there is nothing left to set here.
         std::thread::spawn(move || {
+            // #236: every egress row this thread writes names its trigger.
+            crate::activation::set_worker_trigger(trigger);
             let result: std::result::Result<Answer, String> = catch_worker(|| {
                 (|| -> Result<Answer> {
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
@@ -823,7 +880,6 @@ impl App {
                         &raw,
                         foreground_hwnd_isize,
                         &prompt,
-                        want_difficulty,
                     )
                 })()
                 .map_err(|e| {
@@ -1041,7 +1097,7 @@ impl App {
     /// never produces) is a no-op, not a panic (rule 7).
     fn dispatch_palette_action(&mut self, action_id: &str) {
         match palette_model::dispatch_target_for(action_id) {
-            Some(DispatchTarget::CheckMyWork) => self.ask(),
+            Some(DispatchTarget::CheckMyWork) => self.ask(Trigger::Palette),
             Some(DispatchTarget::ExtractText) => self.extract_text(),
             Some(DispatchTarget::ReadQr) => self.read_qr(),
             Some(DispatchTarget::AddToCalendar) => self.add_event_from_screen(),
@@ -1391,6 +1447,15 @@ impl App {
     /// executor", the case `docs/actions.md` documents as the intended
     /// shape for a new `actions.toml` action.
     fn run_generic_action(&mut self, action_id: &str) {
+        self.run_generic_action_with(action_id, None);
+    }
+
+    /// [`App::run_generic_action`], with the address the user confirmed when
+    /// the action reads a linked page (#127). Such an action runs twice:
+    /// first with `None`, which finds the link and shows the confirmation
+    /// card (nothing is fetched, no model is asked), then, after "Do it",
+    /// with the confirmed address, which fetches the page and summarizes it.
+    fn run_generic_action_with(&mut self, action_id: &str, confirmed_link: Option<String>) {
         let resolved = match actions::load_actions() {
             Ok(r) => r,
             Err(e) => {
@@ -1427,7 +1492,13 @@ impl App {
             return;
         };
 
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        // #127: the fetch step reads no screen, so it takes no screenshot.
+        let link_step = actions::link_summary::step_for(&action, confirmed_link.as_deref());
+        let plan = BeginPlan {
+            capture: !matches!(link_step, actions::link_summary::Step::Fetch(_)),
+            ..BeginPlan::MODEL
+        };
+        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_action(plan, |_| Some(()))
         else {
             return;
         };
@@ -1450,16 +1521,53 @@ impl App {
         // `actions.toml` against a concurrent edit -- must never panic the
         // main thread (rule 7); using exactly what was dispatched makes
         // that whole class of failure unreachable instead of merely rare.
-        let action_for_result = action.clone();
-        let schema_for_result = schema.clone();
+        //
+        // #127: the first step of a linked-page action answers with the
+        // confirmation card's own action and schema instead.
+        let (action_for_result, schema_for_result) =
+            if link_step == actions::link_summary::Step::Confirm {
+                (
+                    actions::link_summary::confirm_action(&action),
+                    actions::link_summary::confirm_schema(),
+                )
+            } else {
+                (action.clone(), schema.clone())
+            };
         std::thread::spawn(move || {
             let result: GenericResult = catch_worker(|| {
                 (|| -> Result<_, GenericFailure> {
-                    // #484: gather what the action's `inputs` list asks for, then
-                    // let the pure `plan` decide the user text and whether the
-                    // screenshot goes along (a selection-only action sends no image).
-                    let gathered =
-                        gather_generic_inputs(&inputs, foreground_hwnd_isize, writes_back)?;
+                    // #127 step 1: find the link, check it, and hand it back for
+                    // confirmation. Nothing is fetched and no model is asked.
+                    if link_step == actions::link_summary::Step::Confirm {
+                        let target = link_to_confirm(&inputs, foreground_hwnd_isize, raw.as_ref())?;
+                        return Ok((actions::link_summary::confirm_proposal(&target), None));
+                    }
+                    // #127 step 2: the user confirmed this address. The page is the
+                    // only input: the selection and the screen are not read again.
+                    let mut redirected_to: Option<(String, String)> = None;
+                    let (gathered, inputs) = match &link_step {
+                        actions::link_summary::Step::Fetch(url) => {
+                            let page = crate::inputs::web_page::fetch_page(url)
+                                .map_err(GenericFailure::UserState)?;
+                            // A redirect to another site is named on the result card.
+                            let confirmed = crate::inputs::web_page::parse_target(url)
+                                .map(|t| t.host)
+                                .unwrap_or_default();
+                            redirected_to = Some((confirmed, page.host.clone()));
+                            (
+                                actions::link_summary::gathered_from(page),
+                                vec![actions::InputKind::LinkedPage],
+                            )
+                        }
+                        _ => (
+                            // #484: gather what the action's `inputs` list asks
+                            // for, then let the pure `plan` decide the user text
+                            // and whether the screenshot goes along (a
+                            // selection-only action sends no image).
+                            gather_generic_inputs(&inputs, foreground_hwnd_isize, writes_back)?,
+                            inputs,
+                        ),
+                    };
                     let planned = plan_generic_inputs(&inputs, &gathered)?;
                     if writes_back && actions::generic_replace::too_long(&gathered) {
                         return Err(GenericFailure::UserState(
@@ -1475,7 +1583,10 @@ impl App {
                         None => prompt.clone(),
                     };
                     let shot = if planned.screen {
-                        Some(encode_for_upload(&mut raw, &providers, mode, redact)?)
+                        let screen = raw
+                            .as_mut()
+                            .context("no screenshot was taken for this request")?;
+                        Some(encode_for_upload(screen, &providers, mode, redact)?)
                     } else {
                         None
                     };
@@ -1490,9 +1601,20 @@ impl App {
                     let proposal =
                         noting_attribution(chain.complete_parsed_with_fallback_attributed(
                             &req,
-                            || non_vision_inputs(&raw, foreground_hwnd_isize),
+                            || match raw.as_ref() {
+                                Some(screen) => non_vision_inputs(screen, foreground_hwnd_isize),
+                                None => {
+                                    Err(anyhow::anyhow!("no screenshot was taken for this request"))
+                                }
+                            },
                             |c| actions::parse_generic_proposal(&c.text),
                         ))?;
+                    let proposal = match redirected_to {
+                        Some((confirmed, read)) => {
+                            actions::link_summary::note_final_host(proposal, &confirmed, &read)
+                        }
+                        None => proposal,
+                    };
                     Ok((proposal, replace))
                 })()
                 .map_err(pack_generic_failure)
@@ -1543,6 +1665,24 @@ impl App {
                 return;
             }
         };
+
+        // #127 step 1 of a linked-page action: the confirmation card. Only
+        // its "Do it" fetches anything (`on_preview_decided`).
+        if action.proposal == actions::link_summary::CONFIRM_PROPOSAL {
+            let host = proposal
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|url| crate::inputs::web_page::parse_target(url).ok())
+                .map_or_else(|| "this link".to_string(), |t| t.host);
+            self.pending_preview = Some(PendingPreview::FetchLink(action.id.clone()));
+            self.pending_preview_generation = self.card.show_preview(
+                &actions::link_summary::confirm_title(&host),
+                &schema,
+                &proposal,
+                false,
+            );
+            return;
+        }
 
         // #314: nothing to list or copy is an answer, not a blank preview.
         if actions::action_items::is_empty_result(&action.proposal, &proposal) {
@@ -1664,6 +1804,27 @@ impl App {
             }
             Some(PendingPreview::GenericReplace(action, plan)) => {
                 self.run_confirmed_generic_replace(&action, plan, confirmed);
+            }
+            Some(PendingPreview::FetchLink(action_id)) => {
+                // #127: the user confirmed the address on the card, so this
+                // is the one place a linked page is fetched.
+                let url = confirmed
+                    .value()
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                match url {
+                    Some(url) => self.run_generic_action_with(&action_id, Some(url)),
+                    None => {
+                        let detail = self.track_error(
+                            "Couldn't fetch the link",
+                            "the confirmed card had no address",
+                        );
+                        self.card
+                            .show_error_with_details("Couldn't fetch the link", &detail);
+                        self.set_watch(true);
+                    }
+                }
             }
             Some(PendingPreview::Send(reply)) => {
                 crate::ui::send_gate::decide(reply, true);
@@ -3318,13 +3479,11 @@ impl App {
 /// `%APPDATA%\Wingman\actions.toml`) and runs the hotkey's one default
 /// action (`actions::DEFAULT_ACTION_ID`, "Check my work") through it,
 /// instead of building the physics request straight from config. `ui_prompt`
-/// and `ui_show_difficulty` are `config.ui.prompt` /
-/// `config.ui.show_difficulty` exactly as before -- see the design spec's
-/// "Origin tracking" section for why they are only the FALLBACK now, not
-/// the only source: an `actions.toml` override of the default action's
-/// `prompt` wins outright (Origin::User), while `ui_show_difficulty` and
-/// the action's own `rate_difficulty` OR together, so the existing global
-/// toggle keeps working as an override for existing users (#197 part 2).
+/// is `config.ui.prompt` exactly as before -- see the design spec's
+/// "Origin tracking" section for why it is only the FALLBACK now, not the
+/// only source: an `actions.toml` override of the default action's `prompt`
+/// wins outright (Origin::User). The difficulty rating comes only from the
+/// action's own `rate_difficulty` (#197).
 ///
 /// A malformed `actions.toml`, or the default action being disabled/missing,
 /// surfaces as `Err` here exactly like any other worker failure -- `ask()`'s
@@ -3337,7 +3496,6 @@ fn worker(
     raw: &capture::RawShot,
     foreground_hwnd: isize,
     ui_prompt: &str,
-    ui_show_difficulty: bool,
 ) -> Result<Answer> {
     let resolved = actions::load_actions().context("failed to load actions")?;
     let default = actions::default_action(&resolved).with_context(|| {
@@ -3347,8 +3505,7 @@ fn worker(
         )
     })?;
 
-    let (prompt, want_difficulty) =
-        resolve_prompt_and_difficulty(default, ui_prompt, ui_show_difficulty);
+    let (prompt, want_difficulty) = resolve_prompt_and_difficulty(default, ui_prompt);
 
     let ollama_ready = mode == Mode::Auto
         && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
@@ -3903,6 +4060,72 @@ fn pack_generic_failure(f: GenericFailure) -> String {
     }
 }
 
+/// #127 step 1 of a linked-page action: the address to ask the user to
+/// confirm. Looks in the selection and the clipboard (when the action lists
+/// them), then at the screen through OCR (when it lists `screen`), and the
+/// first source with a link decides: one link is offered, several are
+/// refused as ambiguous, and a link the fetch rules refuse ends with the
+/// reason. The model never picks the link. Fails first when the current mode
+/// cannot fetch, so nobody is asked to confirm a fetch that would be refused.
+fn link_to_confirm(
+    inputs: &[actions::InputKind],
+    foreground_hwnd: isize,
+    raw: Option<&capture::RawShot>,
+) -> Result<crate::inputs::web_page::Target, GenericFailure> {
+    use actions::link_summary::{decide, NO_LINK_MESSAGE};
+    if let Some(refusal) = crate::inputs::web_page::network_refusal() {
+        return Err(GenericFailure::UserState(refusal));
+    }
+    let text_inputs: Vec<actions::InputKind> = inputs
+        .iter()
+        .copied()
+        .filter(|k| {
+            matches!(
+                k,
+                actions::InputKind::Selection | actions::InputKind::Clipboard
+            )
+        })
+        .collect();
+    let gathered = gather_generic_inputs(&text_inputs, foreground_hwnd, false)?;
+    if gathered.selection_in_password_field {
+        return Err(GenericFailure::UserState(
+            actions::generic_inputs::PASSWORD_FIELD_MESSAGE.to_string(),
+        ));
+    }
+    for text in [gathered.selection.as_deref(), gathered.clipboard.as_deref()] {
+        if let Some(decision) = decide(text) {
+            return decision.map_err(GenericFailure::UserState);
+        }
+    }
+    if let (true, Some(raw)) = (inputs.contains(&actions::InputKind::Screen), raw) {
+        let screen_text = ocr_text_of(raw)?;
+        if let Some(decision) = decide(Some(&screen_text)) {
+            return decision.map_err(GenericFailure::UserState);
+        }
+    }
+    Err(GenericFailure::UserState(NO_LINK_MESSAGE.to_string()))
+}
+
+/// The text on the screenshot, read by OCR on a thread of its own (OCR and
+/// UIA must not share a thread's COM apartment, see [`non_vision_inputs`]).
+fn ocr_text_of(raw: &capture::RawShot) -> Result<String> {
+    let output = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                crate::ocr::recognize(
+                    &raw.rgba,
+                    raw.width,
+                    raw.height,
+                    crate::ocr::DEFAULT_TIMEOUT,
+                )
+            })
+            .join()
+    })
+    .map_err(|_| anyhow::anyhow!("the OCR thread stopped unexpectedly"))?
+    .context("OCR unavailable")?;
+    Ok(crate::ocr::serialize_lines(&output.lines))
+}
+
 /// #484: reads the text inputs a generic action's `inputs` list names
 /// (selection, clipboard, UIA fields) using the existing readers, only the
 /// ones listed. Runs on the worker thread (the selection and UIA readers
@@ -3970,21 +4193,17 @@ fn gather_generic_inputs(
 /// - The prompt: an `actions.toml` override (`Origin::User`) wins outright;
 ///   otherwise `ui_prompt` (today's only source, `config.ui.prompt`)
 ///   applies unchanged.
-/// - The difficulty flag: `ui_show_difficulty` (the existing global
-///   override, #197 part 1) and the resolved action's own
-///   `rate_difficulty` (#197 part 2) OR together -- either one being on is
-///   enough.
+/// - The difficulty flag: only the resolved action's own `rate_difficulty`.
+///   The old global `ui.show_difficulty` setting is gone (#197).
 fn resolve_prompt_and_difficulty<'a>(
     default: &'a actions::Resolved,
     ui_prompt: &'a str,
-    ui_show_difficulty: bool,
 ) -> (&'a str, bool) {
     let prompt = match default.origin {
         actions::Origin::User => default.action.prompt.as_str(),
         actions::Origin::Builtin => ui_prompt,
     };
-    let want_difficulty = ui_show_difficulty || default.action.rate_difficulty;
-    (prompt, want_difficulty)
+    (prompt, default.action.rate_difficulty)
 }
 
 /// Issue #181: which action a pause-toggle-chord press should take. Pure
@@ -4709,6 +4928,9 @@ enum PendingPreview {
         actions::Action,
         Option<Box<actions::generic_replace::ReplaceSelection>>,
     ),
+    /// #127: a linked-page action's confirmation card. Carries the action's
+    /// id; "Do it" starts the fetch step with the address on the card.
+    FetchLink(String),
     /// #105: a worker is blocked before a request that leaves the machine,
     /// waiting for this preview's answer. Holds the channel back to it:
     /// "Send" answers it (`ui::send_gate::decide`), and every other way the
@@ -4974,7 +5196,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 match decode(id) {
                     MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
-                    MenuChoice::Command(cmd::ASK_NOW) => app.ask(),
+                    MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
                     MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
                     MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
@@ -5018,16 +5240,42 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_APP_HOTKEY => {
             let _which = wparam.0; // both bindings do the same thing
             if !app.cancel_pending_send_preview() {
-                app.ask();
+                app.ask(Trigger::Hotkey);
             }
             LRESULT(0)
         }
         WM_APP_ACTIVATE => {
             // `ask` already no-ops while `busy`, so a second Copilot-key press
             // landing here while a request is in flight is harmless, except
-            // that it cancels a waiting send preview (#105).
+            // that it cancels a waiting send preview (#105). Any process can
+            // post this message (#236), so unlike the hotkey it is rate
+            // limited, and a refusal is counted for the diagnostics report.
             if !app.cancel_pending_send_preview() {
-                app.ask();
+                // The limiter is only consulted when an ask would really run:
+                // busy and paused make `ask` a no-op (or a Paused card), and
+                // must not cost the user an allowance.
+                let would_run = matches!(
+                    model_action_gate(app.busy, pause::is_paused_now()),
+                    ModelActionGate::Proceed
+                );
+                if !would_run {
+                    app.ask(Trigger::Activation);
+                } else {
+                    match crate::activation::check_activation_now() {
+                        crate::activation::Verdict::Allowed => app.ask(Trigger::Activation),
+                        // Rule 7: the Start menu and the Copilot-key picker
+                        // arrive here too, so a refusal says so once.
+                        crate::activation::Verdict::Refused { notify: true } => {
+                            app.card.show_answer(
+                                "Too many requests in a row",
+                                "Try again in a moment.",
+                                3,
+                                None,
+                            )
+                        }
+                        crate::activation::Verdict::Refused { notify: false } => {}
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -5265,7 +5513,7 @@ mod tests {
         // config.ui.prompt says, regardless of the built-in's own prompt
         // text.
         let r = resolved(Origin::Builtin, "builtin default text", false);
-        let (prompt, _) = resolve_prompt_and_difficulty(&r, "config.toml prompt", false);
+        let (prompt, _) = resolve_prompt_and_difficulty(&r, "config.toml prompt");
         assert_eq!(prompt, "config.toml prompt");
     }
 
@@ -5274,35 +5522,26 @@ mod tests {
         // #23's Done-when: a user action overriding a built-in's prompt is
         // what runs.
         let r = resolved(Origin::User, "overridden prompt", false);
-        let (prompt, _) = resolve_prompt_and_difficulty(&r, "config.toml prompt", false);
+        let (prompt, _) = resolve_prompt_and_difficulty(&r, "config.toml prompt");
         assert_eq!(prompt, "overridden prompt");
     }
 
     #[test]
-    fn difficulty_flags_or_together() {
-        for (ui_flag, action_flag, expected) in [
-            (false, false, false),
-            (true, false, true),
-            (false, true, true),
-            (true, true, true),
-        ] {
+    fn difficulty_follows_only_the_actions_own_flag() {
+        for action_flag in [false, true] {
             let r = resolved(Origin::Builtin, "p", action_flag);
-            let (_, want_difficulty) = resolve_prompt_and_difficulty(&r, "p", ui_flag);
-            assert_eq!(
-                want_difficulty, expected,
-                "ui_flag={ui_flag} action_flag={action_flag}"
-            );
+            let (_, want_difficulty) = resolve_prompt_and_difficulty(&r, "p");
+            assert_eq!(want_difficulty, action_flag);
         }
     }
 
     #[test]
     fn fresh_install_defaults_send_no_difficulty_rubric() {
-        // Both #197 part 1 (ui.show_difficulty default false) and #197 part
-        // 2 (rate_difficulty default false) must combine to "off", matching
-        // today's already-shipped default (commit d88f78b).
+        // `rate_difficulty` defaults to false, so a fresh install sends no
+        // rubric (#197).
         let r = resolved(Origin::Builtin, crate::provider::DEFAULT_PROMPT, false);
         let (prompt, want_difficulty) =
-            resolve_prompt_and_difficulty(&r, crate::provider::DEFAULT_PROMPT, false);
+            resolve_prompt_and_difficulty(&r, crate::provider::DEFAULT_PROMPT);
         assert_eq!(prompt, crate::provider::DEFAULT_PROMPT);
         assert!(!want_difficulty);
     }
@@ -6416,6 +6655,59 @@ mod tests {
         );
     }
 
+    // -- activation trust (#236, #237) ---------------------------------------
+
+    #[test]
+    fn startup_card_shows_neither_one_or_both_problems() {
+        let keys = vec!["openai".to_string()];
+        assert_eq!(super::startup_card(&[], false), None);
+        let only_keys = super::startup_card(&keys, false).unwrap();
+        assert!(only_keys.0.contains("key"), "{only_keys:?}");
+        let only_squat = super::startup_card(&[], true).unwrap();
+        assert!(only_squat.0.contains("startup lock"), "{only_squat:?}");
+        let (headline, detail) = super::startup_card(&keys, true).unwrap();
+        assert_eq!(headline, only_keys.0);
+        assert!(detail.contains(&only_keys.1), "keys text kept: {detail}");
+        assert!(detail.contains(&only_squat.0), "squat text added: {detail}");
+        assert!(!detail.contains('\u{2014}'));
+    }
+
+    /// #237: the owner window must exist before the single-instance name is
+    /// taken, or a duplicate arriving in the gap finds the name held and no
+    /// window to poke. Source scan over `run`'s body, so it needs no window.
+    #[test]
+    fn run_creates_the_owner_window_before_taking_the_instance_name() {
+        let app_src = lf(include_str!("app.rs"));
+        let run_src = run_body(&app_src);
+        let window = run_src.find("create_owner_window(instance)");
+        let acquire = run_src.find("single_instance::acquire()");
+        assert!(window.is_some(), "run no longer creates the owner window");
+        assert!(acquire.is_some(), "run no longer takes the instance name");
+        assert!(
+            window < acquire,
+            "the owner window must be created before single_instance::acquire"
+        );
+    }
+
+    /// #236: only the activation arm may be rate limited, and it must be.
+    #[test]
+    fn only_the_activation_arm_is_rate_limited() {
+        let app_src = lf(include_str!("app.rs"));
+        let body = wnd_proc_body(&app_src);
+        let arm = body
+            .split("WM_APP_ACTIVATE => {")
+            .nth(1)
+            .expect("wnd_proc has no WM_APP_ACTIVATE arm");
+        let arm = &arm[..arm.find("LRESULT(0)").expect("arm has no end")];
+        assert!(arm.contains("check_activation_now()"), "{arm}");
+        assert!(arm.contains("Trigger::Activation"), "{arm}");
+        assert_eq!(
+            body.matches("check_activation_now()").count(),
+            1,
+            "the limiter must guard activations only, never a key press"
+        );
+    }
+
     // -- settings_reentrancy_policy exhaustiveness (issue #213) -----------
     //
     // #163's ALL_WM_APP_IDS/wm_app_ids_registry_is_exhaustive above already
@@ -6899,8 +7191,13 @@ mod tests {
         // matches them.
         let upload = ["encode_for", "_upload(&mut raw"].concat();
         let router_upload = ["encode_for", "_upload(raw,"].concat();
+        // The generic worker's screenshot is optional (#127), so it reaches
+        // the helper through a borrowed `screen`.
+        let optional_upload = ["encode_for", "_upload(screen,"].concat();
         let plain = ["capture", "::encode("].concat();
-        let encode_calls = src.matches(&upload).count() + src.matches(&router_upload).count();
+        let encode_calls = src.matches(&upload).count()
+            + src.matches(&router_upload).count()
+            + src.matches(&optional_upload).count();
         assert!(
             encode_calls >= 6,
             "expected the six worker call sites, found {encode_calls}"

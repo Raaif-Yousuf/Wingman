@@ -78,7 +78,6 @@ card_seconds = 12
 text_scale = 1.0
 card_corner = "bottom_right"
 card_monitor = "cursor"
-show_difficulty = false
 prompt = """
 You are shown a screenshot of the user's screen (or, if no image could be captured, its recognized text and fields instead). They are working through a physics or statistics problem and want a second opinion before committing an answer. Usually the problem statement is on screen (often an online assignment) while the user has done the working on paper, so their derivation is generally NOT visible to you. Sometimes a value they are about to submit is already typed into an input field, and sometimes their working is on screen too.
 

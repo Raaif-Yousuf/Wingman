@@ -39,6 +39,11 @@ pub const MAX_BULLETS: usize = 5;
 /// Longest bullet, in characters.
 pub const MAX_BULLET_CHARS: usize = 160;
 
+/// A key the app adds to a proposal when the page was read from a different
+/// site than the one the user confirmed (a redirect). The model never
+/// fills it and it is not in the schema.
+pub const READ_FROM_KEY: &str = "read_from";
+
 /// What the card says when there is nothing to summarize.
 pub const NOTHING_HEADLINE: &str = "Nothing to summarize";
 
@@ -98,7 +103,7 @@ pub fn card_text(proposal: &Value) -> CardText {
             detail: String::new(),
         };
     }
-    let detail = proposal
+    let bullets = proposal
         .get("bullets")
         .and_then(Value::as_array)
         .map(|items| {
@@ -112,6 +117,18 @@ pub fn card_text(proposal: &Value) -> CardText {
                 .join("\n")
         })
         .unwrap_or_default();
+    // A redirect: the user confirmed one site and another was read.
+    let read_from = proposal
+        .get(READ_FROM_KEY)
+        .and_then(Value::as_str)
+        .map(|h| clean_line(Some(&Value::from(h)), 253))
+        .filter(|h| !h.is_empty())
+        .map(|h| format!("Read from {h} (the link redirected there)."));
+    let detail = match read_from {
+        Some(note) if bullets.is_empty() => note,
+        Some(note) => format!("{note}\n{bullets}"),
+        None => bullets,
+    };
     CardText { headline, detail }
 }
 
@@ -119,6 +136,26 @@ pub fn card_text(proposal: &Value) -> CardText {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_page_read_from_another_site_names_that_site_on_the_card() {
+        let c = card_text(&json!({
+            "bullets": ["Point."],
+            "line1": "A page.",
+            "line2": "It matters.",
+            READ_FROM_KEY: "b.example"
+        }));
+        assert!(c.detail.starts_with("Read from b.example"), "{}", c.detail);
+        assert!(c.detail.contains("- Point."), "{}", c.detail);
+        assert!(!c.headline.contains("b.example"));
+        // Still shown when the model gave no bullets.
+        let c = card_text(&json!({"line1": "A page.", READ_FROM_KEY: "b.example"}));
+        assert!(c.detail.contains("b.example"), "{}", c.detail);
+        // A summary of the page the user asked for says nothing extra.
+        let c = card_text(&json!({"line1": "A page.", "bullets": ["P."]}));
+        assert_eq!(c.detail, "- P.");
+        assert!(!c.detail.contains('\u{2014}'));
+    }
 
     #[test]
     fn two_lines_and_the_bullets_land_on_the_card() {

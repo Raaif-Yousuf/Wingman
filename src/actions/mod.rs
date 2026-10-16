@@ -16,6 +16,7 @@ pub mod fill_form;
 pub mod generic_answer;
 pub mod generic_inputs;
 pub mod generic_replace;
+pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
 pub mod review_email;
@@ -34,8 +35,8 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_ACTION_ID: &str = "check-my-work";
 
 /// What an action gathers before the model is asked. A generic action's
-/// worker gathers `Screen`, `Selection`, `Clipboard`, `Uia` and `PageText`
-/// (`actions::generic_inputs`); `Window` and `Region` are treated as
+/// worker gathers `Screen`, `Selection`, `Clipboard`, `Uia`, `PageText` and
+/// `LinkedPage` (`actions::generic_inputs`, `actions::link_summary`); `Window` and `Region` are treated as
 /// `Screen`, and `Text` and `Context` are accepted but gathered by nothing
 /// yet (expansion plan §7 "Inputs"). A closed enum, not a
 /// bare `String`, so an action naming an input Wingman doesn't gather yet
@@ -54,6 +55,10 @@ pub enum InputKind {
     /// The foreground browser or reader's document text, read through UI
     /// Automation (#104).
     PageText,
+    /// The text of the web page behind a link found in the selection, the
+    /// clipboard or on screen. Fetched only after the user confirms the
+    /// link (#127).
+    LinkedPage,
     Context,
 }
 
@@ -135,11 +140,10 @@ pub struct Action {
     pub prefer: Prefer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hotkey: Option<ActionHotkey>,
-    /// #197 part 2: ask for and render the 1-10/Ultra difficulty badge for
-    /// this action. Only meaningful for the `"verdict"` proposal kind
-    /// today. Defaults to `false` -- see the design spec's "Origin
-    /// tracking" section for why this ORs with `config.ui.show_difficulty`
-    /// rather than replacing it.
+    /// #197: ask for and render the 1-10/Ultra difficulty badge for this
+    /// action. Only meaningful for the `"verdict"` proposal kind today.
+    /// Defaults to `false`. This is the only switch for the rating: the old
+    /// global `ui.show_difficulty` setting was retired.
     #[serde(default)]
     pub rate_difficulty: bool,
     /// The disabled flag from #23's Done-when. `true` unless the action (or
@@ -257,6 +261,10 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 /// - `"explain-this-screen"` (#131, `explain_screen::builtin_action`): proposal
 ///   `screen_explanation`, executor `none`. A one-sentence headline on the
 ///   collapsed card, a short explanation on expand. Works on any screen.
+/// - `"summarize-link"` (#127, `link_summary::builtin_action`): proposal
+///   `page_summary`, executor `none`. Finds the link in the selection (else on
+///   screen), asks the user to confirm the address, then fetches the page and
+///   summarizes it.
 pub fn builtin_actions() -> Vec<Action> {
     vec![
         Action {
@@ -311,6 +319,7 @@ pub fn builtin_actions() -> Vec<Action> {
         translate::builtin_action(),
         describe_image::builtin_action(),
         explain_screen::builtin_action(),
+        link_summary::builtin_action(),
     ]
 }
 

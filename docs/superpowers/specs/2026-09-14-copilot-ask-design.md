@@ -77,7 +77,8 @@ pub enum Difficulty {
 
 ### Difficulty
 
-Off by config (`ui.show_difficulty`). When off the property is absent from the
+Off unless the Check my work action sets `rate_difficulty` (the global
+`ui.show_difficulty` setting was retired in #197). When off the property is absent from the
 schema and the rubric is absent from the prompt, so it costs nothing — the
 toggle is not merely a rendering switch.
 

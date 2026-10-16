@@ -52,8 +52,8 @@ HTTP call to a local Ollama server, only ever `127.0.0.1` (never
 has no server of its own; there is no Wingman-operated backend anywhere in
 the path. Exact per-provider request shapes are in
 [`docs/providers.md`](docs/providers.md). The response (the verdict text
-and, if the opt-in `ui.show_difficulty` setting is on, the difficulty
-rating) is shown in the card and is not written anywhere except the
+and, if the Check my work action's `rate_difficulty` option is on, the
+difficulty rating) is shown in the card and is not written anywhere except the
 in-memory "last answer" the tray's **Copy last answer** reads from.
 
 In Auto mode (the default), before a cloud request is sent Wingman may also
@@ -62,6 +62,20 @@ against your configured Ollama server, to decide whether to try Local first.
 This probe is skipped entirely unless you have already added `"ollama"` to
 `providers.order` yourself (`mode::should_probe_ollama`); a user who never
 configured Ollama sees no extra network activity from this at all.
+
+One action reads a web page for you: **Summarize a link**. It finds a link
+in your selection (or, failing that, on your screen), shows you the site and
+the exact address on a confirmation card, and fetches nothing until you press
+"Do it". The fetch is a plain `GET` over `https` (port 443 only) with no
+cookies, no sign-in and no proxy, sent from your computer, so the site sees
+your IP address and the address you asked for. Wingman refuses any link that
+points at a private, loopback or link-local address (checked after the name
+is looked up, and again on every redirect), follows at most 4 redirects,
+reads at most 1 MB and gives up after 20 seconds. The page text is then sent
+to your model like any other text, marked as untrusted data. The fetch is
+refused in Offline and Local mode, is one row in the egress log (the site
+name and the bytes received, never the path, the query or the page), and
+lives in `src/inputs/web_page.rs`.
 
 ## Modes and the Offline guard
 
@@ -155,7 +169,8 @@ in the same change, per issue #58.
 
 Wingman is open source under the MIT license. `src/provider/openai.rs`,
 `src/provider/anthropic.rs`, `src/provider/gemini.rs`,
-`src/provider/ollama.rs` and `src/provider/openai_compat.rs` are the only
+`src/provider/ollama.rs` and `src/provider/openai_compat.rs`, plus
+`src/inputs/web_page.rs` (the confirmed link fetch above), are the only
 files that open a network connection;
 everything above can be checked by reading them and `src/provider/common.rs`
 (the shared, guarded send path and the Offline guard), or by running the app

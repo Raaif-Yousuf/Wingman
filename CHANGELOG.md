@@ -44,6 +44,12 @@ tagged release.
 
 ### Changed
 
+- The global "Show difficulty rating" setting is gone (issue #197). The
+  difficulty rating now belongs only to the Check my work action: override it
+  in `actions.toml` with `rate_difficulty = true` to get the badge (an
+  override replaces the whole entry, prompt included). An old `config.toml`
+  that still has `show_difficulty` loads fine and the key is dropped on the
+  next save.
 - Product name: the app is now referred to as Wingman in documentation; the
   crate, binary and installed paths still say `copilot-ask` until the Phase 0
   rename (issue #1) lands.
