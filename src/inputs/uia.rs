@@ -395,6 +395,47 @@ pub fn snapshot_hwnd(
     })
 }
 
+/// How many password rectangles one lookup returns at most (#506). A window
+/// with more masked fields than this is not a login form; the rest are left.
+pub const MAX_PASSWORD_RECTS: usize = 64;
+
+/// How long the password lookup may take before it is given up (#506). The
+/// `FindAll` is one blocking COM call against another process, and UIA's own
+/// transaction timeout is five seconds, too long to hold a request for.
+pub const PASSWORD_LOOKUP_BUDGET: Duration = Duration::from_millis(1500);
+
+/// The on-screen rectangles of every password field (`IsPassword`) under the
+/// window `hwnd` (a raw `HWND` value), in virtual-screen pixels, with no text
+/// read (#506). One `FindAll` with a property condition, on a thread of its
+/// own so a hung provider can only cost `budget`: after that this returns an
+/// error and the thread is left to finish by itself. At most
+/// [`MAX_PASSWORD_RECTS`] come back. An `hwnd` of 0 has no window to ask and
+/// returns none.
+pub fn password_rects(
+    hwnd: isize,
+    budget: Duration,
+) -> anyhow::Result<Vec<crate::capture::ScreenRect>> {
+    if hwnd == 0 {
+        return Ok(Vec::new());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("password-rects".into())
+        .spawn(move || {
+            let _ = tx.send(com::password_rects(
+                windows::Win32::Foundation::HWND(hwnd as *mut _),
+                MAX_PASSWORD_RECTS,
+            ));
+        })?;
+    match rx.recv_timeout(budget) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "{} (password fields)",
+            crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT
+        )),
+    }
+}
+
 /// Snapshots the current foreground window. A thin wrapper: every
 /// constraint on [`snapshot_hwnd`] (threading, budget, truncation) applies
 /// unchanged.
@@ -470,6 +511,50 @@ mod com {
     /// must be checked with this before use.
     fn is_null<I: Interface>(i: &I) -> bool {
         i.as_raw().is_null()
+    }
+
+    /// #506: the bounding rectangles of the password fields under `hwnd`.
+    pub(super) fn password_rects(
+        hwnd: HWND,
+        max: usize,
+    ) -> anyhow::Result<Vec<crate::capture::ScreenRect>> {
+        let _apartment = ComApartment::enter()?;
+        let automation: IUIAutomation =
+            unsafe { crate::inputs::uia_automation::create_automation() }?;
+        let root = crate::inputs::uia_automation::describe_timeout(
+            unsafe { automation.ElementFromHandle(hwnd) },
+            "ElementFromHandle",
+        )?;
+        if is_null(&root) {
+            return Ok(Vec::new());
+        }
+        let cache_request = unsafe { automation.CreateCacheRequest() }?;
+        unsafe { cache_request.AddProperty(UIA_BoundingRectanglePropertyId) }?;
+        let condition = unsafe {
+            automation.CreatePropertyCondition(
+                UIA_IsPasswordPropertyId,
+                &windows::Win32::System::Variant::VARIANT::from(true),
+            )
+        }?;
+        let found = crate::inputs::uia_automation::describe_timeout(
+            unsafe { root.FindAllBuildCache(TreeScope_Descendants, &condition, &cache_request) },
+            "FindAllBuildCache",
+        )?;
+        let total = unsafe { found.Length() }?.max(0) as usize;
+        let mut out = Vec::new();
+        for i in 0..total.min(max) {
+            let element = unsafe { found.GetElement(i as i32) }?;
+            // A password field whose rectangle cannot be read is an error,
+            // not a skip: the caller fails closed rather than send it.
+            let r = unsafe { element.CachedBoundingRectangle() }?;
+            out.push(crate::capture::ScreenRect {
+                left: r.left,
+                top: r.top,
+                right: r.right,
+                bottom: r.bottom,
+            });
+        }
+        Ok(out)
     }
 
     /// The single bulk COM call, plus turning its result into
@@ -1296,6 +1381,130 @@ mod tests {
                 password.value,
                 FieldValue::Text("hunter2".to_string()),
                 "the password field's real text must never appear in the snapshot"
+            );
+
+            unsafe {
+                let _ = DestroyWindow(frame);
+            }
+        }
+
+        /// Times the lookup on whatever window is in front (counts and
+        /// timings only, nothing read). Run by hand with a busy browser open:
+        /// `cargo test password_rects_live -- --ignored --nocapture`.
+        #[test]
+        #[ignore = "reads the real foreground window"]
+        fn password_rects_live_times_the_foreground_window() {
+            let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0
+                as isize;
+            for run in 0..3 {
+                let start = std::time::Instant::now();
+                let r = crate::inputs::uia::password_rects(
+                    hwnd,
+                    crate::inputs::uia::PASSWORD_LOOKUP_BUDGET,
+                );
+                eprintln!(
+                    "run {run}: {:?}, {} rect(s), ok={}",
+                    start.elapsed(),
+                    r.as_ref().map(|v| v.len()).unwrap_or(0),
+                    r.is_ok()
+                );
+            }
+        }
+
+        #[test]
+        fn password_rects_returns_only_the_password_field_where_it_is() {
+            use windows::Win32::Foundation::RECT;
+            use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+            let _uia = crate::inputs::lock_uia_test();
+            let hinstance = instance();
+            assert!(ensure_class_registered(hinstance));
+            let frame = unsafe {
+                CreateWindowExW(
+                    Default::default(),
+                    CLASS_NAME,
+                    w!("Wingman password rect test window"),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    0,
+                    0,
+                    320,
+                    240,
+                    None,
+                    None,
+                    Some(hinstance),
+                    None,
+                )
+            }
+            .expect("CreateWindowExW (frame)");
+            unsafe {
+                let _ = ShowWindow(frame, SW_SHOWNOACTIVATE);
+            }
+            pump_pending_messages();
+            let edit = |y: i32, style: u32| -> HWND {
+                unsafe {
+                    CreateWindowExW(
+                        Default::default(),
+                        w!("EDIT"),
+                        w!("x"),
+                        WS_CHILD
+                            | WS_VISIBLE
+                            | WS_TABSTOP
+                            | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
+                        10,
+                        y,
+                        200,
+                        20,
+                        Some(frame),
+                        None,
+                        Some(hinstance),
+                        None,
+                    )
+                }
+                .expect("CreateWindowExW (edit)")
+            };
+
+            // Calls the COM half directly (see below).
+            // No password field yet: nothing comes back.
+            let plain = edit(10, ES_AUTOHSCROLL as u32);
+            pump_pending_messages();
+            let none = crate::inputs::uia::com::password_rects(
+                frame,
+                crate::inputs::uia::MAX_PASSWORD_RECTS,
+            )
+            .expect("password_rects");
+            assert!(none.is_empty(), "{none:?}");
+
+            let password = edit(50, (ES_AUTOHSCROLL | ES_PASSWORD) as u32);
+            pump_pending_messages();
+            let start = std::time::Instant::now();
+            let rects = crate::inputs::uia::com::password_rects(
+                frame,
+                crate::inputs::uia::MAX_PASSWORD_RECTS,
+            )
+            .expect("password_rects");
+            eprintln!("uia::password_rects took {:?}", start.elapsed());
+            assert_eq!(rects.len(), 1, "{rects:?}");
+
+            let mut want = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(password, &mut want);
+                let _ = GetWindowRect(plain, &mut RECT::default());
+            }
+            let got = rects[0];
+            assert!(
+                got.left < want.right
+                    && want.left < got.right
+                    && got.top < want.bottom
+                    && want.top < got.bottom,
+                "UIA rect {got:?} must overlap the password edit at {want:?}"
+            );
+            assert!(got.bottom - got.top < 60, "{got:?}");
+
+            // No window to ask: nothing, not an error.
+            assert!(
+                crate::inputs::uia::password_rects(0, std::time::Duration::from_millis(10))
+                    .expect("hwnd 0")
+                    .is_empty()
             );
 
             unsafe {

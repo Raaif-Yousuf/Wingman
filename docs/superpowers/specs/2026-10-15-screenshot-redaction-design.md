@@ -184,8 +184,7 @@ Slices 1 and 2 land together (rule 8: no pipeline stage nobody calls).
   #509.
 - The intent router's tiny capture goes through the same helper. At that size OCR
   reads little, so it paints little; the router stays silent on failure by design.
-- Not built here: password-field rectangles (#506), the egress `redactions` count
-  (#508).
+- Not built here: the egress `redactions` count (#508).
 - Known blind spot, MEASURED 2026-10-15: Windows OCR returned no line at all for a
   rendered "Card 4111 1111 1111 1111", but read "Card 4539 1488 0343 6467"
   normally. A number OCR does not return is not painted (#507).
@@ -200,3 +199,24 @@ Slices 1 and 2 land together (rule 8: no pipeline stage nobody calls).
   build: `redact::apply` on that 900x160 image took 37 ms and painted one region.
   The full-screen figure in the Cost section is the one that applies to real use;
   a release-build timing was not taken.
+
+## As built (slice 3, #506)
+
+- `RawShot.screen` is a `ScreenMap`: the screen position of pixel (0, 0), the
+  screen pixels per image pixel (above 1 after the downscale) and the
+  foreground window at capture time. `grab_raw` and `grab_virtual_desktop_raw`
+  set it; the region tool carries it through a crop with `ScreenMap::cropped`.
+  A shot without one (a test canvas) has no password lookup.
+- `inputs::uia::password_rects` does one `FindAllBuildCache` with an
+  `IsPassword = true` condition on the foreground window and caches only the
+  bounding rectangle, so no text is read. It runs on a thread of its own and is
+  given up after 1.5 s; at most 64 rectangles come back.
+  `redact::apply` paints them (padded and clipped like OCR regions) before the
+  OCR regions. A lookup that fails or times out fails closed, like OCR.
+- Only the foreground window is asked. A password field in another window on the
+  same monitor is not painted. A revealed password (the field is no longer
+  `IsPassword`) is not found by UIA; OCR and the span rules still apply to it.
+- MEASURED 2026-10-15 (debug build): 3 ms on a two-field test window, and 37 to
+  117 ms on the window that was in front on the dev machine (not a browser).
+  THEORY (unverified): a busy browser window takes longer. Reproduce with
+  `cargo test password_rects_live -- --ignored --nocapture`.

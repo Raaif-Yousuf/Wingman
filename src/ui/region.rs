@@ -605,6 +605,7 @@ impl Overlay {
             rgba: vec![0u8; (w as usize) * (h as usize) * 4],
             width: w,
             height: h,
+            screen: None,
         };
         Self::create(instance, TEST_CLASS_NAME, desktop, original)
     }
@@ -762,12 +763,19 @@ impl Overlay {
     /// Crops `rect` (buffer-local, space 3) out of the frozen, UNDIMMED
     /// capture this overlay was opened with.
     fn crop_original(&self, rect: RectPx) -> RawShot {
-        capture::crop_rgba(
-            &self.inner.original.rgba,
-            self.inner.original.width,
-            self.inner.original.height,
-            rect,
-        )
+        let original = &self.inner.original;
+        let mut cropped = capture::crop_rgba(&original.rgba, original.width, original.height, rect);
+        // Keep the screen position (#506) so a password field inside the
+        // selection is still found. `crop_rgba` clamps the origin of `rect`
+        // to the image, so do the same here to stay in step with it.
+        cropped.screen = original.screen.map(|m| {
+            m.cropped(capture::RectPx {
+                x: rect.x.min(original.width.saturating_sub(1)),
+                y: rect.y.min(original.height.saturating_sub(1)),
+                ..rect
+            })
+        });
+        cropped
     }
 
     /// Test-only seam: feeds a synthetic message directly to the window's

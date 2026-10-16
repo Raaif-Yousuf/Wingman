@@ -7901,6 +7901,7 @@ mod tests {
             rgba,
             width,
             height,
+            screen: None,
         };
         let shot = capture::encode_unredacted(&raw).expect("encode synthetic PNG");
 

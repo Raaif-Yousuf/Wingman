@@ -148,6 +148,7 @@ mod tests {
             rgba: vec![0; 4],
             width: 1,
             height: 1,
+            screen: None,
         }
     }
 

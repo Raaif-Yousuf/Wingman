@@ -92,6 +92,86 @@ pub struct RawShot {
     pub rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Where these pixels sit on the screen, so screen rectangles (a UIA
+    /// password field) can be mapped onto them (#506). `None` for an image
+    /// that is not a screen capture (a test canvas): nothing can be mapped.
+    pub screen: Option<ScreenMap>,
+}
+
+/// A rectangle in virtual-screen coordinates (physical pixels; the process is
+/// per-monitor-v2 DPI aware, so UIA and `GetMonitorInfoW` agree). `right` and
+/// `bottom` are exclusive. Can be negative (a monitor left of or above the
+/// primary one) and is untrusted input from another process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// How a [`RawShot`]'s pixels relate to the virtual screen: the screen
+/// position of pixel (0, 0) and how many screen pixels one image pixel
+/// covers (above 1.0 once `fit_for_model` has shrunk the capture). Carries
+/// the foreground window the capture was taken against, so the password
+/// lookup asks the window the user was looking at, not whatever is in front
+/// when the worker runs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenMap {
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub scale_x: f64,
+    pub scale_y: f64,
+    /// Raw `HWND` of the foreground window at capture time, 0 if none.
+    pub foreground: isize,
+}
+
+impl ScreenMap {
+    /// The map of a monitor whose top-left is `(left, top)` and whose native
+    /// size is `native_w` x `native_h`, captured and then resized to
+    /// `width` x `height`.
+    pub fn for_capture(
+        left: i32,
+        top: i32,
+        native_w: u32,
+        native_h: u32,
+        width: u32,
+        height: u32,
+        foreground: isize,
+    ) -> Self {
+        Self {
+            origin_x: f64::from(left),
+            origin_y: f64::from(top),
+            scale_x: f64::from(native_w.max(1)) / f64::from(width.max(1)),
+            scale_y: f64::from(native_h.max(1)) / f64::from(height.max(1)),
+            foreground,
+        }
+    }
+
+    /// The map of a crop of this image taken at `rect` (buffer-local pixels).
+    pub fn cropped(&self, rect: RectPx) -> Self {
+        Self {
+            origin_x: self.origin_x + f64::from(rect.x) * self.scale_x,
+            origin_y: self.origin_y + f64::from(rect.y) * self.scale_y,
+            ..*self
+        }
+    }
+
+    /// `rect` as float image pixels `(x0, y0, x1, y1)`, not clipped. `None`
+    /// for a map that cannot be inverted (a scale that is zero or not
+    /// finite) or a rect that is empty or reversed.
+    pub fn to_image(self, rect: ScreenRect) -> Option<(f32, f32, f32, f32)> {
+        let ok = |s: f64| s.is_finite() && s > 0.0;
+        if !(ok(self.scale_x) && ok(self.scale_y))
+            || rect.right <= rect.left
+            || rect.bottom <= rect.top
+        {
+            return None;
+        }
+        let x = |v: i32| ((f64::from(v) - self.origin_x) / self.scale_x) as f32;
+        let y = |v: i32| ((f64::from(v) - self.origin_y) / self.scale_y) as f32;
+        Some((x(rect.left), y(rect.top), x(rect.right), y(rect.bottom)))
+    }
 }
 
 /// Resolves the `(max_long_edge, max_pixels)` [`fit_for_model`] should use
@@ -154,6 +234,11 @@ pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Resu
     let image = target
         .capture_image()
         .map_err(|e| anyhow!("capturing monitor: {e}"))?;
+    let (origin_x, origin_y) = (
+        target.x().unwrap_or(rect.left),
+        target.y().unwrap_or(rect.top),
+    );
+    let foreground = unsafe { GetForegroundWindow() }.0 as isize;
 
     let (w, h) = (image.width(), image.height());
     let (nw, nh) = fit_for_model(w, h, max_long_edge, max_pixels);
@@ -169,6 +254,9 @@ pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Resu
         rgba: resized.into_raw(),
         width: final_w,
         height: final_h,
+        screen: Some(ScreenMap::for_capture(
+            origin_x, origin_y, w, h, final_w, final_h, foreground,
+        )),
     })
 }
 
@@ -468,6 +556,15 @@ pub fn grab_virtual_desktop_raw() -> Result<RawShot> {
         rgba,
         width,
         height,
+        screen: Some(ScreenMap::for_capture(
+            desktop.left,
+            desktop.top,
+            width,
+            height,
+            width,
+            height,
+            unsafe { GetForegroundWindow() }.0 as isize,
+        )),
     })
 }
 
@@ -545,6 +642,7 @@ pub fn crop_rgba(rgba: &[u8], width: u32, height: u32, rect: RectPx) -> RawShot 
             rgba: vec![0; 4],
             width: 1,
             height: 1,
+            screen: None,
         };
     }
 
@@ -568,6 +666,9 @@ pub fn crop_rgba(rgba: &[u8], width: u32, height: u32, rect: RectPx) -> RawShot 
         rgba: out,
         width: cw,
         height: ch,
+        // The caller owns the source's map and sets the crop's with
+        // `ScreenMap::cropped` (this takes bare pixels).
+        screen: None,
     }
 }
 
@@ -930,6 +1031,7 @@ mod tests {
             rgba: checkerboard_rgba(w, h),
             width: w,
             height: h,
+            screen: None,
         };
         let shot = encode(&raw).expect("encode");
         assert_eq!(shot.width, w);
@@ -1117,6 +1219,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- ScreenMap (#506) --------------------------------------------------
+
+    fn sr(left: i32, top: i32, right: i32, bottom: i32) -> super::ScreenRect {
+        super::ScreenRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn screen_map_full_size_capture_subtracts_the_monitor_origin() {
+        let m = super::ScreenMap::for_capture(100, 50, 800, 600, 800, 600, 0);
+        assert_eq!(
+            m.to_image(sr(110, 60, 210, 80)),
+            Some((10.0, 10.0, 110.0, 30.0))
+        );
+    }
+
+    #[test]
+    fn screen_map_follows_a_downscale() {
+        // 2000x1000 monitor shrunk to 1000x500: one image pixel is two screen pixels.
+        let m = super::ScreenMap::for_capture(0, 0, 2000, 1000, 1000, 500, 0);
+        assert_eq!(
+            m.to_image(sr(200, 100, 600, 300)),
+            Some((100.0, 50.0, 300.0, 150.0))
+        );
+    }
+
+    #[test]
+    fn screen_map_handles_a_monitor_left_of_and_above_the_primary() {
+        let m = super::ScreenMap::for_capture(-1920, -200, 1920, 1080, 1920, 1080, 0);
+        assert_eq!(
+            m.to_image(sr(-1900, -190, -1800, -170)),
+            Some((20.0, 10.0, 120.0, 30.0))
+        );
+    }
+
+    #[test]
+    fn screen_map_of_a_crop_moves_the_origin_by_the_crop_offset() {
+        let whole = super::ScreenMap::for_capture(0, 0, 2000, 1000, 1000, 500, 0);
+        let crop = whole.cropped(RectPx {
+            x: 100,
+            y: 50,
+            w: 200,
+            h: 100,
+        });
+        // Screen (200,100) is image (100,50) of the whole, (0,0) of the crop.
+        assert_eq!(
+            crop.to_image(sr(200, 100, 400, 200)),
+            Some((0.0, 0.0, 100.0, 50.0))
+        );
+    }
+
+    #[test]
+    fn screen_map_refuses_what_it_cannot_map_instead_of_panicking() {
+        let m = super::ScreenMap::for_capture(0, 0, 100, 100, 100, 100, 0);
+        assert_eq!(m.to_image(sr(10, 10, 10, 20)), None, "empty");
+        assert_eq!(m.to_image(sr(30, 10, 10, 20)), None, "reversed");
+        let bad = super::ScreenMap { scale_x: 0.0, ..m };
+        assert_eq!(bad.to_image(sr(0, 0, 5, 5)), None);
+        let nan = super::ScreenMap {
+            scale_y: f64::NAN,
+            ..m
+        };
+        assert_eq!(nan.to_image(sr(0, 0, 5, 5)), None);
+        // A zero-sized capture still builds a usable (non-zero) scale.
+        let z = super::ScreenMap::for_capture(0, 0, 0, 0, 0, 0, 0);
+        assert!(z.scale_x > 0.0 && z.scale_y > 0.0);
+        assert!(m
+            .to_image(sr(i32::MIN, i32::MIN, i32::MAX, i32::MAX))
+            .is_some());
     }
 
     // -- blit_into (issue #29's virtual-desktop compositing) -------------
