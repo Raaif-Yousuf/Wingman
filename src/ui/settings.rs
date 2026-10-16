@@ -1127,8 +1127,10 @@ const WIN_W_DP: i32 = 620;
 /// back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout` itself
 /// never overlaps regardless of this constant, but a taller default is nicer
 /// than always squeezing. #427 added one more row (the hint under the cloud
-/// model dropdowns), so it is raised by another `ROW_H + ROW_GAP`.
-const WIN_H_DP: i32 = 918 + 4 * (ROW_H + ROW_GAP);
+/// model dropdowns), so it is raised by another `ROW_H + ROW_GAP`. #822 gave
+/// each Thinking dropdown (three) and the Capture Screen dropdown their own
+/// row, four more.
+const WIN_H_DP: i32 = 918 + 8 * (ROW_H + ROW_GAP);
 
 /// The one-line hint under the model dropdowns (#427). Plain words, no dash.
 const MODEL_LIST_HINT: &str = "Missing a cloud model? Add its name to models in config.toml.";
