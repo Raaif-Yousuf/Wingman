@@ -6070,9 +6070,17 @@ fn exec_work_restore(undo: executors::Undo) -> ExecDone {
 }
 
 /// #712: why Quit is refused right now, if it is. An executor worker that is
-/// mid-write (typing into a form) is never killed; the user tries again.
-fn quit_refusal(exec_in_flight: bool) -> Option<&'static str> {
-    exec_in_flight.then_some("Wingman is still typing into a form; try again in a moment.")
+/// mid-write (typing into a form) is never killed; the user tries again. The
+/// same for "Fix it" on the Ollama GPU setting: it stops and restarts Ollama,
+/// and quitting between the two would leave Ollama stopped (#795).
+fn quit_refusal(exec_in_flight: bool, gpu_fix_running: bool) -> Option<&'static str> {
+    if exec_in_flight {
+        Some("Wingman is still typing into a form; try again in a moment.")
+    } else if gpu_fix_running {
+        Some("Wingman is still restarting Ollama; try again in a moment.")
+    } else {
+        None
+    }
 }
 
 /// Issue #227: runs a worker's whole computation and turns a panic into the
@@ -6630,7 +6638,10 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
         MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
         MenuChoice::Command(cmd::QUIT) => {
-            if let Some(text) = quit_refusal(app.exec_in_flight) {
+            if let Some(text) = quit_refusal(
+                app.exec_in_flight,
+                crate::provider::ollama_gpu_fix::is_running(),
+            ) {
                 app.card.show_answer("Still working", text, 5, None);
                 app.set_watch(true);
             } else {
@@ -7561,8 +7572,16 @@ mod tests {
 
     #[test]
     fn quit_is_refused_only_while_an_executor_is_writing() {
-        assert!(super::quit_refusal(true).is_some_and(|t| !t.contains('\u{2014}')));
-        assert!(super::quit_refusal(false).is_none());
+        assert!(super::quit_refusal(true, false).is_some_and(|t| !t.contains('\u{2014}')));
+        assert!(super::quit_refusal(false, false).is_none());
+    }
+
+    #[test]
+    fn quit_is_refused_while_the_ollama_fix_is_running() {
+        // #795: quitting between the stop and the restart leaves Ollama stopped.
+        let text = super::quit_refusal(false, true).expect("must refuse");
+        assert!(!text.contains('\u{2014}'));
+        assert!(super::quit_refusal(true, true).is_some());
     }
 
     #[test]

@@ -194,7 +194,56 @@ fn quarantine(path: &Path) -> Result<PathBuf, StoreError> {
             })?;
         }
     }
+    prune_quarantined(path, &name, KEEP_CORRUPT_COPIES);
     Ok(main_target)
+}
+
+/// How many damaged-database copies are kept (#795). Each holds a full copy of
+/// the egress log and the sealed profile rows, so they are not kept forever.
+const KEEP_CORRUPT_COPIES: usize = 2;
+
+/// The stamp in `<base>[-wal|-shm].corrupt-<unix time>`, if `file` is one.
+fn corrupt_stamp(file: &str, base: &str) -> Option<u64> {
+    let rest = file.strip_prefix(base)?;
+    let rest = rest
+        .strip_prefix("-wal")
+        .or_else(|| rest.strip_prefix("-shm"))
+        .unwrap_or(rest);
+    let digits = rest.strip_prefix(".corrupt-")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The stamps to delete: all but the `keep` newest.
+fn stamps_to_prune(mut stamps: Vec<u64>, keep: usize) -> Vec<u64> {
+    stamps.sort_unstable_by(|a, b| b.cmp(a));
+    stamps.dedup();
+    stamps.split_off(keep.min(stamps.len()))
+}
+
+/// Deletes older quarantined copies, keeping the newest `keep`. Best effort: a
+/// file that cannot be listed or removed is left alone.
+fn prune_quarantined(path: &Path, base: &str, keep: usize) {
+    let Some(dir) = path.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let files: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stamp = corrupt_stamp(&name, base)?;
+            Some((name, stamp))
+        })
+        .collect();
+    let drop_stamps = stamps_to_prune(files.iter().map(|(_, s)| *s).collect(), keep);
+    for (name, stamp) in files {
+        if drop_stamps.contains(&stamp) {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+    }
 }
 
 // -- the process-wide store ------------------------------------------------
@@ -559,6 +608,62 @@ mod tests {
         assert_eq!(moved.len(), 1);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_newest_damaged_copies_are_kept() {
+        // #795
+        assert_eq!(stamps_to_prune(vec![5, 9, 7, 3], 2), vec![5, 3]);
+        assert!(stamps_to_prune(vec![5, 9], 2).is_empty());
+        assert!(stamps_to_prune(vec![], 2).is_empty());
+        assert_eq!(stamps_to_prune(vec![4, 4, 8], 1), vec![4]);
+    }
+
+    #[test]
+    fn corrupt_stamps_are_read_only_from_our_own_file_names() {
+        assert_eq!(
+            corrupt_stamp("wingman.db.corrupt-12", "wingman.db"),
+            Some(12)
+        );
+        assert_eq!(
+            corrupt_stamp("wingman.db-wal.corrupt-12", "wingman.db"),
+            Some(12)
+        );
+        assert_eq!(corrupt_stamp("wingman.db", "wingman.db"), None);
+        assert_eq!(corrupt_stamp("wingman.db.corrupt-", "wingman.db"), None);
+        assert_eq!(corrupt_stamp("wingman.db.corrupt-1x", "wingman.db"), None);
+        assert_eq!(corrupt_stamp("other.db.corrupt-1", "wingman.db"), None);
+    }
+
+    #[test]
+    fn a_third_damaged_file_removes_the_oldest_copy() {
+        let dir = std::env::temp_dir().join(format!("wingman-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("wingman.db");
+        for stamp in [100, 200, 300] {
+            std::fs::write(dir.join(format!("wingman.db.corrupt-{stamp}")), b"x").unwrap();
+            std::fs::write(dir.join(format!("wingman.db-wal.corrupt-{stamp}")), b"x").unwrap();
+        }
+        std::fs::write(dir.join("unrelated.txt"), b"x").unwrap();
+        prune_quarantined(&db, "wingman.db", 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            left,
+            vec![
+                "unrelated.txt",
+                "wingman.db-wal.corrupt-200",
+                "wingman.db-wal.corrupt-300",
+                "wingman.db.corrupt-200",
+                "wingman.db.corrupt-300",
+            ]
+        );
     }
 
     #[test]
