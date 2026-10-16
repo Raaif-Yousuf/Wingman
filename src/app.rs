@@ -1201,7 +1201,7 @@ impl App {
         if let Some(d) = first_run_detail(&found) {
             detail = d;
         }
-        self.card.show_settings_needed(&headline, &detail);
+        self.show_setup_card(&headline, &detail);
     }
 
     /// #339: a password manager is in front now, or was when Wingman's own
@@ -1322,7 +1322,7 @@ impl App {
             if self.start_first_run_probe() {
                 return None;
             }
-            self.card.show_settings_needed(&headline, &detail);
+            self.show_setup_card(&headline, &detail);
             return None;
         }
 
@@ -3455,8 +3455,7 @@ impl App {
                 let (headline, detail) = self.empty_chain_card_now();
                 let chain = unpack_error(packed).1.to_string();
                 let _ = self.record_last(Err(pack_error(&headline, &chain)));
-                self.card.show_settings_needed(&headline, &detail);
-                self.set_watch(true);
+                self.show_setup_card(&headline, &detail);
                 return;
             }
         }
@@ -3607,9 +3606,16 @@ impl App {
         }
         let (headline, detail) = self.empty_chain_card_now();
         self.record_run_failure(&headline, &headline, unpack_error(packed).1);
-        self.card.show_settings_needed(&headline, &detail);
-        self.set_watch(true);
+        self.show_setup_card(&headline, &detail);
         true
+    }
+
+    /// #893: the one way to show a setup card. It persists until dismissed, so
+    /// it also arms the click-away hook; a call site that showed it directly
+    /// could forget, and the card would then only go away by a click on it.
+    fn show_setup_card(&mut self, headline: &str, detail: &str) {
+        self.card.show_settings_needed(headline, detail);
+        self.set_watch(true);
     }
 
     fn record_run_failure(&mut self, action: &str, human: &str, raw_chain: &str) {
@@ -3943,6 +3949,8 @@ impl App {
                     .show_error_with_details("Couldn't reload settings", &detail);
             }
         }
+        // Every card above but "Settings reloaded" persists.
+        self.set_watch(true);
     }
 
     /// Open the GUI settings window. Modal: it runs its own message loop, so
@@ -4209,6 +4217,7 @@ impl App {
         let Ok(path) = Config::path() else {
             self.card
                 .show_error("Couldn't locate config.toml", "%APPDATA% is not readable.");
+            self.set_watch(true);
             return;
         };
         // Make sure the file exists before asking the shell to open it.
@@ -4227,6 +4236,7 @@ impl App {
                 let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't save settings", &detail);
+                self.set_watch(true);
             }
             return;
         }
@@ -4327,7 +4337,7 @@ impl App {
             // press, so say so now and point at Settings.
             Ok(()) if provider_needs_key(provider, &self.config.providers, self.config.mode) => {
                 let (headline, detail) = missing_key_card(provider);
-                self.card.show_settings_needed(&headline, &detail);
+                self.show_setup_card(&headline, &detail);
             }
             Ok(()) => self.card.show_answer(name, "", 3, None),
             Err(e) => {
@@ -10610,6 +10620,34 @@ mod tests {
             );
         }
     }
+    /// #893: a setup card is persistent, so showing one must also arm the
+    /// click-away hook. That happens in `show_setup_card`, the only place
+    /// outside startup (the watcher is not installed yet there) that calls
+    /// `Card::show_settings_needed`; `reload` and `edit_settings` arm their own
+    /// persistent cards.
+    #[test]
+    fn setup_cards_are_shown_through_the_one_helper_that_arms_click_away() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let body_of = |name: &str| {
+            let start = production
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &production[start + 1..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        let direct = production.matches("card.show_settings_needed(").count();
+        // The helper itself and the startup welcome card.
+        assert_eq!(direct, 2, "a setup card bypasses show_setup_card");
+        assert!(body_of("show_setup_card").contains("set_watch(true)"));
+        for name in ["reload", "edit_settings"] {
+            assert!(
+                body_of(name).contains("set_watch(true)"),
+                "{name} shows a persistent card without arming click-away"
+            );
+        }
+    }
+
     #[test]
     fn a_worker_result_hands_its_attribution_to_the_main_thread_once() {
         let _g = ATTRIBUTION_TEST_LOCK
