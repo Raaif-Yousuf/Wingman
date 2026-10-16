@@ -500,6 +500,10 @@ pub fn run() -> Result<()> {
         .name("ics-startup-sweep".into())
         .spawn(|| crate::connectors::IcsConnector::new().sweep_stale());
 
+    // #831: read before `Config::load`, which creates the file on a first
+    // run. If the path cannot be found, say it existed: no welcome is the
+    // safe side.
+    let config_existed = Config::path().map(|p| p.exists()).unwrap_or(true);
     let config = Config::load().unwrap_or_default();
     // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
     // anything below can start a request (the hotkey hook isn't installed
@@ -663,6 +667,22 @@ pub fn run() -> Result<()> {
         app.card.show_error_with_details(&headline, &detail);
     }
 
+    // #831: after every startup problem card above, so it never replaces one.
+    // No model call: this is text only.
+    let opens_settings = crate::single_instance::first_launch_action(std::env::args())
+        == crate::single_instance::FirstLaunchAction::OpenSettings;
+    let other_card = !matches!(app.card.state(), crate::ui::card::CardState::Hidden);
+    let welcome = match (Config::path(), Config::old_path()) {
+        (Ok(path), Ok(old)) => {
+            should_show_welcome(&path, &old, config_existed, opens_settings, other_card)
+        }
+        _ => false,
+    };
+    if welcome {
+        let (headline, detail) = welcome_card(&chord_to_string(&app.config.hotkeys.secondary));
+        app.card.show_settings_needed(&headline, &detail);
+    }
+
     // Non-fatal: without it the card still auto-dismisses on its timer.
     app.watcher = ClickWatcher::install(hwnd).ok();
 
@@ -722,6 +742,38 @@ fn startup_card(
         detail = format!("{detail}\n\n{h}. {d}");
     }
     Some((headline, detail))
+}
+
+/// #831: whether to show the welcome card. A bare launch must not ask a
+/// model, and the login autostart is a bare launch too, so the only "first
+/// time" signal is the config file: absent before this start's
+/// `Config::load` AND present after it (this start created it, which is what
+/// remembers it). A folder that cannot be written leaves no file, so the card
+/// never repeats (#879). A leftover pre-rename `copilot-ask` config means a
+/// returning user whose migration did not finish. Also skipped when
+/// `--settings` is already opening Settings or a startup problem card shows.
+/// It reads only paths and flags, so a check that cannot run shows no card.
+fn should_show_welcome(
+    config_path: &std::path::Path,
+    old_path: &std::path::Path,
+    existed_before: bool,
+    opens_settings: bool,
+    other_card: bool,
+) -> bool {
+    !existed_before && config_path.exists() && !old_path.exists() && !opens_settings && !other_card
+}
+
+/// #831: the first-launch welcome card. `secondary` is the display form of
+/// the second hotkey. Shown through the settings-needed card, so a click
+/// opens Settings. No em dash (rule 11).
+pub(crate) fn welcome_card(secondary: &str) -> (String, String) {
+    (
+        "Wingman is running".to_string(),
+        format!(
+            "Press the Copilot key or {secondary}. The icon may be under the ^ arrow in the tray; \
+             drag it out to keep it in view. Click here to open Settings."
+        ),
+    )
 }
 
 /// #793: whether `mode` may be switched on while the config file's state is
@@ -8033,6 +8085,51 @@ mod tests {
             assert!(!headline.contains('\u{2014}'), "{headline}");
             assert!(!detail.contains('\u{2014}'), "{detail}");
         }
+    }
+
+    // -- #831: the welcome card on the very first launch -------------------
+
+    #[test]
+    fn welcome_decision_against_a_scratch_folder() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("wingman-test-welcome-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        let old = dir.join("old-config.toml");
+        let show = |existed, settings, other| {
+            super::should_show_welcome(&cfg, &old, existed, settings, other)
+        };
+
+        // Unwritable folder: load could not create the file, so no card.
+        assert!(!show(false, false, false));
+
+        // Fresh start: absent before, created by this start.
+        fs::write(&cfg, "").unwrap();
+        assert!(show(false, false, false));
+
+        // Every later launch (and autostart): the file existed before.
+        assert!(!show(true, false, false));
+        // install.ps1's `--settings` launch already opens Settings.
+        assert!(!show(false, true, false));
+        // A startup problem card must not be replaced.
+        assert!(!show(false, false, true));
+
+        // Unfinished copilot-ask migration: a returning user.
+        fs::write(&old, "").unwrap();
+        assert!(!show(false, false, false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn welcome_card_names_the_keys_and_the_tray_icon() {
+        let (headline, detail) = super::welcome_card("Ctrl+Shift+/");
+        assert!(headline.starts_with("Wingman is running"), "{headline}");
+        assert!(detail.contains("Copilot key"), "{detail}");
+        assert!(detail.contains("Ctrl+Shift+/"), "{detail}");
+        assert!(detail.contains("tray"), "{detail}");
+        assert!(detail.contains("Click here"), "{detail}");
+        assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
     }
 
     // -- #832: an empty chain at run time ends in the setup card ----------

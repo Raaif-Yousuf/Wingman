@@ -1077,6 +1077,9 @@ const CARD_WIDTH_DP: i32 = 384;
 /// never silently `DT_END_ELLIPSIS`'d. (The card is as wide as it is so
 /// the larger type keeps the 50-character budget the prompts promise.)
 pub(crate) const HEADLINE_MAX_LINES: i32 = 3;
+/// #885: the most lines of detail a setup card shows; the rest ends in an
+/// ellipsis, so a long config path cannot make the card taller than the screen.
+const SETUP_DETAIL_MAX_LINES: i32 = 6;
 /// Characters that fit on one collapsed headline line once the chevron's
 /// width is reserved: (352dp content - 24dp chevron) / 6.6dp per glyph = 50.
 /// A budget for callers that must fit text in `HEADLINE_MAX_LINES`
@@ -1692,7 +1695,12 @@ impl CardInner {
         // reasoning as `set_window_text_for_pending_stage` (#354) -- covers
         // show_answer, show_error, show_error_with_details and
         // show_settings_needed, every one of which funnels through here.
-        self.set_window_text(headline);
+        // #885: a setup card's detail is on screen, so Narrator reads it too.
+        if open_settings && !detail.is_empty() {
+            self.set_window_text(&format!("{headline}. {detail}"));
+        } else {
+            self.set_window_text(headline);
+        }
         // Issue #347: every ordinary show_answer/show_error call starts a
         // plain card, not a "click to open Settings" prompt -- only
         // `Card::show_settings_needed` sets this, right after this call
@@ -2339,7 +2347,7 @@ impl CardInner {
         // `paint_collapsed` draws it.
         if self.shows_setup_detail() {
             let gap = self.scale(GAP_DP);
-            height += gap + self.measure_wrapped(self.fonts.caption, &self.detail, content_width);
+            height += gap + self.setup_detail_height(content_width);
         }
 
         self.place_bottom_right(work, width, height);
@@ -2590,6 +2598,14 @@ impl CardInner {
     /// under the headline, because a click opens Settings, not the detail.
     fn shows_setup_detail(&self) -> bool {
         self.state == CardState::Collapsed && self.open_settings_on_click && !self.detail.is_empty()
+    }
+
+    /// Height of the setup card's detail: measured, capped at
+    /// [`SETUP_DETAIL_MAX_LINES`] lines. Layout and paint both use it.
+    fn setup_detail_height(&self, content_w: i32) -> i32 {
+        let cap = self.line_height(self.fonts.caption).max(1) * SETUP_DETAIL_MAX_LINES;
+        self.measure_wrapped(self.fonts.caption, &self.detail, content_w)
+            .min(cap)
     }
 
     /// Space kept free at the right of a collapsed headline for the "click
@@ -2871,7 +2887,7 @@ impl CardInner {
                 left: rc.left + padding,
                 top,
                 right: rc.left + padding + content_w,
-                bottom: top + self.measure_wrapped(self.fonts.caption, &self.detail, content_w),
+                bottom: top + self.setup_detail_height(content_w),
             };
             SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
@@ -2879,7 +2895,7 @@ impl CardInner {
                 hdc,
                 &self.detail,
                 detail_rect,
-                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
             );
         }
 
@@ -4953,6 +4969,18 @@ mod tests {
             card.inner.chevron_reserve(),
             0,
             "a click opens Settings, so no expand chevron"
+        );
+        // Narrator reads the detail too (the window text is the accessible name).
+        assert!(window_text(card.hwnd()).contains("paste an API key"));
+        // A very long detail is capped, not taller than a few lines.
+        let normal = height(&card);
+        card.show_settings_needed("No AI model set up yet", &"word ".repeat(200));
+        let long = height(&card);
+        let line = card.inner.line_height(card.inner.fonts.caption);
+        assert!(long > normal);
+        assert!(
+            long <= normal + line * SETUP_DETAIL_MAX_LINES,
+            "{long} vs {normal}"
         );
         // An ordinary answer card with the same text is unchanged: it keeps
         // the chevron and shows no detail until expanded.
