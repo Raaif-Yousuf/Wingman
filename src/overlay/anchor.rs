@@ -14,6 +14,9 @@
 //! - A word hyphenated at a line break is matched joined (`recei-` + `ve`
 //!   finds `receive`), but only if the plain words matched nothing, so a real
 //!   hyphen is never eaten.
+//! - Fuzzy matching: a quote with a digit is exact-only, a quote under 9
+//!   characters gets no edits (only the `rn`/`m`, `1`/`l`, `0`/`o` folds),
+//!   and from 9 characters one edit per 8, rounded up.
 //! - A word whose box is not finite or has no area is dropped from the
 //!   stream. A line with no word boxes at all matches as its whole rect.
 
@@ -25,6 +28,8 @@ const MIN_QUOTE_CHARS: usize = 2;
 const MAX_QUOTE_CHARS: usize = 400;
 /// A quote shorter than this is never matched fuzzily.
 const MIN_FUZZY_CHARS: usize = 4;
+/// A quote shorter than this gets no edits, only the OCR confusion folds.
+const MIN_EDIT_CHARS: usize = 9;
 /// One edit allowed per this many characters of quote (rounded up).
 const FUZZY_CHARS_PER_EDIT: usize = 8;
 
@@ -272,10 +277,18 @@ enum Fuzzy {
 fn fuzzy(plain: &[Tok], joined: Option<&[Tok]>, qkeys: &[String]) -> Fuzzy {
     let q = qkeys.join(" ");
     let qlen = q.chars().count();
-    if qlen < MIN_FUZZY_CHARS {
+    // A number is exact-only: a misread digit is a different number, and
+    // pointing at the wrong one is worse than not pointing.
+    if qlen < MIN_FUZZY_CHARS || q.chars().any(|c| c.is_ascii_digit()) {
         return Fuzzy::None;
     }
-    let budget = qlen.div_ceil(FUZZY_CHARS_PER_EDIT);
+    // Short quotes get no edits (only the confusion folds): "Send" is not
+    // "Sent". From 9 characters, one edit per 8, rounded up.
+    let budget = if qlen < MIN_EDIT_CHARS {
+        0
+    } else {
+        qlen.div_ceil(FUZZY_CHARS_PER_EDIT)
+    };
     let qf: Vec<char> = fold(&q).chars().collect();
     match fuzzy_in(plain, qkeys.len(), &qf, budget) {
         Fuzzy::None => match joined {
@@ -667,8 +680,33 @@ mod tests {
             locate(&lines, &quote("follow-up", 1), &space()),
             Located::Found(_)
         ));
-        assert!(matches!(
+        // A quote with a digit in it is exact-only: a misread number is a
+        // different number.
+        assert_eq!(
             locate(&lines, &quote("2024", 1), &space()),
+            Located::NotFound
+        );
+    }
+
+    #[test]
+    fn numbers_and_short_words_are_never_taken_for_a_near_one() {
+        for (screen, q) in [
+            ("total 1900 due", "1000"),
+            ("please Sent it", "Send"),
+            ("pay invoice 19000 now", "invoice 10000"),
+            ("order 0123456789 shipped", "order 0123456780"),
+        ] {
+            let lines = [line(screen, 0.0, 0.0)];
+            assert_eq!(
+                locate(&lines, &quote(q, 1), &space()),
+                Located::NotFound,
+                "{q}"
+            );
+        }
+        // The exact number is still found.
+        let lines = [line("total 1000 due", 0.0, 0.0)];
+        assert!(matches!(
+            locate(&lines, &quote("1000", 1), &space()),
             Located::Found(_)
         ));
     }
@@ -687,13 +725,20 @@ mod tests {
 
     #[test]
     fn fuzzy_is_not_tried_when_the_exact_pass_found_something() {
-        // Two exact "cat"; asking for a third must not fall through to a
-        // near match like "cot".
-        let lines = [line("cat cot cat", 0.0, 0.0)];
+        // Two exact matches; asking for a third must not fall through to the
+        // near "gooseberrx". The quote is long enough to be fuzzy-eligible,
+        // so this fails if the guard is removed (Ambiguous, or Found).
+        let lines = [line("gooseberry gooseberry gooseberrx", 0.0, 0.0)];
         assert_eq!(
-            locate(&lines, &quote("cat", 3), &space()),
+            locate(&lines, &quote("gooseberry", 3), &space()),
             Located::NotFound
         );
+        // Sanity: with no exact match that near word is found.
+        let lines = [line("one gooseberrx only", 0.0, 0.0)];
+        assert!(matches!(
+            locate(&lines, &quote("gooseberry", 1), &space()),
+            Located::Found(_)
+        ));
     }
 
     #[test]

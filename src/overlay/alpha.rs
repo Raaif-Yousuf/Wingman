@@ -30,6 +30,7 @@ pub fn finish_pills(buf: &mut [u8], width: u32, height: u32, pills: &[Pill]) -> 
     if w.checked_mul(h).and_then(|n| n.checked_mul(4)) != Some(buf.len()) {
         return false;
     }
+    let source = buf.to_vec();
     for pill in pills {
         let r = pill.rect;
         if r.left >= r.right || r.top >= r.bottom {
@@ -51,10 +52,13 @@ pub fn finish_pills(buf: &mut [u8], width: u32, height: u32, pills: &[Pill]) -> 
         for y in y0..y1 {
             for x in x0..x1 {
                 let cover = coverage(x as f32 + 0.5 - cx, y as f32 + 0.5 - cy, pw, ph, radius);
-                let a = (cover * 255.0).round() as u32;
                 let i = (y * w + x) * 4;
-                for c in &mut buf[i..i + 3] {
-                    *c = ((u32::from(*c) * a + 127) / 255) as u8;
+                // Overlapping pills: the more opaque one wins, and colour is
+                // always premultiplied from the pixel GDI drew, never from a
+                // value an earlier pill already scaled.
+                let a = ((cover * 255.0).round() as u32).max(u32::from(buf[i + 3]));
+                for k in 0..3 {
+                    buf[i + k] = ((u32::from(source[i + k]) * a + 127) / 255) as u8;
                 }
                 buf[i + 3] = a as u8;
             }
@@ -179,6 +183,45 @@ mod tests {
         assert_eq!(u32::from(p[0]), (200 * a + 127) / 255);
         assert_eq!(u32::from(p[1]), (100 * a + 127) / 255);
         assert_eq!(u32::from(p[2]), (50 * a + 127) / 255);
+    }
+
+    #[test]
+    fn overlapping_pills_never_lose_opacity_or_double_premultiply() {
+        // B's transparent corner (4,4) lies inside A's interior.
+        let mut b = gdi_bitmap();
+        finish_pills(
+            &mut b,
+            W,
+            H,
+            &[pill(2, 2, 18, 10, 0), pill(4, 4, 16, 12, 4)],
+        );
+        assert_eq!(
+            px(&b, 4, 4),
+            [200, 100, 50, 255],
+            "corner over an opaque pixel"
+        );
+        // Order must not matter.
+        let mut c = gdi_bitmap();
+        finish_pills(
+            &mut c,
+            W,
+            H,
+            &[pill(4, 4, 16, 12, 4), pill(2, 2, 18, 10, 0)],
+        );
+        assert_eq!(b, c);
+        // The overlap of two opaque pills is not premultiplied twice.
+        assert_eq!(px(&b, 8, 6), [200, 100, 50, 255]);
+        // Two soft edges on one pixel: colour still follows the source.
+        let mut d = gdi_bitmap();
+        finish_pills(
+            &mut d,
+            W,
+            H,
+            &[pill(2, 2, 18, 10, 3), pill(2, 2, 18, 10, 3)],
+        );
+        let mut e = gdi_bitmap();
+        finish_pills(&mut e, W, H, &[pill(2, 2, 18, 10, 3)]);
+        assert_eq!(d, e);
     }
 
     #[test]

@@ -34,6 +34,16 @@ pub enum HookKind {
     Keyboard,
 }
 
+/// One thing the Win32 side must set up for the overlay to be allowed to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Install {
+    Hook(HookKind),
+    /// The one-shot age timer (`SetTimer`). Without it nothing bounds the
+    /// residual case the table cannot see, so a failed `SetTimer` refuses
+    /// the overlay like a failed hook.
+    AgeTimer,
+}
+
 /// What the table needs installed, in install order.
 pub const REQUIRED_HOOKS: [HookKind; 6] = [
     HookKind::LocationChange,
@@ -43,6 +53,24 @@ pub const REQUIRED_HOOKS: [HookKind; 6] = [
     HookKind::Mouse,
     HookKind::Keyboard,
 ];
+
+/// Why [`Overlay::show`] said no, and what the caller must remove again.
+/// Slice 2 must remove every hook and timer named in `undo` before it shows
+/// the summary card alone, and carries a test that it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub why: RefusedBecause,
+    /// What did install before the failure, in install order.
+    pub undo: Vec<Install>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedBecause {
+    /// No window under the marks that is not Wingman's own: there is nothing
+    /// to watch, so nothing could ever tell the overlay it went stale.
+    NoTargets,
+    Failed(Install),
+}
 
 /// One input, as posted by a hook callback or timer to the main thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,26 +150,43 @@ impl Overlay {
     /// clickable label rects (empty for a read-only set), `now_ms` a
     /// monotonic tick.
     ///
-    /// If any hook cannot be installed the overlay is refused: `Err` carries
-    /// the hooks that did install, for the caller to remove. An overlay with
-    /// no way to go stale is the one outcome to avoid.
+    /// The overlay is refused if any hook or the age timer cannot be set up,
+    /// or if no target window is left once Wingman's own are removed: `Err`
+    /// names what did install, for the caller to remove. An overlay with no
+    /// way to go stale is the one outcome to avoid.
     pub fn show(
         targets: Vec<isize>,
         own: Vec<isize>,
         labels: Vec<ScreenRect>,
         now_ms: u64,
         age_ms: u64,
-        install: &mut dyn FnMut(HookKind) -> bool,
-    ) -> Result<Self, Vec<HookKind>> {
+        install: &mut dyn FnMut(Install) -> bool,
+    ) -> Result<Self, Refused> {
+        let targets: Vec<isize> = targets.into_iter().filter(|t| !own.contains(t)).collect();
+        if targets.is_empty() {
+            return Err(Refused {
+                why: RefusedBecause::NoTargets,
+                undo: Vec::new(),
+            });
+        }
         let mut hooks = Vec::new();
-        for kind in REQUIRED_HOOKS {
-            if install(kind) {
+        let mut done = Vec::new();
+        let steps = REQUIRED_HOOKS
+            .into_iter()
+            .map(Install::Hook)
+            .chain(std::iter::once(Install::AgeTimer));
+        for step in steps {
+            if !install(step) {
+                return Err(Refused {
+                    why: RefusedBecause::Failed(step),
+                    undo: done,
+                });
+            }
+            done.push(step);
+            if let Install::Hook(kind) = step {
                 hooks.push(kind);
-            } else {
-                return Err(hooks);
             }
         }
-        let targets: Vec<isize> = targets.into_iter().filter(|t| !own.contains(t)).collect();
         Ok(Self {
             targets,
             own,
@@ -271,25 +316,53 @@ mod tests {
 
     #[test]
     fn a_hook_that_cannot_install_refuses_the_overlay_and_names_what_to_undo() {
+        let fg = Install::Hook(HookKind::Foreground);
         let mut tried = Vec::new();
         let r = Overlay::show(vec![TERM], vec![], vec![], 0, DEFAULT_AGE_MS, &mut |k| {
             tried.push(k);
-            k != HookKind::Foreground
+            k != fg
         });
-        let undo = r.unwrap_err();
+        let refused = r.unwrap_err();
+        assert_eq!(refused.why, RefusedBecause::Failed(fg));
         assert_eq!(
-            undo,
+            refused.undo,
             vec![
-                HookKind::LocationChange,
-                HookKind::Destroy,
-                HookKind::MinimizeStart
+                Install::Hook(HookKind::LocationChange),
+                Install::Hook(HookKind::Destroy),
+                Install::Hook(HookKind::MinimizeStart)
             ]
         );
         // Nothing after the failure was tried.
-        assert_eq!(tried.last(), Some(&HookKind::Foreground));
+        assert_eq!(tried.last(), Some(&fg));
         // The very first hook failing leaves nothing to undo.
         let r = Overlay::show(vec![TERM], vec![], vec![], 0, 5, &mut |_| false);
-        assert_eq!(r.unwrap_err(), Vec::<HookKind>::new());
+        assert!(r.unwrap_err().undo.is_empty());
+    }
+
+    #[test]
+    fn a_timer_that_cannot_be_set_refuses_the_overlay_and_names_every_hook() {
+        let r = Overlay::show(vec![TERM], vec![], vec![], 0, 5, &mut |k| {
+            k != Install::AgeTimer
+        });
+        let refused = r.unwrap_err();
+        assert_eq!(refused.why, RefusedBecause::Failed(Install::AgeTimer));
+        let expected: Vec<Install> = REQUIRED_HOOKS.into_iter().map(Install::Hook).collect();
+        assert_eq!(refused.undo, expected);
+    }
+
+    #[test]
+    fn no_target_window_refuses_the_overlay_before_installing_anything() {
+        for targets in [vec![], vec![CARD]] {
+            let mut calls = 0;
+            let r = Overlay::show(targets, vec![CARD], vec![], 0, 5, &mut |_| {
+                calls += 1;
+                true
+            });
+            let refused = r.unwrap_err();
+            assert_eq!(refused.why, RefusedBecause::NoTargets);
+            assert!(refused.undo.is_empty());
+            assert_eq!(calls, 0, "nothing to undo if nothing was installed");
+        }
     }
 
     #[test]
@@ -517,7 +590,10 @@ mod tests {
 
     #[test]
     fn huge_ticks_do_not_overflow() {
-        let o = Overlay::show(vec![], vec![], vec![], u64::MAX, u64::MAX, &mut |_| true).unwrap();
+        let o = Overlay::show(vec![TERM], vec![], vec![], u64::MAX, u64::MAX, &mut |_| {
+            true
+        })
+        .unwrap();
         assert!(o.esc_claimed(false, u64::MAX - 1));
     }
 }

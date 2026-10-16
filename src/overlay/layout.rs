@@ -8,10 +8,11 @@
 
 use crate::capture::ScreenRect;
 
-/// Space between a label and the text it is about, in pixels. The caller
-/// scales it for DPI by scaling the sizes and the monitor, not this constant,
-/// so a label never touches its anchor at any scale.
-pub const GAP: i32 = 4;
+/// Space between a label and the text it is about, in design pixels (96 DPI).
+/// Everything this module takes and returns is physical pixels, so the caller
+/// multiplies this by the monitor's scale and passes the result as `gap` to
+/// [`place_labels`], the same way it scales label sizes and mark thickness.
+pub const GAP_DESIGN_PX: i32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -103,7 +104,8 @@ fn clamp_span(v: i32, len: i32, lo: i32, hi: i32) -> i32 {
 /// cover any annotation's anchor, and does not overlap a label already
 /// placed. Requests are served in order, so reading order wins a contested
 /// spot.
-pub fn place_labels(requests: &[Request], monitor: ScreenRect) -> Layout {
+pub fn place_labels(requests: &[Request], monitor: ScreenRect, gap: i32) -> Layout {
+    let gap = gap.max(0);
     let all_anchors: Vec<ScreenRect> = requests
         .iter()
         .flat_map(|r| r.anchors.iter().copied())
@@ -122,13 +124,13 @@ pub fn place_labels(requests: &[Request], monitor: ScreenRect) -> Layout {
         let candidates = [
             (
                 Side::Above,
-                at(x, b.top.saturating_sub(GAP).saturating_sub(size.1), size),
+                at(x, b.top.saturating_sub(gap).saturating_sub(size.1), size),
             ),
-            (Side::Right, at(b.right.saturating_add(GAP), y, size)),
-            (Side::Below, at(x, b.bottom.saturating_add(GAP), size)),
+            (Side::Right, at(b.right.saturating_add(gap), y, size)),
+            (Side::Below, at(x, b.bottom.saturating_add(gap), size)),
             (
                 Side::Left,
-                at(b.left.saturating_sub(GAP).saturating_sub(size.0), y, size),
+                at(b.left.saturating_sub(gap).saturating_sub(size.0), y, size),
             ),
         ];
         let pick = candidates.into_iter().find(|(_, c)| {
@@ -205,6 +207,23 @@ mod tests {
         }
     }
 
+    fn place(requests: &[Request], monitor: ScreenRect) -> Layout {
+        place_labels(requests, monitor, GAP_DESIGN_PX)
+    }
+
+    #[test]
+    fn the_gap_is_a_parameter_the_caller_scales() {
+        let a = req(r(100, 100, 200, 120), 50, 20);
+        // 200% scale: gap 8, so the label sits 8 px above, not 4.
+        let l = place_labels(std::slice::from_ref(&a), MON, 2 * GAP_DESIGN_PX);
+        assert_eq!(l.placed[0].rect, r(100, 72, 150, 92));
+        let l = place_labels(std::slice::from_ref(&a), MON, 0);
+        assert_eq!(l.placed[0].rect, r(100, 80, 150, 100));
+        // A negative gap is read as 0, never as overlap.
+        let l = place_labels(&[a], MON, -50);
+        assert_eq!(l.placed[0].rect, r(100, 80, 150, 100));
+    }
+
     const MON: ScreenRect = ScreenRect {
         left: 0,
         top: 0,
@@ -214,7 +233,7 @@ mod tests {
 
     #[test]
     fn a_label_goes_above_its_anchor() {
-        let l = place_labels(&[req(r(100, 100, 200, 120), 50, 20)], MON);
+        let l = place(&[req(r(100, 100, 200, 120), 50, 20)], MON);
         assert_eq!(
             l.placed,
             vec![Placed {
@@ -228,7 +247,7 @@ mod tests {
 
     #[test]
     fn it_falls_right_when_above_is_off_screen() {
-        let l = place_labels(&[req(r(100, 5, 200, 25), 50, 20)], MON);
+        let l = place(&[req(r(100, 5, 200, 25), 50, 20)], MON);
         assert_eq!(l.placed[0].side, Side::Right);
         assert_eq!(l.placed[0].rect, r(204, 5, 254, 25));
     }
@@ -236,12 +255,12 @@ mod tests {
     #[test]
     fn it_tries_below_then_left() {
         // Top-right corner: above is off-screen and right is off-screen.
-        let l = place_labels(&[req(r(940, 5, 1000, 25), 50, 20)], MON);
+        let l = place(&[req(r(940, 5, 1000, 25), 50, 20)], MON);
         assert_eq!(l.placed[0].side, Side::Below);
         assert_eq!(l.placed[0].rect, r(940, 29, 990, 49));
         // Boxed in above (off-screen), right (off), below (a second anchor).
         let blocker = r(900, 29, 1000, 60);
-        let l = place_labels(
+        let l = place(
             &[
                 req(r(940, 5, 1000, 25), 50, 20),
                 req(blocker, 1, 1), // its own label goes elsewhere
@@ -254,7 +273,7 @@ mod tests {
 
     #[test]
     fn a_label_near_the_edge_is_moved_inward() {
-        let l = place_labels(&[req(r(960, 100, 1000, 120), 50, 20)], MON);
+        let l = place(&[req(r(960, 100, 1000, 120), 50, 20)], MON);
         assert_eq!(l.placed[0].side, Side::Above);
         assert_eq!(l.placed[0].rect, r(950, 76, 1000, 96));
     }
@@ -262,7 +281,7 @@ mod tests {
     #[test]
     fn a_second_label_avoids_the_first() {
         let a = r(100, 100, 200, 120);
-        let l = place_labels(&[req(a, 50, 20), req(a, 50, 20)], MON);
+        let l = place(&[req(a, 50, 20), req(a, 50, 20)], MON);
         assert_eq!(l.placed.len(), 2);
         assert_eq!(l.placed[0].side, Side::Above);
         assert_eq!(l.placed[1].side, Side::Right);
@@ -274,7 +293,7 @@ mod tests {
         // B's anchor sits where A's label would go above.
         let a = r(100, 100, 200, 120);
         let b = r(90, 70, 210, 98);
-        let l = place_labels(&[req(a, 50, 20), req(b, 50, 20)], MON);
+        let l = place(&[req(a, 50, 20), req(b, 50, 20)], MON);
         for p in &l.placed {
             for anchor in [a, b] {
                 assert!(!intersects(&p.rect, &anchor), "{p:?} covers {anchor:?}");
@@ -289,14 +308,14 @@ mod tests {
             anchors: vec![r(100, 100, 300, 112), r(100, 116, 160, 128)],
             size: (50, 20),
         };
-        let l = place_labels(&[two], MON);
+        let l = place(&[two], MON);
         assert_eq!(l.placed[0].rect, r(100, 76, 150, 96));
     }
 
     #[test]
     fn a_label_that_fits_nowhere_is_dropped_and_counted() {
         let tiny = r(0, 0, 60, 30);
-        let l = place_labels(&[req(r(10, 5, 50, 25), 50, 20)], tiny);
+        let l = place(&[req(r(10, 5, 50, 25), 50, 20)], tiny);
         assert!(l.placed.is_empty());
         assert_eq!(l.dropped, vec![0]);
     }
@@ -309,17 +328,17 @@ mod tests {
         };
         let empty_rect = req(r(5, 5, 5, 9), 50, 20);
         let no_size = req(r(100, 100, 200, 120), 0, 20);
-        let l = place_labels(&[none, empty_rect, no_size], MON);
+        let l = place(&[none, empty_rect, no_size], MON);
         assert_eq!(l.dropped, vec![0, 1, 2]);
     }
 
     #[test]
     fn huge_coordinates_do_not_overflow() {
         let wild = r(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
-        let l = place_labels(&[req(wild, i32::MAX, i32::MAX)], MON);
+        let l = place(&[req(wild, i32::MAX, i32::MAX)], MON);
         assert_eq!(l.dropped, vec![0]);
         let edge = r(i32::MAX - 10, i32::MAX - 10, i32::MAX, i32::MAX);
-        let l = place_labels(&[req(edge, 50, 20)], MON);
+        let l = place(&[req(edge, 50, 20)], MON);
         assert_eq!(l.dropped, vec![0]);
         assert_eq!(underline(edge, i32::MAX).bottom, i32::MAX);
     }
@@ -327,7 +346,7 @@ mod tests {
     #[test]
     fn a_monitor_with_negative_coordinates_works() {
         let mon = r(-1920, 0, 0, 1080);
-        let l = place_labels(&[req(r(-1000, 500, -900, 520), 50, 20)], mon);
+        let l = place(&[req(r(-1000, 500, -900, 520), 50, 20)], mon);
         assert_eq!(l.placed[0].rect, r(-1000, 476, -950, 496));
     }
 
