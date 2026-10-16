@@ -1985,7 +1985,8 @@ impl App {
                             };
                         }
                         let detail = with_fallback_footer(&detail, self.fallback_footer.as_deref());
-                        self.card.show_answer(&text.headline, &detail, 0, None);
+                        self.card
+                            .show_model_answer(&text.headline, &detail, 0, None);
                     }
                     Err(e) => {
                         let detail = self.track_error(
@@ -2589,7 +2590,7 @@ impl App {
                 .show_error_with_details(&answer.headline, &answer.detail);
         } else {
             let detail = with_fallback_footer(&answer.detail, self.fallback_footer.as_deref());
-            self.card.show_answer(
+            self.card.show_model_answer(
                 &answer.headline,
                 &detail,
                 self.config.ui.card_seconds,

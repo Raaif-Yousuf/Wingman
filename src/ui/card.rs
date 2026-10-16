@@ -97,8 +97,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
-    VK_NEXT, VK_PRIOR, VK_RETURN, VK_UP,
+    GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END, VK_ESCAPE,
+    VK_HOME, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -239,7 +239,7 @@ impl Card {
             copy_details_rect: None,
             copy_available: false,
             copy_rect: None,
-            copied: false,
+            copy_feedback: CopyFeedback::None,
             read_aloud_available: false,
             read_aloud_rect: None,
             speaker: None,
@@ -354,7 +354,19 @@ impl Card {
             .show_collapsed(headline, detail, auto_dismiss_secs, difficulty);
         // Issue #77: an answer card offers "Read aloud" once expanded.
         self.inner.read_aloud_available = true;
-        // Issue #531: and a "Copy" link.
+    }
+
+    /// Issue #531: like [`Card::show_answer`], and the card also offers
+    /// "Copy". Only for a model's answer; status and confirmation cards use
+    /// [`Card::show_answer`], which has nothing worth copying.
+    pub fn show_model_answer(
+        &mut self,
+        headline: &str,
+        detail: &str,
+        auto_dismiss_secs: u32,
+        difficulty: Option<Difficulty>,
+    ) {
+        self.show_answer(headline, detail, auto_dismiss_secs, difficulty);
         self.inner.copy_available = true;
     }
 
@@ -1068,6 +1080,11 @@ fn blend_colors(from: u32, to: u32, pct: u32) -> u32 {
 /// Where an expanded card scrolls to for a key, or `None` when the key does
 /// not scroll. Down/Up move a line, PageDown/PageUp a page, Home/End the
 /// ends; the result is always inside `0..=max`.
+/// `true` while the virtual key is physically down.
+fn key_is_down(vk: u16) -> bool {
+    unsafe { GetKeyState(vk as i32) < 0 }
+}
+
 fn scroll_target_for_key(vk: u16, offset: i32, max: i32, line: i32, page: i32) -> Option<i32> {
     let target = match vk {
         k if k == VK_DOWN.0 => offset + line,
@@ -1155,8 +1172,23 @@ fn footer_links_layout(
 }
 
 /// Issue #531: `C` (so also Ctrl+C) copies on an expanded answer card.
-fn is_copy_key(vk: u16) -> bool {
-    vk == 0x43
+/// Not for auto-repeat (lparam bit 30), and not with Shift or Alt: plain C
+/// and Ctrl+C only.
+fn is_copy_key(vk: u16, lparam: isize, shift: bool, alt: bool) -> bool {
+    vk == 0x43 && lparam & 0x4000_0000 == 0 && !shift && !alt
+}
+
+/// Issue #531: a link squeezed to nothing counts as not there.
+fn rect_has_area(r: RECT) -> bool {
+    r.right > r.left && r.bottom > r.top
+}
+
+/// What the "Copy" link says after a copy attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopyFeedback {
+    None,
+    Copied,
+    Failed,
 }
 /// A rotation needs ~16-33ms/frame to read as smooth; the old text-dot
 /// animation could get away with much slower ticks, but a spinner cannot.
@@ -1315,9 +1347,9 @@ struct CardInner {
     /// The "Copy" link's hit-test rect while Expanded, same coordinates as
     /// `read_aloud_rect`.
     copy_rect: Option<RECT>,
-    /// Issue #531: `true` for `COPIED_FEEDBACK_MS` after a successful copy;
-    /// the link then reads "Copied".
-    copied: bool,
+    /// Issue #531: for `COPIED_FEEDBACK_MS` after a copy attempt the link
+    /// reads "Copied" or "Couldn't copy".
+    copy_feedback: CopyFeedback,
     /// The system voice, created on the first "Read aloud" click (so a card
     /// that is never read aloud never touches COM or SAPI). Lives on the
     /// main STA thread, like the card.
@@ -1539,7 +1571,7 @@ impl CardInner {
         // already killed its timer.
         self.copy_available = false;
         self.copy_rect = None;
-        self.copied = false;
+        self.copy_feedback = CopyFeedback::None;
 
         unsafe {
             if auto_dismiss_secs > 0 {
@@ -1560,7 +1592,7 @@ impl CardInner {
         self.leave_preview_if_active();
         self.stop_reading();
         self.kill_timers();
-        self.copied = false;
+        self.copy_feedback = CopyFeedback::None;
         self.set_noactivate(true);
         self.state = CardState::Hidden;
         // Issue #356: no headline is showing any more, so the accessible
@@ -1877,23 +1909,35 @@ impl CardInner {
 
     /// Issue #531: the link's label for the current state.
     fn copy_label(&self) -> &'static str {
-        if self.copied {
-            "Copied"
-        } else {
-            "Copy"
+        match self.copy_feedback {
+            CopyFeedback::None => "Copy",
+            CopyFeedback::Copied => "Copied",
+            CopyFeedback::Failed => "Couldn't copy",
         }
     }
 
     /// Issue #531: `true` when `vk` should copy: the copy key while an
     /// answer card is Expanded and showing its "Copy" link.
-    fn copy_key_applies(&self, vk: u16) -> bool {
-        is_copy_key(vk) && self.state == CardState::Expanded && self.copy_rect.is_some()
+    fn copy_key_applies(&self, vk: u16, lparam: isize, shift: bool, alt: bool) -> bool {
+        is_copy_key(vk, lparam, shift, alt)
+            && self.state == CardState::Expanded
+            && self.copy_rect.is_some()
     }
 
     /// Issue #531: shows "Copied" and arms the one-shot timer that puts
     /// "Copy" back.
     fn mark_copied(&mut self) {
-        self.copied = true;
+        self.set_copy_feedback(CopyFeedback::Copied);
+    }
+
+    /// Issue #531: a clipboard that could not be written. The answer stays;
+    /// the link says so for the same one-shot timer.
+    fn mark_copy_failed(&mut self) {
+        self.set_copy_feedback(CopyFeedback::Failed);
+    }
+
+    fn set_copy_feedback(&mut self, feedback: CopyFeedback) {
+        self.copy_feedback = feedback;
         unsafe {
             let _ = SetTimer(Some(self.hwnd), TIMER_COPIED, COPIED_FEEDBACK_MS, None);
         }
@@ -1901,13 +1945,14 @@ impl CardInner {
     }
 
     /// Issue #531: click or the copy key on "Copy". Puts the headline and
-    /// detail on the clipboard. A clipboard that cannot be written ends in
-    /// an error card (AGENTS.md rule 7), never a silent no-op.
+    /// detail on the clipboard. A clipboard that cannot be written is said
+    /// on the link itself (AGENTS.md rule 7), never a silent no-op, and the
+    /// answer stays on screen.
     fn copy_activated(&mut self) {
         let text = answer_clipboard_text(&self.headline, &self.detail);
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
             Ok(()) => self.mark_copied(),
-            Err(e) => self.show_collapsed("Couldn't copy", &format!("{e}"), 0, None),
+            Err(_) => self.mark_copy_failed(),
         }
     }
 
@@ -2071,19 +2116,21 @@ impl CardInner {
         self.copy_rect = None;
         if let Some(f) = footer.filter(|_| self.copy_available || self.read_aloud_available) {
             let body = self.fonts.body;
-            let widest = |a: &str, b: &str| {
-                self.measure_label(body, a)
-                    .0
-                    .max(self.measure_label(body, b).0)
+            let widest = |labels: &[&str]| {
+                labels
+                    .iter()
+                    .map(|l| self.measure_label(body, l).0)
+                    .max()
+                    .unwrap_or(0)
             };
             let read_w = self
                 .read_aloud_available
-                .then(|| widest("Read aloud", "Stop reading"));
-            let copy_w = widest("Copy", "Copied");
+                .then(|| widest(&["Read aloud", "Stop reading"]));
+            let copy_w = widest(&["Copy", "Copied", "Couldn't copy"]);
             let gap = self.scale(FOOTER_LINK_GAP_DP);
             let (read, copy) = footer_links_layout(f, read_w, copy_w, gap);
             self.read_aloud_rect = read;
-            self.copy_rect = self.copy_available.then_some(copy);
+            self.copy_rect = (self.copy_available && rect_has_area(copy)).then_some(copy);
         }
 
         self.place_bottom_right(work, width, window_h);
@@ -2755,13 +2802,13 @@ impl CardInner {
                         self.set_pending_stage(PendingStage::StillWorking);
                     }
                     // Issue #531: one-shot; a stale message after the card
-                    // moved on finds `copied` already false.
+                    // moved on finds the feedback already cleared.
                     TIMER_COPIED => {
                         unsafe {
                             let _ = KillTimer(Some(self.hwnd), TIMER_COPIED);
                         }
-                        if self.copied {
-                            self.copied = false;
+                        if self.copy_feedback != CopyFeedback::None {
+                            self.copy_feedback = CopyFeedback::None;
                             self.invalidate();
                         }
                     }
@@ -2848,7 +2895,12 @@ impl CardInner {
                         self.scroll_offset = target;
                         self.invalidate();
                     }
-                } else if self.copy_key_applies(wparam.0 as u16) {
+                } else if self.copy_key_applies(
+                    wparam.0 as u16,
+                    lparam.0,
+                    key_is_down(VK_SHIFT.0),
+                    key_is_down(VK_MENU.0),
+                ) {
                     // Issue #531: C and Ctrl+C copy the answer.
                     self.copy_activated();
                 } else if self.state == CardState::Expanded
@@ -4557,7 +4609,7 @@ mod tests {
     fn expanded_answer_card_has_a_copy_link_beside_read_aloud() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
-        card.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        card.show_model_answer("2 + 2 = 4", "You carried correctly.", 0, None);
         card.inner.try_expand();
         let read = card.inner.read_aloud_rect.expect("read aloud");
         let copy = card.inner.copy_rect.expect("copy");
@@ -4578,7 +4630,12 @@ mod tests {
         card.show_error("Oops", "detail");
         card.inner.try_expand();
         assert!(card.inner.copy_rect.is_none());
-        card.show_answer("Right.", "Details.", 0, None);
+        // A status or confirmation card (plain show_answer) has none either.
+        card.show_answer("Details copied", "Paste them.", 0, None);
+        card.inner.try_expand();
+        assert!(card.inner.copy_rect.is_none());
+        assert!(card.inner.read_aloud_rect.is_some());
+        card.show_model_answer("Right.", "Details.", 0, None);
         card.show_error("Oops", "detail");
         card.inner.try_expand();
         assert!(card.inner.copy_rect.is_none());
@@ -4589,7 +4646,7 @@ mod tests {
         // Issue #531, AGENTS.md rule 5.
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
-        card.show_answer("Right.", "Details.", 0, None);
+        card.show_model_answer("Right.", "Details.", 0, None);
         card.inner.try_expand();
         assert!(!timer_was_live(&card, TIMER_COPIED), "idle: no timer");
         card.inner.mark_copied();
@@ -4606,29 +4663,72 @@ mod tests {
         assert!(!timer_was_live(&card, TIMER_COPIED));
         assert_eq!(card.inner.copy_label(), "Copy");
         // A replacement card never inherits "Copied".
-        card.show_answer("A", "B", 0, None);
+        card.show_model_answer("A", "B", 0, None);
         card.inner.try_expand();
         card.inner.mark_copied();
-        card.show_answer("C", "D", 0, None);
+        card.show_model_answer("C", "D", 0, None);
         assert_eq!(card.inner.copy_label(), "Copy");
         assert!(!timer_was_live(&card, TIMER_COPIED));
     }
 
     #[test]
-    fn c_key_is_the_copy_shortcut_only_on_an_expanded_answer_card() {
-        assert!(is_copy_key(0x43));
-        assert!(!is_copy_key(VK_RETURN.0));
+    fn copy_key_ignores_repeat_and_shift_alt() {
+        assert!(is_copy_key(0x43, 0, false, false));
+        assert!(!is_copy_key(VK_RETURN.0, 0, false, false));
+        assert!(!is_copy_key(0x43, 0x4000_0001, false, false), "auto-repeat");
+        assert!(!is_copy_key(0x43, 0, true, false), "Shift+C");
+        assert!(!is_copy_key(0x43, 0, false, true), "Alt+C");
+    }
+
+    #[test]
+    fn rect_with_no_area_counts_as_unavailable() {
+        let r = RECT {
+            left: 5,
+            top: 1,
+            right: 5,
+            bottom: 9,
+        };
+        assert!(!rect_has_area(r));
+        assert!(rect_has_area(RECT { right: 6, ..r }));
+    }
+
+    #[test]
+    fn copy_key_applies_only_on_an_expanded_model_answer_card() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
         card.show_error("Oops", "detail");
         card.inner.try_expand();
-        // No copy link, so the key must not reach the clipboard path.
-        assert!(!card.inner.copy_key_applies(0x43));
-        card.show_answer("Right.", "Details.", 0, None);
-        assert!(!card.inner.copy_key_applies(0x43), "collapsed: not yet");
+        assert!(!card.inner.copy_key_applies(0x43, 0, false, false));
+        card.show_answer("Details copied", "x", 0, None);
         card.inner.try_expand();
-        assert!(card.inner.copy_key_applies(0x43));
-        assert!(!card.inner.copy_key_applies(VK_RETURN.0));
+        assert!(
+            !card.inner.copy_key_applies(0x43, 0, false, false),
+            "status card"
+        );
+        card.show_model_answer("Right.", "Details.", 0, None);
+        assert!(
+            !card.inner.copy_key_applies(0x43, 0, false, false),
+            "collapsed"
+        );
+        card.inner.try_expand();
+        assert!(card.inner.copy_key_applies(0x43, 0, false, false));
+        assert!(!card.inner.copy_key_applies(VK_RETURN.0, 0, false, false));
+    }
+
+    #[test]
+    fn failed_copy_keeps_the_answer_and_relabels_the_link() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_model_answer("Right.", "Details.", 0, None);
+        card.inner.try_expand();
+        card.inner.mark_copy_failed();
+        assert_eq!(card.state(), CardState::Expanded);
+        assert_eq!(card.inner.headline, "Right.");
+        assert_eq!(card.inner.copy_label(), "Couldn't copy");
+        assert!(timer_was_live(&card, TIMER_COPIED));
+        card.inner.mark_copy_failed();
+        let _ = card.handle_message(WM_TIMER, WPARAM(TIMER_COPIED), LPARAM(0));
+        assert_eq!(card.inner.copy_label(), "Copy");
     }
 
     /// Issue #531 live check, run manually (it overwrites the clipboard):
@@ -4639,7 +4739,7 @@ mod tests {
     fn copy_live_click_puts_the_answer_on_the_clipboard() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
-        card.show_answer("2 + 2 = 4", "You carried.", 0, None);
+        card.show_model_answer("2 + 2 = 4", "You carried.", 0, None);
         card.inner.try_expand();
         let r = card.inner.copy_rect.expect("copy link");
         let lparam = LPARAM(((r.top + 1) << 16 | ((r.left + 1) & 0xFFFF)) as isize);
