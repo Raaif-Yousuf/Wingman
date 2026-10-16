@@ -1120,6 +1120,7 @@ mod tests {
             crate::actions::link_summary::ACTION_ID,
             crate::actions::convert_times::ACTION_ID,
             crate::actions::scam_check::ACTION_ID,
+            crate::actions::jargon::ACTION_ID,
         ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {

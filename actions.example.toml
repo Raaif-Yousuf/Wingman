@@ -304,6 +304,24 @@ enabled = true
 mode = "auto"
 
 [[actions]]
+id = "explain-jargon"
+name = "Jargon to plain English"
+group = "Study"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "jargon_terms"
+executor = "none"
+confirm = false
+prompt = 'You are shown some text (as text if some was selected, as a screenshot otherwise). Find the jargon, technical terms and acronyms that a general reader would not know, and explain each in plain English. Fill `terms` with at most 12 entries, in the order they first appear. Each entry has `term`, copied exactly as shown, and `meaning`, one plain sentence of at most 80 characters that a non-expert understands, with no jargon of its own. List each term once, at its first appearance. Skip ordinary words, names of people and places, and anything a general reader already knows. If a term could mean different things in different fields, give the meaning that fits the text and never invent a definition: if you are not sure what it means here, leave it out. If there is no jargon, return an empty list. Use plain text only: no markdown and no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead).'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
 id = "explain-this-code"
 name = "Explain this code"
 group = "Code"

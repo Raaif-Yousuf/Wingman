@@ -18,6 +18,7 @@ pub mod fill_form;
 pub mod generic_answer;
 pub mod generic_inputs;
 pub mod generic_replace;
+pub mod jargon;
 pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
@@ -477,6 +478,7 @@ pub fn builtin_actions() -> Vec<Action> {
         link_summary::builtin_action(),
         convert_times::builtin_action(),
         scam_check::builtin_action(),
+        jargon::builtin_action(),
     ];
     actions.extend(code_actions::builtin_actions());
     actions.extend(rewrite_tone::builtin_actions());
