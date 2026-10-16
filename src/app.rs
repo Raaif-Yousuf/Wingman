@@ -2432,6 +2432,7 @@ impl App {
                     .show_pending(crate::ui::card::PendingStage::AskingModel { model_name });
             }
             Some(PendingPreview::Calendar) => self.run_confirmed_calendar_add(confirmed),
+            Some(PendingPreview::ImportAction(prepared)) => self.commit_import(&prepared),
             // Nothing is waiting on this decision, so nothing runs.
             None => {}
         }
@@ -4189,6 +4190,139 @@ impl App {
     fn hwnd_isize(&self) -> isize {
         OWNER_HWND.with(|h| h.get())
     }
+
+    /// #117: hands the tray the actions the user wrote, for "Export action".
+    /// Called as the menu opens; a missing or broken actions.toml shows none.
+    fn sync_export_menu(&mut self) {
+        let written = actions::load_actions()
+            .map(|a| actions::share::export_candidates(&a))
+            .unwrap_or_default();
+        self.tray.set_export_actions(&written);
+    }
+
+    /// #117: runs an OS file dialog without `&mut App` being reachable from it.
+    /// The dialog pumps this thread's messages, so `wnd_proc` can be entered
+    /// while it is open; `SETTINGS_OPEN` makes that entry defer or ignore
+    /// everything instead of forming a second `&mut App` (see its doc
+    /// comment). What was deferred is delivered afterwards, as
+    /// `open_settings` does. The closure must not touch `self`.
+    fn run_os_dialog<T>(&mut self, dialog: impl FnOnce() -> T) -> T {
+        // Like `open_settings`: no card timers or click watcher while the
+        // nested loop runs.
+        self.card.hide();
+        self.set_watch(false);
+        SETTINGS_OPEN.with(|c| c.set(true));
+        let out = dialog();
+        SETTINGS_OPEN.with(|c| c.set(false));
+        let pending: VecDeque<DeferredMessage> =
+            PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
+            self.try_restore_tray_icon()
+        } else {
+            None
+        };
+        if PAUSE_REEVALUATE_PENDING.with(|c| c.replace(false)) {
+            self.reevaluate_pause(self.hwnd());
+        }
+        self.deliver_deferred(pending);
+        self.show_tray_restore_error(tray_restore_error);
+        out
+    }
+
+    /// #117: tray > Import action from file. Pick a file, check it, and show
+    /// what it does on a preview card. Only "Do it" adds it to actions.toml
+    /// (`on_preview_decided`); Esc or a click away adds nothing. Nothing runs.
+    fn import_action(&mut self) {
+        let owner = HWND(self.hwnd_isize() as *mut _);
+        let Some(file) = self.run_os_dialog(|| crate::ui::file_dialog::pick_action_file(owner))
+        else {
+            return;
+        };
+        let prepared = (|| -> anyhow::Result<actions::share::Prepared> {
+            let text = actions::share::read_import_file(&file)?;
+            let import = actions::share::parse_import(&text)?;
+            actions::share::prepare(&actions::path()?, import)
+        })();
+        match prepared {
+            Ok(prepared) => {
+                let value = prepared.preview_value();
+                self.pending_preview = Some(PendingPreview::ImportAction(Box::new(prepared)));
+                self.pending_preview_generation = self.card.show_preview(
+                    "Add this action?",
+                    &actions::share::preview_schema(),
+                    &value,
+                    false,
+                );
+            }
+            Err(e) => {
+                let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't import the action", &detail);
+            }
+        }
+    }
+
+    /// #117: the user said "Do it" on an import preview. Re-checks that
+    /// actions.toml is still the file the preview was made against.
+    fn commit_import(&mut self, prepared: &actions::share::Prepared) {
+        let result = actions::path().and_then(|path| prepared.commit(&path));
+        match result {
+            Ok(()) => self.card.show_answer(
+                "Action added",
+                &format!("{} is in the Quick Ask list.", prepared.action.name),
+                4,
+                None,
+            ),
+            Err(e) => {
+                let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't import the action", &detail);
+            }
+        }
+    }
+
+    /// #117: tray > Export action to file > (one of your actions).
+    fn export_action(&mut self, index: usize) {
+        let Some(id) = self.tray.export_action_at(index).map(str::to_owned) else {
+            return;
+        };
+        let owner = HWND(self.hwnd_isize() as *mut _);
+        let mut turned_off = false;
+        let text = actions::load_actions().and_then(|all| {
+            let found = all
+                .iter()
+                .find(|r| r.action.id == id && r.origin == actions::Origin::User)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the action \"{id}\" is no longer in actions.toml")
+                })?;
+            turned_off = actions::share::imports_turned_off(&found.action);
+            actions::share::export_toml(&found.action)
+        });
+        let outcome = text.and_then(|text| {
+            let picked = self.run_os_dialog(|| crate::ui::file_dialog::pick_save_path(owner, &id));
+            let Some(path) = picked else {
+                return Ok(None);
+            };
+            std::fs::write(&path, text)
+                .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
+            Ok(Some(()))
+        });
+        match outcome {
+            Ok(Some(())) if turned_off => self.card.show_answer(
+                "Action saved",
+                "Its prompt is long, so it will be added turned off. Whoever imports it must read the prompt in actions.toml, then turn it on.",
+                8,
+                None,
+            ),
+            Ok(Some(())) => self.card.show_answer("Action saved", "", 3, None),
+            Ok(None) => {}
+            Err(e) => {
+                let detail = self.track_error("Couldn't export the action", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't export the action", &detail);
+            }
+        }
+    }
 }
 
 /// Issue #19: builds the mode-aware chain HERE, on the worker thread, from
@@ -5739,6 +5873,9 @@ enum PendingPreview {
     /// "Send" answers it (`ui::send_gate::decide`), and every other way the
     /// preview ends drops it, which cancels the send.
     Send(std::sync::mpsc::Sender<confirm::SendAuthorized>),
+    /// #117: an action file waiting for "Do it" before it is added to
+    /// actions.toml.
+    ImportAction(Box<actions::share::Prepared>),
 }
 
 /// What `wnd_proc` should do with a message addressed to the owner window
@@ -6062,6 +6199,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // the next one. Never waits on Ollama, so the menu opens at once.
             if Tray::opens_menu(lparam) {
                 app.sync_ollama_menu();
+                app.sync_export_menu();
             }
             if let Some(id) = app.tray.on_tray_message(lparam) {
                 app.password_manager_hint = menu_hint;
@@ -6082,6 +6220,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
                     MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
+                    MenuChoice::ExportAction(i) => app.export_action(i),
+                    MenuChoice::Command(cmd::IMPORT_ACTION) => app.import_action(),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
                     MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
@@ -7426,6 +7566,7 @@ mod tests {
             "OPENAI_MODEL_BASE",
             "ANTHROPIC_MODEL_BASE",
             "OLLAMA_MODEL_BASE",
+            "ACTION_EXPORT_BASE",
         ];
         // Display-only items: added disabled (greyed), so no click can ever
         // produce their WM_COMMAND and they need no wnd_proc arm (#317).
