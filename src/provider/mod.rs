@@ -2980,12 +2980,16 @@ mod tests {
         let seen = provider.seen_handle();
         let chain = Chain::new(vec![Box::new(provider)]);
 
-        let result = crate::router::route(&chain, vec![1, 2, 3, 4], &candidates, || {
-            Ok(non_vision_inputs_for_test())
-        })
+        let result = crate::router::route(
+            &chain,
+            vec![1, 2, 3, 4],
+            &candidates,
+            crate::router::RouterLimits::default(),
+            || Ok(non_vision_inputs_for_test()),
+        )
         .unwrap();
 
-        assert_eq!(result.intent, None);
+        assert!(result.options.is_empty());
         let requests = seen.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(
@@ -3016,9 +3020,13 @@ mod tests {
         let seen = provider.seen_handle();
         let chain = Chain::new(vec![Box::new(provider)]);
 
-        crate::router::route(&chain, image_png.clone(), &candidates, || {
-            panic!("fallback must never run for a vision provider")
-        })
+        crate::router::route(
+            &chain,
+            image_png.clone(),
+            &candidates,
+            crate::router::RouterLimits::default(),
+            || panic!("fallback must never run for a vision provider"),
+        )
         .unwrap();
 
         let requests = seen.lock().unwrap();
