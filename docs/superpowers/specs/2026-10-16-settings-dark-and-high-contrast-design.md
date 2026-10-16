@@ -1,6 +1,6 @@
 # Settings window: dark mode and high contrast (#582, part of #427, #362)
 
-Status: **proposed**
+Status: **accepted, 2026-10-16**
 
 Scope: `src/ui/settings.rs` (the Win32 window and its controls), a small
 paint helper next to it, `src/ui/theme.rs` (tokens for control states), a
@@ -56,9 +56,9 @@ Do **not** use the undocumented uxtheme ordinals (`SetPreferredAppMode`,
 changed meaning between Windows builds and a wrong guess fails silently, which
 is the failure this repo guards against (rule 8). Everything below uses
 documented APIs. The one undocumented string, the `DarkMode_Explorer` theme
-name, is allowed only as a measured, fail-back fallback (see below), and it is
-widely reported to need those ordinals to take effect for scrollbars, so
-Slice 0 measures it on this machine before any design leans on it.
+name, is allowed only for the body scrollbar, as a measured, fail-back route (see
+below). It is widely reported to need those ordinals, so Slice 0 measured it
+on this machine, and it works there for the scrollbar only.
 
 Keeping the native control classes (EDIT, COMBOBOX, BUTTON, trackbar) and
 changing only how they paint means keystrokes, tab order, IME and most of
@@ -133,7 +133,7 @@ and 6 were not measured, see below. The throwaway code is not kept.
 confirmed as the way, and nothing but v6 can custom-draw a real checkbox;
 `BS_OWNERDRAW` is the rejected fallback with the measured role loss. (b)
 Group boxes cannot use `NM_CUSTOMDRAW`; see below. (c) The scrollbar's
-documented route works, so open question 3 and 5 lean to using it. (d) Do not
+documented route works, so it is used for the body scrollbar (questions 3 and 5). (d) Do not
 theme edits or the combo list with `DarkMode_Explorer`. (e) The light-mode
 scrollbar result is unmeasured and gets a note in slice 5's check.
 ## The theme source
@@ -175,7 +175,7 @@ Edits are created with `WS_EX_BORDER`, a 1 px frame in the system frame colour
 dark. **Decision: a custom frame is part of this design, not a maybe.** Keep
 `WS_EX_BORDER` (it reserves the non-client area), and paint the frame in
 `control_border` (hot: `control_border_hot`; focused: `accent`) in a
-`WM_NCPAINT` handler on a subclass. The open question is only the colours.
+`WM_NCPAINT` handler on a subclass. The colours are settled from the slice 1 screenshots (question 2).
 
 ### Push buttons
 
@@ -190,7 +190,7 @@ owner-draw style is added to it.
 The role problem applies to checkboxes only (there are no radios), so the
 decision is per control and depends on Slice 0:
 
-- **Manifest route (recommended; Slice 0 confirmed v5 today and that v6 sends
+- **Manifest route (Decision; Slice 0 confirmed v5 today and that v6 sends
   the notification):** add the
   common-controls 6.0.0.0 manifest, keep `BS_AUTOCHECKBOX`, and draw in
   `NM_CUSTOMDRAW` (a v6 button sends it to its parent through `WM_NOTIFY`;
@@ -255,8 +255,8 @@ weakest piece of the plan and is ordered by risk:
    in a dark window. This is the accessible choice and the default fallback.
 3. **A custom owned scrollbar is allowed only with a UI Automation provider**
    (an `IRawElementProviderSimple` with `IScrollProvider`) that keeps the
-   scroll pattern. That is a large piece of work, so it needs its own approval
-   once 1 and 2 are measured. See the open questions.
+   scroll pattern. That is a large piece of work, so it is not built.
+   Decision: see question 5.
 
 ### Focus rects and keyboard cues
 
@@ -280,8 +280,7 @@ surface: nothing a high-contrast user sees changes. If Slice 0's manifest route
 is taken, light and high contrast do change to v6 visuals, which is why that
 slice is checked in Aquatic and Desert before it lands.
 
-Open question 4 asks whether light mode should also use the custom paint, for
-a consistent look.
+Decision: light mode does not use the custom paint (question 4).
 
 ## Live re-theme
 
@@ -372,7 +371,7 @@ manifest slice, which is a deliberate light-mode change.
 0. **Measurements** (no product change): the seven items above, recorded in
    this spec. Decides the manifest, the checkbox route, the combo approach and
    the scrollbar approach.
-0b. **Manifest** (only if Slice 0 chooses it): `assets/app.manifest`
+0b. **Manifest** (decided, question 1): `assets/app.manifest`
     requesting common-controls 6.0.0.0, wired through `app.rc`. Checked in
     light and high contrast at 100%, 150% and 200%, then shipped alone with a
     release note.
@@ -387,8 +386,8 @@ manifest slice, which is a deliberate light-mode change.
 3. **Combo boxes**: the paint subclass for the closed face, list items, and
    the drop-down list.
 4. **Trackbar.**
-5. **Scrollbar**: the documented route, or the stock fallback (a separate
-   approval for a custom bar, see the open questions).
+5. **Scrollbar**: the documented route, or the stock fallback (no custom
+   bar, question 5).
 6. **Verification pass and release**: the Narrator pass, real high contrast,
    Windows colour-mode switch while open; the `SETTINGS_DARK_ENABLED` constant
    is deleted in this slice and a source-scan test asserts the identifier no
@@ -397,8 +396,8 @@ manifest slice, which is a deliberate light-mode change.
 
 ### Size budget
 
-The gate is `perf-budgets.json` `exe_size_bytes.max` 4,000,000 against a last
-measurement of 3,908,096, about 92 KB of headroom shared with the options
+The gate is `perf-budgets.json` `exe_size_bytes.max` 4,500,000 against a last
+measurement of 3,982,336, about 518 KB of headroom shared with the options
 card, overlay and knowledge specs. No new crate and no new `windows` feature is
 planned (`Win32_Graphics_Dwm`, `Win32_UI_Controls` and GDI are already on;
 `SetWindowTheme` lives in `Win32_UI_Controls`). Estimates, THEORY
@@ -409,31 +408,32 @@ custom scrollbar with a UIA provider about 20 KB. About 25 to 30 KB without
 the last two, and a manifest is about 1 KB. Each slice's PR records the
 measured size from CI and raises the gate in the same PR if it must.
 
-## Open questions
+## Resolved questions
 
-1. **Common-controls v6 manifest.** Recommended: add it (Slice 0 confirmed
-   Settings runs v5), because it keeps the checkbox a real checkbox with no
-   accessibility wrapper. Counter-argument: it is a visible change for every
-   light-mode and high-contrast user, can shift hard-coded metrics, and the
-   same decision affects any other window that uses a list view (the planned
-   Memory window in the knowledge spec). Decide after the manifest slice's screenshots.
-2. **Edit frame colours.** The custom frame is decided. Which colours and the
-   hot and focus states are decided by looking at slice 1's screenshots.
-3. **`DarkMode_Explorer` fallback.** Slice 0 showed it works on this
-   build without ordinals for the scrollbar (dark mode), and not for the combo
-   list, trackbar or combo face. Recommended: use it for the body scrollbar only,
-   with the stock look as the fallback if it ever fails.
-4. **Custom paint in light mode too.** Recommended: no, stock in light, so light
-   and high contrast cannot regress and the custom code only runs for dark
-   users. Counter-argument: a dark checkbox and a light checkbox then differ
-   in shape, and the custom path gets less everyday exercise. Revisit if the
-   two look too different in the gallery.
-5. **Custom scrollbar.** Recommended: do not build one. Use the documented theme
-   route if it works, otherwise leave the stock scrollbar. Counter-argument: a
-   light strip in a dark window looks unfinished. A custom bar needs a UI
-   Automation provider, which is a project in itself.
-6. **When to ship dark.** Recommended: at slice 6, after the Narrator pass.
-   High contrast no longer gates it, because it stays stock and is verified in
-   Slice 0, but the Narrator and colour-mode-switch checks do. Counter-argument:
-   dark could ship at slice 5 once the scrollbar fallback is chosen, since the
-   stock scrollbar is accessible and the rest is done.
+Each was an open question with a recommended answer; the recommended answer
+is the decision.
+
+1. **Decision: add the common-controls v6 manifest** (Slice 0 confirmed
+   Settings runs v5). It keeps the checkbox a real checkbox with no
+   accessibility wrapper. It is a visible change for light-mode and
+   high-contrast users, so it ships alone in slice 0b, checked at 100%, 150%
+   and 200% and in Aquatic and Desert. The Memory window in the knowledge spec
+   benefits from the same manifest.
+2. **Decision: the custom edit frame is built; the exact colours and the hot
+   and focus states are set from slice 1's screenshots**, within the token
+   contrast tests (3:1 non-text).
+3. **Decision: use `DarkMode_Explorer` for the body scrollbar only.** The
+   stock look is the fallback if it ever fails. Never for edits, the combo
+   face, the combo list or the trackbar (measured not to help).
+4. **Decision: no custom paint in light mode.** Stock in light, so light and
+   high contrast cannot regress and the custom code runs only for dark users.
+5. **Decision: no custom scrollbar.** Use the documented theme route, else the
+   stock scrollbar. A custom bar would need a UI Automation provider, which is
+   a project in itself.
+6. **Decision: dark ships at slice 6, after the Narrator pass** and the
+   colour-mode-switch check. `SETTINGS_DARK_ENABLED` stays false until then.
+
+## Related decisions
+
+- **Decision: the Quick Ask palette sends no model request when it opens.**
+  This spec does not touch the palette, so nothing here changes.
