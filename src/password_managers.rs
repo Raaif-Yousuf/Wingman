@@ -15,10 +15,11 @@
 //!
 //! # Limits
 //!
-//! Only the FOREGROUND window is checked. A password manager visible beside
-//! it is still in a full-monitor screenshot. Store/UWP builds run under
+//! Only the FOREGROUND window is REFUSED. A password manager visible beside
+//! it (#575) is painted out of a cloud-bound screenshot instead: see
+//! [`manager_window_rects`]. Store/UWP builds run under
 //! `ApplicationFrameHost.exe`, so their process name says nothing and they
-//! are not covered. The tray menu and the palette take the foreground
+//! are not covered either way. The tray menu and the palette take the foreground
 //! before an action runs, so `App` remembers who was in front when they
 //! opened (see `password_manager_hint` in `app.rs`).
 
@@ -148,12 +149,247 @@ pub fn foreground_is_password_manager(extra: &[String]) -> bool {
     is_password_manager(image.as_deref(), &title, extra)
 }
 
+/// What the window enumeration learned about one top-level window.
+#[derive(Debug, Clone)]
+pub struct WindowFacts {
+    pub image_path: Option<String>,
+    pub title: String,
+    pub rect: crate::capture::ScreenRect,
+}
+
+/// The most rectangles one capture paints for password managers (#575).
+/// More than this is a failure, not a truncation: nothing is sent unpainted.
+pub const MAX_MANAGER_RECTS: usize = 16;
+
+/// The most on-screen top-level windows looked at (#575). Hidden, cloaked
+/// and minimised windows do not count, so this is generous.
+pub const MAX_WINDOWS_SCANNED: usize = 2000;
+
+/// Why the list of password-manager windows cannot be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanError {
+    /// The window enumeration itself failed.
+    EnumerationFailed,
+    /// More on-screen windows than [`MAX_WINDOWS_SCANNED`]: some were not looked at.
+    BudgetExhausted,
+    /// More than [`MAX_MANAGER_RECTS`] manager windows.
+    TooMany,
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EnumerationFailed => "the window list could not be read",
+            Self::BudgetExhausted => "too many windows to check for password managers",
+            Self::TooMany => "too many password manager windows to paint",
+        })
+    }
+}
+
+/// Collects [`WindowFacts`] during the window enumeration. Pure, so the
+/// budget is tested without windows. A window that is not on screen costs
+/// nothing and builds nothing; an on-screen one spends the budget.
+pub struct Scan {
+    left: usize,
+    pub exhausted: bool,
+    pub facts: Vec<WindowFacts>,
+}
+
+impl Scan {
+    pub fn new(budget: usize) -> Self {
+        Self {
+            left: budget,
+            exhausted: false,
+            facts: Vec::new(),
+        }
+    }
+
+    /// Offers one window: `None` when it is not on screen, else a closure
+    /// that reads its facts. Returns whether the enumeration should go on.
+    pub fn offer(&mut self, on_screen: Option<impl FnOnce() -> WindowFacts>) -> bool {
+        let Some(read) = on_screen else {
+            return true;
+        };
+        if self.left == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.left -= 1;
+        self.facts.push(read());
+        true
+    }
+}
+
+/// The rectangles of the password-manager windows among `windows` that
+/// overlap `monitor` (#575). Pure: the Win32 enumeration in `capture.rs`
+/// collects the facts. A rect from another process is never trusted: empty
+/// or reversed ones are dropped. More than [`MAX_MANAGER_RECTS`] is an error.
+pub fn manager_window_rects(
+    windows: &[WindowFacts],
+    monitor: crate::capture::ScreenRect,
+    extra: &[String],
+) -> Result<Vec<crate::capture::ScreenRect>, ScanError> {
+    let found: Vec<_> = windows
+        .iter()
+        .filter(|w| {
+            let r = w.rect;
+            r.right > r.left
+                && r.bottom > r.top
+                && r.left < monitor.right
+                && r.right > monitor.left
+                && r.top < monitor.bottom
+                && r.bottom > monitor.top
+        })
+        .filter(|w| is_password_manager(w.image_path.as_deref(), &w.title, extra))
+        .map(|w| w.rect)
+        .collect();
+    if found.len() > MAX_MANAGER_RECTS {
+        return Err(ScanError::TooMany);
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn none() -> Vec<String> {
         Vec::new()
+    }
+
+    // -- beside the front window (#575) ------------------------------------
+
+    fn sr(left: i32, top: i32, right: i32, bottom: i32) -> crate::capture::ScreenRect {
+        crate::capture::ScreenRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    fn facts(image: &str, title: &str, rect: crate::capture::ScreenRect) -> WindowFacts {
+        WindowFacts {
+            image_path: Some(image.to_string()),
+            title: title.to_string(),
+            rect,
+        }
+    }
+
+    #[test]
+    fn a_manager_beside_the_front_window_is_listed_and_ordinary_windows_are_not() {
+        let monitor = sr(0, 0, 1920, 1080);
+        let windows = [
+            facts(r"C:\Windows\explorer.exe", "Docs", sr(0, 0, 900, 1000)),
+            facts(
+                r"C:\Program Files\KeePassXC\KeePassXC.exe",
+                "Vault",
+                sr(900, 0, 1900, 1000),
+            ),
+        ];
+        assert_eq!(
+            manager_window_rects(&windows, monitor, &none()),
+            Ok(vec![sr(900, 0, 1900, 1000)])
+        );
+    }
+
+    #[test]
+    fn the_users_own_list_and_title_screens_count_beside_the_front_window_too() {
+        let monitor = sr(0, 0, 100, 100);
+        let extra = vec!["myvault".to_string()];
+        let windows = [
+            facts(r"C:\x\MyVault.exe", "x", sr(0, 0, 10, 10)),
+            facts(
+                r"C:\Windows\explorer.exe",
+                "Credential Manager",
+                sr(20, 20, 40, 40),
+            ),
+        ];
+        assert_eq!(
+            manager_window_rects(&windows, monitor, &extra)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_manager_on_another_monitor_or_with_a_bad_rect_is_not_listed() {
+        let monitor = sr(0, 0, 1920, 1080);
+        let kp = r"C:\Program Files\KeePass\KeePass.exe";
+        let windows = [
+            facts(kp, "elsewhere", sr(1920, 0, 3000, 500)),
+            facts(kp, "left of it", sr(-900, 0, 0, 500)),
+            facts(kp, "empty", sr(10, 10, 10, 50)),
+            facts(kp, "reversed", sr(500, 500, 100, 100)),
+            facts(kp, "minimised", sr(-32000, -32000, -31840, -31972)),
+        ];
+        assert!(manager_window_rects(&windows, monitor, &none())
+            .unwrap()
+            .is_empty());
+        // A window that only overlaps the monitor is still listed.
+        let edge = [facts(kp, "edge", sr(1800, 900, 2500, 1500))];
+        assert_eq!(
+            manager_window_rects(&edge, monitor, &none()).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn more_manager_windows_than_the_cap_is_an_error_not_a_truncation() {
+        let monitor = sr(0, 0, 100, 100);
+        let mk = |n: usize| -> Vec<WindowFacts> {
+            (0..n)
+                .map(|_| facts(r"C:\x\bitwarden.exe", "v", sr(0, 0, 50, 50)))
+                .collect()
+        };
+        assert_eq!(
+            manager_window_rects(&mk(MAX_MANAGER_RECTS), monitor, &none())
+                .unwrap()
+                .len(),
+            MAX_MANAGER_RECTS
+        );
+        assert_eq!(
+            manager_window_rects(&mk(MAX_MANAGER_RECTS + 1), monitor, &none()),
+            Err(ScanError::TooMany)
+        );
+    }
+
+    #[test]
+    fn hidden_windows_do_not_spend_the_scan_budget() {
+        let mut scan = Scan::new(MAX_WINDOWS_SCANNED);
+        let hidden: Option<fn() -> WindowFacts> = None;
+        for _ in 0..(MAX_WINDOWS_SCANNED * 3) {
+            assert!(scan.offer(hidden));
+        }
+        let kp = || {
+            facts(
+                r"C:\Program Files\KeePass\KeePass.exe",
+                "v",
+                sr(0, 0, 50, 50),
+            )
+        };
+        assert!(scan.offer(Some(kp)));
+        assert!(!scan.exhausted);
+        assert_eq!(
+            manager_window_rects(&scan.facts, sr(0, 0, 100, 100), &none())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn running_out_of_budget_stops_the_scan_and_says_so() {
+        let mut scan = Scan::new(3);
+        let w = || facts(r"C:\x\a.exe", "t", sr(0, 0, 5, 5));
+        for _ in 0..3 {
+            assert!(scan.offer(Some(w)));
+        }
+        assert!(!scan.exhausted);
+        assert!(!scan.offer(Some(w)), "the fourth stops the walk");
+        assert!(scan.exhausted);
+        assert_eq!(scan.facts.len(), 3);
     }
 
     #[test]

@@ -976,6 +976,7 @@ impl App {
                 max_long_edge,
                 max_pixels,
                 lookup,
+                &self.config.capture.extra_password_managers,
             ) {
                 Ok(r) => Some(r),
                 Err(e) => {
@@ -1215,6 +1216,7 @@ impl App {
                 capture::needs_password_lookup(self.config.capture.redact, &providers, mode),
                 capture::LookupWindow::Window(underlying_window),
             ),
+            &self.config.capture.extra_password_managers,
         ) {
             Ok(r) => r,
             Err(_) => return,

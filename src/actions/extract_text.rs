@@ -84,6 +84,7 @@ pub fn capture_screen() -> Result<RawShot> {
         u32::MAX,
         u64::MAX,
         crate::capture::LookupWindow::None,
+        &[],
     )
 }
 
