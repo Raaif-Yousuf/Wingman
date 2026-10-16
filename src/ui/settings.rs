@@ -2492,6 +2492,11 @@ fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
         return;
     };
     if !key_fits_vendor(index, &key) {
+        // No key text: the report is pasted into public issues.
+        crate::diagnostics::note_warning(&format!(
+            "Live model list skipped for {}: the typed key has an unrecognised format",
+            CLOUD_VENDORS[index].tag()
+        ));
         return;
     }
     if crate::mode::is_offline_now() {
@@ -2545,10 +2550,12 @@ fn spawn_one_cloud_fetch(
                 return;
             }
             guard[index] = Some(ids);
-            drop(guard);
+            // The fetched-key record is written under the same slots lock
+            // (always slots first, then keys), so it cannot go stale.
             if let Ok(mut keys) = sync.fetched_keys.lock() {
                 keys[index] = key.trim().to_string();
             }
+            drop(guard);
             post_while_open(&alive, || unsafe {
                 let _ = PostMessageW(
                     Some(HWND(hwnd_raw as *mut c_void)),
