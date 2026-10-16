@@ -1119,10 +1119,25 @@ function Remove-Item { process { Write-Output "REMOVED:$($_.Thumbprint)" } }
 
 Describe 'Registration stays sparse (issue #251)' {
     It 'registers the package with -ExternalLocation' {
-        $src = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Wingman.Common.psm1') -Raw) -replace "`r", ''
-        $calls = @($src -split "`n" | Where-Object { $_ -match '^\s*Add-AppxPackage\b' })
+        # Parsed, not text-matched, so comments, `&` calls, one-line blocks and
+        # continuation lines cannot fool it.
+        $files = @(Get-ChildItem -Path $PSScriptRoot -Include *.ps1, *.psm1 -Recurse -File |
+                Where-Object { $_.Name -notlike '*.Tests.ps1' })
+        $files.Count | Should -BeGreaterThan 0
+        $calls = @(foreach ($f in $files) {
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+                $ast.FindAll({
+                        param($n)
+                        $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-AppxPackage'
+                    }, $true)
+            })
         $calls.Count | Should -BeGreaterThan 0
-        foreach ($c in $calls) { $c | Should -Match '-ExternalLocation' }
+        foreach ($c in $calls) {
+            $names = @($c.CommandElements |
+                    Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } |
+                    ForEach-Object { $_.ParameterName })
+            $names | Should -Contain 'ExternalLocation'
+        }
     }
 
     It 'tells release readers to install with install.ps1, not the msix' {
