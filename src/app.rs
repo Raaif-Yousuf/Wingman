@@ -288,7 +288,7 @@ const CARD_SETTLE_MS: u64 = 60;
 /// re-armed or cancelled.
 const PAUSE_TIMER_ID: usize = 1;
 /// #723: one-shot, armed only while a run is in flight (rule 5), fires when
-/// the run has outlasted `provider::WORST_CASE_RUN_SECS`.
+/// the run has outlasted `provider::worst_case_run_secs` for its chain.
 const STUCK_TIMER_ID: usize = 4;
 
 struct App {
@@ -909,6 +909,9 @@ fn is_run_result(msg: u32) -> bool {
             | WM_APP_REVIEW_RESULT
             | WM_APP_FORM_FILL_RESULT
             | WM_APP_GENERIC_ACTION_RESULT
+            // The worker is blocked on this preview; a stale one is freed,
+            // which drops its reply channel and cancels that send.
+            | WM_APP_SEND_PREVIEW
     )
 }
 
@@ -929,6 +932,11 @@ impl App {
     fn busy_now(&mut self) -> bool {
         if busy_after_press(self.busy, BUSY_STUCK.with(|c| c.get())) != self.busy {
             self.set_busy(false);
+            // Advance now, not only when the next run starts: if this press
+            // returns early (paused, a readiness card, ...) the abandoned
+            // run's late result must still be stale.
+            self.run_generation = self.run_generation.wrapping_add(1);
+            CURRENT_RUN.with(|c| c.set(self.run_generation));
         }
         self.busy
     }
@@ -944,6 +952,11 @@ impl App {
             return;
         }
         BUSY_STUCK.with(|c| c.set(true));
+        // A send preview is waiting on the user: leave it. The next press
+        // still abandons the run.
+        if matches!(self.card.state(), crate::ui::card::CardState::Preview) {
+            return;
+        }
         self.card
             .show_error("This is taking too long", "Press again to start over.");
     }
@@ -1358,6 +1371,7 @@ impl App {
         // `AskingModel` inside `begin_model_action` (findings 1 and 2), so
         // there is nothing left to set here.
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             // #236: every egress row this thread writes names its trigger.
             crate::activation::set_worker_trigger(trigger);
             let result: std::result::Result<Answer, String> = catch_worker(|| {
@@ -1718,6 +1732,7 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let result: std::result::Result<Answer, String> = catch_worker(|| {
                 work(&raw).map_err(|e| {
                     let chain_text = worker_error_chain_text(&e);
@@ -1847,6 +1862,7 @@ impl App {
         let run = self.run_generation;
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 (|| -> Result<Value> {
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
@@ -2107,6 +2123,7 @@ impl App {
                 (action.clone(), schema.clone())
             };
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let result: GenericResult = catch_worker(|| {
                 (|| -> Result<_, GenericFailure> {
                     // #127 step 1: find the link, check it, and hand it back for
@@ -2772,6 +2789,7 @@ impl App {
         let run = self.run_generation;
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
                 catch_worker(|| {
                     (|| -> Result<actions::review_email::ReviewOutcome> {
@@ -2982,6 +3000,7 @@ impl App {
         let run = self.run_generation;
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let mut raw = raw;
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 form_fill_worker(
@@ -3299,7 +3318,8 @@ impl App {
                 let _ = SetTimer(
                     Some(hwnd),
                     STUCK_TIMER_ID,
-                    (crate::provider::WORST_CASE_RUN_SECS as u32).saturating_mul(1000),
+                    (crate::provider::worst_case_run_secs(self.chain.provider_count()) as u32)
+                        .saturating_mul(1000),
                     None,
                 );
             }
@@ -3512,6 +3532,7 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let result: std::result::Result<Answer, String> = catch_worker(|| {
                 match crate::calc::run_on_selection(
                 &crate::calc::ForegroundSelection,
@@ -6917,7 +6938,12 @@ mod tests {
         for msg in [WM_APP_RESULT, WM_APP_CALENDAR_RESULT, WM_APP_REVIEW_RESULT] {
             assert!(super::is_run_result(msg));
         }
+        // A send preview from an abandoned run is stale too.
+        assert!(super::is_run_result(WM_APP_SEND_PREVIEW));
         assert!(!super::is_run_result(WM_APP_HOTKEY));
+        let src = lf(include_str!("app.rs"));
+        let tagged = src.matches("send_gate::set_worker_run(run);").count();
+        assert!(tagged >= 7, "workers that tag their run: {tagged}");
     }
 
     /// #723: every worker result is posted with its run generation, or the
@@ -6946,9 +6972,13 @@ mod tests {
     /// wall clock, so a healthy run is never called stuck.
     #[test]
     fn stuck_bound_covers_the_slowest_honest_chain() {
-        let bound = std::hint::black_box(crate::provider::WORST_CASE_RUN_SECS);
-        assert!(bound >= 4 * crate::provider::common::MAX_TOTAL_WALL_CLOCK_SECS);
-        assert!(bound >= 4 * crate::provider::ollama::TOTAL_TIMEOUT_SECS);
+        for n in [1usize, 4, 9] {
+            let bound = std::hint::black_box(crate::provider::worst_case_run_secs(n));
+            assert!(bound >= n as u64 * crate::provider::common::MAX_TOTAL_WALL_CLOCK_SECS);
+            assert!(bound >= n as u64 * crate::provider::ollama::TOTAL_TIMEOUT_SECS);
+        }
+        // A chain with no providers still gets a positive bound.
+        assert!(crate::provider::worst_case_run_secs(0) > 0);
     }
 
     /// #723: no busy gate may return without a card. Scans every
@@ -6958,7 +6988,7 @@ mod tests {
         let src = lf(include_str!("app.rs"));
         let mut seen = 0;
         for (i, _) in src.match_indices(&("if self.".to_owned() + "busy_now() {")) {
-            let after = &src[i..i + 120.min(src.len() - i)];
+            let after = src.get(i..i + 120).unwrap_or(&src[i..]);
             assert!(
                 after.contains("self.show_busy_card()"),
                 "a busy gate returns without a card: {after}"
@@ -6969,7 +6999,10 @@ mod tests {
         let gate = src
             .find("ModelActionGate::Busy => {")
             .expect("begin_action has no Busy arm");
-        assert!(src[gate..gate + 120].contains("self.show_busy_card()"));
+        assert!(src
+            .get(gate..gate + 120)
+            .unwrap_or(&src[gate..])
+            .contains("self.show_busy_card()"));
     }
 
     #[test]

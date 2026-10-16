@@ -1213,9 +1213,10 @@ enum CopyFeedback {
 /// animation could get away with much slower ticks, but a spinner cannot.
 const ANIM_INTERVAL_MS: u32 = 20;
 /// A last resort if the worker never reports back. Derived from the provider
-/// timeouts, so a card is never hidden while an honest request still runs
-/// (#723).
-const PENDING_SAFETY_TIMEOUT_SECS: u32 = crate::provider::WORST_CASE_RUN_SECS as u32;
+/// timeouts for a typical chain. A longer chain can outlast it, which is
+/// recoverable: a press while busy shows the working card again (#723).
+const PENDING_SAFETY_TIMEOUT_SECS: u32 =
+    crate::provider::worst_case_run_secs(crate::provider::TYPICAL_CHAIN_LEN) as u32;
 /// How long "Asking {model}..." stays up before the line changes to "Still
 /// working." -- issue #354's "after a few seconds".
 const STILL_WORKING_DELAY_MS: u32 = 4000;
