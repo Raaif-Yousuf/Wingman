@@ -374,7 +374,9 @@ pub(crate) fn accent_fill(theme: Theme, shades: AccentShades, surface: u32) -> u
 pub(crate) fn read_accent_shades() -> AccentShades {
     let subkey = wide_z(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent");
     let value = wide_z("AccentPalette");
-    let mut data = [0u8; 32];
+    // The real value is 32 bytes; the buffer is larger, and bounded, so a
+    // longer value is parsed instead of failing with ERROR_MORE_DATA.
+    let mut data = [0u8; 256];
     let mut size = data.len() as u32;
     let status = unsafe {
         RegGetValueW(

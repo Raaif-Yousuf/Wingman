@@ -119,6 +119,16 @@ pub(crate) fn readable_on(fill: u32) -> u32 {
     }
 }
 
+/// Black on a light surface, white on a dark one: the colour that raises a
+/// fill's contrast against `surface`.
+fn away_from(surface: u32) -> u32 {
+    if crate::ui::theme::relative_luminance(surface) > 0.5 {
+        0x0000_0000
+    } else {
+        0x00FF_FFFF
+    }
+}
+
 /// How an `itemState` (plus whether the mouse is over the button) reads.
 pub(crate) fn state_from(item_state: u32, hovered: bool) -> State {
     if item_state & ODS_DISABLED != 0 {
@@ -148,8 +158,10 @@ pub(crate) fn look(
         Role::Primary => {
             let fill = match state {
                 State::Normal => accent,
-                State::Hover => blend(accent, 0x00FF_FFFF, 14),
-                State::Pressed => blend(accent, 0x0000_0000, 18),
+                // Hover and pressed move away from the card colour, so they
+                // keep at least the resting fill's contrast against it (#857).
+                State::Hover => blend(accent, away_from(surface.bg), 10),
+                State::Pressed => blend(accent, away_from(surface.bg), 22),
                 State::Disabled => blend(surface.bg, surface.hint, 30),
             };
             // The disabled label is about 3.2:1 on its fill: WCAG 1.4.3 exempts
@@ -368,6 +380,41 @@ mod tests {
             assert_ne!(hover, pressed, "{role:?} pressed must differ from hover");
             assert_ne!(normal, pressed);
         }
+    }
+
+    #[test]
+    fn every_primary_state_keeps_3_to_1_against_the_card() {
+        use crate::ui::theme::{
+            accent_fill, contrast_ratio, relative_luminance, AccentShades, Theme, DARK, LIGHT,
+        };
+        let accents = [
+            rgb(0x00, 0x78, 0xD4),
+            rgb(0xFF, 0xB9, 0x00),
+            rgb(0x3A, 0x3A, 0x3A),
+            rgb(0xFF, 0xFF, 0xFF),
+            rgb(0x00, 0x00, 0x00),
+        ];
+        let mut checked = 0;
+        for (theme, bg) in [(Theme::Light, LIGHT.surface), (Theme::Dark, DARK.surface)] {
+            let surface = Surface { bg, ..SURFACE };
+            for a in accents {
+                let rest = accent_fill(
+                    theme,
+                    AccentShades {
+                        light2: a,
+                        dark1: a,
+                    },
+                    bg,
+                );
+                for state in [State::Normal, State::Hover, State::Pressed] {
+                    let fill = look(Role::Primary, state, &surface, rest, None).fill;
+                    let c = contrast_ratio(relative_luminance(fill), relative_luminance(bg));
+                    assert!(c >= 3.0, "{theme:?} {a:#08x} {state:?}: {c:.2}:1");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 30);
     }
 
     #[test]
