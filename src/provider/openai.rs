@@ -167,12 +167,26 @@ impl OpenAi {
             _ => StopReason::Other,
         };
 
-        // `output_tokens` already includes reasoning tokens.
+        // `output_tokens` already includes reasoning tokens. `input_tokens`
+        // includes the cached part, so the cached count is split out and
+        // billed at the cached rate. The Responses API reports it under
+        // `input_tokens_details`; the chat-style name is read as a fallback.
         let usage = value.get("usage").map(|u| {
             let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
+            let cached = ["input_tokens_details", "prompt_tokens_details"]
+                .iter()
+                .find_map(|d| {
+                    u.get(*d)
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(Value::as_u64)
+                })
+                .unwrap_or(0) as u32;
+            let input = count("input_tokens");
+            let cached = cached.min(input);
             Usage {
-                input_tokens: count("input_tokens"),
+                input_tokens: input - cached,
                 output_tokens: count("output_tokens"),
+                cache_read_tokens: cached,
                 ..Default::default()
             }
         });
@@ -443,6 +457,30 @@ mod tests {
         let body = include_str!("../../tests/fixtures/openai_response.json");
         let u = OpenAi::parse_completion(body).unwrap().usage.unwrap();
         assert_eq!((u.input_tokens, u.output_tokens), (1200, 85));
+    }
+
+    // Cached tokens are a subset of `input_tokens`: they are split out so the
+    // plain remainder is billed at the input rate and the cached part at the
+    // cached rate.
+    #[test]
+    fn parse_completion_splits_cached_tokens_out_of_input() {
+        let body = r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{}"}]}],"usage":{"input_tokens":1000,"output_tokens":5,"input_tokens_details":{"cached_tokens":600}}}"#;
+        let u = OpenAi::parse_completion(body).unwrap().usage.unwrap();
+        assert_eq!((u.input_tokens, u.cache_read_tokens), (400, 600));
+    }
+
+    #[test]
+    fn parse_completion_reads_chat_style_cached_field_too() {
+        let body = r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{}"}]}],"usage":{"input_tokens":1000,"output_tokens":5,"prompt_tokens_details":{"cached_tokens":250}}}"#;
+        let u = OpenAi::parse_completion(body).unwrap().usage.unwrap();
+        assert_eq!((u.input_tokens, u.cache_read_tokens), (750, 250));
+    }
+
+    #[test]
+    fn parse_completion_without_cached_field_has_no_cache_read() {
+        let body = include_str!("../../tests/fixtures/openai_response.json");
+        let u = OpenAi::parse_completion(body).unwrap().usage.unwrap();
+        assert_eq!(u.cache_read_tokens, 0);
     }
 
     #[test]

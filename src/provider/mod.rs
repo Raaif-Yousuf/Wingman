@@ -253,7 +253,9 @@ pub struct Usage {
     /// Anthropic prompt-cache writes (billed above the input rate). Zero
     /// from every other provider.
     pub cache_write_tokens: u32,
-    /// Anthropic prompt-cache reads (billed far below the input rate).
+    /// Cached input (Anthropic cache reads, OpenAI `cached_tokens`, Gemini
+    /// `cachedContentTokenCount`), billed far below the input rate and
+    /// never also counted in `input_tokens`.
     pub cache_read_tokens: u32,
 }
 

@@ -17,11 +17,11 @@
 //! same model with a later `from` date: the newest row whose `from` is on or
 //! before the day of the request wins.
 //!
-//! Known gaps, all of which make the estimate an upper bound or a close
-//! approximation rather than a guess: OpenAI and Gemini cached-input
-//! discounts are not read (those tokens are billed at the full input rate
-//! here), and long-prompt surcharges (over 200k or 272k tokens) are ignored
-//! because a screenshot press is nowhere near them.
+//! Known gap, which makes the estimate an upper bound rather than a guess:
+//! long-prompt surcharges (over 200k or 272k tokens) are ignored because a
+//! screenshot press is nowhere near them. Cached input is priced at each
+//! provider's cached rate (OpenAI `cached_tokens`, Gemini
+//! `cachedContentTokenCount`, Anthropic cache read).
 //!
 //! Totals are a floor: only successful, parsed responses are counted, so a
 //! refused or failed call that the vendor still billed is not included. The
@@ -61,7 +61,8 @@ pub struct Price {
     pub output: f64,
     /// Anthropic prompt-cache write (5 minute) rate. Others: the input rate.
     pub cache_write: f64,
-    /// Anthropic prompt-cache read rate. Others: the input rate.
+    /// Prompt-cache read rate (Anthropic cache read, OpenAI cached input,
+    /// Gemini context caching). The input rate when the page lists none.
     pub cache_read: f64,
 }
 
@@ -233,35 +234,35 @@ const PRICES: &[PriceRow] = &[
         "gemini",
         "gemini-3.8-flash",
         ALWAYS,
-        p(0.75, 3.75, 0.75, 0.75),
+        p(0.75, 3.75, 0.75, 0.075),
         GEMINI_SRC,
     ),
     row(
         "gemini",
         "gemini-3.8-flash",
         "2027-01-01",
-        p(1.50, 7.50, 1.50, 1.50),
+        p(1.50, 7.50, 1.50, 0.15),
         GEMINI_SRC,
     ),
     row(
         "gemini",
         "gemini-3.1-pro-preview",
         ALWAYS,
-        p(2.0, 12.0, 2.0, 2.0),
+        p(2.0, 12.0, 2.0, 0.20),
         GEMINI_SRC,
     ),
     row(
         "gemini",
         "gemini-2.5-pro",
         ALWAYS,
-        p(1.25, 10.0, 1.25, 1.25),
+        p(1.25, 10.0, 1.25, 0.125),
         GEMINI_SRC,
     ),
     row(
         "gemini",
         "gemini-2.5-flash",
         ALWAYS,
-        p(0.30, 2.5, 0.30, 0.30),
+        p(0.30, 2.5, 0.30, 0.03),
         GEMINI_SRC,
     ),
     // THEORY (unverified): "gemini-3.5-flash" is in the default model list
@@ -585,6 +586,24 @@ mod tests {
         };
         let c = cost_usd("anthropic", "claude-opus-5", "2026-10-15", &u).unwrap();
         assert!(close(c, 100.0 * 5.0 / 1e6 + 6.25 + 0.50), "{c}");
+    }
+
+    #[test]
+    fn cached_reads_are_priced_at_the_provider_cached_rate() {
+        let u = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_write_tokens: 0,
+            cache_read_tokens: 1_000_000,
+        };
+        let c = |p: &str, m: &str| cost_usd(p, m, "2026-10-15", &u).unwrap();
+        assert!(close(c("openai", "gpt-5.4"), 0.25));
+        assert!(close(c("gemini", "gemini-2.5-pro"), 0.125));
+        assert!(close(c("gemini", "gemini-2.5-flash"), 0.03));
+        assert!(close(c("gemini", "gemini-3.1-pro-preview"), 0.20));
+        assert!(close(c("gemini", "gemini-3.8-flash"), 0.075));
+        let later = cost_usd("gemini", "gemini-3.8-flash", "2027-01-01", &u).unwrap();
+        assert!(close(later, 0.15), "{later}");
     }
 
     #[test]

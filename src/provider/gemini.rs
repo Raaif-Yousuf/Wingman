@@ -218,10 +218,14 @@ impl Gemini {
         // thinking response and is billed as output, so it is added in.
         let usage = value.get("usageMetadata").map(|u| {
             let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
+            // `promptTokenCount` includes the cached part: split it out.
+            let prompt = count("promptTokenCount");
+            let cached = count("cachedContentTokenCount").min(prompt);
             Usage {
-                input_tokens: count("promptTokenCount"),
+                input_tokens: prompt - cached,
                 output_tokens: count("candidatesTokenCount")
                     .saturating_add(count("thoughtsTokenCount")),
+                cache_read_tokens: cached,
                 ..Default::default()
             }
         });
@@ -617,6 +621,14 @@ mod tests {
         let body = r#"{"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":7}}"#;
         let usage = Gemini::parse_completion(body).unwrap().usage.unwrap();
         assert_eq!((usage.input_tokens, usage.output_tokens), (10, 12));
+    }
+
+    // `cachedContentTokenCount` is a subset of `promptTokenCount`.
+    #[test]
+    fn parse_completion_splits_cached_content_out_of_input() {
+        let body = r#"{"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1000,"cachedContentTokenCount":700,"candidatesTokenCount":5}}"#;
+        let usage = Gemini::parse_completion(body).unwrap().usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.cache_read_tokens), (300, 700));
     }
 
     #[test]
