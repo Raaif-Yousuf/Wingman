@@ -349,6 +349,10 @@ struct App {
     /// `WM_APP_PENDING_STAGE` carries the number it started under, so a late
     /// stage cannot relabel the card of a newer run.
     run_generation: u64,
+    /// #133: the number of the latest first-run probe. A probe's answer
+    /// carries the number it started under; an older one is ignored, so two
+    /// quick presses cannot make the first answer clobber the second's card.
+    first_run_probe: u64,
     /// #228: the footer line for the answer now being shown, set by each
     /// action result handler from the worker's attribution and `None` unless
     /// a fallback answered.
@@ -536,6 +540,7 @@ pub fn run() -> Result<()> {
         pending_preview: None,
         pending_preview_generation: 0,
         run_generation: 0,
+        first_run_probe: 0,
         fallback_footer: None,
         last_form_undo: None,
         last_error: None,
@@ -764,6 +769,19 @@ impl BeginPlan {
     }
 }
 
+/// #133: whether a probe's answer belongs to the latest probe. An older
+/// one (an earlier press) is dropped.
+fn first_run_result_is_current(run: u64, latest: u64) -> bool {
+    run == latest
+}
+
+/// #133: after a probe whose answer needs no card, whether to hide the card
+/// on screen. Only the working card this probe put up: a card for something
+/// else (an answer, or a run in flight) is left alone.
+fn should_hide_after_first_run(card_is_pending: bool, busy: bool) -> bool {
+    card_is_pending && !busy
+}
+
 /// #133: the card shown once a local Ollama has been adopted. A stock tray
 /// listener can be CPU only (AGENTS.md pitfall), so that case says answers may
 /// be slow and where to look.
@@ -870,6 +888,8 @@ impl App {
         }
         self.card
             .show_pending(crate::ui::card::PendingStage::Working);
+        self.first_run_probe = self.first_run_probe.wrapping_add(1);
+        let run = self.first_run_probe;
         let target = self.hwnd_isize();
         let base_url = self.config.providers.ollama.base_url.clone();
         let preferred = self.config.providers.ollama.model.clone();
@@ -880,7 +900,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_FIRST_RUN,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -898,14 +918,20 @@ impl App {
     /// else shows the readiness card, with a sharper detail when Ollama runs
     /// but has no vision model. If the setup changed while the probe ran
     /// (a key was pasted), there is nothing to say.
-    fn on_first_run_result(&mut self, found: FirstRun) {
+    fn on_first_run_result(&mut self, run: u64, found: FirstRun) {
+        if !first_run_result_is_current(run, self.first_run_probe) {
+            return;
+        }
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
         let Some((headline, mut detail)) =
             Self::readiness_gate(self.config.mode, &self.config.providers, &path)
         else {
-            self.card.hide();
+            let pending = matches!(self.card.state(), crate::ui::card::CardState::Pending);
+            if should_hide_after_first_run(pending, self.busy) {
+                self.card.hide();
+            }
             return;
         };
         let eligible = self
@@ -913,7 +939,9 @@ impl App {
             .providers
             .first_run_local_eligible(self.config.mode);
         if let (FirstRun::Found { model, kind }, true) = (&found, eligible) {
-            self.config.providers.adopt_local_model(model);
+            let base_url = ollama_admin::first_run_base_url(&self.config.providers.ollama.base_url)
+                .unwrap_or_else(|| self.config.providers.ollama.base_url.clone());
+            self.config.providers.adopt_local_model(model, &base_url);
             self.chain = Arc::new(self.config.build_chain());
             let saved = self.config.save();
             self.refresh_tray_labels();
@@ -6042,7 +6070,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_APP_FIRST_RUN => {
             // #133: take ownership of the probe's answer.
             let found = unsafe { *Box::from_raw(lparam.0 as *mut FirstRun) };
-            app.on_first_run_result(found);
+            app.on_first_run_result(wparam.0 as u64, found);
             LRESULT(0)
         }
         WM_APP_ROUTER_RESULT => {
@@ -6477,6 +6505,26 @@ mod tests {
     }
 
     // -- first-run readiness (issue #133) ----------------------------------
+
+    #[test]
+    fn only_the_latest_first_run_probe_is_acted_on() {
+        assert!(super::first_run_result_is_current(3, 3));
+        assert!(!super::first_run_result_is_current(2, 3), "an older press");
+        assert!(!super::first_run_result_is_current(4, 3));
+    }
+
+    #[test]
+    fn a_quiet_first_run_result_hides_only_its_own_working_card() {
+        assert!(super::should_hide_after_first_run(true, false));
+        assert!(
+            !super::should_hide_after_first_run(false, false),
+            "an answer is showing"
+        );
+        assert!(
+            !super::should_hide_after_first_run(true, true),
+            "a real run owns the card"
+        );
+    }
 
     #[test]
     fn the_adopted_card_names_the_model_and_warns_only_for_the_stock_app() {

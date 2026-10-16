@@ -1647,11 +1647,17 @@ impl Providers {
 
     /// #133: makes the local Ollama and `model` the setup. Returns `false`
     /// (and changes nothing) when it is already so.
-    pub fn adopt_local_model(&mut self, model: &str) -> bool {
+    ///
+    /// `base_url` is the address the probe actually answered on (`localhost`
+    /// already read as `127.0.0.1`), so a hand-typed `localhost` is not saved:
+    /// it stalls every request (AGENTS.md rule 6) and the Offline guard
+    /// refuses it.
+    pub fn adopt_local_model(&mut self, model: &str, base_url: &str) -> bool {
         let listed = self.order.iter().any(|n| n == "ollama");
-        if listed && self.ollama.model == model {
+        if listed && self.ollama.model == model && self.ollama.base_url == base_url {
             return false;
         }
+        self.ollama.base_url = base_url.to_string();
         if !listed {
             self.order.push("ollama".to_string());
         }
@@ -2061,12 +2067,12 @@ win = true
     #[test]
     fn adopting_a_local_model_adds_ollama_and_sets_the_model_once() {
         let mut p = Providers::default();
-        assert!(p.adopt_local_model("qwen3.5:9b"));
+        assert!(p.adopt_local_model("qwen3.5:9b", "http://127.0.0.1:11434"));
         assert_eq!(p.order.last().map(String::as_str), Some("ollama"));
         assert_eq!(p.ollama.model, "qwen3.5:9b");
         assert_eq!(p.order.iter().filter(|n| *n == "ollama").count(), 1);
         assert!(
-            !p.adopt_local_model("qwen3.5:9b"),
+            !p.adopt_local_model("qwen3.5:9b", "http://127.0.0.1:11434"),
             "second call changes nothing"
         );
         assert_eq!(p.order.iter().filter(|n| *n == "ollama").count(), 1);
@@ -2074,6 +2080,14 @@ win = true
             .build_chain_for_mode(Mode::Local, true)
             .ready_provider_names()
             .contains(&"ollama"));
+    }
+
+    #[test]
+    fn adopting_a_local_model_saves_the_address_that_answered() {
+        let mut p = Providers::default();
+        p.ollama.base_url = "http://localhost:11434".to_string();
+        assert!(p.adopt_local_model("gemma3:4b", "http://127.0.0.1:11434"));
+        assert_eq!(p.ollama.base_url, "http://127.0.0.1:11434");
     }
 
     #[test]
