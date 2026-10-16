@@ -768,7 +768,7 @@ fn should_show_welcome(
 /// opens Settings. No em dash (rule 11).
 pub(crate) fn welcome_card(secondary: &str) -> (String, String) {
     (
-        "Wingman is running. Press the Copilot key. The icon is in the tray (^).".to_string(),
+        "Wingman is running".to_string(),
         format!(
             "Press the Copilot key or {secondary}. The icon may be under the ^ arrow in the tray; \
              drag it out to keep it in view. Click here to open Settings."
@@ -1520,11 +1520,6 @@ impl App {
             return;
         }
 
-        // #506: the window under the palette, read before the palette takes
-        // the foreground. The router's capture looks for password fields
-        // there, not in Wingman's own palette.
-        let underlying =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
         let resolved = match actions::load_actions_report() {
             Ok(report) => {
                 self.show_skipped_notice(&report);
@@ -1555,24 +1550,20 @@ impl App {
             self.first_provider_model_label().as_deref(),
         );
 
-        // #24: candidates are built from the SAME catalogue about to be
-        // shown, before it moves into `Palette::show` below.
-        let candidates = router::candidates_from_catalogue(&catalogue);
-        // #339: asked BEFORE the palette takes the foreground. The router
-        // sends a screenshot, so it must not run over a password manager.
-        let password_manager_in_front = self.password_manager_now();
-        self.palette_password_manager = password_manager_in_front;
+        // #339: asked BEFORE the palette takes the foreground, read when the
+        // palette runs an action.
+        self.palette_password_manager = self.password_manager_now();
+        // #805: opening the palette sends nothing, no screenshot and no
+        // model request. A request starts only when the user picks an
+        // action (or, later, from the options card), never from this call.
         self.palette.show(catalogue, model_configured, footer);
-        self.maybe_start_router(candidates, password_manager_in_front, underlying);
     }
 
-    /// #24: the intent router's hook, called right after
-    /// [`App::toggle_palette`]'s `Palette::show` -- the palette is already
-    /// visible and painted by the time this runs (`Palette::show` forces a
-    /// synchronous first paint), so nothing here can add to the palette's
-    /// own sub-100ms show latency; only the eventual card-free suggestion
-    /// arrives late. Mirrors `App::ask`'s own capture-on-main-thread-then-
-    /// spawn ordering.
+    /// #24: starts the intent router: a small screenshot and one cheap model
+    /// call. Since #805 nothing calls this: opening the palette sends no
+    /// request, and the router belongs to the key press and the options card
+    /// (#307). Mirrors `App::ask`'s own capture-on-main-thread-then-spawn
+    /// ordering.
     ///
     /// A silent no-op (never a card, never a hint) when: Paused; no
     /// provider is ready at all (the cheap, optimistic "is anything
@@ -1583,6 +1574,7 @@ impl App {
     /// failure the user is told about (rule 7's "every failure ends in a
     /// card" is about the action the user actually asked for; the router
     /// never was one).
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     fn maybe_start_router(
         &mut self,
         candidates: Vec<router::RouterCandidate>,
@@ -5068,6 +5060,7 @@ fn encode_for_upload(
 /// repair attempt), but there is no multi-provider fallback: the router
 /// only ever tries the one cheapest ready provider, and if that fails, this
 /// press simply gets no suggestion.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn router_worker(
     providers: &Providers,
     mode: Mode,
@@ -5118,6 +5111,7 @@ fn router_worker(
 /// `Chain::complete_parsed_with_fallback`'s caller); router failures are
 /// silent by the time they reach the user regardless (see
 /// `App::maybe_start_router`'s doc comment), so this never becomes a card.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::NonVisionInputs> {
     let ocr_output = crate::ocr::recognize(
         &raw.rgba,
@@ -5138,6 +5132,7 @@ fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::N
 /// one-line call into [`Providers::models_for`] (`config.rs`), which used
 /// to be hand-mirrored here -- see that function's doc for why keeping
 /// exactly one copy of this name-to-model-list mapping matters.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn router_models_for(providers: &Providers, name: &str) -> Vec<String> {
     providers.models_for(name)
 }
@@ -5148,6 +5143,7 @@ fn router_models_for(providers: &Providers, name: &str) -> Vec<String> {
 /// [`Providers::provider_for_named_model`] (`config.rs`) with
 /// `Some(model)`, which used to be a hand-mirrored match with the same five
 /// arms here -- see that function's doc for the drift this closed off.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn provider_for_router(
     providers: &Providers,
     name: &str,
@@ -6477,7 +6473,11 @@ fn is_no_providers(packed: &str) -> bool {
 /// cannot probe Ollama, so it lets an Ollama-only setup through; when the
 /// worker then finds nothing answering, this says what to do. Any other
 /// setup gets the gate's own card.
-fn empty_chain_card(mode: Mode, providers: &Providers, config_path: &str) -> (String, String) {
+pub(crate) fn empty_chain_card(
+    mode: Mode,
+    providers: &Providers,
+    config_path: &str,
+) -> (String, String) {
     if mode == Mode::Auto
         && crate::mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
     {
@@ -7623,6 +7623,39 @@ mod tests {
             }
         }
         assert!(seen >= 7, "expected the result post sites, found {seen}");
+    }
+
+    /// #805: opening the palette sends nothing. The router's request (a
+    /// screenshot to a model) used to start at the end of `toggle_palette`;
+    /// it now belongs to the key press and the options card. Scans the body
+    /// of `toggle_palette` for anything that captures the screen or starts a
+    /// model request.
+    #[test]
+    fn opening_the_palette_sends_no_model_request() {
+        let src = lf(include_str!("app.rs"));
+        let start = src
+            .find("    fn toggle_palette(&mut self) {")
+            .expect("toggle_palette exists");
+        let body = &src[start..];
+        let end = body.find("\n    }\n").expect("toggle_palette ends");
+        let body = &body[..end];
+        assert!(
+            body.contains("self.palette.show("),
+            "the scan found the wrong body"
+        );
+        for forbidden in [
+            "maybe_start_router",
+            "router_worker",
+            "capture::",
+            "grab_raw",
+            "thread::spawn",
+            "set_router_pending",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "toggle_palette starts a request again: {forbidden}"
+            );
+        }
     }
 
     /// #723: the stuck bound covers every provider in a chain at its own

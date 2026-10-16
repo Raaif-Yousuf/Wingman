@@ -60,10 +60,8 @@ pub fn matrix_filename(state_name: &str, theme_name: &str, percent: u32) -> Stri
 }
 
 /// Whether a state can be drawn under a simulated theme and DPI. The card
-/// states and the region overlay can. The palette reads the live theme and
-/// the window's own DPI, so `--matrix` draws it once, as
-/// `<state>--system--<percent>.png` at the DPI the window really has.
-/// Settings follows the DPI only (see [`follows_dpi_only`]).
+/// states and the region overlay can. The palette follows the theme only (see
+/// [`follows_theme_only`]) and Settings the DPI only (see [`follows_dpi_only`]).
 #[cfg(any(test, debug_assertions))]
 pub fn follows_variants(state: GalleryState) -> bool {
     use GalleryState::*;
@@ -86,6 +84,19 @@ pub fn follows_variants(state: GalleryState) -> bool {
 /// The card and Settings paint with GDI and `PrintWindow` is exact for them.
 #[cfg(any(test, debug_assertions))]
 pub fn prints_with_wm_print(state: GalleryState) -> bool {
+    use GalleryState::*;
+    matches!(
+        state,
+        PaletteDefault | PaletteRouterSuggestion | PaletteNoMatches | PaletteNoModel
+    )
+}
+
+/// Whether a state follows `--theme` but not `--dpi`: the palette can be drawn
+/// in any theme (it takes the shared theme tokens, #579), but it is laid out
+/// at the DPI of the monitor it opens on, so `--matrix` draws it once per theme
+/// as `<state>--<theme>--<percent>.png` at the DPI the window really has.
+#[cfg(any(test, debug_assertions))]
+pub fn follows_theme_only(state: GalleryState) -> bool {
     use GalleryState::*;
     matches!(
         state,
@@ -194,6 +205,9 @@ pub enum GalleryState {
     /// The preview's title line replaced by an error message, drawn in the
     /// error colour (a number field holding text).
     CardPreviewError,
+    /// #885: the setup cards a new user sees, which show their detail line.
+    CardSetupNoModel,
+    CardSetupOllamaDown,
     PaletteDefault,
     PaletteRouterSuggestion,
     PaletteNoMatches,
@@ -232,6 +246,8 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardPreviewCalendar,
         CardPreviewFormLongLabels,
         CardPreviewError,
+        CardSetupNoModel,
+        CardSetupOllamaDown,
         PaletteDefault,
         PaletteRouterSuggestion,
         PaletteNoMatches,
@@ -267,6 +283,8 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardPreviewCalendar => "card-preview-calendar",
         CardPreviewFormLongLabels => "card-preview-form-long-labels",
         CardPreviewError => "card-preview-error",
+        CardSetupNoModel => "card-setup-no-model",
+        CardSetupOllamaDown => "card-setup-ollama-down",
         PaletteDefault => "palette-default",
         PaletteRouterSuggestion => "palette-router-suggestion",
         PaletteNoMatches => "palette-no-matches",
@@ -392,31 +410,47 @@ mod driver {
                         )?;
                     }
                 } else {
-                    // Live theme, the window's own DPI: named for the DPI it
-                    // really had, found out once the window exists.
-                    let path = dir.join("pending.png");
-                    let named = shoot(
-                        &mut card,
-                        &mut palette,
-                        &mut settings,
-                        &mut region,
-                        Variant::default(),
-                        *state,
-                        &path,
-                    )
-                    .and_then(|hwnd| {
-                        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
-                        // 0 means the window is gone: a "0" file would lie.
-                        anyhow::ensure!(dpi > 0, "no DPI for the {} window", state_name(*state));
-                        let name =
-                            matrix_filename(state_name(*state), "system", scale_percent(dpi));
-                        std::fs::rename(&path, dir.join(name))?;
-                        Ok(())
-                    });
-                    if named.is_err() {
-                        let _ = std::fs::remove_file(&path);
+                    // The window's own DPI: named for the DPI it really had,
+                    // found out once the window exists. The palette is drawn
+                    // in every theme, anything else once in the live one.
+                    let themes: &[&str] = if follows_theme_only(*state) {
+                        &MATRIX_THEMES
+                    } else {
+                        &["system"]
+                    };
+                    for theme_name in themes {
+                        let variant = Variant {
+                            theme: theme_from_arg(theme_name),
+                            dpi: None,
+                        };
+                        let path = dir.join("pending.png");
+                        let named = shoot(
+                            &mut card,
+                            &mut palette,
+                            &mut settings,
+                            &mut region,
+                            variant,
+                            *state,
+                            &path,
+                        )
+                        .and_then(|hwnd| {
+                            let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+                            // 0 means the window is gone: a "0" file would lie.
+                            anyhow::ensure!(
+                                dpi > 0,
+                                "no DPI for the {} window",
+                                state_name(*state)
+                            );
+                            let name =
+                                matrix_filename(state_name(*state), theme_name, scale_percent(dpi));
+                            std::fs::rename(&path, dir.join(name))?;
+                            Ok(())
+                        });
+                        if named.is_err() {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                        named?;
                     }
-                    named?;
                 }
             }
             std::process::exit(0);
@@ -452,7 +486,7 @@ mod driver {
         }
 
         let mut idx = 0usize;
-        apply_variant(&mut card, variant);
+        apply_variant(&mut card, &mut palette, variant);
         let hwnd0 = show_state(
             &mut card,
             &mut palette,
@@ -505,9 +539,10 @@ mod driver {
         dpi: Option<u32>,
     }
 
-    fn apply_variant(card: &mut Card, variant: Variant) {
+    fn apply_variant(card: &mut Card, palette: &mut Palette, variant: Variant) {
         if let Some(theme) = variant.theme {
             card.force_theme_for_gallery(theme);
+            palette.force_theme_for_gallery(theme);
         }
         if let Some(dpi) = variant.dpi {
             card.force_dpi_for_gallery(dpi);
@@ -524,7 +559,7 @@ mod driver {
         state: GalleryState,
         path: &std::path::Path,
     ) -> anyhow::Result<HWND> {
-        apply_variant(card, variant);
+        apply_variant(card, palette, variant);
         let hwnd = show_state(card, palette, settings, region, variant, state)?;
         pump_and_wait(Duration::from_millis(120));
         print_window_png(hwnd, path, prints_with_wm_print(state))?;
@@ -704,6 +739,24 @@ mod driver {
                     "Couldn't reach the model",
                     "The request timed out. Check your connection and try again.",
                 );
+            }
+            CardSetupNoModel | CardSetupOllamaDown => {
+                card.hide();
+                palette.hide();
+                let mut providers = crate::config::Providers {
+                    order: vec!["openai".to_string()],
+                    ..Default::default()
+                };
+                if state == CardSetupOllamaDown {
+                    providers.order = vec!["ollama".to_string()];
+                    providers.ollama.base_url = "http://127.0.0.1:11434".to_string();
+                }
+                let (headline, detail) = crate::app::empty_chain_card(
+                    crate::mode::Mode::Auto,
+                    &providers,
+                    "config.toml",
+                );
+                card.show_settings_needed(&headline, &detail);
             }
             CardWelcome => {
                 card.hide();
@@ -1019,6 +1072,20 @@ mod tests {
     }
 
     #[test]
+    fn only_the_palette_states_follow_the_theme_alone() {
+        let mut palette_states = 0;
+        for state in gallery_states() {
+            let n = state_name(state);
+            assert_eq!(follows_theme_only(state), n.starts_with("palette-"), "{n}");
+            if follows_theme_only(state) {
+                assert!(!follows_variants(state) && !follows_dpi_only(state), "{n}");
+                palette_states += 1;
+            }
+        }
+        assert_eq!(palette_states, 4, "the test must see every palette state");
+    }
+
+    #[test]
     fn only_the_palette_states_are_printed_with_wm_print() {
         let mut palette_states = 0;
         for state in gallery_states() {
@@ -1108,8 +1175,9 @@ mod tests {
         // pending sub-stages (#354) + 3 previews (calendar, long labels,
         // the error title) + the expanded answer, with and without link
         // focus = 15 card states, + 4 palette states + 4 settings states
-        // (#560) + the region overlay (#580) + the welcome card (#831) = 25.
-        assert_eq!(states.len(), 25);
+        // (#560) + the region overlay (#580) + the welcome card (#831) = 25,
+        // + the two setup cards (#885) = 27.
+        assert_eq!(states.len(), 27);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
