@@ -8,6 +8,22 @@ pub(crate) mod common;
 pub mod gemini;
 pub mod model_list;
 pub mod ollama;
+
+/// Providers a fallback chain can try in one run (OpenAI, Anthropic, Gemini,
+/// Ollama).
+const CHAIN_LEN_BOUND: u64 = 4;
+
+/// The longest an honest run can take (#723): every provider in the chain
+/// using its full wall clock, the larger of the cloud and Ollama bounds, plus
+/// a minute for capture and the hand-off. Longer than this and a run is
+/// treated as stuck.
+pub const WORST_CASE_RUN_SECS: u64 = CHAIN_LEN_BOUND
+    * (if common::MAX_TOTAL_WALL_CLOCK_SECS > ollama::TOTAL_TIMEOUT_SECS {
+        common::MAX_TOTAL_WALL_CLOCK_SECS
+    } else {
+        ollama::TOTAL_TIMEOUT_SECS
+    })
+    + 60;
 pub mod ollama_admin;
 pub mod ollama_gpu_fix;
 pub mod openai;

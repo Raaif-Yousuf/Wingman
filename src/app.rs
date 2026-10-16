@@ -272,6 +272,9 @@ const CARD_SETTLE_MS: u64 = 60;
 /// `SetTimer` would otherwise repeat forever, rule 5) or whenever pausing is
 /// re-armed or cancelled.
 const PAUSE_TIMER_ID: usize = 1;
+/// #723: one-shot, armed only while a run is in flight (rule 5), fires when
+/// the run has outlasted `provider::WORST_CASE_RUN_SECS`.
+const STUCK_TIMER_ID: usize = 4;
 
 struct App {
     /// Kept so the settings window can be created on demand.
@@ -831,11 +834,36 @@ enum BusyPress {
 fn busy_press_card(card: crate::ui::card::CardState) -> BusyPress {
     use crate::ui::card::CardState;
     match card {
-        CardState::Pending | CardState::Preview => BusyPress::Leave,
-        CardState::Hidden | CardState::Collapsed | CardState::Expanded => {
-            BusyPress::ShowStillWorking
+        // Never cover a card the user may be reading, or one waiting on them.
+        CardState::Pending | CardState::Preview | CardState::Collapsed | CardState::Expanded => {
+            BusyPress::Leave
         }
+        CardState::Hidden => BusyPress::ShowStillWorking,
     }
+}
+
+/// #723: whether a press still finds the app busy. A run flagged stuck is
+/// abandoned by the press, so the press can start a new one.
+fn busy_after_press(busy: bool, stuck: bool) -> bool {
+    busy && !stuck
+}
+
+/// #723: whether a worker result belongs to the run now in flight. `0` is a
+/// result posted without a generation, which is always kept.
+fn result_is_current(posted_run: usize, current_run: u64) -> bool {
+    posted_run == 0 || posted_run as u64 == current_run
+}
+
+/// #723: the messages carrying a worker's result for the run in flight.
+fn is_run_result(msg: u32) -> bool {
+    matches!(
+        msg,
+        WM_APP_RESULT
+            | WM_APP_CALENDAR_RESULT
+            | WM_APP_REVIEW_RESULT
+            | WM_APP_FORM_FILL_RESULT
+            | WM_APP_GENERIC_ACTION_RESULT
+    )
 }
 
 fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
@@ -849,6 +877,31 @@ fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
 }
 
 impl App {
+    /// #723: whether a run is in flight for the purposes of a press. A run
+    /// the stuck timer already gave up on is abandoned here, so the press
+    /// starts over; its late result is dropped as stale.
+    fn busy_now(&mut self) -> bool {
+        if busy_after_press(self.busy, BUSY_STUCK.with(|c| c.get())) != self.busy {
+            self.set_busy(false);
+        }
+        self.busy
+    }
+
+    /// #723: the stuck timer fired. Says so on a card; the next press
+    /// starts over.
+    fn on_busy_stuck(&mut self) {
+        let hwnd = self.hwnd();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), STUCK_TIMER_ID);
+        }
+        if !self.busy {
+            return;
+        }
+        BUSY_STUCK.with(|c| c.set(true));
+        self.card
+            .show_error("This is taking too long", "Press again to start over.");
+    }
+
     /// #723: a press while a request is running. Puts the working card back
     /// if the user cannot see one, so the key never seems dead.
     fn show_busy_card(&mut self) {
@@ -1075,7 +1128,7 @@ impl App {
         plan: BeginPlan,
         extra: impl FnOnce(&mut Self) -> Option<T>,
     ) -> Option<(Option<capture::RawShot>, isize, T)> {
-        match model_action_gate(self.busy, pause::is_paused_now()) {
+        match model_action_gate(self.busy_now(), pause::is_paused_now()) {
             ModelActionGate::Busy => {
                 self.show_busy_card();
                 return None;
@@ -1249,6 +1302,7 @@ impl App {
         let mode = self.config.mode;
         let prompt = self.config.ui.prompt.clone();
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         let redact = self.config.capture.redact;
 
         // Issue #354 follow-up review: the pending card already started at
@@ -1282,7 +1336,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -1576,7 +1630,7 @@ impl App {
         &mut self,
         work: fn(&crate::capture::RawShot) -> anyhow::Result<Answer>,
     ) {
-        if self.busy {
+        if self.busy_now() {
             self.show_busy_card();
             return;
         }
@@ -1613,6 +1667,7 @@ impl App {
             .show_pending(crate::ui::card::PendingStage::Working);
 
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> = catch_worker(|| {
                 work(&raw).map_err(|e| {
@@ -1628,7 +1683,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -1652,7 +1707,7 @@ impl App {
     /// "backing out is not a failure" status `Ok(None)` gets everywhere
     /// else in this crate (e.g. a declined confirm-card proposal).
     fn copy_region(&mut self) {
-        if self.busy {
+        if self.busy_now() {
             self.show_busy_card();
             return;
         }
@@ -1740,6 +1795,7 @@ impl App {
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
             let result: std::result::Result<Value, String> = catch_worker(|| {
@@ -1768,7 +1824,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_CALENDAR_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -2108,7 +2164,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_GENERIC_ACTION_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -2648,6 +2704,7 @@ impl App {
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
@@ -2669,7 +2726,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_REVIEW_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -2857,6 +2914,7 @@ impl App {
         let mode = self.config.mode;
         let require_tick_for = self.config.forms.require_tick_for;
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
             let mut raw = raw;
@@ -2883,7 +2941,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_FORM_FILL_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -3164,8 +3222,22 @@ impl App {
     /// run's failure badge ("until the next press").
     fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
+        BUSY_STUCK.with(|c| c.set(false));
+        let hwnd = self.hwnd();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), STUCK_TIMER_ID);
+        }
         if busy {
             self.run_generation = self.run_generation.wrapping_add(1);
+            CURRENT_RUN.with(|c| c.set(self.run_generation));
+            unsafe {
+                let _ = SetTimer(
+                    Some(hwnd),
+                    STUCK_TIMER_ID,
+                    (crate::provider::WORST_CASE_RUN_SECS as u32).saturating_mul(1000),
+                    None,
+                );
+            }
             forget_last_attribution();
             self.tray.set_failed(false);
         }
@@ -3310,7 +3382,7 @@ impl App {
     /// slow UIA provider or another app's own clipboard handling -- the
     /// message loop must stay responsive regardless.
     fn calculate_selection(&mut self) {
-        if self.busy {
+        if self.busy_now() {
             self.show_busy_card();
             return;
         }
@@ -3333,6 +3405,7 @@ impl App {
             .show_pending(crate::ui::card::PendingStage::ReadingSelection);
 
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         std::thread::spawn(move || {
             let result: std::result::Result<Answer, String> = catch_worker(|| {
                 match crate::calc::run_on_selection(
@@ -3364,7 +3437,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -5539,6 +5612,15 @@ thread_local! {
     /// The `WM_TIMER` case specifically must still be killed immediately,
     /// not merely deferred -- see the `wnd_proc` guard that sets this flag.
     static PAUSE_REEVALUATE_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// #723: the run generation currently in flight, mirrored from
+    /// `App::run_generation` so `wnd_proc` can drop a stale worker result
+    /// before it forms `&mut App`.
+    static CURRENT_RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// #723: the in-flight run outlasted its bound; the next press abandons
+    /// it. Thread-local for the same reason as `SETTINGS_OPEN`.
+    static BUSY_STUCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 use std::os::windows::ffi::OsStrExt;
@@ -5839,6 +5921,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
 
+    // #723: a result from a run the app gave up on is dropped here, before
+    // anything else, so it can neither clear the new run's busy flag nor
+    // show an old answer.
+    if is_run_result(msg) && !result_is_current(wparam.0, CURRENT_RUN.with(|c| c.get())) {
+        free_boxed_payload(msg, lparam);
+        return LRESULT(0);
+    }
+
     // Issue #152: apply the reentrancy policy BEFORE forming `&mut App` --
     // not merely before using it -- and using only thread-local state to do
     // so. See `SETTINGS_OPEN`'s doc comment for why even reading `app.*`
@@ -5857,6 +5947,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 let _ = KillTimer(Some(hwnd), PAUSE_TIMER_ID);
             }
             PAUSE_REEVALUATE_PENDING.with(|c| c.set(true));
+            return LRESULT(0);
+        }
+        if msg == WM_TIMER && wparam.0 == STUCK_TIMER_ID {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), STUCK_TIMER_ID);
+            }
+            BUSY_STUCK.with(|c| c.set(true));
             return LRESULT(0);
         }
         if msg == WM_POWERBROADCAST {
@@ -6043,7 +6140,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 // busy and paused make `ask` a no-op (or a Paused card), and
                 // must not cost the user an allowance.
                 let would_run = matches!(
-                    model_action_gate(app.busy, pause::is_paused_now()),
+                    model_action_gate(app.busy_now(), pause::is_paused_now()),
                     ModelActionGate::Proceed
                 );
                 if !would_run {
@@ -6186,6 +6283,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_TIMER => {
             if wparam.0 == PAUSE_TIMER_ID {
                 app.on_pause_timer(hwnd);
+            } else if wparam.0 == STUCK_TIMER_ID {
+                app.on_busy_stuck();
             }
             LRESULT(0)
         }
@@ -6514,11 +6613,65 @@ mod tests {
             (CardState::Pending, super::BusyPress::Leave),
             (CardState::Preview, super::BusyPress::Leave),
             (CardState::Hidden, super::BusyPress::ShowStillWorking),
-            (CardState::Collapsed, super::BusyPress::ShowStillWorking),
-            (CardState::Expanded, super::BusyPress::ShowStillWorking),
+            (CardState::Collapsed, super::BusyPress::Leave),
+            (CardState::Expanded, super::BusyPress::Leave),
         ] {
             assert_eq!(super::busy_press_card(state), expected, "{state:?}");
         }
+    }
+
+    /// #723: a run flagged stuck is abandoned by the next press; a healthy
+    /// busy run still blocks it.
+    #[test]
+    fn a_stuck_run_is_abandoned_by_the_next_press() {
+        assert!(!super::busy_after_press(false, false));
+        assert!(!super::busy_after_press(false, true));
+        assert!(super::busy_after_press(true, false));
+        assert!(!super::busy_after_press(true, true));
+    }
+
+    /// #723: a late result from an abandoned run is dropped; one posted
+    /// without a generation (0) is always kept.
+    #[test]
+    fn stale_results_are_dropped_by_generation() {
+        assert!(super::result_is_current(5, 5));
+        assert!(!super::result_is_current(4, 5));
+        assert!(super::result_is_current(0, 5));
+        for msg in [WM_APP_RESULT, WM_APP_CALENDAR_RESULT, WM_APP_REVIEW_RESULT] {
+            assert!(super::is_run_result(msg));
+        }
+        assert!(!super::is_run_result(WM_APP_HOTKEY));
+    }
+
+    /// #723: every worker result is posted with its run generation, or the
+    /// stale check would never see it. Scans the post sites in app.rs.
+    #[test]
+    fn worker_results_carry_their_run_generation() {
+        let src = lf(include_str!("app.rs"));
+        let mut seen = 0;
+        for id in [
+            "WM_APP_RESULT,",
+            "WM_APP_CALENDAR_RESULT,",
+            "WM_APP_REVIEW_RESULT,",
+            "WM_APP_FORM_FILL_RESULT,",
+            "WM_APP_GENERIC_ACTION_RESULT,",
+        ] {
+            for (i, _) in src.match_indices(&format!("                    {id}\n")) {
+                let next = src[i..].lines().nth(1).unwrap_or("");
+                assert!(next.contains("WPARAM(run as usize)"), "{id} {next}");
+                seen += 1;
+            }
+        }
+        assert!(seen >= 7, "expected the result post sites, found {seen}");
+    }
+
+    /// #723: the stuck bound covers every provider in a chain at its own
+    /// wall clock, so a healthy run is never called stuck.
+    #[test]
+    fn stuck_bound_covers_the_slowest_honest_chain() {
+        let bound = std::hint::black_box(crate::provider::WORST_CASE_RUN_SECS);
+        assert!(bound >= 4 * crate::provider::common::MAX_TOTAL_WALL_CLOCK_SECS);
+        assert!(bound >= 4 * crate::provider::ollama::TOTAL_TIMEOUT_SECS);
     }
 
     /// #723: no busy gate may return without a card. Scans every
@@ -6527,7 +6680,7 @@ mod tests {
     fn busy_gates_never_return_silently() {
         let src = lf(include_str!("app.rs"));
         let mut seen = 0;
-        for (i, _) in src.match_indices(&("if self.".to_owned() + "busy {")) {
+        for (i, _) in src.match_indices(&("if self.".to_owned() + "busy_now() {")) {
             let after = &src[i..i + 120.min(src.len() - i)];
             assert!(
                 after.contains("self.show_busy_card()"),

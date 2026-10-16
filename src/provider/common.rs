@@ -278,6 +278,10 @@ pub(crate) struct RetryPolicy {
     pub retry_floor: Duration,
 }
 
+/// The most wall clock one provider's retries may take (#723). The app's
+/// stuck-run bound is derived from this and Ollama's own total timeout.
+pub(crate) const MAX_TOTAL_WALL_CLOCK_SECS: u64 = 150;
+
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
@@ -285,7 +289,7 @@ impl Default for RetryPolicy {
             base_delay: Duration::from_millis(200),
             max_total_backoff: Duration::from_secs(3),
             max_retry_after: Duration::from_secs(5),
-            max_total_wall_clock: Duration::from_secs(150),
+            max_total_wall_clock: Duration::from_secs(MAX_TOTAL_WALL_CLOCK_SECS),
             retry_floor: Duration::from_secs(5),
         }
     }

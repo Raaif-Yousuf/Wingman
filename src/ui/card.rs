@@ -1201,10 +1201,10 @@ enum CopyFeedback {
 /// A rotation needs ~16-33ms/frame to read as smooth; the old text-dot
 /// animation could get away with much slower ticks, but a spinner cannot.
 const ANIM_INTERVAL_MS: u32 = 20;
-/// A last resort if the worker never reports back. Longer than the slowest
-/// honest request (a four-provider fallback chain at 90 s each), so a card is
-/// never hidden while work is still running (#723).
-const PENDING_SAFETY_TIMEOUT_SECS: u32 = 420;
+/// A last resort if the worker never reports back. Derived from the provider
+/// timeouts, so a card is never hidden while an honest request still runs
+/// (#723).
+const PENDING_SAFETY_TIMEOUT_SECS: u32 = crate::provider::WORST_CASE_RUN_SECS as u32;
 /// How long "Asking {model}..." stays up before the line changes to "Still
 /// working." -- issue #354's "after a few seconds".
 const STILL_WORKING_DELAY_MS: u32 = 4000;
@@ -4452,11 +4452,13 @@ mod tests {
     use super::*;
     use crate::ui::theme;
 
-    /// #723: the pending card must outlive the slowest honest request: four
-    /// providers in a fallback chain at 90 s each.
+    /// #723: the pending card must outlive the slowest honest request: every
+    /// provider in the chain at its own wall clock.
     #[test]
     fn pending_safety_timeout_outlasts_a_full_provider_chain() {
-        assert!(std::hint::black_box(PENDING_SAFETY_TIMEOUT_SECS) >= 4 * 90);
+        let timeout = u64::from(std::hint::black_box(PENDING_SAFETY_TIMEOUT_SECS));
+        assert!(timeout >= 4 * crate::provider::common::MAX_TOTAL_WALL_CLOCK_SECS);
+        assert!(timeout >= 4 * crate::provider::ollama::TOTAL_TIMEOUT_SECS);
     }
 
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
