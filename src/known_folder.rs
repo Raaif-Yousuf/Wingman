@@ -11,7 +11,7 @@
 //! addition, not a second copy of the `SHGetKnownFolderPath`/`CoTaskMemFree`
 //! dance.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use windows::core::GUID;
@@ -44,7 +44,23 @@ fn known_folder(id: &GUID) -> Result<PathBuf> {
 /// `%APPDATA%` (roaming), e.g. `C:\Users\<user>\AppData\Roaming`. Same
 /// folder `dirs::config_dir()` resolved to on Windows.
 pub fn roaming_app_data() -> Result<PathBuf> {
-    known_folder(&FOLDERID_RoamingAppData)
+    resolve(crate::portable::root(), || {
+        known_folder(&FOLDERID_RoamingAppData)
+    })
+}
+
+/// The portable seam (#130): in portable mode both app-data folders are the
+/// folder next to the exe, and the system is never asked. Every file path in
+/// the crate comes from [`roaming_app_data`] or [`local_app_data`], so this
+/// one function moves them all.
+fn resolve(
+    portable_root: Option<&Path>,
+    system: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    match portable_root {
+        Some(root) => Ok(root.to_path_buf()),
+        None => system(),
+    }
 }
 
 /// `%LOCALAPPDATA%`, e.g. `C:\Users\<user>\AppData\Local`. Machine-scoped,
@@ -54,7 +70,9 @@ pub fn roaming_app_data() -> Result<PathBuf> {
 /// machines the way `config.toml` (in [`roaming_app_data`]) intentionally
 /// does.
 pub fn local_app_data() -> Result<PathBuf> {
-    known_folder(&FOLDERID_LocalAppData)
+    resolve(crate::portable::root(), || {
+        known_folder(&FOLDERID_LocalAppData)
+    })
 }
 
 /// `%USERPROFILE%`, e.g. `C:\Users\<user>`. Issue #270: the one place the
@@ -68,6 +86,19 @@ pub fn user_profile() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_root_wins_and_the_system_is_not_asked() {
+        let root = PathBuf::from(r"C:\usb\Wingman-test-root");
+        let got = resolve(Some(&root), || panic!("system must not be asked")).unwrap();
+        assert_eq!(got, root);
+    }
+
+    #[test]
+    fn without_a_portable_root_the_system_answer_is_used() {
+        let sys = PathBuf::from(r"C:\sys\Roaming");
+        assert_eq!(resolve(None, || Ok(sys.clone())).unwrap(), sys);
+    }
 
     /// Read-only comparison against the `APPDATA` env var Windows itself
     /// sets for every process to the same folder -- never writes anything

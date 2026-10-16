@@ -3779,6 +3779,12 @@ fn build_ui_recorded(
         ID_AUTOSTART,
     );
     set_checkbox(autostart, crate::autostart::is_enabled());
+    // Portable mode (#130) makes no registry writes, so the switch is greyed.
+    if crate::portable::is_portable() {
+        unsafe {
+            let _ = EnableWindow(autostart, false);
+        }
+    }
     r.advance();
 
     let hotkeys_bottom = r.y + 4;

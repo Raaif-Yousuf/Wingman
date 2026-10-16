@@ -27,6 +27,7 @@ mod ocr;
 mod password_managers;
 mod pause;
 mod payment_denylist;
+mod portable;
 mod profile;
 mod provider;
 mod redact;

@@ -1310,6 +1310,15 @@ impl Config {
             anyhow::bail!("ACL restriction forced to fail for a test");
         }
 
+        // Portable mode (#130) on a FAT/exFAT drive: the volume has no ACLs,
+        // so icacls could only fail and the start would break. Skipped only
+        // when the volume is known to have none; an unknown answer still
+        // runs icacls. The config file holds no API key (those live in
+        // Credential Manager), so nothing secret is left unprotected.
+        if crate::portable::skip_acl(path) {
+            return Ok(());
+        }
+
         let username = std::env::var("USERNAME")
             .ok()
             .filter(|u| !u.is_empty())

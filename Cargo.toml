@@ -60,6 +60,8 @@ features = [
   # dpapi.rs (#62): CryptProtectData/CryptUnprotectData for DPAPI
   # encryption at rest.
   "Win32_Security_Cryptography",
+  # portable.rs (#130): GetVolumeInformationW tells FAT/exFAT (no ACLs) apart.
+  "Win32_Storage_FileSystem",
   "Win32_Storage_Packaging_Appx",
   # speech.rs (#77): ISpVoice, the system text-to-speech voice (SAPI).
   "Win32_Media_Speech",
