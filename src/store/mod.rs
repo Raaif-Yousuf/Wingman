@@ -173,10 +173,16 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
 
 /// Renames the database and its `-wal`/`-shm` to `*.corrupt-<unix time>`.
 fn quarantine(path: &Path) -> Result<PathBuf, StoreError> {
-    let stamp = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .ok();
+    quarantine_at(path, now)
+}
+
+/// [`quarantine`] with the clock reading injected (`None`: the clock failed).
+fn quarantine_at(path: &Path, now: Option<u64>) -> Result<PathBuf, StoreError> {
+    let stamp = now.unwrap_or(0);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -194,7 +200,11 @@ fn quarantine(path: &Path) -> Result<PathBuf, StoreError> {
             })?;
         }
     }
-    prune_quarantined(path, &name, KEEP_CORRUPT_COPIES);
+    // With no usable clock the fresh copy is stamped 0, which would sort as
+    // the oldest and be deleted at once, so nothing is pruned then.
+    if now.is_some() {
+        prune_quarantined(path, &name, KEEP_CORRUPT_COPIES);
+    }
     Ok(main_target)
 }
 
@@ -633,6 +643,26 @@ mod tests {
         assert_eq!(corrupt_stamp("wingman.db.corrupt-", "wingman.db"), None);
         assert_eq!(corrupt_stamp("wingman.db.corrupt-1x", "wingman.db"), None);
         assert_eq!(corrupt_stamp("other.db.corrupt-1", "wingman.db"), None);
+    }
+
+    #[test]
+    fn a_failed_clock_prunes_nothing_so_the_fresh_copy_survives() {
+        let dir = std::env::temp_dir().join(format!("wingman-noclock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("wingman.db");
+        for stamp in [100, 200] {
+            std::fs::write(dir.join(format!("wingman.db.corrupt-{stamp}")), b"x").unwrap();
+        }
+        std::fs::write(&db, b"damaged").unwrap();
+        let kept = quarantine_at(&db, None).unwrap();
+        let fresh_survived = kept.exists();
+        let old_ones = [100, 200]
+            .iter()
+            .all(|s| dir.join(format!("wingman.db.corrupt-{s}")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(fresh_survived, "the fresh copy must not be deleted at once");
+        assert!(old_ones, "nothing is pruned without a clock");
     }
 
     #[test]

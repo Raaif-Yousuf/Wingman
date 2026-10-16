@@ -3942,6 +3942,14 @@ impl App {
         self.show_tray_restore_error(tray_restore_error);
     }
 
+    /// #712: why Quit (or a `WM_CLOSE`) is refused right now, if it is.
+    fn quit_blocked(&self) -> Option<&'static str> {
+        quit_refusal(
+            self.exec_in_flight,
+            crate::provider::ollama_gpu_fix::is_running(),
+        )
+    }
+
     /// Issue #213: delivers every message `wnd_proc` deferred while Settings
     /// was open, in arrival (push) order, through the exact handler it would
     /// have reached had Settings not been open. Each handler shows its own
@@ -6648,10 +6656,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
         MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
         MenuChoice::Command(cmd::QUIT) => {
-            if let Some(text) = quit_refusal(
-                app.exec_in_flight,
-                crate::provider::ollama_gpu_fix::is_running(),
-            ) {
+            if let Some(text) = app.quit_blocked() {
                 app.card.show_answer("Still working", text, 5, None);
                 app.set_watch(true);
             } else {
