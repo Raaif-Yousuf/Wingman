@@ -33,7 +33,13 @@ rustflags = ["-C", "link-arg=/Brepro"]
 # `fts5_is_compiled_in` test in src/store/mod.rs guards the first.
 # `force = true`: a LIBSQLITE3_FLAGS already set in someone's shell must not
 # change the compile options of the shipped exe (docs/reproducible-builds.md).
+# #771: also off, because nothing in the store uses them: column metadata,
+# memory management, tracing, UTF-16 entry points, authorizer callbacks,
+# sqlite3_get_table, sqlite3_complete, column decltype and the Tcl variable
+# syntax. MEASURED 2026-10-16: about 9.7 KB (3,993,600 to 3,983,872 bytes).
+# Tried and dropped: OMIT_EXPLAIN, OMIT_ANALYZE and OMIT_BTREECOUNT together
+# stop the amalgamation compiling.
 # SQL JSON functions stay on (MEASURED 2026-10-15: switching them off saves only
 # about 36 KB, not worth a later slice hitting a missing json_extract).
 [env]
-LIBSQLITE3_FLAGS = { force = true, value = "-DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_STAT4 -USQLITE_SOUNDEX -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS" }
+LIBSQLITE3_FLAGS = { force = true, value = "-DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_STAT4 -USQLITE_SOUNDEX -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_COLUMN_METADATA -USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_OMIT_TRACE -DSQLITE_OMIT_UTF16 -DSQLITE_OMIT_AUTHORIZATION -DSQLITE_OMIT_GET_TABLE -DSQLITE_OMIT_COMPLETE -DSQLITE_OMIT_DECLTYPE -DSQLITE_OMIT_TCL_VARIABLE" }

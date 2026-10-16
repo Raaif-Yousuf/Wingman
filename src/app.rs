@@ -60,7 +60,9 @@ use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
 use crate::ui::palette_model::{self, DispatchTarget};
 use crate::ui::settings;
-use crate::ui::tray::{cmd, decode, register_taskbar_created, MenuChoice, Tray, WM_APP_TRAY};
+use crate::ui::tray::{
+    cmd, decode, register_taskbar_created, MenuChoice, Tray, TrayEvent, WM_APP_TRAY,
+};
 
 /// Posted by the worker when a request finishes. `lparam` is
 /// `Box::into_raw(Box::new(Result<Answer, String>))`; the handler takes
@@ -295,6 +297,9 @@ const CARD_SETTLE_MS: u64 = 60;
 /// `SetTimer` would otherwise repeat forever, rule 5) or whenever pausing is
 /// re-armed or cancelled.
 const PAUSE_TIMER_ID: usize = 1;
+/// #723: one-shot, armed only while a run is in flight (rule 5), fires when
+/// the run has outlasted `provider::worst_case_run_secs` for its chain.
+const STUCK_TIMER_ID: usize = 4;
 
 struct App {
     /// Kept so the settings window can be created on demand.
@@ -405,14 +410,15 @@ struct LastError {
     /// "Couldn't add the event" -- not a separate taxonomy to keep in sync.
     action: String,
     occurred_at: SystemTime,
-    /// Already redacted (#253, `egress::redact_opaque_tokens`) -- this is
-    /// the only place the *original*, non-humanized chain survives at all.
+    /// Already scrubbed (`diagnostics::scrub_error_chain`: key tokens, the
+    /// text redaction and the account name, #253 and #733) -- this is the
+    /// only place the non-humanized chain survives at all.
     chain: String,
 }
 
 /// Issue #425: the exact text "Copy details" puts on the clipboard.
-/// `last_error.chain` is already redacted (#253) at `record_last_error`
-/// time -- this is a plain accessor, not a second redaction pass -- but it
+/// `last_error.chain` is already scrubbed (#253, #733) at the time it is
+/// stored -- this is a plain accessor, not a second pass -- but it
 /// is factored out (rather than inlined in `copy_error_details`) so the
 /// "the redacted chain, and only the redacted chain, is what reaches the
 /// clipboard" guarantee is unit-tested directly, without touching the real
@@ -486,6 +492,13 @@ pub fn run() -> Result<()> {
         let _ = Config::migrate_from(&old_path, &new_path);
     }
     let _ = crate::autostart::remove_old_run_value();
+
+    // #769: delete old calendar files once at startup, on a short-lived
+    // thread (one directory read), so a lone event's file does not wait for
+    // the next "Add to calendar". No timer: nothing runs while idle.
+    let _ = std::thread::Builder::new()
+        .name("ics-startup-sweep".into())
+        .spawn(|| crate::connectors::IcsConnector::new().sweep_stale());
 
     let config = Config::load().unwrap_or_default();
     // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
@@ -643,7 +656,9 @@ pub fn run() -> Result<()> {
         app.last_error = Some(LastError {
             action: headline.clone(),
             occurred_at: SystemTime::now(),
-            chain,
+            // #733: the note is text from a previous run, scrubbed like any
+            // other error before it can be pasted into a bug report.
+            chain: crate::diagnostics::scrub_error_chain_here(&chain),
         });
         app.card.show_error_with_details(&headline, &detail);
     }
@@ -875,6 +890,55 @@ fn first_run_detail(found: &FirstRun) -> Option<String> {
     }
 }
 
+/// #723: what a press that arrives while a request is still running does to
+/// the card (rule 7: it must never end in nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyPress {
+    /// A card already explains the wait, or is waiting on the user (a send
+    /// preview): leave it.
+    Leave,
+    /// Nothing explains the wait: show the working card again.
+    ShowStillWorking,
+}
+
+fn busy_press_card(card: crate::ui::card::CardState) -> BusyPress {
+    use crate::ui::card::CardState;
+    match card {
+        // Never cover a card the user may be reading, or one waiting on them.
+        CardState::Pending | CardState::Preview | CardState::Collapsed | CardState::Expanded => {
+            BusyPress::Leave
+        }
+        CardState::Hidden => BusyPress::ShowStillWorking,
+    }
+}
+
+/// #723: whether a press still finds the app busy. A run flagged stuck is
+/// abandoned by the press, so the press can start a new one.
+fn busy_after_press(busy: bool, stuck: bool) -> bool {
+    busy && !stuck
+}
+
+/// #723: whether a worker result belongs to the run now in flight. `0` is a
+/// result posted without a generation, which is always kept.
+fn result_is_current(posted_run: usize, current_run: u64) -> bool {
+    posted_run == 0 || posted_run as u64 == current_run
+}
+
+/// #723: the messages carrying a worker's result for the run in flight.
+fn is_run_result(msg: u32) -> bool {
+    matches!(
+        msg,
+        WM_APP_RESULT
+            | WM_APP_CALENDAR_RESULT
+            | WM_APP_REVIEW_RESULT
+            | WM_APP_FORM_FILL_RESULT
+            | WM_APP_GENERIC_ACTION_RESULT
+            // The worker is blocked on this preview; a stale one is freed,
+            // which drops its reply channel and cancels that send.
+            | WM_APP_SEND_PREVIEW
+    )
+}
+
 fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
     if busy {
         ModelActionGate::Busy
@@ -886,6 +950,53 @@ fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
 }
 
 impl App {
+    /// #723: whether a run is in flight for the purposes of a press. A run
+    /// the stuck timer already gave up on is abandoned here, so the press
+    /// starts over; its late result is dropped as stale.
+    fn busy_now(&mut self) -> bool {
+        let stuck = BUSY_STUCK.with(|c| c.get()) && !self.exec_in_flight;
+        if busy_after_press(self.busy, stuck) != self.busy {
+            self.set_busy(false);
+            // Advance now, not only when the next run starts: if this press
+            // returns early (paused, a readiness card, ...) the abandoned
+            // run's late result must still be stale.
+            self.run_generation = self.run_generation.wrapping_add(1);
+            CURRENT_RUN.with(|c| c.set(self.run_generation));
+        }
+        self.busy
+    }
+
+    /// #723: the stuck timer fired. Says so on a card; the next press
+    /// starts over.
+    fn on_busy_stuck(&mut self) {
+        let hwnd = self.hwnd();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), STUCK_TIMER_ID);
+        }
+        // An executor is a confirmed write that is really happening: it is
+        // never called stuck, and its done message is never treated as stale.
+        if !self.busy || self.exec_in_flight {
+            return;
+        }
+        BUSY_STUCK.with(|c| c.set(true));
+        // A send preview is waiting on the user: leave it. The next press
+        // still abandons the run.
+        if matches!(self.card.state(), crate::ui::card::CardState::Preview) {
+            return;
+        }
+        self.card
+            .show_error("This is taking too long", "Press again to start over.");
+    }
+
+    /// #723: a press while a request is running. Puts the working card back
+    /// if the user cannot see one, so the key never seems dead.
+    fn show_busy_card(&mut self) {
+        if busy_press_card(self.card.state()) == BusyPress::ShowStillWorking {
+            self.card
+                .show_pending(crate::ui::card::PendingStage::StillWorking);
+        }
+    }
+
     /// Issue #192: the card `App::ask`'s pre-flight gate should show, or
     /// `None` when at least one provider the current `Mode` would actually
     /// try is ready. Decided entirely from `config` -- no network call, so
@@ -1106,8 +1217,11 @@ impl App {
         plan: BeginPlan,
         extra: impl FnOnce(&mut Self) -> Option<T>,
     ) -> Option<(Option<capture::RawShot>, isize, T)> {
-        match model_action_gate(self.busy, pause::is_paused_now()) {
-            ModelActionGate::Busy => return None,
+        match model_action_gate(self.busy_now(), pause::is_paused_now()) {
+            ModelActionGate::Busy => {
+                self.show_busy_card();
+                return None;
+            }
             ModelActionGate::Paused => {
                 self.card
                     .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
@@ -1277,12 +1391,14 @@ impl App {
         let mode = self.config.mode;
         let prompt = self.config.ui.prompt.clone();
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         let redact = self.config.capture.redact;
 
         // Issue #354 follow-up review: the pending card already started at
         // `AskingModel` inside `begin_model_action` (findings 1 and 2), so
         // there is nothing left to set here.
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             // #236: every egress row this thread writes names its trigger.
             crate::activation::set_worker_trigger(trigger);
             let result: std::result::Result<Answer, String> = catch_worker(|| {
@@ -1310,7 +1426,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -1457,15 +1573,32 @@ impl App {
         self.palette.set_router_pending(generation);
 
         std::thread::spawn(move || {
-            let result: std::result::Result<router::RouterResult, String> = catch_worker(|| {
-                router_worker(&providers, mode, &mut raw, redact, &candidates).map_err(|e| {
-                    let chain_text = worker_error_chain_text(&e);
-                    pack_error(
-                        &human_error_detail(&chain_text),
-                        &crate::egress::redact_opaque_tokens(&chain_text),
-                    )
-                })
+            // The call runs on its own thread so the wait can be capped: past
+            // `ROUTER_WALL_CLOCK` the placeholder is cleared and the late
+            // answer, if any, is dropped with the channel.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result: std::result::Result<router::RouterResult, String> =
+                    catch_worker(|| {
+                        router_worker(&providers, mode, &mut raw, redact, &candidates).map_err(
+                            |e| {
+                                let chain_text = worker_error_chain_text(&e);
+                                pack_error(
+                                    &human_error_detail(&chain_text),
+                                    &crate::egress::redact_opaque_tokens(&chain_text),
+                                )
+                            },
+                        )
+                    });
+                let _ = tx.send(result);
             });
+            let result =
+                router::await_result(&rx, router::ROUTER_WALL_CLOCK).unwrap_or_else(|| {
+                    Err(pack_error(
+                        "The router took too long.",
+                        "router: no answer within the wall-clock cap",
+                    ))
+                });
             let payload = Box::into_raw(Box::new((generation, result)));
             unsafe {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1557,6 +1690,7 @@ impl App {
             Some(DispatchTarget::CheckMyWork) => self.ask(Trigger::Palette),
             Some(DispatchTarget::ExtractText) => self.extract_text(),
             Some(DispatchTarget::ReadQr) => self.read_qr(),
+            Some(DispatchTarget::ResolveDates) => self.resolve_dates(),
             Some(DispatchTarget::AddToCalendar) => self.add_event_from_screen(),
             Some(DispatchTarget::ReviewEmail) => self.review_this_email(),
             Some(DispatchTarget::FillForm) => self.fill_form_from_screen(),
@@ -1597,14 +1731,39 @@ impl App {
         self.run_model_free_screen_action(actions::read_qr::read_and_copy);
     }
 
+    /// "Relative dates to real dates" (#336): list what phrases like "next
+    /// Tuesday" in the selection (else on screen) work out to. Same flow,
+    /// gates and card path as `extract_text` (no provider, no `Mode`, no
+    /// network). Today's local date is read here, on the main thread, and
+    /// handed to the worker.
+    fn resolve_dates(&mut self) {
+        if self.busy {
+            return;
+        }
+        let today = match local_today_and_utc_offset() {
+            Ok((today, _)) => today,
+            Err(e) => {
+                let detail = self.track_error("Couldn't read the local date", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't read the local date", &detail);
+                return;
+            }
+        };
+        let week = local_week_start();
+        self.run_model_free_screen_action(move |raw| {
+            actions::relative_dates::run(raw, today, week)
+        });
+    }
+
     /// The shared body of the model-free screen actions: gate on Paused,
     /// capture on the main thread, then run `work` on a worker thread and
     /// report through `WM_APP_RESULT`. See `extract_text` for the ordering.
     fn run_model_free_screen_action(
         &mut self,
-        work: fn(&crate::capture::RawShot) -> anyhow::Result<Answer>,
+        work: impl FnOnce(&crate::capture::RawShot) -> anyhow::Result<Answer> + Send + 'static,
     ) {
-        if self.busy {
+        if self.busy_now() {
+            self.show_busy_card();
             return;
         }
 
@@ -1640,7 +1799,9 @@ impl App {
             .show_pending(crate::ui::card::PendingStage::Working);
 
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let result: std::result::Result<Answer, String> = catch_worker(|| {
                 work(&raw).map_err(|e| {
                     let chain_text = worker_error_chain_text(&e);
@@ -1655,7 +1816,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -1679,7 +1840,8 @@ impl App {
     /// "backing out is not a failure" status `Ok(None)` gets everywhere
     /// else in this crate (e.g. a declined confirm-card proposal).
     fn copy_region(&mut self) {
-        if self.busy {
+        if self.busy_now() {
+            self.show_busy_card();
             return;
         }
 
@@ -1766,8 +1928,10 @@ impl App {
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 (|| -> Result<Value> {
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
@@ -1794,7 +1958,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_CALENDAR_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -2028,6 +2192,7 @@ impl App {
                 (action.clone(), schema.clone())
             };
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let result: GenericResult = catch_worker(|| {
                 (|| -> Result<_, GenericFailure> {
                     // #127 step 1: find the link, check it, and hand it back for
@@ -2134,7 +2299,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_GENERIC_ACTION_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -2620,8 +2785,10 @@ impl App {
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
                 catch_worker(|| {
                     (|| -> Result<actions::review_email::ReviewOutcome> {
@@ -2641,7 +2808,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_REVIEW_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -2813,8 +2980,10 @@ impl App {
         let mode = self.config.mode;
         let require_tick_for = self.config.forms.require_tick_for;
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let mut raw = raw;
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 form_fill_worker(
@@ -2839,7 +3008,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_FORM_FILL_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -3278,8 +3447,23 @@ impl App {
     /// run's failure badge ("until the next press").
     fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
+        BUSY_STUCK.with(|c| c.set(false));
+        let hwnd = self.hwnd();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), STUCK_TIMER_ID);
+        }
         if busy {
             self.run_generation = self.run_generation.wrapping_add(1);
+            CURRENT_RUN.with(|c| c.set(self.run_generation));
+            unsafe {
+                let _ = SetTimer(
+                    Some(hwnd),
+                    STUCK_TIMER_ID,
+                    (crate::provider::worst_case_run_secs(self.chain.provider_count()) as u32)
+                        .saturating_mul(1000),
+                    None,
+                );
+            }
             forget_last_attribution();
             self.tray.set_failed(false);
         }
@@ -3300,7 +3484,10 @@ impl App {
         self.last_error = Some(LastError {
             action: action.to_string(),
             occurred_at: SystemTime::now(),
-            chain: crate::egress::redact_opaque_tokens(raw_chain),
+            // #733: also text redaction and the account name, because this
+            // chain is pasted into public bug reports. When the profile
+            // folder cannot be found the name step is skipped, nothing else.
+            chain: crate::diagnostics::scrub_error_chain_here(raw_chain),
         });
     }
 
@@ -3464,7 +3651,8 @@ impl App {
     /// slow UIA provider or another app's own clipboard handling -- the
     /// message loop must stay responsive regardless.
     fn calculate_selection(&mut self) {
-        if self.busy {
+        if self.busy_now() {
+            self.show_busy_card();
             return;
         }
         if pause::is_paused_now() {
@@ -3486,7 +3674,9 @@ impl App {
             .show_pending(crate::ui::card::PendingStage::ReadingSelection);
 
         let target = self.hwnd_isize();
+        let run = self.run_generation;
         std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
             let result: std::result::Result<Answer, String> = catch_worker(|| {
                 match crate::calc::run_on_selection(
                 &crate::calc::ForegroundSelection,
@@ -3517,7 +3707,7 @@ impl App {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
                     WM_APP_RESULT,
-                    WPARAM(0),
+                    WPARAM(run as usize),
                     LPARAM(payload as isize),
                 )
                 .is_err()
@@ -3761,12 +3951,33 @@ impl App {
                 DeferredMessage::ReviewResult(result) => self.on_review_result(result),
                 DeferredMessage::FormFillResult(result) => self.on_form_fill_result(result),
                 DeferredMessage::PreviewDecided(generation) => self.on_preview_decided(generation),
+                DeferredMessage::SendPreview(request) => self.on_send_preview(request),
+                DeferredMessage::PendingStage(run, stage) => self.on_pending_stage(run, stage),
+                DeferredMessage::FirstRun(run, found) => self.on_first_run_result(run, found),
                 DeferredMessage::GenericActionResult(action, schema, result) => {
                     self.on_generic_action_result(action, schema, result)
                 }
                 DeferredMessage::ExecutorDone(result) => self.on_exec_done(result),
             }
         }
+    }
+
+    /// #722: the tray menu runs with the same reentrancy policy as Settings,
+    /// so whatever it deferred is delivered here once the menu has closed.
+    fn finish_modal_deferrals(&mut self) {
+        let pending: VecDeque<DeferredMessage> =
+            PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let taskbar_recreated = TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false));
+        let tray_restore_error = if taskbar_recreated {
+            self.try_restore_tray_icon()
+        } else {
+            None
+        };
+        if PAUSE_REEVALUATE_PENDING.with(|c| c.replace(false)) {
+            self.reevaluate_pause(self.hwnd());
+        }
+        self.deliver_deferred(pending);
+        self.show_tray_restore_error(tray_restore_error);
     }
 
     /// Issue #178: shows the tray-restore error card if `error` is `Some`,
@@ -4886,6 +5097,33 @@ fn with_fallback_footer(detail: &str, footer: Option<&str>) -> String {
     }
 }
 
+/// The first day of the week the user's Windows region sets (#336), for "this
+/// week" and "next week". Monday when Windows cannot say. Win32, so checked by
+/// hand (rule 8): set the region's first day of the week to Sunday and run
+/// "Relative dates to real dates" on "Friday this week" on a Sunday; the date
+/// moves a week.
+fn local_week_start() -> actions::dates::WeekStart {
+    use windows::core::PCWSTR;
+    use windows::Win32::Globalization::{
+        GetLocaleInfoEx, LOCALE_IFIRSTDAYOFWEEK, LOCALE_RETURN_NUMBER,
+    };
+    // With LOCALE_RETURN_NUMBER the answer is a DWORD written into the buffer.
+    let mut buf = [0u16; 2];
+    let written = unsafe {
+        GetLocaleInfoEx(
+            PCWSTR::null(),
+            LOCALE_IFIRSTDAYOFWEEK | LOCALE_RETURN_NUMBER,
+            Some(&mut buf),
+        )
+    };
+    let value = if written > 0 {
+        u32::from(buf[0]) | (u32::from(buf[1]) << 16)
+    } else {
+        0
+    };
+    actions::dates::week_start_from_locale(value)
+}
+
 /// #39: today's local date and current local UTC offset, for the "Add
 /// event from screen" prompt -- DST-correct the same way
 /// `deadline_until_tomorrow` already is for Pause, via the identical
@@ -5917,6 +6155,11 @@ thread_local! {
     /// opaque TLS accessor call.
     static SETTINGS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// True while the tray menu's loop runs (#722). Always set together with
+    /// `SETTINGS_OPEN`, which supplies the reentrancy machinery; this only
+    /// selects [`tray_menu_policy`] instead of the Settings one.
+    static TRAY_MENU_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// Every `WM_APP_RESULT`/`WM_APP_CALENDAR_RESULT`/`WM_APP_REVIEW_RESULT`/
     /// `WM_APP_PREVIEW_DECIDED` message that arrived while `SETTINGS_OPEN`
     /// was true, oldest first. `open_settings` drains and delivers all of
@@ -5954,6 +6197,15 @@ thread_local! {
     /// The `WM_TIMER` case specifically must still be killed immediately,
     /// not merely deferred -- see the `wnd_proc` guard that sets this flag.
     static PAUSE_REEVALUATE_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// #723: the run generation currently in flight, mirrored from
+    /// `App::run_generation` so `wnd_proc` can drop a stale worker result
+    /// before it forms `&mut App`.
+    static CURRENT_RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// #723: the in-flight run outlasted its bound; the next press abandons
+    /// it. Thread-local for the same reason as `SETTINGS_OPEN`.
+    static BUSY_STUCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 use std::os::windows::ffi::OsStrExt;
@@ -5962,7 +6214,6 @@ use std::os::windows::ffi::OsStrExt;
 /// open (issue #213), holding whatever payload its `WM_APP_*` counterpart
 /// boxed into `lparam` -- already taken out of that box, so `PENDING_MESSAGES`
 /// never stores a raw pointer.
-#[derive(Debug)]
 enum DeferredMessage {
     /// `WM_APP_RESULT`.
     Result(std::result::Result<Answer, String>),
@@ -5981,6 +6232,14 @@ enum DeferredMessage {
     /// deferred notification is still matched against the right preview
     /// when Settings closes and the queue drains.
     PreviewDecided(u32),
+    /// `WM_APP_SEND_PREVIEW`, deferred only while the tray menu is open
+    /// (#722), so opening the menu never cancels a send waiting on its
+    /// preview.
+    SendPreview(crate::ui::send_gate::SendRequest),
+    /// `WM_APP_PENDING_STAGE` (run, stage), tray menu only (#722).
+    PendingStage(u64, crate::ui::card::PendingStage),
+    /// `WM_APP_FIRST_RUN` (run, probe answer), tray menu only (#722).
+    FirstRun(u64, FirstRun),
     /// `WM_APP_GENERIC_ACTION_RESULT` (#242). Carries the exact `Action`
     /// and schema `run_generic_action` dispatched with, not just the id --
     /// see `on_generic_action_result`'s doc comment for why.
@@ -6109,6 +6368,20 @@ enum SettingsReentrancy {
     /// itself unreachable while Settings is open: its only path is the
     /// tray's Quit command, and `WM_APP_TRAY` is `Ignore`d above.
     Fallback,
+}
+
+/// #722: the policy while the tray menu is open. Settings hides the card
+/// before it opens, so it can drop a send preview, a first-run answer and a
+/// pending-stage update; the tray menu does not, so those are deferred and
+/// delivered when the menu closes (a send preview must not be cancelled just
+/// because the tray was opened). `WM_APP_DISMISS` stays dropped: the click
+/// that closes the menu is the user's dismissal, and the menu took that
+/// click, so there is no card click left to act on.
+fn tray_menu_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
+    match msg {
+        WM_APP_SEND_PREVIEW | WM_APP_FIRST_RUN | WM_APP_PENDING_STAGE => SettingsReentrancy::Defer,
+        _ => settings_reentrancy_policy(msg, taskbar_created_msg),
+    }
 }
 
 fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
@@ -6264,10 +6537,132 @@ fn drain_queued_payloads(hwnd: HWND) {
     }
 }
 
+/// The tray callback (#722). `TrackPopupMenu` runs a nested message loop, so
+/// no `&mut App` may be live across it: the menu is built under a short
+/// borrow, shown with none held, and the chosen command runs under a fresh
+/// one. While the menu is open the Settings reentrancy policy is on, so a
+/// result, hotkey or timer that arrives meanwhile is deferred or dropped
+/// before it can form a second `&mut App`.
+fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
+    let app: &mut App = unsafe { &mut *ptr };
+    // #339: the menu takes the foreground (SetForegroundWindow in
+    // `PreparedMenu::track`), so ask who was in front first. Only on the
+    // menu gesture, so tray hover traffic costs nothing.
+    let menu_hint = Tray::opens_menu(lparam) && app.password_manager_now();
+    // #567: show what the last background refresh found, then start
+    // the next one. Never waits on Ollama, so the menu opens at once.
+    if Tray::opens_menu(lparam) {
+        app.sync_ollama_menu();
+        app.sync_export_menu();
+    }
+    let mut was_menu = false;
+    let id = match app.tray.on_tray_message(lparam) {
+        TrayEvent::None => return LRESULT(0),
+        TrayEvent::Command(id) => id,
+        TrayEvent::Menu(menu) => {
+            was_menu = true;
+            SETTINGS_OPEN.with(|c| c.set(true));
+            TRAY_MENU_OPEN.with(|c| c.set(true));
+            let chosen = menu.track();
+            TRAY_MENU_OPEN.with(|c| c.set(false));
+            SETTINGS_OPEN.with(|c| c.set(false));
+            match chosen {
+                Some(id) => id,
+                None => {
+                    unsafe { &mut *ptr }.finish_modal_deferrals();
+                    return LRESULT(0);
+                }
+            }
+        }
+    };
+    // A fresh borrow: the one above ended before the menu loop started.
+    let app: &mut App = unsafe { &mut *ptr };
+    if was_menu {
+        app.finish_modal_deferrals();
+    }
+    app.password_manager_hint = menu_hint;
+    // Choosing anything other than a rebind disarms a learn mode
+    // left armed by an earlier "Set ... key" click; otherwise it
+    // would silently swallow the next key pressed anywhere.
+    if !matches!(
+        decode(id),
+        MenuChoice::Command(cmd::SET_PRIMARY)
+            | MenuChoice::Command(cmd::SET_SECONDARY)
+            | MenuChoice::Command(cmd::SET_PAUSE)
+    ) {
+        if let Some(h) = &app.hook {
+            h.cancel_learning();
+        }
+    }
+    match decode(id) {
+        MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
+        MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
+        MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
+        MenuChoice::ExportAction(i) => app.export_action(i),
+        MenuChoice::Command(cmd::IMPORT_ACTION) => app.import_action(),
+        MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
+        MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
+        MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
+        MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
+        MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
+        MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
+        MenuChoice::Command(cmd::QUICK_ASK) => app.toggle_palette(),
+        MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
+        MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
+        MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
+        MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
+        MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
+        MenuChoice::Command(cmd::SET_PAUSE) => app.start_learning(HK_PAUSE),
+        MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
+        MenuChoice::Command(cmd::RELOAD) => app.reload(),
+        MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
+        MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
+        MenuChoice::Command(cmd::CHECK_MACHINE) => app.check_machine(),
+        MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
+        MenuChoice::Command(cmd::USE_OPENAI) => app.set_provider(ActiveProvider::OpenAi),
+        MenuChoice::Command(cmd::USE_ANTHROPIC) => app.set_provider(ActiveProvider::Anthropic),
+        MenuChoice::Command(cmd::USE_OLLAMA) => app.set_provider(ActiveProvider::Ollama),
+        MenuChoice::Command(cmd::USE_GEMINI) => app.set_provider(ActiveProvider::Gemini),
+        MenuChoice::Command(cmd::PAUSE_1H) => app.pause_for(PauseChoice::OneHour),
+        MenuChoice::Command(cmd::PAUSE_UNTIL_TOMORROW) => app.pause_for(PauseChoice::UntilTomorrow),
+        MenuChoice::Command(cmd::PAUSE_UNTIL_RESUMED) => app.pause_for(PauseChoice::UntilResumed),
+        MenuChoice::Command(cmd::RESUME) => app.resume(),
+        MenuChoice::Command(cmd::MODE_CLOUD) => app.set_mode(Mode::Cloud),
+        MenuChoice::Command(cmd::MODE_LOCAL) => app.set_mode(Mode::Local),
+        MenuChoice::Command(cmd::MODE_AUTO) => app.set_mode(Mode::Auto),
+        MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
+        MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
+        MenuChoice::Command(cmd::QUIT) => {
+            if let Some(text) = quit_refusal(app.exec_in_flight) {
+                app.card.show_answer("Still working", text, 5, None);
+                app.set_watch(true);
+            } else {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+            }
+        }
+        _ => {}
+    }
+    // Not after Quit: the window (and `app`) may already be gone.
+    if !matches!(decode(id), MenuChoice::Command(cmd::QUIT)) {
+        app.password_manager_hint = false;
+    }
+    LRESULT(0)
+}
+
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         OWNER_HWND.with(|h| h.set(hwnd.0 as isize));
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+
+    // #723: a result from a run the app gave up on is dropped here, before
+    // anything else, so it can neither clear the new run's busy flag nor
+    // show an old answer.
+    if is_run_result(msg) && !result_is_current(wparam.0, CURRENT_RUN.with(|c| c.get())) {
+        free_boxed_payload(msg, lparam);
+        return LRESULT(0);
     }
 
     // Issue #152: apply the reentrancy policy BEFORE forming `&mut App` --
@@ -6290,6 +6685,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             PAUSE_REEVALUATE_PENDING.with(|c| c.set(true));
             return LRESULT(0);
         }
+        if msg == WM_TIMER && wparam.0 == STUCK_TIMER_ID {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), STUCK_TIMER_ID);
+            }
+            BUSY_STUCK.with(|c| c.set(true));
+            return LRESULT(0);
+        }
         if msg == WM_POWERBROADCAST {
             if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC {
                 PAUSE_REEVALUATE_PENDING.with(|c| c.set(true));
@@ -6302,7 +6704,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         }
 
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
-        match settings_reentrancy_policy(msg, taskbar_created_msg) {
+        let policy = if TRAY_MENU_OPEN.with(|c| c.get()) {
+            tray_menu_policy(msg, taskbar_created_msg)
+        } else {
+            settings_reentrancy_policy(msg, taskbar_created_msg)
+        };
+        match policy {
             SettingsReentrancy::Ignore => {
                 // WM_APP_LEARNED, WM_APP_PALETTE_RUN and WM_APP_ROUTER_RESULT
                 // are the only ignored messages carrying a boxed payload;
@@ -6341,6 +6748,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
                     }),
                     WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
+                    // #722: only `tray_menu_policy` defers these three.
+                    WM_APP_SEND_PREVIEW => DeferredMessage::SendPreview(unsafe {
+                        *Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest)
+                    }),
+                    WM_APP_PENDING_STAGE => {
+                        DeferredMessage::PendingStage(wparam.0 as u64, unsafe {
+                            *Box::from_raw(lparam.0 as *mut crate::ui::card::PendingStage)
+                        })
+                    }
+                    WM_APP_FIRST_RUN => DeferredMessage::FirstRun(wparam.0 as u64, unsafe {
+                        *Box::from_raw(lparam.0 as *mut FirstRun)
+                    }),
                     // #242: same treatment as WM_APP_CALENDAR_RESULT above.
                     WM_APP_GENERIC_ACTION_RESULT => {
                         let (action, schema, result) = *unsafe {
@@ -6351,9 +6770,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     WM_APP_EXECUTOR_DONE => DeferredMessage::ExecutorDone(unsafe {
                         *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>)
                     }),
-                    _ => unreachable!(
-                        "settings_reentrancy_policy only returns Defer for the seven ids above"
-                    ),
+                    _ => {
+                        unreachable!("the reentrancy policies only return Defer for the ids above")
+                    }
                 };
                 PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
                 return LRESULT(0);
@@ -6372,104 +6791,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     if ptr.is_null() {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
+    // #722: handed the raw pointer, before any `&mut App` is bound here, so
+    // that no borrow can be live across the tray menu's message loop.
+    if msg == WM_APP_TRAY {
+        return handle_tray_message(hwnd, ptr, lparam);
+    }
     let app: &mut App = unsafe { &mut *ptr };
 
     match msg {
-        WM_APP_TRAY => {
-            // #339: the menu takes the foreground (SetForegroundWindow in
-            // `Tray::show_menu`), so ask who was in front first. Only on the
-            // menu gesture, so tray hover traffic costs nothing.
-            let menu_hint = Tray::opens_menu(lparam) && app.password_manager_now();
-            // #567: show what the last background refresh found, then start
-            // the next one. Never waits on Ollama, so the menu opens at once.
-            if Tray::opens_menu(lparam) {
-                app.sync_ollama_menu();
-                app.sync_export_menu();
-            }
-            if let Some(id) = app.tray.on_tray_message(lparam) {
-                app.password_manager_hint = menu_hint;
-                // Choosing anything other than a rebind disarms a learn mode
-                // left armed by an earlier "Set ... key" click; otherwise it
-                // would silently swallow the next key pressed anywhere.
-                if !matches!(
-                    decode(id),
-                    MenuChoice::Command(cmd::SET_PRIMARY)
-                        | MenuChoice::Command(cmd::SET_SECONDARY)
-                        | MenuChoice::Command(cmd::SET_PAUSE)
-                ) {
-                    if let Some(h) = &app.hook {
-                        h.cancel_learning();
-                    }
-                }
-                match decode(id) {
-                    MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
-                    MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
-                    MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
-                    MenuChoice::ExportAction(i) => app.export_action(i),
-                    MenuChoice::Command(cmd::IMPORT_ACTION) => app.import_action(),
-                    MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
-                    MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
-                    MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
-                    MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
-                    MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
-                    MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
-                    MenuChoice::Command(cmd::QUICK_ASK) => app.toggle_palette(),
-                    MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
-                    MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
-                    MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
-                    MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
-                    MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
-                    MenuChoice::Command(cmd::SET_PAUSE) => app.start_learning(HK_PAUSE),
-                    MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
-                    MenuChoice::Command(cmd::RELOAD) => app.reload(),
-                    MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
-                    MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
-                    MenuChoice::Command(cmd::CHECK_MACHINE) => app.check_machine(),
-                    MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
-                    MenuChoice::Command(cmd::USE_OPENAI) => {
-                        app.set_provider(ActiveProvider::OpenAi)
-                    }
-                    MenuChoice::Command(cmd::USE_ANTHROPIC) => {
-                        app.set_provider(ActiveProvider::Anthropic)
-                    }
-                    MenuChoice::Command(cmd::USE_OLLAMA) => {
-                        app.set_provider(ActiveProvider::Ollama)
-                    }
-                    MenuChoice::Command(cmd::USE_GEMINI) => {
-                        app.set_provider(ActiveProvider::Gemini)
-                    }
-                    MenuChoice::Command(cmd::PAUSE_1H) => app.pause_for(PauseChoice::OneHour),
-                    MenuChoice::Command(cmd::PAUSE_UNTIL_TOMORROW) => {
-                        app.pause_for(PauseChoice::UntilTomorrow)
-                    }
-                    MenuChoice::Command(cmd::PAUSE_UNTIL_RESUMED) => {
-                        app.pause_for(PauseChoice::UntilResumed)
-                    }
-                    MenuChoice::Command(cmd::RESUME) => app.resume(),
-                    MenuChoice::Command(cmd::MODE_CLOUD) => app.set_mode(Mode::Cloud),
-                    MenuChoice::Command(cmd::MODE_LOCAL) => app.set_mode(Mode::Local),
-                    MenuChoice::Command(cmd::MODE_AUTO) => app.set_mode(Mode::Auto),
-                    MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
-                    MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
-                    MenuChoice::Command(cmd::QUIT) => {
-                        if let Some(text) = quit_refusal(app.exec_in_flight) {
-                            app.card.show_answer("Still working", text, 5, None);
-                            app.set_watch(true);
-                        } else {
-                            unsafe {
-                                let _ = DestroyWindow(hwnd);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                // Not after Quit: the window (and `app`) may already be gone.
-                if !matches!(decode(id), MenuChoice::Command(cmd::QUIT)) {
-                    app.password_manager_hint = false;
-                }
-            }
-            LRESULT(0)
-        }
         WM_APP_HOTKEY => {
             let _which = wparam.0; // both bindings do the same thing
             if !app.cancel_pending_send_preview() {
@@ -6488,7 +6817,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 // busy and paused make `ask` a no-op (or a Paused card), and
                 // must not cost the user an allowance.
                 let would_run = matches!(
-                    model_action_gate(app.busy, pause::is_paused_now()),
+                    model_action_gate(app.busy_now(), pause::is_paused_now()),
                     ModelActionGate::Proceed
                 );
                 if !would_run {
@@ -6642,6 +6971,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_TIMER => {
             if wparam.0 == PAUSE_TIMER_ID {
                 app.on_pause_timer(hwnd);
+            } else if wparam.0 == STUCK_TIMER_ID {
+                app.on_busy_stuck();
             }
             LRESULT(0)
         }
@@ -6965,6 +7296,111 @@ mod tests {
             super::model_action_gate(false, true),
             super::ModelActionGate::Paused
         );
+    }
+
+    /// #723: a press while busy must leave a card on screen, but must not
+    /// cover a card that already says so or one waiting on the user.
+    #[test]
+    fn busy_press_card_shows_only_when_nothing_explains_the_wait() {
+        use crate::ui::card::CardState;
+        for (state, expected) in [
+            (CardState::Pending, super::BusyPress::Leave),
+            (CardState::Preview, super::BusyPress::Leave),
+            (CardState::Hidden, super::BusyPress::ShowStillWorking),
+            (CardState::Collapsed, super::BusyPress::Leave),
+            (CardState::Expanded, super::BusyPress::Leave),
+        ] {
+            assert_eq!(super::busy_press_card(state), expected, "{state:?}");
+        }
+    }
+
+    /// #723: a run flagged stuck is abandoned by the next press; a healthy
+    /// busy run still blocks it.
+    #[test]
+    fn a_stuck_run_is_abandoned_by_the_next_press() {
+        assert!(!super::busy_after_press(false, false));
+        assert!(!super::busy_after_press(false, true));
+        assert!(super::busy_after_press(true, false));
+        assert!(!super::busy_after_press(true, true));
+    }
+
+    /// #723: a late result from an abandoned run is dropped; one posted
+    /// without a generation (0) is always kept.
+    #[test]
+    fn stale_results_are_dropped_by_generation() {
+        assert!(super::result_is_current(5, 5));
+        assert!(!super::result_is_current(4, 5));
+        assert!(super::result_is_current(0, 5));
+        for msg in [WM_APP_RESULT, WM_APP_CALENDAR_RESULT, WM_APP_REVIEW_RESULT] {
+            assert!(super::is_run_result(msg));
+        }
+        // A send preview from an abandoned run is stale too.
+        assert!(super::is_run_result(WM_APP_SEND_PREVIEW));
+        assert!(!super::is_run_result(WM_APP_HOTKEY));
+        // An executor's done message is a real write: never dropped as stale.
+        assert!(!super::is_run_result(WM_APP_EXECUTOR_DONE));
+        let src = lf(include_str!("app.rs"));
+        let tagged = src.matches("send_gate::set_worker_run(run);").count();
+        assert!(tagged >= 7, "workers that tag their run: {tagged}");
+    }
+
+    /// #723: every worker result is posted with its run generation, or the
+    /// stale check would never see it. Scans the post sites in app.rs.
+    #[test]
+    fn worker_results_carry_their_run_generation() {
+        let src = lf(include_str!("app.rs"));
+        let mut seen = 0;
+        for id in [
+            "WM_APP_RESULT,",
+            "WM_APP_CALENDAR_RESULT,",
+            "WM_APP_REVIEW_RESULT,",
+            "WM_APP_FORM_FILL_RESULT,",
+            "WM_APP_GENERIC_ACTION_RESULT,",
+        ] {
+            for (i, _) in src.match_indices(&format!("                    {id}\n")) {
+                let next = src[i..].lines().nth(1).unwrap_or("");
+                assert!(next.contains("WPARAM(run as usize)"), "{id} {next}");
+                seen += 1;
+            }
+        }
+        assert!(seen >= 7, "expected the result post sites, found {seen}");
+    }
+
+    /// #723: the stuck bound covers every provider in a chain at its own
+    /// wall clock, so a healthy run is never called stuck.
+    #[test]
+    fn stuck_bound_covers_the_slowest_honest_chain() {
+        for n in [1usize, 4, 9] {
+            let bound = std::hint::black_box(crate::provider::worst_case_run_secs(n));
+            assert!(bound >= n as u64 * crate::provider::common::MAX_TOTAL_WALL_CLOCK_SECS);
+            assert!(bound >= n as u64 * crate::provider::ollama::TOTAL_TIMEOUT_SECS);
+        }
+        // A chain with no providers still gets a positive bound.
+        assert!(crate::provider::worst_case_run_secs(0) > 0);
+    }
+
+    /// #723: no busy gate may return without a card. Scans every
+    /// early return on the busy flag in app.rs.
+    #[test]
+    fn busy_gates_never_return_silently() {
+        let src = lf(include_str!("app.rs"));
+        let mut seen = 0;
+        for (i, _) in src.match_indices(&("if self.".to_owned() + "busy_now() {")) {
+            let after = src.get(i..i + 120).unwrap_or(&src[i..]);
+            assert!(
+                after.contains("self.show_busy_card()"),
+                "a busy gate returns without a card: {after}"
+            );
+            seen += 1;
+        }
+        assert!(seen >= 3, "expected the busy gates, found {seen}");
+        let gate = src
+            .find("ModelActionGate::Busy => {")
+            .expect("begin_action has no Busy arm");
+        assert!(src
+            .get(gate..gate + 120)
+            .unwrap_or(&src[gate..])
+            .contains("self.show_busy_card()"));
     }
 
     #[test]
@@ -8319,6 +8755,73 @@ mod tests {
             window < acquire,
             "the owner window must be created before single_instance::acquire"
         );
+    }
+
+    /// #722: the tray menu defers what Settings drops, so opening the menu
+    /// never cancels a send waiting on its preview.
+    #[test]
+    fn tray_menu_policy_defers_send_preview_first_run_and_stage() {
+        for msg in [WM_APP_SEND_PREVIEW, WM_APP_FIRST_RUN, WM_APP_PENDING_STAGE] {
+            assert_eq!(super::tray_menu_policy(msg, 0), SettingsReentrancy::Defer);
+            assert_eq!(
+                settings_reentrancy_policy(msg, 0),
+                SettingsReentrancy::Ignore
+            );
+        }
+        // Everything else matches the Settings policy.
+        for msg in [WM_APP_RESULT, WM_APP_HOTKEY, WM_APP_DISMISS, WM_APP_TRAY, 0] {
+            assert_eq!(
+                super::tray_menu_policy(msg, 0),
+                settings_reentrancy_policy(msg, 0)
+            );
+        }
+    }
+
+    /// #722: the tray menu runs a nested message loop. No `&mut App` may be
+    /// live across it, and the reentrancy policy must be on while it runs.
+    #[test]
+    fn tray_menu_loop_runs_without_an_app_borrow() {
+        let src = lf(include_str!("app.rs"));
+        let start = src
+            .find("\nfn handle_tray_message(")
+            .expect("app.rs has no fn handle_tray_message");
+        let body = &src[start + 1..];
+        let body = &body[..body.find("\n}\n").expect("fn has no end")];
+        assert!(!body.is_empty());
+        let track = body.find(".track()").expect("the menu is never tracked");
+        let on = body[..track]
+            .rfind("SETTINGS_OPEN.with(|c| c.set(true));")
+            .expect("the reentrancy policy is not switched on before the menu loop");
+        let off = track
+            + body[track..]
+                .find("SETTINGS_OPEN.with(|c| c.set(false));")
+                .expect("the reentrancy policy is never switched off");
+        let span = &body[on..off];
+        assert!(
+            !span.contains("app."),
+            "App is used while the menu loop runs"
+        );
+        assert!(
+            !span.contains("tray."),
+            "Tray is used while the menu loop runs"
+        );
+        // The wnd_proc arm only delegates; it never reaches the menu itself.
+        let proc_src = wnd_proc_body(&src);
+        let call = proc_src
+            .find("handle_tray_message(")
+            .expect("wnd_proc never delegates the tray message");
+        let bind = proc_src
+            .find("let app: &mut App")
+            .expect("wnd_proc binds no app");
+        assert!(call < bind, "the tray call must precede any App borrow");
+        assert!(!proc_src.contains("on_tray_message"));
+        // And the tray's own message handler no longer calls TrackPopupMenu.
+        let tray = lf(include_str!("ui/tray.rs"));
+        let h = tray
+            .find("pub fn on_tray_message(")
+            .expect("no on_tray_message");
+        let h = &tray[h..h + tray[h..].find("\n    }\n").expect("no end")];
+        assert!(!h.contains("TrackPopupMenu"));
     }
 
     /// #236: only the activation arm may be rate limited, and it must be.

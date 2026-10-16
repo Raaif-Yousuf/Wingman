@@ -18,7 +18,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// first-load `gemma3:4b` call on this machine (CPU-only, stock Ollama tray
 /// owns the port) took ~18 s end to end; this leaves headroom for a bigger
 /// model or a slower cold start.
-const TOTAL_TIMEOUT: Duration = Duration::from_secs(180);
+pub const TOTAL_TIMEOUT_SECS: u64 = 180;
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(TOTAL_TIMEOUT_SECS);
 /// Used when `Request::max_tokens` is `0` (the caller has no opinion).
 const DEFAULT_MAX_TOKENS: u32 = 2500;
 /// `options.num_ctx` is always sent explicitly -- the server default is
@@ -298,7 +299,7 @@ impl Provider for Ollama {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{parse_answer, physics_request, Shot};
+    use crate::provider::{parse_answer, physics_request_no_note, Shot};
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -310,7 +311,7 @@ mod tests {
     }
 
     fn req(prompt: &str, want_difficulty: bool) -> Request {
-        physics_request(&sample_shot(), prompt, want_difficulty)
+        physics_request_no_note(&sample_shot(), prompt, want_difficulty)
     }
 
     // -- base_url / default -----------------------------------------------
