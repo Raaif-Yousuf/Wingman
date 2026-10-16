@@ -17,7 +17,7 @@
 //! support it. `fill_form` (#33) calls `write_with_fallback`, whose real
 //! (`com::UiaTextElementAccess`) implementation additionally falls back to
 //! focus plus typed Unicode input ([`plan_typed_input`]) for a control that
-//! exposes no `ValuePattern` and is editable ([`is_editable_control_type`]).
+//! exposes no `ValuePattern` and is an `Edit` or `ComboBox` ([`plan_typed_fallback`]).
 //! The default trait implementation is just `write` -- only the real,
 //! UIA-backed implementation overrides it, so every fake used by this
 //! file's and `fill_form.rs`'s tests gets plain `write` semantics with no
@@ -192,16 +192,6 @@ pub fn is_invokable_control_type(control_type: &str) -> bool {
     )
 }
 
-/// Whether a UIA control type is the kind of thing typed text can go into --
-/// used only to decide whether [`TextElementAccess::write_with_fallback`]'s
-/// typed-input fallback is even worth attempting for a control with no
-/// `ValuePattern`. Deliberately narrow (the three control types this crate's
-/// `control_type_to_string` maps to something text-editable); a control type
-/// not in this list refuses rather than guessing.
-pub fn is_editable_control_type(control_type: &str) -> bool {
-    matches!(control_type, "Edit" | "Document" | "ComboBox")
-}
-
 /// One `SendInput` Unicode key event: a UTF-16 code unit plus whether this is
 /// the key-down or key-up half. Deliberately not a `windows::Win32::...`
 /// type -- this stays plain data so [`plan_typed_input`] is testable with no
@@ -239,6 +229,39 @@ pub fn plan_typed_input(text: &str) -> Vec<UnicodeKeyEvent> {
     events
 }
 
+/// What the typed-input fallback does to a field, in order (#592): select
+/// everything, delete the selection when there is nothing to type, then type
+/// `text`. Typing over a selection replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedReplacePlan {
+    pub select_all: bool,
+    pub delete_selection: bool,
+    pub text: Vec<UnicodeKeyEvent>,
+}
+
+/// The fallback's whole decision: refuse, or a REPLACE plan (never an append).
+/// The fallback only runs for a control with no `ValuePattern`, and the walk
+/// reads `current_text` only from a `ValuePattern`, so the expected text is
+/// always empty here even when the field holds text. So this never looks at
+/// it: select-all is unconditional (harmless on an empty field).
+/// Only `Edit` is allowed. Ctrl+A in a `Document` (a browser page, a Word
+/// body) selects the whole document and typing would wipe it. A `ComboBox`
+/// with no `ValuePattern` cannot be told apart from a drop-down list, where
+/// Ctrl+A does nothing and typing is only type-ahead, so the card would say
+/// Filled when nothing was filled. Both refuse, as does any other type.
+pub fn plan_typed_fallback(control_type: &str, new_text: &str) -> Result<TypedReplacePlan> {
+    if control_type != "Edit" {
+        return Err(anyhow!(
+            "Wingman cannot safely type into this field ({control_type}): the app does not let it set the text directly, and typing could overwrite the wrong thing. Nothing was written. Click the field and type the value yourself."
+        ));
+    }
+    let text = plan_typed_input(new_text);
+    Ok(TypedReplacePlan {
+        select_all: true,
+        delete_selection: text.is_empty(),
+        text,
+    })
+}
 // ---------------------------------------------------------------------------
 // The injectable seam (mirrors executors::clipboard::ClipboardAccess)
 // ---------------------------------------------------------------------------
@@ -290,8 +313,8 @@ pub mod com {
     #![allow(dead_code)]
 
     use super::{
-        ensure_unchanged, is_editable_control_type, plan_typed_input, resolve_index, MatchOutcome,
-        ResolvedElement, TargetRef, TextElementAccess, UnicodeKeyEvent,
+        ensure_unchanged, plan_typed_fallback, resolve_index, MatchOutcome, ResolvedElement,
+        TargetRef, TextElementAccess, TypedReplacePlan, UnicodeKeyEvent,
     };
     use anyhow::Result;
     use windows::core::{Interface, BSTR};
@@ -312,7 +335,7 @@ pub mod com {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-        VIRTUAL_KEY,
+        VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL,
     };
 
     use crate::hotkey::INJECTED_MARKER;
@@ -618,22 +641,95 @@ pub mod com {
         }
     }
 
-    /// `SendInput`s the typed-input fallback plan. Never called by this
-    /// module's own automated tests -- see the module doc comment's "The
-    /// typed-input fallback" section and `fill_form.rs`'s tests, none of
-    /// which target a control lacking `ValuePattern`, so this function is
-    /// only ever reached in production. Covered by [`plan_typed_input`]'s
-    /// own pure tests plus the manual check filed to #166. `dwExtraInfo` is
-    /// tagged with `crate::hotkey::INJECTED_MARKER` (issue #209: the single
-    /// constant every `SendInput` call site in the crate now shares) so
-    /// `hook_proc` never treats this typed fallback's own keystrokes as a
-    /// real hotkey press.
-    fn inject_unicode_events(events: &[UnicodeKeyEvent]) {
+    /// The one real `SendInput` call, returning how many events were
+    /// accepted. Never called by this module's own automated tests (tests use
+    /// a fake sender): it would type into whatever window has focus.
+    fn real_sender(inputs: &[INPUT]) -> usize {
+        unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) as usize }
+    }
+
+    /// Types the planned Unicode events through the real sender. Never called
+    /// by this module's own automated tests -- see the module doc comment's
+    /// "The typed-input fallback" section; covered by [`plan_typed_input`]'s
+    /// pure tests plus the manual check filed to #166. `dwExtraInfo` is tagged
+    /// with `crate::hotkey::INJECTED_MARKER` (issue #209: the one constant
+    /// every `SendInput` call site shares) so `hook_proc` never treats these
+    /// keystrokes as a real hotkey press.
+    fn inject_unicode_events(events: &[UnicodeKeyEvent]) -> Result<()> {
         let inputs: Vec<INPUT> = events.iter().map(to_unicode_input).collect();
+        send_all(&inputs, &real_sender).map_err(|e| {
+            anyhow::anyhow!("typing was cut short and the field may hold partial text: {e}")
+        })
+    }
+
+    /// Sends a batch, treating a short count (blocked by UIPI, another
+    /// desktop, a full queue) as an error instead of ignoring it. `sender`
+    /// returns how many events were accepted.
+    fn send_all(inputs: &[INPUT], sender: &dyn Fn(&[INPUT]) -> usize) -> Result<()> {
         if inputs.is_empty() {
-            return;
+            return Ok(());
         }
-        unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        let sent = sender(inputs);
+        anyhow::ensure!(
+            sent == inputs.len(),
+            "the keystrokes could not be sent ({sent} of {})",
+            inputs.len()
+        );
+        Ok(())
+    }
+
+    /// Ctrl+A. On a short count A or Ctrl may be left down, so key-ups for
+    /// both are sent best-effort before reporting the error.
+    fn send_select_all(sender: &dyn Fn(&[INPUT]) -> usize) -> Result<()> {
+        let r = send_all(
+            &[
+                vk_input(VK_CONTROL, false),
+                vk_input(VK_A, false),
+                vk_input(VK_A, true),
+                vk_input(VK_CONTROL, true),
+            ],
+            sender,
+        );
+        if r.is_err() {
+            sender(&[vk_input(VK_A, true), vk_input(VK_CONTROL, true)]);
+        }
+        r
+    }
+    fn vk_input(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: if key_up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        Default::default()
+                    },
+                    time: 0,
+                    dwExtraInfo: INJECTED_MARKER,
+                },
+            },
+        }
+    }
+
+    /// Runs a [`TypedReplacePlan`]. Select-all (and delete) is sent first and
+    /// on its own: if it cannot be sent, nothing is typed and this errs, so a
+    /// failed clear never turns into an append (#592).
+    fn inject_typed_replace(plan: &TypedReplacePlan) -> Result<()> {
+        if plan.select_all {
+            send_select_all(&real_sender).map_err(|e| {
+                anyhow::anyhow!("could not select the existing text, so nothing was typed: {e}")
+            })?;
+        }
+        if plan.delete_selection {
+            send_all(
+                &[vk_input(VK_BACK, false), vk_input(VK_BACK, true)],
+                &real_sender,
+            )?;
+        }
+        inject_unicode_events(&plan.text)
     }
 
     /// The real, UIA-backed [`TextElementAccess`]. Each call is a
@@ -707,17 +803,12 @@ pub mod com {
                     Ok(())
                 }
                 Err(e) => {
-                    anyhow::ensure!(
-                        is_editable_control_type(&matched.control_type),
-                        "the target element does not support ValuePattern and is not a known editable control type; cannot write to it"
-                    );
+                    let plan = plan_typed_fallback(&matched.control_type, new_text)?;
                     // Focus, then type via SendInput Unicode injection.
                     // plan_typed_input never emits Enter/Tab, so this can
                     // never submit or focus-advance out of the field.
                     unsafe { matched.element.SetFocus() }.map_err(|_| e)?;
-                    let events = plan_typed_input(new_text);
-                    inject_unicode_events(&events);
-                    Ok(())
+                    inject_typed_replace(&plan)
                 }
             }
         }
@@ -735,6 +826,39 @@ pub mod com {
             unsafe { crate::inputs::uia_automation::create_automation() }?;
         let (candidates, _elements, _extra) = walk(&automation, hwnd)?;
         Ok(candidates)
+    }
+
+    /// Test-only: drives `send_select_all` with a fake sender, never
+    /// `SendInput`. Each call is recorded as (event count, is a Ctrl key-up).
+    #[cfg(test)]
+    pub mod test_support {
+        use super::*;
+        use std::cell::RefCell;
+
+        fn run(accept: usize) -> (Result<()>, Vec<(usize, bool)>) {
+            let calls = RefCell::new(Vec::new());
+            let sender = |inputs: &[INPUT]| {
+                let is_up = |i: &INPUT, vk: VIRTUAL_KEY| unsafe {
+                    i.Anonymous.ki.wVk == vk
+                        && i.Anonymous.ki.dwFlags == KEYEVENTF_KEYUP
+                        && i.Anonymous.ki.dwExtraInfo == INJECTED_MARKER
+                };
+                let up =
+                    inputs.len() == 2 && is_up(&inputs[0], VK_A) && is_up(&inputs[1], VK_CONTROL);
+                calls.borrow_mut().push((inputs.len(), up));
+                accept.min(inputs.len())
+            };
+            let r = send_select_all(&sender);
+            (r, calls.into_inner())
+        }
+
+        pub fn select_all_with_short_count() -> (Result<()>, Vec<(usize, bool)>) {
+            run(2)
+        }
+
+        pub fn select_all_with_full_count() -> (Result<()>, Vec<(usize, bool)>) {
+            run(4)
+        }
     }
 }
 
@@ -872,22 +996,6 @@ mod tests {
         }
     }
 
-    // -- is_editable_control_type --------------------------------------
-
-    #[test]
-    fn edit_document_combobox_are_editable() {
-        for ct in ["Edit", "Document", "ComboBox"] {
-            assert!(is_editable_control_type(ct), "{ct} should be editable");
-        }
-    }
-
-    #[test]
-    fn button_and_other_are_not_editable() {
-        for ct in ["Button", "CheckBox", "Text", "Other", ""] {
-            assert!(!is_editable_control_type(ct), "{ct} should not be editable");
-        }
-    }
-
     // -- plan_typed_input (SendInput fallback planning, purely) -------------
 
     #[test]
@@ -961,5 +1069,59 @@ mod tests {
         assert!(!events[2].key_up && events[3].key_up);
         // The two surrogate halves are different code units.
         assert_ne!(events[0].code_unit, events[2].code_unit);
+    }
+
+    // -- plan_typed_fallback (#592: the fallback replaces, never appends) ---
+
+    #[test]
+    fn fallback_always_selects_all_because_expected_is_empty_without_a_value_pattern() {
+        // The real path: no ValuePattern means the walk reads "" for a field
+        // that may still hold text, so the plan cannot depend on that text.
+        let plan = plan_typed_fallback("Edit", "new").unwrap();
+        assert!(plan.select_all, "must select existing text first");
+        assert!(!plan.delete_selection);
+        assert_eq!(plan.text, plan_typed_input("new"));
+    }
+
+    #[test]
+    fn fallback_deletes_the_selection_when_the_new_value_is_empty() {
+        let plan = plan_typed_fallback("Edit", "").unwrap();
+        assert!(plan.select_all && plan.delete_selection && plan.text.is_empty());
+    }
+
+    #[test]
+    fn fallback_refuses_document_and_other_control_types() {
+        for ct in ["Document", "ComboBox", "Button", "Pane", ""] {
+            let err = plan_typed_fallback(ct, "x").unwrap_err().to_string();
+            assert!(err.contains("type the value yourself"), "{ct}: {err}");
+            assert!(!err.contains('\u{2014}'), "no em dash in a card string");
+        }
+    }
+
+    #[test]
+    fn fallback_keeps_the_never_enter_or_tab_rule() {
+        let plan = plan_typed_fallback("Edit", "a\nb\tc").unwrap();
+        let units: Vec<u16> = plan.text.iter().map(|e| e.code_unit).collect();
+        assert!(!units.contains(&0x0A) && !units.contains(&0x09));
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::com::test_support::*;
+
+    #[test]
+    fn short_select_all_batch_releases_ctrl_and_errs() {
+        let (r, calls) = select_all_with_short_count();
+        assert!(r.is_err());
+        // The 4-event batch, then key-ups for A and Ctrl.
+        assert_eq!(calls, vec![(4, false), (2, true)]);
+    }
+
+    #[test]
+    fn full_select_all_batch_sends_once() {
+        let (r, calls) = select_all_with_full_count();
+        assert!(r.is_ok());
+        assert_eq!(calls, vec![(4, false)]);
     }
 }
