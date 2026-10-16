@@ -494,22 +494,38 @@ impl HotkeyHook {
     /// is captured instead of matched (see [`WM_APP_LEARNED`]). Expires after
     /// 10 seconds if nothing is pressed.
     pub fn start_learning(&self, which: usize) {
-        if let Some(state) = STATE.get() {
-            if let Ok(mut s) = state.lock() {
-                s.learn = LearnState::Armed {
-                    which,
-                    deadline: Instant::now() + LEARN_TIMEOUT,
-                };
-            }
-        }
+        arm_learning(which);
     }
 
     /// Disarm learn mode without capturing anything.
     pub fn cancel_learning(&self) {
-        if let Some(state) = STATE.get() {
-            if let Ok(mut s) = state.lock() {
-                s.learn = LearnState::Idle;
-            }
+        disarm_learning();
+    }
+}
+
+/// Arms learn mode for slot `which` without needing the [`HotkeyHook`]
+/// handle, which the Settings window (a modal loop that never receives
+/// `App`) does not have. Returns `false` when no hook is installed, so the
+/// caller can say so instead of waiting for a key that cannot arrive.
+pub fn arm_learning(which: usize) -> bool {
+    if let Some(state) = STATE.get() {
+        if let Ok(mut s) = state.lock() {
+            s.learn = LearnState::Armed {
+                which,
+                deadline: Instant::now() + LEARN_TIMEOUT,
+            };
+            return true;
+        }
+    }
+    false
+}
+
+/// Disarms learn mode; the free-function twin of
+/// [`HotkeyHook::cancel_learning`].
+pub fn disarm_learning() {
+    if let Some(state) = STATE.get() {
+        if let Ok(mut s) = state.lock() {
+            s.learn = LearnState::Idle;
         }
     }
 }
