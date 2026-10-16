@@ -855,7 +855,22 @@ fn colorref_to_d2d(c: COLORREF) -> D2D1_COLOR_F {
 }
 
 fn selected_row_color() -> COLORREF {
-    COLORREF(0x0098_7858)
+    COLORREF(crate::ui::theme::rgb(0x3A, 0x44, 0x55))
+}
+
+/// The palette's background.
+fn background_color() -> COLORREF {
+    COLORREF(0x0026_2626)
+}
+
+/// The 3 px bar on the selected row.
+fn accent_color() -> COLORREF {
+    COLORREF(0x00FF_B080)
+}
+
+/// Action row text.
+fn row_text_color() -> COLORREF {
+    COLORREF(0x00E6_E6E6)
 }
 
 /// The palette's GDI font: Segoe UI, `D2D_FONT_SIZE_DIP` tall at `dpi`, in
@@ -1325,7 +1340,7 @@ impl PaletteInner {
 
         unsafe {
             target.BeginDraw();
-            target.Clear(Some(&colorref_to_d2d(COLORREF(0x0026_2626)) as *const _));
+            target.Clear(Some(&colorref_to_d2d(background_color()) as *const _));
         }
 
         // #24: the router summary band is always reserved (see
@@ -1391,7 +1406,7 @@ impl PaletteInner {
 
                         if let Ok(accent) = unsafe {
                             target.CreateSolidColorBrush(
-                                &colorref_to_d2d(COLORREF(0x00FF_B080)) as *const _,
+                                &colorref_to_d2d(accent_color()) as *const _,
                                 None,
                             )
                         } {
@@ -1400,7 +1415,7 @@ impl PaletteInner {
                             }
                         }
                     }
-                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(0x00E6_E6E6));
+                    draw_text_line_d2d(&target, &format, name, row_rect, row_text_color());
                 }
             }
         }
@@ -1442,7 +1457,7 @@ impl PaletteInner {
             let mut rc = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rc);
 
-            let bg = CreateSolidBrush(COLORREF(0x0026_2626));
+            let bg = CreateSolidBrush(background_color());
             FillRect(hdc, &rc, bg);
             let _ = DeleteObject(bg.into());
 
@@ -1522,7 +1537,7 @@ impl PaletteInner {
                             let _ = DeleteObject(hl.into());
                         }
                         if i == self.state.selected {
-                            let accent = CreateSolidBrush(COLORREF(0x00FF_B080));
+                            let accent = CreateSolidBrush(accent_color());
                             let accent_rect = RECT {
                                 left: row_rect.left,
                                 top: row_rect.top,
@@ -1532,7 +1547,7 @@ impl PaletteInner {
                             FillRect(hdc, &accent_rect, accent);
                             let _ = DeleteObject(accent.into());
                         }
-                        SetTextColor(hdc, COLORREF(0x00E6_E6E6));
+                        SetTextColor(hdc, row_text_color());
                         draw_text_line(
                             hdc,
                             name,
@@ -1832,6 +1847,34 @@ mod tests {
     // #357: pure hit-test tests, written before `row_at` exists (RED first).
     // `dpi` is 96 throughout (logical == physical) so the expected pixel
     // values are the raw layout constants.
+    // #476: the accent bar carries "this row is selected" (3:1 against the
+    // background); the row text must stay readable on the selected fill (4.5:1).
+    mod colour_tests {
+        use super::super::{accent_color, background_color, row_text_color, selected_row_color};
+        use crate::ui::theme::{contrast_ratio, relative_luminance};
+        use windows::Win32::Foundation::COLORREF;
+
+        fn ratio(a: COLORREF, b: COLORREF) -> f64 {
+            contrast_ratio(relative_luminance(a.0), relative_luminance(b.0))
+        }
+
+        #[test]
+        fn accent_bar_has_at_least_3_to_1_contrast_with_background() {
+            let r = ratio(accent_color(), background_color());
+            assert!(r >= 3.0, "accent bar vs background is {r:.2}:1");
+        }
+
+        #[test]
+        fn row_text_has_at_least_4_5_to_1_contrast_on_the_selected_row() {
+            let r = ratio(row_text_color(), selected_row_color());
+            assert!(r >= 4.5, "row text vs selected row is {r:.2}:1");
+        }
+
+        #[test]
+        fn selected_row_is_still_distinct_from_the_background() {
+            assert_ne!(selected_row_color(), background_color());
+        }
+    }
     mod row_at_tests {
         use super::super::row_at;
 
@@ -1840,43 +1883,6 @@ mod tests {
         //          = 8 + 30 + 8 + 18 = 64
         const LIST_TOP: i32 = 64;
         const ROW_H: i32 = 26;
-
-        #[test]
-        fn selected_row_has_at_least_3_to_1_contrast_with_background() {
-            fn relative_luminance(color: windows::Win32::Foundation::COLORREF) -> f64 {
-                let channels = [
-                    color.0 & 0xFF,
-                    (color.0 >> 8) & 0xFF,
-                    (color.0 >> 16) & 0xFF,
-                ];
-
-                let linear = channels.map(|channel| {
-                    let value = channel as f64 / 255.0;
-                    if value <= 0.03928 {
-                        value / 12.92
-                    } else {
-                        ((value + 0.055) / 1.055).powf(2.4)
-                    }
-                });
-
-                0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
-            }
-
-            let background = windows::Win32::Foundation::COLORREF(0x0026_2626);
-            let selected = crate::ui::palette::selected_row_color();
-
-            let background_luminance = relative_luminance(background);
-            let selected_luminance = relative_luminance(selected);
-
-            let lighter = background_luminance.max(selected_luminance);
-            let darker = background_luminance.min(selected_luminance);
-            let contrast = (lighter + 0.05) / (darker + 0.05);
-
-            assert!(
-                contrast >= 3.0,
-                "selected row contrast must be at least 3:1, got {contrast:.2}:1"
-            );
-        }
 
         #[test]
         fn y_in_the_header_padding_above_the_list_is_none() {
@@ -1966,7 +1972,7 @@ mod tests {
             ReleaseDC(None, screen);
         }
         assert_eq!(selected, selected_row_color(), "the selected row fill");
-        assert_eq!(empty, COLORREF(0x0026_2626), "the palette background");
+        assert_eq!(empty, background_color(), "the palette background");
     }
     #[test]
     fn window_and_edit_control_are_created() {
