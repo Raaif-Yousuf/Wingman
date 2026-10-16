@@ -182,9 +182,6 @@ const KEY_PREFIXES: &[&str] = &[
     "xkeysib-",
     "NRAK-",
 ];
-/// Vendor prefixes that contain a dot, so the key is a run over key
-/// characters and dots: Google OAuth access tokens and SendGrid keys.
-const DOTTED_KEY_PREFIXES: &[&str] = &["ya29.", "SG."];
 const MIN_PREFIXED_KEY_CHARS: usize = 16;
 /// A run with no known prefix must be this long, purely alphanumeric, and
 /// hold both a digit and a letter. A hyphenated or underscored run is a slug
@@ -221,11 +218,27 @@ fn is_aws_key_id(run: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
-/// A key with a recognisable vendor shape. Safe to apply inside a link too:
-/// a vendor prefix is not something a document id happens to start with.
+/// What follows a vendor prefix has to look like random key material, not a
+/// name: `npm_config_cache_dir` and `npm_lifecycle_event` are environment
+/// variable names, `hf_hub_offline` is a setting. Key material has digits: at
+/// least three, or one beside an upper-case letter. (A key with fewer digits
+/// than that exists, but is rare enough that missing it is the cheaper error.)
+fn looks_like_key_material(rest: &str) -> bool {
+    let digits = rest.bytes().filter(u8::is_ascii_digit).count();
+    let upper = rest.bytes().any(|b| b.is_ascii_uppercase());
+    digits >= 3 || (digits >= 1 && upper)
+}
+
+/// A key with a recognisable vendor shape: an AWS id, or a vendor prefix
+/// followed by key material. Also applied inside a link: a vendor prefix plus
+/// random-looking material is unlikely to be a document id.
 fn is_prefixed_key_run(run: &str) -> bool {
     is_aws_key_id(run)
-        || (run.len() >= MIN_PREFIXED_KEY_CHARS && KEY_PREFIXES.iter().any(|p| run.starts_with(p)))
+        || (run.len() >= MIN_PREFIXED_KEY_CHARS
+            && KEY_PREFIXES
+                .iter()
+                .find(|p| run.starts_with(**p))
+                .is_some_and(|p| looks_like_key_material(&run[p.len()..])))
 }
 
 /// A long letters-and-digits run with no vendor shape. Not applied inside a
@@ -250,37 +263,78 @@ fn is_jwt(run: &str) -> bool {
     head.starts_with("eyJ") && payload.len() >= 2 && run.len() >= MIN_PREFIXED_KEY_CHARS
 }
 
+/// A SendGrid key is `SG.` then 22 characters, a dot and 43 characters; a
+/// Google OAuth access token is `ya29.` then a long run of key characters
+/// (40 or more, no more dots). Anything else with the prefix, such as
+/// `SG.Reports.Quarterly.xlsx`, is not one.
 fn is_dotted_vendor_key(run: &str) -> bool {
-    run.len() >= MIN_PREFIXED_KEY_CHARS && DOTTED_KEY_PREFIXES.iter().any(|p| run.starts_with(p))
+    let all_key = |s: &str| s.chars().all(is_key_char);
+    if let Some(rest) = run.strip_prefix("SG.") {
+        return rest
+            .split_once('.')
+            .is_some_and(|(a, b)| a.len() == 22 && b.len() == 43 && all_key(a) && all_key(b));
+    }
+    run.strip_prefix("ya29.")
+        .is_some_and(|rest| rest.len() >= 40 && all_key(rest))
 }
 
-/// Private key blocks: from a `-----BEGIN ... PRIVATE KEY-----` line through
-/// the matching `-----END ... PRIVATE KEY-----`, or to the end of the text
-/// when the block is cut off (a selection often is). Certificates and public
-/// keys are not secrets and are left alone.
+/// How far past a private key header the search for its end line looks, and
+/// the most a block with no end line is redacted. Real keys are a few
+/// kilobytes; the bound keeps the scan linear on hostile text.
+const PEM_WINDOW: usize = 16 * 1024;
+
+/// Private key blocks: from a `-----BEGIN <label>-----` header whose label
+/// ends in `PRIVATE KEY` (or is `PGP PRIVATE KEY BLOCK`) through the matching
+/// `-----END <label>-----` line. Certificates and public keys are not secrets
+/// and are left alone.
+///
+/// When there is no end line in reach (a selection often cuts the block off)
+/// the redaction runs to the next blank line, or [`PEM_WINDOW`] bytes after
+/// the header, whichever comes first. The choice: never the rest of the text,
+/// so a cut-off key does not swallow the question typed after it, and a
+/// real key body has no blank line in it.
+///
+/// Every step moves past what it looked at, so the scan is linear.
 fn pem_private_key_spans(text: &str) -> Vec<Range<usize>> {
     const BEGIN: &str = "-----BEGIN ";
-    const TAIL: &str = "PRIVATE KEY-----";
+    const DASHES: &str = "-----";
     let mut spans = Vec::new();
     let mut from = 0;
     while let Some(rel) = text[from..].find(BEGIN) {
         let start = from + rel;
-        let line_end = text[start..].find('\n').map_or(text.len(), |n| start + n);
-        let Some(tail_rel) = text[start + BEGIN.len()..line_end].find(TAIL) else {
-            from = start + BEGIN.len();
-            continue;
+        let label_start = start + BEGIN.len();
+        // The label ends at the closing dashes, on the same line.
+        let Some(label_len) = text[label_start..].find(DASHES) else {
+            break; // no dashes anywhere later, so no header can follow
         };
-        let after_header = start + BEGIN.len() + tail_rel + TAIL.len();
-        let end = text[after_header..]
-            .find("-----END ")
-            .and_then(|e| {
-                let at = after_header + e;
-                let tail = text[at..].find(TAIL)?;
-                Some(at + tail + TAIL.len())
-            })
-            .unwrap_or(text.len());
+        let label = &text[label_start..label_start + label_len];
+        let header_end = label_start + label_len + DASHES.len();
+        if label.contains('\n') {
+            from = label_start;
+            continue;
+        }
+        if !(label.ends_with("PRIVATE KEY") || label == "PGP PRIVATE KEY BLOCK") {
+            from = header_end;
+            continue;
+        }
+        let mut limit = (header_end + PEM_WINDOW).min(text.len());
+        while !text.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        let window = &text[header_end..limit];
+        let end_line = format!("-----END {label}-----");
+        let end = match window.find(&end_line) {
+            Some(e) => header_end + e + end_line.len(),
+            None => {
+                let blank = ["\n\n", "\r\n\r\n"]
+                    .iter()
+                    .filter_map(|b| window.find(b))
+                    .min();
+                header_end + blank.unwrap_or(window.len())
+            }
+        };
         spans.push(start..end);
-        from = end.max(start + BEGIN.len());
+        from = end;
     }
     spans
 }
@@ -289,8 +343,9 @@ fn pem_private_key_spans(text: &str) -> Vec<Range<usize>> {
 /// [`KEY_PREFIXES`], a dotted vendor key (`ya29.`, `SG.`), a JWT, and a PEM
 /// private key block. The text path adds its narrow bare-run rule, the
 /// screenshot path adds the wide opaque-token rule, but these cannot drift
-/// apart because there is one copy. Safe inside a link: nothing here is a
-/// shape a document id happens to take.
+/// apart because there is one copy. Also applied inside a link: each shape is
+/// specific enough (a vendor prefix plus key material, a JWT's `eyJ`, a PEM
+/// header) that a document id is unlikely to match it.
 pub(crate) fn shared_key_spans(text: &str) -> Vec<Range<usize>> {
     let mut spans = pem_private_key_spans(text);
     // Runs over key characters: vendor prefixes and AWS ids.
@@ -1027,10 +1082,14 @@ mod tests {
     fn more_vendor_prefixes_are_keys() {
         let keys = [
             ["npm_", "abcdEFGH1234abcdEFGH1234abcdEFGH1234"].concat(),
-            ["ya29.", "a0AfH6SMBx-3Kq_Zp9wT7vLm2NcXy8Rd4"].concat(),
+            [
+                "ya29.",
+                "a0AfH6SMBx-3Kq_Zp9wT7vLm2NcXy8Rd4-Zp9wT7vLm2NcXy8Rd4Kq",
+            ]
+            .concat(),
             [
                 "SG.",
-                "abcdEFGHijklMNOPqrstUV.abcdEFGHijklMNOPqrstUVwxyz0123456789ABCDE",
+                "abcdEFGHijklMNOPqrstUV.abcdEFGHijklMNOPqrstUVwxyz0123456789ABCDEFG",
             ]
             .concat(),
             ["shpat_", "0123456789abcdef0123456789abcdef"].concat(),
@@ -1051,6 +1110,57 @@ mod tests {
         let got = text_of(&t, spans);
         assert!(got.contains(&jwt().as_str()), "{got:?}");
         assert!(got.contains(&key.as_str()), "{got:?}");
+    }
+
+    #[test]
+    fn many_pem_headers_without_newlines_are_scanned_in_linear_time() {
+        let t = "-----BEGIN ".repeat(100_000);
+        let start = std::time::Instant::now();
+        let _ = red(&t);
+        let t2 = "-----BEGIN PRIVATE KEY-----".repeat(20_000);
+        let _ = red(&t2);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_cut_off_pem_block_stops_at_a_blank_line_not_the_end_of_the_text() {
+        const BEGIN: &str = "-----BEGIN ";
+        let t = format!("{BEGIN}EC PRIVATE KEY-----\nMHcCAQEEIA+x/Ab12=\n\nwhy does it fail?");
+        assert_eq!(red(&t), "[key 1]\n\nwhy does it fail?");
+        let pgp = format!("{BEGIN}PGP PRIVATE KEY BLOCK-----\nlQdGBF+x/Ab12=\n-----END PGP PRIVATE KEY BLOCK-----\nok");
+        assert_eq!(red(&pgp), "[key 1]\nok");
+        // An END line of another label does not end the block.
+        let mixed = format!("{BEGIN}PRIVATE KEY-----\nabc\n-----END CERTIFICATE-----\nmore");
+        assert!(red(&mixed).contains("[key 1]"), "{}", red(&mixed));
+    }
+
+    #[test]
+    fn dotted_vendor_keys_need_their_structure() {
+        for t in [
+            "open SG.Reports.Quarterly.xlsx now",
+            "see SG.team-notes-2024.final.docx",
+            "token ya29.short",
+        ] {
+            assert_eq!(red(t), t, "{t}");
+        }
+        let sg = format!("SG.aB3dE6gH9jK2mN5pQ8sT1v.{}", "x".repeat(43));
+        assert_eq!(red(&format!("k {sg} z")), "k [key 1] z");
+    }
+
+    #[test]
+    fn prefixed_names_that_are_not_key_material_are_left_alone() {
+        for t in [
+            "set npm_config_cache_dir to a folder",
+            "npm_lifecycle_event is test",
+            "hf_hub_offline_mode=1",
+            "sbp_command_line_options",
+        ] {
+            assert_eq!(red(t), t, "{t}");
+        }
     }
 
     #[test]
