@@ -49,7 +49,7 @@ project), so 163 - 1 = 162 matches the table below.
 | base64 | 0.23.1 | MIT OR Apache-2.0 | https://github.com/marshallpierce/rust-base64 |
 | embed-resource | 3.0.11 (build) | MIT | https://github.com/nabijaczleweli/rust-embed-resource |
 | image | 0.25.10 | MIT OR Apache-2.0 | https://github.com/image-rs/image |
-| rqrr | 0.11.0 (default features off) | (MIT OR Apache-2.0) AND ISC | https://github.com/WanzenBug/rqrr |
+| rqrr | 0.11.0 (default features off, vendored and patched, see below) | (MIT OR Apache-2.0) AND ISC | https://github.com/WanzenBug/rqrr |
 | rusqlite | 0.40.2 (feature `bundled`) | MIT | https://github.com/rusqlite/rusqlite |
 | serde | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde |
 | serde_json | 1.0.151 | MIT OR Apache-2.0 | https://github.com/serde-rs/json |
@@ -278,14 +278,34 @@ that, only attribution, which this file provides.
 not list it, and it has no license text to reproduce. `rusqlite` and
 `libsqlite3-sys` are MIT. Added with the local store, issue #46.
 
+## Vendored and patched: rqrr
+
+`vendor/rqrr` is `rqrr` 0.11.0 from crates.io (https://github.com/WanzenBug/rqrr,
+Copyright WanzenBug), licensed `(MIT OR Apache-2.0) AND ISC`, used through
+`[patch.crates-io]` in `Cargo.toml` with a handful of marked changes (#537,
+#616) listed in `vendor/rqrr/WINGMAN_PATCHES.md`. Its `LICENSE-MIT`,
+`LICENSE-APACHE` and `LICENSE-ISC` files are kept in that directory. The
+decoder is derived from quirc, whose ISC notice follows; it must stay with any
+copy of this code:
+
+> quirc -- QR-code recognition library
+> Copyright (C) 2010-2012 Daniel Beer <dlbeer@gmail.com>
+>
+> Permission to use, copy, modify, and/or distribute this software for any
+> purpose with or without fee is hereby granted, provided that the above
+> copyright notice and this permission notice appear in all copies.
+>
+> THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+> WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+> MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+> SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+> WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+> ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+> IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 ## Copied code
 
-- `src/actions/read_qr.rs` (`binarize_like_rqrr`, `rqrr_row_hit`): the local-average
-  thresholding and the row test for a finder pattern, re-expressed from `rqrr` 0.11.0
-  (`prepare.rs`, `detect.rs`; MIT OR Apache-2.0, https://github.com/WanzenBug/rqrr).
-  Copied in spirit so the shape counter that guards `rqrr` reads the same pixels it does.
-
-When a further snippet is copied from another MIT-licensed project (per
+None yet. When a snippet is copied from another MIT-licensed project (per
 AGENTS.md rule 2, e.g. the planned study of PowerToys' Text Extractor overlay
 or Flow Launcher's fuzzy ranking, see the expansion plan §14), it is listed
 here with the source file, the origin project, and its license text.
