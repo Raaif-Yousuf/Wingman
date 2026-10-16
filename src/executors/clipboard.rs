@@ -2,10 +2,8 @@
 //! Copies the confirmed proposal's `"text"` string field to the clipboard,
 //! recording whatever was there before so [`Undo::undo`] restores it.
 //!
-//! No built-in action names `"clipboard"` as its executor yet (no
-//! `text_answer`-shaped action exists) -- this is forward wiring for the
-//! first one that does, the same status the action-model design doc gives
-//! an unregistered proposal kind.
+//! Several built-in actions name `"clipboard"` as their executor, for example
+//! action items to a checklist, describe image, and table to CSV.
 
 use std::sync::Arc;
 
