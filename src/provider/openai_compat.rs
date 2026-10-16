@@ -339,7 +339,7 @@ impl Provider for OpenAiCompat {
         let body_text = common::post_json(
             &self.endpoint(),
             &headers,
-            &body,
+            body,
             REQUEST_TIMEOUT,
             "openai-compat",
         )?;
@@ -901,7 +901,7 @@ mod tests {
         let unload = common::post_json(
             "http://127.0.0.1:11434/api/generate",
             &[("Content-Type", "application/json")],
-            &json!({"model": "gemma3:4b", "keep_alive": 0}),
+            json!({"model": "gemma3:4b", "keep_alive": 0}),
             Duration::from_secs(10),
             "ollama-unload",
         );

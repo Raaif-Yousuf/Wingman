@@ -270,7 +270,7 @@ impl Provider for Ollama {
         let body_text = common::post_json_with_connect_timeout(
             &url,
             &[("Content-Type", "application/json")],
-            &body,
+            body,
             CONNECT_TIMEOUT,
             TOTAL_TIMEOUT,
             "ollama",

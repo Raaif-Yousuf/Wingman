@@ -265,7 +265,7 @@ impl Provider for OpenAi {
                 ("Authorization", auth.as_str()),
                 ("Content-Type", "application/json"),
             ],
-            &body,
+            body,
             REQUEST_TIMEOUT,
             "openai",
         )?;

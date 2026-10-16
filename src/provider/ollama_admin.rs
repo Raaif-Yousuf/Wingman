@@ -395,7 +395,7 @@ pub fn show_capabilities(base_url: &str, model: &str) -> Result<ShowCapabilities
     let response_body = common::post_json(
         &url,
         &[("Content-Type", "application/json")],
-        &body,
+        body,
         DISCOVERY_TOTAL_TIMEOUT,
         "ollama",
     )?;

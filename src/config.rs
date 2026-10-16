@@ -4522,10 +4522,26 @@ mod egress_preview_tests {
     }
 
     #[test]
-    fn redact_text_is_on_until_something_turns_it_off() {
-        // Safe direction: a request before anything has set the mirror is
-        // redacted. Only this test and app startup ever write it.
+    fn set_redact_text_enabled_is_reflected_by_the_getter() {
+        // Shares the egress lock: the provider tests that send a request read
+        // this flag while they hold it.
+        let _guard = EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = redact_text_enabled();
+        set_redact_text_enabled(false);
+        assert!(!redact_text_enabled());
+        set_redact_text_enabled(true);
         assert!(redact_text_enabled());
+        set_redact_text_enabled(before);
+    }
+
+    #[test]
+    fn redact_text_mirror_follows_capture_redact_through_apply_config() {
+        // The wiring is a one-line setter in `App::run` and `App::apply_config`
+        // (the `config_mirror` guard test in app.rs checks they match); this
+        // pins the setting it mirrors and the safe default of that setting.
+        assert!(Config::default().capture.redact);
     }
 
     #[test]
