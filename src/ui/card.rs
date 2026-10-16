@@ -3971,7 +3971,11 @@ impl CardInner {
                 } else {
                     row_h
                 };
-                let wrapped_h = self.measure_wrapped(self.fonts.body, &field.value, content_width);
+                let wrapped_h = self.measure_wrapped(
+                    self.fonts.body,
+                    &field.value,
+                    content_width - self.scale(FIELD_PAD_X_DP) * 2,
+                );
                 let text_h = wrapped_h.clamp(line_h, line_h * PREVIEW_MULTILINE_MAX_LINES);
                 // An editable field is a framed box, so its text needs room
                 // inside the frame (#811).
@@ -3998,6 +4002,7 @@ impl CardInner {
                     label_rect,
                     value_rect,
                     label_wrapped,
+                    value_stacked: true,
                 });
                 y += label_h + value_h + row_gap;
                 continue;
@@ -4033,6 +4038,7 @@ impl CardInner {
                 label_rect,
                 value_rect,
                 label_wrapped,
+                value_stacked: false,
             });
             y += row_content_h + row_gap;
         }
@@ -4207,12 +4213,12 @@ impl CardInner {
                 value_rect.left += self.scale(FIELD_PAD_X_DP);
                 SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
                 SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-                let value_format = if field.multiline {
-                    DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS
-                } else {
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
-                };
-                draw_text_line(hdc, &field.value, value_rect, value_format);
+                draw_text_line(
+                    hdc,
+                    &field.value,
+                    value_rect,
+                    value_draw_format(row.value_stacked),
+                );
             }
         }
 
@@ -4254,6 +4260,17 @@ const PREVIEW_LABEL_MAX_FRACTION: f32 = 0.45;
 /// Most lines a multi-line preview value (#105, the send preview's prompt and
 /// text) may take before it ends in an ellipsis.
 const PREVIEW_MULTILINE_MAX_LINES: i32 = 10;
+
+/// How a read-only value is drawn (#813): a stacked value wraps from the top
+/// of its box (the box is as tall as the wrapped text), a beside-the-label
+/// value is one centred line.
+fn value_draw_format(stacked: bool) -> windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT {
+    if stacked {
+        DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS
+    } else {
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
+    }
+}
 
 /// Whether a preview row puts its label above its value instead of beside
 /// it (#813): a multi-line field always does, and so does a label too wide
@@ -4384,6 +4401,9 @@ struct PreviewRowMetrics {
     /// so it must be drawn wrapped (`DT_WORDBREAK`) instead of ellipsized
     /// on one line (#355).
     label_wrapped: bool,
+    /// The value sits under its label on the full width (#813), and is
+    /// drawn wrapped from the top, not on one centred line.
+    value_stacked: bool,
 }
 
 struct PreviewButtonMetrics {
@@ -7436,14 +7456,19 @@ mod tests {
                 row.value_rect.top >= row.label_rect.bottom,
                 "dpi {dpi}: value must sit below its label"
             );
-            let (text_w, line_h) = card.inner.measure_label(card.inner.fonts.body, value);
-            let box_w =
-                row.value_rect.right - row.value_rect.left - card.inner.scale(FIELD_PAD_X_DP);
-            let box_h = row.value_rect.bottom - row.value_rect.top;
+            assert!(row.value_stacked, "dpi {dpi}");
+            let format = value_draw_format(row.value_stacked);
             assert!(
-                text_w <= box_w || box_h >= 2 * line_h,
-                "dpi {dpi}: the whole value must fit, wrapped if need be"
+                format.0 & DT_WORDBREAK.0 != 0 && format.0 & DT_SINGLELINE.0 == 0,
+                "dpi {dpi}: the value must be drawn wrapped, not on one cut line"
             );
+            assert!(format.0 & DT_VCENTER.0 == 0, "dpi {dpi}: top aligned");
+            // The box holds the wrapped text.
+            let box_w = row.value_rect.right - row.value_rect.left;
+            let wrapped = card
+                .inner
+                .measure_wrapped(card.inner.fonts.body, value, box_w);
+            assert!(row.value_rect.bottom - row.value_rect.top >= wrapped);
         }
     }
 
