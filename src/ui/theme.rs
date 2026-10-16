@@ -1,17 +1,23 @@
 //! The shared design tokens every surface draws from (#362): colours for
 //! light, dark and high contrast, type, radius and spacing.
 //!
-//! Pure on purpose: nothing here talks to the registry or a window, so the
-//! palettes and their contrast can be unit-tested. Colours are GDI
+//! The palettes and their contrast are pure, so they can be unit-tested. The
+//! only live reads are `detect_theme` (the app-mode registry value and the
+//! high contrast flag) and `SysColors::read`, and the `WM_SETTINGCHANGE`
+//! helpers every surface uses to know when to call them again. Colours are GDI
 //! `COLORREF` values (`0x00BBGGRR`), the same layout `rgb` builds.
 //!
-//! The card paints from these tokens in light, dark and high contrast. The
-//! palette and region overlay move onto them in later slices.
+//! The card and the region overlay paint from these tokens in light, dark and
+//! high contrast. The palette and Settings move onto them in later slices.
 
+use std::ffi::c_void;
+
+use windows::Win32::Foundation::LPARAM;
 use windows::Win32::Graphics::Gdi::{
     GetSysColor, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_HOTLIGHT,
     COLOR_WINDOW, COLOR_WINDOWTEXT,
 };
+use windows::Win32::UI::WindowsAndMessaging::SPI_SETHIGHCONTRAST;
 
 /// Packs 8-bit channels into a GDI `COLORREF` (`0x00BBGGRR`).
 pub(crate) const fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -42,6 +48,106 @@ impl Theme {
             Theme::Dark
         }
     }
+}
+
+/// Reads `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`.
+///
+/// `windows` 0.62 is built in this project *without* the `Win32_System_Registry`
+/// feature (see `Cargo.toml`, owned by another agent), so `RegGetValueW` is not
+/// available through the `windows` crate here. Rather than touch `Cargo.toml`,
+/// this module declares the one registry function it needs itself and links
+/// directly against `advapi32.dll` (a standard system import library, not a
+/// new crate dependency).
+pub(crate) fn detect_theme() -> Theme {
+    Theme::resolve(
+        registry_apps_use_light_theme(),
+        crate::ui::card_buttons::system_high_contrast().is_some(),
+    )
+}
+
+/// Whether a `WM_SETTINGCHANGE` names the light/dark switch. Windows sends
+/// `"ImmersiveColorSet"` in `lparam` when the user changes app mode or the
+/// accent color.
+fn setting_change_is_theme(name: &str) -> bool {
+    name == "ImmersiveColorSet"
+}
+
+/// Whether a `WM_SETTINGCHANGE` is one the card's theme depends on: the
+/// light/dark switch, or the high contrast flag (`wparam` is
+/// `SPI_SETHIGHCONTRAST`; its `lparam` carries no name).
+pub(crate) fn setting_change_affects_theme(wparam: usize, name: &str) -> bool {
+    wparam == SPI_SETHIGHCONTRAST.0 as usize || setting_change_is_theme(name)
+}
+
+/// The text of a `WM_SETTINGCHANGE` `lparam` (a null-terminated UTF-16
+/// string, or null for the broadcasts that carry none).
+///
+/// # Safety
+/// `lparam` must be zero or point at a null-terminated UTF-16 string, which
+/// is what Windows guarantees for this message.
+pub(crate) unsafe fn setting_change_name(lparam: LPARAM) -> String {
+    let ptr = lparam.0 as *const u16;
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+}
+
+const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+
+fn hkey_current_user() -> *mut c_void {
+    // HKEY_CURRENT_USER is defined by the Windows headers as
+    // ((HKEY)(ULONG_PTR)((LONG)0x80000001)) — i.e. sign-extended.
+    (0x8000_0001u32 as i32 as isize) as *mut c_void
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegGetValueW(
+        hkey: *mut c_void,
+        lpsubkey: *const u16,
+        lpvalue: *const u16,
+        dwflags: u32,
+        pdwtype: *mut u32,
+        pvdata: *mut c_void,
+        pcbdata: *mut u32,
+    ) -> i32;
+}
+
+fn registry_apps_use_light_theme() -> bool {
+    let subkey = wide_z(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let value = wide_z("AppsUseLightTheme");
+    let mut data: u32 = 1; // default to light on any failure
+    let mut size: u32 = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            hkey_current_user(),
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut data as *mut u32 as *mut c_void,
+            &mut size,
+        )
+    };
+    if status == 0 {
+        data != 0
+    } else {
+        // #356: a dark desktop would get a light card with no explanation.
+        crate::diagnostics::note_warning(&format!(
+            "Card: could not read the app theme setting (error {status}), using the light theme"
+        ));
+        true
+    }
+}
+
+/// UTF-16, null-terminated, for the registry call below.
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +262,7 @@ pub(crate) const HC_BLACK: SysColors = SysColors {
     highlight_text: 0x0000_0000,
 };
 #[cfg(test)]
-const HC_WHITE: SysColors = SysColors {
+pub(crate) const HC_WHITE: SysColors = SysColors {
     window: 0x00FF_FFFF,
     window_text: 0x0000_0000,
     gray_text: rgb(0, 0x60, 0),
@@ -345,6 +451,22 @@ mod tests {
         // Light and dark ignore the system colours entirely.
         assert_eq!(Tokens::for_theme(Theme::Light, &HC_WHITE), LIGHT);
         assert_eq!(Tokens::for_theme(Theme::Dark, &HC_BLACK), DARK);
+    }
+
+    #[test]
+    fn only_theme_names_and_the_high_contrast_flag_are_theme_changes() {
+        let hc = SPI_SETHIGHCONTRAST.0 as usize;
+        assert!(setting_change_affects_theme(0, "ImmersiveColorSet"));
+        assert!(setting_change_affects_theme(hc, ""));
+        assert!(!setting_change_affects_theme(0, "intl"));
+        assert!(!setting_change_affects_theme(0, ""));
+    }
+
+    #[test]
+    fn only_the_immersive_color_set_setting_is_a_theme_change() {
+        assert!(setting_change_is_theme("ImmersiveColorSet"));
+        assert!(!setting_change_is_theme("intl"));
+        assert!(!setting_change_is_theme(""));
     }
 
     #[test]

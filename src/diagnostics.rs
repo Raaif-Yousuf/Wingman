@@ -377,8 +377,10 @@ pub fn render_report(input: &DiagnosticsInput) -> String {
 /// window yet to give the log its own page (#44/#51 -- the WebView2
 /// settings host does not exist), so this is the same "no page, but not
 /// invisible either" answer #124 already gave diagnostics: read the real
-/// `egress.log` (`egress::read_all_human`) and put it on the clipboard,
-/// human-readable, ready to paste into a bug report. See `app.rs`'s
+/// request log in the local store (`egress::read_all_human`) and put it on
+/// the clipboard, human-readable, ready to paste into a bug report. When the
+/// store cannot be read or written, the report says so and lists the
+/// requests still held in memory, instead of looking empty. See `app.rs`'s
 /// `copy_egress_log` for the clipboard write itself.
 pub fn egress_report() -> String {
     crate::egress::read_all_human()
@@ -399,7 +401,11 @@ pub fn egress_report() -> String {
 pub fn collect(config: &Config, last_error: Option<LastError>) -> DiagnosticsInput {
     let ollama_port =
         ollama_admin::port_from_base_url(&config.providers.ollama.base_url).unwrap_or(11434);
-    let ollama_health = ollama_admin::query_ollama_health(ollama_port).message();
+    let mut ollama_health = ollama_admin::query_ollama_health(ollama_port).message();
+    // #382: Wingman exited in the middle of the Intel GPU fix.
+    if crate::provider::ollama_gpu_fix::interrupted() {
+        ollama_health.push_str(" The last Fix it did not finish, so Ollama may be stopped.");
+    }
 
     // Issue #270: redact the account name out of the two fields it can
     // leak from before it ever reaches `DiagnosticsInput`. Best-effort, same

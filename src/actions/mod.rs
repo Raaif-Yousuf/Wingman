@@ -7,6 +7,8 @@
 
 pub mod action_items;
 pub mod calendar;
+pub mod chart_table;
+pub mod code_actions;
 pub mod convert_times;
 pub mod define_word;
 pub mod describe_image;
@@ -17,12 +19,17 @@ pub mod fill_form;
 pub mod generic_answer;
 pub mod generic_inputs;
 pub mod generic_replace;
+pub mod jargon;
 pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
+pub mod receipt;
 pub mod review_email;
+pub mod rewrite_tone;
 pub mod scam_check;
 pub mod schema;
+pub mod share;
+pub mod table;
 pub mod time_zones;
 pub mod translate;
 
@@ -408,8 +415,20 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `scam_check`, executor `none`. A calibrated verdict (likely a scam,
 ///   suspicious, no clear signs) with the signs behind it, for the message or
 ///   page on screen.
+/// - `"explain-this-code"`, `"fix-this-code"`, `"write-tests-for-code"` (#73,
+///   `code_actions::builtin_actions`): group Code, the selection only. Explain
+///   is a read-only card, Fix confirms then replaces the selection, Tests
+///   confirms then copies.
+/// - `"rewrite-shorter"`, `"rewrite-friendlier"`, `"rewrite-formal"` (#72,
+///   `rewrite_tone::builtin_actions`): proposal `text_answer`, executor
+///   `replace_text`. Rewrite the selection in a fixed tone, confirmed on a
+///   card, then written over the selection like "Translate selection".
+/// - `"explain-jargon"` (#335, `jargon::builtin_action`): proposal
+///   `jargon_terms`, executor `none`. Lists the technical terms and acronyms in
+///   the selection (else on screen) with a short plain meaning each, on the
+///   card.
 pub fn builtin_actions() -> Vec<Action> {
-    vec![
+    let mut actions = vec![
         Action {
             id: DEFAULT_ACTION_ID.to_string(),
             name: "Check my work".to_string(),
@@ -457,6 +476,9 @@ pub fn builtin_actions() -> Vec<Action> {
         review_email::builtin_action(),
         fill_form::builtin_action(),
         action_items::builtin_action(),
+        table::builtin_action(),
+        chart_table::builtin_action(),
+        receipt::builtin_action(),
         explain_error::builtin_action(),
         define_word::builtin_action(),
         translate::builtin_action(),
@@ -465,7 +487,11 @@ pub fn builtin_actions() -> Vec<Action> {
         link_summary::builtin_action(),
         convert_times::builtin_action(),
         scam_check::builtin_action(),
-    ]
+        jargon::builtin_action(),
+    ];
+    actions.extend(code_actions::builtin_actions());
+    actions.extend(rewrite_tone::builtin_actions());
+    actions
 }
 
 /// Replaces each built-in whose `id` a user action matches (wholesale -- the
@@ -726,6 +752,15 @@ fn validate_action(action: &Action) -> Result<()> {
             "action \"{}\" uses executor \"replace_text\", {}",
             action.id,
             "which writes over the selected text, so its inputs must include \"selection\""
+        );
+    }
+    // `confirm = false` on a writing executor is refused by
+    // `auto_confirm_read_only` only after the model has answered (#732).
+    if !action.confirm && executor.effect() == crate::executors::Effect::Writes {
+        anyhow::bail!(
+            "action \"{}\" uses executor \"{}\", which writes, so it needs confirm = true",
+            action.id,
+            action.executor
         );
     }
     Ok(())
@@ -1307,6 +1342,48 @@ prompt = "Make it loud."
         assert!(msg.contains("replace_text"), "names the executor: {msg}");
         assert!(msg.contains("selection"), "names the fix: {msg}");
         assert!(!msg.contains('\u{2014}'), "no em dash: {msg}");
+    }
+
+    // -- confirm = false on a writing executor (#732) -------------------------
+
+    #[test]
+    fn confirm_false_on_a_writing_executor_is_skipped_at_load_naming_the_field() {
+        for executor in ["replace_text", "calendar_add", "fill_form"] {
+            let path = scratch_path("confirm-false-writes");
+            write(
+                &path,
+                &one_action("shout", "text_answer", executor, "Make it loud."),
+            );
+            let report = load_actions_report_from(&path).unwrap();
+            cleanup(&path);
+            assert!(
+                !report.actions.iter().any(|r| r.action.id == "shout"),
+                "{executor}"
+            );
+            assert_eq!(report.skipped.len(), 1, "{executor}");
+            let msg = &report.skipped[0];
+            assert!(msg.contains("shout"), "names the action: {msg}");
+            assert!(msg.contains("confirm"), "names the field: {msg}");
+            assert!(msg.contains(executor), "names the executor: {msg}");
+            assert!(!msg.contains('\u{2014}'), "no em dash: {msg}");
+        }
+    }
+
+    #[test]
+    fn confirm_true_on_a_writing_executor_and_confirm_false_on_a_read_only_one_load() {
+        let path = scratch_path("confirm-ok");
+        let text = format!(
+            "{}{}",
+            one_action("w", "text_answer", "replace_text", "Go.")
+                .replace("confirm = false", "confirm = true"),
+            one_action("r", "text_answer", "clipboard", "Go.")
+        );
+        write(&path, &text);
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert!(report.actions.iter().any(|r| r.action.id == "w"));
+        assert!(report.actions.iter().any(|r| r.action.id == "r"));
     }
 
     // -- unknown executor / proposal and skip-not-fail (#620) -----------------

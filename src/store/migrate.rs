@@ -17,10 +17,20 @@ pub struct Migration {
 }
 
 /// Every step, in order. Versions are contiguous from 1 (a test checks it).
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("schema/v001.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("schema/v001.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("schema/v002.sql"),
+    },
+    Migration {
+        version: 3,
+        sql: include_str!("schema/v003.sql"),
+    },
+];
 
 pub fn current_version(conn: &Connection) -> Result<i64, StoreError> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
@@ -159,6 +169,81 @@ mod tests {
         assert_eq!(n, 1);
         drop(snap);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_real_v1_database_upgrades_to_v2_with_its_rows_intact() {
+        // One test per shipped step (spec): a database at version 1 with
+        // real rows opens at version 2 and keeps every one.
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..1], None).unwrap();
+        conn.execute(
+            "INSERT INTO usage_day (date, provider, model, requests, usd)
+             VALUES ('2026-10-15', 'anthropic', 'm', 4, 1.5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('imported_spend', '1')",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, &MIGRATIONS[..2], None).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), 2);
+        let (requests, usd): (i64, f64) = conn
+            .query_row("SELECT requests, usd FROM usage_day", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((requests, usd), (4, 1.5));
+        let flag: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'imported_spend'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, "1");
+        // The new table is there and empty.
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM egress", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn the_real_v2_database_upgrades_to_v3_with_its_rows_intact() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..2], None).unwrap();
+        conn.execute(
+            "INSERT INTO egress (time_unix, provider, outcome) VALUES (5, 'anthropic', 'success')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_day (date, provider, model, requests, usd)
+             VALUES ('2026-10-15', 'anthropic', 'm', 4, 1.5)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS, None).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), 3);
+        let (egress, usage): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM egress), (SELECT count(*) FROM usage_day)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((egress, usage), (1, 1));
+        let profile: i64 = conn
+            .query_row("SELECT count(*) FROM profile_field", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(profile, 0, "the new table is there and empty");
     }
 
     #[test]

@@ -1104,15 +1104,25 @@ mod tests {
         // nothing a plain `actions.toml` entry lacks.
         let generic_on_purpose = [
             crate::actions::action_items::ACTION_ID,
+            crate::actions::table::ACTION_ID,
+            crate::actions::chart_table::ACTION_ID,
+            crate::actions::receipt::ACTION_ID,
             crate::actions::explain_error::ACTION_ID,
             crate::actions::define_word::ACTION_ID,
             crate::actions::translate::ACTION_ID,
+            crate::actions::code_actions::EXPLAIN_ID,
+            crate::actions::code_actions::FIX_ID,
+            crate::actions::code_actions::TESTS_ID,
+            crate::actions::rewrite_tone::SHORTER_ID,
+            crate::actions::rewrite_tone::FRIENDLIER_ID,
+            crate::actions::rewrite_tone::FORMAL_ID,
             crate::actions::page_summary::ACTION_ID,
             crate::actions::describe_image::ACTION_ID,
             crate::actions::explain_screen::ACTION_ID,
             crate::actions::link_summary::ACTION_ID,
             crate::actions::convert_times::ACTION_ID,
             crate::actions::scam_check::ACTION_ID,
+            crate::actions::jargon::ACTION_ID,
         ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {

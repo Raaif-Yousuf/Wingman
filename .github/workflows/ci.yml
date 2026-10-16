@@ -71,6 +71,11 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
+      # The release profile compiles out the debug-only gallery, so items that
+      # only it uses are dead code here and nothing else would notice (#652).
+      - name: cargo clippy --release -D warnings
+        run: cargo clippy --release -- -D warnings
+
       - name: Performance budgets (exe size)
         shell: pwsh
         run: ./scripts/perf-budget.ps1
@@ -79,12 +84,45 @@ jobs:
         shell: pwsh
         run: ./scripts/perf-runtime.ps1
 
+      - name: Smoke test (start, second launch hands off, clean exit)
+        shell: pwsh
+        run: ./scripts/smoke-launch.ps1
+
       - name: Upload exe artifact
         uses: actions/upload-artifact@v7
         with:
           name: wingman-windows-exe
           path: target/release/*.exe
           if-no-files-found: error
+
+  size-report:
+    # Informational: which crates take the bytes in the release exe, in the
+    # job summary. A separate job so it adds no time to the gating one (it
+    # needs its own unstripped build). It never fails the run.
+    name: exe size by crate (informational)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-bloat
+        run: cargo install cargo-bloat --version 0.12.1 --locked
+
+      - name: cargo bloat --crates
+        shell: pwsh
+        env:
+          # The release profile strips symbols and cargo-bloat needs them.
+          CARGO_PROFILE_RELEASE_STRIP: none
+        run: |
+          $out = cargo bloat --release --crates -n 25 2>&1 | Out-String
+          $out
+          "## Exe size by crate (unstripped build, informational)`n" +
+            '```' + "`n" + $out + "`n" + '```' |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
   supply-chain:
     # cargo-deny-action is a Docker container action, and GitHub runs those

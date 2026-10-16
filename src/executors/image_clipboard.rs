@@ -51,6 +51,17 @@ pub trait ImageClipboardAccess: Send + Sync {
     fn has_any_content(&self) -> bool;
 }
 
+/// Puts an RGBA image (top-down rows, `width * height * 4` bytes) on the
+/// real clipboard as `CF_DIB`. For the card's "copy as image" (#376); the
+/// executor itself goes through the same encoder.
+pub(crate) fn copy_rgba(rgba: &[u8], width: u32, height: u32) -> Result<()> {
+    let expected = (width as usize) * (height as usize) * 4;
+    if width == 0 || height == 0 || rgba.len() != expected {
+        anyhow::bail!("image is {} bytes, expected {expected}", rgba.len());
+    }
+    win32::set_dib(&encode_dib(rgba, width, height), true)
+}
+
 /// The real clipboard, via raw Win32 calls (`arboard`, already a crate
 /// dependency, does not expose a byte-exact `CF_DIB` write on Windows --
 /// this needs the literal format this executor's own tests golden-check).
@@ -62,7 +73,7 @@ impl ImageClipboardAccess for Win32ImageClipboard {
     }
 
     fn set_dib(&self, dib: &[u8]) -> Result<()> {
-        win32::set_dib(dib)
+        win32::set_dib(dib, false)
     }
 
     fn has_any_content(&self) -> bool {
@@ -304,16 +315,52 @@ mod win32 {
         read_hglobal_bytes(handle)
     }
 
-    pub(super) fn set_dib(bytes: &[u8]) -> Result<()> {
-        let _guard = OpenGuard::open()?;
-        unsafe { EmptyClipboard() }?;
+    pub(super) fn set_dib(bytes: &[u8], cloud_exclude: bool) -> Result<()> {
+        // Allocate before touching the clipboard: a failed allocation must
+        // leave the user's clipboard as it was (#716).
         let hglobal = alloc_hglobal_bytes(bytes)?;
-        // Ownership transfers to the clipboard on success; must not be
-        // freed here either way -- same reasoning
-        // `inputs::selection::win32::Win32Clipboard::set_formats` documents.
-        unsafe { SetClipboardData(CF_DIB, Some(HANDLE(hglobal.0))) }
-            .map_err(|e| anyhow::anyhow!("SetClipboardData(CF_DIB) failed: {e}"))?;
+        let _guard = match OpenGuard::open() {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = unsafe { GlobalFree(Some(hglobal)) };
+                return Err(e);
+            }
+        };
+        if let Err(e) = unsafe { EmptyClipboard() } {
+            let _ = unsafe { GlobalFree(Some(hglobal)) };
+            return Err(e.into());
+        }
+        // Ownership transfers to the clipboard on success only. When the call
+        // fails the memory is still ours, so free it (#376 made this
+        // reachable from a key press).
+        if let Err(e) = unsafe { SetClipboardData(CF_DIB, Some(HANDLE(hglobal.0))) } {
+            let _ = unsafe { GlobalFree(Some(hglobal)) };
+            anyhow::bail!("SetClipboardData(CF_DIB) failed: {e}");
+        }
+        // Decision (#716): the card's image copy is never offered to the
+        // cloud clipboard (it can show anything that was on screen), but
+        // stays in local Win+V history so the copy is still useful. Only
+        // `copy_rgba` asks for this; the executor's undo restores the user's
+        // own earlier image as it was. Best effort.
+        if cloud_exclude {
+            exclude_from_cloud();
+        }
         Ok(())
+    }
+
+    /// Sets the `CanUploadToCloudClipboard` format to 0 on the open clipboard.
+    fn exclude_from_cloud() {
+        use windows::core::w;
+        use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+        let format = unsafe { RegisterClipboardFormatW(w!("CanUploadToCloudClipboard")) };
+        if format == 0 {
+            return;
+        }
+        if let Ok(hglobal) = alloc_hglobal_bytes(&0u32.to_le_bytes()) {
+            if unsafe { SetClipboardData(format, Some(HANDLE(hglobal.0))) }.is_err() {
+                let _ = unsafe { GlobalFree(Some(hglobal)) };
+            }
+        }
     }
 }
 

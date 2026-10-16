@@ -12,7 +12,7 @@ mod calendar_add;
 mod clipboard;
 mod fill_form;
 mod format_probe;
-mod image_clipboard;
+pub(crate) mod image_clipboard;
 mod none;
 pub mod registry;
 mod replace_text;

@@ -66,9 +66,9 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, GetMonitorInfoW, GetStockObject,
     MonitorFromPoint, Rectangle, RoundRect, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    NULL_BRUSH, NULL_PEN, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DT_WORDBREAK, HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, LOGFONTW, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
@@ -78,10 +78,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
     GWLP_USERDATA, HWND_TOPMOST, IDC_CROSS, MSG, SWP_NOACTIVATE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE,
     WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::{self, RawShot, RectPx};
+use crate::ui::theme::{relative_luminance, SysColors, Theme, Tokens};
 
 // ---------------------------------------------------------------------------
 // Pure geometry
@@ -322,6 +324,17 @@ const HINT_SIDE_PADDING_DP: i32 = 40;
 /// The hint's font size, design pixels at 96 DPI (negative `lfHeight`
 /// convention, matched by [`hint_font`]).
 const HINT_FONT_HEIGHT_DP: i32 = 18;
+/// What one more line of hint text adds to the pill (#744).
+const HINT_LINE_DP: i32 = 24;
+/// Space kept between the hint text and the pill's edge on each side.
+const HINT_TEXT_INSET_DP: i32 = 14;
+/// The selection's size label (#742): font height, and its box next to the
+/// outline, all design pixels at 96 DPI.
+const LABEL_FONT_HEIGHT_DP: i32 = 14;
+const LABEL_LEFT_DP: i32 = 4;
+const LABEL_HEIGHT_DP: i32 = 20;
+const LABEL_WIDTH_DP: i32 = 240;
+const OUTLINE_WIDTH_DP: i32 = 2;
 
 /// Converts a 96-DPI design pixel to a physical pixel at `dpi`, rounding to
 /// the nearest pixel -- same `(dp * dpi + 48) / 96` rounding `card.rs`'s
@@ -338,10 +351,27 @@ fn scale_for_dpi(dp: i32, dpi: u32) -> i32 {
 /// it's unit-tested directly; clamped to stay within `monitor`'s width (and
 /// never negative-sized) on a narrow monitor.
 pub fn hint_rect(monitor: Rect, dpi: u32) -> Rect {
+    hint_rect_for_lines(monitor, dpi, 1)
+}
+
+/// How many lines the word-wrapped hint takes, from its measured wrapped
+/// height and one line's height: at least one, at most three (#744).
+pub fn hint_lines_from_height(wrapped_height: i32, line_height: i32) -> i32 {
+    if line_height <= 0 || wrapped_height <= 0 {
+        return 1;
+    }
+    ((wrapped_height + line_height - 1) / line_height).clamp(1, 3)
+}
+
+/// [`hint_rect`] for a hint that wraps onto `lines` lines: the same pill,
+/// taller by [`HINT_LINE_DP`] for each line after the first.
+pub fn hint_rect_for_lines(monitor: Rect, dpi: u32, lines: i32) -> Rect {
+    let extra_lines = (lines - 1).clamp(0, 2);
     let side_padding = scale_for_dpi(HINT_SIDE_PADDING_DP, dpi);
     let max_width = scale_for_dpi(HINT_MAX_WIDTH_DP, dpi);
     let top_margin = scale_for_dpi(HINT_TOP_MARGIN_DP, dpi);
-    let height = scale_for_dpi(HINT_HEIGHT_DP, dpi);
+    let height =
+        scale_for_dpi(HINT_HEIGHT_DP, dpi) + extra_lines * scale_for_dpi(HINT_LINE_DP, dpi);
 
     let available = (monitor.width() - side_padding).max(0);
     let box_width = max_width.min(available);
@@ -413,8 +443,13 @@ fn hint_monitor_and_dpi(desktop: Rect) -> (Rect, u32) {
 /// GUI font if `CreateFontIndirectW` fails, mirroring `card.rs`'s
 /// `font_or_stock`.
 fn hint_font(dpi: u32) -> HFONT {
+    segoe_font(HINT_FONT_HEIGHT_DP, dpi)
+}
+
+/// Segoe UI at `height_dp` design pixels, scaled to `dpi`.
+fn segoe_font(height_dp: i32, dpi: u32) -> HFONT {
     let mut lf = LOGFONTW {
-        lfHeight: -scale_for_dpi(HINT_FONT_HEIGHT_DP, dpi),
+        lfHeight: -scale_for_dpi(height_dp, dpi),
         ..Default::default()
     };
     for (i, u) in "Segoe UI".encode_utf16().enumerate() {
@@ -447,6 +482,43 @@ pub fn dim_rgba(rgba: &mut [u8], factor: f32) {
 /// keeps enough detail to recognize what is under the cursor while making
 /// the live selection rectangle read clearly against it).
 const BACKGROUND_DIM_FACTOR: f32 = 0.45;
+
+/// The overlay's colours for one theme (#580). The backdrop is the dimmed
+/// capture in every theme, so the outline and the size label need a light
+/// ink even in the dark theme; the hint pill is a small card and follows the
+/// theme like one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayColors {
+    /// The selection outline.
+    outline: u32,
+    /// The size label next to the selection. Drawn straight on the dimmed
+    /// capture, so it uses the same light ink as the outline.
+    label: u32,
+    hint_fill: u32,
+    hint_text: u32,
+    hint_border: u32,
+}
+
+/// The overlay's colours for `theme`, from the shared tokens. High contrast
+/// takes the system colours in `sys`; light and dark ignore them.
+fn overlay_colors(theme: Theme, sys: &SysColors) -> OverlayColors {
+    let tokens = Tokens::for_theme(theme, sys);
+    // Whichever of the theme's two inks is lighter reads against the dimmed
+    // capture: the surface in light, the text in dark, either in high
+    // contrast black, the window colour in high contrast white.
+    let ink = if relative_luminance(tokens.surface) >= relative_luminance(tokens.text) {
+        tokens.surface
+    } else {
+        tokens.text
+    };
+    OverlayColors {
+        outline: ink,
+        label: ink,
+        hint_fill: tokens.surface,
+        hint_text: tokens.text,
+        hint_border: tokens.border,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -610,6 +682,55 @@ impl Overlay {
         Self::create(instance, TEST_CLASS_NAME, desktop, original)
     }
 
+    /// The UI gallery's seam (#580): a small overlay over a synthetic
+    /// backdrop with a selection already staged, drawn in `theme` whatever
+    /// the system is set to. High contrast uses Windows' black palette. The
+    /// hint pill is laid out at `dpi` (the gallery's `--dpi`; 96 for none).
+    #[cfg(debug_assertions)]
+    pub(crate) fn open_for_gallery(
+        instance: HINSTANCE,
+        theme: Theme,
+        dpi: u32,
+    ) -> anyhow::Result<Self> {
+        let desktop = Rect {
+            left: 80,
+            top: 80,
+            right: 1040,
+            bottom: 680,
+        };
+        let (w, h) = (desktop.width() as u32, desktop.height() as u32);
+        // A light page with darker bands, so the dim and the outline have
+        // both bright and dark pixels to read against.
+        let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+            let y = i as u32 / w;
+            let v = if (y / 60) % 2 == 0 { 245 } else { 120 };
+            px.copy_from_slice(&[v, v, v, 255]);
+        }
+        let original = RawShot {
+            rgba,
+            width: w,
+            height: h,
+            screen: None,
+        };
+        let mut overlay = Self::create(instance, CLASS_NAME, desktop, original)?;
+        overlay.inner.current_rect = Some(Rect {
+            left: 240,
+            top: 200,
+            right: 640,
+            bottom: 420,
+        });
+        // The hint goes at the top of this small window, not of whatever
+        // monitor the cursor is on.
+        overlay.inner.hint_monitor = overlay.inner.local_bounds();
+        overlay.inner.hint_dpi = dpi.max(1);
+        overlay.inner.theme = theme;
+        overlay.inner.sys = crate::ui::theme::HC_BLACK;
+        overlay.inner.theme_forced = true;
+        overlay.inner.invalidate();
+        Ok(overlay)
+    }
+
     fn create(
         instance: HINSTANCE,
         class_name: &str,
@@ -662,6 +783,9 @@ impl Overlay {
             window_snapshot,
             hint_monitor,
             hint_dpi,
+            theme: crate::ui::theme::detect_theme(),
+            sys: SysColors::read(),
+            theme_forced: false,
         });
         let raw = Box::into_raw(inner);
 
@@ -901,6 +1025,13 @@ struct OverlayInner {
     /// creation via [`hint_monitor_and_dpi`], not re-queried per paint.
     hint_monitor: Rect,
     hint_dpi: u32,
+    /// #580: the look the overlay is drawn in, re-read on every theme
+    /// message, and the system colours high contrast draws from.
+    theme: Theme,
+    sys: SysColors,
+    /// Set by the UI gallery's `--theme`: `theme` and `sys` are simulated
+    /// and no theme message may replace them.
+    theme_forced: bool,
 }
 
 impl OverlayInner {
@@ -1032,7 +1163,19 @@ impl OverlayInner {
         }
     }
 
+    /// Re-reads the theme and the system colours, then repaints. Runs on
+    /// every message that can change them; a forced (gallery) theme stays.
+    fn refresh_theme(&mut self) {
+        if self.theme_forced {
+            return;
+        }
+        self.theme = crate::ui::theme::detect_theme();
+        self.sys = SysColors::read();
+        self.invalidate();
+    }
+
     fn on_paint(&self) {
+        let colors = overlay_colors(self.theme, &self.sys);
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
@@ -1044,13 +1187,14 @@ impl OverlayInner {
             if !hdc.0.is_null() && w > 0 && h > 0 && !self.background_dc.0.is_null() {
                 let _ = BitBlt(hdc, 0, 0, w, h, Some(self.background_dc), 0, 0, SRCCOPY);
             }
-            if let Some(rect) = self.visible_rect() {
-                draw_selection(hdc, rect);
-            }
             // #360: hidden once dragging starts -- the size label next to
             // the live selection already tells the user what they're doing.
+            // Drawn first, so the selection and its size label stay on top.
             if !self.dragging {
-                draw_hint(hdc, self.hint_monitor, self.hint_dpi);
+                draw_hint(hdc, self.hint_monitor, self.hint_dpi, &colors);
+            }
+            if let Some(rect) = self.visible_rect() {
+                draw_selection(hdc, rect, self.hint_dpi, &colors);
             }
 
             let _ = EndPaint(self.hwnd, &ps);
@@ -1094,6 +1238,18 @@ impl OverlayInner {
                 self.on_activate(wparam);
                 Some(LRESULT(0))
             }
+            WM_SETTINGCHANGE => {
+                // SAFETY: Windows passes a null-terminated string or null.
+                let name = unsafe { crate::ui::theme::setting_change_name(lparam) };
+                if crate::ui::theme::setting_change_affects_theme(wparam.0, &name) {
+                    self.refresh_theme();
+                }
+                None
+            }
+            WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+                self.refresh_theme();
+                None
+            }
             WM_DESTROY | WM_NCDESTROY => Some(LRESULT(0)),
             _ => None,
         }
@@ -1107,8 +1263,24 @@ fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
     (x, y)
 }
 
-unsafe fn draw_selection(hdc: HDC, rect: Rect) {
-    let pen = CreatePen(PS_SOLID, 2, COLORREF(0x0000FFFF)); // bright yellow, BGR-packed
+/// Where the size label goes: above the selection's top-left corner, scaled
+/// to `dpi` like the hint (#742). Pure, so it is tested without a DC.
+pub fn size_label_rect(selection: Rect, dpi: u32) -> RECT {
+    let height = scale_for_dpi(LABEL_HEIGHT_DP, dpi);
+    RECT {
+        left: selection.left + scale_for_dpi(LABEL_LEFT_DP, dpi),
+        top: (selection.top - height).max(0),
+        right: selection.left + scale_for_dpi(LABEL_WIDTH_DP, dpi),
+        bottom: selection.top.max(height),
+    }
+}
+
+unsafe fn draw_selection(hdc: HDC, rect: Rect, dpi: u32, colors: &OverlayColors) {
+    let pen = CreatePen(
+        PS_SOLID,
+        scale_for_dpi(OUTLINE_WIDTH_DP, dpi).max(1),
+        COLORREF(colors.outline),
+    );
     let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
     let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
     let _ = Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
@@ -1124,28 +1296,54 @@ unsafe fn draw_selection(hdc: HDC, rect: Rect) {
     // `453fe0b`).
     let label = size_label(rect);
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, COLORREF(0x00FFFFFF));
-    let text_rc = RECT {
-        left: rect.left + 4,
-        top: (rect.top - 20).max(0),
-        right: rect.left + 240,
-        bottom: rect.top.max(20),
-    };
+    SetTextColor(hdc, COLORREF(colors.label));
+    let text_rc = size_label_rect(rect, dpi);
+    let font = segoe_font(LABEL_FONT_HEIGHT_DP, dpi);
+    let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     crate::ui::text::draw_text_line(hdc, &label, text_rc, DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(hdc, old_font);
+    let _ = DeleteObject(HGDIOBJ(font.0));
 }
 
-/// #360: draws [`HINT_TEXT`] centered in a dark backing pill (readable
-/// against both a light and a dark wallpaper) near the top of the overlay,
-/// at the position [`hint_rect`] computes for `width`.
-unsafe fn draw_hint(hdc: HDC, monitor: Rect, dpi: u32) {
-    let rect = hint_rect(monitor, dpi);
-    if rect.width() <= 0 || rect.height() <= 0 {
+/// #360: draws [`HINT_TEXT`] centered in a backing pill near the top of the
+/// overlay, at the position [`hint_rect`] computes for `width`. The pill
+/// follows the theme (#580), so the text is readable on it in every one.
+unsafe fn draw_hint(hdc: HDC, monitor: Rect, dpi: u32, colors: &OverlayColors) {
+    let one_line = hint_rect(monitor, dpi);
+    if one_line.width() <= 0 || one_line.height() <= 0 {
         return;
     }
 
-    let brush = CreateSolidBrush(COLORREF(0x00303030)); // dark grey, BGR-packed
+    // #744: measure the text in its own font, and wrap it onto more lines
+    // (a taller pill) when it does not fit, instead of cutting it off.
+    let font = hint_font(dpi);
+    let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+    // DT_CALCRECT with word wrap gives the real wrapped height, which can need
+    // more lines than text width / pill width suggests.
+    let mut text: Vec<u16> = HINT_TEXT.encode_utf16().collect();
+    let available = one_line.width() - 2 * scale_for_dpi(HINT_TEXT_INSET_DP, dpi);
+    let mut calc = RECT {
+        left: 0,
+        top: 0,
+        right: available.max(1),
+        bottom: 0,
+    };
+    windows::Win32::Graphics::Gdi::DrawTextW(
+        hdc,
+        &mut text,
+        &mut calc,
+        DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+    );
+    let mut one = windows::Win32::Foundation::SIZE::default();
+    let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &text, &mut one);
+    let text_h = calc.bottom - calc.top;
+    let lines = hint_lines_from_height(text_h, one.cy);
+    let rect = hint_rect_for_lines(monitor, dpi, lines);
+
+    let brush = CreateSolidBrush(COLORREF(colors.hint_fill));
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    let border = CreatePen(PS_SOLID, 1, COLORREF(colors.hint_border));
+    let old_pen = SelectObject(hdc, HGDIOBJ(border.0));
     let radius = scale_for_dpi(16, dpi);
     let _ = RoundRect(
         hdc,
@@ -1159,23 +1357,26 @@ unsafe fn draw_hint(hdc: HDC, monitor: Rect, dpi: u32) {
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(HGDIOBJ(brush.0));
+    let _ = DeleteObject(HGDIOBJ(border.0));
 
-    let font = hint_font(dpi);
-    let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, COLORREF(0x00FFFFFF));
-    let text_rc = RECT {
-        left: rect.left,
+    SetTextColor(hdc, COLORREF(colors.hint_text));
+    let inset = scale_for_dpi(HINT_TEXT_INSET_DP, dpi);
+    let mut text_rc = RECT {
+        left: rect.left + inset,
         top: rect.top,
-        right: rect.right,
+        right: rect.right - inset,
         bottom: rect.bottom,
     };
-    crate::ui::text::draw_text_line(
-        hdc,
-        HINT_TEXT,
-        text_rc,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-    );
+    let format = if lines > 1 {
+        // DT_VCENTER only works with DT_SINGLELINE, so centre the wrapped
+        // block by hand.
+        text_rc.top = rect.top + ((rect.bottom - rect.top) - text_h).max(0) / 2;
+        DT_CENTER | DT_WORDBREAK | DT_NOPREFIX
+    } else {
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
+    };
+    crate::ui::text::draw_text_line(hdc, HINT_TEXT, text_rc, format);
     SelectObject(hdc, old_font);
     let _ = DeleteObject(HGDIOBJ(font.0));
 }
@@ -2264,9 +2465,12 @@ mod tests {
         // lands on the last of the two, which is `OverlayInner`'s own. Its
         // body ends at the first column-4 closing brace, since it is a
         // method rather than a free function.
-        let at = src.rfind("fn handle_message").expect(
-            "region.rs no longer has a `fn handle_message`; this guard is checking nothing",
-        );
+        // Spelled with `concat!` so this test's own text is not a match.
+        let at = src
+            .find(concat!("fn handle_", "message(&mut self, msg: u32"))
+            .expect(
+                "region.rs no longer has OverlayInner's handler; this guard is checking nothing",
+            );
         let handler = &src[at..];
         let body = &handler[..handler.find("\n    }\n").unwrap_or(handler.len())];
         assert!(
@@ -2392,6 +2596,49 @@ mod tests {
     }
 
     #[test]
+    fn the_size_label_box_scales_with_dpi_and_stays_on_screen() {
+        let sel = monitor_rect(300, 200, 700, 420);
+        let at96 = size_label_rect(sel, 96);
+        assert_eq!(
+            (at96.left, at96.top, at96.right, at96.bottom),
+            (304, 180, 540, 200)
+        );
+        let at240 = size_label_rect(sel, 240);
+        assert_eq!(at240.left - sel.left, 10);
+        assert_eq!(at240.bottom - at240.top, 50);
+        assert_eq!(at240.right - sel.left, 600);
+        // A selection at the very top keeps its label inside the window.
+        let top = size_label_rect(monitor_rect(0, 0, 100, 100), 240);
+        assert!(top.top >= 0 && top.bottom > top.top);
+    }
+
+    #[test]
+    fn a_hint_that_does_not_fit_wraps_to_more_lines_and_a_taller_pill() {
+        assert_eq!(hint_lines_from_height(24, 24), 1);
+        assert_eq!(hint_lines_from_height(48, 24), 2);
+        assert_eq!(hint_lines_from_height(49, 24), 3);
+        assert_eq!(hint_lines_from_height(240, 24), 3, "capped at three lines");
+        assert_eq!(
+            hint_lines_from_height(48, 0),
+            1,
+            "no line height is not a divide by zero"
+        );
+        assert_eq!(hint_lines_from_height(0, 24), 1);
+        let m = monitor_rect(0, 0, 960, 600);
+        let one = hint_rect_for_lines(m, 240, 1);
+        let two = hint_rect_for_lines(m, 240, 2);
+        assert_eq!(one, hint_rect(m, 240));
+        assert_eq!(
+            two.height() - one.height(),
+            scale_for_dpi(HINT_LINE_DP, 240)
+        );
+        assert_eq!(
+            (two.left, two.right, two.top),
+            (one.left, one.right, one.top)
+        );
+    }
+
+    #[test]
     fn draw_selection_with_a_zero_size_rect_does_not_crash() {
         unsafe {
             let hdc = CreateCompatibleDC(None);
@@ -2422,6 +2669,8 @@ mod tests {
                     right: 0,
                     bottom: 0,
                 },
+                96,
+                &overlay_colors(Theme::Light, &HC_BLACK),
             );
 
             SelectObject(hdc, old_bitmap);
@@ -2453,16 +2702,212 @@ mod tests {
                 .expect("CreateDIBSection failed");
             let old_bitmap = SelectObject(hdc, hbitmap.into());
 
-            draw_hint(hdc, monitor_rect(0, 0, 800, 600), 96);
+            let colors = overlay_colors(Theme::Dark, &HC_BLACK);
+            draw_hint(hdc, monitor_rect(0, 0, 800, 600), 96, &colors);
             // 144 DPI: exercises the scaled-font/scaled-pill path.
-            draw_hint(hdc, monitor_rect(0, 0, 800, 600), 144);
+            draw_hint(hdc, monitor_rect(0, 0, 800, 600), 144, &colors);
             // A monitor too narrow for any pill: exercises the zero-size
             // early-return path without crashing.
-            draw_hint(hdc, monitor_rect(0, 0, 0, 0), 96);
+            draw_hint(hdc, monitor_rect(0, 0, 0, 0), 96, &colors);
 
             SelectObject(hdc, old_bitmap);
             let _ = DeleteObject(hbitmap.into());
             let _ = DeleteDC(hdc);
+        }
+    }
+
+    // -- theme (#580) ----------------------------------------------------
+
+    use crate::ui::theme::{contrast_ratio, rgb, HC_BLACK, HC_WHITE};
+
+    /// The themes the overlay is drawn in, with a system palette for
+    /// high contrast.
+    fn all_overlay_themes() -> [(Theme, SysColors); 4] {
+        [
+            (Theme::Light, HC_BLACK),
+            (Theme::Dark, HC_BLACK),
+            (Theme::HighContrast, HC_BLACK),
+            (Theme::HighContrast, HC_WHITE),
+        ]
+    }
+
+    /// The brightest a dimmed capture pixel can get: white times the dim.
+    fn brightest_dimmed_pixel() -> u32 {
+        let v = (255.0 * BACKGROUND_DIM_FACTOR).round() as u8;
+        rgb(v, v, v)
+    }
+
+    #[test]
+    fn the_outline_and_label_read_against_the_dimmed_capture_in_every_theme() {
+        let backdrop = relative_luminance(brightest_dimmed_pixel());
+        let mut checked = 0;
+        for (theme, sys) in all_overlay_themes() {
+            let c = overlay_colors(theme, &sys);
+            for (name, ink) in [("outline", c.outline), ("label", c.label)] {
+                let ratio = contrast_ratio(relative_luminance(ink), backdrop);
+                assert!(ratio >= 3.0, "{theme:?} {name}: {ratio:.2}:1");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 8);
+    }
+
+    #[test]
+    fn the_hint_text_meets_aa_on_its_pill_in_every_theme() {
+        for (theme, sys) in all_overlay_themes() {
+            let c = overlay_colors(theme, &sys);
+            let ratio = contrast_ratio(
+                relative_luminance(c.hint_text),
+                relative_luminance(c.hint_fill),
+            );
+            assert!(ratio >= 4.5, "{theme:?}: {ratio:.2}:1");
+        }
+    }
+
+    #[test]
+    fn the_overlay_colours_follow_the_theme() {
+        let light = overlay_colors(Theme::Light, &HC_BLACK);
+        let dark = overlay_colors(Theme::Dark, &HC_BLACK);
+        let hc = overlay_colors(Theme::HighContrast, &HC_BLACK);
+        assert_ne!(light.hint_fill, dark.hint_fill);
+        assert_eq!(hc.hint_fill, HC_BLACK.window);
+        assert_eq!(hc.hint_text, HC_BLACK.window_text);
+        assert_eq!(hc.outline, HC_BLACK.window_text);
+    }
+
+    /// The drawing code must take its colours from `OverlayColors`, so a
+    /// literal colour sneaking back in (the bug this issue fixed) fails here.
+    #[test]
+    fn the_drawing_code_has_no_literal_colours() {
+        let src = include_str!("region.rs").replace('\r', "");
+        let start = src
+            .find("unsafe fn draw_selection")
+            .expect("region.rs no longer has draw_selection; this guard checks nothing");
+        let end = src[start..]
+            .find("fn build_background")
+            .expect("region.rs no longer has build_background; this guard checks nothing");
+        let body = &src[start..start + end];
+        assert!(
+            body.contains("SetTextColor"),
+            "the candidate set must not be empty"
+        );
+        let no_null = body.replace("NULL_BRUSH", "");
+        assert!(
+            !body.contains("rgb("),
+            "a literal colour is back in the drawing code"
+        );
+        assert!(
+            !no_null.contains("_BRUSH") && !no_null.contains("_PEN"),
+            "a stock brush or pen is back in the drawing code"
+        );
+        let mut rest = body;
+        while let Some(i) = rest.find("COLORREF(") {
+            let next = rest[i + "COLORREF(".len()..].chars().next();
+            assert!(
+                !next.is_some_and(|c| c.is_ascii_digit()),
+                "a literal COLORREF is back in the drawing code"
+            );
+            rest = &rest[i + 1..];
+        }
+    }
+
+    /// A sentinel the real system colours can never equal, so "re-read" is
+    /// visible in the field.
+    fn stale_sys_colors() -> SysColors {
+        SysColors {
+            window: 1,
+            window_text: 2,
+            gray_text: 3,
+            hotlight: 6,
+            highlight: 4,
+            highlight_text: 5,
+        }
+    }
+
+    fn opposite_theme(theme: Theme) -> Theme {
+        match theme {
+            Theme::Light => Theme::Dark,
+            Theme::Dark | Theme::HighContrast => Theme::Light,
+        }
+    }
+
+    #[test]
+    fn theme_messages_sent_to_a_live_overlay_make_it_re_read_the_theme() {
+        // Through the window procedure of a live window of the test class
+        // (#658): an overlay whose class never routed the message, or whose
+        // arm did nothing, would keep the stale values.
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+        let desktop = Rect {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 150,
+        };
+        let name = wide_z("ImmersiveColorSet");
+        for msg in [WM_SETTINGCHANGE, WM_THEMECHANGED, WM_SYSCOLORCHANGE] {
+            let mut overlay =
+                Overlay::open_for_test(test_instance(), desktop).expect("Overlay::open_for_test");
+            let detected = crate::ui::theme::detect_theme();
+            overlay.inner.theme = opposite_theme(detected);
+            overlay.inner.sys = stale_sys_colors();
+            let hwnd = overlay.hwnd();
+            let lparam = if msg == WM_SETTINGCHANGE {
+                LPARAM(name.as_ptr() as isize)
+            } else {
+                LPARAM(0)
+            };
+
+            unsafe {
+                SendMessageW(hwnd, msg, Some(WPARAM(0)), Some(lparam));
+            }
+
+            assert_eq!(overlay.inner.theme, detected, "message {msg:#x}");
+            assert_eq!(overlay.inner.sys, SysColors::read(), "message {msg:#x}");
+        }
+    }
+
+    #[test]
+    fn an_unrelated_setting_change_sent_to_a_live_overlay_leaves_the_theme_alone() {
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+        let desktop = Rect {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 150,
+        };
+        let mut overlay =
+            Overlay::open_for_test(test_instance(), desktop).expect("Overlay::open_for_test");
+        let forced = opposite_theme(crate::ui::theme::detect_theme());
+        overlay.inner.theme = forced;
+        overlay.inner.sys = stale_sys_colors();
+        let name = wide_z("intl");
+
+        unsafe {
+            SendMessageW(
+                overlay.hwnd(),
+                WM_SETTINGCHANGE,
+                Some(WPARAM(0)),
+                Some(LPARAM(name.as_ptr() as isize)),
+            );
+        }
+
+        assert_eq!(overlay.inner.theme, forced);
+        assert_eq!(overlay.inner.sys, stale_sys_colors());
+    }
+    #[test]
+    fn a_theme_message_is_dispatched_to_the_overlay() {
+        let src = include_str!("region.rs").replace('\r', "");
+        let at = src.find(concat!("fn handle_", "message(&mut self, msg: u32")).expect(
+            "region.rs no longer has the OverlayInner handle_message; this guard checks nothing",
+        );
+        let end = src[at..]
+            .find("fn point_from_lparam")
+            .expect("region.rs no longer has point_from_lparam; this guard checks nothing");
+        let body = &src[at..at + end];
+        for msg in ["WM_SETTINGCHANGE", "WM_THEMECHANGED", "WM_SYSCOLORCHANGE"] {
+            assert!(body.contains(msg), "handle_message has no {msg} arm");
         }
     }
 }
