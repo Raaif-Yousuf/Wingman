@@ -2246,8 +2246,11 @@ fn spawn_cloud_models_fetch(
 
 /// Runs `post` only while the Settings window is still open (#569). `alive`
 /// is cleared on the UI thread in `WM_DESTROY`, before Windows can hand the
-/// window's handle value to another window, so a worker that finishes late
-/// never posts to a stranger. Returns whether it posted.
+/// window's handle value to another window, so a worker that finishes after
+/// the window closed does not post. A worker that checked the flag just
+/// before `WM_DESTROY` can still post once; that post goes to a dead handle
+/// and fails harmlessly unless the value was reused in that instant.
+/// Returns whether it posted.
 fn post_while_open(alive: &std::sync::atomic::AtomicBool, post: impl FnOnce()) -> bool {
     if alive.load(Ordering::SeqCst) {
         post();
