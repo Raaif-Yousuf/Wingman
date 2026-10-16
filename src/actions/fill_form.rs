@@ -169,7 +169,7 @@ pub fn control_type_str(kind: ControlKind) -> &'static str {
 /// `FieldSnapshot` at all -- see that module's `build_snapshot` -- so
 /// "never touches a button" (AGENTS.md, Wingman never presses Send/Submit)
 /// holds by construction upstream of this function; this narrows further,
-/// to the three kinds (`Edit`, `Document`, `ComboBox`) that `executors::target` (and
+/// to the three kinds (`Edit`, `Document`, `ComboBox`; an unreadable Document or ComboBox is dropped, see below) that `executors::target` (and
 /// therefore `TextElementAccess::write`/`write_with_fallback`) actually
 /// know how to write a text value into. A `CheckBox`/`RadioButton`/`List`
 /// field is real UIA data this snapshot carries for other future actions,
