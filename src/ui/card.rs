@@ -1765,7 +1765,7 @@ impl CardInner {
             role,
             btn::state_of(dis, hovered),
             &surface,
-            btn::system_accent(),
+            btn::system_accent(self.theme, palette.bg),
             high_contrast.as_ref(),
         );
         let text = window_text(dis.hwndItem);
@@ -5548,7 +5548,12 @@ mod tests {
             let preview = card.inner.preview.as_ref().unwrap();
             let (do_it, edit) = (preview.do_it_btn, preview.edit_btn.unwrap());
             let do_px = drawn_pixel(&mut card, do_it, ID_PREVIEW_DO_IT, 0, 8, 12);
-            assert_eq!(do_px, system_accent(), "Do it fills with the accent");
+            let bg = palette_for(theme, &SysColors::read()).bg;
+            assert_eq!(
+                do_px,
+                system_accent(theme, bg),
+                "Do it fills with the accent"
+            );
             let edit_px = drawn_pixel(&mut card, edit, ID_PREVIEW_EDIT, 0, 8, 12);
             assert_eq!(
                 edit_px,
