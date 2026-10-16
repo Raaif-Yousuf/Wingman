@@ -25,6 +25,12 @@ pub fn acl_args(dir: &Path, user: &str) -> Vec<OsString> {
 /// store must not open: an unrestricted store is what this module exists to
 /// avoid.
 pub fn restrict_dir(dir: &Path) -> Result<(), StoreError> {
+    // Portable mode (#130): an owner-only folder from one PC would lock the
+    // next user out, and FAT/exFAT has no ACLs to set. Skipped, so the store
+    // keeps the drive's permissions and the drive should be kept private.
+    if crate::portable::skip_acl() {
+        return Ok(());
+    }
     let user = std::env::var("USERNAME")
         .ok()
         .filter(|u| !u.is_empty())
