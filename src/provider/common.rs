@@ -697,6 +697,13 @@ fn log_attempt(
             Some(&format!("HTTP {status} then body read failed: {error}")),
         ),
     };
+    record_entry(entry, redactions);
+}
+
+/// Writes one egress row with the text step's counts added. Both send paths
+/// end here, so a row can never miss them. Image counts are per painted
+/// region; text counts are per distinct value replaced (#508).
+fn record_entry(entry: egress::EgressEntry, redactions: &crate::redact::Redactions) {
     egress::record(&entry.with_text_redactions(redactions.counts()));
 }
 
@@ -988,16 +995,19 @@ pub(crate) fn post_json_with_connect_timeout(
     let mut response = match sent {
         Ok(r) => r,
         Err(e) => {
-            egress::record(&egress::build_entry(
-                tag,
-                url,
-                body,
-                false,
-                bytes_sent,
-                0,
-                egress::Outcome::Failure,
-                Some(&format!("transport error: {e}")),
-            ));
+            record_entry(
+                egress::build_entry(
+                    tag,
+                    url,
+                    body,
+                    false,
+                    bytes_sent,
+                    0,
+                    egress::Outcome::Failure,
+                    Some(&format!("transport error: {e}")),
+                ),
+                &redactions,
+            );
             return Err(anyhow!("{tag}: transport error: {}", redact_detail(&e)));
         }
     };
@@ -1006,16 +1016,19 @@ pub(crate) fn post_json_with_connect_timeout(
     let body_text = match response.body_mut().read_to_string() {
         Ok(t) => t,
         Err(e) => {
-            egress::record(&egress::build_entry(
-                tag,
-                url,
-                body,
-                false,
-                bytes_sent,
-                0,
-                egress::Outcome::Failure,
-                Some(&format!("failed to read response body: {e}")),
-            ));
+            record_entry(
+                egress::build_entry(
+                    tag,
+                    url,
+                    body,
+                    false,
+                    bytes_sent,
+                    0,
+                    egress::Outcome::Failure,
+                    Some(&format!("failed to read response body: {e}")),
+                ),
+                &redactions,
+            );
             return Err(anyhow!(
                 "{tag}: failed to read response body: {}",
                 redact_detail(&e)
@@ -1025,21 +1038,24 @@ pub(crate) fn post_json_with_connect_timeout(
 
     if !status.is_success() {
         let truncated = redact_and_truncate(&body_text);
-        egress::record(&egress::build_entry(
-            tag,
-            url,
-            body,
-            false,
-            bytes_sent,
-            body_text.len(),
-            egress::Outcome::Failure,
-            Some(&format!("HTTP {status}: {truncated}")),
-        ));
+        record_entry(
+            egress::build_entry(
+                tag,
+                url,
+                body,
+                false,
+                bytes_sent,
+                body_text.len(),
+                egress::Outcome::Failure,
+                Some(&format!("HTTP {status}: {truncated}")),
+            ),
+            &redactions,
+        );
         return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
     }
 
-    egress::record(
-        &egress::build_entry(
+    record_entry(
+        egress::build_entry(
             tag,
             url,
             body,
@@ -1050,6 +1066,7 @@ pub(crate) fn post_json_with_connect_timeout(
             None,
         )
         .with_cost(success_cost(tag, url, body, &body_text)),
+        &redactions,
     );
     Ok(redactions.restore_in_json(body_text))
 }
@@ -1566,6 +1583,28 @@ mod tests {
             "anthropic",
         )
         .unwrap();
+        let log = crate::egress::read_all();
+        let row = log.lines().last().expect("one row");
+        let v: serde_json::Value = serde_json::from_str(row).unwrap();
+        assert_eq!(v["redactions"]["card number"], 1, "{row}");
+        assert_eq!(v["redactions"]["email"], 1, "{row}");
+        assert!(!row.contains("4111"), "{row}");
+    }
+
+    #[test]
+    fn the_connect_timeout_path_logs_text_counts_too() {
+        let _g = network_guard();
+        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        // `.invalid` never resolves, so this fails fast and still logs a row.
+        let r = post_json_with_connect_timeout(
+            "https://example.invalid/v1/chat",
+            &[],
+            private_body(),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            "ollama chat",
+        );
+        assert!(r.is_err());
         let log = crate::egress::read_all();
         let row = log.lines().last().expect("one row");
         let v: serde_json::Value = serde_json::from_str(row).unwrap();
