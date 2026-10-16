@@ -7,8 +7,8 @@
 //! helpers every surface uses to know when to call them again. Colours are GDI
 //! `COLORREF` values (`0x00BBGGRR`), the same layout `rgb` builds.
 //!
-//! The card and the region overlay paint from these tokens in light, dark and
-//! high contrast. The palette and Settings move onto them in later slices.
+//! The card, the region overlay and the palette paint from these tokens in
+//! light, dark and high contrast. Settings moves onto them in a later slice.
 
 use std::ffi::c_void;
 
