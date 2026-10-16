@@ -3636,7 +3636,7 @@ impl App {
 
         let p = &self.config.providers;
         self.tray
-            .set_active_provider(ActiveProvider::from_order(&p.order));
+            .set_active_provider(ActiveProvider::shown_for(&p.order));
         self.tray.set_models(
             &p.openai.models,
             &p.openai.model,
