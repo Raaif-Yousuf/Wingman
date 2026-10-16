@@ -126,15 +126,13 @@ fn is_space_separator(c: char) -> bool {
 }
 
 /// A separator between the digit groups of a card number: any space from
-/// [`is_space_separator`] or a hyphen-like character (ASCII hyphen, U+2010 to
-/// U+2015 including the non-breaking hyphen, minus sign U+2212, small and
-/// full-width hyphen-minus).
+/// [`is_space_separator`] or a hyphen character (ASCII hyphen, U+2010 to
+/// U+2012 including the non-breaking hyphen, small and full-width hyphen-minus).
+/// En and em dashes and the minus sign are deliberately not here: in prose and
+/// tables they sit between unrelated numbers, and chaining those would paint
+/// over innocent text in screenshots.
 fn is_card_separator(c: char) -> bool {
-    is_space_separator(c)
-        || matches!(
-            c,
-            '-' | '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{FE63}' | '\u{FF0D}'
-        )
+    is_space_separator(c) || matches!(c, '-' | '\u{2010}'..='\u{2012}' | '\u{FE63}' | '\u{FF0D}')
 }
 
 /// Extracts maximal runs of `[0-9 -]` from `text`, returning just the
@@ -523,9 +521,8 @@ mod tests {
     }
 
     /// Separators #726 names, placed between the groups of one Visa test number.
-    const CARD_SEPARATORS: [char; 10] = [
+    const CARD_SEPARATORS: [char; 7] = [
         '\u{A0}', '\u{202F}', '\u{2009}', '\u{3000}', '\u{2010}', '\u{2011}', '\u{2012}',
-        '\u{2013}', '\u{2014}', '\u{2212}',
     ];
 
     fn card_with(sep: char) -> String {
@@ -543,6 +540,15 @@ mod tests {
             assert_eq!(known.len(), 1, "known prefix {sep:?}");
             // The kept text is untouched: the span is exactly the number.
             assert_eq!(&text[known[0].clone()], card, "range {sep:?}");
+        }
+    }
+
+    #[test]
+    fn prose_dashes_do_not_chain_separate_numbers() {
+        for dash in ['\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}'] {
+            let text = format!("4111 {dash} 1111 {dash} 1111 {dash} 1111");
+            assert!(card_number_spans(&text).is_empty(), "{dash:?}");
+            assert!(!contains_card_number(&text), "{dash:?}");
         }
     }
 
