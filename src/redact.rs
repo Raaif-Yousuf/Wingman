@@ -599,14 +599,21 @@ fn apply_password_fields(raw: &mut RawShot) -> Result<usize> {
 /// when `raw` was captured (#575). Returns how many regions were painted.
 /// Needs no lookup and nothing to wait for: the rectangles were read at
 /// capture time. A shot with no screen map has none.
-fn apply_manager_windows(raw: &mut RawShot) -> usize {
+///
+/// Fails closed: a list that could not be built (the window enumeration
+/// failed, ran out of budget, or found too many managers) is an `Err`, so
+/// nothing unpainted is sent.
+fn apply_manager_windows(raw: &mut RawShot) -> Result<usize> {
     let Some(map) = &raw.screen else {
-        return 0;
+        return Ok(0);
     };
-    let regions = password_regions(&map.manager_windows, map, raw.width, raw.height);
+    let rects = map.manager_windows.as_ref().map_err(|why| {
+        anyhow::anyhow!("password manager windows: {why}").context(FAILURE_NEEDLE)
+    })?;
+    let regions = password_regions(rects, map, raw.width, raw.height);
     paint(raw, &regions);
     note_image_redactions("password manager", regions.len());
-    regions.len()
+    Ok(regions.len())
 }
 
 /// Paints the password-field `regions` and counts them for the egress log.
@@ -669,7 +676,7 @@ pub fn apply(raw: &mut RawShot) -> Result<usize> {
         .context(FAILURE_NEEDLE)?;
     // A password manager beside the front window is a whole window, painted
     // before anything else so nothing of it is read or sent (#575).
-    let managers = apply_manager_windows(raw);
+    let managers = apply_manager_windows(raw)?;
     // Password fields: OCR cannot read a masked field, and a revealed one is
     // not key-shaped (#506). A lookup that fails fails closed, like OCR.
     let passwords = apply_password_fields(raw)?;
@@ -1360,8 +1367,8 @@ mod tests {
     fn a_password_manager_window_is_painted_and_counted() {
         reset_image_counts();
         let mut raw = shot_with(None);
-        raw.screen.as_mut().unwrap().manager_windows = vec![sr(50, 0, 100, 100)];
-        assert_eq!(apply_manager_windows(&mut raw), 1);
+        raw.screen.as_mut().unwrap().manager_windows = Ok(vec![sr(50, 0, 100, 100)]);
+        assert_eq!(apply_manager_windows(&mut raw).unwrap(), 1);
         assert_eq!(&raw.rgba[(50 * 100 + 75) * 4..][..4], &FILL);
         assert_eq!(&raw.rgba[(50 * 100 + 10) * 4..][..4], &[255; 4]);
         assert_eq!(image_counts().get("password manager"), Some(&1));
@@ -1370,15 +1377,24 @@ mod tests {
     #[test]
     fn manager_windows_off_the_image_paint_nothing_and_a_bare_shot_is_left_alone() {
         let mut raw = shot_with(None);
-        raw.screen.as_mut().unwrap().manager_windows = vec![
+        raw.screen.as_mut().unwrap().manager_windows = Ok(vec![
             sr(500, 500, 600, 600),
             sr(i32::MIN, i32::MIN, i32::MIN + 5, i32::MIN + 5),
             sr(30, 30, 10, 10),
-        ];
-        assert_eq!(apply_manager_windows(&mut raw), 0);
+        ]);
+        assert_eq!(apply_manager_windows(&mut raw).unwrap(), 0);
         assert!(raw.rgba.iter().all(|b| *b == 255));
         let mut bare = white(10, 10);
-        assert_eq!(apply_manager_windows(&mut bare), 0);
+        assert_eq!(apply_manager_windows(&mut bare).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_manager_list_that_could_not_be_built_fails_closed_and_paints_nothing() {
+        let mut raw = shot_with(None);
+        raw.screen.as_mut().unwrap().manager_windows = Err("too many".to_string());
+        let err = apply_manager_windows(&mut raw).unwrap_err();
+        assert!(format!("{err:#}").contains(FAILURE_NEEDLE), "{err:#}");
+        assert!(raw.rgba.iter().all(|b| *b == 255));
     }
 
     #[test]
@@ -1407,7 +1423,11 @@ mod tests {
 ",
                 )
                 .unwrap()];
-        assert!(body.contains("manager_windows_on("), "{body}");
+        assert!(
+            body.contains("screen.manager_windows = managers;")
+                && body.contains("manager_windows_on("),
+            "{body}"
+        );
     }
 
     fn shot_with(lookup: Option<crate::inputs::uia::PasswordLookup>) -> RawShot {
