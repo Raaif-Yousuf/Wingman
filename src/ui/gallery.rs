@@ -68,6 +68,13 @@ pub enum GalleryState {
     PaletteRouterSuggestion,
     PaletteNoMatches,
     PaletteNoModel,
+    /// Issue #560: the Settings window from a default config, Advanced
+    /// collapsed, scrolled to the top / bottom.
+    SettingsTop,
+    SettingsBottom,
+    /// Issue #560: the same with Advanced expanded.
+    SettingsAdvancedTop,
+    SettingsAdvancedBottom,
 }
 
 /// The full ordered list of states the gallery steps through. Order is the
@@ -91,6 +98,10 @@ pub fn gallery_states() -> Vec<GalleryState> {
         PaletteRouterSuggestion,
         PaletteNoMatches,
         PaletteNoModel,
+        SettingsTop,
+        SettingsBottom,
+        SettingsAdvancedTop,
+        SettingsAdvancedBottom,
     ]
 }
 
@@ -116,6 +127,10 @@ pub fn state_name(state: GalleryState) -> &'static str {
         PaletteRouterSuggestion => "palette-router-suggestion",
         PaletteNoMatches => "palette-no-matches",
         PaletteNoModel => "palette-no-model",
+        SettingsTop => "settings-top",
+        SettingsBottom => "settings-bottom",
+        SettingsAdvancedTop => "settings-advanced-top",
+        SettingsAdvancedBottom => "settings-advanced-bottom",
     }
 }
 
@@ -148,6 +163,7 @@ mod driver {
     use crate::ui::card::Card;
     use crate::ui::palette::Palette;
     use crate::ui::palette_model::PaletteAction;
+    use crate::ui::settings::GalleryWindow;
     use std::time::Duration;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
@@ -178,13 +194,14 @@ mod driver {
 
         let mut card = Card::new_for_test(instance)?;
         let mut palette = Palette::new_for_test(instance)?;
+        let mut settings: Option<GalleryWindow> = None;
 
         let states = gallery_states();
 
         if let Some(dir) = &args.screenshot_dir {
             std::fs::create_dir_all(dir)?;
             for state in &states {
-                let hwnd = show_state(&mut card, &mut palette, *state);
+                let hwnd = show_state(&mut card, &mut palette, &mut settings, *state)?;
                 pump_and_wait(Duration::from_millis(120));
                 let path = dir.join(screenshot_filename(state_name(*state)));
                 print_window_png(hwnd, &path)?;
@@ -193,7 +210,7 @@ mod driver {
         }
 
         let mut idx = 0usize;
-        let hwnd0 = show_state(&mut card, &mut palette, states[idx]);
+        let hwnd0 = show_state(&mut card, &mut palette, &mut settings, states[idx])?;
         let _ = hwnd0;
         let mut msg = MSG::default();
         while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -201,10 +218,10 @@ mod driver {
                 let vk = msg.wParam.0 as u16;
                 if vk == VK_RIGHT.0 && idx + 1 < states.len() {
                     idx += 1;
-                    show_state(&mut card, &mut palette, states[idx]);
+                    show_state(&mut card, &mut palette, &mut settings, states[idx])?;
                 } else if vk == VK_LEFT.0 && idx > 0 {
                     idx -= 1;
-                    show_state(&mut card, &mut palette, states[idx]);
+                    show_state(&mut card, &mut palette, &mut settings, states[idx])?;
                 }
             }
             unsafe {
@@ -302,8 +319,19 @@ mod driver {
         ]
     }
 
-    fn show_state(card: &mut Card, palette: &mut Palette, state: GalleryState) -> HWND {
+    fn show_state(
+        card: &mut Card,
+        palette: &mut Palette,
+        settings: &mut Option<GalleryWindow>,
+        state: GalleryState,
+    ) -> anyhow::Result<HWND> {
         use GalleryState::*;
+        *settings = None;
+        let instance = unsafe {
+            windows::Win32::Foundation::HINSTANCE(
+                windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?.0,
+            )
+        };
         match state {
             CardAnswerShort => {
                 card.hide();
@@ -429,13 +457,29 @@ mod driver {
                 palette.hide();
                 palette.show(free_palette_catalogue(), false, "mode: Auto".to_string());
             }
+            SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => {
+                card.hide();
+                palette.hide();
+                let mut w = GalleryWindow::open(instance)
+                    .ok_or_else(|| anyhow::anyhow!("could not open the Settings window"))?;
+                w.set_advanced(matches!(
+                    state,
+                    SettingsAdvancedTop | SettingsAdvancedBottom
+                ));
+                w.scroll_to_end(matches!(state, SettingsBottom | SettingsAdvancedBottom));
+                *settings = Some(w);
+            }
         }
-        match state {
+        Ok(match state {
             PaletteDefault | PaletteRouterSuggestion | PaletteNoMatches | PaletteNoModel => {
                 palette.hwnd()
             }
+            SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => settings
+                .as_ref()
+                .map(|w| w.hwnd())
+                .ok_or_else(|| anyhow::anyhow!("no Settings window"))?,
             _ => card.hwnd(),
-        }
+        })
     }
 
     /// Captures `hwnd`'s client area via `PrintWindow` and saves it as a PNG
@@ -492,6 +536,9 @@ mod driver {
             // BGRA -> RGBA for the `image` crate.
             for px in buf.chunks_exact_mut(4) {
                 px.swap(0, 2);
+                // GDI drawing leaves alpha at 0, which a PNG viewer shows as
+                // a blank page (Settings, palette). The window is opaque.
+                px[3] = 255;
             }
             let img: image::RgbaImage =
                 image::ImageBuffer::from_raw(width as u32, height as u32, buf)
@@ -580,8 +627,8 @@ mod tests {
         let states = gallery_states();
         // 5 card-answer variants (short + 4 difficulty badges) + error + 4
         // pending sub-stages (#354) + 2 previews = 12 card states, + 4
-        // palette states = 16.
-        assert_eq!(states.len(), 16);
+        // palette states + 4 settings states (#560) = 20.
+        assert_eq!(states.len(), 20);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -589,6 +636,19 @@ mod tests {
             states.len(),
             "every gallery state must have a unique name"
         );
+    }
+
+    #[test]
+    fn the_settings_states_are_listed_in_scroll_and_advanced_pairs() {
+        let names: Vec<&str> = gallery_states().into_iter().map(state_name).collect();
+        for want in [
+            "settings-top",
+            "settings-bottom",
+            "settings-advanced-top",
+            "settings-advanced-bottom",
+        ] {
+            assert!(names.contains(&want), "missing {want}");
+        }
     }
 
     #[test]

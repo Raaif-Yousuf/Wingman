@@ -4655,6 +4655,142 @@ fn put_on_clipboard(owner: HWND, text: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `--ui-gallery` support (#560, debug builds only)
+// ---------------------------------------------------------------------------
+
+/// Window class for the gallery's Settings window: the production `wndproc`
+/// under its own name, so the gallery never touches [`CLASS_NAME`] (rule 9).
+#[cfg(debug_assertions)]
+const GALLERY_CLASS_NAME: &str = "Wingman.Settings.Gallery.3b8f6a52";
+
+/// A Settings window built from `Config::default()` for the offline gallery:
+/// no message loop, no `OPEN_HWND`, no Ollama or cloud model fetch, never the
+/// user's `config.toml`. Dropping it destroys the window.
+#[cfg(debug_assertions)]
+pub struct GalleryWindow {
+    raw: *mut SettingsInner,
+}
+
+#[cfg(debug_assertions)]
+impl GalleryWindow {
+    /// Opens the window and shows it without taking focus.
+    pub fn open(instance: HINSTANCE) -> Option<GalleryWindow> {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        ONCE.call_once(|| {
+            let _ = OK.set(unsafe { register_class_named(instance, GALLERY_CLASS_NAME) });
+        });
+        if !OK.get().copied().unwrap_or(false) {
+            return None;
+        }
+        ensure_common_controls();
+
+        let config = Config::default();
+        let raw = Box::into_raw(Box::new(SettingsInner::new(config.clone())));
+        let class_name = wide_z(GALLERY_CLASS_NAME);
+        let title = wide_z("Wingman settings (gallery)");
+        let created = unsafe {
+            CreateWindowExW(
+                WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_CAPTION | WS_SYSMENU,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                window_width_px(96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                Some(raw as *const c_void),
+            )
+        };
+        let Ok(hwnd) = created else {
+            unsafe { drop(Box::from_raw(raw)) };
+            return None;
+        };
+        // From here the window owns nothing the Drop below cannot free.
+        let gallery = GalleryWindow { raw };
+        let inner = unsafe { &mut *raw };
+        inner.hwnd = hwnd;
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        inner.font = build_font(dpi);
+        let fitted_h = fitted_height_dp(hwnd, dpi);
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                window_width_px(dpi),
+                to_px(fitted_h, dpi),
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+        }
+        let mut rc = windows::Win32::Foundation::RECT::default();
+        let client_h_dp = if unsafe { GetClientRect(hwnd, &mut rc) }.is_ok() {
+            ((rc.bottom - rc.top) * 96 / dpi as i32).max(1)
+        } else {
+            fitted_h
+        };
+        inner.dpi = dpi;
+        let built = build_ui_recorded(hwnd, instance, dpi, inner.font, &config, client_h_dp);
+        inner.adopt(built);
+        unsafe {
+            show_prompt_state(inner);
+            let _ = ShowWindow(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE,
+            );
+        }
+        Some(gallery)
+    }
+
+    pub fn hwnd(&self) -> HWND {
+        unsafe { (*self.raw).hwnd }
+    }
+
+    /// Expands or collapses the Advanced group (what its toggle does).
+    pub fn set_advanced(&mut self, expanded: bool) {
+        let inner = unsafe { &mut *self.raw };
+        if inner.prompt_expanded != expanded {
+            inner.prompt_expanded = expanded;
+            unsafe { show_prompt_state(inner) };
+        }
+    }
+
+    /// Scrolls the body to the top or the bottom (the scrollbar's Home and
+    /// End).
+    pub fn scroll_to_end(&mut self, bottom: bool) {
+        let inner = unsafe { &*self.raw };
+        let code = if bottom {
+            windows::Win32::UI::WindowsAndMessaging::SB_BOTTOM
+        } else {
+            windows::Win32::UI::WindowsAndMessaging::SB_TOP
+        };
+        unsafe {
+            SendMessageW(
+                inner.body,
+                WM_VSCROLL,
+                Some(WPARAM(code.0 as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for GalleryWindow {
+    fn drop(&mut self) {
+        // WM_DESTROY frees the font and flags the close; the Box is ours.
+        unsafe {
+            let _ = DestroyWindow((*self.raw).hwnd);
+            drop(Box::from_raw(self.raw));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
