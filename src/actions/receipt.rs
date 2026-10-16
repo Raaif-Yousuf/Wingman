@@ -4,7 +4,7 @@
 //! Nothing here needs new plumbing. The model fills the same `table` proposal
 //! as "Table to CSV" (#69) with a fixed header and a single row; the preview
 //! card shows that row, and "Do it" runs the `clipboard` executor, which writes
-//! it through [`super::table`]'s CSV quoting and spreadsheet-formula guard. A
+//! it through [`super::table`]'s tab-separated quoting and spreadsheet-formula guard. A
 //! merchant name read off a hostile receipt cannot run as a formula.
 
 use super::{Action, InputKind, Prefer};
@@ -106,9 +106,9 @@ mod tests {
             "rows": [["2026-10-03", "Cafe Nero, Main St", "12.50", "GBP", "Meals"]]
         });
         assert_eq!(
-            crate::actions::table::csv_from_value(&clamp_receipt(&p)).unwrap(),
-            "Date,Merchant,Amount,Currency,Category\r\n\
-             2026-10-03,\"Cafe Nero, Main St\",12.50,GBP,Meals"
+            crate::actions::table::tsv_from_value(&clamp_receipt(&p)).unwrap(),
+            "Date\tMerchant\tAmount\tCurrency\tCategory\r\n\
+             2026-10-03\tCafe Nero, Main St\t12.50\tGBP\tMeals"
         );
     }
 
@@ -118,7 +118,7 @@ mod tests {
             "columns": COLUMNS,
             "rows": [["2026-10-03", "=HYPERLINK(\"http://x\")", "5.00", "USD", "Other"]]
         });
-        let csv = crate::actions::table::csv_from_value(&clamp_receipt(&p)).unwrap();
+        let csv = crate::actions::table::tsv_from_value(&clamp_receipt(&p)).unwrap();
         assert!(csv.contains("\"'=HYPERLINK("), "{csv}");
     }
 
@@ -126,7 +126,7 @@ mod tests {
     fn no_receipt_is_an_empty_table() {
         let p = clamp_receipt(&json!({"columns": [], "rows": []}));
         assert!(crate::actions::table::is_empty_result("table", &p));
-        assert!(crate::actions::table::csv_from_value(&p).is_none());
+        assert!(crate::actions::table::tsv_from_value(&p).is_none());
         let headers_only = clamp_receipt(&json!({"columns": COLUMNS, "rows": []}));
         assert!(crate::actions::table::is_empty_result(
             "table",
