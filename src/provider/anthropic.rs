@@ -206,7 +206,7 @@ impl Provider for Anthropic {
                 ("anthropic-version", ANTHROPIC_VERSION),
                 ("content-type", "application/json"),
             ],
-            &body,
+            body,
             REQUEST_TIMEOUT,
             "anthropic",
         )?;

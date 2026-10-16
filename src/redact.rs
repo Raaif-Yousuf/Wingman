@@ -94,7 +94,8 @@ pub fn email_spans(text: &str) -> Vec<Range<usize>> {
 
 /// Every sensitive byte range in one line of text, sorted by start: card
 /// numbers, IBANs, key-shaped tokens, emails. Ranges may overlap (a key-shaped
-/// run can contain digits that also pass Luhn); callers paint each one.
+/// run can contain digits that also pass Luhn); callers paint each one. This
+/// is the screenshot rule set; text uses [`text_spans`], which is narrower.
 pub fn sensitive_spans(text: &str) -> Vec<Range<usize>> {
     let mut spans = crate::payment_denylist::card_number_spans(text);
     spans.extend(crate::payment_denylist::iban_spans(text));
@@ -102,6 +103,318 @@ pub fn sensitive_spans(text: &str) -> Vec<Range<usize>> {
     spans.extend(email_spans(text));
     spans.sort_by_key(|r| (r.start, r.end));
     spans
+}
+
+// -- text redaction (#505) -------------------------------------------------
+//
+// The same four kinds as the screenshot step, with rules tuned for running
+// text instead of OCR lines: free text is long and mostly innocent, so a
+// false positive costs the model real context. Differences from the pixel
+// rules: card numbers need a known network prefix, and key-shaped tokens use
+// a narrow rule (a known vendor prefix, or a long digit-bearing alphanumeric
+// run) and are never looked for inside a URL.
+
+/// Marker label for each kind. The marker in the request is `[label N]`.
+const CARD: &str = "card number";
+const IBAN: &str = "IBAN";
+const KEY: &str = "key";
+const EMAIL: &str = "email";
+
+/// Vendor key prefixes. A run starting with one of these is a key from
+/// [`MIN_PREFIXED_KEY_CHARS`] characters on.
+const KEY_PREFIXES: &[&str] = &[
+    "sk-",
+    "sk_",
+    "pk_",
+    "rk_",
+    "AIza",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "glpat-",
+    "hf_",
+    "whsec_",
+];
+const MIN_PREFIXED_KEY_CHARS: usize = 16;
+/// A run with no known prefix must be this long, purely alphanumeric, and
+/// hold both a digit and a letter. A hyphenated or underscored run is a slug
+/// or an identifier (`2024-10-15-weekly-sync-notes`), not a key.
+const MIN_BARE_KEY_CHARS: usize = 24;
+
+/// True when a whitespace-free chunk is a URL or a web address (`https://x`,
+/// `www.x`, `docs.google.com/d/<id>`): its long ids are links, not secrets.
+fn url_shaped(chunk: &str) -> bool {
+    if chunk.contains("://") || chunk.starts_with("www.") {
+        return true;
+    }
+    match chunk.find('/') {
+        Some(slash) => {
+            let host = &chunk[..slash];
+            host.contains('.') && !host.contains('@') && !host.starts_with('.')
+        }
+        None => false,
+    }
+}
+
+fn is_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// An AWS access key id: `AKIA` or `ASIA` then exactly 16 upper-case letters
+/// or digits, 20 in all. `run` is already bounded by non-key characters, so
+/// the whole run must be that shape (`ASIA-PACIFIC-REGION-REPORT` is not).
+fn is_aws_key_id(run: &str) -> bool {
+    run.len() == 20
+        && (run.starts_with("AKIA") || run.starts_with("ASIA"))
+        && run[4..]
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// A key with a recognisable vendor shape. Safe to apply inside a link too:
+/// a vendor prefix is not something a document id happens to start with.
+fn is_prefixed_key_run(run: &str) -> bool {
+    is_aws_key_id(run)
+        || (run.len() >= MIN_PREFIXED_KEY_CHARS && KEY_PREFIXES.iter().any(|p| run.starts_with(p)))
+}
+
+/// A long letters-and-digits run with no vendor shape. Not applied inside a
+/// link, where long mixed-case ids are ordinary.
+fn is_bare_key_run(run: &str) -> bool {
+    run.len() >= MIN_BARE_KEY_CHARS
+        && run.bytes().all(|b| b.is_ascii_alphanumeric())
+        && run.bytes().any(|b| b.is_ascii_digit())
+        && run.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+/// Key-shaped runs inside one whitespace-free chunk of `text`. A URL-shaped
+/// chunk only gets the vendor-shape rule, never the bare-run rule.
+fn chunk_key_spans(text: &str, range: Range<usize>, spans: &mut Vec<Range<usize>>) {
+    let chunk = &text[range.clone()];
+    let in_link = url_shaped(chunk);
+    let mut run_start = None;
+    // A trailing space sentinel closes a run that reaches the chunk's end.
+    for (i, c) in chunk
+        .char_indices()
+        .chain(std::iter::once((chunk.len(), ' ')))
+    {
+        match (is_key_char(c), run_start) {
+            (true, None) => run_start = Some(i),
+            (false, Some(b)) => {
+                run_start = None;
+                let run = &chunk[b..i];
+                if is_prefixed_key_run(run) || (!in_link && is_bare_key_run(run)) {
+                    spans.push(range.start + b..range.start + i);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Byte ranges of key-shaped tokens in running text (see the section note).
+fn text_key_spans(text: &str) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    let mut chunk_start = None;
+    for (i, c) in text.char_indices() {
+        match (c.is_whitespace(), chunk_start) {
+            (false, None) => chunk_start = Some(i),
+            (true, Some(b)) => {
+                chunk_key_spans(text, b..i, &mut spans);
+                chunk_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(b) = chunk_start {
+        chunk_key_spans(text, b..text.len(), &mut spans);
+    }
+    spans
+}
+
+/// Every sensitive byte range in `text` with its marker label, sorted by
+/// start. Ranges may overlap (a key can contain digits that pass Luhn).
+fn text_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
+    let mut spans: Vec<(Range<usize>, &'static str)> = Vec::new();
+    let mut add = |found: Vec<Range<usize>>, label| {
+        spans.extend(found.into_iter().map(|r| (r, label)));
+    };
+    add(
+        crate::payment_denylist::card_number_spans_with_known_prefix(text),
+        CARD,
+    );
+    add(crate::payment_denylist::iban_spans(text), IBAN);
+    add(text_key_spans(text), KEY);
+    add(email_spans(text), EMAIL);
+    spans.sort_by_key(|(r, _)| (r.start, r.end));
+    spans
+}
+
+/// The private details swapped out of one outbound request, kept only in
+/// memory for the life of that request so the answer can get its real values
+/// back. Numbered markers (`[email 1]`); the same value always gets the same
+/// marker. Never logged, never stored: `Debug` prints a count, and the type
+/// has no `Clone` or `Serialize`.
+#[derive(Default)]
+pub struct Redactions {
+    /// `(marker, original)` in first-seen order.
+    pairs: Vec<(String, String)>,
+    /// The highest number used so far per label, counting both the markers
+    /// issued here and any `[label N]` already written in the input, so a new
+    /// marker can never be confused with text that was there already.
+    last: std::collections::HashMap<&'static str, u32>,
+}
+
+impl std::fmt::Debug for Redactions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Redactions({} item(s))", self.pairs.len())
+    }
+}
+
+impl Redactions {
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Notes every `[label N]` already written in `text`, so numbering
+    /// starts above it. Call on all of a request's text before redacting any
+    /// of it ([`Redactions::redact_value`] does).
+    pub fn note_existing(&mut self, text: &str) {
+        if !text.contains('[') {
+            return;
+        }
+        for label in [CARD, IBAN, KEY, EMAIL] {
+            let open = format!("[{label} ");
+            for (at, _) in text.match_indices(&open) {
+                let rest = &text[at + open.len()..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if !digits.is_empty() && rest[digits.len()..].starts_with(']') {
+                    if let Ok(n) = digits.parse::<u32>() {
+                        let slot = self.last.entry(label).or_insert(0);
+                        *slot = (*slot).max(n);
+                    }
+                }
+            }
+        }
+    }
+
+    fn marker_for(&mut self, label: &'static str, original: &str) -> String {
+        if let Some((marker, _)) = self.pairs.iter().find(|(_, o)| o == original) {
+            return marker.clone();
+        }
+        let n = self.last.get(label).copied().unwrap_or(0) + 1;
+        self.last.insert(label, n);
+        let marker = format!("[{label} {n}]");
+        self.pairs.push((marker.clone(), original.to_string()));
+        marker
+    }
+
+    /// `text` with every sensitive span replaced by its numbered marker.
+    /// Overlapping spans become one marker, the first one's. Text with
+    /// nothing sensitive comes back unchanged.
+    pub fn redact_text(&mut self, text: &str) -> String {
+        let spans = text_spans(text);
+        if spans.is_empty() {
+            return text.to_string();
+        }
+        self.note_existing(text);
+        // Join overlapping spans into one range each, keeping the first
+        // one's label, so the stored original is the whole union and the
+        // restored answer loses nothing.
+        let mut groups: Vec<(Range<usize>, &'static str)> = Vec::new();
+        for (r, label) in spans {
+            match groups.last_mut() {
+                Some((last, _)) if r.start < last.end => last.end = last.end.max(r.end),
+                _ => groups.push((r, label)),
+            }
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        for (r, label) in groups {
+            out.push_str(&text[at..r.start]);
+            out.push_str(&self.marker_for(label, &text[r.clone()]));
+            at = r.end;
+        }
+        out.push_str(&text[at..]);
+        out
+    }
+
+    /// Puts the originals back into a model response that is JSON text.
+    /// Each original is JSON-escaped first, so a restored value can never
+    /// break the document. A marker the model made up, one not in this
+    /// request's list, is left as it is.
+    pub fn restore_in_json(&self, response: String) -> String {
+        let mut out = response;
+        for (marker, original) in &self.pairs {
+            if !out.contains(marker.as_str()) {
+                continue;
+            }
+            let escaped = serde_json::to_string(original).unwrap_or_default();
+            let escaped = escaped
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or("");
+            out = out.replace(marker.as_str(), escaped);
+        }
+        out
+    }
+
+    /// Redacts every text string in a provider request body, in place, and
+    /// says whether anything changed. Skips structural metadata (`model`,
+    /// `role`, ...) and embedded PNGs, which the pixel step already handled
+    /// and which a text rule would corrupt. In place on purpose: nothing is
+    /// copied, images included.
+    pub fn redact_value(&mut self, v: &mut serde_json::Value) -> bool {
+        self.note_existing_in(v);
+        self.redact_value_under(v, "")
+    }
+
+    fn note_existing_in(&mut self, v: &serde_json::Value) {
+        use serde_json::Value;
+        match v {
+            Value::String(s) => self.note_existing(s),
+            Value::Array(items) => items.iter().for_each(|i| self.note_existing_in(i)),
+            Value::Object(map) => map.values().for_each(|i| self.note_existing_in(i)),
+            _ => {}
+        }
+    }
+
+    fn redact_value_under(&mut self, v: &mut serde_json::Value, key: &str) -> bool {
+        use serde_json::Value;
+        match v {
+            Value::String(s) => {
+                if crate::egress::is_structural_key(key) || crate::egress::is_embedded_png(s) {
+                    return false;
+                }
+                let redacted = self.redact_text(s);
+                if redacted == *s {
+                    return false;
+                }
+                *s = redacted;
+                true
+            }
+            Value::Array(items) => {
+                let mut changed = false;
+                for i in items {
+                    changed |= self.redact_value_under(i, key);
+                }
+                changed
+            }
+            Value::Object(map) => {
+                let mut changed = false;
+                for (k, i) in map.iter_mut() {
+                    changed |= self.redact_value_under(i, k);
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Where each word of `line_text` sits, as byte ranges, found by searching for
@@ -399,6 +712,302 @@ mod tests {
         let t = format!("me@example.com {CARD}");
         let got = text_of(&t, sensitive_spans(&t));
         assert_eq!(got, vec!["me@example.com", CARD]);
+    }
+
+    // -- text redaction (#505) ---------------------------------------------
+
+    /// A fake key, built at run time so no secret-looking literal sits in the
+    /// source for the secret scan to find.
+    fn fake_key() -> String {
+        ["sk-ant-", "api03-", "FAKEFAKEFAKEFAKEFAKE", "1234567890"].concat()
+    }
+
+    fn red(text: &str) -> String {
+        Redactions::default().redact_text(text)
+    }
+
+    #[test]
+    fn redact_text_replaces_each_kind_with_a_numbered_marker() {
+        let key = fake_key();
+        let t = format!(
+            "mail me@example.com card {CARD} iban GB29 NWBK 6016 1331 9268 19 key {key} end"
+        );
+        assert_eq!(
+            red(&t),
+            "mail [email 1] card [card number 1] iban [IBAN 1] key [key 1] end"
+        );
+    }
+
+    #[test]
+    fn the_same_value_gets_the_same_marker_and_a_new_value_the_next_number() {
+        let mut r = Redactions::default();
+        let out = r.redact_text("a@x.org then b@x.org then a@x.org");
+        assert_eq!(out, "[email 1] then [email 2] then [email 1]");
+        // The same instance keeps numbering across calls (one request).
+        assert_eq!(r.redact_text("c@x.org b@x.org"), "[email 3] [email 2]");
+    }
+
+    #[test]
+    fn redact_text_leaves_ordinary_text_alone() {
+        for t in [
+            "A 2 kg block slides 3.5 m down a 30 degree slope.\nWhat is g?",
+            "Internationalization and responsibilities are long words",
+            "see 2024-10-15-weekly-sync-notes-final and my_long_snake_case_identifier_2",
+            "https://example.com/a/b?c=d",
+        ] {
+            assert_eq!(red(t), t, "{t}");
+        }
+    }
+
+    #[test]
+    fn a_google_docs_url_with_a_long_mixed_case_id_survives() {
+        for t in [
+            "open https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit now",
+            "docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit#gid=0",
+            "(https://drive.google.com/file/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/view)",
+            &format!("https://example.com/reset?{}={}", "t", "Ab3dE6gH9jK2mN5pQ8sT1vX4zC7fL0"),
+        ] {
+            assert_eq!(red(t), t, "{t}");
+        }
+    }
+
+    #[test]
+    fn a_vendor_prefixed_key_is_redacted_even_beside_a_url() {
+        let key = fake_key();
+        let t = format!("curl -H {key} and https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms");
+        let got = red(&t);
+        assert!(
+            got.starts_with("curl -H [key 1] and https://docs.google.com/"),
+            "{got}"
+        );
+        assert!(
+            got.contains("1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn a_long_bare_alphanumeric_run_with_a_digit_is_a_key() {
+        assert_eq!(
+            red(&format!(
+                "token {} ok",
+                ["wJalrXUtnFEMIK7MDENG", "bPxRfiCYEXAMPLEKEY1"].concat()
+            )),
+            "token [key 1] ok"
+        );
+    }
+
+    #[test]
+    fn a_luhn_valid_run_with_no_card_prefix_is_not_a_card() {
+        // Valid Luhn, but they start with 1 and 9: tracking and order numbers.
+        assert!(crate::payment_denylist::card_number_spans("1234567890000007").len() == 1);
+        for t in [
+            "tracking 1234567890000007",
+            "order 9234567890000000 shipped",
+        ] {
+            assert_eq!(red(t), t, "{t}");
+        }
+        assert_eq!(red(&format!("pay {CARD}")), "pay [card number 1]");
+    }
+
+    #[test]
+    fn a_card_number_split_by_a_line_break_is_not_one_run() {
+        let t = "4111 1111\n1111 1111";
+        assert_eq!(red(t), t);
+    }
+
+    #[test]
+    fn redact_text_handles_multi_line_and_non_ascii_text() {
+        let t = format!("naïve line one\nCard: {CARD}\nbob@x.org – fin");
+        assert_eq!(
+            red(&t),
+            "naïve line one\nCard: [card number 1]\n[email 1] – fin"
+        );
+    }
+
+    #[test]
+    fn redact_text_uses_one_marker_for_overlapping_matches() {
+        // The key contains digits that also pass Luhn.
+        let t = format!(
+            "k {}4111111111111111FAKEFAKEFAKE9 z",
+            ["sk-ant-", "api03-"].concat()
+        );
+        let got = red(&t);
+        assert!(!got.contains("4111"), "{got}");
+        assert_eq!(got, "k [key 1] z");
+    }
+
+    #[test]
+    fn a_vendor_key_inside_a_url_is_still_a_key() {
+        let key = ["AIza", "SyA1234567890abcdefgh"].concat();
+        let t = format!("https://x.com/a?key={key}");
+        assert_eq!(red(&t), "https://x.com/a?key=[key 1]");
+    }
+
+    #[test]
+    fn a_mastercard_two_series_number_is_a_card() {
+        // Luhn-valid, first four digits 2223 (inside 2221 to 2720).
+        assert_eq!(red("pay 2223000048400011 now"), "pay [card number 1] now");
+        // Luhn-valid but outside the range (2720 is the top, this is 2800).
+        assert_eq!(red("order 2800000000000004"), "order 2800000000000004",);
+    }
+
+    #[test]
+    fn aws_key_ids_need_the_exact_shape() {
+        let id = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+        assert_eq!(red(&format!("id {id} ok")), "id [key 1] ok");
+        let temp = ["ASIA", "IOSFODNN7EXAMPLE"].concat();
+        assert_eq!(red(&format!("({temp})")), "([key 1])");
+        for t in [
+            "ASIA-PACIFIC-REGION-REPORT",
+            "AKIAS are a thing",
+            "AKIAIOSFODNN7EXAMPLE1",
+            "ASIAN-MARKET-REVIEW-2026",
+        ] {
+            assert_eq!(red(t), t, "{t}");
+        }
+    }
+
+    #[test]
+    fn numbering_starts_above_markers_already_in_the_input() {
+        let mut r = Redactions::default();
+        let out = r.redact_text("see [email 1] and a@x.org");
+        assert_eq!(out, "see [email 1] and [email 2]");
+        // Only the real one comes back; the literal text is left alone.
+        assert_eq!(
+            r.restore_in_json(r#"["[email 1]","[email 2]"]"#.to_string()),
+            r#"["[email 1]","a@x.org"]"#
+        );
+    }
+
+    #[test]
+    fn a_literal_marker_in_a_later_field_is_still_not_reused() {
+        let mut v = serde_json::json!({"a": "write a@x.org", "b": "keep [email 1] as is"});
+        let mut r = Redactions::default();
+        r.redact_value(&mut v);
+        assert_eq!(v["a"], "write [email 2]");
+        assert_eq!(v["b"], "keep [email 1] as is");
+    }
+
+    #[test]
+    fn overlapping_matches_store_the_whole_union_as_the_original() {
+        // The key-shaped run and the address share the start; the address
+        // runs on past the key, so the union is the whole thing.
+        let key = ["sk-ant-", "api03-", "FAKEFAKEFAKE12345"].concat();
+        let t = format!("send {key}@example.com now");
+        let mut r = Redactions::default();
+        let out = r.redact_text(&t);
+        assert_eq!(out, "send [key 1] now");
+        assert_eq!(r.restore_in_json(format!("\"{out}\"")), format!("\"{t}\""));
+    }
+
+    #[test]
+    fn restore_puts_the_real_values_back_and_leaves_invented_markers() {
+        let mut r = Redactions::default();
+        r.redact_text(&format!("me@example.com and {CARD}"));
+        let answer = r#"{"to":"[email 1]","card":"[card number 1]","other":"[email 7]"}"#;
+        assert_eq!(
+            r.restore_in_json(answer.to_string()),
+            format!(r#"{{"to":"me@example.com","card":"{CARD}","other":"[email 7]"}}"#)
+        );
+    }
+
+    #[test]
+    fn restore_escapes_the_value_so_the_json_stays_valid() {
+        let mut r = Redactions::default();
+        // A value with a quote and a backslash cannot come from the real
+        // rules, so plant one to prove the escaping on its own.
+        r.pairs.push(("[key 1]".to_string(), "a\"b\\c".to_string()));
+        let out = r.restore_in_json(r#"{"k":"[key 1]"}"#.to_string());
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["k"], "a\"b\\c");
+    }
+
+    #[test]
+    fn restore_with_nothing_redacted_returns_the_response_untouched() {
+        let r = Redactions::default();
+        assert!(r.is_empty());
+        assert_eq!(r.restore_in_json("[email 1]".to_string()), "[email 1]");
+    }
+
+    #[test]
+    fn debug_never_prints_the_originals() {
+        let mut r = Redactions::default();
+        r.redact_text("me@example.com");
+        let shown = format!("{r:?}");
+        assert!(!shown.contains("example"), "{shown}");
+    }
+
+    #[test]
+    fn redact_value_redacts_nested_strings_but_not_structure_or_images() {
+        let png = format!("iVBORw0KGgo{}", "A".repeat(60));
+        let mut v = serde_json::json!({
+            "model": "gpt-5-mini",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "mail me@example.com"},
+                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{png}")}}
+                ]}
+            ],
+            "images": [png.clone()],
+            "options": {"num_ctx": 4096}
+        });
+        let mut r = Redactions::default();
+        assert!(r.redact_value(&mut v));
+        assert_eq!(v["messages"][0]["content"][0]["text"], "mail [email 1]");
+        assert_eq!(v["model"], "gpt-5-mini");
+        assert_eq!(v["messages"][0]["role"], "user");
+        assert_eq!(v["images"][0], png.as_str());
+        assert_eq!(
+            v["messages"][0]["content"][1]["image_url"]["url"],
+            format!("data:image/png;base64,{png}")
+        );
+        assert_eq!(v["options"]["num_ctx"], 4096);
+    }
+
+    #[test]
+    fn redact_value_reports_no_change_for_clean_bodies() {
+        let mut v = serde_json::json!({"model": "m", "prompt": "hello there"});
+        let before = v.clone();
+        let mut r = Redactions::default();
+        assert!(!r.redact_value(&mut v));
+        assert!(r.is_empty());
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn every_registered_schema_and_the_system_prompt_survive_redaction_unchanged() {
+        // Every real request carries one of these. A rule that rewrote them
+        // would silently break every cloud request.
+        let ids = [
+            "verdict",
+            "calendar_event",
+            "text_review",
+            "form_fill",
+            "text_answer",
+            "action_items",
+            "error_explanation",
+            "word_definition",
+            "page_summary",
+            "screen_explanation",
+            "time_list",
+            "scam_check",
+        ];
+        for id in ids {
+            for want_difficulty in [false, true] {
+                let schema = crate::actions::schema::schema_for(id, want_difficulty)
+                    .unwrap_or_else(|| panic!("{id} has no schema"));
+                let mut v = serde_json::json!({
+                    "schema": schema,
+                    "system": crate::provider::common::augmented_system_prompt(
+                        "You check physics problems.", want_difficulty),
+                });
+                let before = v.clone();
+                let mut r = Redactions::default();
+                assert!(!r.redact_value(&mut v), "{id}");
+                assert_eq!(v, before, "{id}");
+            }
+        }
     }
 
     // -- word mapping ----------------------------------------------------

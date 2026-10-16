@@ -5,3 +5,7 @@
 # realistic-looking FAKE key in the test proving Copy diagnostics never leaks
 # any substring of a configured key (#124). Reviewed 2026-09-24.
 5d68281169c069f1e2198d4de259f7c449ca6885:src/diagnostics.rs:generic-api-key:596
+#
+# src/redact.rs: a fake mixed-case id in a URL, in the test proving text redaction
+# leaves links alone (#505). The test now builds the string at run time.
+b52fbb2a735670004173bea910c499ed205670b0:src/redact.rs:generic-api-key:657

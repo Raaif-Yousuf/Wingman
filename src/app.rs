@@ -336,6 +336,9 @@ pub fn run() -> Result<()> {
     // this line the toggle is permanently off and the preview never
     // appears, whatever config.toml says.
     crate::config::set_egress_preview_enabled(config.egress_preview.enabled);
+    // #505: same reason: text is redacted at the HTTP boundary, which has no
+    // `Config` in reach.
+    crate::config::set_redact_text_enabled(config.capture.redact);
     // #101: same reason: the send guard has no `Config` in reach.
     crate::usage::set_daily_budget(config.budget.daily_usd, config.budget.warn_percent);
     // #111: `ocr::recognize` runs on worker threads with no Config in reach.
@@ -3138,6 +3141,7 @@ impl App {
         // Settings save, the same way `set_mode` already does for the mode.
         // A hand-edited `[egress_preview]` otherwise needs a full restart.
         crate::config::set_egress_preview_enabled(self.config.egress_preview.enabled);
+        crate::config::set_redact_text_enabled(self.config.capture.redact);
         crate::usage::set_daily_budget(
             self.config.budget.daily_usd,
             self.config.budget.warn_percent,

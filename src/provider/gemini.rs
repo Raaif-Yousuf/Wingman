@@ -297,7 +297,7 @@ impl Provider for Gemini {
                 ("x-goog-api-key", self.api_key.as_str()),
                 ("Content-Type", "application/json"),
             ],
-            &body,
+            body,
             REQUEST_TIMEOUT,
             "gemini",
         )?;

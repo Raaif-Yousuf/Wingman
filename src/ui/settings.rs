@@ -210,6 +210,15 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     inner_ref.dpi = dpi;
     let built = build_ui_recorded(hwnd, instance, dpi, inner_ref.font, config, client_h_dp);
     inner_ref.adopt(built);
+    // #527, #568: the Ollama status and button arrive later, off the UI
+    // thread; the group says "Checking Ollama..." until then.
+    spawn_ollama_status_probe(
+        hwnd,
+        config.providers.ollama.clone(),
+        config.providers.order.iter().any(|p| p == "ollama"),
+        inner_ref.ollama_status.clone(),
+        inner_ref.alive.clone(),
+    );
     // #183: the model list arrives later, off the UI thread.
     spawn_ollama_models_fetch(
         hwnd,
@@ -469,8 +478,11 @@ struct SettingsInner {
     /// The dpi the body's scroll position is expressed in, so a dpi change
     /// can rescale it.
     body_dpi: u32,
-    /// #343: where the Ollama group's link button goes, if it has one.
+    /// #343: where the Ollama group's link button goes, if it has one. Set
+    /// when the status probe reports (#527).
     ollama_link_url: Option<&'static str>,
+    /// #527: the Ollama status probe's result, filled by its worker.
+    ollama_status: OllamaStatusSlot,
     /// #183: the pulled-model list the background fetch reports into.
     ollama_tags: OllamaTags,
     /// #380: the cloud providers' live model lists, filled the same way.
@@ -510,6 +522,7 @@ impl SettingsInner {
             body: HWND(std::ptr::null_mut()),
             body_dpi: 96,
             ollama_link_url: None,
+            ollama_status: Default::default(),
             ollama_tags: Default::default(),
             cloud_models: Default::default(),
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -532,7 +545,6 @@ impl SettingsInner {
         self.children = built.children;
         self.content_top_dp = built.content_top_dp;
         self.win_h_dp = built.win_h_dp;
-        self.ollama_link_url = built.ollama_link_url;
     }
 }
 
@@ -564,6 +576,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_HSCROLL => {
             update_text_scale_label(hwnd);
+            LRESULT(0)
+        }
+        WM_OLLAMA_STATUS => {
+            let section = inner.ollama_status.lock().ok().and_then(|g| g.clone());
+            if let Some(section) = section {
+                apply_ollama_section(inner, &section);
+            }
             LRESULT(0)
         }
         WM_OLLAMA_MODELS => {
@@ -2304,6 +2323,71 @@ fn spawn_ollama_models_fetch(
         });
 }
 
+/// Posted to the Settings window when the background Ollama status probe has
+/// stored its result in [`SettingsInner::ollama_status`].
+const WM_OLLAMA_STATUS: u32 = 0x8000 + 43; // WM_APP + 43
+
+/// The probe's result, shared with the worker thread. `None` until it reports.
+type OllamaStatusSlot = std::sync::Arc<std::sync::Mutex<Option<OllamaSection>>>;
+
+/// Works out the Ollama group's text and button on a worker thread (#527,
+/// #568): the listener check, the optional HTTP calls and the install
+/// search (which can touch a slow network share on `PATH`) must not hold up
+/// opening Settings. One shot per open, no timer. The result goes into
+/// `slot`, then [`WM_OLLAMA_STATUS`] wakes the window, but only while the
+/// window is still open (`alive`, see [`post_while_open`]).
+fn spawn_ollama_status_probe(
+    hwnd: HWND,
+    cfg: OllamaConfig,
+    ollama_configured: bool,
+    slot: OllamaStatusSlot,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let hwnd_raw = hwnd.0 as isize;
+    let _ = std::thread::Builder::new()
+        .name("settings-ollama-status".into())
+        .spawn(move || {
+            let (status, listening) = ollama_status_line(&cfg, ollama_configured);
+            // Only searched for when nothing listens: it is not needed
+            // otherwise.
+            let installed = !listening && ollama_installed();
+            let section = ollama_section(status, listening, installed, ollama_configured);
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(section);
+            }
+            post_while_open(&alive, || unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd_raw as *mut c_void)),
+                    WM_OLLAMA_STATUS,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            });
+        });
+}
+
+/// Shows the probe's result: the text, and the link button with its label
+/// (hidden when there is no link).
+fn apply_ollama_section(inner: &mut SettingsInner, section: &OllamaSection) {
+    if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
+        set_text(status, &section.text);
+    }
+    inner.ollama_link_url = section.link.map(|(_, url)| url);
+    if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
+        if let Some((label, _)) = section.link {
+            set_text(link, label);
+        }
+        let cmd = if section.link.is_some() {
+            SW_SHOW
+        } else {
+            SW_HIDE
+        };
+        unsafe {
+            let _ = ShowWindow(link, cmd);
+        }
+    }
+}
+
 /// #188: total budget for the (at most two) optional HTTP calls
 /// `ollama_status_line` can make (`/api/ps` for GPU/CPU, `/api/tags` for
 /// vision counts). Tighter than `ollama_admin`'s general discovery timeout
@@ -2383,7 +2467,10 @@ fn ollama_section(
     let text = if configured {
         status
     } else {
-        format!("{status} To use it, see Local models.")
+        join_within(
+            OLLAMA_TEXT_BUDGET,
+            &[&status, "To use it, see Local models."],
+        )
     };
     OllamaSection {
         text,
@@ -2402,7 +2489,12 @@ fn ollama_install_candidates(
         out.push(std::path::Path::new(l).join(r"Programs\Ollama\ollama.exe"));
     }
     if let Some(p) = path_var {
-        for dir in p.split(';').filter(|d| !d.is_empty()) {
+        // `PATH` entries may be wrapped in quotes (#527).
+        for dir in p
+            .split(';')
+            .map(|d| d.trim().trim_matches('"'))
+            .filter(|d| !d.is_empty())
+        {
             out.push(std::path::Path::new(dir).join("ollama.exe"));
         }
     }
@@ -2434,17 +2526,83 @@ fn open_url(url: &str) -> bool {
     r.0 as isize > 32
 }
 
+/// What the Ollama status shows until the probe reports (#527, #568).
+const OLLAMA_CHECKING_TEXT: &str = "Checking Ollama...";
+
+/// The most characters the two-row Ollama status label shows without
+/// clipping, with room to spare for word wrapping (#527). Optional parts
+/// that would push the text past it are left out (see [`join_within`]).
+const OLLAMA_TEXT_BUDGET: usize = 140;
+
+/// Longest listener path shown in the status, in characters.
+const OLLAMA_PATH_MAX_CHARS: usize = 60;
+
+/// `s` cut to at most `max` characters by replacing the middle with `...`,
+/// so a long path keeps its start and its file name. Cuts on character
+/// boundaries.
+fn shorten_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 3 {
+        return chars.iter().take(max).collect();
+    }
+    let keep = max - 3;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let mut out: String = chars[..head].iter().collect();
+    out.push_str("...");
+    out.extend(chars[chars.len() - tail..].iter());
+    out
+}
+
+/// Joins the non-empty `parts` with spaces: the first always, each later one
+/// only if the result stays within `budget` characters. A part that does not
+/// fit is skipped, and a shorter later one can still go in.
+fn join_within(budget: usize, parts: &[&str]) -> String {
+    let mut out = String::new();
+    for part in parts.iter().filter(|p| !p.is_empty()) {
+        if out.is_empty() {
+            out.push_str(part);
+        } else if out.chars().count() + 1 + part.chars().count() <= budget {
+            out.push(' ');
+            out.push_str(part);
+        }
+    }
+    out
+}
+
+/// [`OllamaHealth::message`] with a long listener path shortened, so the
+/// message fits the status label.
+fn health_message(health: &OllamaHealth) -> String {
+    match health {
+        OllamaHealth::Listening {
+            pid,
+            image_path,
+            kind,
+        } => OllamaHealth::Listening {
+            pid: *pid,
+            image_path: shorten_middle(image_path, OLLAMA_PATH_MAX_CHARS),
+            kind: *kind,
+        }
+        .message(),
+        other => other.message(),
+    }
+}
+
 /// Combines #15's health check with #14's GPU/CPU indicator into the one
-/// status line Settings shows for Ollama. Computed once, synchronously,
-/// when Settings opens (AGENTS.md rule 5: discovery happens on demand,
-/// never on a timer): the health check is Win32-only (no network at all)
-/// and always runs; the two HTTP calls it can make (`/api/ps`, `/api/tags`)
-/// only run when [`should_query_ollama_details`] says so (#188), and are
-/// bounded by [`OLLAMA_STATUS_HTTP_BUDGET`] in total when they do.
+/// status line Settings shows for Ollama. Runs on a worker thread
+/// ([`spawn_ollama_status_probe`], #568) once when Settings opens (AGENTS.md
+/// rule 5: discovery happens on demand, never on a timer): the health check
+/// is Win32-only (no network at all) and always runs; the two HTTP calls it
+/// can make (`/api/ps`, `/api/tags`) only run when
+/// [`should_query_ollama_details`] says so (#188), and are bounded by
+/// [`OLLAMA_STATUS_HTTP_BUDGET`] in total when they do.
 fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, bool) {
     let port = ollama_admin::port_from_base_url(&cfg.base_url).unwrap_or(11434);
     let health = ollama_admin::query_ollama_health(port);
-    let health_msg = health.message();
+    let health_msg = health_message(&health);
     let listening = matches!(health, OllamaHealth::Listening { .. });
 
     if !should_query_ollama_details(ollama_configured, &health) {
@@ -2475,7 +2633,7 @@ fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, b
                     .filter(|m| ollama_admin::vision_from_tags_entry(m))
                     .count();
                 format!(
-                    " {vision_count} of {} local models support vision.",
+                    "{vision_count} of {} local models support vision.",
                     models.len()
                 )
             }
@@ -2483,7 +2641,10 @@ fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, b
         }
     };
 
-    (format!("{health_msg} {gpu_line}{vision_line}"), listening)
+    (
+        join_within(OLLAMA_TEXT_BUDGET, &[&health_msg, &gpu_line, &vision_line]),
+        listening,
+    )
 }
 
 /// Builds every child control and returns the prompt edit's `HWND` (the
@@ -2510,8 +2671,6 @@ struct BuiltUi {
     content_top_dp: i32,
     /// The client height (dp) the elastic region was laid out for.
     win_h_dp: i32,
-    /// #343: the Ollama link button's target, if one was created.
-    ollama_link_url: Option<&'static str>,
 }
 
 fn build_ui_recorded(
@@ -2901,19 +3060,15 @@ fn build_ui_recorded(
     // config.toml setting.
     let ollama_top = y;
     y += GROUP_LABEL_TOP;
-    let ollama_configured = config.providers.order.iter().any(|p| p == "ollama");
-    let (status, listening) = ollama_status_line(&config.providers.ollama, ollama_configured);
-    let section = ollama_section(status, listening, ollama_installed(), ollama_configured);
-    // The link button sits at the right of the two text rows, so it adds no
-    // height to the window (#481).
-    let link_w = if section.link.is_some() {
-        OLLAMA_LINK_W + 12
-    } else {
-        0
-    };
+    // The text is a placeholder until the worker reports (#527, #568), so the
+    // window never waits on Ollama or the disk. The link button sits at the
+    // right of the two text rows, so it adds no height to the window (#481);
+    // it is created hidden and shown when the result says it has a link, so
+    // the text is always laid out narrower to leave room for it.
+    let link_w = OLLAMA_LINK_W + 12;
     ctx.create(
         WC_STATIC,
-        &section.text,
+        OLLAMA_CHECKING_TEXT,
         0,
         0,
         content_x + MARGIN,
@@ -2922,20 +3077,22 @@ fn build_ui_recorded(
         ROW_H * 2,
         ID_OLLAMA_STATUS,
     );
-    let ollama_link_url = section.link.map(|(label, url)| {
-        ctx.create(
-            WC_BUTTON,
-            label,
-            BS_PUSHBUTTON as u32,
-            0,
-            content_x + content_w - MARGIN - OLLAMA_LINK_W,
-            y + (ROW_H * 2 - BTN_H) / 2,
-            OLLAMA_LINK_W,
-            BTN_H,
-            ID_OLLAMA_LINK,
-        );
-        url
-    });
+    ctx.create(
+        WC_BUTTON,
+        "Local models",
+        BS_PUSHBUTTON as u32,
+        0,
+        content_x + content_w - MARGIN - OLLAMA_LINK_W,
+        y + (ROW_H * 2 - BTN_H) / 2,
+        OLLAMA_LINK_W,
+        BTN_H,
+        ID_OLLAMA_LINK,
+    );
+    if let Some(link) = get_dlg_item(hwnd, ID_OLLAMA_LINK) {
+        unsafe {
+            let _ = ShowWindow(link, SW_HIDE);
+        }
+    }
     y += ROW_H * 2;
     let ollama_bottom = y + 8;
     ctx.create(
@@ -3513,7 +3670,6 @@ fn build_ui_recorded(
         children: ctx.children.into_inner(),
         content_top_dp,
         win_h_dp,
-        ollama_link_url,
     }
 }
 
@@ -4584,6 +4740,231 @@ mod tests {
             ]
         );
         assert!(ollama_install_candidates(None, None).is_empty());
+    }
+
+    // -- #527: status text fits, PATH entries unquoted, probe off-thread ---
+
+    #[test]
+    fn ollama_install_candidates_unquote_path_entries() {
+        let c = ollama_install_candidates(None, Some(r#""C:\Program Files\Ollama";D:\b"#));
+        let s: Vec<String> = c
+            .iter()
+            .map(|p| p.to_string_lossy().replace('/', "\\"))
+            .collect();
+        assert_eq!(
+            s,
+            vec![
+                r"C:\Program Files\Ollama\ollama.exe".to_string(),
+                r"D:\b\ollama.exe".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shorten_middle_keeps_short_text_and_trims_long_text_in_the_middle() {
+        assert_eq!(shorten_middle("abc", 10), "abc");
+        let long = r"C:\Users\someone\AppData\Local\Programs\Ollama\a\very\long\folder\ollama.exe";
+        let short = shorten_middle(long, 40);
+        assert_eq!(short.chars().count(), 40, "{short}");
+        assert!(short.starts_with(r"C:\Users"), "{short}");
+        assert!(short.ends_with(r"ollama.exe"), "{short}");
+        assert!(short.contains("..."), "{short}");
+        // Multi-byte text is cut on character boundaries, never panics.
+        let _ = shorten_middle(&"\u{e9}".repeat(100), 21);
+        assert_eq!(shorten_middle("abcdef", 0), "");
+    }
+
+    #[test]
+    fn join_within_keeps_the_first_part_and_drops_parts_that_do_not_fit() {
+        assert_eq!(join_within(10, &["aaaa", "bbbb", "cccc"]), "aaaa bbbb");
+        assert_eq!(join_within(3, &["aaaa", "bbbb"]), "aaaa");
+        assert_eq!(join_within(100, &["a", "", "b"]), "a b");
+        // A part that does not fit does not stop a shorter later one.
+        assert_eq!(join_within(8, &["aaaa", "bbbbbbbb", "cc"]), "aaaa cc");
+    }
+
+    #[test]
+    fn the_longest_ollama_status_text_fits_the_two_row_label() {
+        let path = r"C:\Users\a-rather-long-user-name\AppData\Local\Programs\Ollama\some\deep\folder\ollama.exe";
+        let health = OllamaHealth::Listening {
+            pid: 1,
+            image_path: path.to_string(),
+            kind: ListenerKind::Other,
+        };
+        let msg = health_message(&health);
+        assert!(msg.ends_with("ollama.exe."), "{msg}");
+        let text = join_within(
+            OLLAMA_TEXT_BUDGET,
+            &[
+                &msg,
+                "some-long-model-name:latest-q4 is loaded on GPU.",
+                "12 of 12 local models support vision.",
+            ],
+        );
+        assert!(text.chars().count() <= OLLAMA_TEXT_BUDGET, "{text}");
+        // The stock tray app's warning plus the Local models hint was the
+        // overflowing case: the hint is dropped, the warning is kept whole.
+        let warning = listening_stock_tray().message();
+        let stock = ollama_section(warning.clone(), true, true, false);
+        assert_eq!(stock.text, warning);
+        assert!(stock.link.is_some());
+    }
+
+    /// #527 / #568: the Settings window is built without asking Ollama
+    /// anything. The status says it is checking, and the link button exists
+    /// but is hidden until the worker reports. A UI-thread probe would
+    /// instead have filled in a real answer here.
+    #[test]
+    fn build_ui_shows_checking_and_hides_the_ollama_link_until_the_probe_reports() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE, WS_VISIBLE};
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+        let title = wide_z("Wingman settings (ollama checking test)");
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        let font = build_font(dpi);
+        build_ui(hwnd, instance, dpi, font, &Config::default(), WIN_H_DP);
+
+        let status = get_dlg_item(hwnd, ID_OLLAMA_STATUS).expect("status label");
+        assert_eq!(get_text(status), OLLAMA_CHECKING_TEXT);
+        let link = get_dlg_item(hwnd, ID_OLLAMA_LINK).expect("link button exists");
+        let style = unsafe { GetWindowLongPtrW(link, GWL_STYLE) } as u32;
+        assert_eq!(style & WS_VISIBLE.0, 0, "the link starts hidden");
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+    }
+
+    /// #527 / #568 "wired to nothing" check: the worker's result reaches the
+    /// real window through `WM_OLLAMA_STATUS`. Nothing listens on the port
+    /// used here, so the answer is one of the two "not running" sections.
+    /// If the worker were never spawned, or the message had no arm, the text
+    /// would stay at "Checking Ollama...".
+    #[test]
+    fn the_ollama_probe_result_reaches_the_window() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, GetWindowLongPtrW, PeekMessageW, TranslateMessage, GWL_STYLE, MSG,
+            PM_REMOVE, WS_VISIBLE,
+        };
+
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+
+        let raw = Box::into_raw(Box::new(SettingsInner::new(Config::default())));
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let title = wide_z("Wingman settings (ollama probe test)");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_CAPTION | WS_SYSMENU,
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                Some(raw as *const c_void),
+            )
+        }
+        .expect("CreateWindowExW");
+        struct Guard(HWND, *mut SettingsInner);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                    drop(Box::from_raw(self.1));
+                }
+            }
+        }
+        let _guard = Guard(hwnd, raw);
+
+        let font = build_font(96);
+        let client_h_dp = client_size(hwnd).1;
+        let built = build_ui_recorded(hwnd, instance, 96, font, &Config::default(), client_h_dp);
+        let slot = {
+            let inner = unsafe { &mut *raw };
+            inner.hwnd = hwnd;
+            inner.font = font;
+            inner.adopt(built);
+            inner.ollama_status.clone()
+        };
+        let alive = unsafe { &*raw }.alive.clone();
+
+        // A port nothing listens on: bind, note it, release it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+        let cfg = OllamaConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "gemma3:4b".to_string(),
+            effort: "low".to_string(),
+        };
+        spawn_ollama_status_probe(hwnd, cfg, false, slot, alive);
+
+        let status = get_dlg_item(hwnd, ID_OLLAMA_STATUS).expect("status label");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while get_text(status) == OLLAMA_CHECKING_TEXT && std::time::Instant::now() < deadline {
+            let mut msg = MSG::default();
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let text = get_text(status);
+        assert_ne!(text, OLLAMA_CHECKING_TEXT, "the probe never reported");
+        assert!(
+            text.starts_with("Ollama is installed but not running")
+                || text.starts_with("Ollama runs AI models"),
+            "{text}"
+        );
+        let link = get_dlg_item(hwnd, ID_OLLAMA_LINK).expect("link button");
+        let visible = unsafe { GetWindowLongPtrW(link, GWL_STYLE) } as u32 & WS_VISIBLE.0 != 0;
+        assert_eq!(
+            visible,
+            text.starts_with("Ollama runs AI models"),
+            "the button shows exactly when there is something to open"
+        );
+        assert_eq!(
+            unsafe { &*raw }.ollama_link_url.is_some(),
+            visible,
+            "the click target follows the button"
+        );
+
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
     }
 
     // -- should_query_ollama_details (#188, pure) -------------------------
