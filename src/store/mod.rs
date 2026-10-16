@@ -310,21 +310,26 @@ fn open_in(
     if let Some(n) = import::spend_json(&mut store.lock(), legacy.spend)? {
         note(n);
     }
-    // The request log imports are not allowed to take the store down: a
-    // failure here is a notice, and the store still opens (rows would
-    // otherwise have nowhere to go for the whole run).
-    // Each import takes the lock on its own: guards held across both would
-    // deadlock the second.
-    let old_log = import::egress_log(&mut store.lock(), legacy.egress);
-    let pending = import::egress_pending(&mut store.lock(), legacy.pending);
-    for imported in [old_log, pending] {
-        match imported {
-            Ok(Some(n)) => note(n),
-            Ok(None) => {}
-            Err(e) => note(e.to_string()),
-        }
+    for n in request_log_notices(&store, legacy) {
+        note(n);
     }
     Ok(store)
+}
+
+/// Runs the request log imports. They are not allowed to take the store
+/// down: a failure is a notice, and the store still opens (rows would
+/// otherwise have nowhere to go for the whole run). Each import takes the
+/// lock on its own; guards held across both would deadlock the second.
+fn request_log_notices(store: &Store, legacy: &Legacy<'_>) -> Vec<String> {
+    let old_log = import::egress_log(&mut store.lock(), legacy.egress);
+    let pending = import::egress_pending(&mut store.lock(), legacy.pending);
+    [old_log, pending]
+        .into_iter()
+        .filter_map(|r| match r {
+            Ok(n) => n,
+            Err(e) => Some(e.to_string()),
+        })
+        .collect()
 }
 
 /// Test builds only: removes `wingman-test-store-<pid>` directories left in
@@ -717,6 +722,33 @@ mod tests {
     }
 
     #[test]
+    fn a_row_cut_off_by_a_crash_does_not_swallow_the_next_one() {
+        let dir = scratch("pending-cut");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        std::fs::write(&pending, "{\"a\":1").unwrap();
+        egress::append_pending_at(&pending, &sample_row("after-crash")).unwrap();
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+        };
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+
+        let got: Vec<String> = s
+            .egress_rows()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        assert_eq!(got, ["after-crash"]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_failing_request_log_import_does_not_stop_the_store_opening() {
         let dir = scratch("import-fails");
         let path = dir.join("store").join("wingman.db");
@@ -749,6 +781,12 @@ mod tests {
             .expect("an import failure must not fail the open");
 
         assert!(egress.exists() && pending.exists(), "both stay for a retry");
+        let notices = request_log_notices(&s, &legacy);
+        assert_eq!(
+            notices.len(),
+            2,
+            "each failed import raises a notice: {notices:?}"
+        );
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

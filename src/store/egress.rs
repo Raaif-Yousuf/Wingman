@@ -141,33 +141,84 @@ pub fn append_pending(entry: &EgressEntry) -> Result<(), StoreError> {
     append_pending_at(&super::pending_egress_path()?, entry)
 }
 
+/// The pending file stops growing here, like the old 2 MB log; further rows
+/// are refused, so the caller counts them as dropped and the report says so.
+pub const PENDING_CAP_BYTES: u64 = 2_000_000;
+
+/// 0 = not tried, 1 = restricted, 2 = failed once (one retry left), 3 = gave up.
+static PENDING_ACL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 pub(crate) fn append_pending_at(
     path: &std::path::Path,
     entry: &EgressEntry,
 ) -> Result<(), StoreError> {
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
     let io = |e: std::io::Error| StoreError::Other(e.to_string());
     let line = serde_json::to_string(entry).map_err(|e| StoreError::Other(e.to_string()))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io)?;
     }
-    let is_new = !path.exists();
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(io)?;
-    writeln!(f, "{line}").map_err(io)?;
-    drop(f);
-    if is_new {
-        // Same owner-only rule the old log had; best effort, the row is
-        // already safe on disk.
-        #[cfg(windows)]
-        if let Err(e) = crate::config::Config::restrict_acl(path) {
-            eprintln!("wingman: failed to restrict {}: {e:#}", path.display());
+    // `create_new` tells a file this call made from one that was already
+    // there, with no gap between the check and the create.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true);
+    let (mut f, is_new) = match opts.clone().create_new(true).open(path) {
+        Ok(f) => (f, true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            (opts.open(path).map_err(io)?, false)
+        }
+        Err(e) => return Err(io(e)),
+    };
+    let len = f.metadata().map_err(io)?.len();
+    if len >= PENDING_CAP_BYTES {
+        return Err(StoreError::Other(
+            "the pending request log is full".to_string(),
+        ));
+    }
+    // A crash in the middle of an earlier append can leave a row without its
+    // newline; start on a fresh line so two rows are never glued together.
+    let mut buf = String::with_capacity(line.len() + 2);
+    if len > 0 {
+        let mut last = [0u8; 1];
+        let mut r = std::fs::File::open(path).map_err(io)?;
+        r.seek(SeekFrom::End(-1)).map_err(io)?;
+        r.read_exact(&mut last).map_err(io)?;
+        if last[0] != b'\n' {
+            buf.push('\n');
         }
     }
+    buf.push_str(&line);
+    buf.push('\n');
+    f.write_all(buf.as_bytes()).map_err(io)?;
+    drop(f);
+    restrict_pending_acl(path, is_new);
     Ok(())
+}
+
+/// Same owner-only rule the old log had. Tried when the file is new, and once
+/// more later in the run if the first try failed; best effort, the row is
+/// already safe on disk.
+fn restrict_pending_acl(path: &std::path::Path, is_new: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let state = PENDING_ACL.load(SeqCst);
+    if !(is_new || state == 0 || state == 2) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        match crate::config::Config::restrict_acl(path) {
+            Ok(()) => PENDING_ACL.store(1, SeqCst),
+            Err(e) => {
+                eprintln!("wingman: failed to restrict {}: {e:#}", path.display());
+                PENDING_ACL.store(if state == 2 { 3 } else { 2 }, SeqCst);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        PENDING_ACL.store(1, SeqCst);
+    }
 }
 
 pub(super) fn now_unix() -> u64 {
@@ -363,6 +414,22 @@ mod tests {
         assert_eq!(skipped, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].provider, "good");
+    }
+
+    #[test]
+    fn the_pending_file_stops_growing_at_its_cap_and_says_so() {
+        let dir =
+            std::env::temp_dir().join(format!("wingman-test-pending-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.log");
+        std::fs::write(&path, vec![b'x'; PENDING_CAP_BYTES as usize]).unwrap();
+
+        let err = append_pending_at(&path, &entry("over", 1)).unwrap_err();
+
+        assert!(err.to_string().contains("full"), "{err}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), PENDING_CAP_BYTES);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
