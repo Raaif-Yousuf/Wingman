@@ -135,6 +135,14 @@ pub const WM_APP_GENERIC_ACTION_RESULT: u32 = WM_APP + 16;
 /// request (as the Settings-open `Ignore` path does) cancels the send.
 pub const WM_APP_SEND_PREVIEW: u32 = WM_APP + 18;
 
+/// #551: posted by a worker thread to move the pending card to its next
+/// stage ("Reading the page" to "Asking a model"). `wparam` is the run
+/// number the worker was started for (`App::run_generation`), `lparam` is
+/// `Box::into_raw(Box::new(PendingStage))` that the handler takes back. A
+/// stage for an older run, or one arriving after a result card is showing,
+/// is dropped. `WM_APP + 19`: `+18` is `WM_APP_SEND_PREVIEW`.
+pub const WM_APP_PENDING_STAGE: u32 = WM_APP + 19;
+
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
 /// How long to wait after hiding a visible card before capturing, so the
@@ -218,6 +226,10 @@ struct App {
     /// abandonment for a preview that has already been replaced, and acting
     /// on it would clear the state belonging to the preview now on screen.
     pending_preview_generation: u32,
+    /// #551: counts runs (bumped each time `busy` turns on). A worker's
+    /// `WM_APP_PENDING_STAGE` carries the number it started under, so a late
+    /// stage cannot relabel the card of a newer run.
+    run_generation: u64,
     /// #228: the footer line for the answer now being shown, set by each
     /// action result handler from the worker's attribution and `None` unless
     /// a fallback answered.
@@ -403,6 +415,7 @@ pub fn run() -> Result<()> {
         pending_conflict: None,
         pending_preview: None,
         pending_preview_generation: 0,
+        run_generation: 0,
         fallback_footer: None,
         last_form_undo: None,
         last_error: None,
@@ -1603,6 +1616,16 @@ impl App {
             return;
         };
 
+        // #551: the card opened on "Asking a model", but a confirmed link is
+        // downloaded first. Relabel it now, before the loop paints anything;
+        // the worker moves it on to the model once the page is in.
+        if let actions::link_summary::Step::Fetch(url) = &link_step {
+            if let Ok(t) = crate::inputs::web_page::parse_target(url) {
+                self.card
+                    .set_pending_stage(crate::ui::card::PendingStage::ReadingPage { host: t.host });
+            }
+        }
+        let run = self.run_generation;
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
         let redact = self.config.capture.redact;
@@ -1649,6 +1672,15 @@ impl App {
                         actions::link_summary::Step::Fetch(url) => {
                             let page = crate::inputs::web_page::fetch_page(url)
                                 .map_err(GenericFailure::UserState)?;
+                            // #551: the page is in; the model is next.
+                            post_pending_stage(
+                                target,
+                                run,
+                                crate::ui::card::PendingStage::AskingModel {
+                                    model_name: first_provider_model_label(mode, &providers)
+                                        .unwrap_or_default(),
+                                },
+                            );
                             // A redirect to another site is named on the result card.
                             let confirmed = crate::inputs::web_page::parse_target(url)
                                 .map(|t| t.host)
@@ -1729,6 +1761,14 @@ impl App {
                 );
             }
         });
+    }
+
+    /// #551: applies a worker's stage message. Ignored when it belongs to an
+    /// earlier run; the card itself ignores it unless it is still pending.
+    fn on_pending_stage(&mut self, run: u64, stage: crate::ui::card::PendingStage) {
+        if crate::ui::pending_status::stage_is_current(run, self.run_generation) && self.busy {
+            self.card.set_pending_stage(stage);
+        }
     }
 
     /// Handles [`App::run_generic_action`]'s worker result (#242): an error
@@ -2708,6 +2748,7 @@ impl App {
     fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
         if busy {
+            self.run_generation = self.run_generation.wrapping_add(1);
             forget_last_attribution();
             self.tray.set_failed(false);
         }
@@ -3968,6 +4009,24 @@ fn provider_for_router(
 /// #354 follow-up: reads the first entry `mode` would actually try
 /// (`Providers::selected_order_for_mode`, shared with `build_chain_for_mode`)
 /// rather than `providers.order.first()` unfiltered.
+/// #551: posts a pending-card stage from a worker thread. `run` is the
+/// `App::run_generation` the worker was started under. If the post fails the
+/// box is freed here, so nothing leaks.
+fn post_pending_stage(target: isize, run: u64, stage: crate::ui::card::PendingStage) {
+    let payload = Box::into_raw(Box::new(stage));
+    let posted = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(HWND(target as *mut _)),
+            WM_APP_PENDING_STAGE,
+            WPARAM(run as usize),
+            LPARAM(payload as isize),
+        )
+    };
+    if posted.is_err() {
+        drop(unsafe { Box::from_raw(payload) });
+    }
+}
+
 fn first_provider_model_label(mode: Mode, providers: &Providers) -> Option<String> {
     let selected = providers.selected_order_for_mode(mode, true);
     let name = selected.first()?;
@@ -5223,6 +5282,9 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
         | WM_APP_ROUTER_RESULT
+        // #551: advisory, and the pending card is hidden while Settings is
+        // open; the boxed stage is freed below.
+        | WM_APP_PENDING_STAGE
         // #105: a send preview cannot be answered while Settings is
         // modal-open, so it is dropped, which cancels the send (the worker
         // sees the reply channel close and the request ends in a card).
@@ -5285,6 +5347,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     drop(unsafe {
                         Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest)
                     });
+                } else if msg == WM_APP_PENDING_STAGE {
+                    drop(unsafe { Box::from_raw(lparam.0 as *mut crate::ui::card::PendingStage) });
                 } else if msg == WM_APP_ROUTER_RESULT {
                     drop(unsafe {
                         Box::from_raw(
@@ -5510,6 +5574,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_generic_action_result(action, schema, result);
             LRESULT(0)
         }
+        WM_APP_PENDING_STAGE => {
+            let stage = unsafe { *Box::from_raw(lparam.0 as *mut crate::ui::card::PendingStage) };
+            app.on_pending_stage(wparam.0 as u64, stage);
+            LRESULT(0)
+        }
         WM_APP_PREVIEW_DECIDED => {
             app.on_preview_decided(wparam.0 as u32);
             LRESULT(0)
@@ -5674,8 +5743,8 @@ mod tests {
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
-        WM_APP_GENERIC_ACTION_RESULT, WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
-        WM_APP_SEND_PREVIEW,
+        WM_APP_GENERIC_ACTION_RESULT, WM_APP_PENDING_STAGE, WM_APP_RESULT, WM_APP_REVIEW_RESULT,
+        WM_APP_ROUTER_RESULT, WM_APP_SEND_PREVIEW,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
@@ -6411,6 +6480,7 @@ mod tests {
         ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
+        ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
     ];
 
     #[test]
@@ -6993,6 +7063,11 @@ mod tests {
         (
             "WM_APP_SEND_PREVIEW",
             WM_APP_SEND_PREVIEW,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_PENDING_STAGE",
+            WM_APP_PENDING_STAGE,
             SettingsReentrancy::Ignore,
         ),
     ];
