@@ -1,10 +1,12 @@
 # Activation trust: who may make Wingman ask
 
-Status: **draft, owner approval owed.** Written 2026-09-19 against commit
-`a55ab42` to unblock issues **#236** and **#237**, both P1. No code was written
-for either; AGENTS.md rule 12 says an architectural change gets a spec first,
-and both issues propose changing how the app decides that a request to act is
-legitimate. That is architecture.
+Status: **approved as written.** Written 2026-09-19 against commit
+`a55ab42` to unblock issues **#236** and **#237**, both P1. AGENTS.md rule 12
+says an architectural change gets a spec first, and both issues propose
+changing how the app decides that a request to act is legitimate. That is
+architecture. Decision: section 7 is settled as proposed (start anyway without
+the lock after 2 s, 3 s activation interval, authentication dropped as a goal,
+#101 as the backstop).
 
 Related: [#236](https://github.com/Raaif-Yousuf/Wingman/issues/236),
 [#237](https://github.com/Raaif-Yousuf/Wingman/issues/237),

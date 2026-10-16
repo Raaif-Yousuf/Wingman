@@ -12,7 +12,7 @@
 //! file that would need cleaning up after a crash.
 
 use windows::core::w;
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND};
 use windows::Win32::System::Threading::CreateMutexW;
 
 /// `Local\` rather than `Global\`: the scope is the logged-in session, so two
@@ -85,21 +85,79 @@ pub enum Activation {
     Settings,
 }
 
+/// What a duplicate launch managed to do (#237).
+#[derive(Debug, PartialEq, Eq)]
+pub enum PokeOutcome {
+    /// A running instance's window was found and the message posted.
+    Delivered,
+    /// The name is held but no window answered, even after retrying. With
+    /// the owner window created before the name is taken, this means the
+    /// holder is not Wingman: see [`mark_lock_squatted`].
+    NoWindow,
+}
+
+/// How long a duplicate keeps looking for the running instance's window
+/// (absorbs a genuine instance that is mid-exit), and how often.
+const POKE_RETRY_ATTEMPTS: u32 = 40;
+const POKE_RETRY_WAIT_MS: u64 = 50;
+
+/// The retry shape, with the window search, the wait and the delivery
+/// injected so the three outcomes are testable without a window. `find` is
+/// tried up to `attempts` times with `wait` between tries.
+fn deliver_with<T>(
+    attempts: u32,
+    mut find: impl FnMut() -> Option<T>,
+    mut wait: impl FnMut(),
+    deliver: impl FnOnce(T),
+) -> PokeOutcome {
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            wait();
+        }
+        if let Some(found) = find() {
+            deliver(found);
+            return PokeOutcome::Delivered;
+        }
+    }
+    PokeOutcome::NoWindow
+}
+
 /// Hand focus to the instance that is already running.
 ///
 /// Called just before a duplicate exits. Silently vanishing would look like
 /// the app failed to start, so the running instance is told what to do
-/// instead.
-pub fn poke_existing(activation: Activation) {
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_LBUTTONUP};
+/// instead. `own` is this process's own owner window, which shares the
+/// class and must never be mistaken for the other instance's.
+pub fn poke_existing(activation: Activation, own: HWND) -> PokeOutcome {
+    deliver_with(
+        POKE_RETRY_ATTEMPTS,
+        || find_other_owner_window(own),
+        || std::thread::sleep(std::time::Duration::from_millis(POKE_RETRY_WAIT_MS)),
+        |hwnd| post_activation(hwnd, activation),
+    )
+}
+
+/// The first top-level window of the owner class that is not `own`.
+fn find_other_owner_window(own: HWND) -> Option<HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowExW;
+
+    let mut after: Option<HWND> = None;
+    loop {
+        let found =
+            unsafe { FindWindowExW(None, after, w!("Wingman.Owner.Window.4d1b62f0"), None) }
+                .ok()
+                .filter(|h| !h.0.is_null())?;
+        if found != own {
+            return Some(found);
+        }
+        after = Some(found);
+    }
+}
+
+fn post_activation(hwnd: HWND, activation: Activation) {
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_LBUTTONUP};
 
     unsafe {
-        let Ok(hwnd) = FindWindowW(w!("Wingman.Owner.Window.4d1b62f0"), None) else {
-            return;
-        };
-        if hwnd.0.is_null() {
-            return;
-        }
         match activation {
             // Reuses the tray's own left-click message rather than calling
             // into app.rs directly, so this stays byte-for-byte what a real
@@ -125,6 +183,19 @@ pub fn poke_existing(activation: Activation) {
             }
         }
     }
+}
+
+static LOCK_SQUATTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records that the name was held by something that is not Wingman, so
+/// this process started without the lock. Shown in the diagnostics report.
+pub fn mark_lock_squatted() {
+    LOCK_SQUATTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this process started without the lock (see [`mark_lock_squatted`]).
+pub fn lock_squatted() -> bool {
+    LOCK_SQUATTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Decide what a duplicate launch means from its `argv`, without touching
@@ -201,6 +272,60 @@ mod tests {
         // Guards against someone "simplifying" the test back onto MUTEX_NAME,
         // which would make the suite fail whenever the app is running.
         assert!(!std::ptr::eq(TEST_NAME.0, MUTEX_NAME.0));
+    }
+
+    // -- #237: a duplicate that cannot find the running instance's window ---
+
+    #[test]
+    fn a_window_found_at_once_is_delivered_without_waiting() {
+        let mut waits = 0;
+        let mut delivered = None;
+        let out = deliver_with(5, || Some(7), || waits += 1, |h| delivered = Some(h));
+        assert_eq!(out, PokeOutcome::Delivered);
+        assert_eq!(waits, 0);
+        assert_eq!(delivered, Some(7));
+    }
+
+    #[test]
+    fn a_window_that_appears_on_retry_is_delivered() {
+        let mut tries = 0;
+        let mut waits = 0;
+        let mut delivered = None;
+        let out = deliver_with(
+            5,
+            || {
+                tries += 1;
+                (tries == 3).then_some(9)
+            },
+            || waits += 1,
+            |h| delivered = Some(h),
+        );
+        assert_eq!(out, PokeOutcome::Delivered);
+        assert_eq!(waits, 2);
+        assert_eq!(delivered, Some(9));
+    }
+
+    #[test]
+    fn a_window_that_never_appears_gives_up_after_the_bound() {
+        let mut tries = 0;
+        let mut delivered = false;
+        let out = deliver_with(
+            5,
+            || {
+                tries += 1;
+                None::<u8>
+            },
+            || {},
+            |_| delivered = true,
+        );
+        assert_eq!(out, PokeOutcome::NoWindow);
+        assert_eq!(tries, 5);
+        assert!(!delivered);
+    }
+
+    #[test]
+    fn the_retry_window_is_about_two_seconds() {
+        assert_eq!(POKE_RETRY_ATTEMPTS as u64 * POKE_RETRY_WAIT_MS, 2000);
     }
 
     fn args(strs: &[&str]) -> Vec<String> {

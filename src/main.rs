@@ -3,6 +3,7 @@
 mod actions;
 #[cfg(test)]
 mod actions_example;
+mod activation;
 mod app;
 mod autostart;
 mod calc;

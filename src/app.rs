@@ -34,6 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::actions;
+use crate::activation::Trigger;
 use crate::capture;
 use crate::config::{Config, Providers};
 use crate::connectors::civil_time::{CivilDate, CivilDateTime};
@@ -256,20 +257,35 @@ pub fn run() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    // #237: the owner window comes BEFORE the single-instance name. Then
+    // "the name is held" implies "a window of our class exists", because
+    // whoever holds the name created its window first, and a duplicate that
+    // finds no window knows the holder is not Wingman.
+    let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
+    let hwnd = create_owner_window(instance)?;
+
     // Claim the single-instance name before anything else is created. A
     // duplicate must not register a tray icon or install a keyboard hook,
     // because both would double every keypress -- and the second API call is
     // billed just like the first.
     let _instance = match crate::single_instance::acquire() {
-        crate::single_instance::Instance::First(lock) => lock,
+        crate::single_instance::Instance::First(lock) => Some(lock),
         crate::single_instance::Instance::Already => {
             // The shell launches this app by AUMID with no way to pass
             // arguments, so the Copilot key always arrives here bare; only a
             // launch explicitly carrying `--settings` should open Settings
             // instead of asking.
             let activation = crate::single_instance::activation_from_args(std::env::args());
-            crate::single_instance::poke_existing(activation);
-            return Ok(());
+            match crate::single_instance::poke_existing(activation, hwnd) {
+                crate::single_instance::PokeOutcome::Delivered => return Ok(()),
+                // Decision: a process squatting the name must not stop the
+                // app from starting. No instance answered, so start without
+                // the lock and say so (shown on a card below).
+                crate::single_instance::PokeOutcome::NoWindow => {
+                    crate::single_instance::mark_lock_squatted();
+                    None
+                }
+            }
         }
     };
 
@@ -286,7 +302,6 @@ pub fn run() -> Result<()> {
     }
     let _ = crate::autostart::remove_old_run_value();
 
-    let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let config = Config::load().unwrap_or_default();
     // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
     // anything below can start a request (the hotkey hook isn't installed
@@ -306,7 +321,6 @@ pub fn run() -> Result<()> {
     crate::ocr::set_preferred_language(&config.capture.ocr_language);
     let chain = Arc::new(config.build_chain());
 
-    let hwnd = create_owner_window(instance)?;
     // #105: every `Chain` built from here on asks the owner window to show
     // the send preview before a request leaves the machine (when the toggle
     // is on). Installed before anything can build a chain.
@@ -335,6 +349,13 @@ pub fn run() -> Result<()> {
     if !config.unreadable_secrets.is_empty() {
         let (headline, detail) = unreadable_secrets_card(&config.unreadable_secrets);
         card.show_error(&headline, &detail);
+    }
+    if crate::single_instance::lock_squatted() {
+        // Rule 7: this path ends in a card, not a silent start.
+        card.show_error(
+            "Another program holds Wingman's startup lock",
+            "Wingman started anyway. If you see two Wingman tray icons, quit one of them.",
+        );
     }
     let tray = Tray::new(hwnd, instance).context("creating the tray icon")?;
 
@@ -761,7 +782,7 @@ impl App {
     /// The whole flow: hide any stale card, check a provider is actually
     /// ready, grab the screen, then hand the bytes to a worker so the
     /// message loop stays responsive during the call.
-    fn ask(&mut self) {
+    fn ask(&mut self, trigger: Trigger) {
         let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
@@ -786,6 +807,8 @@ impl App {
         // `AskingModel` inside `begin_model_action` (findings 1 and 2), so
         // there is nothing left to set here.
         std::thread::spawn(move || {
+            // #236: every egress row this thread writes names its trigger.
+            crate::activation::set_worker_trigger(trigger);
             let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
                 let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                 worker(
@@ -1011,7 +1034,7 @@ impl App {
     /// never produces) is a no-op, not a panic (rule 7).
     fn dispatch_palette_action(&mut self, action_id: &str) {
         match palette_model::dispatch_target_for(action_id) {
-            Some(DispatchTarget::CheckMyWork) => self.ask(),
+            Some(DispatchTarget::CheckMyWork) => self.ask(Trigger::Palette),
             Some(DispatchTarget::ExtractText) => self.extract_text(),
             Some(DispatchTarget::ReadQr) => self.read_qr(),
             Some(DispatchTarget::AddToCalendar) => self.add_event_from_screen(),
@@ -4882,7 +4905,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 match decode(id) {
                     MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
-                    MenuChoice::Command(cmd::ASK_NOW) => app.ask(),
+                    MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
                     MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
                     MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
@@ -4926,16 +4949,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_APP_HOTKEY => {
             let _which = wparam.0; // both bindings do the same thing
             if !app.cancel_pending_send_preview() {
-                app.ask();
+                app.ask(Trigger::Hotkey);
             }
             LRESULT(0)
         }
         WM_APP_ACTIVATE => {
             // `ask` already no-ops while `busy`, so a second Copilot-key press
             // landing here while a request is in flight is harmless, except
-            // that it cancels a waiting send preview (#105).
-            if !app.cancel_pending_send_preview() {
-                app.ask();
+            // that it cancels a waiting send preview (#105). Any process can
+            // post this message (#236), so unlike the hotkey it is rate
+            // limited, and a refusal is counted for the diagnostics report.
+            if !app.cancel_pending_send_preview() && crate::activation::allow_activation_now() {
+                app.ask(Trigger::Activation);
             }
             LRESULT(0)
         }
@@ -6321,6 +6346,44 @@ mod tests {
         assert!(
             unresynced.is_empty(),
             "these config-mirror setters run at startup (App::run) but apply_config never calls a setter of the same name, so a Reload/Settings-save leaves their mirror on whatever was true at the last full restart: {unresynced:?}"
+        );
+    }
+
+    // -- activation trust (#236, #237) ---------------------------------------
+
+    /// #237: the owner window must exist before the single-instance name is
+    /// taken, or a duplicate arriving in the gap finds the name held and no
+    /// window to poke. Source scan over `run`'s body, so it needs no window.
+    #[test]
+    fn run_creates_the_owner_window_before_taking_the_instance_name() {
+        let app_src = lf(include_str!("app.rs"));
+        let run_src = run_body(&app_src);
+        let window = run_src.find("create_owner_window(instance)");
+        let acquire = run_src.find("single_instance::acquire()");
+        assert!(window.is_some(), "run no longer creates the owner window");
+        assert!(acquire.is_some(), "run no longer takes the instance name");
+        assert!(
+            window < acquire,
+            "the owner window must be created before single_instance::acquire"
+        );
+    }
+
+    /// #236: only the activation arm may be rate limited, and it must be.
+    #[test]
+    fn only_the_activation_arm_is_rate_limited() {
+        let app_src = lf(include_str!("app.rs"));
+        let body = wnd_proc_body(&app_src);
+        let arm = body
+            .split("WM_APP_ACTIVATE => {")
+            .nth(1)
+            .expect("wnd_proc has no WM_APP_ACTIVATE arm");
+        let arm = &arm[..arm.find("LRESULT(0)").expect("arm has no end")];
+        assert!(arm.contains("allow_activation_now()"), "{arm}");
+        assert!(arm.contains("Trigger::Activation"), "{arm}");
+        assert_eq!(
+            body.matches("allow_activation_now()").count(),
+            1,
+            "the limiter must guard activations only, never a key press"
         );
     }
 
