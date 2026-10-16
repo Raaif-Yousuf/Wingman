@@ -538,7 +538,7 @@ fn build_replace_text_proposal(ctx: &ReviewContext) -> Value {
                 "name": target.name,
                 "control_type": target.control_type
             },
-            "new_text": ctx.new_text,
+            "new_text": super::generic_replace::match_line_endings(&ctx.original_text, &ctx.new_text),
             "mode": "replace_all",
             "expected_current_text": ctx.original_text
         }),
@@ -1291,6 +1291,16 @@ mod tests {
         let v = build_replace_text_proposal(&ctx);
         assert_eq!(v["new_text"], "I wanted to help");
         assert_eq!(v["expected_current_text"], "I wnated to help");
+    }
+
+    #[test]
+    fn whole_text_replace_keeps_the_original_line_endings() {
+        // #689: a model returns LF; a CRLF body must not get a mix.
+        let mut ctx = sample_ctx();
+        ctx.original_text = "Hi\r\nI wnated to help\r\nBye".to_string();
+        ctx.new_text = "Hi\nI wanted to help\nBye".to_string();
+        let v = build_replace_text_proposal(&ctx);
+        assert_eq!(v["new_text"], "Hi\r\nI wanted to help\r\nBye");
     }
 
     // -- build_replace_text_proposal: ReplaceSelection target (#219) --------

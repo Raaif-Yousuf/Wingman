@@ -121,9 +121,9 @@ pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
 
 /// #242: posted by `App::run_generic_action`'s worker thread when the
 /// provider chain finishes for a non-built-in `actions.toml` action:
-/// `lparam` is `Box::into_raw(Box::new((String, Result<Value, String>)))`,
+/// `lparam` is `Box::into_raw(Box::new((Action, Value, GenericResult)))`,
 /// the generic-dispatch analogue of [`WM_APP_CALENDAR_RESULT`] -- the
-/// `String` is the action id, carried along because (unlike the calendar
+/// `Action` is carried along because (unlike the calendar
 /// flow) there is no single fixed action this result can belong to.
 /// `WM_APP + 16`: `+15` is already `crate::ui::card::WM_APP_CARD_OPEN_SETTINGS`.
 pub const WM_APP_GENERIC_ACTION_RESULT: u32 = WM_APP + 16;
