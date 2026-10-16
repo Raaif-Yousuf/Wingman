@@ -41,9 +41,9 @@ use crate::connectors::civil_time::{CivilDate, CivilDateTime};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::executors;
 use crate::hotkey::{
-    apply_learned, chord_to_string, pause_binding_label, pause_clash, slot_name, Chord, HotkeyHook,
-    HK_PAUSE, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE,
-    WM_APP_PAUSE_TOGGLE,
+    apply_learned, chord_to_string, pause_binding_label, slot_name, Chord, HotkeyHook,
+    LearnedVerdict, HK_PAUSE, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
+    WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
 };
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
@@ -3106,45 +3106,36 @@ impl App {
     }
 
     fn on_learned(&mut self, which: usize, chord: Chord) {
-        // Issue #202: the pause chord is matched first in the hook, so a
-        // chord shared with another slot would silently disable one of them.
-        // Refuse it with a card and keep the previous bindings. Checked
-        // before the system-shortcut warning below so the user is never
-        // asked to confirm a chord that is then refused anyway.
-        if let Some(other) = pause_clash(&self.config.hotkeys, which, chord) {
-            self.card.show_answer(
-                &format!("{} is already the {other}", chord_to_string(&chord)),
-                "Press a different key combo. The previous binding is unchanged.",
-                8,
-                None,
-            );
-            return;
-        }
-
-        // Issue #112: a known system/app shortcut warns and keeps the
-        // previous binding, unless the user just confirmed by capturing the
-        // exact same chord again for this slot -- see
-        // `hotkey_conflicts`'s module doc comment for the full flow.
-        match crate::hotkey_conflicts::decide(self.pending_conflict, which, chord) {
-            crate::hotkey_conflicts::LearnDecision::Warn(conflict) => {
-                self.pending_conflict = Some((which, chord));
-                self.card.show_answer(
-                    &format!(
-                        "{} is already used by {}",
-                        chord_to_string(&chord),
-                        conflict.owner
-                    ),
-                    "Press the same key combo again to bind it anyway, or press a different one. The previous binding is unchanged.",
-                    8,
-                    None,
-                );
+        // #576: the same judge Settings' Change buttons use (#345), so the
+        // tray refuses the same keys with the same words: a bare typing key,
+        // a chord already bound to another slot (pause chord #202, palette,
+        // primary vs secondary), and a known system shortcut (#112, press
+        // again to confirm). A refusal keeps the previous binding.
+        match crate::hotkey::judge_learned(
+            &self.config.hotkeys,
+            self.pending_conflict,
+            which,
+            chord,
+        ) {
+            LearnedVerdict::Cancel => {
+                self.pending_conflict = None;
+                self.card
+                    .show_answer("Cancelled", "The shortcut is unchanged.", 6, None);
                 return;
             }
-            crate::hotkey_conflicts::LearnDecision::Apply => {
-                self.pending_conflict = None;
+            LearnedVerdict::Refuse(text) => {
+                self.card
+                    .show_answer(&text, "The previous binding is unchanged.", 8, None);
+                return;
             }
+            LearnedVerdict::Warn(text) => {
+                self.pending_conflict = Some((which, chord));
+                self.card
+                    .show_answer(&text, "The previous binding is unchanged.", 8, None);
+                return;
+            }
+            LearnedVerdict::Apply => self.pending_conflict = None,
         }
-
         apply_learned(&mut self.config.hotkeys, which, chord);
         if let Some(hook) = &self.hook {
             if which == HK_PAUSE {

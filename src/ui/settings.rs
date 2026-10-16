@@ -100,8 +100,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::{ActiveProvider, CardCorner, Config, Hotkeys, OllamaConfig, RequireTickFor};
 use crate::hotkey::{
-    apply_learned, arm_learning, chord_to_string, disarm_learning, slot_name, Chord, HK_PAUSE,
-    HK_PRIMARY, HK_SECONDARY, WM_APP_LEARNED,
+    apply_learned, arm_learning, chord_to_string, disarm_learning, judge_learned, Chord,
+    LearnedVerdict, HK_PRIMARY, HK_SECONDARY, WM_APP_LEARNED,
 };
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::DEFAULT_PROMPT;
@@ -4200,68 +4200,6 @@ fn read_form(inner: &SettingsInner) -> Config {
 // ---------------------------------------------------------------------------
 // #345: changing the two shortcuts from here
 // ---------------------------------------------------------------------------
-
-/// What to do with a chord the learn hook captured for a pending Change.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LearnedVerdict {
-    /// A bare Esc: the user is backing out.
-    Cancel,
-    /// Not allowed, with the inline text to show. Learning stays armed.
-    Refuse(String),
-    /// A known system shortcut: show the text, and a second press of the
-    /// same chord applies it. Learning stays armed.
-    Warn(String),
-    /// Stage it.
-    Apply,
-}
-
-/// Judges a captured `chord` for slot `which`. Pure, so the flow is tested
-/// without a hook or a window. The conflict warning and its "press it again"
-/// confirmation are `hotkey_conflicts::decide`, the same as the tray's.
-fn judge_learned(
-    hotkeys: &Hotkeys,
-    pending: Option<(usize, Chord)>,
-    which: usize,
-    chord: Chord,
-) -> LearnedVerdict {
-    let bare = !(chord.ctrl || chord.shift || chord.alt || chord.win);
-    if bare && chord.vk == VK_ESCAPE.0 as u32 {
-        return LearnedVerdict::Cancel;
-    }
-    let anchored = chord.ctrl || chord.alt || chord.win;
-    let name = chord_to_string(&chord);
-    // A plain letter or Enter, or Shift plus a letter, as a global shortcut
-    // would swallow that key in every app. Function keys are fine without.
-    if !anchored && !(0x70..=0x87).contains(&chord.vk) {
-        return LearnedVerdict::Refuse(format!(
-            "{name} needs Ctrl, Alt or Win with it. Press another."
-        ));
-    }
-    let others = [
-        (HK_PRIMARY, Some(hotkeys.primary), slot_name(HK_PRIMARY)),
-        (
-            HK_SECONDARY,
-            Some(hotkeys.secondary),
-            slot_name(HK_SECONDARY),
-        ),
-        (HK_PAUSE, hotkeys.pause, slot_name(HK_PAUSE)),
-        (0, hotkeys.palette, "palette key"),
-    ];
-    for (slot, bound, label) in others {
-        if slot != which && bound == Some(chord) {
-            return LearnedVerdict::Refuse(format!(
-                "{name} is already the {label}. Press another."
-            ));
-        }
-    }
-    match crate::hotkey_conflicts::decide(pending, which, chord) {
-        crate::hotkey_conflicts::LearnDecision::Apply => LearnedVerdict::Apply,
-        crate::hotkey_conflicts::LearnDecision::Warn(conflict) => LearnedVerdict::Warn(format!(
-            "{name} is already used by {}. Press it again to use it anyway.",
-            conflict.owner
-        )),
-    }
-}
 
 /// Why a Change cannot work right now, or `None`. While paused the hook
 /// passes every key through untouched, so nothing would ever be captured.
