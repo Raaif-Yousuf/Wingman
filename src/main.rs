@@ -25,6 +25,7 @@ mod known_folder;
 mod machine;
 mod mode;
 mod ocr;
+mod overlay;
 mod owner_acl;
 mod password_managers;
 mod pause;
