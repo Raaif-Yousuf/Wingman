@@ -42,6 +42,9 @@ rqrr = { version = "0.11", default-features = false }
 version = "0.62"
 features = [
   "Win32_Foundation",
+  # web_page.rs (#552): MultiByteToWideChar decodes a linked page's declared
+  # character set with no extra crate.
+  "Win32_Globalization",
   # Issue #216: the Quick Ask palette's row list and query text, via
   # ID2D1HwndRenderTarget + IDWriteTextFormat (palette.rs's `d2d` module).
   "Win32_Graphics_Direct2D",
