@@ -125,6 +125,9 @@ pub struct ScreenMap {
     /// The password-field lookup started at capture time. `None` for a map
     /// built without one (a test).
     pub lookup: Option<crate::inputs::uia::PasswordLookup>,
+    /// Password-manager windows beside the front one, on this monitor when
+    /// the capture was taken (#575). Painted out of a redacted shot.
+    pub manager_windows: Vec<ScreenRect>,
 }
 
 /// Which window's password fields a capture asks about.
@@ -262,6 +265,90 @@ fn not_ours(hwnd: isize) -> isize {
     first_foreign_window(hwnd, own, &pid_of, &shown, &next, 200)
 }
 
+/// The most top-level windows looked at when listing password managers.
+const MAX_WINDOWS_SCANNED: usize = 400;
+
+/// The visible, un-minimised, un-cloaked top-level windows of other
+/// processes that are password managers and overlap `monitor` (#575). Main
+/// thread, no UI Automation: the process image path and title only, the same
+/// matcher as the foreground check. Scans at most [`MAX_WINDOWS_SCANNED`]
+/// windows and returns at most `MAX_MANAGER_RECTS`. A failure to enumerate
+/// is an empty list, as for any window that cannot be queried.
+fn manager_windows_on(monitor: ScreenRect, extra: &[String]) -> Vec<ScreenRect> {
+    use crate::password_managers::WindowFacts;
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible,
+    };
+    struct Scan {
+        own: u32,
+        left: usize,
+        facts: Vec<WindowFacts>,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        // SAFETY: `lparam` is the `&mut Scan` passed to `EnumWindows` below,
+        // which does not return until this callback has.
+        let scan = unsafe { &mut *(lparam.0 as *mut Scan) };
+        if scan.left == 0 {
+            return false.into();
+        }
+        scan.left -= 1;
+        let mut cloaked = 0u32;
+        let _ = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        let mut r = RECT::default();
+        let got = unsafe { GetWindowRect(hwnd, &mut r) }.is_ok();
+        let empty = !got || r.right <= r.left || r.bottom <= r.top;
+        // A tool window is not the app, but a password manager's own
+        // floating panel is still the manager: only the checks that decide
+        // "is it on screen" apply here, so the tool flag is passed as false.
+        if !walk_target(
+            unsafe { IsWindowVisible(hwnd) }.as_bool(),
+            cloaked != 0,
+            false,
+            unsafe { IsIconic(hwnd) }.as_bool(),
+            empty,
+        ) {
+            return true.into();
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid == 0 || pid == scan.own {
+            return true.into();
+        }
+        let mut buf = [0u16; 256];
+        let len = unsafe { GetWindowTextW(hwnd, &mut buf) }.max(0) as usize;
+        scan.facts.push(WindowFacts {
+            image_path: crate::provider::ollama_admin::process_image_path(pid),
+            title: String::from_utf16_lossy(&buf[..len.min(buf.len())]),
+            rect: ScreenRect {
+                left: r.left,
+                top: r.top,
+                right: r.right,
+                bottom: r.bottom,
+            },
+        });
+        true.into()
+    }
+    let mut scan = Scan {
+        own: unsafe { GetCurrentProcessId() },
+        left: MAX_WINDOWS_SCANNED,
+        facts: Vec::new(),
+    };
+    // SAFETY: `scan` outlives the call; the callback is the only user.
+    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut scan as *mut Scan as isize)) };
+    crate::password_managers::manager_window_rects(&scan.facts, monitor, extra)
+}
+
 impl ScreenMap {
     /// The map of a monitor whose top-left is `(left, top)` and whose native
     /// size is `native_w` x `native_h`, captured and then resized to
@@ -281,6 +368,7 @@ impl ScreenMap {
             scale_x: f64::from(native_w.max(1)) / f64::from(width.max(1)),
             scale_y: f64::from(native_h.max(1)) / f64::from(height.max(1)),
             lookup,
+            manager_windows: Vec::new(),
         }
     }
 
@@ -354,17 +442,21 @@ pub fn grab_raw(monitor_mode: &str, max_long_edge: u32, max_pixels: u64) -> Resu
         max_long_edge,
         max_pixels,
         LookupWindow::Foreground,
+        &[],
     )
 }
 
 /// [`grab_raw`], with the window whose password fields are looked up named.
 /// The lookup thread starts here, before the monitor is grabbed, so it runs
-/// alongside the capture, the resize and the encode (#506).
+/// alongside the capture, the resize and the encode (#506). When a lookup is
+/// asked for, the password-manager windows on the monitor are listed too
+/// (#575; `extra_managers` is `capture.extra_password_managers`).
 pub fn grab_raw_for(
     monitor_mode: &str,
     max_long_edge: u32,
     max_pixels: u64,
     lookup_window: LookupWindow,
+    extra_managers: &[String],
 ) -> Result<RawShot> {
     let lookup = lookup_window
         .resolve()
@@ -397,6 +489,19 @@ pub fn grab_raw_for(
     );
 
     let (w, h) = (image.width(), image.height());
+    let managers = if lookup_window == LookupWindow::None {
+        Vec::new()
+    } else {
+        manager_windows_on(
+            ScreenRect {
+                left: origin_x,
+                top: origin_y,
+                right: origin_x.saturating_add(i32::try_from(w).unwrap_or(i32::MAX)),
+                bottom: origin_y.saturating_add(i32::try_from(h).unwrap_or(i32::MAX)),
+            },
+            extra_managers,
+        )
+    };
     let (nw, nh) = fit_for_model(w, h, max_long_edge, max_pixels);
 
     let resized = if (nw, nh) == (w, h) {
@@ -406,13 +511,13 @@ pub fn grab_raw_for(
     };
 
     let (final_w, final_h) = (resized.width(), resized.height());
+    let mut screen = ScreenMap::for_capture(origin_x, origin_y, w, h, final_w, final_h, lookup);
+    screen.manager_windows = managers;
     Ok(RawShot {
         rgba: resized.into_raw(),
         width: final_w,
         height: final_h,
-        screen: Some(ScreenMap::for_capture(
-            origin_x, origin_y, w, h, final_w, final_h, lookup,
-        )),
+        screen: Some(screen),
     })
 }
 

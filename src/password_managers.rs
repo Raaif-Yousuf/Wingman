@@ -15,10 +15,11 @@
 //!
 //! # Limits
 //!
-//! Only the FOREGROUND window is checked. A password manager visible beside
-//! it is still in a full-monitor screenshot. Store/UWP builds run under
+//! Only the FOREGROUND window is REFUSED. A password manager visible beside
+//! it (#575) is painted out of a cloud-bound screenshot instead: see
+//! [`manager_window_rects`]. Store/UWP builds run under
 //! `ApplicationFrameHost.exe`, so their process name says nothing and they
-//! are not covered. The tray menu and the palette take the foreground
+//! are not covered either way. The tray menu and the palette take the foreground
 //! before an action runs, so `App` remembers who was in front when they
 //! opened (see `password_manager_hint` in `app.rs`).
 
@@ -148,12 +149,129 @@ pub fn foreground_is_password_manager(extra: &[String]) -> bool {
     is_password_manager(image.as_deref(), &title, extra)
 }
 
+/// What the window enumeration learned about one top-level window.
+#[derive(Debug, Clone)]
+pub struct WindowFacts {
+    pub image_path: Option<String>,
+    pub title: String,
+    pub rect: crate::capture::ScreenRect,
+}
+
+/// The most rectangles one capture paints for password managers (#575).
+pub const MAX_MANAGER_RECTS: usize = 16;
+
+/// The rectangles of the password-manager windows among `windows` that
+/// overlap `monitor` (#575), at most [`MAX_MANAGER_RECTS`]. Pure: the Win32
+/// enumeration in `capture.rs` collects the facts. A rect from another
+/// process is never trusted: empty or reversed ones are dropped.
+pub fn manager_window_rects(
+    windows: &[WindowFacts],
+    monitor: crate::capture::ScreenRect,
+    extra: &[String],
+) -> Vec<crate::capture::ScreenRect> {
+    windows
+        .iter()
+        .filter(|w| {
+            let r = w.rect;
+            r.right > r.left
+                && r.bottom > r.top
+                && r.left < monitor.right
+                && r.right > monitor.left
+                && r.top < monitor.bottom
+                && r.bottom > monitor.top
+        })
+        .filter(|w| is_password_manager(w.image_path.as_deref(), &w.title, extra))
+        .map(|w| w.rect)
+        .take(MAX_MANAGER_RECTS)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn none() -> Vec<String> {
         Vec::new()
+    }
+
+    // -- beside the front window (#575) ------------------------------------
+
+    fn sr(left: i32, top: i32, right: i32, bottom: i32) -> crate::capture::ScreenRect {
+        crate::capture::ScreenRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    fn facts(image: &str, title: &str, rect: crate::capture::ScreenRect) -> WindowFacts {
+        WindowFacts {
+            image_path: Some(image.to_string()),
+            title: title.to_string(),
+            rect,
+        }
+    }
+
+    #[test]
+    fn a_manager_beside_the_front_window_is_listed_and_ordinary_windows_are_not() {
+        let monitor = sr(0, 0, 1920, 1080);
+        let windows = [
+            facts(r"C:\Windows\explorer.exe", "Docs", sr(0, 0, 900, 1000)),
+            facts(
+                r"C:\Program Files\KeePassXC\KeePassXC.exe",
+                "Vault",
+                sr(900, 0, 1900, 1000),
+            ),
+        ];
+        assert_eq!(
+            manager_window_rects(&windows, monitor, &none()),
+            vec![sr(900, 0, 1900, 1000)]
+        );
+    }
+
+    #[test]
+    fn the_users_own_list_and_title_screens_count_beside_the_front_window_too() {
+        let monitor = sr(0, 0, 100, 100);
+        let extra = vec!["myvault".to_string()];
+        let windows = [
+            facts(r"C:\x\MyVault.exe", "x", sr(0, 0, 10, 10)),
+            facts(
+                r"C:\Windows\explorer.exe",
+                "Credential Manager",
+                sr(20, 20, 40, 40),
+            ),
+        ];
+        assert_eq!(manager_window_rects(&windows, monitor, &extra).len(), 2);
+    }
+
+    #[test]
+    fn a_manager_on_another_monitor_or_with_a_bad_rect_is_not_listed() {
+        let monitor = sr(0, 0, 1920, 1080);
+        let kp = r"C:\Program Files\KeePass\KeePass.exe";
+        let windows = [
+            facts(kp, "elsewhere", sr(1920, 0, 3000, 500)),
+            facts(kp, "left of it", sr(-900, 0, 0, 500)),
+            facts(kp, "empty", sr(10, 10, 10, 50)),
+            facts(kp, "reversed", sr(500, 500, 100, 100)),
+            facts(kp, "minimised", sr(-32000, -32000, -31840, -31972)),
+        ];
+        assert!(manager_window_rects(&windows, monitor, &none()).is_empty());
+        // A window that only overlaps the monitor is still listed.
+        let edge = [facts(kp, "edge", sr(1800, 900, 2500, 1500))];
+        assert_eq!(manager_window_rects(&edge, monitor, &none()).len(), 1);
+    }
+
+    #[test]
+    fn the_list_is_capped() {
+        let monitor = sr(0, 0, 100, 100);
+        let many: Vec<WindowFacts> = (0..MAX_MANAGER_RECTS * 3)
+            .map(|_| facts(r"C:\x\bitwarden.exe", "v", sr(0, 0, 50, 50)))
+            .collect();
+        assert_eq!(
+            manager_window_rects(&many, monitor, &none()).len(),
+            MAX_MANAGER_RECTS
+        );
     }
 
     #[test]
