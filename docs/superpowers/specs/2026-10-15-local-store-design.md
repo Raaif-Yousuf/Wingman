@@ -404,6 +404,13 @@ wired to nothing (AGENTS.md rule 8).
 | 5 | v5 = `document`, `chunk`, `chunk_fts`, the `VectorIndex` trait and chosen implementation (with #83 and #85) | the ingest pipeline and retrieval | A phrase from a dropped resume comes back as the first hit; deleting the file leaves no chunk rows |
 | 6 | delete-after-release: remove the `.migrated` files; context table with #61 | the same startup path | the files are gone |
 
+Slice 2 as built: v2 adds `trigger_label` and `redactions` to the `egress`
+table (fields added to `EgressEntry` after this spec, #236 and #508). When the
+store cannot save a row, the row is kept in a bounded in-memory list (500 rows,
+oldest dropped and counted), reported once per run, written first by the next
+successful save, and listed by the diagnostics report with the reason. There is
+no second file.
+
 Slices 1 to 3 do not depend on the knowledge track and can land in order as soon
 as this design is accepted. Slices 5 and 6 are listed so their tables have a
 reserved home; their own specs and issues own the detail.

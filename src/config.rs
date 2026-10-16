@@ -740,15 +740,6 @@ thread_local! {
     static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Test-only seam onto [`FORCE_ACL_FAILURE_FOR_TEST`] for modules other than
-/// this one (#277: `egress.rs` reuses `restrict_acl` and needs to prove its
-/// own "ACL failure must not lose the log entry" contract the same way this
-/// module already proves "ACL failure aborts the write").
-#[cfg(all(test, windows))]
-pub(crate) fn force_acl_failure_for_test(active: bool) {
-    FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.set(active));
-}
-
 impl Config {
     /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {

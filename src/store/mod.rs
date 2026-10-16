@@ -18,6 +18,7 @@
 //! * **Only this module names `rusqlite`.** Callers get typed methods.
 
 mod acl;
+mod egress;
 mod import;
 mod migrate;
 mod usage_day;
@@ -215,10 +216,39 @@ fn legacy_spend_path() -> Result<PathBuf, StoreError> {
     }
 }
 
+/// `%LOCALAPPDATA%\Wingman\egress.log`, the file the `egress` table
+/// replaced. Under `#[cfg(test)]` a per-process file in `%TEMP%` (rule 9).
+fn legacy_egress_path() -> Result<PathBuf, StoreError> {
+    #[cfg(test)]
+    {
+        Ok(std::env::temp_dir().join(format!("wingman-test-egress-{}.log", std::process::id())))
+    }
+    #[cfg(not(test))]
+    {
+        let base = crate::known_folder::local_app_data()
+            .map_err(|e| StoreError::Other(format!("no local app data folder: {e}")))?;
+        Ok(base.join("Wingman").join("egress.log"))
+    }
+}
+
+/// The old files that are imported once, then renamed `.migrated`.
+struct Legacy<'a> {
+    spend: &'a Path,
+    egress: &'a Path,
+}
+
 /// The real open, at the real paths.
 fn open_default() -> Result<Store, StoreError> {
     sweep_stale_test_dirs();
-    open_in(&db_path()?, &legacy_spend_path()?, acl::restrict_dir)
+    let (spend, egress) = (legacy_spend_path()?, legacy_egress_path()?);
+    open_in(
+        &db_path()?,
+        &Legacy {
+            spend: &spend,
+            egress: &egress,
+        },
+        acl::restrict_dir,
+    )
 }
 
 /// Owner-only directory, recovery, migrations, imports.
@@ -230,7 +260,7 @@ fn open_default() -> Result<Store, StoreError> {
 /// instead of trusting an unrestricted folder.
 fn open_in(
     path: &Path,
-    legacy_spend: &Path,
+    legacy: &Legacy<'_>,
     restrict: impl FnOnce(&Path) -> Result<(), StoreError>,
 ) -> Result<Store, StoreError> {
     let dir = path
@@ -247,7 +277,10 @@ fn open_in(
     if let Some(n) = recovered {
         note(n);
     }
-    if let Some(n) = import::spend_json(&mut store.lock(), legacy_spend)? {
+    if let Some(n) = import::spend_json(&mut store.lock(), legacy.spend)? {
+        note(n);
+    }
+    if let Some(n) = import::egress_log(&mut store.lock(), legacy.egress)? {
         note(n);
     }
     Ok(store)
@@ -347,7 +380,7 @@ mod tests {
             migrate::current_version(&conn).unwrap(),
             migrate::MIGRATIONS.last().unwrap().version
         );
-        for table in ["meta", "usage_day"] {
+        for table in ["meta", "usage_day", "egress"] {
             let n: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE name = ?1",
@@ -492,7 +525,11 @@ mod tests {
     fn the_acl_step_runs_only_when_the_directory_is_created() {
         let dir = scratch("acl-once");
         let path = dir.join("store").join("wingman.db");
-        let legacy = dir.join("spend.json");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+        };
         let calls = std::cell::Cell::new(0);
         let count = |_: &Path| {
             calls.set(calls.get() + 1);
@@ -515,7 +552,12 @@ mod tests {
     fn a_failed_acl_step_removes_the_directory_so_the_next_launch_retries() {
         let dir = scratch("acl-fail");
         let path = dir.join("store").join("wingman.db");
-        let err = open_in(&path, &dir.join("spend.json"), |_: &Path| {
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+        };
+        let err = open_in(&path, &legacy, |_: &Path| {
             Err(StoreError::Acl("nope".to_string()))
         })
         .err()
@@ -532,13 +574,49 @@ mod tests {
         // (directory, ACL step, migrations) and every later launch.
         let dir = scratch("timing");
         let path = dir.join("store").join("wingman.db");
-        let legacy = dir.join("spend.json");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+        };
         let t = std::time::Instant::now();
         drop(open_in(&path, &legacy, acl::restrict_dir).unwrap());
         println!("first-ever launch: {:?}", t.elapsed());
         let t = std::time::Instant::now();
         drop(open_in(&path, &legacy, acl::restrict_dir).unwrap());
         println!("later launch: {:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_open_imports_a_waiting_egress_log_and_renames_it() {
+        // The wiring check for the import: through the real open path, not
+        // the import function alone.
+        let dir = scratch("egress-import");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let row = crate::egress::build_entry(
+            "legacy",
+            "https://api.example.com/",
+            &serde_json::json!({"model": "m"}),
+            false,
+            1,
+            2,
+            crate::egress::Outcome::Success,
+            None,
+        );
+        std::fs::write(&egress, serde_json::to_string(&row).unwrap() + "\n").unwrap();
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+        };
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+
+        assert_eq!(s.egress_rows().unwrap().len(), 1);
+        assert!(!egress.exists());
+        assert!(dir.join("egress.log.migrated").exists());
+        drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
