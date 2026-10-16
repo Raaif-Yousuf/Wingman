@@ -7,6 +7,7 @@
 
 pub mod action_items;
 pub mod calendar;
+pub mod code_actions;
 pub mod convert_times;
 pub mod define_word;
 pub mod describe_image;
@@ -21,6 +22,7 @@ pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
 pub mod review_email;
+pub mod rewrite_tone;
 pub mod scam_check;
 pub mod schema;
 pub mod table;
@@ -409,8 +411,16 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `scam_check`, executor `none`. A calibrated verdict (likely a scam,
 ///   suspicious, no clear signs) with the signs behind it, for the message or
 ///   page on screen.
+/// - `"explain-this-code"`, `"fix-this-code"`, `"write-tests-for-code"` (#73,
+///   `code_actions::builtin_actions`): group Code, the selection only. Explain
+///   is a read-only card, Fix confirms then replaces the selection, Tests
+///   confirms then copies.
+/// - `"rewrite-shorter"`, `"rewrite-friendlier"`, `"rewrite-formal"` (#72,
+///   `rewrite_tone::builtin_actions`): proposal `text_answer`, executor
+///   `replace_text`. Rewrite the selection in a fixed tone, confirmed on a
+///   card, then written over the selection like "Translate selection".
 pub fn builtin_actions() -> Vec<Action> {
-    vec![
+    let mut actions = vec![
         Action {
             id: DEFAULT_ACTION_ID.to_string(),
             name: "Check my work".to_string(),
@@ -467,7 +477,10 @@ pub fn builtin_actions() -> Vec<Action> {
         link_summary::builtin_action(),
         convert_times::builtin_action(),
         scam_check::builtin_action(),
-    ]
+    ];
+    actions.extend(code_actions::builtin_actions());
+    actions.extend(rewrite_tone::builtin_actions());
+    actions
 }
 
 /// Replaces each built-in whose `id` a user action matches (wholesale -- the

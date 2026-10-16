@@ -117,7 +117,8 @@ fn value_at(key_path: &str, value_name: &str) -> Option<String> {
 
 /// Whether Wingman is registered to start with Windows.
 pub fn is_enabled() -> bool {
-    is_enabled_at(RUN_KEY, VALUE_NAME)
+    // Portable mode (#130) never touches the Run key, so it is never on.
+    !crate::portable::is_portable() && is_enabled_at(RUN_KEY, VALUE_NAME)
 }
 
 /// [`is_enabled`], with the key path and value name injected so tests can
@@ -130,7 +131,18 @@ fn is_enabled_at(key_path: &str, value_name: &str) -> bool {
 /// executable path, so toggling it off and on is also the way to repair a
 /// stale entry after moving the exe.
 pub fn set_enabled(on: bool) -> Result<()> {
-    set_enabled_at(RUN_KEY, VALUE_NAME, on)
+    set_enabled_in(crate::portable::is_portable(), RUN_KEY, VALUE_NAME, on)
+}
+
+/// [`set_enabled`] with the portable flag and the key injected for tests.
+/// In portable mode (#130) this is a no-op that reports success: Wingman
+/// makes no registry writes there, and a failure card for a switch the
+/// Settings window already shows as off would help nobody.
+fn set_enabled_in(portable: bool, key_path: &str, value_name: &str, on: bool) -> Result<()> {
+    if portable {
+        return Ok(());
+    }
+    set_enabled_at(key_path, value_name, on)
 }
 
 /// [`set_enabled`], with the key path and value name injected so tests can
@@ -154,6 +166,9 @@ fn set_enabled_at(key_path: &str, value_name: &str, on: bool) -> Result<()> {
 /// old value is already absent, so this is safe to call unconditionally on
 /// every startup rather than gating it on whether config migration also ran.
 pub fn remove_old_run_value() -> Result<()> {
+    if crate::portable::is_portable() {
+        return Ok(());
+    }
     let cmd = command()?;
     migrate_value_at(RUN_KEY, OLD_VALUE_NAME, VALUE_NAME, &cmd)
 }
@@ -208,6 +223,9 @@ fn delete_value_at(key_path: &str, value_name: &str) -> Result<()> {
 /// silently stops working and the checkbox still says it is on, which is the
 /// worst of both.
 pub fn repair_if_stale() {
+    if crate::portable::is_portable() {
+        return;
+    }
     let Some(registered) = current_value() else {
         return;
     };
@@ -232,6 +250,17 @@ mod tests {
             std::path::Path::new(inner).is_absolute(),
             "path must be absolute so the shell does not resolve it against CWD: {inner}"
         );
+    }
+
+    #[test]
+    fn portable_mode_writes_nothing_to_the_registry() {
+        let key = r"Software\WingmanTest\AutostartPortable";
+        let name = "WingmanPortableTest";
+        // The scratch key does not even exist: a real write attempt would
+        // fail, so Ok(()) plus "still not enabled" proves nothing was tried.
+        assert!(set_enabled_in(true, key, name, true).is_ok());
+        assert!(set_enabled_in(true, key, name, false).is_ok());
+        assert!(!is_enabled_at(key, name));
     }
 
     #[test]

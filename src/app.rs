@@ -47,6 +47,7 @@ use crate::hotkey::{
 };
 use crate::mode::{self, Mode};
 use crate::pause::{self, PauseChoice, PauseState};
+use crate::provider::ollama_admin::{self, FirstRun};
 use crate::provider::{
     calendar_request, generic_action_request, parse_answer, physics_request,
     review_request_from_screen, review_request_from_text, Answer, Chain, Provider, Shot,
@@ -120,9 +121,9 @@ pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
 
 /// #242: posted by `App::run_generic_action`'s worker thread when the
 /// provider chain finishes for a non-built-in `actions.toml` action:
-/// `lparam` is `Box::into_raw(Box::new((String, Result<Value, String>)))`,
+/// `lparam` is `Box::into_raw(Box::new((Action, Value, GenericResult)))`,
 /// the generic-dispatch analogue of [`WM_APP_CALENDAR_RESULT`] -- the
-/// `String` is the action id, carried along because (unlike the calendar
+/// `Action` is carried along because (unlike the calendar
 /// flow) there is no single fixed action this result can belong to.
 /// `WM_APP + 16`: `+15` is already `crate::ui::card::WM_APP_CARD_OPEN_SETTINGS`.
 pub const WM_APP_GENERIC_ACTION_RESULT: u32 = WM_APP + 16;
@@ -143,14 +144,21 @@ pub const WM_APP_SEND_PREVIEW: u32 = WM_APP + 18;
 /// is dropped. `WM_APP + 19`: `+18` is `WM_APP_SEND_PREVIEW`.
 pub const WM_APP_PENDING_STAGE: u32 = WM_APP + 19;
 
+/// #133: posted by the first-run probe's worker thread when it has looked for
+/// a local Ollama. `lparam` is `Box::into_raw(Box::new(FirstRun))`; the
+/// handler takes ownership. The probe waits on the network, so it never runs
+/// on the message loop (which is also the keyboard hook's thread).
+/// `WM_APP + 20`: `+19` is `WM_APP_PENDING_STAGE`.
+pub const WM_APP_FIRST_RUN: u32 = WM_APP + 20;
+
 /// #328: posted by the "Check this PC for local models" worker thread when
 /// its reads finish. `lparam` is
 /// `Box::into_raw(Box::new(machine::MachineFacts))`; the receiver takes
 /// ownership. The reads (including a loopback `/api/ps` call) run off the
 /// message thread because that thread also hosts the low-level keyboard
-/// hook, which Windows drops if it stalls. `WM_APP + 20`: `+19` is
-/// `WM_APP_PENDING_STAGE`.
-pub const WM_APP_MACHINE_CHECK_RESULT: u32 = WM_APP + 20;
+/// hook, which Windows drops if it stalls. `WM_APP + 21`: `+20` is
+/// `WM_APP_FIRST_RUN`.
+pub const WM_APP_MACHINE_CHECK_RESULT: u32 = WM_APP + 21;
 
 /// Set while a machine check is gathering, so a second click does not start
 /// a second worker. Cleared by the worker just before it posts, so an
@@ -356,6 +364,10 @@ struct App {
     /// `WM_APP_PENDING_STAGE` carries the number it started under, so a late
     /// stage cannot relabel the card of a newer run.
     run_generation: u64,
+    /// #133: the number of the latest first-run probe. A probe's answer
+    /// carries the number it started under; an older one is ignored, so two
+    /// quick presses cannot make the first answer clobber the second's card.
+    first_run_probe: u64,
     /// #228: the footer line for the answer now being shown, set by each
     /// action result handler from the worker's attribution and `None` unless
     /// a fallback answered.
@@ -399,6 +411,9 @@ fn error_details_clipboard_text(last_error: &LastError) -> &str {
 }
 
 pub fn run() -> Result<()> {
+    // #700: the thread that runs this hosts the keyboard hook, and a `--settings`
+    // launch runs the Settings loop before `pump_messages`, so mark it first.
+    crate::ui_thread::mark_current_thread();
     // Before any window exists, so the card's metrics are right on a mixed-DPI
     // setup (a laptop panel next to an external monitor).
     unsafe {
@@ -543,6 +558,7 @@ pub fn run() -> Result<()> {
         pending_preview: None,
         pending_preview_generation: 0,
         run_generation: 0,
+        first_run_probe: 0,
         fallback_footer: None,
         last_form_undo: None,
         last_error: None,
@@ -707,6 +723,8 @@ fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
 }
 
 fn pump_messages() {
+    // #700: this thread hosts the keyboard hook, so no blocking network call may run here.
+    crate::ui_thread::mark_current_thread();
     let mut msg = MSG::default();
     // GetMessageW returns -1 on error; treat anything non-positive as "stop".
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -771,6 +789,49 @@ impl BeginPlan {
     }
 }
 
+/// #133: whether a probe's answer belongs to the latest probe. An older
+/// one (an earlier press) is dropped.
+fn first_run_result_is_current(run: u64, latest: u64) -> bool {
+    run == latest
+}
+
+/// #133: after a probe whose answer needs no card, whether to hide the card
+/// on screen. Only the working card this probe put up: a card for something
+/// else (an answer, or a run in flight) is left alone.
+fn should_hide_after_first_run(card_is_pending: bool, busy: bool) -> bool {
+    card_is_pending && !busy
+}
+
+/// #133: the card shown once a local Ollama has been adopted. A stock tray
+/// listener can be CPU only (AGENTS.md pitfall), so that case says answers may
+/// be slow and where to look.
+fn first_run_adopted_card(
+    model: &str,
+    kind: crate::provider::ollama_admin::ListenerKind,
+) -> (String, String) {
+    let mut detail =
+        format!("Wingman will answer with {model}, which runs on this PC. Press again to ask.");
+    if kind == crate::provider::ollama_admin::ListenerKind::StockTrayServer {
+        detail.push_str(
+            " This is the stock Ollama app, which can run on the CPU only, so answers may be slow. Settings shows what it is using.",
+        );
+    }
+    ("Using Ollama on this PC".to_string(), detail)
+}
+
+/// #133: the readiness card's detail when Ollama is running but has nothing
+/// that can read the screen; `None` leaves the usual card alone. The card
+/// already opens Settings, where the model can be downloaded.
+fn first_run_detail(found: &FirstRun) -> Option<String> {
+    match found {
+        FirstRun::NoVisionModel => Some(
+            "Ollama is running, but none of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
+                .to_string(),
+        ),
+        FirstRun::NotRunning | FirstRun::Found { .. } => None,
+    }
+}
+
 fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
     if busy {
         ModelActionGate::Busy
@@ -828,6 +889,101 @@ impl App {
                 "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
             ),
         })
+    }
+
+    /// #133: on the press that hit the readiness gate with nothing set up,
+    /// looks for a local Ollama with a vision model. The look waits on the
+    /// network, so it runs on a worker thread and posts [`WM_APP_FIRST_RUN`];
+    /// this only shows the pending card and starts it. Nothing is cached: a
+    /// press re-runs the probe, which costs the worker a moment, never the
+    /// message loop. Returns `false` (nothing started) when this setup is not
+    /// eligible: a key, a chosen provider or Cloud mode.
+    fn start_first_run_probe(&mut self) -> bool {
+        if !self
+            .config
+            .providers
+            .first_run_local_eligible(self.config.mode)
+        {
+            return false;
+        }
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        self.first_run_probe = self.first_run_probe.wrapping_add(1);
+        let run = self.first_run_probe;
+        let target = self.hwnd_isize();
+        let base_url = self.config.providers.ollama.base_url.clone();
+        let preferred = self.config.providers.ollama.model.clone();
+        std::thread::spawn(move || {
+            let found = ollama_admin::probe_first_run(&base_url, &preferred);
+            let payload = Box::into_raw(Box::new(found));
+            unsafe {
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_FIRST_RUN,
+                    WPARAM(run as usize),
+                    LPARAM(payload as isize),
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_FIRST_RUN, LPARAM(payload as isize));
+                }
+            }
+        });
+        true
+    }
+
+    /// #133: the probe's answer. A found model becomes the setup (saved,
+    /// chain rebuilt) and the card says so; the next press asks it. Anything
+    /// else shows the readiness card, with a sharper detail when Ollama runs
+    /// but has no vision model. If the setup changed while the probe ran
+    /// (a key was pasted), there is nothing to say.
+    fn on_first_run_result(&mut self, run: u64, found: FirstRun) {
+        if !first_run_result_is_current(run, self.first_run_probe) {
+            return;
+        }
+        let path = Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "config.toml".into());
+        let Some((headline, mut detail)) =
+            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+        else {
+            let pending = matches!(self.card.state(), crate::ui::card::CardState::Pending);
+            if should_hide_after_first_run(pending, self.busy) {
+                self.card.hide();
+            }
+            return;
+        };
+        let eligible = self
+            .config
+            .providers
+            .first_run_local_eligible(self.config.mode);
+        if let (FirstRun::Found { model, kind }, true) = (&found, eligible) {
+            let base_url = ollama_admin::first_run_base_url(&self.config.providers.ollama.base_url)
+                .unwrap_or_else(|| self.config.providers.ollama.base_url.clone());
+            self.config.providers.adopt_local_model(model, &base_url);
+            self.chain = Arc::new(self.config.build_chain());
+            let saved = self.config.save();
+            self.refresh_tray_labels();
+            let (title, text) = first_run_adopted_card(model, *kind);
+            match saved {
+                Ok(()) => self.card.show_answer(&title, &text, 8, None),
+                Err(e) => {
+                    let headline = format!("{title}: not saved");
+                    let human = self.track_error(&headline, &format!("{e:#}"));
+                    self.card.show_error_with_details(
+                        &headline,
+                        &format!("It will revert when you quit.\n\n{human}"),
+                    );
+                }
+            }
+            self.set_watch(true);
+            return;
+        }
+        if let Some(d) = first_run_detail(&found) {
+            detail = d;
+        }
+        self.card.show_settings_needed(&headline, &detail);
     }
 
     /// #339: a password manager is in front now, or was when Wingman's own
@@ -936,13 +1092,15 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        if let Some((headline, detail)) =
-            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-                .filter(|_| plan.require_provider)
-        {
-            // Issue #347: readiness-gate cards are always "go fix something
-            // in Settings" cards (a missing API key or Ollama config), so a
-            // click opens Settings directly instead of just expanding.
+        let blocked = Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+            .filter(|_| plan.require_provider);
+        if let Some((headline, detail)) = blocked {
+            // #133: nothing is set up. Look for a local Ollama on a worker
+            // (never here: this is the keyboard hook's thread), once per
+            // press that reaches this card, never on a bare launch.
+            if self.start_first_run_probe() {
+                return None;
+            }
             self.card.show_settings_needed(&headline, &detail);
             return None;
         }
@@ -1800,6 +1958,7 @@ impl App {
         // #68: an action that writes the answer over the selection needs the
         // selection's UIA identity as well as its text.
         let writes_back = action.executor == "replace_text";
+        let cut_selection_refused = actions::code_actions::refuses_cut_selection(&action.id);
         let target = self.hwnd_isize();
         // #242 review: the action and the schema it was dispatched with are
         // carried through the worker and back in the result payload, rather
@@ -1870,6 +2029,13 @@ impl App {
                     if writes_back && actions::generic_replace::too_long(&gathered) {
                         return Err(GenericFailure::UserState(
                             actions::generic_replace::TOO_LONG_MESSAGE.to_string(),
+                        ));
+                    }
+                    // #73: an explanation or tests for part of the code would
+                    // read as if they covered all of it.
+                    if cut_selection_refused && actions::generic_replace::too_long(&gathered) {
+                        return Err(GenericFailure::UserState(
+                            actions::code_actions::TOO_LONG_MESSAGE.to_string(),
                         ));
                     }
                     let replace = writes_back
@@ -2008,6 +2174,28 @@ impl App {
             return;
         }
 
+        // A write-back whose text is the selection as it was has nothing to
+        // write: say so instead of showing a pointless preview.
+        // The text also takes the document's line endings here, so the card,
+        // the write and the copy-instead all carry the same text.
+        let proposal = match (action.executor == "replace_text", replace.as_deref()) {
+            (true, Some(plan)) => actions::generic_replace::normalize_proposal(plan, proposal),
+            _ => proposal,
+        };
+        if action.executor == "replace_text" {
+            if let Some(plan) = replace.as_deref() {
+                if actions::generic_replace::is_unchanged(&plan.selected_text, &proposal) {
+                    self.card.show_answer(
+                        actions::generic_replace::NO_CHANGES_HEADLINE,
+                        &with_pending_notices(""),
+                        0,
+                        None,
+                    );
+                    self.set_watch(true);
+                    return;
+                }
+            }
+        }
         // #69: no table on screen, or a reply that is not a table, is an
         // answer, not an empty preview.
         let table_headline = if actions::table::is_unreadable(&action.proposal, &proposal) {
@@ -2035,7 +2223,10 @@ impl App {
         if action.confirm {
             let writes_back = action.executor == "replace_text";
             let title = if writes_back {
-                actions::generic_replace::preview_title(&action.name, replace.is_some())
+                actions::generic_replace::preview_title(
+                    &action.name,
+                    replace.as_deref().is_some_and(|p| p.will_replace()),
+                )
             } else {
                 action.name.clone()
             };
@@ -3691,7 +3882,7 @@ impl App {
 
         let p = &self.config.providers;
         self.tray
-            .set_active_provider(ActiveProvider::from_order(&p.order));
+            .set_active_provider(ActiveProvider::shown_for(&p.order));
         self.tray.set_models(
             &p.openai.models,
             &p.openai.model,
@@ -5546,6 +5737,9 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_DISMISS
         | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
+        // #133: only a card update; with Settings open there is nothing to
+        // update, so the box is freed and the probe's answer dropped.
+        | WM_APP_FIRST_RUN
         // #347: like WM_APP_TRAY's own OPEN_SETTINGS command, this just
         // calls open_settings() with no payload to leak, and the card that
         // posts it is hidden the moment it does so, so there is nothing
@@ -5635,6 +5829,7 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_MACHINE_CHECK_RESULT => {
                 drop(Box::from_raw(p as *mut crate::machine::MachineFacts))
             }
+            WM_APP_FIRST_RUN => drop(Box::from_raw(p as *mut FirstRun)),
             WM_APP_ROUTER_RESULT => drop(Box::from_raw(
                 p as *mut (u64, std::result::Result<router::RouterResult, String>),
             )),
@@ -6002,6 +6197,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.dispatch_palette_action(&action_id);
             LRESULT(0)
         }
+        WM_APP_FIRST_RUN => {
+            // #133: take ownership of the probe's answer.
+            let found = unsafe { *Box::from_raw(lparam.0 as *mut FirstRun) };
+            app.on_first_run_result(wparam.0 as u64, found);
+            LRESULT(0)
+        }
         WM_APP_ROUTER_RESULT => {
             // #24: take ownership of the (generation, result) box the
             // router's worker thread leaked into the message (this
@@ -6104,6 +6305,7 @@ mod tests {
     use super::unreadable_secrets_card;
     use super::App;
     use super::BeginPlan;
+    use super::WM_APP_FIRST_RUN;
     use super::{final_settings_card, SettingsFinalCard};
     use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
@@ -6120,6 +6322,7 @@ mod tests {
         WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
     };
     use crate::mode::Mode;
+    use crate::provider::ollama_admin::FirstRun;
     use crate::provider::Provider;
     use crate::router;
     use crate::ui::card::{
@@ -6445,6 +6648,75 @@ mod tests {
         assert!(!none.capture, "nothing to capture when nothing is sent");
         assert!(!none.asks_model, "the card must not claim a model is asked");
         assert_eq!(BeginPlan::for_fill_form(true), BeginPlan::MODEL);
+    }
+
+    // -- first-run readiness (issue #133) ----------------------------------
+
+    #[test]
+    fn only_the_latest_first_run_probe_is_acted_on() {
+        assert!(super::first_run_result_is_current(3, 3));
+        assert!(!super::first_run_result_is_current(2, 3), "an older press");
+        assert!(!super::first_run_result_is_current(4, 3));
+    }
+
+    #[test]
+    fn a_quiet_first_run_result_hides_only_its_own_working_card() {
+        assert!(super::should_hide_after_first_run(true, false));
+        assert!(
+            !super::should_hide_after_first_run(false, false),
+            "an answer is showing"
+        );
+        assert!(
+            !super::should_hide_after_first_run(true, true),
+            "a real run owns the card"
+        );
+    }
+
+    #[test]
+    fn the_adopted_card_names_the_model_and_warns_only_for_the_stock_app() {
+        use crate::provider::ollama_admin::ListenerKind;
+        let (head, other) = super::first_run_adopted_card("gemma3:4b", ListenerKind::Other);
+        assert!(other.contains("gemma3:4b"), "{other}");
+        assert!(!other.contains("CPU"), "{other}");
+        let (_, stock) = super::first_run_adopted_card("gemma3:4b", ListenerKind::StockTrayServer);
+        assert!(
+            stock.contains("CPU") && stock.contains("Settings"),
+            "{stock}"
+        );
+        for text in [&head, &other, &stock] {
+            assert!(
+                !text.contains('\u{2014}') && !text.contains('\u{2013}'),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_run_probe_box_is_freed_when_dropped_unhandled() {
+        use windows::Win32::Foundation::LPARAM;
+        let boxed = Box::into_raw(Box::new(FirstRun::NoVisionModel));
+        assert!(super::free_boxed_payload(
+            WM_APP_FIRST_RUN,
+            LPARAM(boxed as isize)
+        ));
+    }
+
+    #[test]
+    fn first_run_card_only_changes_the_card_when_ollama_has_no_vision_model() {
+        use crate::provider::ollama_admin::{FirstRun, ListenerKind};
+        assert!(super::first_run_detail(&FirstRun::NotRunning).is_none());
+        let found = FirstRun::Found {
+            model: "gemma3:4b".to_string(),
+            kind: ListenerKind::Other,
+        };
+        assert!(super::first_run_detail(&found).is_none());
+        let detail = super::first_run_detail(&FirstRun::NoVisionModel).expect("a detail");
+        assert!(detail.contains("gemma3:4b"), "{detail}");
+        assert!(detail.contains("Settings"), "{detail}");
+        assert!(
+            !detail.contains('\u{2014}') && !detail.contains('\u{2013}'),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -6920,6 +7192,7 @@ mod tests {
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
         ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
+        ("WM_APP_FIRST_RUN", WM_APP_FIRST_RUN),
     ];
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -7584,6 +7857,11 @@ mod tests {
         (
             "WM_APP_MACHINE_CHECK_RESULT",
             WM_APP_MACHINE_CHECK_RESULT,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_FIRST_RUN",
+            WM_APP_FIRST_RUN,
             SettingsReentrancy::Ignore,
         ),
     ];

@@ -277,6 +277,12 @@ flight, grey while paused, a blue tint in Offline mode, and a red dot after a
 run failed (it clears when you start the next one). The tooltip says the same
 in words.
 
+## Keys on the card
+
+On an open answer card, `C` or `Ctrl+C` copies the text, and `Ctrl+Shift+C`
+copies the card as an image. `Tab` moves between the footer links, `Enter` or
+`Space` runs the one that has focus, and `Esc` closes the card.
+
 ## Cost on the card
 
 A cloud answer ends with a small line such as `About $0.002`: what that answer
@@ -340,6 +346,23 @@ remove it.
 The checkbox reads the registry when Settings opens, so it always reflects
 reality rather than a mirrored setting that can drift. If you move or rebuild
 the exe somewhere else, the entry is repaired to the new path on next launch.
+
+## Portable mode
+
+Put an empty file named `wingman.portable` next to `wingman.exe` and restart.
+Wingman then keeps its settings, store and logs in a `Wingman` folder next to
+the exe (calendar temp files included), and makes no registry writes: Start with Windows is off and greyed
+out. Delete the marker to go back to the normal folders (your files are not
+moved either way).
+
+API keys still live in Windows Credential Manager on each PC, never in that
+folder, so a copy on a new PC starts without keys. Set them again, or use the
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` environment
+variables. The owner-only file restriction is skipped in portable mode (the
+drive moves between PCs and users, and FAT or exFAT has no file permissions),
+so the folder keeps the drive's own permissions: keep the drive private. A key
+you typed into the config file by hand would sit there in plain text. The
+marker is ignored when the exe is under `Program Files` or `WindowsApps`.
 
 ## Only one instance
 

@@ -245,10 +245,19 @@ impl IcsConnector<ShellOpener> {
     /// real Win32 timezone converter.
     pub fn new() -> Self {
         Self {
-            temp_dir: std::env::temp_dir().join("Wingman"),
+            temp_dir: temp_dir_for(crate::portable::root().as_deref(), std::env::temp_dir()),
             opener: ShellOpener,
             local_time_converter: Box::new(Win32LocalTimeConverter),
         }
+    }
+}
+
+/// `%TEMP%\Wingman`, or `Wingman\tmp` under the portable root (#130) so
+/// portable mode leaves nothing on the host PC.
+fn temp_dir_for(portable_root: Option<&Path>, system_temp: PathBuf) -> PathBuf {
+    match portable_root {
+        Some(root) => root.join("Wingman").join("tmp"),
+        None => system_temp.join("Wingman"),
     }
 }
 
@@ -749,6 +758,19 @@ fn parse_offset(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn portable_mode_keeps_the_calendar_temp_files_under_the_root() {
+        let root = std::path::Path::new(r"E:\usb");
+        assert_eq!(
+            temp_dir_for(Some(root), PathBuf::from(r"C:\T")),
+            PathBuf::from(r"E:\usb\Wingman\tmp")
+        );
+        assert_eq!(
+            temp_dir_for(None, PathBuf::from(r"C:\T")),
+            PathBuf::from(r"C:\T\Wingman")
+        );
+    }
+
     use super::*;
     use std::cell::RefCell;
     use std::path::PathBuf;

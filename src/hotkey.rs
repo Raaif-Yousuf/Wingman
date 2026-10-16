@@ -736,7 +736,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         if let LearnOutcome::Captured { which, chord } = outcome {
             let boxed = Box::into_raw(Box::new(chord));
             let hwnd = HWND(target_hwnd as *mut _);
-            let _ = unsafe {
+            let posted = unsafe {
                 PostMessageW(
                     Some(hwnd),
                     WM_APP_LEARNED,
@@ -744,6 +744,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     LPARAM(boxed as isize),
                 )
             };
+            if posted.is_err() {
+                // Nobody will receive the box, so free it here.
+                drop(unsafe { Box::from_raw(boxed) });
+            }
 
             // Learn mode swallows this keydown the same way the ordinary
             // match branch below swallows a bound hotkey; a captured

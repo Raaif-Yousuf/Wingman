@@ -632,6 +632,7 @@ impl ureq::unversioned::resolver::Resolver for PinnedResolver {
 
 impl Net for RealNet {
     fn resolve(&self, host: &str, timeout: Duration) -> Result<Vec<IpAddr>, String> {
+        crate::ui_thread::blocking_call("page resolve");
         let (tx, rx) = std::sync::mpsc::channel();
         let host = host.to_string();
         std::thread::spawn(move || {
@@ -678,6 +679,7 @@ fn fetch_hop(
     timeout: Duration,
     https_only: bool,
 ) -> Result<Hop, String> {
+    crate::ui_thread::blocking_call("page fetch");
     let pinned = PinnedResolver(pinned);
     let config = ureq::Agent::config_builder()
         // Redirects are followed by `fetch_with`, one checked hop at a time.

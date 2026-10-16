@@ -1101,6 +1101,26 @@ const WIN_H_DP: i32 = 918 + 4 * (ROW_H + ROW_GAP);
 
 /// The one-line hint under the model dropdowns (#427). Plain words, no dash.
 const MODEL_LIST_HINT: &str = "Missing a cloud model? Add its name to models in config.toml.";
+
+/// #674: shown instead of [`MODEL_LIST_HINT`] when the mode keeps every
+/// request on this computer, so the user knows why no live cloud list loads.
+const MODEL_LIST_HINT_LOCAL: &str = "Local mode: live cloud model lists are not fetched.";
+const MODEL_LIST_HINT_OFFLINE: &str = "Offline mode: live cloud model lists are not fetched.";
+
+/// Whether the mode allows asking a cloud vendor for its model list. Both
+/// Local and Offline are loopback only (#674); the saved key rides along.
+fn cloud_list_allowed(mode: crate::mode::Mode) -> bool {
+    !matches!(mode, crate::mode::Mode::Local | crate::mode::Mode::Offline)
+}
+
+/// The hint line under the cloud model dropdowns for `mode`.
+fn model_list_hint_for(mode: crate::mode::Mode) -> &'static str {
+    match mode {
+        crate::mode::Mode::Local => MODEL_LIST_HINT_LOCAL,
+        crate::mode::Mode::Offline => MODEL_LIST_HINT_OFFLINE,
+        _ => MODEL_LIST_HINT,
+    }
+}
 /// The shortest the window is ever made, in dp: the pinned footer and a sliver
 /// of body. It is only a floor against a failed or absurd monitor query (see
 /// `fitted_height_for_work_px`); a real work area is always taller, and a
@@ -2389,7 +2409,7 @@ fn spawn_cloud_models_fetch(
     sync: std::sync::Arc<CloudSync>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    if crate::mode::is_offline_now() {
+    if !cloud_list_allowed(crate::mode::current()) {
         return;
     }
     let keys = [
@@ -2455,6 +2475,19 @@ fn key_to_fetch(original: &str, form_text: &str, last_fetched: &str) -> Option<S
     Some(key.to_string())
 }
 
+/// Whether a typed `key` has the shape of vendor `index`'s keys (#678), so a
+/// key pasted into the wrong vendor's field is not sent to that vendor.
+/// OpenAI keys start `sk-` (Anthropic's `sk-ant-` do not count), Anthropic's
+/// `sk-ant-`, Gemini's `AIza`.
+fn key_fits_vendor(index: usize, key: &str) -> bool {
+    let key = key.trim();
+    match index {
+        0 => key.starts_with("sk-") && !key.starts_with("sk-ant-"),
+        1 => key.starts_with("sk-ant-"),
+        _ => key.starts_with("AIza"),
+    }
+}
+
 /// #585: the user left a key field. Fetch that vendor's list with what is
 /// typed now, saved or not. Nothing runs in Offline mode.
 fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
@@ -2478,7 +2511,15 @@ fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
     let Some(key) = key_to_fetch(original, &get_text(edit), &last) else {
         return;
     };
-    if crate::mode::is_offline_now() {
+    if !cloud_list_allowed(crate::mode::current()) {
+        return;
+    }
+    if !key_fits_vendor(index, &key) {
+        // No key text: the report is pasted into public issues.
+        crate::diagnostics::note_warning(&format!(
+            "Live model list skipped for {}: the typed key has an unrecognised format",
+            CLOUD_VENDORS[index].tag()
+        ));
         return;
     }
     spawn_one_cloud_fetch(
@@ -2519,16 +2560,22 @@ fn spawn_one_cloud_fetch(
                 }
             };
             // A newer fetch for this vendor started while this one ran: its
-            // result wins, so this one is dropped.
+            // result wins, so this one is dropped. The check and the store
+            // happen under one lock, so an older worker cannot pass the check
+            // and then store after a newer one finished (#678).
+            let Ok(mut guard) = slots.lock() else {
+                return;
+            };
             if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
                 return;
             }
-            if let Ok(mut guard) = slots.lock() {
-                guard[index] = Some(ids);
-            }
+            guard[index] = Some(ids);
+            // The fetched-key record is written under the same slots lock
+            // (always slots first, then keys), so it cannot go stale.
             if let Ok(mut keys) = sync.fetched_keys.lock() {
                 keys[index] = key.trim().to_string();
             }
+            drop(guard);
             post_while_open(&alive, || unsafe {
                 let _ = PostMessageW(
                     Some(HWND(hwnd_raw as *mut c_void)),
@@ -3520,7 +3567,7 @@ fn build_ui_recorded(
     // Ollama's list comes from what is pulled, so this sits above its row.
     ctx.create(
         WC_STATIC,
-        MODEL_LIST_HINT,
+        model_list_hint_for(config.mode),
         0,
         0,
         r.x,
@@ -3779,6 +3826,12 @@ fn build_ui_recorded(
         ID_AUTOSTART,
     );
     set_checkbox(autostart, crate::autostart::is_enabled());
+    // Portable mode (#130) makes no registry writes, so the switch is greyed.
+    if crate::portable::is_portable() {
+        unsafe {
+            let _ = EnableWindow(autostart, false);
+        }
+    }
     r.advance();
 
     let hotkeys_bottom = r.y + 4;
@@ -4613,11 +4666,7 @@ fn choice_from_order(order: &[String]) -> usize {
 /// instead of showing ChatGPT as if it were the active provider. An empty
 /// order still reads as ChatGPT, the default.
 fn combo_index_for_order(order: &[String]) -> i32 {
-    match ActiveProvider::leading(order) {
-        Some(p) => p.index() as i32,
-        None if order.is_empty() => 0,
-        None => -1,
-    }
+    ActiveProvider::shown_for(order).map_or(-1, |p| p.index() as i32)
 }
 
 /// #194: `build_config`'s provider-order merge. `choice` (the Settings
@@ -6315,10 +6364,47 @@ mod tests {
         );
     }
 
+    /// #678: a key typed into the wrong vendor's field is not fetched with.
+    #[test]
+    fn a_typed_key_is_fetched_only_for_its_own_vendor() {
+        let anthropic = "sk-ant-api03-xyz";
+        let openai = "sk-proj-abc";
+        let gemini = "AIzaSyABC";
+        assert!(key_fits_vendor(0, openai));
+        assert!(!key_fits_vendor(0, anthropic));
+        assert!(!key_fits_vendor(0, gemini));
+        assert!(key_fits_vendor(1, anthropic));
+        assert!(!key_fits_vendor(1, openai));
+        assert!(key_fits_vendor(2, &format!(" {gemini} ")));
+        assert!(!key_fits_vendor(2, openai));
+        assert!(!key_fits_vendor(0, ""));
+    }
+
     #[test]
     fn the_model_list_hint_is_one_short_line_without_a_dash() {
-        assert!(MODEL_LIST_HINT.len() <= 64, "it must fit one row");
-        assert!(!MODEL_LIST_HINT.contains('\u{2014}'));
+        for h in [
+            MODEL_LIST_HINT,
+            MODEL_LIST_HINT_LOCAL,
+            MODEL_LIST_HINT_OFFLINE,
+        ] {
+            assert!(h.len() <= 64, "it must fit one row: {h}");
+            assert!(!h.contains('\u{2014}'));
+        }
+    }
+
+    /// #674: only Auto and Cloud may ask a cloud vendor for its model list,
+    /// and Local and Offline say why they do not.
+    #[test]
+    fn cloud_lists_are_skipped_in_local_and_offline_with_a_reason() {
+        use crate::mode::Mode;
+        assert!(cloud_list_allowed(Mode::Auto));
+        assert!(cloud_list_allowed(Mode::Cloud));
+        assert!(!cloud_list_allowed(Mode::Local));
+        assert!(!cloud_list_allowed(Mode::Offline));
+        assert_eq!(model_list_hint_for(Mode::Auto), MODEL_LIST_HINT);
+        assert_eq!(model_list_hint_for(Mode::Cloud), MODEL_LIST_HINT);
+        assert!(model_list_hint_for(Mode::Local).starts_with("Local"));
+        assert!(model_list_hint_for(Mode::Offline).starts_with("Offline"));
     }
 
     /// #427 wired-to-nothing: the hint is a real control in the built window,
