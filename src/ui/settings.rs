@@ -208,6 +208,14 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
         hwnd,
         config.providers.ollama.base_url.clone(),
         inner_ref.ollama_tags.clone(),
+        inner_ref.alive.clone(),
+    );
+    // #380: the cloud providers' live model lists, the same way.
+    spawn_cloud_models_fetch(
+        hwnd,
+        config,
+        inner_ref.cloud_models.clone(),
+        inner_ref.alive.clone(),
     );
     // #342: the prompt starts hidden, so shrink the window to match.
     unsafe { show_prompt_state(inner_ref) };
@@ -441,6 +449,11 @@ struct SettingsInner {
     ollama_link_url: Option<&'static str>,
     /// #183: the pulled-model list the background fetch reports into.
     ollama_tags: OllamaTags,
+    /// #380: the cloud providers' live model lists, filled the same way.
+    cloud_models: CloudModels,
+    /// True while this window is open. Cleared in `WM_DESTROY`; the model
+    /// fetch workers check it before posting (#569).
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// #342: whether the Advanced group shows the Check my work prompt.
     /// Starts collapsed on every open.
     prompt_expanded: bool,
@@ -466,6 +479,8 @@ impl SettingsInner {
             body_dpi: 96,
             ollama_link_url: None,
             ollama_tags: Default::default(),
+            cloud_models: Default::default(),
+            alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             prompt_expanded: false,
             original,
             result: None,
@@ -523,11 +538,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_CLOUD_MODELS => {
+            let index = wparam.0;
+            let fetched = inner
+                .cloud_models
+                .lock()
+                .ok()
+                .and_then(|g| g.get(index).cloned().flatten());
+            if let Some(fetched) = fetched {
+                let p = &inner.original.providers;
+                let (combo_id, configured) = match index {
+                    0 => (ID_OPENAI_MODEL, &p.openai.models),
+                    1 => (ID_ANTHROPIC_MODEL, &p.anthropic.models),
+                    _ => (ID_GEMINI_MODEL, &p.gemini.models),
+                };
+                apply_cloud_models(hwnd, combo_id, &fetched, configured);
+            }
+            LRESULT(0)
+        }
         WM_DPICHANGED => {
             on_dpi_changed(inner, wparam, lparam);
             LRESULT(0)
         }
         WM_DESTROY => {
+            inner.alive.store(false, Ordering::SeqCst);
             if !inner.font.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(inner.font.0));
                 inner.font = HFONT(std::ptr::null_mut());
@@ -2026,6 +2060,134 @@ fn apply_ollama_models(hwnd: HWND, models: &[ollama_admin::TagsModel]) {
     }
 }
 
+/// The model combo's items for a cloud provider (#380): the live `fetched`
+/// list merged with the `configured` one, and the index to select. The
+/// `current` model is never dropped: when neither list has it, it is kept at
+/// the top and stays selected, so a hand-edited value is never swapped.
+fn cloud_model_entries(
+    fetched: &[String],
+    configured: &[String],
+    current: &str,
+) -> (Vec<String>, usize) {
+    let mut labels = crate::provider::model_list::merge(fetched, configured);
+    let mut selected = labels.iter().position(|m| m == current);
+    if selected.is_none() && !current.is_empty() {
+        labels.insert(0, current.to_string());
+        selected = Some(0);
+    }
+    (labels, selected.unwrap_or(0))
+}
+
+/// Fills a cloud provider's model combo from its live list (#380), keeping
+/// whatever is selected now. Called on the UI thread when the fetch reports in.
+fn apply_cloud_models(hwnd: HWND, combo_id: i32, fetched: &[String], configured: &[String]) {
+    let Some(combo) = get_dlg_item(hwnd, combo_id) else {
+        return;
+    };
+    let shown = combo_selected_text(hwnd, combo_id);
+    let (labels, selected) = cloud_model_entries(fetched, configured, shown.trim());
+    unsafe {
+        SendMessageW(combo, CB_RESETCONTENT, None, None);
+    }
+    for label in &labels {
+        combo_add(combo, label);
+    }
+    if !labels.is_empty() {
+        combo_select_index(combo, selected as i32);
+    }
+}
+
+/// Posted to the Settings window when a cloud model-list fetch has stored
+/// its result in [`SettingsInner::cloud_models`]; `wparam` is the vendor's
+/// index in [`CLOUD_VENDORS`].
+const WM_CLOUD_MODELS: u32 = 0x8000 + 42; // WM_APP + 42
+
+/// The cloud vendors Settings refreshes, in the order [`CloudModels`] stores
+/// them.
+const CLOUD_VENDORS: [crate::provider::model_list::Vendor; 3] = [
+    crate::provider::model_list::Vendor::OpenAi,
+    crate::provider::model_list::Vendor::Anthropic,
+    crate::provider::model_list::Vendor::Gemini,
+];
+
+/// The fetched cloud model lists, one slot per [`CLOUD_VENDORS`] entry,
+/// shared with the worker threads. A slot stays `None` until its fetch
+/// succeeds.
+type CloudModels = std::sync::Arc<std::sync::Mutex<[Option<Vec<String>>; 3]>>;
+
+/// Asks each cloud provider that has a key for its live model list, one
+/// worker thread per provider, so a slow or hung vendor never holds up the
+/// Settings window (#380). Nothing runs in Offline mode, so no cloud request
+/// is even attempted. A failure keeps the built-in list and leaves one line
+/// in the diagnostics report; it never shows a card, since the user did not
+/// ask for anything.
+fn spawn_cloud_models_fetch(
+    hwnd: HWND,
+    config: &Config,
+    slots: CloudModels,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if crate::mode::is_offline_now() {
+        return;
+    }
+    let keys = [
+        &config.providers.openai.api_key,
+        &config.providers.anthropic.api_key,
+        &config.providers.gemini.api_key,
+    ];
+    for (index, key) in keys.into_iter().enumerate() {
+        if key.trim().is_empty() || key == crate::config::UNREADABLE_KEY_MARKER {
+            continue;
+        }
+        let key = key.clone();
+        let vendor = CLOUD_VENDORS[index];
+        let slots = slots.clone();
+        let alive = alive.clone();
+        let hwnd_raw = hwnd.0 as isize;
+        let _ = std::thread::Builder::new()
+            .name("settings-cloud-models".into())
+            .spawn(move || {
+                let ids = match crate::provider::model_list::fetch(vendor, &key) {
+                    Ok(ids) => ids,
+                    Err(_) => {
+                        // No error text: it can carry a vendor body, and the
+                        // report is pasted into public issues. The egress
+                        // log has the failure.
+                        crate::diagnostics::note_warning(&format!(
+                            "Live model list unavailable for {}: using the built-in list",
+                            vendor.tag()
+                        ));
+                        return;
+                    }
+                };
+                if let Ok(mut guard) = slots.lock() {
+                    guard[index] = Some(ids);
+                }
+                post_while_open(&alive, || unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(hwnd_raw as *mut c_void)),
+                        WM_CLOUD_MODELS,
+                        WPARAM(index),
+                        LPARAM(0),
+                    );
+                });
+            });
+    }
+}
+
+/// Runs `post` only while the Settings window is still open (#569). `alive`
+/// is cleared on the UI thread in `WM_DESTROY`, before Windows can hand the
+/// window's handle value to another window, so a worker that finishes late
+/// never posts to a stranger. Returns whether it posted.
+fn post_while_open(alive: &std::sync::atomic::AtomicBool, post: impl FnOnce()) -> bool {
+    if alive.load(Ordering::SeqCst) {
+        post();
+        true
+    } else {
+        false
+    }
+}
+
 /// Posted to the Settings window when the background Ollama model fetch has
 /// stored its result in [`SettingsInner::ollama_tags`].
 const WM_OLLAMA_MODELS: u32 = 0x8000 + 41; // WM_APP + 41
@@ -2036,9 +2198,14 @@ type OllamaTags = std::sync::Arc<std::sync::Mutex<Option<Vec<ollama_admin::TagsM
 
 /// Asks Ollama for its pulled models on a worker thread, so a slow or hung
 /// server never holds up the Settings window (#183). The result goes into
-/// `slot`, then [`WM_OLLAMA_MODELS`] wakes the window. If the window is
-/// already gone the post simply fails.
-fn spawn_ollama_models_fetch(hwnd: HWND, base_url: String, slot: OllamaTags) {
+/// `slot`, then [`WM_OLLAMA_MODELS`] wakes the window, but only while the
+/// window is still open (`alive`, see [`post_while_open`]).
+fn spawn_ollama_models_fetch(
+    hwnd: HWND,
+    base_url: String,
+    slot: OllamaTags,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     let hwnd_raw = hwnd.0 as isize;
     let _ = std::thread::Builder::new()
         .name("settings-ollama-models".into())
@@ -2049,14 +2216,14 @@ fn spawn_ollama_models_fetch(hwnd: HWND, base_url: String, slot: OllamaTags) {
             if let Ok(mut guard) = slot.lock() {
                 *guard = Some(models);
             }
-            unsafe {
+            post_while_open(&alive, || unsafe {
                 let _ = PostMessageW(
                     Some(HWND(hwnd_raw as *mut c_void)),
                     WM_OLLAMA_MODELS,
                     WPARAM(0),
                     LPARAM(0),
                 );
-            }
+            });
         });
 }
 
@@ -4357,6 +4524,46 @@ mod tests {
             details: Default::default(),
             capabilities: caps.iter().map(|c| c.to_string()).collect(),
         }
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cloud_entries_show_a_new_model_and_select_the_current_one() {
+        let fetched = strings(&["brand-new", "model-b", "model-a"]);
+        let configured = strings(&["model-a", "model-b"]);
+        let (labels, sel) = cloud_model_entries(&fetched, &configured, "model-b");
+        assert_eq!(labels, ["brand-new", "model-b", "model-a"]);
+        assert_eq!(sel, 1);
+    }
+
+    #[test]
+    fn cloud_entries_keep_a_current_model_the_vendor_did_not_list() {
+        let fetched = strings(&["brand-new"]);
+        let configured = strings(&["old-listed"]);
+        let (labels, sel) = cloud_model_entries(&fetched, &configured, "hand-typed");
+        assert_eq!(labels, ["hand-typed", "brand-new", "old-listed"]);
+        assert_eq!(sel, 0);
+    }
+
+    #[test]
+    fn cloud_entries_with_no_current_model_select_the_first() {
+        let (labels, sel) = cloud_model_entries(&strings(&["a", "b"]), &[], "");
+        assert_eq!(labels, ["a", "b"]);
+        assert_eq!(sel, 0);
+    }
+
+    #[test]
+    fn a_late_post_is_dropped_once_the_window_is_closed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let alive = AtomicBool::new(true);
+        let mut posted = 0;
+        assert!(post_while_open(&alive, || posted += 1));
+        alive.store(false, Ordering::SeqCst);
+        assert!(!post_while_open(&alive, || posted += 1));
+        assert_eq!(posted, 1, "the closure must not run after close");
     }
 
     #[test]

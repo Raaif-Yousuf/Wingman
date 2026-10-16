@@ -1,0 +1,38 @@
+{
+  "data": [
+    {
+      "id": "claude-future-9-0",
+      "type": "model",
+      "display_name": "Claude Future 9",
+      "created_at": "2027-03-01T00:00:00Z",
+      "max_input_tokens": 1000000,
+      "max_tokens": 64000,
+      "capabilities": {"image_input": {"supported": true}, "thinking": {"supported": true}}
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "type": "model",
+      "display_name": "Claude Haiku 5.5",
+      "created_at": "2026-06-01T00:00:00Z",
+      "max_input_tokens": 200000,
+      "max_tokens": 64000,
+      "capabilities": {"image_input": {"supported": true}}
+    },
+    {
+      "id": "claude-text-only-1",
+      "type": "model",
+      "display_name": "Text Only",
+      "created_at": "2026-01-01T00:00:00Z",
+      "capabilities": {"image_input": {"supported": false}}
+    },
+    {
+      "id": "claude-no-capabilities",
+      "type": "model",
+      "display_name": "No Capabilities Listed",
+      "created_at": "2025-01-01T00:00:00Z"
+    }
+  ],
+  "has_more": false,
+  "first_id": "claude-future-9-0",
+  "last_id": "claude-no-capabilities"
+}
