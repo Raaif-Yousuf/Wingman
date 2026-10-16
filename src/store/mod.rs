@@ -23,6 +23,10 @@ mod import;
 mod migrate;
 mod usage_day;
 
+pub use egress::append_pending;
+#[cfg(test)]
+pub(crate) use egress::append_pending_at;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -231,21 +235,47 @@ fn legacy_egress_path() -> Result<PathBuf, StoreError> {
     }
 }
 
-/// The old files that are imported once, then renamed `.migrated`.
+/// `%LOCALAPPDATA%\Wingman\egress-pending.log`: where request log rows wait
+/// while the store cannot open (`egress::record`). Under `#[cfg(test)]` a
+/// per-process file in `%TEMP%` (rule 9).
+fn pending_egress_path() -> Result<PathBuf, StoreError> {
+    #[cfg(test)]
+    {
+        Ok(std::env::temp_dir().join(format!(
+            "wingman-test-egress-pending-{}.log",
+            std::process::id()
+        )))
+    }
+    #[cfg(not(test))]
+    {
+        let base = crate::known_folder::local_app_data()
+            .map_err(|e| StoreError::Other(format!("no local app data folder: {e}")))?;
+        Ok(base.join("Wingman").join("egress-pending.log"))
+    }
+}
+
+/// The old files that are imported once, then renamed `.migrated`, and the
+/// pending file that is imported on every open that finds it.
 struct Legacy<'a> {
     spend: &'a Path,
     egress: &'a Path,
+    pending: &'a Path,
 }
 
 /// The real open, at the real paths.
 fn open_default() -> Result<Store, StoreError> {
     sweep_stale_test_dirs();
-    let (spend, egress) = (legacy_spend_path()?, legacy_egress_path()?);
+    let (spend, egress, pending) = (
+        legacy_spend_path()?,
+        legacy_egress_path()?,
+        pending_egress_path()?,
+    );
     open_in(
         &db_path()?,
         &Legacy {
             spend: &spend,
             egress: &egress,
+            pending: &pending,
         },
         acl::restrict_dir,
     )
@@ -280,8 +310,19 @@ fn open_in(
     if let Some(n) = import::spend_json(&mut store.lock(), legacy.spend)? {
         note(n);
     }
-    if let Some(n) = import::egress_log(&mut store.lock(), legacy.egress)? {
-        note(n);
+    // The request log imports are not allowed to take the store down: a
+    // failure here is a notice, and the store still opens (rows would
+    // otherwise have nowhere to go for the whole run).
+    // Each import takes the lock on its own: guards held across both would
+    // deadlock the second.
+    let old_log = import::egress_log(&mut store.lock(), legacy.egress);
+    let pending = import::egress_pending(&mut store.lock(), legacy.pending);
+    for imported in [old_log, pending] {
+        match imported {
+            Ok(Some(n)) => note(n),
+            Ok(None) => {}
+            Err(e) => note(e.to_string()),
+        }
     }
     Ok(store)
 }
@@ -526,9 +567,11 @@ mod tests {
         let dir = scratch("acl-once");
         let path = dir.join("store").join("wingman.db");
         let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
         let legacy = Legacy {
             spend: &spend,
             egress: &egress,
+            pending: &pending,
         };
         let calls = std::cell::Cell::new(0);
         let count = |_: &Path| {
@@ -553,9 +596,11 @@ mod tests {
         let dir = scratch("acl-fail");
         let path = dir.join("store").join("wingman.db");
         let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
         let legacy = Legacy {
             spend: &spend,
             egress: &egress,
+            pending: &pending,
         };
         let err = open_in(&path, &legacy, |_: &Path| {
             Err(StoreError::Acl("nope".to_string()))
@@ -575,9 +620,11 @@ mod tests {
         let dir = scratch("timing");
         let path = dir.join("store").join("wingman.db");
         let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
         let legacy = Legacy {
             spend: &spend,
             egress: &egress,
+            pending: &pending,
         };
         let t = std::time::Instant::now();
         drop(open_in(&path, &legacy, acl::restrict_dir).unwrap());
@@ -595,6 +642,7 @@ mod tests {
         let dir = scratch("egress-import");
         let path = dir.join("store").join("wingman.db");
         let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
         let row = crate::egress::build_entry(
             "legacy",
             "https://api.example.com/",
@@ -609,6 +657,7 @@ mod tests {
         let legacy = Legacy {
             spend: &spend,
             egress: &egress,
+            pending: &pending,
         };
 
         let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
@@ -616,6 +665,90 @@ mod tests {
         assert_eq!(s.egress_rows().unwrap().len(), 1);
         assert!(!egress.exists());
         assert!(dir.join("egress.log.migrated").exists());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_row(provider: &str) -> crate::egress::EgressEntry {
+        crate::egress::build_entry(
+            provider,
+            "https://api.example.com/",
+            &serde_json::json!({"model": "m"}),
+            false,
+            1,
+            2,
+            crate::egress::Outcome::Success,
+            None,
+        )
+    }
+
+    #[test]
+    fn rows_written_while_the_store_was_down_are_imported_by_the_next_open() {
+        let dir = scratch("pending");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        egress::append_pending_at(&pending, &sample_row("down-1")).unwrap();
+        egress::append_pending_at(&pending, &sample_row("down-2")).unwrap();
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+        };
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+
+        let got: Vec<String> = s
+            .egress_rows()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        assert_eq!(got, ["down-1", "down-2"]);
+        assert!(!pending.exists(), "imported rows are not imported twice");
+        drop(s);
+        // A later run that finds the store down again appends again, and the
+        // import runs again even though the old log was imported long ago.
+        egress::append_pending_at(&pending, &sample_row("down-3")).unwrap();
+        let s = open_in(&path, &legacy, |_: &Path| Ok(())).unwrap();
+        assert_eq!(s.egress_rows().unwrap().len(), 3);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_request_log_import_does_not_stop_the_store_opening() {
+        let dir = scratch("import-fails");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+        };
+        drop(open_in(&path, &legacy, |_: &Path| Ok(())).unwrap());
+        {
+            // Make every egress insert fail, then leave rows waiting.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "DELETE FROM meta WHERE key = 'imported_egress';
+                 CREATE TRIGGER boom BEFORE INSERT ON egress
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            &egress,
+            serde_json::to_string(&sample_row("old")).unwrap() + "\n",
+        )
+        .unwrap();
+        egress::append_pending_at(&pending, &sample_row("waiting")).unwrap();
+
+        let s = open_in(&path, &legacy, |_: &Path| Ok(()))
+            .expect("an import failure must not fail the open");
+
+        assert!(egress.exists() && pending.exists(), "both stay for a retry");
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -34,21 +34,35 @@ impl Store {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         insert(&tx, entry)?;
-        prune(&tx, now, keep_rows)?;
+        prune(&tx, now, keep_rows, true)?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Every kept row, oldest first.
+    /// Test builds only: every kept row, oldest first.
+    #[cfg(test)]
     pub fn egress_rows(&self) -> Result<Vec<EgressEntry>, StoreError> {
+        Ok(self.egress_rows_counted()?.0)
+    }
+
+    /// Every readable row, oldest first, and how many rows could not be
+    /// read. One damaged row must not make the whole history unreadable.
+    pub fn egress_rows_counted(&self) -> Result<(Vec<EgressEntry>, usize), StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT time_unix, provider, model, retried, trigger_label, attachments,
                     snippets, redactions, bytes_sent, bytes_received, outcome, error, cost
              FROM egress ORDER BY id",
         )?;
-        let rows = stmt.query_map([], entry_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut rows = Vec::new();
+        let mut skipped = 0;
+        for row in stmt.query_map([], entry_from_row)? {
+            match row {
+                Ok(e) => rows.push(e),
+                Err(_) => skipped += 1,
+            }
+        }
+        Ok((rows, skipped))
     }
 
     /// Test builds only: forgets every row.
@@ -95,24 +109,64 @@ pub(super) fn insert(
     Ok(())
 }
 
-/// Drops rows past the retention limits. The row inserted last is exempt
-/// from the age rule, so a bad clock cannot make the newest request the first
-/// thing deleted.
+/// Drops rows past the retention limits. With `exempt_newest`, the row
+/// inserted last is exempt from the age rule, so a bad clock cannot make the
+/// request just made the first thing deleted. An import passes `false`: its
+/// last row is only as new as its own timestamp says.
 pub(super) fn prune(
     tx: &rusqlite::Transaction<'_>,
     now: u64,
     keep_rows: usize,
+    exempt_newest: bool,
 ) -> Result<(), StoreError> {
     let cutoff = i64::try_from(now.saturating_sub(KEEP_SECS)).unwrap_or(i64::MAX);
-    tx.execute(
-        "DELETE FROM egress WHERE time_unix < ?1 AND id != last_insert_rowid()",
-        [cutoff],
-    )?;
+    let age_sql = if exempt_newest {
+        "DELETE FROM egress WHERE time_unix < ?1 AND id != last_insert_rowid()"
+    } else {
+        "DELETE FROM egress WHERE time_unix < ?1"
+    };
+    tx.execute(age_sql, [cutoff])?;
     tx.execute(
         "DELETE FROM egress WHERE id <=
            (SELECT id FROM egress ORDER BY id DESC LIMIT 1 OFFSET ?1)",
         [i64::try_from(keep_rows).unwrap_or(i64::MAX)],
     )?;
+    Ok(())
+}
+
+/// Where rows wait when the store cannot open: `egress-pending.log` next to
+/// the database folder, one JSON row per line. The store imports and removes
+/// it on the next open that works (`import::egress_pending`).
+pub fn append_pending(entry: &EgressEntry) -> Result<(), StoreError> {
+    append_pending_at(&super::pending_egress_path()?, entry)
+}
+
+pub(crate) fn append_pending_at(
+    path: &std::path::Path,
+    entry: &EgressEntry,
+) -> Result<(), StoreError> {
+    use std::io::Write;
+    let io = |e: std::io::Error| StoreError::Other(e.to_string());
+    let line = serde_json::to_string(entry).map_err(|e| StoreError::Other(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io)?;
+    }
+    let is_new = !path.exists();
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(io)?;
+    writeln!(f, "{line}").map_err(io)?;
+    drop(f);
+    if is_new {
+        // Same owner-only rule the old log had; best effort, the row is
+        // already safe on disk.
+        #[cfg(windows)]
+        if let Err(e) = crate::config::Config::restrict_acl(path) {
+            eprintln!("wingman: failed to restrict {}: {e:#}", path.display());
+        }
+    }
     Ok(())
 }
 
@@ -292,6 +346,23 @@ mod tests {
         assert!(back.attachments.is_empty() && back.snippets.is_empty());
         assert!(back.redactions.is_empty());
         assert_eq!(back.provider, "p");
+    }
+
+    #[test]
+    fn one_unreadable_row_is_skipped_and_counted_not_fatal() {
+        let s = Store::in_memory();
+        s.record_egress_at(&entry("good", 1), 1, KEEP_ROWS).unwrap();
+        s.record_egress_at(&entry("bad", 2), 2, KEEP_ROWS).unwrap();
+        s.lock()
+            .execute(
+                "UPDATE egress SET time_unix = 'abc' WHERE provider = 'bad'",
+                [],
+            )
+            .unwrap();
+        let (rows, skipped) = s.egress_rows_counted().unwrap();
+        assert_eq!(skipped, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "good");
     }
 
     #[test]

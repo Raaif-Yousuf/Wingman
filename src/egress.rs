@@ -35,14 +35,16 @@
 //!
 //! **A store failure never fails the request and never loses a row
 //! silently.** When the store cannot open or a write fails (locked, full,
-//! damaged, newer than this build), the row is kept in a bounded in-memory
-//! list ([`UNSAVED_CAP`] rows, oldest dropped first and counted), the failure
-//! is reported once per run on the next card (`store::report`), and the next
-//! successful write saves the kept rows first, in order. [`read_all_human`]
-//! shows the kept rows and the reason, so "Copy egress log" still answers
-//! "what left this machine" in the meantime. Rows kept only in memory are
-//! lost if Wingman closes before a save succeeds; there is deliberately no
-//! second file (one source of truth).
+//! damaged, newer than this build, a failed ACL step), the failure is
+//! reported once per run on the next card (`store::report`) and the row is
+//! appended to `egress-pending.log` next to the store folder. The store
+//! imports and removes that file on the next open that works, so the row
+//! reaches the table and nothing reads two sources for long. Only when even
+//! that append fails is the row kept in a bounded in-memory list
+//! ([`UNSAVED_CAP`] rows, oldest dropped first and counted); the next
+//! successful save writes the kept rows first, in order. [`read_all_human`]
+//! shows the kept rows, the count waiting in the pending file, and the reason,
+//! so "Copy egress log" still answers "what left this machine" meanwhile.
 //!
 //! # Knowledge snippets (#85+)
 //!
@@ -662,12 +664,17 @@ struct Unsaved {
     rows: VecDeque<EgressEntry>,
     /// Rows pushed out of `rows` by the cap.
     dropped: usize,
+    /// Rows written to the pending file this run (not in `rows`).
+    parked: usize,
 }
 
 static UNSAVED: Mutex<Unsaved> = Mutex::new(Unsaved {
     rows: VecDeque::new(),
     dropped: 0,
+    parked: 0,
 });
+
+static SAVE_GATE: Mutex<()> = Mutex::new(());
 
 fn lock_unsaved(unsaved: &Mutex<Unsaved>) -> std::sync::MutexGuard<'_, Unsaved> {
     // A panic elsewhere must not take the history with it.
@@ -679,25 +686,40 @@ fn lock_unsaved(unsaved: &Mutex<Unsaved>) -> std::sync::MutexGuard<'_, Unsaved> 
 /// itself fails or shows an error card). A failure keeps the row in memory
 /// and is reported once per run; see this module's doc comment.
 pub fn record(entry: &EgressEntry) {
-    save(&crate::store::global, &UNSAVED, entry);
+    save(
+        &crate::store::global,
+        crate::store::append_pending,
+        &UNSAVED,
+        entry,
+    );
 }
 
 /// The body of [`record`], with the store and the kept-rows list passed in so
 /// the failure paths can be tested without touching process-wide state.
 fn save(
     open: &dyn Fn() -> Result<Arc<Store>, StoreError>,
+    fallback: impl FnMut(&EgressEntry) -> Result<(), StoreError>,
     unsaved: &Mutex<Unsaved>,
     entry: &EgressEntry,
 ) {
+    // One save at a time, so rows kept by a failed save cannot be reordered
+    // behind a newer row from another thread.
+    let _gate = SAVE_GATE.lock().unwrap_or_else(|e| e.into_inner());
     // Anything kept from earlier failures goes first, then this row.
     let mut pending: Vec<EgressEntry> = lock_unsaved(unsaved).rows.drain(..).collect();
     pending.push(entry.clone());
-    if let Err(e) =
-        open().and_then(|store| write_pending(&mut pending, |row| store.record_egress(row)))
-    {
-        keep(unsaved, pending);
-        crate::store::report(&e);
-    }
+    let Err(e) = open().and_then(|store| write_pending(&mut pending, |r| store.record_egress(r)))
+    else {
+        return;
+    };
+    crate::store::report(&e);
+    // The store is down: park what is left in the pending file, which the
+    // store imports on the next open that works. Only a row that cannot be
+    // parked either stays in memory.
+    let before = pending.len();
+    let _ = write_pending(&mut pending, fallback);
+    lock_unsaved(unsaved).parked += before - pending.len();
+    keep(unsaved, pending);
 }
 
 /// Writes `pending` oldest first and removes each row as it is saved, so on a
@@ -734,9 +756,15 @@ fn keep(unsaved: &Mutex<Unsaved>, rows: Vec<EgressEntry>) {
     }
 }
 
-/// Every saved row, oldest first.
+/// Test builds only: every saved row, oldest first.
+#[cfg(test)]
 pub fn rows() -> Result<Vec<EgressEntry>, StoreError> {
     crate::store::global()?.egress_rows()
+}
+
+/// [`rows`] and how many stored rows were unreadable and left out.
+fn rows_counted() -> Result<(Vec<EgressEntry>, usize), StoreError> {
+    crate::store::global()?.egress_rows_counted()
 }
 
 /// Test builds only: every saved row as JSON lines, the shape the old log
@@ -838,14 +866,25 @@ fn human_bytes(n: usize) -> String {
 /// `diagnostics::egress_report` puts on the clipboard. Never blank: a store
 /// that cannot be read says so instead of looking like an empty log.
 pub fn read_all_human() -> String {
-    human_report(rows(), &lock_unsaved(&UNSAVED))
+    human_report(rows_counted(), &lock_unsaved(&UNSAVED))
 }
 
-fn human_report(saved: Result<Vec<EgressEntry>, StoreError>, unsaved: &Unsaved) -> String {
+fn human_report(saved: Result<(Vec<EgressEntry>, usize), StoreError>, unsaved: &Unsaved) -> String {
     let mut lines: Vec<String> = Vec::new();
     match saved {
-        Ok(rows) => lines.extend(rows.iter().map(render_human)),
+        Ok((rows, skipped)) => {
+            lines.extend(rows.iter().map(render_human));
+            if skipped > 0 {
+                lines.push(format!("{skipped} saved requests could not be read."));
+            }
+        }
         Err(e) => lines.push(format!("The saved request log could not be read. {e}")),
+    }
+    if unsaved.parked > 0 {
+        lines.push(format!(
+            "{} requests are waiting in egress-pending.log and will be listed after the next start.",
+            unsaved.parked
+        ));
     }
     if !unsaved.rows.is_empty() || unsaved.dropped > 0 {
         lines.push(format!(
@@ -1416,10 +1455,23 @@ mod tests {
         Err(StoreError::Other("disk full".to_string()))
     }
 
+    fn no_fallback(_: &EgressEntry) -> Result<(), StoreError> {
+        Err(StoreError::Other("no pending file".to_string()))
+    }
+
+    /// The shared test store is also cleared by `provider::common`'s tests,
+    /// which hold this lock; so must anything that reads it back.
+    fn store_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn record_saves_a_row_the_diagnostics_report_lists() {
         // The wired-to-nothing check: the public entry point, through the
         // real store, to the text "Copy egress log" puts on the clipboard.
+        let _lock = store_lock();
         record(&tagged("wired-check"));
         assert_eq!(providers_like("wired-check"), ["wired-check"]);
         assert!(
@@ -1431,20 +1483,55 @@ mod tests {
     #[test]
     fn a_failing_store_keeps_the_row_in_memory_and_does_not_panic() {
         let unsaved = Mutex::new(Unsaved::default());
-        save(&refuse, &unsaved, &tagged("kept-1"));
+        save(&refuse, no_fallback, &unsaved, &tagged("kept-1"));
         let u = lock_unsaved(&unsaved);
         assert_eq!(u.rows.len(), 1);
         assert_eq!(u.rows[0].provider, "kept-1");
     }
 
     #[test]
-    fn the_next_good_save_writes_the_kept_rows_first_in_order() {
+    fn a_store_that_cannot_open_parks_the_row_in_the_pending_file() {
+        // The regression the old ACL test guarded: a store failure for the
+        // whole run must not turn into rows lost on exit.
+        let path = std::env::temp_dir().join(format!(
+            "wingman-test-egress-park-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
         let unsaved = Mutex::new(Unsaved::default());
-        save(&refuse, &unsaved, &tagged("flush-a"));
-        save(&refuse, &unsaved, &tagged("flush-b"));
+
+        save(
+            &refuse,
+            |r| crate::store::append_pending_at(&path, r),
+            &unsaved,
+            &tagged("parked-1"),
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("\"provider\":\"parked-1\""), "{text}");
+        let u = lock_unsaved(&unsaved);
+        assert!(u.rows.is_empty(), "a parked row is not also kept");
+        assert_eq!(u.parked, 1);
+        let report = human_report(Ok((Vec::new(), 0)), &u);
+        assert!(report.contains("1 requests are waiting"), "{report}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_next_good_save_writes_the_kept_rows_first_in_order() {
+        let _lock = store_lock();
+        let unsaved = Mutex::new(Unsaved::default());
+        save(&refuse, no_fallback, &unsaved, &tagged("flush-a"));
+        save(&refuse, no_fallback, &unsaved, &tagged("flush-b"));
         assert_eq!(lock_unsaved(&unsaved).rows.len(), 2);
 
-        save(&crate::store::global, &unsaved, &tagged("flush-c"));
+        save(
+            &crate::store::global,
+            no_fallback,
+            &unsaved,
+            &tagged("flush-c"),
+        );
 
         assert!(lock_unsaved(&unsaved).rows.is_empty());
         assert_eq!(providers_like("flush-"), ["flush-a", "flush-b", "flush-c"]);
@@ -1473,7 +1560,7 @@ mod tests {
     fn the_kept_list_is_bounded_and_counts_what_it_drops() {
         let unsaved = Mutex::new(Unsaved::default());
         for i in 0..UNSAVED_CAP + 3 {
-            save(&refuse, &unsaved, &tagged(&format!("cap-{i}")));
+            save(&refuse, no_fallback, &unsaved, &tagged(&format!("cap-{i}")));
         }
         let u = lock_unsaved(&unsaved);
         assert_eq!(u.rows.len(), UNSAVED_CAP);
@@ -1503,7 +1590,11 @@ mod tests {
     fn the_report_lists_saved_rows_then_kept_rows() {
         let mut unsaved = Unsaved::default();
         unsaved.rows.push_back(tagged("second"));
-        let text = human_report(Ok(vec![tagged("first")]), &unsaved);
+        let text = human_report(Ok((vec![tagged("first")], 1)), &unsaved);
+        assert!(
+            text.contains("1 saved requests could not be read"),
+            "{text}"
+        );
         let (first, second) = (
             text.find("provider=first").unwrap(),
             text.find("provider=second").unwrap(),
@@ -1514,7 +1605,7 @@ mod tests {
     #[test]
     fn an_empty_log_says_so() {
         assert_eq!(
-            human_report(Ok(Vec::new()), &Unsaved::default()),
+            human_report(Ok((Vec::new(), 0)), &Unsaved::default()),
             "No requests logged yet."
         );
     }

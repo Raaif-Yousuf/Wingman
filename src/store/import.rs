@@ -77,9 +77,41 @@ pub fn egress_log(conn: &mut Connection, path: &Path) -> Result<Option<String>, 
         }
         Err(_) => return Ok(Some(egress_unreadable())),
     };
+    let skipped = import_rows(conn, &bytes, Some(EGRESS_FLAG))?;
+    // Harmless if it fails: the flag is set, so the file is not read again.
+    let _ = std::fs::rename(path, path.with_extension("log.migrated"));
+    Ok((skipped > 0).then(|| bad_lines_notice(skipped)))
+}
+
+/// Imports rows that were written to `egress-pending.log` while the store
+/// could not open (see `crate::egress`), then removes the file. Unlike the
+/// old log this happens on every open that finds the file, with no flag: the
+/// file can be written again by any later run in which the store is down.
+pub fn egress_pending(conn: &mut Connection, path: &Path) -> Result<Option<String>, StoreError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(Some(egress_unreadable())),
+    };
+    let skipped = import_rows(conn, &bytes, None)?;
+    // If this fails the rows would be imported twice next time; a duplicate
+    // log row is the cheaper mistake than losing one.
+    let _ = std::fs::remove_file(path);
+    Ok((skipped > 0).then(|| bad_lines_notice(skipped)))
+}
+
+/// Writes every parsable row of `bytes` (one JSON row per line) and the
+/// optional `meta` flag in one transaction, then applies the table's
+/// retention by age and count with no exemption for the last row. Returns how
+/// many lines were skipped.
+fn import_rows(
+    conn: &mut Connection,
+    bytes: &[u8],
+    flag: Option<&str>,
+) -> Result<usize, StoreError> {
     // A stray byte must not cost the whole log, so decode leniently; the
     // damaged line then fails to parse and is counted like any other.
-    let text = String::from_utf8_lossy(&bytes);
+    let text = String::from_utf8_lossy(bytes);
     let mut rows = Vec::new();
     let mut skipped = 0usize;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -92,17 +124,15 @@ pub fn egress_log(conn: &mut Connection, path: &Path) -> Result<Option<String>, 
     for e in &rows {
         egress::insert(&tx, e)?;
     }
-    tx.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, '1')",
-        [EGRESS_FLAG],
-    )?;
-    // The old log was capped by size, the table by age and count: apply the
-    // table's rule to what came in.
-    egress::prune(&tx, egress::now_unix(), egress::KEEP_ROWS)?;
+    if let Some(flag) = flag {
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, '1')",
+            [flag],
+        )?;
+    }
+    egress::prune(&tx, egress::now_unix(), egress::KEEP_ROWS, false)?;
     tx.commit()?;
-    // Harmless if it fails: the flag is set, so the file is not read again.
-    let _ = std::fs::rename(path, path.with_extension("log.migrated"));
-    Ok((skipped > 0).then(|| bad_lines_notice(skipped)))
+    Ok(skipped)
 }
 
 fn flag_is_set(conn: &Connection, flag: &str) -> Result<bool, StoreError> {
@@ -299,6 +329,28 @@ mod tests {
         row["time_unix"] = 5.into();
         let ancient = row.to_string();
         std::fs::write(&path, format!("{ancient}\n{}\n", line("recent", 0))).unwrap();
+        let mut conn = db();
+
+        egress_log(&mut conn, &path).unwrap();
+
+        let kept: Vec<String> = conn
+            .prepare("SELECT provider FROM egress")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(kept, ["recent"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ancient_last_line_is_dropped_by_the_import_not_exempted() {
+        let dir = scratch("eg-ancient-last");
+        let path = dir.join("egress.log");
+        let mut row: serde_json::Value = serde_json::from_str(&line("ancient", 0)).unwrap();
+        row["time_unix"] = 5.into();
+        std::fs::write(&path, format!("{}\n{}\n", line("recent", 0), row)).unwrap();
         let mut conn = db();
 
         egress_log(&mut conn, &path).unwrap();
