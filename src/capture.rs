@@ -202,14 +202,23 @@ fn first_foreign_window(
     0
 }
 
-/// `hwnd` unless it belongs to Wingman: then the next visible, titled
+/// Whether a window may be the password lookup target when the walk passes
+/// Wingman's own windows. The title is not asked: borderless and custom-chrome
+/// apps have none. Cloaked frames (a suspended Settings), tool windows,
+/// minimised windows and zero-size ones are never the app being looked at.
+fn walk_target(visible: bool, cloaked: bool, tool: bool, minimised: bool, empty: bool) -> bool {
+    visible && !cloaked && !tool && !minimised && !empty
+}
+/// `hwnd` unless it belongs to Wingman: then the next visible
 /// top-level window of another process behind it (0 if none), so the tray
 /// menu or a card in front does not become the lookup target.
 fn not_ours(hwnd: isize) -> isize {
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindow, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible, GW_HWNDNEXT,
+        GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible, GWL_EXSTYLE, GW_HWNDNEXT, WS_EX_TOOLWINDOW,
     };
     let own = unsafe { GetCurrentProcessId() };
     let h = |v: isize| HWND(v as *mut _);
@@ -219,7 +228,28 @@ fn not_ours(hwnd: isize) -> isize {
         pid
     };
     let shown = |v: isize| {
-        unsafe { IsWindowVisible(h(v)) }.as_bool() && unsafe { GetWindowTextLengthW(h(v)) } > 0
+        let mut cloaked = 0u32;
+        // A failed query leaves 0: treated as not cloaked.
+        let _ = unsafe {
+            DwmGetWindowAttribute(
+                h(v),
+                DWMWA_CLOAKED,
+                &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        let tool = unsafe { GetWindowLongW(h(v), GWL_EXSTYLE) } as u32 & WS_EX_TOOLWINDOW.0 != 0;
+        let mut r = RECT::default();
+        let empty = unsafe { GetWindowRect(h(v), &mut r) }.is_err()
+            || r.right <= r.left
+            || r.bottom <= r.top;
+        walk_target(
+            unsafe { IsWindowVisible(h(v)) }.as_bool(),
+            cloaked != 0,
+            tool,
+            unsafe { IsIconic(h(v)) }.as_bool(),
+            empty,
+        )
     };
     let next = |v: isize| {
         unsafe { GetWindow(h(v), GW_HWNDNEXT) }
@@ -1451,6 +1481,19 @@ mod tests {
             0
         );
         assert_eq!(first_foreign_window(0, 7, &pid, &shown, &next, 50), 0);
+    }
+
+    #[test]
+    fn walk_target_rejects_cloaked_tool_and_empty_windows_but_not_untitled_ones() {
+        use super::walk_target;
+        // A normal visible window, titled or not (the title is not asked).
+        assert!(walk_target(true, false, false, false, false));
+        // Hidden, cloaked, tool, minimised or zero-size windows are skipped.
+        assert!(!walk_target(false, false, false, false, false));
+        assert!(!walk_target(true, true, false, false, false));
+        assert!(!walk_target(true, false, true, false, false));
+        assert!(!walk_target(true, false, false, true, false));
+        assert!(!walk_target(true, false, false, false, true));
     }
 
     #[test]
