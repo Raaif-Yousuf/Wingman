@@ -24,10 +24,16 @@ const RAM_COMFORTABLE: u64 = 15 * GIB;
 /// room for a small vision model. Below it the adapter is treated as an
 /// integrated one that shares system RAM.
 const VRAM_DISCRETE: u64 = 3 * GIB;
+/// An integrated GPU's dedicated carve-out is small (128 MB on the Arc
+/// iGPU); anything with a GiB or more of its own memory is a card.
+const IGPU_DEDICATED_MAX: u64 = GIB;
+const INTEL_VENDOR_ID: u32 = 0x8086;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuInfo {
     pub name: String,
+    /// PCI vendor id from DXGI (0x8086 is Intel).
+    pub vendor_id: u32,
     pub dedicated_bytes: u64,
     pub shared_bytes: u64,
 }
@@ -37,8 +43,14 @@ impl GpuInfo {
         self.dedicated_bytes >= VRAM_DISCRETE
     }
 
-    fn is_intel_arc(&self) -> bool {
-        self.name.to_ascii_lowercase().contains("arc")
+    /// Only an Intel Arc integrated GPU (the Core Ultra kind, which has a
+    /// tiny dedicated carve-out and shares system RAM) needs
+    /// OLLAMA_IGPU_ENABLE=1. A discrete Arc A-series card has gigabytes of
+    /// its own memory and does not.
+    fn is_intel_arc_igpu(&self) -> bool {
+        self.vendor_id == INTEL_VENDOR_ID
+            && self.dedicated_bytes < IGPU_DEDICATED_MAX
+            && self.name.to_ascii_lowercase().contains("arc")
     }
 }
 
@@ -64,16 +76,22 @@ pub enum Power {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineFacts {
-    pub ram_bytes: u64,
+    /// None when Windows would not say. An unreadable value is unknown,
+    /// never a small number or an empty list: a failed read must not turn
+    /// into a confident "little memory" or "no GPU".
+    pub ram_bytes: Option<u64>,
     /// Hardware adapters only (the software "Basic Render Driver" is left
-    /// out by [`gather`]).
-    pub gpus: Vec<GpuInfo>,
+    /// out by [`gather`]). None when DXGI could not be read;
+    /// Some(empty) means it was read and there is no hardware GPU.
+    pub gpus: Option<Vec<GpuInfo>>,
     pub ollama: OllamaState,
     pub power: Power,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
+    /// Not enough could be read to say anything.
+    Unknown,
     Good,
     Slow,
     NotRecommended,
@@ -128,20 +146,27 @@ fn best_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
 }
 
 fn numbers_text(f: &MachineFacts) -> String {
-    let gpu = match best_gpu(&f.gpus) {
-        None => "No GPU found.".to_string(),
-        Some(g) if g.is_discrete() => format!(
-            "GPU: {}, {} of its own memory.",
-            g.name,
-            gib_text(g.dedicated_bytes)
-        ),
-        Some(g) => format!(
-            "GPU: {}, integrated, shares up to {} of system memory.",
-            g.name,
-            gib_text(g.shared_bytes.max(g.dedicated_bytes))
-        ),
+    let ram = match f.ram_bytes {
+        Some(b) => format!("RAM: {}.", gib_text(b)),
+        None => "RAM: could not read.".to_string(),
     };
-    format!("RAM: {}. {gpu}", gib_text(f.ram_bytes))
+    let gpu = match f.gpus.as_deref() {
+        None => "GPU: could not read.".to_string(),
+        Some(gpus) => match best_gpu(gpus) {
+            None => "No GPU found.".to_string(),
+            Some(g) if g.is_discrete() => format!(
+                "GPU: {}, {} of its own memory.",
+                g.name,
+                gib_text(g.dedicated_bytes)
+            ),
+            Some(g) => format!(
+                "GPU: {}, integrated, shares up to {} of system memory.",
+                g.name,
+                gib_text(g.shared_bytes.max(g.dedicated_bytes))
+            ),
+        },
+    };
+    format!("{ram} {gpu}")
 }
 
 fn battery_note(power: Power) -> Option<String> {
@@ -156,9 +181,59 @@ fn battery_note(power: Power) -> Option<String> {
     }
 }
 
+/// The verdict from hardware alone (no loaded model to look at). A value
+/// that could not be read never counts against the machine: it makes the
+/// verdict "unknown" instead.
+fn hardware_verdict(f: &MachineFacts) -> (Level, &'static str, String) {
+    let Some(gpus) = f.gpus.as_deref() else {
+        return (
+            Level::Unknown,
+            "Local models: could not check",
+            "Could not read this PC's GPU, so there is no verdict. Load a model in Ollama and try again."
+                .to_string(),
+        );
+    };
+    let gpu = best_gpu(gpus);
+    if gpu.is_some_and(GpuInfo::is_discrete) {
+        return (
+            Level::Good,
+            "Local models: should work well",
+            "This GPU has room for a small model. Not measured yet: load a model in Ollama to confirm."
+                .to_string(),
+        );
+    }
+    let Some(ram) = f.ram_bytes else {
+        return (
+            Level::Unknown,
+            "Local models: could not check",
+            "Could not read this PC's memory, so there is no verdict.".to_string(),
+        );
+    };
+    if ram < RAM_LOW {
+        (
+            Level::NotRecommended,
+            "Local models: not recommended",
+            "Little memory and no discrete GPU. Use a cloud model.".to_string(),
+        )
+    } else if gpu.is_some() && ram >= RAM_COMFORTABLE {
+        (
+            Level::Slow,
+            "Local models: should work, slowly",
+            "An integrated GPU shares system memory. Not measured yet: load a model in Ollama to confirm it uses the GPU."
+                .to_string(),
+        )
+    } else {
+        (
+            Level::Slow,
+            "Local models: slow",
+            "No discrete GPU and modest memory. Single presses may work, but expect waits."
+                .to_string(),
+        )
+    }
+}
+
 /// The honest one-line verdict for running local models on this machine.
 pub fn verdict(f: &MachineFacts) -> Verdict {
-    let gpu = best_gpu(&f.gpus);
     let (level, headline, line) = match f.ollama {
         OllamaState::StockTray => (
             Level::Slow,
@@ -174,50 +249,36 @@ pub fn verdict(f: &MachineFacts) -> Verdict {
         ),
         OllamaState::Running {
             on_gpu: Some(false),
-        } if gpu.is_some() => {
-            let hint = if gpu.is_some_and(GpuInfo::is_intel_arc) {
-                " Intel Arc needs OLLAMA_IGPU_ENABLE=1 before Ollama starts."
-            } else {
-                " Check the GPU driver and that Ollama can see this adapter."
-            };
-            (
+        } => match f.gpus.as_deref() {
+            None => (
                 Level::Slow,
                 "Local models: slow",
-                format!("Ollama is running a model on the CPU although this PC has a GPU.{hint}"),
-            )
-        }
-        OllamaState::Running {
-            on_gpu: Some(false),
-        } => (
-            Level::NotRecommended,
-            "Local models: not recommended",
-            "Ollama is running on the CPU and no GPU was found. Use a cloud model.".to_string(),
-        ),
-        // No loaded model to look at (or Ollama is off): judge by hardware
-        // and say it was not measured.
-        _ => match gpu {
-            _ if f.ram_bytes < RAM_LOW && !gpu.is_some_and(GpuInfo::is_discrete) => (
-                Level::NotRecommended,
-                "Local models: not recommended",
-                "Little memory and no discrete GPU. Use a cloud model.".to_string(),
-            ),
-            Some(g) if g.is_discrete() => (
-                Level::Good,
-                "Local models: should work well",
-                "This GPU has room for a small model. Not measured yet: load a model in Ollama to confirm.".to_string(),
-            ),
-            Some(_) if f.ram_bytes >= RAM_COMFORTABLE => (
-                Level::Slow,
-                "Local models: should work, slowly",
-                "An integrated GPU shares system memory. Not measured yet: load a model in Ollama to confirm it uses the GPU.".to_string(),
-            ),
-            _ => (
-                Level::Slow,
-                "Local models: slow",
-                "No discrete GPU and modest memory. Single presses may work, but expect waits."
+                "Ollama is running a model on the CPU. Could not read this PC's GPU list to say why."
                     .to_string(),
             ),
+            Some([]) => (
+                Level::NotRecommended,
+                "Local models: not recommended",
+                "Ollama is running on the CPU and no GPU was found. Use a cloud model.".to_string(),
+            ),
+            Some(gpus) => {
+                let hint = if gpus.iter().any(GpuInfo::is_intel_arc_igpu) {
+                    " Intel Arc integrated graphics need OLLAMA_IGPU_ENABLE=1 before Ollama starts."
+                } else {
+                    " Check the GPU driver and that Ollama can see this adapter."
+                };
+                (
+                    Level::Slow,
+                    "Local models: slow",
+                    format!(
+                        "Ollama is running a model on the CPU although this PC has a GPU.{hint}"
+                    ),
+                )
+            }
         },
+        // No loaded model to look at (or Ollama is off): judge by hardware
+        // and say it was not measured.
+        _ => hardware_verdict(f),
     };
     Verdict {
         level,
@@ -265,30 +326,33 @@ mod win {
     use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
-    pub fn total_ram_bytes() -> u64 {
+    /// None when the call fails (or reports zero): unknown, not "no memory".
+    pub fn total_ram_bytes() -> Option<u64> {
         let mut st = MEMORYSTATUSEX {
             dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
             ..Default::default()
         };
         // SAFETY: `st` is a valid, correctly sized MEMORYSTATUSEX.
         match unsafe { GlobalMemoryStatusEx(&mut st) } {
-            Ok(()) => st.ullTotalPhys,
-            Err(_) => 0,
+            Ok(()) if st.ullTotalPhys > 0 => Some(st.ullTotalPhys),
+            _ => None,
         }
     }
 
-    pub fn gpus() -> Vec<GpuInfo> {
+    /// None when DXGI could not be read at all (factory failure, or every
+    /// adapter's description failed): unknown, not "no GPU".
+    pub fn gpus() -> Option<Vec<GpuInfo>> {
         let mut out = Vec::new();
+        let mut failed = false;
         // SAFETY: plain DXGI enumeration; every returned interface is owned
         // and released on drop.
         unsafe {
-            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
-                return out;
-            };
+            let factory = CreateDXGIFactory1::<IDXGIFactory1>().ok()?;
             let mut i = 0;
             while let Ok(adapter) = factory.EnumAdapters1(i) {
                 i += 1;
                 let Ok(desc) = adapter.GetDesc1() else {
+                    failed = true;
                     continue;
                 };
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
@@ -301,12 +365,17 @@ mod win {
                     .unwrap_or(desc.Description.len());
                 out.push(GpuInfo {
                     name: String::from_utf16_lossy(&desc.Description[..end]),
+                    vendor_id: desc.VendorId,
                     dedicated_bytes: desc.DedicatedVideoMemory as u64,
                     shared_bytes: desc.SharedSystemMemory as u64,
                 });
             }
         }
-        out
+        if out.is_empty() && failed {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     pub fn power() -> Power {
@@ -334,6 +403,7 @@ mod tests {
     fn gpu(name: &str, dedicated_gb: u64, shared_gb: u64) -> GpuInfo {
         GpuInfo {
             name: name.to_string(),
+            vendor_id: 0x10de,
             dedicated_bytes: dedicated_gb * GIB,
             shared_bytes: shared_gb * GIB,
         }
@@ -341,8 +411,8 @@ mod tests {
 
     fn facts(ram_gb: u64, gpus: Vec<GpuInfo>, ollama: OllamaState, power: Power) -> MachineFacts {
         MachineFacts {
-            ram_bytes: ram_gb * GIB,
-            gpus,
+            ram_bytes: Some(ram_gb * GIB),
+            gpus: Some(gpus),
             ollama,
             power,
         }
@@ -351,6 +421,7 @@ mod tests {
     fn arc() -> GpuInfo {
         GpuInfo {
             name: "Intel(R) Arc(TM) Graphics".to_string(),
+            vendor_id: INTEL_VENDOR_ID,
             dedicated_bytes: 128 * MIB,
             shared_bytes: 8 * GIB,
         }
@@ -452,6 +523,91 @@ mod tests {
     }
 
     #[test]
+    fn discrete_arc_card_does_not_get_the_igpu_hint() {
+        let card = GpuInfo {
+            name: "Intel(R) Arc(TM) A770 Graphics".to_string(),
+            vendor_id: INTEL_VENDOR_ID,
+            dedicated_bytes: 16 * GIB,
+            shared_bytes: 8 * GIB,
+        };
+        let v = verdict(&facts(
+            32,
+            vec![card],
+            running(Some(false)),
+            Power::PluggedIn,
+        ));
+        assert_eq!(v.level, Level::Slow);
+        assert!(!v.line.contains("OLLAMA_IGPU_ENABLE"), "{}", v.line);
+    }
+
+    #[test]
+    fn a_non_intel_adapter_named_arc_does_not_get_the_igpu_hint() {
+        let mut other = arc();
+        other.vendor_id = 0x1002;
+        let v = verdict(&facts(
+            16,
+            vec![other],
+            running(Some(false)),
+            Power::PluggedIn,
+        ));
+        assert!(!v.line.contains("OLLAMA_IGPU_ENABLE"), "{}", v.line);
+    }
+
+    #[test]
+    fn unreadable_ram_is_unknown_not_little_memory() {
+        let f = MachineFacts {
+            ram_bytes: None,
+            gpus: Some(vec![arc()]),
+            ollama: OllamaState::NotRunning,
+            power: Power::PluggedIn,
+        };
+        let v = verdict(&f);
+        assert_eq!(v.level, Level::Unknown);
+        assert!(v.line.contains("Could not read"), "{}", v.line);
+        assert!(v.numbers.contains("RAM: could not read"), "{}", v.numbers);
+        assert!(!v.line.contains("Little memory"), "{}", v.line);
+    }
+
+    #[test]
+    fn unreadable_gpu_list_is_unknown_not_no_gpu() {
+        let f = MachineFacts {
+            ram_bytes: Some(8 * GIB),
+            gpus: None,
+            ollama: OllamaState::NotRunning,
+            power: Power::PluggedIn,
+        };
+        let v = verdict(&f);
+        assert_eq!(v.level, Level::Unknown);
+        assert!(v.line.contains("Could not read"), "{}", v.line);
+        assert!(v.numbers.contains("GPU: could not read"), "{}", v.numbers);
+        assert!(!v.numbers.contains("No GPU found"), "{}", v.numbers);
+    }
+
+    #[test]
+    fn unreadable_gpu_list_with_ollama_on_cpu_is_slow_not_not_recommended() {
+        let f = MachineFacts {
+            ram_bytes: Some(32 * GIB),
+            gpus: None,
+            ollama: running(Some(false)),
+            power: Power::PluggedIn,
+        };
+        let v = verdict(&f);
+        assert_eq!(v.level, Level::Slow);
+        assert!(v.line.contains("Could not read"), "{}", v.line);
+    }
+
+    #[test]
+    fn a_discrete_gpu_still_gives_a_verdict_when_ram_is_unreadable() {
+        let f = MachineFacts {
+            ram_bytes: None,
+            gpus: Some(vec![gpu("NVIDIA GeForce RTX 4060", 8, 8)]),
+            ollama: OllamaState::NotRunning,
+            power: Power::PluggedIn,
+        };
+        assert_eq!(verdict(&f).level, Level::Good);
+    }
+
+    #[test]
     fn on_battery_adds_the_battery_line_with_the_percentage() {
         let v = verdict(&facts(
             16,
@@ -546,6 +702,9 @@ mod tests {
             v.headline,
             v.detail()
         );
-        assert!(facts.ram_bytes > 0, "GlobalMemoryStatusEx returned nothing");
+        assert!(
+            facts.ram_bytes.is_some(),
+            "GlobalMemoryStatusEx returned nothing"
+        );
     }
 }

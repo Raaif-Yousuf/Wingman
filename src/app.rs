@@ -143,6 +143,21 @@ pub const WM_APP_SEND_PREVIEW: u32 = WM_APP + 18;
 /// is dropped. `WM_APP + 19`: `+18` is `WM_APP_SEND_PREVIEW`.
 pub const WM_APP_PENDING_STAGE: u32 = WM_APP + 19;
 
+/// #328: posted by the "Check this PC for local models" worker thread when
+/// its reads finish. `lparam` is
+/// `Box::into_raw(Box::new(machine::MachineFacts))`; the receiver takes
+/// ownership. The reads (including a loopback `/api/ps` call) run off the
+/// message thread because that thread also hosts the low-level keyboard
+/// hook, which Windows drops if it stalls. `WM_APP + 20`: `+19` is
+/// `WM_APP_PENDING_STAGE`.
+pub const WM_APP_MACHINE_CHECK_RESULT: u32 = WM_APP + 20;
+
+/// Set while a machine check is gathering, so a second click does not start
+/// a second worker. Cleared by the worker just before it posts, so an
+/// ignored (Settings open) or dropped result can never leave it stuck.
+static MACHINE_CHECK_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// #567: what Ollama reported for one base URL, as (name, supports vision).
 type PulledOllamaModels = (String, Vec<(String, bool)>);
 
@@ -3074,13 +3089,42 @@ impl App {
         }
     }
 
-    /// Issue #328: "Check this PC for local models". One on-demand read of
-    /// RAM, GPU, battery and Ollama's GPU use (a few quick local calls, the
-    /// same kind `copy_diagnostics` already makes on the message thread),
-    /// then a card with the verdict. Nothing is kept and nothing polls.
+    /// Issue #328: "Check this PC for local models". Reads RAM, GPU, battery
+    /// and Ollama's GPU use once, on click, on a worker thread (the message
+    /// thread also hosts the keyboard hook and must never wait on a
+    /// socket), then `on_machine_check_result` shows the verdict. Nothing is
+    /// kept and nothing polls.
     fn check_machine(&mut self) {
-        let facts = crate::machine::gather(&self.config.providers.ollama.base_url);
-        let verdict = crate::machine::verdict(&facts);
+        use std::sync::atomic::Ordering;
+        if MACHINE_CHECK_RUNNING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        let target = self.hwnd_isize();
+        let base_url = self.config.providers.ollama.base_url.clone();
+        std::thread::spawn(move || {
+            let facts = crate::machine::gather(&base_url);
+            MACHINE_CHECK_RUNNING.store(false, Ordering::SeqCst);
+            let payload = Box::into_raw(Box::new(facts));
+            unsafe {
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_MACHINE_CHECK_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_MACHINE_CHECK_RESULT, LPARAM(payload as isize));
+                }
+            }
+        });
+    }
+
+    fn on_machine_check_result(&mut self, facts: &crate::machine::MachineFacts) {
+        let verdict = crate::machine::verdict(facts);
         self.card
             .show_answer(&verdict.headline, &verdict.detail(), 20, None);
     }
@@ -5531,6 +5575,10 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
+        // #328: an on-demand card; Settings hides every card when it
+        // opens, so a result arriving then has nothing to show on. The
+        // boxed facts are freed below.
+        | WM_APP_MACHINE_CHECK_RESULT
         // #105: a send preview cannot be answered while Settings is
         // modal-open, so it is dropped, which cancels the send (the worker
         // sees the reply channel close and the request ends in a card).
@@ -5584,6 +5632,9 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_PALETTE_RUN => drop(Box::from_raw(p as *mut String)),
             WM_APP_SEND_PREVIEW => drop(Box::from_raw(p as *mut crate::ui::send_gate::SendRequest)),
             WM_APP_PENDING_STAGE => drop(Box::from_raw(p as *mut crate::ui::card::PendingStage)),
+            WM_APP_MACHINE_CHECK_RESULT => {
+                drop(Box::from_raw(p as *mut crate::machine::MachineFacts))
+            }
             WM_APP_ROUTER_RESULT => drop(Box::from_raw(
                 p as *mut (u64, std::result::Result<router::RouterResult, String>),
             )),
@@ -5883,6 +5934,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_generic_action_result(action, schema, result);
             LRESULT(0)
         }
+        WM_APP_MACHINE_CHECK_RESULT => {
+            let facts = unsafe { *Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts) };
+            app.on_machine_check_result(&facts);
+            LRESULT(0)
+        }
         WM_APP_PENDING_STAGE => {
             let stage = unsafe { *Box::from_raw(lparam.0 as *mut crate::ui::card::PendingStage) };
             app.on_pending_stage(wparam.0 as u64, stage);
@@ -6053,8 +6109,8 @@ mod tests {
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
-        WM_APP_GENERIC_ACTION_RESULT, WM_APP_PENDING_STAGE, WM_APP_RESULT, WM_APP_REVIEW_RESULT,
-        WM_APP_ROUTER_RESULT, WM_APP_SEND_PREVIEW,
+        WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
+        WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT, WM_APP_SEND_PREVIEW,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
@@ -6308,6 +6364,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #328: a machine-check result dropped unhandled (Settings open, window
+    /// closing, post failure) must free its boxed facts, not leak them.
+    #[test]
+    fn free_boxed_payload_frees_a_machine_check_result() {
+        let facts = Box::into_raw(Box::new(crate::machine::MachineFacts {
+            ram_bytes: None,
+            gpus: None,
+            ollama: crate::machine::OllamaState::NotRunning,
+            power: crate::machine::Power::Unknown,
+        }));
+        assert!(super::free_boxed_payload(
+            super::WM_APP_MACHINE_CHECK_RESULT,
+            windows::Win32::Foundation::LPARAM(facts as isize)
+        ));
     }
 
     #[test]
@@ -6847,6 +6919,7 @@ mod tests {
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
+        ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
     ];
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -7506,6 +7579,11 @@ mod tests {
         (
             "WM_APP_PENDING_STAGE",
             WM_APP_PENDING_STAGE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_MACHINE_CHECK_RESULT",
+            WM_APP_MACHINE_CHECK_RESULT,
             SettingsReentrancy::Ignore,
         ),
     ];
