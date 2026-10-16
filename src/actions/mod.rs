@@ -10,6 +10,7 @@ pub mod calendar;
 pub mod chart_table;
 pub mod code_actions;
 pub mod convert_times;
+pub mod dates;
 pub mod define_word;
 pub mod describe_image;
 pub mod explain_error;
@@ -24,6 +25,7 @@ pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
 pub mod receipt;
+pub mod relative_dates;
 pub mod review_email;
 pub mod rewrite_tone;
 pub mod scam_check;
@@ -423,6 +425,10 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `rewrite_tone::builtin_actions`): proposal `text_answer`, executor
 ///   `replace_text`. Rewrite the selection in a fixed tone, confirmed on a
 ///   card, then written over the selection like "Translate selection".
+/// - `"resolve-relative-dates"` (#336, `relative_dates::builtin_action`):
+///   model-free. Finds phrases like "next Tuesday" or "in 3 days" in the
+///   selection (else on screen) and lists the date each works out to
+///   (`dates`), from today's local date.
 /// - `"explain-jargon"` (#335, `jargon::builtin_action`): proposal
 ///   `jargon_terms`, executor `none`. Lists the technical terms and acronyms in
 ///   the selection (else on screen) with a short plain meaning each, on the
@@ -487,6 +493,7 @@ pub fn builtin_actions() -> Vec<Action> {
         link_summary::builtin_action(),
         convert_times::builtin_action(),
         scam_check::builtin_action(),
+        relative_dates::builtin_action(),
         jargon::builtin_action(),
     ];
     actions.extend(code_actions::builtin_actions());

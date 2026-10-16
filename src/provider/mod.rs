@@ -8,6 +8,25 @@ pub(crate) mod common;
 pub mod gemini;
 pub mod model_list;
 pub mod ollama;
+
+/// The longest one provider can hold a run (#723): the larger of the cloud
+/// retry wall clock and Ollama's own total timeout.
+const PER_PROVIDER_SECS: u64 = if common::MAX_TOTAL_WALL_CLOCK_SECS > ollama::TOTAL_TIMEOUT_SECS {
+    common::MAX_TOTAL_WALL_CLOCK_SECS
+} else {
+    ollama::TOTAL_TIMEOUT_SECS
+};
+
+/// What a card assumes about chain length when it cannot see the real one.
+pub const TYPICAL_CHAIN_LEN: usize = 4;
+
+/// The longest an honest run can take (#723): every provider in a chain of
+/// `providers` using its full wall clock, plus a minute for capture and the
+/// hand-off. Longer than this and a run is treated as stuck.
+pub const fn worst_case_run_secs(providers: usize) -> u64 {
+    let n = if providers == 0 { 1 } else { providers as u64 };
+    n * PER_PROVIDER_SECS + 60
+}
 pub mod ollama_admin;
 pub mod ollama_gpu_fix;
 pub mod openai;
@@ -663,16 +682,25 @@ pub struct Chain {
     /// #105: `true` for a chain that must never show the send preview (see
     /// [`Chain::without_prompt`]).
     no_prompt: bool,
+    /// #792: past this instant the chain starts no new provider call and
+    /// sends no repair request (see [`Chain::with_deadline`]).
+    deadline: Option<std::time::Instant>,
     /// Test seam: used instead of the process-wide gate.
     #[cfg(test)]
     test_gate: Option<std::sync::Arc<dyn SendGate>>,
 }
 
 impl Chain {
+    /// How many providers this chain can try.
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
     pub fn new(providers: Vec<Box<dyn Provider>>) -> Self {
         Self {
             providers,
             no_prompt: false,
+            deadline: None,
             #[cfg(test)]
             test_gate: None,
         }
@@ -684,6 +712,15 @@ impl Chain {
     /// own when the palette opens and so must not pop a card.
     pub fn without_prompt(mut self) -> Self {
         self.no_prompt = true;
+        self
+    }
+
+    /// #792: gives the chain a deadline. A call already in flight cannot be
+    /// interrupted (blocking HTTP), but once the deadline has passed the chain
+    /// starts no further provider and sends no repair request, so a hint
+    /// nobody is waiting for is never billed twice.
+    pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 
@@ -733,11 +770,11 @@ impl Chain {
                     return Err(SendCancelled.into());
                 };
                 return common::with_send_authorized(authorized, || {
-                    attempt_provider(provider, req, parse)
+                    attempt_provider(provider, req, parse, self.deadline)
                 });
             }
         }
-        attempt_provider(provider, req, parse)
+        attempt_provider(provider, req, parse, self.deadline)
     }
 
     /// Tries each ready provider in order, returning the first success. See
@@ -793,6 +830,12 @@ impl Chain {
         for provider in &self.providers {
             if !provider.ready() {
                 continue;
+            }
+            if past_deadline(self.deadline) {
+                first_err.get_or_insert_with(|| {
+                    anyhow::anyhow!("the time limit passed before the request was sent")
+                });
+                break;
             }
             match self.attempt(provider.as_ref(), req, &mut parse) {
                 Ok(value) => return Ok(value),
@@ -869,6 +912,12 @@ impl Chain {
         for (idx, provider) in self.providers.iter().enumerate() {
             if !provider.ready() {
                 continue;
+            }
+            if past_deadline(self.deadline) {
+                first_err.get_or_insert_with(|| {
+                    anyhow::anyhow!("the time limit passed before the request was sent")
+                });
+                break;
             }
             if first_idx.is_none() {
                 first_idx = Some(idx);
@@ -1093,6 +1142,11 @@ pub fn review_request_from_screen(prompt: &str, shot: &Shot) -> Request {
     }
 }
 
+/// #792: true once `deadline` (if any) has passed.
+fn past_deadline(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|d| std::time::Instant::now() >= d)
+}
+
 /// One provider's whole attempt at `req`: the call, the #200 local cleanup,
 /// and the #99 one-shot repair pass, exactly as [`Chain::complete_parsed`]
 /// always ran them inline. Factored out so
@@ -1106,6 +1160,7 @@ fn attempt_provider<T>(
     provider: &dyn Provider,
     req: &Request,
     parse: &mut impl FnMut(&Completion) -> anyhow::Result<T>,
+    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<T> {
     let completion = provider.complete(req)?;
 
@@ -1131,7 +1186,8 @@ fn attempt_provider<T>(
                 }
             }
 
-            if completion.stop != StopReason::MaxTokens {
+            // #792: past the deadline nobody is waiting, so no billed repair.
+            if completion.stop != StopReason::MaxTokens && !past_deadline(deadline) {
                 let repair_req = repair_request(req, &completion.text, &parse_err.to_string());
                 if let Ok(repaired) = provider.complete(&repair_req) {
                     if let Ok(value) = parse(&repaired) {
@@ -1512,6 +1568,122 @@ mod tests {
         let completion = chain.complete(&req()).unwrap();
         let answer = parse_answer(&completion.text).unwrap();
         assert_eq!(answer.headline, "42");
+    }
+
+    #[test]
+    fn a_chain_past_its_deadline_does_not_fall_through_to_the_next_provider() {
+        // #792: the slow first provider outlives the deadline and fails; the
+        // second must never be called (it would bill again for an answer
+        // nobody waits for).
+        static SECOND_CALLS: AtomicU32 = AtomicU32::new(0);
+        fn slow_failure() -> anyhow::Result<Completion> {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            Err(anyhow::anyhow!("slow provider failed"))
+        }
+        fn counted_ok() -> anyhow::Result<Completion> {
+            SECOND_CALLS.fetch_add(1, Ordering::SeqCst);
+            ok_completion()
+        }
+        let a = MockProvider {
+            id: "a",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: slow_failure,
+        };
+        let b = MockProvider {
+            id: "b",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: counted_ok,
+        };
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)])
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(30));
+        let err = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap_err();
+        assert_eq!(SECOND_CALLS.load(Ordering::SeqCst), 0);
+        assert!(
+            format!("{err:#}").contains("slow provider failed"),
+            "{err:#}"
+        );
+    }
+
+    /// #792: the same for the vision-aware path the router uses.
+    #[test]
+    fn the_fallback_path_also_stops_at_the_deadline() {
+        static SECOND_CALLS: AtomicU32 = AtomicU32::new(0);
+        fn slow_failure() -> anyhow::Result<Completion> {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            Err(anyhow::anyhow!("slow provider failed"))
+        }
+        fn counted_ok() -> anyhow::Result<Completion> {
+            SECOND_CALLS.fetch_add(1, Ordering::SeqCst);
+            ok_completion()
+        }
+        let a = VisionAwareProvider::new("a", true, slow_failure);
+        let b = VisionAwareProvider::new("b", true, counted_ok);
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)])
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(30));
+        let result = chain.complete_parsed_with_fallback(
+            &req(),
+            || Ok(non_vision_inputs_for_test()),
+            |c| parse_answer(&c.text),
+        );
+        assert!(result.is_err());
+        assert_eq!(SECOND_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    /// #792: a slow provider whose answer does not parse must not get the
+    /// repair round trip once the deadline has passed.
+    #[test]
+    fn no_repair_request_is_sent_after_the_deadline() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        fn slow_unparseable() -> anyhow::Result<Completion> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            Ok(Completion {
+                text: r#"{"not":"an answer"}"#.to_string(),
+                usage: None,
+                stop: StopReason::Complete,
+            })
+        }
+        let a = MockProvider {
+            id: "a",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: slow_unparseable,
+        };
+        let chain = Chain::new(vec![Box::new(a)])
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(30));
+        assert!(chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .is_err());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    /// #792: with no deadline the chain behaves as before (falls through).
+    #[test]
+    fn a_chain_without_a_deadline_still_falls_through() {
+        fn slow_failure() -> anyhow::Result<Completion> {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            Err(anyhow::anyhow!("slow provider failed"))
+        }
+        let a = MockProvider {
+            id: "a",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: slow_failure,
+        };
+        let b = MockProvider {
+            id: "b",
+            ready: true,
+            calls: AtomicU32::new(0),
+            result: ok_completion,
+        };
+        let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        assert!(chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .is_ok());
     }
 
     #[test]
@@ -2808,12 +2980,16 @@ mod tests {
         let seen = provider.seen_handle();
         let chain = Chain::new(vec![Box::new(provider)]);
 
-        let result = crate::router::route(&chain, vec![1, 2, 3, 4], &candidates, || {
-            Ok(non_vision_inputs_for_test())
-        })
+        let result = crate::router::route(
+            &chain,
+            vec![1, 2, 3, 4],
+            &candidates,
+            crate::router::RouterLimits::default(),
+            || Ok(non_vision_inputs_for_test()),
+        )
         .unwrap();
 
-        assert_eq!(result.intent, None);
+        assert!(result.options.is_empty());
         let requests = seen.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(
@@ -2844,9 +3020,13 @@ mod tests {
         let seen = provider.seen_handle();
         let chain = Chain::new(vec![Box::new(provider)]);
 
-        crate::router::route(&chain, image_png.clone(), &candidates, || {
-            panic!("fallback must never run for a vision provider")
-        })
+        crate::router::route(
+            &chain,
+            image_png.clone(),
+            &candidates,
+            crate::router::RouterLimits::default(),
+            || panic!("fallback must never run for a vision provider"),
+        )
         .unwrap();
 
         let requests = seen.lock().unwrap();
