@@ -1026,7 +1026,10 @@ const CARD_WIDTH_DP: i32 = 384;
 /// The headline is 14 px semibold Segoe UI: from the gallery renders an
 /// average glyph is ~6.6dp once `DT_WORDBREAK`'s end-of-line slack is
 /// priced in. With the chevron's 24dp reserved that is 328 / 6.6 ~= 50
-/// characters per line, so two lines already cover a 90-character
+/// characters per line (THEORY, unverified for wide text: MEASURED 2026-10-16
+/// a news-style 50-character line fits one line but a wide one needs 371 px
+/// of the 352 available and wraps, see
+/// `a_fifty_character_headline_fits_one_collapsed_line`), so two lines already cover a 90-character
 /// headline; three lines leave real headroom for wider glyphs and short
 /// words that push wrapping earlier, so a full 90-character headline is
 /// never silently `DT_END_ELLIPSIS`'d. (The card is as wide as it is so
@@ -1044,7 +1047,7 @@ const PENDING_SIZE_DP: i32 = 40;
 /// Full width of the pending card, once it carries status text -- matches
 /// the Collapsed/Expanded card width so the pending card no longer looks
 /// like a different surface from the states that immediately replace it.
-const PENDING_WIDTH_DP: i32 = CARD_WIDTH_DP;
+const PENDING_WIDTH_DP: i32 = 280;
 /// Vertical gap between the glyph and the status line beneath it.
 const PENDING_TEXT_GAP_DP: i32 = 8;
 const WHEEL_SCROLL_DP: i32 = 48;
@@ -5769,7 +5772,7 @@ mod tests {
         assert!(card.inner.scroll_max > 0);
         let padding = card.inner.scale(PADDING_DP);
         let gap = card.inner.scale(GAP_DP);
-        let line = card.inner.line_height(card.inner.fonts.body).max(1);
+        let line = card.inner.line_height(card.inner.fonts.caption).max(1);
         let fade_h = line + card.inner.scale(FADE_EXTRA_DP);
         let ink = card.inner.palette().detail;
         // Pixels in the fade band, left half (the chevron is on the right),
@@ -6125,6 +6128,42 @@ mod tests {
         // given.
         assert_ne!(dark_bg, light_bg);
         assert_ne!(dark_text, light_text);
+    }
+
+    /// MEASURED in the card's own headline font: a 50-character first line
+    /// (`HEADLINE_CHARS_PER_LINE`, what the prompts promise) fits one
+    /// collapsed headline line, with the chevron's room reserved.
+    #[test]
+    fn a_fifty_character_headline_fits_one_collapsed_line() {
+        let card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let content_w = card.inner.scale(CARD_WIDTH_DP) - 2 * card.inner.scale(PADDING_DP);
+        let avail = card.inner.headline_content_width(content_w);
+        let samples = [
+            "Fed holds rates at 5.25%, signals 2 or 3 cuts now.",
+            "Summary of the quarterly results and what changed.",
+            "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+            "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii",
+        ];
+        for text in samples {
+            assert_eq!(text.chars().count(), HEADLINE_CHARS_PER_LINE, "{text}");
+        }
+        // MEASURED 2026-10-16: a news-style line of 50 characters fits one
+        // line; a wide one needs 371 px of the 352 px available, so it
+        // wraps to a second line. Wrapping is fine (the card allows
+        // `HEADLINE_MAX_LINES`), clipping is not: both must stay within it.
+        let fits = card
+            .inner
+            .measure_label(card.inner.fonts.headline, samples[0])
+            .0;
+        assert!(
+            fits <= avail,
+            "{:?} needs {fits}px of {avail}px",
+            samples[0]
+        );
+        for text in &samples[1..3] {
+            let w = card.inner.measure_label(card.inner.fonts.headline, text).0;
+            assert!(w <= avail * 2, "{text:?} needs {w}px of {avail}px per line");
+        }
     }
 
     #[test]
