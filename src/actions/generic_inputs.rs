@@ -127,6 +127,15 @@ fn wants_screen(inputs: &[InputKind]) -> bool {
         .any(|k| matches!(k, InputKind::Screen | InputKind::Window | InputKind::Region))
 }
 
+/// Whether the request could carry the screenshot, decided from the `inputs`
+/// list alone, before anything is gathered (#494). `false` for a text-only
+/// action: [`plan`] never sends the screen for it, so `App` skips the capture
+/// and a capture failure cannot block it. `true` exactly when `plan` can
+/// answer `screen: true`, which a test sweeps.
+pub fn screen_may_be_needed(inputs: &[InputKind]) -> bool {
+    wants_screen(inputs) || !wants_any_text(inputs)
+}
+
 /// Decides the request's contents. `Err` is the card text for "the action
 /// asked for text and there was none, and it did not ask for the screen".
 pub fn plan(inputs: &[InputKind], gathered: &Gathered) -> Result<RequestInputs, String> {
@@ -178,7 +187,7 @@ pub fn plan(inputs: &[InputKind], gathered: &Gathered) -> Result<RequestInputs, 
     // Nothing gathered. Send the screen when the action asked for it, or
     // asked for no text input at all (the pre-#484 behaviour, and what an
     // empty or `text`/`context`-only list still means).
-    if wants_screen(inputs) || !wants_any_text(inputs) {
+    if screen_may_be_needed(inputs) {
         return Ok(RequestInputs {
             user: SCREEN_USER_TEXT.to_string(),
             screen: true,
@@ -229,6 +238,69 @@ mod tests {
             uia: uia.map(String::from),
             ..Gathered::default()
         }
+    }
+
+    #[test]
+    fn text_only_inputs_never_need_the_screen() {
+        for inputs in [
+            vec![Selection],
+            vec![Clipboard],
+            vec![Uia],
+            vec![PageText],
+            vec![LinkedPage],
+            vec![Selection, Clipboard, Uia],
+        ] {
+            assert!(!screen_may_be_needed(&inputs), "{inputs:?}");
+        }
+    }
+
+    #[test]
+    fn a_screen_input_or_no_text_input_may_need_the_screen() {
+        for inputs in [
+            vec![],
+            vec![Screen],
+            vec![Window],
+            vec![Region],
+            vec![Selection, Screen],
+            vec![Text],
+            vec![Context],
+        ] {
+            assert!(screen_may_be_needed(&inputs), "{inputs:?}");
+        }
+    }
+
+    #[test]
+    fn no_capture_is_skipped_when_plan_would_send_the_screen() {
+        let kinds = [
+            Screen, Window, Region, Selection, Clipboard, Uia, PageText, LinkedPage, Text, Context,
+        ];
+        let gathers = [
+            Gathered::default(),
+            g(Some("s"), Some("c"), Some("u")),
+            Gathered {
+                page_text: Some("p".into()),
+                linked_page: Some("l".into()),
+                ..Gathered::default()
+            },
+        ];
+        let mut sent_screen = 0;
+        for mask in 0u32..(1 << kinds.len()) {
+            let inputs: Vec<InputKind> = kinds
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, k)| *k)
+                .collect();
+            for gathered in &gathers {
+                if let Ok(r) = plan(&inputs, gathered) {
+                    if r.screen {
+                        sent_screen += 1;
+                        assert!(screen_may_be_needed(&inputs), "{inputs:?}");
+                    }
+                }
+            }
+        }
+        assert!(sent_screen > 0, "the sweep must reach a screen request");
     }
 
     #[test]
