@@ -6513,11 +6513,18 @@ mod tests {
             );
         });
 
-        // The classic button-face grey the Settings surface is drawn on.
-        let face = rgb(240, 240, 240);
-        let ink = hotkey_hint_color(false, rgb(0, 0, 0));
-        let ratio = contrast_ratio(relative_luminance(ink), relative_luminance(face));
-        assert!(ratio >= 4.5, "hint contrast {ratio:.2}:1 is under 4.5:1");
+        // The surface Settings is drawn on, read from the system. In a real
+        // high contrast session the grey path is not used, so skip it there.
+        if crate::ui::card_buttons::system_high_contrast().is_none() {
+            let face = unsafe {
+                windows::Win32::Graphics::Gdi::GetSysColor(
+                    windows::Win32::Graphics::Gdi::COLOR_3DFACE,
+                )
+            };
+            let ink = hotkey_hint_color(false, rgb(0, 0, 0));
+            let ratio = contrast_ratio(relative_luminance(ink), relative_luminance(face));
+            assert!(ratio >= 4.5, "hint contrast {ratio:.2}:1 is under 4.5:1");
+        }
         // High contrast uses the system's own text colour, never a grey.
         let hc = rgb(255, 255, 255);
         assert_eq!(hotkey_hint_color(true, hc), hc);
