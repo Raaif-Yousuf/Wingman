@@ -2295,6 +2295,11 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n")
             };
+            let detail = if outcome.cut {
+                format!("{detail}\n\n{}", actions::review_email::CUT_NOTICE)
+            } else {
+                detail
+            };
             let detail = with_pending_notices(&detail);
             let detail = with_fallback_footer(&detail, self.fallback_footer.as_deref());
             self.card
@@ -3755,6 +3760,7 @@ fn review_worker(
         original_text,
         target,
         source,
+        cut: captured.was_cut(),
     })
 }
 
