@@ -1450,7 +1450,8 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
-                self.card.show_error_with_details(&headline, human);
+                self.card
+                    .show_error_with_details(&headline, &with_pending_notices(human));
                 self.set_watch(true);
                 return;
             }
@@ -1459,7 +1460,9 @@ impl App {
         if actions::calendar::is_no_event(&proposal) {
             self.card.show_answer(
                 "No event found on screen",
-                "Point the Copilot key at something with a date and time, then try again.",
+                &with_pending_notices(
+                    "Point the Copilot key at something with a date and time, then try again.",
+                ),
                 5,
                 None,
             );
@@ -1757,7 +1760,8 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
-                self.card.show_error_with_details(&headline, human);
+                self.card
+                    .show_error_with_details(&headline, &with_pending_notices(human));
                 self.set_watch(true);
                 return;
             }
@@ -1783,8 +1787,12 @@ impl App {
 
         // #314: nothing to list or copy is an answer, not a blank preview.
         if actions::action_items::is_empty_result(&action.proposal, &proposal) {
-            self.card
-                .show_answer(actions::action_items::NO_ITEMS_HEADLINE, "", 0, None);
+            self.card.show_answer(
+                actions::action_items::NO_ITEMS_HEADLINE,
+                &with_pending_notices(""),
+                0,
+                None,
+            );
             self.set_watch(true);
             return;
         }
@@ -2002,14 +2010,8 @@ impl App {
                             &undo.summary,
                             &proposal,
                         );
-                        let mut detail = text.detail;
-                        if let Some(notice) = crate::usage::take_budget_notice() {
-                            detail = if detail.is_empty() {
-                                notice
-                            } else {
-                                format!("{detail}\n\n{notice}")
-                            };
-                        }
+                        let detail = with_pending_notices(&text.detail);
+
                         let detail = with_fallback_footer(&detail, self.fallback_footer.as_deref());
                         self.card
                             .show_model_answer(&text.headline, &detail, 0, None);
@@ -2064,15 +2066,28 @@ impl App {
                     confirmed,
                 ) {
                     ReplaceReport::Replaced(summary) => {
-                        self.card
-                            .show_answer("Selection replaced", &summary, 0, None);
+                        self.card.show_answer(
+                            "Selection replaced",
+                            &with_pending_notices(&summary),
+                            0,
+                            None,
+                        );
                     }
                     ReplaceReport::Copied(detail) => {
-                        self.card
-                            .show_answer("Copied to the clipboard", &detail, 0, None);
+                        self.card.show_answer(
+                            "Copied to the clipboard",
+                            &with_pending_notices(&detail),
+                            0,
+                            None,
+                        );
                     }
                     ReplaceReport::NothingToReplace => {
-                        self.card.show_answer("Nothing to replace", "", 0, None);
+                        self.card.show_answer(
+                            "Nothing to replace",
+                            &with_pending_notices(""),
+                            0,
+                            None,
+                        );
                     }
                     ReplaceReport::Failed(reason) => {
                         let detail = self.track_error(&title, &reason);
@@ -2153,7 +2168,8 @@ impl App {
         match executor.execute(confirmed) {
             Ok(undo) => {
                 let headline = Self::calendar_headline(&undo.summary);
-                self.card.show_answer(headline, &undo.summary, 0, None);
+                self.card
+                    .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
             }
             Err(e) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
@@ -2244,15 +2260,18 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
-                self.card.show_error_with_details(&headline, human);
+                self.card
+                    .show_error_with_details(&headline, &with_pending_notices(human));
                 self.set_watch(true);
                 return;
             }
         };
 
         if actions::review_email::is_good_to_go(&outcome.proposal) {
-            let detail =
-                with_fallback_footer("No changes needed.", self.fallback_footer.as_deref());
+            let detail = with_fallback_footer(
+                &with_pending_notices("No changes needed."),
+                self.fallback_footer.as_deref(),
+            );
             self.card.show_answer("Good to go", &detail, 5, None);
             self.set_watch(true);
             return;
@@ -2276,6 +2295,7 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n")
             };
+            let detail = with_pending_notices(&detail);
             let detail = with_fallback_footer(&detail, self.fallback_footer.as_deref());
             self.card
                 .show_answer("Review needs edits", &detail, 0, None);
@@ -2320,8 +2340,12 @@ impl App {
             Ok(executor) => {
                 match actions::review_email::do_review_confirmed(executor.as_ref(), &ctx) {
                     Ok(undo) => {
-                        self.card
-                            .show_answer("Email updated", &undo.summary, 0, None);
+                        self.card.show_answer(
+                            "Email updated",
+                            &with_pending_notices(&undo.summary),
+                            0,
+                            None,
+                        );
                     }
                     Err(e) => {
                         let detail =
@@ -2436,7 +2460,8 @@ impl App {
                 let (human, chain) = unpack_error(&packed);
                 let headline = first_line(human, 88);
                 self.record_run_failure(&headline, human, chain);
-                self.card.show_error_with_details(&headline, human);
+                self.card
+                    .show_error_with_details(&headline, &with_pending_notices(human));
                 self.set_watch(true);
                 return;
             }
@@ -2447,7 +2472,9 @@ impl App {
             let bin_path = value.get("bin_path").and_then(Value::as_str).unwrap_or("");
             self.card.show_answer(
                 actions::fill_form::EMPTY_PROFILE_HEADLINE,
-                &actions::fill_form::empty_profile_detail(toml_path, bin_path),
+                &with_pending_notices(&actions::fill_form::empty_profile_detail(
+                    toml_path, bin_path,
+                )),
                 0,
                 None,
             );
@@ -2458,7 +2485,7 @@ impl App {
         if !actions::fill_form::has_fillable_fields(&value) {
             self.card.show_answer(
                 "Nothing to fill",
-                &actions::fill_form::nothing_to_fill_detail(&value),
+                &with_pending_notices(&actions::fill_form::nothing_to_fill_detail(&value)),
                 5,
                 None,
             );
@@ -2530,7 +2557,8 @@ impl App {
         match executor.execute(confirmed) {
             Ok(undo) => {
                 let headline = Self::form_fill_headline(&undo.summary);
-                self.card.show_answer(headline, &undo.summary, 0, None);
+                self.card
+                    .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
                 self.last_form_undo = Some(undo);
             }
             Err(e) => {
@@ -2598,19 +2626,7 @@ impl App {
         // A store failure never fails the request (#46); it rides on the
         // next card instead, once per run.
         // #101: the daily budget warning rides the same way.
-        for notice in [
-            crate::store::take_notice(),
-            crate::usage::take_budget_notice(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            answer.detail = if answer.detail.is_empty() {
-                notice
-            } else {
-                format!("{}\n\n{notice}", answer.detail)
-            };
-        }
+        answer.detail = with_pending_notices(&answer.detail);
         if is_err {
             self.card
                 .show_error_with_details(&answer.headline, &answer.detail);
@@ -3993,6 +4009,36 @@ fn fallback_footer_for(attribution: Option<&crate::provider::Attribution>) -> Op
     }
 }
 
+/// #541: `detail` with each notice as a trailing paragraph.
+fn append_notices(detail: &str, notices: Vec<String>) -> String {
+    let mut out = detail.to_string();
+    for notice in notices {
+        out = if out.is_empty() {
+            notice
+        } else {
+            format!("{out}\n\n{notice}")
+        };
+    }
+    out
+}
+
+/// #541: the one place a result card asks for the notices queued for "the
+/// next card": a store failure (#46) and the daily budget warning (#101).
+/// Every handler that ends a run on a card calls this on its detail text
+/// (a source-scanning test lists them), so a notice is shown once, on
+/// whichever result card comes first, and never sits unseen.
+fn with_pending_notices(detail: &str) -> String {
+    append_notices(
+        detail,
+        [
+            crate::store::take_notice(),
+            crate::usage::take_budget_notice(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    )
+}
 /// #228: `detail` with the footer as its last paragraph, or `detail`
 /// unchanged when there is none.
 fn with_fallback_footer(detail: &str, footer: Option<&str>) -> String {
@@ -5611,6 +5657,7 @@ mod tests {
         assert!(!super::is_send_cancelled(&other));
     }
 
+    use super::append_notices;
     use super::first_line;
     use super::resolve_prompt_and_difficulty;
     use super::unreadable_secrets_card;
@@ -8102,6 +8149,48 @@ mod tests {
         assert_eq!(with_fallback_footer("", Some(footer)), footer);
     }
 
+    #[test]
+    fn notices_ride_after_the_detail_one_paragraph_each() {
+        let n = || vec!["Store failed.".to_string(), "Budget hit.".to_string()];
+        assert_eq!(
+            append_notices("answer", n()),
+            "answer\n\nStore failed.\n\nBudget hit."
+        );
+        assert_eq!(append_notices("", n()), "Store failed.\n\nBudget hit.");
+        assert_eq!(append_notices("answer", Vec::new()), "answer");
+        assert_eq!(append_notices("", Vec::new()), "");
+    }
+
+    /// #541: every handler that ends a run on a result card must consult the
+    /// pending notices through `with_pending_notices`, so a new path cannot
+    /// quietly forget them.
+    #[test]
+    fn every_result_card_path_consults_the_pending_notices() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let paths = [
+            "on_result",
+            "on_calendar_result",
+            "on_generic_action_result",
+            "on_review_result",
+            "on_form_fill_result",
+            "run_confirmed_generic_action",
+            "run_confirmed_generic_replace",
+            "run_calendar_executor",
+            "run_review_executor",
+            "run_form_fill_executor",
+        ];
+        for name in paths {
+            let start = src
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &src[start + 1..];
+            let end = rest.find("\n    fn ").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("with_pending_notices("),
+                "{name} shows a result card without with_pending_notices"
+            );
+        }
+    }
     #[test]
     fn a_worker_result_hands_its_attribution_to_the_main_thread_once() {
         let _g = ATTRIBUTION_TEST_LOCK
