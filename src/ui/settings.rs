@@ -606,6 +606,9 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         ID_ANTHROPIC_SHOW_KEY if notify == BN_CLICKED => {
             toggle_password(inner.hwnd, ID_ANTHROPIC_SHOW_KEY, ID_ANTHROPIC_KEY);
         }
+        ID_GEMINI_SHOW_KEY if notify == BN_CLICKED => {
+            toggle_password(inner.hwnd, ID_GEMINI_SHOW_KEY, ID_GEMINI_KEY);
+        }
         _ => {}
     }
 }
@@ -694,6 +697,11 @@ const ID_PROMPT_TOGGLE: i32 = 123;
 const ID_BODY: i32 = 125;
 /// #183: the Ollama model combo, filled from the locally pulled models.
 const ID_OLLAMA_MODEL: i32 = 126;
+/// #195: the Gemini key field, its Show toggle, and its model and thinking combos.
+const ID_GEMINI_KEY: i32 = 127;
+const ID_GEMINI_SHOW_KEY: i32 = 128;
+const ID_GEMINI_MODEL: i32 = 129;
+const ID_GEMINI_EFFORT: i32 = 130;
 
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
@@ -730,6 +738,10 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_PROMPT_TOGGLE", ID_PROMPT_TOGGLE),
     ("ID_BODY", ID_BODY),
     ("ID_OLLAMA_MODEL", ID_OLLAMA_MODEL),
+    ("ID_GEMINI_KEY", ID_GEMINI_KEY),
+    ("ID_GEMINI_SHOW_KEY", ID_GEMINI_SHOW_KEY),
+    ("ID_GEMINI_MODEL", ID_GEMINI_MODEL),
+    ("ID_GEMINI_EFFORT", ID_GEMINI_EFFORT),
 ];
 
 // ---------------------------------------------------------------------------
@@ -2311,6 +2323,7 @@ fn build_ui_recorded(
     combo_add(active_combo, "ChatGPT (OpenAI)");
     combo_add(active_combo, "Claude (Anthropic)");
     combo_add(active_combo, "Ollama (local)");
+    combo_add(active_combo, "Gemini (Google)");
     combo_select_index(
         active_combo,
         choice_from_order(&config.providers.order) as i32,
@@ -2487,6 +2500,92 @@ fn build_ui_recorded(
         anthropic_effort,
         &EFFORT_LABELS,
         &effort_display(&config.providers.anthropic.effort),
+    );
+    r.advance();
+
+    // Gemini (#195): same three rows as the other cloud providers.
+    ctx.create(
+        WC_STATIC,
+        "Gemini API key:",
+        0,
+        0,
+        r.x,
+        r.y,
+        LABEL_W,
+        ROW_H,
+        0,
+    );
+    ctx.create(
+        WC_EDIT,
+        &key_field_display(&config.providers.gemini.api_key),
+        (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
+        WS_EX_BORDER,
+        r.x + LABEL_W,
+        r.y,
+        r.w - LABEL_W - 70,
+        ROW_H,
+        ID_GEMINI_KEY,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Show",
+        BS_AUTOCHECKBOX as u32,
+        0,
+        r.x + r.w - 62,
+        r.y,
+        62,
+        ROW_H,
+        ID_GEMINI_SHOW_KEY,
+    );
+    r.advance();
+
+    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, 50, ROW_H, 0);
+    let gemini_model = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + 50,
+        r.y,
+        half - 50,
+        ROW_H * 8,
+        ID_GEMINI_MODEL,
+    );
+    fill_model_combo(
+        gemini_model,
+        &config.providers.gemini.models,
+        &config.providers.gemini.model,
+    );
+
+    ctx.create(
+        WC_STATIC,
+        "Thinking:",
+        0,
+        0,
+        r.x + half + 12,
+        r.y,
+        60,
+        ROW_H,
+        0,
+    );
+    let gemini_effort = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + half + 12 + 60,
+        r.y,
+        half - 60,
+        ROW_H * 4,
+        ID_GEMINI_EFFORT,
+    );
+    for e in EFFORT_LABELS {
+        combo_add(gemini_effort, e);
+    }
+    combo_select_with_custom(
+        gemini_effort,
+        &EFFORT_LABELS,
+        &effort_display(&config.providers.gemini.effort),
     );
     r.advance();
 
@@ -3069,6 +3168,10 @@ fn build_ui_recorded(
         ID_ANTHROPIC_SHOW_KEY,
         ID_ANTHROPIC_MODEL,
         ID_ANTHROPIC_EFFORT,
+        ID_GEMINI_KEY,
+        ID_GEMINI_SHOW_KEY,
+        ID_GEMINI_MODEL,
+        ID_GEMINI_EFFORT,
         ID_OLLAMA_MODEL,
         ID_MAX_EDGE,
         ID_MONITOR,
@@ -3134,6 +3237,9 @@ struct RawForm {
     anthropic_key: String,
     anthropic_model: String,
     anthropic_effort: String,
+    gemini_key: String,
+    gemini_model: String,
+    gemini_effort: String,
     max_edge_text: String,
     monitor: String,
     card_seconds_text: String,
@@ -3168,6 +3274,11 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
             .unwrap_or_default(),
         anthropic_model: combo_selected_text(hwnd, ID_ANTHROPIC_MODEL),
         anthropic_effort: combo_selected_text(hwnd, ID_ANTHROPIC_EFFORT),
+        gemini_key: get_dlg_item(hwnd, ID_GEMINI_KEY)
+            .map(get_text)
+            .unwrap_or_default(),
+        gemini_model: combo_selected_text(hwnd, ID_GEMINI_MODEL),
+        gemini_effort: combo_selected_text(hwnd, ID_GEMINI_EFFORT),
         // #341: the combo now shows "Low"/"Medium"/.../"Maximum" rather than
         // the raw number, so convert back to the numeric text `build_config`
         // and `find_invalid_numeric_field` (#344) already expect. An
@@ -3210,14 +3321,11 @@ fn order_from_choice(choice: usize) -> Vec<String> {
     }
 }
 
-/// The "Active provider" combo index for `order`: 0 ChatGPT, 1 Claude,
-/// 2 Ollama (#183). A config led by anything else shows as ChatGPT.
+/// The "Active provider" combo index for `order` (an index into
+/// `ActiveProvider::ALL`: ChatGPT, Claude, Ollama, Gemini). A config led by
+/// anything else shows as ChatGPT.
 fn choice_from_order(order: &[String]) -> usize {
-    match ActiveProvider::from_order(order) {
-        ActiveProvider::OpenAi => 0,
-        ActiveProvider::Anthropic => 1,
-        ActiveProvider::Ollama => 2,
-    }
+    ActiveProvider::from_order(order).index()
 }
 
 /// #194: `build_config`'s provider-order merge. `choice` (the Settings
@@ -3242,30 +3350,29 @@ fn choice_from_order(order: &[String]) -> usize {
 ///   -- matching what `order_from_choice` always produced when `configured`
 ///   was empty.
 ///
-/// #183: choice 2 is Ollama. It moves to the front (or is added there) and
-/// leaves everything else where it was. Switching away from an Ollama-led
-/// order puts the chosen provider first, since the swap above alone would
-/// leave Ollama answering.
+/// #183, #195: choosing Ollama or Gemini (choice 2 or 3) moves it to the
+/// front (or adds it there) and leaves everything else where it was.
+/// Switching away from an order led by one of them puts the chosen provider
+/// first, since the swap above alone would leave the old leader answering.
 fn merge_provider_order(configured: &[String], choice: usize) -> Vec<String> {
-    if choice == 2 {
+    let chosen = ActiveProvider::from_index(choice);
+    if matches!(chosen, ActiveProvider::Ollama | ActiveProvider::Gemini) {
         if configured.is_empty() {
             return vec![
-                "ollama".to_string(),
+                chosen.order_name().to_string(),
                 "openai".to_string(),
                 "anthropic".to_string(),
             ];
         }
         let mut order = configured.to_vec();
-        ActiveProvider::Ollama.move_to_front(&mut order);
+        chosen.move_to_front(&mut order);
         return order;
     }
     let mut order = merge_cloud_order(configured, choice);
-    if ActiveProvider::from_order(configured) == ActiveProvider::Ollama {
-        let chosen = if choice == 1 {
-            ActiveProvider::Anthropic
-        } else {
-            ActiveProvider::OpenAi
-        };
+    if matches!(
+        ActiveProvider::from_order(configured),
+        ActiveProvider::Ollama | ActiveProvider::Gemini
+    ) {
         chosen.move_to_front(&mut order);
     }
     order
@@ -3629,6 +3736,15 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     }
     if let Some(v) = label_to_effort(raw.anthropic_effort.trim()) {
         cfg.providers.anthropic.effort = v;
+    }
+
+    cfg.providers.gemini.api_key =
+        resolve_key_field(&original.providers.gemini.api_key, &raw.gemini_key);
+    if !raw.gemini_model.trim().is_empty() {
+        cfg.providers.gemini.model = raw.gemini_model.clone();
+    }
+    if let Some(v) = label_to_effort(raw.gemini_effort.trim()) {
+        cfg.providers.gemini.effort = v;
     }
 
     cfg.capture.max_edge = parse_max_edge_or(&raw.max_edge_text, original.capture.max_edge);
@@ -4299,6 +4415,85 @@ mod tests {
         );
     }
 
+    // -- #195: Gemini fields and active-provider choice ------------------
+
+    #[test]
+    fn choice_three_is_gemini_first() {
+        assert_eq!(choice_from_order(&names(&["gemini", "openai"])), 3);
+        assert_eq!(choice_from_order(&names(&["openai", "gemini"])), 0);
+    }
+
+    #[test]
+    fn merge_order_choice_three_moves_gemini_to_the_front_and_keeps_the_rest() {
+        assert_eq!(
+            merge_provider_order(&names(&["openai", "anthropic"]), 3),
+            names(&["gemini", "openai", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&names(&["anthropic", "gemini", "openai"]), 3),
+            names(&["gemini", "anthropic", "openai"])
+        );
+        assert_eq!(
+            merge_provider_order(&[], 3),
+            names(&["gemini", "openai", "anthropic"])
+        );
+    }
+
+    #[test]
+    fn merge_order_leaving_gemini_puts_the_chosen_provider_first() {
+        let configured = names(&["gemini", "openai", "anthropic"]);
+        assert_eq!(
+            merge_provider_order(&configured, 0),
+            names(&["openai", "gemini", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&configured, 1),
+            names(&["anthropic", "gemini", "openai"])
+        );
+        assert_eq!(
+            merge_provider_order(&configured, 2),
+            names(&["ollama", "gemini", "openai", "anthropic"])
+        );
+    }
+
+    #[test]
+    fn an_untouched_save_keeps_a_gemini_led_order() {
+        let mut original = Config::default();
+        original.providers.order = names(&["gemini", "openai", "anthropic"]);
+        let cfg = build_config(&original, &raw_from(&original));
+        assert_eq!(cfg.providers.order, original.providers.order);
+    }
+
+    #[test]
+    fn build_config_applies_an_edited_gemini_model_and_effort() {
+        let original = Config::default();
+        let mut raw = raw_from(&original);
+        raw.gemini_model = "gemini-2.5-pro".to_string();
+        raw.gemini_effort = "Thorough".to_string();
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.gemini.model, "gemini-2.5-pro");
+        assert_eq!(cfg.providers.gemini.effort, "high");
+    }
+
+    #[test]
+    fn build_config_keeps_the_stored_gemini_key_when_the_field_still_shows_the_mask() {
+        let mut original = Config::default();
+        original.providers.gemini.api_key = "AIza-real-test-key-0000".to_string();
+        let mut raw = raw_from(&original);
+        raw.gemini_key = key_field_display(&original.providers.gemini.api_key);
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.gemini.api_key, "AIza-real-test-key-0000");
+    }
+
+    #[test]
+    fn build_config_takes_a_newly_pasted_gemini_key() {
+        let original = Config::default();
+        let mut raw = raw_from(&original);
+        raw.gemini_key = "AIza-pasted-test-key".to_string();
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.gemini.api_key, "AIza-pasted-test-key");
+    }
+
     // -- mask_key / resolve_key_field (#2 settings masking) ---------------
 
     #[test]
@@ -4414,6 +4609,9 @@ mod tests {
             anthropic_key: original.providers.anthropic.api_key.clone(),
             anthropic_model: original.providers.anthropic.model.clone(),
             anthropic_effort: effort_display(&original.providers.anthropic.effort),
+            gemini_key: original.providers.gemini.api_key.clone(),
+            gemini_model: original.providers.gemini.model.clone(),
+            gemini_effort: effort_display(&original.providers.gemini.effort),
             max_edge_text: original.capture.max_edge.to_string(),
             monitor: monitor_display(&original.capture.monitor),
             card_seconds_text: original.ui.card_seconds.to_string(),

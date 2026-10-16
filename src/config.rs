@@ -301,16 +301,9 @@ impl Default for Providers {
             // #17: gemini is a cloud provider (same "unusable until a key
             // is pasted in" shape as openai/anthropic), so the ollama
             // reasoning above does not apply to it -- it is still left out
-            // of the default order for a simpler reason: Settings' Active
-            // provider control is a two-way openai/anthropic radio with no
-            // way to represent a third cloud provider at all (tracked
-            // against #51). #194 fixed `ui::settings::build_config` so a
-            // hand-added `"gemini"` entry now survives every Settings save
-            // untouched (it only reorders openai/anthropic relative to each
-            // other via `merge_provider_order`) -- so putting gemini in the
-            // default order is no longer blocked by data loss, only by
-            // Settings having nothing to show for it. Opt-in via a
-            // hand-edited config.toml until #51.
+            // of the default order so a fresh install does not list a
+            // provider the user has no key for. Settings (#195) and the
+            // tray's Provider menu can put it first.
             order: vec!["openai".to_string(), "anthropic".to_string()],
             openai: ProviderConfig {
                 model: "gpt-5.5".to_string(),
@@ -433,24 +426,49 @@ impl Default for OllamaConfig {
 }
 
 /// The provider the tray's Provider submenu and Settings' "Active provider"
-/// control can pick (#183): whichever name leads `providers.order`. Gemini and
-/// the compat endpoints are reached by editing `providers.order` for now, so
-/// a config that leads with one of them reads as [`ActiveProvider::OpenAi`],
-/// the same fallback the two-way picker always had.
+/// control can pick (#183, #195): whichever name leads `providers.order`. The
+/// compat endpoints are reached by editing `providers.order` for now, so a
+/// config that leads with one of them reads as [`ActiveProvider::OpenAi`], the
+/// same fallback the two-way picker always had.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveProvider {
     OpenAi,
     Anthropic,
     Ollama,
+    Gemini,
 }
 
 impl ActiveProvider {
+    /// Every provider the pickers offer, in menu order. A provider's position
+    /// here is its index in Settings' "Active provider" combo.
+    pub const ALL: [ActiveProvider; 4] = [
+        ActiveProvider::OpenAi,
+        ActiveProvider::Anthropic,
+        ActiveProvider::Ollama,
+        ActiveProvider::Gemini,
+    ];
+
+    /// This provider's index in [`ActiveProvider::ALL`].
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
+    }
+
+    /// The provider at `index` in [`ActiveProvider::ALL`]; an index out of
+    /// range (a combo with nothing selected) reads as ChatGPT.
+    pub fn from_index(index: usize) -> Self {
+        Self::ALL
+            .get(index)
+            .copied()
+            .unwrap_or(ActiveProvider::OpenAi)
+    }
+
     /// The `providers.order` name.
     pub fn order_name(self) -> &'static str {
         match self {
             ActiveProvider::OpenAi => "openai",
             ActiveProvider::Anthropic => "anthropic",
             ActiveProvider::Ollama => "ollama",
+            ActiveProvider::Gemini => "gemini",
         }
     }
 
@@ -460,6 +478,7 @@ impl ActiveProvider {
             ActiveProvider::OpenAi => "ChatGPT",
             ActiveProvider::Anthropic => "Claude",
             ActiveProvider::Ollama => "Ollama",
+            ActiveProvider::Gemini => "Gemini",
         }
     }
 
@@ -468,6 +487,7 @@ impl ActiveProvider {
         match order.first().map(String::as_str) {
             Some("anthropic") => ActiveProvider::Anthropic,
             Some("ollama") => ActiveProvider::Ollama,
+            Some("gemini") => ActiveProvider::Gemini,
             _ => ActiveProvider::OpenAi,
         }
     }
@@ -4507,9 +4527,33 @@ mod egress_preview_tests {
     fn active_provider_falls_back_to_openai_for_other_leaders() {
         assert_eq!(ActiveProvider::from_order(&[]), ActiveProvider::OpenAi);
         assert_eq!(
-            ActiveProvider::from_order(&order(&["gemini", "anthropic"])),
+            ActiveProvider::from_order(&order(&["compat:lmstudio", "anthropic"])),
             ActiveProvider::OpenAi
         );
+    }
+
+    #[test]
+    fn active_provider_reads_gemini_at_the_front() {
+        assert_eq!(
+            ActiveProvider::from_order(&order(&["gemini", "anthropic"])),
+            ActiveProvider::Gemini
+        );
+    }
+
+    #[test]
+    fn active_provider_index_round_trips_and_out_of_range_is_openai() {
+        for p in ActiveProvider::ALL {
+            assert_eq!(ActiveProvider::from_index(p.index()), p);
+        }
+        assert_eq!(ActiveProvider::from_index(99), ActiveProvider::OpenAi);
+    }
+
+    #[test]
+    fn active_provider_order_names_are_unique() {
+        let mut names: Vec<&str> = ActiveProvider::ALL.iter().map(|p| p.order_name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ActiveProvider::ALL.len());
     }
 
     #[test]

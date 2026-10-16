@@ -109,6 +109,8 @@ pub mod cmd {
     pub const USE_ANTHROPIC: u32 = 1010;
     /// Make Ollama (the local model server) the active provider (#183).
     pub const USE_OLLAMA: u32 = 1032;
+    /// Make Gemini the active provider (#195).
+    pub const USE_GEMINI: u32 = 1033;
 
     /// Pause (issue #20): 1 hour / until tomorrow / until resumed. Shown as
     /// a "Pause" submenu while running; see [`super::cmd::RESUME`] for the
@@ -839,19 +841,12 @@ fn append_mode_submenu(parent: HMENU, current: crate::mode::Mode) -> Result<()> 
 fn append_provider_submenu(parent: HMENU, active: ActiveProvider) -> Result<()> {
     let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
     attach_submenu_or_destroy(parent, sub, "Provider")?;
-    for provider in PROVIDER_MENU {
+    for provider in ActiveProvider::ALL {
         append_item(sub, provider_cmd(provider), provider_menu_label(provider))?;
     }
     mark_radio_checked(sub, provider_cmd(active));
     Ok(())
 }
-
-/// The Provider submenu's entries, in menu order.
-const PROVIDER_MENU: [ActiveProvider; 3] = [
-    ActiveProvider::OpenAi,
-    ActiveProvider::Anthropic,
-    ActiveProvider::Ollama,
-];
 
 /// The menu command each Provider entry sends.
 fn provider_cmd(provider: ActiveProvider) -> u32 {
@@ -859,6 +854,7 @@ fn provider_cmd(provider: ActiveProvider) -> u32 {
         ActiveProvider::OpenAi => cmd::USE_OPENAI,
         ActiveProvider::Anthropic => cmd::USE_ANTHROPIC,
         ActiveProvider::Ollama => cmd::USE_OLLAMA,
+        ActiveProvider::Gemini => cmd::USE_GEMINI,
     }
 }
 
@@ -869,6 +865,7 @@ fn provider_menu_label(provider: ActiveProvider) -> &'static str {
         ActiveProvider::OpenAi => "ChatGPT",
         ActiveProvider::Anthropic => "Claude",
         ActiveProvider::Ollama => "Ollama (local)",
+        ActiveProvider::Gemini => "Gemini",
     }
 }
 
@@ -1831,6 +1828,7 @@ mod tests {
         ("USE_OPENAI", cmd::USE_OPENAI),
         ("USE_ANTHROPIC", cmd::USE_ANTHROPIC),
         ("USE_OLLAMA", cmd::USE_OLLAMA),
+        ("USE_GEMINI", cmd::USE_GEMINI),
         ("PAUSE_1H", cmd::PAUSE_1H),
         ("PAUSE_UNTIL_TOMORROW", cmd::PAUSE_UNTIL_TOMORROW),
         ("PAUSE_UNTIL_RESUMED", cmd::PAUSE_UNTIL_RESUMED),
@@ -1994,18 +1992,26 @@ mod tests {
     }
 
     #[test]
-    fn provider_menu_offers_ollama_with_its_own_command() {
-        assert!(PROVIDER_MENU.contains(&ActiveProvider::Ollama));
+    fn provider_menu_offers_ollama_and_gemini_with_their_own_commands() {
         assert_eq!(provider_cmd(ActiveProvider::Ollama), cmd::USE_OLLAMA);
+        assert_eq!(provider_cmd(ActiveProvider::Gemini), cmd::USE_GEMINI);
         assert_eq!(
             provider_menu_label(ActiveProvider::Ollama),
             "Ollama (local)"
         );
-        let mut ids: Vec<u32> = PROVIDER_MENU.iter().map(|p| provider_cmd(*p)).collect();
+        assert_eq!(provider_menu_label(ActiveProvider::Gemini), "Gemini");
+        let mut ids: Vec<u32> = ActiveProvider::ALL
+            .iter()
+            .map(|p| provider_cmd(*p))
+            .collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), PROVIDER_MENU.len(), "one command per entry");
-        for p in PROVIDER_MENU {
+        assert_eq!(
+            ids.len(),
+            ActiveProvider::ALL.len(),
+            "one command per entry"
+        );
+        for p in ActiveProvider::ALL {
             assert!(!provider_menu_label(p).contains('\u{2014}'));
         }
     }

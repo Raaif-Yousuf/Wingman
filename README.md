@@ -77,8 +77,8 @@ not planned. What has landed alongside those actions:
   and Gemini (cloud, your key), Ollama (local, your own machine), and any
   OpenAI-compatible server (OpenRouter, Groq, LM Studio, llama.cpp, vLLM,
   ...). See [`docs/providers.md`](docs/providers.md) for request shapes and
-  how to add Ollama, Gemini or a compat endpoint to the fallback order today
-  (Settings only exposes OpenAI/Anthropic so far).
+  how to add a compat endpoint to the fallback order today (Settings covers
+  OpenAI, Anthropic, Gemini and Ollama).
 - **Modes**: Cloud, Local, Auto (default) or Offline, from the tray's
   **Mode** submenu. Offline refuses any non-loopback network call in code;
   see [`docs/offline.md`](docs/offline.md).
@@ -187,12 +187,13 @@ card timeout, text size and the prompt. A saved key moves into Windows
 Credential Manager, not the file; Settings shows only its last four
 characters afterward.
 
-Settings exposes OpenAI and Anthropic today; Gemini and Ollama both work but
-need one hand-edit of `config.toml` to enable, since the fixed-layout
-Settings dialog does not have a field group for either yet. See
-[`docs/providers.md`](docs/providers.md#how-to-add-ollama-or-gemini-to-providersorder-by-hand-today)
-for the exact steps and the limitation to know about (a Settings save can
-discard the hand-edit).
+Settings has key and model fields for OpenAI, Anthropic and Gemini, a model
+list for Ollama (models you have pulled, with "(vision)" on the ones that can
+read images), and an Active provider choice. The tray's Provider menu picks the
+active provider too. An OpenAI-compatible endpoint still needs a hand-edit of
+`config.toml`; see
+[`docs/providers.md`](docs/providers.md#how-to-add-ollama-gemini-or-a-compat-endpoint-to-providersorder-by-hand-today)
+for the steps.
 
 Local (Ollama) and Offline are both real options now, via the tray's
 **Mode** submenu: Cloud, Local, Auto (default: local first if Ollama is up,
@@ -301,7 +302,7 @@ in words.
 | `capture.monitor` | `"active"` | `"active"` follows the focused window; `"primary"` pins it |
 | `capture.redact` | `true` | paint over card numbers, IBANs, key-like tokens and email addresses in the screenshot before a cloud request; adds about 0.2 to 0.3 s. Local-only requests skip it. If the check cannot run, nothing is sent |
 | `egress_preview.enabled` | `false` | before any request leaves this computer, show a card with what will be sent (the image size, the prompt and the text) and the provider it goes to; **Send** sends it, Esc cancels and nothing is sent. Requests to Ollama on 127.0.0.1 stay on this machine and are not shown. The Quick Ask suggestion that reads your screen when the palette opens is skipped while this is on |
-| `providers.order` | `["openai", "anthropic"]` | fallback order; add `"ollama"`/`"gemini"` by hand, see [`docs/providers.md`](docs/providers.md) |
+| `providers.order` | `["openai", "anthropic"]` | fallback order; Settings and the tray set the first entry; add `"compat:<name>"` by hand, see [`docs/providers.md`](docs/providers.md) |
 | `providers.*.effort` | `"low"` | reasoning depth; raise for harder problems |
 | `providers.ollama.base_url` | `"http://127.0.0.1:11434"` | never `localhost`, see [`docs/providers.md`](docs/providers.md#ollama) |
 | `ui.card_seconds` | `12` | auto-dismiss for the collapsed card; `0` = never |
