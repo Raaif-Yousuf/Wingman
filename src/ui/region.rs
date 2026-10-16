@@ -66,9 +66,9 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, GetMonitorInfoW, GetStockObject,
     MonitorFromPoint, Rectangle, RoundRect, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DT_WORDBREAK, HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, LOGFONTW, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
@@ -324,6 +324,17 @@ const HINT_SIDE_PADDING_DP: i32 = 40;
 /// The hint's font size, design pixels at 96 DPI (negative `lfHeight`
 /// convention, matched by [`hint_font`]).
 const HINT_FONT_HEIGHT_DP: i32 = 18;
+/// What one more line of hint text adds to the pill (#744).
+const HINT_LINE_DP: i32 = 24;
+/// Space kept between the hint text and the pill's edge on each side.
+const HINT_TEXT_INSET_DP: i32 = 14;
+/// The selection's size label (#742): font height, and its box next to the
+/// outline, all design pixels at 96 DPI.
+const LABEL_FONT_HEIGHT_DP: i32 = 14;
+const LABEL_LEFT_DP: i32 = 4;
+const LABEL_HEIGHT_DP: i32 = 20;
+const LABEL_WIDTH_DP: i32 = 240;
+const OUTLINE_WIDTH_DP: i32 = 2;
 
 /// Converts a 96-DPI design pixel to a physical pixel at `dpi`, rounding to
 /// the nearest pixel -- same `(dp * dpi + 48) / 96` rounding `card.rs`'s
@@ -340,10 +351,27 @@ fn scale_for_dpi(dp: i32, dpi: u32) -> i32 {
 /// it's unit-tested directly; clamped to stay within `monitor`'s width (and
 /// never negative-sized) on a narrow monitor.
 pub fn hint_rect(monitor: Rect, dpi: u32) -> Rect {
+    hint_rect_for_lines(monitor, dpi, 1)
+}
+
+/// How many lines the word-wrapped hint takes, from its measured wrapped
+/// height and one line's height: at least one, at most three (#744).
+pub fn hint_lines_from_height(wrapped_height: i32, line_height: i32) -> i32 {
+    if line_height <= 0 || wrapped_height <= 0 {
+        return 1;
+    }
+    ((wrapped_height + line_height - 1) / line_height).clamp(1, 3)
+}
+
+/// [`hint_rect`] for a hint that wraps onto `lines` lines: the same pill,
+/// taller by [`HINT_LINE_DP`] for each line after the first.
+pub fn hint_rect_for_lines(monitor: Rect, dpi: u32, lines: i32) -> Rect {
+    let extra_lines = (lines - 1).clamp(0, 2);
     let side_padding = scale_for_dpi(HINT_SIDE_PADDING_DP, dpi);
     let max_width = scale_for_dpi(HINT_MAX_WIDTH_DP, dpi);
     let top_margin = scale_for_dpi(HINT_TOP_MARGIN_DP, dpi);
-    let height = scale_for_dpi(HINT_HEIGHT_DP, dpi);
+    let height =
+        scale_for_dpi(HINT_HEIGHT_DP, dpi) + extra_lines * scale_for_dpi(HINT_LINE_DP, dpi);
 
     let available = (monitor.width() - side_padding).max(0);
     let box_width = max_width.min(available);
@@ -415,8 +443,13 @@ fn hint_monitor_and_dpi(desktop: Rect) -> (Rect, u32) {
 /// GUI font if `CreateFontIndirectW` fails, mirroring `card.rs`'s
 /// `font_or_stock`.
 fn hint_font(dpi: u32) -> HFONT {
+    segoe_font(HINT_FONT_HEIGHT_DP, dpi)
+}
+
+/// Segoe UI at `height_dp` design pixels, scaled to `dpi`.
+fn segoe_font(height_dp: i32, dpi: u32) -> HFONT {
     let mut lf = LOGFONTW {
-        lfHeight: -scale_for_dpi(HINT_FONT_HEIGHT_DP, dpi),
+        lfHeight: -scale_for_dpi(height_dp, dpi),
         ..Default::default()
     };
     for (i, u) in "Segoe UI".encode_utf16().enumerate() {
@@ -1154,13 +1187,14 @@ impl OverlayInner {
             if !hdc.0.is_null() && w > 0 && h > 0 && !self.background_dc.0.is_null() {
                 let _ = BitBlt(hdc, 0, 0, w, h, Some(self.background_dc), 0, 0, SRCCOPY);
             }
-            if let Some(rect) = self.visible_rect() {
-                draw_selection(hdc, rect, &colors);
-            }
             // #360: hidden once dragging starts -- the size label next to
             // the live selection already tells the user what they're doing.
+            // Drawn first, so the selection and its size label stay on top.
             if !self.dragging {
                 draw_hint(hdc, self.hint_monitor, self.hint_dpi, &colors);
+            }
+            if let Some(rect) = self.visible_rect() {
+                draw_selection(hdc, rect, self.hint_dpi, &colors);
             }
 
             let _ = EndPaint(self.hwnd, &ps);
@@ -1229,8 +1263,24 @@ fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
     (x, y)
 }
 
-unsafe fn draw_selection(hdc: HDC, rect: Rect, colors: &OverlayColors) {
-    let pen = CreatePen(PS_SOLID, 2, COLORREF(colors.outline));
+/// Where the size label goes: above the selection's top-left corner, scaled
+/// to `dpi` like the hint (#742). Pure, so it is tested without a DC.
+pub fn size_label_rect(selection: Rect, dpi: u32) -> RECT {
+    let height = scale_for_dpi(LABEL_HEIGHT_DP, dpi);
+    RECT {
+        left: selection.left + scale_for_dpi(LABEL_LEFT_DP, dpi),
+        top: (selection.top - height).max(0),
+        right: selection.left + scale_for_dpi(LABEL_WIDTH_DP, dpi),
+        bottom: selection.top.max(height),
+    }
+}
+
+unsafe fn draw_selection(hdc: HDC, rect: Rect, dpi: u32, colors: &OverlayColors) {
+    let pen = CreatePen(
+        PS_SOLID,
+        scale_for_dpi(OUTLINE_WIDTH_DP, dpi).max(1),
+        COLORREF(colors.outline),
+    );
     let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
     let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
     let _ = Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
@@ -1247,23 +1297,48 @@ unsafe fn draw_selection(hdc: HDC, rect: Rect, colors: &OverlayColors) {
     let label = size_label(rect);
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, COLORREF(colors.label));
-    let text_rc = RECT {
-        left: rect.left + 4,
-        top: (rect.top - 20).max(0),
-        right: rect.left + 240,
-        bottom: rect.top.max(20),
-    };
+    let text_rc = size_label_rect(rect, dpi);
+    let font = segoe_font(LABEL_FONT_HEIGHT_DP, dpi);
+    let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     crate::ui::text::draw_text_line(hdc, &label, text_rc, DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(hdc, old_font);
+    let _ = DeleteObject(HGDIOBJ(font.0));
 }
 
 /// #360: draws [`HINT_TEXT`] centered in a backing pill near the top of the
 /// overlay, at the position [`hint_rect`] computes for `width`. The pill
 /// follows the theme (#580), so the text is readable on it in every one.
 unsafe fn draw_hint(hdc: HDC, monitor: Rect, dpi: u32, colors: &OverlayColors) {
-    let rect = hint_rect(monitor, dpi);
-    if rect.width() <= 0 || rect.height() <= 0 {
+    let one_line = hint_rect(monitor, dpi);
+    if one_line.width() <= 0 || one_line.height() <= 0 {
         return;
     }
+
+    // #744: measure the text in its own font, and wrap it onto more lines
+    // (a taller pill) when it does not fit, instead of cutting it off.
+    let font = hint_font(dpi);
+    let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+    // DT_CALCRECT with word wrap gives the real wrapped height, which can need
+    // more lines than text width / pill width suggests.
+    let mut text: Vec<u16> = HINT_TEXT.encode_utf16().collect();
+    let available = one_line.width() - 2 * scale_for_dpi(HINT_TEXT_INSET_DP, dpi);
+    let mut calc = RECT {
+        left: 0,
+        top: 0,
+        right: available.max(1),
+        bottom: 0,
+    };
+    windows::Win32::Graphics::Gdi::DrawTextW(
+        hdc,
+        &mut text,
+        &mut calc,
+        DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+    );
+    let mut one = windows::Win32::Foundation::SIZE::default();
+    let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &text, &mut one);
+    let text_h = calc.bottom - calc.top;
+    let lines = hint_lines_from_height(text_h, one.cy);
+    let rect = hint_rect_for_lines(monitor, dpi, lines);
 
     let brush = CreateSolidBrush(COLORREF(colors.hint_fill));
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
@@ -1284,22 +1359,24 @@ unsafe fn draw_hint(hdc: HDC, monitor: Rect, dpi: u32, colors: &OverlayColors) {
     let _ = DeleteObject(HGDIOBJ(brush.0));
     let _ = DeleteObject(HGDIOBJ(border.0));
 
-    let font = hint_font(dpi);
-    let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, COLORREF(colors.hint_text));
-    let text_rc = RECT {
-        left: rect.left,
+    let inset = scale_for_dpi(HINT_TEXT_INSET_DP, dpi);
+    let mut text_rc = RECT {
+        left: rect.left + inset,
         top: rect.top,
-        right: rect.right,
+        right: rect.right - inset,
         bottom: rect.bottom,
     };
-    crate::ui::text::draw_text_line(
-        hdc,
-        HINT_TEXT,
-        text_rc,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-    );
+    let format = if lines > 1 {
+        // DT_VCENTER only works with DT_SINGLELINE, so centre the wrapped
+        // block by hand.
+        text_rc.top = rect.top + ((rect.bottom - rect.top) - text_h).max(0) / 2;
+        DT_CENTER | DT_WORDBREAK | DT_NOPREFIX
+    } else {
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
+    };
+    crate::ui::text::draw_text_line(hdc, HINT_TEXT, text_rc, format);
     SelectObject(hdc, old_font);
     let _ = DeleteObject(HGDIOBJ(font.0));
 }
@@ -2519,6 +2596,49 @@ mod tests {
     }
 
     #[test]
+    fn the_size_label_box_scales_with_dpi_and_stays_on_screen() {
+        let sel = monitor_rect(300, 200, 700, 420);
+        let at96 = size_label_rect(sel, 96);
+        assert_eq!(
+            (at96.left, at96.top, at96.right, at96.bottom),
+            (304, 180, 540, 200)
+        );
+        let at240 = size_label_rect(sel, 240);
+        assert_eq!(at240.left - sel.left, 10);
+        assert_eq!(at240.bottom - at240.top, 50);
+        assert_eq!(at240.right - sel.left, 600);
+        // A selection at the very top keeps its label inside the window.
+        let top = size_label_rect(monitor_rect(0, 0, 100, 100), 240);
+        assert!(top.top >= 0 && top.bottom > top.top);
+    }
+
+    #[test]
+    fn a_hint_that_does_not_fit_wraps_to_more_lines_and_a_taller_pill() {
+        assert_eq!(hint_lines_from_height(24, 24), 1);
+        assert_eq!(hint_lines_from_height(48, 24), 2);
+        assert_eq!(hint_lines_from_height(49, 24), 3);
+        assert_eq!(hint_lines_from_height(240, 24), 3, "capped at three lines");
+        assert_eq!(
+            hint_lines_from_height(48, 0),
+            1,
+            "no line height is not a divide by zero"
+        );
+        assert_eq!(hint_lines_from_height(0, 24), 1);
+        let m = monitor_rect(0, 0, 960, 600);
+        let one = hint_rect_for_lines(m, 240, 1);
+        let two = hint_rect_for_lines(m, 240, 2);
+        assert_eq!(one, hint_rect(m, 240));
+        assert_eq!(
+            two.height() - one.height(),
+            scale_for_dpi(HINT_LINE_DP, 240)
+        );
+        assert_eq!(
+            (two.left, two.right, two.top),
+            (one.left, one.right, one.top)
+        );
+    }
+
+    #[test]
     fn draw_selection_with_a_zero_size_rect_does_not_crash() {
         unsafe {
             let hdc = CreateCompatibleDC(None);
@@ -2549,6 +2669,7 @@ mod tests {
                     right: 0,
                     bottom: 0,
                 },
+                96,
                 &overlay_colors(Theme::Light, &HC_BLACK),
             );
 

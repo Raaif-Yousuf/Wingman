@@ -23,8 +23,11 @@
 //! provider's cached rate (OpenAI `cached_tokens`, Gemini
 //! `cachedContentTokenCount`, Anthropic cache read).
 //!
-//! Totals are a floor: only successful, parsed responses are counted, so a
-//! refused or failed call that the vendor still billed is not included. The
+//! Totals are a floor: a reply that arrived is counted even when it was not an
+//! answer (a refusal, a truncated thinking reply, a blocked prompt: [`tally`]
+//! reads the usage block from the raw body, #730), but a call that failed
+//! before any reply (a timeout, a transport error) or a body with no usage
+//! block adds nothing, so the total can still be short. The
 //! tooltip refreshes only after a request finishes (no timer, AGENTS.md
 //! rule 5), so it can show yesterday's total until the first press of a day.
 //!
@@ -714,8 +717,14 @@ pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
     queue_budget_notice(&date);
 }
 
-/// Counts the usage of a successful completion and passes the result through
-/// unchanged. What every provider's `complete` ends with.
+/// Counts the usage of a completion and passes the result through unchanged.
+/// What every provider's `complete` ends with.
+///
+/// A reply that did not become an answer (a refusal, a truncated thinking
+/// reply, a blocked prompt) was still billed, so `error_usage` reads the
+/// usage block out of the raw body for that case (#730). It runs only on an
+/// `Err`, and when it finds nothing (a body that is not JSON) nothing is
+/// counted: there is no usage to count.
 ///
 /// `local` is true when the request ran on this machine and so costs nothing.
 pub fn tally(
@@ -723,9 +732,15 @@ pub fn tally(
     model: &str,
     local: bool,
     result: anyhow::Result<Completion>,
+    error_usage: impl FnOnce() -> Option<Usage>,
 ) -> anyhow::Result<Completion> {
-    if let Ok(c) = &result {
-        record(provider, model, local, c.usage);
+    match &result {
+        Ok(c) => record(provider, model, local, c.usage),
+        Err(_) => {
+            if let Some(usage) = error_usage() {
+                record(provider, model, local, Some(usage));
+            }
+        }
     }
     result
 }
@@ -937,33 +952,103 @@ mod tests {
         assert!(!format_tooltip_part(&d).unwrap().contains('\u{2014}'));
     }
 
+    /// Held by every test that records into the real store (or flips the
+    /// store-down switch), so a before/after difference is exact.
+    static TALLY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn tally_lock() -> std::sync::MutexGuard<'static, ()> {
+        TALLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn day_total_today(today: &str) -> DayTotal {
+        crate::store::global()
+            .unwrap()
+            .day_total(today)
+            .unwrap()
+            .unwrap_or_default()
+    }
+
     /// The wiring check: a completion passed through `tally` (what every
     /// provider's `complete` ends with) shows up in what the tooltip reads.
     #[test]
     fn tally_puts_a_completion_into_the_tooltip_text() {
-        // Other tests may also record today through the shared test store,
-        // so compare against what is there before.
+        // The lock keeps the other recording tests out, so the before/after
+        // difference below is exactly this request.
+        let _lock = tally_lock();
         let today = local_date_today();
-        let before = crate::store::global()
-            .unwrap()
-            .day_total(&today)
-            .unwrap()
-            .unwrap_or_default();
+        let before = day_total_today(&today);
         let completion = Completion {
             text: String::new(),
             usage: Some(usage(1_000_000, 0)),
             stop: crate::provider::StopReason::Complete,
         };
-        let out = tally("anthropic", "claude-opus-5", false, Ok(completion)).unwrap();
+        let out = tally("anthropic", "claude-opus-5", false, Ok(completion), || None).unwrap();
         assert_eq!(out.usage.unwrap().input_tokens, 1_000_000);
-        let after = crate::store::global()
-            .unwrap()
-            .day_total(&today)
-            .unwrap()
-            .unwrap();
+        let after = day_total_today(&today);
         assert_eq!(after.requests, before.requests + 1);
         assert!(close(after.usd - before.usd, 5.0), "{after:?}");
         assert!(tooltip_part().unwrap().contains("today"));
+    }
+
+    /// #730: a reply that is an error (here `max_tokens` with no text, the
+    /// whole budget spent thinking) still costs money, so it is counted.
+    #[test]
+    fn tally_counts_the_usage_of_a_reply_that_is_an_error() {
+        let body = r#"{"stop_reason":"max_tokens","content":[{"type":"thinking","thinking":"..."}],"usage":{"input_tokens":1000000,"output_tokens":0}}"#;
+        let _lock = tally_lock();
+        let today = local_date_today();
+        let before = day_total_today(&today);
+        let result = crate::provider::anthropic::Anthropic::parse_completion(body);
+        assert!(result.is_err());
+        let out = tally("anthropic", "claude-opus-5", false, result, || {
+            crate::provider::anthropic::Anthropic::parse_usage(body)
+        });
+        assert!(out.is_err(), "the error still reaches the caller");
+        let after = day_total_today(&today);
+        assert_eq!(after.requests, before.requests + 1, "counted once");
+        assert!(close(after.usd - before.usd, 5.0), "{after:?}");
+    }
+
+    /// An error with no usage block anywhere (a body that is not JSON) adds
+    /// nothing: there is nothing to count.
+    #[test]
+    fn tally_adds_nothing_for_an_error_with_no_usage() {
+        let _lock = tally_lock();
+        let today = local_date_today();
+        let before = day_total_today(&today);
+        let called = std::cell::Cell::new(false);
+        let out = tally(
+            "anthropic",
+            "claude-opus-5",
+            false,
+            Err(anyhow::anyhow!("bad")),
+            || {
+                called.set(true);
+                None
+            },
+        );
+        assert!(out.is_err());
+        assert!(called.get());
+        assert_eq!(day_total_today(&today), before, "nothing was counted");
+    }
+
+    /// #730 with the store down (#713): a failed reply's usage still lands in
+    /// the in-memory total the budget falls back to.
+    #[test]
+    fn with_the_store_down_an_error_reply_still_counts_toward_the_budget() {
+        let (_scope, _guard) = down_scope(0.01);
+        assert!(check_budget().is_ok());
+        for _ in 0..2 {
+            let _ = tally(
+                "anthropic",
+                "claude-opus-5",
+                false,
+                Err(anyhow::anyhow!("anthropic: model refused to answer")),
+                || Some(usage(900, 60)),
+            );
+        }
+        let err = check_budget().expect_err("two billed refusals reach the limit");
+        assert!(err.contains("Daily budget"), "{err}");
     }
 
     #[test]
@@ -1102,10 +1187,20 @@ mod tests {
         }
     }
 
-    fn down_scope(limit: f64) -> (DownScope, std::sync::MutexGuard<'static, ()>) {
-        let guard = crate::config::EGRESS_PREVIEW_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    type DownGuards = (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    );
+
+    fn down_scope(limit: f64) -> (DownScope, DownGuards) {
+        // The tally lock first: no recording test may run while the store is
+        // switched off.
+        let guard = (
+            tally_lock(),
+            crate::config::EGRESS_PREVIEW_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         let scope = DownScope;
         set_daily_budget(limit, 80);
         STORE_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
