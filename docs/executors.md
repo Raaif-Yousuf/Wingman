@@ -81,6 +81,11 @@ text that ends up on an error card. `actions::resolve_executor(&action)` is
 the one call site that turns `Action::executor` (a plain, unvalidated-until-now
 string) into this lookup.
 
+One pairing is checked earlier, when `actions.toml` loads: an action with
+`executor = "replace_text"` must list `selection` in `inputs` (#536), or the
+load fails with an error naming the action. Without a selection there is
+nothing to write over.
+
 ## The `Confirmed<P>` boundary, and why an executor cannot fabricate one
 
 `execute` only ever receives a `Confirmed<serde_json::Value>` -- never a
