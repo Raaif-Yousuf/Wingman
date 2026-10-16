@@ -60,9 +60,10 @@ pub fn matrix_filename(state_name: &str, theme_name: &str, percent: u32) -> Stri
 }
 
 /// Whether a state can be drawn under a simulated theme and DPI. The card
-/// states and the region overlay can. The palette and Settings read the live
-/// theme and the window's own DPI, so `--matrix` draws them once, as
+/// states and the region overlay can. The palette reads the live theme and
+/// the window's own DPI, so `--matrix` draws it once, as
 /// `<state>--system--<percent>.png` at the DPI the window really has.
+/// Settings follows the DPI only (see [`follows_dpi_only`]).
 #[cfg(any(test, debug_assertions))]
 pub fn follows_variants(state: GalleryState) -> bool {
     use GalleryState::*;
@@ -76,6 +77,18 @@ pub fn follows_variants(state: GalleryState) -> bool {
             | SettingsBottom
             | SettingsAdvancedTop
             | SettingsAdvancedBottom
+    )
+}
+
+/// Whether a state follows `--dpi` but not `--theme`: Settings can be laid out
+/// at a simulated scale, but it has no forced theme yet (issue #662), so
+/// `--matrix` draws it once per scale as `<state>--system--<percent>.png`.
+#[cfg(any(test, debug_assertions))]
+pub fn follows_dpi_only(state: GalleryState) -> bool {
+    use GalleryState::*;
+    matches!(
+        state,
+        SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom
     )
 }
 
@@ -343,6 +356,23 @@ mod driver {
                                 &dir.join(name),
                             )?;
                         }
+                    }
+                } else if follows_dpi_only(*state) {
+                    for percent in MATRIX_SCALES {
+                        let variant = Variant {
+                            theme: None,
+                            dpi: dpi_from_arg(&percent.to_string()),
+                        };
+                        let name = matrix_filename(state_name(*state), "system", percent);
+                        shoot(
+                            &mut card,
+                            &mut palette,
+                            &mut settings,
+                            &mut region,
+                            variant,
+                            *state,
+                            &dir.join(name),
+                        )?;
                     }
                 } else {
                     // Live theme, the window's own DPI: named for the DPI it
@@ -744,7 +774,7 @@ mod driver {
             SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => {
                 card.hide();
                 palette.hide();
-                let mut w = GalleryWindow::open(instance)
+                let mut w = GalleryWindow::open(instance, variant.dpi)
                     .ok_or_else(|| anyhow::anyhow!("could not open the Settings window"))?;
                 w.set_advanced(matches!(
                     state,

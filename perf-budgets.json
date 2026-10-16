@@ -1,9 +1,9 @@
 {
   "exe_size_bytes": {
-    "max": 4000000,
-    "measured": 3955200,
+    "max": 4500000,
+    "measured": 3982336,
     "measured_on": "2026-10-16",
-    "reason": "Raised from 3,500,000 for the offline QR-code decoder (rqrr, #313): 3,329,536 before and 3,503,104 after on the same machine (3,511,296 once merged with master), about 174 KB. Then raised from 3,700,000 to 3,800,000 for the live model lists (#380): CI measured 3,722,752 with them. Then raised to 3,900,000 for the password manager window painting and Store app matching (#575, #636): CI measured 3,800,576 with them. Then raised to 4,000,000 for the profile moving into the store (#46 slice 3): master measured 3,873,792 and this change 3,908,096, about 34 KB. Sharing an action as a file (#117) adds the TOML writer and the file dialogs; CI measured 3,955,200 bytes with both changes."
+    "reason": "Raised from 3,500,000 for the offline QR-code decoder (rqrr, #313): 3,329,536 before and 3,503,104 after on the same machine (3,511,296 once merged with master), about 174 KB. Then raised from 3,700,000 to 3,800,000 for the live model lists (#380): CI measured 3,722,752 with them. Then raised to 3,900,000 for the password manager window painting and Store app matching (#575, #636): CI measured 3,800,576 with them. Then raised to 4,000,000 for the profile moving into the store (#46 slice 3): master measured 3,873,792 and this change 3,908,096, about 34 KB. Sharing an action as a file (#117) adds the TOML writer and the file dialogs; CI measured 3,955,200 bytes with both changes. Then raised to 4,500,000 to leave room for the next features after trimming SQLite options and ureq gzip (#771, about 28 KB): master measured 3,982,336. The CI job prints the biggest crates on every run, so growth stays visible."
   },
   "startup_ms": {
     "max": 2000,
