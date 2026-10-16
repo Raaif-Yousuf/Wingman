@@ -321,6 +321,20 @@ fn resolve_control_type<E>(read: Result<RawControlType, E>) -> RawControlType {
     read.unwrap_or_default()
 }
 
+/// #591: an element whose fetch failed is skipped (`None`) and the snapshot is
+/// marked partial, so one bad element costs only itself instead of aborting
+/// the whole walk. Generic over the error type like [`resolve_control_type`].
+#[allow(dead_code)] // see the module doc comment's "nothing calls this yet"
+fn skip_failed_element<T, E>(read: Result<T, E>, partial: &mut bool) -> Option<T> {
+    match read {
+        Ok(v) => Some(v),
+        Err(_) => {
+            *partial = true;
+            None
+        }
+    }
+}
+
 /// How many of `total` walked elements to keep, and whether that is fewer
 /// than `total` (the caller must then report `truncated: true`). Pure so
 /// the boundary is unit-tested without a COM call: `total == max_elements`
@@ -916,7 +930,13 @@ mod com {
                 truncated = true;
                 break;
             }
-            let element = unsafe { found.GetElement(i as i32) }?;
+            // #591: skip an element that cannot be fetched; the snapshot
+            // is then reported as truncated (partial).
+            let Some(element) =
+                super::skip_failed_element(unsafe { found.GetElement(i as i32) }, &mut truncated)
+            else {
+                continue;
+            };
             let mut re = extract(&element)?;
             // Set here, not in `extract` (which has no window handle in
             // scope): every element from one `walk` call shares the same
@@ -1899,5 +1919,16 @@ mod tests {
                 let _ = DestroyWindow(frame);
             }
         }
+    }
+
+    // -- #591: one element that cannot be fetched costs only itself --------
+
+    #[test]
+    fn a_failed_element_fetch_is_skipped_and_marks_the_snapshot_partial() {
+        let mut partial = false;
+        assert_eq!(skip_failed_element::<u8, ()>(Ok(7), &mut partial), Some(7));
+        assert!(!partial, "a good fetch must not mark the snapshot partial");
+        assert_eq!(skip_failed_element::<u8, ()>(Err(()), &mut partial), None);
+        assert!(partial, "a skipped element must be reported as partial");
     }
 }

@@ -90,6 +90,36 @@ pub fn resolve_index(candidates: &[TargetRef], target: &TargetRef) -> MatchOutco
     }
 }
 
+/// #590: a control type that could not be read degrades to `"Other"` (the
+/// bucket `control_type_to_string` already uses for unknown ids), so one
+/// non-conformant element costs only itself. `"Other"` is never a type a
+/// proposal targets for writing, so a degraded element cannot become a write
+/// target by accident.
+pub fn degraded_control_type<E>(read: Result<String, E>) -> String {
+    read.unwrap_or_else(|_| "Other".to_string())
+}
+
+/// #590: an `IsPassword` read that fails is treated as a password field
+/// (fails CLOSED): its value is not read and it is refused for writing.
+/// Same rule as `inputs::uia`'s `resolve_is_password`.
+pub fn resolve_password_read<E>(read: Result<bool, E>) -> bool {
+    read.unwrap_or(true)
+}
+
+/// #590: elements whose fetch failed were left out of the walk. Their
+/// identity is unknown, so a target that has no runtime id (identity is only
+/// name, automation id and type) can no longer be shown unique and a `Found`
+/// becomes `Ambiguous`. A target with a runtime id is unique per element, so
+/// skips cannot hide a twin. `NotFound` and `Ambiguous` pass through.
+pub fn guard_skipped(outcome: MatchOutcome, target: &TargetRef, skipped: usize) -> MatchOutcome {
+    match outcome {
+        MatchOutcome::Found(_) if skipped > 0 && target.runtime_id.is_empty() => {
+            MatchOutcome::Ambiguous
+        }
+        other => other,
+    }
+}
+
 /// Whether the element's current text has drifted from what the preview
 /// showed -- the stale-target check both callers need ("someone typed in
 /// between").
@@ -313,8 +343,9 @@ pub mod com {
     #![allow(dead_code)]
 
     use super::{
-        ensure_unchanged, plan_typed_fallback, resolve_index, MatchOutcome, ResolvedElement,
-        TargetRef, TextElementAccess, TypedReplacePlan, UnicodeKeyEvent,
+        degraded_control_type, ensure_unchanged, guard_skipped, plan_typed_fallback, resolve_index,
+        resolve_password_read, MatchOutcome, ResolvedElement, TargetRef, TextElementAccess,
+        TypedReplacePlan, UnicodeKeyEvent,
     };
     use anyhow::Result;
     use windows::core::{Interface, BSTR};
@@ -382,8 +413,15 @@ pub mod com {
     type WalkExtra = (bool, Option<String>);
 
     /// `walk`'s result: parallel `TargetRef`/element/extra vectors, one
-    /// entry per candidate, in the same order.
-    type WalkResult = (Vec<TargetRef>, Vec<IUIAutomationElement>, Vec<WalkExtra>);
+    /// entry per candidate, in the same order, plus how many elements were
+    /// skipped because they could not be fetched (#590). A skipped element
+    /// is pushed to none of the three vectors, so they stay aligned.
+    type WalkResult = (
+        Vec<TargetRef>,
+        Vec<IUIAutomationElement>,
+        Vec<WalkExtra>,
+        usize,
+    );
 
     /// The one bulk COM call this module makes: walks `hwnd`'s descendants
     /// with a single `FindAllBuildCache`, same shape as
@@ -420,19 +458,25 @@ pub mod com {
         let mut candidates = Vec::with_capacity(total);
         let mut elements = Vec::with_capacity(total);
         let mut extra = Vec::with_capacity(total);
+        let mut skipped = 0usize;
 
         for i in 0..total {
-            let element = unsafe { found.GetElement(i as i32) }?;
+            // #590: an element that cannot be fetched is skipped, not fatal.
+            let Ok(element) = (unsafe { found.GetElement(i as i32) }) else {
+                skipped += 1;
+                continue;
+            };
             let name = unsafe { element.CachedName() }
                 .map(|b| b.to_string())
                 .unwrap_or_default();
             let automation_id = unsafe { element.CachedAutomationId() }
                 .map(|b| b.to_string())
                 .unwrap_or_default();
-            let control_type = control_type_to_string(unsafe { element.CachedControlType() }?);
-            let is_password = unsafe { element.CachedIsPassword() }
-                .map(|b| b.as_bool())
-                .unwrap_or(false);
+            let control_type = degraded_control_type(
+                unsafe { element.CachedControlType() }.map(control_type_to_string),
+            );
+            let is_password =
+                resolve_password_read(unsafe { element.CachedIsPassword() }.map(|b| b.as_bool()));
 
             // NEVER read the value of a password field -- checked before any
             // pattern lookup, same guard shape as `inputs::uia::com::extract`.
@@ -470,7 +514,7 @@ pub mod com {
             extra.push((is_password, value));
         }
 
-        Ok((candidates, elements, extra))
+        Ok((candidates, elements, extra, skipped))
     }
 
     /// Walks, then matches `target` against the walk via the pure
@@ -481,9 +525,9 @@ pub mod com {
         hwnd: HWND,
         target: &TargetRef,
     ) -> Result<MatchedElement> {
-        let (candidates, elements, extra) = walk(automation, hwnd)?;
+        let (candidates, elements, extra, skipped) = walk(automation, hwnd)?;
 
-        match resolve_index(&candidates, target) {
+        match guard_skipped(resolve_index(&candidates, target), target, skipped) {
             MatchOutcome::Found(i) => {
                 let (is_password, value) = extra[i].clone();
                 Ok(MatchedElement {
@@ -824,7 +868,7 @@ pub mod com {
         let _apartment = ComApartment::enter()?;
         let automation: IUIAutomation =
             unsafe { crate::inputs::uia_automation::create_automation() }?;
-        let (candidates, _elements, _extra) = walk(&automation, hwnd)?;
+        let (candidates, _elements, _extra, _skipped) = walk(&automation, hwnd)?;
         Ok(candidates)
     }
 
@@ -1103,6 +1147,90 @@ mod tests {
         let plan = plan_typed_fallback("Edit", "a\nb\tc").unwrap();
         let units: Vec<u16> = plan.text.iter().map(|e| e.code_unit).collect();
         assert!(!units.contains(&0x0A) && !units.contains(&0x09));
+    }
+
+    // -- #590: one unreadable element costs only itself ---------------------
+
+    #[test]
+    fn an_unreadable_control_type_degrades_to_other() {
+        assert_eq!(degraded_control_type::<()>(Err(())), "Other");
+        assert_eq!(degraded_control_type::<()>(Ok("Edit".to_string())), "Edit");
+    }
+
+    #[test]
+    fn an_unreadable_password_flag_fails_closed() {
+        assert!(resolve_password_read::<()>(Err(())));
+        assert!(!resolve_password_read::<()>(Ok(false)));
+        assert!(resolve_password_read::<()>(Ok(true)));
+    }
+
+    #[test]
+    fn a_degraded_element_never_matches_an_edit_target() {
+        let target = sample_target(); // control_type "Edit"
+        let degraded = TargetRef {
+            control_type: degraded_control_type::<()>(Err(())),
+            ..target.clone()
+        };
+        assert_eq!(
+            resolve_index(&[degraded], &target),
+            MatchOutcome::NotFound,
+            "a degraded element must not become the write target by accident"
+        );
+    }
+
+    #[test]
+    fn skipping_an_element_does_not_change_which_element_is_matched() {
+        // Matching is by identity, never by position: dropping an element
+        // from the walk shifts indices, but the match is still the element
+        // equal to the target, and the walk's parallel vectors stay aligned.
+        let target = sample_target();
+        let a = TargetRef {
+            name: "A".to_string(),
+            ..target.clone()
+        };
+        let b = TargetRef {
+            name: "B".to_string(),
+            ..target.clone()
+        };
+        let full = vec![a.clone(), b.clone(), target.clone()];
+        let skipped_one = vec![a, target.clone()];
+        let MatchOutcome::Found(i) = resolve_index(&full, &target) else {
+            panic!("full walk must find the target");
+        };
+        let MatchOutcome::Found(j) = resolve_index(&skipped_one, &target) else {
+            panic!("walk with a skipped element must find the target");
+        };
+        assert_ne!(i, j, "the slot did shift");
+        assert_eq!(full[i], skipped_one[j]);
+    }
+
+    #[test]
+    fn a_skipped_element_makes_an_identity_only_match_ambiguous() {
+        // A skipped element's identity is unknown: with no runtime id to
+        // tell it apart, a unique match may only be unique because the twin
+        // was skipped, so refuse.
+        let no_rid = TargetRef {
+            runtime_id: vec![],
+            ..sample_target()
+        };
+        assert_eq!(
+            guard_skipped(MatchOutcome::Found(0), &no_rid, 1),
+            MatchOutcome::Ambiguous
+        );
+        assert_eq!(
+            guard_skipped(MatchOutcome::Found(0), &no_rid, 0),
+            MatchOutcome::Found(0)
+        );
+        let with_rid = sample_target();
+        assert_eq!(
+            guard_skipped(MatchOutcome::Found(0), &with_rid, 3),
+            MatchOutcome::Found(0),
+            "a runtime id is unique per element, so skips cannot hide a twin"
+        );
+        assert_eq!(
+            guard_skipped(MatchOutcome::NotFound, &no_rid, 2),
+            MatchOutcome::NotFound
+        );
     }
 }
 
