@@ -80,7 +80,7 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         // #314: a list of action-item lines for the clipboard executor.
         "action_items" => Some(action_items_schema()),
         // #69: header names, then rows of cells, for the clipboard executor
-        // to write as CSV. Reused by the receipt (#70) and chart (#114) actions.
+        // to write as tab-separated text. Reused by the receipt (#70) and chart (#114) actions.
         "table" => Some(table_schema()),
         // #66: a read-only explanation of an error, shown on the card.
         "error_explanation" => Some(error_explanation_schema()),
@@ -270,7 +270,7 @@ fn action_items_schema() -> Value {
 /// `rows` (a list of cell lists). Property order is load-bearing (rule 3):
 /// naming the columns first fixes how many cells each row has before the
 /// model starts filling rows. Not editable: the card lists the rows, and
-/// `executors::clipboard` writes them as CSV (`actions::table::csv_from_value`).
+/// `executors::clipboard` writes them as tab-separated text (`actions::table::tsv_from_value`).
 fn table_schema() -> Value {
     json!({
         "type": "object",
