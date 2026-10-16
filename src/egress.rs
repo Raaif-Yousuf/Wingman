@@ -630,7 +630,9 @@ pub fn build_entry(
         bytes_sent,
         bytes_received,
         outcome,
-        error: error.map(redact_opaque_tokens),
+        // #733: the log is pasted into bug reports too: text redaction and
+        // the account name as well as key tokens.
+        error: error.map(crate::diagnostics::scrub_error_chain_here),
         cost: None,
         trigger: crate::activation::worker_trigger_label().map(str::to_string),
         redactions,
