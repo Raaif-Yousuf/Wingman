@@ -473,6 +473,22 @@ pub fn path() -> Result<PathBuf> {
 /// against a scratch directory. Only [`load_actions`] touches the real
 /// `%APPDATA%`.
 pub fn load_actions_from(user_path: &Path) -> Result<Vec<Resolved>> {
+    load_actions_report_from(user_path).map(|report| report.actions)
+}
+
+/// What a load produced: the actions that can run, and one plain sentence for
+/// each action that was left out because its own fields are wrong (#620).
+#[derive(Debug, Default)]
+pub struct LoadReport {
+    pub actions: Vec<Resolved>,
+    pub skipped: Vec<String>,
+}
+
+/// [`load_actions_from`] plus the reasons any action was skipped. A file that
+/// cannot be read or parsed is still an `Err` for the whole file; a single
+/// action with a bad executor, proposal or input list is skipped on its own
+/// so one typo never hides the built-ins.
+pub fn load_actions_report_from(user_path: &Path) -> Result<LoadReport> {
     let user_file = if user_path.exists() {
         let contents = fs::read_to_string(user_path)
             .with_context(|| format!("failed to read {}", user_path.display()))?;
@@ -483,22 +499,42 @@ pub fn load_actions_from(user_path: &Path) -> Result<Vec<Resolved>> {
     };
 
     let merged = merge_actions(builtin_actions(), user_file.actions);
-    let visible = visible(merged, &user_file.disabled_groups);
-    for resolved in &visible {
-        validate_action(&resolved.action)?;
+    let mut report = LoadReport::default();
+    for resolved in visible(merged, &user_file.disabled_groups) {
+        match validate_action(&resolved.action) {
+            Ok(()) => report.actions.push(resolved),
+            Err(e) => report.skipped.push(format!("{e:#}")),
+        }
     }
-    Ok(visible)
+    Ok(report)
 }
 
 /// Rejects a combination that could only fail (or quietly do something else)
-/// after the user had spent a model call (#536). Only actions that can run
-/// are checked, so a hidden one never blocks the others. A named error, never
-/// a panic (rule 7).
+/// after the user had spent a model call (#536, #620). Only actions that can
+/// run are checked, so a hidden one never blocks the others. A named error,
+/// never a panic (rule 7).
 fn validate_action(action: &Action) -> Result<()> {
+    if crate::executors::registry::resolve(&action.executor).is_err() {
+        anyhow::bail!(
+            "action \"{}\" names executor \"{}\", which does not exist",
+            action.id,
+            action.executor
+        );
+    }
+    // An empty prompt means the action never calls a model, so its proposal
+    // name (`"ocr_text"`) is deliberately not a registered schema.
+    if !action.prompt.trim().is_empty()
+        && schema::schema_for(&action.proposal, action.rate_difficulty).is_none()
+    {
+        anyhow::bail!(
+            "action \"{}\" names proposal \"{}\", which does not exist",
+            action.id,
+            action.proposal
+        );
+    }
     if action.executor == "replace_text" && !action.inputs.contains(&InputKind::Selection) {
         anyhow::bail!(
-            "action \"{}\" uses executor \"replace_text\", which writes over the selected text, \
-             so its inputs must include \"selection\"",
+            "action \"{}\" uses executor \"replace_text\", which writes over the selected text,              so its inputs must include \"selection\"",
             action.id
         );
     }
@@ -509,6 +545,12 @@ fn validate_action(action: &Action) -> Result<()> {
 /// The only entry point `app.rs` calls.
 pub fn load_actions() -> Result<Vec<Resolved>> {
     load_actions_from(&path()?)
+}
+
+/// [`load_actions_report_from`] against the real `actions.toml`. The palette
+/// uses it so it can tell the user about a skipped action.
+pub fn load_actions_report() -> Result<LoadReport> {
+    load_actions_report_from(&path()?)
 }
 
 #[cfg(test)]
@@ -992,16 +1034,108 @@ prompt = "Make it loud."
 "#;
 
     #[test]
-    fn replace_text_without_a_selection_input_is_a_named_load_error() {
+    fn replace_text_without_a_selection_input_is_skipped_with_a_named_reason() {
         let path = scratch_path("replace-no-selection");
         write(&path, REPLACE_NO_SELECTION);
-        let err = load_actions_from(&path).unwrap_err();
+        let report = load_actions_report_from(&path).unwrap();
         cleanup(&path);
-        let msg = format!("{err:#}");
+        assert!(!report.actions.iter().any(|r| r.action.id == "shout"));
+        assert_eq!(report.skipped.len(), 1);
+        let msg = &report.skipped[0];
         assert!(msg.contains("shout"), "names the action: {msg}");
         assert!(msg.contains("replace_text"), "names the executor: {msg}");
         assert!(msg.contains("selection"), "names the fix: {msg}");
         assert!(!msg.contains('\u{2014}'), "no em dash: {msg}");
+    }
+
+    // -- unknown executor / proposal and skip-not-fail (#620) -----------------
+
+    fn one_action(id: &str, proposal: &str, executor: &str, prompt: &str) -> String {
+        format!(
+            "[[actions]]\nid = \"{id}\"\nname = \"{id}\"\ninputs = [\"selection\"]\n\
+             proposal = \"{proposal}\"\nexecutor = \"{executor}\"\nconfirm = false\n\
+             prompt = \"{prompt}\"\n"
+        )
+    }
+
+    #[test]
+    fn an_unknown_executor_is_skipped_and_named() {
+        let path = scratch_path("unknown-executor");
+        write(
+            &path,
+            &one_action("typo", "text_answer", "clipbaord", "Do it."),
+        );
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        assert!(!report.actions.iter().any(|r| r.action.id == "typo"));
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].contains("typo"));
+        assert!(report.skipped[0].contains("clipbaord"));
+    }
+
+    #[test]
+    fn an_unknown_proposal_is_skipped_and_named() {
+        let path = scratch_path("unknown-proposal");
+        write(
+            &path,
+            &one_action("odd", "no_such_schema", "none", "Answer."),
+        );
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        assert!(!report.actions.iter().any(|r| r.action.id == "odd"));
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].contains("odd"));
+        assert!(report.skipped[0].contains("no_such_schema"));
+    }
+
+    #[test]
+    fn an_unregistered_proposal_is_fine_when_the_action_never_calls_a_model() {
+        let path = scratch_path("no-model");
+        write(&path, &one_action("ocr-copy", "ocr_text", "clipboard", ""));
+        let report = load_actions_report_from(&path).unwrap();
+        cleanup(&path);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert!(report.actions.iter().any(|r| r.action.id == "ocr-copy"));
+    }
+
+    #[test]
+    fn a_bad_action_does_not_hide_the_good_ones_or_the_builtins() {
+        let path = scratch_path("mixed");
+        let text = format!(
+            "{}\n{}",
+            one_action("good", "text_answer", "clipboard", "Fine."),
+            one_action("bad", "text_answer", "nope", "Broken.")
+        );
+        write(&path, &text);
+        let report = load_actions_report_from(&path).unwrap();
+        let plain = load_actions_from(&path).unwrap();
+        cleanup(&path);
+        assert!(report.actions.iter().any(|r| r.action.id == "good"));
+        assert!(!report.actions.iter().any(|r| r.action.id == "bad"));
+        assert!(report
+            .actions
+            .iter()
+            .any(|r| r.action.id == DEFAULT_ACTION_ID));
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(plain.len(), report.actions.len());
+    }
+
+    #[test]
+    fn a_toml_syntax_error_is_still_a_whole_file_error() {
+        let path = scratch_path("syntax");
+        write(&path, "[[actions]\nid = ");
+        let result = load_actions_report_from(&path);
+        cleanup(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn every_builtin_passes_validation() {
+        let builtins = builtin_actions();
+        assert!(!builtins.is_empty());
+        for a in builtins {
+            validate_action(&a).unwrap_or_else(|e| panic!("{}: {e:#}", a.id));
+        }
     }
 
     #[test]
@@ -1020,9 +1154,9 @@ prompt = "Make it loud."
     fn a_disabled_replace_text_action_without_a_selection_still_loads() {
         let path = scratch_path("replace-disabled");
         write(&path, &format!("{REPLACE_NO_SELECTION}enabled = false\n"));
-        let resolved = load_actions_from(&path);
+        let report = load_actions_report_from(&path).unwrap();
         cleanup(&path);
-        assert!(resolved.is_ok(), "a hidden action never runs");
+        assert!(report.skipped.is_empty(), "a hidden action is not checked");
     }
 
     #[test]

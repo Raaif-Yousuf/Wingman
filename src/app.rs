@@ -169,6 +169,9 @@ struct App {
     /// showed. Read only when the palette runs an action, so a stale value
     /// from an earlier session can never apply: every open overwrites it.
     palette_password_manager: bool,
+    /// #620: the last "actions were skipped" notice shown, so the palette does
+    /// not repeat it on every open.
+    last_skipped_notice: Option<String>,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -397,6 +400,7 @@ pub fn run() -> Result<()> {
         watcher: None,
         password_manager_hint: false,
         palette_password_manager: false,
+        last_skipped_notice: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -988,8 +992,20 @@ impl App {
         // there, not in Wingman's own palette.
         let underlying =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
-        let resolved = match actions::load_actions() {
-            Ok(r) => r,
+        let resolved = match actions::load_actions_report() {
+            Ok(report) => {
+                // #620: say once per distinct problem, not on every open.
+                let notice = report.skipped.join(" ");
+                if notice.is_empty() {
+                    self.last_skipped_notice = None;
+                } else if self.last_skipped_notice.as_deref() != Some(notice.as_str()) {
+                    let headline = "Some actions in actions.toml were skipped";
+                    let detail = self.track_error(headline, &notice);
+                    self.card.show_error_with_details(headline, &detail);
+                    self.last_skipped_notice = Some(notice);
+                }
+                report.actions
+            }
             Err(e) => {
                 let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
                 self.card
