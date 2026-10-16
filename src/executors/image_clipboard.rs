@@ -316,9 +316,20 @@ mod win32 {
     }
 
     pub(super) fn set_dib(bytes: &[u8]) -> Result<()> {
-        let _guard = OpenGuard::open()?;
-        unsafe { EmptyClipboard() }?;
+        // Allocate before touching the clipboard: a failed allocation must
+        // leave the user's clipboard as it was (#716).
         let hglobal = alloc_hglobal_bytes(bytes)?;
+        let _guard = match OpenGuard::open() {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = unsafe { GlobalFree(Some(hglobal)) };
+                return Err(e);
+            }
+        };
+        if let Err(e) = unsafe { EmptyClipboard() } {
+            let _ = unsafe { GlobalFree(Some(hglobal)) };
+            return Err(e.into());
+        }
         // Ownership transfers to the clipboard on success only. When the call
         // fails the memory is still ours, so free it (#376 made this
         // reachable from a key press).
@@ -326,7 +337,26 @@ mod win32 {
             let _ = unsafe { GlobalFree(Some(hglobal)) };
             anyhow::bail!("SetClipboardData(CF_DIB) failed: {e}");
         }
+        // Decision (#716): a copied image is never offered to the cloud
+        // clipboard (it can show anything that was on screen), but stays in
+        // local Win+V history so the copy is still useful. Best effort.
+        exclude_from_cloud();
         Ok(())
+    }
+
+    /// Sets the `CanUploadToCloudClipboard` format to 0 on the open clipboard.
+    fn exclude_from_cloud() {
+        use windows::core::w;
+        use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+        let format = unsafe { RegisterClipboardFormatW(w!("CanUploadToCloudClipboard")) };
+        if format == 0 {
+            return;
+        }
+        if let Ok(hglobal) = alloc_hglobal_bytes(&0u32.to_le_bytes()) {
+            if unsafe { SetClipboardData(format, Some(HANDLE(hglobal.0))) }.is_err() {
+                let _ = unsafe { GlobalFree(Some(hglobal)) };
+            }
+        }
     }
 }
 

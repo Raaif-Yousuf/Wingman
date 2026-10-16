@@ -218,6 +218,11 @@ impl Profile {
     /// why that path cannot afford to be best-effort and this one can.
     #[cfg(windows)]
     fn restrict_acl(path: &Path) {
+        // Portable mode (#681, #714): the drive moves between PCs and users,
+        // and a per-user ACL would block the next one from replacing the file.
+        if crate::portable::skip_acl() {
+            return;
+        }
         let username = match std::env::var("USERNAME") {
             Ok(u) if !u.is_empty() => u,
             _ => return,
@@ -408,6 +413,28 @@ mod tests {
             "inheritance must still be disabled after adding CREATE_NO_WINDOW: {listing}"
         );
 
+        let _ = fs::remove_file(&path);
+    }
+
+    // -- #714: portable mode leaves the profile file's ACL alone ----------
+
+    #[test]
+    #[cfg(windows)]
+    fn save_to_in_portable_mode_leaves_inheritance_on() {
+        let path = scratch_path("acl-portable");
+        let _forced = crate::portable::ForcedRoot::new(path.parent().unwrap());
+        sample_profile()
+            .save_to(&path)
+            .expect("save_to should succeed");
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .expect("icacls should run");
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            listing.contains("(I)"),
+            "portable mode must not strip inheritance: {listing}"
+        );
         let _ = fs::remove_file(&path);
     }
 
