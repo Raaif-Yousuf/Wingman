@@ -3151,7 +3151,16 @@ impl App {
         self.last_error = Some(LastError {
             action: action.to_string(),
             occurred_at: SystemTime::now(),
-            chain: crate::egress::redact_opaque_tokens(raw_chain),
+            // #733: also text redaction and the account name, because this
+            // chain is pasted into public bug reports. When the profile
+            // folder cannot be found the name step is skipped, nothing else.
+            chain: crate::diagnostics::scrub_error_chain(
+                raw_chain,
+                &crate::known_folder::user_profile()
+                    .ok()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            ),
         });
     }
 

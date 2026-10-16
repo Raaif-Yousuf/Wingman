@@ -253,6 +253,17 @@ pub fn redact_user_profile(text: &str, profile: &str) -> String {
     result
 }
 
+/// What an error chain goes through before it is stored as the last error,
+/// which "Copy diagnostics" and "Copy details" both paste into public bug
+/// reports (#733): key-shaped tokens, then the same text redaction requests
+/// get (email, card number, IBAN, key), then the account name out of any
+/// path under `profile`. An empty `profile` skips only the last step.
+pub fn scrub_error_chain(raw: &str, profile: &str) -> String {
+    let no_tokens = crate::egress::redact_opaque_tokens(raw);
+    let redacted = crate::redact::Redactions::default().redact_text(&no_tokens);
+    redact_user_profile(&redacted, profile)
+}
+
 /// Renders `input` as a plain-text report, ready for the clipboard and for
 /// pasting into a bug report's "Steps to reproduce" / attachment field. Pure
 /// -- no Win32, no I/O -- so every line is unit-tested directly. No em
@@ -842,6 +853,7 @@ mod tests {
     #[test]
     fn render_report_includes_the_last_error_action_age_and_full_chain() {
         let mut input = sample_input();
+        input.config_path = None; // the sample path would carry the name itself
         input.last_error = Some(LastError {
             action: "Couldn't add the event".to_string(),
             seconds_ago: 42,
@@ -856,6 +868,30 @@ mod tests {
             text.contains("TzSpecificLocalTimeToSystemTime failed: os error 87"),
             "{text}: the full chain must be present so Copy diagnostics is not an empty promise"
         );
+    }
+
+    #[test]
+    fn a_scrubbed_last_error_prints_neither_the_account_name_nor_an_email() {
+        let raw = r"could not create C:\Users\test\AppData\Local\Temp\Wingman for ana@example.com";
+        let mut input = sample_input();
+        input.config_path = None; // the sample path would carry the name itself
+        input.last_error = Some(LastError {
+            action: "Couldn't add the event".to_string(),
+            seconds_ago: 3,
+            chain: scrub_error_chain(raw, r"C:\Users\test"),
+        });
+        let text = render_report(&input);
+        assert!(!text.contains(r"Users\test"), "{text}");
+        assert!(!text.contains("ana@example.com"), "{text}");
+        assert!(text.contains("%USERPROFILE%"), "{text}");
+        assert!(text.contains("could not create"), "{text}");
+    }
+
+    #[test]
+    fn scrub_error_chain_keeps_ordinary_text_and_survives_an_empty_profile() {
+        let raw = "HTTP 429: too many requests, retry in 30s";
+        assert_eq!(scrub_error_chain(raw, ""), raw);
+        assert_eq!(scrub_error_chain(raw, r"C:\Users\test"), raw);
     }
 
     #[test]
