@@ -182,10 +182,18 @@ pub fn control_type_str(kind: ControlKind) -> &'static str {
 /// Never a password field (`FieldValue::Redacted`) -- its real value was
 /// never read into this process in the first place.
 pub fn is_fillable_candidate(field: &FieldSnapshot) -> bool {
-    matches!(
-        field.control_type,
-        ControlKind::Edit | ControlKind::Document | ControlKind::ComboBox
-    ) && field.enabled
+    let type_ok = match field.control_type {
+        ControlKind::Edit => true,
+        // The typed fallback only writes an Edit (#592), so a Document or
+        // ComboBox with no readable value would be offered and then always
+        // refused at Do time (#675).
+        ControlKind::Document | ControlKind::ComboBox => {
+            !matches!(field.value, FieldValue::Unreadable)
+        }
+        _ => false,
+    };
+    type_ok
+        && field.enabled
         && !matches!(field.value, FieldValue::Redacted)
         && !is_forbidden_target(&field.name, &field.automation_id)
 }
@@ -204,7 +212,7 @@ pub fn fillable_candidates(fields: &[FieldSnapshot]) -> Vec<FieldSnapshot> {
 fn current_text(value: &FieldValue) -> String {
     match value {
         FieldValue::Text(s) => s.clone(),
-        FieldValue::Empty | FieldValue::Redacted => String::new(),
+        FieldValue::Empty | FieldValue::Unreadable | FieldValue::Redacted => String::new(),
     }
 }
 
@@ -677,6 +685,7 @@ pub fn build_proposal(
                 "target": target_json(field),
                 "label": m.label,
                 "current": m.current,
+                "current_unknown": matches!(field.value, FieldValue::Unreadable),
                 "value": m.value,
                 "sensitive": sensitive,
                 "approved": !sensitive,
@@ -760,8 +769,11 @@ pub fn nothing_to_fill_detail(proposal: &Value) -> String {
 // Preview translation: merged proposal <-> the existing flat PreviewModel
 // ---------------------------------------------------------------------------
 
-fn format_display_value(current: &str, proposed: &str, source: &str) -> String {
-    if current.trim().is_empty() {
+fn format_display_value(current: &str, proposed: &str, source: &str, unknown: bool) -> String {
+    if unknown {
+        // #675: the field's text could not be read, so do not show it as blank.
+        format!("{proposed} (from {source}). Current text unknown: will be replaced")
+    } else if current.trim().is_empty() {
         format!("{proposed} (from {source})")
     } else {
         format!("{current} -> {proposed} (from {source})")
@@ -799,13 +811,23 @@ pub fn build_preview_schema_and_value(proposal: &Value) -> (Value, Value) {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
+        let unknown = field
+            .get("current_unknown")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
         if sensitive {
+            let note = if unknown {
+                ", current text unknown, will be replaced"
+            } else {
+                ""
+            };
             properties.insert(
                 key.clone(),
                 json!({
                     "type": "string",
                     "editable": true,
-                    "label": format!("{label} (sensitive, clear to skip)"),
+                    "label": format!("{label} (sensitive, clear to skip{note})"),
                 }),
             );
             value_obj.insert(key, Value::String(proposed.to_string()));
@@ -819,7 +841,7 @@ pub fn build_preview_schema_and_value(proposal: &Value) -> (Value, Value) {
             );
             value_obj.insert(
                 key,
-                Value::String(format_display_value(current, proposed, source)),
+                Value::String(format_display_value(current, proposed, source, unknown)),
             );
         }
     }
@@ -1092,6 +1114,50 @@ mod tests {
             let f = field(ct, "Full name", FieldValue::Empty, true);
             assert!(is_fillable_candidate(&f), "{ct:?} should be fillable");
         }
+    }
+
+    #[test]
+    fn unreadable_document_and_combobox_are_not_fillable_but_edit_is() {
+        // #675: the typed fallback only writes an Edit, so a field with no
+        // ValuePattern is offered only when it is one.
+        let f = field(ControlKind::Edit, "Name", FieldValue::Unreadable, true);
+        assert!(is_fillable_candidate(&f));
+        for ct in [ControlKind::Document, ControlKind::ComboBox] {
+            let f = field(ct, "Name", FieldValue::Unreadable, true);
+            assert!(!is_fillable_candidate(&f), "{ct:?} with no value interface");
+        }
+    }
+
+    fn proposal_for(value: FieldValue, tick: RequireTickFor) -> Value {
+        let f = field(ControlKind::Edit, "Full name", value, true);
+        let (mapped, _) = map_candidates_locally(std::slice::from_ref(&f), &sample_profile());
+        build_proposal(&[f], &mapped, tick)
+    }
+
+    #[test]
+    fn unreadable_edit_is_marked_unknown_in_proposal_and_preview() {
+        let proposal = proposal_for(FieldValue::Unreadable, RequireTickFor::None);
+        assert_eq!(proposal["fields"][0]["current_unknown"], true);
+        let (_, value) = build_preview_schema_and_value(&proposal);
+        let row = value["f0"].as_str().unwrap();
+        assert!(row.contains("Current text unknown"), "{row}");
+        assert!(!row.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn readable_empty_field_is_not_marked_unknown() {
+        let proposal = proposal_for(FieldValue::Empty, RequireTickFor::None);
+        assert_eq!(proposal["fields"][0]["current_unknown"], false);
+        let (_, value) = build_preview_schema_and_value(&proposal);
+        assert!(!value["f0"].as_str().unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn unreadable_sensitive_row_label_says_current_text_unknown() {
+        let proposal = proposal_for(FieldValue::Unreadable, RequireTickFor::All);
+        let (schema, _) = build_preview_schema_and_value(&proposal);
+        let label = schema["properties"]["f0"]["label"].as_str().unwrap();
+        assert!(label.contains("current text unknown"), "{label}");
     }
 
     #[test]

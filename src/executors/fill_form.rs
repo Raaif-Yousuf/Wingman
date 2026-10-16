@@ -592,7 +592,9 @@ fn restore_fields(access: &Arc<dyn TextElementAccess>, filled: &[FilledField]) -
                     Err(e) if target::is_stale_target_error(&e) => {
                         skipped.push(format!("\"{}\" (edited since the fill)", field.label));
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        skipped.push(format!("\"{}\" (could not be written: {e})", field.label));
+                    }
                 }
             }
             RestoreAction::SkipStale => {
@@ -644,6 +646,8 @@ mod tests {
         /// read it (#432): that `resolve` returns the old text, then the
         /// live text becomes this value.
         typed_after_resolve: RefCell<HashMap<TargetRef, String>>,
+        /// Targets whose `write` fails with a non-stale error (#678).
+        failing_writes: RefCell<Vec<TargetRef>>,
     }
 
     // `RefCell` isn't `Sync`; this fake is never touched from more than one
@@ -686,6 +690,10 @@ mod tests {
             new_text: &str,
         ) -> Result<()> {
             self.write_calls.borrow_mut().push(target.clone());
+            anyhow::ensure!(
+                !self.failing_writes.borrow().contains(target),
+                "fake: write failed"
+            );
             let field = self
                 .fields
                 .get(target)
@@ -731,6 +739,7 @@ mod tests {
             write_calls: RefCell::new(Vec::new()),
             unresolvable: Vec::new(),
             typed_after_resolve: RefCell::new(HashMap::new()),
+            failing_writes: RefCell::new(Vec::new()),
         })
     }
 
@@ -1345,6 +1354,7 @@ mod tests {
             write_calls: RefCell::new(Vec::new()),
             unresolvable: vec![target_for("missing")],
             typed_after_resolve: RefCell::new(HashMap::new()),
+            failing_writes: RefCell::new(Vec::new()),
         });
         let executor = FillFormExecutor::with_access(access.clone());
         let form = form_json(vec![
@@ -1669,6 +1679,44 @@ mod tests {
         assert_eq!(
             *access.fields[&target_for("email")].text.borrow(),
             "old@example.com"
+        );
+    }
+
+    #[test]
+    fn undo_keeps_going_after_a_field_whose_write_fails() {
+        let access = access(vec![
+            (
+                "name",
+                field("name", "Edit", false, "Full name", "old name"),
+            ),
+            (
+                "email",
+                field("email", "Edit", false, "Email", "old@example.com"),
+            ),
+        ]);
+        let executor = FillFormExecutor::with_access(access.clone());
+        let form = form_json(vec![
+            field_json("name", "Full name", "Ada", false, false, "old name"),
+            field_json(
+                "email",
+                "Email",
+                "ada@example.com",
+                false,
+                false,
+                "old@example.com",
+            ),
+        ]);
+        let undo = executor.execute(confirmed(form)).unwrap();
+
+        access.failing_writes.borrow_mut().push(target_for("name"));
+
+        let err = undo.undo().expect_err("the failed field must be reported");
+        assert!(err.to_string().contains("Restored 1 of 2"), "{err}");
+        assert!(err.to_string().contains("Full name"), "{err}");
+        assert_eq!(
+            *access.fields[&target_for("email")].text.borrow(),
+            "old@example.com",
+            "a later field is still restored"
         );
     }
 
