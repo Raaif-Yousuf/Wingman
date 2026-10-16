@@ -98,7 +98,8 @@ use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
 use crate::ui::theme::{
-    detect_theme, setting_change_affects_theme, setting_change_name, SysColors, Theme, Tokens,
+    detect_theme, ensure_contrast, setting_change_affects_theme, setting_change_name, SysColors,
+    Theme, Tokens,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -318,7 +319,7 @@ impl Palette {
             suppress_en_change: false,
             theme,
             sys,
-            colors: palette_colors(theme, &sys, crate::ui::card_buttons::system_accent()),
+            colors: palette_colors(theme, &sys, live_accent(theme, &sys)),
             theme_forced: false,
             edit_brush: HBRUSH(std::ptr::null_mut()),
         });
@@ -933,22 +934,12 @@ struct PaletteColors {
     bar: u32,
 }
 
-/// `color` moved towards white or black (whichever the `background` is
-/// furthest from) in 5% steps until it reaches `min` contrast against
-/// `background`. A user's accent can be any colour, so it cannot be trusted to
-/// be visible on its own.
-fn visible_on(color: u32, background: u32, min: f64) -> u32 {
-    use crate::ui::card_buttons::blend;
-    use crate::ui::theme::{contrast_ratio, relative_luminance};
-    let bg_l = relative_luminance(background);
-    let towards = if bg_l < 0.18 { 0x00FF_FFFF } else { 0 };
-    (0..=100)
-        .step_by(5)
-        .map(|pct| blend(color, towards, pct))
-        .find(|c| contrast_ratio(relative_luminance(*c), bg_l) >= min)
-        .unwrap_or(towards)
+/// The user's accent for the selection bar in `theme`, kept at 3:1 against the
+/// theme's surface (the same shade and fit the primary button uses). Read live,
+/// so call it when the theme or the accent changes, never per paint.
+fn live_accent(theme: Theme, sys: &SysColors) -> u32 {
+    crate::ui::card_buttons::system_accent(theme, Tokens::for_theme(theme, sys).surface)
 }
-
 /// The palette's colours in `theme`. High contrast uses the system colours
 /// only: the selected row is the system highlight, as in a Windows list.
 fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
@@ -969,7 +960,9 @@ fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
             bar: sys.highlight,
         };
     }
-    let bar = visible_on(accent, t.surface, 3.0);
+    // An accent from live_accent already clears 3:1; this keeps any other
+    // caller honest too.
+    let bar = ensure_contrast(accent, t.surface, 3.0);
     PaletteColors {
         background: t.surface,
         border: t.border,
@@ -1367,11 +1360,7 @@ impl PaletteInner {
     }
 
     fn apply_colors(&mut self) {
-        self.colors = palette_colors(
-            self.theme,
-            &self.sys,
-            crate::ui::card_buttons::system_accent(),
-        );
+        self.colors = palette_colors(self.theme, &self.sys, live_accent(self.theme, &self.sys));
         self.drop_edit_brush();
         unsafe {
             use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
@@ -2247,11 +2236,8 @@ mod tests {
         use windows::Win32::UI::WindowsAndMessaging::{WM_SYSCOLORCHANGE, WM_THEMECHANGED};
 
         fn live_colors() -> PaletteColors {
-            palette_colors(
-                detect_theme(),
-                &SysColors::read(),
-                crate::ui::card_buttons::system_accent(),
-            )
+            let (theme, sys) = (detect_theme(), SysColors::read());
+            palette_colors(theme, &sys, live_accent(theme, &sys))
         }
 
         #[test]
@@ -2303,11 +2289,7 @@ mod tests {
             let forced = p.inner.colors;
             assert_eq!(
                 forced,
-                palette_colors(
-                    Theme::Dark,
-                    &HC_BLACK,
-                    crate::ui::card_buttons::system_accent()
-                )
+                palette_colors(Theme::Dark, &HC_BLACK, live_accent(Theme::Dark, &HC_BLACK))
             );
             unsafe {
                 SendMessageW(p.hwnd(), WM_THEMECHANGED, Some(WPARAM(0)), Some(LPARAM(0)));
