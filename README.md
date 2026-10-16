@@ -187,7 +187,9 @@ card timeout, text size and the prompt. A saved key moves into Windows
 Credential Manager, not the file; Settings shows only its last four
 characters afterward.
 
-Settings has key and model fields for OpenAI, Anthropic and Gemini, a model
+Settings has key and model fields for OpenAI, Anthropic and Gemini (with a
+key saved, opening Settings asks the provider for its current model list, so
+a new model shows up on its own; this is skipped in Offline mode), a model
 list for Ollama (models you have pulled, with "(vision)" on the ones that can
 read images), and an Active provider choice. The tray's Provider menu picks the
 active provider too. An OpenAI-compatible endpoint still needs a hand-edit of

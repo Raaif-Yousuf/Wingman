@@ -1,0 +1,53 @@
+{
+  "models": [
+    {
+      "name": "models/gemini-2.5-flash",
+      "baseModelId": "gemini-2.5-flash",
+      "version": "001",
+      "displayName": "Gemini 2.5 Flash",
+      "inputTokenLimit": 1048576,
+      "outputTokenLimit": 65536,
+      "supportedGenerationMethods": ["generateContent", "countTokens", "createCachedContent"]
+    },
+    {
+      "name": "models/gemini-9.0-future",
+      "displayName": "Gemini 9 Future",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-2.5-flash-preview-tts",
+      "displayName": "Gemini 2.5 Flash TTS",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-2.5-flash-image",
+      "displayName": "Gemini 2.5 Flash Image",
+      "supportedGenerationMethods": ["generateContent"]
+    },
+    {
+      "name": "models/gemini-embedding-001",
+      "displayName": "Gemini Embedding 001",
+      "supportedGenerationMethods": ["embedContent", "countTextTokens"]
+    },
+    {
+      "name": "models/embedding-gecko-001",
+      "displayName": "Embedding Gecko",
+      "supportedGenerationMethods": ["embedText", "countTextTokens"]
+    },
+    {
+      "name": "models/imagen-4.0-generate-001",
+      "displayName": "Imagen 4",
+      "supportedGenerationMethods": ["predict"]
+    },
+    {
+      "name": "models/aqa",
+      "displayName": "Model that performs Attributed Question Answering.",
+      "supportedGenerationMethods": ["generateAnswer"]
+    },
+    {
+      "name": "models/gemini-2.5-pro",
+      "displayName": "Gemini 2.5 Pro",
+      "supportedGenerationMethods": ["generateContent", "countTokens", "createCachedContent", "batchGenerateContent"]
+    }
+  ]
+}

@@ -297,6 +297,18 @@ that moves that provider to the front of `providers.order`. The tray's
 Provider submenu does the same. There is no UI to add a `"compat:<name>"`
 entry to the order.
 
+Opening Settings also refreshes the OpenAI, Anthropic and Gemini model
+combos from each provider's own list (issue #380, `src/provider/model_list.rs`):
+`GET /v1/models` for OpenAI and Anthropic, `GET /v1beta/models` for Gemini,
+only for a provider that has a saved key, on a worker thread, and not at all
+in Offline mode. The request goes through `provider::common`, so it is in the
+egress log (key redacted). The list is filtered to chat models (Anthropic:
+not one that says it cannot read images; Gemini: `generateContent` only), and
+your configured models are kept at the end, so the current choice is never
+dropped. If the call fails, the built-in list stays and the diagnostics
+report gets one warning line. Nothing is cached on disk yet, and the OpenAI
+list has no capability flags, so a text-only model may still appear.
+
 To use an OpenAI-compatible endpoint today, edit
 `%APPDATA%\Wingman\config.toml` by hand (**Open config.toml** in the tray
 menu) and add the provider name to `providers.order`, e.g.:

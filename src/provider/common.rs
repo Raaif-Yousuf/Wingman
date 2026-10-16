@@ -799,6 +799,83 @@ pub(crate) fn get_text_with_timeout(url: &str, timeout: Duration, tag: &str) -> 
     Ok(body_text)
 }
 
+/// GET with request `headers`, single attempt, for the cloud providers'
+/// free model-list endpoints (#380). Goes through [`offline_guard`] first,
+/// like every entry point here, and writes one egress-log line (the key is
+/// in `headers`, which is never passed to the log entry). Deliberately
+/// skips [`budget_guard`]: listing models is not billed, so a spent daily
+/// budget must not blank the dropdown. It also skips [`send_preview_guard`]:
+/// nothing the user captured is in the request.
+pub(crate) fn get_json_with_headers(
+    url: &str,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+    tag: &str,
+) -> Result<String> {
+    offline_guard(url)?;
+
+    let result = get_with_headers_raw(url, headers, timeout);
+    let (outcome, received, error) = match &result {
+        Ok(resp) if (200..300).contains(&resp.status) => {
+            (egress::Outcome::Success, resp.body.len(), None)
+        }
+        Ok(resp) => (
+            egress::Outcome::Failure,
+            resp.body.len(),
+            Some(format!("HTTP {}", resp.status)),
+        ),
+        Err(e) => (egress::Outcome::Failure, 0, Some(e.clone())),
+    };
+    egress::record(&egress::build_entry(
+        tag,
+        url,
+        &Value::Null,
+        false,
+        0,
+        received,
+        outcome,
+        error.as_deref(),
+    ));
+
+    // `e` was redacted by `get_with_headers_raw` already.
+    let resp = result.map_err(|e| anyhow!("{tag}: transport error: {}", e))?;
+    if !(200..300).contains(&resp.status) {
+        let truncated = redact_and_truncate(&resp.body);
+        return Err(anyhow!("{tag}: HTTP {}: {truncated}", resp.status));
+    }
+    Ok(resp.body)
+}
+
+/// The socket half of [`get_json_with_headers`]. The `Err` text is already
+/// redacted by `redact_detail`.
+fn get_with_headers_raw(
+    url: &str,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> std::result::Result<RawResponse, String> {
+    let mut builder = ureq::get(url);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let mut response = builder
+        .config()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+        .map_err(|e| redact_detail(&e))?;
+    let status = response.status().as_u16();
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("failed to read response body: {}", redact_detail(&e)))?;
+    Ok(RawResponse {
+        status,
+        headers: Vec::new(),
+        body,
+    })
+}
+
 /// POST whose response body is consumed incrementally by `read` (Ollama's
 /// `/api/pull` NDJSON download progress; not model output, so the
 /// no-streaming rule does not apply). Single attempt, only the connect phase
@@ -1751,6 +1828,23 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Offline"), "{msg}");
         assert!(!msg.contains('\u{2014}'), "rule 11: no em dash: {msg}");
+    }
+
+    #[test]
+    fn the_model_list_get_is_refused_offline_before_any_socket_opens() {
+        let _g = network_guard();
+        crate::mode::set_current(crate::mode::Mode::Offline);
+        let err = get_json_with_headers(
+            "https://api.anthropic.com/v1/models",
+            &[("x-api-key", "sk-test")],
+            Duration::from_secs(1),
+            "anthropic models",
+        )
+        .unwrap_err();
+        crate::mode::set_current(crate::mode::Mode::Auto);
+        let msg = err.to_string();
+        assert!(msg.contains("Offline"), "{msg}");
+        assert!(!msg.contains("sk-test"), "{msg}");
     }
 
     #[test]
