@@ -63,12 +63,13 @@ use std::sync::{Once, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreatePen,
-    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, GetMonitorInfoW, GetStockObject,
-    MonitorFromPoint, Rectangle, RoundRect, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DT_WORDBREAK, HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, LOGFONTW, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection,
+    CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint,
+    GetMonitorInfoW, GetStockObject, MonitorFromPoint, Rectangle, RoundRect, SelectObject,
+    SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CALCRECT,
+    DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HBITMAP, HDC, HFONT, HGDIOBJ,
+    HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, PAINTSTRUCT, PS_SOLID,
+    SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
@@ -764,6 +765,9 @@ impl Overlay {
         dim_rgba(&mut dimmed, BACKGROUND_DIM_FACTOR);
         let (background_bitmap, background_dc, background_old_bitmap) =
             build_background(&dimmed, original.width, original.height);
+        // The bitmap holds its own copy: free this one now, so the peak is
+        // not four full-desktop buffers.
+        drop(dimmed);
         let (bright_bitmap, bright_dc, bright_old_bitmap) =
             build_background(&original.rgba, original.width, original.height);
 
@@ -1210,43 +1214,79 @@ impl OverlayInner {
             let w = rc.right - rc.left;
             let h = rc.bottom - rc.top;
 
-            if !hdc.0.is_null() && w > 0 && h > 0 && !self.background_dc.0.is_null() {
-                let _ = BitBlt(hdc, 0, 0, w, h, Some(self.background_dc), 0, 0, SRCCOPY);
-            }
-            // #360: hidden once dragging starts -- the size label next to
-            // the live selection already tells the user what they're doing.
-            // Drawn first, so the selection and its size label stay on top.
-            if !self.dragging {
-                draw_hint(hdc, self.hint_monitor, self.hint_dpi, &colors);
-            }
-            if let Some(rect) = self.visible_rect() {
-                // The selection shows the page undimmed; only the outside
-                // stays dim (#814).
-                if !self.bright_dc.0.is_null() {
-                    let sel = Rect {
-                        left: rect.left.max(0),
-                        top: rect.top.max(0),
-                        right: rect.right.min(w),
-                        bottom: rect.bottom.min(h),
-                    };
-                    if !sel.is_empty() {
-                        let _ = BitBlt(
-                            hdc,
-                            sel.left,
-                            sel.top,
-                            sel.width(),
-                            sel.height(),
-                            Some(self.bright_dc),
-                            sel.left,
-                            sel.top,
-                            SRCCOPY,
-                        );
-                    }
+            if !hdc.0.is_null() && w > 0 && h > 0 {
+                // Double-buffered: everything is drawn off screen and copied
+                // once, so the selection never shows dim for a moment while
+                // it is dragged (#814). If the buffer cannot be made, draw
+                // straight to the window as before.
+                let mem_dc = CreateCompatibleDC(Some(hdc));
+                let bmp = if mem_dc.0.is_null() {
+                    HBITMAP(std::ptr::null_mut())
+                } else {
+                    CreateCompatibleBitmap(hdc, w, h)
+                };
+                if mem_dc.0.is_null() || bmp.0.is_null() {
+                    self.paint_into(hdc, w, h, &colors);
+                } else {
+                    let old = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+                    self.paint_into(mem_dc, w, h, &colors);
+                    let _ = BitBlt(hdc, 0, 0, w, h, Some(mem_dc), 0, 0, SRCCOPY);
+                    SelectObject(mem_dc, old);
                 }
-                draw_selection(hdc, rect, self.hint_dpi, &colors);
+                if !bmp.0.is_null() {
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                }
+                if !mem_dc.0.is_null() {
+                    let _ = DeleteDC(mem_dc);
+                }
             }
 
             let _ = EndPaint(self.hwnd, &ps);
+        }
+    }
+
+    /// Draws the whole overlay (`w` x `h`, client space) into `hdc`.
+    unsafe fn paint_into(&self, hdc: HDC, w: i32, h: i32, colors: &OverlayColors) {
+        if !self.background_dc.0.is_null() {
+            let _ = BitBlt(hdc, 0, 0, w, h, Some(self.background_dc), 0, 0, SRCCOPY);
+        }
+        // #360: hidden once dragging starts -- the size label next to
+        // the live selection already tells the user what they're doing.
+        // Drawn first, so the selection and its size label stay on top.
+        if !self.dragging {
+            draw_hint(hdc, self.hint_monitor, self.hint_dpi, colors);
+        }
+        if let Some(rect) = self.visible_rect() {
+            // The selection shows the page undimmed; only the outside
+            // stays dim (#814).
+            if !self.bright_dc.0.is_null() {
+                let sel = Rect {
+                    left: rect.left.max(0),
+                    top: rect.top.max(0),
+                    right: rect.right.min(w),
+                    bottom: rect.bottom.min(h),
+                };
+                if !sel.is_empty() {
+                    let _ = BitBlt(
+                        hdc,
+                        sel.left,
+                        sel.top,
+                        sel.width(),
+                        sel.height(),
+                        Some(self.bright_dc),
+                        sel.left,
+                        sel.top,
+                        SRCCOPY,
+                    );
+                }
+            }
+            let bounds = Rect {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            draw_selection(hdc, rect, self.hint_dpi, colors, bounds);
         }
     }
 
@@ -1315,9 +1355,10 @@ fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
 /// Where the size label pill goes: `text_w` wide plus padding, above the
 /// selection's top-left corner with a small gap, scaled to `dpi` like the
 /// hint (#742). A selection at the very top has no room above, so the pill
-/// goes just inside it instead of off the window. Pure, so it is tested
+/// goes just inside it instead of off the window, and the pill is clamped to
+/// `bounds` on the right and bottom too. Pure, so it is tested
 /// without a DC.
-pub fn size_label_rect(selection: Rect, text_w: i32, dpi: u32) -> RECT {
+pub fn size_label_rect(selection: Rect, text_w: i32, dpi: u32, bounds: Rect) -> RECT {
     let height = scale_for_dpi(LABEL_HEIGHT_DP, dpi);
     let gap = scale_for_dpi(LABEL_GAP_DP, dpi);
     let width = text_w.max(0) + 2 * scale_for_dpi(LABEL_PAD_X_DP, dpi);
@@ -1327,15 +1368,18 @@ pub fn size_label_rect(selection: Rect, text_w: i32, dpi: u32) -> RECT {
     } else {
         selection.top + gap
     };
+    // Keep the whole pill inside the window on every side.
+    let left = selection.left.min(bounds.right - width).max(bounds.left);
+    let top = top.min(bounds.bottom - height).max(bounds.top);
     RECT {
-        left: selection.left,
+        left,
         top,
-        right: selection.left + width,
+        right: left + width,
         bottom: top + height,
     }
 }
 
-unsafe fn draw_selection(hdc: HDC, rect: Rect, dpi: u32, colors: &OverlayColors) {
+unsafe fn draw_selection(hdc: HDC, rect: Rect, dpi: u32, colors: &OverlayColors, bounds: Rect) {
     // Two-tone outline: a thin edge ink either side of the light line, so it
     // reads on a white page and on a black one (#814).
     let line = scale_for_dpi(OUTLINE_WIDTH_DP, dpi).max(1);
@@ -1361,7 +1405,7 @@ unsafe fn draw_selection(hdc: HDC, rect: Rect, dpi: u32, colors: &OverlayColors)
     let wide: Vec<u16> = label.encode_utf16().collect();
     let mut extent = windows::Win32::Foundation::SIZE::default();
     let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &wide, &mut extent);
-    let pill = size_label_rect(rect, extent.cx, dpi);
+    let pill = size_label_rect(rect, extent.cx, dpi, bounds);
 
     // A solid pill like the hint's, so the size reads on any page.
     let brush = CreateSolidBrush(COLORREF(colors.hint_fill));
@@ -2688,21 +2732,31 @@ mod tests {
     #[test]
     fn the_size_label_pill_scales_with_dpi_and_stays_on_screen() {
         let sel = monitor_rect(300, 200, 700, 420);
-        let at96 = size_label_rect(sel, 60, 96);
+        let screen = monitor_rect(0, 0, 1000, 800);
+        let at96 = size_label_rect(sel, 60, 96, screen);
         // 24 tall, 4 off the outline, text plus 8 either side.
         assert_eq!(
             (at96.left, at96.top, at96.right, at96.bottom),
             (300, 172, 376, 196)
         );
-        let at240 = size_label_rect(sel, 150, 240);
+        let at240 = size_label_rect(sel, 150, 240, monitor_rect(0, 0, 2000, 1600));
         assert_eq!(at240.bottom - at240.top, 60);
         assert_eq!(at240.right - at240.left, 150 + 40);
         assert_eq!(sel.top - at240.bottom, 10);
         // A selection at the very top keeps its label inside the window,
         // just under the outline.
-        let top = size_label_rect(monitor_rect(0, 0, 100, 100), 60, 240);
+        let top = size_label_rect(
+            monitor_rect(0, 0, 100, 100),
+            60,
+            240,
+            monitor_rect(0, 0, 400, 400),
+        );
         assert!(top.top >= 0 && top.bottom > top.top);
         assert!(top.top > 0, "inside the selection, off the outline");
+        // A selection at the right or bottom edge keeps the pill on screen.
+        let right = size_label_rect(monitor_rect(950, 780, 1000, 800), 60, 96, screen);
+        assert!(right.right <= 1000 && right.bottom <= 800, "{right:?}");
+        assert!(right.left >= 0 && right.top >= 0);
     }
 
     #[test]
@@ -2764,6 +2818,7 @@ mod tests {
                 },
                 96,
                 &overlay_colors(Theme::Light, &HC_BLACK),
+                monitor_rect(0, 0, 16, 16),
             );
 
             SelectObject(hdc, old_bitmap);
