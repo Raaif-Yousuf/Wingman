@@ -2033,9 +2033,21 @@ impl CardInner {
     /// answer stays on screen.
     fn copy_activated(&mut self) {
         let text = answer_clipboard_text(&self.headline, &self.detail);
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-            Ok(()) => self.mark_copied(),
-            Err(_) => self.mark_copy_failed(),
+        // Decision (#716): the answer came from the user's screen, so it is
+        // kept out of the cloud clipboard, but stays in local Win+V history.
+        // If the exclusion cannot be written, fall back to a plain copy so
+        // the card never says "failed" when the text is on the clipboard.
+        use arboard::SetExtWindows;
+        let copied = arboard::Clipboard::new()
+            .and_then(|mut c| c.set().exclude_from_cloud().text(text.clone()))
+            .is_ok()
+            || arboard::Clipboard::new()
+                .and_then(|mut c| c.set_text(text))
+                .is_ok();
+        if copied {
+            self.mark_copied();
+        } else {
+            self.mark_copy_failed();
         }
     }
 
