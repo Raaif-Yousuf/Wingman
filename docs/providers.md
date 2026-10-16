@@ -273,8 +273,11 @@ through `provider/common.rs::post_json` / `post_json_with` (issue #98). Ollama u
 a different helper (`post_json_with_connect_timeout`) with no retry policy,
 since a local server has no rate limit to retry against.
 
-- A transport error (DNS, connect, timeout, dropped connection) or an HTTP
-  5xx is retried up to `RetryPolicy::max_retries` (2) times with full-jitter
+- A request that timed out after the connection was made is **never**
+  retried (#727): the vendor may already have processed and billed it. Only
+  failures that prove nothing was sent (DNS, connect, a DNS or connect
+  timeout) are retried, along with an HTTP 5xx.
+- A transport error that proves nothing was sent, or an HTTP 5xx, is retried up to `RetryPolicy::max_retries` (2) times with full-jitter
   exponential backoff (`base_delay` 200ms), capped at `max_total_backoff`
   (3 seconds) of cumulative sleep across all retries for one call.
 - An HTTP 429 is retried **exactly once**, sleeping the server's own

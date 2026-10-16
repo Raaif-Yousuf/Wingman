@@ -137,6 +137,22 @@ pub(crate) enum TransportError {
     /// fresh attempt -- it surfaces immediately, naming the status that was
     /// received, so the card is honest about what's known to have happened.
     BodyReadFailed { status: u16, error: String },
+    /// #727: the request timed out somewhere after the connection was made,
+    /// so the vendor may have received it and may already have billed it.
+    /// Never retried: a second send could be a second charge.
+    TimedOut(String),
+}
+
+/// #727: true when this send failure proves nothing reached the vendor, so a
+/// retry cannot bill twice. Only a DNS or connect timeout qualifies; any
+/// other timeout (global, send, waiting for the response) may have come
+/// after the request was delivered. Non-timeout failures (refused, TLS,
+/// unknown host) happen before the body is sent and stay retryable.
+fn is_provably_unsent(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Timeout(t) => matches!(t, ureq::Timeout::Resolve | ureq::Timeout::Connect),
+        _ => true,
+    }
 }
 
 pub(crate) trait Transport {
@@ -177,7 +193,13 @@ impl Transport for UreqTransport {
             .timeout_global(Some(timeout))
             .build()
             .send_json(body)
-            .map_err(|e| TransportError::NoResponse(e.to_string()))?;
+            .map_err(|e| {
+                if is_provably_unsent(&e) {
+                    TransportError::NoResponse(e.to_string())
+                } else {
+                    TransportError::TimedOut(e.to_string())
+                }
+            })?;
 
         // A status was received from here on -- any further failure is
         // `BodyReadFailed`, never folded back into `NoResponse` (#187).
@@ -582,6 +604,14 @@ pub(crate) fn post_json_with(
                     redact_detail(&error)
                 ));
             }
+            // #727: the request may have arrived and been billed; a second
+            // send could charge again, so this surfaces as a card at once.
+            Err(TransportError::TimedOut(e)) => {
+                return Err(anyhow!(
+                    "{tag}: the request timed out and was not sent again, in case it was already processed: {}",
+                    redact_detail(&e)
+                ));
+            }
             Err(TransportError::NoResponse(transport_err)) => {
                 let backoff_remaining = policy.max_total_backoff.saturating_sub(backoff_spent);
                 if retries < policy.max_retries
@@ -690,6 +720,16 @@ fn log_attempt(
             0,
             egress::Outcome::Failure,
             Some(&format!("transport error: {e}")),
+        ),
+        Err(TransportError::TimedOut(e)) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            0,
+            egress::Outcome::Failure,
+            Some(&format!("timed out: {e}")),
         ),
         Err(TransportError::BodyReadFailed { status, error }) => egress::build_entry(
             tag,
@@ -1586,6 +1626,12 @@ mod tests {
         })
     }
 
+    /// A scripted #727 failure: the request timed out after it may have
+    /// reached the vendor.
+    fn timed_out(msg: &str) -> std::result::Result<RawResponse, TransportError> {
+        Err(TransportError::TimedOut(msg.to_string()))
+    }
+
     /// A scripted #187 failure: a status was received, then reading the
     /// body failed.
     fn body_read_failed(
@@ -2095,6 +2141,52 @@ mod tests {
         assert_eq!(transport.call_count(), 1);
         assert!(sleeper.recorded().is_empty());
         assert!(err.to_string().contains("500"));
+    }
+
+    #[test]
+    fn a_timeout_is_never_retried_because_the_vendor_may_have_billed_it() {
+        let _g = network_guard();
+        // #727: a timeout does not prove the request never arrived, so a
+        // second send could be a second billed completion.
+        let transport = ScriptedTransport::new(vec![timed_out("timeout: global"), ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+
+        let err = run(&transport, &sleeper, &clock).unwrap_err();
+
+        assert_eq!(transport.call_count(), 1);
+        assert!(sleeper.recorded().is_empty());
+        let text = err.to_string();
+        assert!(text.contains("timed out"), "{text}");
+        assert!(!text.contains('\u{2014}'), "{text}");
+    }
+
+    #[test]
+    fn the_real_transport_reports_a_silent_server_as_timed_out() {
+        // The wiring check for #727: a server that accepts and never answers
+        // must come back as `TimedOut` from the real `ureq` transport, not
+        // `NoResponse`, or the retry loop would send the request again.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let result = UreqTransport.post_json(&url, &[], &json!({}), Duration::from_millis(300));
+        drop(listener);
+        assert!(matches!(result, Err(TransportError::TimedOut(_))));
+    }
+
+    #[test]
+    fn only_a_resolve_or_connect_timeout_counts_as_provably_unsent() {
+        use ureq::Timeout;
+        assert!(is_provably_unsent(&ureq::Error::Timeout(Timeout::Resolve)));
+        assert!(is_provably_unsent(&ureq::Error::Timeout(Timeout::Connect)));
+        assert!(!is_provably_unsent(&ureq::Error::Timeout(Timeout::Global)));
+        assert!(!is_provably_unsent(&ureq::Error::Timeout(
+            Timeout::RecvResponse
+        )));
+        assert!(!is_provably_unsent(&ureq::Error::Timeout(
+            Timeout::SendBody
+        )));
+        // Any non-timeout failure keeps the existing behaviour (retryable).
+        assert!(is_provably_unsent(&ureq::Error::HostNotFound));
     }
 
     #[test]
