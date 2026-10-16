@@ -888,6 +888,17 @@ pub(crate) mod tests {
     /// screenshot this test can run the real OCR pipeline over without a
     /// live screen capture. Test-only; not reachable from production code.
     pub(crate) unsafe fn render_gdi_text_rgba(text: &str, width: u32, height: u32) -> Vec<u8> {
+        render_gdi_text_rgba_styled(text, width, height, 40, "Segoe UI")
+    }
+
+    /// As [`render_gdi_text_rgba`] with a chosen font pixel height and face.
+    pub(crate) unsafe fn render_gdi_text_rgba_styled(
+        text: &str,
+        width: u32,
+        height: u32,
+        font_px: i32,
+        face: &str,
+    ) -> Vec<u8> {
         use windows::Win32::Foundation::{COLORREF, RECT};
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
@@ -929,8 +940,9 @@ pub(crate) mod tests {
         FillRect(hdc, &rect, white);
         let _ = DeleteObject(white.into());
 
+        let face_w: Vec<u16> = face.encode_utf16().chain(Some(0)).collect();
         let hfont = CreateFontW(
-            -40,
+            -font_px,
             0,
             0,
             0,
@@ -943,7 +955,7 @@ pub(crate) mod tests {
             CLIP_DEFAULT_PRECIS,
             DEFAULT_QUALITY,
             DEFAULT_PITCH.0 as u32,
-            windows::core::w!("Segoe UI"),
+            windows::core::PCWSTR(face_w.as_ptr()),
         );
         let old_font = SelectObject(hdc, hfont.into());
         SetTextColor(hdc, COLORREF(0x0000_0000));
@@ -971,6 +983,52 @@ pub(crate) mod tests {
             rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
         }
         rgba
+    }
+
+    /// Issue #507: Windows OCR drops a whole line that holds a word of four
+    /// or more consecutive `1` glyphs (`4111 1111 1111 1111`, `1111`).
+    ///
+    /// MEASURED 2026-10-16 (Segoe UI, Arial and Consolas at 14, 20 and 40 px,
+    /// 900x160, only the `en-US` pack installed): every line with a `1111`
+    /// word came back as zero lines, the rest of the line (`Card`) included.
+    /// `Card 111` and `Card 4222 2222 2222 2222`, `5555 5555 5555 4444`,
+    /// `4000 0000 0000 0000`, `0000 0000 0000 0000` and `4242 4242 4242 4242`
+    /// were all read. `llll` and `IIII` drop in Segoe UI (Arial 20 px read `llll` as `lill`). Resizing (x0.5 to x3, each
+    /// axis alone or both), blur, inversion, shear, bolding, thinning and
+    /// noise did not bring the line back. A crop that cut the run (`Card 4111
+    /// 11`) was read. So the engine rejects the line itself and no
+    /// preprocessing of the whole image recovers it. This test asserts the
+    /// measured behaviour so a Windows update that changes it shows up.
+    /// `cargo test ocr_live_card_number -- --ignored --nocapture`
+    #[test]
+    #[ignore = "live WinRT OCR (issue #507); run manually, see this test's doc comment"]
+    fn ocr_live_card_number_ones_run_is_dropped() {
+        let _g = PREF_TEST_LOCK.lock().unwrap();
+        set_preferred_language("auto");
+        let read = |t: &str, font_px: i32, face: &str| -> String {
+            let (w, h) = (900u32, 160u32);
+            let rgba = unsafe { render_gdi_text_rgba_styled(t, w, h, font_px, face) };
+            let out = recognize(&rgba, w, h, Duration::from_secs(15)).expect("recognize");
+            serialize_lines(&out.lines)
+        };
+        for face in ["Segoe UI", "Arial", "Consolas"] {
+            for px in [14, 20, 40] {
+                for t in ["Card 4111 1111 1111 1111", "Card 1111"] {
+                    let got = read(t, px, face);
+                    println!("MEASURED 2026-10-16: {face} {px}px {t:?} -> {got:?}");
+                    assert_eq!(got, "", "{face} {px}px {t:?}: engine behaviour changed");
+                }
+                for t in [
+                    "Card 111",
+                    "Card 4222 2222 2222 2222",
+                    "Card 4539 1488 0343 6467",
+                ] {
+                    let got = read(t, px, face);
+                    println!("MEASURED 2026-10-16: {face} {px}px {t:?} -> {got:?}");
+                    assert!(got.to_lowercase().starts_with("card"), "{t:?} -> {got:?}");
+                }
+            }
+        }
     }
 
     /// Issue #111 hand check: lists the installed packs, then asks for a
