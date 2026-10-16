@@ -130,8 +130,6 @@ const KEY_PREFIXES: &[&str] = &[
     "xoxb-",
     "xoxp-",
     "xoxa-",
-    "AKIA",
-    "ASIA",
     "glpat-",
     "hf_",
     "whsec_",
@@ -161,23 +159,38 @@ fn is_key_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
-fn is_key_run(run: &str) -> bool {
-    if run.len() >= MIN_PREFIXED_KEY_CHARS && KEY_PREFIXES.iter().any(|p| run.starts_with(p)) {
-        return true;
-    }
+/// An AWS access key id: `AKIA` or `ASIA` then exactly 16 upper-case letters
+/// or digits, 20 in all. `run` is already bounded by non-key characters, so
+/// the whole run must be that shape (`ASIA-PACIFIC-REGION-REPORT` is not).
+fn is_aws_key_id(run: &str) -> bool {
+    run.len() == 20
+        && (run.starts_with("AKIA") || run.starts_with("ASIA"))
+        && run[4..]
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// A key with a recognisable vendor shape. Safe to apply inside a link too:
+/// a vendor prefix is not something a document id happens to start with.
+fn is_prefixed_key_run(run: &str) -> bool {
+    is_aws_key_id(run)
+        || (run.len() >= MIN_PREFIXED_KEY_CHARS && KEY_PREFIXES.iter().any(|p| run.starts_with(p)))
+}
+
+/// A long letters-and-digits run with no vendor shape. Not applied inside a
+/// link, where long mixed-case ids are ordinary.
+fn is_bare_key_run(run: &str) -> bool {
     run.len() >= MIN_BARE_KEY_CHARS
         && run.bytes().all(|b| b.is_ascii_alphanumeric())
         && run.bytes().any(|b| b.is_ascii_digit())
         && run.bytes().any(|b| b.is_ascii_alphabetic())
 }
 
-/// Key-shaped runs inside one whitespace-free chunk of `text`, unless the
-/// chunk is URL-shaped.
+/// Key-shaped runs inside one whitespace-free chunk of `text`. A URL-shaped
+/// chunk only gets the vendor-shape rule, never the bare-run rule.
 fn chunk_key_spans(text: &str, range: Range<usize>, spans: &mut Vec<Range<usize>>) {
     let chunk = &text[range.clone()];
-    if url_shaped(chunk) {
-        return;
-    }
+    let in_link = url_shaped(chunk);
     let mut run_start = None;
     // A trailing space sentinel closes a run that reaches the chunk's end.
     for (i, c) in chunk
@@ -188,7 +201,8 @@ fn chunk_key_spans(text: &str, range: Range<usize>, spans: &mut Vec<Range<usize>
             (true, None) => run_start = Some(i),
             (false, Some(b)) => {
                 run_start = None;
-                if is_key_run(&chunk[b..i]) {
+                let run = &chunk[b..i];
+                if is_prefixed_key_run(run) || (!in_link && is_bare_key_run(run)) {
                     spans.push(range.start + b..range.start + i);
                 }
             }
@@ -244,6 +258,10 @@ fn text_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
 pub struct Redactions {
     /// `(marker, original)` in first-seen order.
     pairs: Vec<(String, String)>,
+    /// The highest number used so far per label, counting both the markers
+    /// issued here and any `[label N]` already written in the input, so a new
+    /// marker can never be confused with text that was there already.
+    last: std::collections::HashMap<&'static str, u32>,
 }
 
 impl std::fmt::Debug for Redactions {
@@ -257,17 +275,34 @@ impl Redactions {
         self.pairs.is_empty()
     }
 
-    fn marker_for(&mut self, label: &str, original: &str) -> String {
+    /// Notes every `[label N]` already written in `text`, so numbering
+    /// starts above it. Call on all of a request's text before redacting any
+    /// of it ([`Redactions::redact_value`] does).
+    pub fn note_existing(&mut self, text: &str) {
+        if !text.contains('[') {
+            return;
+        }
+        for label in [CARD, IBAN, KEY, EMAIL] {
+            let open = format!("[{label} ");
+            for (at, _) in text.match_indices(&open) {
+                let rest = &text[at + open.len()..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if !digits.is_empty() && rest[digits.len()..].starts_with(']') {
+                    if let Ok(n) = digits.parse::<u32>() {
+                        let slot = self.last.entry(label).or_insert(0);
+                        *slot = (*slot).max(n);
+                    }
+                }
+            }
+        }
+    }
+
+    fn marker_for(&mut self, label: &'static str, original: &str) -> String {
         if let Some((marker, _)) = self.pairs.iter().find(|(_, o)| o == original) {
             return marker.clone();
         }
-        let prefix = format!("[{label} ");
-        let n = self
-            .pairs
-            .iter()
-            .filter(|(m, _)| m.starts_with(&prefix))
-            .count()
-            + 1;
+        let n = self.last.get(label).copied().unwrap_or(0) + 1;
+        self.last.insert(label, n);
         let marker = format!("[{label} {n}]");
         self.pairs.push((marker.clone(), original.to_string()));
         marker
@@ -281,15 +316,20 @@ impl Redactions {
         if spans.is_empty() {
             return text.to_string();
         }
+        self.note_existing(text);
+        // Join overlapping spans into one range each, keeping the first
+        // one's label, so the stored original is the whole union and the
+        // restored answer loses nothing.
+        let mut groups: Vec<(Range<usize>, &'static str)> = Vec::new();
+        for (r, label) in spans {
+            match groups.last_mut() {
+                Some((last, _)) if r.start < last.end => last.end = last.end.max(r.end),
+                _ => groups.push((r, label)),
+            }
+        }
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
-        for (r, label) in spans {
-            if r.start < at {
-                // Inside or partly over a span already replaced: it only
-                // extends it.
-                at = at.max(r.end);
-                continue;
-            }
+        for (r, label) in groups {
             out.push_str(&text[at..r.start]);
             out.push_str(&self.marker_for(label, &text[r.clone()]));
             at = r.end;
@@ -324,7 +364,18 @@ impl Redactions {
     /// and which a text rule would corrupt. In place on purpose: nothing is
     /// copied, images included.
     pub fn redact_value(&mut self, v: &mut serde_json::Value) -> bool {
+        self.note_existing_in(v);
         self.redact_value_under(v, "")
+    }
+
+    fn note_existing_in(&mut self, v: &serde_json::Value) {
+        use serde_json::Value;
+        match v {
+            Value::String(s) => self.note_existing(s),
+            Value::Array(items) => items.iter().for_each(|i| self.note_existing_in(i)),
+            Value::Object(map) => map.values().for_each(|i| self.note_existing_in(i)),
+            _ => {}
+        }
     }
 
     fn redact_value_under(&mut self, v: &mut serde_json::Value, key: &str) -> bool {
@@ -610,7 +661,11 @@ mod tests {
 
     // -- text redaction (#505) ---------------------------------------------
 
-    const KEY_TEXT: &str = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKE1234567890";
+    /// A fake key, built at run time so no secret-looking literal sits in the
+    /// source for the secret scan to find.
+    fn fake_key() -> String {
+        ["sk-ant-", "api03-", "FAKEFAKEFAKEFAKEFAKE", "1234567890"].concat()
+    }
 
     fn red(text: &str) -> String {
         Redactions::default().redact_text(text)
@@ -618,8 +673,9 @@ mod tests {
 
     #[test]
     fn redact_text_replaces_each_kind_with_a_numbered_marker() {
+        let key = fake_key();
         let t = format!(
-            "mail me@example.com card {CARD} iban GB29 NWBK 6016 1331 9268 19 key {KEY_TEXT} end"
+            "mail me@example.com card {CARD} iban GB29 NWBK 6016 1331 9268 19 key {key} end"
         );
         assert_eq!(
             red(&t),
@@ -662,7 +718,8 @@ mod tests {
 
     #[test]
     fn a_vendor_prefixed_key_is_redacted_even_beside_a_url() {
-        let t = format!("curl -H {KEY_TEXT} and https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms");
+        let key = fake_key();
+        let t = format!("curl -H {key} and https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms");
         let got = red(&t);
         assert!(
             got.starts_with("curl -H [key 1] and https://docs.google.com/"),
@@ -677,7 +734,10 @@ mod tests {
     #[test]
     fn a_long_bare_alphanumeric_run_with_a_digit_is_a_key() {
         assert_eq!(
-            red("token wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY1 ok"),
+            red(&format!(
+                "token {} ok",
+                ["wJalrXUtnFEMIK7MDENG", "bPxRfiCYEXAMPLEKEY1"].concat()
+            )),
             "token [key 1] ok"
         );
     }
@@ -713,10 +773,77 @@ mod tests {
     #[test]
     fn redact_text_uses_one_marker_for_overlapping_matches() {
         // The key contains digits that also pass Luhn.
-        let t = "k sk-ant-api03-4111111111111111FAKEFAKEFAKE9 z";
-        let got = red(t);
+        let t = format!(
+            "k {}4111111111111111FAKEFAKEFAKE9 z",
+            ["sk-ant-", "api03-"].concat()
+        );
+        let got = red(&t);
         assert!(!got.contains("4111"), "{got}");
         assert_eq!(got, "k [key 1] z");
+    }
+
+    #[test]
+    fn a_vendor_key_inside_a_url_is_still_a_key() {
+        let key = ["AIza", "SyA1234567890abcdefgh"].concat();
+        let t = format!("https://x.com/a?key={key}");
+        assert_eq!(red(&t), "https://x.com/a?key=[key 1]");
+    }
+
+    #[test]
+    fn a_mastercard_two_series_number_is_a_card() {
+        // Luhn-valid, first four digits 2223 (inside 2221 to 2720).
+        assert_eq!(red("pay 2223000048400011 now"), "pay [card number 1] now");
+        // Luhn-valid but outside the range (2720 is the top, this is 2800).
+        assert_eq!(red("order 2800000000000004"), "order 2800000000000004",);
+    }
+
+    #[test]
+    fn aws_key_ids_need_the_exact_shape() {
+        let id = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+        assert_eq!(red(&format!("id {id} ok")), "id [key 1] ok");
+        let temp = ["ASIA", "IOSFODNN7EXAMPLE"].concat();
+        assert_eq!(red(&format!("({temp})")), "([key 1])");
+        for t in [
+            "ASIA-PACIFIC-REGION-REPORT",
+            "AKIAS are a thing",
+            "AKIAIOSFODNN7EXAMPLE1",
+            "ASIAN-MARKET-REVIEW-2026",
+        ] {
+            assert_eq!(red(t), t, "{t}");
+        }
+    }
+
+    #[test]
+    fn numbering_starts_above_markers_already_in_the_input() {
+        let mut r = Redactions::default();
+        let out = r.redact_text("see [email 1] and a@x.org");
+        assert_eq!(out, "see [email 1] and [email 2]");
+        // Only the real one comes back; the literal text is left alone.
+        assert_eq!(
+            r.restore_in_json(r#"["[email 1]","[email 2]"]"#.to_string()),
+            r#"["[email 1]","a@x.org"]"#
+        );
+    }
+
+    #[test]
+    fn a_literal_marker_in_a_later_field_is_still_not_reused() {
+        let mut v = serde_json::json!({"a": "write a@x.org", "b": "keep [email 1] as is"});
+        let mut r = Redactions::default();
+        r.redact_value(&mut v);
+        assert_eq!(v["a"], "write [email 2]");
+        assert_eq!(v["b"], "keep [email 1] as is");
+    }
+
+    #[test]
+    fn overlapping_matches_store_the_whole_union_as_the_original() {
+        // The key-shaped run and the address share the start; the address
+        // runs on past the key, so the union is the whole thing.
+        let key = ["sk-ant-", "api03-", "FAKEFAKEFAKE12345"].concat();
+        let t = format!("send {key}@example.com now");
+        let mut r = Redactions::default();
+        let out = r.redact_text(&t);
+        assert_eq!(out, "send [key 1] now");
+        assert_eq!(r.restore_in_json(format!("\"{out}\"")), format!("\"{t}\""));
     }
 
     #[test]

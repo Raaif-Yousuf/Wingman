@@ -1447,6 +1447,80 @@ mod tests {
         assert_eq!(got, "[email 1]");
     }
 
+    /// The remote-Ollama path (`post_json_with_connect_timeout`) talks to
+    /// `ureq` directly, so no fake transport can watch it. This scans the
+    /// non-test source instead: every send that carries a body must redact
+    /// it with [`outbound_body`] and restore the answer. `post_json_read_body`
+    /// is the one allowed exception (a model download request, no user text).
+    #[test]
+    fn every_function_that_posts_a_body_redacts_and_restores_it() {
+        let whole = include_str!("common.rs").replace('\r', "");
+        let code = whole.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+
+        // Top-level functions: a line starting at column 0 with `fn`,
+        // `pub fn` or `pub(crate) fn` runs to the next one.
+        let starts: Vec<usize> = code
+            .match_indices('\n')
+            .map(|(i, _)| i + 1)
+            .filter(|&i| {
+                let line = &code[i..];
+                line.starts_with("fn ")
+                    || line.starts_with("pub fn ")
+                    || line.starts_with("pub(crate) fn ")
+            })
+            .collect();
+        assert!(
+            starts.len() > 10,
+            "the scan found no functions: {}",
+            starts.len()
+        );
+        let body_of = |name: &str| -> Option<&str> {
+            let needle = format!("fn {name}(");
+            let at = starts.iter().position(|&i| {
+                code[i..]
+                    .lines()
+                    .next()
+                    .is_some_and(|l| l.contains(&needle) || l.contains(&format!("fn {name}<")))
+            })?;
+            let i = starts[at];
+            let end = code[i..].find("\n}\n").map_or(code.len(), |e| i + e + 3);
+            Some(&code[i..end])
+        };
+
+        // The candidate set must not be empty, or this proves nothing.
+        let posters: Vec<&str> = starts
+            .iter()
+            .filter_map(|&i| {
+                let end = code[i..].find("\n}\n").map_or(code.len(), |e| i + e + 3);
+                let f = &code[i..end];
+                f.contains("ureq::post(").then_some(f)
+            })
+            .collect();
+        assert!(
+            !posters.is_empty(),
+            "no function posting through ureq was found"
+        );
+        for f in posters {
+            let header = f.lines().next().unwrap_or_default();
+            if header.contains("post_json_read_body") {
+                continue;
+            }
+            assert!(
+                f.contains("outbound_body(") && f.contains("restore_in_json("),
+                "this function posts a body without redacting and restoring it: {header}"
+            );
+        }
+
+        for name in ["post_json_with", "post_json_with_connect_timeout"] {
+            let f = body_of(name).unwrap_or_else(|| panic!("{name} not found"));
+            assert!(f.contains("outbound_body("), "{name} must redact its body");
+            assert!(
+                f.contains("restore_in_json("),
+                "{name} must restore the answer"
+            );
+        }
+    }
+
     #[test]
     fn the_egress_log_row_describes_the_redacted_body() {
         // The log sees what was sent, never the original.

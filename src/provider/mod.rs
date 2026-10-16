@@ -329,6 +329,8 @@ fn preview_request(req: &Request, redact: bool) -> std::borrow::Cow<'_, Request>
         return std::borrow::Cow::Borrowed(req);
     }
     let mut redactions = crate::redact::Redactions::default();
+    redactions.note_existing(&req.system);
+    redactions.note_existing(&req.user);
     let system = redactions.redact_text(&req.system);
     let user = redactions.redact_text(&req.user);
     if redactions.is_empty() {
