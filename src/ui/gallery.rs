@@ -72,6 +72,8 @@ pub enum GalleryState {
     CardAnswerDifficultyUltra,
     /// A model answer opened up, so both footer links (Read aloud, Copy) show.
     CardAnswerExpanded,
+    /// The same with the Tab focus rectangle on the first link (#606).
+    CardAnswerFocused,
     CardError,
     /// Issue #354. Replaces the old single glyph-only `CardPending` state:
     /// the pending card now always carries a status line, so each sub-stage
@@ -120,6 +122,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardAnswerDifficultyHigh,
         CardAnswerDifficultyUltra,
         CardAnswerExpanded,
+        CardAnswerFocused,
         CardError,
         CardPendingReadingSelection,
         CardPendingAskingModelShort,
@@ -152,6 +155,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardAnswerDifficultyHigh => "card-answer-difficulty-high",
         CardAnswerDifficultyUltra => "card-answer-difficulty-ultra",
         CardAnswerExpanded => "card-answer-expanded",
+        CardAnswerFocused => "card-answer-focused",
         CardError => "card-error",
         CardPendingReadingSelection => "card-pending-reading-selection",
         CardPendingAskingModelShort => "card-pending-asking-model-short",
@@ -459,7 +463,7 @@ mod driver {
                     Some(Difficulty::Ultra),
                 );
             }
-            CardAnswerExpanded => {
+            CardAnswerExpanded | CardAnswerFocused => {
                 card.hide();
                 palette.hide();
                 card.show_model_answer(
@@ -469,6 +473,9 @@ mod driver {
                     Some(Difficulty::Level(5)),
                 );
                 card.expand_for_gallery();
+                if state == CardAnswerFocused {
+                    card.focus_first_link_for_gallery();
+                }
             }
             CardError => {
                 card.hide();
@@ -761,9 +768,10 @@ mod tests {
         let states = gallery_states();
         // 5 card-answer variants (short + 4 difficulty badges) + error + 4
         // pending sub-stages (#354) + 3 previews (calendar, long labels,
-        // the error title) + the expanded answer = 14 card states, + 4
-        // palette states + 4 settings states (#560) + the region overlay (#580) = 23.
-        assert_eq!(states.len(), 23);
+        // the error title) + the expanded answer, with and without link
+        // focus = 15 card states, + 4 palette states + 4 settings states
+        // (#560) + the region overlay (#580) = 24.
+        assert_eq!(states.len(), 24);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
