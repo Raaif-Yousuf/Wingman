@@ -4,7 +4,7 @@
 //! Nothing here needs new plumbing. The model fills the same `table` proposal
 //! as "Table to CSV" (#69) with a fixed header and a single row; the preview
 //! card shows that row, and "Do it" runs the `clipboard` executor, which writes
-//! it through [`super::table`]'s quoting and spreadsheet-formula guard. A
+//! it through [`super::table`]'s tab-separated quoting and spreadsheet-formula guard. A
 //! merchant name read off a hostile receipt cannot run as a formula.
 
 use super::{Action, InputKind, Prefer};
@@ -82,10 +82,46 @@ fn check_cell(column: usize, cell: &str) -> (String, bool) {
     }
 }
 
+const MONTHS: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+
+/// A month name and a day with no year, in either order (`Oct 3`, `3 Oct`,
+/// `October 3rd`). The prompt asks for a date exactly as printed when the
+/// receipt shows no year, so this form is expected and kept as it is.
+fn is_yearless_date(cell: &str) -> bool {
+    let words: Vec<&str> = cell
+        .split(|c: char| c.is_whitespace() || c == ',' || c == '.')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let [a, b] = words.as_slice() else {
+        return false;
+    };
+    let month = |w: &str| {
+        let w = w.to_ascii_lowercase();
+        w.len() >= 3
+            && w.bytes().all(|b| b.is_ascii_lowercase())
+            && MONTHS.iter().any(|m| w.starts_with(m))
+    };
+    let day = |w: &str| {
+        let digits = w.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        let suffix = w[digits.len()..].to_ascii_lowercase();
+        matches!(digits.len(), 1 | 2)
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && matches!(suffix.as_str(), "" | "st" | "nd" | "rd" | "th")
+            && digits.parse::<u32>().is_ok_and(|d| (1..=31).contains(&d))
+    };
+    (month(a) && day(b)) || (day(a) && month(b))
+}
+
 /// `YYYY-MM-DD`, from a year-first date with `-`, `/` or `.` between the
-/// parts (a time after it is dropped). `None` for anything else, including a
-/// day that the month does not have.
+/// parts (a time after it is dropped). A yearless date such as `Oct 3` is
+/// kept as printed. `None` for anything else, including a day that the month
+/// does not have.
 fn normalise_date(cell: &str) -> Option<String> {
+    if is_yearless_date(cell) {
+        return Some(cell.to_string());
+    }
     let date = cell
         .split_once(['T', ' '])
         .filter(|(_, rest)| rest.starts_with(|c: char| c.is_ascii_digit()))
@@ -114,14 +150,26 @@ fn normalise_date(cell: &str) -> Option<String> {
         .then(|| format!("{y:04}-{m:02}-{d:02}"))
 }
 
-/// Digits and one decimal point, with an optional leading minus. A currency
-/// symbol and spaces are dropped, and so are thousands commas when they sit
+/// Digits and one decimal point, with an optional leading minus. One leading
+/// or trailing currency symbol and spaces are dropped, and so are thousands commas when they sit
 /// exactly between groups of three digits (`1,234.50`). `12,50` could be a
 /// European decimal, so it is not touched. `None` when it is not a number.
 fn normalise_amount(cell: &str) -> Option<String> {
-    let stripped: String = cell
+    const SYMBOLS: [char; 4] = ['$', '\u{20ac}', '\u{a3}', '\u{a5}'];
+    // Only a symbol at the start (after a minus) or the end counts; one in the
+    // middle (`1$2`) means the cell is not a plain amount.
+    let cell = cell.trim();
+    let (neg, cell) = match cell.strip_prefix('-') {
+        Some(rest) => ("-", rest.trim_start()),
+        None => ("", cell),
+    };
+    let cell = match cell.strip_prefix(SYMBOLS) {
+        Some(rest) => rest,
+        None => cell.strip_suffix(SYMBOLS).unwrap_or(cell),
+    };
+    let stripped: String = neg
         .chars()
-        .filter(|c| !c.is_whitespace() && !matches!(c, '$' | '\u{20ac}' | '\u{a3}' | '\u{a5}'))
+        .chain(cell.chars().filter(|c| !c.is_whitespace()))
         .collect();
     let (sign, body) = match stripped.strip_prefix('-') {
         Some(rest) => ("-", rest),
@@ -268,9 +316,9 @@ mod tests {
             "rows": [["2026-10-03", "Cafe Nero, Main St", "12.50", "GBP", "Meals"]]
         });
         assert_eq!(
-            crate::actions::table::csv_from_value(&clamp_receipt(&p)).unwrap(),
-            "Date,Merchant,Amount,Currency,Category\r\n\
-             2026-10-03,\"Cafe Nero, Main St\",12.50,GBP,Meals"
+            crate::actions::table::tsv_from_value(&clamp_receipt(&p)).unwrap(),
+            "Date\tMerchant\tAmount\tCurrency\tCategory\r\n\
+             2026-10-03\tCafe Nero, Main St\t12.50\tGBP\tMeals"
         );
     }
 
@@ -280,7 +328,7 @@ mod tests {
             "columns": COLUMNS,
             "rows": [["2026-10-03", "=HYPERLINK(\"http://x\")", "5.00", "USD", "Other"]]
         });
-        let csv = crate::actions::table::csv_from_value(&clamp_receipt(&p)).unwrap();
+        let csv = crate::actions::table::tsv_from_value(&clamp_receipt(&p)).unwrap();
         assert!(csv.contains("\"'=HYPERLINK("), "{csv}");
     }
 
@@ -288,7 +336,7 @@ mod tests {
     fn no_receipt_is_an_empty_table() {
         let p = clamp_receipt(&json!({"columns": [], "rows": []}));
         assert!(crate::actions::table::is_empty_result("table", &p));
-        assert!(crate::actions::table::csv_from_value(&p).is_none());
+        assert!(crate::actions::table::tsv_from_value(&p).is_none());
         let headers_only = clamp_receipt(&json!({"columns": COLUMNS, "rows": []}));
         assert!(crate::actions::table::is_empty_result(
             "table",
@@ -392,10 +440,51 @@ mod tests {
             assert_eq!(cells(&out)[0], want, "{raw:?}");
             assert!(unchecked_columns(&out).is_empty(), "{raw:?}");
         }
-        for raw in ["Oct 3", "2026-13-01", "2026-02-30", "yesterday"] {
+        for raw in [
+            "2026-13-01",
+            "2026-02-30",
+            "yesterday",
+            "Oct 32",
+            "Oct 3 4 5",
+        ] {
             let out = clamp_receipt(&row([raw, "Cafe", "5", "USD", "Meals"]));
             assert_eq!(cells(&out)[0], raw);
             assert_eq!(unchecked_columns(&out), ["Date"], "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_date_with_no_year_is_kept_as_printed_and_not_flagged() {
+        for raw in ["Oct 3", "3 Oct", "October 3rd", "Oct. 3", "Oct 3,"] {
+            let out = clamp_receipt(&row([raw, "Cafe", "5", "USD", "Meals"]));
+            assert_eq!(cells(&out)[0], raw);
+            assert!(unchecked_columns(&out).is_empty(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_refund_amount_pastes_as_a_number_not_text() {
+        use super::super::table::guard_formula;
+        let out = clamp_receipt(&row(["2026-10-03", "Cafe", "-3.20", "USD", "Meals"]));
+        assert_eq!(cells(&out)[2], "-3.20");
+        assert!(unchecked_columns(&out).is_empty());
+        assert_eq!(guard_formula("-3.20"), "-3.20");
+        for risky in ["=1+1", "+1+1", "@SUM(A1)", "-1+1", "-cmd"] {
+            assert!(guard_formula(risky).starts_with('\''), "{risky:?}");
+        }
+    }
+
+    #[test]
+    fn a_currency_symbol_only_counts_at_the_ends_of_an_amount() {
+        for (raw, want) in [("$12", "12"), ("12\u{20ac}", "12"), ("-$3.20", "-3.20")] {
+            let out = clamp_receipt(&row(["", "", raw, "", ""]));
+            assert_eq!(cells(&out)[2], want, "{raw:?}");
+            assert!(unchecked_columns(&out).is_empty(), "{raw:?}");
+        }
+        for raw in ["1$2", "$$5", "$5$"] {
+            let out = clamp_receipt(&row(["", "", raw, "", ""]));
+            assert_eq!(cells(&out)[2], raw);
+            assert_eq!(unchecked_columns(&out), ["Amount"], "{raw:?}");
         }
     }
 
@@ -404,7 +493,7 @@ mod tests {
         let out = clamp_receipt(&row(["", "", "", "", ""]));
         assert!(unchecked_columns(&out).is_empty());
         assert_eq!(card_note(&out, None), None);
-        let out = clamp_receipt(&row(["Oct 3", "Cafe", "lots", "USD", "Meals"]));
+        let out = clamp_receipt(&row(["yesterday", "Cafe", "lots", "USD", "Meals"]));
         let note = card_note(&out, Some("Footer.")).unwrap();
         assert!(note.contains("Date and Amount"), "{note}");
         assert!(note.ends_with("Footer."), "{note}");

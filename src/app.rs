@@ -405,14 +405,15 @@ struct LastError {
     /// "Couldn't add the event" -- not a separate taxonomy to keep in sync.
     action: String,
     occurred_at: SystemTime,
-    /// Already redacted (#253, `egress::redact_opaque_tokens`) -- this is
-    /// the only place the *original*, non-humanized chain survives at all.
+    /// Already scrubbed (`diagnostics::scrub_error_chain`: key tokens, the
+    /// text redaction and the account name, #253 and #733) -- this is the
+    /// only place the non-humanized chain survives at all.
     chain: String,
 }
 
 /// Issue #425: the exact text "Copy details" puts on the clipboard.
-/// `last_error.chain` is already redacted (#253) at `record_last_error`
-/// time -- this is a plain accessor, not a second redaction pass -- but it
+/// `last_error.chain` is already scrubbed (#253, #733) at the time it is
+/// stored -- this is a plain accessor, not a second pass -- but it
 /// is factored out (rather than inlined in `copy_error_details`) so the
 /// "the redacted chain, and only the redacted chain, is what reaches the
 /// clipboard" guarantee is unit-tested directly, without touching the real
@@ -486,6 +487,13 @@ pub fn run() -> Result<()> {
         let _ = Config::migrate_from(&old_path, &new_path);
     }
     let _ = crate::autostart::remove_old_run_value();
+
+    // #769: delete old calendar files once at startup, on a short-lived
+    // thread (one directory read), so a lone event's file does not wait for
+    // the next "Add to calendar". No timer: nothing runs while idle.
+    let _ = std::thread::Builder::new()
+        .name("ics-startup-sweep".into())
+        .spawn(|| crate::connectors::IcsConnector::new().sweep_stale());
 
     let config = Config::load().unwrap_or_default();
     // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
@@ -643,7 +651,9 @@ pub fn run() -> Result<()> {
         app.last_error = Some(LastError {
             action: headline.clone(),
             occurred_at: SystemTime::now(),
-            chain,
+            // #733: the note is text from a previous run, scrubbed like any
+            // other error before it can be pasted into a bug report.
+            chain: crate::diagnostics::scrub_error_chain_here(&chain),
         });
         app.card.show_error_with_details(&headline, &detail);
     }
@@ -1457,15 +1467,32 @@ impl App {
         self.palette.set_router_pending(generation);
 
         std::thread::spawn(move || {
-            let result: std::result::Result<router::RouterResult, String> = catch_worker(|| {
-                router_worker(&providers, mode, &mut raw, redact, &candidates).map_err(|e| {
-                    let chain_text = worker_error_chain_text(&e);
-                    pack_error(
-                        &human_error_detail(&chain_text),
-                        &crate::egress::redact_opaque_tokens(&chain_text),
-                    )
-                })
+            // The call runs on its own thread so the wait can be capped: past
+            // `ROUTER_WALL_CLOCK` the placeholder is cleared and the late
+            // answer, if any, is dropped with the channel.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result: std::result::Result<router::RouterResult, String> =
+                    catch_worker(|| {
+                        router_worker(&providers, mode, &mut raw, redact, &candidates).map_err(
+                            |e| {
+                                let chain_text = worker_error_chain_text(&e);
+                                pack_error(
+                                    &human_error_detail(&chain_text),
+                                    &crate::egress::redact_opaque_tokens(&chain_text),
+                                )
+                            },
+                        )
+                    });
+                let _ = tx.send(result);
             });
+            let result =
+                router::await_result(&rx, router::ROUTER_WALL_CLOCK).unwrap_or_else(|| {
+                    Err(pack_error(
+                        "The router took too long.",
+                        "router: no answer within the wall-clock cap",
+                    ))
+                });
             let payload = Box::into_raw(Box::new((generation, result)));
             unsafe {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -3306,7 +3333,10 @@ impl App {
         self.last_error = Some(LastError {
             action: action.to_string(),
             occurred_at: SystemTime::now(),
-            chain: crate::egress::redact_opaque_tokens(raw_chain),
+            // #733: also text redaction and the account name, because this
+            // chain is pasted into public bug reports. When the profile
+            // folder cannot be found the name step is skipped, nothing else.
+            chain: crate::diagnostics::scrub_error_chain_here(raw_chain),
         });
     }
 
