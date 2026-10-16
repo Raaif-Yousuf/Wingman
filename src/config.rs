@@ -772,6 +772,7 @@ impl Default for Options {
 
 impl Options {
     /// The clamped limits the router validates a shortlist with.
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub fn router_limits(&self) -> crate::router::RouterLimits {
         crate::router::RouterLimits::new(self.min_confidence, self.max_options)
     }
@@ -1802,6 +1803,7 @@ impl Providers {
     /// Empty for an unrecognized name or a `"compat:<name>"` entry with no
     /// matching `self.compat` config, same "just skip it" behavior as
     /// [`Providers::provider_for_named_model`].
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub(crate) fn models_for(&self, name: &str) -> Vec<String> {
         match Self::known_provider_for(name) {
             Some(KnownProvider::Openai) => self.openai.models.clone(),

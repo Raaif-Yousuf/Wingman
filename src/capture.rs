@@ -141,6 +141,8 @@ pub enum LookupWindow {
     Foreground,
     /// A window remembered earlier (the router capture runs while Wingman's
     /// own palette is in front). 0 means there is none: no fields.
+    #[allow(dead_code)]
+    // #805: no caller until the options card (#307) starts the router again.
     Window(isize),
     /// No lookup: nothing in this request is redacted (the pixels stay on
     /// this machine, or redaction is off), so nobody would use the answer.
