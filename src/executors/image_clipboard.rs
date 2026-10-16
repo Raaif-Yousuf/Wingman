@@ -51,6 +51,17 @@ pub trait ImageClipboardAccess: Send + Sync {
     fn has_any_content(&self) -> bool;
 }
 
+/// Puts an RGBA image (top-down rows, `width * height * 4` bytes) on the
+/// real clipboard as `CF_DIB`. For the card's "copy as image" (#376); the
+/// executor itself goes through the same encoder.
+pub(crate) fn copy_rgba(rgba: &[u8], width: u32, height: u32) -> Result<()> {
+    let expected = (width as usize) * (height as usize) * 4;
+    if width == 0 || height == 0 || rgba.len() != expected {
+        anyhow::bail!("image is {} bytes, expected {expected}", rgba.len());
+    }
+    Win32ImageClipboard.set_dib(&encode_dib(rgba, width, height))
+}
+
 /// The real clipboard, via raw Win32 calls (`arboard`, already a crate
 /// dependency, does not expose a byte-exact `CF_DIB` write on Windows --
 /// this needs the literal format this executor's own tests golden-check).
@@ -308,11 +319,13 @@ mod win32 {
         let _guard = OpenGuard::open()?;
         unsafe { EmptyClipboard() }?;
         let hglobal = alloc_hglobal_bytes(bytes)?;
-        // Ownership transfers to the clipboard on success; must not be
-        // freed here either way -- same reasoning
-        // `inputs::selection::win32::Win32Clipboard::set_formats` documents.
-        unsafe { SetClipboardData(CF_DIB, Some(HANDLE(hglobal.0))) }
-            .map_err(|e| anyhow::anyhow!("SetClipboardData(CF_DIB) failed: {e}"))?;
+        // Ownership transfers to the clipboard on success only. When the call
+        // fails the memory is still ours, so free it (#376 made this
+        // reachable from a key press).
+        if let Err(e) = unsafe { SetClipboardData(CF_DIB, Some(HANDLE(hglobal.0))) } {
+            let _ = unsafe { GlobalFree(Some(hglobal)) };
+            anyhow::bail!("SetClipboardData(CF_DIB) failed: {e}");
+        }
         Ok(())
     }
 }

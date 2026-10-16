@@ -1642,6 +1642,40 @@ impl Providers {
         Chain::new(providers)
     }
 
+    /// #133: whether a first press with no model ready may look for a local
+    /// Ollama and adopt it. Only for a setup the user has not shaped: Cloud
+    /// mode is a choice to use the cloud, an `order` that already names
+    /// Ollama or a compat endpoint (or anything but the stock cloud list) was
+    /// edited on purpose, and a provider that is ready needs no help.
+    pub fn first_run_local_eligible(&self, mode: Mode) -> bool {
+        mode != Mode::Cloud
+            && self.order == Providers::default().order
+            && self
+                .build_chain_for_mode(mode, true)
+                .ready_provider_names()
+                .is_empty()
+    }
+
+    /// #133: makes the local Ollama and `model` the setup. Returns `false`
+    /// (and changes nothing) when it is already so.
+    ///
+    /// `base_url` is the address the probe actually answered on (`localhost`
+    /// already read as `127.0.0.1`), so a hand-typed `localhost` is not saved:
+    /// it stalls every request (AGENTS.md rule 6) and the Offline guard
+    /// refuses it.
+    pub fn adopt_local_model(&mut self, model: &str, base_url: &str) -> bool {
+        let listed = self.order.iter().any(|n| n == "ollama");
+        if listed && self.ollama.model == model && self.ollama.base_url == base_url {
+            return false;
+        }
+        self.ollama.base_url = base_url.to_string();
+        if !listed {
+            self.order.push("ollama".to_string());
+        }
+        self.ollama.model = model.to_string();
+        true
+    }
+
     /// Issue #19: like [`Providers::build_chain`], but `order` is first
     /// filtered and reordered by `mode::select_providers` for `mode`.
     /// `ollama_ready` is the caller's already-computed answer to "is Ollama
@@ -2005,6 +2039,67 @@ win = true
     }
 
     // -- #13: Ollama config ---------------------------------------------
+
+    // -- #133: adopting a local Ollama on first run ------------------------
+
+    #[test]
+    fn first_run_local_adoption_is_for_an_untouched_keyless_setup() {
+        let p = Providers::default();
+        for mode in [Mode::Auto, Mode::Local, Mode::Offline] {
+            assert!(p.first_run_local_eligible(mode), "{mode:?}");
+        }
+        // Cloud mode is a choice to use the cloud: never switched for them.
+        assert!(!p.first_run_local_eligible(Mode::Cloud));
+    }
+
+    #[test]
+    fn first_run_local_adoption_never_overrides_a_choice_the_user_made() {
+        let mut keyed = Providers::default();
+        keyed.openai.api_key = "sk-real".to_string();
+        assert!(!keyed.first_run_local_eligible(Mode::Auto), "a key is set");
+
+        let mut listed = Providers::default();
+        listed.order.push("ollama".to_string());
+        assert!(
+            !listed.first_run_local_eligible(Mode::Auto),
+            "ollama already chosen"
+        );
+
+        let compat = Providers {
+            order: vec!["compat:lmstudio".to_string()],
+            ..Providers::default()
+        };
+        assert!(
+            !compat.first_run_local_eligible(Mode::Auto),
+            "order was edited"
+        );
+    }
+
+    #[test]
+    fn adopting_a_local_model_adds_ollama_and_sets_the_model_once() {
+        let mut p = Providers::default();
+        assert!(p.adopt_local_model("qwen3.5:9b", "http://127.0.0.1:11434"));
+        assert_eq!(p.order.last().map(String::as_str), Some("ollama"));
+        assert_eq!(p.ollama.model, "qwen3.5:9b");
+        assert_eq!(p.order.iter().filter(|n| *n == "ollama").count(), 1);
+        assert!(
+            !p.adopt_local_model("qwen3.5:9b", "http://127.0.0.1:11434"),
+            "second call changes nothing"
+        );
+        assert_eq!(p.order.iter().filter(|n| *n == "ollama").count(), 1);
+        assert!(p
+            .build_chain_for_mode(Mode::Local, true)
+            .ready_provider_names()
+            .contains(&"ollama"));
+    }
+
+    #[test]
+    fn adopting_a_local_model_saves_the_address_that_answered() {
+        let mut p = Providers::default();
+        p.ollama.base_url = "http://localhost:11434".to_string();
+        assert!(p.adopt_local_model("gemma3:4b", "http://127.0.0.1:11434"));
+        assert_eq!(p.ollama.base_url, "http://127.0.0.1:11434");
+    }
 
     #[test]
     fn default_order_does_not_include_ollama() {
