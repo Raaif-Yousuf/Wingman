@@ -314,9 +314,29 @@ pub fn cheapest_router_target(
 /// follow, and it degrades safely (falls back to SOME configured model,
 /// never `None`, unless the list itself is empty).
 fn smallest_model(models: &[String]) -> Option<String> {
-    const CHEAP_MARKERS: [&str; 6] = ["nano", "mini", "haiku", "flash-lite", "flash", "lite"];
+    // Markers are matched as whole name segments, not substrings: "mini" is
+    // inside every "gemini" id. `flash-lite` needs both segments, so it ranks
+    // above plain `flash`.
+    const CHEAP_MARKERS: [&[&str]; 6] = [
+        &["nano"],
+        &["mini"],
+        &["haiku"],
+        &["flash", "lite"],
+        &["flash"],
+        &["lite"],
+    ];
+    let segments = |m: &str| -> Vec<String> {
+        m.to_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .map(str::to_string)
+            .collect()
+    };
     for marker in CHEAP_MARKERS {
-        if let Some(m) = models.iter().find(|m| m.to_lowercase().contains(marker)) {
+        let found = models.iter().find(|m| {
+            let segs = segments(m);
+            marker.iter().all(|w| segs.iter().any(|s| s == w))
+        });
+        if let Some(m) = found {
             return Some(m.clone());
         }
     }
@@ -606,6 +626,29 @@ mod tests {
             cheapest_router_target(&ready, models).unwrap().model,
             "gemini-3.8-flash"
         );
+    }
+
+    #[test]
+    fn smallest_model_does_not_match_mini_inside_gemini_ids() {
+        // A pro model listed first must not win through the "mini" in "gemini".
+        let models = vec![
+            "gemini-3.1-pro-preview".to_string(),
+            "gemini-2.5-pro".to_string(),
+            "gemini-2.5-flash".to_string(),
+        ];
+        assert_eq!(smallest_model(&models).unwrap(), "gemini-2.5-flash");
+        let lite_first = vec![
+            "gemini-3.1-pro-preview".to_string(),
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.5-flash-lite".to_string(),
+        ];
+        assert_eq!(
+            smallest_model(&lite_first).unwrap(),
+            "gemini-2.5-flash-lite"
+        );
+        // Real "mini" and "nano" segments still match.
+        let openai = vec!["gpt-5.4".to_string(), "gpt-5.4-mini".to_string()];
+        assert_eq!(smallest_model(&openai).unwrap(), "gpt-5.4-mini");
     }
 
     #[test]
