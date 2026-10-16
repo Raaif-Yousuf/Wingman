@@ -1082,7 +1082,10 @@ const WIN_W_DP: i32 = 620;
 /// back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout` itself
 /// never overlaps regardless of this constant, but a taller default is nicer
 /// than always squeezing.
-const WIN_H_DP: i32 = 918 + 3 * (ROW_H + ROW_GAP);
+const WIN_H_DP: i32 = 918 + 4 * (ROW_H + ROW_GAP);
+
+/// The one-line hint under the model dropdowns (#427). Plain words, no dash.
+const MODEL_LIST_HINT: &str = "Missing a model? Add its name to models in config.toml.";
 /// The shortest the window is ever made, in dp: the pinned footer and a sliver
 /// of body. It is only a floor against a failed or absurd monitor query (see
 /// `fitted_height_for_work_px`); a real work area is always taller, and a
@@ -3422,6 +3425,11 @@ fn build_ui_recorded(
     if !labels.is_empty() {
         combo_select_index(ollama_model, selected as i32);
     }
+    r.advance();
+
+    // #427: the model dropdowns list what the provider offers (or what is
+    // in config.toml), so say where to add one that is missing.
+    ctx.create(WC_STATIC, MODEL_LIST_HINT, 0, 0, r.x, r.y, r.w, ROW_H, 0);
     r.advance();
 
     let providers_bottom = r.y + ROW_H + 8;
@@ -6122,6 +6130,13 @@ mod tests {
         assert_eq!(combo_index_for_order(&["gemini".to_string()]), 3);
         // CB_GETCURSEL returns -1 for "nothing", read as usize.
         assert_eq!(merge_provider_order(&order, (-1i32) as usize), order);
+    }
+
+    #[test]
+    fn the_model_list_hint_is_one_short_line_without_a_dash() {
+        assert!(MODEL_LIST_HINT.len() <= 60, "it must fit one row");
+        assert!(!MODEL_LIST_HINT.contains('\u{2014}'));
+        assert!(MODEL_LIST_HINT.contains("config.toml"));
     }
 
     #[test]
