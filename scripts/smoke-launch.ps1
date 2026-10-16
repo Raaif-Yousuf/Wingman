@@ -7,8 +7,14 @@
 .DESCRIPTION
   Like scripts/perf-runtime.ps1 this runs the real app, with the real mutex
   and window class names, so it is for a throwaway CI runner and refuses to
-  start when a Wingman is already running. The process gets its own empty
-  APPDATA and LOCALAPPDATA, so it never reads a real config.
+  start when a Wingman is already running. It also refuses to run unless the
+  CI environment variable is set or -AllowLocal is passed.
+
+  The child gets its own empty APPDATA and LOCALAPPDATA and no *_API_KEY
+  variables, but that does NOT isolate it from a real machine: the config
+  path comes from SHGetKnownFolderPath (not the environment) and keys can
+  also come from Windows Credential Manager. That is why a clean runner, or
+  an explicit -AllowLocal, is required.
 
   Steps:
     1. Launch. The owner window must appear and the process must go idle.
@@ -29,12 +35,16 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ExePath = 'target\release\wingman.exe'
+    [string]$ExePath = 'target\release\wingman.exe',
+    [switch]$AllowLocal
 )
 
 # Window class, mutex name and Test-MutexHeld, shared with perf-runtime.ps1
-# (dot-sourcing it only loads them).
+# (dot-sourcing it only loads them). Dot-sourcing re-runs that script's
+# param() block and resets $ExePath to its default, so keep ours.
+$smokeExePath = $ExePath
 . (Join-Path $PSScriptRoot 'perf-runtime.ps1')
+$ExePath = $smokeExePath
 
 # From src/ui/settings.rs; a Pester test checks it still matches.
 $SettingsWindowClass = 'Wingman.Settings.Window.9d4e2b71'
@@ -63,6 +73,9 @@ function Exit-Smoke {
     throw "smoke test failed: $Message"
 }
 
+if (-not $env:CI -and -not $AllowLocal) {
+    throw 'This script launches the real app. Run it on a CI runner (CI is set) or pass -AllowLocal.'
+}
 if (-not (Test-Path -LiteralPath $ExePath)) { throw "exe not found: $ExePath" }
 if (Test-MutexHeld -Name $InstanceMutexName) {
     throw 'Wingman is already running. This script launches the real app, so it only runs when none is.'
@@ -87,6 +100,9 @@ function Invoke-Wingman {
     $psi.UseShellExecute = $false
     $psi.Environment['APPDATA'] = $data
     $psi.Environment['LOCALAPPDATA'] = $data
+    foreach ($k in @($psi.Environment.Keys | Where-Object { $_ -like '*_API_KEY' })) {
+        $psi.Environment.Remove($k) | Out-Null
+    }
     [System.Diagnostics.Process]::Start($psi)
 }
 
@@ -101,7 +117,9 @@ try {
     }
     if (-not $up) { Exit-Smoke 'no owner window within 30 s' }
     if (-not $first.WaitForInputIdle(30000)) { Exit-Smoke 'first launch not idle within 30 s' }
-    if (-not (Test-MutexHeld -Name $InstanceMutexName)) { Exit-Smoke 'first launch does not hold the single-instance name' }
+    if (-not (Wait-Until -TimeoutMs 5000 -Condition { Test-MutexHeld -Name $InstanceMutexName })) {
+        Exit-Smoke 'first launch does not hold the single-instance name'
+    }
     'ok: first launch is up and holds the single-instance name'
 
     # 2. A second launch hands off and exits.
@@ -118,17 +136,17 @@ try {
     if (-not $opened) { Exit-Smoke 'the first instance never opened the settings window it was asked for' }
     'ok: second launch handed off and exited 0, first opened settings and is still running'
 
-    # 3. It exits cleanly when asked. The settings window is modal and the
-    # owner window ignores WM_CLOSE while it is open, so close it first.
+    # 3. It exits cleanly when asked. Close the settings window first: while
+    # it is open the owner window does not act on WM_CLOSE (issue #673).
     $WM_CLOSE = 0x0010
     if (-not [Smoke.Win]::PostMessageW($script:settings, $WM_CLOSE, [UIntPtr]::Zero, [IntPtr]::Zero)) { Exit-Smoke 'could not post WM_CLOSE to settings' }
     $closed = Wait-Until -TimeoutMs 10000 -Condition {
         [Smoke.Win]::FindWindowW($SettingsWindowClass, [NullString]::Value) -eq [IntPtr]::Zero
     }
     if (-not $closed) { Exit-Smoke 'settings window did not close within 10 s' }
-    $hwnd =[Smoke.Win]::FindWindowW($OwnerWindowClass, [NullString]::Value)
+    $hwnd = [Smoke.Win]::FindWindowW($OwnerWindowClass, [NullString]::Value)
     if ($hwnd -eq [IntPtr]::Zero) { Exit-Smoke 'owner window vanished before the close' }
-    if (-not [Smoke.Win]::PostMessageW($hwnd,$WM_CLOSE, [UIntPtr]::Zero, [IntPtr]::Zero)) { Exit-Smoke 'could not post WM_CLOSE' }
+    if (-not [Smoke.Win]::PostMessageW($hwnd, $WM_CLOSE, [UIntPtr]::Zero, [IntPtr]::Zero)) { Exit-Smoke 'could not post WM_CLOSE' }
     if (-not $first.WaitForExit(15000)) { Exit-Smoke 'first launch did not exit within 15 s of WM_CLOSE' }
     if ($first.ExitCode -ne 0) { Exit-Smoke "first launch exited with code $($first.ExitCode)" }
     if (-not (Wait-Until -TimeoutMs 5000 -Condition { -not (Test-MutexHeld -Name $InstanceMutexName) })) {
@@ -139,8 +157,9 @@ try {
 finally {
     foreach ($p in @($first, $second)) {
         if ($p) {
-            if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit(10000) | Out-Null }
-            $p.Dispose()
+            # Cleanup must not throw: it would replace the real failure.
+            try { if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit(10000) | Out-Null } } catch { Write-Warning "cleanup: $_" }
+            try { $p.Dispose() } catch { Write-Warning "cleanup: $_" }
         }
     }
     Remove-Item -LiteralPath $data -Recurse -Force -ErrorAction SilentlyContinue
