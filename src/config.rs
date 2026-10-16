@@ -510,6 +510,17 @@ impl ActiveProvider {
         Self::ALL.into_iter().find(|p| p.order_name() == first)
     }
 
+    /// The provider a picker (Settings combo, tray radio) should show as
+    /// active for `order` (#302, #677): the leader, ChatGPT for an empty list
+    /// (the default), and `None` when something the pickers do not list leads
+    /// (a `compat:` endpoint), so nothing is shown as active.
+    pub fn shown_for(order: &[String]) -> Option<Self> {
+        if order.is_empty() {
+            return Some(ActiveProvider::OpenAi);
+        }
+        Self::leading(order)
+    }
+
     /// Moves this provider to the front of `order` (adding it if absent).
     /// Everything else keeps its relative order, so the old leader stays in
     /// the list as the fallback. Returns whether `order` changed.
@@ -738,15 +749,6 @@ impl Default for Palette {
 #[cfg(test)]
 thread_local! {
     static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Test-only seam onto [`FORCE_ACL_FAILURE_FOR_TEST`] for modules other than
-/// this one (#277: `egress.rs` reuses `restrict_acl` and needs to prove its
-/// own "ACL failure must not lose the log entry" contract the same way this
-/// module already proves "ACL failure aborts the write").
-#[cfg(all(test, windows))]
-pub(crate) fn force_acl_failure_for_test(active: bool) {
-    FORCE_ACL_FAILURE_FOR_TEST.with(|f| f.set(active));
 }
 
 impl Config {
@@ -4591,6 +4593,16 @@ mod egress_preview_tests {
     #[test]
     fn active_provider_falls_back_to_openai_for_other_leaders() {
         assert_eq!(ActiveProvider::from_order(&[]), ActiveProvider::OpenAi);
+        // #677: what the pickers show.
+        assert_eq!(ActiveProvider::shown_for(&[]), Some(ActiveProvider::OpenAi));
+        assert_eq!(
+            ActiveProvider::shown_for(&order(&["compat:lmstudio", "anthropic"])),
+            None
+        );
+        assert_eq!(
+            ActiveProvider::shown_for(&order(&["gemini"])),
+            Some(ActiveProvider::Gemini)
+        );
         assert_eq!(
             ActiveProvider::from_order(&order(&["compat:lmstudio", "anthropic"])),
             ActiveProvider::OpenAi

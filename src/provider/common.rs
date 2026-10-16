@@ -1832,7 +1832,7 @@ mod tests {
     #[test]
     fn the_egress_row_counts_what_the_text_step_replaced() {
         let _g = network_guard();
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
         let transport = ScriptedTransport::new(vec![ok("done")]);
         let sleeper = RecordingSleeper::new();
         let clock = FixedClock(0);
@@ -1863,7 +1863,7 @@ mod tests {
     #[test]
     fn the_connect_timeout_path_logs_text_counts_too() {
         let _g = network_guard();
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
         // `.invalid` never resolves, so this fails fast and still logs a row.
         let r = post_json_with_connect_timeout(
             "https://example.invalid/v1/chat",
@@ -2758,7 +2758,7 @@ mod tests {
     #[test]
     fn post_json_with_logs_a_successful_attempt_to_the_egress_log() {
         let _g = network_guard();
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
 
         let transport = ScriptedTransport::new(vec![ok("done")]);
         let sleeper = RecordingSleeper::new();
@@ -2773,7 +2773,7 @@ mod tests {
     /// #487: the success row carries what the response cost, from the same
     /// price table the tooltip uses.
     fn cost_in_last_egress_row(model: &str) -> serde_json::Value {
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
         let body = include_str!("../../tests/fixtures/anthropic_response.json");
         let transport = ScriptedTransport::new(vec![ok(body)]);
         let sleeper = RecordingSleeper::new();
@@ -2818,7 +2818,7 @@ mod tests {
     #[test]
     fn post_json_with_logs_the_retry_attempt_as_retried() {
         let _g = network_guard();
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
 
         let transport = ScriptedTransport::new(vec![no_response("connection refused"), ok("done")]);
         let sleeper = RecordingSleeper::new();
@@ -2838,7 +2838,7 @@ mod tests {
     #[test]
     fn post_json_with_never_logs_a_fake_key_from_headers_or_a_failing_response_body() {
         let _g = network_guard();
-        let _ = std::fs::remove_file(crate::egress::log_path().unwrap());
+        crate::egress::clear_for_test();
 
         let fake_key = "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKE1234567890";
         let body_text = format!("{{\"error\": \"invalid api key {fake_key}\"}}");

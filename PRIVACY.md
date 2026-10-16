@@ -191,11 +191,12 @@ Remove-Item "$env:LOCALAPPDATA\Wingman" -Recurse -Force
 - `%APPDATA%\Wingman` holds `config.toml` (your settings, and a key if one is
   still sitting in the file rather than Credential Manager) and, if you used
   Fill this form, your encrypted profile (`profile.bin`).
-- `%LOCALAPPDATA%\Wingman` holds the local store (`store\wingman.db`, the
-  daily spend totals behind the tray tooltip), the egress log (`egress.log`:
-  one line per request, with sizes and kinds, never content), and, after an
-  upgrade, the old `spend.json.migrated`. The `store` folder is readable only
-  by your Windows account.
+- `%LOCALAPPDATA%\Wingman` holds the local store (`store\wingman.db`): the
+  daily spend totals behind the tray tooltip and the egress log, one row per
+  request with sizes and kinds, never content. Rows are kept for 90 days, at
+  most 10 000. After an upgrade it also holds the old `spend.json.migrated`
+  and `egress.log.migrated`. The `store` folder is readable only by your
+  Windows account.
 
 Deleting `config.toml` removes a key that was stored in it, but rotate any
 exposed key with your provider regardless; deleting the file does not

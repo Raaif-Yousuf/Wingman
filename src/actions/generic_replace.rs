@@ -17,13 +17,27 @@ use crate::executors::Executor;
 use crate::inputs::selection::SelectionTarget;
 use crate::ui::confirm::Confirmed;
 
-/// What a replace needs from "Look": the selection's UIA identity and the
-/// text that was selected (what the model was shown). `replace_plan` boxes
-/// it, because it is much bigger than the rest of a message payload.
+/// What a replace needs from "Look": the selection's UIA identity (`None`
+/// when it can only be copied, not written back) and the text that was
+/// selected (what the model was shown). `replace_plan` boxes it, because it
+/// is much bigger than the rest of a message payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplaceSelection {
-    pub target: SelectionTarget,
+    pub target: Option<SelectionTarget>,
     pub selected_text: String,
+}
+
+impl ReplaceSelection {
+    /// The text of the whole control, when known: the line endings to use
+    /// when the selection itself has no line break to copy them from.
+    fn eol_hint(&self) -> &str {
+        self.target.as_ref().map_or("", |t| t.full_text.as_str())
+    }
+
+    /// Whether "Do it" will write over the selection (otherwise it copies).
+    pub fn will_replace(&self) -> bool {
+        self.target.is_some()
+    }
 }
 
 /// What the card says when the text could not be replaced in place and was
@@ -31,16 +45,16 @@ pub struct ReplaceSelection {
 pub const COPIED_INSTEAD_DETAIL: &str =
     "Wingman could not replace the text in place here, so the result is on the clipboard.";
 
-/// The replace to offer for what was gathered, or `None` when the text
-/// cannot be written back safely (the caller then copies it instead).
-/// `None` for: no UIA target (a clipboard-fallback or value-only control),
-/// a selection cut to the length limit (replacing it would drop the rest),
-/// a password field, and a blank selection.
+/// The replace to offer for what was gathered, or `None` when there is
+/// nothing safe to offer. `None` for: a selection cut to the length limit
+/// (replacing it would drop the rest), a password field, and a blank
+/// selection. With no UIA target (a clipboard-fallback or value-only control)
+/// the plan has no target, and "Do it" copies the text instead of writing it.
 pub fn replace_plan(gathered: &Gathered) -> Option<Box<ReplaceSelection>> {
     if gathered.selection_in_password_field || gathered.selection_truncated {
         return None;
     }
-    let target = gathered.selection_target.clone()?;
+    let target = gathered.selection_target.clone();
     let selected_text = gathered.selection.clone()?;
     if selected_text.trim().is_empty() {
         return None;
@@ -53,17 +67,34 @@ pub fn replace_plan(gathered: &Gathered) -> Option<Box<ReplaceSelection>> {
 
 /// The `ReviewContext` for a confirmed `text_answer`-shaped value: its `text`
 /// is the new selection. `None` when the confirmed value has no usable text
-/// (blank text would delete the selection).
+/// (blank text would delete the selection) or the plan has no target to
+/// write through.
 pub fn review_context(plan: &ReplaceSelection, confirmed: &Value) -> Option<ReviewContext> {
+    let target = plan.target.clone()?;
     let new_text = confirmed.get("text")?.as_str()?;
     if new_text.trim().is_empty() {
         return None;
     }
     Some(ReviewContext {
-        target: ReplaceTarget::Selection(plan.target.clone()),
+        target: ReplaceTarget::Selection(target),
         original_text: plan.selected_text.clone(),
-        new_text: match_line_endings(&plan.selected_text, new_text),
+        new_text: match_line_endings_hinted(&plan.selected_text, plan.eol_hint(), new_text),
     })
+}
+
+/// The proposal with its `text` given the selection's line endings, so the
+/// card shows, and a write or a copy-instead uses, text that matches the
+/// document. A proposal with no text is returned as it was.
+pub fn normalize_proposal(plan: &ReplaceSelection, proposal: Value) -> Value {
+    let mut proposal = proposal;
+    let matched = proposal
+        .get("text")
+        .and_then(Value::as_str)
+        .map(|t| match_line_endings_hinted(&plan.selected_text, plan.eol_hint(), t));
+    if let (Some(text), Some(slot)) = (matched, proposal.get_mut("text")) {
+        *slot = Value::String(text);
+    }
+    proposal
 }
 
 /// The model's text with the selection's own line endings: a model returns
@@ -74,8 +105,13 @@ pub fn review_context(plan: &ReplaceSelection, confirmed: &Value) -> Option<Revi
 /// all leaves `new`'s line breaks alone (nothing to match), but still drops
 /// a trailing one the selection did not have.
 pub fn match_line_endings(original: &str, new: &str) -> String {
+    match_line_endings_hinted(original, "", new)
+}
+
+/// Counts of CRLF, lone LF and lone CR line breaks in `text`.
+fn count_breaks(text: &str) -> (usize, usize, usize) {
     let (mut crlf, mut lf, mut cr) = (0usize, 0usize, 0usize);
-    let mut chars = original.chars().peekable();
+    let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\r' if chars.peek() == Some(&'\n') => {
@@ -86,6 +122,17 @@ pub fn match_line_endings(original: &str, new: &str) -> String {
             '\n' => lf += 1,
             _ => {}
         }
+    }
+    (crlf, lf, cr)
+}
+
+/// [`match_line_endings`] where `hint` (the whole control's text) supplies
+/// the line ending when `original` has no line break of its own: a one-line
+/// selection in a CRLF document still gets CRLF for any break the model adds.
+pub fn match_line_endings_hinted(original: &str, hint: &str, new: &str) -> String {
+    let (mut crlf, mut lf, mut cr) = count_breaks(original);
+    if crlf + lf + cr == 0 {
+        (crlf, lf, cr) = count_breaks(hint);
     }
     // Normalise the model's breaks to LF first, then pick the target.
     let mut text = new.replace("\r\n", "\n").replace('\r', "\n");
@@ -280,12 +327,55 @@ mod tests {
     #[test]
     fn the_replace_context_carries_the_matched_line_endings() {
         let plan = ReplaceSelection {
-            target: target(),
+            target: Some(target()),
             selected_text: "a\r\nb".into(),
         };
         let ctx = review_context(&plan, &json!({"text": "x\ny\n"})).unwrap();
         assert_eq!(ctx.new_text, "x\r\ny");
         assert_eq!(ctx.original_text, "a\r\nb");
+    }
+
+    #[test]
+    fn a_one_line_selection_takes_the_line_ending_of_the_whole_control() {
+        assert_eq!(
+            match_line_endings_hinted("one line", "a\r\none line\r\nz", "x\ny"),
+            "x\r\ny"
+        );
+        // The selection's own breaks win over the hint.
+        assert_eq!(
+            match_line_endings_hinted("a\nb", "a\r\nb\r\nc\r\n", "x\r\ny"),
+            "x\ny"
+        );
+        // No breaks anywhere: left alone, but the extra trailing one goes.
+        assert_eq!(match_line_endings_hinted("one", "one", "x\ny\n"), "x\ny");
+        let mut g = gathered();
+        g.selection_target.as_mut().unwrap().full_text = "p\r\nSay bonjour please\r\n".into();
+        let plan = replace_plan(&g).unwrap();
+        let ctx = review_context(&plan, &json!({"text": "a\nb"})).unwrap();
+        assert_eq!(ctx.new_text, "a\r\nb");
+    }
+
+    #[test]
+    fn the_proposal_text_is_matched_before_it_is_shown_or_copied() {
+        let plan = ReplaceSelection {
+            target: None,
+            selected_text: "a\r\nb".into(),
+        };
+        let p = normalize_proposal(&plan, json!({"text": "x\ny\n", "other": 1}));
+        assert_eq!(p, json!({"text": "x\r\ny", "other": 1}));
+        // No text: unchanged.
+        assert_eq!(normalize_proposal(&plan, json!({"a": 1})), json!({"a": 1}));
+    }
+
+    #[test]
+    fn a_selection_with_no_target_is_copied_not_written() {
+        let mut g = gathered();
+        g.selection_target = None;
+        let plan = replace_plan(&g).expect("still offered, as a copy");
+        assert!(!plan.will_replace());
+        assert_eq!(plan.selected_text, "bonjour");
+        assert_eq!(review_context(&plan, &json!({"text": "x"})), None);
+        assert!(replace_plan(&gathered()).unwrap().will_replace());
     }
 
     #[test]
@@ -304,14 +394,12 @@ mod tests {
     #[test]
     fn a_readable_selection_with_a_target_can_be_replaced() {
         let plan = replace_plan(&gathered()).expect("replaceable");
-        assert_eq!(plan.target, target());
+        assert_eq!(plan.target, Some(target()));
         assert_eq!(plan.selected_text, "bonjour");
     }
 
     #[test]
-    fn no_target_a_cut_selection_a_password_or_a_blank_selection_are_not_replaced() {
-        let mut no_target = gathered();
-        no_target.selection_target = None;
+    fn a_cut_selection_a_password_or_a_blank_selection_are_not_replaced() {
         let mut cut = gathered();
         cut.selection_truncated = true;
         let mut password = gathered();
@@ -321,7 +409,6 @@ mod tests {
         let mut none = gathered();
         none.selection = None;
         for (name, g) in [
-            ("no target", no_target),
             ("cut", cut),
             ("password", password),
             ("blank", blank),

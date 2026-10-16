@@ -154,9 +154,13 @@ jobs:
             'certificate that eventually signs it; build from source and run install.ps1 for a ' +
             'locally-signed, installable copy in the meantime.'
           }
+          $installNote = 'Install Wingman with install.ps1 from the source, never by double-clicking wingman.msix or running Add-AppxPackage on it. ' +
+            'This package carries the exe inside it. Installed that way, Windows puts the exe in a per-version folder, ' +
+            'so autostart does not work and settings are written to a private copy. install.ps1 registers the package ' +
+            'with -ExternalLocation so the exe stays in one place.'
           $sums = Get-Content dist\SHA256SUMS.txt -Raw
           $verifyHint = 'Verify a download: (Get-FileHash .\wingman.exe -Algorithm SHA256).Hash.ToLower() should match its line in SHA256SUMS.txt.'
-          $notes = "$signedNote`n`n$verifyHint`n`n``````text`n$sums``````"
+          $notes = "$signedNote`n`n$installNote`n`n$verifyHint`n`n``````text`n$sums``````"
           $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           Set-Content -Path $notesPath -Value $notes -Encoding utf8
           gh release view $tag *> $null

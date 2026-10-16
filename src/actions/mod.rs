@@ -25,6 +25,7 @@ pub mod review_email;
 pub mod rewrite_tone;
 pub mod scam_check;
 pub mod schema;
+pub mod table;
 pub mod time_zones;
 pub mod translate;
 
@@ -467,6 +468,7 @@ pub fn builtin_actions() -> Vec<Action> {
         review_email::builtin_action(),
         fill_form::builtin_action(),
         action_items::builtin_action(),
+        table::builtin_action(),
         explain_error::builtin_action(),
         define_word::builtin_action(),
         translate::builtin_action(),

@@ -1092,6 +1092,7 @@ mod tests {
             "form_fill",
             "text_answer",
             "action_items",
+            "table",
             "error_explanation",
             "word_definition",
             "page_summary",

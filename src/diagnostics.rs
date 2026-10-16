@@ -377,8 +377,10 @@ pub fn render_report(input: &DiagnosticsInput) -> String {
 /// window yet to give the log its own page (#44/#51 -- the WebView2
 /// settings host does not exist), so this is the same "no page, but not
 /// invisible either" answer #124 already gave diagnostics: read the real
-/// `egress.log` (`egress::read_all_human`) and put it on the clipboard,
-/// human-readable, ready to paste into a bug report. See `app.rs`'s
+/// request log in the local store (`egress::read_all_human`) and put it on
+/// the clipboard, human-readable, ready to paste into a bug report. When the
+/// store cannot be read or written, the report says so and lists the
+/// requests still held in memory, instead of looking empty. See `app.rs`'s
 /// `copy_egress_log` for the clipboard write itself.
 pub fn egress_report() -> String {
     crate::egress::read_all_human()
