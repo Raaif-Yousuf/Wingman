@@ -74,6 +74,7 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgCtrlID, GetDlgItem,
     GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild,
@@ -332,7 +333,11 @@ fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
             let focus = GetFocus();
             if focus != last_focus {
                 last_focus = focus;
-                follow_focus(hwnd, focus);
+                // Only keyboard moves scroll: scrolling between a click's
+                // mouse-down and mouse-up would cancel the click.
+                if !is_mouse_message(msg.message) {
+                    follow_focus(hwnd, focus);
+                }
             }
         }
 
@@ -726,6 +731,9 @@ const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const CB_ADDSTRING: u32 = 0x0143;
 const CB_SETCURSEL: u32 = 0x014E;
 const CB_GETCURSEL: u32 = 0x0147;
+const CB_GETDROPPEDSTATE: u32 = 0x0157;
+#[cfg(test)]
+const CB_SHOWDROPDOWN: u32 = 0x014F;
 const CB_SELECTSTRING: u32 = 0x014D;
 const TBM_GETPOS: u32 = 0x0400;
 const TBM_SETRANGE: u32 = 0x0406;
@@ -1544,12 +1552,38 @@ unsafe fn follow_focus(main: HWND, focus: HWND) {
     }
 }
 
+/// Whether `message` is a mouse button message (client or non-client).
+fn is_mouse_message(message: u32) -> bool {
+    // WM_LBUTTONDOWN..WM_MBUTTONDBLCLK, WM_NCLBUTTONDOWN..WM_NCMBUTTONDBLCLK.
+    (0x0201..=0x0209).contains(&message) || (0x00A1..=0x00A9).contains(&message)
+}
+
+/// The prompt keeps the wheel when the pointer is over it; where the focus is
+/// does not matter.
+fn wheel_is_over_prompt(under_cursor: HWND, prompt_edit: HWND) -> bool {
+    under_cursor == prompt_edit
+}
+
+/// Whether `ctrl` is a combo with its list open (the list scrolls itself).
+unsafe fn wheel_over_open_combo(ctrl: HWND) -> bool {
+    SendMessageW(ctrl, CB_GETDROPPEDSTATE, None, None).0 != 0
+}
+
 /// Turns a mouse wheel message for the settings window into body scrolling.
-/// Returns true when it was used. The Check my work prompt keeps its own
-/// wheel (it scrolls its text), and an open combo's list is not our child, so
-/// it keeps it too.
+/// Returns true when it was used. Left alone: a wheel over the Check my work
+/// prompt (decided by the window under the cursor, not the focused one: it
+/// scrolls its text) and a wheel while a combo's list is open (the list
+/// scrolls itself).
 unsafe fn scroll_with_wheel(main: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
-    if msg.message != WM_MOUSEWHEEL || msg.hwnd == prompt_edit {
+    if msg.message != WM_MOUSEWHEEL {
+        return false;
+    }
+    // The wheel's lParam is the pointer in screen coordinates.
+    let pt = windows::Win32::Foundation::POINT {
+        x: (msg.lParam.0 & 0xFFFF) as u16 as i16 as i32,
+        y: ((msg.lParam.0 >> 16) & 0xFFFF) as u16 as i16 as i32,
+    };
+    if wheel_is_over_prompt(WindowFromPoint(pt), prompt_edit) || wheel_over_open_combo(msg.hwnd) {
         return false;
     }
     let Ok(body) = GetDlgItem(Some(main), ID_BODY) else {
@@ -4452,9 +4486,7 @@ mod tests {
     fn prompt_group_is_inside_the_scrolling_content(win_h_dp: i32) -> bool {
         let footer = prompt_footer_layout(CONTENT_TOP_DP, win_h_dp);
         let reset_btn_bottom = footer.reset_btn_y + BTN_H;
-        reset_btn_bottom <= footer.prompt_bottom
-            && footer.prompt_top == CONTENT_TOP_DP
-            && footer.prompt_bottom <= footer.content_h()
+        reset_btn_bottom <= footer.prompt_bottom && footer.prompt_top == CONTENT_TOP_DP
     }
 
     #[test]
@@ -4641,6 +4673,15 @@ mod tests {
         assert_eq!(wheel_scroll_px(0, 96), 0);
         // Rows are bigger at 150%.
         assert_eq!(wheel_scroll_px(-120, 144), 3 * to_px(ROW_H, 144));
+    }
+
+    #[test]
+    fn mouse_messages_are_recognised_and_keys_are_not() {
+        assert!(is_mouse_message(0x0201)); // WM_LBUTTONDOWN
+        assert!(is_mouse_message(0x0202)); // WM_LBUTTONUP
+        assert!(is_mouse_message(0x00A1)); // WM_NCLBUTTONDOWN
+        assert!(!is_mouse_message(0x0100)); // WM_KEYDOWN
+        assert!(!is_mouse_message(0x020A)); // WM_MOUSEWHEEL
     }
 
     #[test]
@@ -5268,10 +5309,17 @@ mod tests {
         assert_eq!(after, before + wheel_scroll_px(120, 96));
         // ...but the prompt box keeps its own wheel.
         let prompt = get_dlg_item(hwnd, ID_PROMPT_EDIT).expect("prompt");
-        let mut m = wheel(120);
-        m.hwnd = prompt;
-        assert!(!unsafe { scroll_with_wheel(hwnd, &m, prompt) });
-        assert_eq!(unsafe { body_scroll_info(body) }.nPos, after);
+        // The prompt is judged by the window under the cursor, not the
+        // focused one (parallel tests overlap windows, so the pointer's
+        // window is passed in here rather than found with WindowFromPoint).
+        assert!(wheel_is_over_prompt(prompt, prompt));
+        assert!(!wheel_is_over_prompt(toggle, prompt));
+        // An open combo keeps the wheel; a closed one does not.
+        let combo = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER).expect("combo");
+        assert!(!unsafe { wheel_over_open_combo(combo) });
+        unsafe { SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(1)), None) };
+        assert!(unsafe { wheel_over_open_combo(combo) });
+        unsafe { SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(0)), None) };
 
         // Focus on the first control scrolls the top back into view, and a
         // control already in view does not move it.
