@@ -409,6 +409,33 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Issue #227: the last run ended in a panic. Shown after the hotkey
+    // install so its error card cannot replace this one. No model call, no dialog:
+    // a card, and the note rides along as the last error so "Copy details"
+    // and "Copy diagnostics" include it. Read once, then the note is gone.
+    if let Some(note) = crate::crash_note::note_path()
+        .ok()
+        .and_then(|p| crate::crash_note::take_note(&p))
+    {
+        let (headline, detail) = crate::crash_note::card_text(&note);
+        // A startup error recorded above (e.g. hotkeys unavailable) is kept
+        // after the note, so "Copy details" carries both.
+        let chain = match app.last_error.take() {
+            Some(earlier) => format!(
+                "{note}
+{}",
+                earlier.chain
+            ),
+            None => note,
+        };
+        app.last_error = Some(LastError {
+            action: headline.clone(),
+            occurred_at: SystemTime::now(),
+            chain,
+        });
+        app.card.show_error_with_details(&headline, &detail);
+    }
+
     // Non-fatal: without it the card still auto-dismisses on its timer.
     app.watcher = ClickWatcher::install(hwnd).ok();
 
@@ -786,24 +813,26 @@ impl App {
         // `AskingModel` inside `begin_model_action` (findings 1 and 2), so
         // there is nothing left to set here.
         std::thread::spawn(move || {
-            let result: std::result::Result<Answer, String> = (|| -> Result<Answer> {
-                let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
-                worker(
-                    &providers,
-                    mode,
-                    &shot,
-                    &raw,
-                    foreground_hwnd_isize,
-                    &prompt,
-                    want_difficulty,
-                )
-            })()
-            .map_err(|e| {
-                let chain_text = worker_error_chain_text(&e);
-                pack_error(
-                    &human_error_detail(&chain_text),
-                    &crate::egress::redact_opaque_tokens(&chain_text),
-                )
+            let result: std::result::Result<Answer, String> = catch_worker(|| {
+                (|| -> Result<Answer> {
+                    let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
+                    worker(
+                        &providers,
+                        mode,
+                        &shot,
+                        &raw,
+                        foreground_hwnd_isize,
+                        &prompt,
+                        want_difficulty,
+                    )
+                })()
+                .map_err(|e| {
+                    let chain_text = worker_error_chain_text(&e);
+                    pack_error(
+                        &human_error_detail(&chain_text),
+                        &crate::egress::redact_opaque_tokens(&chain_text),
+                    )
+                })
             });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
@@ -929,14 +958,15 @@ impl App {
         self.palette.set_router_pending(generation);
 
         std::thread::spawn(move || {
-            let result: std::result::Result<router::RouterResult, String> =
+            let result: std::result::Result<router::RouterResult, String> = catch_worker(|| {
                 router_worker(&providers, mode, &mut raw, redact, &candidates).map_err(|e| {
                     let chain_text = worker_error_chain_text(&e);
                     pack_error(
                         &human_error_detail(&chain_text),
                         &crate::egress::redact_opaque_tokens(&chain_text),
                     )
-                });
+                })
+            });
             let payload = Box::into_raw(Box::new((generation, result)));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1094,12 +1124,14 @@ impl App {
 
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
-            let result: std::result::Result<Answer, String> = work(&raw).map_err(|e| {
-                let chain_text = worker_error_chain_text(&e);
-                pack_error(
-                    &human_error_detail(&chain_text),
-                    &crate::egress::redact_opaque_tokens(&chain_text),
-                )
+            let result: std::result::Result<Answer, String> = catch_worker(|| {
+                work(&raw).map_err(|e| {
+                    let chain_text = worker_error_chain_text(&e);
+                    pack_error(
+                        &human_error_detail(&chain_text),
+                        &crate::egress::redact_opaque_tokens(&chain_text),
+                    )
+                })
             });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
@@ -1210,24 +1242,26 @@ impl App {
         let target = self.hwnd_isize();
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
-            let result: std::result::Result<Value, String> = (|| -> Result<Value> {
-                let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
-                calendar_worker(
-                    &providers,
-                    mode,
-                    &shot,
-                    &raw,
-                    foreground_hwnd_isize,
-                    today,
-                    offset_minutes,
-                )
-            })()
-            .map_err(|e| {
-                let chain_text = worker_error_chain_text(&e);
-                pack_error(
-                    &human_error_detail(&chain_text),
-                    &crate::egress::redact_opaque_tokens(&chain_text),
-                )
+            let result: std::result::Result<Value, String> = catch_worker(|| {
+                (|| -> Result<Value> {
+                    let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
+                    calendar_worker(
+                        &providers,
+                        mode,
+                        &shot,
+                        &raw,
+                        foreground_hwnd_isize,
+                        today,
+                        offset_minutes,
+                    )
+                })()
+                .map_err(|e| {
+                    let chain_text = worker_error_chain_text(&e);
+                    pack_error(
+                        &human_error_detail(&chain_text),
+                        &crate::egress::redact_opaque_tokens(&chain_text),
+                    )
+                })
             });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
@@ -1419,46 +1453,50 @@ impl App {
         let action_for_result = action.clone();
         let schema_for_result = schema.clone();
         std::thread::spawn(move || {
-            let result: GenericResult = (|| -> Result<_, GenericFailure> {
-                // #484: gather what the action's `inputs` list asks for, then
-                // let the pure `plan` decide the user text and whether the
-                // screenshot goes along (a selection-only action sends no image).
-                let gathered = gather_generic_inputs(&inputs, foreground_hwnd_isize, writes_back)?;
-                let planned = plan_generic_inputs(&inputs, &gathered)?;
-                if writes_back && actions::generic_replace::too_long(&gathered) {
-                    return Err(GenericFailure::UserState(
-                        actions::generic_replace::TOO_LONG_MESSAGE.to_string(),
-                    ));
-                }
-                let replace = writes_back
-                    .then(|| actions::generic_replace::replace_plan(&gathered))
-                    .flatten();
-                // #493: gathered text is data, not instructions.
-                let system = match planned.system_note {
-                    Some(note) => format!("{prompt}\n\n{note}"),
-                    None => prompt.clone(),
-                };
-                let shot = if planned.screen {
-                    Some(encode_for_upload(&mut raw, &providers, mode, redact)?)
-                } else {
-                    None
-                };
-                let ollama_ready = mode == Mode::Auto
-                    && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
-                    && mode::probe_ollama_ready(
-                        &providers.ollama.base_url,
-                        &providers.ollama.model,
-                    );
-                let chain = providers.build_chain_for_mode(mode, ollama_ready);
-                let req = generic_action_request(shot.as_ref(), &system, &planned.user, schema);
-                let proposal = noting_attribution(chain.complete_parsed_with_fallback_attributed(
-                    &req,
-                    || non_vision_inputs(&raw, foreground_hwnd_isize),
-                    |c| actions::parse_generic_proposal(&c.text),
-                ))?;
-                Ok((proposal, replace))
-            })()
-            .map_err(pack_generic_failure);
+            let result: GenericResult = catch_worker(|| {
+                (|| -> Result<_, GenericFailure> {
+                    // #484: gather what the action's `inputs` list asks for, then
+                    // let the pure `plan` decide the user text and whether the
+                    // screenshot goes along (a selection-only action sends no image).
+                    let gathered =
+                        gather_generic_inputs(&inputs, foreground_hwnd_isize, writes_back)?;
+                    let planned = plan_generic_inputs(&inputs, &gathered)?;
+                    if writes_back && actions::generic_replace::too_long(&gathered) {
+                        return Err(GenericFailure::UserState(
+                            actions::generic_replace::TOO_LONG_MESSAGE.to_string(),
+                        ));
+                    }
+                    let replace = writes_back
+                        .then(|| actions::generic_replace::replace_plan(&gathered))
+                        .flatten();
+                    // #493: gathered text is data, not instructions.
+                    let system = match planned.system_note {
+                        Some(note) => format!("{prompt}\n\n{note}"),
+                        None => prompt.clone(),
+                    };
+                    let shot = if planned.screen {
+                        Some(encode_for_upload(&mut raw, &providers, mode, redact)?)
+                    } else {
+                        None
+                    };
+                    let ollama_ready = mode == Mode::Auto
+                        && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
+                        && mode::probe_ollama_ready(
+                            &providers.ollama.base_url,
+                            &providers.ollama.model,
+                        );
+                    let chain = providers.build_chain_for_mode(mode, ollama_ready);
+                    let req = generic_action_request(shot.as_ref(), &system, &planned.user, schema);
+                    let proposal =
+                        noting_attribution(chain.complete_parsed_with_fallback_attributed(
+                            &req,
+                            || non_vision_inputs(&raw, foreground_hwnd_isize),
+                            |c| actions::parse_generic_proposal(&c.text),
+                        ))?;
+                    Ok((proposal, replace))
+                })()
+                .map_err(pack_generic_failure)
+            });
             let payload = Box::into_raw(Box::new((action_for_result, schema_for_result, result)));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -1892,16 +1930,18 @@ impl App {
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
-                (|| -> Result<actions::review_email::ReviewOutcome> {
-                    let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
-                    review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
-                })()
-                .map_err(|e| {
-                    let chain_text = worker_error_chain_text(&e);
-                    pack_error(
-                        &human_error_detail(&chain_text),
-                        &crate::egress::redact_opaque_tokens(&chain_text),
-                    )
+                catch_worker(|| {
+                    (|| -> Result<actions::review_email::ReviewOutcome> {
+                        let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
+                        review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
+                    })()
+                    .map_err(|e| {
+                        let chain_text = worker_error_chain_text(&e);
+                        pack_error(
+                            &human_error_detail(&chain_text),
+                            &crate::egress::redact_opaque_tokens(&chain_text),
+                        )
+                    })
                 });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
@@ -2081,21 +2121,23 @@ impl App {
         let redact = self.config.capture.redact;
         std::thread::spawn(move || {
             let mut raw = raw;
-            let result: std::result::Result<Value, String> = form_fill_worker(
-                &providers,
-                mode,
-                &mut raw,
-                redact,
-                foreground_hwnd_isize,
-                require_tick_for,
-                use_model,
-            )
-            .map_err(|e| {
-                let chain_text = worker_error_chain_text(&e);
-                pack_error(
-                    &human_error_detail(&chain_text),
-                    &crate::egress::redact_opaque_tokens(&chain_text),
+            let result: std::result::Result<Value, String> = catch_worker(|| {
+                form_fill_worker(
+                    &providers,
+                    mode,
+                    &mut raw,
+                    redact,
+                    foreground_hwnd_isize,
+                    require_tick_for,
+                    use_model,
                 )
+                .map_err(|e| {
+                    let chain_text = worker_error_chain_text(&e);
+                    pack_error(
+                        &human_error_detail(&chain_text),
+                        &crate::egress::redact_opaque_tokens(&chain_text),
+                    )
+                })
             });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
@@ -2548,7 +2590,8 @@ impl App {
 
         let target = self.hwnd_isize();
         std::thread::spawn(move || {
-            let result: std::result::Result<Answer, String> = match crate::calc::run_on_selection(
+            let result: std::result::Result<Answer, String> = catch_worker(|| {
+                match crate::calc::run_on_selection(
                 &crate::calc::ForegroundSelection,
             ) {
                 crate::calc::SelectionCalcOutcome::Result { headline } => Ok(Answer {
@@ -2570,7 +2613,8 @@ impl App {
                 crate::calc::SelectionCalcOutcome::Error(e) => {
                     Err(human_error_detail(&e.to_string()))
                 }
-            };
+            }
+            });
             let payload = Box::into_raw(Box::new(result));
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -4462,6 +4506,54 @@ fn unpack_error(packed: &str) -> (&str, &str) {
     packed
         .split_once(ERROR_PACK_SEP)
         .unwrap_or((packed, packed))
+}
+
+/// Issue #227: runs a worker's whole computation and turns a panic into the
+/// same packed error a failed run produces, so the result message is always
+/// posted and `busy` is always cleared. Only matters where panics unwind
+/// (dev and test builds); a release build aborts, and the crash note
+/// (`crash_note.rs`) covers that instead.
+fn catch_worker<T>(
+    work: impl FnOnce() -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let profile = crate::known_folder::user_profile()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            Err(packed_panic_error(
+                &crate::crash_note::message_of(payload.as_ref()),
+                &crate::crash_note::take_location(),
+                &profile,
+            ))
+        }
+    }
+}
+
+/// A caught panic as a [`pack_error`] string: a fixed human sentence (never
+/// the panic text) and a chain for "Copy details" that names the location
+/// and, only for a string-literal message, the message
+/// ([`crate::crash_note::message_of`] drops formatted ones, which can carry
+/// selection, OCR or model text).
+fn packed_panic_error(message: &str, location: &str, profile: &str) -> String {
+    let mut chain = String::from("Wingman hit an internal error");
+    if !location.is_empty() {
+        chain.push_str(&format!(
+            " in {}",
+            crate::crash_note::sanitize(location, profile, 120)
+        ));
+    }
+    if !message.is_empty() {
+        chain.push_str(&format!(
+            ": {}",
+            crate::crash_note::sanitize(message, profile, crate::crash_note::MAX_MESSAGE_CHARS)
+        ));
+    }
+    pack_error(
+        &human_error_detail("Wingman hit an internal error."),
+        &chain,
+    )
 }
 
 thread_local! {
@@ -6447,6 +6539,48 @@ mod tests {
                  settings_reentrancy_policy disagrees"
             );
         }
+    }
+
+    /// #227: a panicking worker body must come back as an ordinary packed
+    /// error (so the result message is still posted and `busy` clears), and a
+    /// normal result must pass through untouched. Tests build with unwind.
+    #[test]
+    fn catch_worker_turns_a_panic_into_a_packed_error() {
+        let out: std::result::Result<u32, String> =
+            super::catch_worker(|| panic!("boom in worker"));
+        let packed = out.expect_err("a panic must become an Err");
+        let (human, chain) = super::unpack_error(&packed);
+        assert!(super::is_run_fault(human), "{human}");
+        assert!(!human.contains("boom in worker"), "{human}");
+        assert!(chain.contains("boom in worker"), "{chain}");
+    }
+
+    #[test]
+    fn catch_worker_passes_results_through() {
+        assert_eq!(super::catch_worker(|| Ok::<_, String>(7)), Ok(7));
+        assert_eq!(
+            super::catch_worker(|| Err::<u32, _>("plain".to_string())),
+            Err("plain".to_string())
+        );
+    }
+
+    #[test]
+    fn a_formatted_panic_keeps_the_location_and_drops_the_text() {
+        let secret = "SECRET selection text";
+        crate::crash_note::note_location("src/x.rs:9:9");
+        let out: std::result::Result<u32, String> =
+            super::catch_worker(|| panic!("bad input: {secret}"));
+        let packed = out.unwrap_err();
+        let (_, chain) = super::unpack_error(&packed);
+        assert!(!packed.contains("SECRET"), "{packed}");
+        assert!(chain.contains("src/x.rs:9:9"), "{chain}");
+    }
+
+    #[test]
+    fn a_literal_panic_message_is_kept_in_the_chain() {
+        let out: std::result::Result<u32, String> = super::catch_worker(|| panic!("plain literal"));
+        let packed = out.unwrap_err();
+        assert!(super::unpack_error(&packed).1.contains("plain literal"));
     }
 
     #[test]
