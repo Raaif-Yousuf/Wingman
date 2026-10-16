@@ -817,7 +817,7 @@ fn badge_text_color(fill: u32) -> u32 {
 /// this module declares the one registry function it needs itself and links
 /// directly against `advapi32.dll` (a standard system import library, not a
 /// new crate dependency).
-fn detect_theme() -> Theme {
+pub(crate) fn detect_theme() -> Theme {
     Theme::resolve(
         registry_apps_use_light_theme(),
         crate::ui::card_buttons::system_high_contrast().is_some(),
@@ -834,7 +834,7 @@ fn setting_change_is_theme(name: &str) -> bool {
 /// Whether a `WM_SETTINGCHANGE` is one the card's theme depends on: the
 /// light/dark switch, or the high contrast flag (`wparam` is
 /// `SPI_SETHIGHCONTRAST`; its `lparam` carries no name).
-fn setting_change_affects_theme(wparam: usize, name: &str) -> bool {
+pub(crate) fn setting_change_affects_theme(wparam: usize, name: &str) -> bool {
     wparam == SPI_SETHIGHCONTRAST.0 as usize || setting_change_is_theme(name)
 }
 
@@ -844,7 +844,7 @@ fn setting_change_affects_theme(wparam: usize, name: &str) -> bool {
 /// # Safety
 /// `lparam` must be zero or point at a null-terminated UTF-16 string, which
 /// is what Windows guarantees for this message.
-unsafe fn setting_change_name(lparam: LPARAM) -> String {
+pub(crate) unsafe fn setting_change_name(lparam: LPARAM) -> String {
     let ptr = lparam.0 as *const u16;
     if ptr.is_null() {
         return String::new();

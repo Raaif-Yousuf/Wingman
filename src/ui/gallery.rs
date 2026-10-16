@@ -104,6 +104,9 @@ pub enum GalleryState {
     /// Issue #560: the same with Advanced expanded.
     SettingsAdvancedTop,
     SettingsAdvancedBottom,
+    /// Issue #580: the region-select overlay over a synthetic backdrop, with a
+    /// selection staged.
+    RegionOverlay,
 }
 
 /// The full ordered list of states the gallery steps through. Order is the
@@ -133,6 +136,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsBottom,
         SettingsAdvancedTop,
         SettingsAdvancedBottom,
+        RegionOverlay,
     ]
 }
 
@@ -164,6 +168,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsBottom => "settings-bottom",
         SettingsAdvancedTop => "settings-advanced-top",
         SettingsAdvancedBottom => "settings-advanced-bottom",
+        RegionOverlay => "region-overlay",
     }
 }
 
@@ -196,6 +201,7 @@ mod driver {
     use crate::ui::card::Card;
     use crate::ui::palette::Palette;
     use crate::ui::palette_model::PaletteAction;
+    use crate::ui::region::Overlay;
     use crate::ui::settings::GalleryWindow;
     use std::time::Duration;
     use windows::Win32::Foundation::HWND;
@@ -226,23 +232,33 @@ mod driver {
         };
 
         let mut card = Card::new_for_test(instance)?;
+        let mut region_theme: Option<crate::ui::theme::Theme> = None;
         if let Some(name) = &args.theme {
             let theme = theme_from_arg(name).ok_or_else(|| {
                 anyhow::anyhow!("--theme {name:?} is not one of light, dark, high-contrast")
             })?;
-            // The Card states only: the palette and Settings still follow
-            // the live system theme.
+            // The Card and region overlay states only: the palette and
+            // Settings still follow the live system theme.
             card.force_theme_for_gallery(theme);
+            region_theme = Some(theme);
         }
         let mut palette = Palette::new_for_test(instance)?;
         let mut settings: Option<GalleryWindow> = None;
+        let mut region: Option<Overlay> = None;
 
         let states = gallery_states();
 
         if let Some(dir) = &args.screenshot_dir {
             std::fs::create_dir_all(dir)?;
             for state in &states {
-                let hwnd = show_state(&mut card, &mut palette, &mut settings, *state)?;
+                let hwnd = show_state(
+                    &mut card,
+                    &mut palette,
+                    &mut settings,
+                    &mut region,
+                    region_theme,
+                    *state,
+                )?;
                 pump_and_wait(Duration::from_millis(120));
                 let path = dir.join(screenshot_filename(state_name(*state)));
                 print_window_png(hwnd, &path)?;
@@ -251,7 +267,14 @@ mod driver {
         }
 
         let mut idx = 0usize;
-        let hwnd0 = show_state(&mut card, &mut palette, &mut settings, states[idx])?;
+        let hwnd0 = show_state(
+            &mut card,
+            &mut palette,
+            &mut settings,
+            &mut region,
+            region_theme,
+            states[idx],
+        )?;
         let _ = hwnd0;
         let mut msg = MSG::default();
         while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -259,10 +282,24 @@ mod driver {
                 let vk = msg.wParam.0 as u16;
                 if vk == VK_RIGHT.0 && idx + 1 < states.len() {
                     idx += 1;
-                    show_state(&mut card, &mut palette, &mut settings, states[idx])?;
+                    show_state(
+                        &mut card,
+                        &mut palette,
+                        &mut settings,
+                        &mut region,
+                        region_theme,
+                        states[idx],
+                    )?;
                 } else if vk == VK_LEFT.0 && idx > 0 {
                     idx -= 1;
-                    show_state(&mut card, &mut palette, &mut settings, states[idx])?;
+                    show_state(
+                        &mut card,
+                        &mut palette,
+                        &mut settings,
+                        &mut region,
+                        region_theme,
+                        states[idx],
+                    )?;
                 }
             }
             unsafe {
@@ -364,10 +401,13 @@ mod driver {
         card: &mut Card,
         palette: &mut Palette,
         settings: &mut Option<GalleryWindow>,
+        region: &mut Option<Overlay>,
+        region_theme: Option<crate::ui::theme::Theme>,
         state: GalleryState,
     ) -> anyhow::Result<HWND> {
         use GalleryState::*;
         *settings = None;
+        *region = None;
         let instance = unsafe {
             windows::Win32::Foundation::HINSTANCE(
                 windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?.0,
@@ -516,6 +556,13 @@ mod driver {
                 palette.hide();
                 palette.show(free_palette_catalogue(), false, "mode: Auto".to_string());
             }
+            RegionOverlay => {
+                card.hide();
+                palette.hide();
+                // Without `--theme` it follows the live system theme.
+                let theme = region_theme.unwrap_or_else(crate::ui::card::detect_theme);
+                *region = Some(Overlay::open_for_gallery(instance, theme)?);
+            }
             SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => {
                 card.hide();
                 palette.hide();
@@ -533,6 +580,10 @@ mod driver {
             PaletteDefault | PaletteRouterSuggestion | PaletteNoMatches | PaletteNoModel => {
                 palette.hwnd()
             }
+            RegionOverlay => region
+                .as_ref()
+                .map(|o| o.hwnd())
+                .ok_or_else(|| anyhow::anyhow!("no region overlay"))?,
             SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => settings
                 .as_ref()
                 .map(|w| w.hwnd())
@@ -711,8 +762,8 @@ mod tests {
         // 5 card-answer variants (short + 4 difficulty badges) + error + 4
         // pending sub-stages (#354) + 3 previews (calendar, long labels,
         // the error title) + the expanded answer = 14 card states, + 4
-        // palette states + 4 settings states (#560) = 22.
-        assert_eq!(states.len(), 22);
+        // palette states + 4 settings states (#560) + the region overlay (#580) = 23.
+        assert_eq!(states.len(), 23);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
