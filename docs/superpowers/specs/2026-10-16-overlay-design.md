@@ -66,6 +66,23 @@ idle. Every failure ends in a card. Redaction applies before any upload.
   screen. **`Action` has no `output` field**; `executor = "none"` means the card
   is the result.
 
+- **Capture backend.** `Cargo.toml` takes `xcap = "0.9"` with default
+  features, and xcap 0.9.8's `wgc` feature is off by default, so a monitor
+  capture here goes through `gdi::capture_monitor`: `BitBlt` with `SRCCOPY`
+  and no `CAPTUREBLT`. THEORY (unverified, read from the crate source):
+  `BitBlt` without `CAPTUREBLT` skips layered windows, so today's capture may
+  not contain a layered overlay even without the affinity flag. The flag is
+  still required (below), because the user's screen share, a recorder and any
+  future switch to the `wgc` feature all read the composed desktop. Slice 0
+  measures both.
+- **Exe size.** `perf-budgets.json` records 3,800,576 bytes measured against a
+  gate of 3,900,000, about 99 KB of headroom, shared with the options card,
+  Settings dark mode and knowledge specs. AGENTS.md's "about 3.5 MB" is stale.
+  See "Size budget".
+- `Action` (in `actions/mod.rs`) has `id, name, group, inputs, proposal,
+  executor, confirm, prompt, prefer, hotkey, rate_difficulty, enabled` and no
+  `output` or `detector` field. `Action.hotkey` exists and is inert (#535).
+
 ## Decisions
 
 - **One overlay window type, owned by the main thread, never focused.**
@@ -82,23 +99,44 @@ idle. Every failure ends in a card. Redaction applies before any upload.
 - **The overlay is excluded from capture.** If that cannot be arranged, no
   overlay is shown.
 
+- **The overlay belongs to a card.** Its key, Esc, click-away and lifetime rules
+  are the options card spec's "Shared rules for every surface". The overlay is
+  not a surface, not a `CardKind`, and never outlives its summary card or the
+  preview it annotates.
+- **Hook callbacks never decide.** A low-level hook callback only posts a
+  message; the main thread decides whether the input matters. See "When the
+  screen changes".
+- **A guard that cannot run means no overlay.** The affinity call, the hooks,
+  OCR and the main-thread decision all fail closed to the summary card alone.
+
 ## User-visible behaviour
 
 1. The user presses the Wingman key. The usual Pending card shows.
 2. When the action finishes, labels appear beside their text and a summary card
    appears in the corner as it does today ("3 things marked. Esc to close.").
-3. The overlay goes away on Esc, on the key, on a click that is not on a label,
-   on any change listed under "When the screen changes", or after 30 s.
+   Appearing raises a system alert event named by the summary, so a screen
+   reader user learns something is there.
+3. The overlay goes away with its summary card: on Esc, on the key, on a click
+   that is not on a label (the overlay always hides; the card follows
+   `options.click_away_dismiss`), on any
+   change listed under "When the screen changes", or after 30 s.
 4. If nothing could be anchored, the user gets the summary card alone. If the
    card is the only surface, it says so in one line ("Could not place the marks
    on screen, here they are").
 
-The key table from the options card spec gets one row: **overlay showing:
-single press dismisses the overlay and its summary card, double press does
-the same.** Nothing is run by a press while an overlay is showing, in every key
-mode, for the same reason a preview is never confirmed by the key. The
-options-card "claimed keys" function gains one more state, `OverlayShowing`,
-that claims only Esc.
+**Keys, Esc and click-away follow the options card spec's "Shared rules for
+every surface".** In short: the key acts on the highest surface only (preview,
+then options card, then answer card), and whatever it dismisses takes its
+overlay with it. A press never runs anything while an overlay is showing, in
+every key mode, for the same reason a preview is never confirmed by the key.
+The overlay adds `overlay: bool` to the key state machine's `Context`, not a
+card kind.
+
+**Esc reaches the summary card by a bounded claim.** The summary card never
+takes focus, so Esc has to be claimed in the hook, the same way the options card
+claims 1 to 4 and Esc: only with no modifiers down, only while an overlay is
+showing, and with an expiry tick (overlay age cap plus 1 s) that lapses by
+itself, cleared on every hide path. The claim covers Esc only and no digits.
 
 ## The overlay window
 
@@ -185,16 +223,24 @@ press, a region capture, and any later awareness capture (#330) never read
 Wingman's own labels as screen content. It also keeps labels out of the user's
 screen share and recordings.
 
+- **Slice 0 gate, before this spec is approved.** The whole design hangs on
+  this working for the exact window kind used here: a `WS_EX_LAYERED` popup
+  updated with `UpdateLayeredWindow`, not any window. A 20-line throwaway
+  program records, for that window with and without the flag: (a) whether
+  `xcap`'s monitor capture as Wingman uses it (the GDI `BitBlt` path) contains
+  the labels, (b) whether a `wgc` or DXGI capture does, since the `wgc` feature
+  could be enabled later and a screen share uses the composed desktop, and (c)
+  whether `PrintWindow` on the overlay returns the labels, for the gallery. The
+  result is written into this spec, replacing the theories. If the flag does
+  not hold for a layered window, the design changes (see open question 3)
+  before anything else is built.
 - **Fail closed.** If the call fails, the overlay is not shown and the summary
   card says "Could not show marks on screen here, here they are". A visible
   overlay that a later capture can read is a privacy and feedback problem
   (a translation of private text re-uploaded as "the screen").
 - **Belt and braces.** The key dismisses the overlay before a press captures
-  anything (the key table row above), and every Wingman-initiated capture path
+  anything (the shared key rule), and every Wingman-initiated capture path
   hides the overlay first, exactly as the palette hides itself first.
-- THEORY (unverified): that `xcap` (the capture crate) honours the affinity,
-  whichever of GDI `BitBlt` or DXGI duplication it uses on this machine.
-  Manual check 1 is the proof; it is a prerequisite for slice 2.
 - **Demos.** A screen recorder that honours the flag will not show the labels,
   which defeats the #332 demo GIF. A config field `overlay.capturable` (default
   `false`, documented as "for recording a demo") skips the flag, and the
@@ -203,9 +249,9 @@ screen share and recordings.
 ## When the screen changes
 
 An annotation is only true for the pixels it was found in. If those pixels move,
-the overlay lies. `SetWinEventHook` and the existing mouse hook make the check
-event-driven, installed **only while an overlay is visible** and removed on
-every hide path. No polling timer, no `timeBeginPeriod` (rule 5).
+the overlay lies. `SetWinEventHook` and the existing mouse and keyboard hooks
+make the check event-driven, installed **only while an overlay is visible** and
+removed on every hide path. No polling timer, no `timeBeginPeriod` (rule 5).
 
 ### What fires and what does not
 
@@ -215,8 +261,7 @@ names:
 - `EVENT_OBJECT_LOCATIONCHANGE` on a window object (`idObject ==
   OBJID_WINDOW`) fires when a **window** moves, resizes, maximises or restores.
   It also fires continuously for the caret and the cursor (`OBJID_CARET`,
-  `OBJID_CURSOR`), so the callback's first test is `idObject == OBJID_WINDOW`
-  and `hwnd` in the target set, before anything else.
+  `OBJID_CURSOR`), system wide.
 - **Scrolling inside a window does not move the window.** A native scrollbar
   fires location events for its own child objects, but a browser, Electron app
   or PDF viewer renders its own content and fires nothing unless an
@@ -232,22 +277,53 @@ So the staleness rules are the union of events plus the input that causes them:
 | Window moved, resized, minimised, restored | `EVENT_OBJECT_LOCATIONCHANGE` (`OBJID_WINDOW`) | the window is in the target set |
 | Window destroyed | `EVENT_OBJECT_DESTROY` (`OBJID_WINDOW`) | the window is in the target set |
 | Minimised | `EVENT_SYSTEM_MINIMIZESTART` | the window is in the target set |
-| Another app comes forward | `EVENT_SYSTEM_FOREGROUND` | the new foreground window is **not** in the target set and **not** one of Wingman's own windows |
+| Another app comes forward (including Alt+Tab) | `EVENT_SYSTEM_FOREGROUND` | the new foreground window is **not** in the target set and **not** one of Wingman's own windows |
 | Wheel | `WH_MOUSE_LL` (existing watcher, `WM_MOUSEWHEEL`/`WM_MOUSEHWHEEL` added while armed) | the pointer is over a target window |
 | Click not on a label | the same watcher | the click lands anywhere (a tab, a scrollbar, a link all change content) |
 | A key that can scroll or edit | `WH_KEYBOARD_LL` (existing) | any non-modifier keydown while the foreground window is in the target set |
 | Age | one `SetTimer` that fires once, killed on hide | 30 s (`overlay.auto_dismiss_secs`) after the overlay appeared |
 
-Notes:
+### Where each decision is made
+
+- **The hook callbacks never decide.** `GetForegroundWindow`, `WindowFromPoint`
+  and set lookups inside a `WH_KEYBOARD_LL` or `WH_MOUSE_LL` callback risk the
+  hook timeout, and Windows unhooks a hook that is too slow. The callbacks
+  only post a message (`WM_APP_OVERLAY_INPUT`, carrying the kind of input and,
+  for the mouse, the point). The main thread then asks the pure `state` machine
+  whether it hides the overlay. The overlay therefore hides a few
+  milliseconds after the input reached the app, which is fine: it is a
+  staleness guard, not a gate. The one exception is the click on a label, which
+  is a hit-test against a snapshot of the label rectangles held in an atomic
+  read-only structure, so a click that lands on a label is never dismissed at
+  button-down before the label's own handler sees it.
+- **The `SetWinEventHook` callbacks run out of context** (`WINEVENT_OUTOFCONTEXT`)
+  on the main thread's message loop, so they are not under the hook timeout, but
+  a location event fires for the caret and the cursor constantly. To keep that
+  cheap: install the narrow ranges only (one hook for `LOCATIONCHANGE` per target
+  process, `idProcess` set to the process of each target window; one each for
+  `DESTROY`, `MINIMIZESTART` and `FOREGROUND`), use `WINEVENT_SKIPOWNPROCESS`,
+  and make the callback's first test `idObject == OBJID_WINDOW` and `hwnd` in the
+  target set, before anything else. A typing user hides the overlay on the first
+  key, so any caret event flood is bounded to one.
+- **A single hide function** removes the hooks, kills the age timer, clears the
+  Esc claim and frees the bitmap, and every hide path (key, Esc, click, event,
+  age, owner card gone) calls only it. A unit test over the pure state asserts
+  the registry of installed hooks and timers is empty after each path.
+- The one-shot age timer is not polling: it is set once, never rearmed, and is
+  the same mechanism as the card's `auto_dismiss_secs`. It bounds the residual
+  case the table cannot see (a chat that keeps appending, a page that rewrites
+  itself while the user watches).
+
+### Notes
 
 - "Not one of Wingman's own windows" matters for #329. A form preview card takes
   focus, so the target legitimately loses the foreground, and ghost text must
   stay. The same filter applies to keys: a key typed into Wingman's own preview
   card (Enter, Esc, Tab) is not a change to the target.
-- The one-shot age timer is not polling: it is set once, never rearmed, and is
-  the same mechanism as the card's `auto_dismiss_secs`. It bounds the residual
-  case the table cannot see (a chat that keeps appending, a page that rewrites
-  itself while the user watches).
+- **Alt+Tab to another app hides the overlay and it is not restored when the user
+  returns.** A preview card (options card spec) survives Alt+Tab with its edits;
+  the ghost text it annotated does not. The preview card stays the source of
+  truth, and a new press redraws.
 - The target set is **every top-level window under an annotation's rect**,
   found with `WindowFromPoint` + `GetAncestor(GA_ROOT)` at the rect's centre
   when the annotation is resolved, normally one window, two for #337 (terminal
@@ -395,8 +471,9 @@ Why the default holds without more measurement:
 - The anchor needs a *word box for text we can name*, and Windows OCR returns
   exactly that. A grounding model solves a harder problem (find something
   describable) than the one posed (find these words).
-- The exe budget is roughly 3.5 MB (AGENTS.md; the spike text says about 2 MB,
-  which is out of date), and any model runtime must stay optional. Adopting a
+- The exe gate is 3,900,000 bytes with 3,800,576 measured (perf-budgets.json;
+  AGENTS.md's about 3.5 MB and the spike text's about 2 MB are both out of date),
+  and any model runtime must stay optional. Adopting a
   runtime for the sake of a fallback is a large cost for the cases it rescues.
 - One OCR pass can serve both redaction (`redact::apply_lines`) and anchoring,
   so a cloud overlay pays for OCR once.
@@ -431,13 +508,28 @@ Nothing in slices 1 to 5 waits for it.
 A new `Action` field, `output = "card" | "overlay"` (default `"card"`, so every
 existing action is unchanged). `"overlay"` means the proposal is mapped to
 annotations after the model replies, and a summary card is shown. The executor
-stays `"none"` for read-only actions. A deterministic overlay (units, relative
-dates) has no proposal and no model: a detector over the OCR text produces
-annotations directly, and its action declares `inputs = ["screen"]`, `output =
-"overlay"`, and no `prompt`.
+stays `"none"` for read-only actions.
 
-`actions.toml` entries opt in with the generic list below, so a contributor can
-add an annotating action without touching Rust.
+**A deterministic overlay (units, relative dates) has no proposal and no
+model.** A second new field, `detector = "units" | "dates" | ..`, names a
+built-in detector over the OCR text, and is accepted only on built-in actions
+(a user-authored `actions.toml` entry cannot name one). Such an action declares
+`inputs = ["screen"]`, `output = "overlay"`, a `detector` and no `prompt`.
+The generic runner (`run_generic_action`) needs a new model-free branch for
+it: capture on the main thread, OCR on a worker, run the detector, show the
+overlay, with no provider, no readiness gate and no `Mode` consulted (the same
+shape as `run_model_free_screen_action`), and Paused as the only gate. Both
+fields and the runner branch land in slice 2, with a debug-only action as the
+first user, so slice 3 only adds a detector.
+
+**How a user invokes a model-free overlay.** The router needs a model to offer
+an action, so it cannot be the only door. A model-free overlay action is a
+catalogue entry like "Copy text from screen": it is a palette row, a tray item,
+and, because it is model-free, it appears in the options card's static floor
+(no model, or Offline). With a model ready the router may also offer it.
+
+`actions.toml` entries opt in to `output = "overlay"` with the generic list
+below, so a contributor can add an annotating action without touching Rust.
 
 ### The generic schema, `annotation_list`
 
@@ -568,14 +660,19 @@ this sends the whole screen text, so the redaction rules above apply in full.
 - **Text scale and DPI** as above. The overlay does not animate, so there is
   nothing to reduce.
 - **Screen readers and keyboard.** A layered window with no focus is not usefully
-  in the UIA tree, so the overlay is not the interface. The summary card lists
-  every annotation as text, in reading order, and every #326 action
-  (Fix, Copy, Add to calendar, Fix all) is also a button or a list entry on the
-  card, reachable with the keyboard (#119, #606). Esc closes. This is why the
-  summary card is mandatory.
-- **Do not trap keys.** The overlay claims Esc only (and only while showing),
-  through the same lock-free flag and pure "which keys are claimed" function the
-  options card uses.
+  in the UIA tree, so the overlay is not the interface. The summary card carries
+  the result as text, and its appearing raises a system alert event named by the
+  summary (full UIA is #119). The card's collapsed line gives the counts ("3
+  marked, 1 could not be placed"); its expanded detail lists every annotation in
+  reading order, and that list is scrollable, so a #333 translation of 80 lines
+  fits (the collapsed card never lists them all). Every #326 action (Fix, Copy,
+  Add to calendar, Fix all) is also a button or a list entry on the card,
+  reachable with the keyboard (#119, #606). Esc closes. This is why the summary
+  card is mandatory.
+- **Do not trap keys.** The overlay claims Esc only, only with no modifiers,
+  only while showing, and with an expiry that lapses by itself (see "User-visible
+  behaviour"), through the same lock-free claim and pure "which keys are
+  claimed" function the options card uses.
 
 ## Privacy
 
@@ -604,60 +701,97 @@ this sends the whole screen text, so the redaction rules above apply in full.
 
 ## #326: clickable labels
 
-Slice 6, built after the read-only slices have proven the window. It adds only
-what #326 asks for, under the executor rules:
+Slice 7, built after the read-only slices have proven the window. **It does not
+start until open question 13 is answered**, because it can write without an
+Enter confirm, which the product rule (Look, Propose, Confirm, Do) does not
+allow as drafted.
+
+As #326 is written, a click on a label writes the fix at once: "the label is the
+preview, the click is the confirmation". The options card spec states that every
+writing option goes through the preview card and waits for Enter, so this is an
+exception to a fixed rule, not a design detail. Two further risks: labels sit
+over neighbouring text, so an accidental click on one is a write; and a click is
+easy to land on a label that moved.
+
+**Recommended design: Enter confirm.** A click on a label is the Propose step: it
+opens the existing preview card for exactly that change (the old and new text,
+Do it focused), and Enter or the button is the Confirm. Preview equals
+execution still holds, one extra keypress. If open question 13 is answered the
+other way, the single click write ships only with every guard below plus the
+rule documented as an exception in AGENTS.md.
+
+What #326 adds, under the executor rules either way:
 
 - **Preview equals execution.** The label is the exact change ("recieve ->
-  receive" drawn as `recieve` with `receive` above), and the click writes
-  exactly that string. The annotation is the proposal and the click is the
-  confirmation; a Fix all button is the only multi-write, and it is shown as a
-  list on the summary card first.
+  receive" drawn as `recieve` with `receive` above), and what is written is
+  exactly that string. A Fix all button is the only multi-write, and it is shown
+  as a list on the summary card first.
 - **Only through UIA.** A fix-in-place requires an anchor from a UIA
   `TextPattern` range and goes through the existing `replace_text` executor
   and its guards (`uia_guard`, the payment and password denylists, the
   `IsPassword` fail-closed check). OCR-anchored text offers **Copy** instead.
-- **Staleness check at click.** Re-read the range and write only if it still says
+- **Staleness check at write.** Re-read the range and write only if it still says
   `recieve`; otherwise a card says it changed (the #266 bug class). The overlay
   was already hidden by any edit through the staleness table, so this is the
   second line.
 - **Undo** is the target app's own Ctrl+Z, said on the result card.
 - Clicking a label never activates Wingman, so the target stays foreground for
   the write.
+- **The click handler hit-tests the label rectangles before the dismiss rule
+  runs**, so a click on a label is a pick, not a dismissal (see the shared rules).
 
 ## #329: ghost text in form fields
 
 Uses `FieldSnapshot.rect` (no OCR) and the existing fill executor's resolved
-field list, so the ghost value is the exact string the executor will write,
-including values a refusal rule changed. Fields it will skip show "skipped". The
-form preview card still takes Enter and Esc and holds focus; the overlay stays
-up while the card has the foreground (the "not one of Wingman's own windows"
-filter) and goes on any change to the form's own window. A field whose rect is
-empty, off-screen or clipped is not drawn and is listed on the card only. This
-slice depends only on slice 2, not on the matcher, and validates the field
-anchor source early.
+field list, so the ghost value is the exact string the executor will write for
+an unedited field, including values a refusal rule changed. Fields it will
+skip show "skipped". The form preview card still takes Enter and Esc and holds
+focus; the overlay stays up while the card has the foreground (the "not one of
+Wingman's own windows" filter) and goes on any change to the form's own window,
+and on Alt+Tab to another app (not restored). A field whose rect is empty,
+off-screen or clipped is not drawn and is listed on the card only.
+
+**Editing a value in the preview card hides that field's ghost text.** The
+preview's fields are editable, so after an edit the ghost would show a string
+the executor will not write. The card posts "field edited" with the field
+index, and the overlay drops that one ghost (it does not try to mirror the
+edit; the card is the source of truth). Updating the ghost live is a later
+refinement, not part of this slice.
+
+Key, Esc and click-away follow the shared rules: with the overlay and the
+preview card up together, the key dismisses the preview, nothing runs, and the
+ghost text goes with it. This slice depends only on slice 2, not on the matcher,
+and validates the field anchor source early.
 
 ## Fit with the options card (PR #661)
 
-- **Separate surface, same plumbing.** The overlay is not a `CardState`. It is
-  its own window the `App` owns, with the summary card as an ordinary answer card
-  beside it. The options card is untouched.
+- **Separate window, same rules.** The overlay is not a `CardState` and not a
+  `CardKind`. It is its own window the `App` owns, with the summary card as an
+  ordinary answer card beside it. The options card is untouched. The shared key,
+  Esc and click-away rules live in the options card spec ("Shared rules for every
+  surface"); this spec does not restate or differ from them.
+- **Precedence.** Highest surface first: preview, options card, answer card
+  (with its overlay). With the #329 overlay and a preview card showing, the key
+  dismisses the preview and the ghost text goes with it.
 - **An option can start an overlay action.** "Mark the errors on screen" is a
   catalogue action like any other, so the router can offer it and
   `dispatch_palette_action` runs it. The options card hides first, before the
   capture, as it already does, so neither card is in the OCR.
-- **Key table.** One new row (above): overlay showing, a press dismisses.
-  Digits 1 to 4 are only claimed while an options card shows; the overlay
-  claims Esc only.
-- **Click-away.** `options.click_away_dismiss` governs answer and options cards.
-  The overlay does **not** honour it: any click not on a label dismisses, because
-  a click on a tab, a link or a scrollbar changes the content and the table above
-  has no other way to see it. A preview that outlives a click-away (the #661
-  decision) keeps its ghost text only while the form window itself is unchanged.
-- **Shared guards.** The auto-repeat guard on the key and the claimed-keys flag
-  are shared with the options card; this spec adds a state to the pure function
-  rather than a second mechanism.
-- **New `WM_APP_*` ids** (`WM_APP_OVERLAY_CLICK`, `WM_APP_OVERLAY_STALE`) join
-  `ALL_WM_APP_IDS` in `app.rs` (the registry test enforces it).
+- **Click-away.** The overlay always hides on a click that is not on a label,
+  whatever the setting, because a click on a tab, a link or a scrollbar changes
+  the content and a stale overlay would lie. Its summary card follows
+  `options.click_away_dismiss` (default true) like any answer card. If the card
+  stays (setting off), its line is rewritten to "Marks hidden, the screen
+  changed. Press the key to mark again" and the findings text stays, so the card
+  never claims marks that are gone and the accessibility floor is kept. The same
+  rewrite applies when any other staleness row hides the overlay.
+- **Shared guards.** The auto-repeat guard on the key and the claim (an expiry
+  tick, no modifiers, cleared on every hide path) are shared with the options
+  card; this spec adds an Esc-only state to the pure function rather than a
+  second mechanism.
+- **New `WM_APP_*` ids** (`WM_APP_OVERLAY_CLICK`, `WM_APP_OVERLAY_STALE`,
+  `WM_APP_OVERLAY_INPUT`) join `ALL_WM_APP_IDS` in `app.rs` (the registry test
+  enforces it).
 
 ## Config
 
@@ -705,6 +839,17 @@ Pure logic is unit-tested (rule 8); each Win32 piece names its observable.
 - A source-scanning guard that no `SetTimer` with a repeating interval exists in
   `ui/overlay.rs`, normalising `\r` and asserting its candidate set is not empty
   (the CRLF trap).
+- The main-thread decision path: a posted `WM_APP_OVERLAY_INPUT` for each row of
+  the staleness table hides or keeps the overlay, a click on a label rectangle is
+  never dismissed, and a source-scanning guard (CRLF-normalised, candidate set
+  asserted non-empty) that no hook callback in `ui/overlay.rs` calls
+  `GetForegroundWindow` or `WindowFromPoint`.
+- Precedence: overlay with a preview card, key dismisses the preview and the
+  overlay together; overlay with `click_away_dismiss` off stays with its card.
+- The Esc claim: only with no modifiers, only while an overlay shows, lapses
+  at its expiry tick, cleared by the single hide function.
+- Ghost text: an edited field's ghost is dropped, the others stay.
+- Source-scan: no `allow(dead_code)` remains under `src/overlay/` after slice 2.
 
 **Gallery** (`ui/gallery.rs`): new states `overlay-notes`, `overlay-wrong-ok`,
 `overlay-ghost`, `overlay-clickable`, `overlay-translation`, each in light,
@@ -734,6 +879,11 @@ against the **real** OCR in an `#[ignore]`d live test (the pattern of
    the right size.
 6. With the overlay showing and no input, idle CPU and wakeups are zero
    (Process Explorer or `powercfg`), and after hide the hooks are gone.
+7. With the form preview showing ghost text, Alt+Tab away and back: the ghost
+   text is gone and the preview card is intact with its edits. Observable: the
+   field edits survive, the ghost does not reappear.
+8. Narrator: the summary card appearing is announced, and its expanded list
+   reads every annotation.
 
 ## Costs
 
@@ -753,24 +903,37 @@ against the **real** OCR in an `#[ignore]`d live test (the pattern of
 
 Each ships alone and has an observable.
 
+0. **Spike, before approval (no product change).** The throwaway program from
+   "Excluding the overlay from capture": a layered window with
+   `WDA_EXCLUDEFROMCAPTURE`, captured through `xcap` as Wingman uses it, through
+   a `wgc` or DXGI capture, and through `PrintWindow`, with and without the flag.
+   Written into this spec. Gate: if the flag does not hold for a layered window,
+   this design is revised before slice 1 starts. Cheap enough to do now rather
+   than after merge.
 1. **Anchor core and layout (pure).** `anchor`, `layout`, the alpha pass,
-   `state`, the shared span helpers extracted from `redact.rs`. Observable:
-   the unit tests, and `redact` still passes after the extraction. Nothing
-   user-visible.
-2. **The window, and one real annotation.** `ui/overlay.rs`, the hooks, the
-   affinity flag and its fail-closed rule, the gallery states, `output =
-   "overlay"` on `Action` (default `"card"`) and a debug-only trigger that marks
-   a word. Observable: Manual checks 1, 3 and 6. Gate: Manual check 1 must pass
-   or this design is wrong and is revised.
+   `state`, the shared span helpers extracted from `redact.rs`. It has no
+   runtime caller until slice 2, so the new modules carry
+   `#[cfg_attr(not(test), allow(dead_code))]`, and slice 2's done criterion is
+   that no `allow(dead_code)` remains under `src/overlay/` (a source-scan test,
+   CRLF-normalised, candidate set asserted non-empty). The extracted `redact`
+   helpers do have a caller from the first commit. Observable: the unit tests,
+   and `redact` still passes after the extraction. Nothing user-visible.
+2. **The window, and one real annotation.** `ui/overlay.rs`, the hooks and the
+   main-thread decision path, the affinity flag and its fail-closed rule, the
+   gallery states, `Action.output` (default `"card"`) and `Action.detector`,
+   the generic runner's model-free overlay branch, and a debug-only action that
+   marks a word. Observable: Manual checks 1, 3, 6 and 7. Gate: Manual check 1
+   must pass or this design is wrong and is revised.
 3. **Units overlay (#325's first user).** `5 km` gets `3.1 mi`, `72 F` gets
-   `22 C`, via `calc/units.rs`. No model, works offline. Currency is left out:
-   it needs a rate source, which is a network call and a privacy decision of its
-   own.
+   `22 C`, via `calc/units.rs` and `detector = "units"`. No model, works
+   offline, reachable from the palette, the tray and the options card's static
+   floor. Currency is left out: it needs a rate source, which is a network call
+   and a privacy decision of its own.
 4. **Dates (#336, then #315).** The relative-date resolver (pure, tested against
    fixed dates), then the time-zone labels from the existing `time_zones`
    conversion.
-5. **#329 ghost text.** Field anchors only. Validates the "own window" filter
-   and the Enter/Esc interplay with the preview card.
+5. **#329 ghost text.** Field anchors only. Validates the "own window" filter,
+   the edit-hides-ghost rule and the Enter/Esc interplay with the preview card.
 6. **Model-backed read-only marks**, in this order: #334 (smallest, `signs[]`
    gains an anchor, nothing clickable), #332 (the demo; needs the handwriting
    fallback), #335 (needs the code clamp), #337 (needs the gutter matcher and a
@@ -778,10 +941,27 @@ Each ships alone and has an observable.
    packs, a local model that translates well).
 7. **#326 clickable.** UIA text anchors, `Copy`, `replace_text`, `Add to
    calendar`, Fix all on the card. Last, because it is the only slice that
-   writes.
+   writes, and it waits for open question 13.
 
 #383's measurements run alongside slices 1 to 3 and feed the hit-rate figure
 slice 6 needs.
+
+### Size budget
+
+The gate is `perf-budgets.json` `exe_size_bytes.max` 3,900,000 against a last
+measurement of 3,800,576, about 99 KB of headroom, shared with the options card,
+Settings dark mode and knowledge specs. Estimates for this spec, each THEORY
+(unverified) until a CI measurement replaces it: slice 1 about 12 KB (matcher,
+layout, edit distance, state), slice 2 about 25 KB (window, three hook kinds,
+layered bitmap, the runner branch), slice 3 about 8 KB, slice 4 about 12 KB,
+slice 5 about 6 KB, slice 6 about 30 KB across the five proposal kinds, the
+gutter matcher and font fitting, slice 7 about 10 KB. That is 60 to 120 KB in
+all, so **this spec cannot be absorbed by the existing headroom alone**: the
+pull request that crosses the gate raises it with the measured size and the
+reason, as the QR decoder and the live model lists did, and the order the
+specs merge in decides which one does. No new crate is planned (a `windows`
+feature may be: `Win32_UI_Accessibility` for the event hook is already on). Each
+slice's PR records the CI-measured size.
 
 ## What this deliberately does not do
 
@@ -797,7 +977,8 @@ slice 6 needs.
 
 ## Open questions
 
-Each with a recommended answer.
+Each with a recommended answer. Where a counter-argument exists it is stated, so
+the question stays open.
 
 1. **One window per monitor sized to the marks' bounding box, or one per
    annotation?** One per monitor. Per-annotation windows make z-order and
@@ -805,20 +986,30 @@ Each with a recommended answer.
    to hide atomically.
 2. **Put the OCR text in the model prompt?** Yes for text-anchored model
    overlays, redacted through the existing text path. It turns most matches
-   into exact matches. Revisit if the token count is larger than 600 on real
-   captures.
-3. **Does `xcap` honour `WDA_EXCLUDEFROMCAPTURE`?** Unknown. Manual check 1 before
-   slice 2 merges. If it does not, hide the overlay before every Wingman capture
-   and treat awareness capture (#330) as blocked on a different exclusion.
+   into exact matches. The token count must be measured on real captures before
+   slice 6; revisit if it is larger than 600.
+3. **Does the display affinity flag hold for a layered window under `xcap`?**
+   Unknown, and the whole design hangs on it, so it is the Slice 0 spike, run
+   before this spec is approved rather than before slice 2 merges. If it does
+   not hold, hide the overlay before every Wingman capture and treat awareness
+   capture (#330) as blocked on a different exclusion.
 4. **Any key dismisses, or only keys that can change content?** Any non-modifier
-   key while the foreground window is in the target set. A narrower list would
-   miss an app's own shortcuts. The cost is that a stray key press hides the
-   overlay, which is the safe direction.
+   key while the foreground window is in the target set, decided on the main
+   thread, never inside the hook callback. A narrower list would miss an app's
+   own shortcuts. The cost is that a stray key press hides the overlay, which is
+   the safe direction.
 5. **How long is the age cap?** 30 s. A person reads a screen of labels in
-   seconds. The cap exists for the pages that change under the user.
-6. **Should the overlay honour `options.click_away_dismiss`?** No, see above:
-   a click can change content, and the overlay has no other way to see it.
-7. **Fuzzy matching in the first slice?** Yes, with the unique-match rule. OCR
+   seconds. The cap exists for the pages that change under the user. A one-shot
+   timer set at show and killed in the single hide function is the same pattern
+   as the card's `auto_dismiss_secs`, not a polling timer.
+6. **Should the overlay honour `options.click_away_dismiss`?** Revised answer: the
+   overlay never does, its card does. The overlay always hides on a click not on a
+   label (the staleness table already says so), and the card follows the setting;
+   if the card stays it says the marks are hidden. Counter-argument for one
+   switch governing both: a user who turned click-away off wants a persistent
+   card, and a card that edits its own line is surprising. Recommended: keep the
+   two separate, because a stale overlay is a correctness problem and a stale
+   card line is not.7. **Fuzzy matching in the first slice?** Yes, with the unique-match rule. OCR
    misreads (`l`/`1`, `rn`/`m`) are the common failure and a model quoting
    from the image rather than the OCR text will hit them. Tune the threshold
    from the fixture hit rate.
@@ -837,3 +1028,17 @@ Each with a recommended answer.
 12. **Do UIA text ranges replace OCR where both exist?** No. OCR is the default
     for read-only marks (one code path, works everywhere). UIA is used where the
     action must also write (#326) or the anchor is a field (#329).
+13. **#326: may a click write without an Enter confirm?** This needs a decision
+    against Look, Propose, Confirm, Do. Recommended: no. A click on a label opens
+    the preview card for that exact change and Enter confirms. Counter-argument:
+    one click is the point of #326, and the label already shows the exact change.
+    The risks are an accidental click on a label that sits over other text, and a
+    click that lands on a label that has just moved. If the answer is yes, the
+    exception is written into AGENTS.md and slice 7 keeps every guard listed in
+    "#326: clickable labels".
+14. **Do ghost text and marks survive Alt+Tab?** Recommended: no, hide and do not
+    restore, with the preview card as the source of truth (stated in "When the
+    screen changes"). Counter-argument: the preview survives Alt+Tab by design,
+    so a user who tabs back finds a preview with no ghost text. Restoring needs
+    the overlay to re-verify that the form window has not changed, which is the
+    tracking this spec rejects.
