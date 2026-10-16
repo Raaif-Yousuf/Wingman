@@ -8,6 +8,25 @@ pub(crate) mod common;
 pub mod gemini;
 pub mod model_list;
 pub mod ollama;
+
+/// The longest one provider can hold a run (#723): the larger of the cloud
+/// retry wall clock and Ollama's own total timeout.
+const PER_PROVIDER_SECS: u64 = if common::MAX_TOTAL_WALL_CLOCK_SECS > ollama::TOTAL_TIMEOUT_SECS {
+    common::MAX_TOTAL_WALL_CLOCK_SECS
+} else {
+    ollama::TOTAL_TIMEOUT_SECS
+};
+
+/// What a card assumes about chain length when it cannot see the real one.
+pub const TYPICAL_CHAIN_LEN: usize = 4;
+
+/// The longest an honest run can take (#723): every provider in a chain of
+/// `providers` using its full wall clock, plus a minute for capture and the
+/// hand-off. Longer than this and a run is treated as stuck.
+pub const fn worst_case_run_secs(providers: usize) -> u64 {
+    let n = if providers == 0 { 1 } else { providers as u64 };
+    n * PER_PROVIDER_SECS + 60
+}
 pub mod ollama_admin;
 pub mod ollama_gpu_fix;
 pub mod openai;
@@ -669,6 +688,11 @@ pub struct Chain {
 }
 
 impl Chain {
+    /// How many providers this chain can try.
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
     pub fn new(providers: Vec<Box<dyn Provider>>) -> Self {
         Self {
             providers,

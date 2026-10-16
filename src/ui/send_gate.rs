@@ -71,6 +71,19 @@ pub fn ask(
     rx.recv().ok()
 }
 
+thread_local! {
+    /// #723: the run generation this worker thread was started for. Set by
+    /// each worker on its first line; read when it posts a preview, so a run
+    /// the app gave up on cannot put a preview over a newer one. `0` (never
+    /// set) is always accepted.
+    static WORKER_RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Records the run generation for this worker thread (#723).
+pub fn set_worker_run(run: u64) {
+    WORKER_RUN.with(|c| c.set(run));
+}
+
 /// The real gate: posts to the owner window. `hwnd` is carried as an `isize`
 /// because an `HWND` wraps a raw pointer and is not `Send`.
 pub struct WindowSendGate {
@@ -86,6 +99,7 @@ impl WindowSendGate {
 impl SendGate for WindowSendGate {
     fn confirm(&self, provider_id: &str, req: &Request) -> Option<SendAuthorized> {
         let hwnd = self.hwnd;
+        let run = WORKER_RUN.with(|c| c.get());
         ask(
             move |request| {
                 let raw = Box::into_raw(Box::new(request));
@@ -93,7 +107,7 @@ impl SendGate for WindowSendGate {
                     PostMessageW(
                         Some(HWND(hwnd as *mut _)),
                         WM_APP_SEND_PREVIEW,
-                        WPARAM(0),
+                        WPARAM(run as usize),
                         LPARAM(raw as isize),
                     )
                 };
