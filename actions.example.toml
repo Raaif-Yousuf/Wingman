@@ -249,6 +249,24 @@ enabled = true
 mode = "auto"
 
 [[actions]]
+id = "convert-times-to-my-zone"
+name = "Convert times to my time zone"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "time_list"
+executor = "none"
+confirm = false
+prompt = """You are shown what is on the user's screen, as text if some was selected and as a screenshot otherwise. List every time of day that is shown, in the order they appear, at most 12. Do not convert anything and do not work out any time zone yourself: copy what is written. For each one fill `text`: the time as it appears with the day or date words next to it, for example "Thursday 9:00 PT", at most 40 characters. Then `time`: the clock time only, as written, for example "9:00 PM" or "21:00". Then `date`: the date or day only if one is shown for that time, as written, for example "Thursday", "Oct 22" or "2026-10-22", otherwise an empty string. Then `zone`: the time zone exactly as written, for example "PT", "CET", "IST", "UTC+5:30", otherwise an empty string. Never guess a zone or a date that is not shown. For a range such as "9-10am PT", list the start and the end as two times. If no time of day is shown, return an empty list. Use plain text only: no markdown, no LaTeX, and no em dashes."""
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
 id = "is-this-a-scam"
 name = "Is this a scam?"
 group = "Work"

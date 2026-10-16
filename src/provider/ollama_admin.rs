@@ -342,13 +342,9 @@ pub fn vision_from_tags_entry(model: &TagsModel) -> bool {
 }
 
 /// `GET /api/tags` -- every model pulled locally, at the ordinary discovery
-/// timeout. Not called from any live path today: Settings' Ollama status
-/// line (#188) needs an explicit, tighter total budget and calls
-/// [`list_tags_with_timeout`] directly instead. Kept as the general-purpose
-/// entry point for a future caller that just wants the ordinary default --
-/// same "reserved for a consumer that doesn't exist yet" shape as
-/// `show_capabilities` above.
-#[allow(dead_code)]
+/// timeout. Settings' Ollama model picker (#183) calls this from a worker
+/// thread; the status line (#188) needs a tighter budget and calls
+/// [`list_tags_with_timeout`] instead.
 pub fn list_tags(base_url: &str) -> Result<Vec<TagsModel>> {
     list_tags_with_timeout(base_url, DISCOVERY_TOTAL_TIMEOUT)
 }

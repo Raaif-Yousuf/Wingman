@@ -94,7 +94,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_VSCROLL,
 };
 
-use crate::config::{Config, OllamaConfig, RequireTickFor};
+use crate::config::{ActiveProvider, Config, OllamaConfig, RequireTickFor};
 use crate::hotkey::chord_to_string;
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::DEFAULT_PROMPT;
@@ -203,6 +203,12 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     inner_ref.dpi = dpi;
     let built = build_ui_recorded(hwnd, instance, dpi, inner_ref.font, config, client_h_dp);
     inner_ref.adopt(built);
+    // #183: the model list arrives later, off the UI thread.
+    spawn_ollama_models_fetch(
+        hwnd,
+        config.providers.ollama.base_url.clone(),
+        inner_ref.ollama_tags.clone(),
+    );
     // #342: the prompt starts hidden, so shrink the window to match.
     unsafe { show_prompt_state(inner_ref) };
     unsafe {
@@ -433,6 +439,8 @@ struct SettingsInner {
     body_dpi: u32,
     /// #343: where the Ollama group's link button goes, if it has one.
     ollama_link_url: Option<&'static str>,
+    /// #183: the pulled-model list the background fetch reports into.
+    ollama_tags: OllamaTags,
     /// #342: whether the Advanced group shows the Check my work prompt.
     /// Starts collapsed on every open.
     prompt_expanded: bool,
@@ -457,6 +465,7 @@ impl SettingsInner {
             body: HWND(std::ptr::null_mut()),
             body_dpi: 96,
             ollama_link_url: None,
+            ollama_tags: Default::default(),
             prompt_expanded: false,
             original,
             result: None,
@@ -505,6 +514,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_HSCROLL => {
             update_text_scale_label(hwnd);
+            LRESULT(0)
+        }
+        WM_OLLAMA_MODELS => {
+            let models = inner.ollama_tags.lock().ok().and_then(|g| g.clone());
+            if let Some(models) = models {
+                apply_ollama_models(hwnd, &models);
+            }
             LRESULT(0)
         }
         WM_DPICHANGED => {
@@ -589,6 +605,9 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         }
         ID_ANTHROPIC_SHOW_KEY if notify == BN_CLICKED => {
             toggle_password(inner.hwnd, ID_ANTHROPIC_SHOW_KEY, ID_ANTHROPIC_KEY);
+        }
+        ID_GEMINI_SHOW_KEY if notify == BN_CLICKED => {
+            toggle_password(inner.hwnd, ID_GEMINI_SHOW_KEY, ID_GEMINI_KEY);
         }
         _ => {}
     }
@@ -676,6 +695,13 @@ const ID_OLLAMA_LINK: i32 = 124;
 const ID_PROMPT_TOGGLE: i32 = 123;
 /// #481: the scrolling body window that holds every group above the footer.
 const ID_BODY: i32 = 125;
+/// #183: the Ollama model combo, filled from the locally pulled models.
+const ID_OLLAMA_MODEL: i32 = 126;
+/// #195: the Gemini key field, its Show toggle, and its model and thinking combos.
+const ID_GEMINI_KEY: i32 = 127;
+const ID_GEMINI_SHOW_KEY: i32 = 128;
+const ID_GEMINI_MODEL: i32 = 129;
+const ID_GEMINI_EFFORT: i32 = 130;
 
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
@@ -711,6 +737,11 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_OLLAMA_LINK", ID_OLLAMA_LINK),
     ("ID_PROMPT_TOGGLE", ID_PROMPT_TOGGLE),
     ("ID_BODY", ID_BODY),
+    ("ID_OLLAMA_MODEL", ID_OLLAMA_MODEL),
+    ("ID_GEMINI_KEY", ID_GEMINI_KEY),
+    ("ID_GEMINI_SHOW_KEY", ID_GEMINI_SHOW_KEY),
+    ("ID_GEMINI_MODEL", ID_GEMINI_MODEL),
+    ("ID_GEMINI_EFFORT", ID_GEMINI_EFFORT),
 ];
 
 // ---------------------------------------------------------------------------
@@ -729,6 +760,7 @@ const BST_UNCHECKED: i32 = 0;
 const BN_CLICKED: u32 = 0;
 const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const CB_ADDSTRING: u32 = 0x0143;
+const CB_RESETCONTENT: u32 = 0x014B;
 const CB_SETCURSEL: u32 = 0x014E;
 const CB_GETCURSEL: u32 = 0x0147;
 const CB_GETDROPPEDSTATE: u32 = 0x0157;
@@ -1942,6 +1974,92 @@ fn fill_model_combo(hwnd: HWND, models: &[String], active: &str) {
     }
 }
 
+/// The suffix the Ollama model combo adds to a model that can read images.
+const VISION_BADGE: &str = " (vision)";
+
+/// `text` without a trailing [`VISION_BADGE`]: the model name to save.
+fn strip_vision_badge(text: &str) -> &str {
+    text.strip_suffix(VISION_BADGE).unwrap_or(text)
+}
+
+/// The Ollama model combo's items (#183) for the locally pulled `models`,
+/// and the index to select. Vision models carry [`VISION_BADGE`], decided by
+/// `ollama_admin::vision_from_tags_entry`. A `current` model that is not
+/// pulled is kept at the top, unbadged, so a hand-edited value is never
+/// silently swapped for another model.
+fn ollama_model_entries(models: &[ollama_admin::TagsModel], current: &str) -> (Vec<String>, usize) {
+    let mut labels: Vec<String> = models
+        .iter()
+        .map(|m| {
+            if ollama_admin::vision_from_tags_entry(m) {
+                format!("{}{VISION_BADGE}", m.name)
+            } else {
+                m.name.clone()
+            }
+        })
+        .collect();
+    let mut selected = models.iter().position(|m| m.name == current);
+    if selected.is_none() && !current.is_empty() {
+        labels.insert(0, current.to_string());
+        selected = Some(0);
+    }
+    (labels, selected.unwrap_or(0))
+}
+
+/// Fills the Ollama model combo from the pulled models, keeping whatever is
+/// selected now (#183). Called on the UI thread when the background fetch
+/// reports in.
+fn apply_ollama_models(hwnd: HWND, models: &[ollama_admin::TagsModel]) {
+    let Some(combo) = get_dlg_item(hwnd, ID_OLLAMA_MODEL) else {
+        return;
+    };
+    let shown = combo_selected_text(hwnd, ID_OLLAMA_MODEL);
+    let (labels, selected) = ollama_model_entries(models, strip_vision_badge(shown.trim()));
+    unsafe {
+        SendMessageW(combo, CB_RESETCONTENT, None, None);
+    }
+    for label in &labels {
+        combo_add(combo, label);
+    }
+    if !labels.is_empty() {
+        combo_select_index(combo, selected as i32);
+    }
+}
+
+/// Posted to the Settings window when the background Ollama model fetch has
+/// stored its result in [`SettingsInner::ollama_tags`].
+const WM_OLLAMA_MODELS: u32 = 0x8000 + 41; // WM_APP + 41
+
+/// The fetched model list, shared with the worker thread. `None` until it
+/// reports in, and left `None` when the server was not reachable.
+type OllamaTags = std::sync::Arc<std::sync::Mutex<Option<Vec<ollama_admin::TagsModel>>>>;
+
+/// Asks Ollama for its pulled models on a worker thread, so a slow or hung
+/// server never holds up the Settings window (#183). The result goes into
+/// `slot`, then [`WM_OLLAMA_MODELS`] wakes the window. If the window is
+/// already gone the post simply fails.
+fn spawn_ollama_models_fetch(hwnd: HWND, base_url: String, slot: OllamaTags) {
+    let hwnd_raw = hwnd.0 as isize;
+    let _ = std::thread::Builder::new()
+        .name("settings-ollama-models".into())
+        .spawn(move || {
+            let Ok(models) = ollama_admin::list_tags(&base_url) else {
+                return;
+            };
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(models);
+            }
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd_raw as *mut c_void)),
+                    WM_OLLAMA_MODELS,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        });
+}
+
 /// #188: total budget for the (at most two) optional HTTP calls
 /// `ollama_status_line` can make (`/api/ps` for GPU/CPU, `/api/tags` for
 /// vision counts). Tighter than `ollama_admin`'s general discovery timeout
@@ -2191,8 +2309,6 @@ fn build_ui_recorded(
         ROW_H,
         0,
     );
-    let active_is_anthropic =
-        config.providers.order.first().map(|s| s.as_str()) == Some("anthropic");
     let active_combo = ctx.create(
         WC_COMBOBOX,
         "",
@@ -2206,7 +2322,12 @@ fn build_ui_recorded(
     );
     combo_add(active_combo, "ChatGPT (OpenAI)");
     combo_add(active_combo, "Claude (Anthropic)");
-    combo_select_index(active_combo, if active_is_anthropic { 1 } else { 0 });
+    combo_add(active_combo, "Ollama (local)");
+    combo_add(active_combo, "Gemini (Google)");
+    combo_select_index(
+        active_combo,
+        choice_from_order(&config.providers.order) as i32,
+    );
     r.advance();
 
     // OpenAI
@@ -2382,6 +2503,126 @@ fn build_ui_recorded(
     );
     r.advance();
 
+    // Gemini (#195): same three rows as the other cloud providers.
+    ctx.create(
+        WC_STATIC,
+        "Gemini API key:",
+        0,
+        0,
+        r.x,
+        r.y,
+        LABEL_W,
+        ROW_H,
+        0,
+    );
+    ctx.create(
+        WC_EDIT,
+        &key_field_display(&config.providers.gemini.api_key),
+        (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
+        WS_EX_BORDER,
+        r.x + LABEL_W,
+        r.y,
+        r.w - LABEL_W - 70,
+        ROW_H,
+        ID_GEMINI_KEY,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Show",
+        BS_AUTOCHECKBOX as u32,
+        0,
+        r.x + r.w - 62,
+        r.y,
+        62,
+        ROW_H,
+        ID_GEMINI_SHOW_KEY,
+    );
+    r.advance();
+
+    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, 50, ROW_H, 0);
+    let gemini_model = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + 50,
+        r.y,
+        half - 50,
+        ROW_H * 8,
+        ID_GEMINI_MODEL,
+    );
+    fill_model_combo(
+        gemini_model,
+        &config.providers.gemini.models,
+        &config.providers.gemini.model,
+    );
+
+    ctx.create(
+        WC_STATIC,
+        "Thinking:",
+        0,
+        0,
+        r.x + half + 12,
+        r.y,
+        60,
+        ROW_H,
+        0,
+    );
+    let gemini_effort = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + half + 12 + 60,
+        r.y,
+        half - 60,
+        ROW_H * 4,
+        ID_GEMINI_EFFORT,
+    );
+    for e in EFFORT_LABELS {
+        combo_add(gemini_effort, e);
+    }
+    combo_select_with_custom(
+        gemini_effort,
+        &EFFORT_LABELS,
+        &effort_display(&config.providers.gemini.effort),
+    );
+    r.advance();
+
+    // Ollama (#183): no key, only which pulled model to use. The combo starts
+    // with the configured model alone; the pulled models are added when the
+    // background fetch reports in (see `spawn_ollama_models_fetch`).
+    ctx.create(
+        WC_STATIC,
+        "Ollama model:",
+        0,
+        0,
+        r.x,
+        r.y,
+        LABEL_W,
+        ROW_H,
+        0,
+    );
+    let ollama_model = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + LABEL_W,
+        r.y,
+        r.w - LABEL_W,
+        ROW_H * 8,
+        ID_OLLAMA_MODEL,
+    );
+    let (labels, selected) = ollama_model_entries(&[], &config.providers.ollama.model);
+    for label in &labels {
+        combo_add(ollama_model, label);
+    }
+    if !labels.is_empty() {
+        combo_select_index(ollama_model, selected as i32);
+    }
+    r.advance();
+
     let providers_bottom = r.y + ROW_H + 8;
     // Created last, once the real extent of what it should enclose is
     // known, so its height doesn't need to be precomputed by hand. This
@@ -2411,12 +2652,9 @@ fn build_ui_recorded(
     // configured model is currently loaded on GPU or CPU and how many
     // local models support vision. See `ollama_status_line`.
     //
-    // Read-only by design: editing `base_url`/`model`/enabling Ollama as
-    // an active provider here would need a model combo and an "enabled"
-    // control the same way OpenAI/Anthropic have above, which is a bigger
-    // Win32 UI addition than fits this pass -- filed as a follow-up
-    // referencing #51's upcoming WebView2 settings window instead of
-    // built here.
+    // Read-only: choosing Ollama as the active provider and its model is
+    // done in the Providers group above (#183). `base_url` stays a
+    // config.toml setting.
     let ollama_top = y;
     y += GROUP_LABEL_TOP;
     let ollama_configured = config.providers.order.iter().any(|p| p == "ollama");
@@ -2930,6 +3168,11 @@ fn build_ui_recorded(
         ID_ANTHROPIC_SHOW_KEY,
         ID_ANTHROPIC_MODEL,
         ID_ANTHROPIC_EFFORT,
+        ID_GEMINI_KEY,
+        ID_GEMINI_SHOW_KEY,
+        ID_GEMINI_MODEL,
+        ID_GEMINI_EFFORT,
+        ID_OLLAMA_MODEL,
         ID_MAX_EDGE,
         ID_MONITOR,
         ID_CARD_SECONDS,
@@ -2986,12 +3229,17 @@ const BM_SETCHECK: u32 = 0x00F1;
 #[derive(Debug, Clone, Default)]
 struct RawForm {
     provider_choice: usize,
+    /// The Ollama model combo's text, which may carry a "(vision)" badge.
+    ollama_model: String,
     openai_key: String,
     openai_model: String,
     openai_effort: String,
     anthropic_key: String,
     anthropic_model: String,
     anthropic_effort: String,
+    gemini_key: String,
+    gemini_model: String,
+    gemini_effort: String,
     max_edge_text: String,
     monitor: String,
     card_seconds_text: String,
@@ -3015,6 +3263,7 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
             )
             .0 as usize
         },
+        ollama_model: combo_selected_text(hwnd, ID_OLLAMA_MODEL),
         openai_key: get_dlg_item(hwnd, ID_OPENAI_KEY)
             .map(get_text)
             .unwrap_or_default(),
@@ -3025,6 +3274,11 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
             .unwrap_or_default(),
         anthropic_model: combo_selected_text(hwnd, ID_ANTHROPIC_MODEL),
         anthropic_effort: combo_selected_text(hwnd, ID_ANTHROPIC_EFFORT),
+        gemini_key: get_dlg_item(hwnd, ID_GEMINI_KEY)
+            .map(get_text)
+            .unwrap_or_default(),
+        gemini_model: combo_selected_text(hwnd, ID_GEMINI_MODEL),
+        gemini_effort: combo_selected_text(hwnd, ID_GEMINI_EFFORT),
         // #341: the combo now shows "Low"/"Medium"/.../"Maximum" rather than
         // the raw number, so convert back to the numeric text `build_config`
         // and `find_invalid_numeric_field` (#344) already expect. An
@@ -3067,12 +3321,11 @@ fn order_from_choice(choice: usize) -> Vec<String> {
     }
 }
 
-#[allow(dead_code)] // exercised by tests; kept for symmetry with order_from_choice
+/// The "Active provider" combo index for `order` (an index into
+/// `ActiveProvider::ALL`: ChatGPT, Claude, Ollama, Gemini). A config led by
+/// anything else shows as ChatGPT.
 fn choice_from_order(order: &[String]) -> usize {
-    match order.first().map(|s| s.as_str()) {
-        Some("anthropic") => 1,
-        _ => 0,
-    }
+    ActiveProvider::from_order(order).index()
 }
 
 /// #194: `build_config`'s provider-order merge. `choice` (the Settings
@@ -3096,7 +3349,38 @@ fn choice_from_order(order: &[String]) -> usize {
 /// - **Neither present:** both are appended to the end, in `choice`'s order
 ///   -- matching what `order_from_choice` always produced when `configured`
 ///   was empty.
+///
+/// #183, #195: choosing Ollama or Gemini (choice 2 or 3) moves it to the
+/// front (or adds it there) and leaves everything else where it was.
+/// Switching away from an order led by one of them puts the chosen provider
+/// first, since the swap above alone would leave the old leader answering.
 fn merge_provider_order(configured: &[String], choice: usize) -> Vec<String> {
+    let chosen = ActiveProvider::from_index(choice);
+    if matches!(chosen, ActiveProvider::Ollama | ActiveProvider::Gemini) {
+        if configured.is_empty() {
+            return vec![
+                chosen.order_name().to_string(),
+                "openai".to_string(),
+                "anthropic".to_string(),
+            ];
+        }
+        let mut order = configured.to_vec();
+        chosen.move_to_front(&mut order);
+        return order;
+    }
+    let mut order = merge_cloud_order(configured, choice);
+    if matches!(
+        ActiveProvider::from_order(configured),
+        ActiveProvider::Ollama | ActiveProvider::Gemini
+    ) {
+        chosen.move_to_front(&mut order);
+    }
+    order
+}
+
+/// The #194 rule: `choice` 0/1 only decides the relative order of openai and
+/// anthropic within `configured`.
+fn merge_cloud_order(configured: &[String], choice: usize) -> Vec<String> {
     let (first, second) = if choice == 1 {
         ("anthropic", "openai")
     } else {
@@ -3431,6 +3715,11 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
 
     cfg.providers.order = merge_provider_order(&original.providers.order, raw.provider_choice);
 
+    let ollama_model = strip_vision_badge(raw.ollama_model.trim());
+    if !ollama_model.is_empty() {
+        cfg.providers.ollama.model = ollama_model.to_string();
+    }
+
     cfg.providers.openai.api_key =
         resolve_key_field(&original.providers.openai.api_key, &raw.openai_key);
     if !raw.openai_model.trim().is_empty() {
@@ -3447,6 +3736,15 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     }
     if let Some(v) = label_to_effort(raw.anthropic_effort.trim()) {
         cfg.providers.anthropic.effort = v;
+    }
+
+    cfg.providers.gemini.api_key =
+        resolve_key_field(&original.providers.gemini.api_key, &raw.gemini_key);
+    if !raw.gemini_model.trim().is_empty() {
+        cfg.providers.gemini.model = raw.gemini_model.clone();
+    }
+    if let Some(v) = label_to_effort(raw.gemini_effort.trim()) {
+        cfg.providers.gemini.effort = v;
     }
 
     cfg.capture.max_edge = parse_max_edge_or(&raw.max_edge_text, original.capture.max_edge);
@@ -3916,16 +4214,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_order_ollama_first_is_left_in_place() {
-        let configured = names(&["ollama", "openai", "anthropic"]);
-        assert_eq!(
-            merge_provider_order(&configured, 0),
-            names(&["ollama", "openai", "anthropic"])
-        );
-        assert_eq!(
-            merge_provider_order(&configured, 1),
-            names(&["ollama", "anthropic", "openai"])
-        );
+    fn merge_order_ollama_first_is_left_in_place_when_ollama_stays_chosen() {
+        // The combo now shows Ollama (choice 2) for an Ollama-led order, so an
+        // untouched save is choice 2 and changes nothing.
+        let configured = names(&["ollama", "anthropic", "openai"]);
+        assert_eq!(merge_provider_order(&configured, 2), configured);
     }
 
     #[test]
@@ -3964,11 +4257,11 @@ mod tests {
         let configured = names(&["ollama", "openai"]);
         assert_eq!(
             merge_provider_order(&configured, 0),
-            names(&["ollama", "openai", "anthropic"])
+            names(&["openai", "ollama", "anthropic"])
         );
         assert_eq!(
             merge_provider_order(&configured, 1),
-            names(&["ollama", "anthropic", "openai"])
+            names(&["anthropic", "ollama", "openai"])
         );
     }
 
@@ -3990,11 +4283,11 @@ mod tests {
         let configured = names(&["ollama"]);
         assert_eq!(
             merge_provider_order(&configured, 0),
-            names(&["ollama", "openai", "anthropic"])
+            names(&["openai", "ollama", "anthropic"])
         );
         assert_eq!(
             merge_provider_order(&configured, 1),
-            names(&["ollama", "anthropic", "openai"])
+            names(&["anthropic", "ollama", "openai"])
         );
     }
 
@@ -4008,6 +4301,197 @@ mod tests {
             merge_provider_order(&[], 1),
             names(&["anthropic", "openai"])
         );
+    }
+
+    // -- #183: Ollama as the active provider ----------------------------
+
+    #[test]
+    fn choice_two_is_ollama_first() {
+        assert_eq!(choice_from_order(&names(&["ollama", "openai"])), 2);
+        assert_eq!(choice_from_order(&names(&["openai", "ollama"])), 0);
+    }
+
+    #[test]
+    fn merge_order_choice_two_moves_ollama_to_the_front() {
+        assert_eq!(
+            merge_provider_order(&names(&["openai", "anthropic"]), 2),
+            names(&["ollama", "openai", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&names(&["anthropic", "openai", "ollama"]), 2),
+            names(&["ollama", "anthropic", "openai"])
+        );
+        assert_eq!(
+            merge_provider_order(&names(&["ollama", "openai", "anthropic"]), 2),
+            names(&["ollama", "openai", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&[], 2),
+            names(&["ollama", "openai", "anthropic"])
+        );
+    }
+
+    #[test]
+    fn merge_order_leaving_ollama_puts_the_chosen_cloud_provider_first() {
+        let configured = names(&["ollama", "openai", "anthropic"]);
+        assert_eq!(
+            merge_provider_order(&configured, 0),
+            names(&["openai", "ollama", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&configured, 1),
+            names(&["anthropic", "ollama", "openai"])
+        );
+    }
+
+    #[test]
+    fn vision_badge_round_trips_through_the_combo_text() {
+        assert_eq!(strip_vision_badge("llava:7b (vision)"), "llava:7b");
+        assert_eq!(strip_vision_badge("gemma3:4b"), "gemma3:4b");
+    }
+
+    fn tag(name: &str, caps: &[&str]) -> ollama_admin::TagsModel {
+        ollama_admin::TagsModel {
+            name: name.to_string(),
+            size: 0,
+            details: Default::default(),
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn ollama_entries_badge_vision_models_and_select_the_current_one() {
+        let models = [
+            tag("qwen3:4b", &["completion"]),
+            tag("gemma3:4b", &["completion", "vision"]),
+        ];
+        let (labels, sel) = ollama_model_entries(&models, "gemma3:4b");
+        assert_eq!(labels, vec!["qwen3:4b", "gemma3:4b (vision)"]);
+        assert_eq!(sel, 1);
+    }
+
+    #[test]
+    fn ollama_entries_keep_a_current_model_that_is_not_pulled() {
+        let models = [tag("qwen3:4b", &["completion"])];
+        let (labels, sel) = ollama_model_entries(&models, "gemma3:4b");
+        assert_eq!(labels, vec!["gemma3:4b", "qwen3:4b"]);
+        assert_eq!(sel, 0);
+    }
+
+    #[test]
+    fn ollama_entries_with_nothing_pulled_show_only_the_current_model() {
+        let (labels, sel) = ollama_model_entries(&[], "gemma3:4b");
+        assert_eq!(labels, vec!["gemma3:4b"]);
+        assert_eq!(sel, 0);
+    }
+
+    #[test]
+    fn build_config_applies_the_chosen_ollama_model_without_its_badge() {
+        let original = Config::default();
+        let mut raw = raw_from(&original);
+        raw.ollama_model = "llava:7b (vision)".to_string();
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.ollama.model, "llava:7b");
+    }
+
+    #[test]
+    fn build_config_keeps_the_ollama_model_when_the_combo_is_blank() {
+        let original = Config::default();
+        let mut raw = raw_from(&original);
+        raw.ollama_model = "  ".to_string();
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.ollama.model, original.providers.ollama.model);
+    }
+
+    #[test]
+    fn build_config_saving_ollama_as_active_puts_it_first_in_the_order() {
+        let original = Config::default();
+        let mut raw = raw_from(&original);
+        raw.provider_choice = 2;
+        let cfg = build_config(&original, &raw);
+        assert_eq!(
+            cfg.providers.order.first().map(String::as_str),
+            Some("ollama")
+        );
+    }
+
+    // -- #195: Gemini fields and active-provider choice ------------------
+
+    #[test]
+    fn choice_three_is_gemini_first() {
+        assert_eq!(choice_from_order(&names(&["gemini", "openai"])), 3);
+        assert_eq!(choice_from_order(&names(&["openai", "gemini"])), 0);
+    }
+
+    #[test]
+    fn merge_order_choice_three_moves_gemini_to_the_front_and_keeps_the_rest() {
+        assert_eq!(
+            merge_provider_order(&names(&["openai", "anthropic"]), 3),
+            names(&["gemini", "openai", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&names(&["anthropic", "gemini", "openai"]), 3),
+            names(&["gemini", "anthropic", "openai"])
+        );
+        assert_eq!(
+            merge_provider_order(&[], 3),
+            names(&["gemini", "openai", "anthropic"])
+        );
+    }
+
+    #[test]
+    fn merge_order_leaving_gemini_puts_the_chosen_provider_first() {
+        let configured = names(&["gemini", "openai", "anthropic"]);
+        assert_eq!(
+            merge_provider_order(&configured, 0),
+            names(&["openai", "gemini", "anthropic"])
+        );
+        assert_eq!(
+            merge_provider_order(&configured, 1),
+            names(&["anthropic", "gemini", "openai"])
+        );
+        assert_eq!(
+            merge_provider_order(&configured, 2),
+            names(&["ollama", "gemini", "openai", "anthropic"])
+        );
+    }
+
+    #[test]
+    fn an_untouched_save_keeps_a_gemini_led_order() {
+        let mut original = Config::default();
+        original.providers.order = names(&["gemini", "openai", "anthropic"]);
+        let cfg = build_config(&original, &raw_from(&original));
+        assert_eq!(cfg.providers.order, original.providers.order);
+    }
+
+    #[test]
+    fn build_config_applies_an_edited_gemini_model_and_effort() {
+        let original = Config::default();
+        let mut raw = raw_from(&original);
+        raw.gemini_model = "gemini-2.5-pro".to_string();
+        raw.gemini_effort = "Thorough".to_string();
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.gemini.model, "gemini-2.5-pro");
+        assert_eq!(cfg.providers.gemini.effort, "high");
+    }
+
+    #[test]
+    fn build_config_keeps_the_stored_gemini_key_when_the_field_still_shows_the_mask() {
+        let mut original = Config::default();
+        original.providers.gemini.api_key = "AIza-real-test-key-0000".to_string();
+        let mut raw = raw_from(&original);
+        raw.gemini_key = key_field_display(&original.providers.gemini.api_key);
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.gemini.api_key, "AIza-real-test-key-0000");
+    }
+
+    #[test]
+    fn build_config_takes_a_newly_pasted_gemini_key() {
+        let original = Config::default();
+        let mut raw = raw_from(&original);
+        raw.gemini_key = "AIza-pasted-test-key".to_string();
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.providers.gemini.api_key, "AIza-pasted-test-key");
     }
 
     // -- mask_key / resolve_key_field (#2 settings masking) ---------------
@@ -4115,13 +4599,19 @@ mod tests {
 
     fn raw_from(original: &Config) -> RawForm {
         RawForm {
-            provider_choice: 0,
+            // What the combo would show for this config, so an untouched
+            // form is an untouched save.
+            provider_choice: choice_from_order(&original.providers.order),
+            ollama_model: original.providers.ollama.model.clone(),
             openai_key: original.providers.openai.api_key.clone(),
             openai_model: original.providers.openai.model.clone(),
             openai_effort: effort_display(&original.providers.openai.effort),
             anthropic_key: original.providers.anthropic.api_key.clone(),
             anthropic_model: original.providers.anthropic.model.clone(),
             anthropic_effort: effort_display(&original.providers.anthropic.effort),
+            gemini_key: original.providers.gemini.api_key.clone(),
+            gemini_model: original.providers.gemini.model.clone(),
+            gemini_effort: effort_display(&original.providers.gemini.effort),
             max_edge_text: original.capture.max_edge.to_string(),
             monitor: monitor_display(&original.capture.monitor),
             card_seconds_text: original.ui.card_seconds.to_string(),

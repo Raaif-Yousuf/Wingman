@@ -148,8 +148,12 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   pointing at `127.0.0.1`.
 - **Models:** `providers.ollama.model`, default `gemma3:4b`. There is no
   `providers.ollama.models` list (unlike the cloud providers) -- Ollama's
-  own `/api/tags` is the source of what is actually pulled; Settings shows a
-  read-only status line, not an editable list.
+  own `/api/tags` is the source of what is actually pulled. Settings has an
+  "Ollama model" picker that lists those models once a background fetch
+  returns (the window never waits on it), with "(vision)" after each model
+  that can read images. A model set by hand that is not pulled stays in the
+  list. The tray's Provider submenu has an "Ollama (local)" entry; the model
+  itself is chosen in Settings.
 - **Effort/thinking:** `think` (boolean) is **always sent explicitly**,
   never omitted (AGENTS.md rule 6: leaving it unset on a thinking model was
   MEASURED 28x slower, 366s vs 13s for the same answer). `Effort::Unset` and
@@ -286,15 +290,14 @@ since a local server has no rate limit to retry against.
 
 ## How to add Ollama, Gemini or a compat endpoint to `providers.order` by hand today
 
-Settings (`src/ui/settings.rs`) only exposes OpenAI and Anthropic:
-`ID_OPENAI_KEY`/`ID_ANTHROPIC_KEY` and their model/effort combos, plus a
-two-way `order_from_choice` toggle (`0` -> `["openai", "anthropic"]`, `1`
--> `["anthropic", "openai"]`) that **rebuilds `providers.order` from
-scratch on every Settings save**. There is no UI path to add `"ollama"`,
-`"gemini"` or a `"compat:<name>"` entry to the order, and Gemini has no
-key/model/effort fields in Settings at all (issue #195).
+Settings (`src/ui/settings.rs`) has key/model/effort fields for OpenAI,
+Anthropic and Gemini (issue #195), a model picker for Ollama (issue #183),
+and an "Active provider" choice of ChatGPT, Claude, Ollama (local) or Gemini
+that moves that provider to the front of `providers.order`. The tray's
+Provider submenu does the same. There is no UI to add a `"compat:<name>"`
+entry to the order.
 
-To use Ollama, Gemini or an OpenAI-compatible endpoint today, edit
+To use an OpenAI-compatible endpoint today, edit
 `%APPDATA%\Wingman\config.toml` by hand (**Open config.toml** in the tray
 menu) and add the provider name to `providers.order`, e.g.:
 
@@ -310,38 +313,32 @@ api_key = "..."
 model = "..."
 ```
 
-Gemini additionally needs `providers.gemini.api_key` set (or the
-`GEMINI_API_KEY` environment variable) since it has no Settings field to
-paste a key into. Ollama needs nothing beyond the order entry: its
-`base_url`/`model`/`effort` already have working defaults in
+Gemini needs a key: paste it in Settings, or set the `GEMINI_API_KEY`
+environment variable. Ollama needs nothing beyond being first or listed in
+the order: its `base_url`/`model`/`effort` already have working defaults in
 `OllamaConfig::default`. A compat endpoint needs its own
 `[[providers.compat]]` table (`CompatConfig`, `src/config.rs`), one entry
 per endpoint, matched to the order by its `name` (`"compat:<name>"` in
 `providers.order` resolves to the `[[providers.compat]]` entry with that
 `name`).
 
-**The Settings limitation, precisely:** any edit made by hand to
-`providers.order` beyond `openai`/`anthropic` survives a **Reload
-settings** (re-reads the file) but is **silently discarded** the next time
-Settings itself is opened and saved, because `order_from_choice` always
-rewrites `order` to one of its two fixed two-provider lists on save
-(tracked as issue #194's original bug, now understood and filed against
-#195 as the reason a Gemini field group has not been added). Until #51
-(retiring the fixed-layout Win32 Settings dialog for a main-window
-settings surface) lands with a proper N-provider order editor, a
-hand-edited order that includes Ollama, Gemini or a compat endpoint must
-not be re-saved from Settings, or it reverts to `openai`/`anthropic` only.
+**What a Settings save does to the order:** it keeps every entry you added
+by hand (compat endpoints, a duplicate) where it was
+(`merge_provider_order`, issue #194). Only the choice in "Active provider"
+changes it: picking ChatGPT or Claude swaps those two, and picking Ollama or
+Gemini puts it first. A config that leads with a compat endpoint shows as
+ChatGPT in that control; saving without touching it leaves the order alone.
 
 ## Model discovery
 
 Ollama: `GET /api/tags` lists pulled models; each entry's vision badge comes
 from its own `capabilities` array (0.34+) or the static allowlist fallback
-above. `POST /api/show` (`show_capabilities`, issue #14) gives the same
+above. Settings' Ollama model picker reads that list (`list_tags`, issue
+#183). `POST /api/show` (`show_capabilities`, issue #14) gives the same
 badge for one model plus its raw capability list, but nothing in the
-running app calls it yet -- it exists and is tested ahead of a settings
-surface that will use it. `POST /api/pull` (`pull`, issue #14) streams
+running app calls it yet. `POST /api/pull` (`pull`, issue #14) streams
 newline-delimited JSON progress and is built and tested, but nothing calls
-it yet either; both are reserved for a future settings surface (see each
+it yet either; both wait for a pull-with-progress surface (see each
 function's doc comment in `src/provider/ollama_admin.rs`).
 
 OpenAI-compatible: the provider exists (`openai_compat.rs`, issue #16,
