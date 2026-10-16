@@ -4013,11 +4013,22 @@ impl App {
         }
     }
 
-    fn set_watch(&self, on: bool) {
+    fn set_watch(&mut self, on: bool) {
+        let failed = match &self.watcher {
+            Some(w) if on => !w.arm(),
+            _ => false,
+        };
+        // Never overwrite a real earlier error: the card being shown may be it.
+        if failed && self.last_error.is_none() {
+            // Issue #729: no click-away for this card. Record it for
+            // "Copy diagnostics" rather than failing the card itself.
+            self.record_last_error(
+                "Click-away dismissal unavailable",
+                "SetWindowsHookExW(WH_MOUSE_LL) failed",
+            );
+        }
         if let Some(w) = &self.watcher {
-            if on {
-                w.arm();
-            } else {
+            if !on {
                 w.disarm();
             }
         }

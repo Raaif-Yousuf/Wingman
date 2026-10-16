@@ -192,12 +192,16 @@ impl ClickWatcher {
     }
 
     /// Install the hook and start reporting clicks. Called when a card that
-    /// wants click-away becomes visible. If the hook cannot be installed the
-    /// card still auto-dismisses on its timer, as it always did.
-    pub fn arm(&self) {
-        if HOOK.arm(install_real_hook) {
+    /// wants click-away becomes visible. Returns `false` if the hook could not
+    /// be installed. Cards with a dismiss timer still close on it; cards with
+    /// no timer (errors, "Review needs edits") then close only by their own
+    /// controls or Esc, so the caller should record the failure.
+    pub fn arm(&self) -> bool {
+        let ok = HOOK.arm(install_real_hook);
+        if ok {
             ARMED.store(true, Ordering::Relaxed);
         }
+        ok
     }
 
     /// Remove the hook. Called while a request is in flight and whenever the
