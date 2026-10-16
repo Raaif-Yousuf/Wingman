@@ -344,7 +344,7 @@ mod driver {
                     // Live theme, the window's own DPI: named for the DPI it
                     // really had, found out once the window exists.
                     let path = dir.join("pending.png");
-                    let hwnd = shoot(
+                    let named = shoot(
                         &mut card,
                         &mut palette,
                         &mut settings,
@@ -352,10 +352,20 @@ mod driver {
                         Variant::default(),
                         *state,
                         &path,
-                    )?;
-                    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
-                    let name = matrix_filename(state_name(*state), "system", scale_percent(dpi));
-                    std::fs::rename(&path, dir.join(name))?;
+                    )
+                    .and_then(|hwnd| {
+                        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+                        // 0 means the window is gone: a "0" file would lie.
+                        anyhow::ensure!(dpi > 0, "no DPI for the {} window", state_name(*state));
+                        let name =
+                            matrix_filename(state_name(*state), "system", scale_percent(dpi));
+                        std::fs::rename(&path, dir.join(name))?;
+                        Ok(())
+                    });
+                    if named.is_err() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    named?;
                 }
             }
             std::process::exit(0);
@@ -498,34 +508,33 @@ mod driver {
     }
 
     fn form_long_labels_fixture() -> (serde_json::Value, serde_json::Value) {
-        let schema = crate::actions::schema::schema_for("form_fill", false)
-            .expect("form_fill is a registered action schema");
-        let value = serde_json::json!({
+        let proposal = serde_json::json!({
             "fields": [
                 {
                     "control_id": "ctl1",
                     "source": "profile",
-                    "profile_field": "Employer-provided legal first and middle name",
+                    "label": "Employer-provided legal first and middle name",
                     "value": "Jordan Alexander",
                     "sensitive": false
                 },
                 {
                     "control_id": "ctl2",
                     "source": "profile",
-                    "profile_field": "Mailing address, including apartment or unit number",
+                    "label": "Mailing address, including apartment or unit number",
                     "value": "742 Evergreen Terrace, Apt 4B",
                     "sensitive": false
                 },
                 {
                     "control_id": "ctl3",
                     "source": "profile",
-                    "profile_field": "Social security number (last four digits only)",
+                    "label": "Social security number (last four digits only)",
                     "value": "6789",
                     "sensitive": true
                 }
             ]
         });
-        (schema, value)
+        // Built the way a real form fill is, so the labels are real labels.
+        crate::actions::fill_form::build_preview_schema_and_value(&proposal)
     }
 
     fn free_palette_catalogue() -> Vec<PaletteAction> {
