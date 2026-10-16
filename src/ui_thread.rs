@@ -83,7 +83,10 @@ mod tests {
     fn every_blocking_entry_point_calls_the_check() {
         let sources = [
             ("src/provider/common.rs", include_str!("provider/common.rs")),
-            ("src/connectors/oauth.rs", include_str!("connectors/oauth.rs")),
+            (
+                "src/connectors/oauth.rs",
+                include_str!("connectors/oauth.rs"),
+            ),
             ("src/inputs/web_page.rs", include_str!("inputs/web_page.rs")),
         ];
         let mut found = 0;
