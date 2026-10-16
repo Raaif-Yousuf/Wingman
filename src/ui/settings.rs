@@ -232,13 +232,9 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
         hwnd,
         config,
         inner_ref.cloud_models.clone(),
+        inner_ref.cloud_sync.clone(),
         inner_ref.alive.clone(),
     );
-    inner_ref.fetched_keys = [
-        config.providers.openai.api_key.clone(),
-        config.providers.anthropic.api_key.clone(),
-        config.providers.gemini.api_key.clone(),
-    ];
     // #342: the prompt starts hidden, so shrink the window to match.
     unsafe { show_prompt_state(inner_ref) };
     unsafe {
@@ -495,9 +491,9 @@ struct SettingsInner {
     ollama_tags: OllamaTags,
     /// #380: the cloud providers' live model lists, filled the same way.
     cloud_models: CloudModels,
-    /// #585: the key each cloud list was last asked for, so leaving a key
-    /// field with the same key does not fetch again.
-    fetched_keys: [String; 3],
+    /// #585: per-vendor fetch generation and the key each list was last
+    /// fetched with successfully.
+    cloud_sync: std::sync::Arc<CloudSync>,
     /// #566: the running pull's progress, filled by its worker. Replaced by a
     /// fresh slot for every pull, so a stopped pull's worker never writes
     /// into the next one.
@@ -549,7 +545,7 @@ impl SettingsInner {
             ollama_status: Default::default(),
             ollama_tags: Default::default(),
             cloud_models: Default::default(),
-            fetched_keys: Default::default(),
+            cloud_sync: Default::default(),
             pull_slot: Default::default(),
             pull_cancel: None,
             pull_gen: 0,
@@ -699,6 +695,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
+    // #585: a key typed but not saved yet still fetches its model list once
+    // the user leaves the field.
+    if let Some(index) = typed_key_vendor(id, notify) {
+        fetch_for_typed_key(inner, index);
+        return;
+    }
     match id {
         ID_SAVE => {
             // #566: Save would close the window and silently stop the pull.
@@ -759,11 +761,6 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         }
         ID_CARD_CORNER if notify == CBN_SELCHANGE => sync_card_display_enabled(inner.hwnd),
         ID_GEMINI_MODEL if notify == CBN_SELCHANGE => sync_gemini_thinking_enabled(inner.hwnd),
-        // #585: a key typed but not saved yet still fetches its model list
-        // once the user leaves the field.
-        ID_OPENAI_KEY if notify == EN_KILLFOCUS => fetch_for_typed_key(inner, 0),
-        ID_ANTHROPIC_KEY if notify == EN_KILLFOCUS => fetch_for_typed_key(inner, 1),
-        ID_GEMINI_KEY if notify == EN_KILLFOCUS => fetch_for_typed_key(inner, 2),
         // #635: the user picked a model themselves, so a pending "select the
         // pulled model" must not override it.
         ID_OLLAMA_MODEL if notify == CBN_SELCHANGE => inner.pull_select = None,
@@ -2383,6 +2380,7 @@ fn spawn_cloud_models_fetch(
     hwnd: HWND,
     config: &Config,
     slots: CloudModels,
+    sync: std::sync::Arc<CloudSync>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     if crate::mode::is_offline_now() {
@@ -2397,7 +2395,44 @@ fn spawn_cloud_models_fetch(
         if key.trim().is_empty() || key == crate::config::UNREADABLE_KEY_MARKER {
             continue;
         }
-        spawn_one_cloud_fetch(hwnd, index, key.clone(), slots.clone(), alive.clone());
+        spawn_one_cloud_fetch(
+            hwnd,
+            index,
+            key.clone(),
+            slots.clone(),
+            sync.clone(),
+            alive.clone(),
+        );
+    }
+}
+
+/// #585: state shared between Settings and its model-list workers.
+#[derive(Default)]
+struct CloudSync {
+    /// The newest fetch started for each vendor. A worker whose number is no
+    /// longer current has been replaced and drops its result.
+    generation: [std::sync::atomic::AtomicU64; 3],
+    /// The key each list was last fetched with successfully, so leaving a
+    /// key field with the same key does not fetch again, and a failed fetch
+    /// is retried on the next focus-out.
+    fetched_keys: std::sync::Mutex<[String; 3]>,
+}
+
+/// Whether a worker holding `mine` is still the newest for its vendor.
+fn is_current_generation(newest: u64, mine: u64) -> bool {
+    newest == mine
+}
+
+/// Which vendor index a command is a key field losing focus for (#585).
+fn typed_key_vendor(id: i32, notify: u32) -> Option<usize> {
+    if notify != EN_KILLFOCUS {
+        return None;
+    }
+    match id {
+        ID_OPENAI_KEY => Some(0),
+        ID_ANTHROPIC_KEY => Some(1),
+        ID_GEMINI_KEY => Some(2),
+        _ => None,
     }
 }
 
@@ -2428,18 +2463,24 @@ fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
     let Some(edit) = get_dlg_item(inner.hwnd, edit_id) else {
         return;
     };
-    let Some(key) = key_to_fetch(original, &get_text(edit), &inner.fetched_keys[index]) else {
+    let last = inner
+        .cloud_sync
+        .fetched_keys
+        .lock()
+        .map(|g| g[index].clone())
+        .unwrap_or_default();
+    let Some(key) = key_to_fetch(original, &get_text(edit), &last) else {
         return;
     };
     if crate::mode::is_offline_now() {
         return;
     }
-    inner.fetched_keys[index] = key.clone();
     spawn_one_cloud_fetch(
         inner.hwnd,
         index,
         key,
         inner.cloud_models.clone(),
+        inner.cloud_sync.clone(),
         inner.alive.clone(),
     );
 }
@@ -2449,9 +2490,11 @@ fn spawn_one_cloud_fetch(
     index: usize,
     key: String,
     slots: CloudModels,
+    sync: std::sync::Arc<CloudSync>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let vendor = CLOUD_VENDORS[index];
+    let mine = sync.generation[index].fetch_add(1, Ordering::SeqCst) + 1;
     let hwnd_raw = hwnd.0 as isize;
     let _ = std::thread::Builder::new()
         .name("settings-cloud-models".into())
@@ -2469,8 +2512,16 @@ fn spawn_one_cloud_fetch(
                     return;
                 }
             };
+            // A newer fetch for this vendor started while this one ran: its
+            // result wins, so this one is dropped.
+            if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
+                return;
+            }
             if let Ok(mut guard) = slots.lock() {
                 guard[index] = Some(ids);
+            }
+            if let Ok(mut keys) = sync.fetched_keys.lock() {
+                keys[index] = key.trim().to_string();
             }
             post_while_open(&alive, || unsafe {
                 let _ = PostMessageW(
@@ -6187,6 +6238,30 @@ mod tests {
         assert_eq!(combo_index_for_order(&["gemini".to_string()]), 3);
         // CB_GETCURSEL returns -1 for "nothing", read as usize.
         assert_eq!(merge_provider_order(&order, (-1i32) as usize), order);
+    }
+
+    #[test]
+    fn only_the_newest_fetch_for_a_vendor_is_kept() {
+        let sync = CloudSync::default();
+        let first = sync.generation[0].fetch_add(1, Ordering::SeqCst) + 1;
+        let second = sync.generation[0].fetch_add(1, Ordering::SeqCst) + 1;
+        let newest = sync.generation[0].load(Ordering::SeqCst);
+        assert!(!is_current_generation(newest, first));
+        assert!(is_current_generation(newest, second));
+        // Another vendor's counter is independent.
+        assert!(is_current_generation(
+            sync.generation[1].load(Ordering::SeqCst),
+            0
+        ));
+    }
+
+    #[test]
+    fn only_a_key_field_losing_focus_triggers_a_typed_key_fetch() {
+        assert_eq!(typed_key_vendor(ID_OPENAI_KEY, EN_KILLFOCUS), Some(0));
+        assert_eq!(typed_key_vendor(ID_ANTHROPIC_KEY, EN_KILLFOCUS), Some(1));
+        assert_eq!(typed_key_vendor(ID_GEMINI_KEY, EN_KILLFOCUS), Some(2));
+        assert_eq!(typed_key_vendor(ID_OPENAI_KEY, 0x0300), None); // EN_CHANGE
+        assert_eq!(typed_key_vendor(ID_OLLAMA_MODEL, EN_KILLFOCUS), None);
     }
 
     #[test]

@@ -53,6 +53,15 @@ const GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta/model
 /// A vendor that keeps saying "more" stops here: a runaway list is a bug on
 /// their side, and the pages read so far are still a usable list.
 const MAX_PAGES: usize = 10;
+/// Stop following pages once this many bytes have been read in all.
+const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+/// The page to read next, or `None` to stop: there is no next page, the
+/// vendor sent the URL just read again (a loop), or enough has been read.
+fn follow(current: &str, next: Option<String>, total_bytes: usize) -> Option<String> {
+    let next = next?;
+    (next != current && total_bytes < MAX_TOTAL_BYTES).then_some(next)
+}
 
 /// Asks the vendor for its model list. An empty result counts as a failure,
 /// so the caller keeps its built-in list instead of showing an empty
@@ -65,6 +74,7 @@ pub fn fetch(vendor: Vendor, api_key: &str) -> Result<Vec<String>> {
     };
     let auth = format!("Bearer {api_key}");
     let mut bodies: Vec<String> = Vec::new();
+    let mut total_bytes = 0usize;
     for _ in 0..MAX_PAGES {
         let body = match vendor {
             Vendor::OpenAi => common::get_json_with_headers(
@@ -97,8 +107,9 @@ pub fn fetch(vendor: Vendor, api_key: &str) -> Result<Vec<String>> {
             Err(_) => break,
         };
         let next = next_page_url(vendor, &body);
+        total_bytes += body.len();
         bodies.push(body);
-        match next {
+        match follow(&url, next, total_bytes) {
             Some(n) => url = n,
             None => break,
         }
@@ -441,6 +452,17 @@ mod tests {
             None
         );
         assert_eq!(next_page_url(Vendor::Gemini, r#"{"models":[]}"#), None);
+    }
+
+    #[test]
+    fn paging_stops_on_a_repeated_url_and_on_too_many_bytes() {
+        let a = "https://x/models?p=1".to_string();
+        let b = "https://x/models?p=2".to_string();
+        assert_eq!(follow(&a, Some(b.clone()), 10), Some(b.clone()));
+        // The vendor repeats the token it just gave: stop.
+        assert_eq!(follow(&b, Some(b.clone()), 10), None);
+        assert_eq!(follow(&a, None, 10), None);
+        assert_eq!(follow(&a, Some(b), MAX_TOTAL_BYTES), None);
     }
 
     #[test]
