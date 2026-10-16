@@ -3881,6 +3881,14 @@ impl App {
     /// the save-error card is re-shown immediately after so it is still the
     /// one left on screen.
     fn open_settings(&mut self) {
+        self.open_settings_inner();
+        // #673: every modal path ends here, whatever branch it took, so a
+        // completed Save and the deferred messages are handled first and the
+        // close request is honoured last.
+        self.repost_close_if_requested();
+    }
+
+    fn open_settings_inner(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
         self.card.hide();
@@ -3889,12 +3897,6 @@ impl App {
         SETTINGS_OPEN.with(|c| c.set(true));
         let edited = settings::show_modal(self.instance, &self.config);
         SETTINGS_OPEN.with(|c| c.set(false));
-
-        // #673: the owner was asked to close while Settings was open.
-        // Nothing else is delivered: the process is exiting.
-        if self.repost_close_if_requested() {
-            return;
-        }
 
         let pending: VecDeque<DeferredMessage> =
             PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
@@ -3948,12 +3950,18 @@ impl App {
         self.show_tray_restore_error(tray_restore_error);
     }
 
-    /// #673: if the owner window got `WM_CLOSE` while a nested loop (Settings
-    /// or a file dialog) was running, re-post it now that the loop is over so
-    /// it takes the normal path (`WM_DESTROY` drops the App and quits).
-    /// Returns whether it did.
+    /// #712: why Quit (or a `WM_CLOSE`) is refused right now, if it is.
+    fn quit_blocked(&self) -> Option<&'static str> {
+        quit_refusal(self.exec_in_flight)
+    }
+
+    /// #673: if the owner window got `WM_CLOSE` while a nested loop (the tray
+    /// menu, Settings or a file dialog) was running, re-post it now that the
+    /// loop is over so it takes the normal path. Every place that clears
+    /// `SETTINGS_OPEN` must call this once its own work is done (a test
+    /// checks the count). Returns whether it did.
     fn repost_close_if_requested(&self) -> bool {
-        if !CLOSE_AFTER_SETTINGS.with(|c| c.replace(false)) {
+        if !take_close_request() {
             return false;
         }
         unsafe {
@@ -4009,6 +4017,7 @@ impl App {
         }
         self.deliver_deferred(pending);
         self.show_tray_restore_error(tray_restore_error);
+        self.repost_close_if_requested();
     }
 
     /// Issue #178: shows the tray-restore error card if `error` is `Some`,
@@ -4524,9 +4533,6 @@ impl App {
         SETTINGS_OPEN.with(|c| c.set(true));
         let out = dialog();
         SETTINGS_OPEN.with(|c| c.set(false));
-        if self.repost_close_if_requested() {
-            return out;
-        }
         let pending: VecDeque<DeferredMessage> =
             PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
         let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
@@ -4539,6 +4545,7 @@ impl App {
         }
         self.deliver_deferred(pending);
         self.show_tray_restore_error(tray_restore_error);
+        self.repost_close_if_requested();
         out
     }
 
@@ -6573,6 +6580,16 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
     true
 }
 
+/// #673: remember that the owner got `WM_CLOSE` during a nested loop.
+fn note_close_request() {
+    CLOSE_AFTER_SETTINGS.with(|c| c.set(true));
+}
+
+/// #673: whether a close was asked for during a nested loop; clears it.
+fn take_close_request() -> bool {
+    CLOSE_AFTER_SETTINGS.with(|c| c.replace(false))
+}
+
 /// Issue #302: `DestroyWindow` discards messages still queued for the window,
 /// so a worker result posted just before Quit would never reach `wnd_proc` and
 /// its box would leak. Pull each one out and free it.
@@ -6679,7 +6696,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
         MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
         MenuChoice::Command(cmd::QUIT) => {
-            if let Some(text) = quit_refusal(app.exec_in_flight) {
+            if let Some(text) = app.quit_blocked() {
                 app.card.show_answer("Still working", text, 5, None);
                 app.set_watch(true);
             } else {
@@ -6831,7 +6848,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
             SettingsReentrancy::CloseAfterSettings => {
-                CLOSE_AFTER_SETTINGS.with(|c| c.set(true));
+                // Settings, a file dialog or the tray menu is open. Only
+                // Settings can be closed from here; the others end on their
+                // own and then repost this (`repost_close_if_requested`).
+                note_close_request();
                 settings::request_close();
                 return LRESULT(0);
             }
@@ -7051,6 +7071,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         id if id == app.taskbar_created_msg => {
             app.on_taskbar_created();
             LRESULT(0)
+        }
+        // #673: an owner-window close (a script, a smoke test) takes the same
+        // refusal as tray > Quit while work is in flight. Session end is
+        // WM_ENDSESSION, which never comes through here and is not blocked.
+        WM_CLOSE => {
+            if let Some(text) = app.quit_blocked() {
+                app.card.show_answer("Still working", text, 5, None);
+                app.set_watch(true);
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
         WM_DESTROY => {
             // Drop the App (and with it the hook, tray icon and card) before
@@ -8190,6 +8222,41 @@ mod tests {
                 "msg {msg:#x} should be Ignore while Settings is open"
             );
         }
+    }
+
+    #[test]
+    fn a_close_request_is_remembered_once_and_then_cleared() {
+        // #673: the flag is set by wnd_proc during a nested loop and must be
+        // consumed exactly once, or a later Settings open+close would quit.
+        let _ = super::take_close_request();
+        assert!(!super::take_close_request());
+        super::note_close_request();
+        assert!(super::take_close_request());
+        assert!(
+            !super::take_close_request(),
+            "consumed, so it cannot fire again"
+        );
+    }
+
+    #[test]
+    fn every_modal_path_that_clears_settings_open_reposts_a_pending_close() {
+        // The tray menu, Settings and file dialogs all set SETTINGS_OPEN, and
+        // wnd_proc swallows WM_CLOSE while it is set. Each of them has to
+        // repost it afterwards. Source scan, CRLF-safe, non-empty.
+        let src = include_str!("app.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let clears = code
+            .matches("SETTINGS_OPEN.with(|c| c.set(false));")
+            .count();
+        assert_eq!(
+            clears, 3,
+            "a modal path was added or removed: update this test"
+        );
+        let reposts = code.matches("self.repost_close_if_requested();").count();
+        assert_eq!(
+            reposts, clears,
+            "each path that clears SETTINGS_OPEN must call repost_close_if_requested"
+        );
     }
 
     #[test]
