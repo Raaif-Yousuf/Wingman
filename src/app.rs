@@ -159,6 +159,16 @@ struct App {
     /// doc comment.
     taskbar_created_msg: u32,
     config: Config,
+    /// #339: whether a password manager was in front before Wingman's own UI
+    /// (the tray menu, the palette) took the foreground. Set only around a
+    /// dispatch from that UI and cleared right after, so it never leaks into
+    /// a later hotkey press. `refuse_if_password_manager` honours it as well
+    /// as the live check.
+    password_manager_hint: bool,
+    /// #339: the palette's own answer, taken in `toggle_palette` before it
+    /// showed. Read only when the palette runs an action, so a stale value
+    /// from an earlier session can never apply: every open overwrites it.
+    palette_password_manager: bool,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -382,6 +392,8 @@ pub fn run() -> Result<()> {
         tray,
         hook: None,
         watcher: None,
+        password_manager_hint: false,
+        palette_password_manager: false,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -675,6 +687,33 @@ impl App {
         })
     }
 
+    /// #339: a password manager is in front now, or was when Wingman's own
+    /// UI (tray menu, palette) took the foreground.
+    fn password_manager_now(&self) -> bool {
+        self.password_manager_hint
+            || crate::password_managers::foreground_is_password_manager(
+                &self.config.capture.extra_password_managers,
+            )
+    }
+
+    /// #339: when a password manager is the foreground window, shows the
+    /// "does not read password managers" card and returns `true`; the caller
+    /// must then return without capturing, reading or asking anything. Every
+    /// main-thread entry point that gathers input calls this first, which
+    /// `password_managers`' source-scanning tests enforce.
+    fn refuse_if_password_manager(&mut self) -> bool {
+        if !self.password_manager_now() {
+            return false;
+        }
+        self.card.show_answer(
+            crate::password_managers::REFUSAL_HEADLINE,
+            crate::password_managers::REFUSAL_DETAIL,
+            3,
+            None,
+        );
+        true
+    }
+
     /// Issue #214: the pause/busy/hide-stale-card/readiness/capture pipeline
     /// shared by every action that shows a pending card, captures the
     /// screen, and hands off to a worker thread which posts back one of the
@@ -730,6 +769,11 @@ impl App {
                 return None;
             }
             ModelActionGate::Proceed => {}
+        }
+
+        // #339: before the card is touched and before anything is read.
+        if self.refuse_if_password_manager() {
+            return None;
         }
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
@@ -952,8 +996,12 @@ impl App {
         // #24: candidates are built from the SAME catalogue about to be
         // shown, before it moves into `Palette::show` below.
         let candidates = router::candidates_from_catalogue(&catalogue);
+        // #339: asked BEFORE the palette takes the foreground. The router
+        // sends a screenshot, so it must not run over a password manager.
+        let password_manager_in_front = self.password_manager_now();
+        self.palette_password_manager = password_manager_in_front;
         self.palette.show(catalogue, model_configured, footer);
-        self.maybe_start_router(candidates);
+        self.maybe_start_router(candidates, password_manager_in_front);
     }
 
     /// #24: the intent router's hook, called right after
@@ -973,8 +1021,12 @@ impl App {
     /// failure the user is told about (rule 7's "every failure ends in a
     /// card" is about the action the user actually asked for; the router
     /// never was one).
-    fn maybe_start_router(&mut self, candidates: Vec<router::RouterCandidate>) {
-        if pause::is_paused_now() {
+    fn maybe_start_router(
+        &mut self,
+        candidates: Vec<router::RouterCandidate>,
+        password_manager_in_front: bool,
+    ) {
+        if pause::is_paused_now() || password_manager_in_front {
             return;
         }
 
@@ -1096,6 +1148,15 @@ impl App {
     /// palette-only code path. A `None` target (an id the palette itself
     /// never produces) is a no-op, not a panic (rule 7).
     fn dispatch_palette_action(&mut self, action_id: &str) {
+        // #339: the palette hid itself before this runs, so the live check
+        // sees whatever Windows re-activated. Honour what was in front when
+        // it opened as well, for the length of this one dispatch.
+        self.password_manager_hint = self.palette_password_manager;
+        self.dispatch_palette_target(action_id);
+        self.password_manager_hint = false;
+    }
+
+    fn dispatch_palette_target(&mut self, action_id: &str) {
         match palette_model::dispatch_target_for(action_id) {
             Some(DispatchTarget::CheckMyWork) => self.ask(Trigger::Palette),
             Some(DispatchTarget::ExtractText) => self.extract_text(),
@@ -1153,6 +1214,10 @@ impl App {
 
         if let Err((headline, detail)) = actions::extract_text::gate(pause::is_paused_now()) {
             self.card.show_answer(headline, detail, 3, None);
+            return;
+        }
+
+        if self.refuse_if_password_manager() {
             return;
         }
 
@@ -1214,6 +1279,10 @@ impl App {
     /// else in this crate (e.g. a declined confirm-card proposal).
     fn copy_region(&mut self) {
         if self.busy {
+            return;
+        }
+
+        if self.refuse_if_password_manager() {
             return;
         }
 
@@ -2738,6 +2807,10 @@ impl App {
         if pause::is_paused_now() {
             self.card
                 .show_answer("Paused", "Resume from the tray menu to calculate.", 3, None);
+            return;
+        }
+
+        if self.refuse_if_password_manager() {
             return;
         }
 
@@ -5175,7 +5248,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 
     match msg {
         WM_APP_TRAY => {
+            // #339: the menu takes the foreground (SetForegroundWindow in
+            // `Tray::show_menu`), so ask who was in front first. Only on the
+            // menu gesture, so tray hover traffic costs nothing.
+            let menu_hint = Tray::opens_menu(lparam) && app.password_manager_now();
             if let Some(id) = app.tray.on_tray_message(lparam) {
+                app.password_manager_hint = menu_hint;
                 // Choosing anything other than a rebind disarms a learn mode
                 // left armed by an earlier "Set ... key" click; otherwise it
                 // would silently swallow the next key pressed anywhere.
@@ -5239,6 +5317,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         let _ = DestroyWindow(hwnd);
                     },
                     _ => {}
+                }
+                // Not after Quit: the window (and `app`) may already be gone.
+                if !matches!(decode(id), MenuChoice::Command(cmd::QUIT)) {
+                    app.password_manager_hint = false;
                 }
             }
             LRESULT(0)

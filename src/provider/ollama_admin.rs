@@ -233,7 +233,7 @@ fn tcp_listener_pid(port: u16) -> Option<u32> {
 
 /// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + QueryFullProcessImageNameW`.
 /// `None` on any failure (process exited, access denied, ...).
-fn process_image_path(pid: u32) -> Option<String> {
+pub(crate) fn process_image_path(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];

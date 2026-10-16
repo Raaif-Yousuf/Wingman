@@ -19,6 +19,7 @@ max_edge = 1568
 monitor = "active"
 redact = true
 ocr_language = "auto"
+extra_password_managers = []
 
 [providers]
 order = [
