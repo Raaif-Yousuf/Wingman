@@ -926,8 +926,9 @@ fn get_with_headers_raw(
 /// because `ureq` has no per-read timeout: a stalled server would keep the
 /// reading thread blocked after the caller cancelled. Here every read waits at
 /// most [`STREAM_POLL`], and between waits the call returns an error as soon
-/// as `cancel` is set, or when nothing has arrived for `stall`. Only
-/// `http://` addresses work (Ollama is loopback); anything else is an error.
+/// as `cancel` is set, or when nothing has arrived for `stall`. An `https://`
+/// address falls back to `ureq` ([`post_json_read_body_ureq`]), where a Stop
+/// is NOT prompt: the cancel is only seen when the next line arrives.
 pub(crate) fn post_json_read_body<T>(
     url: &str,
     body: &Value,
@@ -942,24 +943,33 @@ pub(crate) fn post_json_read_body<T>(
     offline_guard(url)?;
     budget_guard(url)?;
 
+    if has_scheme(url, "https://") {
+        return post_json_read_body_ureq(url, body, connect_timeout, tag, read);
+    }
     let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| anyhow!("{tag}: only plain http addresses are supported here"))?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let with_port = if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{authority}:80")
-    };
-    let addr = std::net::ToSocketAddrs::to_socket_addrs(&with_port)
-        .ok()
-        .and_then(|mut a| a.next())
-        .ok_or_else(|| anyhow!("{tag}: transport error: could not resolve {authority}"))?;
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, connect_timeout)
-        .map_err(|e| anyhow!("{tag}: transport error: {}", e.kind()))?;
+        .get(7..)
+        .filter(|_| has_scheme(url, "http://"))
+        .ok_or_else(|| anyhow!("{tag}: only http and https addresses are supported here"))?;
+    let (authority, path) = split_authority_path(rest);
+    let host_port = with_default_port(authority);
+    // Try every address the name resolves to; keep the first that connects.
+    let mut last_kind = None;
+    let mut connected = None;
+    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&host_port) {
+        for addr in addrs {
+            match std::net::TcpStream::connect_timeout(&addr, connect_timeout) {
+                Ok(s) => {
+                    connected = Some(s);
+                    break;
+                }
+                Err(e) => last_kind = Some(e.kind()),
+            }
+        }
+    }
+    let mut stream = connected.ok_or_else(|| match last_kind {
+        Some(kind) => anyhow!("{tag}: transport error: {kind}"),
+        None => anyhow!("{tag}: transport error: could not resolve the address"),
+    })?;
     let payload = body.to_string();
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
@@ -999,15 +1009,20 @@ pub(crate) fn post_json_read_body<T>(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("{tag}: transport error: not an HTTP response"))?;
     let mut chunked = false;
-    for _ in 0..100 {
+    let mut headers_ended = false;
+    for _ in 0..MAX_RESPONSE_HEADERS {
         read_line(&mut reader, &mut line)?;
         let header = line.trim_end().to_ascii_lowercase();
         if header.is_empty() {
+            headers_ended = true;
             break;
         }
         if header.starts_with("transfer-encoding:") && header.contains("chunked") {
             chunked = true;
         }
+    }
+    if !headers_ended {
+        return Err(anyhow!("{tag}: transport error: too many response headers"));
     }
 
     let mut body_reader: Box<dyn Read + '_> = if chunked {
@@ -1027,6 +1042,76 @@ pub(crate) fn post_json_read_body<T>(
         return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
     }
     read(&mut body_reader)
+}
+
+/// The most response header lines [`post_json_read_body`] reads before it
+/// gives up (#635), so a server cannot make it treat a header as the body.
+const MAX_RESPONSE_HEADERS: usize = 100;
+
+/// Whether `url` starts with `scheme` (e.g. `"http://"`), ignoring case.
+fn has_scheme(url: &str, scheme: &str) -> bool {
+    url.get(..scheme.len())
+        .is_some_and(|s| s.eq_ignore_ascii_case(scheme))
+}
+
+/// Splits what follows `http://` into the host and port as the `Host` header
+/// should carry them (any `user:password@` removed: credentials never go in
+/// `Host`) and the request path.
+fn split_authority_path(rest: &str) -> (&str, &str) {
+    let (authority, path) = match rest.find(['/', '?', '#']) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], &rest[i..]),
+        Some(i) => (&rest[..i], "/"),
+        None => (rest, "/"),
+    };
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    (host, path)
+}
+
+/// `host_port` with `:80` added when it names no port. An IPv6 literal's
+/// colons do not count: the port is whatever follows the closing `]`.
+fn with_default_port(host_port: &str) -> String {
+    let has_port = match host_port.strip_prefix('[') {
+        Some(inner) => inner
+            .split_once(']')
+            .is_some_and(|(_, after)| after.starts_with(':')),
+        None => host_port.contains(':'),
+    };
+    if has_port {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    }
+}
+
+/// The `https://` fallback of [`post_json_read_body`]: `ureq`, whose reads
+/// have no timeout, so a Stop is only noticed when the next progress line
+/// arrives (or the connection closes). Ollama is loopback http, so this is
+/// for a hand-edited https address. Single attempt, only the connect phase
+/// is timed out.
+fn post_json_read_body_ureq<T>(
+    url: &str,
+    body: &Value,
+    connect_timeout: Duration,
+    tag: &str,
+    read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
+) -> Result<T> {
+    let mut response = ureq::post(url)
+        .config()
+        .http_status_as_error(false)
+        .timeout_connect(Some(connect_timeout))
+        .build()
+        .send_json(body)
+        .map_err(|e| anyhow!("{tag}: transport error: {}", redact_detail(&e)))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.body_mut().read_to_string().unwrap_or_default();
+        let truncated = redact_and_truncate(&body_text);
+        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+    }
+
+    let mut reader = response.body_mut().as_reader();
+    read(&mut reader)
 }
 
 /// How long one read on a streamed response waits before the cancel flag and
@@ -1633,7 +1718,9 @@ mod tests {
     /// `ureq` directly, so no fake transport can watch it. This scans the
     /// non-test source instead: every send that carries a body must redact
     /// it with [`outbound_body`] and restore the answer. `post_json_read_body`
-    /// is the one allowed exception (a model download request, no user text).
+    /// and its https fallback are the only allowed exceptions, by name (a
+    /// model download request, no user text). Raw-socket senders are scanned
+    /// too, not only `ureq::post`.
     #[test]
     fn every_function_that_posts_a_body_redacts_and_restores_it() {
         let whole = include_str!("common.rs").replace('\r', "");
@@ -1675,16 +1762,34 @@ mod tests {
             .filter_map(|&i| {
                 let end = code[i..].find("\n}\n").map_or(code.len(), |e| i + e + 3);
                 let f = &code[i..end];
-                f.contains("ureq::post(").then_some(f)
+                (f.contains("ureq::post(") || f.contains("TcpStream::connect")).then_some(f)
             })
             .collect();
         assert!(
             !posters.is_empty(),
-            "no function posting through ureq was found"
+            "no function posting through ureq or a raw socket was found"
+        );
+        // The model-download request carries a model name, no user text, so
+        // its two senders (raw socket, and the https `ureq` fallback) are
+        // allowed by name. Any other sender must redact and restore.
+        const ALLOWED: [&str; 2] = [
+            "fn post_json_read_body<T>(",
+            "fn post_json_read_body_ureq<T>(",
+        ];
+        let allowed_seen = posters
+            .iter()
+            .filter(|f| {
+                let header = f.lines().next().unwrap_or_default();
+                ALLOWED.iter().any(|a| header.contains(a))
+            })
+            .count();
+        assert_eq!(
+            allowed_seen, 2,
+            "both model-download senders should be found by this scan"
         );
         for f in posters {
             let header = f.lines().next().unwrap_or_default();
-            if header.contains("post_json_read_body") {
+            if ALLOWED.iter().any(|a| header.contains(a)) {
                 continue;
             }
             assert!(
@@ -3208,6 +3313,7 @@ mod tests {
     }
 
     fn read_all_body(url: &str, cancel: &std::sync::atomic::AtomicBool) -> Result<String> {
+        let _g = network_guard();
         post_json_read_body(
             url,
             &json!({"model": "m"}),
@@ -3277,6 +3383,7 @@ mod tests {
 
     #[test]
     fn a_silent_server_times_out_at_the_stall_limit() {
+        let _g = network_guard();
         let url = raw_server(
             vec![
                 b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec(),
@@ -3307,10 +3414,78 @@ mod tests {
     #[test]
     fn a_non_http_address_is_refused() {
         let err = read_all_body(
+            "ftp://127.0.0.1:1/api/pull",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("only http"), "{err}");
+    }
+
+    #[test]
+    fn the_scheme_is_matched_without_regard_to_case() {
+        let url = raw_server(
+            vec![b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nok".to_vec()],
+            0,
+        )
+        .replacen("http://", "HTTP://", 1);
+        let got = read_all_body(&url, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        assert_eq!(got, "ok");
+        assert!(has_scheme("HtTpS://x", "https://"));
+        assert!(!has_scheme("htt", "http://"));
+    }
+
+    #[test]
+    fn an_https_address_takes_the_ureq_path() {
+        // Nothing listens on port 1; the point is that the error is ureq's
+        // transport error, not the "only http" refusal.
+        let err = read_all_body(
             "https://127.0.0.1:1/api/pull",
             &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("plain http"), "{err}");
+        assert!(err.to_string().contains("transport error"), "{err}");
+        assert!(!err.to_string().contains("only http"), "{err}");
+    }
+
+    #[test]
+    fn userinfo_is_never_put_in_the_host_and_ipv6_ports_are_found() {
+        assert_eq!(
+            split_authority_path("user:pw@127.0.0.1:11434/api/pull"),
+            ("127.0.0.1:11434", "/api/pull")
+        );
+        assert_eq!(split_authority_path("host"), ("host", "/"));
+        assert_eq!(with_default_port("host"), "host:80");
+        assert_eq!(with_default_port("host:11434"), "host:11434");
+        // The colons inside the brackets are not a port.
+        assert_eq!(with_default_port("[::1]"), "[::1]:80");
+        assert_eq!(with_default_port("[::1]:11434"), "[::1]:11434");
+    }
+
+    #[test]
+    fn more_than_a_hundred_headers_is_an_error_not_a_body() {
+        let mut head = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for i in 0..150 {
+            head.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+        }
+        head.extend_from_slice(b"\r\nbody");
+        let url = raw_server(vec![head], 0);
+        let err = read_all_body(&url, &std::sync::atomic::AtomicBool::new(false)).unwrap_err();
+        assert!(
+            err.to_string().contains("too many response headers"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_resolved_address_is_tried() {
+        // `localhost` resolves to ::1 first on many machines while the server
+        // listens on 127.0.0.1 only; the second address must still connect.
+        let url = raw_server(
+            vec![b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nok".to_vec()],
+            0,
+        )
+        .replacen("127.0.0.1", "localhost", 1);
+        let got = read_all_body(&url, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        assert_eq!(got, "ok");
     }
 }

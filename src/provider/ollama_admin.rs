@@ -680,8 +680,9 @@ pub fn pull(
 }
 
 /// How long a pull may go without a single byte from Ollama before it ends
-/// with an error. Real pulls send a progress line every second or so; the
-/// quietest phase (verifying a large file) is well under this.
+/// with an error. THEORY (unverified): real pulls send a progress line every
+/// second or so, and the quietest phase (verifying a large file) is well
+/// under this; not measured against a live multi-gigabyte pull.
 const PULL_STALL: Duration = Duration::from_secs(120);
 
 /// [`pull`] with its stall limit as a parameter (so a test need not wait

@@ -606,6 +606,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_OLLAMA_MODELS => {
+            // wparam 1: the fetch after a pull failed, so there is no list to
+            // select the pulled model in (#635).
+            if wparam.0 == 1 {
+                inner.pull_select = None;
+                return LRESULT(0);
+            }
             let models = inner.ollama_tags.lock().ok().and_then(|g| g.clone());
             if let Some(models) = models {
                 let prefer = inner
@@ -744,6 +750,9 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         }
         ID_CARD_CORNER if notify == CBN_SELCHANGE => sync_card_display_enabled(inner.hwnd),
         ID_GEMINI_MODEL if notify == CBN_SELCHANGE => sync_gemini_thinking_enabled(inner.hwnd),
+        // #635: the user picked a model themselves, so a pending "select the
+        // pulled model" must not override it.
+        ID_OLLAMA_MODEL if notify == CBN_SELCHANGE => inner.pull_select = None,
         ID_CHANGE_PRIMARY if notify == BN_CLICKED => start_change(inner, HK_PRIMARY),
         ID_CHANGE_SECONDARY if notify == BN_CLICKED => start_change(inner, HK_SECONDARY),
         ID_PROMPT_TOGGLE if notify == BN_CLICKED => {
@@ -2448,6 +2457,16 @@ fn spawn_ollama_models_fetch(
         .name("settings-ollama-models".into())
         .spawn(move || {
             let Ok(models) = ollama_admin::list_tags(&base_url) else {
+                // Tell the window (wparam 1) so a pending "select the pulled
+                // model" does not wait for a list that is not coming.
+                post_while_open(&alive, || unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(hwnd_raw as *mut c_void)),
+                        WM_OLLAMA_MODELS,
+                        WPARAM(1),
+                        LPARAM(0),
+                    );
+                });
                 return;
             };
             if let Ok(mut guard) = slot.lock() {
