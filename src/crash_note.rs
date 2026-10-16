@@ -9,13 +9,16 @@
 //!
 //! # What the note may hold
 //!
-//! Version, thread name, a unix timestamp, the source location and the
-//! panic message. Never a screenshot, OCR text, a key or the clipboard: the
-//! hook reads nothing of the sort. The one place user data could sneak in
-//! is the panic message itself (`unwrap()` on an `Err` formats the error,
-//! and an error can quote a response). So [`sanitize`] runs the message
-//! through the key-shaped-token redaction, strips the account name out of
-//! paths, folds it onto one line and cuts it to [`MAX_MESSAGE_CHARS`].
+//! Version, thread name, a unix timestamp, the source location and, only
+//! when the panic message is a string literal, that message. Never a
+//! screenshot, OCR text, a key or the clipboard: the hook reads nothing of
+//! the sort. The one place user data could sneak in is a *formatted* panic
+//! message (`unwrap()` on an `Err` formats the error, and an error can quote
+//! a selection, OCR text or a model reply), so [`message_of`] drops every
+//! payload that is not a `&'static str` and the note carries the location
+//! alone. What is kept still goes through [`sanitize`]: cut first (so the
+//! quadratic profile redaction stays cheap), key-shaped tokens redacted,
+//! account name stripped, one line, at most [`MAX_MESSAGE_CHARS`].
 //!
 //! # Debug builds
 //!
@@ -31,6 +34,9 @@ use std::path::{Path, PathBuf};
 
 /// Longest panic message kept, in characters.
 pub const MAX_MESSAGE_CHARS: usize = 160;
+
+/// Input is cut to this many characters before any redaction pass runs.
+const MAX_INPUT_CHARS: usize = 1024;
 
 /// Longest location kept, in characters.
 const MAX_LOCATION_CHARS: usize = 120;
@@ -69,7 +75,8 @@ pub fn note_path() -> anyhow::Result<PathBuf> {
 /// Folds `text` onto one line, redacts key-shaped tokens and the account
 /// name, and cuts it to `max` characters (with an ellipsis when cut). Pure.
 pub fn sanitize(text: &str, profile: &str, max: usize) -> String {
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded: String = text.chars().take(MAX_INPUT_CHARS).collect();
+    let one_line = bounded.split_whitespace().collect::<Vec<_>>().join(" ");
     let redacted = crate::egress::redact_opaque_tokens(&one_line);
     let redacted = crate::diagnostics::redact_user_profile(&redacted, profile);
     let (cut, was_cut) = crate::provider::truncate_chars(&redacted, max);
@@ -82,14 +89,43 @@ pub fn sanitize(text: &str, profile: &str, max: usize) -> String {
 
 /// The note's text: one `key: value` line each, every value sanitised.
 pub fn format_note(facts: &PanicFacts, profile: &str) -> String {
-    format!(
-        "version: {}\nthread: {}\ntime_unix: {}\nlocation: {}\nmessage: {}\n",
+    let mut note = format!(
+        "version: {}\nthread: {}\ntime_unix: {}\nlocation: {}\n",
         sanitize(facts.version, profile, 20),
         sanitize(facts.thread, profile, MAX_THREAD_CHARS),
         facts.unix_secs,
         sanitize(facts.location, profile, MAX_LOCATION_CHARS),
-        sanitize(facts.message, profile, MAX_MESSAGE_CHARS),
-    )
+    );
+    let message = sanitize(facts.message, profile, MAX_MESSAGE_CHARS);
+    if !message.is_empty() {
+        note.push_str(&format!("message: {message}\n"));
+    }
+    note
+}
+
+/// The panic message, but only when the payload is a `&'static str`. A
+/// `String` payload is a formatted message and may carry user data, so it
+/// yields an empty string (see the module docs).
+pub fn message_of(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+thread_local! {
+    static LAST_LOCATION: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Remembers where the most recent panic on this thread happened, so
+/// `app::catch_worker` can name it in the error card in builds that unwind.
+pub fn note_location(location: &str) {
+    LAST_LOCATION.with(|l| *l.borrow_mut() = location.to_string());
+}
+
+/// The location [`note_location`] last saw on this thread, then forgotten.
+pub fn take_location() -> String {
+    LAST_LOCATION.with(|l| std::mem::take(&mut *l.borrow_mut()))
 }
 
 /// The value after `key: ` in a note, if that line exists.
@@ -116,42 +152,58 @@ pub fn card_text(note: &str) -> (String, String) {
 }
 
 /// Writes `note` to `path`, creating the folder. Best effort for the hook.
+///
+/// Written to a temp file in the same folder and renamed over `path`, so two
+/// threads panicking together never leave a half-written note.
 pub fn write_note(path: &Path, note: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, note)
+    let tid: String = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.{tid}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, note)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
-/// Reads the note at `path` and deletes it, so the card shows once. `None`
-/// when there is no note, it is empty, or it could not be deleted (a note
-/// that cannot be removed would otherwise show on every start).
+/// Reads the note at `path` and clears it, so the card shows once. If the
+/// file cannot be deleted it is truncated to empty instead; the note is
+/// returned if either worked, so a crash is never silently swallowed. `None`
+/// when there is no note, it is empty, or it could be neither deleted nor
+/// emptied (it would otherwise show on every start).
 pub fn take_note(path: &Path) -> Option<String> {
     let note = std::fs::read_to_string(path).ok()?;
-    std::fs::remove_file(path).ok()?;
+    if std::fs::remove_file(path).is_err() && std::fs::File::create(path).is_err() {
+        return None;
+    }
     if note.trim().is_empty() {
         return None;
     }
     Some(note)
 }
 
-/// Installs the panic hook. Call first thing in `main`. A no-op unless the
-/// build aborts on panic (see the module docs).
+/// Installs the panic hook. Call first thing in `main`. Every panic records
+/// its location ([`note_location`]); only a build that aborts on panic also
+/// writes the note (see the module docs).
 pub fn install_hook() {
-    if !cfg!(panic = "abort") {
-        return;
-    }
-    std::panic::set_hook(Box::new(|info| {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
         let location = info
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".to_string());
-        let payload = info.payload();
-        let message = payload
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_default();
+        note_location(&location);
+        if !cfg!(panic = "abort") {
+            previous(info);
+            return;
+        }
+        let message = message_of(info.payload());
         let thread = std::thread::current()
             .name()
             .unwrap_or("unnamed")
@@ -274,6 +326,71 @@ mod tests {
 
     fn temp_note(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("wingman-test-crash-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn only_a_literal_message_is_kept() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("index out of bounds");
+        let formatted: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("SECRET selection text"));
+        assert_eq!(message_of(literal.as_ref()), "index out of bounds");
+        assert_eq!(message_of(formatted.as_ref()), "");
+    }
+
+    #[test]
+    fn a_note_without_a_message_still_names_the_location() {
+        let note = format_note(&facts("", "src\\app.rs:10:5"), "");
+        assert!(note.contains("location: src\\app.rs:10:5"));
+        assert!(!note.contains("message:"));
+        let (_, detail) = card_text(&note);
+        assert!(detail.contains("src\\app.rs:10:5"));
+        assert!(!detail.contains("Error:"));
+    }
+
+    #[test]
+    fn huge_input_is_bounded_before_redaction() {
+        let huge = "C:\\Users\\jdoe ".repeat(200_000);
+        let out = sanitize(&huge, "C:\\Users\\jdoe", MAX_MESSAGE_CHARS);
+        assert!(out.chars().count() <= MAX_MESSAGE_CHARS + 3);
+    }
+
+    #[test]
+    fn location_is_remembered_once_per_thread() {
+        note_location("src\\a.rs:1:2");
+        assert_eq!(take_location(), "src\\a.rs:1:2");
+        assert_eq!(take_location(), "");
+    }
+
+    #[test]
+    fn rewriting_a_note_replaces_it_and_leaves_no_temp_files() {
+        let dir = temp_note("atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("note.txt");
+        write_note(&path, "first").unwrap();
+        write_note(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note that cannot be deleted (another process holds it without
+    /// delete sharing) is emptied instead, and the card still shows once.
+    #[test]
+    fn an_undeletable_note_is_emptied_and_still_shown() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = temp_note("locked");
+        write_note(&path, "version: 1\nlocation: a.rs:1:1\n").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        assert!(std::fs::remove_file(&path).is_err(), "precondition: locked");
+        let taken = take_note(&path);
+        drop(holder);
+        assert_eq!(taken.as_deref(), Some("version: 1\nlocation: a.rs:1:1\n"));
+        assert_eq!(take_note(&path), None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

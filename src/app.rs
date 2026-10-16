@@ -365,22 +365,6 @@ pub fn run() -> Result<()> {
     // submenu and key bindings.
     app.tray.set_mode(app.config.mode);
 
-    // Issue #227: the last run ended in a panic. No model call, no dialog:
-    // a card, and the note rides along as the last error so "Copy details"
-    // and "Copy diagnostics" include it. Read once, then the note is gone.
-    if let Some(note) = crate::crash_note::note_path()
-        .ok()
-        .and_then(|p| crate::crash_note::take_note(&p))
-    {
-        let (headline, detail) = crate::crash_note::card_text(&note);
-        app.last_error = Some(LastError {
-            action: headline.clone(),
-            occurred_at: SystemTime::now(),
-            chain: note,
-        });
-        app.card.show_error_with_details(&headline, &detail);
-    }
-
     // issue #149: install.ps1's post-install step launches the freshly
     // installed exe with `--settings`, expecting Settings to open so the
     // user can enter an API key. That only happened on the *duplicate*
@@ -418,6 +402,33 @@ pub fn run() -> Result<()> {
                 &format!("{detail}\n\nUse Ask now from the tray menu instead."),
             );
         }
+    }
+
+    // Issue #227: the last run ended in a panic. Shown after the hotkey
+    // install so its error card cannot replace this one. No model call, no dialog:
+    // a card, and the note rides along as the last error so "Copy details"
+    // and "Copy diagnostics" include it. Read once, then the note is gone.
+    if let Some(note) = crate::crash_note::note_path()
+        .ok()
+        .and_then(|p| crate::crash_note::take_note(&p))
+    {
+        let (headline, detail) = crate::crash_note::card_text(&note);
+        // A startup error recorded above (e.g. hotkeys unavailable) is kept
+        // after the note, so "Copy details" carries both.
+        let chain = match app.last_error.take() {
+            Some(earlier) => format!(
+                "{note}
+{}",
+                earlier.chain
+            ),
+            None => note,
+        };
+        app.last_error = Some(LastError {
+            action: headline.clone(),
+            occurred_at: SystemTime::now(),
+            chain,
+        });
+        app.card.show_error_with_details(&headline, &detail);
     }
 
     // Non-fatal: without it the card still auto-dismisses on its timer.
@@ -4444,28 +4455,34 @@ fn catch_worker<T>(
             let profile = crate::known_folder::user_profile()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
-            Err(packed_panic_error(&panic_text(payload.as_ref()), &profile))
+            Err(packed_panic_error(
+                &crate::crash_note::message_of(payload.as_ref()),
+                &crate::crash_note::take_location(),
+                &profile,
+            ))
         }
     }
 }
 
-/// The panic message out of a `catch_unwind` payload (`&str` or `String`).
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_default()
-}
-
 /// A caught panic as a [`pack_error`] string: a fixed human sentence (never
-/// the panic text, which can quote data) and the redacted, shortened text as
-/// the chain for "Copy details".
-fn packed_panic_error(text: &str, profile: &str) -> String {
-    let chain = format!(
-        "Wingman hit an internal error: {}",
-        crate::crash_note::sanitize(text, profile, crate::crash_note::MAX_MESSAGE_CHARS)
-    );
+/// the panic text) and a chain for "Copy details" that names the location
+/// and, only for a string-literal message, the message
+/// ([`crate::crash_note::message_of`] drops formatted ones, which can carry
+/// selection, OCR or model text).
+fn packed_panic_error(message: &str, location: &str, profile: &str) -> String {
+    let mut chain = String::from("Wingman hit an internal error");
+    if !location.is_empty() {
+        chain.push_str(&format!(
+            " in {}",
+            crate::crash_note::sanitize(location, profile, 120)
+        ));
+    }
+    if !message.is_empty() {
+        chain.push_str(&format!(
+            ": {}",
+            crate::crash_note::sanitize(message, profile, crate::crash_note::MAX_MESSAGE_CHARS)
+        ));
+    }
     pack_error(
         &human_error_detail("Wingman hit an internal error."),
         &chain,
@@ -6481,12 +6498,22 @@ mod tests {
     }
 
     #[test]
-    fn a_formatted_panic_is_caught_and_redacted() {
-        let key = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+    fn a_formatted_panic_keeps_the_location_and_drops_the_text() {
+        let secret = "SECRET selection text";
+        crate::crash_note::note_location("src/x.rs:9:9");
         let out: std::result::Result<u32, String> =
-            super::catch_worker(|| panic!("bad response for {key}"));
+            super::catch_worker(|| panic!("bad input: {secret}"));
         let packed = out.unwrap_err();
-        assert!(!packed.contains("AbCdEfGhIjKl"), "{packed}");
+        let (_, chain) = super::unpack_error(&packed);
+        assert!(!packed.contains("SECRET"), "{packed}");
+        assert!(chain.contains("src/x.rs:9:9"), "{chain}");
+    }
+
+    #[test]
+    fn a_literal_panic_message_is_kept_in_the_chain() {
+        let out: std::result::Result<u32, String> = super::catch_worker(|| panic!("plain literal"));
+        let packed = out.unwrap_err();
+        assert!(super::unpack_error(&packed).1.contains("plain literal"));
     }
 
     #[test]
