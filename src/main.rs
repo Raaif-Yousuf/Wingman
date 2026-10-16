@@ -22,6 +22,7 @@ mod hotkey;
 mod hotkey_conflicts;
 mod inputs;
 mod known_folder;
+mod machine;
 mod mode;
 mod ocr;
 mod password_managers;
@@ -37,6 +38,7 @@ mod single_instance;
 mod speech;
 mod store;
 mod ui;
+mod ui_thread;
 mod usage;
 
 fn main() {

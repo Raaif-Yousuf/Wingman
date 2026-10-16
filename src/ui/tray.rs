@@ -148,6 +148,11 @@ pub mod cmd {
     /// `App::copy_egress_log` in `app.rs` and `egress::read_all_human`.
     pub const COPY_EGRESS_LOG: u32 = 1028;
 
+    /// Issue #328: "Check this PC for local models". Gathers RAM, GPU,
+    /// battery and Ollama's GPU use once, on click, and shows a verdict card.
+    /// See `App::check_machine` in `app.rs` and `machine::verdict`.
+    pub const CHECK_MACHINE: u32 = 1040;
+
     /// Issue #41: "Copy text from screen" -- OCR the active monitor and copy
     /// the text to the clipboard, offline and model-free. See
     /// `App::extract_text` in `app.rs` and `actions::extract_text`. The
@@ -761,6 +766,7 @@ impl Tray {
         append_item(help, cmd::RELOAD, "Reload settings")?;
         append_item(help, cmd::COPY_DIAGNOSTICS, "Copy diagnostics")?;
         append_item(help, cmd::COPY_EGRESS_LOG, "Copy egress log")?;
+        append_item(help, cmd::CHECK_MACHINE, "Check this PC for local models")?;
         append_separator(hmenu)?;
         append_item(hmenu, cmd::QUIT, "Quit")?;
         Ok(())
@@ -1847,6 +1853,7 @@ mod tests {
             cmd::RELOAD,
             cmd::COPY_DIAGNOSTICS,
             cmd::COPY_EGRESS_LOG,
+            cmd::CHECK_MACHINE,
         ];
         want.sort_unstable();
         assert_eq!(help, want);
@@ -2321,6 +2328,7 @@ mod tests {
         ("MODE_OFFLINE", cmd::MODE_OFFLINE),
         ("COPY_DIAGNOSTICS", cmd::COPY_DIAGNOSTICS),
         ("COPY_EGRESS_LOG", cmd::COPY_EGRESS_LOG),
+        ("CHECK_MACHINE", cmd::CHECK_MACHINE),
         ("EXTRACT_TEXT", cmd::EXTRACT_TEXT),
         ("CALCULATE_SELECTION", cmd::CALCULATE_SELECTION),
         ("COPY_REGION", cmd::COPY_REGION),
