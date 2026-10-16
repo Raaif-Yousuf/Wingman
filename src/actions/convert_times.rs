@@ -42,6 +42,8 @@ pub const MAX_TIMES: usize = 12;
 /// Longest headline, in characters: the collapsed card's whole headline
 /// budget, less a little slack for word wrap.
 pub const MAX_HEADLINE_CHARS: usize = HEADLINE_MAX_LINES as usize * HEADLINE_CHARS_PER_LINE - 15;
+/// Longest card detail, in characters, like the sibling actions.
+pub const MAX_DETAIL_CHARS: usize = 700;
 /// Longest piece of model text kept (`text`, `time`, `date`, `zone`).
 const MAX_FIELD_CHARS: usize = 60;
 
@@ -100,13 +102,18 @@ fn clock(t: &CivilDateTime, twelve_hour: bool) -> String {
     }
 }
 
-fn day_label(d: &CivilDate) -> String {
-    format!(
+fn day_label(d: &CivilDate, with_year: bool) -> String {
+    let base = format!(
         "{} {} {}",
-        WEEKDAYS[weekday(d) as usize],
+        WEEKDAYS[weekday(d) as usize % 7],
         d.day,
-        MONTHS[d.month as usize - 1]
-    )
+        MONTHS[(d.month as usize).clamp(1, 12) - 1]
+    );
+    if with_year {
+        format!("{base} {}", d.year)
+    } else {
+        base
+    }
 }
 
 fn days(d: &CivilDate) -> i64 {
@@ -114,44 +121,44 @@ fn days(d: &CivilDate) -> i64 {
 }
 
 /// One reading of one time, as a card fragment: "Thu 22 Oct, 5:00 PM (next
-/// day, UTC-4)" or the reason it cannot be converted.
+/// day, UTC-7 to UTC-4)", or the reason it cannot be converted. The two
+/// offsets are the source zone's and yours on that date, so what was used is
+/// visible ("9:00 PST" in July reads as UTC-7).
 fn convert_one(
     p: &dyn TzProvider,
     now: i64,
     time: TimeOfDay,
     date_text: &str,
     reading: &Reading,
-) -> String {
-    let Some((source_now, _)) = local_with_offset(p, &reading.zone, now) else {
-        return format!("cannot look up the time zone {}", reading.name);
-    };
-    let spec = match parse_date(date_text) {
-        Ok(s) => s,
-        Err(()) => return format!("the date \"{date_text}\" is not clear"),
-    };
-    let Some(date) = resolve_date(spec.as_ref(), source_now.date) else {
-        return format!("there is no such date as \"{date_text}\"");
-    };
+) -> Result<String, String> {
+    let lookup = || format!("cannot look up the time zone {}", reading.name);
+    let (source_now, _) = local_with_offset(p, &reading.zone, now).ok_or_else(lookup)?;
+    let spec =
+        parse_date(date_text).map_err(|()| format!("the date \"{date_text}\" is not clear"))?;
+    let date = resolve_date(spec.as_ref(), source_now.date)
+        .ok_or_else(|| format!("there is no such date as \"{date_text}\""))?;
     let local = CivilDateTime {
         date,
         hour: time.hour,
         minute: time.minute,
         second: 0,
     };
-    let (instant, repeated) = match local_to_utc(p, &reading.zone, &local) {
-        Some(Resolved::Instant(t)) => (t, false),
-        Some(Resolved::Repeated(t)) => (t, true),
-        Some(Resolved::Skipped) => {
-            return format!(
+    let (instant, repeated) = match local_to_utc(p, &reading.zone, &local).ok_or_else(lookup)? {
+        Resolved::Instant(t) => (t, false),
+        Resolved::Repeated(t) => (t, true),
+        Resolved::Skipped => {
+            return Err(format!(
                 "that time does not exist on {}: the clocks skip ahead",
-                day_label(&date)
-            )
+                day_label(&date, date.year != source_now.date.year)
+            ))
         }
-        None => return format!("cannot look up the time zone {}", reading.name),
     };
-    let Some((mine, offset)) = local_with_offset(p, &ZoneId::Local, instant) else {
-        return "cannot look up your time zone".to_string();
-    };
+    let (_, from_offset) = local_with_offset(p, &reading.zone, instant).ok_or_else(lookup)?;
+    let (mine, offset) = local_with_offset(p, &ZoneId::Local, instant)
+        .ok_or_else(|| "cannot look up your time zone".to_string())?;
+    // The year is shown whenever the date is not in the current year, so a
+    // weekday that only fits 2031 is visible as such.
+    let with_year = date.year != source_now.date.year || mine.date.year != source_now.date.year;
     let mut notes = Vec::new();
     match days(&mine.date) - days(&date) {
         0 => {}
@@ -159,16 +166,28 @@ fn convert_one(
         -1 => notes.push("previous day".to_string()),
         n => notes.push(format!("{n:+} days")),
     }
-    notes.push(format_offset(offset));
+    notes.push(format!(
+        "{} to {}",
+        format_offset(from_offset),
+        format_offset(offset)
+    ));
     if repeated {
         notes.push("that hour happens twice, the first is shown".to_string());
     }
-    format!(
+    Ok(format!(
         "{}, {} ({})",
-        day_label(&mine.date),
+        day_label(&mine.date, with_year),
         clock(&mine, time.twelve_hour),
         notes.join(", ")
-    )
+    ))
+}
+
+/// "label is result" or "label: reason".
+fn line(label: &str, r: Result<String, String>) -> String {
+    match r {
+        Ok(s) => format!("{label} is {s}"),
+        Err(e) => format!("{label}: {e}"),
+    }
 }
 
 /// The card lines for one found time: one line, or a header and one line per
@@ -198,19 +217,18 @@ fn lines_for(p: &dyn TzProvider, now: i64, item: &Value) -> Vec<String> {
         ZoneParse::Missing => vec![format!("{label}: no time zone is shown")],
         ZoneParse::Unknown => vec![format!("{label}: I do not know the zone \"{zone_text}\"")],
         ZoneParse::Readings(readings) if readings.len() == 1 => {
-            vec![format!(
-                "{label} is {}",
-                convert_one(p, now, time, &date_text, &readings[0])
+            vec![line(
+                &label,
+                convert_one(p, now, time, &date_text, &readings[0]),
             )]
         }
         ZoneParse::Readings(readings) => {
             let mut lines = vec![format!("{label}: {zone_text} can mean more than one zone")];
             for reading in &readings {
-                lines.push(format!(
-                    "  If {}: {}",
-                    reading.name,
-                    convert_one(p, now, time, &date_text, reading)
-                ));
+                let text = match convert_one(p, now, time, &date_text, reading) {
+                    Ok(s) | Err(s) => s,
+                };
+                lines.push(format!("  If {}: {text}", reading.name));
             }
             lines
         }
@@ -219,44 +237,59 @@ fn lines_for(p: &dyn TzProvider, now: i64, item: &Value) -> Vec<String> {
 
 /// The card text for a `time_list` proposal, with the zone data and the
 /// clock injected. The headline is the first time (and how many more there
-/// are); the detail lists every time.
+/// are); the detail lists the times until it reaches [`MAX_DETAIL_CHARS`],
+/// then says "and N more".
 pub fn card_text_with(proposal: &Value, p: &dyn TzProvider, now_secs: i64) -> CardText {
-    let entries: Vec<Vec<String>> = proposal
+    let items = proposal
         .get("times")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .take(MAX_TIMES)
-                .map(|item| lines_for(p, now_secs, item))
-                .filter(|lines| !lines.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+        .map_or(&[][..], Vec::as_slice);
+    let skipped_items = items.len().saturating_sub(MAX_TIMES);
+    let entries: Vec<Vec<String>> = items
+        .iter()
+        .take(MAX_TIMES)
+        .map(|item| lines_for(p, now_secs, item))
+        .filter(|lines| !lines.is_empty())
+        .collect();
     let Some(first) = entries.first() else {
         return CardText {
             headline: NOTHING_HEADLINE.to_string(),
             detail: String::new(),
         };
     };
-    let more = entries.len() - 1;
+    let more = entries.len() - 1 + skipped_items;
     let suffix = match more {
         0 => String::new(),
         n => format!(" (+{n} more)"),
     };
     let budget = MAX_HEADLINE_CHARS - suffix.chars().count();
     let headline = format!("{}{suffix}", sanitize_model_text(&first[0], budget));
-    let detail = if entries.len() == 1 && first.len() == 1 {
-        String::new()
-    } else {
-        entries
-            .iter()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    CardText { headline, detail }
+    if more == 0 && first.len() == 1 {
+        return CardText {
+            headline,
+            detail: String::new(),
+        };
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = 0;
+    let mut shown = 0;
+    for entry in &entries {
+        let cost: usize = entry.iter().map(|l| l.chars().count() + 1).sum();
+        if shown > 0 && used + cost > MAX_DETAIL_CHARS {
+            break;
+        }
+        used += cost;
+        shown += 1;
+        lines.extend(entry.iter().cloned());
+    }
+    let left = entries.len() - shown + skipped_items;
+    if left > 0 {
+        lines.push(format!("and {left} more"));
+    }
+    CardText {
+        headline,
+        detail: lines.join("\n"),
+    }
 }
 
 /// [`card_text_with`] over Windows' time zone data and the real clock.
@@ -306,7 +339,7 @@ mod tests {
         );
         assert_eq!(
             c.headline,
-            "Thursday 9:00 PM PT is Fri 16 Oct, 12:00 AM (next day, UTC-4)"
+            "Thursday 9:00 PM PT is Fri 16 Oct, 12:00 AM (next day, UTC-7 to UTC-4)"
         );
         assert_eq!(c.detail, "");
     }
@@ -320,7 +353,7 @@ mod tests {
             14,
         );
         // January: CET is UTC+1 and Eastern UTC-5, six hours apart.
-        assert_eq!(c.headline, "Standup 14:00 CET is Wed 14 Jan, 8:00 (UTC-5)");
+        assert_eq!(c.headline, "Standup 14:00 CET is Wed 14 Jan, 8:00 (UTC+1 to UTC-5)");
     }
 
     #[test]
@@ -368,7 +401,60 @@ mod tests {
             3,
             1,
         );
-        assert!(c.headline.contains("does not exist"), "{}", c.headline);
+        assert_eq!(
+            c.headline,
+            "2:30 AM PT: that time does not exist on Sun 8 Mar: the clocks skip ahead"
+        );
+    }
+
+    #[test]
+    fn the_source_offset_used_is_shown_and_pst_in_july_reads_as_utc_minus_7() {
+        let c = at(
+            &json!({"times": [item("9:00 AM PST", "9:00 AM", "Jul 15", "PST")]}),
+            2026,
+            7,
+            1,
+        );
+        assert_eq!(
+            c.headline,
+            "9:00 AM PST is Wed 15 Jul, 12:00 PM (UTC-7 to UTC-4)"
+        );
+    }
+
+    #[test]
+    fn the_year_is_shown_when_the_date_is_not_this_year() {
+        // A Thursday the 13th of November only comes in 2031 from 2026.
+        let c = at(
+            &json!({"times": [item("Thu Nov 13 9:00 UTC", "9:00", "Thu Nov 13", "UTC")]}),
+            2026,
+            10,
+            15,
+        );
+        assert!(c.headline.contains("Thu 13 Nov 2031"), "{}", c.headline);
+        // This year: no year.
+        let c = at(
+            &json!({"times": [item("Fri Nov 13 9:00 UTC", "9:00", "Fri Nov 13", "UTC")]}),
+            2026,
+            10,
+            15,
+        );
+        assert!(!c.headline.contains("2026"), "{}", c.headline);
+    }
+
+    #[test]
+    fn error_lines_read_as_a_reason_after_the_label() {
+        for p in [
+            item("t", "9:00", "Feb 30", "UTC"),
+            item("t", "9:00", "1/2/99999", "UTC"),
+        ] {
+            let c = at(&json!({"times": [p]}), 2026, 1, 14);
+            assert!(c.headline.starts_with("t: "), "{}", c.headline);
+            assert!(!c.headline.contains(" is "), "{}", c.headline);
+        }
+        let c = at(&json!({"times": [item("t", "9:00", "Feb 30", "UTC")]}), 2026, 1, 14);
+        assert_eq!(c.headline, "t: there is no such date as \"Feb 30\"");
+        let c = at(&json!({"times": [item("t", "9:00", "3/4", "UTC")]}), 2026, 1, 14);
+        assert_eq!(c.headline, "t: the date \"3/4\" is not clear");
     }
 
     #[test]
@@ -399,11 +485,11 @@ mod tests {
             1,
         );
         assert!(
-            before.headline.contains("12:00 (UTC-5)"),
+            before.headline.contains("12:00 (UTC-8 to UTC-5)"),
             "{}",
             before.headline
         );
-        assert!(eu.headline.contains("10:00 (UTC-4)"), "{}", eu.headline);
+        assert!(eu.headline.contains("10:00 (UTC+1 to UTC-4)"), "{}", eu.headline);
     }
 
     #[test]
@@ -447,7 +533,16 @@ mod tests {
             .map(|i| item(&format!("{i}:00 UTC"), &format!("{i}:00"), "", "UTC"))
             .collect();
         let c = at(&json!({ "times": many }), 2026, 1, 14);
-        assert_eq!(c.detail.lines().count(), MAX_TIMES);
+        assert_eq!(c.detail.lines().count(), MAX_TIMES + 1);
+        assert_eq!(c.detail.lines().last(), Some("and 8 more"));
+        assert!(c.headline.ends_with("(+19 more)"), "{}", c.headline);
+        // Long lines hit the character cap before the item cap.
+        let wide: Vec<Value> = (0..MAX_TIMES)
+            .map(|_| item(&"w".repeat(55), "9:00", "", "IST"))
+            .collect();
+        let c = at(&json!({ "times": wide }), 2026, 1, 14);
+        assert!(c.detail.chars().count() <= MAX_DETAIL_CHARS + 40, "{}", c.detail.len());
+        assert!(c.detail.lines().last().unwrap().starts_with("and "));
         let long = "very long label ".repeat(10);
         let c = at(
             &json!({"times": [item(&long, "9:00", "", "UTC")]}),

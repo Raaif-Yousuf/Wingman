@@ -138,19 +138,32 @@ fn abbreviation(key: &str) -> Option<Vec<Reading>> {
 /// "+5:30", "-08", "+0530", "+5": sign, then hours and optional minutes.
 /// `None` for anything else or an offset outside UTC-12:00 to UTC+14:00.
 fn parse_offset(s: &str) -> Option<i32> {
-    let (sign, rest) = match s.chars().next()? {
-        '+' => (1, &s[1..]),
-        '-' | '\u{2212}' => (-1, &s[s.chars().next()?.len_utf8()..]),
+    let mut chars = s.chars();
+    let sign = match chars.next()? {
+        '+' => 1,
+        '-' | '\u{2212}' => -1,
         _ => return None,
     };
+    let rest = chars.as_str();
+    // ASCII digits and colons only, so the byte slices below are on
+    // character boundaries, and short enough that nothing can overflow.
+    if rest.is_empty() || rest.len() > 5 || !rest.bytes().all(|b| b.is_ascii_digit() || b == b':')
+    {
+        return None;
+    }
     let (h, m): (i32, i32) = if let Some((h, m)) = rest.split_once(':') {
+        if h.is_empty() || h.len() > 2 || m.len() != 2 {
+            return None;
+        }
         (h.parse().ok()?, m.parse().ok()?)
     } else if rest.len() == 4 {
         (rest[..2].parse().ok()?, rest[2..].parse().ok()?)
-    } else {
+    } else if rest.len() <= 2 {
         (rest.parse().ok()?, 0)
+    } else {
+        return None;
     };
-    if !rest.chars().all(|c| c.is_ascii_digit() || c == ':') || !(0..60).contains(&m) {
+    if !(0..60).contains(&m) {
         return None;
     }
     let total = sign * (h * 60 + m);
@@ -460,6 +473,10 @@ pub fn parse_date(text: &str) -> Result<Option<DateSpec>, ()> {
     if spec == DateSpec::default() {
         return Ok(None);
     }
+    // The range Windows time structures can hold.
+    if spec.year.is_some_and(|y| !(1601..=30827).contains(&y)) {
+        return Err(());
+    }
     // A month needs a day and a day needs a month.
     if spec.month.is_some() != spec.day.is_some() {
         return Err(());
@@ -615,7 +632,10 @@ impl Default for WindowsZones {
 impl TzProvider for WindowsZones {
     fn utc_to_local(&self, zone: &ZoneId, utc_secs: i64) -> Option<CivilDateTime> {
         use windows::Win32::Foundation::SYSTEMTIME;
-        use windows::Win32::System::Time::SystemTimeToTzSpecificLocalTimeEx;
+        use windows::Win32::System::Time::{
+            GetTimeZoneInformationForYear, SystemTimeToTzSpecificLocalTime,
+            TIME_ZONE_INFORMATION,
+        };
         let key = match zone {
             ZoneId::Windows(key) => Some(*key),
             ZoneId::Local => self.local_override,
@@ -626,6 +646,25 @@ impl TzProvider for WindowsZones {
             None => None,
         };
         let c = unix_to_civil_datetime(utc_secs);
+        if !(1601..=30827).contains(&c.date.year) {
+            return None;
+        }
+        // The rules in force that year (they change: Israel, Brazil...), as a
+        // plain TIME_ZONE_INFORMATION, then the plain conversion.
+        let mut tzi = TIME_ZONE_INFORMATION::default();
+        // SAFETY: `tzi` is a valid, writable struct; `info` is a valid zone or
+        // `None` for the user's current zone.
+        if unsafe {
+            GetTimeZoneInformationForYear(
+                c.date.year as u16,
+                info.as_ref().map(|i| i as *const _),
+                &mut tzi,
+            )
+        }
+        .is_err()
+        {
+            return None;
+        }
         let utc = SYSTEMTIME {
             wYear: c.date.year as u16,
             wMonth: c.date.month as u16,
@@ -636,16 +675,8 @@ impl TzProvider for WindowsZones {
             ..Default::default()
         };
         let mut local = SYSTEMTIME::default();
-        // SAFETY: both SYSTEMTIMEs and the optional zone info are valid for
-        // the call; `None` asks for the user's current zone.
-        unsafe {
-            SystemTimeToTzSpecificLocalTimeEx(
-                info.as_ref().map(|i| i as *const _),
-                &utc,
-                &mut local,
-            )
-        }
-        .ok()?;
+        // SAFETY: both SYSTEMTIMEs and `tzi` are valid for the call.
+        unsafe { SystemTimeToTzSpecificLocalTime(Some(&tzi), &utc, &mut local) }.ok()?;
         Some(CivilDateTime {
             date: CivilDate {
                 year: local.wYear as i32,
@@ -1079,6 +1110,80 @@ mod tests {
             local_with_offset(&w, &cet, utc(2026, 10, 25, 2)).unwrap().1,
             60
         );
+    }
+
+    #[test]
+    fn odd_zone_text_never_panics() {
+        let long = "9".repeat(5000);
+        let odd = [
+            "+1\u{20ac}",
+            "-\u{20ac}",
+            "\u{2212}",
+            "+\u{1F600}\u{1F600}",
+            "UTC+\u{20ac}30",
+            "+12:\u{20ac}",
+            "",
+            " ",
+            "+",
+            "-",
+            ":",
+            "+:",
+            "UTC+71582789",
+            "+99999999999999999999",
+            "+1:2:3",
+            "\u{0}",
+            long.as_str(),
+        ];
+        for z in odd {
+            let _ = parse_zone(z);
+            let _ = parse_zone(&format!("UTC+{z}"));
+            let _ = parse_zone(&format!("{z}{z}"));
+            let _ = parse_time(z);
+            let _ = parse_date(z);
+        }
+        for t in ["\u{20ac}:\u{20ac}", "9:\u{20ac}", "\u{20ac}pm", &long] {
+            assert_eq!(parse_time(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn long_or_impossible_offsets_are_unknown() {
+        for z in [
+            "+71582789", "UTC+71582789", "+1260", "+1:60", "+15:00", "-12:01", "+123", "+1:2",
+            "+1:234",
+        ] {
+            assert_eq!(parse_zone(z), ZoneParse::Unknown, "{z}");
+        }
+        assert_eq!(only("+1234"), ZoneId::Fixed(12 * 60 + 34));
+        assert_eq!(only("-12:00"), ZoneId::Fixed(-720));
+    }
+
+    #[test]
+    fn years_outside_the_windows_range_are_refused() {
+        for d in ["0000-01-01", "1600-05-05", "30828-01-01", "99999 Oct 1", "1/2/70000"] {
+            assert!(parse_date(d).is_err(), "{d}");
+        }
+        assert!(parse_date("1601-01-01").unwrap().is_some());
+        assert!(parse_date("2030-01-01").unwrap().is_some());
+    }
+
+    #[test]
+    fn windows_applies_the_rules_of_the_year_asked_about() {
+        let w = WindowsZones::new();
+        let off = |key: &'static str, y, mo, d, h| {
+            local_with_offset(&w, &ZoneId::Windows(key), utc(y, mo, d, h)).map(|x| x.1)
+        };
+        // Israel: daylight time starts on the Friday before the last Sunday
+        // of March, so 2027-03-25 is still standard time (UTC+2).
+        assert_eq!(off("Israel Standard Time", 2027, 3, 25, 7), Some(120));
+        assert_eq!(off("Israel Standard Time", 2027, 3, 27, 12), Some(180));
+        assert_eq!(off("Israel Standard Time", 2027, 10, 31, 12), Some(120));
+        // Newfoundland (half hour), Sydney (southern summer) and Pacific.
+        assert_eq!(off("Newfoundland Standard Time", 2027, 1, 15, 12), Some(-210));
+        assert_eq!(off("Newfoundland Standard Time", 2027, 7, 15, 12), Some(-150));
+        assert_eq!(off("AUS Eastern Standard Time", 2027, 1, 15, 12), Some(660));
+        assert_eq!(off("AUS Eastern Standard Time", 2027, 7, 15, 12), Some(600));
+        assert_eq!(off("Pacific Standard Time", 2031, 7, 15, 12), Some(-420));
     }
 
     #[test]
