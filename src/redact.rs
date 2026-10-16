@@ -113,6 +113,7 @@ fn sensitive_spans_labeled(text: &str) -> Vec<(Range<usize>, &'static str)> {
     add(crate::payment_denylist::card_number_spans(text), CARD);
     add(crate::payment_denylist::iban_spans(text), IBAN);
     add(crate::egress::find_opaque_tokens(text), KEY);
+    add(shared_key_spans(text), KEY);
     add(email_spans(text), EMAIL);
     spans.sort_by_key(|(r, _)| (r.start, r.end));
     spans
@@ -134,7 +135,9 @@ const KEY: &str = "key";
 const EMAIL: &str = "email";
 
 /// Vendor key prefixes. A run starting with one of these is a key from
-/// [`MIN_PREFIXED_KEY_CHARS`] characters on.
+/// [`MIN_PREFIXED_KEY_CHARS`] characters on. One list for both paths: the text
+/// rule and the screenshot rule both call [`shared_key_spans`], so a prefix
+/// added here is covered everywhere (#734).
 const KEY_PREFIXES: &[&str] = &[
     "sk-",
     "sk_",
@@ -145,14 +148,43 @@ const KEY_PREFIXES: &[&str] = &[
     "gho_",
     "ghu_",
     "ghs_",
+    "ghr_",
     "github_pat_",
     "xoxb-",
     "xoxp-",
     "xoxa-",
+    "xoxs-",
+    "xoxe-",
+    "xoxr-",
+    "xapp-",
     "glpat-",
     "hf_",
     "whsec_",
+    "npm_",
+    "pypi-",
+    "rubygems_",
+    "shpat_",
+    "shpca_",
+    "shppa_",
+    "shpss_",
+    "dop_v1_",
+    "doo_v1_",
+    "dor_v1_",
+    "gsk_",
+    "pplx-",
+    "nvapi-",
+    "sq0atp-",
+    "sq0csp-",
+    "figd_",
+    "lin_api_",
+    "sbp_",
+    "tskey-",
+    "xkeysib-",
+    "NRAK-",
 ];
+/// Vendor prefixes that contain a dot, so the key is a run over key
+/// characters and dots: Google OAuth access tokens and SendGrid keys.
+const DOTTED_KEY_PREFIXES: &[&str] = &["ya29.", "SG."];
 const MIN_PREFIXED_KEY_CHARS: usize = 16;
 /// A run with no known prefix must be this long, purely alphanumeric, and
 /// hold both a digit and a letter. A hyphenated or underscored run is a slug
@@ -205,8 +237,98 @@ fn is_bare_key_run(run: &str) -> bool {
         && run.bytes().any(|b| b.is_ascii_alphabetic())
 }
 
+/// A JWT: three dot-joined base64url segments, the first two non-empty and
+/// the first starting `eyJ` (the base64 of `{"`). The signature may be empty
+/// (`alg: none`), so it is not required to hold anything.
+fn is_jwt(run: &str) -> bool {
+    let mut parts = run.split('.');
+    let (Some(head), Some(payload), Some(_sig), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    head.starts_with("eyJ") && payload.len() >= 2 && run.len() >= MIN_PREFIXED_KEY_CHARS
+}
+
+fn is_dotted_vendor_key(run: &str) -> bool {
+    run.len() >= MIN_PREFIXED_KEY_CHARS && DOTTED_KEY_PREFIXES.iter().any(|p| run.starts_with(p))
+}
+
+/// Private key blocks: from a `-----BEGIN ... PRIVATE KEY-----` line through
+/// the matching `-----END ... PRIVATE KEY-----`, or to the end of the text
+/// when the block is cut off (a selection often is). Certificates and public
+/// keys are not secrets and are left alone.
+fn pem_private_key_spans(text: &str) -> Vec<Range<usize>> {
+    const BEGIN: &str = "-----BEGIN ";
+    const TAIL: &str = "PRIVATE KEY-----";
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(BEGIN) {
+        let start = from + rel;
+        let line_end = text[start..].find('\n').map_or(text.len(), |n| start + n);
+        let Some(tail_rel) = text[start + BEGIN.len()..line_end].find(TAIL) else {
+            from = start + BEGIN.len();
+            continue;
+        };
+        let after_header = start + BEGIN.len() + tail_rel + TAIL.len();
+        let end = text[after_header..]
+            .find("-----END ")
+            .and_then(|e| {
+                let at = after_header + e;
+                let tail = text[at..].find(TAIL)?;
+                Some(at + tail + TAIL.len())
+            })
+            .unwrap_or(text.len());
+        spans.push(start..end);
+        from = end.max(start + BEGIN.len());
+    }
+    spans
+}
+
+/// Key shapes both paths share (#734): a run with a vendor prefix from
+/// [`KEY_PREFIXES`], a dotted vendor key (`ya29.`, `SG.`), a JWT, and a PEM
+/// private key block. The text path adds its narrow bare-run rule, the
+/// screenshot path adds the wide opaque-token rule, but these cannot drift
+/// apart because there is one copy. Safe inside a link: nothing here is a
+/// shape a document id happens to take.
+pub(crate) fn shared_key_spans(text: &str) -> Vec<Range<usize>> {
+    let mut spans = pem_private_key_spans(text);
+    // Runs over key characters: vendor prefixes and AWS ids.
+    // Runs over key characters and dots: dotted vendor keys and JWTs.
+    let mut key_start = None;
+    let mut dot_start = None;
+    for (i, c) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        match (is_key_char(c), key_start) {
+            (true, None) => key_start = Some(i),
+            (false, Some(b)) => {
+                key_start = None;
+                if is_prefixed_key_run(&text[b..i]) {
+                    spans.push(b..i);
+                }
+            }
+            _ => {}
+        }
+        match (is_key_char(c) || c == '.', dot_start) {
+            (true, None) => dot_start = Some(i),
+            (false, Some(b)) => {
+                dot_start = None;
+                let run = text[b..i].trim_end_matches('.');
+                if is_jwt(run) || is_dotted_vendor_key(run) {
+                    spans.push(b..b + run.len());
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
 /// Key-shaped runs inside one whitespace-free chunk of `text`. A URL-shaped
-/// chunk only gets the vendor-shape rule, never the bare-run rule.
+/// chunk only gets the bare-run rule when it is not a link; the vendor shapes
+/// are in [`shared_key_spans`].
 fn chunk_key_spans(text: &str, range: Range<usize>, spans: &mut Vec<Range<usize>>) {
     let chunk = &text[range.clone()];
     let in_link = url_shaped(chunk);
@@ -221,7 +343,7 @@ fn chunk_key_spans(text: &str, range: Range<usize>, spans: &mut Vec<Range<usize>
             (false, Some(b)) => {
                 run_start = None;
                 let run = &chunk[b..i];
-                if is_prefixed_key_run(run) || (!in_link && is_bare_key_run(run)) {
+                if !in_link && is_bare_key_run(run) {
                     spans.push(range.start + b..range.start + i);
                 }
             }
@@ -263,6 +385,7 @@ fn text_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
     );
     add(crate::payment_denylist::iban_spans(text), IBAN);
     add(text_key_spans(text), KEY);
+    add(shared_key_spans(text), KEY);
     add(email_spans(text), EMAIL);
     spans.sort_by_key(|(r, _)| (r.start, r.end));
     spans
@@ -860,6 +983,82 @@ mod tests {
             "Internationalization and responsibilities are long words",
             "see 2024-10-15-weekly-sync-notes-final and my_long_snake_case_identifier_2",
             "https://example.com/a/b?c=d",
+        ] {
+            assert_eq!(red(t), t, "{t}");
+        }
+    }
+
+    fn jwt() -> String {
+        [
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4tRG9lXyJ9",
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        ]
+        .join(".")
+    }
+
+    #[test]
+    fn a_jwt_is_one_key_even_with_dashes_and_underscores() {
+        let t = format!("Authorization: Bearer {} thanks", jwt());
+        assert_eq!(red(&t), "Authorization: Bearer [key 1] thanks");
+        let t2 = format!("token={}.", jwt());
+        assert_eq!(red(&t2), "token=[key 1].");
+    }
+
+    #[test]
+    fn a_pem_private_key_block_is_redacted_through_its_end_line() {
+        // Split so no whole PEM header sits in the source for a secret scan.
+        const BEGIN: &str = "-----BEGIN ";
+        const END: &str = "-----END ";
+        let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC+x/Ab12=\nQ3fZ9o+Pk2lm/Zx0aB7y==";
+        let t = format!(
+            "my key:\n{BEGIN}PRIVATE KEY-----\n{body}\n{END}PRIVATE KEY-----\nwhy does it fail?"
+        );
+        assert_eq!(red(&t), "my key:\n[key 1]\nwhy does it fail?");
+        // A block cut off before its end line goes to the end of the text.
+        let cut = format!("{BEGIN}RSA PRIVATE KEY-----\n{body}");
+        assert_eq!(red(&cut), "[key 1]");
+        // A certificate is not a secret.
+        let cert = "-----BEGIN CERTIFICATE-----\nMIIDdzCCAl+gAwIBAgIE\n-----END CERTIFICATE-----";
+        assert_eq!(red(cert), cert);
+    }
+
+    #[test]
+    fn more_vendor_prefixes_are_keys() {
+        let keys = [
+            ["npm_", "abcdEFGH1234abcdEFGH1234abcdEFGH1234"].concat(),
+            ["ya29.", "a0AfH6SMBx-3Kq_Zp9wT7vLm2NcXy8Rd4"].concat(),
+            [
+                "SG.",
+                "abcdEFGHijklMNOPqrstUV.abcdEFGHijklMNOPqrstUVwxyz0123456789ABCDE",
+            ]
+            .concat(),
+            ["shpat_", "0123456789abcdef0123456789abcdef"].concat(),
+            ["dop_v1_", "0123456789abcdef0123456789abcdef"].concat(),
+            ["gsk_", "abcdEFGH1234abcdEFGH1234"].concat(),
+            ["pypi-", "AgEIcHlwaS5vcmcCJGFiY2Q"].concat(),
+        ];
+        for k in keys {
+            assert_eq!(red(&format!("use {k} here")), "use [key 1] here", "{k}");
+        }
+    }
+
+    #[test]
+    fn the_screenshot_rule_finds_the_same_shapes() {
+        let key = ["npm_", "abcdEFGH1234abcd"].concat();
+        let t = format!("{} and {key}", jwt());
+        let spans = sensitive_spans(&t);
+        let got = text_of(&t, spans);
+        assert!(got.contains(&jwt().as_str()), "{got:?}");
+        assert!(got.contains(&key.as_str()), "{got:?}");
+    }
+
+    #[test]
+    fn short_look_alikes_of_the_new_shapes_are_left_alone() {
+        for t in [
+            "see 2024-10-15-weekly-sync-notes and npm_config",
+            "version 1.2.3 of eyJ.x and SG.1 and ya29.",
+            "-----BEGIN CERTIFICATE----- only",
         ] {
             assert_eq!(red(t), t, "{t}");
         }
