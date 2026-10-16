@@ -1,13 +1,18 @@
 //! "Table to CSV" (#69): read a table off the screen and put it on the
-//! clipboard as CSV.
+//! clipboard as tab-separated text, which a spreadsheet pastes into columns (#708).
 //!
 //! The model fills `columns` (the header names) and then `rows` (each row a
 //! list of cell strings). The preview card lists the rows; "Do it" runs the
-//! `"clipboard"` executor, which turns the proposal into CSV with
-//! [`csv_from_value`]. The quoting is done in Rust, never trusted to the
+//! `"clipboard"` executor, which turns the proposal into tab-separated text with
+//! [`tsv_from_value`]. The quoting is done in Rust, never trusted to the
 //! model.
 //!
-//! [`Table`] and its [`csv`](Table::csv) are the shared piece: a receipt or a
+//! Decision (#708): tab-separated text only, in the one text format on the
+//! clipboard. Excel and Sheets split pasted text on tabs, so CSV landed in one
+//! column. A second CSV clipboard format would need raw clipboard code for a
+//! rarer target; the action keeps its name and id.
+//!
+//! [`Table`] and its [`tsv`](Table::tsv) are the shared piece: a receipt or a
 //! chart read into the same `table` proposal (#70, #114) gets the same quoting
 //! and the same spreadsheet-formula guard for free.
 
@@ -106,11 +111,11 @@ impl Table {
         self.rows.iter().flatten().all(|c| c.trim().is_empty())
     }
 
-    /// The table as CSV (RFC 4180): a header line, then one line per row,
+    /// The table as tab-separated text: a header line, then one line per row,
     /// CRLF line endings, no trailing newline. Every line has as many cells
     /// as the widest row (at most [`MAX_COLUMNS`]), short rows padded with
     /// empty cells.
-    pub fn csv(&self) -> String {
+    pub fn tsv(&self) -> String {
         let width = self
             .rows
             .iter()
@@ -120,9 +125,9 @@ impl Table {
             .unwrap_or(0);
         let line = |cells: &[String]| {
             (0..width)
-                .map(|i| csv_field(cells.get(i).map_or("", String::as_str)))
+                .map(|i| tsv_field(cells.get(i).map_or("", String::as_str)))
                 .collect::<Vec<_>>()
-                .join(",")
+                .join("\t")
         };
         std::iter::once(line(&self.columns))
             .chain(self.rows.iter().map(|r| line(r)))
@@ -139,11 +144,14 @@ fn cell_text(v: &Value) -> String {
     }
 }
 
-/// One CSV field: made safe for a spreadsheet first (see [`guard_formula`]),
-/// then quoted when it holds a comma, quote, CR or LF (quotes doubled).
-pub fn csv_field(cell: &str) -> String {
+/// One tab-separated field: made safe for a spreadsheet first (see
+/// [`guard_formula`]), then quoted when it holds a tab, quote, CR or LF
+/// (quotes doubled). A comma needs no quoting here, which is the point: a
+/// spreadsheet splits pasted text on tabs, and CSV text pasted into Excel
+/// lands in one column (#708).
+pub fn tsv_field(cell: &str) -> String {
     let safe = guard_formula(cell);
-    if safe.contains([',', '"', '\r', '\n']) {
+    if safe.contains(['\t', '"', '\r', '\n']) {
         format!("\"{}\"", safe.replace('"', "\"\""))
     } else {
         safe
@@ -194,11 +202,11 @@ fn is_signed_number(cell: &str) -> bool {
         && exponent_ok
 }
 
-/// The CSV for a confirmed `table` proposal, `None` when it has no table or
+/// The tab-separated text for a confirmed `table` proposal, `None` when it has no table or
 /// the table is empty.
-pub fn csv_from_value(proposal: &Value) -> Option<String> {
+pub fn tsv_from_value(proposal: &Value) -> Option<String> {
     let table = Table::from_value(proposal)?;
-    (!table.is_empty()).then(|| table.csv())
+    (!table.is_empty()).then(|| table.tsv())
 }
 
 /// Whether a model proposal for the `table` kind has nothing to copy: it
@@ -236,23 +244,24 @@ mod tests {
             &["Item", "Qty", "Price"],
             &[&["Pen", "2", "1.50"], &["Ink", "1", "7.25"]],
         );
-        assert_eq!(t.csv(), "Item,Qty,Price\r\nPen,2,1.50\r\nInk,1,7.25");
+        assert_eq!(t.tsv(), "Item\tQty\tPrice\r\nPen\t2\t1.50\r\nInk\t1\t7.25");
     }
 
     #[test]
-    fn commas_quotes_and_newlines_are_quoted() {
-        assert_eq!(csv_field("a,b"), "\"a,b\"");
-        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
-        assert_eq!(csv_field("one\ntwo"), "\"one\ntwo\"");
-        assert_eq!(csv_field("one\r\ntwo"), "\"one\r\ntwo\"");
-        assert_eq!(csv_field("plain"), "plain");
-        assert_eq!(csv_field(""), "");
+    fn tabs_quotes_and_newlines_are_quoted_but_commas_are_not() {
+        assert_eq!(tsv_field("a,b"), "a,b");
+        assert_eq!(tsv_field("a\tb"), "\"a\tb\"");
+        assert_eq!(tsv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(tsv_field("one\ntwo"), "\"one\ntwo\"");
+        assert_eq!(tsv_field("one\r\ntwo"), "\"one\r\ntwo\"");
+        assert_eq!(tsv_field("plain"), "plain");
+        assert_eq!(tsv_field(""), "");
     }
 
     #[test]
     fn short_rows_are_padded_and_long_rows_are_kept() {
         let t = table(&["A", "B"], &[&["1"], &["1", "2", "3"]]);
-        assert_eq!(t.csv(), "A,B,\r\n1,,\r\n1,2,3");
+        assert_eq!(t.tsv(), "A\tB\t\r\n1\t\t\r\n1\t2\t3");
     }
 
     #[test]
@@ -269,9 +278,11 @@ mod tests {
         assert_eq!(guard_formula("+"), "'+");
         // The guard runs before the quoting.
         assert_eq!(
-            csv_field("=HYPERLINK(\"x\",\"y\")"),
+            tsv_field("=HYPERLINK(\"x\",\"y\")"),
             "\"'=HYPERLINK(\"\"x\"\",\"\"y\"\")\""
         );
+        // No quote or tab in the cell: the guard alone, no quoting.
+        assert_eq!(tsv_field("=1+1"), "'=1+1");
     }
 
     #[test]
@@ -296,25 +307,25 @@ mod tests {
     #[test]
     fn the_header_row_is_guarded_too() {
         let t = table(&["=evil", "ok"], &[&["1", "2"]]);
-        assert_eq!(t.csv(), "'=evil,ok\r\n1,2");
+        assert_eq!(t.tsv(), "'=evil\tok\r\n1\t2");
     }
 
     #[test]
-    fn a_proposal_becomes_csv() {
+    fn a_proposal_becomes_tab_separated_text() {
         let p = json!({"columns": ["Name", "Note"], "rows": [["Ann", "hi, there"], ["Bo", 12]]});
         assert_eq!(
-            csv_from_value(&p).unwrap(),
-            "Name,Note\r\nAnn,\"hi, there\"\r\nBo,12"
+            tsv_from_value(&p).unwrap(),
+            "Name\tNote\r\nAnn\thi, there\r\nBo\t12"
         );
     }
 
     #[test]
     fn nothing_to_copy_is_none() {
-        assert!(csv_from_value(&json!({"columns": [], "rows": []})).is_none());
-        assert!(csv_from_value(&json!({"columns": ["A"], "rows": [[""]]})).is_none());
-        assert!(csv_from_value(&json!({"rows": [["a"]]})).is_none());
-        assert!(csv_from_value(&json!({"columns": ["A"], "rows": "x"})).is_none());
-        assert!(csv_from_value(&json!({"columns": ["A"], "rows": ["x"]})).is_none());
+        assert!(tsv_from_value(&json!({"columns": [], "rows": []})).is_none());
+        assert!(tsv_from_value(&json!({"columns": ["A"], "rows": [[""]]})).is_none());
+        assert!(tsv_from_value(&json!({"rows": [["a"]]})).is_none());
+        assert!(tsv_from_value(&json!({"columns": ["A"], "rows": "x"})).is_none());
+        assert!(tsv_from_value(&json!({"columns": ["A"], "rows": ["x"]})).is_none());
         assert!(is_empty_result(
             "table",
             &json!({"columns": [], "rows": []})
