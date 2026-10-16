@@ -1562,9 +1562,11 @@ impl App {
         };
 
         // #127: the fetch step reads no screen, so it takes no screenshot.
+        // #494: nor does an action whose inputs are all text.
         let link_step = actions::link_summary::step_for(&action, confirmed_link.as_deref());
         let plan = BeginPlan {
-            capture: !matches!(link_step, actions::link_summary::Step::Fetch(_)),
+            capture: !matches!(link_step, actions::link_summary::Step::Fetch(_))
+                && actions::generic_inputs::screen_may_be_needed(&action.inputs),
             ..BeginPlan::MODEL
         };
         let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_action(plan, |_| Some(()))
