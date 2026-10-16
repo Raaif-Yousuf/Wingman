@@ -223,6 +223,7 @@ impl Card {
             theme,
             sys: SysColors::read(),
             theme_forced: false,
+            dpi_forced: false,
             fonts: Fonts::null(),
             text_scale: 1.0,
             corner: CardCorner::default(),
@@ -569,6 +570,16 @@ impl Card {
         if !self.inner.hwnd.0.is_null() {
             self.inner.repaint_for_theme();
         }
+    }
+
+    /// The UI gallery's `--dpi`: lays the card out at `dpi` whatever the
+    /// monitor says, and ignores later DPI changes. Fonts and every layout
+    /// measure are rebuilt for it. Never touches display or registry settings.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn force_dpi_for_gallery(&mut self, dpi: u32) {
+        self.inner.dpi = dpi.max(1);
+        self.inner.dpi_forced = true;
+        self.inner.rebuild_fonts();
     }
 
     /// The UI gallery's expanded answer: what a click on the card does.
@@ -1268,6 +1279,9 @@ struct CardInner {
     /// Set by the UI gallery's `--theme`: `theme` and `sys` are simulated
     /// and no theme message may replace them.
     theme_forced: bool,
+    /// Set by the UI gallery's `--dpi`: `dpi` is simulated and neither the
+    /// monitor the card moves to nor `WM_DPICHANGED` may replace it.
+    dpi_forced: bool,
     fonts: Fonts,
     /// User-tunable multiplier applied to every font size. Set via
     /// [`Card::set_text_scale`]; defaults to 1.0.
@@ -1613,6 +1627,9 @@ impl CardInner {
         self.copy_feedback = CopyFeedback::None;
         self.set_noactivate(true);
         self.state = CardState::Hidden;
+        // Issue #729: nothing is showing, so nothing needs a click-away hook.
+        // Every hide goes through here, the auto-dismiss timer included.
+        crate::dismiss::disarm();
         // Issue #356: no headline is showing any more, so the accessible
         // name reverts to the plain app name set at `Card::create`, rather
         // than leaking the last-shown headline into a window nothing is
@@ -2033,9 +2050,21 @@ impl CardInner {
     /// answer stays on screen.
     fn copy_activated(&mut self) {
         let text = answer_clipboard_text(&self.headline, &self.detail);
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-            Ok(()) => self.mark_copied(),
-            Err(_) => self.mark_copy_failed(),
+        // Decision (#716): the answer came from the user's screen, so it is
+        // kept out of the cloud clipboard, but stays in local Win+V history.
+        // If the exclusion cannot be written, fall back to a plain copy so
+        // the card never says "failed" when the text is on the clipboard.
+        use arboard::SetExtWindows;
+        let copied = arboard::Clipboard::new()
+            .and_then(|mut c| c.set().exclude_from_cloud().text(text.clone()))
+            .is_ok()
+            || arboard::Clipboard::new()
+                .and_then(|mut c| c.set_text(text))
+                .is_ok();
+        if copied {
+            self.mark_copied();
+        } else {
+            self.mark_copy_failed();
         }
     }
 
@@ -2146,7 +2175,9 @@ impl CardInner {
         let (mut dx, mut dy) = (0u32, 0u32);
         let queried =
             unsafe { GetDpiForMonitor(target, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) }.is_ok();
-        if let Some(dpi) = dpi_to_apply(self.dpi, queried.then_some(dx)) {
+        if self.dpi_forced {
+            // The gallery's simulated DPI stays whatever monitor this is.
+        } else if let Some(dpi) = dpi_to_apply(self.dpi, queried.then_some(dx)) {
             self.dpi = dpi;
             self.rebuild_fonts();
         }
@@ -3157,6 +3188,7 @@ impl CardInner {
                 self.refresh_theme();
                 Some(LRESULT(0))
             }
+            WM_DPICHANGED if self.dpi_forced => Some(LRESULT(0)),
             WM_DPICHANGED => {
                 let new_dpi = (wparam.0 & 0xFFFF) as u32;
                 self.dpi = new_dpi.max(1);
@@ -5810,6 +5842,31 @@ mod tests {
         assert_eq!(hc.text, theme::HC_BLACK.window_text);
         card.force_theme_for_gallery(Theme::Dark);
         assert!(card.inner.button_high_contrast().is_none());
+    }
+
+    fn card_width(card: &Card) -> i32 {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(card.hwnd(), &mut r);
+        }
+        r.right - r.left
+    }
+
+    #[test]
+    fn a_forced_dpi_lays_the_card_out_at_that_dpi_and_survives_dpi_messages() {
+        let mut small = Card::new_for_test(instance()).expect("Card::new_for_test");
+        small.force_dpi_for_gallery(96);
+        small.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        let mut big = Card::new_for_test(instance()).expect("Card::new_for_test");
+        big.force_dpi_for_gallery(240);
+        big.show_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+        assert_eq!(small.inner.dpi, 96);
+        assert_eq!(big.inner.dpi, 240, "a layout must not reset the DPI");
+        // 250%: the card is 2.5 times as wide (give or take rounding).
+        let (s, b) = (card_width(&small), card_width(&big));
+        assert!(s > 0 && (b * 100 / s) >= 240, "width {s} -> {b}");
+        big.handle_message(WM_DPICHANGED, WPARAM(96), LPARAM(0));
+        assert_eq!(big.inner.dpi, 240, "a DPI message must not replace it");
     }
 
     #[test]

@@ -151,6 +151,21 @@ pub const WM_APP_PENDING_STAGE: u32 = WM_APP + 19;
 /// `WM_APP + 20`: `+19` is `WM_APP_PENDING_STAGE`.
 pub const WM_APP_FIRST_RUN: u32 = WM_APP + 20;
 
+/// #328: posted by the "Check this PC for local models" worker thread when
+/// its reads finish. `lparam` is
+/// `Box::into_raw(Box::new(machine::MachineFacts))`; the receiver takes
+/// ownership. The reads (including a loopback `/api/ps` call) run off the
+/// message thread because that thread also hosts the low-level keyboard
+/// hook, which Windows drops if it stalls. `WM_APP + 21`: `+20` is
+/// `WM_APP_FIRST_RUN`.
+pub const WM_APP_MACHINE_CHECK_RESULT: u32 = WM_APP + 21;
+
+/// Set while a machine check is gathering, so a second click does not start
+/// a second worker. Cleared by the worker just before it posts, so an
+/// ignored (Settings open) or dropped result can never leave it stuck.
+static MACHINE_CHECK_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// #567: what Ollama reported for one base URL, as (name, supports vision).
 type PulledOllamaModels = (String, Vec<(String, bool)>);
 
@@ -512,6 +527,7 @@ pub fn run() -> Result<()> {
     if let Some((headline, detail)) = startup_card(
         &config.unreadable_secrets,
         crate::single_instance::lock_squatted(),
+        config.load_problem.as_deref(),
     ) {
         card.show_error(&headline, &detail);
     }
@@ -652,20 +668,46 @@ fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
 /// unreadable keys, #237 lockless start) end in a card, and one must never
 /// overwrite the other, so when both apply their text is joined. Pure so the
 /// wording is unit-tested without a `Card`. No em dash (rule 11).
-fn startup_card(unreadable: &[String], lock_squatted: bool) -> Option<(String, String)> {
+fn startup_card(
+    unreadable: &[String],
+    lock_squatted: bool,
+    config_problem: Option<&str>,
+) -> Option<(String, String)> {
     let squat = (
         "Another program holds Wingman's startup lock".to_string(),
         "Wingman started anyway. If you see two Wingman tray icons, quit one of them.".to_string(),
     );
-    match (unreadable.is_empty(), lock_squatted) {
-        (true, false) => None,
-        (false, false) => Some(unreadable_secrets_card(unreadable)),
-        (true, true) => Some(squat),
-        (false, true) => {
-            let (headline, detail) = unreadable_secrets_card(unreadable);
-            Some((headline, format!("{detail}\n\n{}. {}", squat.0, squat.1)))
-        }
+    // Every problem that applies, in order; the first one's headline leads
+    // and the rest are joined, so none is dropped.
+    let mut cards = Vec::new();
+    if let Some(problem) = config_problem {
+        cards.push(config_problem_card(problem));
     }
+    if !unreadable.is_empty() {
+        cards.push(unreadable_secrets_card(unreadable));
+    }
+    if lock_squatted {
+        cards.push(squat);
+    }
+    let mut cards = cards.into_iter();
+    let (headline, mut detail) = cards.next()?;
+    for (h, d) in cards {
+        detail = format!("{detail}\n\n{h}. {d}");
+    }
+    Some((headline, detail))
+}
+
+/// #711: config.toml exists but did not parse. Names the line and column
+/// (`problem` already carries them), never file text. No em dash (rule 11).
+fn config_problem_card(problem: &str) -> (String, String) {
+    (
+        "Settings file not read".to_string(),
+        format!(
+            "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
+             computer) and will not save over your file. Fix it, then choose Reload settings \
+             from the tray menu."
+        ),
+    )
 }
 
 fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
@@ -813,6 +855,10 @@ fn first_run_detail(found: &FirstRun) -> Option<String> {
             "Ollama is running, but none of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
                 .to_string(),
         ),
+        FirstRun::VisionUnknown => Some(
+            "Ollama is running, but Wingman could not tell which of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
+                .to_string(),
+        ),
         FirstRun::NotRunning | FirstRun::Found { .. } => None,
     }
 }
@@ -899,7 +945,10 @@ impl App {
         let base_url = self.config.providers.ollama.base_url.clone();
         let preferred = self.config.providers.ollama.model.clone();
         std::thread::spawn(move || {
-            let found = ollama_admin::probe_first_run(&base_url, &preferred);
+            // A panic must still post a result, or the Working card never
+            // goes away (dev builds; release aborts). Read as "not found".
+            let found = catch_worker(|| Ok(ollama_admin::probe_first_run(&base_url, &preferred)))
+                .unwrap_or(FirstRun::NotRunning);
             let payload = Box::into_raw(Box::new(found));
             unsafe {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -2181,6 +2230,13 @@ impl App {
                 }
             }
         }
+        // #70: a receipt is one row under five fixed headers, whatever the
+        // model sent.
+        let proposal = if action.id == actions::receipt::ACTION_ID {
+            actions::receipt::clamp_receipt(&proposal)
+        } else {
+            proposal
+        };
         // #69: no table on screen, or a reply that is not a table, is an
         // answer, not an empty preview.
         let table_headline = if actions::table::is_unreadable(&action.proposal, &proposal) {
@@ -2203,6 +2259,14 @@ impl App {
                 (t.to_value(), Some(actions::table::CAPPED_NOTE.to_string()))
             }
             _ => (proposal, self.fallback_footer.clone()),
+        };
+        // #114: values read off a chart are estimates. The headers say so (and
+        // so does the CSV), and the card says so under the rows.
+        let (proposal, note) = if action.id == actions::chart_table::ACTION_ID {
+            let (marked, card_note) = actions::chart_table::finish(&proposal, note.as_deref());
+            (marked, Some(card_note))
+        } else {
+            (proposal, note)
         };
 
         if action.confirm {
@@ -3265,6 +3329,46 @@ impl App {
         }
     }
 
+    /// Issue #328: "Check this PC for local models". Reads RAM, GPU, battery
+    /// and Ollama's GPU use once, on click, on a worker thread (the message
+    /// thread also hosts the keyboard hook and must never wait on a
+    /// socket), then `on_machine_check_result` shows the verdict. Nothing is
+    /// kept and nothing polls.
+    fn check_machine(&mut self) {
+        use std::sync::atomic::Ordering;
+        if MACHINE_CHECK_RUNNING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        let target = self.hwnd_isize();
+        let base_url = self.config.providers.ollama.base_url.clone();
+        std::thread::spawn(move || {
+            let facts = crate::machine::gather(&base_url);
+            MACHINE_CHECK_RUNNING.store(false, Ordering::SeqCst);
+            let payload = Box::into_raw(Box::new(facts));
+            unsafe {
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_MACHINE_CHECK_RESULT,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_MACHINE_CHECK_RESULT, LPARAM(payload as isize));
+                }
+            }
+        });
+    }
+
+    fn on_machine_check_result(&mut self, facts: &crate::machine::MachineFacts) {
+        let verdict = crate::machine::verdict(facts);
+        self.card
+            .show_answer(&verdict.headline, &verdict.detail(), 20, None);
+    }
+
     /// Issue #115: "Calculate selection" tray item. Model-free: reads the
     /// current selection (UIA, falling back to a clipboard-safe Ctrl+C --
     /// see `inputs::selection`) and evaluates it locally via `calc`, with no
@@ -3421,6 +3525,13 @@ impl App {
 
     fn reload(&mut self) {
         match Config::load() {
+            // #711: a file that does not parse must not replace the settings
+            // already running; keep them and say what is wrong.
+            Ok(config) if config.load_problem.is_some() => {
+                let (headline, detail) =
+                    config_problem_card(config.load_problem.as_deref().unwrap_or_default());
+                self.card.show_error(&headline, &detail);
+            }
             Ok(config) => {
                 // #175: report before self.config is overwritten, since the
                 // freshly loaded config is the one whose hydrate ran.
@@ -4013,11 +4124,22 @@ impl App {
         }
     }
 
-    fn set_watch(&self, on: bool) {
+    fn set_watch(&mut self, on: bool) {
+        let failed = match &self.watcher {
+            Some(w) if on => !w.arm(),
+            _ => false,
+        };
+        // Never overwrite a real earlier error: the card being shown may be it.
+        if failed && self.last_error.is_none() {
+            // Issue #729: no click-away for this card. Record it for
+            // "Copy diagnostics" rather than failing the card itself.
+            self.record_last_error(
+                "Click-away dismissal unavailable",
+                "SetWindowsHookExW(WH_MOUSE_LL) failed",
+            );
+        }
         if let Some(w) = &self.watcher {
-            if on {
-                w.arm();
-            } else {
+            if !on {
                 w.disarm();
             }
         }
@@ -4524,6 +4646,7 @@ fn with_pending_notices(detail: &str) -> String {
         [
             crate::store::take_notice(),
             crate::usage::take_budget_notice(),
+            crate::config::take_backup_warning(),
             crate::actions::take_skipped_notice(),
         ]
         .into_iter()
@@ -5715,6 +5838,10 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
+        // #328: an on-demand card; Settings hides every card when it
+        // opens, so a result arriving then has nothing to show on. The
+        // boxed facts are freed below.
+        | WM_APP_MACHINE_CHECK_RESULT
         // #105: a send preview cannot be answered while Settings is
         // modal-open, so it is dropped, which cancels the send (the worker
         // sees the reply channel close and the request ends in a card).
@@ -5768,6 +5895,9 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_PALETTE_RUN => drop(Box::from_raw(p as *mut String)),
             WM_APP_SEND_PREVIEW => drop(Box::from_raw(p as *mut crate::ui::send_gate::SendRequest)),
             WM_APP_PENDING_STAGE => drop(Box::from_raw(p as *mut crate::ui::card::PendingStage)),
+            WM_APP_MACHINE_CHECK_RESULT => {
+                drop(Box::from_raw(p as *mut crate::machine::MachineFacts))
+            }
             WM_APP_FIRST_RUN => drop(Box::from_raw(p as *mut FirstRun)),
             WM_APP_ROUTER_RESULT => drop(Box::from_raw(
                 p as *mut (u64, std::result::Result<router::RouterResult, String>),
@@ -5952,6 +6082,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     MenuChoice::Command(cmd::RELOAD) => app.reload(),
                     MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
                     MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
+                    MenuChoice::Command(cmd::CHECK_MACHINE) => app.check_machine(),
                     MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
                     MenuChoice::Command(cmd::USE_OPENAI) => {
                         app.set_provider(ActiveProvider::OpenAi)
@@ -6065,6 +6196,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let (action, schema, result) =
                 unsafe { *Box::from_raw(lparam.0 as *mut (actions::Action, Value, GenericResult)) };
             app.on_generic_action_result(action, schema, result);
+            LRESULT(0)
+        }
+        WM_APP_MACHINE_CHECK_RESULT => {
+            let facts = unsafe { *Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts) };
+            app.on_machine_check_result(&facts);
             LRESULT(0)
         }
         WM_APP_PENDING_STAGE => {
@@ -6244,8 +6380,8 @@ mod tests {
     use super::{settings_reentrancy_policy, SettingsReentrancy};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
-        WM_APP_GENERIC_ACTION_RESULT, WM_APP_PENDING_STAGE, WM_APP_RESULT, WM_APP_REVIEW_RESULT,
-        WM_APP_ROUTER_RESULT, WM_APP_SEND_PREVIEW,
+        WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
+        WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT, WM_APP_SEND_PREVIEW,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
@@ -6502,6 +6638,22 @@ mod tests {
         }
     }
 
+    /// #328: a machine-check result dropped unhandled (Settings open, window
+    /// closing, post failure) must free its boxed facts, not leak them.
+    #[test]
+    fn free_boxed_payload_frees_a_machine_check_result() {
+        let facts = Box::into_raw(Box::new(crate::machine::MachineFacts {
+            ram_bytes: None,
+            gpus: None,
+            ollama: crate::machine::OllamaState::NotRunning,
+            power: crate::machine::Power::Unknown,
+        }));
+        assert!(super::free_boxed_payload(
+            super::WM_APP_MACHINE_CHECK_RESULT,
+            windows::Win32::Foundation::LPARAM(facts as isize)
+        ));
+    }
+
     #[test]
     fn choosing_a_keyed_provider_with_no_key_needs_a_key() {
         use crate::config::{ActiveProvider as P, Providers};
@@ -6634,6 +6786,13 @@ mod tests {
             !detail.contains('\u{2014}') && !detail.contains('\u{2013}'),
             "{detail}"
         );
+        // An older Ollama that lists no capabilities: say so, do not claim
+        // that no model can read the screen.
+        let unknown = super::first_run_detail(&FirstRun::VisionUnknown).expect("a detail");
+        assert!(unknown.contains("could not tell"), "{unknown}");
+        assert!(!unknown.contains("none of its models"), "{unknown}");
+        assert!(unknown.contains("Settings"), "{unknown}");
+        assert!(!unknown.contains('\u{2014}') && !unknown.contains('\u{2013}'));
     }
 
     #[test]
@@ -7108,6 +7267,7 @@ mod tests {
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
+        ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
         ("WM_APP_FIRST_RUN", WM_APP_FIRST_RUN),
     ];
 
@@ -7627,16 +7787,35 @@ mod tests {
     #[test]
     fn startup_card_shows_neither_one_or_both_problems() {
         let keys = vec!["openai".to_string()];
-        assert_eq!(super::startup_card(&[], false), None);
-        let only_keys = super::startup_card(&keys, false).unwrap();
+        assert_eq!(super::startup_card(&[], false, None), None);
+        let only_keys = super::startup_card(&keys, false, None).unwrap();
         assert!(only_keys.0.contains("key"), "{only_keys:?}");
-        let only_squat = super::startup_card(&[], true).unwrap();
+        let only_squat = super::startup_card(&[], true, None).unwrap();
         assert!(only_squat.0.contains("startup lock"), "{only_squat:?}");
-        let (headline, detail) = super::startup_card(&keys, true).unwrap();
+        let (headline, detail) = super::startup_card(&keys, true, None).unwrap();
         assert_eq!(headline, only_keys.0);
         assert!(detail.contains(&only_keys.1), "keys text kept: {detail}");
         assert!(detail.contains(&only_squat.0), "squat text added: {detail}");
         assert!(!detail.contains('\u{2014}'));
+    }
+
+    /// #711: a config.toml that did not parse gets its own card, with the
+    /// location, and it is not lost when the other startup problems apply.
+    #[test]
+    fn startup_card_reports_a_config_file_that_did_not_parse() {
+        let problem = "config.toml has an error at line 3, column 7";
+        let (headline, detail) = super::startup_card(&[], false, Some(problem)).unwrap();
+        assert!(headline.contains("Settings file"), "{headline}");
+        assert!(detail.contains(problem), "{detail}");
+        assert!(detail.contains("Reload settings"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
+        let (_, both) = super::startup_card(&["openai".to_string()], true, Some(problem)).unwrap();
+        assert!(
+            both.contains(problem) && both.contains("startup lock"),
+            "{both}"
+        );
+        assert!(both.contains("Stored API key unreadable"), "{both}");
+        assert!(both.contains("Offline"), "{both}");
     }
 
     /// #237: the owner window must exist before the single-instance name is
@@ -7768,6 +7947,11 @@ mod tests {
         (
             "WM_APP_PENDING_STAGE",
             WM_APP_PENDING_STAGE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_MACHINE_CHECK_RESULT",
+            WM_APP_MACHINE_CHECK_RESULT,
             SettingsReentrancy::Ignore,
         ),
         (

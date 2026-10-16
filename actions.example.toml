@@ -167,6 +167,39 @@ enabled = true
 mode = "auto"
 
 [[actions]]
+id = "chart-to-data-table"
+name = "Chart to data table"
+group = "Work"
+inputs = ["screen"]
+proposal = "table"
+executor = "clipboard"
+confirm = true
+prompt = 'You are shown a chart (a bar chart, line chart, pie chart or similar), as a screenshot. Turn it into a table. First fill `columns`: the first header names what the labels are (the axis title if there is one, otherwise "Label"), then one header per data series, named as in the legend, or with the axis title or unit when there is a single series. Then fill `rows` with one list of cells per bar, point or slice, in the order shown, each cell a plain string. The first cell is the label exactly as shown. The other cells are the values: copy a number that is printed on the chart exactly as shown, otherwise read the value against the axis and give a plain number with at most three significant digits, with no units or symbols. For a pie chart use the printed percentage when there is one. If a value is unclear or cannot be read, use an empty string and never invent one. Do not add totals, trends or comments. If the screen holds no chart, return empty lists. Use plain text only: no markdown and no LaTeX.'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
+id = "receipt-to-expense-row"
+name = "Receipt to expense row"
+group = "Work"
+inputs = [
+    "selection",
+    "screen",
+]
+proposal = "table"
+executor = "clipboard"
+confirm = true
+prompt = 'You are shown a receipt or an invoice (as text, or as a screenshot if no text was selected). Fill `columns` with exactly these five headers in this order: "Date", "Merchant", "Amount", "Currency", "Category". Then fill `rows` with exactly one row of five cells, one per column. Date: the date printed on the receipt, written as YYYY-MM-DD when the year is shown and exactly as printed when it is not. Merchant: the shop or company name as printed. Amount: the final total paid, copied as printed, digits and decimal point only, with no currency symbol; do not add up the items yourself and do not use a subtotal. Currency: the three-letter code (USD, EUR, GBP and so on) when the receipt shows a code or an unambiguous symbol, otherwise an empty string. Category: one of Meals, Groceries, Travel, Fuel, Lodging, Office, Software, Entertainment, Health, Other; use Other when unsure. Use an empty string for anything the receipt does not show and never guess a value. If there is no receipt, return empty lists. Use plain text only: no markdown and no LaTeX.'
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
 id = "explain-this-error"
 name = "Explain this error"
 group = "Work"

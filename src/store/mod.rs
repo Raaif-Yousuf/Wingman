@@ -322,13 +322,20 @@ fn open_default() -> Result<Store, StoreError> {
     )
 }
 
+/// Written into the store folder once its owner-only restriction succeeded.
+const ACL_MARKER: &str = ".owner-only";
+
 /// Owner-only directory, recovery, migrations, imports.
 ///
-/// The directory is restricted when it is created, not on every launch:
-/// spawning `icacls` costs tens of milliseconds on the UI thread at startup
-/// (MEASURED 2026-10-15, see the PR for the numbers). If the restriction
-/// fails, the directory is removed again so the next launch retries it
-/// instead of trusting an unrestricted folder.
+/// The directory is restricted once, not on every launch: spawning `icacls`
+/// costs tens of milliseconds on the UI thread at startup (MEASURED
+/// 2026-10-15, see the PR for the numbers). "Once" means until the marker
+/// file exists, so a launch cut short after the folder was made, or a folder
+/// first made in portable mode, is restricted on the next normal launch. If
+/// the restriction fails on a folder made this run, the folder is removed
+/// again so the next launch retries instead of trusting an unrestricted one.
+/// Limit: the marker records only that the step ran once, so an ACL reset by
+/// someone later is not detected.
 fn open_in(
     path: &Path,
     legacy: &Legacy<'_>,
@@ -337,11 +344,26 @@ fn open_in(
     let dir = path
         .parent()
         .ok_or_else(|| StoreError::Other("the store path has no folder".to_string()))?;
-    if !dir.exists() {
-        std::fs::create_dir_all(dir).map_err(|e| StoreError::Other(e.to_string()))?;
+    // A marker file records that the restriction finished. A folder with no
+    // marker was either interrupted between create and restrict, or made in
+    // portable mode (no ACL by design) and now opened in normal mode, so it
+    // is restricted now. One `icacls` call, once.
+    let marker = dir.join(ACL_MARKER);
+    if !dir.exists() || !marker.exists() {
+        let created = !dir.exists();
+        if created {
+            std::fs::create_dir_all(dir).map_err(|e| StoreError::Other(e.to_string()))?;
+        }
         if let Err(e) = restrict(dir) {
-            let _ = std::fs::remove_dir(dir);
+            if created {
+                let _ = std::fs::remove_dir(dir);
+            }
             return Err(e);
+        }
+        // Portable mode skips the restriction, so it must not claim it ran.
+        if !crate::portable::skip_acl() {
+            // Best effort: a missing marker only means one more restrict.
+            let _ = std::fs::write(&marker, b"");
         }
     }
     let (store, recovered) = Store::open_recovering(path)?;
@@ -651,6 +673,60 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(calls.get(), 1, "an existing directory is not re-restricted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_without_the_marker_is_restricted_on_open_and_kept() {
+        // A folder left behind by a launch cut short (or made in portable
+        // mode) has no marker, so the next open restricts it.
+        let dir = scratch("acl-marker");
+        let store_dir = dir.join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let path = store_dir.join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
+        let calls = std::cell::Cell::new(0);
+        let count = |_: &Path| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        drop(open_in(&path, &legacy, count).unwrap());
+        assert_eq!(calls.get(), 1, "an unmarked folder is restricted");
+        assert!(store_dir.join(ACL_MARKER).exists());
+        // A failure on a folder that was not made this run keeps the folder.
+        std::fs::remove_file(store_dir.join(ACL_MARKER)).unwrap();
+        let err = open_in(&path, &legacy, |_: &Path| {
+            Err(StoreError::Acl("nope".to_string()))
+        })
+        .err()
+        .expect("must fail");
+        assert!(matches!(err, StoreError::Acl(_)));
+        assert!(store_dir.exists(), "an existing folder is never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn portable_mode_does_not_write_the_marker() {
+        let dir = scratch("acl-marker-portable");
+        let path = dir.join("store").join("wingman.db");
+        let (spend, egress) = (dir.join("spend.json"), dir.join("egress.log"));
+        let pending = dir.join("egress-pending.log");
+        let legacy = Legacy {
+            spend: &spend,
+            egress: &egress,
+            pending: &pending,
+            profile: &dir.join("profile.bin"),
+        };
+        let _forced = crate::portable::ForcedRoot::new(&dir);
+        drop(open_in(&path, &legacy, |_: &Path| Ok(())).unwrap());
+        assert!(!dir.join("store").join(ACL_MARKER).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
