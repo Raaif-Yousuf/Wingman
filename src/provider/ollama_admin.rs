@@ -727,14 +727,37 @@ pub enum FirstRun {
 }
 
 /// The model to use from a `/api/tags` listing: `preferred` when it is
-/// installed and sees images, else the first installed model that does.
-/// "Sees images" is [`vision_from_tags_entry`]: the server's own
-/// `capabilities` list when it sent one, the static name list otherwise.
+/// installed and the server lists "vision" for it, else the smallest
+/// installed model the server lists "vision" for. Unlike the Settings badge
+/// ([`vision_from_tags_entry`]) this never falls back to the static name
+/// list: an entry with no `capabilities` array is not adopted, because a
+/// name prefix is wrong for some models (`gemma3:1b` and `gemma3:270m` are
+/// text only) and adopting one would break the user's first answer.
 pub fn pick_first_run_model(tags: &[TagsModel], preferred: &str) -> Option<String> {
+    let sees = |m: &&TagsModel| m.capabilities.iter().any(|c| c == "vision");
     tags.iter()
-        .find(|m| m.name == preferred && vision_from_tags_entry(m))
-        .or_else(|| tags.iter().find(|m| vision_from_tags_entry(m)))
+        .filter(sees)
+        .find(|m| m.name == preferred)
+        .or_else(|| tags.iter().filter(sees).min_by_key(|m| m.size))
         .map(|m| m.name.clone())
+}
+
+/// The URL the first-run probe talks to, or `None` to skip the probe.
+/// `localhost` is read as `127.0.0.1` (AGENTS.md rule 6: it resolves IPv6
+/// first and stalls); any other host is not a local Ollama this app may
+/// adopt, so it is skipped.
+pub fn first_run_base_url(base_url: &str) -> Option<String> {
+    use crate::mode::{classify_host, HostClass};
+    match classify_host(base_url) {
+        HostClass::Loopback => Some(base_url.to_string()),
+        HostClass::Localhost => {
+            let at = base_url.to_ascii_lowercase().find("localhost")?;
+            let mut fixed = base_url.to_string();
+            fixed.replace_range(at..at + "localhost".len(), "127.0.0.1");
+            Some(fixed)
+        }
+        HostClass::NotLoopback => None,
+    }
 }
 
 /// Pure decision behind [`probe_first_run`]. `tags` is only called when a
@@ -763,11 +786,17 @@ const FIRST_RUN_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Looks for a usable local Ollama: who owns the port (read-only Win32
 /// queries, [`query_ollama_health`]), then `/api/tags`. Called only from the
 /// readiness gate, never on a timer.
+///
+/// It blocks for up to [`FIRST_RUN_TIMEOUT`], so call it from a worker
+/// thread, never the message loop (which is also the keyboard hook's thread).
 pub fn probe_first_run(base_url: &str, preferred: &str) -> FirstRun {
-    let port = port_from_base_url(base_url).unwrap_or(11434);
+    let Some(base_url) = first_run_base_url(base_url) else {
+        return FirstRun::NotRunning;
+    };
+    let port = port_from_base_url(&base_url).unwrap_or(11434);
     first_run_outcome(
         &query_ollama_health(port),
-        || list_tags_with_timeout(base_url, FIRST_RUN_TIMEOUT),
+        || list_tags_with_timeout(&base_url, FIRST_RUN_TIMEOUT),
         preferred,
     )
 }
@@ -1488,9 +1517,13 @@ mod tests {
     }
 
     #[test]
-    fn first_run_trusts_the_capabilities_array_over_the_name_list() {
+    fn first_run_requires_a_capabilities_array_and_never_adopts_by_name() {
         // A name on the fallback list, but the server says no vision.
         let tags = vec![tag("gemma3:1b", &["completion"])];
+        assert_eq!(pick_first_run_model(&tags, "gemma3:4b"), None);
+        // No capabilities array at all (older server): gemma3:270m is text
+        // only, so a name prefix must not adopt it.
+        let tags = vec![tag("gemma3:270m", &[]), tag("gemma3:12b", &[])];
         assert_eq!(pick_first_run_model(&tags, "gemma3:4b"), None);
         // A name nobody has heard of, but the server says vision.
         let tags = vec![tag("mystery:7b", &["completion", "vision"])];
@@ -1501,14 +1534,33 @@ mod tests {
     }
 
     #[test]
-    fn first_run_uses_the_name_list_only_when_there_is_no_capabilities_array() {
-        let tags = vec![tag("gemma3:12b", &[])];
+    fn first_run_takes_the_smallest_vision_model_when_the_configured_one_is_absent() {
+        let mut big = tag("qwen3.5:32b", &["vision"]);
+        big.size = 20_000_000_000;
+        let mut small = tag("qwen3.5:2b", &["vision"]);
+        small.size = 2_000_000_000;
         assert_eq!(
-            pick_first_run_model(&tags, "gemma3:4b").as_deref(),
-            Some("gemma3:12b")
+            pick_first_run_model(&[big, small], "gemma3:4b").as_deref(),
+            Some("qwen3.5:2b")
         );
-        let tags = vec![tag("llama3.1:8b", &[])];
-        assert_eq!(pick_first_run_model(&tags, "gemma3:4b"), None);
+    }
+
+    #[test]
+    fn first_run_reads_localhost_as_loopback_and_skips_other_hosts() {
+        assert_eq!(
+            first_run_base_url("http://localhost:11434").as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
+        assert_eq!(
+            first_run_base_url("http://LocalHost:11434/").as_deref(),
+            Some("http://127.0.0.1:11434/")
+        );
+        assert_eq!(
+            first_run_base_url("http://127.0.0.1:11434").as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
+        assert_eq!(first_run_base_url("http://192.168.1.9:11434"), None);
+        assert_eq!(first_run_base_url("not a url"), None);
     }
 
     #[test]

@@ -144,6 +144,13 @@ pub const WM_APP_SEND_PREVIEW: u32 = WM_APP + 18;
 /// is dropped. `WM_APP + 19`: `+18` is `WM_APP_SEND_PREVIEW`.
 pub const WM_APP_PENDING_STAGE: u32 = WM_APP + 19;
 
+/// #133: posted by the first-run probe's worker thread when it has looked for
+/// a local Ollama. `lparam` is `Box::into_raw(Box::new(FirstRun))`; the
+/// handler takes ownership. The probe waits on the network, so it never runs
+/// on the message loop (which is also the keyboard hook's thread).
+/// `WM_APP + 20`: `+19` is `WM_APP_PENDING_STAGE`.
+pub const WM_APP_FIRST_RUN: u32 = WM_APP + 20;
+
 /// #567: what Ollama reported for one base URL, as (name, supports vision).
 type PulledOllamaModels = (String, Vec<(String, bool)>);
 
@@ -757,6 +764,23 @@ impl BeginPlan {
     }
 }
 
+/// #133: the card shown once a local Ollama has been adopted. A stock tray
+/// listener can be CPU only (AGENTS.md pitfall), so that case says answers may
+/// be slow and where to look.
+fn first_run_adopted_card(
+    model: &str,
+    kind: crate::provider::ollama_admin::ListenerKind,
+) -> (String, String) {
+    let mut detail =
+        format!("Wingman will answer with {model}, which runs on this PC. Press again to ask.");
+    if kind == crate::provider::ollama_admin::ListenerKind::StockTrayServer {
+        detail.push_str(
+            " This is the stock Ollama app, which can run on the CPU only, so answers may be slow. Settings shows what it is using.",
+        );
+    }
+    ("Using Ollama on this PC".to_string(), detail)
+}
+
 /// #133: the readiness card's detail when Ollama is running but has nothing
 /// that can read the screen; `None` leaves the usual card alone. The card
 /// already opens Settings, where the model can be downloaded.
@@ -830,32 +854,88 @@ impl App {
     }
 
     /// #133: on the press that hit the readiness gate with nothing set up,
-    /// asks whether a local Ollama with a vision model is answering. When it
-    /// is, it becomes the setup (saved, chain rebuilt) and the press goes on
-    /// to ask it. `None` when this setup is not eligible (a key, a chosen
-    /// provider or Cloud mode) so nothing is probed at all.
-    fn first_run_local(&mut self) -> Option<FirstRun> {
-        let providers = &self.config.providers;
-        if !providers.first_run_local_eligible(self.config.mode)
-            || matches!(
-                mode::classify_host(&providers.ollama.base_url),
-                mode::HostClass::NotLoopback
-            )
+    /// looks for a local Ollama with a vision model. The look waits on the
+    /// network, so it runs on a worker thread and posts [`WM_APP_FIRST_RUN`];
+    /// this only shows the pending card and starts it. Nothing is cached: a
+    /// press re-runs the probe, which costs the worker a moment, never the
+    /// message loop. Returns `false` (nothing started) when this setup is not
+    /// eligible: a key, a chosen provider or Cloud mode.
+    fn start_first_run_probe(&mut self) -> bool {
+        if !self
+            .config
+            .providers
+            .first_run_local_eligible(self.config.mode)
         {
-            return None;
+            return false;
         }
-        let found =
-            ollama_admin::probe_first_run(&providers.ollama.base_url, &providers.ollama.model);
-        if let FirstRun::Found { model, .. } = &found {
-            if self.config.providers.adopt_local_model(model) {
-                self.chain = Arc::new(self.config.build_chain());
-                if let Err(e) = self.config.save() {
-                    self.track_error("Couldn't save the local model choice", &format!("{e:#}"));
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        let target = self.hwnd_isize();
+        let base_url = self.config.providers.ollama.base_url.clone();
+        let preferred = self.config.providers.ollama.model.clone();
+        std::thread::spawn(move || {
+            let found = ollama_admin::probe_first_run(&base_url, &preferred);
+            let payload = Box::into_raw(Box::new(found));
+            unsafe {
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_FIRST_RUN,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here.
+                    free_boxed_payload(WM_APP_FIRST_RUN, LPARAM(payload as isize));
                 }
-                self.refresh_tray_labels();
             }
+        });
+        true
+    }
+
+    /// #133: the probe's answer. A found model becomes the setup (saved,
+    /// chain rebuilt) and the card says so; the next press asks it. Anything
+    /// else shows the readiness card, with a sharper detail when Ollama runs
+    /// but has no vision model. If the setup changed while the probe ran
+    /// (a key was pasted), there is nothing to say.
+    fn on_first_run_result(&mut self, found: FirstRun) {
+        let path = Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "config.toml".into());
+        let Some((headline, mut detail)) =
+            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+        else {
+            self.card.hide();
+            return;
+        };
+        let eligible = self
+            .config
+            .providers
+            .first_run_local_eligible(self.config.mode);
+        if let (FirstRun::Found { model, kind }, true) = (&found, eligible) {
+            self.config.providers.adopt_local_model(model);
+            self.chain = Arc::new(self.config.build_chain());
+            let saved = self.config.save();
+            self.refresh_tray_labels();
+            let (title, text) = first_run_adopted_card(model, *kind);
+            match saved {
+                Ok(()) => self.card.show_answer(&title, &text, 8, None),
+                Err(e) => {
+                    let headline = format!("{title}: not saved");
+                    let human = self.track_error(&headline, &format!("{e:#}"));
+                    self.card.show_error_with_details(
+                        &headline,
+                        &format!("It will revert when you quit.\n\n{human}"),
+                    );
+                }
+            }
+            self.set_watch(true);
+            return;
         }
-        Some(found)
+        if let Some(d) = first_run_detail(&found) {
+            detail = d;
+        }
+        self.card.show_settings_needed(&headline, &detail);
     }
 
     /// #339: a password manager is in front now, or was when Wingman's own
@@ -964,21 +1044,15 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        let mut blocked = Self::readiness_gate(self.config.mode, &self.config.providers, &path)
+        let blocked = Self::readiness_gate(self.config.mode, &self.config.providers, &path)
             .filter(|_| plan.require_provider);
-        // #133: nothing is set up. Look for a local Ollama once, right here
-        // on this press (never on a timer, never on a bare launch).
-        let first_run = blocked.as_ref().and_then(|_| self.first_run_local());
-        if matches!(first_run, Some(FirstRun::Found { .. })) {
-            blocked = None;
-        }
-        if let Some((headline, mut detail)) = blocked {
-            if let Some(d) = first_run.as_ref().and_then(first_run_detail) {
-                detail = d;
+        if let Some((headline, detail)) = blocked {
+            // #133: nothing is set up. Look for a local Ollama on a worker
+            // (never here: this is the keyboard hook's thread), once per
+            // press that reaches this card, never on a bare launch.
+            if self.start_first_run_probe() {
+                return None;
             }
-            // Issue #347: readiness-gate cards are always "go fix something
-            // in Settings" cards (a missing API key or Ollama config), so a
-            // click opens Settings directly instead of just expanding.
             self.card.show_settings_needed(&headline, &detail);
             return None;
         }
@@ -5518,6 +5592,9 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_DISMISS
         | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
+        // #133: only a card update; with Settings open there is nothing to
+        // update, so the box is freed and the probe's answer dropped.
+        | WM_APP_FIRST_RUN
         // #347: like WM_APP_TRAY's own OPEN_SETTINGS command, this just
         // calls open_settings() with no payload to leak, and the card that
         // posts it is hidden the moment it does so, so there is nothing
@@ -5600,6 +5677,7 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_PALETTE_RUN => drop(Box::from_raw(p as *mut String)),
             WM_APP_SEND_PREVIEW => drop(Box::from_raw(p as *mut crate::ui::send_gate::SendRequest)),
             WM_APP_PENDING_STAGE => drop(Box::from_raw(p as *mut crate::ui::card::PendingStage)),
+            WM_APP_FIRST_RUN => drop(Box::from_raw(p as *mut FirstRun)),
             WM_APP_ROUTER_RESULT => drop(Box::from_raw(
                 p as *mut (u64, std::result::Result<router::RouterResult, String>),
             )),
@@ -5961,6 +6039,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.dispatch_palette_action(&action_id);
             LRESULT(0)
         }
+        WM_APP_FIRST_RUN => {
+            // #133: take ownership of the probe's answer.
+            let found = unsafe { *Box::from_raw(lparam.0 as *mut FirstRun) };
+            app.on_first_run_result(found);
+            LRESULT(0)
+        }
         WM_APP_ROUTER_RESULT => {
             // #24: take ownership of the (generation, result) box the
             // router's worker thread leaked into the message (this
@@ -6063,6 +6147,7 @@ mod tests {
     use super::unreadable_secrets_card;
     use super::App;
     use super::BeginPlan;
+    use super::WM_APP_FIRST_RUN;
     use super::{final_settings_card, SettingsFinalCard};
     use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{settings_reentrancy_policy, SettingsReentrancy};
@@ -6079,6 +6164,7 @@ mod tests {
         WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
     };
     use crate::mode::Mode;
+    use crate::provider::ollama_admin::FirstRun;
     use crate::provider::Provider;
     use crate::router;
     use crate::ui::card::{
@@ -6391,6 +6477,35 @@ mod tests {
     }
 
     // -- first-run readiness (issue #133) ----------------------------------
+
+    #[test]
+    fn the_adopted_card_names_the_model_and_warns_only_for_the_stock_app() {
+        use crate::provider::ollama_admin::ListenerKind;
+        let (head, other) = super::first_run_adopted_card("gemma3:4b", ListenerKind::Other);
+        assert!(other.contains("gemma3:4b"), "{other}");
+        assert!(!other.contains("CPU"), "{other}");
+        let (_, stock) = super::first_run_adopted_card("gemma3:4b", ListenerKind::StockTrayServer);
+        assert!(
+            stock.contains("CPU") && stock.contains("Settings"),
+            "{stock}"
+        );
+        for text in [&head, &other, &stock] {
+            assert!(
+                !text.contains('\u{2014}') && !text.contains('\u{2013}'),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_run_probe_box_is_freed_when_dropped_unhandled() {
+        use windows::Win32::Foundation::LPARAM;
+        let boxed = Box::into_raw(Box::new(FirstRun::NoVisionModel));
+        assert!(super::free_boxed_payload(
+            WM_APP_FIRST_RUN,
+            LPARAM(boxed as isize)
+        ));
+    }
 
     #[test]
     fn first_run_card_only_changes_the_card_when_ollama_has_no_vision_model() {
@@ -6882,6 +6997,7 @@ mod tests {
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
+        ("WM_APP_FIRST_RUN", WM_APP_FIRST_RUN),
     ];
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -7541,6 +7657,11 @@ mod tests {
         (
             "WM_APP_PENDING_STAGE",
             WM_APP_PENDING_STAGE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_FIRST_RUN",
+            WM_APP_FIRST_RUN,
             SettingsReentrancy::Ignore,
         ),
     ];
