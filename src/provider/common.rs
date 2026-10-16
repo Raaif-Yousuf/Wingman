@@ -1365,6 +1365,11 @@ pub(crate) fn encode_images_base64(images: &[Vec<u8>]) -> Vec<String> {
 /// Key order is kept (rule 3): the map is rebuilt in order rather than using
 /// `Map::remove`, which swaps the last key into the hole under
 /// `preserve_order`. A property that is itself NAMED `editable` is left alone.
+///
+/// The walk is by structure, not by meaning: it also descends into `enum`,
+/// `const`, `default` and `examples` values, so a literal object there that
+/// has an `editable` key would lose it. No registered schema has one (the
+/// all-kinds test checks the output byte for byte).
 pub(crate) fn wire_schema(schema: &Value) -> Value {
     fn strip(node: &mut Value, is_property_map: bool) {
         match node {

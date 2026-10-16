@@ -670,8 +670,6 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "high");
     }
 
-    /// #12 neighbour: a request with no schema (a future plain-text action)
-    /// must not fabricate a `text` key.
     /// #719: the UI-only `editable` keyword never goes out.
     #[test]
     fn no_registered_schema_sends_the_editable_keyword() {
@@ -684,6 +682,8 @@ mod tests {
         }
     }
 
+    /// #12 neighbour: a request with no schema (a future plain-text action)
+    /// must not fabricate a `text` key.
     #[test]
     fn no_schema_request_omits_text_format() {
         let provider = OpenAi::new("sk-test", "gpt-5.5", "low");
