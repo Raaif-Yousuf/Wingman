@@ -249,7 +249,9 @@ pub struct Capture {
     pub monitor: String,
     /// Paint over card numbers, IBANs, key-shaped tokens and emails in the
     /// screenshot before it is sent to a cloud provider (#103). On by
-    /// default. A request whose providers are all local skips it either way.
+    /// default. Text in the request body (selection, page text, OCR text,
+    /// field values) gets the same rules, with markers like `[email]` (#505).
+    /// A request whose providers are all local skips it either way.
     pub redact: bool,
     /// OCR recognizer language (#111): "auto" (the Windows profile
     /// languages) or a BCP-47 tag such as "de" or "de-DE" naming an
@@ -4457,6 +4459,22 @@ pub fn egress_preview_enabled() -> bool {
     EGRESS_PREVIEW_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// #505: process-wide mirror of `capture.redact`, read at the HTTP boundary
+/// (`provider::common::outbound_body`), which has no `Config` in reach. It
+/// defaults to `true`, not `false`: a request made before anything has set it
+/// is redacted, the safe direction. `App::run` and `App::apply_config` keep it
+/// in step with the setting.
+static REDACT_TEXT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_redact_text_enabled(on: bool) {
+    REDACT_TEXT_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn redact_text_enabled() -> bool {
+    REDACT_TEXT_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod budget_tests {
     use super::*;
@@ -4501,6 +4519,13 @@ mod egress_preview_tests {
         assert!(egress_preview_enabled());
         set_egress_preview_enabled(false);
         assert!(!egress_preview_enabled());
+    }
+
+    #[test]
+    fn redact_text_is_on_until_something_turns_it_off() {
+        // Safe direction: a request before anything has set the mirror is
+        // redacted. Only this test and app startup ever write it.
+        assert!(redact_text_enabled());
     }
 
     #[test]

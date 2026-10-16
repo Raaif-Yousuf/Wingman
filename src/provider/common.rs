@@ -524,6 +524,8 @@ pub(crate) fn post_json_with(
     send_preview_guard(url)?;
     offline_guard(url)?;
     budget_guard(url)?;
+    let sendable = outbound_body(url, body, crate::config::redact_text_enabled());
+    let body = &*sendable;
 
     let policy = env.policy;
     let mut retries = 0u32;
@@ -755,6 +757,32 @@ pub(crate) fn offline_guard(url: &str) -> Result<()> {
     }
 }
 
+/// #505: the body that actually leaves, given the request's URL. A request
+/// that could leave this machine has the text in its body redacted with the
+/// same rules as the screenshot step (cards, IBANs, key-shaped tokens, emails),
+/// so no input path (selection, page text, OCR fallback, UIA fields, ...) can
+/// skip it: this is decided at the one boundary every provider request
+/// crosses, like the guards above. A literal loopback URL stays on this
+/// machine and is sent as built, matching the screenshot rule
+/// (`Providers::sends_screenshot_off_machine`); everything else counts as
+/// leaving, including a remote Ollama host and `localhost` by name. `enabled`
+/// is the `capture.redact` setting.
+pub(crate) fn outbound_body<'a>(
+    url: &str,
+    body: &'a Value,
+    enabled: bool,
+) -> std::borrow::Cow<'a, Value> {
+    if !enabled || crate::mode::classify_host(url) == crate::mode::HostClass::Loopback {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut copy = body.clone();
+    if crate::redact::redact_value(&mut copy) {
+        std::borrow::Cow::Owned(copy)
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    }
+}
+
 /// #101: refuses a request that would be billed once today's spend has
 /// reached `[budget] daily_usd`. A loopback URL is free (Ollama, LM Studio)
 /// and always passes. Called by `post_json_with`, the only send path for a
@@ -933,6 +961,8 @@ pub(crate) fn post_json_with_connect_timeout(
     send_preview_guard(url)?;
     offline_guard(url)?;
     budget_guard(url)?;
+    let sendable = outbound_body(url, body, crate::config::redact_text_enabled());
+    let body = &*sendable;
 
     // #191: no retry loop here (Ollama is local/loopback and unbilled), so
     // an attempt logged from this function is never a retry.
@@ -1077,6 +1107,8 @@ mod tests {
     struct ScriptedTransport {
         responses: Mutex<Vec<std::result::Result<RawResponse, TransportError>>>,
         calls: Mutex<u32>,
+        /// Every body the transport was asked to send, in order (#505).
+        bodies: Mutex<Vec<Value>>,
     }
 
     impl ScriptedTransport {
@@ -1084,6 +1116,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 calls: Mutex::new(0),
+                bodies: Mutex::new(Vec::new()),
             }
         }
 
@@ -1097,10 +1130,11 @@ mod tests {
             &self,
             _url: &str,
             _headers: &[(&str, &str)],
-            _body: &Value,
+            body: &Value,
             _timeout: Duration,
         ) -> std::result::Result<RawResponse, TransportError> {
             *self.calls.lock().unwrap() += 1;
+            self.bodies.lock().unwrap().push(body.clone());
             let mut responses = self.responses.lock().unwrap();
             assert!(
                 !responses.is_empty(),
@@ -1239,6 +1273,96 @@ mod tests {
         assert_eq!(result, "done");
         assert_eq!(transport.call_count(), 2);
         assert_eq!(sleeper.recorded().len(), 1);
+    }
+
+    // -- #505: text is redacted at the one HTTP boundary --------------------
+
+    const PRIVATE_BODY_TEXT: &str = "card 4111 1111 1111 1111 mail me@example.com";
+
+    fn private_body() -> Value {
+        json!({"model": "m", "messages": [{"role": "user", "content": PRIVATE_BODY_TEXT}]})
+    }
+
+    #[test]
+    fn outbound_body_redacts_for_a_cloud_url() {
+        let body = private_body();
+        let out = outbound_body("https://api.example.com/v1/chat", &body, true);
+        let text = out.to_string();
+        assert!(
+            text.contains("[card number]") && text.contains("[email]"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("4111") && !text.contains("example.com\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn outbound_body_redacts_for_a_remote_ollama_host() {
+        // A past review found text reaching a remote Ollama unredacted.
+        for url in [
+            "http://192.168.1.50:11434/api/chat",
+            "http://my-box.lan:11434/api/chat",
+            "http://localhost:11434/api/chat",
+        ] {
+            let body = private_body();
+            let out = outbound_body(url, &body, true);
+            assert!(!out.to_string().contains("4111"), "{url}");
+        }
+    }
+
+    #[test]
+    fn outbound_body_leaves_a_loopback_url_alone() {
+        let body = private_body();
+        for url in [
+            "http://127.0.0.1:11434/api/chat",
+            "http://[::1]:11434/api/chat",
+        ] {
+            assert_eq!(*outbound_body(url, &body, true), body, "{url}");
+        }
+    }
+
+    #[test]
+    fn outbound_body_leaves_everything_alone_when_the_setting_is_off() {
+        let body = private_body();
+        assert_eq!(
+            *outbound_body("https://api.example.com/", &body, false),
+            body
+        );
+    }
+
+    #[test]
+    fn post_json_with_sends_the_redacted_body_to_the_transport() {
+        let _g = network_guard();
+        let transport = ScriptedTransport::new(vec![ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv {
+            transport: &transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
+        post_json_with(
+            &env,
+            "https://example.invalid/",
+            &[],
+            &private_body(),
+            Duration::from_secs(1),
+            "anthropic",
+        )
+        .unwrap();
+        let sent = transport.bodies.lock().unwrap()[0].to_string();
+        assert!(
+            !sent.contains("4111") && !sent.contains("me@example.com"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("[card number]") && sent.contains("[email]"),
+            "{sent}"
+        );
     }
 
     #[test]
