@@ -10,13 +10,86 @@
 
 use std::path::PathBuf;
 
-/// Parsed `--ui-gallery [--screenshot <dir>] [--theme <name>]` invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed `--ui-gallery [--screenshot <dir>] [--theme <name>] [--dpi <percent>]
+/// [--matrix]` invocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GalleryArgs {
     pub screenshot_dir: Option<PathBuf>,
     /// The raw `--theme` value. Checked by the driver with
     /// [`theme_from_arg`], so a typo is an error and not a silent default.
     pub theme: Option<String>,
+    /// The raw `--dpi` value, a display scale in percent (`100`, `150`,
+    /// `250`). Checked by the driver with [`dpi_from_arg`].
+    pub dpi: Option<String>,
+    /// `--matrix`: with `--screenshot <dir>`, render every state under every
+    /// theme and scale in [`MATRIX_THEMES`] and [`MATRIX_SCALES`].
+    pub matrix: bool,
+}
+
+/// The themes `--matrix` renders, by their `--theme` names.
+#[cfg(any(test, debug_assertions))]
+pub const MATRIX_THEMES: [&str; 3] = ["light", "dark", "high-contrast"];
+
+/// The display scales (percent) `--matrix` renders.
+#[cfg(any(test, debug_assertions))]
+pub const MATRIX_SCALES: [u32; 4] = [100, 150, 200, 250];
+
+/// The DPI a `--dpi` value names. The value is a display scale in percent
+/// (`150` or `150%`), 100 to 500, and 100% is 96 DPI. `None` for anything
+/// else.
+#[cfg(any(test, debug_assertions))]
+pub fn dpi_from_arg(value: &str) -> Option<u32> {
+    let percent: u32 = value.strip_suffix('%').unwrap_or(value).parse().ok()?;
+    (100..=500)
+        .contains(&percent)
+        .then(|| (percent * 96 + 50) / 100)
+}
+
+/// The display scale in percent a DPI is, rounded: 144 is 150.
+#[cfg(any(test, debug_assertions))]
+pub fn scale_percent(dpi: u32) -> u32 {
+    (dpi * 100 + 48) / 96
+}
+
+/// The file a `--matrix` run writes: `<state>--<theme>--<percent>.png`, for
+/// example `card-error--dark--150.png`. The same names on every run, so two
+/// folders can be compared file by file.
+#[cfg(any(test, debug_assertions))]
+pub fn matrix_filename(state_name: &str, theme_name: &str, percent: u32) -> String {
+    format!("{state_name}--{theme_name}--{percent}.png")
+}
+
+/// Whether a state can be drawn under a simulated theme and DPI. The card
+/// states and the region overlay can. The palette reads the live theme and
+/// the window's own DPI, so `--matrix` draws it once, as
+/// `<state>--system--<percent>.png` at the DPI the window really has.
+/// Settings follows the DPI only (see [`follows_dpi_only`]).
+#[cfg(any(test, debug_assertions))]
+pub fn follows_variants(state: GalleryState) -> bool {
+    use GalleryState::*;
+    !matches!(
+        state,
+        PaletteDefault
+            | PaletteRouterSuggestion
+            | PaletteNoMatches
+            | PaletteNoModel
+            | SettingsTop
+            | SettingsBottom
+            | SettingsAdvancedTop
+            | SettingsAdvancedBottom
+    )
+}
+
+/// Whether a state follows `--dpi` but not `--theme`: Settings can be laid out
+/// at a simulated scale, but it has no forced theme yet (issue #662), so
+/// `--matrix` draws it once per scale as `<state>--system--<percent>.png`.
+#[cfg(any(test, debug_assertions))]
+pub fn follows_dpi_only(state: GalleryState) -> bool {
+    use GalleryState::*;
+    matches!(
+        state,
+        SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom
+    )
 }
 
 /// The theme a `--theme` value names: `light`, `dark` or `high-contrast`
@@ -33,7 +106,7 @@ pub fn theme_from_arg(name: &str) -> Option<crate::ui::theme::Theme> {
 }
 
 /// Recognizes `--ui-gallery` (optionally followed anywhere later by
-/// `--screenshot <dir>` and `--theme <name>`) among `args` (normally `std::env::args().skip(1)`
+/// `--screenshot <dir>`, `--theme <name>`, `--dpi <percent>` and `--matrix`) among `args` (normally `std::env::args().skip(1)`
 /// collected by the caller). Returns `None` when `--ui-gallery` is absent.
 /// `--screenshot` with no following value is treated as if `--screenshot`
 /// were absent (documented, not an error): the gallery still runs
@@ -44,6 +117,8 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
     }
     let mut screenshot_dir = None;
     let mut theme = None;
+    let mut dpi = None;
+    let mut matrix = false;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         if a == "--screenshot" {
@@ -54,15 +129,24 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
             if let Some(name) = iter.next() {
                 theme = Some(name.clone());
             }
+        } else if a == "--dpi" {
+            if let Some(value) = iter.next() {
+                dpi = Some(value.clone());
+            }
+        } else if a == "--matrix" {
+            matrix = true;
         }
     }
     Some(GalleryArgs {
         screenshot_dir,
         theme,
+        dpi,
+        matrix,
     })
 }
 
 /// One state the gallery can drive `Card` or `Palette` into.
+#[cfg(any(debug_assertions, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GalleryState {
     CardAnswerShort,
@@ -106,10 +190,14 @@ pub enum GalleryState {
     /// Issue #560: the same with Advanced expanded.
     SettingsAdvancedTop,
     SettingsAdvancedBottom,
+    /// Issue #580: the region-select overlay over a synthetic backdrop, with a
+    /// selection staged.
+    RegionOverlay,
 }
 
 /// The full ordered list of states the gallery steps through. Order is the
 /// Right/Left stepping order and the order states are screenshotted in.
+#[cfg(any(debug_assertions, test))]
 pub fn gallery_states() -> Vec<GalleryState> {
     use GalleryState::*;
     vec![
@@ -136,12 +224,14 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsBottom,
         SettingsAdvancedTop,
         SettingsAdvancedBottom,
+        RegionOverlay,
     ]
 }
 
 /// A stable, filesystem-safe, human-readable name for a state -- used both
 /// for the screenshot filename and for any future debug printing. Lowercase,
 /// hyphen-separated, no spaces or characters Windows forbids in filenames.
+#[cfg(any(debug_assertions, test))]
 pub fn state_name(state: GalleryState) -> &'static str {
     use GalleryState::*;
     match state {
@@ -168,11 +258,13 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsBottom => "settings-bottom",
         SettingsAdvancedTop => "settings-advanced-top",
         SettingsAdvancedBottom => "settings-advanced-bottom",
+        RegionOverlay => "region-overlay",
     }
 }
 
 /// `<state-name>.png`, the file a `--screenshot <dir>` run writes for a
 /// given state.
+#[cfg(any(debug_assertions, test))]
 pub fn screenshot_filename(state_name: &str) -> String {
     format!("{state_name}.png")
 }
@@ -200,6 +292,7 @@ mod driver {
     use crate::ui::card::Card;
     use crate::ui::palette::Palette;
     use crate::ui::palette_model::PaletteAction;
+    use crate::ui::region::Overlay;
     use crate::ui::settings::GalleryWindow;
     use std::time::Duration;
     use windows::Win32::Foundation::HWND;
@@ -230,32 +323,127 @@ mod driver {
         };
 
         let mut card = Card::new_for_test(instance)?;
-        if let Some(name) = &args.theme {
-            let theme = theme_from_arg(name).ok_or_else(|| {
-                anyhow::anyhow!("--theme {name:?} is not one of light, dark, high-contrast")
-            })?;
-            // The Card states only: the palette and Settings still follow
-            // the live system theme.
-            card.force_theme_for_gallery(theme);
-        }
         let mut palette = Palette::new_for_test(instance)?;
         let mut settings: Option<GalleryWindow> = None;
-
+        let mut region: Option<Overlay> = None;
         let states = gallery_states();
+
+        if args.matrix {
+            if args.theme.is_some() || args.dpi.is_some() {
+                anyhow::bail!("--matrix renders every theme and scale; drop --theme and --dpi");
+            }
+            let dir = args
+                .screenshot_dir
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--matrix needs --screenshot <dir>"))?;
+            std::fs::create_dir_all(dir)?;
+            for state in &states {
+                if follows_variants(*state) {
+                    for theme_name in MATRIX_THEMES {
+                        for percent in MATRIX_SCALES {
+                            let variant = Variant {
+                                theme: theme_from_arg(theme_name),
+                                dpi: dpi_from_arg(&percent.to_string()),
+                            };
+                            let name = matrix_filename(state_name(*state), theme_name, percent);
+                            shoot(
+                                &mut card,
+                                &mut palette,
+                                &mut settings,
+                                &mut region,
+                                variant,
+                                *state,
+                                &dir.join(name),
+                            )?;
+                        }
+                    }
+                } else if follows_dpi_only(*state) {
+                    for percent in MATRIX_SCALES {
+                        let variant = Variant {
+                            theme: None,
+                            dpi: dpi_from_arg(&percent.to_string()),
+                        };
+                        let name = matrix_filename(state_name(*state), "system", percent);
+                        shoot(
+                            &mut card,
+                            &mut palette,
+                            &mut settings,
+                            &mut region,
+                            variant,
+                            *state,
+                            &dir.join(name),
+                        )?;
+                    }
+                } else {
+                    // Live theme, the window's own DPI: named for the DPI it
+                    // really had, found out once the window exists.
+                    let path = dir.join("pending.png");
+                    let named = shoot(
+                        &mut card,
+                        &mut palette,
+                        &mut settings,
+                        &mut region,
+                        Variant::default(),
+                        *state,
+                        &path,
+                    )
+                    .and_then(|hwnd| {
+                        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+                        // 0 means the window is gone: a "0" file would lie.
+                        anyhow::ensure!(dpi > 0, "no DPI for the {} window", state_name(*state));
+                        let name =
+                            matrix_filename(state_name(*state), "system", scale_percent(dpi));
+                        std::fs::rename(&path, dir.join(name))?;
+                        Ok(())
+                    });
+                    if named.is_err() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    named?;
+                }
+            }
+            std::process::exit(0);
+        }
+
+        let mut variant = Variant::default();
+        if let Some(name) = &args.theme {
+            variant.theme = Some(theme_from_arg(name).ok_or_else(|| {
+                anyhow::anyhow!("--theme {name:?} is not one of light, dark, high-contrast")
+            })?);
+        }
+        if let Some(value) = &args.dpi {
+            variant.dpi = Some(dpi_from_arg(value).ok_or_else(|| {
+                anyhow::anyhow!("--dpi {value:?} is not a scale from 100 to 500 percent")
+            })?);
+        }
 
         if let Some(dir) = &args.screenshot_dir {
             std::fs::create_dir_all(dir)?;
             for state in &states {
-                let hwnd = show_state(&mut card, &mut palette, &mut settings, *state)?;
-                pump_and_wait(Duration::from_millis(120));
                 let path = dir.join(screenshot_filename(state_name(*state)));
-                print_window_png(hwnd, &path)?;
+                shoot(
+                    &mut card,
+                    &mut palette,
+                    &mut settings,
+                    &mut region,
+                    variant,
+                    *state,
+                    &path,
+                )?;
             }
             std::process::exit(0);
         }
 
         let mut idx = 0usize;
-        let hwnd0 = show_state(&mut card, &mut palette, &mut settings, states[idx])?;
+        apply_variant(&mut card, variant);
+        let hwnd0 = show_state(
+            &mut card,
+            &mut palette,
+            &mut settings,
+            &mut region,
+            variant,
+            states[idx],
+        )?;
         let _ = hwnd0;
         let mut msg = MSG::default();
         while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -263,10 +451,24 @@ mod driver {
                 let vk = msg.wParam.0 as u16;
                 if vk == VK_RIGHT.0 && idx + 1 < states.len() {
                     idx += 1;
-                    show_state(&mut card, &mut palette, &mut settings, states[idx])?;
+                    show_state(
+                        &mut card,
+                        &mut palette,
+                        &mut settings,
+                        &mut region,
+                        variant,
+                        states[idx],
+                    )?;
                 } else if vk == VK_LEFT.0 && idx > 0 {
                     idx -= 1;
-                    show_state(&mut card, &mut palette, &mut settings, states[idx])?;
+                    show_state(
+                        &mut card,
+                        &mut palette,
+                        &mut settings,
+                        &mut region,
+                        variant,
+                        states[idx],
+                    )?;
                 }
             }
             unsafe {
@@ -275,6 +477,41 @@ mod driver {
             }
         }
         Ok(())
+    }
+
+    /// The theme and DPI a state is drawn under. `None` follows the system.
+    /// Applies to the card states and the region overlay (see
+    /// [`follows_variants`]).
+    #[derive(Debug, Clone, Copy, Default)]
+    struct Variant {
+        theme: Option<crate::ui::theme::Theme>,
+        dpi: Option<u32>,
+    }
+
+    fn apply_variant(card: &mut Card, variant: Variant) {
+        if let Some(theme) = variant.theme {
+            card.force_theme_for_gallery(theme);
+        }
+        if let Some(dpi) = variant.dpi {
+            card.force_dpi_for_gallery(dpi);
+        }
+    }
+
+    /// Shows `state` under `variant`, lets it paint, and saves it to `path`.
+    fn shoot(
+        card: &mut Card,
+        palette: &mut Palette,
+        settings: &mut Option<GalleryWindow>,
+        region: &mut Option<Overlay>,
+        variant: Variant,
+        state: GalleryState,
+        path: &std::path::Path,
+    ) -> anyhow::Result<HWND> {
+        apply_variant(card, variant);
+        let hwnd = show_state(card, palette, settings, region, variant, state)?;
+        pump_and_wait(Duration::from_millis(120));
+        print_window_png(hwnd, path)?;
+        Ok(hwnd)
     }
 
     fn pump_and_wait(dur: Duration) {
@@ -305,34 +542,33 @@ mod driver {
     }
 
     fn form_long_labels_fixture() -> (serde_json::Value, serde_json::Value) {
-        let schema = crate::actions::schema::schema_for("form_fill", false)
-            .expect("form_fill is a registered action schema");
-        let value = serde_json::json!({
+        let proposal = serde_json::json!({
             "fields": [
                 {
                     "control_id": "ctl1",
                     "source": "profile",
-                    "profile_field": "Employer-provided legal first and middle name",
+                    "label": "Employer-provided legal first and middle name",
                     "value": "Jordan Alexander",
                     "sensitive": false
                 },
                 {
                     "control_id": "ctl2",
                     "source": "profile",
-                    "profile_field": "Mailing address, including apartment or unit number",
+                    "label": "Mailing address, including apartment or unit number",
                     "value": "742 Evergreen Terrace, Apt 4B",
                     "sensitive": false
                 },
                 {
                     "control_id": "ctl3",
                     "source": "profile",
-                    "profile_field": "Social security number (last four digits only)",
+                    "label": "Social security number (last four digits only)",
                     "value": "6789",
                     "sensitive": true
                 }
             ]
         });
-        (schema, value)
+        // Built the way a real form fill is, so the labels are real labels.
+        crate::actions::fill_form::build_preview_schema_and_value(&proposal)
     }
 
     fn free_palette_catalogue() -> Vec<PaletteAction> {
@@ -368,10 +604,13 @@ mod driver {
         card: &mut Card,
         palette: &mut Palette,
         settings: &mut Option<GalleryWindow>,
+        region: &mut Option<Overlay>,
+        variant: Variant,
         state: GalleryState,
     ) -> anyhow::Result<HWND> {
         use GalleryState::*;
         *settings = None;
+        *region = None;
         let instance = unsafe {
             windows::Win32::Foundation::HINSTANCE(
                 windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?.0,
@@ -523,10 +762,19 @@ mod driver {
                 palette.hide();
                 palette.show(free_palette_catalogue(), false, "mode: Auto".to_string());
             }
+            RegionOverlay => {
+                card.hide();
+                palette.hide();
+                // Without `--theme` it follows the live system theme; without
+                // `--dpi` the hint is drawn at 96.
+                let theme = variant.theme.unwrap_or_else(crate::ui::theme::detect_theme);
+                let dpi = variant.dpi.unwrap_or(96);
+                *region = Some(Overlay::open_for_gallery(instance, theme, dpi)?);
+            }
             SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => {
                 card.hide();
                 palette.hide();
-                let mut w = GalleryWindow::open(instance)
+                let mut w = GalleryWindow::open(instance, variant.dpi)
                     .ok_or_else(|| anyhow::anyhow!("could not open the Settings window"))?;
                 w.set_advanced(matches!(
                     state,
@@ -540,6 +788,10 @@ mod driver {
             PaletteDefault | PaletteRouterSuggestion | PaletteNoMatches | PaletteNoModel => {
                 palette.hwnd()
             }
+            RegionOverlay => region
+                .as_ref()
+                .map(|o| o.hwnd())
+                .ok_or_else(|| anyhow::anyhow!("no region overlay"))?,
             SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => settings
                 .as_ref()
                 .map(|w| w.hwnd())
@@ -639,9 +891,83 @@ mod tests {
             parse_gallery_args(&args(&["--ui-gallery"])),
             Some(GalleryArgs {
                 screenshot_dir: None,
-                theme: None
+                ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn ui_gallery_with_a_dpi_override_and_the_matrix_flag() {
+        let parsed = parse_gallery_args(&args(&["--ui-gallery", "--dpi", "150", "--matrix"]))
+            .expect("--ui-gallery is present");
+        assert_eq!(parsed.dpi.as_deref(), Some("150"));
+        assert!(parsed.matrix);
+        // A trailing --dpi with no value is absent, like --theme.
+        let parsed = parse_gallery_args(&args(&["--ui-gallery", "--dpi"])).unwrap();
+        assert_eq!((parsed.dpi, parsed.matrix), (None, false));
+    }
+
+    #[test]
+    fn dpi_values_are_percent_scales_and_a_typo_maps_to_none() {
+        assert_eq!(dpi_from_arg("100"), Some(96));
+        assert_eq!(dpi_from_arg("125"), Some(120));
+        assert_eq!(dpi_from_arg("150%"), Some(144));
+        assert_eq!(dpi_from_arg("200"), Some(192));
+        assert_eq!(dpi_from_arg("250"), Some(240));
+        for bad in ["", "96", "99", "501", "abc", "1.5", "-100", "150 "] {
+            assert_eq!(dpi_from_arg(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn every_matrix_scale_round_trips_through_its_dpi() {
+        for pct in MATRIX_SCALES {
+            let dpi = dpi_from_arg(&pct.to_string()).unwrap();
+            assert_eq!(scale_percent(dpi), pct);
+        }
+        assert_eq!(scale_percent(96), 100);
+    }
+
+    #[test]
+    fn matrix_filenames_are_predictable_and_unique_across_the_matrix() {
+        assert_eq!(
+            matrix_filename("card-error", "dark", 150),
+            "card-error--dark--150.png"
+        );
+        for t in MATRIX_THEMES {
+            assert!(theme_from_arg(t).is_some(), "{t} is not a --theme name");
+        }
+        let mut files = std::collections::HashSet::new();
+        let mut count = 0;
+        for state in gallery_states()
+            .into_iter()
+            .filter(|s| follows_variants(*s))
+        {
+            for t in MATRIX_THEMES {
+                for pct in MATRIX_SCALES {
+                    files.insert(matrix_filename(state_name(state), t, pct));
+                    count += 1;
+                }
+            }
+        }
+        assert!(count > 0);
+        assert_eq!(files.len(), count);
+    }
+
+    #[test]
+    fn only_the_palette_and_settings_states_ignore_variants() {
+        assert!(follows_variants(GalleryState::CardError));
+        assert!(follows_variants(GalleryState::RegionOverlay));
+        assert!(!follows_variants(GalleryState::PaletteDefault));
+        assert!(!follows_variants(GalleryState::SettingsTop));
+        for state in gallery_states() {
+            let n = state_name(state);
+            assert_eq!(
+                follows_variants(state),
+                !(n.starts_with("palette-") || n.starts_with("settings-")),
+                "{n}"
+            );
+        }
     }
 
     #[test]
@@ -670,7 +996,7 @@ mod tests {
             parse_gallery_args(&args(&["--ui-gallery", "--screenshot", "out"])),
             Some(GalleryArgs {
                 screenshot_dir: Some(PathBuf::from("out")),
-                theme: None
+                ..Default::default()
             })
         );
     }
@@ -681,7 +1007,7 @@ mod tests {
             parse_gallery_args(&args(&["--ui-gallery", "--screenshot"])),
             Some(GalleryArgs {
                 screenshot_dir: None,
-                theme: None
+                ..Default::default()
             })
         );
     }
@@ -700,7 +1026,7 @@ mod tests {
             ])),
             Some(GalleryArgs {
                 screenshot_dir: Some(PathBuf::from("C:\\out dir")),
-                theme: None
+                ..Default::default()
             })
         );
     }
@@ -719,8 +1045,8 @@ mod tests {
         // pending sub-stages (#354) + 3 previews (calendar, long labels,
         // the error title) + the expanded answer, with and without link
         // focus = 15 card states, + 4 palette states + 4 settings states
-        // (#560) = 23.
-        assert_eq!(states.len(), 23);
+        // (#560) + the region overlay (#580) = 24.
+        assert_eq!(states.len(), 24);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(

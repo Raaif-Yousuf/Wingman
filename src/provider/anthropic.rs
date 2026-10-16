@@ -58,7 +58,8 @@ impl Anthropic {
 
         let mut output_config = serde_json::json!({});
         if let Some(schema) = &req.schema {
-            output_config["format"] = serde_json::json!({"type": "json_schema", "schema": schema});
+            output_config["format"] =
+                serde_json::json!({"type": "json_schema", "schema": common::wire_schema(schema)});
         }
         let effort = if req.effort != Effort::Unset {
             req.effort
@@ -123,7 +124,19 @@ impl Anthropic {
                         "anthropic: The model ran out of room before answering. Lower the effort setting or raise the token limit."
                     ));
                 }
-                return Err(anyhow!("anthropic: no text block found in content[]"));
+                return Err(match stop_reason {
+                    Some("pause_turn") => anyhow!(
+                        "anthropic: the reply was paused before it finished (pause_turn)"
+                    ),
+                    Some("model_context_window_exceeded") => anyhow!(
+                        "anthropic: the request was too long for the model's context window (model_context_window_exceeded)"
+                    ),
+                    Some(other) => anyhow!(
+                        "anthropic: no text block found in content[] (stop_reason: {})",
+                        super::safe_reason(other)
+                    ),
+                    None => anyhow!("anthropic: no text block found in content[]"),
+                });
             }
         };
 
@@ -135,7 +148,23 @@ impl Anthropic {
 
         // `input_tokens` excludes the two cache fields; each is priced at its
         // own rate (see `usage.rs`). Absent today (no `cache_control`, #180).
-        let usage = value.get("usage").map(|u| {
+        let usage = Self::usage_of(&value);
+
+        Ok(Completion {
+            text: text.to_string(),
+            usage,
+            stop,
+        })
+    }
+
+    /// The usage block of a body, whether or not it holds an answer: a
+    /// refusal or a truncated reply was billed too (#730).
+    pub(crate) fn parse_usage(body: &str) -> Option<Usage> {
+        Self::usage_of(&serde_json::from_str::<Value>(body).ok()?)
+    }
+
+    fn usage_of(value: &Value) -> Option<Usage> {
+        value.get("usage").map(|u| {
             let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
             Usage {
                 input_tokens: count("input_tokens"),
@@ -143,12 +172,6 @@ impl Anthropic {
                 cache_write_tokens: count("cache_creation_input_tokens"),
                 cache_read_tokens: count("cache_read_input_tokens"),
             }
-        });
-
-        Ok(Completion {
-            text: text.to_string(),
-            usage,
-            stop,
         })
     }
 }
@@ -216,23 +239,77 @@ impl Provider for Anthropic {
             &self.model,
             false,
             Self::parse_completion(&body_text),
+            || Self::parse_usage(&body_text),
         )
     }
 }
 
 /// Whether a model accepts `output_config.effort`.
 ///
-/// Effort is rejected outright on the 4.5-generation Sonnet and Haiku models —
-/// sending it returns a 400 rather than being ignored — so those must be
-/// filtered out rather than passed through hopefully. Everything current
-/// (Opus 5 / 4.8 / 4.7 / 4.6, Sonnet 5, the Fable line) accepts it, so the
-/// default is to send it and carve out the known exceptions.
+/// An allowlist by family and version, because sending effort to a model that
+/// lacks it is a hard 400, not a no-op. MEASURED 2026-10-16 (one tiny call
+/// each, test key): Haiku 4.5 answers 400 "This model does not support the
+/// effort parameter"; these accepted it: Opus 4.5, 4.6, 4.7, 4.8, 5, 5.5,
+/// Sonnet 4.6, 5, 5.5, Haiku 5.5, Fable 5 and 5.1. Sonnet 4.5 was measured
+/// on 2026-09-15 to reject it too. Older ids (Sonnet 4, Opus 4 and 4.1, the
+/// 3.x line) are retired for this key (404), so they could not be measured;
+/// THEORY (unverified): they reject effort like Sonnet and Haiku 4.5, so they
+/// are left out. An id this cannot place also gets no effort: the cost of a
+/// wrong "no" is the model's default effort, the cost of a wrong "yes" is a
+/// 400 card on every press.
+///
+/// Minimum versions: Opus 4.5, Sonnet 4.6, Haiku 5, any Fable. A `-latest`
+/// alias carries no version, so it gets no effort (the model's own default).
 ///
 /// Also used as this provider's `thinking` capability: on this API, effort
 /// support and extended-thinking support are the same models.
 fn supports_effort(model: &str) -> bool {
-    const NO_EFFORT: [&str; 2] = ["claude-haiku-4-5", "claude-sonnet-4-5"];
-    !NO_EFFORT.iter().any(|m| model.starts_with(m))
+    match parse_claude_id(model) {
+        Some((Family::Opus, v)) => v >= (4, 5),
+        Some((Family::Sonnet, v)) => v >= (4, 6),
+        Some((Family::Haiku, v)) => v >= (5, 0),
+        Some((Family::Fable, _)) => true,
+        None => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Family {
+    Opus,
+    Sonnet,
+    Haiku,
+    Fable,
+}
+
+/// Family and (major, minor) version of a Claude model id, in either naming
+/// order (`claude-opus-4-5-20251101`, `claude-3-7-sonnet-20250219`). Date
+/// stamps (more than two digits) and other words are ignored; a missing minor
+/// is 0 (`claude-opus-5` is 5.0). `None` when no known family appears.
+fn parse_claude_id(model: &str) -> Option<(Family, (u32, u32))> {
+    let lower = model.to_ascii_lowercase();
+    if !lower.starts_with("claude-") {
+        return None;
+    }
+    let mut family = None;
+    let mut nums = Vec::new();
+    for part in lower.split('-').skip(1) {
+        match part {
+            "opus" => family = family.or(Some(Family::Opus)),
+            "sonnet" => family = family.or(Some(Family::Sonnet)),
+            "haiku" => family = family.or(Some(Family::Haiku)),
+            "fable" => family = family.or(Some(Family::Fable)),
+            _ => {
+                if part.len() <= 2 {
+                    if let Ok(n) = part.parse::<u32>() {
+                        nums.push(n);
+                    }
+                }
+            }
+        }
+    }
+    let major = *nums.first()?;
+    let minor = nums.get(1).copied().unwrap_or(0);
+    Some((family?, (major, minor)))
 }
 
 /// Whether `model` is on Anthropic's "high-resolution" image tier (Claude
@@ -242,25 +319,22 @@ fn supports_effort(model: &str) -> bool {
 /// doc comments for the MEASURED 2026-09-17 source of the two tiers
 /// themselves.
 ///
-/// THEORY (unverified): which SPECIFIC models fall in the standard tier is
-/// inferred, not independently confirmed against Anthropic's docs per
-/// model -- this reuses `supports_effort`'s excluded 4.5-generation models
-/// (`claude-haiku-4-5`, `claude-sonnet-4-5`) on the reasoning that a model
-/// old enough to reject `output_config.effort` predates the 4.7+
-/// high-resolution tier too. Everything else in `Providers::default`'s
-/// model list (`claude-opus-5`, `claude-sonnet-5`, `claude-opus-4-8`,
-/// `claude-fable-5-1`) is 4.7 or later by version number, so this degrades
-/// to "not explicitly a known-old model" the same way `supports_effort`
-/// does, rather than a hand-maintained allowlist that silently excludes a
-/// new model release.
+/// By version number (4.7 or later), not by effort support: Opus 4.5/4.6 and
+/// Sonnet 4.6 accept effort but sit on the standard tier. An id that cannot be
+/// placed gets the standard tier, the smaller images (the safe side).
+///
+/// THEORY (unverified, not probed): that the Haiku 5.x and Fable lines are on
+/// the high-resolution tier is inferred from "4.7 and later" in the vision
+/// docs, by version number alone. A `-latest` alias has no version, so it is
+/// "cannot be placed": no effort and the standard tier.
 fn supports_high_res_tier(model: &str) -> bool {
-    supports_effort(model)
+    parse_claude_id(model).is_some_and(|(_, v)| v >= (4, 7))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{parse_answer, physics_request, Difficulty, Shot};
+    use crate::provider::{parse_answer, physics_request_no_note, Difficulty, Shot};
     use std::fs;
 
     fn sample_shot() -> Shot {
@@ -272,7 +346,7 @@ mod tests {
     }
 
     fn req(prompt: &str, want_difficulty: bool) -> Request {
-        physics_request(&sample_shot(), prompt, want_difficulty)
+        physics_request_no_note(&sample_shot(), prompt, want_difficulty)
     }
 
     #[test]
@@ -574,6 +648,35 @@ mod tests {
         assert!(err.to_string().contains("no text block found"));
     }
 
+    /// #731: stop reasons with no text block name themselves instead of
+    /// blaming a missing block or the effort setting.
+    #[test]
+    fn parse_completion_names_other_stop_reasons_with_no_text() {
+        for (reason, words) in [
+            ("pause_turn", "paused"),
+            ("model_context_window_exceeded", "too long"),
+            ("some_new_reason", "some_new_reason"),
+        ] {
+            let body = format!(r#"{{"stop_reason":"{reason}","content":[]}}"#);
+            let msg = Anthropic::parse_completion(&body).unwrap_err().to_string();
+            assert!(msg.contains(reason), "{msg}");
+            assert!(msg.contains(words), "{msg}");
+            assert!(!msg.contains("ran out of room"), "{msg}");
+            assert!(!msg.contains('\u{2014}'), "{msg}");
+        }
+    }
+
+    /// #730: the usage block is readable from a reply that is not an answer.
+    #[test]
+    fn parse_usage_reads_a_max_tokens_body_with_no_text_block() {
+        let body = r#"{"stop_reason":"max_tokens","content":[{"type":"thinking","thinking":"..."}],"usage":{"input_tokens":120,"output_tokens":4000}}"#;
+        assert!(Anthropic::parse_completion(body).is_err());
+        let u = Anthropic::parse_usage(body).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (120, 4000));
+        assert!(Anthropic::parse_usage("not json").is_none());
+        assert!(Anthropic::parse_usage(r#"{"content":[]}"#).is_none());
+    }
+
     #[test]
     fn parse_completion_rejects_invalid_json() {
         let err = Anthropic::parse_completion("not json").unwrap_err();
@@ -599,6 +702,94 @@ mod tests {
             );
             // The schema must still be there — only effort is dropped.
             assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        }
+    }
+
+    /// #719: the UI-only `editable` keyword never goes to the vendor.
+    #[test]
+    fn no_registered_schema_sends_the_editable_keyword() {
+        let p = Anthropic::new("k", "claude-opus-5", "low");
+        for kind in crate::actions::schema::PROPOSAL_KINDS {
+            let mut r = req("sys", false);
+            r.schema = crate::actions::schema::schema_for(kind, false);
+            let body = serde_json::to_string(&p.build_body(&r)).unwrap();
+            assert!(!body.contains("editable"), "{kind}: {body}");
+        }
+    }
+
+    #[test]
+    fn effort_allowlist_follows_family_and_version() {
+        // MEASURED 2026-10-16 (test key): these accepted output_config.effort.
+        for ok in [
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+        ] {
+            assert!(supports_effort(ok), "{ok} should get effort");
+        }
+        // MEASURED 2026-10-16: Haiku 4.5 returns 400 "does not support the
+        // effort parameter". The rest are older generations or ids we cannot
+        // place; they are not sent effort (the safe side).
+        for no in [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-opus-4-1-20250805",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-haiku-20241022",
+            "claude-3-opus-20240229",
+            "custom-claude-model",
+            "",
+        ] {
+            assert!(!supports_effort(no), "{no} must not get effort");
+        }
+    }
+
+    #[test]
+    fn older_models_get_no_effort_in_the_body() {
+        for model in ["claude-opus-4-1-20250805", "claude-3-7-sonnet-20250219"] {
+            let p = Anthropic::new("k", model, "low");
+            let body = p.build_body(&req("sys", false));
+            assert!(body["output_config"].get("effort").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn high_res_tier_starts_at_4_7_not_at_effort_support() {
+        // Opus 4.5/4.6 and Sonnet 4.6 take effort but are on the standard
+        // image tier (docs: high resolution is Claude 4.7 and later).
+        for hi in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+        ] {
+            assert!(supports_high_res_tier(hi), "{hi}");
+        }
+        for std in [
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-4-1-20250805",
+            "custom-claude-model",
+        ] {
+            assert!(!supports_high_res_tier(std), "{std}");
         }
     }
 

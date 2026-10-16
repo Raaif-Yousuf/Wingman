@@ -22,11 +22,14 @@ mod hotkey;
 mod hotkey_conflicts;
 mod inputs;
 mod known_folder;
+mod machine;
 mod mode;
 mod ocr;
+mod owner_acl;
 mod password_managers;
 mod pause;
 mod payment_denylist;
+mod portable;
 mod profile;
 mod provider;
 mod redact;
@@ -36,6 +39,7 @@ mod single_instance;
 mod speech;
 mod store;
 mod ui;
+mod ui_thread;
 mod usage;
 
 fn main() {

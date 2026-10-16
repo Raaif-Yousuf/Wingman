@@ -400,6 +400,15 @@ fn display_array_item(v: &Value) -> String {
             };
         }
     }
+    // A list inside a list (a table row, #69) reads as one line, cells joined
+    // by " | ", so the rows of a table stay one per line.
+    if let Some(cells) = v.as_array() {
+        return cells
+            .iter()
+            .map(display_array_item)
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
     display_string(v)
 }
 
