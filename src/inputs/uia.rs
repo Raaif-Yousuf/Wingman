@@ -395,6 +395,334 @@ pub fn snapshot_hwnd(
     })
 }
 
+/// How many password rectangles one lookup returns at most (#506). A window
+/// with more masked fields than this is not a login form; the rest are left.
+pub const MAX_PASSWORD_RECTS: usize = 64;
+
+/// How long the password lookup may take, counted from the moment it starts
+/// (the capture), before it is given up (#506). The `FindAll` is one blocking
+/// COM call against another process, and UIA's own transaction timeout is
+/// five seconds, too long to hold a request for.
+pub const PASSWORD_LOOKUP_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Why a password lookup gave no answer (#506). Every one fails closed except
+/// a window that has gone, which is not an error at all (no fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupError {
+    /// The lookup did not finish within its budget.
+    TimedOut,
+    /// Windows refused (E_ACCESSDENIED): an app running as administrator.
+    AccessDenied,
+    /// The thread could not start, or UIA failed in an unexpected way.
+    Failed,
+}
+
+type LookupSlot = std::sync::Arc<(
+    std::sync::Mutex<Option<Result<Vec<crate::capture::ScreenRect>, LookupError>>>,
+    std::sync::Condvar,
+)>;
+
+/// A password-field lookup running on a thread of its own, started at capture
+/// time (#506). Cloning shares the one lookup (a region crop keeps it). The
+/// thread is never waited for here: [`PasswordLookup::collect`] waits only
+/// for what is left of the budget, and a thread that outlives it finishes by
+/// itself.
+#[derive(Clone)]
+pub struct PasswordLookup {
+    started: std::time::Instant,
+    slot: LookupSlot,
+}
+
+impl std::fmt::Debug for PasswordLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordLookup").finish_non_exhaustive()
+    }
+}
+
+/// Whether the target window's process is out of reach because it runs
+/// elevated and Wingman does not (#506).
+mod elevation {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    /// What looking at the target process told us.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Access {
+        /// Windows refused to open the process or its token: the mark of a
+        /// process that outranks us.
+        Denied,
+        /// The token says whether the process is elevated.
+        Elevated(bool),
+        /// Could not tell (the process is gone, or another error).
+        Unknown,
+    }
+
+    /// Pure: the answer is "blocked" only when we are not elevated and the
+    /// target is, or cannot be opened because it outranks us.
+    pub fn blocks(ours_elevated: bool, target: Access) -> bool {
+        if ours_elevated {
+            return false;
+        }
+        match target {
+            Access::Denied => true,
+            Access::Elevated(e) => e,
+            Access::Unknown => false,
+        }
+    }
+
+    fn is_denied(e: &windows::core::Error) -> bool {
+        e.code().0 == super::E_ACCESSDENIED_HRESULT
+    }
+
+    /// `Some(elevated)` from a process token handle.
+    fn token_elevated(token: HANDLE) -> Option<bool> {
+        let mut info = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                Some(&mut info as *mut _ as *mut core::ffi::c_void),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            )
+        }
+        .ok()?;
+        Some(info.TokenIsElevated != 0)
+    }
+
+    fn ours_elevated() -> bool {
+        let mut token = HANDLE::default();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+            return false;
+        }
+        let r = token_elevated(token).unwrap_or(false);
+        let _ = unsafe { CloseHandle(token) };
+        r
+    }
+
+    fn target_access(hwnd: isize) -> Access {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid)) };
+        if pid == 0 {
+            return Access::Unknown;
+        }
+        let process = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+            Ok(p) => p,
+            Err(e) if is_denied(&e) => return Access::Denied,
+            Err(_) => return Access::Unknown,
+        };
+        let mut token = HANDLE::default();
+        let access = match unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } {
+            Ok(()) => {
+                let a = token_elevated(token).map_or(Access::Unknown, Access::Elevated);
+                let _ = unsafe { CloseHandle(token) };
+                a
+            }
+            Err(e) if is_denied(&e) => Access::Denied,
+            Err(_) => Access::Unknown,
+        };
+        let _ = unsafe { CloseHandle(process) };
+        access
+    }
+
+    /// Whether the process owning `hwnd` is out of reach (see [`blocks`]).
+    pub fn blocks_us(hwnd: isize) -> bool {
+        blocks(ours_elevated(), target_access(hwnd))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn blocked_only_when_the_target_outranks_us() {
+            assert!(blocks(false, Access::Denied));
+            assert!(blocks(false, Access::Elevated(true)));
+            assert!(!blocks(false, Access::Elevated(false)));
+            assert!(!blocks(false, Access::Unknown));
+            // We are elevated: nothing outranks us.
+            assert!(!blocks(true, Access::Denied));
+            assert!(!blocks(true, Access::Elevated(true)));
+        }
+
+        #[test]
+        fn no_window_is_never_blocked() {
+            assert!(!blocks_us(0));
+        }
+    }
+}
+
+/// How a lookup error should be treated, from the error alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// The window or its root element no longer exists: no fields.
+    Gone,
+    Denied,
+    Timeout,
+    Other,
+}
+
+/// `E_ACCESSDENIED`.
+const E_ACCESSDENIED_HRESULT: i32 = 0x8007_0005u32 as i32;
+/// `UIA_E_ELEMENTNOTAVAILABLE`.
+const UIA_E_ELEMENTNOTAVAILABLE_HRESULT: i32 = 0x8004_0201u32 as i32;
+
+/// Sorts an error from the COM half. Pure so every branch is tested.
+pub fn classify_error(err: &anyhow::Error) -> ErrorClass {
+    if let Some(e) = err.downcast_ref::<windows::core::Error>() {
+        match e.code().0 {
+            E_ACCESSDENIED_HRESULT => return ErrorClass::Denied,
+            UIA_E_ELEMENTNOTAVAILABLE_HRESULT => return ErrorClass::Gone,
+            _ => {}
+        }
+    }
+    if format!("{err:#}").contains(crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT) {
+        return ErrorClass::Timeout;
+    }
+    ErrorClass::Other
+}
+
+/// The blocking lookup, run on the lookup thread: a window that no longer
+/// exists has no fields, anything else follows [`classify_error`].
+fn lookup_blocking(hwnd: isize) -> Result<Vec<crate::capture::ScreenRect>, LookupError> {
+    let handle = windows::Win32::Foundation::HWND(hwnd as *mut _);
+    let alive = |h| unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(h)) }.as_bool();
+    if hwnd == 0 || !alive(handle) {
+        return Ok(Vec::new());
+    }
+    // Look at the process token before asking UIA: an app running as
+    // administrator is not readable from here, and guessing that from an
+    // error code is less certain than asking.
+    if elevation::blocks_us(hwnd) {
+        return Err(LookupError::AccessDenied);
+    }
+    match com::password_rects(handle, MAX_PASSWORD_RECTS) {
+        Ok(rects) => Ok(rects),
+        // A window closed while the lookup ran is not a failure.
+        Err(_) if !alive(handle) => Ok(Vec::new()),
+        // The window is alive, so "element not available" or a null root is
+        // not "no fields": it is a window UIA cannot read right now.
+        Err(e) => match classify_error(&e) {
+            ErrorClass::Denied => Err(LookupError::AccessDenied),
+            ErrorClass::Timeout => Err(LookupError::TimedOut),
+            ErrorClass::Gone | ErrorClass::Other => Err(LookupError::Failed),
+        },
+    }
+}
+
+/// Lookup threads running right now, and the most that may run at once. A
+/// hung provider holds its thread until UIA's own timeout, so a burst of
+/// presses against one must not pile threads up.
+static LOOKUP_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_LOOKUP_THREADS: usize = 4;
+
+/// Takes one of `max` places in `counter`; `false` when none is free.
+fn try_take_place(counter: &std::sync::atomic::AtomicUsize, max: usize) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    if counter.fetch_add(1, SeqCst) >= max {
+        counter.fetch_sub(1, SeqCst);
+        return false;
+    }
+    true
+}
+
+/// Gives the place back when the lookup thread ends, however it ends.
+struct Place;
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        LOOKUP_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl PasswordLookup {
+    /// Starts the lookup for the window `hwnd` (a raw `HWND` value; 0 means
+    /// no window and finds nothing). Returns at once. If the thread cannot be
+    /// spawned, or [`MAX_LOOKUP_THREADS`] are already running, the lookup is
+    /// already finished with [`LookupError::Failed`].
+    pub fn start(hwnd: isize) -> Self {
+        if hwnd == 0 {
+            return Self::finished(Ok(Vec::new()));
+        }
+        if !try_take_place(&LOOKUP_THREADS, MAX_LOOKUP_THREADS) {
+            return Self::finished(Err(LookupError::Failed));
+        }
+        let slot: LookupSlot = Default::default();
+        let for_thread = slot.clone();
+        let spawned = std::thread::Builder::new()
+            .name("password-rects".into())
+            .spawn(move || {
+                let _place = Place;
+                Self::finish(&for_thread, lookup_blocking(hwnd));
+            });
+        let this = Self {
+            started: std::time::Instant::now(),
+            slot,
+        };
+        if spawned.is_err() {
+            LOOKUP_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Self::finish(&this.slot, Err(LookupError::Failed));
+        }
+        this
+    }
+
+    fn finish(slot: &LookupSlot, result: Result<Vec<crate::capture::ScreenRect>, LookupError>) {
+        let (lock, cv) = &**slot;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        cv.notify_all();
+    }
+
+    /// The rectangles, waiting at most until `budget` after the lookup
+    /// started. Safe to call more than once. A lookup still running at the
+    /// deadline is [`LookupError::TimedOut`].
+    pub fn collect(
+        &self,
+        budget: Duration,
+    ) -> Result<Vec<crate::capture::ScreenRect>, LookupError> {
+        let (lock, cv) = &*self.slot;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(result) = guard.as_ref() {
+                return result.clone();
+            }
+            let left = budget.saturating_sub(self.started.elapsed());
+            if left.is_zero() {
+                return Err(LookupError::TimedOut);
+            }
+            guard = cv
+                .wait_timeout(guard, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// A lookup that has already finished with `result`.
+    pub fn finished(result: Result<Vec<crate::capture::ScreenRect>, LookupError>) -> Self {
+        let this = Self {
+            started: std::time::Instant::now(),
+            slot: Default::default(),
+        };
+        Self::finish(&this.slot, result);
+        this
+    }
+
+    /// A lookup that never finishes, started `ago` ago (tests).
+    #[cfg(test)]
+    pub fn never_finishing(ago: Duration) -> Self {
+        Self {
+            started: std::time::Instant::now() - ago,
+            slot: Default::default(),
+        }
+    }
+}
+
 /// Snapshots the current foreground window. A thin wrapper: every
 /// constraint on [`snapshot_hwnd`] (threading, budget, truncation) applies
 /// unchanged.
@@ -470,6 +798,56 @@ mod com {
     /// must be checked with this before use.
     fn is_null<I: Interface>(i: &I) -> bool {
         i.as_raw().is_null()
+    }
+
+    /// #506: the bounding rectangles of the password fields under `hwnd`.
+    pub(super) fn password_rects(
+        hwnd: HWND,
+        max: usize,
+    ) -> anyhow::Result<Vec<crate::capture::ScreenRect>> {
+        let _apartment = ComApartment::enter()?;
+        let automation: IUIAutomation =
+            unsafe { crate::inputs::uia_automation::create_automation() }?;
+        let root = crate::inputs::uia_automation::describe_timeout(
+            unsafe { automation.ElementFromHandle(hwnd) },
+            "ElementFromHandle",
+        )?;
+        if is_null(&root) {
+            anyhow::bail!("UIA gave no root element for the window");
+        }
+        let cache_request = unsafe { automation.CreateCacheRequest() }?;
+        unsafe { cache_request.AddProperty(UIA_BoundingRectanglePropertyId) }?;
+        let condition = unsafe {
+            automation.CreatePropertyCondition(
+                UIA_IsPasswordPropertyId,
+                &windows::Win32::System::Variant::VARIANT::from(true),
+            )
+        }?;
+        let found = crate::inputs::uia_automation::describe_timeout(
+            unsafe { root.FindAllBuildCache(TreeScope_Descendants, &condition, &cache_request) },
+            "FindAllBuildCache",
+        )?;
+        let total = unsafe { found.Length() }?.max(0) as usize;
+        // More than `max` is not a login form and not safe to truncate: a
+        // field past the cut would go out unpainted.
+        anyhow::ensure!(
+            total <= max,
+            "{total} password fields, more than the {max} that can be boxed"
+        );
+        let mut out = Vec::new();
+        for i in 0..total {
+            let element = unsafe { found.GetElement(i as i32) }?;
+            // A password field whose rectangle cannot be read is an error,
+            // not a skip: the caller fails closed rather than send it.
+            let r = unsafe { element.CachedBoundingRectangle() }?;
+            out.push(crate::capture::ScreenRect {
+                left: r.left,
+                top: r.top,
+                right: r.right,
+                bottom: r.bottom,
+            });
+        }
+        Ok(out)
     }
 
     /// The single bulk COM call, plus turning its result into
@@ -1062,6 +1440,96 @@ mod tests {
     }
 
     // -- real Win32 window: label resolution and password redaction, for
+    // -- password lookup (#506) --------------------------------------------
+
+    fn rect(l: i32) -> crate::capture::ScreenRect {
+        crate::capture::ScreenRect {
+            left: l,
+            top: 0,
+            right: l + 10,
+            bottom: 10,
+        }
+    }
+
+    #[test]
+    fn classify_error_sorts_access_denied_gone_timeout_and_the_rest() {
+        use super::{classify_error, ErrorClass::*};
+        let win = |code: i32| {
+            anyhow::Error::from(windows::core::Error::from_hresult(windows::core::HRESULT(
+                code,
+            )))
+        };
+        assert_eq!(classify_error(&win(0x8007_0005u32 as i32)), Denied);
+        assert_eq!(classify_error(&win(0x8004_0201u32 as i32)), Gone);
+        assert_eq!(classify_error(&win(0x8000_4005u32 as i32)), Other);
+        let timeout = anyhow::anyhow!(
+            "{} (FindAllBuildCache)",
+            crate::inputs::uia_automation::TIMEOUT_MESSAGE_FRAGMENT
+        );
+        assert_eq!(classify_error(&timeout), Timeout);
+        assert_eq!(classify_error(&anyhow::anyhow!("boom")), Other);
+    }
+
+    #[test]
+    fn a_finished_lookup_returns_its_result_every_time() {
+        use super::{LookupError, PasswordLookup};
+        let ok = PasswordLookup::finished(Ok(vec![rect(1)]));
+        assert_eq!(ok.collect(Duration::ZERO).unwrap(), vec![rect(1)]);
+        assert_eq!(ok.clone().collect(Duration::ZERO).unwrap(), vec![rect(1)]);
+        let denied = PasswordLookup::finished(Err(LookupError::AccessDenied));
+        assert_eq!(
+            denied.collect(Duration::ZERO),
+            Err(LookupError::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn lookup_threads_are_capped_and_the_place_comes_back() {
+        use std::sync::atomic::AtomicUsize;
+        let counter = AtomicUsize::new(0);
+        assert!(super::try_take_place(&counter, 2));
+        assert!(super::try_take_place(&counter, 2));
+        assert!(!super::try_take_place(&counter, 2), "third is refused");
+        // A refusal does not leak a place.
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_lookup_still_running_at_the_deadline_times_out_and_the_elapsed_time_counts() {
+        use super::{LookupError, PasswordLookup};
+        // Started 10 s ago with a 1.5 s budget: already over, returns at once.
+        let late = PasswordLookup::never_finishing(Duration::from_secs(10));
+        let t = std::time::Instant::now();
+        assert_eq!(
+            late.collect(crate::inputs::uia::PASSWORD_LOOKUP_BUDGET),
+            Err(LookupError::TimedOut)
+        );
+        assert!(t.elapsed() < Duration::from_millis(500));
+        // Only the rest of the budget is waited for.
+        let soon = PasswordLookup::never_finishing(Duration::ZERO);
+        let t = std::time::Instant::now();
+        assert_eq!(
+            soon.collect(Duration::from_millis(60)),
+            Err(LookupError::TimedOut)
+        );
+        assert!(t.elapsed() >= Duration::from_millis(40));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn no_window_or_a_closed_window_has_no_password_fields() {
+        use super::PasswordLookup;
+        assert!(PasswordLookup::start(0)
+            .collect(Duration::from_secs(5))
+            .unwrap()
+            .is_empty());
+        // 0x7777 is not a window handle in this process.
+        assert!(PasswordLookup::start(0x7777)
+            .collect(Duration::from_secs(5))
+            .unwrap()
+            .is_empty());
+    }
+
     // real, via snapshot_hwnd -----------------------------------------------
     //
     // A test-only window class (AGENTS.md rule 9): two labelled EDIT
@@ -1297,6 +1765,135 @@ mod tests {
                 FieldValue::Text("hunter2".to_string()),
                 "the password field's real text must never appear in the snapshot"
             );
+
+            unsafe {
+                let _ = DestroyWindow(frame);
+            }
+        }
+
+        /// Times the lookup on whatever window is in front (counts and
+        /// timings only, nothing read). Run by hand with a busy browser open:
+        /// `cargo test password_rects_live -- --ignored --nocapture`.
+        #[test]
+        #[ignore = "reads the real foreground window"]
+        fn password_rects_live_times_the_foreground_window() {
+            let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0
+                as isize;
+            for run in 0..3 {
+                let start = std::time::Instant::now();
+                let r = crate::inputs::uia::PasswordLookup::start(hwnd)
+                    .collect(crate::inputs::uia::PASSWORD_LOOKUP_BUDGET);
+                eprintln!(
+                    "run {run}: {:?}, {} rect(s), result={:?}",
+                    start.elapsed(),
+                    r.as_ref().map(|v| v.len()).unwrap_or(0),
+                    r.as_ref().map(|_| ()).map_err(|e| *e)
+                );
+            }
+        }
+
+        #[test]
+        fn password_rects_returns_only_the_password_field_where_it_is() {
+            use windows::Win32::Foundation::RECT;
+            use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+            let _uia = crate::inputs::lock_uia_test();
+            let hinstance = instance();
+            assert!(ensure_class_registered(hinstance));
+            let frame = unsafe {
+                CreateWindowExW(
+                    Default::default(),
+                    CLASS_NAME,
+                    w!("Wingman password rect test window"),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    0,
+                    0,
+                    320,
+                    240,
+                    None,
+                    None,
+                    Some(hinstance),
+                    None,
+                )
+            }
+            .expect("CreateWindowExW (frame)");
+            unsafe {
+                let _ = ShowWindow(frame, SW_SHOWNOACTIVATE);
+            }
+            pump_pending_messages();
+            let edit = |y: i32, style: u32| -> HWND {
+                unsafe {
+                    CreateWindowExW(
+                        Default::default(),
+                        w!("EDIT"),
+                        w!("x"),
+                        WS_CHILD
+                            | WS_VISIBLE
+                            | WS_TABSTOP
+                            | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
+                        10,
+                        y,
+                        200,
+                        20,
+                        Some(frame),
+                        None,
+                        Some(hinstance),
+                        None,
+                    )
+                }
+                .expect("CreateWindowExW (edit)")
+            };
+
+            // Calls the COM half directly: `PasswordLookup` waits on another
+            // thread, and this thread owns the window, so it would have to
+            // pump messages for UIA to answer. In the app the window belongs
+            // to another process.
+            // No password field yet: nothing comes back.
+            let plain = edit(10, ES_AUTOHSCROLL as u32);
+            pump_pending_messages();
+            let none = crate::inputs::uia::com::password_rects(
+                frame,
+                crate::inputs::uia::MAX_PASSWORD_RECTS,
+            )
+            .expect("password_rects");
+            assert!(none.is_empty(), "{none:?}");
+
+            let password = edit(50, (ES_AUTOHSCROLL | ES_PASSWORD) as u32);
+            pump_pending_messages();
+            // More fields than the cap is an error, never a silent cut.
+            let second = edit(80, (ES_AUTOHSCROLL | ES_PASSWORD) as u32);
+            pump_pending_messages();
+            assert!(
+                crate::inputs::uia::com::password_rects(frame, 1).is_err(),
+                "two password fields with a cap of one must fail"
+            );
+            unsafe {
+                let _ = DestroyWindow(second);
+            }
+            pump_pending_messages();
+            let start = std::time::Instant::now();
+            let rects = crate::inputs::uia::com::password_rects(
+                frame,
+                crate::inputs::uia::MAX_PASSWORD_RECTS,
+            )
+            .expect("password_rects");
+            eprintln!("uia::password_rects took {:?}", start.elapsed());
+            assert_eq!(rects.len(), 1, "{rects:?}");
+
+            let mut want = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(password, &mut want);
+                let _ = GetWindowRect(plain, &mut RECT::default());
+            }
+            let got = rects[0];
+            assert!(
+                got.left < want.right
+                    && want.left < got.right
+                    && got.top < want.bottom
+                    && want.top < got.bottom,
+                "UIA rect {got:?} must overlap the password edit at {want:?}"
+            );
+            assert!(got.bottom - got.top < 60, "{got:?}");
 
             unsafe {
                 let _ = DestroyWindow(frame);
