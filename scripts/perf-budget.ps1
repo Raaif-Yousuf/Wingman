@@ -4,11 +4,8 @@
   Prints the measured number on every run, pass or fail.
 
 .DESCRIPTION
-  Only the exe size is gated. It is deterministic. Startup time and idle
-  memory need the app to run (tray icon, keyboard hook, single-instance
-  mutex), which a CI runner cannot do without side effects, and they are
-  too noisy on shared runners to gate tightly, so they are not measured
-  here.
+  Only the exe size is gated here. It is deterministic. Startup time and idle
+  memory need the app to run, so scripts/perf-runtime.ps1 gates those.
 
   Usage: pwsh scripts/perf-budget.ps1 [-ExePath target\release\wingman.exe]
                                       [-BudgetsPath perf-budgets.json]
@@ -23,9 +20,18 @@ param(
 function Get-BudgetResult {
     param(
         [Parameter(Mandatory)] $Budgets,
-        [Parameter(Mandatory)] [hashtable] $Measured
+        [Parameter(Mandatory)] [hashtable] $Measured,
+        # Check only these budgets (perf-runtime.ps1 owns the other two).
+        [string[]] $Names
     )
-    foreach ($p in $Budgets.PSObject.Properties) {
+    $props = $Budgets.PSObject.Properties
+    if ($Names) {
+        foreach ($n in $Names) {
+            if (-not $Budgets.PSObject.Properties[$n]) { throw "no budget named '$n'" }
+        }
+        $props = $props | Where-Object { $Names -contains $_.Name }
+    }
+    foreach ($p in $props) {
         if (-not $Measured.ContainsKey($p.Name)) {
             throw "no measurement for budget '$($p.Name)'"
         }
@@ -46,7 +52,7 @@ $budgets = Get-Content -LiteralPath $BudgetsPath -Raw | ConvertFrom-Json
 $measured = @{ exe_size_bytes = (Get-Item -LiteralPath $ExePath).Length }
 
 $failed = $false
-foreach ($r in Get-BudgetResult -Budgets $budgets -Measured $measured) {
+foreach ($r in Get-BudgetResult -Budgets $budgets -Measured $measured -Names 'exe_size_bytes') {
     $status = if ($r.Passed) { 'ok' } else { 'OVER BUDGET' }
     "$($r.Name): measured $($r.Measured), budget $($r.Max) ($status)"
     if (-not $r.Passed) { $failed = $true }

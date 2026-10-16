@@ -75,6 +75,10 @@ jobs:
         shell: pwsh
         run: ./scripts/perf-budget.ps1
 
+      - name: Performance budgets (startup time, idle memory)
+        shell: pwsh
+        run: ./scripts/perf-runtime.ps1
+
       - name: Upload exe artifact
         uses: actions/upload-artifact@v7
         with:
