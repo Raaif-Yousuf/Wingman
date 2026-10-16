@@ -632,7 +632,14 @@ pub fn stream_pull_progress<R: BufRead>(
         let n = (&mut reader)
             .take(MAX_PULL_LINE_BYTES as u64 + 1)
             .read_until(b'\n', &mut buf)
-            .context("ollama: failed to read /api/pull response")?;
+            .map_err(|e| match e.kind() {
+                // The cancel flag is set: the caller ignores this error.
+                std::io::ErrorKind::ConnectionAborted => anyhow!("pull cancelled"),
+                std::io::ErrorKind::TimedOut => {
+                    anyhow!("ollama: pull failed: Ollama stopped sending data.")
+                }
+                _ => anyhow::Error::new(e).context("ollama: failed to read /api/pull response"),
+            })?;
         if n == 0 {
             break;
         }
@@ -669,13 +676,37 @@ pub fn pull(
     cancel: &AtomicBool,
     on_progress: impl FnMut(&PullProgress),
 ) -> Result<()> {
+    pull_with_stall(base_url, model, cancel, PULL_STALL, on_progress)
+}
+
+/// How long a pull may go without a single byte from Ollama before it ends
+/// with an error. Real pulls send a progress line every second or so; the
+/// quietest phase (verifying a large file) is well under this.
+const PULL_STALL: Duration = Duration::from_secs(120);
+
+/// [`pull`] with its stall limit as a parameter (so a test need not wait
+/// two minutes). The read polls `cancel` several times a second, so a Stop
+/// ends the call promptly even when the server has gone quiet (#635).
+fn pull_with_stall(
+    base_url: &str,
+    model: &str,
+    cancel: &AtomicBool,
+    stall: Duration,
+    on_progress: impl FnMut(&PullProgress),
+) -> Result<()> {
     let url = format!("{}/api/pull", base_url.trim_end_matches('/'));
     let body = json!({"model": model, "stream": true});
 
     // #189: through `common` so the Offline guard (#19) covers pulls too.
-    super::common::post_json_read_body(&url, &body, DISCOVERY_CONNECT_TIMEOUT, "ollama", |r| {
-        stream_pull_progress(std::io::BufReader::new(r), cancel, on_progress)
-    })
+    super::common::post_json_read_body(
+        &url,
+        &body,
+        DISCOVERY_CONNECT_TIMEOUT,
+        "ollama",
+        cancel,
+        stall,
+        |r| stream_pull_progress(std::io::BufReader::new(r), cancel, on_progress),
+    )
 }
 
 #[cfg(test)]
@@ -1275,6 +1306,71 @@ mod tests {
         let mut seen: Vec<String> = Vec::new();
         pull(&base, "tiny:1b", &cancel, |p| seen.push(p.status.clone())).expect("pull");
         assert_eq!(seen, vec!["pulling manifest", "pulling x", "success"]);
+    }
+
+    /// A fake Ollama that sends one progress line and then goes quiet for
+    /// 5 s (a stalled download).
+    fn stalled_pull_server() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.ends_with(b"}") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\":\"pulling manifest\"}\n",
+                );
+                let _ = s.flush();
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn pull_ends_promptly_after_a_cancel_even_when_the_server_goes_quiet() {
+        let base = stalled_pull_server();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        let start = std::time::Instant::now();
+        let err = pull(&base, "tiny:1b", &cancel, |_| {
+            // First line arrived; stop while the server is silent.
+            c.store(true, Ordering::SeqCst);
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn pull_gives_up_when_the_server_stops_sending() {
+        let base = stalled_pull_server();
+        let start = std::time::Instant::now();
+        let err = pull_with_stall(
+            &base,
+            "tiny:1b",
+            &AtomicBool::new(false),
+            Duration::from_millis(500),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stopped sending data"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

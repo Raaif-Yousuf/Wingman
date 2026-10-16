@@ -917,37 +917,201 @@ fn get_with_headers_raw(
 
 /// POST whose response body is consumed incrementally by `read` (Ollama's
 /// `/api/pull` NDJSON download progress; not model output, so the
-/// no-streaming rule does not apply). Single attempt, only the connect phase
-/// is timed out: a model download can legitimately run for minutes. Goes
+/// no-streaming rule does not apply). Single attempt; a model download can
+/// legitimately run for minutes, so there is no overall time limit. Goes
 /// through [`offline_guard`] like every other entry point in this file
 /// (#189).
+///
+/// #635: this speaks plain HTTP over its own socket rather than `ureq`,
+/// because `ureq` has no per-read timeout: a stalled server would keep the
+/// reading thread blocked after the caller cancelled. Here every read waits at
+/// most [`STREAM_POLL`], and between waits the call returns an error as soon
+/// as `cancel` is set, or when nothing has arrived for `stall`. Only
+/// `http://` addresses work (Ollama is loopback); anything else is an error.
 pub(crate) fn post_json_read_body<T>(
     url: &str,
     body: &Value,
     connect_timeout: Duration,
     tag: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    stall: Duration,
     read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
 ) -> Result<T> {
+    use std::io::{BufRead, BufReader, Read, Write};
+
     offline_guard(url)?;
     budget_guard(url)?;
 
-    let mut response = ureq::post(url)
-        .config()
-        .http_status_as_error(false)
-        .timeout_connect(Some(connect_timeout))
-        .build()
-        .send_json(body)
-        .map_err(|e| anyhow!("{tag}: transport error: {}", redact_detail(&e)))?;
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow!("{tag}: only plain http addresses are supported here"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let with_port = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:80")
+    };
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&with_port)
+        .ok()
+        .and_then(|mut a| a.next())
+        .ok_or_else(|| anyhow!("{tag}: transport error: could not resolve {authority}"))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, connect_timeout)
+        .map_err(|e| anyhow!("{tag}: transport error: {}", e.kind()))?;
+    let payload = body.to_string();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .and_then(|()| stream.set_read_timeout(Some(STREAM_POLL)))
+        .and_then(|()| stream.write_all(request.as_bytes()))
+        .map_err(|e| anyhow!("{tag}: transport error: {}", e.kind()))?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let body_text = response.body_mut().read_to_string().unwrap_or_default();
-        let truncated = redact_and_truncate(&body_text);
-        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+    let mut reader = BufReader::new(WatchedStream {
+        inner: stream,
+        cancel,
+        stall,
+        last_data: std::time::Instant::now(),
+    });
+
+    // Status line, then headers up to the blank line. Each line is read
+    // through a `Take`, so a server cannot make this buffer grow.
+    let mut line = String::new();
+    let read_line = |reader: &mut BufReader<WatchedStream>, line: &mut String| -> Result<()> {
+        line.clear();
+        let n = (&mut *reader)
+            .take(8 * 1024)
+            .read_line(line)
+            .map_err(|e| anyhow!("{tag}: transport error: {}", e.kind()))?;
+        if n == 0 {
+            return Err(anyhow!("{tag}: transport error: connection closed"));
+        }
+        Ok(())
+    };
+    read_line(&mut reader, &mut line)?;
+    let status: u16 = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow!("{tag}: transport error: not an HTTP response"))?;
+    let mut chunked = false;
+    for _ in 0..100 {
+        read_line(&mut reader, &mut line)?;
+        let header = line.trim_end().to_ascii_lowercase();
+        if header.is_empty() {
+            break;
+        }
+        if header.starts_with("transfer-encoding:") && header.contains("chunked") {
+            chunked = true;
+        }
     }
 
-    let mut reader = response.body_mut().as_reader();
-    read(&mut reader)
+    let mut body_reader: Box<dyn Read + '_> = if chunked {
+        Box::new(ChunkedReader {
+            inner: reader,
+            remaining: 0,
+            done: false,
+        })
+    } else {
+        Box::new(reader)
+    };
+
+    if !(200..300).contains(&status) {
+        let mut text = Vec::new();
+        let _ = (&mut body_reader).take(4096).read_to_end(&mut text);
+        let truncated = redact_and_truncate(&String::from_utf8_lossy(&text));
+        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+    }
+    read(&mut body_reader)
+}
+
+/// How long one read on a streamed response waits before the cancel flag and
+/// the stall limit are looked at again (#635).
+const STREAM_POLL: Duration = Duration::from_millis(250);
+
+/// A socket whose reads give up early for a cancel or a stall (#635); see
+/// [`post_json_read_body`]. A stall is a `TimedOut` error, a cancel an
+/// `ConnectionAborted` one (not `Interrupted`, which std readers retry forever).
+struct WatchedStream<'a> {
+    inner: std::net::TcpStream,
+    cancel: &'a std::sync::atomic::AtomicBool,
+    stall: Duration,
+    last_data: std::time::Instant,
+}
+
+impl std::io::Read for WatchedStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::ErrorKind;
+        loop {
+            if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    ErrorKind::ConnectionAborted,
+                    "cancelled",
+                ));
+            }
+            match self.inner.read(buf) {
+                Ok(n) => {
+                    self.last_data = std::time::Instant::now();
+                    return Ok(n);
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if self.last_data.elapsed() >= self.stall {
+                        return Err(std::io::Error::new(ErrorKind::TimedOut, "stalled"));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// Decodes an HTTP/1.1 `Transfer-Encoding: chunked` body.
+struct ChunkedReader<R> {
+    inner: R,
+    /// Bytes left in the current chunk.
+    remaining: usize,
+    done: bool,
+}
+
+impl<R: std::io::BufRead> std::io::Read for ChunkedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{BufRead, Error, ErrorKind};
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut size_line = String::new();
+            let n = std::io::Read::take(&mut self.inner, 64).read_line(&mut size_line)?;
+            if n == 0 {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "chunk size missing"));
+            }
+            let hex = size_line.split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(hex, 16)
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "bad chunk size"))?;
+            if size == 0 {
+                self.done = true;
+                return Ok(0);
+            }
+            self.remaining = size;
+        }
+        let want = buf.len().min(self.remaining);
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "chunk cut short"));
+        }
+        self.remaining -= n;
+        if self.remaining == 0 {
+            // The CRLF that ends every chunk.
+            let mut crlf = [0u8; 2];
+            self.inner.read_exact(&mut crlf)?;
+        }
+        Ok(n)
+    }
 }
 
 /// Same as [`post_json`] but with the connect phase timed out separately
@@ -3005,9 +3169,148 @@ mod tests {
             &json!({}),
             Duration::from_millis(50),
             "test",
+            &std::sync::atomic::AtomicBool::new(false),
+            Duration::from_secs(1),
             |_| Ok(()),
         )
         .unwrap_err();
         assert!(err.to_string().contains("Daily budget"), "{err}");
+    }
+
+    // -- post_json_read_body over its own socket (#635) --------------------
+
+    /// A loopback server that reads the request, then writes each of `parts`
+    /// in turn with `pause_ms` between them, then closes.
+    fn raw_server(parts: Vec<Vec<u8>>, pause_ms: u64) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.ends_with(b"}") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                for p in parts {
+                    if s.write_all(&p).is_err() {
+                        return;
+                    }
+                    let _ = s.flush();
+                    std::thread::sleep(Duration::from_millis(pause_ms));
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}/api/pull")
+    }
+
+    fn read_all_body(url: &str, cancel: &std::sync::atomic::AtomicBool) -> Result<String> {
+        post_json_read_body(
+            url,
+            &json!({"model": "m"}),
+            Duration::from_secs(2),
+            "test",
+            cancel,
+            Duration::from_secs(5),
+            |r| {
+                let mut s = String::new();
+                r.read_to_string(&mut s)?;
+                Ok(s)
+            },
+        )
+    }
+
+    #[test]
+    fn a_chunked_response_is_decoded_across_chunk_boundaries() {
+        let url = raw_server(
+            vec![
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+                b"6\r\nhello \r\n".to_vec(),
+                b"5\r\nworld\r\n0\r\n\r\n".to_vec(),
+            ],
+            20,
+        );
+        let got = read_all_body(&url, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        assert_eq!(got, "hello world");
+    }
+
+    #[test]
+    fn an_error_status_returns_its_body_text() {
+        let url = raw_server(
+            vec![b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nno such model".to_vec()],
+            0,
+        );
+        let err = read_all_body(&url, &std::sync::atomic::AtomicBool::new(false)).unwrap_err();
+        assert!(err.to_string().contains("HTTP 404"), "{err}");
+        assert!(err.to_string().contains("no such model"), "{err}");
+    }
+
+    #[test]
+    fn a_cancel_ends_a_read_the_server_never_answers_within_a_poll_or_two() {
+        // The server sends the headers and then goes quiet for 5 s.
+        let url = raw_server(
+            vec![
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec(),
+                b"late".to_vec(),
+            ],
+            5000,
+        );
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            c.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        let result = read_all_body(&url, &cancel);
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_silent_server_times_out_at_the_stall_limit() {
+        let url = raw_server(
+            vec![
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec(),
+                b"late".to_vec(),
+            ],
+            5000,
+        );
+        let start = std::time::Instant::now();
+        let err = post_json_read_body(
+            &url,
+            &json!({"model": "m"}),
+            Duration::from_secs(2),
+            "test",
+            &std::sync::atomic::AtomicBool::new(false),
+            Duration::from_millis(600),
+            |r| {
+                let mut s = String::new();
+                r.read_to_string(&mut s)?;
+                Ok(s)
+            },
+        )
+        .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let io = err.downcast_ref::<std::io::Error>().expect("an io error");
+        assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_non_http_address_is_refused() {
+        let err = read_all_body(
+            "https://127.0.0.1:1/api/pull",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("plain http"), "{err}");
     }
 }

@@ -296,7 +296,9 @@ static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 fn enter_command(ctrl_id: i32) -> i32 {
     match ctrl_id {
         ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK | ID_CHANGE_PRIMARY
-        | ID_CHANGE_SECONDARY => ctrl_id,
+        | ID_CHANGE_SECONDARY | ID_PULL_BUTTON => ctrl_id,
+        // #635: Enter in the Pull model box starts the pull.
+        ID_PULL_NAME => ID_PULL_BUTTON,
         _ => ID_SAVE,
     }
 }
@@ -498,6 +500,9 @@ struct SettingsInner {
     /// #566: which pull is current. Each pull's posts carry its number in
     /// `wparam`; a post from an older pull is ignored.
     pull_gen: usize,
+    /// #635: the model a finished pull should select once the refreshed list
+    /// arrives.
+    pull_select: Option<String>,
     /// True while this window is open. Cleared in `WM_DESTROY`; the model
     /// fetch workers check it before posting (#569).
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -539,6 +544,7 @@ impl SettingsInner {
             pull_slot: Default::default(),
             pull_cancel: None,
             pull_gen: 0,
+            pull_select: None,
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             prompt_expanded: false,
             hotkeys: original.hotkeys.clone(),
@@ -602,7 +608,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_OLLAMA_MODELS => {
             let models = inner.ollama_tags.lock().ok().and_then(|g| g.clone());
             if let Some(models) = models {
-                apply_ollama_models(hwnd, &models);
+                let prefer = inner
+                    .pull_select
+                    .take()
+                    .map(|name| resolve_pulled_name(&models, &name));
+                apply_ollama_models(hwnd, &models, prefer.as_deref());
             }
             LRESULT(0)
         }
@@ -627,6 +637,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     _ => (ID_GEMINI_MODEL, &p.gemini.models),
                 };
                 apply_cloud_models(hwnd, combo_id, &fetched, configured);
+                sync_gemini_thinking_enabled(hwnd);
             }
             LRESULT(0)
         }
@@ -732,6 +743,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             set_text(inner.prompt_edit, DEFAULT_PROMPT);
         }
         ID_CARD_CORNER if notify == CBN_SELCHANGE => sync_card_display_enabled(inner.hwnd),
+        ID_GEMINI_MODEL if notify == CBN_SELCHANGE => sync_gemini_thinking_enabled(inner.hwnd),
         ID_CHANGE_PRIMARY if notify == BN_CLICKED => start_change(inner, HK_PRIMARY),
         ID_CHANGE_SECONDARY if notify == BN_CLICKED => start_change(inner, HK_SECONDARY),
         ID_PROMPT_TOGGLE if notify == BN_CLICKED => {
@@ -859,6 +871,9 @@ const ID_CARD_MONITOR_LABEL: i32 = 139;
 const ID_PULL_NAME: i32 = 140;
 const ID_PULL_BUTTON: i32 = 141;
 const ID_PULL_STATUS: i32 = 142;
+/// #569: the Gemini "Thinking:" caption, greyed with its combo for a model
+/// that ignores the setting.
+const ID_GEMINI_EFFORT_LABEL: i32 = 143;
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
 /// the text sent to a cloud or remote model, and the answer (real values put
@@ -922,6 +937,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_PULL_NAME", ID_PULL_NAME),
     ("ID_PULL_BUTTON", ID_PULL_BUTTON),
     ("ID_PULL_STATUS", ID_PULL_STATUS),
+    ("ID_GEMINI_EFFORT_LABEL", ID_GEMINI_EFFORT_LABEL),
 ];
 
 // ---------------------------------------------------------------------------
@@ -2225,15 +2241,48 @@ fn ollama_model_entries(models: &[ollama_admin::TagsModel], current: &str) -> (V
     (labels, selected.unwrap_or(0))
 }
 
+/// The name a just-pulled model is listed under (#635): a name typed without
+/// a tag is listed by Ollama with `:latest`.
+fn resolve_pulled_name(models: &[ollama_admin::TagsModel], name: &str) -> String {
+    if models.iter().any(|m| m.name == name) {
+        return name.to_string();
+    }
+    let latest = format!("{name}:latest");
+    if !name.contains(':') && models.iter().any(|m| m.name == latest) {
+        return latest;
+    }
+    name.to_string()
+}
+
+/// Whether the Gemini Thinking setting does anything for `model` (#569): it
+/// is only sent to the 3.x line.
+fn gemini_thinking_applies(model: &str) -> bool {
+    crate::provider::gemini::supports_thinking(model)
+}
+
+/// Greys the Gemini Thinking combo and its caption for a model it does not
+/// apply to, so a 2.5 model does not look like it has a working setting.
+fn sync_gemini_thinking_enabled(hwnd: HWND) {
+    let on = gemini_thinking_applies(combo_selected_text(hwnd, ID_GEMINI_MODEL).trim());
+    for id in [ID_GEMINI_EFFORT, ID_GEMINI_EFFORT_LABEL] {
+        if let Some(h) = get_dlg_item(hwnd, id) {
+            unsafe {
+                let _ = EnableWindow(h, on);
+            }
+        }
+    }
+}
+
 /// Fills the Ollama model combo from the pulled models, keeping whatever is
-/// selected now (#183). Called on the UI thread when the background fetch
-/// reports in.
-fn apply_ollama_models(hwnd: HWND, models: &[ollama_admin::TagsModel]) {
+/// selected now (#183), or selecting `prefer` (a model just pulled, #635).
+/// Called on the UI thread when the background fetch reports in.
+fn apply_ollama_models(hwnd: HWND, models: &[ollama_admin::TagsModel], prefer: Option<&str>) {
     let Some(combo) = get_dlg_item(hwnd, ID_OLLAMA_MODEL) else {
         return;
     };
     let shown = combo_selected_text(hwnd, ID_OLLAMA_MODEL);
-    let (labels, selected) = ollama_model_entries(models, strip_vision_badge(shown.trim()));
+    let current = prefer.unwrap_or_else(|| strip_vision_badge(shown.trim()));
+    let (labels, selected) = ollama_model_entries(models, current);
     unsafe {
         SendMessageW(combo, CB_RESETCONTENT, None, None);
     }
@@ -2439,11 +2488,12 @@ fn spawn_ollama_status_probe(
     let _ = std::thread::Builder::new()
         .name("settings-ollama-status".into())
         .spawn(move || {
-            let (status, listening) = ollama_status_line(&cfg, ollama_configured);
+            let (status, listening, stock_tray) = ollama_status_line(&cfg, ollama_configured);
             // Only searched for when nothing listens: it is not needed
             // otherwise.
             let installed = !listening && ollama_installed();
             let section = ollama_section(status, listening, installed, ollama_configured);
+            let section = without_link_for_stock_tray(section, stock_tray);
             if let Ok(mut guard) = slot.lock() {
                 *guard = Some(section);
             }
@@ -2492,6 +2542,8 @@ struct PullUpdate {
     finished: bool,
     /// Finished and the model is now pulled.
     succeeded: bool,
+    /// The model that was pulled, set with `succeeded`.
+    model: Option<String>,
 }
 
 type PullSlot = std::sync::Arc<std::sync::Mutex<PullUpdate>>;
@@ -2614,6 +2666,7 @@ fn apply_pull_update(inner: &mut SettingsInner) {
     inner.pull_cancel = None;
     set_pull_idle(inner.hwnd, &update.text);
     if update.succeeded {
+        inner.pull_select = update.model;
         spawn_ollama_models_fetch(
             inner.hwnd,
             inner.original.providers.ollama.base_url.clone(),
@@ -2670,6 +2723,7 @@ fn spawn_ollama_pull(
                     text,
                     finished: false,
                     succeeded: false,
+                    model: None,
                 });
             });
             if cancel.load(Ordering::SeqCst) {
@@ -2683,11 +2737,13 @@ fn spawn_ollama_pull(
                     ),
                     finished: true,
                     succeeded: true,
+                    model: Some(name.clone()),
                 },
                 Err(e) => PullUpdate {
                     text: pull_error_text(&e),
                     finished: true,
                     succeeded: false,
+                    model: None,
                 },
             });
         })
@@ -2782,6 +2838,16 @@ fn ollama_section(
         text,
         link: Some(("Local models", OLLAMA_DOCS_URL)),
     }
+}
+
+/// #604: when the stock Ollama tray app is the listener, the status text
+/// already says what to do (quit it, start Ollama yourself), so the Local
+/// models pointer is dropped rather than offering docs for the wrong server.
+fn without_link_for_stock_tray(mut section: OllamaSection, stock_tray: bool) -> OllamaSection {
+    if stock_tray {
+        section.link = None;
+    }
+    section
 }
 
 /// Where an Ollama install would be (#343): the default per-user install
@@ -2905,14 +2971,22 @@ fn health_message(health: &OllamaHealth) -> String {
 /// can make (`/api/ps`, `/api/tags`) only run when
 /// [`should_query_ollama_details`] says so (#188), and are bounded by
 /// [`OLLAMA_STATUS_HTTP_BUDGET`] in total when they do.
-fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, bool) {
+fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, bool, bool) {
     let port = ollama_admin::port_from_base_url(&cfg.base_url).unwrap_or(11434);
     let health = ollama_admin::query_ollama_health(port);
     let health_msg = health_message(&health);
     let listening = matches!(health, OllamaHealth::Listening { .. });
+    // #604: the third value, whether the listener is the stock tray app.
+    let stock = matches!(
+        health,
+        OllamaHealth::Listening {
+            kind: ListenerKind::StockTrayServer,
+            ..
+        }
+    );
 
     if !should_query_ollama_details(ollama_configured, &health) {
-        return (health_msg, listening);
+        return (health_msg, listening, stock);
     }
 
     let budget_start = std::time::Instant::now();
@@ -2922,7 +2996,7 @@ fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, b
             GpuStatus::Cpu => format!("{} is loaded on CPU.", cfg.model),
             GpuStatus::NotLoaded => format!("{} is not loaded yet.", cfg.model),
         },
-        Err(_) => return (health_msg, listening),
+        Err(_) => return (health_msg, listening, stock),
     };
 
     // Whatever's left of the budget after `/api/ps`, capped at zero rather
@@ -2950,6 +3024,7 @@ fn ollama_status_line(cfg: &OllamaConfig, ollama_configured: bool) -> (String, b
     (
         join_within(OLLAMA_TEXT_BUDGET, &[&health_msg, &gpu_line, &vision_line]),
         listening,
+        stock,
     )
 }
 
@@ -3275,7 +3350,7 @@ fn build_ui_recorded(
         r.y,
         60,
         ROW_H,
-        0,
+        ID_GEMINI_EFFORT_LABEL,
     );
     let gemini_effort = ctx.create(
         WC_COMBOBOX,
@@ -3296,6 +3371,7 @@ fn build_ui_recorded(
         &EFFORT_LABELS,
         &effort_display(&config.providers.gemini.effort),
     );
+    sync_gemini_thinking_enabled(hwnd);
     r.advance();
 
     // Ollama (#183): no key, only which pulled model to use. The combo starts
@@ -5218,7 +5294,7 @@ mod tests {
         };
         assert_eq!(
             ollama_status_line(&cfg, true),
-            ("Ollama is not running.".to_string(), false)
+            ("Ollama is not running.".to_string(), false, false)
         );
     }
 
@@ -5255,6 +5331,63 @@ mod tests {
         let sec = ollama_section("Ollama is running.".into(), true, true, true);
         assert_eq!(sec.text, "Ollama is running.");
         assert!(sec.link.is_some());
+    }
+
+    // -- Follow-ups (#635, #604, #569) -------------------------------------
+
+    #[test]
+    fn the_stock_tray_listener_gets_no_local_models_button() {
+        let running = ollama_section("Ollama is running.".into(), true, true, true);
+        assert!(running.link.is_some());
+        let stock = without_link_for_stock_tray(running.clone(), true);
+        assert_eq!(stock.link, None);
+        assert_eq!(stock.text, running.text, "the warning text is kept");
+        // Any other listener keeps its button.
+        assert_eq!(without_link_for_stock_tray(running.clone(), false), running);
+    }
+
+    #[test]
+    fn enter_in_the_pull_box_pulls_instead_of_saving() {
+        assert_eq!(enter_command(ID_PULL_NAME), ID_PULL_BUTTON);
+        assert_eq!(enter_command(ID_PULL_BUTTON), ID_PULL_BUTTON);
+    }
+
+    #[test]
+    fn a_pulled_model_is_found_under_its_listed_name() {
+        let tag = |name: &str| -> ollama_admin::TagsModel {
+            serde_json::from_value(serde_json::json!({ "name": name })).unwrap()
+        };
+        let models = vec![tag("a:1b"), tag("llama3.2:latest")];
+        assert_eq!(resolve_pulled_name(&models, "a:1b"), "a:1b");
+        // A name typed without a tag is listed with ":latest".
+        assert_eq!(resolve_pulled_name(&models, "llama3.2"), "llama3.2:latest");
+        assert_eq!(resolve_pulled_name(&models, "other"), "other");
+        // And the combo selects it.
+        let (labels, selected) = ollama_model_entries(&models, "llama3.2:latest");
+        assert_eq!(labels[selected], "llama3.2:latest");
+    }
+
+    /// #569 wired check: the Thinking combo is really greyed in the window
+    /// for a 2.5 model, and live for a 3.x one.
+    #[test]
+    fn the_gemini_thinking_combo_is_greyed_for_a_2_5_model() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+        for (model, enabled) in [("gemini-2.5-pro", false), ("gemini-3.8-flash", true)] {
+            let mut cfg = Config::default();
+            cfg.providers.gemini.model = model.to_string();
+            with_window(cfg, |hwnd, _| {
+                for id in [ID_GEMINI_EFFORT, ID_GEMINI_EFFORT_LABEL] {
+                    let h = get_dlg_item(hwnd, id).unwrap();
+                    assert_eq!(unsafe { IsWindowEnabled(h) }.as_bool(), enabled, "{model}");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn gemini_thinking_applies_only_to_the_3_line() {
+        assert!(gemini_thinking_applies("gemini-3.8-flash"));
+        assert!(!gemini_thinking_applies("gemini-2.5-pro"));
     }
 
     // -- Pull model (#566, pure) -------------------------------------------
@@ -5553,6 +5686,13 @@ mod tests {
     /// Opens a real (hidden) Settings window whose Ollama base URL is `base`,
     /// runs `body` with its handle and state, and tears it down.
     fn with_pull_window(base: &str, body: impl FnOnce(HWND, *mut SettingsInner)) {
+        let mut cfg = Config::default();
+        cfg.providers.ollama.base_url = base.to_string();
+        with_window(cfg, body);
+    }
+
+    /// Like [`with_pull_window`] for any config.
+    fn with_window(cfg: Config, body: impl FnOnce(HWND, *mut SettingsInner)) {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
         let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
@@ -5560,8 +5700,6 @@ mod tests {
         ensure_test_class(instance);
         ensure_common_controls();
 
-        let mut cfg = Config::default();
-        cfg.providers.ollama.base_url = base.to_string();
         let raw = Box::into_raw(Box::new(SettingsInner::new(cfg.clone())));
         let class_name = wide_z(TEST_CLASS_NAME);
         let title = wide_z("Wingman settings (pull test)");
@@ -5704,6 +5842,7 @@ mod tests {
                 text: "stale".into(),
                 finished: true,
                 succeeded: true,
+                model: None,
             };
             unsafe {
                 SendMessageW(
@@ -5831,7 +5970,7 @@ mod tests {
             effort: "low".to_string(),
         };
 
-        let (status, _) = ollama_status_line(&cfg, false);
+        let (status, _, _) = ollama_status_line(&cfg, false);
         // The Win32-only health check still runs (it's cheap) and is all
         // this status line shows when not configured -- no GPU/CPU or
         // vision-count sentence appended, which is what the HTTP calls

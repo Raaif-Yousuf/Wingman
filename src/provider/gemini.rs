@@ -245,7 +245,7 @@ impl Gemini {
 /// (scope cut, not a bug -- #17 does not ask for it).
 ///
 /// Also used as this provider's `thinking` capability.
-fn supports_thinking(model: &str) -> bool {
+pub(crate) fn supports_thinking(model: &str) -> bool {
     model.starts_with("gemini-3")
 }
 
