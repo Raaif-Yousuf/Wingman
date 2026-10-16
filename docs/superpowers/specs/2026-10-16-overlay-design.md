@@ -1,12 +1,12 @@
 # The in-place overlay
 
-Status: **proposed, 2026-10-16** (AGENTS.md rule 12). Covers #325 (the
+Status: **accepted, 2026-10-16** (AGENTS.md rule 12). Covers #325 (the
 overlay), #326 (clickable), #329 (ghost text in form fields), #332 (red mark
 on the wrong line), #333 (translate in place), #337 (underline the stack-trace
 line), the overlay half of #334, #335 and #336 (labels for jargon and dates),
 and settles the question in spike #383 (how to locate text on screen) as far as
 the code and docs allow. Fits with the
-[options card spec](2026-10-16-options-card-design.md) (draft, PR #661) and
+[options card spec](2026-10-16-options-card-design.md) (accepted, PR #661) and
 supplements the [expansion plan](2026-09-16-expansion-plan-design.md) §7
 "Outputs", which today lists card, insert at cursor, clipboard and executor
 outcomes. This adds one: **annotations drawn on the screen, next to the text
@@ -77,8 +77,8 @@ idle. Every failure ends in a card. Redaction applies before any upload.
   the flag is what keeps labels out of Wingman's own capture, not the capture
   path. The flag is also what keeps them out of a screen share or a recorder.
   See "Excluding the overlay from capture" for the full result.
-- **Exe size.** `perf-budgets.json` records 3,800,576 bytes measured against a
-  gate of 3,900,000, about 99 KB of headroom, shared with the options card,
+- **Exe size.** `perf-budgets.json` records 3,982,336 bytes measured against a
+  gate of 4,500,000, about 518 KB of headroom, shared with the options card,
   Settings dark mode and knowledge specs. AGENTS.md's "about 3.5 MB" is stale.
   See "Size budget".
 - `Action` (in `actions/mod.rs`) has `id, name, group, inputs, proposal,
@@ -251,7 +251,7 @@ screen share and recordings.
   Windows 10, and an `UpdateLayeredWindow` bitmap with per-pixel partial alpha
   (labels will have some; the flag acts on the whole window, so it is not
   expected to differ, but only a solid colour was checked).
-  Consequences for the design: open question 3 is answered, so no
+  Consequences for the design: question 3 is resolved, so no
   hide-before-capture fallback is needed; the affinity call stays a hard guard
   (see "When a guard cannot run") because a failed call means the labels are in
   the capture; and manual check 1 stays as the end-to-end proof in the real app.
@@ -350,7 +350,7 @@ process on each event. Both are work done while the user does something else,
 and both can show a label on the wrong word during the catch-up. Moving the
 whole overlay by the window's delta on a drag would be cheap and correct for a
 pure move, but a move is the rare event; a scroll is the common one, and it
-cannot be followed. **Recommendation: dismiss on change, no tracking.** One
+cannot be followed. **Decision: dismiss on change, no tracking.** One
 press redraws.
 
 ## The anchor model
@@ -462,7 +462,7 @@ action falls back to the card.
 ## #383: how to locate text, and what is still owed
 
 The spike compares Windows OCR boxes, Florence-2, PaddleOCR-VL and
-Qwen3-VL grounding. **Recommendation: Windows OCR word boxes plus local text
+Qwen3-VL grounding. **Decision: Windows OCR word boxes plus local text
 matching is the default and ships first; UIA ranges are the exact source where
 an app offers them; no grounding model is adopted.** What the code and docs
 already show:
@@ -481,7 +481,7 @@ Why the default holds without more measurement:
 - The anchor needs a *word box for text we can name*, and Windows OCR returns
   exactly that. A grounding model solves a harder problem (find something
   describable) than the one posed (find these words).
-- The exe gate is 3,900,000 bytes with 3,800,576 measured (perf-budgets.json;
+- The exe gate is 4,500,000 bytes with 3,982,336 measured (perf-budgets.json;
   AGENTS.md's about 3.5 MB and the spike text's about 2 MB are both out of date),
   and any model runtime must stay optional. Adopting a
   runtime for the sake of a fallback is a large cost for the cases it rescues.
@@ -711,24 +711,21 @@ this sends the whole screen text, so the redaction rules above apply in full.
 
 ## #326: clickable labels
 
-Slice 7, built after the read-only slices have proven the window. **It does not
-start until open question 13 is answered**, because it can write without an
-Enter confirm, which the product rule (Look, Propose, Confirm, Do) does not
-allow as drafted.
+Slice 7, built after the read-only slices have proven the window. **Decision
+(question 13): a click does not write on its own; Enter confirms**, as the
+product rule (Look, Propose, Confirm, Do) requires.
 
-As #326 is written, a click on a label writes the fix at once: "the label is the
-preview, the click is the confirmation". The options card spec states that every
-writing option goes through the preview card and waits for Enter, so this is an
-exception to a fixed rule, not a design detail. Two further risks: labels sit
+#326 as first written has a click on a label write the fix at once: "the label
+is the preview, the click is the confirmation". The options card spec states
+that every writing option goes through the preview card and waits for Enter, so
+that would have been an exception to a fixed rule, and it is not taken. Two further risks: labels sit
 over neighbouring text, so an accidental click on one is a write; and a click is
 easy to land on a label that moved.
 
-**Recommended design: Enter confirm.** A click on a label is the Propose step: it
+**Design: Enter confirm.** A click on a label is the Propose step: it
 opens the existing preview card for exactly that change (the old and new text,
 Do it focused), and Enter or the button is the Confirm. Preview equals
-execution still holds, one extra keypress. If open question 13 is answered the
-other way, the single click write ships only with every guard below plus the
-rule documented as an exception in AGENTS.md.
+execution still holds, at the cost of one extra keypress.
 
 What #326 adds, under the executor rules either way:
 
@@ -916,7 +913,8 @@ Each ships alone and has an observable.
 0. **Spike (done 2026-10-16, no product change).** `examples/capture_exclusion_spike.rs`:
    a layered window with `WDA_EXCLUDEFROMCAPTURE`, captured through `xcap` (GDI
    and `wgc`) and `PrintWindow`, with and without the flag. The flag holds for
-   all three; result in "Excluding the overlay from capture". Slice 1 can start.1. **Anchor core and layout (pure).** `anchor`, `layout`, the alpha pass,
+   all three; result in "Excluding the overlay from capture". Slice 1 can start.
+1. **Anchor core and layout (pure).** `anchor`, `layout`, the alpha pass,
    `state`, the shared span helpers extracted from `redact.rs`. It has no
    runtime caller until slice 2, so the new modules carry
    `#[cfg_attr(not(test), allow(dead_code))]`, and slice 2's done criterion is
@@ -947,22 +945,22 @@ Each ships alone and has an observable.
    packs, a local model that translates well).
 7. **#326 clickable.** UIA text anchors, `Copy`, `replace_text`, `Add to
    calendar`, Fix all on the card. Last, because it is the only slice that
-   writes, and it waits for open question 13.
+   writes, and it uses the Enter confirm flow (question 13).
 
 #383's measurements run alongside slices 1 to 3 and feed the hit-rate figure
 slice 6 needs.
 
 ### Size budget
 
-The gate is `perf-budgets.json` `exe_size_bytes.max` 3,900,000 against a last
-measurement of 3,800,576, about 99 KB of headroom, shared with the options card,
+The gate is `perf-budgets.json` `exe_size_bytes.max` 4,500,000 against a last
+measurement of 3,982,336, about 518 KB of headroom, shared with the options card,
 Settings dark mode and knowledge specs. Estimates for this spec, each THEORY
 (unverified) until a CI measurement replaces it: slice 1 about 12 KB (matcher,
 layout, edit distance, state), slice 2 about 25 KB (window, three hook kinds,
 layered bitmap, the runner branch), slice 3 about 8 KB, slice 4 about 12 KB,
 slice 5 about 6 KB, slice 6 about 30 KB across the five proposal kinds, the
 gutter matcher and font fitting, slice 7 about 10 KB. That is 60 to 120 KB in
-all, so **this spec cannot be absorbed by the existing headroom alone**: the
+all, so it may not fit the headroom alone alongside the other specs: the
 pull request that crosses the gate raises it with the measured size and the
 reason, as the QR decoder and the live model lists did, and the order the
 specs merge in decides which one does. No new crate is planned (a `windows`
@@ -981,71 +979,74 @@ slice's PR records the CI-measured size.
 - Convert currency.
 - Draw over exclusive-fullscreen apps.
 
-## Open questions
+## Resolved questions
 
-Each with a recommended answer. Where a counter-argument exists it is stated, so
-the question stays open.
+Each was an open question with a recommended answer; the recommended answer
+is the decision.
 
-1. **One window per monitor sized to the marks' bounding box, or one per
-   annotation?** One per monitor. Per-annotation windows make z-order and
-   hit-testing simple but cost 20 window creations and make "the overlay" harder
-   to hide atomically.
-2. **Put the OCR text in the model prompt?** Yes for text-anchored model
-   overlays, redacted through the existing text path. It turns most matches
-   into exact matches. The token count must be measured on real captures before
-   slice 6; revisit if it is larger than 600.
-3. **Does the display affinity flag hold for a layered window under `xcap`?**
-   Yes. MEASURED 2026-10-16 (see "Excluding the overlay from capture"): the
-   call succeeds and the window is absent from the GDI capture, the `wgc`
-   capture and `PrintWindow`. No hide-before-capture fallback is needed for
-   Wingman's own captures, and awareness capture (#330) is not blocked on a
-   different exclusion. The fallback stays only for the case where the call
-   itself fails, which means no overlay.4. **Any key dismisses, or only keys that can change content?** Any non-modifier
-   key while the foreground window is in the target set, decided on the main
-   thread, never inside the hook callback. A narrower list would miss an app's
-   own shortcuts. The cost is that a stray key press hides the overlay, which is
-   the safe direction.
-5. **How long is the age cap?** 30 s. A person reads a screen of labels in
-   seconds. The cap exists for the pages that change under the user. A one-shot
-   timer set at show and killed in the single hide function is the same pattern
-   as the card's `auto_dismiss_secs`, not a polling timer.
-6. **Should the overlay honour `options.click_away_dismiss`?** Revised answer: the
-   overlay never does, its card does. The overlay always hides on a click not on a
-   label (the staleness table already says so), and the card follows the setting;
-   if the card stays it says the marks are hidden. Counter-argument for one
-   switch governing both: a user who turned click-away off wants a persistent
-   card, and a card that edits its own line is surprising. Recommended: keep the
-   two separate, because a stale overlay is a correctness problem and a stale
-   card line is not.7. **Fuzzy matching in the first slice?** Yes, with the unique-match rule. OCR
-   misreads (`l`/`1`, `rn`/`m`) are the common failure and a model quoting
-   from the image rather than the OCR text will hit them. Tune the threshold
-   from the fixture hit rate.
-8. **Order in #332's schema, `steps` before `detail`?** Yes, see "Domain
-   schemas". The issue text says headline first, which conflicts with the code
-   and with rule 3.
-9. **Handwriting (#332)?** Anchor with OCR, fall back to the card when a step
-   cannot be placed, and say so on the card. Do not add a model for it before the
-   spike measures how bad it is.
-10. **Currency in the units overlay?** Not in slice 3. It needs a rate source;
-    that is a network call with privacy and staleness questions of its own, so it
-    is its own issue.
-11. **A recording-friendly overlay (`overlay.capturable`)?** Config only, default
-    off, documented for demos. A Settings toggle would invite turning off the
-    protection by accident.
-12. **Do UIA text ranges replace OCR where both exist?** No. OCR is the default
-    for read-only marks (one code path, works everywhere). UIA is used where the
-    action must also write (#326) or the anchor is a field (#329).
-13. **#326: may a click write without an Enter confirm?** This needs a decision
-    against Look, Propose, Confirm, Do. Recommended: no. A click on a label opens
-    the preview card for that exact change and Enter confirms. Counter-argument:
-    one click is the point of #326, and the label already shows the exact change.
-    The risks are an accidental click on a label that sits over other text, and a
-    click that lands on a label that has just moved. If the answer is yes, the
-    exception is written into AGENTS.md and slice 7 keeps every guard listed in
-    "#326: clickable labels".
-14. **Do ghost text and marks survive Alt+Tab?** Recommended: no, hide and do not
-    restore, with the preview card as the source of truth (stated in "When the
-    screen changes"). Counter-argument: the preview survives Alt+Tab by design,
-    so a user who tabs back finds a preview with no ghost text. Restoring needs
-    the overlay to re-verify that the form window has not changed, which is the
-    tracking this spec rejects.
+1. **Decision: one window per monitor, sized to the marks' bounding box.**
+   Per-annotation windows would cost about 20 window creations and make
+   hiding the overlay atomically harder.
+2. **Decision: the OCR text goes in the model prompt for text-anchored model
+   overlays**, redacted through the existing text path. It turns most matches
+   into exact matches. Measure the token count on real captures before slice
+   6; revisit if it is larger than 600.
+3. **Decision: the display affinity flag is the capture guard.** MEASURED
+   2026-10-16 (see "Excluding the overlay from capture"): the call succeeds
+   and the window is absent from the GDI capture, the `wgc` capture and
+   `PrintWindow`. No hide-before-capture fallback is needed for Wingman's own
+   captures, and awareness capture (#330) is not blocked on a different
+   exclusion. If the call itself fails, there is no overlay.
+4. **Decision: any non-modifier key dismisses** while the foreground window is
+   in the target set, decided on the main thread, never inside the hook
+   callback. A narrower list would miss an app's own shortcuts. A stray key
+   press hides the overlay, which is the safe direction.
+5. **Decision: the age cap is 30 s.** The cap exists for pages that change
+   under the user. A one-shot timer set at show and killed in the single hide
+   function is the same pattern as the card's `auto_dismiss_secs`, not a
+   polling timer.
+6. **Decision: the overlay never honours `options.click_away_dismiss`; its
+   card does.** The overlay always hides on a click not on a label (the
+   staleness table says so), and the card follows the setting; if the card
+   stays it says the marks are hidden. The two are kept separate because a
+   stale overlay is a correctness problem and a stale card line is not.
+7. **Decision: fuzzy matching ships in the first slice, with the
+   unique-match rule.** OCR misreads (`l`/`1`, `rn`/`m`) are the common
+   failure. Tune the threshold from the fixture hit rate.
+8. **Decision: in #332's schema, `steps` comes before `detail`** (see "Domain
+   schemas"). The issue text says headline first, which conflicts with the
+   code and with rule 3.
+9. **Decision: handwriting (#332) is anchored with OCR**, falls back to the
+   card when a step cannot be placed, and says so on the card. No model is
+   added for it before the spike measures how bad it is.
+10. **Decision: no currency in the units overlay.** It needs a rate source,
+    which is a network call with privacy and staleness questions, so it is its
+    own issue.
+11. **Decision: `overlay.capturable` is config only**, default off, documented
+    for demos. A Settings toggle would invite turning off the protection by
+    accident.
+12. **Decision: UIA text ranges do not replace OCR where both exist.** OCR is
+    the default for read-only marks (one code path, works everywhere). UIA is
+    used where the action must also write (#326) or the anchor is a field
+    (#329).
+13. **Decision: #326 uses Enter confirm.** A click on a label opens the
+    preview card for that exact change and Enter confirms (Look, Propose,
+    Confirm, Do). No click-to-write exception is added to AGENTS.md, and
+    slice 7 keeps every guard listed in "#326: clickable labels".
+14. **Decision: Alt+Tab hides the overlay and ghost text, with no restore.**
+    The preview card is the source of truth (see "When the screen changes").
+    Restoring would need the overlay to re-verify that the form window has not
+    changed, which is the tracking this spec rejects.
+
+## Related decisions
+
+- **Decision: the exe size gate is raised as needed by the slices.** The
+  budget is accepted as part of this spec: the slice whose PR crosses the
+  gate raises it with the CI-measured size and the reason.
+- **Decision: the Quick Ask palette sends no model request when it opens.**
+  It sends one only after the user picks or types. The units overlay is
+  reachable from the palette as a model-free row, so opening the palette
+  costs nothing here.
+- **Decision: a remote Ollama `base_url` in Local mode is allowed, with a
+  one-time warning that the screenshot leaves this PC.** A model-backed
+  overlay on a remote Ollama follows the same rule.
