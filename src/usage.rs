@@ -558,6 +558,15 @@ pub(crate) static SPENT_OVERRIDE: Mutex<Option<f64>> = Mutex::new(None);
 /// only for the case where the store is down, and then it is all there is.
 static MEM_SPEND: Mutex<Option<(String, f64)>> = Mutex::new(None);
 static APPROX_NOTICED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The last known price of one request, per `provider/model`, for pricing a
+/// later response that came back with no usage block.
+static LAST_COST: Mutex<Vec<(String, f64)>> = Mutex::new(Vec::new());
+/// What an unpriced cloud response with no known price counts as in the
+/// fallback total: deliberately on the high side.
+const UNPRICED_GUESS_USD: f64 = 0.01;
+/// Test seam: pretend the store cannot be read or written.
+#[cfg(test)]
+static STORE_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Adds `usd` to the in-memory total for `date`; a new date starts from zero.
 fn mem_add(mem: &mut Option<(String, f64)>, date: &str, usd: f64) {
@@ -588,10 +597,18 @@ fn spent_today(date: &str) -> (f64, bool) {
     if let Some(v) = *lock(&SPENT_OVERRIDE) {
         return (v, false);
     }
-    let stored = crate::store::global()
-        .and_then(|s| s.day_total(date))
-        .ok()
-        .map(|day| day.map_or(0.0, |d| d.usd));
+    #[cfg(test)]
+    let down = STORE_DOWN.load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let down = false;
+    let stored = if down {
+        None
+    } else {
+        crate::store::global()
+            .and_then(|s| s.day_total(date))
+            .ok()
+            .map(|day| day.map_or(0.0, |d| d.usd))
+    };
     pick_spent(stored, mem_total(&lock(&MEM_SPEND), date))
 }
 
@@ -600,10 +617,7 @@ const APPROXIMATE_NOTICE: &str = "Wingman cannot read today's saved spend, so th
 /// Once per run, tell the user the limit is running on the fallback count.
 fn queue_approximate_notice() {
     if !APPROX_NOTICED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        let mut slot = lock(&BUDGET_NOTICE);
-        if slot.is_none() {
-            *slot = Some(APPROXIMATE_NOTICE.to_string());
-        }
+        push_notice(APPROXIMATE_NOTICE.to_string());
     }
 }
 
@@ -642,8 +656,17 @@ fn queue_budget_notice(date: &str) {
     let Some(b) = *lock(&BUDGET) else { return };
     let (spent, _) = spent_today(date);
     if let Some(text) = budget_notice_for(spent, &b, date, &mut lock(&NOTIFIED)) {
-        *lock(&BUDGET_NOTICE) = Some(text);
+        push_notice(text);
     }
+}
+
+/// Adds `text` to the pending budget notice, joined with any already waiting.
+fn push_notice(text: String) {
+    let mut slot = lock(&BUDGET_NOTICE);
+    *slot = Some(match slot.take() {
+        Some(old) => format!("{old}\n\n{text}"),
+        None => text,
+    });
 }
 
 /// Counts one provider response toward today's total. Best effort: a failure
@@ -653,10 +676,35 @@ pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
     let date = local_date_today();
     let cost = request_cost(provider, model, &date, local, usage.as_ref());
     note_run_cost(cost);
-    if let Some(usd) = cost {
-        // Always counted, so the budget has a total when the store is down.
-        mem_add(&mut lock(&MEM_SPEND), &date, usd);
-    }
+    // Always counted, so the budget has a total when the store is down. An
+    // unpriced cloud response still costs something: count the last known
+    // price for this model, else a flat guess, so the fallback never undercounts to zero.
+    let counted = {
+        let mut last = lock(&LAST_COST);
+        let key = format!("{provider}/{model}");
+        match cost {
+            Some(usd) => {
+                if usd > 0.0 {
+                    last.retain(|(k, _)| *k != key);
+                    last.push((key, usd));
+                }
+                usd
+            }
+            None => last
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map_or(UNPRICED_GUESS_USD, |(_, v)| *v),
+        }
+    };
+    mem_add(&mut lock(&MEM_SPEND), &date, counted);
+    #[cfg(test)]
+    let saved = if STORE_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        Ok(())
+    } else {
+        crate::store::global()
+            .and_then(|s| s.record_usage(&date, provider, model, cost, usage.as_ref()))
+    };
+    #[cfg(not(test))]
     let saved = crate::store::global()
         .and_then(|s| s.record_usage(&date, provider, model, cost, usage.as_ref()));
     if let Err(e) = saved {
@@ -1038,6 +1086,64 @@ mod tests {
         let (spent, _) = pick_spent(None, mem_total(&mem, "2026-10-16"));
         let err = check_budget_with(&b, spent).unwrap_err();
         assert!(err.contains("Daily budget"), "{err}");
+    }
+
+    /// Puts every global this test touches back, also when an assertion panics.
+    struct DownScope;
+    impl Drop for DownScope {
+        fn drop(&mut self) {
+            set_daily_budget(0.0, 80);
+            STORE_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+            *lock(&MEM_SPEND) = None;
+            lock(&LAST_COST).clear();
+            APPROX_NOTICED.store(false, std::sync::atomic::Ordering::SeqCst);
+            *lock(&NOTIFIED) = None;
+            let _ = take_budget_notice();
+        }
+    }
+
+    fn down_scope(limit: f64) -> (DownScope, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::config::EGRESS_PREVIEW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let scope = DownScope;
+        set_daily_budget(limit, 80);
+        STORE_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+        *lock(&MEM_SPEND) = None;
+        (scope, guard)
+    }
+
+    #[test]
+    fn with_the_store_down_record_and_check_budget_still_stop_the_second_request() {
+        let (_scope, _guard) = down_scope(0.01);
+        // About $0.006 each.
+        assert!(check_budget().is_ok());
+        record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
+        assert!(check_budget().is_ok(), "one request is under the limit");
+        record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
+        let err = check_budget().expect_err("the second request must be refused");
+        assert!(err.contains("Daily budget"), "{err}");
+        let notice = take_budget_notice().unwrap_or_default();
+        assert!(notice.contains("approximate"), "{notice}");
+    }
+
+    #[test]
+    fn an_unpriced_cloud_response_still_counts_in_the_fallback_total() {
+        let (_scope, _guard) = down_scope(0.015);
+        // No usage block: unpriced, counted at the flat guess.
+        record("anthropic", "model-with-no-price", false, None);
+        assert!(check_budget().is_ok());
+        record("anthropic", "model-with-no-price", false, None);
+        assert!(check_budget().is_err());
+    }
+
+    #[test]
+    fn a_notice_already_waiting_is_joined_not_overwritten() {
+        let (_scope, _guard) = down_scope(0.0);
+        let _ = take_budget_notice();
+        push_notice("first".to_string());
+        push_notice("second".to_string());
+        assert_eq!(take_budget_notice().unwrap(), "first\n\nsecond");
     }
 
     #[test]
