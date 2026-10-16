@@ -5699,23 +5699,34 @@ mod tests {
     #[test]
     fn a_theme_message_sent_to_the_real_window_reaches_the_card() {
         // Through the window procedure, not `handle_message`: a card whose
-        // class never routed the message would pass the tests above.
-        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
-        card.inner.sys = SysColors {
-            window: 1,
-            window_text: 2,
-            gray_text: 3,
-            hotlight: 6,
-            highlight: 4,
-            highlight_text: 5,
-        };
-        let hwnd = card.inner.hwnd;
-        unsafe {
-            SendMessageW(hwnd, WM_SYSCOLORCHANGE, None, None);
+        // class never routed the message would pass the tests above. All three
+        // messages (#658), each on a fresh card with stale values.
+        let name = wide_z("ImmersiveColorSet");
+        for msg in [WM_SETTINGCHANGE, WM_THEMECHANGED, WM_SYSCOLORCHANGE] {
+            let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+            let detected = detect_theme();
+            card.inner.theme = opposite(detected);
+            card.inner.sys = SysColors {
+                window: 1,
+                window_text: 2,
+                gray_text: 3,
+                hotlight: 6,
+                highlight: 4,
+                highlight_text: 5,
+            };
+            let hwnd = card.inner.hwnd;
+            let lparam = if msg == WM_SETTINGCHANGE {
+                Some(LPARAM(name.as_ptr() as isize))
+            } else {
+                None
+            };
+            unsafe {
+                SendMessageW(hwnd, msg, None, lparam);
+            }
+            assert_eq!(card.inner.theme, detected, "message {msg:#x}");
+            assert_eq!(card.inner.sys, SysColors::read(), "message {msg:#x}");
         }
-        assert_eq!(card.inner.sys, SysColors::read());
     }
-
     #[test]
     fn the_high_contrast_setting_change_makes_the_card_re_read_the_theme() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
