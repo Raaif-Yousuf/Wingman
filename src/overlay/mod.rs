@@ -5,4 +5,10 @@
 //! removes the `allow(dead_code)` markers in this module.
 
 #[cfg_attr(not(test), allow(dead_code))]
+pub mod alpha;
+#[cfg_attr(not(test), allow(dead_code))]
 pub mod anchor;
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod layout;
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod state;
