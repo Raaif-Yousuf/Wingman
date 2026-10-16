@@ -527,6 +527,7 @@ pub fn run() -> Result<()> {
     if let Some((headline, detail)) = startup_card(
         &config.unreadable_secrets,
         crate::single_instance::lock_squatted(),
+        config.load_problem.as_deref(),
     ) {
         card.show_error(&headline, &detail);
     }
@@ -667,20 +668,46 @@ fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
 /// unreadable keys, #237 lockless start) end in a card, and one must never
 /// overwrite the other, so when both apply their text is joined. Pure so the
 /// wording is unit-tested without a `Card`. No em dash (rule 11).
-fn startup_card(unreadable: &[String], lock_squatted: bool) -> Option<(String, String)> {
+fn startup_card(
+    unreadable: &[String],
+    lock_squatted: bool,
+    config_problem: Option<&str>,
+) -> Option<(String, String)> {
     let squat = (
         "Another program holds Wingman's startup lock".to_string(),
         "Wingman started anyway. If you see two Wingman tray icons, quit one of them.".to_string(),
     );
-    match (unreadable.is_empty(), lock_squatted) {
-        (true, false) => None,
-        (false, false) => Some(unreadable_secrets_card(unreadable)),
-        (true, true) => Some(squat),
-        (false, true) => {
-            let (headline, detail) = unreadable_secrets_card(unreadable);
-            Some((headline, format!("{detail}\n\n{}. {}", squat.0, squat.1)))
-        }
+    // Every problem that applies, in order; the first one's headline leads
+    // and the rest are joined, so none is dropped.
+    let mut cards = Vec::new();
+    if let Some(problem) = config_problem {
+        cards.push(config_problem_card(problem));
     }
+    if !unreadable.is_empty() {
+        cards.push(unreadable_secrets_card(unreadable));
+    }
+    if lock_squatted {
+        cards.push(squat);
+    }
+    let mut cards = cards.into_iter();
+    let (headline, mut detail) = cards.next()?;
+    for (h, d) in cards {
+        detail = format!("{detail}\n\n{h}. {d}");
+    }
+    Some((headline, detail))
+}
+
+/// #711: config.toml exists but did not parse. Names the line and column
+/// (`problem` already carries them), never file text. No em dash (rule 11).
+fn config_problem_card(problem: &str) -> (String, String) {
+    (
+        "Settings file not read".to_string(),
+        format!(
+            "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
+             computer) and will not save over your file. Fix it, then choose Reload settings \
+             from the tray menu."
+        ),
+    )
 }
 
 fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
@@ -2196,6 +2223,13 @@ impl App {
                 }
             }
         }
+        // #70: a receipt is one row under five fixed headers, whatever the
+        // model sent.
+        let proposal = if action.id == actions::receipt::ACTION_ID {
+            actions::receipt::clamp_receipt(&proposal)
+        } else {
+            proposal
+        };
         // #69: no table on screen, or a reply that is not a table, is an
         // answer, not an empty preview.
         let table_headline = if actions::table::is_unreadable(&action.proposal, &proposal) {
@@ -2877,7 +2911,7 @@ impl App {
 
     /// Handles the fill_form worker's result (#40). `value` carries one of
     /// three shapes: an empty-profile signal
-    /// (`{"empty_profile": true, "toml_path": ..., "bin_path": ...}` --
+    /// (`{"empty_profile": true, "toml_path": ..., "data_dir": ...}` --
     /// `form_fill_worker` returns this instead of ever building a UIA
     /// snapshot, per `actions::fill_form::load_or_import_profile`'s own
     /// "point at where to add profile data" decision), a proposal with no
@@ -2910,11 +2944,11 @@ impl App {
 
         if value.get("empty_profile").and_then(Value::as_bool) == Some(true) {
             let toml_path = value.get("toml_path").and_then(Value::as_str).unwrap_or("");
-            let bin_path = value.get("bin_path").and_then(Value::as_str).unwrap_or("");
+            let data_dir = value.get("data_dir").and_then(Value::as_str).unwrap_or("");
             self.card.show_answer(
                 actions::fill_form::EMPTY_PROFILE_HEADLINE,
                 &with_pending_notices(&actions::fill_form::empty_profile_detail(
-                    toml_path, bin_path,
+                    toml_path, data_dir,
                 )),
                 0,
                 None,
@@ -3476,6 +3510,13 @@ impl App {
 
     fn reload(&mut self) {
         match Config::load() {
+            // #711: a file that does not parse must not replace the settings
+            // already running; keep them and say what is wrong.
+            Ok(config) if config.load_problem.is_some() => {
+                let (headline, detail) =
+                    config_problem_card(config.load_problem.as_deref().unwrap_or_default());
+                self.card.show_error(&headline, &detail);
+            }
             Ok(config) => {
                 // #175: report before self.config is overwritten, since the
                 // freshly loaded config is the one whose hydrate ran.
@@ -4308,16 +4349,17 @@ fn form_fill_worker(
     require_tick_for: crate::config::RequireTickFor,
     use_model: bool,
 ) -> Result<Value> {
-    let profile = actions::fill_form::load_or_import_profile()
-        .context("failed to load or import the profile")?;
+    // No added context: the store's own messages are the card text (a
+    // profile sealed for another Windows user or PC says so, in plain words).
+    let profile = actions::fill_form::load_or_import_profile()?;
 
     if actions::fill_form::profile_is_empty(&profile) {
-        let bin_path = crate::profile::Profile::path()?;
-        let toml_path = bin_path.with_file_name("profile.toml");
+        let toml_path = actions::fill_form::profile_toml_path()?;
+        let data_dir = crate::store::data_dir().unwrap_or_default();
         return Ok(serde_json::json!({
             "empty_profile": true,
             "toml_path": toml_path.display().to_string(),
-            "bin_path": bin_path.display().to_string(),
+            "data_dir": data_dir.display().to_string(),
         }));
     }
 
@@ -4578,6 +4620,7 @@ fn with_pending_notices(detail: &str) -> String {
         [
             crate::store::take_notice(),
             crate::usage::take_budget_notice(),
+            crate::config::take_backup_warning(),
             crate::actions::take_skipped_notice(),
         ]
         .into_iter()
@@ -7711,16 +7754,35 @@ mod tests {
     #[test]
     fn startup_card_shows_neither_one_or_both_problems() {
         let keys = vec!["openai".to_string()];
-        assert_eq!(super::startup_card(&[], false), None);
-        let only_keys = super::startup_card(&keys, false).unwrap();
+        assert_eq!(super::startup_card(&[], false, None), None);
+        let only_keys = super::startup_card(&keys, false, None).unwrap();
         assert!(only_keys.0.contains("key"), "{only_keys:?}");
-        let only_squat = super::startup_card(&[], true).unwrap();
+        let only_squat = super::startup_card(&[], true, None).unwrap();
         assert!(only_squat.0.contains("startup lock"), "{only_squat:?}");
-        let (headline, detail) = super::startup_card(&keys, true).unwrap();
+        let (headline, detail) = super::startup_card(&keys, true, None).unwrap();
         assert_eq!(headline, only_keys.0);
         assert!(detail.contains(&only_keys.1), "keys text kept: {detail}");
         assert!(detail.contains(&only_squat.0), "squat text added: {detail}");
         assert!(!detail.contains('\u{2014}'));
+    }
+
+    /// #711: a config.toml that did not parse gets its own card, with the
+    /// location, and it is not lost when the other startup problems apply.
+    #[test]
+    fn startup_card_reports_a_config_file_that_did_not_parse() {
+        let problem = "config.toml has an error at line 3, column 7";
+        let (headline, detail) = super::startup_card(&[], false, Some(problem)).unwrap();
+        assert!(headline.contains("Settings file"), "{headline}");
+        assert!(detail.contains(problem), "{detail}");
+        assert!(detail.contains("Reload settings"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
+        let (_, both) = super::startup_card(&["openai".to_string()], true, Some(problem)).unwrap();
+        assert!(
+            both.contains(problem) && both.contains("startup lock"),
+            "{both}"
+        );
+        assert!(both.contains("Stored API key unreadable"), "{both}");
+        assert!(both.contains("Offline"), "{both}");
     }
 
     /// #237: the owner window must exist before the single-instance name is
