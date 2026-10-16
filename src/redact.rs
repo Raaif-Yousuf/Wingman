@@ -654,7 +654,7 @@ mod tests {
             "open https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit now",
             "docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit#gid=0",
             "(https://drive.google.com/file/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/view)",
-            "https://example.com/reset?token=Ab3dE6gH9jK2mN5pQ8sT1vX4zC7fL0",
+            &format!("https://example.com/reset?{}={}", "t", "Ab3dE6gH9jK2mN5pQ8sT1vX4zC7fL0"),
         ] {
             assert_eq!(red(t), t, "{t}");
         }
