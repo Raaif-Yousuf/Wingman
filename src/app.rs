@@ -675,6 +675,26 @@ impl App {
         })
     }
 
+    /// #339: when a password manager is the foreground window, shows the
+    /// "does not read password managers" card and returns `true`; the caller
+    /// must then return without capturing, reading or asking anything. Every
+    /// main-thread entry point that gathers input calls this first, which
+    /// `password_managers`' source-scanning tests enforce.
+    fn refuse_if_password_manager(&mut self) -> bool {
+        if !crate::password_managers::foreground_is_password_manager(
+            &self.config.capture.extra_password_managers,
+        ) {
+            return false;
+        }
+        self.card.show_answer(
+            crate::password_managers::REFUSAL_HEADLINE,
+            crate::password_managers::REFUSAL_DETAIL,
+            3,
+            None,
+        );
+        true
+    }
+
     /// Issue #214: the pause/busy/hide-stale-card/readiness/capture pipeline
     /// shared by every action that shows a pending card, captures the
     /// screen, and hands off to a worker thread which posts back one of the
@@ -730,6 +750,11 @@ impl App {
                 return None;
             }
             ModelActionGate::Proceed => {}
+        }
+
+        // #339: before the card is touched and before anything is read.
+        if self.refuse_if_password_manager() {
+            return None;
         }
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
@@ -952,8 +977,13 @@ impl App {
         // #24: candidates are built from the SAME catalogue about to be
         // shown, before it moves into `Palette::show` below.
         let candidates = router::candidates_from_catalogue(&catalogue);
+        // #339: asked BEFORE the palette takes the foreground. The router
+        // sends a screenshot, so it must not run over a password manager.
+        let password_manager_in_front = crate::password_managers::foreground_is_password_manager(
+            &self.config.capture.extra_password_managers,
+        );
         self.palette.show(catalogue, model_configured, footer);
-        self.maybe_start_router(candidates);
+        self.maybe_start_router(candidates, password_manager_in_front);
     }
 
     /// #24: the intent router's hook, called right after
@@ -973,8 +1003,12 @@ impl App {
     /// failure the user is told about (rule 7's "every failure ends in a
     /// card" is about the action the user actually asked for; the router
     /// never was one).
-    fn maybe_start_router(&mut self, candidates: Vec<router::RouterCandidate>) {
-        if pause::is_paused_now() {
+    fn maybe_start_router(
+        &mut self,
+        candidates: Vec<router::RouterCandidate>,
+        password_manager_in_front: bool,
+    ) {
+        if pause::is_paused_now() || password_manager_in_front {
             return;
         }
 
@@ -1156,6 +1190,10 @@ impl App {
             return;
         }
 
+        if self.refuse_if_password_manager() {
+            return;
+        }
+
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
             self.card.hide();
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
@@ -1214,6 +1252,10 @@ impl App {
     /// else in this crate (e.g. a declined confirm-card proposal).
     fn copy_region(&mut self) {
         if self.busy {
+            return;
+        }
+
+        if self.refuse_if_password_manager() {
             return;
         }
 
@@ -2738,6 +2780,10 @@ impl App {
         if pause::is_paused_now() {
             self.card
                 .show_answer("Paused", "Resume from the tray menu to calculate.", 3, None);
+            return;
+        }
+
+        if self.refuse_if_password_manager() {
             return;
         }
 

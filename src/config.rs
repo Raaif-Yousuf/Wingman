@@ -255,6 +255,10 @@ pub struct Capture {
     /// languages) or a BCP-47 tag such as "de" or "de-DE" naming an
     /// installed Windows OCR language pack.
     pub ocr_language: String,
+    /// Extra password manager programs (#339), by executable name such as
+    /// "myvault.exe". Wingman never captures or reads while any of these, or
+    /// a built-in password manager, is the foreground window.
+    pub extra_password_managers: Vec<String>,
 }
 
 impl Default for Capture {
@@ -264,6 +268,7 @@ impl Default for Capture {
             monitor: "active".to_string(),
             redact: true,
             ocr_language: "auto".to_string(),
+            extra_password_managers: Vec::new(),
         }
     }
 }
@@ -2149,6 +2154,14 @@ model = "gpt-5.5"
         p.compat = vec![compat_entry("lmstudio", "http://127.0.0.1:1234/v1")];
         p.order = vec!["compat:lmstudio".to_string()];
         assert!(!p.sends_screenshot_off_machine(Mode::Auto));
+    }
+
+    #[test]
+    fn extra_password_managers_defaults_empty_and_reads_from_toml() {
+        assert!(Config::default().capture.extra_password_managers.is_empty());
+        let cfg: Config =
+            toml::from_str("[capture]\nextra_password_managers = [\"myvault.exe\"]\n").unwrap();
+        assert_eq!(cfg.capture.extra_password_managers, vec!["myvault.exe"]);
     }
 
     #[test]
