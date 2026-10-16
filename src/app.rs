@@ -10661,7 +10661,17 @@ mod tests {
     #[test]
     fn setup_cards_are_shown_through_the_one_helper_that_arms_click_away() {
         let src = include_str!("app.rs").replace('\r', "");
-        let production = &src[..src.find("#[cfg(test)]").expect("test module")];
+        // Split on the real test module: a bare "#[cfg(test)]" also appears in
+        // doc comments and on test-only items well before it.
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields a first part");
+        assert!(
+            production.contains("fn show_setup_card("),
+            "production not scanned"
+        );
+        assert!(production.contains("fn wnd_proc("), "production cut short");
         let body_of = |name: &str| {
             let start = production
                 .find(&format!("    fn {name}("))
@@ -10673,11 +10683,19 @@ mod tests {
         // The helper itself and the startup welcome card.
         assert_eq!(direct, 2, "a setup card bypasses show_setup_card");
         assert!(body_of("show_setup_card").contains("set_watch(true)"));
-        for name in ["reload", "edit_settings"] {
-            assert!(
-                body_of(name).contains("set_watch(true)"),
-                "{name} shows a persistent card without arming click-away"
-            );
+        assert!(body_of("reload").contains("set_watch(true)"));
+        // Every early return in edit_settings that follows a card arms it.
+        let edit = body_of("edit_settings");
+        let returns: Vec<usize> = edit.match_indices("return;").map(|(i, _)| i).collect();
+        assert!(returns.len() >= 2, "edit_settings candidates not found");
+        for at in returns {
+            let before = &edit[at.saturating_sub(120)..at];
+            if before.contains(".show_error") {
+                assert!(
+                    before.contains("set_watch(true)"),
+                    "edit_settings returns after a card without arming click-away"
+                );
+            }
         }
     }
 
