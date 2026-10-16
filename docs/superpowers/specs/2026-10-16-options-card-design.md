@@ -4,7 +4,7 @@ Status: **proposed, 2026-10-16** (AGENTS.md rule 12). Covers #305 (epic),
 #306, #307, #308, #324, #393, and, as later slices, #42 and #107. Supplements
 the [expansion plan](2026-09-16-expansion-plan-design.md) §6 "The intent
 router" and the [palette spec](2026-09-17-palette-design.md). Where they
-disagree on what a bare key press does, this spec wins once approved.
+disagree on what a bare key press does, this spec wins.
 
 ## The problem
 
