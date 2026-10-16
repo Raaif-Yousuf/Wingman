@@ -106,6 +106,7 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   `providers.gemini.model`. Ships with `gemini-3.8-flash`,
   `gemini-3.1-pro-preview`, `gemini-3.6-flash`, `gemini-2.5-pro`,
   `gemini-2.5-flash`.
+  A config that still lists `gemini-3.5-flash` keeps it (hand-edited lists are never rewritten), but Google no longer lists that id, so it shows no cost and may be rejected; pick another model.
 - **Effort/thinking:** `generationConfig.thinkingConfig.thinkingLevel`
   (`"low"`/`"medium"`/`"high"`), sent only to the Gemini 3.x line
   (`supports_thinking`). The 2.5-series models think by default under a

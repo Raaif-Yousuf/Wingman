@@ -269,8 +269,8 @@ const PRICES: &[PriceRow] = &[
         p(0.30, 2.5, 0.30, 0.03),
         GEMINI_SRC,
     ),
-    // 3.6 Flash is priced the same as 3.8 Flash, intro rate then doubling
-    // (MEASURED 2026-10-15: the pricing page says "Same as Gemini 3.8 Flash").
+    // 3.6 Flash (MEASURED 2026-10-15): $0.75 in / $3.75 out / $0.075 cached per
+    // 1M tokens through 2026-12-31, doubled from 2027-01-01.
     row(
         "gemini",
         "gemini-3.6-flash",
