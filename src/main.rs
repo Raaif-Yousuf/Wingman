@@ -22,6 +22,7 @@ mod hotkey;
 mod hotkey_conflicts;
 mod inputs;
 mod known_folder;
+mod machine;
 mod mode;
 mod ocr;
 mod password_managers;

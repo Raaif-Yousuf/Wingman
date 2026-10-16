@@ -201,6 +201,11 @@ pub mod cmd {
     /// `App::copy_egress_log` in `app.rs` and `egress::read_all_human`.
     pub const COPY_EGRESS_LOG: u32 = 1028;
 
+    /// Issue #328: "Check this PC for local models". Gathers RAM, GPU,
+    /// battery and Ollama's GPU use once, on click, and shows a verdict card.
+    /// See `App::check_machine` in `app.rs` and `machine::verdict`.
+    pub const CHECK_MACHINE: u32 = 1040;
+
     /// Issue #41: "Copy text from screen" -- OCR the active monitor and copy
     /// the text to the clipboard, offline and model-free. See
     /// `App::extract_text` in `app.rs` and `actions::extract_text`. The
@@ -250,6 +255,10 @@ pub mod cmd {
     /// (`DispatchTarget::ReadQr`); this tray item is the direct path.
     pub const READ_QR: u32 = 1031;
 
+    /// Issue #117: pick an action file and, after a preview and a yes, add
+    /// it to actions.toml. See `App::import_action` in `app.rs`.
+    pub const IMPORT_ACTION: u32 = 1034;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -257,6 +266,10 @@ pub mod cmd {
     pub const ANTHROPIC_MODEL_BASE: u32 = 2100;
     /// Base id for the Ollama model submenu (#567), same scheme.
     pub const OLLAMA_MODEL_BASE: u32 = 2200;
+    /// Base id for the "Export action" submenu (#117), same scheme: the pick
+    /// is `ACTION_EXPORT_BASE + index` into the list last passed to
+    /// `set_export_actions`.
+    pub const ACTION_EXPORT_BASE: u32 = 2400;
     /// Exclusive upper bound for each range — keep the lists under this many
     /// entries, and clamp if a longer list is ever passed in.
     pub const MODEL_RANGE: u32 = 100;
@@ -282,6 +295,8 @@ pub enum MenuChoice {
     AnthropicModel(usize),
     /// Index into the list last passed to `set_ollama_models` (#567).
     OllamaModel(usize),
+    /// Index into the list last passed to `set_export_actions` (#117).
+    ExportAction(usize),
 }
 
 /// Decode a command id returned by [`Tray::on_tray_message`] into a
@@ -295,6 +310,8 @@ pub fn decode(id: u32) -> MenuChoice {
         MenuChoice::AnthropicModel((id - cmd::ANTHROPIC_MODEL_BASE) as usize)
     } else if (cmd::OLLAMA_MODEL_BASE..cmd::OLLAMA_MODEL_BASE + cmd::MODEL_RANGE).contains(&id) {
         MenuChoice::OllamaModel((id - cmd::OLLAMA_MODEL_BASE) as usize)
+    } else if (cmd::ACTION_EXPORT_BASE..cmd::ACTION_EXPORT_BASE + cmd::MODEL_RANGE).contains(&id) {
+        MenuChoice::ExportAction((id - cmd::ACTION_EXPORT_BASE) as usize)
     } else {
         MenuChoice::Command(id)
     }
@@ -306,6 +323,7 @@ struct ShownModels {
     openai: Vec<String>,
     anthropic: Vec<String>,
     ollama: Vec<String>,
+    export_ids: Vec<String>,
 }
 
 pub struct Tray {
@@ -343,6 +361,8 @@ pub struct Tray {
     /// those while the popup is still on screen. Taken by
     /// [`Tray::snapshot_models`] when the menu opens.
     shown: ShownModels,
+    /// (id, menu label) of each action the user wrote, for "Export action".
+    export_actions: Vec<(String, String)>,
     ollama_labels: Vec<String>,
     ollama_current: Option<usize>,
     /// The icon loaded by [`add_icon`] (embedded resource or the
@@ -397,6 +417,7 @@ impl Tray {
             ollama_pulled: Vec::new(),
             ollama_models: Vec::new(),
             shown: ShownModels::default(),
+            export_actions: Vec::new(),
             ollama_labels: Vec::new(),
             ollama_current: None,
             anthropic_current: None,
@@ -607,6 +628,23 @@ impl Tray {
         self.shown.ollama.get(index).map(String::as_str)
     }
 
+    /// #117: the actions the user wrote (id, name), for the "Export action"
+    /// submenu. Only affects the next menu built. Clamped to
+    /// [`cmd::MODEL_RANGE`] entries.
+    pub fn set_export_actions(&mut self, actions: &[(String, String)]) {
+        self.export_actions = actions
+            .iter()
+            .take(cmd::MODEL_RANGE as usize)
+            .map(|(id, name)| (id.clone(), menu_label(name)))
+            .collect();
+    }
+
+    /// Resolves a [`MenuChoice::ExportAction`] index to an action id, against
+    /// the list the open menu was built from.
+    pub fn export_action_at(&self, index: usize) -> Option<&str> {
+        self.shown.export_ids.get(index).map(String::as_str)
+    }
+
     /// Handle the `WM_APP_TRAY` message. Returns `Some(cmd::OPEN_SETTINGS)` on
     /// left-click/Enter activation, or the chosen menu command id on
     /// right-click/context-menu activation (`None` if the menu was
@@ -636,6 +674,11 @@ impl Tray {
             openai: self.openai_models.clone(),
             anthropic: self.anthropic_models.clone(),
             ollama: self.ollama_models.clone(),
+            export_ids: self
+                .export_actions
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect(),
         };
     }
 
@@ -796,9 +839,22 @@ impl Tray {
         append_item(hmenu, cmd::OPEN_SETTINGS, "Settings...")?;
         let help = append_group(hmenu, "Help and diagnostics")?;
         append_item(help, cmd::EDIT_SETTINGS, "Open config.toml")?;
+        append_item(help, cmd::IMPORT_ACTION, "Import action from file...")?;
+        let export_labels: Vec<String> =
+            self.export_actions.iter().map(|(_, l)| l.clone()).collect();
+        let export_ids: Vec<String> = self.export_actions.iter().map(|(i, _)| i.clone()).collect();
+        append_model_submenu(
+            help,
+            "Export action to file",
+            cmd::ACTION_EXPORT_BASE,
+            &export_ids,
+            &export_labels,
+            None,
+        )?;
         append_item(help, cmd::RELOAD, "Reload settings")?;
         append_item(help, cmd::COPY_DIAGNOSTICS, "Copy diagnostics")?;
         append_item(help, cmd::COPY_EGRESS_LOG, "Copy egress log")?;
+        append_item(help, cmd::CHECK_MACHINE, "Check this PC for local models")?;
         append_separator(hmenu)?;
         append_item(hmenu, cmd::QUIT, "Quit")?;
         Ok(())
@@ -1882,9 +1938,11 @@ mod tests {
         help.sort_unstable();
         let mut want = vec![
             cmd::EDIT_SETTINGS,
+            cmd::IMPORT_ACTION,
             cmd::RELOAD,
             cmd::COPY_DIAGNOSTICS,
             cmd::COPY_EGRESS_LOG,
+            cmd::CHECK_MACHINE,
         ];
         want.sort_unstable();
         assert_eq!(help, want);
@@ -2359,6 +2417,7 @@ mod tests {
         ("MODE_OFFLINE", cmd::MODE_OFFLINE),
         ("COPY_DIAGNOSTICS", cmd::COPY_DIAGNOSTICS),
         ("COPY_EGRESS_LOG", cmd::COPY_EGRESS_LOG),
+        ("CHECK_MACHINE", cmd::CHECK_MACHINE),
         ("EXTRACT_TEXT", cmd::EXTRACT_TEXT),
         ("CALCULATE_SELECTION", cmd::CALCULATE_SELECTION),
         ("COPY_REGION", cmd::COPY_REGION),
@@ -2368,6 +2427,7 @@ mod tests {
         ("FILL_FORM", cmd::FILL_FORM),
         ("RESTORE_LAST_FORM", cmd::RESTORE_LAST_FORM),
         ("READ_QR", cmd::READ_QR),
+        ("IMPORT_ACTION", cmd::IMPORT_ACTION),
         ("VERSION_LABEL", cmd::VERSION_LABEL),
     ];
 
@@ -2462,6 +2522,7 @@ mod tests {
             "OPENAI_MODEL_BASE",
             "ANTHROPIC_MODEL_BASE",
             "OLLAMA_MODEL_BASE",
+            "ACTION_EXPORT_BASE",
         ];
 
         let declared: Vec<&str> = include_str!("tray.rs")
@@ -2618,6 +2679,38 @@ mod tests {
                 (cmd::OLLAMA_MODEL_BASE + 1, "qwen3:8b", true),
             ]
         );
+    }
+
+    #[test]
+    fn decode_routes_the_export_range_and_the_ranges_stay_apart() {
+        assert_eq!(
+            decode(cmd::ACTION_EXPORT_BASE + 2),
+            MenuChoice::ExportAction(2)
+        );
+        assert_eq!(
+            decode(cmd::ACTION_EXPORT_BASE + cmd::MODEL_RANGE),
+            MenuChoice::Command(cmd::ACTION_EXPORT_BASE + cmd::MODEL_RANGE)
+        );
+        assert_eq!(
+            decode(cmd::OLLAMA_MODEL_BASE + cmd::MODEL_RANGE - 1),
+            MenuChoice::OllamaModel(cmd::MODEL_RANGE as usize - 1)
+        );
+        const { assert!(cmd::OLLAMA_MODEL_BASE + cmd::MODEL_RANGE <= cmd::ACTION_EXPORT_BASE) };
+    }
+
+    #[test]
+    fn export_action_at_resolves_against_the_menu_on_screen() {
+        let mut seen = None;
+        built_menu_tree(|t| {
+            t.set_export_actions(&[("one".into(), "One".into()), ("two".into(), "Two".into())]);
+            t.snapshot_models();
+            t.set_export_actions(&[("other".into(), "Other".into())]);
+            seen = Some((
+                t.export_action_at(1).map(str::to_owned),
+                t.export_action_at(2).map(str::to_owned),
+            ));
+        });
+        assert_eq!(seen, Some((Some("two".to_string()), None)));
     }
 
     #[test]
