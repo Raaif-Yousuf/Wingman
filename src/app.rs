@@ -60,7 +60,9 @@ use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
 use crate::ui::palette_model::{self, DispatchTarget};
 use crate::ui::settings;
-use crate::ui::tray::{cmd, decode, register_taskbar_created, MenuChoice, Tray, WM_APP_TRAY};
+use crate::ui::tray::{
+    cmd, decode, register_taskbar_created, MenuChoice, Tray, TrayEvent, WM_APP_TRAY,
+};
 
 /// Posted by the worker when a request finishes. `lparam` is
 /// `Box::into_raw(Box::new(Result<Answer, String>))`; the handler takes
@@ -3572,6 +3574,24 @@ impl App {
         }
     }
 
+    /// #722: the tray menu runs with the same reentrancy policy as Settings,
+    /// so whatever it deferred is delivered here once the menu has closed.
+    fn finish_modal_deferrals(&mut self) {
+        let pending: VecDeque<DeferredMessage> =
+            PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let taskbar_recreated = TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false));
+        let tray_restore_error = if taskbar_recreated {
+            self.try_restore_tray_icon()
+        } else {
+            None
+        };
+        if PAUSE_REEVALUATE_PENDING.with(|c| c.replace(false)) {
+            self.reevaluate_pause(self.hwnd());
+        }
+        self.deliver_deferred(pending);
+        self.show_tray_restore_error(tray_restore_error);
+    }
+
     /// Issue #178: shows the tray-restore error card if `error` is `Some`,
     /// overwriting whatever card `open_settings` just showed -- called last,
     /// on every `open_settings` path, so this failure (the app's only
@@ -5797,6 +5817,107 @@ fn drain_queued_payloads(hwnd: HWND) {
     }
 }
 
+/// The tray callback (#722). `TrackPopupMenu` runs a nested message loop, so
+/// no `&mut App` may be live across it: the menu is built under a short
+/// borrow, shown with none held, and the chosen command runs under a fresh
+/// one. While the menu is open the Settings reentrancy policy is on, so a
+/// result, hotkey or timer that arrives meanwhile is deferred or dropped
+/// before it can form a second `&mut App`.
+fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
+    let app: &mut App = unsafe { &mut *ptr };
+    // #339: the menu takes the foreground (SetForegroundWindow in
+    // `PreparedMenu::track`), so ask who was in front first. Only on the
+    // menu gesture, so tray hover traffic costs nothing.
+    let menu_hint = Tray::opens_menu(lparam) && app.password_manager_now();
+    // #567: show what the last background refresh found, then start
+    // the next one. Never waits on Ollama, so the menu opens at once.
+    if Tray::opens_menu(lparam) {
+        app.sync_ollama_menu();
+    }
+    let mut was_menu = false;
+    let id = match app.tray.on_tray_message(lparam) {
+        TrayEvent::None => return LRESULT(0),
+        TrayEvent::Command(id) => id,
+        TrayEvent::Menu(menu) => {
+            was_menu = true;
+            SETTINGS_OPEN.with(|c| c.set(true));
+            let chosen = menu.track();
+            SETTINGS_OPEN.with(|c| c.set(false));
+            match chosen {
+                Some(id) => id,
+                None => {
+                    unsafe { &mut *ptr }.finish_modal_deferrals();
+                    return LRESULT(0);
+                }
+            }
+        }
+    };
+    // A fresh borrow: the one above ended before the menu loop started.
+    let app: &mut App = unsafe { &mut *ptr };
+    if was_menu {
+        app.finish_modal_deferrals();
+    }
+    app.password_manager_hint = menu_hint;
+    // Choosing anything other than a rebind disarms a learn mode
+    // left armed by an earlier "Set ... key" click; otherwise it
+    // would silently swallow the next key pressed anywhere.
+    if !matches!(
+        decode(id),
+        MenuChoice::Command(cmd::SET_PRIMARY)
+            | MenuChoice::Command(cmd::SET_SECONDARY)
+            | MenuChoice::Command(cmd::SET_PAUSE)
+    ) {
+        if let Some(h) = &app.hook {
+            h.cancel_learning();
+        }
+    }
+    match decode(id) {
+        MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
+        MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
+        MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
+        MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
+        MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
+        MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
+        MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
+        MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
+        MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
+        MenuChoice::Command(cmd::QUICK_ASK) => app.toggle_palette(),
+        MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
+        MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
+        MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
+        MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
+        MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
+        MenuChoice::Command(cmd::SET_PAUSE) => app.start_learning(HK_PAUSE),
+        MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
+        MenuChoice::Command(cmd::RELOAD) => app.reload(),
+        MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
+        MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
+        MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
+        MenuChoice::Command(cmd::USE_OPENAI) => app.set_provider(ActiveProvider::OpenAi),
+        MenuChoice::Command(cmd::USE_ANTHROPIC) => app.set_provider(ActiveProvider::Anthropic),
+        MenuChoice::Command(cmd::USE_OLLAMA) => app.set_provider(ActiveProvider::Ollama),
+        MenuChoice::Command(cmd::USE_GEMINI) => app.set_provider(ActiveProvider::Gemini),
+        MenuChoice::Command(cmd::PAUSE_1H) => app.pause_for(PauseChoice::OneHour),
+        MenuChoice::Command(cmd::PAUSE_UNTIL_TOMORROW) => app.pause_for(PauseChoice::UntilTomorrow),
+        MenuChoice::Command(cmd::PAUSE_UNTIL_RESUMED) => app.pause_for(PauseChoice::UntilResumed),
+        MenuChoice::Command(cmd::RESUME) => app.resume(),
+        MenuChoice::Command(cmd::MODE_CLOUD) => app.set_mode(Mode::Cloud),
+        MenuChoice::Command(cmd::MODE_LOCAL) => app.set_mode(Mode::Local),
+        MenuChoice::Command(cmd::MODE_AUTO) => app.set_mode(Mode::Auto),
+        MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
+        MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
+        MenuChoice::Command(cmd::QUIT) => unsafe {
+            let _ = DestroyWindow(hwnd);
+        },
+        _ => {}
+    }
+    // Not after Quit: the window (and `app`) may already be gone.
+    if !matches!(decode(id), MenuChoice::Command(cmd::QUIT)) {
+        app.password_manager_hint = false;
+    }
+    LRESULT(0)
+}
+
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         OWNER_HWND.with(|h| h.set(hwnd.0 as isize));
@@ -5905,90 +6026,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     let app: &mut App = unsafe { &mut *ptr };
 
     match msg {
-        WM_APP_TRAY => {
-            // #339: the menu takes the foreground (SetForegroundWindow in
-            // `Tray::show_menu`), so ask who was in front first. Only on the
-            // menu gesture, so tray hover traffic costs nothing.
-            let menu_hint = Tray::opens_menu(lparam) && app.password_manager_now();
-            // #567: show what the last background refresh found, then start
-            // the next one. Never waits on Ollama, so the menu opens at once.
-            if Tray::opens_menu(lparam) {
-                app.sync_ollama_menu();
-            }
-            if let Some(id) = app.tray.on_tray_message(lparam) {
-                app.password_manager_hint = menu_hint;
-                // Choosing anything other than a rebind disarms a learn mode
-                // left armed by an earlier "Set ... key" click; otherwise it
-                // would silently swallow the next key pressed anywhere.
-                if !matches!(
-                    decode(id),
-                    MenuChoice::Command(cmd::SET_PRIMARY)
-                        | MenuChoice::Command(cmd::SET_SECONDARY)
-                        | MenuChoice::Command(cmd::SET_PAUSE)
-                ) {
-                    if let Some(h) = &app.hook {
-                        h.cancel_learning();
-                    }
-                }
-                match decode(id) {
-                    MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
-                    MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
-                    MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
-                    MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
-                    MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
-                    MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
-                    MenuChoice::Command(cmd::COPY_REGION) => app.copy_region(),
-                    MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
-                    MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
-                    MenuChoice::Command(cmd::QUICK_ASK) => app.toggle_palette(),
-                    MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
-                    MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
-                    MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
-                    MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
-                    MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
-                    MenuChoice::Command(cmd::SET_PAUSE) => app.start_learning(HK_PAUSE),
-                    MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
-                    MenuChoice::Command(cmd::RELOAD) => app.reload(),
-                    MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
-                    MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
-                    MenuChoice::Command(cmd::CALCULATE_SELECTION) => app.calculate_selection(),
-                    MenuChoice::Command(cmd::USE_OPENAI) => {
-                        app.set_provider(ActiveProvider::OpenAi)
-                    }
-                    MenuChoice::Command(cmd::USE_ANTHROPIC) => {
-                        app.set_provider(ActiveProvider::Anthropic)
-                    }
-                    MenuChoice::Command(cmd::USE_OLLAMA) => {
-                        app.set_provider(ActiveProvider::Ollama)
-                    }
-                    MenuChoice::Command(cmd::USE_GEMINI) => {
-                        app.set_provider(ActiveProvider::Gemini)
-                    }
-                    MenuChoice::Command(cmd::PAUSE_1H) => app.pause_for(PauseChoice::OneHour),
-                    MenuChoice::Command(cmd::PAUSE_UNTIL_TOMORROW) => {
-                        app.pause_for(PauseChoice::UntilTomorrow)
-                    }
-                    MenuChoice::Command(cmd::PAUSE_UNTIL_RESUMED) => {
-                        app.pause_for(PauseChoice::UntilResumed)
-                    }
-                    MenuChoice::Command(cmd::RESUME) => app.resume(),
-                    MenuChoice::Command(cmd::MODE_CLOUD) => app.set_mode(Mode::Cloud),
-                    MenuChoice::Command(cmd::MODE_LOCAL) => app.set_mode(Mode::Local),
-                    MenuChoice::Command(cmd::MODE_AUTO) => app.set_mode(Mode::Auto),
-                    MenuChoice::Command(cmd::MODE_OFFLINE) => app.set_mode(Mode::Offline),
-                    MenuChoice::Command(cmd::OPEN_SETTINGS) => app.open_settings(),
-                    MenuChoice::Command(cmd::QUIT) => unsafe {
-                        let _ = DestroyWindow(hwnd);
-                    },
-                    _ => {}
-                }
-                // Not after Quit: the window (and `app`) may already be gone.
-                if !matches!(decode(id), MenuChoice::Command(cmd::QUIT)) {
-                    app.password_manager_hint = false;
-                }
-            }
-            LRESULT(0)
-        }
+        WM_APP_TRAY => handle_tray_message(hwnd, ptr, lparam),
         WM_APP_HOTKEY => {
             let _which = wparam.0; // both bindings do the same thing
             if !app.cancel_pending_send_preview() {
@@ -7653,6 +7691,47 @@ mod tests {
             window < acquire,
             "the owner window must be created before single_instance::acquire"
         );
+    }
+
+    /// #722: the tray menu runs a nested message loop. No `&mut App` may be
+    /// live across it, and the reentrancy policy must be on while it runs.
+    #[test]
+    fn tray_menu_loop_runs_without_an_app_borrow() {
+        let src = lf(include_str!("app.rs"));
+        let start = src
+            .find("\nfn handle_tray_message(")
+            .expect("app.rs has no fn handle_tray_message");
+        let body = &src[start + 1..];
+        let body = &body[..body.find("\n}\n").expect("fn has no end")];
+        assert!(!body.is_empty());
+        let track = body.find(".track()").expect("the menu is never tracked");
+        let on = body[..track]
+            .rfind("SETTINGS_OPEN.with(|c| c.set(true));")
+            .expect("the reentrancy policy is not switched on before the menu loop");
+        let off = track
+            + body[track..]
+                .find("SETTINGS_OPEN.with(|c| c.set(false));")
+                .expect("the reentrancy policy is never switched off");
+        let span = &body[on..off];
+        assert!(
+            !span.contains("app."),
+            "App is used while the menu loop runs"
+        );
+        assert!(
+            !span.contains("tray."),
+            "Tray is used while the menu loop runs"
+        );
+        // The wnd_proc arm only delegates; it never reaches the menu itself.
+        let proc_src = wnd_proc_body(&src);
+        assert!(proc_src.contains("handle_tray_message("));
+        assert!(!proc_src.contains("on_tray_message"));
+        // And the tray's own message handler no longer calls TrackPopupMenu.
+        let tray = lf(include_str!("ui/tray.rs"));
+        let h = tray
+            .find("pub fn on_tray_message(")
+            .expect("no on_tray_message");
+        let h = &tray[h..h + tray[h..].find("\n    }\n").expect("no end")];
+        assert!(!h.contains("TrackPopupMenu"));
     }
 
     /// #236: only the activation arm may be rate limited, and it must be.

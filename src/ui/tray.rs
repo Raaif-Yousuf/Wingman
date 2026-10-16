@@ -65,6 +65,54 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
+/// What a tray message asks for. See [`Tray::on_tray_message`].
+pub enum TrayEvent {
+    /// Nothing to do.
+    None,
+    /// A command id to run now (a left-click opens Settings).
+    Command(u32),
+    /// A built context menu, not yet shown.
+    Menu(PreparedMenu),
+}
+
+/// A built context menu that owns its handle but borrows nothing, so it can
+/// be shown while the app is not borrowed (#722).
+pub struct PreparedMenu {
+    hmenu: HMENU,
+    pt: POINT,
+    hwnd: HWND,
+}
+
+impl PreparedMenu {
+    /// Shows the menu and blocks in its message loop until it closes.
+    /// Returns the chosen command id, or `None` if it was dismissed.
+    pub fn track(self) -> Option<u32> {
+        // Documented Win32 workaround: without a foreground-window switch
+        // right before TrackPopupMenu, the popup does not reliably dismiss
+        // when the user clicks outside it (it can get "stuck").
+        unsafe {
+            let _ = SetForegroundWindow(self.hwnd);
+        }
+        let result = unsafe {
+            TrackPopupMenu(
+                self.hmenu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                self.pt.x,
+                self.pt.y,
+                None,
+                self.hwnd,
+                None,
+            )
+        };
+        let _ = unsafe { DestroyMenu(self.hmenu) };
+        if result.0 != 0 {
+            Some(result.0 as u32)
+        } else {
+            None
+        }
+    }
+}
+
 /// Posted by the shell to this app's window proc on tray icon activity.
 /// Adding another `WM_APP_*` constant anywhere in the crate also means
 /// adding it to `app.rs`'s `tests::ALL_WM_APP_IDS` (issue #163), which is
@@ -594,19 +642,26 @@ impl Tray {
         event == WM_CONTEXTMENU || event == WM_RBUTTONUP
     }
 
-    pub fn on_tray_message(&mut self, lparam: LPARAM) -> Option<u32> {
+    /// Decides what a tray message means. It never runs the menu's modal
+    /// loop (#722): a right-click builds the menu and hands it back as
+    /// [`TrayEvent::Menu`], so the caller can drop its borrow of the app
+    /// before [`PreparedMenu::track`] pumps messages.
+    pub fn on_tray_message(&mut self, lparam: LPARAM) -> TrayEvent {
         let event = (lparam.0 as u32) & 0xFFFF;
         match event {
-            e if e == WM_LBUTTONUP || e == NIN_SELECT => Some(cmd::OPEN_SETTINGS),
+            e if e == WM_LBUTTONUP || e == NIN_SELECT => TrayEvent::Command(cmd::OPEN_SETTINGS),
             e if e == WM_CONTEXTMENU || e == WM_RBUTTONUP => {
                 self.snapshot_models();
-                self.show_menu()
+                match self.prepare_menu() {
+                    Some(menu) => TrayEvent::Menu(menu),
+                    None => TrayEvent::None,
+                }
             }
-            _ => None,
+            _ => TrayEvent::None,
         }
     }
 
-    fn show_menu(&self) -> Option<u32> {
+    fn prepare_menu(&self) -> Option<PreparedMenu> {
         let mut pt = POINT::default();
         if unsafe { GetCursorPos(&mut pt) }.is_err() {
             return None;
@@ -617,33 +672,11 @@ impl Tray {
             let _ = unsafe { DestroyMenu(hmenu) };
             return None;
         }
-
-        // Documented Win32 workaround: without a foreground-window switch
-        // right before TrackPopupMenu, the popup does not reliably dismiss
-        // when the user clicks outside it (it can get "stuck").
-        unsafe {
-            let _ = SetForegroundWindow(self.hwnd);
-        }
-
-        let result = unsafe {
-            TrackPopupMenu(
-                hmenu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                pt.x,
-                pt.y,
-                None,
-                self.hwnd,
-                None,
-            )
-        };
-
-        let _ = unsafe { DestroyMenu(hmenu) };
-
-        if result.0 != 0 {
-            Some(result.0 as u32)
-        } else {
-            None
-        }
+        Some(PreparedMenu {
+            hmenu,
+            pt,
+            hwnd: self.hwnd,
+        })
     }
 
     fn build_menu(&self, hmenu: HMENU) -> Result<()> {
