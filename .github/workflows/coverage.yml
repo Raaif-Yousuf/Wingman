@@ -31,8 +31,10 @@ jobs:
     runs-on: windows-latest
     continue-on-error: true
     env:
-      # Empty when the secret is not set (and always empty on fork PRs).
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      # Only whether the secret exists, never the token itself: the token is
+      # given to the upload step alone, so the test code never sees it.
+      # False when the secret is not set (and always on fork PRs).
+      HAS_CODECOV: ${{ secrets.CODECOV_TOKEN != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -86,8 +88,9 @@ jobs:
           if-no-files-found: error
 
       - name: Upload to Codecov (only when the token secret exists)
-        if: ${{ env.CODECOV_TOKEN != '' }}
+        if: ${{ env.HAS_CODECOV == 'true' }}
         uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage/lcov.info
           fail_ci_if_error: false
