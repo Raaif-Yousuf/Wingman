@@ -77,7 +77,7 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgCtrlID, GetDlgItem,
@@ -93,9 +93,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetParent, GetScrollInfo, GetWindow, GW_CHILD, GW_HWNDNEXT, SB_VERT, SCROLLINFO,
-    SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SM_CXVSCROLL, WM_MOUSEWHEEL,
-    WM_VSCROLL,
+    GetClientRect, GetParent, GetScrollInfo, GetWindow, CBN_SELCHANGE, GW_CHILD, GW_HWNDNEXT,
+    SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
+    SM_CXVSCROLL, WM_MOUSEWHEEL, WM_VSCROLL,
 };
 
 use crate::config::{ActiveProvider, CardCorner, Config, Hotkeys, OllamaConfig, RequireTickFor};
@@ -186,7 +186,7 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
             Some(HWND_TOP),
             0,
             0,
-            window_width_px(dpi),
+            window_width_px(dpi) + nc_width_px(hwnd),
             to_px(fitted_h, dpi),
             SWP_NOMOVE | SWP_NOZORDER,
         );
@@ -210,6 +210,7 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     inner_ref.dpi = dpi;
     let built = build_ui_recorded(hwnd, instance, dpi, inner_ref.font, config, client_h_dp);
     inner_ref.adopt(built);
+    sync_card_display_enabled(hwnd);
     // #527, #568: the Ollama status and button arrive later, off the UI
     // thread; the group says "Checking Ollama..." until then.
     spawn_ollama_status_probe(
@@ -699,6 +700,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, DEFAULT_PROMPT);
         }
+        ID_CARD_CORNER if notify == CBN_SELCHANGE => sync_card_display_enabled(inner.hwnd),
         ID_CHANGE_PRIMARY if notify == BN_CLICKED => start_change(inner, HK_PRIMARY),
         ID_CHANGE_SECONDARY if notify == BN_CLICKED => start_change(inner, HK_SECONDARY),
         ID_PROMPT_TOGGLE if notify == BN_CLICKED => {
@@ -819,6 +821,8 @@ const ID_CARD_CORNER: i32 = 136;
 const ID_CARD_MONITOR: i32 = 137;
 /// #509: the capture.redact checkbox in the Capture group.
 const ID_REDACT: i32 = 138;
+/// #597: the "Card display:" caption, greyed with its combo.
+const ID_CARD_MONITOR_LABEL: i32 = 139;
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
 /// the text sent to a cloud or remote model, and the answer (real values put
@@ -878,6 +882,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_CARD_CORNER", ID_CARD_CORNER),
     ("ID_CARD_MONITOR", ID_CARD_MONITOR),
     ("ID_REDACT", ID_REDACT),
+    ("ID_CARD_MONITOR_LABEL", ID_CARD_MONITOR_LABEL),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1350,9 +1355,6 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
         view_px,
     );
     inner.body_dpi = dpi;
-    // The footer sits right of the body's scrollbar, so it is shifted over by
-    // the bar's width to keep its right edge on the window's.
-    let sbw = scrollbar_width_px(dpi);
 
     let new_font = build_font(dpi);
     // No repaint between the individual moves: one redraw at the end, so a
@@ -1371,8 +1373,10 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     }
     for c in &inner.children {
         let (x, y, w, h) = child_rect_px(c, &old, &new, dpi);
+        // The footer keeps its design x, so Save and Cancel end where the
+        // group boxes end (#625).
         let (x, y) = if c.anchor == Anchor::Footer {
-            (x + sbw, y)
+            (x, y)
         } else {
             (x, y - pos)
         };
@@ -1467,6 +1471,43 @@ unsafe fn show_prompt_state(inner: &mut SettingsInner) {
 /// never shifts (#481).
 fn window_width_px(dpi: u32) -> i32 {
     to_px(WIN_W_DP, dpi) + scrollbar_width_px(dpi)
+}
+
+/// The width of the window's frame (outer minus client), so the client area,
+/// not the outer rect, is `window_width_px` wide (#625).
+fn nc_width_px(hwnd: HWND) -> i32 {
+    let mut wr = windows::Win32::Foundation::RECT::default();
+    let mut cr = windows::Win32::Foundation::RECT::default();
+    unsafe {
+        if GetWindowRect(hwnd, &mut wr).is_err() || GetClientRect(hwnd, &mut cr).is_err() {
+            return 0;
+        }
+    }
+    ((wr.right - wr.left) - (cr.right - cr.left)).max(0)
+}
+
+/// #624: the width of the Card group's first label. Its text is about 262px
+/// at 96 dpi; at 260dp it wrapped and the second line was clipped.
+const CARD_SECONDS_LABEL_W: i32 = 300;
+
+/// #597: whether the Card display choice has any effect for this Card
+/// position label. "Next to the mouse" follows the pointer's own monitor, so
+/// the display choice is ignored there.
+fn card_display_applies(corner_label: &str) -> bool {
+    label_to_card_corner(corner_label) != Some(CardCorner::FollowMouse)
+}
+
+/// #597: greys the Card display combo and its caption to match the chosen
+/// Card position.
+fn sync_card_display_enabled(hwnd: HWND) {
+    let on = card_display_applies(&combo_selected_text(hwnd, ID_CARD_CORNER));
+    for id in [ID_CARD_MONITOR, ID_CARD_MONITOR_LABEL] {
+        if let Some(h) = get_dlg_item(hwnd, id) {
+            unsafe {
+                let _ = EnableWindow(h, on);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3355,7 +3396,7 @@ fn build_ui_recorded(
         0,
         r.x,
         r.y,
-        260,
+        CARD_SECONDS_LABEL_W,
         ROW_H,
         0,
     );
@@ -3364,7 +3405,7 @@ fn build_ui_recorded(
         &config.ui.card_seconds.to_string(),
         (ES_NUMBER | ES_AUTOHSCROLL) as u32,
         WS_EX_BORDER,
-        r.x + 260,
+        r.x + CARD_SECONDS_LABEL_W + 4,
         r.y,
         50,
         ROW_H,
@@ -3435,7 +3476,17 @@ fn build_ui_recorded(
     combo_select(corner, card_corner_label(config.ui.card_corner));
     r.advance();
 
-    ctx.create(WC_STATIC, "Card display:", 0, 0, r.x, r.y, 110, ROW_H, 0);
+    ctx.create(
+        WC_STATIC,
+        "Card display:",
+        0,
+        0,
+        r.x,
+        r.y,
+        110,
+        ROW_H,
+        ID_CARD_MONITOR_LABEL,
+    );
     let card_monitor = ctx.create(
         WC_COMBOBOX,
         "",
@@ -4723,7 +4774,7 @@ impl GalleryWindow {
                 Some(HWND_TOP),
                 0,
                 0,
-                window_width_px(dpi),
+                window_width_px(dpi) + nc_width_px(hwnd),
                 to_px(fitted_h, dpi),
                 SWP_NOMOVE | SWP_NOZORDER,
             );
@@ -4737,6 +4788,7 @@ impl GalleryWindow {
         inner.dpi = dpi;
         let built = build_ui_recorded(hwnd, instance, dpi, inner.font, &config, client_h_dp);
         inner.adopt(built);
+        sync_card_display_enabled(hwnd);
         unsafe {
             show_prompt_state(inner);
             let _ = ShowWindow(
@@ -4794,6 +4846,7 @@ impl Drop for GalleryWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::GW_HWNDPREV;
 
     /// Test-only window class (rule 9): same `wndproc`, never the production
     /// class name.
@@ -7423,6 +7476,189 @@ mod tests {
         };
         assert!(unsafe { ScreenToClient(parent, &mut pt) }.as_bool());
         pt.y
+    }
+
+    // -- layout fixes #624, #625 and the card display grey-out #597 -------
+
+    struct LayoutWin(HWND, *mut SettingsInner);
+    impl Drop for LayoutWin {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+                drop(Box::from_raw(self.1));
+            }
+        }
+    }
+
+    /// A window sized the way `show_modal` sizes it (client width = design
+    /// width + the body's scrollbar), at 96 dpi, built from a default config.
+    fn open_layout_window() -> LayoutWin {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+        let raw = Box::into_raw(Box::new(SettingsInner::new(Config::default())));
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let title = wide_z("Wingman settings (layout test)");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                0,
+                0,
+                window_width_px(96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                Some(raw as *const c_void),
+            )
+        }
+        .expect("CreateWindowExW");
+        let win = LayoutWin(hwnd, raw);
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                window_width_px(96) + nc_width_px(hwnd),
+                to_px(WIN_H_DP, 96),
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+        }
+        let client_h_px = client_size(hwnd).1;
+        let font = build_font(96);
+        let built = build_ui_recorded(
+            hwnd,
+            instance,
+            96,
+            font,
+            &Config::default(),
+            client_h_px.max(1),
+        );
+        let inner = unsafe { &mut *raw };
+        inner.hwnd = hwnd;
+        inner.font = font;
+        inner.adopt(built);
+        unsafe { apply_dpi(inner) };
+        win
+    }
+
+    fn right_in_parent_px(parent: HWND, child: HWND) -> i32 {
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut r = windows::Win32::Foundation::RECT::default();
+        unsafe { GetWindowRect(child, &mut r) }.expect("GetWindowRect");
+        let mut pt = windows::Win32::Foundation::POINT {
+            x: r.right,
+            y: r.top,
+        };
+        assert!(unsafe { ScreenToClient(parent, &mut pt) }.as_bool());
+        pt.x
+    }
+
+    /// #625: Cancel's right edge lines up with the group boxes' (one margin
+    /// before the scrollbar column), and the client is exactly as wide as the
+    /// design says. The window used to be too narrow by its frame width and
+    /// the footer was pushed over the scrollbar column, so Cancel sat a few
+    /// pixels from the window edge.
+    #[test]
+    fn the_footer_ends_in_line_with_the_groups_and_the_client_is_design_wide() {
+        let win = open_layout_window();
+        let (client_w, _) = client_size(win.0);
+        assert_eq!(client_w, window_width_px(96), "client width");
+        let cancel = get_dlg_item(win.0, ID_CANCEL).expect("Cancel");
+        let right = right_in_parent_px(win.0, cancel);
+        assert_eq!(
+            client_w - right,
+            to_px(MARGIN, 96) + scrollbar_width_px(96),
+            "Cancel margin"
+        );
+        // The group boxes end one margin before the scrollbar column.
+        let group_right = to_px(WIN_W_DP - MARGIN, 96);
+        assert_eq!(right, group_right, "footer edge vs group edge");
+    }
+
+    /// #624: the Card group's first label is wide enough for its own text, so
+    /// it does not wrap and clip its second line.
+    #[test]
+    fn the_card_seconds_label_fits_on_one_line() {
+        use windows::Win32::Graphics::Gdi::{GetTextExtentPoint32W, SelectObject};
+        let win = open_layout_window();
+        let seconds = get_dlg_item(win.0, ID_CARD_SECONDS).expect("seconds");
+        let body = unsafe { &*win.1 }.body;
+        let label = unsafe { GetWindow(seconds, GW_HWNDPREV) }.expect("label");
+        let label_w = {
+            let mut r = windows::Win32::Foundation::RECT::default();
+            unsafe { GetClientRect(label, &mut r) }.expect("label rect");
+            r.right - r.left
+        };
+        let text = "Hide the card after this many seconds (0 = never):";
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let dc = unsafe { GetDC(Some(body)) };
+        let old = unsafe { SelectObject(dc, HGDIOBJ((&*win.1).font.0)) };
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        unsafe {
+            let _ = GetTextExtentPoint32W(dc, &wide, &mut size);
+            SelectObject(dc, old);
+            ReleaseDC(Some(body), dc);
+        }
+        assert!(
+            size.cx <= label_w,
+            "label is {label_w}px wide, its text needs {}px",
+            size.cx
+        );
+        // The edit starts right of the label, not under it.
+        assert!(
+            top_in_parent_px(body, label) == top_in_parent_px(body, seconds),
+            "same row"
+        );
+    }
+
+    #[test]
+    fn the_card_display_applies_unless_the_card_follows_the_mouse() {
+        for label in CARD_CORNER_LABELS {
+            assert_eq!(card_display_applies(label), label != "Next to the mouse");
+        }
+        assert!(card_display_applies(""), "an unknown label keeps it usable");
+    }
+
+    /// #597, with a real window: choosing "Next to the mouse" through a real
+    /// `WM_COMMAND` (CBN_SELCHANGE) greys out Card display and its label;
+    /// choosing a corner again re-enables both. The default config starts
+    /// with a corner, so both start enabled.
+    #[test]
+    fn card_display_is_greyed_out_while_the_card_follows_the_mouse() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+        let win = open_layout_window();
+        let monitor = get_dlg_item(win.0, ID_CARD_MONITOR).expect("display combo");
+        let label = get_dlg_item(win.0, ID_CARD_MONITOR_LABEL).expect("display label");
+        let corner = get_dlg_item(win.0, ID_CARD_CORNER).expect("corner combo");
+        let enabled = |h: HWND| unsafe { IsWindowEnabled(h) }.as_bool();
+        assert!(enabled(monitor) && enabled(label), "starts enabled");
+
+        let pick = |text: &str| {
+            combo_select(corner, text);
+            unsafe {
+                SendMessageW(
+                    win.0,
+                    WM_COMMAND,
+                    Some(WPARAM(
+                        ((CBN_SELCHANGE as usize) << 16) | ID_CARD_CORNER as usize,
+                    )),
+                    Some(LPARAM(corner.0 as isize)),
+                );
+            }
+        };
+        pick("Next to the mouse");
+        assert!(!enabled(monitor), "display greyed out");
+        assert!(!enabled(label), "label greyed out");
+        pick("Top left");
+        assert!(enabled(monitor) && enabled(label), "re-enabled");
     }
 
     // -- clamp_suggested_to_work (review of #233) -------------------------
