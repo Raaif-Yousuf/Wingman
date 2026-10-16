@@ -25,8 +25,8 @@ written down and agreed before code.
 - **There is no application manifest.** `assets/app.rc` holds the icon and
   nothing else, and `build.rs` embeds only that. Nothing requests
   common-controls v6. `settings.rs` calls `InitCommonControlsEx` with
-  `ICC_BAR_CLASSES` only. So Settings very probably runs classic (v5) controls
-  (to be confirmed in Slice 0). This matters: `NM_CUSTOMDRAW` for buttons is a
+  `ICC_BAR_CLASSES` only. So Settings runs classic (v5) controls
+  (MEASURED 2026-10-16, Slice 0). This matters: `NM_CUSTOMDRAW` for buttons is a
   v6 feature.
 - Control inventory: `EDIT` (all single-line edits are created with
   `WS_EX_BORDER`, a thin frame-colour border, not a sunken one), `COMBOBOX`
@@ -39,8 +39,8 @@ written down and agreed before code.
   owner-draws push buttons with hover and pressed states (#351). Reuse both
   instead of writing a second version.
 - High contrast: stock controls already follow the system colours, so Settings
-  is probably correct in high contrast today for free (to be confirmed in
-  Slice 0). A plan that replaces stock controls in every theme would regress
+  is probably correct in high contrast today for free (still unmeasured:
+  Slice 0 could not switch themes, so it is a manual check in the last slice). A plan that replaces stock controls in every theme would regress
   that.
 
 ## Decision
@@ -64,41 +64,78 @@ Keeping the native control classes (EDIT, COMBOBOX, BUTTON, trackbar) and
 changing only how they paint means keystrokes, tab order, IME and most of
 accessibility keep working as they do today.
 
-## Slice 0: gates that decide the plan
+## Slice 0: measurements (MEASURED 2026-10-16)
 
-Slice 0 changes no product behaviour. It is a throwaway window plus a short
-written result in this spec, replacing each theory below. Nothing past Slice 0
-is started until it is recorded.
+Slice 0 changed no product behaviour. It was a throwaway test window (test-only
+class name, no registry or theme setting touched) run on Windows 11 build
+26300 with the apps colour mode set to dark, once with no manifest (the way
+Settings runs today) and once with an activation context built from a temp
+common-controls 6.0.0.0 manifest. Results replace the theories above. Items 3
+and 6 were not measured, see below. The throwaway code is not kept.
 
-1. **Is common-controls v6 active?** Check which comctl32 the Settings window
-   loads (the module path under `WinSxS` for 6.x, `System32` for 5.82). Expected
-   today: v5. If v5, the checkbox plan changes: either add a manifest that
-   requests common-controls 6.0.0.0 (its own slice, below), or use
-   `BS_OWNERDRAW`. Adding the manifest restyles every common control in
-   Settings in light mode too (modern checkbox, combo and button visuals) and
-   may shift hard-coded metrics, so it is checked at 100%, 150% and 200%
-   before it is chosen.
-2. **UI Automation role under owner draw.** `THEORY (unverified)`: a
-   `BS_OWNERDRAW` button is exposed as a plain push button, losing the
-   checkbox role and toggle state. Measure with Accessibility Insights or
-   `inspect.exe` for `BS_OWNERDRAW`, for v6 `NM_CUSTOMDRAW` on a native
-   checkbox, and for `CBS_OWNERDRAWFIXED`, and record it.
-3. **Combo arrow.** `CBS_OWNERDRAWFIXED` with `WM_DRAWITEM` paints the closed
-   field and the list items only. The drop-down button stays system-drawn and
-   light. Measure the subclass alternative (paint the whole closed face in
-   `WM_PAINT` and `WM_PRINTCLIENT`) on the throwaway window.
-4. **`DarkMode_Explorer` without ordinals.** Does `SetWindowTheme(.., "DarkMode_Explorer", None)`
-   darken the body's scrollbar, the combo list and the trackbar on this build
-   without any ordinal call? Record yes or no per control.
-5. **`PrintWindow` on children.** Confirm a `PrintWindow` capture includes
-   owner-drawn and custom-drawn children, since the pixel test below depends on
-   it. (`WM_PRINTCLIENT` forwarding is the usual gap.)
-6. **High contrast today.** Open the current Settings in Aquatic and Desert at
-   100% and 200%: record that it is correct, so it can be called a baseline to
-   protect.
-7. **Size.** Build the throwaway paint helpers in release and record the size
-   delta (see "Size budget").
+1. **Common-controls version. MEASURED 2026-10-16: v5 today.** With
+   `InitCommonControlsEx(ICC_BAR_CLASSES)` and no manifest, the loaded
+   `comctl32.dll` is the WinSxS 5.82 one and `DllGetVersion` reports 5.82. With
+   the v6 activation context it is WinSxS 6.0 and reports 6.16. So the "very
+   probably v5" in "Where it is today" is now a fact.
+2. **`NM_CUSTOMDRAW` and `BS_*` buttons. MEASURED 2026-10-16.** Under v5:
+   none arrives for a checkbox, radio, group box or push button (a trackbar
+   does send it, on both versions). Under v6: it arrives (`CDDS_PREPAINT`) for
+   `BS_AUTOCHECKBOX`, `BS_AUTORADIOBUTTON` and `BS_PUSHBUTTON`, and answering
+   `CDRF_SKIPDEFAULT` after filling the rect replaces the control's paint.
+   **It does not arrive for `BS_GROUPBOX`, even under v6**, and obviously not
+   for `BS_OWNERDRAW`. This contradicts the group box line below: the group
+   box cannot ride the manifest route. See "Checkboxes and group boxes".
+3. **UI Automation role. MEASURED 2026-10-16: the theory is right.**
+   `BS_OWNERDRAW` is exposed as ControlType Button (50000) with no Toggle
+   pattern, so a checkbox made owner-drawn loses its role and checked state. A
+   `BS_AUTOCHECKBOX` that is custom-drawn (v6 `NM_CUSTOMDRAW`, fully
+   repainted) keeps ControlType CheckBox (50002) and the Toggle pattern, with
+   the state following `BM_SETCHECK`. A `CBS_OWNERDRAWFIXED` combo keeps
+   ControlType ComboBox (50003), same as a stock one. Push buttons and radios
+   are Button (50000) and RadioButton (50013) as stock.
+4. **Combo arrow.** Not measured. The subclass alternative (paint the whole
+   closed face in `WM_PAINT` and `WM_PRINTCLIENT`) is real work and belongs to
+   the combo slice's own gallery check, so it stays a design decision, not a
+   measurement.
+5. **`DarkMode_Explorer` without ordinals. MEASURED 2026-10-16**, with the
+   apps colour mode set to dark (read only; the light-mode result is not
+   measured, since the setting must not be changed). `SetWindowTheme(hwnd,
+   "DarkMode_Explorer", None)`, no ordinal call:
+   - **Non-client scrollbar (`WS_VSCROLL`): yes**, on both v5 and v6. The bar
+     strip went from near white (luminance 240) to near black (29). This is
+     the body's scrollbar case. It was measured on a multiline edit rather
+     than on the Settings body window, which is the same kind of scrollbar.
+   - **Combo closed face: no change** (0 pixels), v5 and v6.
+   - **Combo drop-down list: effectively no.** Themed on the list window, 212
+     pixels changed of a 200x50 list, so a frame at most. The fill and text
+     still come from `WM_CTLCOLORLISTBOX`.
+   - **Trackbar: no change**, v5 and v6.
+   - **Edit: v6 only**, and it goes fully dark (luminance 236 to 41); on v5 it
+     changes nothing. That would fight the `WM_CTLCOLOREDIT` plan, so do not
+     apply the theme to edits.
+6. **`PrintWindow` on children. MEASURED 2026-10-16: works.** With
+   `PW_RENDERFULLCONTENT`, a capture of a child and of the top-level window
+   both contain the pixels of an owner-drawn button and of a v6 custom-drawn
+   checkbox (thousands of the marker colour in each), and a stock checkbox
+   captures fully. The pixel tests and the gallery can rely on it. Under v5 a
+   custom-drawn checkbox is of course never repainted (see 2).
+7. **High contrast today.** Not measured: it needs Aquatic and Desert switched
+   on, which changes the system theme settings. It stays a named manual check
+   in the last slice, so "stock controls are the baseline" is still unverified.
+8. **Size.** Not built in release (the machine is shared). A minimal manifest
+   is well under 1 KB of text; a resource entry adds a few dozen bytes of
+   directory, and the resource section rounds up to the file alignment. So
+   `THEORY (unverified)`: the manifest costs about 1 KB at most. The release
+   build in the manifest slice records the real number.
 
+**What changes in the design.** (a) Checkboxes: the manifest route is
+confirmed as the way, and nothing but v6 can custom-draw a real checkbox;
+`BS_OWNERDRAW` is the rejected fallback with the measured role loss. (b)
+Group boxes cannot use `NM_CUSTOMDRAW`; see below. (c) The scrollbar's
+documented route works, so open question 3 and 5 lean to using it. (d) Do not
+theme edits or the combo list with `DarkMode_Explorer`. (e) The light-mode
+scrollbar result is unmeasured and gets a note in slice 5's check.
 ## The theme source
 
 `Theme::resolve(apps_use_light_theme, high_contrast)` and `Tokens::for_theme`
@@ -153,18 +190,24 @@ owner-draw style is added to it.
 The role problem applies to checkboxes only (there are no radios), so the
 decision is per control and depends on Slice 0:
 
-- **If Slice 0 confirms v5 and the manifest route is chosen:** add the
+- **Manifest route (recommended; Slice 0 confirmed v5 today and that v6 sends
+  the notification):** add the
   common-controls 6.0.0.0 manifest, keep `BS_AUTOCHECKBOX`, and draw in
   `NM_CUSTOMDRAW` (a v6 button sends it to its parent through `WM_NOTIFY`;
   return `CDRF_SKIPDEFAULT` after painting). The class and style stay a real
   checkbox, so role, toggle state and `BM_GETCHECK` keep working with no
   extra code.
-- **If the manifest is rejected:** `BS_OWNERDRAW` checkboxes, with
+- **If the manifest is rejected:** `BS_OWNERDRAW` checkboxes (measured: the role
+  drops to a plain button with no toggle state), with
   `WM_GETOBJECT` for `OBJID_CLIENT` answered by an `IAccessible` wrapper that
   reports the checkbox role and checked state. Real code to get right, with
   its own tests, and the reason the manifest route is preferred.
-- Group boxes: owner-drawn the same way as the checkbox route, frame in
-  `control_border`, caption drawn over a gap cut in the frame.
+- Group boxes: **`NM_CUSTOMDRAW` does not arrive for `BS_GROUPBOX` even under
+  v6 (MEASURED 2026-10-16)**, so they cannot use the checkbox route. Paint the
+  frame in a subclass (`WM_PAINT`, frame in `control_border`, caption drawn
+  over a gap cut in the frame), keeping the `BS_GROUPBOX` class. THEORY
+  (unverified): a group box reads as a group or static text to assistive tech,
+  so its role is not a regression risk; verify it in the Narrator pass.
 
 A shared helper draws each control from `(state, tokens, dpi)` and is a pure
 layout function plus a thin GDI layer, so the layout half is unit-tested.
@@ -183,10 +226,9 @@ for it.
 
 The open list is a separate window the control owns. It gets
 `WM_CTLCOLORLISTBOX` (fill and text) in the parent. What stays stock is its
-frame and, when it scrolls, its scrollbar. If Slice 0 measured
-`SetWindowTheme(list, "DarkMode_Explorer", None)` as helping, use it on that one
-window (found through `CB_GETCOMBOBOXINFO`); it is allowed to fail back to the
-stock look. Otherwise the list keeps the stock frame.
+frame and, when it scrolls, its scrollbar. Slice 0 measured
+`SetWindowTheme(list, "DarkMode_Explorer", None)` as changing almost nothing
+(MEASURED 2026-10-16), so it is not used: the list keeps the stock frame.
 
 ### Trackbar
 
@@ -205,9 +247,10 @@ where the window's UI Automation scroll pattern comes from. A hidden native
 scrollbar child does not give assistive tech a scrollable pane. So this is the
 weakest piece of the plan and is ordered by risk:
 
-1. **Try the documented route first.** `SetWindowTheme(body, "DarkMode_Explorer",
-   None)` per the Slice 0 measurement. If it darkens the bar, done, and the
-   scroll pattern is untouched.
+1. **Use the documented route.** `SetWindowTheme(body, "DarkMode_Explorer",
+   None)`. MEASURED 2026-10-16: it darkens a `WS_VSCROLL` bar with no ordinal
+   call (dark colour mode; the light-mode case is unmeasured, so slice 5
+   re-checks it), and the scroll pattern is untouched.
 2. **If it does not, keep the stock (light) scrollbar** and accept a light strip
    in a dark window. This is the accessible choice and the default fallback.
 3. **A custom owned scrollbar is allowed only with a UI Automation provider**
@@ -314,7 +357,7 @@ registry value is ever written.
   and read back pixels from a `PrintWindow` capture for one control of each
   kind (a checkbox glyph pixel, a combo arrow pixel, an edit frame pixel). This
   is the "wired to nothing" check for owner painting: with no handler wired,
-  the pixel would be the stock light colour. It depends on Slice 0 item 5.
+  the pixel would be the stock light colour. Slice 0 item 6 measured that it holds.
 - Manual, named in each PR: screenshots in all three themes (looked at by
   eye), a real switch of Windows colour mode with Settings open, real high
   contrast (Aquatic and Desert) at 100% and 200% scale, keyboard-only
@@ -354,12 +397,12 @@ manifest slice, which is a deliberate light-mode change.
 
 ### Size budget
 
-The gate is `perf-budgets.json` `exe_size_bytes.max` 3,900,000 against a last
-measurement of 3,800,576, about 99 KB of headroom shared with the options
+The gate is `perf-budgets.json` `exe_size_bytes.max` 4,000,000 against a last
+measurement of 3,908,096, about 92 KB of headroom shared with the options
 card, overlay and knowledge specs. No new crate and no new `windows` feature is
 planned (`Win32_Graphics_Dwm`, `Win32_UI_Controls` and GDI are already on;
 `SetWindowTheme` lives in `Win32_UI_Controls`). Estimates, THEORY
-(unverified) until Slice 0 item 7 measures them: tokens and the shared paint
+(unverified) until the slices measure them (Slice 0 did not build in release): tokens and the shared paint
 helper about 8 KB, buttons and checkboxes about 6 KB, the combo subclass about
 8 KB, trackbar about 2 KB, an `IAccessible` wrapper if needed about 6 KB, a
 custom scrollbar with a UIA provider about 20 KB. About 25 to 30 KB without
@@ -368,17 +411,18 @@ measured size from CI and raises the gate in the same PR if it must.
 
 ## Open questions
 
-1. **Common-controls v6 manifest.** Recommended: add it if Slice 0 confirms
-   Settings runs v5, because it keeps the checkbox a real checkbox with no
+1. **Common-controls v6 manifest.** Recommended: add it (Slice 0 confirmed
+   Settings runs v5), because it keeps the checkbox a real checkbox with no
    accessibility wrapper. Counter-argument: it is a visible change for every
    light-mode and high-contrast user, can shift hard-coded metrics, and the
    same decision affects any other window that uses a list view (the planned
-   Memory window in the knowledge spec). Decide after Slice 0's screenshots.
+   Memory window in the knowledge spec). Decide after the manifest slice's screenshots.
 2. **Edit frame colours.** The custom frame is decided. Which colours and the
    hot and focus states are decided by looking at slice 1's screenshots.
-3. **`DarkMode_Explorer` fallback.** Allowed only if Slice 0 shows it works on
-   this build without ordinals and it measurably helps. Recommended: try it for
-   the scrollbar and the combo list, and accept the stock look if it fails.
+3. **`DarkMode_Explorer` fallback.** Slice 0 showed it works on this
+   build without ordinals for the scrollbar (dark mode), and not for the combo
+   list, trackbar or combo face. Recommended: use it for the body scrollbar only,
+   with the stock look as the fallback if it ever fails.
 4. **Custom paint in light mode too.** Recommended: no, stock in light, so light
    and high contrast cannot regress and the custom code only runs for dark
    users. Counter-argument: a dark checkbox and a light checkbox then differ
