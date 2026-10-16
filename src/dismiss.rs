@@ -17,6 +17,13 @@
 //! changes after `install`, so it lives in a plain `OnceLock<isize>` (set
 //! once, read with `.get()`, no lock needed either).
 //!
+//! Issue #729 (AGENTS.md rule 5, nothing runs while idle): the hook is only
+//! in the system's hook chain while a card that wants click-away is shown.
+//! [`ClickWatcher::arm`] installs it and [`ClickWatcher::disarm`] (or
+//! [`disarm`], which the card calls whenever it hides, auto-dismiss included)
+//! removes it, both on the UI thread that owns the message loop. The
+//! observable: [`hook_installed`] is `false` whenever no card is visible.
+//!
 //! The callback still must never swallow a click: it always returns
 //! whatever `CallNextHookEx` returns. Reporting a click to the target
 //! window is a side effect running alongside the click, not a replacement
@@ -32,10 +39,10 @@
 //! also means adding it to `app.rs`'s `tests::ALL_WM_APP_IDS` (issue #163),
 //! which is enforced by `wm_app_ids_registry_is_exhaustive`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSLLHOOKSTRUCT,
@@ -98,42 +105,105 @@ static TARGET_HWND: OnceLock<isize> = OnceLock::new();
 /// alone can be enormous -- never blocks.
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-/// Owns the installed `WH_MOUSE_LL` hook. Must be created on, and outlive,
-/// the thread running the Win32 message loop. Starts disarmed.
-pub struct ClickWatcher {
-    hhook: HHOOK,
+/// The installed hook handle (`0` = not installed). The lifecycle logic lives
+/// here, apart from the Win32 calls, so it can be unit-tested with fakes.
+struct HookSlot {
+    handle: AtomicIsize,
 }
 
+impl HookSlot {
+    const fn new() -> Self {
+        Self {
+            handle: AtomicIsize::new(0),
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.handle.load(Ordering::Relaxed) != 0
+    }
+
+    /// Installs once: a second call while installed does nothing. `false`
+    /// means the install failed and nothing is installed.
+    fn arm(&self, install: impl FnOnce() -> Option<isize>) -> bool {
+        if self.is_set() {
+            return true;
+        }
+        match install() {
+            Some(h) if h != 0 => {
+                self.handle.store(h, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Removes the hook if installed; a no-op otherwise.
+    fn disarm(&self, uninstall: impl FnOnce(isize)) {
+        let h = self.handle.swap(0, Ordering::Relaxed);
+        if h != 0 {
+            uninstall(h);
+        }
+    }
+}
+
+static HOOK: HookSlot = HookSlot::new();
+
+fn install_real_hook() -> Option<isize> {
+    unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) }
+        .ok()
+        .map(|h| h.0 as isize)
+}
+
+fn uninstall_real_hook(h: isize) {
+    // Never panic on the main thread: nothing useful to do about a failure.
+    let _ = unsafe { UnhookWindowsHookEx(HHOOK(h as *mut _)) };
+}
+
+/// Whether the `WH_MOUSE_LL` hook is in the system's hook chain right now.
+/// `false` whenever no card needs click-away (issue #729).
+#[allow(dead_code)]
+pub fn hook_installed() -> bool {
+    HOOK.is_set()
+}
+
+/// Removes the hook and stops reporting clicks. Free-function twin of
+/// [`ClickWatcher::disarm`] for code that has no handle (the card, when it
+/// hides). Must run on the thread that installed the hook.
+pub fn disarm() {
+    ARMED.store(false, Ordering::Relaxed);
+    HOOK.disarm(uninstall_real_hook);
+}
+
+/// Handle for the click watcher. The hook itself is installed only between
+/// [`arm`](Self::arm) and [`disarm`](Self::disarm). Must be used on the
+/// thread running the Win32 message loop.
+pub struct ClickWatcher;
+
 impl ClickWatcher {
-    /// Installs the hook. `target` receives [`WM_APP_DISMISS`] once armed.
-    /// Must be called on the thread that runs the message loop, and only
-    /// once per process (a second call fails). Starts disarmed; call
-    /// [`arm`](Self::arm) once an answer is on screen.
-    ///
-    /// Never fails the caller into believing dismissal is unavailable
-    /// without saying so: on error, the caller is expected to fall back to
-    /// timer-based dismissal instead of the click watcher.
+    /// Records `target`, which receives [`WM_APP_DISMISS`] while armed. Must
+    /// be called on the thread that runs the message loop, and only once per
+    /// process (a second call fails). Installs no hook yet.
     pub fn install(target: HWND) -> Result<Self> {
         TARGET_HWND
             .set(target.0 as isize)
             .map_err(|_| anyhow::anyhow!("ClickWatcher::install called more than once"))?;
         ARMED.store(false, Ordering::Relaxed);
-
-        let hhook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) }
-            .context("SetWindowsHookExW(WH_MOUSE_LL) failed")?;
-
-        Ok(Self { hhook })
+        Ok(Self)
     }
 
-    /// Start reporting clicks. Called when an answer becomes visible.
+    /// Install the hook and start reporting clicks. Called when a card that
+    /// wants click-away becomes visible. If the hook cannot be installed the
+    /// card still auto-dismisses on its timer, as it always did.
     pub fn arm(&self) {
-        ARMED.store(true, Ordering::Relaxed);
+        if HOOK.arm(install_real_hook) {
+            ARMED.store(true, Ordering::Relaxed);
+        }
     }
 
-    /// Stop reporting clicks. Called while a request is in flight and
-    /// whenever the card is hidden.
+    /// Remove the hook. Called while a request is in flight and whenever the
+    /// card is hidden.
     pub fn disarm(&self) {
-        ARMED.store(false, Ordering::Relaxed);
+        disarm();
     }
 
     /// Not used by the app today; kept because the armed/disarmed gate is
@@ -146,9 +216,7 @@ impl ClickWatcher {
 
 impl Drop for ClickWatcher {
     fn drop(&mut self) {
-        // Never panic on the main thread: ignore failure, there is nothing
-        // useful to do about it during teardown.
-        let _ = unsafe { UnhookWindowsHookEx(self.hhook) };
+        disarm();
     }
 }
 
@@ -276,6 +344,79 @@ mod tests {
         const WM_MOUSEWHEEL: u32 = 0x020A;
         assert!(!should_report(true, WM_LBUTTONUP));
         assert!(!should_report(true, WM_MOUSEWHEEL));
+    }
+
+    // -- hook lifecycle (issue #729) ------------------------------------
+
+    use std::cell::Cell;
+
+    #[test]
+    fn nothing_is_installed_until_armed() {
+        let slot = HookSlot::new();
+        assert!(!slot.is_set());
+    }
+
+    #[test]
+    fn arm_installs_once_and_disarm_removes_it() {
+        let slot = HookSlot::new();
+        let installs = Cell::new(0);
+        let removed = Cell::new(0);
+        assert!(slot.arm(|| {
+            installs.set(installs.get() + 1);
+            Some(7)
+        }));
+        assert!(slot.is_set());
+        // Arming again while installed must not stack a second hook.
+        assert!(slot.arm(|| {
+            installs.set(installs.get() + 1);
+            Some(8)
+        }));
+        assert_eq!(installs.get(), 1);
+        slot.disarm(|h| {
+            assert_eq!(h, 7);
+            removed.set(removed.get() + 1);
+        });
+        assert!(!slot.is_set());
+        assert_eq!(removed.get(), 1);
+    }
+
+    #[test]
+    fn disarm_when_nothing_is_installed_does_nothing() {
+        let slot = HookSlot::new();
+        slot.disarm(|_| panic!("nothing to remove"));
+        assert!(!slot.is_set());
+    }
+
+    #[test]
+    fn a_failed_install_leaves_nothing_installed_and_can_retry() {
+        let slot = HookSlot::new();
+        assert!(!slot.arm(|| None));
+        assert!(!slot.arm(|| Some(0)));
+        assert!(!slot.is_set());
+        assert!(slot.arm(|| Some(5)));
+        assert!(slot.is_set());
+    }
+
+    #[test]
+    fn can_arm_again_after_a_disarm() {
+        let slot = HookSlot::new();
+        assert!(slot.arm(|| Some(1)));
+        slot.disarm(|_| {});
+        assert!(slot.arm(|| Some(2)));
+        assert!(slot.is_set());
+    }
+
+    /// Live check against the real Win32 hook (ignored by default: it touches
+    /// the process-wide hook slot). Run with
+    /// `cargo test hook_lifecycle_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn hook_lifecycle_live() {
+        assert!(!hook_installed(), "no hook before any arm");
+        assert!(HOOK.arm(install_real_hook), "SetWindowsHookExW failed");
+        assert!(hook_installed());
+        disarm();
+        assert!(!hook_installed(), "hook must be gone after disarm");
     }
 
     #[test]
