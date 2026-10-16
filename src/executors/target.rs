@@ -239,6 +239,31 @@ pub fn plan_typed_input(text: &str) -> Vec<UnicodeKeyEvent> {
     events
 }
 
+/// What the typed-input fallback does to a field, in order (#592): optionally
+/// select everything, optionally delete the selection, then type `text`.
+/// Typing over a selection replaces it, so `delete_selection` is only set when
+/// there is nothing to type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedReplacePlan {
+    pub select_all: bool,
+    pub delete_selection: bool,
+    pub text: Vec<UnicodeKeyEvent>,
+}
+
+/// Plans a typed-input REPLACE, not an append: a field that already holds
+/// text is selected first so the new text overwrites it. The caller has
+/// already checked the live text equals `expected_current_text`, so an empty
+/// expected text means the field really is empty and needs no select-all.
+pub fn plan_typed_replace(expected_current_text: &str, new_text: &str) -> TypedReplacePlan {
+    let text = plan_typed_input(new_text);
+    let select_all = !expected_current_text.is_empty();
+    TypedReplacePlan {
+        select_all,
+        delete_selection: select_all && text.is_empty(),
+        text,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The injectable seam (mirrors executors::clipboard::ClipboardAccess)
 // ---------------------------------------------------------------------------
@@ -290,8 +315,9 @@ pub mod com {
     #![allow(dead_code)]
 
     use super::{
-        ensure_unchanged, is_editable_control_type, plan_typed_input, resolve_index, MatchOutcome,
-        ResolvedElement, TargetRef, TextElementAccess, UnicodeKeyEvent,
+        ensure_unchanged, is_editable_control_type, plan_typed_replace, resolve_index,
+        MatchOutcome, ResolvedElement, TargetRef, TextElementAccess, TypedReplacePlan,
+        UnicodeKeyEvent,
     };
     use anyhow::Result;
     use windows::core::{Interface, BSTR};
@@ -312,7 +338,7 @@ pub mod com {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-        VIRTUAL_KEY,
+        VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL,
     };
 
     use crate::hotkey::INJECTED_MARKER;
@@ -628,12 +654,64 @@ pub mod com {
     /// constant every `SendInput` call site in the crate now shares) so
     /// `hook_proc` never treats this typed fallback's own keystrokes as a
     /// real hotkey press.
-    fn inject_unicode_events(events: &[UnicodeKeyEvent]) {
+    fn inject_unicode_events(events: &[UnicodeKeyEvent]) -> Result<()> {
         let inputs: Vec<INPUT> = events.iter().map(to_unicode_input).collect();
+        send_all(&inputs)
+    }
+
+    /// `SendInput`, treating a short count (blocked by UIPI, another desktop,
+    /// a full queue) as an error instead of ignoring it.
+    fn send_all(inputs: &[INPUT]) -> Result<()> {
         if inputs.is_empty() {
-            return;
+            return Ok(());
         }
-        unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+        anyhow::ensure!(
+            sent as usize == inputs.len(),
+            "the keystrokes could not be sent ({sent} of {})",
+            inputs.len()
+        );
+        Ok(())
+    }
+
+    fn vk_input(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: if key_up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        Default::default()
+                    },
+                    time: 0,
+                    dwExtraInfo: INJECTED_MARKER,
+                },
+            },
+        }
+    }
+
+    /// Runs a [`TypedReplacePlan`]. Select-all (and delete) is sent first and
+    /// on its own: if it cannot be sent, nothing is typed and this errs, so a
+    /// failed clear never turns into an append (#592).
+    fn inject_typed_replace(plan: &TypedReplacePlan) -> Result<()> {
+        if plan.select_all {
+            send_all(&[
+                vk_input(VK_CONTROL, false),
+                vk_input(VK_A, false),
+                vk_input(VK_A, true),
+                vk_input(VK_CONTROL, true),
+            ])
+            .map_err(|e| {
+                anyhow::anyhow!("could not select the existing text, so nothing was typed: {e}")
+            })?;
+        }
+        if plan.delete_selection {
+            send_all(&[vk_input(VK_BACK, false), vk_input(VK_BACK, true)])?;
+        }
+        inject_unicode_events(&plan.text)
     }
 
     /// The real, UIA-backed [`TextElementAccess`]. Each call is a
@@ -715,9 +793,7 @@ pub mod com {
                     // plan_typed_input never emits Enter/Tab, so this can
                     // never submit or focus-advance out of the field.
                     unsafe { matched.element.SetFocus() }.map_err(|_| e)?;
-                    let events = plan_typed_input(new_text);
-                    inject_unicode_events(&events);
-                    Ok(())
+                    inject_typed_replace(&plan_typed_replace(expected_current_text, new_text))
                 }
             }
         }
@@ -961,5 +1037,37 @@ mod tests {
         assert!(!events[2].key_up && events[3].key_up);
         // The two surrogate halves are different code units.
         assert_ne!(events[0].code_unit, events[2].code_unit);
+    }
+
+    // -- plan_typed_replace (#592: the fallback replaces, never appends) ----
+
+    #[test]
+    fn typed_replace_selects_all_first_when_the_field_has_text() {
+        let plan = plan_typed_replace("old", "new");
+        assert!(plan.select_all, "existing text must be selected first");
+        assert!(!plan.delete_selection, "typing replaces the selection");
+        assert_eq!(plan.text, plan_typed_input("new"));
+    }
+
+    #[test]
+    fn typed_replace_skips_select_all_for_an_empty_field() {
+        let plan = plan_typed_replace("", "new");
+        assert!(!plan.select_all);
+        assert!(!plan.delete_selection);
+        assert_eq!(plan.text, plan_typed_input("new"));
+    }
+
+    #[test]
+    fn typed_replace_deletes_the_selection_when_restoring_to_empty() {
+        let plan = plan_typed_replace("old", "");
+        assert!(plan.select_all);
+        assert!(plan.delete_selection, "no text to type means delete");
+        assert!(plan.text.is_empty());
+    }
+
+    #[test]
+    fn typed_replace_of_empty_by_empty_does_nothing() {
+        let plan = plan_typed_replace("", "");
+        assert!(!plan.select_all && !plan.delete_selection && plan.text.is_empty());
     }
 }
