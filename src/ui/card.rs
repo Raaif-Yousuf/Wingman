@@ -4135,6 +4135,64 @@ mod tests {
         // Dropping must not panic (this exercises DestroyWindow + WM_NCDESTROY).
     }
 
+    /// True when `id` is a live timer on the card's window. `KillTimer`
+    /// fails for a timer that does not exist, so killing is the oracle (it
+    /// also removes the timer, so call it once per id per check).
+    fn timer_was_live(card: &Card, id: usize) -> bool {
+        unsafe { KillTimer(Some(card.inner.hwnd), id) }.is_ok()
+    }
+
+    #[test]
+    fn working_timers_run_only_while_pending_and_die_on_every_exit() {
+        // Issue #354, AGENTS.md rule 5: nothing runs while idle.
+        let model = || PendingStage::AskingModel {
+            model_name: "test-model".to_string(),
+        };
+
+        // Pending: the safety timer and the "still working" countdown are
+        // armed; the spinner timer only when animations are on.
+        let mut card = Card::new(instance()).expect("Card::new");
+        card.show_pending(model());
+        assert!(timer_was_live(&card, TIMER_DISMISS));
+        assert!(timer_was_live(&card, TIMER_STILL_WORKING));
+        assert_eq!(
+            timer_was_live(&card, TIMER_ANIM),
+            card.inner.animations_enabled
+        );
+
+        // Every way out of Pending leaves no countdown or spinner behind.
+        type Exit = fn(&mut Card);
+        let exits: [(&str, Exit); 3] = [
+            ("answer", |c| c.show_answer("a", "b", 5, None)),
+            ("error", |c| c.show_error("a", "b")),
+            ("hide", |c| c.hide()),
+        ];
+        for (name, exit) in exits {
+            card.show_pending(model());
+            exit(&mut card);
+            assert!(
+                !timer_was_live(&card, TIMER_STILL_WORKING),
+                "{name}: countdown left running"
+            );
+            assert!(
+                !timer_was_live(&card, TIMER_ANIM),
+                "{name}: spinner timer left running"
+            );
+        }
+
+        // A stage with no countdown (and a fresh Pending after a countdown
+        // stage) must not inherit the old countdown.
+        card.show_pending(model());
+        card.show_pending(PendingStage::Working);
+        assert!(!timer_was_live(&card, TIMER_STILL_WORKING));
+
+        // The countdown fires once: moving to StillWorking kills it.
+        card.show_pending(model());
+        card.set_pending_stage(PendingStage::StillWorking);
+        assert!(!timer_was_live(&card, TIMER_STILL_WORKING));
+        card.hide();
+    }
+
     #[test]
     fn clicking_a_settings_needed_card_opens_settings_instead_of_expanding() {
         // Issue #347: the old "No API key: open Edit settings" card named a
