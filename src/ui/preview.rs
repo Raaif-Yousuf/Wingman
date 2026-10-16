@@ -412,7 +412,7 @@ fn display_array_item(v: &Value) -> String {
     display_string(v)
 }
 
-/// `"start"` ->`"Start"`, `"rate_difficulty"` -> `"Rate difficulty"`: a
+/// `"start"` -> `"Start"`, `"rate_difficulty"` -> `"Rate difficulty"`: a
 /// cheap snake_case-to-sentence-case label so a new schema field never needs
 /// a parallel "pretty label" table that can drift from the actual field
 /// name (the same reasoning `actions::schema`'s doc comment gives for

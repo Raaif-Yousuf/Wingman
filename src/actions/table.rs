@@ -22,6 +22,18 @@ pub const ACTION_ID: &str = "table-to-csv";
 /// The proposal kind this module reads (`actions::schema`'s `table`).
 pub const PROPOSAL_KIND: &str = "table";
 
+/// The most rows and columns kept from a model's table. Real screen tables
+/// are far smaller; the caps stop a runaway reply from exhausting memory.
+pub const MAX_ROWS: usize = 5000;
+pub const MAX_COLUMNS: usize = 200;
+
+/// The note on the preview card when the table was cut to the caps.
+pub const CAPPED_NOTE: &str =
+    "The table was too big, so only the first 5000 rows and 200 columns are kept.";
+
+/// What the card says when the model's reply is not a table it can read.
+pub const NOT_READ_HEADLINE: &str = "The table could not be read";
+
 /// What the card says when the screen holds no table.
 pub const NO_TABLE_HEADLINE: &str = "No table found";
 
@@ -54,28 +66,39 @@ pub fn builtin_action() -> Action {
 pub struct Table {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// True when rows or columns past the caps were dropped.
+    pub capped: bool,
 }
 
 impl Table {
     /// Reads a `table` proposal (`columns`, `rows`). A number or bool cell is
     /// written as text, so a model that returns `12` instead of `"12"` still
-    /// works; a row that is not a list is skipped. `None` when there is no
-    /// `columns` or `rows` field of the right shape.
+    /// works. `None` when there is no `columns` or `rows` list, or a row is
+    /// not a list (the table could not be read). Past [`MAX_ROWS`] rows or
+    /// [`MAX_COLUMNS`] columns the extra is dropped and `capped` is set: a
+    /// model that runs away must not exhaust memory in the tray process.
     pub fn from_value(proposal: &Value) -> Option<Table> {
-        let columns = proposal
-            .get("columns")?
-            .as_array()?
-            .iter()
-            .map(cell_text)
-            .collect();
-        let rows = proposal
-            .get("rows")?
-            .as_array()?
-            .iter()
-            .filter_map(Value::as_array)
-            .map(|row| row.iter().map(cell_text).collect())
-            .collect();
-        Some(Table { columns, rows })
+        let columns_in = proposal.get("columns")?.as_array()?;
+        let rows_in = proposal.get("rows")?.as_array()?;
+        let mut capped = columns_in.len() > MAX_COLUMNS || rows_in.len() > MAX_ROWS;
+        let columns = columns_in.iter().take(MAX_COLUMNS).map(cell_text).collect();
+        let mut rows = Vec::with_capacity(rows_in.len().min(MAX_ROWS));
+        for row in rows_in.iter().take(MAX_ROWS) {
+            let cells = row.as_array()?;
+            capped |= cells.len() > MAX_COLUMNS;
+            rows.push(cells.iter().take(MAX_COLUMNS).map(cell_text).collect());
+        }
+        Some(Table {
+            columns,
+            rows,
+            capped,
+        })
+    }
+
+    /// The table as a `table` proposal again (what the preview card shows
+    /// when the table was capped, so the card matches what is copied).
+    pub fn to_value(&self) -> Value {
+        serde_json::json!({"columns": self.columns, "rows": self.rows})
     }
 
     /// True when there is nothing to copy: no rows, or every cell blank.
@@ -85,8 +108,8 @@ impl Table {
 
     /// The table as CSV (RFC 4180): a header line, then one line per row,
     /// CRLF line endings, no trailing newline. Every line has as many cells
-    /// as the widest row, short rows padded with empty cells (a longer row
-    /// is never cut: dropping data silently is worse than a wide column).
+    /// as the widest row (at most [`MAX_COLUMNS`]), short rows padded with
+    /// empty cells.
     pub fn csv(&self) -> String {
         let width = self
             .rows
@@ -129,30 +152,43 @@ pub fn csv_field(cell: &str) -> String {
 
 /// Spreadsheet formula guard. Excel and Sheets run a cell that starts with
 /// `=`, `+`, `-` or `@` (or a tab or CR) as a formula, so a table read off a
-/// hostile page could run one when pasted. Such a cell gets a leading
-/// apostrophe, which a spreadsheet shows as plain text. The exception is a
-/// number: `-5`, `+3.5`, `-1,234.50` and `-12%` are data, not formulas, and
-/// stay as they are.
+/// hostile page could run one when pasted. Leading spaces do not stop it, so
+/// the check looks past them. Such a cell gets a leading apostrophe (before
+/// the original text), which a spreadsheet shows as plain text. The
+/// exception is a number: `-5`, `+3.5`, `-1,234.50`, `-12%`, `-$5` and `-1e3`
+/// are data, not formulas, and stay as they are.
 pub fn guard_formula(cell: &str) -> String {
-    let risky = cell.starts_with(['=', '+', '-', '@', '\t', '\r']);
-    if risky && !is_signed_number(cell) {
+    let trimmed = cell.trim_start();
+    let risky = cell.starts_with(['\t', '\r']) || trimmed.starts_with(['=', '+', '-', '@']);
+    if risky && !is_signed_number(trimmed) {
         format!("'{cell}")
     } else {
         cell.to_string()
     }
 }
 
-/// A sign followed by only digits, `.`, `,` and an optional trailing `%`,
-/// with at least one digit.
+/// A sign, an optional currency symbol, then digits with `.` and `,`, an
+/// optional exponent (`e3`, `E-3`) or a trailing `%`, and at least one digit.
+/// Nothing else: any other character makes it text that gets the guard.
 fn is_signed_number(cell: &str) -> bool {
     let Some(rest) = cell.strip_prefix(['+', '-']) else {
         return false;
     };
+    let rest = rest
+        .strip_prefix(['$', '\u{20ac}', '\u{a3}', '\u{a5}'])
+        .unwrap_or(rest);
     let rest = rest.strip_suffix('%').unwrap_or(rest);
-    rest.chars().any(|c| c.is_ascii_digit())
-        && rest
+    let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (rest, None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    let exponent_ok = exponent.is_none_or(|e| digits(e.strip_prefix(['+', '-']).unwrap_or(e)));
+    mantissa.chars().any(|c| c.is_ascii_digit())
+        && mantissa
             .chars()
             .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+        && exponent_ok
 }
 
 /// The CSV for a confirmed `table` proposal, `None` when it has no table or
@@ -162,10 +198,17 @@ pub fn csv_from_value(proposal: &Value) -> Option<String> {
     (!table.is_empty()).then(|| table.csv())
 }
 
-/// Whether a model proposal for the `table` kind has nothing to copy.
-/// Always false for any other proposal kind.
+/// Whether a model proposal for the `table` kind has nothing to copy: it
+/// reads as a table with no cells. Always false for any other proposal kind.
 pub fn is_empty_result(proposal_kind: &str, proposal: &Value) -> bool {
-    proposal_kind == PROPOSAL_KIND && csv_from_value(proposal).is_none()
+    proposal_kind == PROPOSAL_KIND && Table::from_value(proposal).is_some_and(|t| t.is_empty())
+}
+
+/// Whether a model proposal for the `table` kind is not a table at all (a
+/// missing list, or a row that is not a list). Always false for any other
+/// proposal kind.
+pub fn is_unreadable(proposal_kind: &str, proposal: &Value) -> bool {
+    proposal_kind == PROPOSAL_KIND && Table::from_value(proposal).is_none()
 }
 
 #[cfg(test)]
@@ -180,6 +223,7 @@ mod tests {
                 .iter()
                 .map(|r| r.iter().map(|s| s.to_string()).collect())
                 .collect(),
+            capped: false,
         }
     }
 
@@ -267,6 +311,7 @@ mod tests {
         assert!(csv_from_value(&json!({"columns": ["A"], "rows": [[""]]})).is_none());
         assert!(csv_from_value(&json!({"rows": [["a"]]})).is_none());
         assert!(csv_from_value(&json!({"columns": ["A"], "rows": "x"})).is_none());
+        assert!(csv_from_value(&json!({"columns": ["A"], "rows": ["x"]})).is_none());
         assert!(is_empty_result(
             "table",
             &json!({"columns": [], "rows": []})
@@ -276,6 +321,51 @@ mod tests {
             "table",
             &json!({"columns": ["A"], "rows": [["1"]]})
         ));
+    }
+
+    #[test]
+    fn an_unreadable_reply_is_told_apart_from_an_empty_table() {
+        let empty = json!({"columns": [], "rows": []});
+        let bad_row = json!({"columns": ["A"], "rows": ["x"]});
+        let no_rows = json!({"columns": ["A"]});
+        assert!(is_empty_result("table", &empty) && !is_unreadable("table", &empty));
+        assert!(is_unreadable("table", &bad_row) && !is_empty_result("table", &bad_row));
+        assert!(is_unreadable("table", &no_rows));
+        assert!(!is_unreadable("text_answer", &bad_row));
+    }
+
+    #[test]
+    fn a_runaway_table_is_cut_to_the_caps_and_says_so() {
+        let row: Vec<Value> = (0..MAX_COLUMNS + 5).map(|i| json!(i.to_string())).collect();
+        let rows: Vec<Value> = (0..MAX_ROWS + 10).map(|_| json!(row)).collect();
+        let t = Table::from_value(&json!({"columns": row, "rows": rows})).unwrap();
+        assert!(t.capped);
+        assert_eq!(t.rows.len(), MAX_ROWS);
+        assert_eq!(t.columns.len(), MAX_COLUMNS);
+        assert!(t.rows.iter().all(|r| r.len() == MAX_COLUMNS));
+        // The card value matches what is copied.
+        assert_eq!(Table::from_value(&t.to_value()).unwrap().rows, t.rows);
+        let small = Table::from_value(&json!({"columns": ["A"], "rows": [["1"]]})).unwrap();
+        assert!(!small.capped);
+    }
+
+    #[test]
+    fn leading_spaces_do_not_hide_a_formula() {
+        assert_eq!(guard_formula(" =1+1"), "' =1+1");
+        assert_eq!(guard_formula("  @SUM(A1)"), "'  @SUM(A1)");
+        assert_eq!(guard_formula(" -5"), " -5");
+    }
+
+    #[test]
+    fn currency_and_exponent_numbers_stay_but_lookalikes_are_guarded() {
+        for ok in ["-$5", "+\u{20ac}1,200.50", "-1e3", "-1.5E-3", "-$1,000%"] {
+            assert_eq!(guard_formula(ok), ok, "{ok:?}");
+        }
+        for bad in [
+            "-$", "-e3", "-1e", "-1e+", "-$5+2", "-1e3+1", "-1e3e4", "-$A1",
+        ] {
+            assert_eq!(guard_formula(bad), format!("'{bad}"), "{bad:?}");
+        }
     }
 
     #[test]
