@@ -1541,6 +1541,16 @@ impl Config {
         on_disk.save_to(&path)
     }
 
+    /// Moves every live, non-env-sourced `api_key` in `self` into Credential
+    /// Manager (and removes the credential of a key the user cleared), the
+    /// store half of [`Config::save`], without writing any file. `self` is not
+    /// changed. Used by the field-level writer (`config_writer`, #870), which
+    /// never puts a key in `config.toml`.
+    pub(crate) fn push_secrets_to_credential_manager(&self) -> Result<()> {
+        let mut copy = self.clone();
+        copy.push_secrets_to_store(&CredManagerStore, &|name| std::env::var(name).is_ok())
+    }
+
     /// #711: refuses a save that would clobber the user's file.
     fn check_save_allowed(&self, path: &Path) -> Result<()> {
         // Defaults standing in for an unreadable file must never replace it.

@@ -336,20 +336,63 @@ fn match_line_endings(original: &str, patched: String) -> String {
     }
 }
 
+/// What a caller asks the writer thread to do, and the words it wants back.
+pub struct JobSpec {
+    /// The keys to change.
+    pub changes: Vec<FieldChange>,
+    /// A config whose API keys should go to Credential Manager first (never to
+    /// the file). If that fails the file is not touched. `None` for a change
+    /// that has no key in it.
+    pub secrets: Option<Config>,
+    /// Card headline when the change was written.
+    pub saved: String,
+    /// Card headline when it was not.
+    pub failed: String,
+    /// Added under the failure headline, e.g. what happens to the choice that
+    /// is already live.
+    pub hint: String,
+}
+
 /// What the writer thread tells the caller when a job is done.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteReply {
-    /// What the caller called the job (for its card or status line).
-    pub label: String,
+    /// [`JobSpec::saved`].
+    pub saved: String,
+    /// [`JobSpec::failed`].
+    pub failed: String,
+    /// [`JobSpec::hint`].
+    pub hint: String,
     /// `Err` holds a plain sentence.
     pub result: Result<(), String>,
 }
 
+impl WriteReply {
+    fn of(spec: &JobSpecTexts, result: Result<(), String>) -> Self {
+        WriteReply {
+            saved: spec.saved.clone(),
+            failed: spec.failed.clone(),
+            hint: spec.hint.clone(),
+            result,
+        }
+    }
+}
+
+struct JobSpecTexts {
+    saved: String,
+    failed: String,
+    hint: String,
+}
+
 struct Job {
     changes: Vec<FieldChange>,
-    label: String,
+    secrets: Option<Config>,
+    texts: JobSpecTexts,
     done: Box<dyn FnOnce(WriteReply) + Send>,
 }
+
+/// Moves the API keys in a config into Credential Manager. Injected so tests
+/// never touch the real store (rule 9).
+type SecretsPusher = Box<dyn Fn(&Config) -> Result<()> + Send>;
 
 /// The writer thread's handle. Cheap to share; the thread ends when the last
 /// handle is dropped.
@@ -358,11 +401,19 @@ pub struct ConfigWriter {
 }
 
 impl ConfigWriter {
-    /// Starts the `settings-writer` thread for `path`. It blocks on the channel,
-    /// so it costs nothing while idle. Jobs that queue up while it writes are
-    /// coalesced into one write (latest value of each key wins) and every job is
-    /// told the one result.
+    /// Starts the `settings-writer` thread for `path`, pushing keys to the real
+    /// Credential Manager. See [`ConfigWriter::spawn_with`].
     pub fn spawn(path: PathBuf) -> Self {
+        Self::spawn_with(path, Box::new(Config::push_secrets_to_credential_manager))
+    }
+
+    /// Starts the thread. It blocks on the channel, so it costs nothing while
+    /// idle. Jobs that queue up while it writes are coalesced into one write
+    /// (the latest value of each key wins) and every job is told the one result.
+    /// A job with keys to store runs its store step first and alone: if the
+    /// store refuses, that job fails and its changes are dropped, and the file
+    /// is not touched for it.
+    pub fn spawn_with(path: PathBuf, push_secrets: SecretsPusher) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         // If the thread cannot start, `rx` is dropped with the closure and
         // `submit` finds the channel closed, which it reports.
@@ -372,38 +423,51 @@ impl ConfigWriter {
                 while let Ok(first) = rx.recv() {
                     let mut jobs = vec![first];
                     jobs.extend(rx.try_iter());
-                    let all = jobs.iter().flat_map(|j| j.changes.clone()).collect();
-                    let result = write_changes(&path, &coalesce(all)).map_err(|e| format!("{e:#}"));
+                    let mut writable = Vec::with_capacity(jobs.len());
                     for job in jobs {
-                        (job.done)(WriteReply {
-                            label: job.label,
-                            result: result.clone(),
-                        });
+                        let stored = match &job.secrets {
+                            Some(config) => push_secrets(config).map_err(|e| format!("{e:#}")),
+                            None => Ok(()),
+                        };
+                        match stored {
+                            Ok(()) => writable.push(job),
+                            Err(reason) => {
+                                (job.done)(WriteReply::of(&job.texts, Err(reason)));
+                            }
+                        }
+                    }
+                    if writable.is_empty() {
+                        continue;
+                    }
+                    let all = writable.iter().flat_map(|j| j.changes.clone()).collect();
+                    let result = write_changes(&path, &coalesce(all)).map_err(|e| format!("{e:#}"));
+                    for job in writable {
+                        (job.done)(WriteReply::of(&job.texts, result.clone()));
                     }
                 }
             });
         Self { jobs: tx }
     }
 
-    /// Queues `changes`; `done` runs on the writer thread with the result. If the
+    /// Queues a job; `done` runs on the writer thread with the result. If the
     /// thread is gone, `done` runs here with an error, so a caller always hears
     /// back.
-    pub fn submit(
-        &self,
-        label: &str,
-        changes: Vec<FieldChange>,
-        done: impl FnOnce(WriteReply) + Send + 'static,
-    ) {
+    pub fn submit(&self, spec: JobSpec, done: impl FnOnce(WriteReply) + Send + 'static) {
         let job = Job {
-            changes,
-            label: label.to_string(),
+            changes: spec.changes,
+            secrets: spec.secrets,
+            texts: JobSpecTexts {
+                saved: spec.saved,
+                failed: spec.failed,
+                hint: spec.hint,
+            },
             done: Box::new(done),
         };
         if let Err(mpsc::SendError(job)) = self.jobs.send(job) {
-            (job.done)(WriteReply {
-                label: job.label,
-                result: Err("the settings writer is not running".to_string()),
-            });
+            (job.done)(WriteReply::of(
+                &job.texts,
+                Err("the settings writer is not running".to_string()),
+            ));
         }
     }
 }
@@ -1052,12 +1116,27 @@ x = 1
 
     // -- the writer thread ------------------------------------------------------
 
+    fn spec(label: &str, changes: Vec<FieldChange>) -> JobSpec {
+        JobSpec {
+            changes,
+            secrets: None,
+            saved: label.to_string(),
+            failed: format!("{label}: not saved"),
+            hint: "hint".to_string(),
+        }
+    }
+
     fn replies(writer: &ConfigWriter, jobs: Vec<(&str, Vec<FieldChange>)>) -> Vec<WriteReply> {
+        let jobs = jobs.into_iter().map(|(l, c)| spec(l, c)).collect();
+        replies_for(writer, jobs)
+    }
+
+    fn replies_for(writer: &ConfigWriter, jobs: Vec<JobSpec>) -> Vec<WriteReply> {
         let (tx, rx) = mpsc::channel();
         let n = jobs.len();
-        for (label, changes) in jobs {
+        for job in jobs {
             let tx = tx.clone();
-            writer.submit(label, changes, move |r| {
+            writer.submit(job, move |r| {
                 let _ = tx.send(r);
             });
         }
@@ -1078,7 +1157,9 @@ x = 1
             &writer,
             vec![("Mode", vec![FieldChange::mode(Mode::Offline)])],
         );
-        assert_eq!(got[0].label, "Mode");
+        assert_eq!(got[0].saved, "Mode");
+        assert_eq!(got[0].failed, "Mode: not saved");
+        assert_eq!(got[0].hint, "hint");
         assert_eq!(got[0].result, Ok(()));
         let out = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -1130,6 +1211,93 @@ x = 1
         assert!(got[0].result.is_err());
     }
 
+    fn spawn_with_fake_store(
+        path: PathBuf,
+        fail: bool,
+    ) -> (ConfigWriter, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let writer = ConfigWriter::spawn_with(
+            path,
+            Box::new(move |config: &Config| {
+                record
+                    .lock()
+                    .unwrap()
+                    .push(config.providers.openai.api_key.clone());
+                if fail {
+                    anyhow::bail!("Credential Manager said no");
+                }
+                Ok(())
+            }),
+        );
+        (writer, seen)
+    }
+
+    fn with_key(changes: Vec<FieldChange>) -> JobSpec {
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-typed-by-the-user".into();
+        JobSpec {
+            secrets: Some(config),
+            ..spec("Settings saved", changes)
+        }
+    }
+
+    #[test]
+    fn keys_go_to_the_store_and_never_to_the_file() {
+        let path = scratch("thread-keys");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let (writer, seen) = spawn_with_fake_store(path.clone(), false);
+        let got = replies_for(
+            &writer,
+            vec![with_key(vec![set(&["ui", "card_seconds"], 9u32)])],
+        );
+        assert_eq!(got[0].result, Ok(()));
+        assert_eq!(*seen.lock().unwrap(), vec!["sk-typed-by-the-user"]);
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(!out.contains("sk-typed-by-the-user"), "{out}");
+        assert!(out.contains("card_seconds = 9"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_store_failure_leaves_the_file_untouched_and_reports_it() {
+        let path = scratch("thread-store-fails");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let (writer, _seen) = spawn_with_fake_store(path.clone(), true);
+        let got = replies_for(
+            &writer,
+            vec![with_key(vec![set(&["ui", "card_seconds"], 9u32)])],
+        );
+        let message = got[0].result.clone().unwrap_err();
+        assert!(message.contains("Credential Manager said no"), "{message}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), HAND_EDITED);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn one_job_failing_to_store_does_not_stop_the_others_from_being_written() {
+        let path = scratch("thread-mixed");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let (writer, _seen) = spawn_with_fake_store(path.clone(), true);
+        let got = replies_for(
+            &writer,
+            vec![
+                with_key(vec![set(&["ui", "card_seconds"], 9u32)]),
+                spec("Mode", vec![FieldChange::mode(Mode::Offline)]),
+            ],
+        );
+        let by_name = |n: &str| got.iter().find(|r| r.saved == n).unwrap();
+        assert!(by_name("Settings saved").result.is_err());
+        assert_eq!(by_name("Mode").result, Ok(()));
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains(r#"mode = "offline""#));
+        assert!(
+            out.contains("card_seconds = 12"),
+            "the failed job's change must not land"
+        );
+        cleanup(&path);
+    }
+
     // -- guards ----------------------------------------------------------------
 
     /// The tray's Mode change reaches the file only through the writer thread:
@@ -1138,19 +1306,48 @@ x = 1
     #[test]
     fn the_tray_mode_change_goes_through_the_writer_thread() {
         let app = include_str!("app.rs").replace('\r', "");
-        let start = app
-            .find("    fn set_mode(&mut self, mode: Mode) {")
-            .expect("set_mode moved: this scan is no longer looking at anything");
-        let rest = &app[start..];
-        let end = rest.find("\n    }\n").expect("end of set_mode");
-        let body = &rest[..end];
+        let body_of = |signature: &str| -> String {
+            let start = app.find(signature).unwrap_or_else(|| {
+                panic!("{signature} moved: this scan is no longer looking at anything")
+            });
+            let rest = &app[start..];
+            let end = rest.find("\n    }\n").expect("end of fn");
+            rest[..end].to_string()
+        };
+        let set_mode = body_of("    fn set_mode(&mut self, mode: Mode) {");
+        assert!(set_mode.contains("self.persist_mode(mode)"), "{set_mode}");
         assert!(
-            body.contains("config_writer::"),
-            "set_mode must use the writer:\n{body}"
+            !set_mode.contains("config.save("),
+            "set_mode must not re-serialise the whole config on the UI thread:\n{set_mode}"
+        );
+        let persist = body_of("    fn persist_mode(&self, mode: Mode) {");
+        assert!(
+            persist.contains("config_writer::FieldChange::mode(mode)"),
+            "{persist}"
+        );
+        assert!(persist.contains("submit_config_job("), "{persist}");
+    }
+
+    /// Settings saves through the same writer: its Save path builds the sink
+    /// from `config_writer::diff` and `submit_config_job`, and never calls
+    /// `Config::save` or touches the disk itself.
+    #[test]
+    fn the_settings_window_saves_through_the_writer_thread() {
+        let src = include_str!("ui/settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(!code.is_empty());
+        assert!(
+            code.contains("crate::config_writer::diff("),
+            "Save must send only the changed fields"
+        );
+        assert!(code.contains("crate::app::submit_config_job("));
+        assert!(
+            !code.contains(".save("),
+            "Settings must not save the whole config itself"
         );
         assert!(
-            !body.contains("config.save("),
-            "set_mode must not re-serialise the whole config on the UI thread:\n{body}"
+            !code.contains("fs::write"),
+            "no file writes on the UI thread"
         );
     }
 }

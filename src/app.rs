@@ -170,6 +170,13 @@ pub const WM_APP_EXECUTOR_DONE: u32 = WM_APP + 22;
 /// `WM_APP_EXECUTOR_DONE`.
 pub const WM_APP_CONFIG_WRITTEN: u32 = WM_APP + 23;
 
+/// #871: posted by the Settings window to the owner window when it loses the
+/// foreground and when it closes. Settings is not modal any more, so nothing
+/// else tells `App` that a card which had to wait (a finished request, a press
+/// of the Wingman key) can now be shown. No payload. `WM_APP + 24`: `+23` is
+/// `WM_APP_CONFIG_WRITTEN`.
+pub const WM_APP_SETTINGS_LEFT: u32 = WM_APP + 24;
+
 /// #328: posted by the "Check this PC for local models" worker thread when
 /// its reads finish. `lparam` is
 /// `Box::into_raw(Box::new(machine::MachineFacts))`; the receiver takes
@@ -800,6 +807,11 @@ fn pump_messages() {
     let mut msg = MSG::default();
     // GetMessageW returns -1 on error; treat anything non-positive as "stop".
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+        // #871: Settings is modeless, so its keys, wheel and Tab order are
+        // handled here, ahead of dispatch. One atomic load when it is closed.
+        if settings::pre_dispatch(&msg) {
+            continue;
+        }
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -3902,125 +3914,43 @@ impl App {
         }
     }
 
-    /// Open the GUI settings window. Modal: it runs its own message loop, so
-    /// the hotkey is inert until it closes. On Save the new config is applied
-    /// in full — the same path `reload` takes — so nothing gets half-applied.
+    /// Opens the Settings window (or brings the open one to the front).
     ///
-    /// Issue #152: for the whole duration of `settings::show_modal` below,
-    /// `wnd_proc` can be reentered -- that call never receives `self`, but it
-    /// pumps every thread message on this thread, including ones addressed
-    /// to *this* window. `open_settings` holds `&mut self` across that call,
-    /// so nothing reachable from `self` may be written anywhere else while
-    /// it runs (see `SETTINGS_OPEN`'s doc comment for why that is a real
-    /// aliasing hazard, not just a logic bug). Every piece of state that a
-    /// reentrant call needs to read or write therefore lives in a
-    /// thread-local, not on `App`: `SETTINGS_OPEN` itself, `PENDING_MESSAGES`
-    /// (issue #213: every worker result or preview decision that arrived
-    /// mid-edit, oldest first), `TASKBAR_RECREATED_WHILE_SETTINGS`, and
-    /// `PAUSE_REEVALUATE_PENDING` (issue #20). All four are only touched
-    /// here, immediately before and after `show_modal`, when no reentrant
-    /// call can possibly be in flight.
-    ///
-    /// Issue #178: the card has a single slot, and every branch below can
-    /// show one -- a pending answer, a save error, or "Settings saved". If a
-    /// tray-icon restore failure (`TASKBAR_RECREATED_WHILE_SETTINGS`) showed
-    /// its card immediately, right here, every one of those branches would
-    /// silently replace it, leaving the user with no tray icon and no
-    /// explanation (rule 7). So the restore is still performed immediately
-    /// (`try_restore_tray_icon` re-adds the real icon and refreshes its
-    /// labels), but its error card, if any, is captured in
-    /// `tray_restore_error` and shown LAST, after every other branch below
-    /// has already shown whatever card it was going to show -- see
-    /// `final_settings_card` (test-only) for a pure model of this ordering.
-    ///
-    /// Issue #213: unlike the old single-slot `WM_APP_RESULT`-only version,
-    /// every deferred message is now delivered through its real handler
-    /// (`deliver_deferred`) on every one of the three paths below --
-    /// cancelled, save failed, and save succeeded -- rather than only being
-    /// silently recorded (`record_last`, no card) on the save-failed path.
-    /// A deferred `WM_APP_PREVIEW_DECIDED` "Do it" must actually run its
-    /// executor regardless of whether the unrelated Settings save
-    /// succeeded -- Look/Propose/Confirm/Do's contract, and rule 7, both
-    /// outrank leaving the save-error card undisturbed. On the save-failed
-    /// path specifically, `final_settings_card`'s `SaveError` invariant
-    /// (unchanged by #213: the save error the user just directly caused
-    /// always wins the single card slot) still holds -- each deferred
-    /// message's own card is shown, and its effects genuinely happen, but
-    /// the save-error card is re-shown immediately after so it is still the
-    /// one left on screen.
+    /// #871: Settings is modeless. It creates its window and returns; it runs no
+    /// loop of its own and `App` holds no borrow across it, so Quit, the tray,
+    /// the pause key and the config writer's answers are all handled on arrival
+    /// while it is open. The window saves by sending only the fields the user
+    /// changed to the writer thread (`submit_config_job`); the answer comes back
+    /// as `WM_APP_CONFIG_WRITTEN`. Cards that would land on the window wait for
+    /// `WM_APP_SETTINGS_LEFT` (`on_settings_left`).
     fn open_settings(&mut self) {
-        self.open_settings_inner();
-        // #673: every modal path ends here, whatever branch it took, so a
-        // completed Save and the deferred messages are handled first and the
-        // close request is honoured last.
-        self.repost_close_if_requested();
-    }
-
-    fn open_settings_inner(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
         self.card.hide();
         self.set_watch(false);
+        if !settings::open(self.instance, self.hwnd(), &self.config) {
+            // Rule 7: never a silent no-op.
+            self.card.show_error(
+                "Couldn't open settings",
+                "Windows would not create the settings window. Try again, or edit config.toml from the tray menu.",
+            );
+        }
+    }
 
-        SETTINGS_OPEN.with(|c| c.set(true));
-        let edited = settings::show_modal(self.instance, &self.config);
-        SETTINGS_OPEN.with(|c| c.set(false));
-
+    /// Settings lost the foreground or closed (#871): show what waited for it,
+    /// in the order it arrived, then run a press of the Wingman key that came
+    /// in meanwhile. Does nothing while Settings is still in front.
+    fn on_settings_left(&mut self) {
+        if settings::is_foreground() {
+            return;
+        }
         let pending: VecDeque<DeferredMessage> =
             PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let taskbar_recreated = TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false));
-        let tray_restore_error = if taskbar_recreated {
-            self.try_restore_tray_icon()
-        } else {
-            None
-        };
-        if PAUSE_REEVALUATE_PENDING.with(|c| c.replace(false)) {
-            self.reevaluate_pause(self.hwnd());
+        self.deliver_deferred(pending);
+        self.set_watch(true);
+        if ASK_WAITING_FOR_SETTINGS.with(|c| c.replace(false)) {
+            self.ask(Trigger::Hotkey);
         }
-
-        let Some(edited) = edited else {
-            // Cancelled/closed without saving. Anything that finished
-            // mid-edit still gets delivered.
-            self.deliver_deferred(pending);
-            self.show_tray_restore_error(tray_restore_error);
-            return;
-        };
-
-        self.config = edited;
-        // #793: the save below is refused while the file does not parse, so
-        // an edited mode must not outlive it in memory (requests read it).
-        if !mode_allowed(self.config.mode, self.config.load_problem.as_deref()) {
-            self.config.mode = Mode::Offline;
-        }
-        if let Err(e) = self.config.save() {
-            // Rule 7: neither failure may be silently dropped. Every
-            // deferred message is delivered for real (its executor runs,
-            // its own card shows) even though the unrelated config save
-            // just failed -- but the save error is the problem the user
-            // just directly caused, so it is re-shown last, restoring it as
-            // the single card slot's final content (`final_settings_card`'s
-            // `SaveError` case, unchanged by #213).
-            let had_pending = !pending.is_empty();
-            let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
-            self.card
-                .show_error_with_details("Couldn't save settings", &detail);
-            self.deliver_deferred(pending);
-            if had_pending {
-                self.card
-                    .show_error_with_details("Couldn't save settings", &detail);
-            }
-            self.show_tray_restore_error(tray_restore_error);
-            return;
-        }
-        self.apply_config();
-
-        if pending.is_empty() {
-            self.card.show_answer("Settings saved", "", 3, None);
-            self.set_watch(true);
-        } else {
-            self.deliver_deferred(pending);
-        }
-        self.show_tray_restore_error(tray_restore_error);
     }
 
     /// #712: why Quit (or a `WM_CLOSE`) is refused right now, if it is.
@@ -4074,6 +4004,7 @@ impl App {
                 }
                 DeferredMessage::ExecutorDone(result) => self.on_exec_done(result),
                 DeferredMessage::ConfigWritten(reply) => self.on_config_written(reply),
+                DeferredMessage::SettingsLeft => self.on_settings_left(),
             }
         }
     }
@@ -4325,47 +4256,29 @@ impl App {
         mode::set_current(mode);
         self.tray.set_mode(mode);
         self.update_tooltip();
-        self.persist_field(mode.label(), crate::config_writer::FieldChange::mode(mode));
+        self.persist_mode(mode);
         self.set_watch(true);
     }
 
-    /// Hands one field change to the writer thread. `label` names it in the
-    /// card that reports the outcome. Never blocks and never touches the disk
-    /// here; if the writer cannot even be reached the failure is posted back
-    /// like any other, so it still ends in a card (rule 7).
-    fn persist_field(&self, label: &str, change: crate::config_writer::FieldChange) {
-        use crate::config_writer::WriteReply;
-        let target = self.hwnd_isize();
-        let done = move |reply: WriteReply| {
-            let payload = Box::into_raw(Box::new(reply));
-            unsafe {
-                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    Some(HWND(target as *mut _)),
-                    WM_APP_CONFIG_WRITTEN,
-                    WPARAM(0),
-                    LPARAM(payload as isize),
-                )
-                .is_err()
-                {
-                    // Window gone: nobody will take the box, so free it here.
-                    free_boxed_payload(WM_APP_CONFIG_WRITTEN, LPARAM(payload as isize));
-                }
-            }
-        };
-        match crate::config_writer::global() {
-            Ok(writer) => writer.submit(label, vec![change], done),
-            Err(reason) => done(WriteReply {
-                label: label.to_string(),
-                result: Err(reason),
-            }),
-        }
+    /// Hands the new mode to the writer thread: one key, nothing else in the
+    /// file touched. Never blocks and never touches the disk here.
+    fn persist_mode(&self, mode: Mode) {
+        submit_config_job(
+            self.hwnd_isize(),
+            crate::config_writer::JobSpec {
+                changes: vec![crate::config_writer::FieldChange::mode(mode)],
+                secrets: None,
+                saved: mode.label().to_string(),
+                failed: format!("Using {}: not saved", mode.label()),
+                hint: "It will revert when you quit.".to_string(),
+            },
+        );
     }
 
     /// The writer thread's answer. On success the file is read again, so
     /// whatever the user hand-edited meanwhile is applied too, and nothing
-    /// afterwards saves a stale copy over it; the card is the one the old
-    /// in-line save showed. On failure the change is live until quit but not on
-    /// disk, and the card says so.
+    /// afterwards saves a stale copy over it. On failure nothing was written
+    /// and the card says why.
     fn on_config_written(&mut self, reply: crate::config_writer::WriteReply) {
         match reply.result {
             Ok(()) => {
@@ -4378,15 +4291,16 @@ impl App {
                     // write: keep the settings already running, as Reload does.
                     _ => {}
                 }
-                self.card.show_answer(&reply.label, "", 3, None);
+                self.card.show_answer(&reply.saved, "", 3, None);
             }
             Err(reason) => {
-                let headline = format!("Using {}: not saved", reply.label);
-                let human = self.track_error(&headline, &reason);
-                self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will revert when you quit.\n\n{human}"),
-                );
+                let human = self.track_error(&reply.failed, &reason);
+                let detail = if reply.hint.is_empty() {
+                    human
+                } else {
+                    format!("{}\n\n{human}", reply.hint)
+                };
+                self.card.show_error_with_details(&reply.failed, &detail);
             }
         }
     }
@@ -5746,70 +5660,6 @@ fn std_to_systemtime_utc(t: SystemTime) -> Result<SYSTEMTIME> {
 }
 
 /// First line of an error, truncated on a char boundary, for the headline.
-/// Issue #178: the single card slot's final content after `open_settings`'s
-/// whole post-modal sequence, as a pure model (no `Card`, no `Tray`, no
-/// `HWND`) -- see that method's doc comment for the real, imperative
-/// version this mirrors. Each variant is one of the cards `open_settings`
-/// can show; `TrayRestoreError` is what proves the fix: it is the outcome
-/// whenever `tray_restore_failed` is true, regardless of every other input,
-/// because `open_settings` always shows that card last (every one of its
-/// branches ends with `self.show_tray_restore_error(tray_restore_error)`).
-/// Test-only (`#[cfg(test)]`, same pattern `secrets.rs`'s `InMemoryStore`
-/// uses for a test-only type living outside `mod tests`): this function is
-/// a verification model of the invariant, not itself called by
-/// `open_settings` -- the real enforcement is the unconditional final call
-/// on every path, checked directly in that method's source.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettingsFinalCard {
-    /// Cancelled/closed with nothing pending: no card shown at all.
-    None,
-    /// A worker answer that arrived mid-edit, shown via `on_result` (its own
-    /// success/error split does not matter for this ordering, only that
-    /// SOME card was shown).
-    PendingAnswer,
-    /// `Config::save` failed.
-    SaveError,
-    /// Saved successfully with nothing pending.
-    SettingsSaved,
-    /// The tray-icon restore failed. Always wins when `tray_restore_failed`
-    /// is true -- see this enum's doc comment.
-    TrayRestoreError,
-}
-
-/// Pure re-derivation of which card is left on screen after
-/// `open_settings`'s branches, in the exact order that method executes
-/// them. `edited` is whether Settings was saved (`Some`) vs.
-/// cancelled/closed (`None`); `save_ok` is only meaningful when `edited` is
-/// true.
-#[cfg(test)]
-fn final_settings_card(
-    edited: bool,
-    save_ok: bool,
-    pending_present: bool,
-    tray_restore_failed: bool,
-) -> SettingsFinalCard {
-    let without_tray_restore = if !edited {
-        if pending_present {
-            SettingsFinalCard::PendingAnswer
-        } else {
-            SettingsFinalCard::None
-        }
-    } else if !save_ok {
-        SettingsFinalCard::SaveError
-    } else if pending_present {
-        SettingsFinalCard::PendingAnswer
-    } else {
-        SettingsFinalCard::SettingsSaved
-    };
-
-    if tray_restore_failed {
-        SettingsFinalCard::TrayRestoreError
-    } else {
-        without_tray_restore
-    }
-}
-
 fn first_line(text: &str, max: usize) -> String {
     let line = text.lines().next().unwrap_or(text).trim();
     if line.chars().count() <= max {
@@ -6389,6 +6239,13 @@ thread_local! {
     /// not merely deferred -- see the `wnd_proc` guard that sets this flag.
     static PAUSE_REEVALUATE_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// #871: the Wingman key was pressed while Settings had the foreground. The
+    /// ask waits (a card over the window being typed in is what #213 was
+    /// written to avoid) and runs when Settings loses the foreground or closes.
+    /// One flag: a second press while waiting changes nothing.
+    static ASK_WAITING_FOR_SETTINGS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     /// #723: the run generation currently in flight, mirrored from
     /// `App::run_generation` so `wnd_proc` can drop a stale worker result
     /// before it forms `&mut App`.
@@ -6440,6 +6297,9 @@ enum DeferredMessage {
     /// `WM_APP_CONFIG_WRITTEN` (#870): a failed write must still end in a card
     /// when Settings was open at the time.
     ConfigWritten(crate::config_writer::WriteReply),
+    /// `WM_APP_SETTINGS_LEFT` (#871), when it arrives during a tray menu or a
+    /// file dialog: the flush it asks for happens once that loop has ended.
+    SettingsLeft,
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -6638,7 +6498,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_FORM_FILL_RESULT
         | WM_APP_GENERIC_ACTION_RESULT
         | WM_APP_EXECUTOR_DONE
-        | WM_APP_CONFIG_WRITTEN => SettingsReentrancy::Defer,
+        | WM_APP_CONFIG_WRITTEN
+        | WM_APP_SETTINGS_LEFT => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
@@ -6719,6 +6580,94 @@ fn missing_key_card(provider: ActiveProvider) -> (String, String) {
     )
 }
 
+/// Queues `spec` on the settings writer thread. Its answer comes back to the
+/// owner window `owner` as `WM_APP_CONFIG_WRITTEN` (`App::on_config_written`).
+/// Called from the UI thread and never waits: the file, `icacls` and Credential
+/// Manager work all happen on the writer thread. If the writer cannot even be
+/// reached the failure is posted back the same way, so it still ends in a card
+/// (rule 7).
+pub(crate) fn submit_config_job(owner: isize, spec: crate::config_writer::JobSpec) {
+    use crate::config_writer::WriteReply;
+    let done = move |reply: WriteReply| {
+        let payload = Box::into_raw(Box::new(reply));
+        unsafe {
+            if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(HWND(owner as *mut _)),
+                WM_APP_CONFIG_WRITTEN,
+                WPARAM(0),
+                LPARAM(payload as isize),
+            )
+            .is_err()
+            {
+                // Window gone: nobody will take the box, so free it here.
+                free_boxed_payload(WM_APP_CONFIG_WRITTEN, LPARAM(payload as isize));
+            }
+        }
+    };
+    match crate::config_writer::global() {
+        Ok(writer) => writer.submit(spec, done),
+        Err(reason) => done(WriteReply {
+            saved: spec.saved,
+            failed: spec.failed,
+            hint: spec.hint,
+            result: Err(reason),
+        }),
+    }
+}
+
+/// Takes ownership of the payload a deferrable message carries and returns it
+/// as a [`DeferredMessage`]. Only called for ids the reentrancy policies mark
+/// `Defer`.
+fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> DeferredMessage {
+    match msg {
+        WM_APP_RESULT => DeferredMessage::Result(unsafe {
+            *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>)
+        }),
+        WM_APP_CALENDAR_RESULT => DeferredMessage::CalendarResult(unsafe {
+            *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
+        }),
+        WM_APP_REVIEW_RESULT => DeferredMessage::ReviewResult(unsafe {
+            *Box::from_raw(
+                lparam.0 as *mut std::result::Result<actions::review_email::ReviewOutcome, String>,
+            )
+        }),
+        // #40: same treatment as WM_APP_CALENDAR_RESULT just
+        // above -- a finished "Fill this form" run must not
+        // silently lose its card just because Settings happened
+        // to be open.
+        WM_APP_FORM_FILL_RESULT => DeferredMessage::FormFillResult(unsafe {
+            *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
+        }),
+        WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
+        // #722: only `tray_menu_policy` defers these three.
+        WM_APP_SEND_PREVIEW => DeferredMessage::SendPreview(unsafe {
+            *Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest)
+        }),
+        WM_APP_PENDING_STAGE => DeferredMessage::PendingStage(wparam.0 as u64, unsafe {
+            *Box::from_raw(lparam.0 as *mut crate::ui::card::PendingStage)
+        }),
+        WM_APP_FIRST_RUN => DeferredMessage::FirstRun(wparam.0 as u64, unsafe {
+            *Box::from_raw(lparam.0 as *mut FirstRun)
+        }),
+        // #242: same treatment as WM_APP_CALENDAR_RESULT above.
+        WM_APP_GENERIC_ACTION_RESULT => {
+            let (action, schema, result) =
+                *unsafe { Box::from_raw(lparam.0 as *mut (actions::Action, Value, GenericResult)) };
+            DeferredMessage::GenericActionResult(action, schema, result)
+        }
+        WM_APP_EXECUTOR_DONE => DeferredMessage::ExecutorDone(unsafe {
+            *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>)
+        }),
+        WM_APP_CONFIG_WRITTEN => DeferredMessage::ConfigWritten(unsafe {
+            *Box::from_raw(lparam.0 as *mut crate::config_writer::WriteReply)
+        }),
+        WM_APP_SETTINGS_LEFT => DeferredMessage::SettingsLeft,
+        _ => {
+            unreachable!("the reentrancy policies only return Defer for the ids above")
+        }
+    }
+}
+
 /// Free the boxed payload a `WM_APP_*` message carries, if `msg` is one that
 /// carries one. Returns whether it was one. Used where a message is dropped
 /// unhandled (Settings is open, or the window is being destroyed) so the
@@ -6771,6 +6720,18 @@ fn note_close_request() {
 /// #673: whether a close was asked for during a nested loop; clears it.
 fn take_close_request() -> bool {
     CLOSE_AFTER_SETTINGS.with(|c| c.replace(false))
+}
+
+/// #871: the messages that show a card or run something visible, and so are
+/// held while Settings has the foreground. The same group the nested loops
+/// defer, except the writer's answer: that one applies the setting at once.
+fn waits_while_settings_is_in_front(msg: u32) -> bool {
+    msg != WM_APP_CONFIG_WRITTEN
+        && msg != WM_APP_SETTINGS_LEFT
+        && matches!(
+            settings_reentrancy_policy(msg, 0),
+            SettingsReentrancy::Defer
+        )
 }
 
 /// Issue #302: `DestroyWindow` discards messages still queued for the window,
@@ -6970,59 +6931,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 // carries (none, for WM_APP_PREVIEW_DECIDED) and queue it;
                 // `open_settings` delivers every queued message, in this
                 // same push order, once `show_modal` returns.
-                let deferred = match msg {
-                    WM_APP_RESULT => DeferredMessage::Result(unsafe {
-                        *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>)
-                    }),
-                    WM_APP_CALENDAR_RESULT => DeferredMessage::CalendarResult(unsafe {
-                        *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
-                    }),
-                    WM_APP_REVIEW_RESULT => DeferredMessage::ReviewResult(unsafe {
-                        *Box::from_raw(
-                            lparam.0
-                                as *mut std::result::Result<
-                                    actions::review_email::ReviewOutcome,
-                                    String,
-                                >,
-                        )
-                    }),
-                    // #40: same treatment as WM_APP_CALENDAR_RESULT just
-                    // above -- a finished "Fill this form" run must not
-                    // silently lose its card just because Settings happened
-                    // to be open.
-                    WM_APP_FORM_FILL_RESULT => DeferredMessage::FormFillResult(unsafe {
-                        *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
-                    }),
-                    WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
-                    // #722: only `tray_menu_policy` defers these three.
-                    WM_APP_SEND_PREVIEW => DeferredMessage::SendPreview(unsafe {
-                        *Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest)
-                    }),
-                    WM_APP_PENDING_STAGE => {
-                        DeferredMessage::PendingStage(wparam.0 as u64, unsafe {
-                            *Box::from_raw(lparam.0 as *mut crate::ui::card::PendingStage)
-                        })
-                    }
-                    WM_APP_FIRST_RUN => DeferredMessage::FirstRun(wparam.0 as u64, unsafe {
-                        *Box::from_raw(lparam.0 as *mut FirstRun)
-                    }),
-                    // #242: same treatment as WM_APP_CALENDAR_RESULT above.
-                    WM_APP_GENERIC_ACTION_RESULT => {
-                        let (action, schema, result) = *unsafe {
-                            Box::from_raw(lparam.0 as *mut (actions::Action, Value, GenericResult))
-                        };
-                        DeferredMessage::GenericActionResult(action, schema, result)
-                    }
-                    WM_APP_EXECUTOR_DONE => DeferredMessage::ExecutorDone(unsafe {
-                        *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>)
-                    }),
-                    WM_APP_CONFIG_WRITTEN => DeferredMessage::ConfigWritten(unsafe {
-                        *Box::from_raw(lparam.0 as *mut crate::config_writer::WriteReply)
-                    }),
-                    _ => {
-                        unreachable!("the reentrancy policies only return Defer for the ids above")
-                    }
-                };
+                let deferred = take_deferred(msg, wparam, lparam);
                 PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
                 return LRESULT(0);
             }
@@ -7041,6 +6950,22 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 settings::request_close();
                 return LRESULT(0);
             }
+        }
+    }
+
+    // #871: Settings is modeless, so everything above is handled on arrival.
+    // The one thing that waits is what would put a card (or start a request)
+    // on top of the window the user is typing in: it is held until Settings
+    // loses the foreground or closes (`WM_APP_SETTINGS_LEFT`).
+    if settings::is_foreground() {
+        if waits_while_settings_is_in_front(msg) {
+            let deferred = take_deferred(msg, wparam, lparam);
+            PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
+            return LRESULT(0);
+        }
+        if msg == WM_APP_HOTKEY {
+            ASK_WAITING_FOR_SETTINGS.with(|c| c.set(true));
+            return LRESULT(0);
         }
     }
 
@@ -7143,6 +7068,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let reply =
                 unsafe { *Box::from_raw(lparam.0 as *mut crate::config_writer::WriteReply) };
             app.on_config_written(reply);
+            LRESULT(0)
+        }
+        WM_APP_SETTINGS_LEFT => {
+            app.on_settings_left();
             LRESULT(0)
         }
         WM_APP_MACHINE_CHECK_RESULT => {
@@ -7277,6 +7206,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
         }
         WM_DESTROY => {
+            // #871: Settings is a top-level window of its own now, so it does
+            // not go away with this one. Close it first.
+            settings::close_now();
             // Drop the App (and with it the hook, tray icon and card) before
             // the loop exits, so the tray icon actually disappears.
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
@@ -7337,10 +7269,10 @@ mod tests {
     use super::BeginPlan;
     use super::WM_APP_CONFIG_WRITTEN;
     use super::WM_APP_FIRST_RUN;
+    use super::WM_APP_SETTINGS_LEFT;
     use super::{
         exec_work_calendar, exec_work_form_fill, exec_work_restore, ExecDone, WM_APP_EXECUTOR_DONE,
     };
-    use super::{final_settings_card, SettingsFinalCard};
     use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{mode_allowed, settings_reentrancy_policy, SettingsReentrancy};
     use super::{
@@ -7449,70 +7381,133 @@ mod tests {
         assert!(!detail.contains('\u{2014}'));
     }
 
-    // -- final_settings_card (issue #178) -----------------------------------
+    // -- Settings is modeless (#871) ---------------------------------------
 
+    /// Only what would put a card on the Settings window waits for it. The
+    /// writer's answer applies at once (the setting must not lag), and the
+    /// "left" notice is what releases the rest.
     #[test]
-    fn tray_restore_error_wins_over_every_other_outcome() {
-        // The core invariant: whatever else happened during open_settings,
-        // a failed tray-icon restore is always the LAST card shown, never
-        // silently replaced. Exhaustive over every other combination.
-        for edited in [false, true] {
-            for save_ok in [false, true] {
-                for pending_present in [false, true] {
-                    assert_eq!(
-                        final_settings_card(edited, save_ok, pending_present, true),
-                        SettingsFinalCard::TrayRestoreError,
-                        "edited={edited}, save_ok={save_ok}, pending_present={pending_present}"
-                    );
-                }
-            }
+    fn what_waits_while_settings_is_in_front_is_the_result_group_only() {
+        use super::{waits_while_settings_is_in_front, WM_APP_PREVIEW_DECIDED};
+        for id in [
+            WM_APP_RESULT,
+            WM_APP_CALENDAR_RESULT,
+            WM_APP_REVIEW_RESULT,
+            WM_APP_FORM_FILL_RESULT,
+            WM_APP_GENERIC_ACTION_RESULT,
+            WM_APP_EXECUTOR_DONE,
+            WM_APP_PREVIEW_DECIDED,
+        ] {
+            assert!(waits_while_settings_is_in_front(id), "{id}");
+        }
+        for id in [
+            WM_APP_CONFIG_WRITTEN,
+            WM_APP_SETTINGS_LEFT,
+            WM_APP_TRAY,
+            WM_CLOSE,
+            WM_DESTROY,
+            WM_APP_PAUSE_TOGGLE,
+            WM_APP_LEARNED,
+        ] {
+            assert!(!waits_while_settings_is_in_front(id), "{id}");
         }
     }
 
     #[test]
-    fn cancel_with_nothing_pending_and_no_tray_failure_shows_no_card() {
-        assert_eq!(
-            final_settings_card(false, true, false, false),
-            SettingsFinalCard::None
-        );
+    fn a_deferred_settings_left_and_a_deferred_writer_answer_keep_their_payloads() {
+        use super::{take_deferred, DeferredMessage};
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        assert!(matches!(
+            take_deferred(WM_APP_SETTINGS_LEFT, WPARAM(0), LPARAM(0)),
+            DeferredMessage::SettingsLeft
+        ));
+        let reply = crate::config_writer::WriteReply {
+            saved: "Settings saved".into(),
+            failed: "Couldn't save settings".into(),
+            hint: String::new(),
+            result: Err("disk full".into()),
+        };
+        let raw = Box::into_raw(Box::new(reply.clone()));
+        match take_deferred(WM_APP_CONFIG_WRITTEN, WPARAM(0), LPARAM(raw as isize)) {
+            DeferredMessage::ConfigWritten(got) => assert_eq!(got, reply),
+            _ => panic!("the writer's answer lost its payload"),
+        }
+    }
+
+    /// The body of `fn <name>` as written in app.rs (LF-normalised): from its
+    /// signature to the first closing brace at `indent` spaces.
+    fn body_between(src: &str, signature: &str, end: &str) -> String {
+        let start = src.find(signature).unwrap_or_else(|| {
+            panic!("{signature} moved: this scan is no longer looking at anything")
+        });
+        let rest = &src[start..];
+        rest[..rest.find(end).expect("end of fn")].to_string()
+    }
+
+    /// #871 dispatch guards: a modeless window that nothing pumps does nothing.
+    #[test]
+    fn the_pump_offers_every_message_to_settings_before_dispatching_it() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "fn pump_messages() {", "\n}\n");
+        let pre = body
+            .find("settings::pre_dispatch(&msg)")
+            .expect("the pump never calls settings::pre_dispatch");
+        let dispatch = body.find("DispatchMessageW(&msg)").expect("no dispatch");
+        assert!(pre < dispatch, "pre_dispatch must run before dispatch");
     }
 
     #[test]
-    fn cancel_with_a_pending_answer_shows_it() {
-        assert_eq!(
-            final_settings_card(false, true, true, false),
-            SettingsFinalCard::PendingAnswer
+    fn opening_settings_runs_no_nested_loop_and_holds_nothing_across_it() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn open_settings(&mut self) {", "\n    }\n");
+        assert!(body.contains("settings::open("), "{body}");
+        assert!(
+            !body.contains("SETTINGS_OPEN"),
+            "Settings no longer runs a loop, so it must not switch the nested-loop policy on:\n{body}"
         );
+        assert!(!body.contains("show_modal"), "show_modal is gone:\n{body}");
     }
 
     #[test]
-    fn save_failure_shows_the_save_error() {
-        assert_eq!(
-            final_settings_card(true, false, false, false),
-            SettingsFinalCard::SaveError
+    fn the_wingman_key_waits_for_settings_and_runs_when_it_leaves() {
+        let src = lf(include_str!("app.rs"));
+        let proc_src = wnd_proc_body(&src);
+        let gate = proc_src
+            .find("settings::is_foreground()")
+            .expect("wnd_proc never asks whether Settings is in front");
+        let bind = proc_src
+            .find("let app: &mut App")
+            .expect("wnd_proc binds no app");
+        assert!(gate < bind, "the gate must precede any App borrow");
+        assert!(proc_src.contains("ASK_WAITING_FOR_SETTINGS.with(|c| c.set(true))"));
+        let left = body_between(&src, "    fn on_settings_left(&mut self) {", "\n    }\n");
+        assert!(left.contains("settings::is_foreground()"), "{left}");
+        assert!(
+            left.contains("ASK_WAITING_FOR_SETTINGS.with(|c| c.replace(false))"),
+            "{left}"
         );
-        // Even with an answer pending -- the save error still wins (matches
-        // the existing, unchanged behavior: the user just directly caused
-        // this one).
-        assert_eq!(
-            final_settings_card(true, false, true, false),
-            SettingsFinalCard::SaveError
-        );
+        assert!(left.contains("self.ask(Trigger::Hotkey)"), "{left}");
+        assert!(left.contains("self.deliver_deferred(pending)"), "{left}");
     }
 
     #[test]
-    fn successful_save_with_nothing_pending_shows_settings_saved() {
-        assert_eq!(
-            final_settings_card(true, true, false, false),
-            SettingsFinalCard::SettingsSaved
-        );
-    }
-
-    #[test]
-    fn successful_save_with_a_pending_answer_shows_it_not_settings_saved() {
-        assert_eq!(
-            final_settings_card(true, true, true, false),
-            SettingsFinalCard::PendingAnswer
+    fn the_owner_window_handles_settings_left_and_closes_settings_on_destroy() {
+        let src = lf(include_str!("app.rs"));
+        let proc_src = wnd_proc_body(&src);
+        assert!(proc_src.contains("WM_APP_SETTINGS_LEFT => {"));
+        let destroy = proc_src
+            .find("        WM_DESTROY => {")
+            .expect("wnd_proc has no WM_DESTROY arm");
+        let tail = &proc_src[destroy..];
+        let close = tail
+            .find("settings::close_now()")
+            .expect("Settings is left open");
+        let drop_app = tail
+            .find("Box::from_raw(ptr)")
+            .expect("App is never dropped");
+        assert!(
+            close < drop_app,
+            "Settings must close before App is dropped"
         );
     }
 
@@ -8517,16 +8512,17 @@ mod tests {
 
     #[test]
     fn every_modal_path_that_clears_settings_open_reposts_a_pending_close() {
-        // The tray menu, Settings and file dialogs all set SETTINGS_OPEN, and
-        // wnd_proc swallows WM_CLOSE while it is set. Each of them has to
-        // repost it afterwards. Source scan, CRLF-safe, non-empty.
+        // The tray menu and file dialogs run a nested loop and set
+        // SETTINGS_OPEN, and wnd_proc swallows WM_CLOSE while it is set. Each of
+        // them has to repost it afterwards. (Settings no longer runs one, #871.)
+        // Source scan, CRLF-safe, non-empty.
         let src = include_str!("app.rs").replace('\r', "");
         let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
         let clears = code
             .matches("SETTINGS_OPEN.with(|c| c.set(false));")
             .count();
         assert_eq!(
-            clears, 3,
+            clears, 2,
             "a modal path was added or removed: update this test"
         );
         let reposts = code.matches("self.repost_close_if_requested();").count();
@@ -8596,6 +8592,7 @@ mod tests {
         ("WM_APP_FIRST_RUN", WM_APP_FIRST_RUN),
         ("WM_APP_EXECUTOR_DONE", WM_APP_EXECUTOR_DONE),
         ("WM_APP_CONFIG_WRITTEN", WM_APP_CONFIG_WRITTEN),
+        ("WM_APP_SETTINGS_LEFT", WM_APP_SETTINGS_LEFT),
     ];
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -9362,6 +9359,11 @@ mod tests {
         (
             "WM_APP_CONFIG_WRITTEN",
             WM_APP_CONFIG_WRITTEN,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_SETTINGS_LEFT",
+            WM_APP_SETTINGS_LEFT,
             SettingsReentrancy::Defer,
         ),
     ];
