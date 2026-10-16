@@ -73,10 +73,10 @@ use crate::ui::card_placement::{
 };
 use crate::ui::text::draw_text_line;
 use crate::ui::theme::{
-    contrast_ratio, relative_luminance, rgb, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK,
-    BADGE_INK_LIGHT, BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, DETAIL_FONT_SCALE,
-    FALLBACK_FONT_FACE, GAP_DP, HEADLINE_FONT_SCALE, MARGIN_DP, PADDING_DP,
-    SMALL_FONT_SCALE as BADGE_FONT_SCALE,
+    contrast_ratio, detect_theme, relative_luminance, rgb, setting_change_affects_theme,
+    setting_change_name, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK, BADGE_INK_LIGHT,
+    BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, DETAIL_FONT_SCALE, FALLBACK_FONT_FACE,
+    GAP_DP, HEADLINE_FONT_SCALE, MARGIN_DP, PADDING_DP, SMALL_FONT_SCALE as BADGE_FONT_SCALE,
 };
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -109,14 +109,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
     HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETCLIENTAREAANIMATION,
-    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SPI_SETHIGHCONTRAST, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
-    WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFONT,
-    WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD,
-    WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
-    WS_VISIBLE,
+    SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+    WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -813,101 +812,6 @@ fn badge_text_color(fill: u32) -> u32 {
         BADGE_INK_DARK
     } else {
         BADGE_INK_LIGHT
-    }
-}
-
-/// Reads `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`.
-///
-/// `windows` 0.62 is built in this project *without* the `Win32_System_Registry`
-/// feature (see `Cargo.toml`, owned by another agent), so `RegGetValueW` is not
-/// available through the `windows` crate here. Rather than touch `Cargo.toml`,
-/// this module declares the one registry function it needs itself and links
-/// directly against `advapi32.dll` (a standard system import library, not a
-/// new crate dependency).
-pub(crate) fn detect_theme() -> Theme {
-    Theme::resolve(
-        registry_apps_use_light_theme(),
-        crate::ui::card_buttons::system_high_contrast().is_some(),
-    )
-}
-
-/// Whether a `WM_SETTINGCHANGE` names the light/dark switch. Windows sends
-/// `"ImmersiveColorSet"` in `lparam` when the user changes app mode or the
-/// accent color.
-fn setting_change_is_theme(name: &str) -> bool {
-    name == "ImmersiveColorSet"
-}
-
-/// Whether a `WM_SETTINGCHANGE` is one the card's theme depends on: the
-/// light/dark switch, or the high contrast flag (`wparam` is
-/// `SPI_SETHIGHCONTRAST`; its `lparam` carries no name).
-pub(crate) fn setting_change_affects_theme(wparam: usize, name: &str) -> bool {
-    wparam == SPI_SETHIGHCONTRAST.0 as usize || setting_change_is_theme(name)
-}
-
-/// The text of a `WM_SETTINGCHANGE` `lparam` (a null-terminated UTF-16
-/// string, or null for the broadcasts that carry none).
-///
-/// # Safety
-/// `lparam` must be zero or point at a null-terminated UTF-16 string, which
-/// is what Windows guarantees for this message.
-pub(crate) unsafe fn setting_change_name(lparam: LPARAM) -> String {
-    let ptr = lparam.0 as *const u16;
-    if ptr.is_null() {
-        return String::new();
-    }
-    let mut len = 0;
-    while *ptr.add(len) != 0 {
-        len += 1;
-    }
-    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
-}
-
-const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
-
-fn hkey_current_user() -> *mut c_void {
-    // HKEY_CURRENT_USER is defined by the Windows headers as
-    // ((HKEY)(ULONG_PTR)((LONG)0x80000001)) — i.e. sign-extended.
-    (0x8000_0001u32 as i32 as isize) as *mut c_void
-}
-
-#[link(name = "advapi32")]
-extern "system" {
-    fn RegGetValueW(
-        hkey: *mut c_void,
-        lpsubkey: *const u16,
-        lpvalue: *const u16,
-        dwflags: u32,
-        pdwtype: *mut u32,
-        pvdata: *mut c_void,
-        pcbdata: *mut u32,
-    ) -> i32;
-}
-
-fn registry_apps_use_light_theme() -> bool {
-    let subkey = wide_z(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
-    let value = wide_z("AppsUseLightTheme");
-    let mut data: u32 = 1; // default to light on any failure
-    let mut size: u32 = std::mem::size_of::<u32>() as u32;
-    let status = unsafe {
-        RegGetValueW(
-            hkey_current_user(),
-            subkey.as_ptr(),
-            value.as_ptr(),
-            RRF_RT_REG_DWORD,
-            std::ptr::null_mut(),
-            &mut data as *mut u32 as *mut c_void,
-            &mut size,
-        )
-    };
-    if status == 0 {
-        data != 0
-    } else {
-        // #356: a dark desktop would get a light card with no explanation.
-        crate::diagnostics::note_warning(&format!(
-            "Card: could not read the app theme setting (error {status}), using the light theme"
-        ));
-        true
     }
 }
 
@@ -5669,20 +5573,11 @@ mod tests {
 
         card.handle_message(
             WM_SETTINGCHANGE,
-            WPARAM(SPI_SETHIGHCONTRAST.0 as usize),
+            WPARAM(windows::Win32::UI::WindowsAndMessaging::SPI_SETHIGHCONTRAST.0 as usize),
             LPARAM(empty.as_ptr() as isize),
         );
 
         assert_eq!(card.inner.theme, detected);
-    }
-
-    #[test]
-    fn only_theme_names_and_the_high_contrast_flag_are_theme_changes() {
-        let hc = SPI_SETHIGHCONTRAST.0 as usize;
-        assert!(setting_change_affects_theme(0, "ImmersiveColorSet"));
-        assert!(setting_change_affects_theme(hc, ""));
-        assert!(!setting_change_affects_theme(0, "intl"));
-        assert!(!setting_change_affects_theme(0, ""));
     }
 
     #[test]
@@ -5817,13 +5712,6 @@ mod tests {
             card.inner.edit_bg_brush.0.is_null(),
             "the cached brush is the old theme's color and must be rebuilt"
         );
-    }
-
-    #[test]
-    fn only_the_immersive_color_set_setting_is_a_theme_change() {
-        assert!(setting_change_is_theme("ImmersiveColorSet"));
-        assert!(!setting_change_is_theme("intl"));
-        assert!(!setting_change_is_theme(""));
     }
 
     #[test]
