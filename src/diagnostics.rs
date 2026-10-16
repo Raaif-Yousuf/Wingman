@@ -120,6 +120,44 @@ pub struct DiagnosticsInput {
     /// #237: this process started without the single-instance lock because
     /// the name was held by something that is not Wingman.
     pub lock_squatted: bool,
+    /// #356: recent silent fallbacks (see [`note_warning`]), oldest first.
+    pub warnings: Vec<String>,
+}
+
+/// Most distinct warnings kept; the oldest is dropped past this.
+const MAX_WARNINGS: usize = 20;
+
+/// Recent fallbacks the app took without telling the user (square card
+/// corners, the light theme on a dark desktop). In memory only: nothing is
+/// written to disk and nothing runs while idle (Hard Rule 5). "Copy
+/// diagnostics" prints them so a bug report can explain what it sees.
+static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Pure half of [`note_warning`]: skips a message already in `list` (the
+/// theme is re-read on every settings change, and one line is enough), and
+/// keeps at most [`MAX_WARNINGS`], dropping the oldest.
+fn push_warning(list: &mut Vec<String>, message: &str) {
+    if list.iter().any(|m| m == message) {
+        return;
+    }
+    if list.len() >= MAX_WARNINGS {
+        list.remove(0);
+    }
+    list.push(message.to_string());
+}
+
+/// Records a silent fallback for the diagnostics report. Never put a path,
+/// key or other user data in `message`: the report is pasted into public
+/// issues.
+pub fn note_warning(message: &str) {
+    if let Ok(mut list) = WARNINGS.lock() {
+        push_warning(&mut list, message);
+    }
+}
+
+/// The warnings recorded so far, oldest first.
+pub fn recent_warnings() -> Vec<String> {
+    WARNINGS.lock().map(|l| l.clone()).unwrap_or_default()
 }
 
 /// Reduces `config.providers` to the report's provider table, in
@@ -295,6 +333,16 @@ pub fn render_report(input: &DiagnosticsInput) -> String {
         }
     }
 
+    out.push_str("\nWarnings:");
+    if input.warnings.is_empty() {
+        out.push_str(" none\n");
+    } else {
+        out.push('\n');
+        for w in &input.warnings {
+            out.push_str(&format!("- {w}\n"));
+        }
+    }
+
     out.push_str("\nLast error:");
     match &input.last_error {
         None => out.push_str(" none\n"),
@@ -387,6 +435,7 @@ pub fn collect(config: &Config, last_error: Option<LastError>) -> DiagnosticsInp
         last_error,
         suppressed_activations: crate::activation::suppressed_count(),
         lock_squatted: crate::single_instance::lock_squatted(),
+        warnings: recent_warnings(),
     }
 }
 
@@ -526,7 +575,53 @@ mod tests {
             last_error: None,
             suppressed_activations: 0,
             lock_squatted: false,
+            warnings: Vec::new(),
         }
+    }
+
+    // -- warnings (#356) ----------------------------------------------------
+
+    #[test]
+    fn report_says_no_warnings_when_there_are_none() {
+        let report = render_report(&sample_input());
+        assert!(report.contains("Warnings: none\n"));
+    }
+
+    #[test]
+    fn report_lists_each_warning() {
+        let mut input = sample_input();
+        input.warnings = vec![
+            "Card: square corners".to_string(),
+            "Theme: light".to_string(),
+        ];
+        let report = render_report(&input);
+        assert!(report.contains("Warnings:\n- Card: square corners\n- Theme: light\n"));
+    }
+
+    #[test]
+    fn push_warning_skips_a_repeat() {
+        let mut list = Vec::new();
+        push_warning(&mut list, "a");
+        push_warning(&mut list, "b");
+        push_warning(&mut list, "a");
+        assert_eq!(list, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn push_warning_drops_the_oldest_past_the_cap() {
+        let mut list = Vec::new();
+        for i in 0..MAX_WARNINGS + 3 {
+            push_warning(&mut list, &format!("w{i}"));
+        }
+        assert_eq!(list.len(), MAX_WARNINGS);
+        assert_eq!(list[0], "w3");
+        assert_eq!(list[MAX_WARNINGS - 1], format!("w{}", MAX_WARNINGS + 2));
+    }
+
+    #[test]
+    fn note_warning_shows_up_in_recent_warnings() {
+        note_warning("diagnostics test marker 356");
+        assert!(recent_warnings().contains(&"diagnostics test marker 356".to_string()));
     }
 
     // -- KeyStatus::from_key ------------------------------------------------
