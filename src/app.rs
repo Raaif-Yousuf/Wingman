@@ -143,6 +143,71 @@ pub const WM_APP_SEND_PREVIEW: u32 = WM_APP + 18;
 /// is dropped. `WM_APP + 19`: `+18` is `WM_APP_SEND_PREVIEW`.
 pub const WM_APP_PENDING_STAGE: u32 = WM_APP + 19;
 
+/// #567: a base URL and the (name, supports vision) pairs it reported.
+type PulledOllamaModels = (String, Vec<(String, bool)>);
+
+/// #567: the models Ollama has pulled, for the tray's Ollama submenu. The
+/// tray menu is built on the UI thread the moment it is right-clicked, so it
+/// must never wait on Ollama: [`OllamaModelCache::refresh`] asks on a worker
+/// thread and parks the answer here, and the next menu open picks it up.
+/// Event-driven (a menu open, a reload, startup), never a timer.
+#[derive(Default)]
+struct OllamaModelCache {
+    /// The base URL asked and what it said, as (name, supports vision).
+    /// An unreachable server stores an empty list, so the menu falls back to
+    /// the configured model only.
+    result: Arc<std::sync::Mutex<Option<PulledOllamaModels>>>,
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OllamaModelCache {
+    /// Starts a background fetch unless one is already running.
+    fn refresh(&self, base_url: &str) {
+        use std::sync::atomic::Ordering;
+        if self.in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let base_url = base_url.to_string();
+        let result = Arc::clone(&self.result);
+        let in_flight = Arc::clone(&self.in_flight);
+        let worker_flag = Arc::clone(&in_flight);
+        let spawned = std::thread::Builder::new()
+            .name("tray-ollama-models".into())
+            .spawn(move || {
+                let pulled = crate::provider::ollama_admin::list_tags_with_timeout(
+                    &base_url,
+                    Duration::from_secs(3),
+                )
+                .map(|models| {
+                    models
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.name.clone(),
+                                crate::provider::ollama_admin::vision_from_tags_entry(m),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+                if let Ok(mut slot) = result.lock() {
+                    *slot = Some((base_url, pulled));
+                }
+                worker_flag.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            in_flight.store(false, Ordering::Release);
+        }
+    }
+
+    /// The finished list, if there is one for `base_url` (a list fetched for
+    /// an address the config has since left is dropped).
+    fn take_for(&self, base_url: &str) -> Option<Vec<(String, bool)>> {
+        let taken = self.result.lock().ok()?.take()?;
+        (taken.0 == base_url).then_some(taken.1)
+    }
+}
+
 const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
 
 /// How long to wait after hiding a visible card before capturing, so the
@@ -173,6 +238,8 @@ struct App {
     /// a later hotkey press. `refuse_if_password_manager` honours it as well
     /// as the live check.
     password_manager_hint: bool,
+    /// #567: the pulled Ollama models, refreshed off the UI thread.
+    ollama_models: OllamaModelCache,
     /// #339: the palette's own answer, taken in `toggle_palette` before it
     /// showed. Read only when the palette runs an action, so a stale value
     /// from an earlier session can never apply: every open overwrites it.
@@ -408,6 +475,7 @@ pub fn run() -> Result<()> {
         hook: None,
         watcher: None,
         password_manager_hint: false,
+        ollama_models: OllamaModelCache::default(),
         palette_password_manager: false,
         busy: false,
         last: None,
@@ -3342,13 +3410,33 @@ impl App {
             return;
         }
         *slot = model.clone();
+        self.commit_model_pick(&model);
+    }
 
+    /// #567: apply a model chosen from the tray's Ollama submenu. Same shape
+    /// as [`App::pick_model`]; the config value written is the bare name, not
+    /// the "(vision)" label.
+    fn pick_ollama_model(&mut self, index: usize) {
+        let Some(model) = self.tray.ollama_model_at(index).map(str::to_owned) else {
+            return;
+        };
+        if self.config.providers.ollama.model == model {
+            return;
+        }
+        self.config.providers.ollama.model = model.clone();
+        self.commit_model_pick(&model);
+    }
+
+    /// The part of a tray model pick that comes after the config field is
+    /// set: rebuild the chain so the pick is live, save, refresh the tray and
+    /// say what happened on a card.
+    fn commit_model_pick(&mut self, model: &str) {
         self.chain = Arc::new(self.config.build_chain());
         let saved = self.config.save();
         self.refresh_tray_labels();
 
         match saved {
-            Ok(()) => self.card.show_answer(&model, "", 3, None),
+            Ok(()) => self.card.show_answer(model, "", 3, None),
             Err(e) => {
                 let headline = format!("Using {model}: not saved");
                 let human = self.track_error(&headline, &format!("{e:#}"));
@@ -3418,6 +3506,17 @@ impl App {
         self.set_watch(true);
     }
 
+    /// #567: hand the tray the newest Ollama model list a background refresh
+    /// has produced (if any), then start another so the next menu open is
+    /// current. Called when the tray menu is about to open.
+    fn sync_ollama_menu(&mut self) {
+        let ollama = &self.config.providers.ollama;
+        if let Some(pulled) = self.ollama_models.take_for(&ollama.base_url) {
+            self.tray.set_ollama_models(&pulled, &ollama.model);
+        }
+        self.ollama_models.refresh(&ollama.base_url);
+    }
+
     fn refresh_tray_labels(&mut self) {
         let primary = chord_to_string(&self.config.hotkeys.primary);
         let secondary = chord_to_string(&self.config.hotkeys.secondary);
@@ -3434,6 +3533,11 @@ impl App {
             &p.anthropic.models,
             &p.anthropic.model,
         );
+        // #567: the Ollama submenu keeps its last pulled list; only the
+        // checked model follows the config. A fresh list is fetched in the
+        // background (never here), see `OllamaModelCache`.
+        self.tray.set_ollama_current(&p.ollama.model);
+        self.ollama_models.refresh(&p.ollama.base_url);
 
         self.update_tooltip();
     }
@@ -5443,6 +5547,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // `Tray::show_menu`), so ask who was in front first. Only on the
             // menu gesture, so tray hover traffic costs nothing.
             let menu_hint = Tray::opens_menu(lparam) && app.password_manager_now();
+            // #567: show what the last background refresh found, then start
+            // the next one. Never waits on Ollama, so the menu opens at once.
+            if Tray::opens_menu(lparam) {
+                app.sync_ollama_menu();
+            }
             if let Some(id) = app.tray.on_tray_message(lparam) {
                 app.password_manager_hint = menu_hint;
                 // Choosing anything other than a rebind disarms a learn mode
@@ -5461,6 +5570,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 match decode(id) {
                     MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
                     MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
+                    MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
                     MenuChoice::Command(cmd::ASK_NOW) => app.ask(Trigger::Tray),
                     MenuChoice::Command(cmd::EXTRACT_TEXT) => app.extract_text(),
                     MenuChoice::Command(cmd::READ_QR) => app.read_qr(),
@@ -6568,7 +6678,12 @@ mod tests {
         // Not fixed menu commands. The two *_MODEL_BASE values start the
         // dynamic model-submenu ranges (dispatched by MenuChoice::OpenAiModel /
         // AnthropicModel, not by exact id) and MODEL_RANGE is that width.
-        const DYNAMIC: &[&str] = &["MODEL_RANGE", "OPENAI_MODEL_BASE", "ANTHROPIC_MODEL_BASE"];
+        const DYNAMIC: &[&str] = &[
+            "MODEL_RANGE",
+            "OPENAI_MODEL_BASE",
+            "ANTHROPIC_MODEL_BASE",
+            "OLLAMA_MODEL_BASE",
+        ];
         // Display-only items: added disabled (greyed), so no click can ever
         // produce their WM_COMMAND and they need no wnd_proc arm (#317).
         const DISPLAY_ONLY: &[&str] = &["VERSION_LABEL"];
