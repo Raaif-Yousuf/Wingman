@@ -47,7 +47,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::config::ActiveProvider;
 use windows::core::{w, BOOL, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP,
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
@@ -58,11 +58,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
-    GetIconInfo, GetSystemMetrics, LoadIconW, LoadImageW, RegisterWindowMessageW,
+    GetIconInfo, GetSystemMetrics, LoadIconW, LoadImageW, PostMessageW, RegisterWindowMessageW,
     SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenu, HICON, HMENU, ICONINFO, IDI_APPLICATION,
     IMAGE_ICON, LR_DEFAULTCOLOR, MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MF_DISABLED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE, MIIM_STATE, SM_CXSMICON, SM_CYSMICON,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
 };
 
 /// What a tray message asks for. See [`Tray::on_tray_message`].
@@ -105,6 +105,11 @@ impl PreparedMenu {
             )
         };
         let _ = unsafe { DestroyMenu(self.hmenu) };
+        // Documented idiom: a menu shown for a tray icon needs a benign
+        // message afterwards, or the next click can be lost.
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        }
         if result.0 != 0 {
             Some(result.0 as u32)
         } else {

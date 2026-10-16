@@ -3567,6 +3567,9 @@ impl App {
                 DeferredMessage::ReviewResult(result) => self.on_review_result(result),
                 DeferredMessage::FormFillResult(result) => self.on_form_fill_result(result),
                 DeferredMessage::PreviewDecided(generation) => self.on_preview_decided(generation),
+                DeferredMessage::SendPreview(request) => self.on_send_preview(request),
+                DeferredMessage::PendingStage(run, stage) => self.on_pending_stage(run, stage),
+                DeferredMessage::FirstRun(run, found) => self.on_first_run_result(run, found),
                 DeferredMessage::GenericActionResult(action, schema, result) => {
                     self.on_generic_action_result(action, schema, result)
                 }
@@ -5486,6 +5489,11 @@ thread_local! {
     /// opaque TLS accessor call.
     static SETTINGS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// True while the tray menu's loop runs (#722). Always set together with
+    /// `SETTINGS_OPEN`, which supplies the reentrancy machinery; this only
+    /// selects [`tray_menu_policy`] instead of the Settings one.
+    static TRAY_MENU_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// Every `WM_APP_RESULT`/`WM_APP_CALENDAR_RESULT`/`WM_APP_REVIEW_RESULT`/
     /// `WM_APP_PREVIEW_DECIDED` message that arrived while `SETTINGS_OPEN`
     /// was true, oldest first. `open_settings` drains and delivers all of
@@ -5531,7 +5539,6 @@ use std::os::windows::ffi::OsStrExt;
 /// open (issue #213), holding whatever payload its `WM_APP_*` counterpart
 /// boxed into `lparam` -- already taken out of that box, so `PENDING_MESSAGES`
 /// never stores a raw pointer.
-#[derive(Debug)]
 enum DeferredMessage {
     /// `WM_APP_RESULT`.
     Result(std::result::Result<Answer, String>),
@@ -5550,6 +5557,14 @@ enum DeferredMessage {
     /// deferred notification is still matched against the right preview
     /// when Settings closes and the queue drains.
     PreviewDecided(u32),
+    /// `WM_APP_SEND_PREVIEW`, deferred only while the tray menu is open
+    /// (#722), so opening the menu never cancels a send waiting on its
+    /// preview.
+    SendPreview(crate::ui::send_gate::SendRequest),
+    /// `WM_APP_PENDING_STAGE` (run, stage), tray menu only (#722).
+    PendingStage(u64, crate::ui::card::PendingStage),
+    /// `WM_APP_FIRST_RUN` (run, probe answer), tray menu only (#722).
+    FirstRun(u64, FirstRun),
     /// `WM_APP_GENERIC_ACTION_RESULT` (#242). Carries the exact `Action`
     /// and schema `run_generic_action` dispatched with, not just the id --
     /// see `on_generic_action_result`'s doc comment for why.
@@ -5673,6 +5688,20 @@ enum SettingsReentrancy {
     /// itself unreachable while Settings is open: its only path is the
     /// tray's Quit command, and `WM_APP_TRAY` is `Ignore`d above.
     Fallback,
+}
+
+/// #722: the policy while the tray menu is open. Settings hides the card
+/// before it opens, so it can drop a send preview, a first-run answer and a
+/// pending-stage update; the tray menu does not, so those are deferred and
+/// delivered when the menu closes (a send preview must not be cancelled just
+/// because the tray was opened). `WM_APP_DISMISS` stays dropped: the click
+/// that closes the menu is the user's dismissal, and the menu took that
+/// click, so there is no card click left to act on.
+fn tray_menu_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
+    match msg {
+        WM_APP_SEND_PREVIEW | WM_APP_FIRST_RUN | WM_APP_PENDING_STAGE => SettingsReentrancy::Defer,
+        _ => settings_reentrancy_policy(msg, taskbar_created_msg),
+    }
 }
 
 fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
@@ -5841,7 +5870,9 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         TrayEvent::Menu(menu) => {
             was_menu = true;
             SETTINGS_OPEN.with(|c| c.set(true));
+            TRAY_MENU_OPEN.with(|c| c.set(true));
             let chosen = menu.track();
+            TRAY_MENU_OPEN.with(|c| c.set(false));
             SETTINGS_OPEN.with(|c| c.set(false));
             match chosen {
                 Some(id) => id,
@@ -5956,7 +5987,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         }
 
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
-        match settings_reentrancy_policy(msg, taskbar_created_msg) {
+        let policy = if TRAY_MENU_OPEN.with(|c| c.get()) {
+            tray_menu_policy(msg, taskbar_created_msg)
+        } else {
+            settings_reentrancy_policy(msg, taskbar_created_msg)
+        };
+        match policy {
             SettingsReentrancy::Ignore => {
                 // WM_APP_LEARNED, WM_APP_PALETTE_RUN and WM_APP_ROUTER_RESULT
                 // are the only ignored messages carrying a boxed payload;
@@ -5995,6 +6031,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
                     }),
                     WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
+                    // #722: only `tray_menu_policy` defers these three.
+                    WM_APP_SEND_PREVIEW => DeferredMessage::SendPreview(unsafe {
+                        *Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest)
+                    }),
+                    WM_APP_PENDING_STAGE => {
+                        DeferredMessage::PendingStage(wparam.0 as u64, unsafe {
+                            *Box::from_raw(lparam.0 as *mut crate::ui::card::PendingStage)
+                        })
+                    }
+                    WM_APP_FIRST_RUN => DeferredMessage::FirstRun(wparam.0 as u64, unsafe {
+                        *Box::from_raw(lparam.0 as *mut FirstRun)
+                    }),
                     // #242: same treatment as WM_APP_CALENDAR_RESULT above.
                     WM_APP_GENERIC_ACTION_RESULT => {
                         let (action, schema, result) = *unsafe {
@@ -6002,9 +6050,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         };
                         DeferredMessage::GenericActionResult(action, schema, result)
                     }
-                    _ => unreachable!(
-                        "settings_reentrancy_policy only returns Defer for the six ids above"
-                    ),
+                    _ => {
+                        unreachable!("the reentrancy policies only return Defer for the ids above")
+                    }
                 };
                 PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
                 return LRESULT(0);
@@ -6023,10 +6071,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     if ptr.is_null() {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
+    // #722: handed the raw pointer, before any `&mut App` is bound here, so
+    // that no borrow can be live across the tray menu's message loop.
+    if msg == WM_APP_TRAY {
+        return handle_tray_message(hwnd, ptr, lparam);
+    }
     let app: &mut App = unsafe { &mut *ptr };
 
     match msg {
-        WM_APP_TRAY => handle_tray_message(hwnd, ptr, lparam),
         WM_APP_HOTKEY => {
             let _which = wparam.0; // both bindings do the same thing
             if !app.cancel_pending_send_preview() {
@@ -7693,6 +7745,26 @@ mod tests {
         );
     }
 
+    /// #722: the tray menu defers what Settings drops, so opening the menu
+    /// never cancels a send waiting on its preview.
+    #[test]
+    fn tray_menu_policy_defers_send_preview_first_run_and_stage() {
+        for msg in [WM_APP_SEND_PREVIEW, WM_APP_FIRST_RUN, WM_APP_PENDING_STAGE] {
+            assert_eq!(super::tray_menu_policy(msg, 0), SettingsReentrancy::Defer);
+            assert_eq!(
+                settings_reentrancy_policy(msg, 0),
+                SettingsReentrancy::Ignore
+            );
+        }
+        // Everything else matches the Settings policy.
+        for msg in [WM_APP_RESULT, WM_APP_HOTKEY, WM_APP_DISMISS, WM_APP_TRAY, 0] {
+            assert_eq!(
+                super::tray_menu_policy(msg, 0),
+                settings_reentrancy_policy(msg, 0)
+            );
+        }
+    }
+
     /// #722: the tray menu runs a nested message loop. No `&mut App` may be
     /// live across it, and the reentrancy policy must be on while it runs.
     #[test]
@@ -7723,7 +7795,13 @@ mod tests {
         );
         // The wnd_proc arm only delegates; it never reaches the menu itself.
         let proc_src = wnd_proc_body(&src);
-        assert!(proc_src.contains("handle_tray_message("));
+        let call = proc_src
+            .find("handle_tray_message(")
+            .expect("wnd_proc never delegates the tray message");
+        let bind = proc_src
+            .find("let app: &mut App")
+            .expect("wnd_proc binds no app");
+        assert!(call < bind, "the tray call must precede any App borrow");
         assert!(!proc_src.contains("on_tray_message"));
         // And the tray's own message handler no longer calls TrackPopupMenu.
         let tray = lf(include_str!("ui/tray.rs"));
