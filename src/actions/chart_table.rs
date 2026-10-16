@@ -5,7 +5,7 @@
 //! label column, then one value column per series. Nothing printed on a chart
 //! is exact (a bar has no number on it), so what the model returns is an
 //! estimate and the action says so in two places. In code, every value column
-//! header gets " (estimate)" ([`mark_estimates`]), so the CSV carries the
+//! header gets " (estimate)" ([`mark_estimates`]), so the copied text carries the
 //! warning into the spreadsheet. On the card, a note sits under the rows
 //! ([`card_note`]). Neither relies on the model remembering to say it.
 
@@ -139,8 +139,8 @@ mod tests {
     fn the_marked_headers_reach_the_csv() {
         let p = json!({"columns": ["Fruit", "Count"], "rows": [["Apple", "3"], ["Pear", "5"]]});
         assert_eq!(
-            crate::actions::table::csv_from_value(&mark_estimates(&p)).unwrap(),
-            "Fruit,Count (estimate)\r\nApple,3\r\nPear,5"
+            crate::actions::table::tsv_from_value(&mark_estimates(&p)).unwrap(),
+            "Fruit\tCount (estimate)\r\nApple\t3\r\nPear\t5"
         );
     }
 
@@ -205,8 +205,8 @@ mod tests {
     #[test]
     fn a_hostile_label_is_still_guarded_in_the_csv() {
         let p = json!({"columns": ["L", "V"], "rows": [["=cmd()", "1"]]});
-        let csv = crate::actions::table::csv_from_value(&mark_estimates(&p)).unwrap();
-        assert!(csv.contains("\r\n'=cmd(),1"), "{csv}");
+        let csv = crate::actions::table::tsv_from_value(&mark_estimates(&p)).unwrap();
+        assert!(csv.contains("\r\n'=cmd()\t1"), "{csv}");
     }
 
     #[test]

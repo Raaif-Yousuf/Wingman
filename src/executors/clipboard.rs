@@ -115,8 +115,8 @@ impl<C: ClipboardAccess + 'static> Executor for ClipboardExecutor<C> {
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .or_else(|| crate::actions::action_items::checklist_from_value(&value))
-            // #69: a `columns` and `rows` proposal is copied as CSV.
-            .or_else(|| crate::actions::table::csv_from_value(&value));
+            // #69: a `columns` and `rows` proposal is copied as tab-separated text (#708).
+            .or_else(|| crate::actions::table::tsv_from_value(&value));
         let Some(text) = text else {
             bail!("clipboard executor: proposal has no \"text\" field to copy");
         };
@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn a_table_from_the_preview_card_is_copied_as_csv() {
+    fn a_table_from_the_preview_card_is_copied_as_tab_separated_text() {
         use crate::ui::preview::PreviewModel;
         let schema = crate::actions::schema::schema_for("table", false).unwrap();
         let proposal = serde_json::json!({
@@ -298,7 +298,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             executor.clipboard.get_text().unwrap(),
-            "Item,Note\r\nPen,\"blue, fine\"\r\nInk,'=1+1"
+            "Item\tNote\r\nPen\tblue, fine\r\nInk\t'=1+1"
         );
     }
 
