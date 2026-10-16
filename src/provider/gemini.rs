@@ -163,7 +163,10 @@ impl Gemini {
                     .and_then(|f| f.get("blockReason"))
                     .and_then(Value::as_str)
                 {
-                    return Err(anyhow!("gemini: the prompt was blocked ({reason})"));
+                    return Err(anyhow!(
+                        "gemini: the prompt was blocked ({})",
+                        super::safe_reason(reason)
+                    ));
                 }
                 return Err(anyhow!("gemini: response has no candidates[]"));
             }
@@ -216,7 +219,8 @@ impl Gemini {
                     anyhow!("gemini: the model returned a malformed reply (MALFORMED_RESPONSE)")
                 }
                 Some(other) => anyhow!(
-                    "gemini: no text part found in candidate content (finishReason: {other})"
+                    "gemini: no text part found in candidate content (finishReason: {})",
+                    super::safe_reason(other)
                 ),
                 None => anyhow!("gemini: no text part found in candidate content"),
             });

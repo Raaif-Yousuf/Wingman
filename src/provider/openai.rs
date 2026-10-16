@@ -171,7 +171,10 @@ impl OpenAi {
                 ));
             }
             return Err(match status {
-                Some(s) => anyhow!("openai: no message text found in output[] (status: {s})"),
+                Some(s) => anyhow!(
+                    "openai: no message text found in output[] (status: {})",
+                    super::safe_reason(s)
+                ),
                 None => anyhow!("openai: no message text found in output[]"),
             });
         }

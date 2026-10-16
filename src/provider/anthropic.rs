@@ -131,7 +131,8 @@ impl Anthropic {
                         "anthropic: the request was too long for the model's context window (model_context_window_exceeded)"
                     ),
                     Some(other) => anyhow!(
-                        "anthropic: no text block found in content[] (stop_reason: {other})"
+                        "anthropic: no text block found in content[] (stop_reason: {})",
+                        super::safe_reason(other)
                     ),
                     None => anyhow!("anthropic: no text block found in content[]"),
                 });

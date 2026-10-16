@@ -229,7 +229,8 @@ impl OpenAiCompat {
             _ => {
                 return Err(match finish_reason {
                     Some(r) => anyhow!(
-                        "openai-compat: response has no message.content (finish_reason: {r})"
+                        "openai-compat: response has no message.content (finish_reason: {})",
+                        super::safe_reason(r)
                     ),
                     None => anyhow!("openai-compat: response has no message.content"),
                 })
