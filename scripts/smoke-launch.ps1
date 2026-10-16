@@ -36,6 +36,9 @@ param(
 # (dot-sourcing it only loads them).
 . (Join-Path $PSScriptRoot 'perf-runtime.ps1')
 
+# From src/ui/settings.rs; a Pester test checks it still matches.
+$SettingsWindowClass = 'Wingman.Settings.Window.9d4e2b71'
+
 # Polls $Condition every $PollMs until it returns true or $TimeoutMs passes.
 # The condition is always checked at least once.
 function Wait-Until {
@@ -55,7 +58,7 @@ function Wait-Until {
 # Dot-sourcing (the Pester tests do) loads the functions without running.
 if ($MyInvocation.InvocationName -eq '.') { return }
 
-function Stop-Smoke {
+function Exit-Smoke {
     param([string] $Message)
     throw "smoke test failed: $Message"
 }
@@ -76,7 +79,7 @@ $exe = (Resolve-Path -LiteralPath $ExePath).Path
 $data = Join-Path ([IO.Path]::GetTempPath()) ('wingman-smoke-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $data | Out-Null
 
-function Start-Wingman {
+function Invoke-Wingman {
     param([string[]] $Arguments = @())
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe
@@ -91,33 +94,45 @@ $first = $null
 $second = $null
 try {
     # 1. It starts.
-    $first = Start-Wingman
+    $first = Invoke-Wingman
     $up = Wait-Until -TimeoutMs 30000 -Condition {
-        if ($first.HasExited) { Stop-Smoke "first launch exited early with code $($first.ExitCode)" }
+        if ($first.HasExited) { Exit-Smoke "first launch exited early with code $($first.ExitCode)" }
         [Smoke.Win]::FindWindowW($OwnerWindowClass, [NullString]::Value) -ne [IntPtr]::Zero
     }
-    if (-not $up) { Stop-Smoke 'no owner window within 30 s' }
-    if (-not $first.WaitForInputIdle(30000)) { Stop-Smoke 'first launch not idle within 30 s' }
-    if (-not (Test-MutexHeld -Name $InstanceMutexName)) { Stop-Smoke 'first launch does not hold the single-instance name' }
+    if (-not $up) { Exit-Smoke 'no owner window within 30 s' }
+    if (-not $first.WaitForInputIdle(30000)) { Exit-Smoke 'first launch not idle within 30 s' }
+    if (-not (Test-MutexHeld -Name $InstanceMutexName)) { Exit-Smoke 'first launch does not hold the single-instance name' }
     'ok: first launch is up and holds the single-instance name'
 
     # 2. A second launch hands off and exits.
-    $second = Start-Wingman -Arguments @('--settings')
-    if (-not $second.WaitForExit(15000)) { Stop-Smoke 'second launch did not exit within 15 s' }
-    if ($second.ExitCode -ne 0) { Stop-Smoke "second launch exited with code $($second.ExitCode)" }
+    $second = Invoke-Wingman -Arguments @('--settings')
+    if (-not $second.WaitForExit(15000)) { Exit-Smoke 'second launch did not exit within 15 s' }
+    if ($second.ExitCode -ne 0) { Exit-Smoke "second launch exited with code $($second.ExitCode)" }
     $first.Refresh()
-    if ($first.HasExited) { Stop-Smoke "first launch died during the hand-off (code $($first.ExitCode))" }
-    'ok: second launch handed off and exited 0, first is still running'
+    if ($first.HasExited) { Exit-Smoke "first launch died during the hand-off (code $($first.ExitCode))" }
+    $settings = [IntPtr]::Zero
+    $opened = Wait-Until -TimeoutMs 10000 -Condition {
+        $script:settings = [Smoke.Win]::FindWindowW($SettingsWindowClass, [NullString]::Value)
+        $script:settings -ne [IntPtr]::Zero
+    }
+    if (-not $opened) { Exit-Smoke 'the first instance never opened the settings window it was asked for' }
+    'ok: second launch handed off and exited 0, first opened settings and is still running'
 
-    # 3. It exits cleanly when asked.
-    $hwnd = [Smoke.Win]::FindWindowW($OwnerWindowClass, [NullString]::Value)
-    if ($hwnd -eq [IntPtr]::Zero) { Stop-Smoke 'owner window vanished before the close' }
+    # 3. It exits cleanly when asked. The settings window is modal and the
+    # owner window ignores WM_CLOSE while it is open, so close it first.
     $WM_CLOSE = 0x0010
-    if (-not [Smoke.Win]::PostMessageW($hwnd, $WM_CLOSE, [UIntPtr]::Zero, [IntPtr]::Zero)) { Stop-Smoke 'could not post WM_CLOSE' }
-    if (-not $first.WaitForExit(15000)) { Stop-Smoke 'first launch did not exit within 15 s of WM_CLOSE' }
-    if ($first.ExitCode -ne 0) { Stop-Smoke "first launch exited with code $($first.ExitCode)" }
+    if (-not [Smoke.Win]::PostMessageW($script:settings, $WM_CLOSE, [UIntPtr]::Zero, [IntPtr]::Zero)) { Exit-Smoke 'could not post WM_CLOSE to settings' }
+    $closed = Wait-Until -TimeoutMs 10000 -Condition {
+        [Smoke.Win]::FindWindowW($SettingsWindowClass, [NullString]::Value) -eq [IntPtr]::Zero
+    }
+    if (-not $closed) { Exit-Smoke 'settings window did not close within 10 s' }
+    $hwnd =[Smoke.Win]::FindWindowW($OwnerWindowClass, [NullString]::Value)
+    if ($hwnd -eq [IntPtr]::Zero) { Exit-Smoke 'owner window vanished before the close' }
+    if (-not [Smoke.Win]::PostMessageW($hwnd,$WM_CLOSE, [UIntPtr]::Zero, [IntPtr]::Zero)) { Exit-Smoke 'could not post WM_CLOSE' }
+    if (-not $first.WaitForExit(15000)) { Exit-Smoke 'first launch did not exit within 15 s of WM_CLOSE' }
+    if ($first.ExitCode -ne 0) { Exit-Smoke "first launch exited with code $($first.ExitCode)" }
     if (-not (Wait-Until -TimeoutMs 5000 -Condition { -not (Test-MutexHeld -Name $InstanceMutexName) })) {
-        Stop-Smoke 'single-instance name still held after exit'
+        Exit-Smoke 'single-instance name still held after exit'
     }
     'ok: closed cleanly with code 0 and released the single-instance name'
 }

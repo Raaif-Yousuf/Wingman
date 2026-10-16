@@ -32,3 +32,11 @@ Describe 'the second launch' {
         $text.Contains("'--settings'") | Should -BeTrue
     }
 }
+
+Describe 'the settings window class' {
+    It 'matches the class in the source' {
+        $src = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\src\ui\settings.rs') -Raw) -replace "`r", ''
+        $src | Should -Not -BeNullOrEmpty
+        $src.Contains('const CLASS_NAME: &str = "' + $SettingsWindowClass + '";') | Should -BeTrue
+    }
+}
