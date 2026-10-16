@@ -49,6 +49,7 @@
 //! table, shared with the tooltip and the daily budget). This module has no
 //! price knowledge of its own.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -119,6 +120,12 @@ pub struct EgressEntry {
     /// field existed.
     #[serde(default)]
     pub trigger: Option<String>,
+    /// How many private details were hidden from this request, by kind
+    /// (`email`, `card number`, ...): regions painted into the screenshot
+    /// plus values swapped for markers in the text (#508). Counts only,
+    /// never what was hidden. Left out of the row when nothing was.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub redactions: BTreeMap<String, usize>,
 }
 
 fn now_unix() -> u64 {
@@ -601,12 +608,20 @@ pub fn build_entry(
     outcome: Outcome,
     error: Option<&str>,
 ) -> EgressEntry {
+    let attachments = attachments_from_body(body);
+    // The painted counts describe the screenshot, so they only belong on a
+    // request that carries one.
+    let redactions = if attachments.iter().any(|a| a.kind == AttachmentKind::Image) {
+        crate::redact::image_counts()
+    } else {
+        BTreeMap::new()
+    };
     EgressEntry {
         time_unix: now_unix(),
         provider: provider.to_string(),
         model: model_from(url, body),
         retried,
-        attachments: attachments_from_body(body),
+        attachments,
         snippets: Vec::new(),
         bytes_sent,
         bytes_received,
@@ -614,6 +629,7 @@ pub fn build_entry(
         error: error.map(redact_opaque_tokens),
         cost: None,
         trigger: crate::activation::worker_trigger_label().map(str::to_string),
+        redactions,
     }
 }
 
@@ -621,6 +637,14 @@ impl EgressEntry {
     /// The same row with its cost filled in (#487).
     pub fn with_cost(mut self, cost: Option<f64>) -> Self {
         self.cost = cost;
+        self
+    }
+
+    /// The same row with the text step's counts added to the painted ones.
+    pub fn with_text_redactions(mut self, counts: BTreeMap<String, usize>) -> Self {
+        for (kind, n) in counts {
+            *self.redactions.entry(kind).or_insert(0) += n;
+        }
         self
     }
 }
@@ -846,6 +870,14 @@ pub fn render_human(entry: &EgressEntry) -> String {
             "failed: {}",
             entry.error.as_deref().unwrap_or("unknown error")
         )),
+    }
+    if !entry.redactions.is_empty() {
+        let kinds: Vec<String> = entry
+            .redactions
+            .iter()
+            .map(|(kind, n)| format!("{n} {kind}"))
+            .collect();
+        parts.push(format!("redacted: {}", kinds.join(", ")));
     }
     match entry.cost {
         Some(c) => parts.push(format!("cost=${c:.4}")),
@@ -1637,5 +1669,90 @@ mod tests {
             unreachable!()
         };
         assert_eq!(rendered, "No requests logged yet.");
+    }
+
+    // -- redaction counts (#508) -------------------------------------------
+
+    fn image_body() -> Value {
+        json!({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"data": base64_png(10, 10)}}
+        ]}]})
+    }
+
+    fn entry_for(body: &Value) -> EgressEntry {
+        build_entry(
+            "p",
+            "https://x.example/",
+            body,
+            false,
+            1,
+            1,
+            Outcome::Success,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_request_with_painted_regions_logs_their_kinds_and_counts() {
+        crate::redact::reset_image_counts();
+        crate::redact::note_image_redactions("card number", 2);
+        let entry = entry_for(&image_body());
+        crate::redact::reset_image_counts();
+        assert_eq!(entry.redactions.get("card number"), Some(&2));
+    }
+
+    #[test]
+    fn painted_counts_stay_off_a_request_that_carries_no_image() {
+        crate::redact::reset_image_counts();
+        crate::redact::note_image_redactions("email", 3);
+        let entry = entry_for(&json!({"model": "m"}));
+        crate::redact::reset_image_counts();
+        assert!(entry.redactions.is_empty());
+    }
+
+    #[test]
+    fn text_counts_add_to_painted_counts_of_the_same_kind() {
+        crate::redact::reset_image_counts();
+        crate::redact::note_image_redactions("email", 1);
+        let text: std::collections::BTreeMap<String, usize> =
+            [("email".to_string(), 2), ("key".to_string(), 1)].into();
+        let entry = entry_for(&image_body()).with_text_redactions(text);
+        crate::redact::reset_image_counts();
+        assert_eq!(entry.redactions.get("email"), Some(&3));
+        assert_eq!(entry.redactions.get("key"), Some(&1));
+    }
+
+    #[test]
+    fn the_row_holds_counts_only_never_the_values() {
+        crate::redact::reset_image_counts();
+        let mut r = crate::redact::Redactions::default();
+        r.redact_text("write to someone@example.com");
+        let entry = entry_for(&json!({"model": "m"})).with_text_redactions(r.counts());
+        let row = serde_json::to_string(&entry).unwrap();
+        assert!(row.contains("\"redactions\":{\"email\":1}"), "{row}");
+        assert!(
+            !row.contains("someone") && !row.contains("example.com\""),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn a_row_with_no_redactions_omits_the_field_and_old_rows_still_read() {
+        crate::redact::reset_image_counts();
+        let row = serde_json::to_string(&entry_for(&json!({"model": "m"}))).unwrap();
+        assert!(!row.contains("redactions"), "{row}");
+        let back: EgressEntry = serde_json::from_str(&row).unwrap();
+        assert!(back.redactions.is_empty());
+    }
+
+    #[test]
+    fn the_human_line_names_redaction_counts() {
+        crate::redact::reset_image_counts();
+        let text: std::collections::BTreeMap<String, usize> =
+            [("email".to_string(), 2), ("key".to_string(), 1)].into();
+        let with = render_human(&entry_for(&json!({"model": "m"})).with_text_redactions(text));
+        assert!(with.contains("redacted: 2 email, 1 key"), "{with}");
+        let without = render_human(&entry_for(&json!({"model": "m"})));
+        assert!(!without.contains("redacted"), "{without}");
     }
 }

@@ -406,6 +406,8 @@ pub fn encode_for_chain(
     mode: crate::mode::Mode,
     redact_setting: bool,
 ) -> Result<Shot> {
+    // #508: the egress row's painted counts describe this encode only.
+    crate::redact::reset_image_counts();
     if needs_password_lookup(redact_setting, providers, mode) {
         crate::redact::apply(raw)?;
     }
@@ -812,6 +814,25 @@ mod tests {
     };
     use crate::provider::ImageLimits;
     use image::ImageEncoder;
+
+    // -- egress painted counts (#508) ------------------------------------
+
+    #[test]
+    fn every_encode_for_a_provider_starts_from_no_painted_counts() {
+        // `encode_for_chain` is the only way pixels reach a provider (`encode`
+        // is private), so resetting there covers every capture path: hotkey,
+        // router, palette, region and `LookupWindow::None` alike.
+        crate::redact::note_image_redactions("email", 4);
+        let mut raw = RawShot {
+            rgba: vec![255; 8 * 8 * 4],
+            width: 8,
+            height: 8,
+            screen: None,
+        };
+        let providers = crate::config::Providers::default();
+        super::encode_for_chain(&mut raw, &providers, crate::mode::Mode::Cloud, false).unwrap();
+        assert!(crate::redact::image_counts().is_empty());
+    }
 
     // -- resolve_limits (issue #169) -------------------------------------
 
