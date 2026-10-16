@@ -243,9 +243,22 @@ fn account_name(profile: &str) -> &str {
 
 /// Replaces the bare account name where it stands as a whole word, case
 /// insensitively (`name` in "user name failed", not in "named"). A name under
-/// three characters is left alone: it would hit ordinary words.
+/// three characters is left alone: it would hit ordinary words. So is a
+/// generic name that identifies nobody (`user`, `admin`, ...): replacing it
+/// would only mangle ordinary text such as "user cancelled".
 pub fn redact_account_name(text: &str, name: &str) -> String {
-    if name.chars().count() < 3 {
+    const GENERIC: [&str; 9] = [
+        "user",
+        "admin",
+        "administrator",
+        "owner",
+        "public",
+        "default",
+        "guest",
+        "test",
+        "dev",
+    ];
+    if name.chars().count() < 3 || GENERIC.iter().any(|g| name.eq_ignore_ascii_case(g)) {
         return text.to_string();
     }
     let lower = text.to_ascii_lowercase();
@@ -274,37 +287,32 @@ fn replace_profile_form(text: &str, profile: &str) -> String {
     let profile = profile.trim_end_matches(['\\', '/']);
 
     let needle_lower = profile.to_ascii_lowercase();
+    // Lower-cased once: ASCII lowering keeps every byte offset.
+    let lower = text.to_ascii_lowercase();
     let mut result = String::with_capacity(text.len());
-    let mut rest = text;
+    let mut pos = 0;
 
-    loop {
-        let rest_lower = rest.to_ascii_lowercase();
-        let Some(idx) = rest_lower.find(&needle_lower) else {
-            result.push_str(rest);
-            break;
-        };
+    while let Some(rel) = lower[pos..].find(&needle_lower) {
+        let idx = pos + rel;
         let end = idx + needle_lower.len();
-        let next = rest[end..].chars().next();
+        let next = text[end..].chars().next();
         let is_boundary = matches!(next, None | Some('\\') | Some('/'));
 
         if is_boundary {
-            result.push_str(&rest[..idx]);
+            result.push_str(&text[pos..idx]);
             result.push_str("%USERPROFILE%");
-            rest = &rest[end..];
+            pos = end;
         } else {
             // A longer name shares this prefix (e.g. needle "raa" inside
             // "test") -- not a real match. Copy through the false match
             // plus the disqualifying character so the next search cannot
             // find the same spot again, and keep scanning the remainder.
             let take = end + next.map(|c| c.len_utf8()).unwrap_or(0);
-            result.push_str(&rest[..take]);
-            rest = &rest[take..];
-        }
-
-        if rest.is_empty() {
-            break;
+            result.push_str(&text[pos..take]);
+            pos = take;
         }
     }
+    result.push_str(&text[pos..]);
 
     result
 }
@@ -325,13 +333,18 @@ pub fn scrub_error_chain(raw: &str, profile: &str) -> String {
 /// folder is looked up once.
 pub fn scrub_error_chain_here(raw: &str) -> String {
     static PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let profile = PROFILE.get_or_init(|| {
-        crate::known_folder::user_profile()
-            .ok()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
-    });
-    scrub_error_chain(raw, profile)
+    // Only a success is cached: a failed lookup is retried next time rather
+    // than skipping the path scrub for the rest of the run.
+    if let Some(profile) = PROFILE.get() {
+        return scrub_error_chain(raw, profile);
+    }
+    match crate::known_folder::user_profile() {
+        Ok(p) => {
+            let profile = PROFILE.get_or_init(|| p.display().to_string());
+            scrub_error_chain(raw, profile)
+        }
+        Err(_) => scrub_error_chain(raw, ""),
+    }
 }
 
 /// Renders `input` as a plain-text report, ready for the clipboard and for
@@ -981,6 +994,21 @@ mod tests {
             let got = redact_user_profile(raw, p);
             assert_eq!(got, kept, "{raw}");
             assert!(!got.to_lowercase().contains("test"), "{got}");
+        }
+    }
+
+    #[test]
+    fn a_generic_account_name_is_not_replaced_in_ordinary_text() {
+        for name in ["user", "Admin", "TEST", "guest"] {
+            let profile = format!(r"C:\Users\{name}");
+            assert_eq!(
+                scrub_error_chain("user cancelled", &profile),
+                "user cancelled"
+            );
+            assert_eq!(
+                redact_account_name("the admin test", name),
+                "the admin test"
+            );
         }
     }
 
