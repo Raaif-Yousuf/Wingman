@@ -143,7 +143,7 @@ impl Gemini {
     /// `RECITATION`, `PROHIBITED_CONTENT`) or a prompt-level block
     /// (`promptFeedback.blockReason` with no candidates at all) rather than
     /// treating either as a malformed response.
-    fn parse_completion(body: &str) -> Result<Completion> {
+    pub(crate) fn parse_completion(body: &str) -> Result<Completion> {
         let value: Value =
             serde_json::from_str(body).context("gemini: response body is not valid JSON")?;
 
