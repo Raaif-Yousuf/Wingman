@@ -7,6 +7,87 @@ tagged release.
 
 ## [Unreleased]
 
+## [0.2.0] - unreleased
+
+The date is set when the tag is made. Changes since 0.1.0, grouped by what you
+notice. The release page has the download and its checksums.
+
+### New actions
+
+Wingman now ships more than two dozen built-in actions, all in the Quick Ask
+palette and the tray's Actions menu. New since 0.1.0: Read QR code from screen
+(no model, works offline), Copy text from screen, Add event from screen,
+Review this email, Fill this form (works with no model too), Action items to a
+checklist, Summarize this page, Summarize a link, Explain this error, Define
+this word, Translate selection, Describe image (alt text), Explain what's on
+screen, Table to CSV, Chart to data table, Receipt to expense row, Convert
+times to my time zone, Relative dates to real dates, Is this a scam?, Jargon to
+plain English, Explain, fix and write tests for code, and three Rewrite for
+tone actions.
+
+You can write your own in `actions.toml`: they appear in the palette and run
+like built-in ones, and an entry with the same id as a built-in changes only
+the fields you write. Share an action as a file from the tray (Help and
+diagnostics) and import one after a preview.
+
+### Privacy and safety
+
+- Card numbers, IBANs, key-like tokens, emails and password fields are
+  painted over in the screenshot before a cloud request, and hidden in any text
+  sent too, then restored in the answer. One checkbox in Settings.
+- Wingman does not read password managers: it shows a card and sends nothing.
+- Optional preview of exactly what will be sent before any cloud request.
+- A daily cost budget with a warning and a stop, and the cost shown on each
+  cloud answer. Local models stay free and are never blocked.
+- A screenshot is treated as content, never as instructions to the model.
+- A write is refused if the field changed after you confirmed it.
+- Calendar files are deleted sooner, and the log and profile files are limited
+  to your account.
+
+### Local models and modes
+
+- First run: with nothing set up, a press looks for a local Ollama with a
+  vision model and uses it.
+- Settings can pull an Ollama model with live progress, pick it from the tray,
+  and fix a CPU-only Ollama on an Intel GPU PC. Tray: "Check this PC for local
+  models".
+- Local mode no longer fetches cloud model lists or starts connector sign-in.
+- Settings has live model lists for ChatGPT, Claude and Gemini, and Gemini
+  key, model and thinking fields.
+
+### The card and Settings
+
+- The card follows light, dark and high contrast live, shows what Wingman is
+  doing while it works, scrolls from the keyboard, and has Tab between its
+  footer links. Copy the answer or the card as an image (Ctrl+Shift+C), read an
+  answer aloud, and choose which corner and display it appears on.
+- Settings is laid out in plain words, scrolls with Save always in view, and
+  Save with no edits changes nothing. The tray menu is regrouped, and its
+  first line shows the running version.
+- The tray icon shows when a run is working or the last one failed.
+
+### Reliability
+
+- A crash leaves a note that is shown on the next start. Copy diagnostics
+  hides your account name and the last error's private details.
+- A config.toml that fails to parse is never saved over.
+- Cards show human errors instead of raw messages, with a next step.
+- Fixes for QR codes that crashed the reader, held keys auto-repeating, and
+  the card opening at 0x0.
+- Confirmed actions no longer run on the keyboard thread.
+
+### Install and release
+
+- Portable mode: a `wingman.portable` file next to the exe keeps every file
+  Wingman writes in that folder.
+- CI now checks the exe size, startup time, idle memory and a start, hand-off
+  and clean-exit smoke test. Release builds are reproducible and ship a
+  CycloneDX SBOM and SHA256SUMS.
+- The release is not code-signed. Windows SmartScreen will warn on first run;
+  see the README.
+
+## [0.1.0] - 2026-09-20
+
 ### Added
 
 - Share an action as a file: tray, Help and diagnostics, "Export action to file"
@@ -95,11 +176,10 @@ tagged release.
   malformed answer from provider 1 correctly falls through to provider 2
   (issue #176).
 
-## [0.1.0] - unreleased
+## Before the first tag
 
-The version currently in `Cargo.toml`. Not yet tagged; listed here because
-this is what exists in the codebase today, per the working name
-`copilot-ask`.
+The state of the code under its working name, `copilot-ask`, before 0.1.0 was
+tagged.
 
 ### Added
 
