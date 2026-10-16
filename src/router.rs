@@ -98,6 +98,12 @@ pub const DEFAULT_ROUTER_THRESHOLD: f64 = 0.7;
 /// runs picked `review-this-email` with a prose summary and no echoed id
 /// (~14-17 s each on CPU: `/api/ps` showed `size_vram` 0 on this machine, so
 /// those times are CPU times). `gemma3:4b` was not re-measured.
+///
+/// That measurement was of the earlier three-field prompt. The shortlist prompt
+/// below is MEASURED 2026-10-16 on one run only (#306, same test, `qwen3.5:4b`,
+/// CPU, ~35 s): `review-this-email` first with the label "Review this email to
+/// Dana" and a prose summary. THEORY (unverified): it holds 5 of 5 like the old
+/// prompt did; it has not been repeated.
 const ROUTER_SYSTEM_PREFIX: &str = "You are shown a heavily downscaled screenshot of the user's screen, just before they open an action picker. Fill two fields. \"summary\": one short plain sentence about what is visible on screen, never an action id or action name. \"options\": up to four of the listed actions that suit this screen, best first, an empty list if none fits. Each option has \"intent\": the id of the listed action, copied exactly; \"label\": a short button label of at most six words that names the thing on screen, for example \"Review this email to Dana\"; \"confidence\": a number from 0 to 1. Never explain your reasoning, only report the result. Use plain text only: no markdown and no em dashes (use a full stop, a colon, or the word \"and\" or \"but\" instead).";
 
 /// One candidate action offered to the router: its id and a one-line
@@ -136,7 +142,12 @@ pub fn candidates_from_catalogue(catalogue: &[PaletteAction]) -> Vec<RouterCandi
 /// prompt-only limit is not trusted either, so [`parse_router_result`]
 /// enforces the cap in code.
 pub fn router_schema(candidate_ids: &[String]) -> Value {
-    let intent_values: Vec<Value> = candidate_ids.iter().map(|id| json!(id)).collect();
+    let mut intent = json!({"type": "string"});
+    // An empty `enum` is invalid JSON Schema and some providers reject the
+    // whole request, so with no candidates the keyword is left out.
+    if !candidate_ids.is_empty() {
+        intent["enum"] = Value::Array(candidate_ids.iter().map(|id| json!(id)).collect());
+    }
     json!({
         "type": "object",
         "properties": {
@@ -146,7 +157,7 @@ pub fn router_schema(candidate_ids: &[String]) -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "intent": {"type": "string", "enum": intent_values},
+                        "intent": intent,
                         "label": {"type": "string"},
                         "confidence": {"type": "number"}
                     },
@@ -191,6 +202,20 @@ pub fn build_request(image_png: Vec<u8>, candidates: &[RouterCandidate]) -> Requ
         effort: Effort::Low,
         max_tokens: ROUTER_MAX_TOKENS,
     }
+}
+
+/// The router's chain: just `provider`, never previewing, and stopping at
+/// [`ROUTER_WALL_CLOCK`] after `started` (#792). It bounds only the chain:
+/// past that point no further provider call and no repair request is
+/// started (and billed). A call already in flight is not interrupted; it
+/// ends on its own HTTP timeout.
+pub fn router_chain(
+    provider: Box<dyn crate::provider::Provider>,
+    started: std::time::Instant,
+) -> Chain {
+    Chain::new(vec![provider])
+        .without_prompt()
+        .with_deadline(started + ROUTER_WALL_CLOCK)
 }
 
 /// Issue #295: runs the router's request through `chain`, the same
@@ -291,17 +316,26 @@ pub struct RouterResult {
     pub options: Vec<RouterOption>,
 }
 
-/// Strips what a button label must not carry: markdown characters, an em dash
+/// Strips what a button label must not carry: markdown markers, an em dash
 /// (rule 11: a colon and a space instead), runs of whitespace, then clamps to
 /// `max_chars` characters (never a byte slice: the text came from a model).
+///
+/// `*` and backticks are dropped anywhere. `_ [ ] | ~` are trimmed only from
+/// the ends of a word and `# >` only from its start, so `_email_` and `#1`
+/// lose their markers while `snake_case` and `C#` keep theirs.
 fn clean_model_line(text: &str, max_chars: usize) -> String {
-    let stripped: String = text
+    let words: Vec<String> = text
         .replace('\u{2014}', ": ")
-        .chars()
-        .filter(|c| !matches!(c, '*' | '_' | '`' | '#' | '~' | '>' | '|' | '[' | ']'))
+        .replace(['*', '`'], "")
+        .split_whitespace()
+        .map(|w| {
+            w.trim_start_matches(['#', '>'])
+                .trim_matches(['_', '[', ']', '|', '~'])
+                .to_string()
+        })
+        .filter(|w| !w.is_empty())
         .collect();
-    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
-    crate::provider::sanitize_model_text(&collapsed, max_chars)
+    crate::provider::sanitize_model_text(&words.join(" "), max_chars)
 }
 
 /// Reads one `options` entry, `None` for anything malformed. One bad entry
@@ -635,6 +669,83 @@ mod tests {
         parse_router_result(text, candidates, RouterLimits::default()).unwrap()
     }
 
+    /// #792: the router's chain sends no repair request once its deadline has
+    /// passed. A slow provider returns an unparseable answer after the cap;
+    /// it must be asked exactly once.
+    #[test]
+    fn router_chain_sends_no_repair_after_the_deadline() {
+        use crate::provider::{Caps, Completion, Provider, StopReason};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        struct SlowBadAnswer(Arc<AtomicU32>);
+        impl Provider for SlowBadAnswer {
+            fn id(&self) -> &'static str {
+                "slow"
+            }
+            fn capabilities(&self, _model: &str) -> Caps {
+                Caps {
+                    vision: true,
+                    ..Caps::default()
+                }
+            }
+            fn own_caps(&self) -> Caps {
+                self.capabilities("")
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                Ok(Completion {
+                    text: "not json".to_string(),
+                    usage: None,
+                    stop: StopReason::Complete,
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        // Started long enough ago that the deadline has passed by the time
+        // the slow answer arrives.
+        let Some(started) = std::time::Instant::now().checked_sub(ROUTER_WALL_CLOCK) else {
+            return; // machine up for under 10 s: no earlier instant exists
+        };
+        let chain = router_chain(Box::new(SlowBadAnswer(calls.clone())), started);
+        let result = route(
+            &chain,
+            vec![1],
+            &[candidate("a", "A")],
+            RouterLimits::default(),
+            || Err(anyhow::anyhow!("no fallback expected")),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "past the deadline: no call at all"
+        );
+
+        let nearly = ROUTER_WALL_CLOCK - std::time::Duration::from_millis(20);
+        let chain = router_chain(
+            Box::new(SlowBadAnswer(calls.clone())),
+            std::time::Instant::now()
+                .checked_sub(nearly)
+                .unwrap_or(started),
+        );
+        let result = route(
+            &chain,
+            vec![1],
+            &[candidate("a", "A")],
+            RouterLimits::default(),
+            || Err(anyhow::anyhow!("no fallback expected")),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "asked once, never repaired"
+        );
+    }
+
     // -- candidates_from_catalogue ------------------------------------------
 
     #[test]
@@ -923,6 +1034,23 @@ mod tests {
         let result = parse(text, &five());
         assert_eq!(result.options[0].label, "Review this email 1");
         assert_eq!(result.summary, "Bold code");
+    }
+
+    #[test]
+    fn inner_underscores_and_hashes_survive_label_cleaning() {
+        let text = r#"{"summary":"s","options":[
+            {"intent":"a","label":"Fix snake_case names in C#","confidence":0.9}]}"#;
+        assert_eq!(
+            parse(text, &five()).options[0].label,
+            "Fix snake_case names in C#"
+        );
+    }
+
+    #[test]
+    fn router_schema_with_no_candidates_has_no_empty_enum() {
+        let schema = router_schema(&[]);
+        let intent = &schema["properties"]["options"]["items"]["properties"]["intent"];
+        assert_eq!(intent, &json!({"type": "string"}));
     }
 
     #[test]

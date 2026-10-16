@@ -2437,6 +2437,12 @@ impl App {
             }
             _ => (proposal, self.fallback_footer.clone()),
         };
+        // #710: a receipt cell that could not be checked is named on the card.
+        let note = if action.id == actions::receipt::ACTION_ID {
+            actions::receipt::card_note(&proposal, note.as_deref())
+        } else {
+            note
+        };
         // #114: values read off a chart are estimates. The headers say so (and
         // so does the CSV), and the card says so under the rows.
         let (proposal, note) = if action.id == actions::chart_table::ACTION_ID {
@@ -4897,6 +4903,7 @@ fn router_worker(
     candidates: &[router::RouterCandidate],
     limits: router::RouterLimits,
 ) -> Result<router::RouterResult> {
+    let started = std::time::Instant::now();
     let ollama_ready = mode == Mode::Auto
         && mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
         && mode::probe_ollama_ready(&providers.ollama.base_url, &providers.ollama.model);
@@ -4916,7 +4923,9 @@ fn router_worker(
     // #105: the router runs by itself when the palette opens, so it never
     // shows the send preview; with the toggle on, a cloud request is refused
     // by the send guard instead and the press simply gets no suggestion.
-    let chain = Chain::new(vec![provider]).without_prompt();
+    // #792: and it stops starting calls (the repair request included) once
+    // the palette has stopped waiting.
+    let chain = router::router_chain(provider, started);
     let raw: &capture::RawShot = raw;
     router::route(&chain, shot.png, candidates, limits, || {
         router_non_vision_inputs(raw)
