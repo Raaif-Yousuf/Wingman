@@ -225,24 +225,43 @@ impl OpenAi {
 
 /// Whether a model accepts `reasoning.effort` on the Responses API.
 ///
-/// #167: `gpt-4.1` (shipped in `Providers::default`'s OpenAI model list,
-/// config.rs) predates the reasoning-effort parameter -- it is not a
-/// reasoning model, unlike the gpt-5.x/o* lines. By analogy with
-/// Anthropic's `supports_effort` gate (a hard 400 on unsupported models,
-/// MEASURED 2026-09-15, AGENTS.md rule 10), `gpt-4.1` is carved out here
-/// too.
+/// #766: an allowlist, not a denylist. `reasoning.effort` goes only to the
+/// families known to be reasoning models: `gpt-5` and later (`gpt-5.5`,
+/// `gpt-5.4-mini`, a dated `gpt-5-2025-08-07`) and the o-series (`o1`, `o3`,
+/// `o4-mini`). Everything else, `gpt-4.1`, `gpt-4o`, `gpt-4-turbo`, the
+/// `-chat` variants, `o1-mini`/`o1-preview`, fine-tunes and any id this
+/// cannot place, is sent without `reasoning` and runs at the model's own
+/// default. The cost of a wrong "no" is the default effort; the cost of a
+/// wrong "yes" is a 400 card on every press, so an unknown id is a "no"
+/// (the same shape as Anthropic's `supports_effort`, #720).
 ///
-/// THEORY (unverified): no live OpenAI call has confirmed whether sending
-/// `reasoning.effort` to `gpt-4.1` actually 400s, is silently ignored, or
-/// errors some other way -- this task explicitly does not make live OpenAI
-/// calls. Replace this comment with `MEASURED <date>:` once checked, per
-/// #167's "Done when".
+/// THEORY (unverified): that a non-reasoning model rejects or ignores
+/// `reasoning.effort` has not been measured live (no OpenAI call in this
+/// change); the allowlist is safe either way. Replace this with
+/// `MEASURED <date>:` per family once checked (#167, #766).
 ///
 /// Also used as this provider's `thinking` capability, mirroring
 /// Anthropic's `supports_effort` doing double duty the same way.
 fn supports_reasoning(model: &str) -> bool {
-    const NO_REASONING: [&str; 1] = ["gpt-4.1"];
-    !NO_REASONING.iter().any(|m| model.starts_with(m))
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.contains("-chat") || lower.starts_with("o1-mini") || lower.starts_with("o1-preview") {
+        return false;
+    }
+    if let Some(rest) = lower.strip_prefix("gpt-") {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        // `gpt-5`, `gpt-5.5`, `gpt-5-mini`: the version must end at a
+        // separator, so `gpt-5x` or a 4-digit date is not a major version.
+        let after = &rest[digits.len()..];
+        let boundary = after.is_empty() || after.starts_with(['.', '-']);
+        return boundary && digits.parse::<u32>().is_ok_and(|major| major >= 5);
+    }
+    // o-series: `o` plus a version number, then end or `-`.
+    if let Some(rest) = lower.strip_prefix('o') {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let after = &rest[digits.len()..];
+        return !digits.is_empty() && (after.is_empty() || after.starts_with('-'));
+    }
+    false
 }
 
 impl Provider for OpenAi {
@@ -457,6 +476,57 @@ mod tests {
         assert!(caps.vision);
         assert!(caps.json_schema);
         assert!(!caps.thinking);
+    }
+
+    /// #766: the gate is an allowlist. Known non-reasoning ids and ids it
+    /// cannot place get no `reasoning` (the model's own default effort);
+    /// only the gpt-5 and later lines and the o-series get it.
+    #[test]
+    fn reasoning_is_an_allowlist_of_known_reasoning_families() {
+        for yes in [
+            "gpt-5",
+            "gpt-5.5",
+            "gpt-5.4-mini",
+            "gpt-5.5-pro",
+            "gpt-5-2025-08-07",
+            "gpt-6",
+            "GPT-5.2",
+            "o1",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+            "o3-2025-04-16",
+        ] {
+            assert!(supports_reasoning(yes), "{yes} should get reasoning");
+        }
+        for no in [
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4-turbo",
+            "gpt-3.5-turbo",
+            "gpt-5-chat-latest",
+            "o1-mini",
+            "o1-preview",
+            "chatgpt-4o-latest",
+            "ft:gpt-4o-mini:acme::abc",
+            "gpt-",
+            "gpt-x",
+            "o",
+            "",
+            "some-new-model",
+        ] {
+            assert!(!supports_reasoning(no), "{no} should not get reasoning");
+        }
+    }
+
+    #[test]
+    fn reasoning_is_omitted_for_a_gpt_4o_id() {
+        let provider = OpenAi::new("sk-test", "gpt-4o", "low");
+        let body = provider.build_body(&req("sys", false));
+        assert!(body.get("reasoning").is_none());
+        assert!(!provider.capabilities("gpt-4o").thinking);
     }
 
     // -- image_limits (issue #169) ---------------------------------------

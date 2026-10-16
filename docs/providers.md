@@ -44,10 +44,12 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
 - **Effort/thinking:** `reasoning.effort` (`low`/`medium`/`high`), from
   `providers.openai.effort` unless a request carries its own `Effort`
   override. Omitted entirely (not sent as an empty string) when effort is
-  unset/blank, or when the model does not support it. `gpt-4.1` predates
-  `reasoning.effort` on the Responses API and is carved out
-  (`supports_reasoning`); THEORY (unverified): whether sending it anyway
-  400s or is silently ignored has not been checked live (#167).
+  unset/blank, or when the model does not support it. `reasoning.effort` is sent only to known reasoning models: `gpt-5` and
+  later and the o-series (`supports_reasoning`, an allowlist, #766). Any other
+  id (`gpt-4.1`, `gpt-4o`, `-chat` variants, an id it cannot place) is sent
+  without `reasoning` and runs at the model's own default. THEORY
+  (unverified): whether a non-reasoning model 400s or ignores the field has
+  not been checked live (#167).
 - **Structured output:** `text.format` with `type: "json_schema"`,
   `strict: true`, and the schema verbatim from `Request::schema`. Property
   order is preserved end to end (`serde_json`'s `preserve_order`, AGENTS.md
