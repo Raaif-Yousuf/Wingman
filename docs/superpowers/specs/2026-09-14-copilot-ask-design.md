@@ -229,6 +229,7 @@ is supplied.
   ]}],
   "reasoning": {"effort": "low"},
   "max_output_tokens": 2500,
+  "store": false,
   "text": {"format": {
     "type": "json_schema", "name": "answer", "strict": true,
     "schema": {"type": "object",

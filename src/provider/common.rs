@@ -3412,13 +3412,18 @@ mod tests {
 
     #[test]
     fn a_cancel_ends_a_read_the_server_never_answers_within_a_poll_or_two() {
-        // The server sends the headers and then goes quiet for 5 s.
+        // Independent of machine speed (#670): the server stays quiet for 60 s
+        // and the stall limit is 300 s, so neither the server nor a stall can
+        // end the read. Only the cancel can, and that is what the error kind
+        // proves. The elapsed bound (30 s) is half the server's silence: it
+        // only has to show the read did not wait for the server, and no
+        // scheduler delay on a loaded machine gets near it.
         let url = raw_server(
             vec![
                 b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec(),
                 b"late".to_vec(),
             ],
-            5000,
+            60_000,
         );
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let c = cancel.clone();
@@ -3426,11 +3431,33 @@ mod tests {
             std::thread::sleep(Duration::from_millis(400));
             c.store(true, std::sync::atomic::Ordering::SeqCst);
         });
+        let _g = network_guard();
         let start = std::time::Instant::now();
-        let result = read_all_body(&url, &cancel);
-        assert!(result.is_err());
+        let err = post_json_read_body(
+            &url,
+            &json!({"model": "m"}),
+            Duration::from_secs(2),
+            "test",
+            &cancel,
+            Duration::from_secs(300),
+            |r| {
+                let mut s = String::new();
+                r.read_to_string(&mut s)?;
+                Ok(s)
+            },
+        )
+        .unwrap_err();
+        // A cancel that lands while the headers are still being read comes
+        // back as ureq's "connection aborted" transport error instead of the
+        // raw io error, so accept both spellings of it.
+        let io_kind = err.downcast_ref::<std::io::Error>().map(|e| e.kind());
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            io_kind == Some(std::io::ErrorKind::ConnectionAborted)
+                || format!("{err:#}").contains("connection aborted"),
+            "{err:#}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
             "took {:?}",
             start.elapsed()
         );
