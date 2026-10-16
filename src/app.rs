@@ -29,8 +29,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, KillTimer, PeekMessageW, PostQuitMessage, RegisterClassExW, SetTimer,
     SetWindowLongPtrW, TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, MSG, PBT_APMRESUMEAUTOMATIC,
-    PM_REMOVE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST,
-    WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+    PM_REMOVE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_NCCREATE,
+    WM_POWERBROADCAST, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use crate::actions;
@@ -3724,6 +3724,12 @@ impl App {
         let edited = settings::show_modal(self.instance, &self.config);
         SETTINGS_OPEN.with(|c| c.set(false));
 
+        // #673: the owner was asked to close while Settings was open.
+        // Nothing else is delivered: the process is exiting.
+        if self.repost_close_if_requested() {
+            return;
+        }
+
         let pending: VecDeque<DeferredMessage> =
             PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
         let taskbar_recreated = TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false));
@@ -3774,6 +3780,25 @@ impl App {
             self.deliver_deferred(pending);
         }
         self.show_tray_restore_error(tray_restore_error);
+    }
+
+    /// #673: if the owner window got `WM_CLOSE` while a nested loop (Settings
+    /// or a file dialog) was running, re-post it now that the loop is over so
+    /// it takes the normal path (`WM_DESTROY` drops the App and quits).
+    /// Returns whether it did.
+    fn repost_close_if_requested(&self) -> bool {
+        if !CLOSE_AFTER_SETTINGS.with(|c| c.replace(false)) {
+            return false;
+        }
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(self.hwnd()),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        true
     }
 
     /// Issue #213: delivers every message `wnd_proc` deferred while Settings
@@ -4312,6 +4337,9 @@ impl App {
         SETTINGS_OPEN.with(|c| c.set(true));
         let out = dialog();
         SETTINGS_OPEN.with(|c| c.set(false));
+        if self.repost_close_if_requested() {
+            return out;
+        }
         let pending: VecDeque<DeferredMessage> =
             PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
         let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
@@ -5943,6 +5971,9 @@ thread_local! {
     /// `open_settings` are plain, unoptimizable-away side effects through an
     /// opaque TLS accessor call.
     static SETTINGS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #673: the owner window got `WM_CLOSE` while Settings was open. Read
+    /// once by `open_settings` after the modal loop returns.
+    static CLOSE_AFTER_SETTINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
     /// Every `WM_APP_RESULT`/`WM_APP_CALENDAR_RESULT`/`WM_APP_REVIEW_RESULT`/
     /// `WM_APP_PREVIEW_DECIDED` message that arrived while `SETTINGS_OPEN`
@@ -6136,6 +6167,14 @@ enum SettingsReentrancy {
     /// itself unreachable while Settings is open: its only path is the
     /// tray's Quit command, and `WM_APP_TRAY` is `Ignore`d above.
     Fallback,
+    /// `WM_CLOSE` on the owner window (#673): a shutdown, a script or a
+    /// smoke test asking Wingman to exit. Falling back to `DefWindowProcW`
+    /// would destroy the owner while Settings is modal-open, and then
+    /// `WM_DESTROY` is also a fallback, so the process would never leave its
+    /// message loop. Instead: remember the request, close Settings (edits are
+    /// discarded, as for its own close box), and let `open_settings` re-post
+    /// `WM_CLOSE` once the modal loop has returned.
+    CloseAfterSettings,
 }
 
 fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
@@ -6143,6 +6182,7 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         return SettingsReentrancy::DeferTaskbarCreated;
     }
     match msg {
+        WM_CLOSE => SettingsReentrancy::CloseAfterSettings,
         // Issue #213: every WM_APP_* message that carries a worker's result
         // or a preview's Do it/Cancel decision is deferred, never Ignored --
         // see DeferredMessage and the Defer variant's own doc comment. #40:
@@ -6391,6 +6431,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             SettingsReentrancy::Fallback => {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            SettingsReentrancy::CloseAfterSettings => {
+                CLOSE_AFTER_SETTINGS.with(|c| c.set(true));
+                settings::request_close();
+                return LRESULT(0);
             }
         }
     }
@@ -6788,7 +6833,7 @@ mod tests {
     use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
     use serde_json::Value;
-    use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
+    use windows::Win32::UI::WindowsAndMessaging::{WM_CLOSE, WM_DESTROY};
 
     // -- #23: resolve_prompt_and_difficulty (the worker's action-model wiring) --
 
@@ -7730,6 +7775,16 @@ mod tests {
                 "msg {msg:#x} should be Ignore while Settings is open"
             );
         }
+    }
+
+    #[test]
+    fn settings_reentrancy_turns_wm_close_into_a_close_after_settings() {
+        // #673: the default path destroyed the owner behind the modal and
+        // the process never left its message loop.
+        assert_eq!(
+            settings_reentrancy_policy(WM_CLOSE, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::CloseAfterSettings
+        );
     }
 
     #[test]
