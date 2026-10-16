@@ -6597,7 +6597,7 @@ mod tests {
         RawForm {
             // What the combo would show for this config, so an untouched
             // form is an untouched save.
-            provider_choice: choice_from_order(&original.providers.order),
+            provider_choice: combo_index_for_order(&original.providers.order) as usize,
             ollama_model: original.providers.ollama.model.clone(),
             openai_key: original.providers.openai.api_key.clone(),
             openai_model: original.providers.openai.model.clone(),
@@ -6980,6 +6980,29 @@ mod tests {
         raw.require_tick_for = String::new();
         let cfg = build_config(&original, &raw);
         assert_eq!(cfg.forms.require_tick_for, RequireTickFor::All);
+    }
+
+    #[test]
+    fn build_config_keeps_a_compat_leading_order_on_an_untouched_save() {
+        let mut original = Config::default();
+        original.providers.order = vec![
+            "compat:groq".to_string(),
+            "anthropic".to_string(),
+            "openai".to_string(),
+        ];
+        let raw = raw_from(&original);
+        // Production reads CB_GETCURSEL = -1 for an empty combo.
+        assert_eq!(raw.provider_choice, (-1i32) as usize);
+        assert_eq!(
+            build_config(&original, &raw).providers.order,
+            original.providers.order
+        );
+        let mut max = raw_from(&original);
+        max.provider_choice = usize::MAX;
+        assert_eq!(
+            build_config(&original, &max).providers.order,
+            original.providers.order
+        );
     }
 
     #[test]
