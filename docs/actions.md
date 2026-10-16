@@ -185,7 +185,9 @@ completion must satisfy. These kinds are registered today: `"verdict"` (today's
 `"form_fill"` (#40), `"text_answer"` (#242), `"page_summary"` (#67: `bullets`,
 then two summary lines, shown on the card only; the first line is cut to 50 characters, the second to 90 so both fit the collapsed card, and bullets are
 clamped in code), `"action_items"` (#314: a list of
-lines the `clipboard` executor copies as a Markdown checklist),
+lines the `clipboard` executor copies as a Markdown checklist), `"table"` (#69:
+`columns`, then `rows`, a list of cell lists; the `clipboard` executor copies them
+as CSV, with spreadsheet formulas made safe),
 `"error_explanation"` (#66: `meaning`, `cause`, `fix`, a read-only answer for
 the card), `"word_definition"` (#75: `definition`, `example`, a read-only answer for
 the card) and `"screen_explanation"` (#131: `detail`, then a one-sentence
