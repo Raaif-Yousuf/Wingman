@@ -69,6 +69,8 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "page_summary" => Some(page_summary_schema()),
         // #131: a short explanation of whatever is on screen, shown on the card.
         "screen_explanation" => Some(screen_explanation_schema()),
+        // #312: signs, then a calibrated verdict.
+        "scam_check" => Some(scam_check_schema()),
         _ => None,
     }
 }
@@ -140,6 +142,26 @@ fn screen_explanation_schema() -> Value {
             "headline": {"type": "string"}
         },
         "required": ["detail", "headline"],
+        "additionalProperties": false
+    })
+}
+
+/// The `scam_check` proposal schema (#312): `signs`, then `verdict`. There is
+/// no advice field on purpose: the text on screen is untrusted, so what to do
+/// next is fixed card text, never model words. Property order is load-bearing (rule 3): the model lists what it
+/// saw before it commits to a verdict, so the verdict follows the evidence
+/// instead of the evidence being written to fit a verdict. The verdict is an
+/// enum of three calibrated values (`actions::scam_check::VERDICTS`, kept
+/// equal by a test); none of them means "safe". Nothing is editable: the card
+/// is read-only.
+fn scam_check_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "signs": {"type": "array", "items": {"type": "string"}},
+            "verdict": {"type": "string", "enum": ["likely_scam", "suspicious", "no_clear_signs"]}
+        },
+        "required": ["signs", "verdict"],
         "additionalProperties": false
     })
 }
@@ -591,6 +613,18 @@ mod tests {
         assert_eq!(schema["required"], json!(["detail", "headline"]));
         assert_eq!(schema["additionalProperties"], false);
         assert!(schema["properties"]["headline"].get("editable").is_none());
+    }
+
+    #[test]
+    fn scam_check_puts_the_signs_before_the_verdict() {
+        let schema = schema_for("scam_check", false).expect("scam_check is registered");
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        // No free-text advice field: what to do next is fixed card text.
+        assert_eq!(keys, ["signs", "verdict"]);
+        assert_eq!(schema["required"], json!(["signs", "verdict"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["signs"]["type"], "array");
+        assert!(schema["properties"]["verdict"].get("editable").is_none());
     }
 
     #[test]

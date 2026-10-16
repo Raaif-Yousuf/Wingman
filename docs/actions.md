@@ -175,7 +175,11 @@ lines the `clipboard` executor copies as a Markdown checklist),
 the card), `"word_definition"` (#75: `definition`, `example`, a read-only answer for
 the card) and `"screen_explanation"` (#131: `detail`, then a one-sentence
 `headline`; the headline is cut to fit the collapsed card and the detail shows
-on expand). Each schema function returns a `serde_json::json!`
+on expand) and `"scam_check"` (#312: `signs`, then a `verdict` of
+`likely_scam`, `suspicious` or `no_clear_signs`; the card shows a fixed label
+for the verdict, the signs under "Seen in it:" and a fixed next step, never
+"safe", and has no model-written advice because the screen text is untrusted).
+Each schema function returns a `serde_json::json!`
 literal shaped like standard JSON Schema (`"type": "object"`, `"properties"`,
 `"required"`, `"additionalProperties": false`), plus one
 non-standard keyword:
