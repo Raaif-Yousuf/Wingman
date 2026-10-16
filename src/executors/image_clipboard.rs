@@ -59,7 +59,7 @@ pub(crate) fn copy_rgba(rgba: &[u8], width: u32, height: u32) -> Result<()> {
     if width == 0 || height == 0 || rgba.len() != expected {
         anyhow::bail!("image is {} bytes, expected {expected}", rgba.len());
     }
-    Win32ImageClipboard.set_dib(&encode_dib(rgba, width, height))
+    win32::set_dib(&encode_dib(rgba, width, height), true)
 }
 
 /// The real clipboard, via raw Win32 calls (`arboard`, already a crate
@@ -73,7 +73,7 @@ impl ImageClipboardAccess for Win32ImageClipboard {
     }
 
     fn set_dib(&self, dib: &[u8]) -> Result<()> {
-        win32::set_dib(dib)
+        win32::set_dib(dib, false)
     }
 
     fn has_any_content(&self) -> bool {
@@ -315,7 +315,7 @@ mod win32 {
         read_hglobal_bytes(handle)
     }
 
-    pub(super) fn set_dib(bytes: &[u8]) -> Result<()> {
+    pub(super) fn set_dib(bytes: &[u8], cloud_exclude: bool) -> Result<()> {
         // Allocate before touching the clipboard: a failed allocation must
         // leave the user's clipboard as it was (#716).
         let hglobal = alloc_hglobal_bytes(bytes)?;
@@ -337,10 +337,14 @@ mod win32 {
             let _ = unsafe { GlobalFree(Some(hglobal)) };
             anyhow::bail!("SetClipboardData(CF_DIB) failed: {e}");
         }
-        // Decision (#716): a copied image is never offered to the cloud
-        // clipboard (it can show anything that was on screen), but stays in
-        // local Win+V history so the copy is still useful. Best effort.
-        exclude_from_cloud();
+        // Decision (#716): the card's image copy is never offered to the
+        // cloud clipboard (it can show anything that was on screen), but
+        // stays in local Win+V history so the copy is still useful. Only
+        // `copy_rgba` asks for this; the executor's undo restores the user's
+        // own earlier image as it was. Best effort.
+        if cloud_exclude {
+            exclude_from_cloud();
+        }
         Ok(())
     }
 

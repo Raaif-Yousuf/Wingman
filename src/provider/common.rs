@@ -161,6 +161,7 @@ impl Transport for UreqTransport {
         body: &Value,
         timeout: Duration,
     ) -> std::result::Result<RawResponse, TransportError> {
+        crate::ui_thread::blocking_call("post_json");
         let mut builder = ureq::post(url);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
@@ -831,6 +832,7 @@ fn budget_guard(url: &str) -> Result<()> {
 /// requires add none of when Ollama is not configured. Goes through
 /// [`offline_guard`] like every other entry point in this file.
 pub(crate) fn get_text_with_timeout(url: &str, timeout: Duration, tag: &str) -> Result<String> {
+    crate::ui_thread::blocking_call(tag);
     offline_guard(url)?;
 
     let response = ureq::get(url)
@@ -910,6 +912,7 @@ fn get_with_headers_raw(
     headers: &[(&str, &str)],
     timeout: Duration,
 ) -> std::result::Result<RawResponse, String> {
+    crate::ui_thread::blocking_call("get_with_headers");
     let mut builder = ureq::get(url);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
@@ -958,6 +961,7 @@ pub(crate) fn post_json_read_body<T>(
 ) -> Result<T> {
     use std::io::{BufRead, BufReader, Read, Write};
 
+    crate::ui_thread::blocking_call(tag);
     offline_guard(url)?;
     budget_guard(url)?;
 
@@ -1236,6 +1240,7 @@ pub(crate) fn post_json_with_connect_timeout(
     total_timeout: Duration,
     tag: &str,
 ) -> Result<String> {
+    crate::ui_thread::blocking_call(tag);
     send_preview_guard(url)?;
     offline_guard(url)?;
     budget_guard(url)?;

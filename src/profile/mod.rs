@@ -11,9 +11,9 @@
 //! second, independent line of defense against a payment-shaped value
 //! landing in a *free-form* field (`notes`, or any address line) by
 //! accident or by a user pasting the wrong thing -- enforced on every
-//! [`Profile::save_to`] (so it is never written) and every
-//! [`Profile::load_from`] (so a hand-edited or otherwise tampered file can
-//! never hand payment-shaped text back into memory either).
+//! `Store::save_profile` (so it is never written) and every
+//! `Store::load_profile` and legacy [`Profile::load_from`] (so a tampered
+//! value can never hand payment-shaped text back into memory either).
 //!
 //! # Sensitivity and the OWNER_TODO decision
 //!
@@ -33,14 +33,13 @@
 //!
 //! # Storage
 //!
-//! `%APPDATA%\Wingman\profile.bin`: JSON (this module's own
-//! [`Profile`] shape) inside a [`crate::dpapi`] envelope, keyed with
-//! [`dpapi::PROFILE_ENTROPY`]. Written atomically (temp file + rename),
-//! the same pattern `config.rs`'s `Config::save_to` uses. The path is
-//! always a parameter to the `_from`/`_to` functions actually doing file
-//! I/O (rule 9): only [`Profile::load`]/[`Profile::save`] hard-code the
-//! real `%APPDATA%` path, so tests exercise everything else against a
-//! scratch directory.
+//! The local store's `profile_field` table (issue #46, `store::profile_field`):
+//! one row per [`Profile`] member, each value as JSON inside its own
+//! [`crate::dpapi`] envelope (entropy [`dpapi::PROFILE_FIELD_ENTROPY`]). The
+//! payment denylist runs inside the store on every write and read. Before the
+//! move the profile was one DPAPI file, `%APPDATA%\Wingman\profile.bin`;
+//! [`Profile::load_from`] still reads that format, for the one-time import
+//! only.
 
 // Issue #36's scope is the data model, the store and the denylist, not
 // wiring a profile settings page (#50) or the "Fill this form" action
@@ -60,7 +59,7 @@ mod labels;
 pub use labels::{match_label, FieldKind};
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -127,22 +126,9 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// `%APPDATA%\Wingman\profile.bin`.
-    pub fn path() -> Result<PathBuf> {
-        let base = crate::known_folder::roaming_app_data()
-            .context("could not determine the platform config directory")?;
-        Ok(base.join("Wingman").join("profile.bin"))
-    }
-
-    /// Loads the profile from the well-known path. A missing file is not
-    /// an error -- first run, or a user who has never opened the profile
-    /// page (#50) -- and yields [`Profile::default`].
-    pub fn load() -> Result<Profile> {
-        Self::load_from(&Self::path()?)
-    }
-
-    /// Same as [`Profile::load`] but against an arbitrary path, so tests
-    /// never touch the real `%APPDATA%\Wingman\profile.bin` (rule 9).
+    /// Reads a legacy `profile.bin` (the format before the profile moved
+    /// into the local store, issue #46). Only the one-time import uses this.
+    /// A missing file is the default profile.
     ///
     /// Runs the payment-data denylist over every field after decrypting
     /// and parsing, *before* returning the profile to the caller -- see
@@ -165,85 +151,23 @@ impl Profile {
         Ok(profile)
     }
 
-    /// Saves the profile to the well-known path.
-    pub fn save(&self) -> Result<()> {
-        self.save_to(&Self::path()?)
-    }
-
-    /// Same as [`Profile::save`] but against an arbitrary path (rule 9).
-    ///
-    /// Runs [`Profile::normalize_sensitivity`] and then the payment-data
-    /// denylist *before touching the filesystem at all* -- a rejected
-    /// value is never written, matching issue #36's requirement exactly.
-    /// Writes atomically: a temp file next to `path`, then an OS-level
-    /// rename, so a reader (or a crash mid-write) never observes a
-    /// half-written envelope.
-    pub fn save_to(&self, path: &Path) -> Result<()> {
+    /// Writes the legacy `profile.bin` format, so tests can build a file for
+    /// the import to find. Not used outside tests: the profile is saved with
+    /// `Store::save_profile`.
+    #[cfg(test)]
+    pub(crate) fn write_legacy_file(&self, path: &Path) -> Result<()> {
         let mut normalized = self.clone();
         normalized.normalize_sensitivity();
         normalized
             .validate()
             .context("profile was not saved: a field failed the payment-data denylist")?;
-
-        let plaintext =
-            serde_json::to_vec(&normalized).context("failed to serialize the profile")?;
-        let envelope = dpapi::protect(plaintext, Some(dpapi::PROFILE_ENTROPY))
-            .context("failed to encrypt the profile")?;
-
+        let plaintext = serde_json::to_vec(&normalized)?;
+        let envelope = dpapi::protect(plaintext, Some(dpapi::PROFILE_ENTROPY))?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context("failed to create the profile directory")?;
+            fs::create_dir_all(parent)?;
         }
-        let mut tmp_name = path.as_os_str().to_os_string();
-        tmp_name.push(".tmp");
-        let tmp_path = PathBuf::from(tmp_name);
-        fs::write(&tmp_path, &envelope).context("failed to write the profile temp file")?;
-        fs::rename(&tmp_path, path).context("failed to move the profile temp file into place")?;
-
-        #[cfg(windows)]
-        Self::restrict_acl(path);
-
+        fs::write(path, &envelope)?;
         Ok(())
-    }
-
-    /// Restricts the profile file's ACL to the current user only, via
-    /// `icacls`. Deliberately best-effort, unlike `Config::restrict_acl`
-    /// (#257), which returns a `Result` and aborts the write on failure:
-    /// the profile file's contents are DPAPI-encrypted under the current
-    /// user's own key (see `save_to` above), so another account cannot
-    /// decrypt it regardless of what the ACL says. This call is defense in
-    /// depth on top of that, not the only barrier, so a failure here
-    /// (missing `icacls`, non-NTFS volume) is ignored rather than failing
-    /// the save. `Config`'s file has no such second layer -- a plaintext
-    /// API key with the wrong ACL is genuinely exposed -- which is exactly
-    /// why that path cannot afford to be best-effort and this one can.
-    #[cfg(windows)]
-    fn restrict_acl(path: &Path) {
-        // Portable mode (#681, #714): the drive moves between PCs and users,
-        // and a per-user ACL would block the next one from replacing the file.
-        if crate::portable::skip_acl() {
-            return;
-        }
-        let username = match std::env::var("USERNAME") {
-            Ok(u) if !u.is_empty() => u,
-            _ => return,
-        };
-        // CREATE_NO_WINDOW (0x0800_0000): Wingman is a windows-subsystem GUI
-        // app with no console of its own, so spawning `icacls` without this
-        // flag allocates and briefly flashes a new console window on every
-        // profile save (#447; `config.rs`'s `restrict_acl` had the same gap,
-        // fixed in #446 -- not yet on `master`, so not shared as a helper
-        // here; see this function's own doc comment for why the two
-        // `restrict_acl`s already differ in error handling and can't simply
-        // be merged into one without also reconciling that).
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("icacls")
-            .arg(path)
-            .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg(format!("{username}:F"))
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
     }
 
     /// Enforces the one non-negotiable sensitivity rule: date of birth is
@@ -251,14 +175,14 @@ impl Profile {
     /// memory. Called by both `load_from` and `save_to`, so it holds for a
     /// profile built by hand in a test, one round-tripped through disk, and
     /// one loaded from a file some older build (without this rule) wrote.
-    fn normalize_sensitivity(&mut self) {
+    pub(crate) fn normalize_sensitivity(&mut self) {
         self.date_of_birth.sensitive = true;
     }
 
     /// Runs the payment-data denylist over every field. See the module
     /// docs' second paragraph for why this exists alongside the type-level
     /// guarantee of having no payment fields at all.
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         check("full_name", &self.full_name.value)?;
         check("preferred_name", &self.preferred_name.value)?;
         for (i, email) in self.emails.iter().enumerate() {
@@ -290,6 +214,7 @@ fn check(field: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn scratch_path(tag: &str) -> PathBuf {
         // Test-only scratch directory under the OS temp dir plus this
@@ -340,7 +265,9 @@ mod tests {
     fn round_trips_a_full_profile() {
         let path = scratch_path("round-trip");
         let mut profile = sample_profile();
-        profile.save_to(&path).expect("save_to should succeed");
+        profile
+            .write_legacy_file(&path)
+            .expect("write_legacy_file should succeed");
 
         let loaded = Profile::load_from(&path).expect("load_from should succeed");
 
@@ -364,7 +291,9 @@ mod tests {
             date_of_birth: Field::new("2000-01-01".to_string(), false),
             ..Profile::default()
         };
-        profile.save_to(&path).expect("save_to should succeed");
+        profile
+            .write_legacy_file(&path)
+            .expect("write_legacy_file should succeed");
 
         let loaded = Profile::load_from(&path).expect("load_from should succeed");
         assert!(loaded.date_of_birth.sensitive);
@@ -376,119 +305,13 @@ mod tests {
     fn non_dob_sensitivity_flags_round_trip_as_set() {
         let path = scratch_path("sensitivity-round-trip");
         let profile = sample_profile();
-        profile.save_to(&path).expect("save_to should succeed");
+        profile
+            .write_legacy_file(&path)
+            .expect("write_legacy_file should succeed");
 
         let loaded = Profile::load_from(&path).expect("load_from should succeed");
         assert!(!loaded.emails[0].sensitive);
         assert!(loaded.emails[1].sensitive);
-
-        let _ = fs::remove_file(&path);
-    }
-
-    // -- #447: CREATE_NO_WINDOW must not break the icacls call -------------
-    //
-    // The console-flash fix itself (spawning `icacls` with `CREATE_NO_WINDOW`
-    // so no console window briefly appears) has no automated observable:
-    // whether a window flashes is a Win32 UI effect, not something a
-    // `cargo test` process can see. That check is by-hand only (see this
-    // module's `#447` follow-up note). What CAN be proven here is the
-    // regression this kind of change risks: a wrong flag value or a
-    // malformed `Command` silently breaking the ACL restriction itself.
-    // This mirrors `config.rs`'s own `save_to_restricts_the_acl_on_a_normal_
-    // successful_save`.
-    #[test]
-    #[cfg(windows)]
-    fn save_to_still_restricts_the_acl_after_the_create_no_window_change() {
-        let path = scratch_path("acl-after-no-window-flag");
-        let profile = sample_profile();
-        profile.save_to(&path).expect("save_to should succeed");
-
-        let output = std::process::Command::new("icacls")
-            .arg(&path)
-            .output()
-            .expect("icacls should run");
-        let listing = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            !listing.contains("(I)"),
-            "inheritance must still be disabled after adding CREATE_NO_WINDOW: {listing}"
-        );
-
-        let _ = fs::remove_file(&path);
-    }
-
-    // -- #714: portable mode leaves the profile file's ACL alone ----------
-
-    #[test]
-    #[cfg(windows)]
-    fn save_to_in_portable_mode_leaves_inheritance_on() {
-        let path = scratch_path("acl-portable");
-        let _forced = crate::portable::ForcedRoot::new(path.parent().unwrap());
-        sample_profile()
-            .save_to(&path)
-            .expect("save_to should succeed");
-        // A control file made beside it keeps the folder's inherited ACL
-        // whatever the machine's folder settings are (a CI runner's temp
-        // folder shows no "(I)" at all), so the two listings must match.
-        let control = path.with_extension("control");
-        fs::write(&control, b"x").unwrap();
-        let acl_of = |p: &Path| {
-            let out = std::process::Command::new("icacls")
-                .arg(p)
-                .output()
-                .expect("icacls should run");
-            String::from_utf8_lossy(&out.stdout)
-                .replace('\r', "")
-                .replace(p.to_string_lossy().as_ref(), "")
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| l.contains(":("))
-                .collect::<Vec<String>>()
-        };
-        let (saved, plain) = (acl_of(&path), acl_of(&control));
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(&control);
-        assert!(!plain.is_empty(), "the control file listed no ACEs");
-        assert_eq!(saved, plain, "portable mode must leave the ACL as it was");
-    }
-
-    // -- atomic write -----------------------------------------------------
-
-    #[test]
-    fn save_to_writes_atomically_leaving_no_temp_file_behind() {
-        let path = scratch_path("atomic");
-        let profile = sample_profile();
-        profile.save_to(&path).expect("save_to should succeed");
-
-        assert!(path.exists(), "the profile file itself must exist");
-        let mut tmp = path.as_os_str().to_os_string();
-        tmp.push(".tmp");
-        assert!(
-            !PathBuf::from(tmp).exists(),
-            "the temp file must be renamed away, not left behind"
-        );
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn saved_file_is_not_plaintext_json() {
-        let path = scratch_path("encrypted");
-        let profile = Profile {
-            full_name: Field::new("a very distinctive plaintext marker".to_string(), false),
-            ..Profile::default()
-        };
-        profile.save_to(&path).expect("save_to should succeed");
-
-        let on_disk = fs::read(&path).expect("file should exist");
-        let on_disk_text = String::from_utf8_lossy(&on_disk);
-        assert!(
-            !on_disk_text.contains("a very distinctive plaintext marker"),
-            "the on-disk bytes must not contain the plaintext value"
-        );
-        assert!(
-            !on_disk_text.contains("full_name"),
-            "the on-disk bytes must not contain the plaintext JSON field names"
-        );
 
         let _ = fs::remove_file(&path);
     }
@@ -503,7 +326,7 @@ mod tests {
             ..Profile::default()
         };
 
-        let result = profile.save_to(&path);
+        let result = profile.write_legacy_file(&path);
         assert!(result.is_err());
         let message = format!("{:#}", result.unwrap_err());
         assert!(message.contains("notes"));
@@ -520,7 +343,7 @@ mod tests {
         let mut profile = Profile::default();
         profile.address.value.lines = vec!["GB29 NWBK 6016 1331 9268 19".to_string()];
 
-        let result = profile.save_to(&path);
+        let result = profile.write_legacy_file(&path);
         assert!(result.is_err());
         assert!(!path.exists());
     }
@@ -533,7 +356,7 @@ mod tests {
             ..Profile::default()
         };
 
-        let result = profile.save_to(&path);
+        let result = profile.write_legacy_file(&path);
         assert!(result.is_err());
         assert!(!path.exists());
     }
@@ -546,7 +369,7 @@ mod tests {
             ..Profile::default()
         };
 
-        let result = profile.save_to(&path);
+        let result = profile.write_legacy_file(&path);
         assert!(result.is_err());
         assert!(!path.exists());
     }
@@ -555,7 +378,7 @@ mod tests {
     fn save_accepts_an_ordinary_profile() {
         let path = scratch_path("denylist-accepts-ordinary");
         let profile = sample_profile();
-        assert!(profile.save_to(&path).is_ok());
+        assert!(profile.write_legacy_file(&path).is_ok());
         let _ = fs::remove_file(&path);
     }
 
