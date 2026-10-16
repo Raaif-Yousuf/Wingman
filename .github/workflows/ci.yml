@@ -110,7 +110,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-bloat
-        run: cargo install cargo-bloat --locked
+        run: cargo install cargo-bloat --version 0.12.1 --locked
 
       - name: cargo bloat --crates
         shell: pwsh

@@ -27,9 +27,10 @@ anyhow = "1.0"
 # checked, through ureq's `unversioned::resolver::Resolver`, which ureq says is
 # outside semver. The test `the_real_transport_connects_to_the_pinned_address_
 # not_to_a_lookup` fails if a newer ureq stops using the hook; bump on purpose.
-# No `gzip` feature (#771): Wingman never asked for compressed bodies by choice,
-# and flate2 plus a second miniz_oxide cost about 18 KB (MEASURED 2026-10-16:
-# 3,983,872 to 3,965,440 bytes). Do not turn default features back on.
+# No `gzip` feature (#771): it only adds ureq's decompression glue and asks
+# servers for compressed bodies, about 18 KB (MEASURED 2026-10-16: 3,983,872 to
+# 3,965,440 bytes). flate2 and miniz_oxide stay, png needs them. web_page.rs
+# refuses a compressed reply. Do not turn default features back on.
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "json"] }
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
