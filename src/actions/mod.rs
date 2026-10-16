@@ -483,7 +483,26 @@ pub fn load_actions_from(user_path: &Path) -> Result<Vec<Resolved>> {
     };
 
     let merged = merge_actions(builtin_actions(), user_file.actions);
-    Ok(visible(merged, &user_file.disabled_groups))
+    let visible = visible(merged, &user_file.disabled_groups);
+    for resolved in &visible {
+        validate_action(&resolved.action)?;
+    }
+    Ok(visible)
+}
+
+/// Rejects a combination that could only fail (or quietly do something else)
+/// after the user had spent a model call (#536). Only actions that can run
+/// are checked, so a hidden one never blocks the others. A named error, never
+/// a panic (rule 7).
+fn validate_action(action: &Action) -> Result<()> {
+    if action.executor == "replace_text" && !action.inputs.contains(&InputKind::Selection) {
+        anyhow::bail!(
+            "action \"{}\" uses executor \"replace_text\", which writes over the selected text, \
+             so its inputs must include \"selection\"",
+            action.id
+        );
+    }
+    Ok(())
 }
 
 /// [`load_actions_from`] against the real `%APPDATA%\Wingman\actions.toml`.
@@ -957,5 +976,64 @@ enabled  = true
         // against a real user file, only the path shape).
         let p = path().expect("SHGetKnownFolderPath should succeed");
         assert!(p.ends_with("Wingman\\actions.toml") || p.ends_with("Wingman/actions.toml"));
+    }
+
+    // -- replace_text needs a selection input (#536) -------------------------
+
+    const REPLACE_NO_SELECTION: &str = r#"
+[[actions]]
+id = "shout"
+name = "Shout"
+inputs = ["clipboard"]
+proposal = "text_answer"
+executor = "replace_text"
+confirm = true
+prompt = "Make it loud."
+"#;
+
+    #[test]
+    fn replace_text_without_a_selection_input_is_a_named_load_error() {
+        let path = scratch_path("replace-no-selection");
+        write(&path, REPLACE_NO_SELECTION);
+        let err = load_actions_from(&path).unwrap_err();
+        cleanup(&path);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("shout"), "names the action: {msg}");
+        assert!(msg.contains("replace_text"), "names the executor: {msg}");
+        assert!(msg.contains("selection"), "names the fix: {msg}");
+        assert!(!msg.contains('\u{2014}'), "no em dash: {msg}");
+    }
+
+    #[test]
+    fn replace_text_with_a_selection_input_loads() {
+        let path = scratch_path("replace-with-selection");
+        write(
+            &path,
+            &REPLACE_NO_SELECTION.replace(r#"["clipboard"]"#, r#"["selection", "clipboard"]"#),
+        );
+        let resolved = load_actions_from(&path);
+        cleanup(&path);
+        assert!(resolved.unwrap().iter().any(|r| r.action.id == "shout"));
+    }
+
+    #[test]
+    fn a_disabled_replace_text_action_without_a_selection_still_loads() {
+        let path = scratch_path("replace-disabled");
+        write(&path, &format!("{REPLACE_NO_SELECTION}enabled = false\n"));
+        let resolved = load_actions_from(&path);
+        cleanup(&path);
+        assert!(resolved.is_ok(), "a hidden action never runs");
+    }
+
+    #[test]
+    fn every_builtin_replace_text_action_lists_selection() {
+        let replacers: Vec<_> = builtin_actions()
+            .into_iter()
+            .filter(|a| a.executor == "replace_text")
+            .collect();
+        assert!(!replacers.is_empty());
+        for a in replacers {
+            assert!(a.inputs.contains(&InputKind::Selection), "{}", a.id);
+        }
     }
 }
