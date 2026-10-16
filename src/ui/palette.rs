@@ -218,6 +218,7 @@ const QUERY_BORDER_OUTSET: i32 = 3;
 /// #359: shown in the router summary band from the moment
 /// `App::maybe_start_router` actually starts a background request until the
 /// result (or a failure) replaces or clears it. No em dash (rule 11).
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 const ROUTER_LOOKING_TEXT: &str = "Looking at your screen...";
 
 fn scale(v: i32, dpi: u32) -> i32 {
@@ -482,6 +483,7 @@ impl Palette {
     }
 
     /// #359: see [`PaletteInner::set_router_pending`].
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub fn set_router_pending(&mut self, generation: u64) {
         self.inner.set_router_pending(generation);
     }
@@ -1249,6 +1251,7 @@ impl PaletteInner {
     /// existing "user already interacted" paths above (`show`, `hide`,
     /// `on_palette_key_command`'s Up/Down/PageUp/PageDown arm, `EN_CHANGE`).
     /// No timer involved (rule 5): this only ever changes on those events.
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     fn set_router_pending(&mut self, generation: u64) {
         if crate::router::is_stale(generation, self.router_generation) {
             return;
