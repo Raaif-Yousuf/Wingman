@@ -71,6 +71,11 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
+      # The release profile compiles out the debug-only gallery, so items that
+      # only it uses are dead code here and nothing else would notice (#652).
+      - name: cargo clippy --release -D warnings
+        run: cargo clippy --release -- -D warnings
+
       - name: Performance budgets (exe size)
         shell: pwsh
         run: ./scripts/perf-budget.ps1
