@@ -3,42 +3,117 @@
 Status: **proposed**
 
 Scope: `src/ui/settings.rs` (the Win32 window and its controls), a small
-paint helper next to it, `src/ui/theme.rs` (tokens for control states), and the
+paint helper next to it, `src/ui/theme.rs` (tokens for control states), a
+Windows application manifest if Slice 0 shows one is needed, and the
 `--ui-gallery --theme` override extended to the Settings states. Out of scope:
 the palette (its own slice of #362), moving theme detection out of `card.rs`
 (#657), any change to what Settings edits or saves.
 
 ## Why a design doc (rule 12)
 
-Settings is the one surface that is made of stock Win32 controls, so it is the
-one surface that cannot simply paint from `theme.rs`. Following the theme means
-replacing how most of its controls are drawn. That changes the module's
-structure, so the approach is written down and agreed before code.
+Settings is made of stock Win32 controls, so unlike the card it cannot simply
+paint from `theme.rs`. Following the theme means replacing how most of its
+controls are drawn. That changes the module's structure, so the approach is
+written down and agreed before code.
+
+## Where it is today (checked against master)
+
+- Settings is always drawn light. The module doc in `settings.rs` says so on
+  purpose: a correct light window beats a half-dark one. It handles none of
+  `WM_CTLCOLOR*`, `WM_THEMECHANGED`, `WM_SETTINGCHANGE` or `WM_SYSCOLORCHANGE`
+  today, so re-theming is new work here, not a copy of the card's.
+- **There is no application manifest.** `assets/app.rc` holds the icon and
+  nothing else, and `build.rs` embeds only that. Nothing requests
+  common-controls v6. `settings.rs` calls `InitCommonControlsEx` with
+  `ICC_BAR_CLASSES` only. So Settings very probably runs classic (v5) controls
+  (to be confirmed in Slice 0). This matters: `NM_CUSTOMDRAW` for buttons is a
+  v6 feature.
+- Control inventory: `EDIT` (all single-line edits are created with
+  `WS_EX_BORDER`, a thin frame-colour border, not a sunken one), `COMBOBOX`
+  (all `CBS_DROPDOWNLIST | CBS_HASSTRINGS`), `BS_AUTOCHECKBOX`, `BS_GROUPBOX`,
+  `BS_PUSHBUTTON` and `BS_DEFPUSHBUTTON`, one trackbar, and a body window with
+  `WS_VSCROLL`. **There is no list box and no radio button.** The only
+  `WM_CTLCOLORLISTBOX` traffic is from a combo's drop-down list.
+- Other surfaces already solved parts of this. `card.rs` answers
+  `WM_CTLCOLOREDIT` for its edit fields (#350) and `card_buttons.rs`
+  owner-draws push buttons with hover and pressed states (#351). Reuse both
+  instead of writing a second version.
+- High contrast: stock controls already follow the system colours, so Settings
+  is probably correct in high contrast today for free (to be confirmed in
+  Slice 0). A plan that replaces stock controls in every theme would regress
+  that.
 
 ## Decision
 
-Draw the controls ourselves, from the shared tokens. Do **not** use the
-undocumented uxtheme ordinals (`SetPreferredAppMode`, `AllowDarkModeForWindow`,
-`FlushMenuThemes`, ordinals 133 to 136): they have changed meaning between
-Windows builds and a wrong guess fails silently, which is the failure this repo
-guards against (rule 8). Everything below uses documented APIs, and high
-contrast needs nothing else than `GetSysColor`.
+Draw the controls ourselves, from the shared tokens, **in dark mode only**.
+Light mode and high contrast keep today's stock controls, untouched. That makes
+every slice safe to ship alone: the only users who can see custom paint are
+the ones who get dark mode, and the high-contrast path is never a regression
+surface.
+
+Do **not** use the undocumented uxtheme ordinals (`SetPreferredAppMode`,
+`AllowDarkModeForWindow`, `FlushMenuThemes`, ordinals 133 to 136): they have
+changed meaning between Windows builds and a wrong guess fails silently, which
+is the failure this repo guards against (rule 8). Everything below uses
+documented APIs. The one undocumented string, the `DarkMode_Explorer` theme
+name, is allowed only as a measured, fail-back fallback (see below), and it is
+widely reported to need those ordinals to take effect for scrollbars, so
+Slice 0 measures it on this machine before any design leans on it.
 
 Keeping the native control classes (EDIT, COMBOBOX, BUTTON, trackbar) and
 changing only how they paint means keystrokes, tab order, IME and most of
 accessibility keep working as they do today.
 
+## Slice 0: gates that decide the plan
+
+Slice 0 changes no product behaviour. It is a throwaway window plus a short
+written result in this spec, replacing each theory below. Nothing past Slice 0
+is started until it is recorded.
+
+1. **Is common-controls v6 active?** Check which comctl32 the Settings window
+   loads (the module path under `WinSxS` for 6.x, `System32` for 5.82). Expected
+   today: v5. If v5, the checkbox plan changes: either add a manifest that
+   requests common-controls 6.0.0.0 (its own slice, below), or use
+   `BS_OWNERDRAW`. Adding the manifest restyles every common control in
+   Settings in light mode too (modern checkbox, combo and button visuals) and
+   may shift hard-coded metrics, so it is checked at 100%, 150% and 200%
+   before it is chosen.
+2. **UI Automation role under owner draw.** `THEORY (unverified)`: a
+   `BS_OWNERDRAW` button is exposed as a plain push button, losing the
+   checkbox role and toggle state. Measure with Accessibility Insights or
+   `inspect.exe` for `BS_OWNERDRAW`, for v6 `NM_CUSTOMDRAW` on a native
+   checkbox, and for `CBS_OWNERDRAWFIXED`, and record it.
+3. **Combo arrow.** `CBS_OWNERDRAWFIXED` with `WM_DRAWITEM` paints the closed
+   field and the list items only. The drop-down button stays system-drawn and
+   light. Measure the subclass alternative (paint the whole closed face in
+   `WM_PAINT` and `WM_PRINTCLIENT`) on the throwaway window.
+4. **`DarkMode_Explorer` without ordinals.** Does `SetWindowTheme(.., "DarkMode_Explorer", None)`
+   darken the body's scrollbar, the combo list and the trackbar on this build
+   without any ordinal call? Record yes or no per control.
+5. **`PrintWindow` on children.** Confirm a `PrintWindow` capture includes
+   owner-drawn and custom-drawn children, since the pixel test below depends on
+   it. (`WM_PRINTCLIENT` forwarding is the usual gap.)
+6. **High contrast today.** Open the current Settings in Aquatic and Desert at
+   100% and 200%: record that it is correct, so it can be called a baseline to
+   protect.
+7. **Size.** Build the throwaway paint helpers in release and record the size
+   delta (see "Size budget").
+
 ## The theme source
 
 `Theme::resolve(apps_use_light_theme, high_contrast)` and `Tokens::for_theme`
 already exist and already serve the card and the region overlay. Settings adds
-a few tokens it needs and the card did not: `control_fill` (edit and combo
+the tokens it needs and the card did not: `control_fill` (edit and combo
 background), `control_border`, `control_border_hot`, `accent` (checked box,
-trackbar fill, default button), `accent_text`, and `disabled_text`. In high
-contrast they come from `SysColors` only: `COLOR_WINDOW`, `COLOR_WINDOWTEXT`,
-`COLOR_GRAYTEXT`, `COLOR_HIGHLIGHT`, `COLOR_HIGHLIGHTTEXT`, `COLOR_HOTLIGHT`.
-No literal colour appears in the paint code, and a source-scan test (see
-Testing) keeps it that way, as it does for the overlay.
+trackbar fill, default button), `accent_text`, and `disabled_text`. In dark
+they are literal tokens. High contrast does not use them: those controls stay
+stock and draw from the system. No literal colour appears in the paint code,
+and a source-scan test (see Testing) keeps it that way, as it does for the
+overlay.
+
+`control_border` is its own token, not `Tokens.border`: the existing light
+`border` (214 on 250) is about 1.4:1 and is decorative, while a control edge
+has to reach 3:1 against its surroundings (see Accessibility).
 
 ## Per control
 
@@ -50,69 +125,95 @@ true for dark, false for light, and left alone in high contrast, where the
 system draws the caption. If the call fails the title bar stays light: the body
 is still correct, so this fails safe.
 
-### Static text, edit, list box
+### Static text, edit
 
-Handled in the parent's `WM_CTLCOLORSTATIC`, `WM_CTLCOLOREDIT` and
-`WM_CTLCOLORLISTBOX`: set the text and background colours, return a cached
-`HBRUSH` for the theme (recreated on a theme change, deleted on destroy).
-Read-only and disabled edits use `disabled_text`. Edits keep the standard
-sunken border; in dark it is drawn by painting a 1 px frame in the parent after
-the control (via `WM_NCPAINT` on a subclass) only if the stock frame proves
-unreadable in the screenshots. That is the open question below, not a decision.
+Handled in the parent's `WM_CTLCOLORSTATIC` and `WM_CTLCOLOREDIT` (and the
+combo list's `WM_CTLCOLORLISTBOX`, below): set the text and background
+colours, return a cached `HBRUSH` for the theme (recreated on a theme change,
+deleted on destroy). Reuse the card's #350 pattern. Read-only and disabled
+edits use `disabled_text`.
 
-### Checkboxes, radios, group boxes, push buttons
+Edits are created with `WS_EX_BORDER`, a 1 px frame in the system frame colour
+(`COLOR_WINDOWFRAME`, near black), which would be near-black on near-black in
+dark. **Decision: a custom frame is part of this design, not a maybe.** Keep
+`WS_EX_BORDER` (it reserves the non-client area), and paint the frame in
+`control_border` (hot: `control_border_hot`; focused: `accent`) in a
+`WM_NCPAINT` handler on a subclass. The open question is only the colours.
 
-These do not honour `WM_CTLCOLOR*` for their glyph or text once visual styles
-are on, so they are drawn by us. Two ways to do it:
+### Push buttons
 
-1. `BS_OWNERDRAW` with `WM_DRAWITEM`.
-2. Keep the native style (`BS_AUTOCHECKBOX`, `BS_GROUPBOX`, `BS_PUSHBUTTON`,
-   `BS_DEFPUSHBUTTON`) and draw in `NM_CUSTOMDRAW`, which a common-controls v6
-   button sends to its parent through `WM_NOTIFY`, returning `CDRF_SKIPDEFAULT`
-   after painting.
+**Decision: `BS_OWNERDRAW` for push buttons, reusing `card_buttons.rs`.** A
+push button is already a push button to assistive tech, so nothing is lost,
+and the paint helper, hover and pressed states already exist from #351. The
+Settings default button (`BS_DEFPUSHBUTTON`) keeps its Enter behaviour; the
+owner-draw style is added to it.
 
-Prefer 2. The class and style stay a real checkbox, so its UI Automation role,
-toggle state and `BM_GETCHECK` keep working with no extra code (see
-Accessibility). Option 1 changes the role. The paint code is the same either
-way: a rounded box or radio dot, check glyph or dot in `accent_text`, label in
-`text`, the group box frame in `control_border`, and the group caption drawn
-over a gap cut in the frame. A shared helper draws each control from
-`(state, tokens, dpi)` and is a pure layout function plus a thin GDI layer, so
-the layout half is unit-tested.
+### Checkboxes and group boxes
 
-States drawn: normal, hot (mouse over), pressed, checked, disabled, and focused.
+The role problem applies to checkboxes only (there are no radios), so the
+decision is per control and depends on Slice 0:
+
+- **If Slice 0 confirms v5 and the manifest route is chosen:** add the
+  common-controls 6.0.0.0 manifest, keep `BS_AUTOCHECKBOX`, and draw in
+  `NM_CUSTOMDRAW` (a v6 button sends it to its parent through `WM_NOTIFY`;
+  return `CDRF_SKIPDEFAULT` after painting). The class and style stay a real
+  checkbox, so role, toggle state and `BM_GETCHECK` keep working with no
+  extra code.
+- **If the manifest is rejected:** `BS_OWNERDRAW` checkboxes, with
+  `WM_GETOBJECT` for `OBJID_CLIENT` answered by an `IAccessible` wrapper that
+  reports the checkbox role and checked state. Real code to get right, with
+  its own tests, and the reason the manifest route is preferred.
+- Group boxes: owner-drawn the same way as the checkbox route, frame in
+  `control_border`, caption drawn over a gap cut in the frame.
+
+A shared helper draws each control from `(state, tokens, dpi)` and is a pure
+layout function plus a thin GDI layer, so the layout half is unit-tested.
+States drawn: normal, hot (mouse over), pressed, checked, disabled, focused.
 
 ### Combo boxes and their drop-downs
 
-All combos are `CBS_DROPDOWNLIST`. Make them `CBS_OWNERDRAWFIXED` and draw both
-the closed field and each list item in `WM_DRAWITEM` (the closed field is item
--1 with `ODS_COMBOBOXEDIT`). The role stays a combo box. The arrow button area
-is painted by us as a chevron.
+All combos are `CBS_DROPDOWNLIST`. `CBS_OWNERDRAWFIXED` with `WM_DRAWITEM`
+paints the closed field (item -1 with `ODS_COMBOBOXEDIT`) and each list item
+but **not the arrow button**, which stays system-drawn and light. So the combo
+needs a paint subclass that draws the whole closed face, field and chevron,
+in `WM_PAINT` and `WM_PRINTCLIENT`, with `WM_DRAWITEM` for the list items.
+The role stays a combo box; `CBS_HASSTRINGS` stays set so item text is
+reachable. This is more than "owner-draw the combo", and the slice is sized
+for it.
 
 The open list is a separate window the control owns. It gets
 `WM_CTLCOLORLISTBOX` (fill and text) in the parent. What stays stock is its
-frame and, when it scrolls, its scrollbar. If the screenshots show a visible
-light edge or scrollbar, the fallback is `SetWindowTheme(list, "DarkMode_Explorer",
-None)` on that one window, found through `CB_GETCOMBOBOXINFO`. That is a
-documented call with an undocumented theme name, uses no ordinals, and fails
-back to the stock look; it is allowed only if measured to help.
+frame and, when it scrolls, its scrollbar. If Slice 0 measured
+`SetWindowTheme(list, "DarkMode_Explorer", None)` as helping, use it on that one
+window (found through `CB_GETCOMBOBOXINFO`); it is allowed to fail back to the
+stock look. Otherwise the list keeps the stock frame.
 
-### Trackbar and scrollbars
+### Trackbar
 
-The trackbar (one, for the card seconds or the image edge) is drawn with
-`NM_CUSTOMDRAW` stages `CDDS_ITEMPREPAINT` for channel, thumb and ticks,
-using `control_fill`, `accent` and `control_border`. Keeping the native
-trackbar keeps arrow-key and page behaviour.
+The trackbar (one, for the card seconds or the image edge) is a v5 or v6
+common control. Draw it in `NM_CUSTOMDRAW` stages `CDDS_ITEMPREPAINT` for
+channel, thumb and ticks, using `control_fill`, `accent` and `control_border`.
+Trackbar custom draw works on both comctl32 versions, so this slice does not
+depend on the manifest. Keeping the native trackbar keeps arrow-key and page
+behaviour.
+
+### Scrollbar
 
 The body scrolls through a `WS_VSCROLL` on the body window. That is a
-non-client scrollbar, which cannot be recoloured by painting. Replace it with a
-slim owned scrollbar painted by us in the body's right edge: the body already
-computes scroll position, page and range, handles `WM_MOUSEWHEEL`, and has
-the pure `WM_VSCROLL` position function, so the new bar reuses those and only
-adds hit-testing (track, thumb, arrows) and paint. It also exposes scroll
-patterns by keeping the `SetScrollInfo` state on a hidden native scrollbar
-control, so assistive tech still sees a scrollable pane. This is the largest
-single piece of work and gets its own slice.
+non-client scrollbar, which cannot be recoloured by painting, and it is also
+where the window's UI Automation scroll pattern comes from. A hidden native
+scrollbar child does not give assistive tech a scrollable pane. So this is the
+weakest piece of the plan and is ordered by risk:
+
+1. **Try the documented route first.** `SetWindowTheme(body, "DarkMode_Explorer",
+   None)` per the Slice 0 measurement. If it darkens the bar, done, and the
+   scroll pattern is untouched.
+2. **If it does not, keep the stock (light) scrollbar** and accept a light strip
+   in a dark window. This is the accessible choice and the default fallback.
+3. **A custom owned scrollbar is allowed only with a UI Automation provider**
+   (an `IRawElementProviderSimple` with `IScrollProvider`) that keeps the
+   scroll pattern. That is a large piece of work, so it needs its own approval
+   once 1 and 2 are measured. See the open questions.
 
 ### Focus rects and keyboard cues
 
@@ -122,29 +223,37 @@ must respect that, or keyboard users lose their place. Each draw helper reads
 `CDIS_FOCUS` plus the control's UI state and, when visible, draws a 2 px focus
 frame in `text` offset 2 px outside the control, and underlines the `&`
 mnemonic. A control that has focus but a hidden cue draws no rect, exactly as
-the stock one does. In high contrast the frame uses `COLOR_WINDOWTEXT` (and the
-checked glyph `COLOR_HIGHLIGHT`), never a colour that could match the
-background.
+the stock one does. The focus frame reaches 3:1 against the window background.
 
 ## High contrast
 
-The only colours are `SysColors`. No tiers of grey and no accent beyond
-`COLOR_HIGHLIGHT` and `COLOR_HOTLIGHT`. Borders are 2 px in `window_text` so
-every control edge is visible. Disabled controls use `COLOR_GRAYTEXT`, never a
-dimmed text colour. The title bar is left to the system. High contrast wins
-over the light and dark app mode, as `Theme::resolve` already does.
+**Decision: in high contrast, and in light mode, Settings keeps stock controls
+and none of the paint code runs.** The system draws every control from
+`SysColors`, as it does today, and the title bar is left to the system. High
+contrast wins over the light and dark app mode, as `Theme::resolve` already
+does: with it on, no `WM_CTLCOLOR*` handler overrides the colours and no
+owner-draw or custom-draw path is taken. This removes the largest regression
+surface: nothing a high-contrast user sees changes. If Slice 0's manifest route
+is taken, light and high contrast do change to v6 visuals, which is why that
+slice is checked in Aquatic and Desert before it lands.
+
+Open question 4 asks whether light mode should also use the custom paint, for
+a consistent look.
 
 ## Live re-theme
 
-The Settings window may be open when the user switches mode. It handles the
-same three messages as the card and the overlay: `WM_SETTINGCHANGE` (when
-`setting_change_affects_theme`), `WM_THEMECHANGED` and `WM_SYSCOLORCHANGE`. On
-any of them: re-resolve the theme and `SysColors`, rebuild the cached brushes,
-set the title-bar attribute, then `RedrawWindow(RDW_INVALIDATE | RDW_ALLCHILDREN |
-RDW_UPDATENOW)` so every child repaints. A forced theme (gallery) ignores them.
-The body window and the child controls get `WM_THEMECHANGED` forwarded
-automatically by Windows, and must not re-resolve independently: one owner (the
-top-level proc) resolves and the rest read it.
+The Settings window may be open when the user switches mode. This is new work
+in `settings.rs`, which handles none of these messages today. It handles
+`WM_SETTINGCHANGE` (when `setting_change_affects_theme`; a top-level window
+receives it even inside the modal loop, confirmed by the manual "switch colour
+mode while open" check), `WM_THEMECHANGED` and `WM_SYSCOLORCHANGE`. On any of
+them: re-resolve the theme and `SysColors`, rebuild the cached brushes, set
+the title-bar attribute, switch between the stock and custom paths, then
+`RedrawWindow(RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW)` so every child
+repaints. A forced theme (gallery) ignores them. The body window and the child
+controls get `WM_THEMECHANGED` forwarded automatically by Windows, and must not
+re-resolve independently: one owner (the top-level proc) resolves and the rest
+read it.
 
 ## DPI
 
@@ -159,27 +268,23 @@ they follow it for free.
 
 Owner painting can break accessibility if it changes the control's identity.
 
-- **`BS_OWNERDRAW` changes the role.** MEASURED nowhere yet. `THEORY
-  (unverified)`: a `BS_OWNERDRAW` button is exposed to UI Automation and MSAA
-  as a plain push button, losing the checkbox or radio role and the
-  toggle state, because the system derives the role from the style bits.
-  That is why option 2 (native style plus `NM_CUSTOMDRAW`) is preferred: the
-  style bits are unchanged, so role, state and `BM_GETCHECK`/`BM_SETCHECK`
-  stay. Slice 0 verifies this with Accessibility Insights or `inspect.exe`
-  on a throwaway window, for both options and for `CBS_OWNERDRAWFIXED`, and
-  records the result here, replacing the theory.
-- If a control must be `BS_OWNERDRAW` after all, answer `WM_GETOBJECT` for
-  `OBJID_CLIENT` with an `IAccessible` wrapper that reports the right role and
-  state. This is a fallback, since it is real code to get right.
-- Combos keep the combo role under `CBS_OWNERDRAWFIXED`; the item text must
-  still be reachable, so `CBS_HASSTRINGS` stays set.
+- The role decision per control is in "Per control" and is gated on Slice 0's
+  measurement, which replaces the theory above with a recorded result.
+- Combos keep the combo role under owner draw; the item text must still be
+  reachable, so `CBS_HASSTRINGS` stays set.
 - Colour is never the only cue: checked state is a glyph, focus is a frame,
   disabled is greyed text plus no hot state.
-- Text contrast: every text pair in every theme meets 4.5:1, enforced by
-  tests over the tokens (as `theme.rs` does today). The new tokens are added to
-  that test.
+- **Text contrast:** every text pair in dark meets 4.5:1, enforced by tests over
+  the tokens (as `theme.rs` does today). The new tokens are added to that test.
+- **Non-text contrast (WCAG 1.4.11):** `control_border` against the adjacent
+  background, the checked glyph (`accent` against `control_fill`), and the focus
+  frame each meet 3:1, enforced by the same kind of token test. The existing
+  `border` token does not, which is why `control_border` exists.
+- The scrollbar keeps (or, if replaced, re-provides) the UI Automation scroll
+  pattern.
 - Narrator reads the screen through UIA, so a pass with Narrator over the
-  Settings window is a named manual check for the last slice.
+  Settings window, in dark and in high contrast, is a named manual check for the
+  last slice.
 
 ## `--ui-gallery --theme` for Settings
 
@@ -187,26 +292,29 @@ Owner painting can break accessibility if it changes the control's identity.
 it sets a forced theme and the Windows high-contrast black `SysColors`
 (`HC_BLACK`), then repaints. The driver passes the `--theme` value to the
 Settings states as it already does for the card and the region overlay. The four
-existing Settings states then give 12 screenshots (light, dark, high contrast).
-`HC_WHITE` is covered by tests on the tokens only, since the gallery takes one
-name `high-contrast`. No registry value is ever written.
+existing Settings states then give 12 screenshots (light, dark, high contrast),
+where light and high contrast show the stock look. `HC_WHITE` is covered by
+tests on the tokens only, since the gallery takes one name `high-contrast`. No
+registry value is ever written.
 
 ## Testing
 
-- Pure and unit-tested: the token contrast (extended), the checkbox, radio,
-  group box, combo and trackbar layout geometry as a function of size and DPI,
-  the scrollbar thumb geometry and hit-testing, and the "which state is this"
-  decision from `CDIS_*`/`ODS_*` flags.
+- Pure and unit-tested: the token contrast (text 4.5:1 and the non-text 3:1
+  cases), the checkbox, group box, combo and trackbar layout geometry as a
+  function of size and DPI, and the "which state is this" decision from
+  `CDIS_*`/`ODS_*` flags.
 - Source-scan guard, CRLF-normalised with a non-empty candidate check: the
   paint helpers contain no `rgb(`, no `COLORREF(` followed by a digit and no
-  stock brush or pen other than `NULL_BRUSH`.
+  stock brush or pen other than `NULL_BRUSH`. The same guard asserts that no
+  paint path is reachable when high contrast is on.
 - Dispatch guards: the top-level proc has arms for the three theme messages,
-  `WM_CTLCOLOR*`, and `WM_NOTIFY` (custom draw); the combo has `WM_DRAWITEM`.
+  `WM_CTLCOLORSTATIC`, `WM_CTLCOLOREDIT`, `WM_CTLCOLORLISTBOX` and `WM_NOTIFY`
+  (custom draw); push buttons and combo list items have `WM_DRAWITEM`.
 - Real Win32 (test class names, rule 9): create the window, force each theme,
   and read back pixels from a `PrintWindow` capture for one control of each
-  kind (a checkbox glyph pixel, a combo field pixel). This is the "wired to
-  nothing" check for owner painting: with no handler wired, the pixel would be
-  the stock light colour.
+  kind (a checkbox glyph pixel, a combo arrow pixel, an edit frame pixel). This
+  is the "wired to nothing" check for owner painting: with no handler wired,
+  the pixel would be the stock light colour. It depends on Slice 0 item 5.
 - Manual, named in each PR: screenshots in all three themes (looked at by
   eye), a real switch of Windows colour mode with Settings open, real high
   contrast (Aquatic and Desert) at 100% and 200% scale, keyboard-only
@@ -214,30 +322,74 @@ name `high-contrast`. No registry value is ever written.
 
 ## Slices (one PR each)
 
-0. **Accessibility measurement** (no product change): a throwaway window with
-   the three control approaches, inspected with `inspect.exe`; record the
-   result in this spec. Decides option 1 or 2 above.
-1. **Plumbing**: theme state on the Settings window, new tokens, DWM title bar,
-   `WM_CTLCOLOR*` for static, edit and list box, live re-theme, gallery
-   `--theme`. Checkboxes, combos and scrollbars still stock, so dark is
-   knowingly incomplete at this point and is not released alone.
-2. **Buttons**: checkboxes, group boxes, push buttons, focus and keyboard cues.
-3. **Combo boxes** and their drop-downs.
-4. **Trackbar.**
-5. **Scrollbar** (replace the non-client one).
-6. **High contrast pass and Narrator pass**, and the module doc's "Theme" note
-   in `settings.rs` is rewritten to say what is true.
+Every slice leaves light mode and high contrast exactly as they are (stock),
+and dark mode gated, so each is safe to ship alone. The one exception is the
+manifest slice, which is a deliberate light-mode change.
 
-Slices 1 to 5 can merge in order behind nothing: until slice 5 lands, dark mode
-is gated by a single constant so users never see a half-dark window. That
-constant is deleted in slice 6.
+0. **Measurements** (no product change): the seven items above, recorded in
+   this spec. Decides the manifest, the checkbox route, the combo approach and
+   the scrollbar approach.
+0b. **Manifest** (only if Slice 0 chooses it): `assets/app.manifest`
+    requesting common-controls 6.0.0.0, wired through `app.rc`. Checked in
+    light and high contrast at 100%, 150% and 200%, then shipped alone with a
+    release note.
+1. **Plumbing**: theme state on the Settings window, new tokens, DWM title bar,
+   `WM_CTLCOLOR*` for static and edit, the custom edit frame, live re-theme,
+   gallery `--theme`. The dark path is gated by one constant,
+   `SETTINGS_DARK_ENABLED = false`, so no user sees a half-dark window.
+   Done when the gallery shows the dark and high-contrast states and the
+   stock states are byte-identical to before.
+2. **Buttons**: push buttons (reusing `card_buttons.rs`), checkboxes, group
+   boxes, focus and keyboard cues.
+3. **Combo boxes**: the paint subclass for the closed face, list items, and
+   the drop-down list.
+4. **Trackbar.**
+5. **Scrollbar**: the documented route, or the stock fallback (a separate
+   approval for a custom bar, see the open questions).
+6. **Verification pass and release**: the Narrator pass, real high contrast,
+   Windows colour-mode switch while open; the `SETTINGS_DARK_ENABLED` constant
+   is deleted in this slice and a source-scan test asserts the identifier no
+   longer exists; and the "Theme" note in the module doc of `settings.rs` is
+   rewritten to say what is true.
+
+### Size budget
+
+The gate is `perf-budgets.json` `exe_size_bytes.max` 3,900,000 against a last
+measurement of 3,800,576, about 99 KB of headroom shared with the options
+card, overlay and knowledge specs. No new crate and no new `windows` feature is
+planned (`Win32_Graphics_Dwm`, `Win32_UI_Controls` and GDI are already on;
+`SetWindowTheme` lives in `Win32_UI_Controls`). Estimates, THEORY
+(unverified) until Slice 0 item 7 measures them: tokens and the shared paint
+helper about 8 KB, buttons and checkboxes about 6 KB, the combo subclass about
+8 KB, trackbar about 2 KB, an `IAccessible` wrapper if needed about 6 KB, a
+custom scrollbar with a UIA provider about 20 KB. About 25 to 30 KB without
+the last two, and a manifest is about 1 KB. Each slice's PR records the
+measured size from CI and raises the gate in the same PR if it must.
 
 ## Open questions
 
-- Whether the stock sunken edit border is acceptable in dark or needs the
-  subclass described above. Decided by looking at slice 1's screenshots.
-- Whether the combo drop-down list needs `SetWindowTheme(..., "DarkMode_Explorer")`
-  for its frame and scrollbar. Decided by slice 3's screenshots. Allowed only
-  if it measurably helps and the call is allowed to fail.
-- Whether to ship dark as the first user-visible change at slice 5 or hold
-  it until slice 6.
+1. **Common-controls v6 manifest.** Recommended: add it if Slice 0 confirms
+   Settings runs v5, because it keeps the checkbox a real checkbox with no
+   accessibility wrapper. Counter-argument: it is a visible change for every
+   light-mode and high-contrast user, can shift hard-coded metrics, and the
+   same decision affects any other window that uses a list view (the planned
+   Memory window in the knowledge spec). Decide after Slice 0's screenshots.
+2. **Edit frame colours.** The custom frame is decided. Which colours and the
+   hot and focus states are decided by looking at slice 1's screenshots.
+3. **`DarkMode_Explorer` fallback.** Allowed only if Slice 0 shows it works on
+   this build without ordinals and it measurably helps. Recommended: try it for
+   the scrollbar and the combo list, and accept the stock look if it fails.
+4. **Custom paint in light mode too.** Recommended: no, stock in light, so light
+   and high contrast cannot regress and the custom code only runs for dark
+   users. Counter-argument: a dark checkbox and a light checkbox then differ
+   in shape, and the custom path gets less everyday exercise. Revisit if the
+   two look too different in the gallery.
+5. **Custom scrollbar.** Recommended: do not build one. Use the documented theme
+   route if it works, otherwise leave the stock scrollbar. Counter-argument: a
+   light strip in a dark window looks unfinished. A custom bar needs a UI
+   Automation provider, which is a project in itself.
+6. **When to ship dark.** Recommended: at slice 6, after the Narrator pass.
+   High contrast no longer gates it, because it stays stock and is verified in
+   Slice 0, but the Narrator and colour-mode-switch checks do. Counter-argument:
+   dark could ship at slice 5 once the scrollbar fallback is chosen, since the
+   stock scrollbar is accessible and the rest is done.
