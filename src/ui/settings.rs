@@ -2640,7 +2640,10 @@ fn spawn_ollama_status_probe(
             let installed = !listening && ollama_installed();
             let section = ollama_section(status, listening, installed, ollama_configured);
             let section = without_link_for_stock_tray(section, stock_tray);
-            let section = with_gpu_fix(section, gpu_fix_offered(listening, stock_tray, gpu));
+            let section = with_gpu_fix(
+                section,
+                gpu_fix_offer(listening, stock_tray, gpu, &cfg.base_url),
+            );
             if let Ok(mut guard) = slot.lock() {
                 *guard = Some(section);
             }
@@ -3006,32 +3009,42 @@ fn without_link_for_stock_tray(mut section: OllamaSection, stock_tray: bool) -> 
     section
 }
 
-/// #382: whether the "Fix it" button is offered: an Intel GPU is present
-/// (DXGI vendor id) and Ollama is on the CPU. Portable mode never writes the
-/// registry (#130), so it never offers it. DXGI is only asked when the other
-/// conditions already hold.
-fn gpu_fix_offered(listening: bool, stock_tray: bool, gpu: Option<GpuStatus>) -> bool {
+/// #382: the text of the "Fix it" offer, or `None` when it is not offered:
+/// an Intel GPU is present (DXGI vendor id), Ollama is on the CPU, the server
+/// is on this machine (the fix stops local processes), no fix is already
+/// running, and this is not portable mode (#130 makes no registry writes).
+fn gpu_fix_offer(
+    listening: bool,
+    stock_tray: bool,
+    gpu: Option<GpuStatus>,
+    base_url: &str,
+) -> Option<String> {
     let kind = match (listening, stock_tray) {
         (false, _) => None,
         (true, true) => Some(ListenerKind::StockTrayServer),
         (true, false) => Some(ListenerKind::Other),
     };
-    // Cheap check first: only enumerate adapters when it could matter.
-    if !ollama_gpu_fix::should_offer_fix(true, kind, gpu) || crate::portable::is_portable() {
-        return false;
+    // Cheap checks first: only enumerate adapters when it could matter.
+    if !ollama_gpu_fix::should_offer_fix(true, kind, gpu)
+        || !ollama_gpu_fix::is_loopback_base_url(base_url)
+        || ollama_gpu_fix::is_running()
+        || crate::portable::is_portable()
+    {
+        return None;
     }
-    ollama_gpu_fix::should_offer_fix(
-        ollama_gpu_fix::has_intel_gpu(&ollama_gpu_fix::adapter_vendor_ids()),
-        kind,
-        gpu,
-    )
+    if !ollama_gpu_fix::has_intel_gpu(&ollama_gpu_fix::adapter_vendor_ids()) {
+        return None;
+    }
+    Some(ollama_gpu_fix::offer_text(
+        ollama_gpu_fix::current_user_value().as_deref(),
+    ))
 }
 
 /// #382: swaps the section for the fix offer: the text says what the button
 /// will do, and the button is "Fix it" instead of a link.
-fn with_gpu_fix(mut section: OllamaSection, offered: bool) -> OllamaSection {
-    if offered {
-        section.text = ollama_gpu_fix::OFFER_TEXT.to_string();
+fn with_gpu_fix(mut section: OllamaSection, offer: Option<String>) -> OllamaSection {
+    if let Some(text) = offer {
+        section.text = text;
         section.link = None;
         section.fix = true;
     }
@@ -3045,6 +3058,25 @@ fn with_gpu_fix(mut section: OllamaSection, offered: bool) -> OllamaSection {
 /// try again. Not run in tests: it kills real processes.
 fn start_gpu_fix(inner: &mut SettingsInner) {
     inner.ollama_fix = false;
+    let cfg = inner.original.providers.ollama.clone();
+    // Refuse before touching anything, and say so inline (rule 7).
+    let refusal = if !ollama_gpu_fix::is_loopback_base_url(&cfg.base_url) {
+        Some("The fix only works on an Ollama running on this PC.")
+    } else {
+        None
+    };
+    let guard = if refusal.is_none() {
+        ollama_gpu_fix::try_begin()
+    } else {
+        None
+    };
+    if guard.is_none() {
+        let msg = refusal.unwrap_or("A fix is already running.");
+        if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
+            set_text(status, msg);
+        }
+        return;
+    }
     if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
         unsafe {
             let _ = ShowWindow(link, SW_HIDE);
@@ -3053,7 +3085,6 @@ fn start_gpu_fix(inner: &mut SettingsInner) {
     if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
         set_text(status, ollama_gpu_fix::RUNNING_TEXT);
     }
-    let cfg = inner.original.providers.ollama.clone();
     let slot = inner.ollama_status.clone();
     let alive = inner.alive.clone();
     let hwnd_raw = inner.hwnd.0 as isize;
@@ -3073,6 +3104,7 @@ fn start_gpu_fix(inner: &mut SettingsInner) {
     let spawned = std::thread::Builder::new()
         .name("settings-ollama-gpu-fix".into())
         .spawn(move || {
+            let _guard = guard;
             let mut sys = ollama_gpu_fix::RealSystem {
                 port: ollama_admin::port_from_base_url(&cfg.base_url).unwrap_or(11434),
                 base_url: cfg.base_url.clone(),
@@ -5540,17 +5572,28 @@ mod tests {
     #[test]
     fn with_gpu_fix_replaces_the_text_and_makes_the_button_a_fix() {
         let running = ollama_section("Ollama is running.".to_string(), true, true, true);
-        let fixed = with_gpu_fix(running.clone(), true);
+        let fixed = with_gpu_fix(running.clone(), Some("offer".to_string()));
         assert!(fixed.fix);
         assert_eq!(fixed.link, None);
-        assert_eq!(fixed.text, ollama_gpu_fix::OFFER_TEXT);
-        assert_eq!(with_gpu_fix(running.clone(), false), running);
+        assert_eq!(fixed.text, "offer");
+        assert_eq!(with_gpu_fix(running.clone(), None), running);
     }
 
     #[test]
     fn the_gpu_fix_offer_is_never_made_when_nothing_listens() {
-        assert!(!gpu_fix_offered(false, false, None));
-        assert!(!gpu_fix_offered(true, false, Some(GpuStatus::Gpu)));
+        let url = "http://127.0.0.1:11434";
+        assert_eq!(gpu_fix_offer(false, false, None, url), None);
+        assert_eq!(gpu_fix_offer(true, false, Some(GpuStatus::Gpu), url), None);
+    }
+
+    #[test]
+    fn the_gpu_fix_offer_is_never_made_for_a_remote_server() {
+        let remote = "http://192.168.1.5:11434";
+        assert_eq!(
+            gpu_fix_offer(true, false, Some(GpuStatus::Cpu), remote),
+            None
+        );
+        assert_eq!(gpu_fix_offer(true, true, None, remote), None);
     }
 
     // -- ollama_section (#343, pure) ---------------------------------------

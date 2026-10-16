@@ -44,10 +44,26 @@ const TRAY_APP_EXE: &str = "ollama app.exe";
 /// PCI vendor id of Intel, as DXGI reports it.
 const VENDOR_INTEL: u32 = 0x8086;
 
-/// What Settings shows next to the button, before it is pressed: the whole
-/// list of things the button does.
-pub const OFFER_TEXT: &str = "Ollama is using the CPU, not your Intel GPU. Fix it sets \
-    OLLAMA_IGPU_ENABLE=1 for your Windows account, then stops and restarts Ollama.";
+/// What Settings shows next to the button, before it is pressed: what the
+/// button does, including that it replaces a different value already set.
+pub fn offer_text(previous: Option<&str>) -> String {
+    match previous
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && *v != ENV_VALUE)
+    {
+        Some(old) => {
+            let old: String = old.chars().take(12).collect();
+            format!(
+                "Ollama is on the CPU, not your Intel GPU. Fix it replaces your \
+                 {ENV_NAME}={old} with {ENV_VALUE} and restarts Ollama."
+            )
+        }
+        None => format!(
+            "Ollama is on the CPU, not your Intel GPU. Fix it sets {ENV_NAME}={ENV_VALUE} \
+             for your account and restarts Ollama."
+        ),
+    }
+}
 
 /// What the button says while the fix runs.
 pub const RUNNING_TEXT: &str = "Fixing: setting the variable and restarting Ollama...";
@@ -59,6 +75,32 @@ pub const RUNNING_TEXT: &str = "Fixing: setting the variable and restarting Olla
 /// Whether any of the DXGI adapter vendor ids is Intel.
 pub fn has_intel_gpu(vendor_ids: &[u32]) -> bool {
     vendor_ids.contains(&VENDOR_INTEL)
+}
+
+/// The last path component, for both `\\` and `/` separators.
+fn file_name(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+/// Whether `path` names `ollama.exe` (case-insensitive). The only program the
+/// fix will stop or start.
+pub fn is_ollama_exe(path: &str) -> bool {
+    file_name(path).eq_ignore_ascii_case("ollama.exe")
+}
+
+/// Whether `base_url` points at this machine. The probe reads whatever
+/// server the URL names, but the fix stops local processes, so it must only
+/// act when they are the same server.
+pub fn is_loopback_base_url(base_url: &str) -> bool {
+    let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
 }
 
 /// Whether Settings offers the fix.
@@ -147,8 +189,11 @@ pub trait FixSystem {
     /// Saves `OLLAMA_IGPU_ENABLE=1` for the user and tells running programs.
     fn set_user_env(&mut self) -> Result<(), String>;
     fn health(&mut self) -> OllamaHealth;
-    /// Quits the stock tray app (it respawns a CPU server if left alone).
-    fn stop_tray_app(&mut self) -> Result<(), String>;
+    /// The image path of `pid` right now (`None` when it is gone).
+    fn image_of(&mut self, pid: u32) -> Option<String>;
+    /// Quits the stock tray app that started the server `server_pid` (it
+    /// respawns a CPU server if left alone). Only that exact process.
+    fn stop_tray_app(&mut self, server_pid: u32) -> Result<(), String>;
     /// Ends the process and everything it started.
     fn kill_tree(&mut self, pid: u32) -> Result<(), String>;
     /// Starts `ollama serve` with the variable set. Returns right away.
@@ -164,9 +209,11 @@ pub trait FixSystem {
 const STOP_WAIT: Duration = Duration::from_secs(10);
 const START_WAIT: Duration = Duration::from_secs(20);
 
-/// Runs the fix. `fallback_exe` is where `ollama.exe` is if the running
-/// server's own path could not be read. `progress` is called with a short
-/// line before each step. Never leaves Ollama stopped without saying so.
+/// Runs the fix. `fallback_exe` is where `ollama.exe` is when nothing is
+/// listening. Only `ollama.exe` is ever stopped or started: a listener with
+/// any other image name stops the fix before anything is touched. `progress`
+/// is called with a short line before each step. Never leaves Ollama stopped
+/// without saying so, and says the setting was saved once it has been.
 pub fn run_fix(
     sys: &mut dyn FixSystem,
     fallback_exe: Option<PathBuf>,
@@ -175,16 +222,28 @@ pub fn run_fix(
     // Look before touching anything, so a missing exe is found while Ollama
     // is still running.
     let before = sys.health();
-    let exe = match &before {
-        OllamaHealth::Listening { image_path, .. } if !image_path.is_empty() => {
-            Some(PathBuf::from(image_path))
+    let (exe, listener_kind) = match &before {
+        OllamaHealth::Listening {
+            image_path, kind, ..
+        } if is_ollama_exe(image_path) => (PathBuf::from(image_path), Some(*kind)),
+        OllamaHealth::Listening { .. } => {
+            return FixOutcome::NotChanged(
+                "Another program, not ollama.exe, is using the Ollama port. \
+                 Nothing was changed."
+                    .to_string(),
+            );
         }
-        _ => fallback_exe,
-    };
-    let Some(exe) = exe else {
-        return FixOutcome::NotChanged(
-            "Could not find ollama.exe to restart it, so nothing was changed.".to_string(),
-        );
+        OllamaHealth::NotListening => {
+            match fallback_exe.filter(|p| is_ollama_exe(&p.to_string_lossy())) {
+                Some(p) => (p, None),
+                None => {
+                    return FixOutcome::NotChanged(
+                        "Could not find ollama.exe to restart it, so nothing was changed."
+                            .to_string(),
+                    );
+                }
+            }
+        }
     };
 
     progress("Saving the setting...");
@@ -195,12 +254,19 @@ pub fn run_fix(
         ));
     }
 
-    if let OllamaHealth::Listening { kind, .. } = before {
+    if let (
+        Some(kind),
+        OllamaHealth::Listening {
+            pid: server_pid, ..
+        },
+    ) = (listener_kind, &before)
+    {
         if kind == ListenerKind::StockTrayServer {
             progress("Quitting the stock Ollama app...");
-            if let Err(e) = sys.stop_tray_app() {
+            if let Err(e) = sys.stop_tray_app(*server_pid) {
                 return FixOutcome::NotChanged(format!(
-                    "Could not quit the stock Ollama app ({}). Quit it from the tray, then try again.",
+                    "Could not quit the stock Ollama app ({}). Setting saved. \
+                     Quit it from the tray, then try again.",
                     short(&e)
                 ));
             }
@@ -211,18 +277,28 @@ pub fn run_fix(
             OllamaHealth::NotListening => None,
         };
         if let Some(pid) = target {
+            // The pid was resolved a moment ago and may have been reused, or
+            // a different program may have taken the port.
+            if !sys.image_of(pid).is_some_and(|i| is_ollama_exe(&i)) {
+                return FixOutcome::NotChanged(
+                    "The Ollama port changed hands, so nothing was stopped. Setting saved. \
+                     Try again."
+                        .to_string(),
+                );
+            }
             progress("Stopping Ollama...");
             if let Err(e) = sys.kill_tree(pid) {
                 return FixOutcome::NotChanged(format!(
-                    "Could not stop Ollama ({}). It is still running. Quit it, then try again.",
+                    "Could not stop Ollama ({}). It is still running. Setting saved. \
+                     Quit it, then try again.",
                     short(&e)
                 ));
             }
         }
         if !sys.wait_for_listener(false, STOP_WAIT) {
             return FixOutcome::NotChanged(
-                "Ollama did not stop, or started again at once. Quit it from the tray, \
-                 then try again."
+                "Ollama did not stop, or started again at once. Setting saved. \
+                 Quit it from the tray, then try again."
                     .to_string(),
             );
         }
@@ -246,6 +322,64 @@ pub fn run_fix(
         Ok(GpuStatus::NotLoaded) => FixOutcome::Unverified("the model is not loaded.".to_string()),
         Err(e) => FixOutcome::Unverified(format!("{}.", short(&e))),
     }
+}
+
+// ===========================================================================
+// One fix at a time, and a trace if Wingman dies in the middle
+// ===========================================================================
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set while a fix runs anywhere in this process, so reopening Settings
+/// cannot start a second one.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Held for the length of a fix. Dropping it clears the flag and the marker.
+pub struct FixGuard {
+    flag: &'static AtomicBool,
+    marker: Option<PathBuf>,
+}
+
+impl Drop for FixGuard {
+    fn drop(&mut self) {
+        if let Some(m) = &self.marker {
+            let _ = std::fs::remove_file(m);
+        }
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+/// [`try_begin`] with the flag and marker injected, for tests.
+fn begin(flag: &'static AtomicBool, marker: Option<PathBuf>) -> Option<FixGuard> {
+    flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .ok()?;
+    if let Some(m) = &marker {
+        // Best effort: a marker that cannot be written must not stop the fix.
+        let _ = std::fs::write(m, "Fix it was running\n");
+    }
+    Some(FixGuard { flag, marker })
+}
+
+/// Starts a fix: `None` when one is already running.
+pub fn try_begin() -> Option<FixGuard> {
+    begin(&RUNNING, marker_path())
+}
+
+pub fn is_running() -> bool {
+    RUNNING.load(Ordering::SeqCst)
+}
+
+/// Next to `config.toml`: present only while a fix runs, so finding it with
+/// no fix running means Wingman exited mid-fix.
+fn marker_path() -> Option<PathBuf> {
+    let cfg = crate::config::Config::path().ok()?;
+    Some(cfg.parent()?.join("gpu-fix-in-progress"))
+}
+
+/// Whether the last fix never finished (Wingman exited during it), so Ollama
+/// may be stopped. Shown in diagnostics.
+pub fn interrupted() -> bool {
+    !is_running() && marker_path().is_some_and(|m| m.exists())
 }
 
 // ===========================================================================
@@ -330,19 +464,55 @@ pub fn default_exe() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-fn taskkill(args: &[&str]) -> Result<(), String> {
+/// Reads a string value under `HKCU\<key_path>`; `None` when absent.
+fn read_user_value(key_path: &str, name: &str) -> Option<String> {
+    use windows::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ};
+    let (sub, name_w) = (wide(key_path), wide(name));
+    let mut buf = [0u16; 256];
+    let mut len = std::mem::size_of_val(&buf) as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name_w.as_ptr()),
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut len),
+        )
+        .ok()
+        .ok()?;
+    }
+    let end = buf.iter().position(|&u| u == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+/// The current user value of the variable, for the pre-press text.
+pub fn current_user_value() -> Option<String> {
+    read_user_value("Environment", ENV_NAME)
+}
+
+/// `taskkill` by PID. Exit code 128 means the process is already gone, which
+/// is what we wanted; any other failure is an error. Exit codes, not message
+/// text, so a localized Windows behaves the same.
+fn taskkill_pid(pid: u32, tree: bool) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let mut args = vec!["/F".to_string()];
+    if tree {
+        args.push("/T".to_string());
+    }
+    args.extend(["/PID".to_string(), pid.to_string()]);
     let out = std::process::Command::new(Path::new(&root).join(r"System32\taskkill.exe"))
-        .args(args)
+        .args(&args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("could not run taskkill: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    match out.status.code() {
+        Some(0) | Some(128) => Ok(()),
+        Some(c) => Err(format!("taskkill exit code {c}")),
+        None => Err("taskkill was interrupted".to_string()),
     }
 }
 
@@ -364,17 +534,26 @@ impl FixSystem for RealSystem {
         ollama_admin::query_ollama_health(self.port)
     }
 
-    fn stop_tray_app(&mut self) -> Result<(), String> {
-        match taskkill(&["/F", "/IM", TRAY_APP_EXE]) {
-            Ok(()) => Ok(()),
-            // Already gone is fine: nothing left to stop.
-            Err(e) if e.contains("not found") => Ok(()),
-            Err(e) => Err(e),
+    fn image_of(&mut self, pid: u32) -> Option<String> {
+        ollama_admin::process_image_path(pid)
+    }
+
+    fn stop_tray_app(&mut self, server_pid: u32) -> Result<(), String> {
+        // Only the server's own parent, and only if it really is the tray
+        // app: never a process picked by name.
+        let Some(parent) = ollama_admin::parent_pid(server_pid) else {
+            return Ok(());
+        };
+        match ollama_admin::process_image_path(parent) {
+            Some(img) if file_name(&img).eq_ignore_ascii_case(TRAY_APP_EXE) => {
+                taskkill_pid(parent, false)
+            }
+            _ => Ok(()),
         }
     }
 
     fn kill_tree(&mut self, pid: u32) -> Result<(), String> {
-        taskkill(&["/F", "/T", "/PID", &pid.to_string()])
+        taskkill_pid(pid, true)
     }
 
     fn start_serve(&mut self, exe: &Path) -> Result<(), String> {
@@ -514,7 +693,7 @@ mod tests {
         assert!(FixOutcome::LeftStopped("x".into())
             .message()
             .contains("Ollama is stopped"));
-        assert!(!OFFER_TEXT.contains('\u{2014}') && !RUNNING_TEXT.contains('\u{2014}'));
+        assert!(!offer_text(Some("0")).contains('\u{2014}') && !RUNNING_TEXT.contains('\u{2014}'));
     }
 
     #[test]
@@ -535,6 +714,7 @@ mod tests {
         kill_err: Option<String>,
         start_err: Option<String>,
         stop_waits_out: bool,
+        image: Option<String>,
         listen_after_start: bool,
         load_err: Option<String>,
         gpu: Option<Result<GpuStatus, String>>,
@@ -564,7 +744,13 @@ mod tests {
                     .unwrap_or(OllamaHealth::NotListening)
             }
         }
-        fn stop_tray_app(&mut self) -> Result<(), String> {
+        fn image_of(&mut self, _pid: u32) -> Option<String> {
+            self.log.push("image".into());
+            self.image
+                .clone()
+                .or(Some(r"C:\fake\ollama.exe".to_string()))
+        }
+        fn stop_tray_app(&mut self, _pid: u32) -> Result<(), String> {
             self.log.push("tray".into());
             self.tray_err.clone().map_or(Ok(()), Err)
         }
@@ -616,6 +802,7 @@ mod tests {
                 "health",
                 "env",
                 "health",
+                "image",
                 "kill 42",
                 "wait false",
                 "start C:\\fake\\ollama.exe",
@@ -763,7 +950,9 @@ mod tests {
         // The label holds `OLLAMA_TEXT_BUDGET` (140) characters in settings.rs.
         let long = "x".repeat(300);
         let mut lines = vec![
-            OFFER_TEXT.to_string(),
+            offer_text(None),
+            offer_text(Some("0")),
+            offer_text(Some(&"y".repeat(100))),
             RUNNING_TEXT.to_string(),
             FixOutcome::Fixed.message(),
             FixOutcome::StillCpu.message(),
@@ -792,6 +981,116 @@ mod tests {
     }
 
     #[test]
+    fn a_listener_that_is_not_ollama_exe_is_never_killed_or_started() {
+        let mut f = Fake {
+            health: vec![OllamaHealth::Listening {
+                pid: 7,
+                image_path: r"C:\x\proxy.exe".to_string(),
+                kind: ListenerKind::Other,
+            }],
+            listen_after_start: true,
+            ..Default::default()
+        };
+        let out = run_fix(&mut f, Some(PathBuf::from(r"C:\d\ollama.exe")), &mut |_| {});
+        assert!(matches!(out, FixOutcome::NotChanged(_)), "{out:?}");
+        assert_eq!(f.log, ["health"], "not even the setting is written");
+    }
+
+    #[test]
+    fn a_non_ollama_fallback_exe_is_refused() {
+        let mut f = Fake::default();
+        let out = run_fix(&mut f, Some(PathBuf::from(r"C:\d\other.exe")), &mut |_| {});
+        assert!(matches!(out, FixOutcome::NotChanged(_)));
+        assert_eq!(f.log, ["health"]);
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_killed() {
+        let mut f = working();
+        f.image = Some(r"C:\x\notepad.exe".to_string());
+        let out = run_fix(&mut f, None, &mut |_| {});
+        assert!(matches!(out, FixOutcome::NotChanged(ref m) if m.contains("Setting saved")));
+        assert!(!f
+            .log
+            .iter()
+            .any(|s| s.starts_with("kill") || s.starts_with("start")));
+    }
+
+    #[test]
+    fn failures_after_the_write_say_the_setting_was_saved() {
+        let mut f = working();
+        f.kill_err = Some("denied".into());
+        assert!(run_fix(&mut f, None, &mut |_| {})
+            .message()
+            .contains("Setting saved"));
+        let mut f = Fake {
+            health: vec![listening(ListenerKind::StockTrayServer)],
+            tray_err: Some("denied".into()),
+            ..Default::default()
+        };
+        assert!(run_fix(&mut f, None, &mut |_| {})
+            .message()
+            .contains("Setting saved"));
+        let mut f = working();
+        f.stop_waits_out = true;
+        assert!(run_fix(&mut f, None, &mut |_| {})
+            .message()
+            .contains("Setting saved"));
+    }
+
+    #[test]
+    fn image_names_are_matched_case_insensitively_on_the_file_name_only() {
+        assert!(is_ollama_exe(r"C:\A\OLLAMA.EXE"));
+        assert!(is_ollama_exe("ollama.exe"));
+        assert!(!is_ollama_exe(r"C:\ollama.exe\proxy.exe"));
+        assert!(!is_ollama_exe(r"C:\x\ollama app.exe"));
+        assert!(!is_ollama_exe(""));
+    }
+
+    #[test]
+    fn only_loopback_urls_count_as_this_machine() {
+        for ok in [
+            "http://127.0.0.1:11434",
+            "http://localhost:11434/",
+            "http://LOCALHOST",
+            "http://[::1]:11434",
+        ] {
+            assert!(is_loopback_base_url(ok), "{ok}");
+        }
+        for bad in [
+            "http://192.168.1.5:11434",
+            "http://example.com",
+            "http://127.0.0.1.evil.com:11434",
+            "http://localhost@evil.com",
+            "",
+        ] {
+            assert!(!is_loopback_base_url(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_offer_text_names_a_different_existing_value() {
+        assert!(offer_text(None).contains("sets OLLAMA_IGPU_ENABLE=1"));
+        assert!(offer_text(Some("1")).contains("sets"));
+        assert!(offer_text(Some("0")).contains("replaces your OLLAMA_IGPU_ENABLE=0"));
+    }
+
+    #[test]
+    fn a_second_fix_cannot_begin_and_the_marker_tracks_the_first() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let dir = std::env::temp_dir().join("wingman-test-382-marker");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("gpu-fix-in-progress");
+        let first = begin(&FLAG, Some(marker.clone())).expect("first");
+        assert!(marker.exists());
+        assert!(begin(&FLAG, Some(marker.clone())).is_none());
+        drop(first);
+        assert!(!marker.exists());
+        assert!(begin(&FLAG, Some(marker)).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn progress_lines_are_reported_in_order() {
         let mut f = working();
         let mut seen = Vec::new();
@@ -807,27 +1106,11 @@ mod tests {
 
     #[test]
     fn write_user_value_round_trips_on_a_scratch_key() {
-        use windows::Win32::System::Registry::{RegDeleteTreeW, RegGetValueW, RRF_RT_REG_SZ};
+        use windows::Win32::System::Registry::RegDeleteTreeW;
         let root = r"Software\WingmanTest382GpuFix";
         let sub = format!(r"{root}\Environment");
         write_user_value(&sub, "WINGMAN_TEST_382", "1").expect("write");
-        let mut buf = [0u16; 16];
-        let mut len = (buf.len() * 2) as u32;
-        let got = unsafe {
-            let (s, n) = (wide(&sub), wide("WINGMAN_TEST_382"));
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                PCWSTR(s.as_ptr()),
-                PCWSTR(n.as_ptr()),
-                RRF_RT_REG_SZ,
-                None,
-                Some(buf.as_mut_ptr().cast()),
-                Some(&mut len),
-            )
-        };
-        let read = got.is_ok().then(|| {
-            String::from_utf16_lossy(&buf[..buf.iter().position(|&u| u == 0).unwrap_or(0)])
-        });
+        let read = read_user_value(&sub, "WINGMAN_TEST_382");
         unsafe {
             let w = wide(root);
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(w.as_ptr()));

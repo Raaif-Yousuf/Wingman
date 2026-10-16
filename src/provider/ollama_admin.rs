@@ -256,7 +256,7 @@ pub(crate) fn process_image_path(pid: u32) -> Option<String> {
 /// `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` + linear scan for `pid`'s
 /// `th32ParentProcessID`. `None` if the snapshot fails or `pid` isn't found
 /// in it (already exited).
-fn parent_pid(pid: u32) -> Option<u32> {
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
         let mut entry = PROCESSENTRY32W {
