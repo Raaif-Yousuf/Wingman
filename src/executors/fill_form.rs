@@ -540,8 +540,12 @@ fn do_fill(access: &Arc<dyn TextElementAccess>, form: &FormFill) -> Result<Undo>
     let mut summary = format_outcomes(&results);
     for label in &not_restorable {
         summary.push_str(&format!(
-            " Typed into \"{label}\": the old text was replaced and Undo cannot put back that field."
+            " Undo cannot restore \"{label}\": its old text could not be read before it was replaced."
         ));
+    }
+    if filled.is_empty() {
+        // Nothing can be put back, so do not offer an Undo that "succeeds".
+        return Ok(Undo::not_undoable(summary));
     }
     let undo_access = Arc::clone(access);
     Ok(Undo::recording(summary, move || {
@@ -1554,7 +1558,11 @@ mod tests {
         let undo = executor.execute(confirmed(form)).unwrap();
         assert!(undo.summary.contains("Filled 2 of 2 fields"));
         assert!(undo.summary.contains("Notes"), "{}", undo.summary);
-        assert!(undo.summary.contains("cannot put back"), "{}", undo.summary);
+        assert!(
+            undo.summary.contains("Undo cannot restore"),
+            "{}",
+            undo.summary
+        );
         assert!(!undo.summary.contains("Full name"), "{}", undo.summary);
         assert!(!undo.summary.contains('\u{2014}'));
 
@@ -1570,6 +1578,29 @@ mod tests {
             3,
             "two fill writes plus one restore, none for the typed field"
         );
+    }
+
+    #[test]
+    fn when_no_written_field_is_restorable_there_is_no_undo() {
+        let mut typed = field("notes", "Edit", false, "Notes", "");
+        typed.value_readable = false;
+        let access = access(vec![("notes", typed)]);
+        let executor = FillFormExecutor::with_access(access.clone());
+        let form = form_json(vec![field_json(
+            "notes", "Notes", "hello", false, false, "",
+        )]);
+
+        let undo = executor.execute(confirmed(form)).unwrap();
+        assert!(
+            undo.summary.contains("Undo cannot restore"),
+            "{}",
+            undo.summary
+        );
+        assert!(
+            undo.undo().is_err(),
+            "nothing was recorded, so Undo must not report success"
+        );
+        assert_eq!(access.write_calls.borrow().len(), 1);
     }
 
     #[test]

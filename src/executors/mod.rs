@@ -86,6 +86,20 @@ impl Undo {
         }
     }
 
+    /// For an executor that changed something it cannot put back (#645).
+    /// Unlike [`Undo::none`], calling `undo` is an error, so it never reports
+    /// success for a change it did not reverse.
+    pub fn not_undoable(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+            restore: Box::new(|| {
+                anyhow::bail!(
+                    "Undo is not available: the old text could not be read before it was replaced"
+                )
+            }),
+        }
+    }
+
     /// For an executor that changed something and can put it back.
     pub fn recording(
         summary: impl Into<String>,
