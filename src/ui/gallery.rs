@@ -419,6 +419,7 @@ mod driver {
         let mut card = Card::new_for_test(instance)?;
         let mut palette = Palette::new_for_test(instance)?;
         palette.keep_open_for_gallery();
+        palette.ignore_mouse_for_test();
         let mut settings: Option<GalleryWindow> = None;
         let mut region: Option<Overlay> = None;
         let mut states = gallery_states();
