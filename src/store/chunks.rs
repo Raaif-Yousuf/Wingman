@@ -22,7 +22,6 @@ impl Store {
     /// transaction: vanished text is deleted, kept rows get their new ordinal
     /// and span, new text is inserted. Returns the diff that was applied. On
     /// any error the transaction rolls back and the old rows stay as they were.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn replace_chunks(
         &self,
         doc_id: i64,

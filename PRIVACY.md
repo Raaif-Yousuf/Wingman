@@ -124,6 +124,17 @@ packet capture, is in [`docs/offline.md`](docs/offline.md).
   the Wingman folder instead). Wingman deletes files at least an hour old when
   it starts and the next time you add an event, and the undo button deletes it
   at once.
+- **Knowledge folder (off unless you set it).** If `[knowledge] folder` in
+  `config.toml` names a folder, Wingman reads the .txt and .md files in it once,
+  when it starts, and keeps their text in the local store (`store\wingman.db`)
+  so it can be searched. Card, bank-account (IBAN) and national-id numbers are
+  replaced with a marker such as `[card number]` before the text is saved. The
+  text is saved as plain text in the store folder, which only your Windows
+  account can open, like the files themselves. Nothing is sent anywhere: this
+  makes no network request. Delete a file and its text is removed at the next
+  start. Change the setting to another folder, or clear it, and the saved text
+  of the old folder is deleted at the next start. Leave the setting empty and
+  Wingman reads no folder and keeps no text from one.
 - Nothing else. No screenshot is written to disk. No history, log or cache of
   past answers persists across a restart.
 
@@ -207,7 +218,8 @@ Remove-Item "$env:LOCALAPPDATA\Wingman" -Recurse -Force
   only be opened by your Windows account on this PC. Rows are kept for 90 days, at
   most 10 000. After an upgrade it also holds the old `spend.json.migrated`
   and `egress.log.migrated`. The `store` folder is readable only by your
-  Windows account.
+  Windows account. If you turned on the knowledge folder, it also holds the
+  text of those files.
 
 Deleting `config.toml` removes a key that was stored in it, but rotate any
 exposed key with your provider regardless; deleting the file does not
