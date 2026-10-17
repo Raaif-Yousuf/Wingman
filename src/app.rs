@@ -578,9 +578,10 @@ struct App {
     /// press of the Wingman key is refused (`settings_hold_card`) rather than run
     /// on settings the user has just changed.
     settings_saves: Arc<std::sync::atomic::AtomicU32>,
-    /// #1013: when `settings_saves` last rose from zero, so a save that never
-    /// answers is reported as stuck (`save_is_stuck`).
-    settings_saves_since: Option<Instant>,
+    /// #1013: when each save still in flight was sent, oldest first (the one
+    /// writer thread answers in order), so a save that never answers is
+    /// reported as stuck by its own age (`save_is_stuck`).
+    settings_save_starts: VecDeque<Instant>,
     /// #870: the newest good load an earlier (not last) reply left unadopted.
     skipped_mtime: Option<Option<std::time::SystemTime>>,
     /// #339: whether a password manager was in front before Wingman's own UI
@@ -886,7 +887,7 @@ pub fn run() -> Result<()> {
         unsaved: Vec::new(),
         pending_writes: Arc::default(),
         settings_saves: Arc::default(),
-        settings_saves_since: None,
+        settings_save_starts: VecDeque::new(),
         skipped_mtime: None,
         chain,
         card,
@@ -4774,7 +4775,7 @@ impl App {
         let saves = self
             .settings_saves
             .load(std::sync::atomic::Ordering::SeqCst);
-        let stuck = save_is_stuck(saves, self.settings_saves_since, Instant::now());
+        let stuck = self.saves_stuck(saves);
         if let Some((headline, detail)) = settings_hold_card(false, saves, stuck) {
             self.card.show_answer(headline, detail, 3, None);
             self.set_watch(true);
@@ -4824,18 +4825,23 @@ impl App {
             original,
             edited,
         } = save;
-        // Remember when the count rose from zero, for "Saving is stuck".
-        let before = self
-            .settings_saves
+        // Remember when this save was sent, for "Saving is stuck".
+        self.settings_save_starts.push_back(Instant::now());
+        self.settings_saves
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if before == 0 {
-            self.settings_saves_since = Some(Instant::now());
-        }
         self.persist_changes_with(
             crate::config_writer::Outcome::settings_save(),
             changes,
             Some((original, edited)),
         );
+    }
+
+    /// Whether the oldest save still in flight has gone unanswered for too
+    /// long (#1013). A reply that could not be posted never reaches this
+    /// thread to pop its start, so the list is trimmed to the live count.
+    fn saves_stuck(&mut self, saves_in_flight: u32) -> bool {
+        let oldest = oldest_save_start(&mut self.settings_save_starts, saves_in_flight);
+        save_is_stuck(saves_in_flight, oldest, Instant::now())
     }
 
     /// The card that explains why a model action does not start because of the
@@ -4850,7 +4856,7 @@ impl App {
             settings::is_foreground(),
             TRAY_COMMAND_RUNNING.with(|c| c.get()),
         );
-        let stuck = save_is_stuck(saves, self.settings_saves_since, Instant::now());
+        let stuck = self.saves_stuck(saves);
         match settings_hold_card(stops, saves, stuck) {
             Some((headline, detail)) => {
                 self.card.show_answer(headline, detail, 3, None);
@@ -8052,6 +8058,16 @@ fn save_is_stuck(saves_in_flight: u32, since: Option<Instant>, now: Instant) -> 
         && since.is_some_and(|s| now.saturating_duration_since(s) >= SAVE_STUCK_AFTER)
 }
 
+/// The send time of the oldest save still in flight. `starts` holds one entry
+/// per save sent, oldest first; replies settle in the same order, so the ones
+/// already answered are the front entries beyond the live count.
+fn oldest_save_start(starts: &mut VecDeque<Instant>, saves_in_flight: u32) -> Option<Instant> {
+    while starts.len() > saves_in_flight as usize {
+        starts.pop_front();
+    }
+    starts.front().copied()
+}
+
 /// Marks a tray command as running for as long as it lives (#1012).
 struct TrayCommandScope;
 
@@ -8900,7 +8916,17 @@ mod tests {
         assert_eq!(settings_hold_card(false, 0, true), None);
         let src = lf(include_str!("app.rs"));
         let save = body_between(&src, "    fn on_settings_save(", "\n    }\n");
-        assert!(save.contains("settings_saves_since"), "{save}");
+        assert!(save.contains("settings_save_starts.push_back"), "{save}");
+        // A second save does not inherit the first one's age: once the first
+        // is answered, the oldest start is the second's own.
+        use super::oldest_save_start;
+        let mut starts = std::collections::VecDeque::from([start, later(Duration::from_secs(40))]);
+        assert_eq!(oldest_save_start(&mut starts, 2), Some(start));
+        assert_eq!(
+            oldest_save_start(&mut starts, 1),
+            Some(later(Duration::from_secs(40)))
+        );
+        assert_eq!(oldest_save_start(&mut starts, 0), None);
     }
 
     /// #1013 item 4: the refusal card can be clicked away, like every card
