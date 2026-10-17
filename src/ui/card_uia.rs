@@ -40,11 +40,12 @@ use windows::Win32::UI::Accessibility::{
     IRawElementProviderFragment_Impl, IRawElementProviderSimple, IRawElementProviderSimple_Impl,
     NavigateDirection, NavigateDirection_FirstChild, NavigateDirection_LastChild,
     NavigateDirection_NextSibling, NavigateDirection_Parent, NavigateDirection_PreviousSibling,
-    ProviderOptions, ProviderOptions_ServerSideProvider, UIA_AutomationIdPropertyId,
-    UIA_ButtonControlTypeId, UIA_ControlTypePropertyId, UIA_HasKeyboardFocusPropertyId,
-    UIA_HyperlinkControlTypeId, UIA_InvokePatternId, UIA_IsContentElementPropertyId,
-    UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
-    UIA_IsOffscreenPropertyId, UIA_NamePropertyId, UiaHostProviderFromHwnd, UiaRect,
+    NotificationKind_Other, NotificationProcessing_ImportantMostRecent, ProviderOptions,
+    ProviderOptions_ServerSideProvider, UIA_AutomationIdPropertyId, UIA_ButtonControlTypeId,
+    UIA_ControlTypePropertyId, UIA_HasKeyboardFocusPropertyId, UIA_HyperlinkControlTypeId,
+    UIA_InvokePatternId, UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
+    UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId,
+    UIA_NamePropertyId, UiaHostProviderFromHwnd, UiaRaiseNotificationEvent, UiaRect,
     UIA_PATTERN_ID, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindowVisible, PostMessageW};
@@ -85,6 +86,46 @@ pub(crate) struct LinkInfo {
 pub(crate) struct Snapshot {
     pub links: Vec<LinkInfo>,
     pub focus: Option<i32>,
+    /// A collapsed card with detail behind it: the card itself offers Invoke
+    /// to expand (#977).
+    pub expandable: bool,
+}
+
+/// The id a card-level Invoke posts in place of a link id (#977). Link ids
+/// are positive, so this never names a link.
+pub(crate) const EXPAND_ID: i32 = -1;
+
+/// What a screen reader says for a new card: the headline, then the detail.
+/// Pure, so the wording is tested without a window.
+pub(crate) fn announcement_text(headline: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        return headline.to_string();
+    }
+    if headline.is_empty() {
+        return detail.to_string();
+    }
+    let sep = if headline.ends_with(['.', '!', '?']) {
+        " "
+    } else {
+        ". "
+    };
+    format!("{headline}{sep}{detail}")
+}
+
+/// Raises a UI Automation notification with `text`, as a polite
+/// most-recent-wins announcement: a newer card replaces one still being read.
+/// The caller has already checked that a client is listening. Raising is
+/// non-blocking; UIA delivers it to clients on its own threads.
+pub(crate) fn raise_announcement(root: &IRawElementProviderSimple, text: &str) {
+    unsafe {
+        let _ = UiaRaiseNotificationEvent(
+            root,
+            NotificationKind_Other,
+            NotificationProcessing_ImportantMostRecent,
+            &BSTR::from(text),
+            &BSTR::from("WingmanCard.Announcement"),
+        );
+    }
 }
 
 pub(crate) type Shared = Arc<Mutex<Snapshot>>;
@@ -198,7 +239,8 @@ fn runtime_id(parts: &[i32]) -> Result<*mut SAFEARRAY> {
 #[implement(
     IRawElementProviderSimple,
     IRawElementProviderFragment,
-    IRawElementProviderFragmentRoot
+    IRawElementProviderFragmentRoot,
+    IInvokeProvider
 )]
 struct CardRoot {
     hwnd: isize,
@@ -209,7 +251,17 @@ impl IRawElementProviderSimple_Impl for CardRoot_Impl {
     fn ProviderOptions(&self) -> Result<ProviderOptions> {
         Ok(ProviderOptions_ServerSideProvider)
     }
-    fn GetPatternProvider(&self, _pattern: UIA_PATTERN_ID) -> Result<IUnknown> {
+    fn GetPatternProvider(&self, pattern: UIA_PATTERN_ID) -> Result<IUnknown> {
+        // #977: a collapsed card with detail can be expanded from a screen
+        // reader. Any other state has nothing to invoke.
+        if pattern == UIA_InvokePatternId && lock(&self.shared).expandable {
+            let invoke: IInvokeProvider = ComObject::new(CardRoot {
+                hwnd: self.hwnd,
+                shared: self.shared.clone(),
+            })
+            .to_interface();
+            return invoke.cast();
+        }
         none()
     }
     fn GetPropertyValue(&self, _property: UIA_PROPERTY_ID) -> Result<VARIANT> {
@@ -301,6 +353,22 @@ impl IRawElementProviderFragmentRoot_Impl for CardRoot_Impl {
             })
             .to_interface()),
             None => none(),
+        }
+    }
+}
+
+impl IInvokeProvider_Impl for CardRoot_Impl {
+    fn Invoke(&self) -> Result<()> {
+        if !lock(&self.shared).expandable {
+            return Err(Error::from(UIA_E_ELEMENTNOTAVAILABLE));
+        }
+        unsafe {
+            PostMessageW(
+                Some(hwnd_of(self.hwnd)),
+                WM_CARD_UIA_LINK,
+                WPARAM(EXPAND_ID as usize),
+                LPARAM(LINK_INVOKE),
+            )
         }
     }
 }
@@ -493,6 +561,21 @@ mod tests {
         assert_eq!(control_type(LinkRole::Hyperlink), 50005);
         assert_eq!(control_type(LinkRole::Button), 50000);
     }
+
+    #[test]
+    fn the_announcement_reads_the_headline_then_the_detail() {
+        assert_eq!(
+            announcement_text("x = 3", "Check the sign"),
+            "x = 3. Check the sign"
+        );
+        // No doubled full stop, and no trailing separator without detail.
+        assert_eq!(announcement_text("Done.", "More"), "Done. More");
+        assert_eq!(announcement_text("x = 3", ""), "x = 3");
+        assert_eq!(announcement_text("", ""), "");
+    }
+
+    /// Link ids are positive, so the card-level Invoke never names a link.
+    const _: () = assert!(EXPAND_ID < 0);
 
     #[test]
     fn automation_ids_are_distinct_per_link() {
