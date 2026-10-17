@@ -85,6 +85,7 @@ pub fn follows_variants(state: GalleryState) -> bool {
             | SettingsKeyChecking
             | SettingsKeyRejected
             | SettingsComboHover
+            | SettingsComboOpen
     )
 }
 
@@ -149,6 +150,7 @@ pub fn follows_dpi_only(state: GalleryState) -> bool {
             | SettingsKeyChecking
             | SettingsKeyRejected
             | SettingsComboHover
+            | SettingsComboOpen
     )
 }
 
@@ -307,6 +309,9 @@ pub enum GalleryState {
     SettingsKeyRejected,
     /// #1109: the General page with the mouse over the Card corner combo.
     SettingsComboHover,
+    /// #1125: the General page with the Card corner list dropped open, the
+    /// list pasted in from its own window.
+    SettingsComboOpen,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
@@ -375,6 +380,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsKeyChecking,
         SettingsKeyRejected,
         SettingsComboHover,
+        SettingsComboOpen,
         RegionOverlay,
         OverlayNotes,
         TrayMenu,
@@ -438,6 +444,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsKeyChecking => "settings-key-checking",
         SettingsKeyRejected => "settings-key-rejected",
         SettingsComboHover => "settings-combo-hover",
+        SettingsComboOpen => "settings-combo-open",
         RegionOverlay => "region-overlay",
         OverlayNotes => "overlay-notes",
         TrayMenu => "tray-menu",
@@ -726,6 +733,16 @@ mod driver {
             // cursor, which clears the hover set above: set it again so the
             // picture does not depend on where the cursor happens to be.
             palette.set_hover_for_test(Some(2));
+        }
+        if state == GalleryState::SettingsComboOpen {
+            // The drop list is a popup window of its own, so the picture of
+            // Settings does not hold it: print it too and paste it in (#1125).
+            let list = settings
+                .as_ref()
+                .and_then(|w| w.combo_list_hwnd(crate::ui::settings::CARD_CORNER_COMBO))
+                .ok_or_else(|| anyhow::anyhow!("the Card corner list did not open"))?;
+            print_window_with_list_png(hwnd, list, path)?;
+            return Ok(hwnd);
         }
         print_window_png(hwnd, path, prints_with_wm_print(state))?;
         if draws_with_direct2d(state) {
@@ -1271,6 +1288,7 @@ mod driver {
             | SettingsInvalid
             | SettingsNotSaved
             | SettingsComboHover
+            | SettingsComboOpen
             | SettingsKeyChecking
             | SettingsKeyRejected => {
                 card.hide();
@@ -1301,6 +1319,7 @@ mod driver {
                         false,
                     ),
                     SettingsComboHover => w.hover_combo(crate::ui::settings::CARD_CORNER_COMBO),
+                    SettingsComboOpen => w.open_combo_list(crate::ui::settings::CARD_CORNER_COMBO),
                     _ => {}
                 }
                 *settings = Some(w);
@@ -1325,6 +1344,7 @@ mod driver {
             | SettingsInvalid
             | SettingsNotSaved
             | SettingsComboHover
+            | SettingsComboOpen
             | SettingsKeyChecking
             | SettingsKeyRejected => settings
                 .as_ref()
@@ -1628,6 +1648,61 @@ mod driver {
             } else {
                 anyhow::bail!("PrintWindow failed for {path:?}")
             }
+        })
+    }
+
+    /// Like [`print_window_png`] for a window with an open combo list: the list
+    /// is its own popup window, so it is printed whole (frame included) and
+    /// copied into the picture at its place on screen.
+    fn print_window_with_list_png(
+        hwnd: HWND,
+        list: HWND,
+        path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        use windows::Win32::Foundation::{POINT, RECT};
+        use windows::Win32::Graphics::Gdi::{BitBlt, ClientToScreen, SRCCOPY};
+        use windows::Win32::Storage::Xps::PRINT_WINDOW_FLAGS;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        capture_client_png(hwnd, path, |dc| {
+            if !unsafe { PrintWindow(hwnd, dc, PW_CLIENTONLY) }.as_bool() {
+                anyhow::bail!("PrintWindow failed for {path:?}");
+            }
+            unsafe {
+                let mut rect = RECT::default();
+                GetWindowRect(list, &mut rect)?;
+                let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+                anyhow::ensure!(w > 0 && h > 0, "the combo list has no size");
+                let mut origin = POINT::default();
+                anyhow::ensure!(
+                    ClientToScreen(hwnd, &mut origin).as_bool(),
+                    "no screen position for the Settings client area"
+                );
+                let screen_dc: HDC = GetDC(None);
+                let list_dc = CreateCompatibleDC(Some(screen_dc));
+                let bitmap: HBITMAP = CreateCompatibleBitmap(screen_dc, w, h);
+                let old = SelectObject(list_dc, bitmap.into());
+                // Flags 0: the whole window, not just its client area.
+                let printed = PrintWindow(list, list_dc, PRINT_WINDOW_FLAGS(0)).as_bool();
+                let pasted = printed
+                    && BitBlt(
+                        dc,
+                        rect.left - origin.x,
+                        rect.top - origin.y,
+                        w,
+                        h,
+                        Some(list_dc),
+                        0,
+                        0,
+                        SRCCOPY,
+                    )
+                    .is_ok();
+                SelectObject(list_dc, old);
+                let _ = DeleteObject(bitmap.into());
+                let _ = DeleteDC(list_dc);
+                ReleaseDC(None, screen_dc);
+                anyhow::ensure!(pasted, "could not paste the combo list into {path:?}");
+            }
+            Ok(())
         })
     }
 
@@ -1953,8 +2028,8 @@ mod tests {
         // button states (#818) = 46, + the status line saved, not valid and not
         // saved (#875) = 49, + the in-place overlay (#809) = 50, + the key being
         // checked and refused (#876) = 52, + the Settings combo under the mouse
-        // (#1109) = 53.
-        assert_eq!(states.len(), 53);
+        // (#1109) = 53, + the same combo with its list open (#1125) = 54.
+        assert_eq!(states.len(), 54);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -1999,14 +2074,15 @@ mod tests {
             "settings-key-checking",
             "settings-key-rejected",
             "settings-combo-hover",
+            "settings-combo-open",
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
         // One state per page of the rail: a page added there needs a picture.
         assert_eq!(
             crate::ui::settings::page_labels().len(),
-            names.iter().filter(|n| n.starts_with("settings-")).count() - 9,
-            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line five (#875, #876) and the combo hover (#1109)"
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 10,
+            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line five (#875, #876), the combo hover (#1109) and the open combo list (#1125)"
         );
     }
 

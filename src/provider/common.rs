@@ -215,6 +215,28 @@ fn is_provably_unsent(e: &ureq::Error) -> bool {
     }
 }
 
+/// #1157: the HTTP agent for one request. `ureq` 3 reads `HTTPS_PROXY`,
+/// `HTTP_PROXY` and `ALL_PROXY` by default and has no loopback bypass, so a
+/// local Ollama call (prompt plus screenshot) would go to the proxy unless
+/// `NO_PROXY` happened to list it. A loopback address never uses a proxy; any
+/// other address keeps the environment's proxy settings.
+fn agent_for(url: &str) -> ureq::Agent {
+    agent_with_base(url, ureq::Agent::config_builder())
+}
+
+/// [`agent_for`] over a given base config (the seam the tests use to put a proxy
+/// in place without touching the process environment).
+fn agent_with_base(
+    url: &str,
+    base: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+) -> ureq::Agent {
+    if crate::usage::is_loopback_url(url) {
+        ureq::Agent::new_with_config(base.proxy(None).build())
+    } else {
+        ureq::Agent::new_with_config(base.build())
+    }
+}
+
 pub(crate) trait Transport {
     fn post_json(
         &self,
@@ -238,7 +260,7 @@ impl Transport for UreqTransport {
         timeout: Duration,
     ) -> std::result::Result<RawResponse, TransportError> {
         crate::ui_thread::blocking_call("post_json");
-        let mut builder = ureq::post(url);
+        let mut builder = agent_for(url).post(url);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
@@ -1062,7 +1084,8 @@ pub(crate) fn get_text_with_timeout(url: &str, timeout: Duration, tag: &str) -> 
     crate::ui_thread::blocking_call(tag);
     offline_guard(url)?;
 
-    let response = ureq::get(url)
+    let response = agent_for(url)
+        .get(url)
         .config()
         .http_status_as_error(false)
         .timeout_global(Some(timeout))
@@ -1141,7 +1164,7 @@ fn get_with_headers_raw(
     timeout: Duration,
 ) -> std::result::Result<RawResponse, String> {
     crate::ui_thread::blocking_call("get_with_headers");
-    let mut builder = ureq::get(url);
+    let mut builder = agent_for(url).get(url);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
@@ -1344,7 +1367,8 @@ fn post_json_read_body_ureq<T>(
     tag: &str,
     read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
 ) -> Result<T> {
-    let mut response = ureq::post(url)
+    let mut response = agent_for(url)
+        .post(url)
         .config()
         .http_status_as_error(false)
         .timeout_connect(Some(connect_timeout))
@@ -1485,7 +1509,7 @@ pub(crate) fn post_json_with_connect_timeout(
         return Err(call_deadline_error(tag));
     };
 
-    let mut builder = ureq::post(url);
+    let mut builder = agent_for(url).post(url);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
@@ -2147,7 +2171,7 @@ mod tests {
             .filter_map(|&i| {
                 let end = code[i..].find("\n}\n").map_or(code.len(), |e| i + e + 3);
                 let f = &code[i..end];
-                (f.contains("ureq::post(") || f.contains("TcpStream::connect")).then_some(f)
+                (f.contains(".post(url)") || f.contains("TcpStream::connect")).then_some(f)
             })
             .collect();
         assert!(
@@ -3053,6 +3077,73 @@ mod tests {
             assert_eq!(transport.call_count(), 1, "mode {mode:?}");
         }
         crate::mode::set_current(crate::mode::Mode::Auto);
+    }
+
+    /// #1157: a loopback request never goes through an env proxy.
+    #[test]
+    fn agent_for_loopback_has_no_proxy() {
+        for url in [
+            "http://127.0.0.1:11434/api/chat",
+            "http://127.1.2.3:8080/x",
+            "http://[::1]:11434/api/tags",
+            "http://localhost:1234/v1/models",
+        ] {
+            assert!(agent_for(url).config().proxy().is_none(), "{url}");
+        }
+        // Remote keeps whatever the default agent resolved from the env.
+        assert_eq!(
+            agent_for("https://api.example.com/v1").config().proxy(),
+            ureq::Agent::new_with_defaults().config().proxy()
+        );
+    }
+
+    /// #1157, end to end: with a proxy configured at a port nobody listens on,
+    /// a request to a local server still arrives, and one to any other
+    /// address still takes the proxy. The proxy is put in place through the
+    /// config, not the environment, so parallel tests are not affected.
+    #[test]
+    fn loopback_request_ignores_a_dead_proxy_and_a_remote_one_does_not() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        });
+        // Port 9 (discard) on loopback is closed on a normal machine.
+        let dead_proxy = || {
+            ureq::Agent::config_builder()
+                .proxy(Some(ureq::Proxy::new("http://127.0.0.1:9").unwrap()))
+        };
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut response = agent_with_base(&url, dead_proxy())
+            .get(&url)
+            .call()
+            .expect("loopback call must not use the proxy");
+        assert_eq!(response.body_mut().read_to_string().unwrap(), "ok");
+        server.join().unwrap();
+
+        // A remote address keeps the proxy: the dead proxy makes it fail.
+        let remote = "http://192.0.2.1:80/";
+        let err = agent_with_base(remote, dead_proxy()).get(remote).call();
+        assert!(err.is_err(), "a remote call must go through the proxy");
+    }
+    /// #1157: every `ureq` send in this file must be built from
+    /// [`agent_for`], or a new call site silently skips the loopback bypass.
+    #[test]
+    fn every_ureq_send_in_common_uses_agent_for() {
+        let whole = include_str!("common.rs").replace('\r', "");
+        let code = whole.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            code.matches("agent_for(url)").count() >= 4,
+            "the scan found too few agent_for call sites"
+        );
+        for bare in ["ureq::post(", "ureq::get(", "ureq::put(", "ureq::request("] {
+            assert!(!code.contains(bare), "{bare} bypasses agent_for");
+        }
     }
 
     /// #19: the guard lives entirely in this file. A provider that called

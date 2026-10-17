@@ -820,6 +820,18 @@ struct KeySeams {
     check: fn(crate::provider::model_list::Vendor, &str) -> crate::provider::model_list::KeyCheck,
     /// The mode now.
     mode: fn() -> crate::mode::Mode,
+    /// The full model list, for a check whose first page was not all of it.
+    fetch_all: fn(crate::provider::model_list::Vendor, &str) -> anyhow::Result<Vec<String>>,
+    /// Starts the check's worker thread (#1140: a test makes it fail).
+    spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+}
+
+/// The real worker thread of a key check.
+fn spawn_key_check_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("settings-key-check".into())
+        .spawn(job)
+        .map(|_| ())
 }
 
 impl KeySeams {
@@ -827,6 +839,8 @@ impl KeySeams {
     const REAL: KeySeams = KeySeams {
         check: crate::provider::model_list::check_key,
         mode: crate::mode::current,
+        fetch_all: crate::provider::model_list::fetch,
+        spawn: spawn_key_check_thread,
     };
 
     /// In a test build a window never reaches a vendor, whichever test made it:
@@ -835,6 +849,8 @@ impl KeySeams {
     const REAL: KeySeams = KeySeams {
         check: |_, _| crate::provider::model_list::KeyCheck::Unchecked,
         mode: || crate::mode::Mode::Auto,
+        fetch_all: |_, _| Err(anyhow::anyhow!("no network in tests")),
+        spawn: spawn_key_check_thread,
     };
 }
 
@@ -1517,10 +1533,23 @@ fn key_refusal(applied: &Config, field: Field, raw: &RawForm) -> Option<&'static
 
 /// Puts the status line's text up, and shows or hides Undo with it.
 fn set_status(inner: &mut SettingsInner, text: &str, undo: bool) {
-    if let Some(line) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-        set_text(line, text);
-    }
+    say(inner.hwnd, ID_VALIDATION_MESSAGE, text);
     set_undo_shown(inner, undo);
+}
+
+/// Sets the words of a status line (the footer's, or the shortcut line) and
+/// raises a live region change on it, so a screen reader announces "Saved:
+/// Card corner" and every error without the focus moving (#781, #877). A
+/// static is a plain, enabled control, which is what the event needs.
+fn say(hwnd: HWND, id: i32, text: &str) {
+    use windows::Win32::UI::Accessibility::NotifyWinEvent;
+    use windows::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_LIVEREGIONCHANGED;
+    const OBJID_CLIENT: i32 = -4;
+    let Some(line) = get_dlg_item(hwnd, id) else {
+        return;
+    };
+    set_text(line, text);
+    unsafe { NotifyWinEvent(EVENT_OBJECT_LIVEREGIONCHANGED, line, OBJID_CLIENT, 0) };
 }
 
 fn set_undo_shown(inner: &mut SettingsInner, shown: bool) {
@@ -1622,50 +1651,79 @@ fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: S
     set_status(inner, commit::CHECKING_LINE, false);
     let vendor = CLOUD_VENDORS[index];
     let check = inner.key_seams.check;
+    let fetch_all = inner.key_seams.fetch_all;
     // The list that comes with the answer replaces a slower list fetch's.
     let mine = inner.cloud_sync.generation[index].fetch_add(1, Ordering::SeqCst) + 1;
     let slots = inner.cloud_models.clone();
     let sync = inner.cloud_sync.clone();
     let alive = inner.alive.clone();
     let hwnd_raw = inner.hwnd.0 as isize;
-    let _ = std::thread::Builder::new()
-        .name("settings-key-check".into())
-        .spawn(move || {
-            use crate::provider::model_list::KeyCheck;
-            let verdict = match check(vendor, &key) {
-                KeyCheck::Accepted(ids) => {
-                    if store_fetched_list(&slots, &sync, index, mine, &key, ids) {
-                        post_while_open(&alive, || unsafe {
-                            let _ = PostMessageW(
-                                Some(HWND(hwnd_raw as *mut c_void)),
-                                WM_CLOUD_MODELS,
-                                WPARAM(index),
-                                LPARAM(0),
-                            );
-                        });
-                    }
-                    commit::KeyVerdict::Accepted
+    let job = move || {
+        use crate::provider::model_list::KeyCheck;
+        let mut full_list_owed = false;
+        let verdict = match check(vendor, &key) {
+            KeyCheck::Accepted(ids, complete) => {
+                // A first page that is not the whole list is not stored: the
+                // dropdown would keep it, and the key would count as fetched.
+                full_list_owed = !complete;
+                if complete && store_fetched_list(&slots, &sync, index, mine, &key, ids) {
+                    post_while_open(&alive, || unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(hwnd_raw as *mut c_void)),
+                            WM_CLOUD_MODELS,
+                            WPARAM(index),
+                            LPARAM(0),
+                        );
+                    });
                 }
-                KeyCheck::Rejected => commit::KeyVerdict::Rejected,
-                KeyCheck::Unchecked => {
-                    // No key text and no error text: the report is pasted into
-                    // public issues. The egress log has the failure.
-                    crate::diagnostics::note_warning(&format!(
-                        "Key check for {} could not finish: saving the key unchecked",
-                        vendor.tag()
-                    ));
-                    commit::KeyVerdict::Unchecked
-                }
-            };
-            post_while_open(&alive, || unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(hwnd_raw as *mut c_void)),
-                    WM_KEY_CHECKED,
-                    WPARAM(index),
-                    LPARAM(commit::encode_verdict(generation, verdict)),
-                );
-            });
+                commit::KeyVerdict::Accepted
+            }
+            KeyCheck::Rejected => commit::KeyVerdict::Rejected,
+            KeyCheck::Unchecked => {
+                // No key text and no error text: the report is pasted into
+                // public issues. The egress log has the failure.
+                crate::diagnostics::note_warning(&format!(
+                    "Key check for {} could not finish: saving the key unchecked",
+                    vendor.tag()
+                ));
+                commit::KeyVerdict::Unchecked
+            }
+        };
+        post_while_open(&alive, || unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd_raw as *mut c_void)),
+                WM_KEY_CHECKED,
+                WPARAM(index),
+                LPARAM(commit::encode_verdict(generation, verdict)),
+            );
         });
+        // The verdict is out; now the rest of a list that goes on, which the
+        // check did not wait for (#1140).
+        if full_list_owed {
+            if let Ok(ids) = fetch_all(vendor, &key) {
+                if store_fetched_list(&slots, &sync, index, mine, &key, ids) {
+                    post_while_open(&alive, || unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(hwnd_raw as *mut c_void)),
+                            WM_CLOUD_MODELS,
+                            WPARAM(index),
+                            LPARAM(0),
+                        );
+                    });
+                }
+            }
+        }
+    };
+    if (inner.key_seams.spawn)(Box::new(job)).is_err() {
+        // No worker, so no answer would ever come and the row would say
+        // "Checking key..." for good (#1140). Settle it as a check that could
+        // not finish: the key is saved with the "not checked" note.
+        crate::diagnostics::note_warning(&format!(
+            "Key check for {} could not start: saving the key unchecked",
+            vendor.tag()
+        ));
+        on_key_checked(inner, index, generation, commit::KeyVerdict::Unchecked);
+    }
 }
 
 /// A vendor answered for a typed key. A refusal keeps the text for fixing and
@@ -2714,8 +2772,28 @@ fn annotate_accessible_names(hwnd: HWND) {
                 );
             }
         }
+        // A screen reader announces a live region change only for a control
+        // whose UIA LiveSetting is set, so the status lines say Polite.
+        let polite = windows::Win32::System::Variant::VARIANT::from(
+            windows::Win32::UI::Accessibility::Polite.0,
+        );
+        for id in LIVE_STATUS_IDS {
+            if let Some(line) = get_dlg_item(hwnd, id) {
+                let _ = service.SetHwndProp(
+                    line,
+                    ACC_OBJID_CLIENT,
+                    0,
+                    windows::Win32::UI::Accessibility::LiveSetting_Property_GUID,
+                    &polite,
+                );
+            }
+        }
     });
 }
+
+/// The status lines that announce what they say: the footer's and the
+/// shortcut line's.
+const LIVE_STATUS_IDS: [i32; 2] = [ID_VALIDATION_MESSAGE, ID_HOTKEY_STATUS];
 
 /// Takes the names of [`annotate_accessible_names`] back as the window goes:
 /// the service keeps them by window handle, and Windows recycles handles, so a
@@ -2726,6 +2804,16 @@ fn clear_accessible_names(hwnd: HWND) {
         for (id, _) in ACCESSIBLE_NAMES {
             if let Some(button) = get_dlg_item(hwnd, id) {
                 let _ = service.ClearHwndProps(button, ACC_OBJID_CLIENT, 0, &[PROPID_ACC_NAME]);
+            }
+        }
+        for id in LIVE_STATUS_IDS {
+            if let Some(line) = get_dlg_item(hwnd, id) {
+                let _ = service.ClearHwndProps(
+                    line,
+                    ACC_OBJID_CLIENT,
+                    0,
+                    &[windows::Win32::UI::Accessibility::LiveSetting_Property_GUID],
+                );
             }
         }
     });
@@ -6468,9 +6556,11 @@ fn send_command_to(hwnd: HWND, owner: HWND, command: crate::app::SettingsCommand
     }
     if !crate::app::post_settings_command(owner.0 as isize, command) {
         // Rule 7: say so inline, never a silent no-op.
-        if let Some(msg) = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE) {
-            set_text(msg, "Wingman's main window is not running.");
-        }
+        say(
+            hwnd,
+            ID_VALIDATION_MESSAGE,
+            "Wingman's main window is not running.",
+        );
     }
 }
 
@@ -6552,9 +6642,7 @@ fn open_config_file(inner: &SettingsInner) {
         _ => false,
     };
     if !opened {
-        if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-            set_text(msg, OPEN_CONFIG_FAILED);
-        }
+        say(inner.hwnd, ID_VALIDATION_MESSAGE, OPEN_CONFIG_FAILED);
     }
 }
 
@@ -8561,9 +8649,7 @@ fn finalize_config(inner: &SettingsInner, raw: &RawForm) -> Config {
 }
 
 fn set_hotkey_status(hwnd: HWND, text: &str) {
-    if let Some(status) = get_dlg_item(hwnd, ID_HOTKEY_STATUS) {
-        set_text(status, text);
-    }
+    say(hwnd, ID_HOTKEY_STATUS, text);
 }
 
 /// Points the two shortcut labels at `hotkeys`.
@@ -9206,9 +9292,7 @@ fn lock_env_key_fields(hwnd: HWND) {
             }
         }
     }
-    if let Some(msg) = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE) {
-        set_text(msg, &env_key_hint(&env_hint_vars()));
-    }
+    say(hwnd, ID_VALIDATION_MESSAGE, &env_key_hint(&env_hint_vars()));
 }
 
 /// The names of the set key variables, for [`env_key_hint`].
@@ -9515,6 +9599,43 @@ impl GalleryWindow {
         let inner = unsafe { &mut *self.raw };
         if let Some(combo) = get_dlg_item(inner.hwnd, id) {
             hover_combo_for_gallery(combo);
+        }
+    }
+
+    /// Drops the list of the combo `id` open (what a click on it does), for the gallery.
+    pub(crate) fn open_combo_list(&mut self, id: i32) {
+        let inner = unsafe { &mut *self.raw };
+        if let Some(combo) = get_dlg_item(inner.hwnd, id) {
+            unsafe {
+                SendMessageW(
+                    combo,
+                    windows::Win32::UI::WindowsAndMessaging::CB_SHOWDROPDOWN,
+                    Some(WPARAM(1)),
+                    Some(LPARAM(0)),
+                );
+            }
+        }
+    }
+
+    /// The window of the open drop list of the combo `id`, if it is showing.
+    pub(crate) fn combo_list_hwnd(&self, id: i32) -> Option<HWND> {
+        use windows::Win32::UI::Controls::COMBOBOXINFO;
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, CB_GETCOMBOBOXINFO};
+        let inner = unsafe { &*self.raw };
+        let combo = get_dlg_item(inner.hwnd, id)?;
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            SendMessageW(
+                combo,
+                CB_GETCOMBOBOXINFO,
+                Some(WPARAM(0)),
+                Some(LPARAM(&mut info as *mut COMBOBOXINFO as isize)),
+            );
+            (!info.hwndList.is_invalid() && IsWindowVisible(info.hwndList).as_bool())
+                .then_some(info.hwndList)
         }
     }
 
@@ -10420,6 +10541,118 @@ mod tests {
             assert_ne!(a, 0, "the hairline got a brush");
             assert_eq!(a, b, "the brush is cached, not made per ask");
             assert_eq!(a, unsafe { edit_style() }.hairline_brush.0 as isize);
+        });
+    }
+
+    thread_local! {
+        /// Live region events the test hook has seen, as the window handles.
+        static LIVE_EVENTS: std::cell::RefCell<Vec<isize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "system" fn live_event_proc(
+        _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+        _event: u32,
+        hwnd: HWND,
+        _id_object: i32,
+        _id_child: i32,
+        _thread: u32,
+        _time: u32,
+    ) {
+        LIVE_EVENTS.with(|e| e.borrow_mut().push(hwnd.0 as isize));
+    }
+
+    /// The observable of the live region: a message on the status line raises
+    /// `EVENT_OBJECT_LIVEREGIONCHANGED` on that control, which is what a
+    /// screen reader listens for. A real out-of-context event hook, pumped on
+    /// this thread, hears it; with the call missing it hears nothing.
+    #[test]
+    fn a_status_message_raises_a_live_region_event_on_the_status_line() {
+        use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, EVENT_OBJECT_LIVEREGIONCHANGED, PM_REMOVE,
+        };
+        with_window(Config::default(), |hwnd, raw| {
+            LIVE_EVENTS.with(|e| e.borrow_mut().clear());
+            let hook = unsafe {
+                SetWinEventHook(
+                    EVENT_OBJECT_LIVEREGIONCHANGED,
+                    EVENT_OBJECT_LIVEREGIONCHANGED,
+                    None,
+                    Some(live_event_proc),
+                    std::process::id(),
+                    windows::Win32::System::Threading::GetCurrentThreadId(),
+                    0, // WINEVENT_OUTOFCONTEXT
+                )
+            };
+            assert!(!hook.0.is_null(), "the event hook was installed");
+            set_status(unsafe { &mut *raw }, "Saved: Card corner", true);
+            let mut m = MSG::default();
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            while LIVE_EVENTS.with(|e| e.borrow().is_empty()) && std::time::Instant::now() < until {
+                while unsafe { PeekMessageW(&mut m, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    unsafe { DispatchMessageW(&m) };
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            unsafe {
+                let _ = UnhookWinEvent(hook);
+            }
+            let line = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("status line");
+            let heard = LIVE_EVENTS.with(|e| e.borrow().clone());
+            assert!(heard.contains(&(line.0 as isize)), "heard {heard:?}");
+            assert_eq!(get_text(line), "Saved: Card corner");
+        });
+    }
+
+    /// Narrator announces a live region change only for a control whose UIA
+    /// `LiveSetting` is set. Read back through real UI Automation (from a
+    /// second thread, as a screen reader is another process; this thread
+    /// pumps the window), both status lines say Polite. Without the annotation
+    /// the property reads 0 (Off) and this fails.
+    #[test]
+    fn the_status_lines_are_polite_uia_live_regions() {
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+        use windows::Win32::UI::Accessibility::UIA_LiveSettingPropertyId;
+        use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, PM_REMOVE};
+        with_window(Config::default(), |hwnd, _raw| {
+            let lines: Vec<isize> = LIVE_STATUS_IDS
+                .iter()
+                .map(|id| get_dlg_item(hwnd, *id).expect("status line").0 as isize)
+                .collect();
+            let reader = std::thread::spawn(move || unsafe {
+                let init = CoInitializeEx(None, COINIT_MULTITHREADED);
+                let automation = crate::inputs::uia_automation::create_automation();
+                let out: Vec<i32> = match automation {
+                    Ok(a) => lines
+                        .iter()
+                        .map(|h| {
+                            a.ElementFromHandle(HWND(*h as *mut c_void))
+                                .and_then(|e| e.GetCurrentPropertyValue(UIA_LiveSettingPropertyId))
+                                .ok()
+                                .and_then(|v| i32::try_from(&v).ok())
+                                .unwrap_or(-1)
+                        })
+                        .collect(),
+                    Err(_) => vec![-1; lines.len()],
+                };
+                if init.is_ok() {
+                    CoUninitialize();
+                }
+                out
+            });
+            let mut m = MSG::default();
+            while !reader.is_finished() {
+                while unsafe { PeekMessageW(&mut m, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    unsafe { DispatchMessageW(&m) };
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let got = reader.join().expect("reader thread");
+            assert_eq!(
+                got,
+                vec![1, 1],
+                "LiveSetting of the two status lines (1 = Polite)"
+            );
         });
     }
 
@@ -15868,11 +16101,14 @@ mod tests {
     static SHAPE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     fn accepts(_: Vendor, _: &str) -> KeyCheck {
-        KeyCheck::Accepted(vec!["gpt-5".to_string()])
+        KeyCheck::Accepted(vec!["gpt-5".to_string()], true)
     }
     fn accepts_and_counts(_: Vendor, _: &str) -> KeyCheck {
         ONCE_CALLS.fetch_add(1, Ordering::SeqCst);
-        KeyCheck::Accepted(vec!["claude-x".to_string()])
+        KeyCheck::Accepted(vec!["claude-x".to_string()], true)
+    }
+    fn accepts_first_page(_: Vendor, _: &str) -> KeyCheck {
+        KeyCheck::Accepted(vec!["page-one".to_string()], false)
     }
     fn rejects(_: Vendor, _: &str) -> KeyCheck {
         KeyCheck::Rejected
@@ -15900,7 +16136,57 @@ mod tests {
         check: fn(Vendor, &str) -> KeyCheck,
         mode: fn() -> crate::mode::Mode,
     ) {
-        unsafe { &mut *raw }.key_seams = KeySeams { check, mode };
+        unsafe { &mut *raw }.key_seams = KeySeams {
+            check,
+            mode,
+            fetch_all: KeySeams::REAL.fetch_all,
+            spawn: spawn_key_check_thread,
+        };
+    }
+
+    /// #1140: a check that read only the first page of a longer list leaves the
+    /// dropdown with the full list, not that page, and the key as not yet fetched.
+    #[test]
+    fn a_first_page_check_ends_with_the_full_list() {
+        with_window(Config::default(), |hwnd, raw| {
+            record_sink(raw);
+            with_vendor(raw, accepts_first_page, auto);
+            unsafe { &mut *raw }.key_seams.fetch_all =
+                |_, _| Ok(vec!["page-one".to_string(), "page-two".to_string()]);
+            set_text(get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap(), "sk-a-whole-key");
+            leave(hwnd, ID_OPENAI_KEY);
+            settle_key_check(hwnd);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let got = unsafe { &*raw }.cloud_models.lock().unwrap()[0].clone();
+                if got.as_ref().is_some_and(|l| l.len() == 2) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no full list: {got:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+    }
+
+    /// #1140: a worker thread that cannot start must not leave the row on
+    /// "Checking key..." for good: it settles as a check that could not finish.
+    #[test]
+    fn a_key_check_whose_thread_cannot_start_does_not_hang_the_row() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            with_vendor(raw, accepts, auto);
+            unsafe { &mut *raw }.key_seams.spawn =
+                |_| Err(std::io::Error::other("no threads left"));
+            set_text(get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap(), "sk-a-whole-key");
+            leave(hwnd, ID_OPENAI_KEY);
+            assert!(!unsafe { &*raw }.key_checks.is_pending(0));
+            assert_eq!(seen.borrow().len(), 1, "the key is saved unchecked");
+            assert!(answer(hwnd, "OpenAI key", Ok(())));
+            assert!(status(hwnd).contains("Could not check"), "{}", status(hwnd));
+        });
     }
 
     /// Delivers the check worker's answer, the way the message loop would. Fails

@@ -333,7 +333,9 @@ pub fn is_loopback_url(base_url: &str) -> bool {
     } else {
         host_port.split(':').next().unwrap_or("")
     };
+    // One trailing dot is the same name ("localhost.").
     let host = host.to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host);
     host == "localhost"
         || host == "::1"
         || host.strip_prefix("127.").is_some_and(|r| {
@@ -1117,6 +1119,7 @@ mod tests {
             "https://LOCALHOST/v1",
             "http://[::1]:8080/v1",
             "http://user:pw@127.0.0.5/v1",
+            "http://localhost.:11434/api/chat",
         ] {
             assert!(is_loopback_url(url), "{url}");
         }
