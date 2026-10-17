@@ -854,6 +854,9 @@ struct KeySeams {
     fetch_all: fn(crate::provider::model_list::Vendor, &str) -> anyhow::Result<Vec<String>>,
     /// Starts the check's worker thread (#1140: a test makes it fail).
     spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    /// #1130: tells the app a key saved on close was refused, as a card. Args:
+    /// the owner window, the headline, the detail. True when it was posted.
+    late_card: fn(isize, String, String) -> bool,
 }
 
 /// The real worker thread of a key check.
@@ -871,6 +874,7 @@ impl KeySeams {
         mode: crate::mode::current,
         fetch_all: crate::provider::model_list::fetch,
         spawn: spawn_key_check_thread,
+        late_card: crate::app::post_late_key_refusal,
     };
 
     /// In a test build a window never reaches a vendor, whichever test made it:
@@ -881,6 +885,7 @@ impl KeySeams {
         mode: || crate::mode::Mode::Auto,
         fetch_all: |_, _| Err(anyhow::anyhow!("no network in tests")),
         spawn: spawn_key_check_thread,
+        late_card: crate::app::post_late_key_refusal,
     };
 }
 
@@ -1035,6 +1040,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(field) = inner.deferred_key.take() {
                 commit_field(inner, field);
             }
+            save_checking_keys_unchecked(inner);
             inner.closing = true;
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -1285,8 +1291,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // queued for the main window, which would take it as a rebind.
                 // Free it unused.
                 drain_learned_messages();
-                // #876: a key still being checked is not written (it was not
-                // checked), and that is told like any other row left unsaved.
+                // #876: a key still being checked that the close did not save
+                // (a plain destroy, or its answer was already on the way) is
+                // not written, and that is told like any other row left unsaved.
                 for vendor in inner.key_checks.take_pending() {
                     if let Some(field) = key_field_of(vendor) {
                         inner.tracker.fail(field, commit::KEY_UNFINISHED);
@@ -1768,6 +1775,13 @@ fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: S
     let sync = inner.cloud_sync.clone();
     let alive = inner.alive.clone();
     let hwnd_raw = inner.hwnd.0 as isize;
+    let owner_raw = inner.owner.0 as isize;
+    let late_card = inner.key_seams.late_card;
+    // This check's claim: the close and this worker settle its answer once.
+    let claim = inner
+        .key_checks
+        .claim_of(index)
+        .unwrap_or_else(commit::new_claim);
     let job = move || {
         use crate::provider::model_list::KeyCheck;
         let mut full_list_owed = false;
@@ -1799,14 +1813,22 @@ fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: S
                 commit::KeyVerdict::Unchecked
             }
         };
-        post_while_open(&alive, || unsafe {
-            let _ = PostMessageW(
-                Some(HWND(hwnd_raw as *mut c_void)),
-                WM_KEY_CHECKED,
-                WPARAM(index),
-                LPARAM(commit::encode_verdict(generation, verdict)),
-            );
-        });
+        // #1130: the answer is the window's unless the close already saved
+        // this very key unchecked; then a refusal is told in a card by the app.
+        if commit::worker_claims(&claim) {
+            post_while_open(&alive, || unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd_raw as *mut c_void)),
+                    WM_KEY_CHECKED,
+                    WPARAM(index),
+                    LPARAM(commit::encode_verdict(generation, verdict)),
+                );
+            });
+        }
+        if commit::late_refusal(verdict, commit::closed_saved(&claim)) {
+            let (headline, detail) = commit::late_refusal_card(index);
+            let _ = late_card(owner_raw, headline, detail);
+        }
         // The verdict is out; now the rest of a list that goes on, which the
         // check did not wait for (#1140).
         if full_list_owed {
@@ -1876,6 +1898,39 @@ fn on_key_checked(
         return;
     }
     apply_field(inner, field, &raw, commit::verdict_note(verdict));
+}
+
+/// #1130: closing while a typed key is still out for checking saves that key
+/// unchecked, as a check that could not finish does (only a refusal blocks a
+/// key), so it is not lost. The check's claim decides who tells the user what
+/// the vendor says: the worker (a refusal after this is a card, `late_refusal`)
+/// or the window (the answer was already posted).
+fn save_checking_keys_unchecked(inner: &mut SettingsInner) {
+    for (index, key, claim) in inner.key_checks.snapshot() {
+        let Some(field) = key_field_of(index) else {
+            continue;
+        };
+        // The worker answered already: its message is on the way to a closing
+        // window, so the key is left to the destroy, which counts it as unsaved.
+        if !commit::close_claims(&claim) {
+            continue;
+        }
+        inner.key_checks.forget(index);
+        // From here the worker sees the window is gone.
+        inner.alive.store(false, Ordering::SeqCst);
+        let mut raw = read_raw_form(inner);
+        match index {
+            0 => raw.openai_key = key,
+            1 => raw.anthropic_key = key,
+            _ => raw.gemini_key = key,
+        }
+        apply_field(
+            inner,
+            field,
+            &raw,
+            commit::verdict_note(commit::KeyVerdict::Unchecked),
+        );
+    }
 }
 
 /// Whether the status line shows exactly `text`.
@@ -18346,6 +18401,7 @@ mod tests {
             mode,
             fetch_all: KeySeams::REAL.fetch_all,
             spawn: spawn_key_check_thread,
+            late_card: KeySeams::REAL.late_card,
         };
     }
 
@@ -18619,9 +18675,9 @@ mod tests {
         });
     }
 
-    /// A key typed, then the window deactivated, then closed: counted as not
-    /// saved, whether it does not fit its vendor or has not been checked yet.
-    /// Never silently dropped.
+    /// A key typed, then the window deactivated, then closed: one that does not
+    /// fit its vendor is counted as not saved, one still being checked is saved
+    /// unchecked (#1130). Never silently dropped.
     #[test]
     fn closing_while_inactive_does_not_drop_a_typed_key() {
         use windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE;
@@ -18641,15 +18697,161 @@ mod tests {
             assert_eq!(left.wParam.0, 1, "a key that does not fit is counted");
         });
         with_open_window(|hwnd, owner| {
+            // The check is held until after the close, so the close finds it
+            // still out (a check that answers at once is the window's, not the
+            // close's, and a loop-less test never delivers its answer).
+            let release = gate_check(hwnd, "sk-a-whole-key");
             away(hwnd, "sk-a-whole-key");
             drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
-            // #876: the key was still being checked, so it was not stored, and
-            // closing counts it as not saved instead of dropping it silently.
-            assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_none());
+            let _ = release.send(());
+            // #1130: the key was still being checked, so closing saves it
+            // unchecked (only a refusal blocks a key) instead of losing it.
+            assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_some());
             let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
                 .expect("closing tells the owner");
-            assert_eq!(left.wParam.0, 1, "an unchecked key is counted");
+            assert_eq!(left.wParam.0, 0, "a saved key is not counted as lost");
+        });
+    }
+
+    // -- a key still being checked when the window closes (#1130) ------------
+
+    static GATES: std::sync::Mutex<
+        Option<std::collections::HashMap<String, std::sync::mpsc::Receiver<()>>>,
+    > = std::sync::Mutex::new(None);
+    static CHECKS_DONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A vendor stub that holds each key's answer until the test releases it:
+    /// a key with "bad" in it is refused, any other is "could not check".
+    fn gated_check(_: Vendor, key: &str) -> KeyCheck {
+        let gate = GATES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .and_then(|g| g.remove(key));
+        if let Some(rx) = gate {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+        }
+        CHECKS_DONE.fetch_add(1, Ordering::SeqCst);
+        if key.contains("bad") {
+            KeyCheck::Rejected
+        } else {
+            KeyCheck::Unchecked
+        }
+    }
+
+    /// Puts the gated vendor behind the window (real late-card post, real
+    /// owner) and holds `key`'s answer. Send on the result to release it.
+    fn gate_check(hwnd: HWND, key: &str) -> std::sync::mpsc::Sender<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        GATES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(key.to_string(), rx);
+        let inner = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
+        inner.key_seams = KeySeams {
+            check: gated_check,
+            mode: auto,
+            fetch_all: KeySeams::REAL.fetch_all,
+            spawn: spawn_key_check_thread,
+            late_card: crate::app::post_late_key_refusal,
+        };
+        tx
+    }
+
+    fn type_key(hwnd: HWND, id: i32, key: &str) {
+        set_text(get_dlg_item(hwnd, id).unwrap(), key);
+        leave(hwnd, id);
+    }
+
+    /// Waits until `n` more stub checks have returned, then a moment for the
+    /// worker to act on its verdict.
+    fn wait_checks(before: usize, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while CHECKS_DONE.load(Ordering::SeqCst) < before + n {
+            assert!(std::time::Instant::now() < deadline, "a check never ended");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    fn queued(headline_start: &str) -> usize {
+        crate::app::queued_shell_open_titles()
+            .iter()
+            .filter(|t| t.starts_with(headline_start))
+            .count()
+    }
+
+    /// The worker glue, end to end: a key still being checked at close is saved
+    /// unchecked and the window does not count it as lost; when the vendor then
+    /// refuses it, exactly one failure is queued for the app and the app is told
+    /// once (`WM_APP_SHELL_OPEN_DONE`). Wired to nothing, either nothing would be
+    /// saved or no card would come.
+    #[test]
+    fn a_key_refused_after_the_window_closed_saved_it_is_one_card() {
+        with_open_window(|hwnd, owner| {
+            let release = gate_check(hwnd, "sk-bad-whole-key");
+            drain_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE);
+            while queued("OpenAI did not accept the key") > 0 {
+                crate::app::retract_shell_open_failure(&commit::late_refusal_card(0).0);
+            }
+            let before = CHECKS_DONE.load(Ordering::SeqCst);
+            type_key(hwnd, ID_OPENAI_KEY, "sk-bad-whole-key");
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_SAVE);
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
+            unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
+            assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_some());
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).unwrap();
+            assert_eq!(left.wParam.0, 0);
+            assert_eq!(queued("OpenAI did not accept the key"), 0, "too early");
+            let _ = release.send(());
+            wait_checks(before, 1);
+            assert_eq!(queued("OpenAI did not accept the key"), 1);
+            assert!(take_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE).is_some());
+            assert!(take_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE).is_none());
+            crate::app::retract_shell_open_failure(&commit::late_refusal_card(0).0);
+        });
+    }
+
+    /// Key A is out for checking, key B replaces it, the window closes: B is
+    /// saved, and A's refusal (A is not what was saved) raises no card.
+    #[test]
+    fn a_replaced_keys_refusal_is_not_a_late_card() {
+        with_open_window(|hwnd, owner| {
+            let a = "sk-ant-bad-key";
+            let b = "sk-ant-ok-key";
+            let release_a = gate_check(hwnd, a);
+            let release_b = gate_check(hwnd, b);
+            drain_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE);
+            let before = CHECKS_DONE.load(Ordering::SeqCst);
+            type_key(hwnd, ID_ANTHROPIC_KEY, a);
+            type_key(hwnd, ID_ANTHROPIC_KEY, b);
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_SAVE);
+            unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
+            assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_some());
+            let _ = release_a.send(());
+            let _ = release_b.send(());
+            wait_checks(before, 2);
+            assert_eq!(queued("Anthropic did not accept the key"), 0);
+            assert!(take_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE).is_none());
+        });
+    }
+
+    /// A plain destroy (not the close button) with a check out: nothing saved
+    /// it, so it is counted as unsaved, not dropped silently.
+    #[test]
+    fn a_plain_destroy_with_a_key_check_out_counts_the_key_as_unsaved() {
+        with_open_window(|hwnd, owner| {
+            let release = gate_check(hwnd, "sk-ok-whole-key");
+            type_key(hwnd, ID_OPENAI_KEY, "sk-ok-whole-key");
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_SAVE);
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
+            close_now();
+            assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_none());
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).unwrap();
+            assert_eq!(left.wParam.0, 1, "the unsaved key is counted");
+            let _ = release.send(());
         });
     }
 
