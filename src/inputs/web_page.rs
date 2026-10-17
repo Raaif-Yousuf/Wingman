@@ -529,22 +529,32 @@ fn code_page_for(label: &str) -> Option<u32> {
 /// crate). Bytes that do not fit the set become replacement characters, so
 /// this does not fail on malformed input; `None` only if the API refuses.
 pub(crate) fn decode_code_page(body: &[u8], code_page: u32) -> Option<String> {
-    use windows::Win32::Globalization::{MultiByteToWideChar, MB_PRECOMPOSED};
+    use windows::Win32::Globalization::{
+        MultiByteToWideChar, MB_PRECOMPOSED, MULTI_BYTE_TO_WIDE_CHAR_FLAGS,
+    };
     if body.is_empty() {
         return Some(String::new());
     }
     if i32::try_from(body.len()).is_err() {
         return None;
     }
+    // These pages (UTF-7, UTF-8, GB18030, ISO-2022, ...) reject any flag but
+    // 0 with ERROR_INVALID_FLAGS, so MB_PRECOMPOSED only goes to the rest.
+    let flags = if matches!(code_page, 42 | 50220..=50229 | 52936 | 54936 | 57002..=57011 | 65000 | 65001)
+    {
+        MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0)
+    } else {
+        MB_PRECOMPOSED
+    };
     // SAFETY: both calls read `body` only and write at most `wide.len()`
     // u16s into `wide`, whose length the first call asked for.
     unsafe {
-        let needed = MultiByteToWideChar(code_page, MB_PRECOMPOSED, body, None);
+        let needed = MultiByteToWideChar(code_page, flags, body, None);
         if needed <= 0 {
             return None;
         }
         let mut wide = vec![0u16; needed as usize];
-        let written = MultiByteToWideChar(code_page, MB_PRECOMPOSED, body, Some(&mut wide));
+        let written = MultiByteToWideChar(code_page, flags, body, Some(&mut wide));
         if written <= 0 {
             return None;
         }
@@ -1511,6 +1521,24 @@ mod tests {
             },
         );
         assert!(fetch(&net, "https://example.com/").unwrap().truncated);
+    }
+
+    #[test]
+    fn pages_that_take_no_flags_still_decode() {
+        // UTF-8 and GB18030 refuse MB_PRECOMPOSED (ERROR_INVALID_FLAGS).
+        assert_eq!(
+            decode_code_page("é".as_bytes(), 65001).as_deref(),
+            Some("é")
+        );
+        assert_eq!(
+            decode_code_page(b"caf\xe9", 65001).as_deref(),
+            Some("caf\u{FFFD}")
+        );
+        assert_eq!(
+            decode_code_page(&[0xC4, 0xE3, 0xBA, 0xC3], 54936).as_deref(),
+            Some("你好")
+        );
+        assert_eq!(decode_code_page(b"caf\xe9", 1252).as_deref(), Some("café"));
     }
 
     #[test]

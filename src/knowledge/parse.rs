@@ -133,6 +133,17 @@ fn decode_8bit(bytes: &[u8], cut: bool, code_page: u32) -> Result<String, ParseE
     match std::str::from_utf8(bytes) {
         Ok(s) => Ok(s.to_string()),
         Err(e) if cut && e.error_len().is_none() => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        Err(_) if code_page == CP_UTF8 || is_mostly_utf8(bytes) => {
+            // Already UTF-8 as far as it goes (the ANSI page is UTF-8, or a
+            // few stray bytes sit in a UTF-8 file): keep it, lossy.
+            let text = String::from_utf8_lossy(bytes).into_owned();
+            // The replacements are expected here; `decode` bounds their share.
+            if looks_like_text(bytes, &text.replace('\u{FFFD}', "")) {
+                Ok(text)
+            } else {
+                Err(ParseError::NotText)
+            }
+        }
         Err(_) => {
             let text = crate::inputs::web_page::decode_code_page(bytes, code_page)
                 .ok_or(ParseError::NotText)?;
@@ -143,6 +154,21 @@ fn decode_8bit(bytes: &[u8], cut: bool, code_page: u32) -> Result<String, ParseE
             }
         }
     }
+}
+
+/// The UTF-8 code page id.
+const CP_UTF8: u32 = 65001;
+
+/// True when the bytes hold valid multibyte UTF-8 and no more invalid bytes
+/// than valid multibyte characters: a UTF-8 file with a stray byte, not a
+/// single-byte file whose accents happen to look like a lead byte.
+fn is_mostly_utf8(bytes: &[u8]) -> bool {
+    let (mut multibyte, mut invalid) = (0usize, 0usize);
+    for chunk in bytes.utf8_chunks() {
+        multibyte += chunk.valid().chars().filter(|c| !c.is_ascii()).count();
+        invalid += chunk.invalid().len();
+    }
+    multibyte > 0 && invalid <= multibyte
 }
 
 /// A code-page decode never fails, so binary data must be told apart by what
@@ -465,10 +491,26 @@ mod tests {
             decode_8bit(bytes, false, 1252).as_deref(),
             Ok("café, naïve, 5 € and “quotes”")
         );
-        // Through the public entry point, on a machine whose ANSI page is 1252.
+        // Through the public entry point. This only says something on a
+        // machine whose ANSI page is 1252, so it is skipped elsewhere; the
+        // assertion above is the machine-independent one.
         if ansi_code_page() == 1252 {
             assert_eq!(txt(bytes).text, "café, naïve, 5 € and “quotes”");
         }
+    }
+
+    #[test]
+    fn the_utf8_ansi_page_reads_a_non_utf8_file_lossily() {
+        // "Beta: Use Unicode UTF-8" makes the ANSI page 65001.
+        assert!(decode_8bit(b"caf\xe9", false, 65001).is_ok());
+    }
+
+    #[test]
+    fn one_stray_byte_does_not_send_a_utf8_file_through_the_ansi_page() {
+        let mut b = "日本語".repeat(20).into_bytes();
+        b.push(0xff);
+        let text = decode_8bit(&b, false, 1252).unwrap();
+        assert!(text.starts_with("日本語日本語"));
     }
 
     #[test]
