@@ -478,6 +478,25 @@ impl Watcher {
         !self.thread.is_finished()
     }
 
+    /// Asks the thread to stop, without waiting.
+    pub fn request_stop(&self) {
+        // SAFETY: `stop` holds a live event handle.
+        unsafe {
+            let _ = SetEvent(self.stop.0);
+        }
+    }
+
+    /// Asks the thread to stop and waits up to `within` for it to end. For a
+    /// worker thread only: the UI thread must use the bounded drop.
+    pub fn stop_and_wait(&self, within: Duration) -> bool {
+        self.request_stop();
+        let end = Instant::now() + within;
+        while !self.thread.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.thread.is_finished()
+    }
+
     #[cfg(test)]
     fn wait_stopped(&self, within: Duration) -> bool {
         let end = Instant::now() + within;
