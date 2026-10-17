@@ -7133,7 +7133,10 @@ fn form_fill_worker(
         ));
     }
 
-    let proposal = actions::fill_form::build_proposal(&candidates, &mapped, require_tick_for);
+    let proposal = actions::fill_form::with_partial_read_note(
+        actions::fill_form::build_proposal(&candidates, &mapped, require_tick_for),
+        snapshot.truncated,
+    );
     // Local-only run: say which fields were left alone.
     Ok(if use_model {
         proposal
