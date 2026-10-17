@@ -21,6 +21,7 @@
 
 use super::*;
 use crate::options_keys::{self, Choice, Claim, WM_APP_OPTIONS_CHOICE};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// One button: the action id it runs and the label shown on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,26 +99,18 @@ pub(super) fn hint_text(count: usize, claim_keys: bool) -> String {
 /// `text` unchanged when `fits` accepts it, otherwise its longest prefix that
 /// still fits once an ellipsis is added (#969). GDI's `DT_END_ELLIPSIS` does not
 /// mark the cut when a wrapped paragraph is clipped by the rectangle, so the
-/// cut is made here, on `char` boundaries (never a byte slice) and after
-/// trimming the whitespace it would leave in front of the ellipsis. The cut
-/// also backs off over a joiner, variation selector, skin tone or combining
-/// mark, so it never leaves a stray joiner or parts a mark from its base.
+/// cut is made here, on grapheme-cluster boundaries (never a byte slice, never
+/// inside a flag, a ZWJ emoji, an Indic conjunct or a base with its marks) and
+/// after trimming the whitespace it would leave in front of the ellipsis.
 pub(super) fn ellipsize_to_fit(text: &str, fits: impl Fn(&str) -> bool) -> String {
     if fits(text) {
         return text.to_string();
     }
-    // Byte offsets of the first `n` chars, for n in 0..=chars: always on a boundary.
-    let mut ends: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    // Byte offsets of every grapheme-cluster boundary, 0 and `text.len()`
+    // included: a cut is only ever made on one of these.
+    let mut ends: Vec<usize> = text.grapheme_indices(true).map(|(i, _)| i).collect();
     ends.push(text.len());
-    let chars: Vec<char> = text.chars().collect();
-    let candidate = |mut n: usize| {
-        // A cut before a continuation, or right after a joiner, splits a cluster.
-        while n > 0 && (n < chars.len() && is_cluster_continuation(chars[n]) || chars[n - 1] == ZWJ)
-        {
-            n -= 1;
-        }
-        format!("{}\u{2026}", text[..ends[n]].trim_end())
-    };
+    let candidate = |n: usize| format!("{}\u{2026}", text[..ends[n]].trim_end());
     // Largest `n` whose prefix fits; `fits` only gets harder as `n` grows.
     let (mut lo, mut hi) = (0usize, ends.len() - 1);
     while lo < hi {
@@ -129,24 +122,6 @@ pub(super) fn ellipsize_to_fit(text: &str, fits: impl Fn(&str) -> bool) -> Strin
         }
     }
     candidate(lo)
-}
-
-const ZWJ: char = '\u{200D}';
-
-/// A char that belongs to the one before it: a joiner, a variation selector,
-/// an emoji skin tone or a combining mark.
-fn is_cluster_continuation(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200D}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{1F3FB}'..='\u{1F3FF}'
-            | '\u{0300}'..='\u{036F}'
-            | '\u{1AB0}'..='\u{1AFF}'
-            | '\u{1DC0}'..='\u{1DFF}'
-            | '\u{20D0}'..='\u{20FF}'
-            | '\u{FE20}'..='\u{FE2F}'
-    )
 }
 
 /// The name a row button carries for assistive tech: the whole label, with
@@ -1081,34 +1056,82 @@ mod tests {
     }
 
     #[test]
-    fn ellipsize_never_leaves_half_a_cluster_before_the_mark() {
-        // Family emoji (joined by U+200D), a heart with a variation selector,
-        // a thumb with a skin tone, and e + combining acute.
+    fn ellipsize_never_splits_a_grapheme_cluster() {
+        use unicode_segmentation::UnicodeSegmentation;
         let texts = [
+            // Family emoji joined by ZWJ.
             "ab\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}cd",
+            // Heart with a variation selector, thumb with a skin tone.
             "ab\u{2764}\u{FE0F}cd",
             "ab\u{1F44D}\u{1F3FD}cd",
+            // e + combining acute.
             "ab\u{0065}\u{0301}cd",
+            // Two flags (regional-indicator pairs).
+            "ab\u{1F1FA}\u{1F1F8}cd\u{1F1EC}\u{1F1E7}ef",
+            // Subdivision flag (tag characters).
+            "ab\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}cd",
+            // Devanagari conjuncts and vowel signs.
+            "\u{0915}\u{094D}\u{0937}\u{093F}\u{0928}\u{094D}\u{0926}\u{0940}ab",
+            // Hebrew with points.
+            "\u{05D1}\u{05B0}\u{05BC}\u{05E8}\u{05B5}ab",
+            // Hangul jamo sequence.
+            "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}ab",
+            // Keycap sequence and CRLF.
+            "a1\u{FE0F}\u{20E3}b\r\nc",
         ];
         for text in texts {
-            for limit in 1..text.chars().count() {
+            let boundaries: Vec<usize> = text.grapheme_indices(true).map(|(i, _)| i).collect();
+            assert!(boundaries.len() > 3, "{text:?}");
+            for limit in 0..=text.chars().count() {
                 let out = ellipsize_to_fit(text, |s| s.chars().count() <= limit);
-                let kept: Vec<char> = out.trim_end_matches('\u{2026}').chars().collect();
-                let last = kept.last().copied();
+                let kept = out.strip_suffix('\u{2026}').unwrap_or(&out);
                 assert!(
-                    last != Some('\u{200D}'),
-                    "stray joiner in {out:?} (limit {limit})"
+                    text.starts_with(kept),
+                    "{out:?} is not a prefix of {text:?}"
                 );
-                // The text after the cut never starts with a continuation, so
-                // no mark was separated from its base.
-                let rest: Vec<char> = text.chars().skip(kept.len()).collect();
+                // The cut sits on a cluster boundary (trimmed spaces aside).
+                let cut = kept.len();
+                let cut_ok = cut == text.len()
+                    || boundaries.contains(&cut)
+                    || text[cut..].chars().next().is_some_and(char::is_whitespace);
                 assert!(
-                    !matches!(
-                        rest.first(),
-                        Some('\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{0301}' | '\u{1F3FD}')
-                    ),
-                    "cut inside a cluster in {out:?} (limit {limit})"
+                    cut_ok,
+                    "cut inside a cluster in {out:?} (limit {limit}) of {text:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn ellipsize_keeps_a_whole_flag_or_drops_it() {
+        let text = "ab\u{1F1FA}\u{1F1F8}cd";
+        // Room for "ab" plus one more char: the flag (two chars) does not fit.
+        let out = ellipsize_to_fit(text, |s| s.chars().count() <= 4);
+        assert_eq!(out, "ab\u{2026}");
+        let out = ellipsize_to_fit(text, |s| s.chars().count() <= 5);
+        assert_eq!(out, "ab\u{1F1FA}\u{1F1F8}\u{2026}");
+    }
+
+    #[test]
+    fn ellipsize_keeps_an_indic_conjunct_whole() {
+        let text = "\u{0915}\u{094D}\u{0937}\u{093F}ab";
+        // The conjunct is four chars: with room for three, none of it stays.
+        let out = ellipsize_to_fit(text, |s| s.chars().count() <= 3);
+        assert_eq!(out, "\u{2026}");
+    }
+
+    #[test]
+    fn ellipsize_never_panics_on_odd_input() {
+        for text in [
+            "",
+            "\u{200D}",
+            "\u{0301}\u{0301}",
+            "\u{1F1FA}",
+            "\u{1F1FA}\u{1F1F8}\u{1F1EC}",
+            "\u{E0067}\u{E007F}",
+        ] {
+            for limit in 0..6 {
+                let _ = ellipsize_to_fit(text, |s| s.chars().count() <= limit);
             }
         }
     }
