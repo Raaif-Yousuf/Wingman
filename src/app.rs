@@ -11612,6 +11612,22 @@ mod tests {
         assert_ne!(human, "Something went wrong.");
     }
 
+    /// #941: the real `http_error` text, run through the card's own strict
+    /// redaction, still names the vendor's error type and code.
+    #[test]
+    fn humanize_error_chain_keeps_the_vendor_error_type_and_code() {
+        let body = r#"{"error":{"message":"The model `gpt-9` does not exist","type":"invalid_request_error","code":"model_not_found"}}"#;
+        let raw = format!(
+            "{:#}",
+            crate::provider::common::http_error("openai", 404, body)
+        );
+        let human = humanize_error_chain(&raw);
+        assert!(human.contains("invalid_request_error"), "{human}");
+        assert!(human.contains("model_not_found"), "{human}");
+        let card = crate::egress::redact_opaque_tokens(&human);
+        assert!(card.contains("invalid_request_error"), "{card}");
+    }
+
     #[test]
     fn humanize_error_chain_keeps_ollama_not_running_specific() {
         // Real shape from the `TransportError::NoResponse` arm:

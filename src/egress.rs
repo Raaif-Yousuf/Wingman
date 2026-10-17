@@ -488,7 +488,10 @@ fn token_spans(run: &str) -> Vec<std::ops::Range<usize>> {
     if let Some(b) = start {
         spans.push(b..run.len());
     }
-    spans.retain(|r| run[r.clone()].chars().count() >= MIN_TOKEN_CHARS);
+    spans.retain(|r| {
+        let part = &run[r.clone()];
+        part.chars().count() >= MIN_TOKEN_CHARS && !KNOWN_VENDOR_CODES.contains(&part)
+    });
     spans.extend(hex_chain_spans(run));
     spans.sort_by_key(|r| r.start);
 
@@ -502,6 +505,25 @@ fn token_spans(run: &str) -> Vec<std::ops::Range<usize>> {
     }
     merged
 }
+
+/// #941: the error `type` and `code` words the vendors publish that are long
+/// enough to look key-shaped. A narrow fragment equal to one of these, whole,
+/// is kept, so the card still says why a request failed. It is a fixed list,
+/// not a shape rule: anything else, however word-like, is still scrubbed.
+const KNOWN_VENDOR_CODES: [&str; 12] = [
+    "invalid_request_error",
+    "authentication_error",
+    "content_policy_violation",
+    "image_content_policy_violation",
+    "context_length_exceeded",
+    "invalid_organization",
+    "string_above_max_length",
+    "unsupported_country_region_territory",
+    "invalid_request_parameters",
+    "request_too_large",
+    "permission_denied_error",
+    "insufficient_permissions",
+];
 
 /// #273: a same-case hex secret split by `/ + = . - _` is a row of short
 /// fragments, none long enough for the narrow rule and none mixed-case
@@ -1055,6 +1077,25 @@ mod tests {
     }
 
     // -- redact_opaque_tokens: the single most important test here --------
+
+    /// #941: a vendor's published error type and code stay readable; word-like
+    /// text that is not on the list (a key with short segments, a passphrase)
+    /// is still scrubbed.
+    #[test]
+    fn redact_opaque_tokens_keeps_known_vendor_codes_only() {
+        let body = r#"{"type":"invalid_request_error","code":"content_policy_violation"}"#;
+        assert_eq!(redact_opaque_tokens(body), body);
+
+        for other in [
+            "tok_prod_abcdefghijkl",
+            "correct_horse_battery",
+            "invalid_request_error_x",
+            "xinvalid_request_error",
+        ] {
+            let out = redact_opaque_tokens(&format!("key {other} bad"));
+            assert!(!out.contains(other), "{out}");
+        }
+    }
 
     #[test]
     fn redact_opaque_tokens_scrubs_a_long_key_shaped_token() {

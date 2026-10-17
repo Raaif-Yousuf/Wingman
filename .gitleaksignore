@@ -12,3 +12,9 @@ b52fbb2a735670004173bea910c499ed205670b0:src/redact.rs:generic-api-key:657
 #
 # src/redact.rs: a fake PEM header in an earlier commit's test of the cut-off key block rule (#734). The tests now build the header at run time.
 33da6200f5d6276a3eb8d3e4ae1b3ae95ae830d5:src/redact.rs:private-key:1120
+
+#
+# src/egress.rs: fake word-like ids in an earlier commit's test of the vendor-code rule (#941). The test now uses neutral ones.
+f4383e4bb951aa953aba9a44594f49df5f94c29c:src/egress.rs:stripe-access-token:527
+f4383e4bb951aa953aba9a44594f49df5f94c29c:src/egress.rs:stripe-access-token:1108
+f4383e4bb951aa953aba9a44594f49df5f94c29c:src/egress.rs:stripe-access-token:1110
