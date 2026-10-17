@@ -124,8 +124,11 @@ impl Store {
         if members.is_empty() {
             return Ok(Profile::default());
         }
-        let mut profile: Profile = serde_json::from_value(Value::Object(members))
-            .map_err(|_| StoreError::Profile("the saved profile is damaged".to_string()))?;
+        // Through bytes, not `from_value`: that would compile a second copy of every
+        // `Profile` deserializer, for `Value` as well as for the byte reader (#1095).
+        let damaged = || StoreError::Profile("the saved profile is damaged".to_string());
+        let joined = serde_json::to_vec(&Value::Object(members)).map_err(|_| damaged())?;
+        let mut profile: Profile = serde_json::from_slice(&joined).map_err(|_| damaged())?;
         profile.normalize_sensitivity();
         profile.validate().map_err(|e| {
             // `e` names the field (for example "notes"), never its value.
