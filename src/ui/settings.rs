@@ -2554,7 +2554,74 @@ unsafe extern "system" fn edit_subclass(
             let _ = RemoveWindowSubclass(hwnd, Some(edit_subclass), EDIT_SUBCLASS_ID);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
-        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        _ => {
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            if edit_may_change_scroll_need(msg) && GetDlgCtrlID(hwnd) == ID_PROMPT_EDIT {
+                sync_prompt_scrollbar(hwnd);
+            }
+            result
+        }
+    }
+}
+
+/// Messages after which the prompt box may need a scroll bar, or no longer
+/// need one: its size, its text and the keys and clipboard that change it.
+fn edit_may_change_scroll_need(msg: u32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_CHAR, WM_CLEAR, WM_CUT, WM_PASTE, WM_SETTEXT, WM_SHOWWINDOW, WM_SIZE, WM_UNDO,
+    };
+    const EM_REPLACESEL: u32 = 0x00C2;
+    matches!(
+        msg,
+        WM_SIZE
+            | WM_SETTEXT
+            | WM_SHOWWINDOW
+            | WM_CHAR
+            | WM_CUT
+            | WM_PASTE
+            | WM_CLEAR
+            | WM_UNDO
+            | EM_REPLACESEL
+    )
+}
+
+/// #1014: whether a vertical scroll range `min..=max` seen through a page of
+/// `page` lines needs a bar. An empty page (a box not laid out yet) keeps it,
+/// so the safe outcome of an unreadable range is the bar.
+fn scrollbar_needed(min: i32, max: i32, page: u32) -> bool {
+    page == 0 || (max as i64 - min as i64 + 1) > page as i64
+}
+
+thread_local! {
+    /// Set while [`sync_prompt_scrollbar`] runs: showing or hiding the bar
+    /// resizes the box, which comes back through the subclass.
+    static SYNCING_PROMPT_BAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// #1014: the prompt box shows a vertical scroll bar only while its text is
+/// taller than the box. An edit control keeps a disabled bar when the text
+/// fits, which reads as an empty strip down the right side.
+unsafe fn sync_prompt_scrollbar(hwnd: HWND) {
+    use windows::Win32::UI::Controls::ShowScrollBar;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE};
+    if SYNCING_PROMPT_BAR.get() {
+        return;
+    }
+    let mut si = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE,
+        ..Default::default()
+    };
+    let need = if GetScrollInfo(hwnd, SB_VERT, &mut si).is_ok() {
+        scrollbar_needed(si.nMin, si.nMax, si.nPage)
+    } else {
+        true
+    };
+    let shown = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VSCROLL.0 != 0;
+    if need != shown {
+        SYNCING_PROMPT_BAR.set(true);
+        let _ = ShowScrollBar(hwnd, SB_VERT, need);
+        SYNCING_PROMPT_BAR.set(false);
     }
 }
 
@@ -8756,6 +8823,40 @@ mod tests {
             assert_eq!(EDIT_STYLE_BUILDS.get(), builds + 1);
             unsafe { invalidate_edit_style() };
             assert!(EDIT_STYLE.get().is_none(), "the brushes are released");
+        });
+    }
+
+    /// #1014: a page that fits needs no bar; a taller one does. An unlaid-out
+    /// box (no page) keeps the bar.
+    #[test]
+    fn a_scroll_bar_is_needed_only_when_the_text_is_taller_than_the_box() {
+        assert!(!scrollbar_needed(0, 9, 30), "30 lines of room, 10 used");
+        assert!(!scrollbar_needed(0, 29, 30), "exactly full");
+        assert!(scrollbar_needed(0, 30, 30), "one line too many");
+        assert!(scrollbar_needed(0, 0, 0), "no page yet: keep the bar");
+    }
+
+    /// #1014: the prompt box has a bar while its text is longer than the box
+    /// and none when it fits, so no empty strip is left down its side.
+    #[test]
+    fn the_prompt_box_shows_a_bar_only_when_its_text_overflows() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowTextW, GWL_STYLE, SW_SHOW, WS_VSCROLL,
+        };
+        with_window(Config::default(), |hwnd, _raw| {
+            let prompt = get_dlg_item(hwnd, ID_PROMPT_EDIT).expect("prompt edit");
+            let has_bar =
+                || unsafe { GetWindowLongPtrW(prompt, GWL_STYLE) } as u32 & WS_VSCROLL.0 != 0;
+            unsafe {
+                let _ = ShowWindow(prompt, SW_SHOW);
+                let long: Vec<u16> = "a line\r\n".repeat(400).encode_utf16().chain([0]).collect();
+                let _ = SetWindowTextW(prompt, windows::core::PCWSTR(long.as_ptr()));
+            }
+            assert!(has_bar(), "400 lines need a bar");
+            unsafe {
+                let _ = SetWindowTextW(prompt, windows::core::w!("short"));
+            }
+            assert!(!has_bar(), "one line needs none");
         });
     }
 
