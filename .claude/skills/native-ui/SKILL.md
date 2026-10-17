@@ -102,8 +102,11 @@ every finding so it can be checked again after the fix.
   capture (#626, #987). The gallery paints it through a DC render target
   instead. A black or see-through palette picture is a capture problem until
   the `--d2d` picture says otherwise.
-- Settings runs comctl32 v5 today; custom-drawn checkboxes need the v6
-  manifest (#662 spec). Group boxes need a `WM_PAINT` subclass for dark.
+- Settings runs comctl32 v6: the exe's manifest has asked for it since #807
+  (MEASURED 2026-10-17; the spec's earlier "v5" came from a probe with no
+  manifest). Push buttons and checkboxes are custom-drawn through
+  `NM_CUSTOMDRAW` in dark (`settings_buttons.rs`), which keeps their UIA role.
+  `NM_CUSTOMDRAW` never arrives for a group box; it needs a `WM_PAINT` subclass.
 - `uxtheme` ordinal APIs (undocumented dark mode) are ruled out; use
   owner/custom draw and DWM attributes.
 - A theme change arrives as `WM_SETTINGCHANGE` with `ImmersiveColorSet`; a
