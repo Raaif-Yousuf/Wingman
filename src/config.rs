@@ -230,6 +230,16 @@ pub struct Hotkeys {
     /// and the id the first time the key is pressed; later presses show the
     /// options card. See [`Hotkeys::primary_target`].
     pub primary_action: String,
+    /// #393: what the key does when a card is showing: `"dynamic"` (the
+    /// default: picks an option if there is one, otherwise closes the card),
+    /// `"pick"` or `"close"`. Anything else is the default. See
+    /// [`crate::keypress::KeyMode`].
+    pub key_mode: String,
+    /// #393: how long, in milliseconds, a second press counts as a double
+    /// press (default 300, clamped to 150 to 600). `0` turns double press
+    /// off, so the first press always acts at once. See
+    /// [`crate::keypress::double_press_window_ms`].
+    pub double_press_ms: u32,
 }
 
 /// What a press of the Wingman key runs, from `hotkeys.primary_action`.
@@ -242,6 +252,16 @@ pub enum PrimaryAction {
 }
 
 impl Hotkeys {
+    /// `key_mode` read as a mode; an unknown value is the default.
+    pub fn key_mode_value(&self) -> crate::keypress::KeyMode {
+        crate::keypress::KeyMode::parse(&self.key_mode)
+    }
+
+    /// The double-press window in milliseconds, or `None` when it is off.
+    pub fn double_press_window_ms(&self) -> Option<u32> {
+        crate::keypress::double_press_window_ms(self.double_press_ms)
+    }
+
     /// `primary_action` read as a target. An empty value (or only spaces) is
     /// the default, `Options`, and the word is matched without regard to case
     /// or surrounding spaces; anything else is an action id, kept as typed.
@@ -275,6 +295,8 @@ impl Default for Hotkeys {
             pause: None,
             palette: None,
             primary_action: "options".to_string(),
+            key_mode: "dynamic".to_string(),
+            double_press_ms: 300,
         }
     }
 }
@@ -1717,6 +1739,75 @@ impl Config {
         result
     }
 
+    /// Stores the keys the user changed between `original` (what the Settings
+    /// window opened with) and `edited` (what it saved) in Credential Manager,
+    /// and removes the credential of a key that was cleared. A key that is the
+    /// same in both is left alone, so a stale copy held by an open window can
+    /// never overwrite a key changed elsewhere meanwhile. It never writes a file:
+    /// the field-level writer (`config_writer`, #870) keeps keys out of
+    /// `config.toml`, and runs this only after the file write has succeeded.
+    pub(crate) fn push_changed_secrets(original: &Config, edited: &Config) -> Result<()> {
+        Self::push_changed_secrets_with(original, edited, &CredManagerStore, &|name| {
+            std::env::var(name).is_ok()
+        })
+    }
+
+    fn push_changed_secrets_with(
+        original: &Config,
+        edited: &Config,
+        store: &dyn SecretStore,
+        env_is_set: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
+        let mut changed = Self::only_changed_secrets(original, edited);
+        let mut undo = Vec::new();
+        let result = changed.push_secrets_logged(store, env_is_set, &mut undo);
+        if result.is_err() {
+            // Best effort: the store error is the one worth reporting.
+            for (target, previous) in undo.into_iter().rev() {
+                let _ = match previous {
+                    Some(secret) => store.set(&target, &secret),
+                    None => store.delete(&target),
+                };
+            }
+        }
+        result
+    }
+
+    /// `edited` with every key that did not change marked as "leave the store
+    /// alone" (the same marker an unreadable credential carries, which
+    /// `push_secrets_logged` skips).
+    fn only_changed_secrets(original: &Config, edited: &Config) -> Config {
+        let mut out = edited.clone();
+        let keep = |was: &str, now: &mut String| {
+            if was == now.as_str() {
+                *now = UNREADABLE_KEY_MARKER.to_string();
+            }
+        };
+        keep(
+            &original.providers.openai.api_key,
+            &mut out.providers.openai.api_key,
+        );
+        keep(
+            &original.providers.anthropic.api_key,
+            &mut out.providers.anthropic.api_key,
+        );
+        keep(
+            &original.providers.gemini.api_key,
+            &mut out.providers.gemini.api_key,
+        );
+        for entry in &mut out.providers.compat {
+            if let Some(was) = original
+                .providers
+                .compat
+                .iter()
+                .find(|o| o.name == entry.name)
+            {
+                keep(&was.api_key, &mut entry.api_key);
+            }
+        }
+        out
+    }
+
     /// #711: refuses a save that would clobber the user's file.
     fn check_save_allowed(&self, path: &Path) -> Result<()> {
         // Defaults standing in for an unreadable file must never replace it.
@@ -1748,7 +1839,8 @@ impl Config {
         write_file_atomically(path, &toml_str, true)
     }
 
-    /// Restricts a file's ACL to the current user only, via `icacls`.
+    /// Restricts a file's ACL to the current user only, via `icacls`: no
+    /// inherited entries, and no SYSTEM or Administrators entry either (#966).
     /// Returns an error rather than swallowing one (#257): a caller that
     /// cannot show a card itself (this module never does, per rule 7) must
     /// propagate this so whichever caller CAN show one does.
@@ -1777,10 +1869,7 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?;
         let output = crate::owner_acl::icacls_command()
             .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?
-            .arg(path)
-            .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg(format!("{account}:F"))
+            .args(crate::owner_acl::owner_only_file_args(path, &account))
             .output()
             .context("failed to run icacls to restrict the config file's permissions")?;
         if !output.status.success() {
@@ -2376,6 +2465,47 @@ mod tests {
             pinned.hotkeys.primary_target(),
             PrimaryAction::Action("check-my-work".to_string())
         );
+    }
+
+    // -- hotkeys.key_mode and double_press_ms (issue #393) --------------------
+
+    #[test]
+    fn the_key_defaults_are_dynamic_with_a_300_ms_double_press_window() {
+        let h = Config::default().hotkeys;
+        assert_eq!(h.key_mode_value(), crate::keypress::KeyMode::Dynamic);
+        assert_eq!(h.double_press_window_ms(), Some(300));
+    }
+
+    #[test]
+    fn key_mode_and_double_press_ms_load_from_toml_and_bad_values_fall_back() {
+        let cfg: Config = toml::from_str(
+            "[hotkeys]
+key_mode = \"pick\"
+double_press_ms = 0
+",
+        )
+        .unwrap();
+        assert_eq!(cfg.hotkeys.key_mode_value(), crate::keypress::KeyMode::Pick);
+        assert_eq!(cfg.hotkeys.double_press_window_ms(), None);
+        let bad: Config = toml::from_str(
+            "[hotkeys]
+key_mode = \"nope\"
+double_press_ms = 5000
+",
+        )
+        .unwrap();
+        assert_eq!(
+            bad.hotkeys.key_mode_value(),
+            crate::keypress::KeyMode::Dynamic
+        );
+        assert_eq!(bad.hotkeys.double_press_window_ms(), Some(600));
+        // An older config.toml has neither key.
+        let old: Config = toml::from_str(
+            "[hotkeys]
+",
+        )
+        .unwrap();
+        assert_eq!(old.hotkeys.double_press_window_ms(), Some(300));
     }
 
     // -- options.auto_dismiss_secs and claim_keys (issue #307) ----------------
@@ -3640,6 +3770,98 @@ structured = "prompt"
         assert_eq!(store.get("Wingman/compat:openrouter").unwrap(), None);
     }
 
+    // -- the keys a Settings save changed (#871) ------------------------------
+
+    fn with_keys(openai: &str, anthropic: &str) -> Config {
+        let mut c = Config::default();
+        c.providers.openai.api_key = openai.into();
+        c.providers.anthropic.api_key = anthropic.into();
+        c
+    }
+
+    #[test]
+    fn a_changed_key_is_stored_and_an_unchanged_one_is_left_alone() {
+        // The window opened with both keys. Meanwhile the Anthropic key was
+        // changed elsewhere (the store holds a newer one). Saving the window must
+        // store the OpenAI key it changed and must not put the stale Anthropic
+        // key back.
+        let store = crate::secrets::InMemoryStore::default();
+        store
+            .set("Wingman/anthropic", "sk-newer-elsewhere")
+            .unwrap();
+        let original = with_keys("sk-old-openai", "sk-old-anthropic");
+        let edited = with_keys("sk-typed", "sk-old-anthropic");
+        Config::push_changed_secrets_with(&original, &edited, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-typed")
+        );
+        assert_eq!(
+            store.get("Wingman/anthropic").unwrap().as_deref(),
+            Some("sk-newer-elsewhere"),
+            "an unchanged key must not be written back"
+        );
+    }
+
+    #[test]
+    fn a_cleared_key_is_removed_and_one_never_set_stays_absent() {
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-old-openai").unwrap();
+        let original = with_keys("sk-old-openai", "");
+        let edited = with_keys("", "");
+        Config::push_changed_secrets_with(&original, &edited, &store, &|_| false).unwrap();
+        assert_eq!(store.get("Wingman/openai").unwrap(), None);
+        assert_eq!(store.get("Wingman/anthropic").unwrap(), None);
+    }
+
+    #[test]
+    fn an_untouched_save_changes_nothing_in_the_store() {
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-newer").unwrap();
+        let same = with_keys("sk-old", "");
+        Config::push_changed_secrets_with(&same, &same, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-newer")
+        );
+    }
+
+    #[test]
+    fn a_compat_key_is_matched_by_name_and_only_a_changed_one_is_stored() {
+        let store = crate::secrets::InMemoryStore::default();
+        let mut original = Config::default();
+        original.providers.compat = vec![
+            compat_entry("kept", "https://a.example/v1"),
+            compat_entry("changed", "https://b.example/v1"),
+        ];
+        let mut edited = original.clone();
+        edited.providers.compat[1].api_key = "sk-new-compat".into();
+        store
+            .set("Wingman/compat:kept", "sk-newer-elsewhere")
+            .unwrap();
+        Config::push_changed_secrets_with(&original, &edited, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get("Wingman/compat:changed").unwrap().as_deref(),
+            Some("sk-new-compat")
+        );
+        assert_eq!(
+            store.get("Wingman/compat:kept").unwrap().as_deref(),
+            Some("sk-newer-elsewhere")
+        );
+    }
+
+    #[test]
+    fn a_key_set_by_an_env_var_is_not_stored_from_a_save() {
+        let store = crate::secrets::InMemoryStore::default();
+        let original = with_keys("", "");
+        let edited = with_keys("sk-from-env", "");
+        Config::push_changed_secrets_with(&original, &edited, &store, &|name| {
+            name == "OPENAI_API_KEY"
+        })
+        .unwrap();
+        assert_eq!(store.get("Wingman/openai").unwrap(), None);
+    }
+
     #[test]
     fn gemini_config_from_an_older_build_gets_its_model_list_backfilled() {
         let old = r#"
@@ -4194,6 +4416,50 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         cleanup(&path);
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn restrict_acl_leaves_the_current_user_as_the_only_entry() {
+        // #966: a file made by an elevated process carries explicit allow
+        // entries for SYSTEM and Administrators (the token's default DACL).
+        // `/inheritance:r` does not touch explicit entries, so they survived.
+        // Plant them the same way, restrict, then read the DACL back.
+        let path = scratch_path("acl-owner-only");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "x").unwrap();
+        for sid in ["*S-1-5-18", "*S-1-5-32-544"] {
+            let planted = crate::owner_acl::icacls_command()
+                .unwrap()
+                .arg(&path)
+                .arg("/grant")
+                .arg(format!("{sid}:F"))
+                .output()
+                .expect("icacls should run");
+            assert!(planted.status.success(), "could not plant {sid}");
+        }
+
+        Config::restrict_acl(&path).expect("restrict_acl should succeed");
+
+        let has_entry_for = |sid: &str| {
+            let out = crate::owner_acl::icacls_command()
+                .unwrap()
+                .arg(&path)
+                .arg("/findsid")
+                .arg(sid)
+                .output()
+                .expect("icacls should run");
+            String::from_utf8_lossy(&out.stdout).contains("SID Found")
+        };
+        let me = crate::owner_acl::grant_account().unwrap();
+        let (mine, system, admins) = (
+            has_entry_for(&me),
+            has_entry_for("*S-1-5-18"),
+            has_entry_for("*S-1-5-32-544"),
+        );
+        cleanup(&path);
+        assert!(mine, "the current user lost access");
+        assert!(!system, "SYSTEM still has an entry");
+        assert!(!admins, "Administrators still has an entry");
+    }
     #[test]
     #[cfg(windows)]
     fn migrate_from_aborts_and_reports_when_acl_restriction_fails() {

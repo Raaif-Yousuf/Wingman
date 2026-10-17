@@ -632,6 +632,31 @@ function Get-ElevatedPowerShellArgumentList {
     return @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
 }
 
+# Whether this process already holds an elevated token. Its own function so a
+# Pester test can say "elevated" or "not" without being either.
+function Test-ProcessElevated {
+    [CmdletBinding()]
+    param()
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Runs a child powershell.exe elevated and returns its exit code (issue #965).
+# From a process that is not elevated this asks for UAC (RunAs). From one that
+# already is, RunAs is skipped and the child is run directly: it inherits the
+# elevated token, and Start-Process -Verb RunAs from an elevated process was
+# MEASURED 2026-10-17 on a GitHub runner to exit 1 while the same command line
+# run directly exited 0. A failure to start counts as non-zero, never as OK.
+function Invoke-ElevatedPowerShell {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string[]]$ArgumentList)
+    if (Test-ProcessElevated) {
+        & powershell.exe @ArgumentList | Out-Null
+        return $LASTEXITCODE
+    }
+    $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ArgumentList $ArgumentList
+    return $p.ExitCode
+}
 # --- certificate trust (issue #184) -------------------------------------
 # Windows' deployment service runs as SYSTEM, so it cannot see the per-user
 # store the signing certificate lives in: it has to be exported to a .cer
@@ -668,9 +693,8 @@ function Confirm-CertTrusted {
         # The path is data, never part of the command text (issue #278).
         $elevatedArgs = Get-ElevatedPowerShellArgumentList -Data @{ CerPath = $CerPath } -Script `
             'Import-Certificate -FilePath $CerPath -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null'
-        $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru `
-             -ArgumentList $elevatedArgs
-        if ($p.ExitCode -ne 0) { throw "Trusting the certificate failed (exit $($p.ExitCode)). Without it Windows will refuse the package." }
+        $exit = Invoke-ElevatedPowerShell -ArgumentList $elevatedArgs
+        if ($exit -ne 0) { throw "Trusting the certificate failed (exit $exit). Without it Windows will refuse the package." }
 
         $ok = Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object { $_.Thumbprint -eq $Cert.Thumbprint }
         if (-not $ok) { throw "Certificate did not land in LocalMachine\TrustedPeople." }
@@ -698,5 +722,7 @@ Export-ModuleMember -Function @(
     'Get-TopLevelPhaseMarkers',
     'Test-InstallPhaseOrder',
     'Get-ElevatedPowerShellArgumentList',
-    'Confirm-CertTrusted'
+    'Confirm-CertTrusted',
+    'Test-ProcessElevated',
+    'Invoke-ElevatedPowerShell'
 )

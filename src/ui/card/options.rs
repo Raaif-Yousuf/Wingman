@@ -93,6 +93,32 @@ pub(super) fn hint_text(count: usize, claim_keys: bool) -> String {
     }
 }
 
+/// `text` unchanged when `fits` accepts it, otherwise its longest prefix that
+/// still fits once an ellipsis is added (#969). GDI's `DT_END_ELLIPSIS` does not
+/// mark the cut when a wrapped paragraph is clipped by the rectangle, so the
+/// cut is made here, on `char` boundaries (never a byte slice) and after
+/// trimming the whitespace it would leave in front of the ellipsis.
+pub(super) fn ellipsize_to_fit(text: &str, fits: impl Fn(&str) -> bool) -> String {
+    if fits(text) {
+        return text.to_string();
+    }
+    // Byte offsets of the first `n` chars, for n in 0..=chars: always on a boundary.
+    let mut ends: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    ends.push(text.len());
+    let candidate = |n: usize| format!("{}\u{2026}", text[..ends[n]].trim_end());
+    // Largest `n` whose prefix fits; `fits` only gets harder as `n` grows.
+    let (mut lo, mut hi) = (0usize, ends.len() - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(&candidate(mid)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    candidate(lo)
+}
+
 /// The name a row button carries for assistive tech: the whole label, with
 /// where it sits in the list ("Review this email, 1 of 3").
 pub(super) fn accessible_name(label: &str, position: usize, count: usize) -> String {
@@ -550,9 +576,32 @@ impl CardInner {
                 palette.headline
             }),
         );
+        // The full text stays in the window's name (`set_window_text`); only
+        // the painted copy is shortened, with the ellipsis on the last line.
+        let max_h = metrics.summary.bottom - metrics.summary.top;
+        let width = metrics.summary.right - metrics.summary.left;
+        let shown = ellipsize_to_fit(&ui.summary, |s| {
+            let mut buf: Vec<u16> = s.encode_utf16().collect();
+            if buf.is_empty() {
+                return true;
+            }
+            let mut r = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: 0,
+            };
+            DrawTextW(
+                hdc,
+                &mut buf,
+                &mut r,
+                DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+            );
+            r.bottom - r.top <= max_h
+        });
         draw_text_line(
             hdc,
-            &ui.summary,
+            &shown,
             metrics.summary,
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
@@ -893,6 +942,37 @@ mod tests {
             (h150 as f32 - h100 as f32 * 1.5).abs() <= 2.0,
             "{h100} {h150}"
         );
+    }
+
+    #[test]
+    fn ellipsize_keeps_text_that_fits() {
+        assert_eq!(
+            ellipsize_to_fit("short", |s| s.chars().count() <= 10),
+            "short"
+        );
+    }
+
+    #[test]
+    fn ellipsize_cuts_at_the_limit_and_marks_it() {
+        let out = ellipsize_to_fit("one two three four", |s| s.chars().count() <= 8);
+        assert_eq!(out, "one two\u{2026}");
+        assert!(out.chars().count() <= 8);
+    }
+
+    #[test]
+    fn ellipsize_is_safe_on_emoji_and_cjk() {
+        for text in ["😀😀😀😀😀😀", "日本語のテキストが長い", "a😀b日c本d語e"]
+        {
+            let out = ellipsize_to_fit(text, |s| s.chars().count() <= 4);
+            assert!(out.ends_with('\u{2026}'), "{out}");
+            assert!(out.chars().count() <= 4, "{out}");
+            assert!(text.starts_with(out.trim_end_matches('\u{2026}')), "{out}");
+        }
+    }
+
+    #[test]
+    fn ellipsize_when_nothing_fits_is_just_the_ellipsis() {
+        assert_eq!(ellipsize_to_fit("abc", |s| s.is_empty()), "\u{2026}");
     }
 
     #[test]

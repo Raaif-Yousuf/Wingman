@@ -125,10 +125,48 @@ pub fn grant_account() -> Result<String, String> {
     Ok(format!("*{}", current_user_sid()?))
 }
 
+/// The `icacls` arguments that leave one file readable by `account` only
+/// (#966). `/inheritance:r` drops inherited entries but not explicit ones, and
+/// a file made by an elevated process carries explicit SYSTEM and
+/// Administrators entries from the token's default DACL, so those two are
+/// removed by name. Neither is needed: the owner is the only reader, and the
+/// file holds nothing a backup service must see.
+pub fn owner_only_file_args(path: &std::path::Path, account: &str) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    vec![
+        path.as_os_str().to_owned(),
+        OsString::from("/inheritance:r"),
+        OsString::from("/grant:r"),
+        OsString::from(format!("{account}:F")),
+        OsString::from("/remove:g"),
+        OsString::from("*S-1-5-18"),
+        OsString::from("*S-1-5-32-544"),
+    ]
+}
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn owner_only_file_args_grant_the_user_and_drop_system_and_admins() {
+        let args: Vec<String> =
+            owner_only_file_args(std::path::Path::new(r"C:\x\config.toml"), "*S-1-5-21-1")
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+        assert_eq!(
+            args,
+            [
+                r"C:\x\config.toml",
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-21-1:F",
+                "/remove:g",
+                "*S-1-5-18",
+                "*S-1-5-32-544"
+            ]
+        );
+    }
     #[test]
     fn icacls_is_named_by_full_path() {
         assert_eq!(
