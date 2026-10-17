@@ -1042,6 +1042,10 @@ mod driver {
                         ("extract-text", "Copy text from screen"),
                         ("read-qr", "Read QR code from screen"),
                         ("calculate-selection", "Calculate selection"),
+                        (
+                            crate::router::SETUP_MODEL_ID,
+                            crate::router::SETUP_MODEL_LABEL,
+                        ),
                     ]),
                     options_behavior(false),
                 );

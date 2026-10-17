@@ -209,9 +209,12 @@ screenshot detail, card corner, monitor and timeout, and the prompt. A saved key
 Credential Manager, not the file; Settings shows only its last four
 characters afterward.
 
-No key but Ollama running on this PC? The first press finds a model that can
-read images, saves it as your setup and says so on the card. It does not ask
-yet: press again to ask it.
+No key but Ollama running on this PC? The first press of the Wingman key (or
+"What can I do here?" in the tray) finds a model that can read images, saves
+it as your setup and says so on the card. It does not ask yet: press again to
+ask it. If it finds nothing, the card lists what works without a model and ends
+with **Set up a model**, which opens Settings (press its number, or click it).
+Nothing is sent and nothing is billed until you pick an option.
 
 Settings has key and model fields for OpenAI, Anthropic and Gemini (with a
 key saved, opening Settings asks the provider for its current model list, so

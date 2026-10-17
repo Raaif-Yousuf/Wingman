@@ -499,6 +499,17 @@ pub const FAILED_SUMMARY: &str = "Could not read the screen, here are a few opti
 /// The summary when no model is set up: these options work without one.
 pub const NO_MODEL_SUMMARY: &str = "No AI model is set up. These work without one.";
 
+/// The summary when Ollama runs on this PC but none of its models can read the
+/// screen (#1017): the same card, saying why nothing was adopted.
+pub const NO_VISION_SUMMARY: &str =
+    "Ollama has no model that can read the screen. These work without one.";
+/// #1017: the id of the one row on the options card that is not a catalogue
+/// action. It opens Settings, runs nothing and bills nothing. It is handled
+/// before the palette's dispatch, so it can never reach an action by accident.
+pub const SETUP_MODEL_ID: &str = "wingman.setup-model";
+/// The label of that row.
+pub const SETUP_MODEL_LABEL: &str = "Set up a model";
+
 /// What the options card shows: a summary line and the ranked options.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OptionsContent {
@@ -519,9 +530,18 @@ pub fn options_content(
     model_ready: bool,
 ) -> OptionsContent {
     if !model_ready {
+        // #1017: the model-free list gives up its last slot to the way out of
+        // this card, so a user with no model is never at a dead end.
+        let mut options = with_fallbacks(Vec::new(), catalogue, false);
+        options.truncate(MAX_OPTIONS_CAP - 1);
+        options.push(RouterOption {
+            intent: SETUP_MODEL_ID.to_string(),
+            label: SETUP_MODEL_LABEL.to_string(),
+            confidence: 0.0,
+        });
         return OptionsContent {
             summary: NO_MODEL_SUMMARY.to_string(),
-            options: with_fallbacks(Vec::new(), catalogue, false),
+            options,
         };
     }
     let Some(result) = result else {
@@ -1340,16 +1360,42 @@ mod tests {
         for r in [Some(&result), None] {
             let c = options_content(r, &catalogue(), false);
             assert_eq!(c.summary, NO_MODEL_SUMMARY);
+            // #1017: three model-free actions, then the way into Settings.
             assert_eq!(
                 intents(&c.options),
                 [
                     crate::actions::EXTRACT_TEXT_ACTION_ID,
                     "calculate-selection",
                     "copy-region",
-                    "f1"
+                    SETUP_MODEL_ID
                 ]
             );
         }
+    }
+
+    #[test]
+    fn with_no_model_the_last_row_is_the_setup_row_and_only_there() {
+        let c = options_content(None, &catalogue(), false);
+        let last = c.options.last().expect("rows");
+        assert_eq!(last.intent, SETUP_MODEL_ID);
+        assert_eq!(last.label, SETUP_MODEL_LABEL);
+        assert!(c.options.len() <= MAX_OPTIONS_CAP);
+        // A model is ready: the row has no place on the card.
+        for r in [None, Some(&routed("S", vec![option("f1", "F1", 0.9)]))] {
+            let c = options_content(r, &catalogue(), true);
+            assert!(c.options.iter().all(|o| o.intent != SETUP_MODEL_ID));
+        }
+        // With no model-free action at all the setup row still stands alone.
+        let c = options_content(None, &[], false);
+        assert_eq!(intents(&c.options), [SETUP_MODEL_ID]);
+    }
+
+    #[test]
+    fn the_setup_row_id_is_not_a_catalogue_action() {
+        assert!(catalogue().iter().all(|a| a.id != SETUP_MODEL_ID));
+        assert!(!SETUP_MODEL_LABEL.contains('\u{2014}'));
+        assert!(!NO_VISION_SUMMARY.contains('\u{2014}'));
+        assert!(NO_VISION_SUMMARY.chars().count() <= MAX_SUMMARY_CHARS);
     }
 
     #[test]
@@ -1372,6 +1418,7 @@ mod tests {
             PICK_SUMMARY,
             FAILED_SUMMARY,
             NO_MODEL_SUMMARY,
+            NO_VISION_SUMMARY,
         ] {
             assert!(!text.contains('\u{2014}'), "{text}");
             assert!(text.chars().count() <= MAX_SUMMARY_CHARS, "{text}");

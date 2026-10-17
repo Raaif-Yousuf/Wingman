@@ -668,6 +668,9 @@ struct App {
     /// carries the number it started under; an older one is ignored, so two
     /// quick presses cannot make the first answer clobber the second's card.
     first_run_probe: u64,
+    /// #1017: whether that probe started from the options card (the key or the
+    /// tray), so a find of nothing ends on that card with its way into Settings.
+    first_run_for_options: bool,
     /// #228: the footer line for the answer now being shown, set by each
     /// action result handler from the worker's attribution and `None` unless
     /// a fallback answered.
@@ -904,6 +907,7 @@ pub fn run() -> Result<()> {
         pending_preview_generation: 0,
         run_generation: 0,
         first_run_probe: 0,
+        first_run_for_options: false,
         fallback_footer: None,
         last_form_undo: None,
         exec_in_flight: false,
@@ -1318,6 +1322,15 @@ fn first_run_card_detail(
     first_run_detail(found).unwrap_or(gate_detail)
 }
 
+/// #1017: the summary of the no-model options card after the probe: it says
+/// why nothing was adopted only when Ollama answered without a usable model.
+fn no_model_options_summary(found: &FirstRun) -> &'static str {
+    match found {
+        FirstRun::NoVisionModel | FirstRun::VisionUnknown => router::NO_VISION_SUMMARY,
+        FirstRun::NotRunning | FirstRun::Found { .. } => router::NO_MODEL_SUMMARY,
+    }
+}
+
 /// #133: the readiness card's detail when Ollama is running but has nothing
 /// that can read the screen; `None` leaves the usual card alone. The card
 /// already opens Settings, where the model can be downloaded.
@@ -1499,7 +1512,11 @@ impl App {
     /// press re-runs the probe, which costs the worker a moment, never the
     /// message loop. Returns `false` (nothing started) when this setup is not
     /// eligible: a key, a chosen provider or Cloud mode.
-    fn start_first_run_probe(&mut self) -> bool {
+    ///
+    /// `for_options` (#1017): the press was the Wingman key on the options
+    /// card, so a probe that finds nothing ends on that card (with its way
+    /// into Settings), not on the setup card.
+    fn start_first_run_probe(&mut self, for_options: bool) -> bool {
         if !self
             .config
             .providers
@@ -1507,6 +1524,7 @@ impl App {
         {
             return false;
         }
+        self.first_run_for_options = for_options;
         self.card
             .show_pending(crate::ui::card::PendingStage::Working);
         self.first_run_probe = self.first_run_probe.wrapping_add(1);
@@ -1581,8 +1599,40 @@ impl App {
             self.set_watch(true);
             return;
         }
+        // #1017: a press of the key that showed the options card ends on it,
+        // with the row that opens Settings. A broken config.toml keeps the
+        // setup card, which says so.
+        if self.first_run_for_options && self.config.load_problem.is_none() {
+            let pending = matches!(self.card.state(), crate::ui::card::CardState::Pending);
+            if should_hide_after_first_run(pending, self.busy) {
+                if let Some(catalogue) = self.load_catalogue(false) {
+                    self.show_no_model_options(&catalogue, no_model_options_summary(&found));
+                }
+            }
+            return;
+        }
         detail = first_run_card_detail(detail, &found, self.config.load_problem.as_deref());
         self.show_setup_card(&headline, &detail);
+    }
+
+    /// #1017: the options card for a setup with no model: the model-free
+    /// actions and the row that opens Settings. Static, no network, nothing
+    /// runs until a row is picked.
+    fn show_no_model_options(&mut self, catalogue: &[palette_model::PaletteAction], summary: &str) {
+        self.options_generation = options_keys::next_generation(self.options_generation);
+        let generation = self.options_generation;
+        let content = router::options_content(None, catalogue, false);
+        let rows = option_rows(&content.options);
+        let key_pickable = option_key_pickable(&rows, catalogue);
+        let behavior = self.options_behavior(keypress_runs_first(&key_pickable));
+        self.options = Some(OptionsSession {
+            generation,
+            ids: rows.iter().map(|r| r.id.clone()).collect(),
+            catalogue: Vec::new(),
+            key_pickable,
+        });
+        self.card.show_options(generation, summary, &rows, behavior);
+        self.set_watch(true);
     }
 
     /// #806: the first press that would ask an Ollama that is not on this PC
@@ -1731,7 +1781,7 @@ impl App {
             // #133: nothing is set up. Look for a local Ollama on a worker
             // (never here: this is the keyboard hook's thread), once per
             // press that reaches this card, never on a bare launch.
-            if self.start_first_run_probe() {
+            if self.start_first_run_probe(false) {
                 return None;
             }
             self.show_setup_card(&headline, &detail);
@@ -2064,25 +2114,21 @@ impl App {
                 .build_chain_for_mode(mode, true)
                 .ready_provider_names()
                 .is_empty();
-        self.options_generation = options_keys::next_generation(self.options_generation);
-        let generation = self.options_generation;
 
         if !model_ready {
-            let content = router::options_content(None, &catalogue, false);
-            let rows = option_rows(&content.options);
-            let key_pickable = option_key_pickable(&rows, &catalogue);
-            let behavior = self.options_behavior(keypress_runs_first(&key_pickable));
-            self.options = Some(OptionsSession {
-                generation,
-                ids: rows.iter().map(|r| r.id.clone()).collect(),
-                catalogue: Vec::new(),
-                key_pickable,
-            });
-            self.card
-                .show_options(generation, &content.summary, &rows, behavior);
-            self.set_watch(true);
+            // #1017: from the key or the tray, look for a local Ollama first
+            // (a worker thread, a local port, no model request); a find is
+            // adopted, anything else lands on this card. A duplicate launch
+            // (`use_router` false: the Start menu, the picker) never looks.
+            if use_router && self.start_first_run_probe(true) {
+                return;
+            }
+            self.show_no_model_options(&catalogue, router::NO_MODEL_SUMMARY);
             return;
         }
+
+        self.options_generation = options_keys::next_generation(self.options_generation);
+        let generation = self.options_generation;
 
         // #918: the router sends the screenshot too, and does not go through
         // `begin_action`, so it asks the same remote-Ollama question: the
@@ -2273,6 +2319,13 @@ impl App {
     /// Hides the options card, lets it settle, and runs the chosen action
     /// through the one dispatch. Shared by a click, a digit and the key.
     fn run_option(&mut self, id: &str) {
+        // #1017: the one row that is not an action. `open_settings` hides the
+        // card itself; nothing is captured, asked or billed.
+        if id == router::SETUP_MODEL_ID {
+            self.options = None;
+            self.open_settings();
+            return;
+        }
         self.close_options_card();
         std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         self.palette_password_manager = false;
@@ -10183,6 +10236,63 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// #1017: the options card says why nothing was adopted only when Ollama
+    /// answered but has nothing that reads the screen.
+    #[test]
+    fn the_no_model_options_summary_follows_what_the_probe_found() {
+        use crate::provider::ollama_admin::ListenerKind;
+        assert_eq!(
+            super::no_model_options_summary(&FirstRun::NotRunning),
+            router::NO_MODEL_SUMMARY
+        );
+        for found in [FirstRun::NoVisionModel, FirstRun::VisionUnknown] {
+            assert_eq!(
+                super::no_model_options_summary(&found),
+                router::NO_VISION_SUMMARY
+            );
+        }
+        // Found never reaches the card (it is adopted), but must not panic.
+        let found = FirstRun::Found {
+            model: "m".into(),
+            kind: ListenerKind::Other,
+        };
+        assert_eq!(
+            super::no_model_options_summary(&found),
+            router::NO_MODEL_SUMMARY
+        );
+    }
+
+    /// #1017, wired-to-nothing: the setup row opens Settings, and is caught
+    /// before the palette's dispatch (it is no catalogue action). The press
+    /// that shows the card looks for a local Ollama only from the key or the
+    /// tray (`use_router`), never from a duplicate launch, and the probe's
+    /// answer shows this card (not the setup card) for such a press.
+    #[test]
+    fn the_setup_row_opens_settings_and_the_no_model_card_looks_for_ollama() {
+        let run = app_method_body("run_option");
+        let setup = run
+            .find("router::SETUP_MODEL_ID")
+            .unwrap_or_else(|| panic!("run_option ignores the setup row: {run}"));
+        let open = run
+            .find("self.open_settings()")
+            .expect("never opens Settings");
+        let dispatch = run.find("self.dispatch_palette_action(").expect("moved");
+        assert!(setup < open && open < dispatch, "{run}");
+
+        let show = app_method_body("show_options_card");
+        let branch = show.find("if !model_ready {").expect("branch moved");
+        let end = show[branch..].find("\n        }\n").expect("branch end");
+        let branch = &show[branch..branch + end];
+        let probe = branch
+            .find("self.start_first_run_probe(true)")
+            .unwrap_or_else(|| panic!("the no-model card never looks for Ollama: {branch}"));
+        let guard = branch.find("use_router").expect("probe ignores use_router");
+        assert!(guard < probe, "{branch}");
+
+        let result = app_method_body("on_first_run_result");
+        assert!(result.contains("self.show_no_model_options("), "{result}");
     }
 
     #[test]
