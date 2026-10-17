@@ -1075,23 +1075,61 @@ fn write_back_fields(path: &Path, changes: &[crate::config_writer::FieldChange])
     Ok(())
 }
 
-/// Names of the providers whose key `before` (as the file read it) held and the
-/// file still holds after an import: every one when the file could not be
-/// rewritten, else those the store refused (`after` still has them).
-fn keys_still_in_file(before: &Config, after: &Config, write_failed: bool) -> Vec<String> {
-    let left = |was: &str, now: &str| !was.is_empty() && (write_failed || !now.is_empty());
-    let (b, a) = (&before.providers, &after.providers);
+/// The changes that write a load's repair (`read` is the file as parsed,
+/// `repaired` the same after `backfill`), without any that set the compat list
+/// whole: a whole list is written with its keys blanked, and a key must not
+/// leave the file before the store has accepted it (#899). A repair that does
+/// touch that list is kept in memory only.
+fn repair_changes(
+    read: &Config,
+    repaired: &Config,
+) -> Result<Vec<crate::config_writer::FieldChange>> {
+    let compat = ["providers".to_string(), "compat".to_string()];
+    let mut changes = crate::config_writer::diff(read, repaired)?;
+    changes.retain(|c| {
+        let path = c.path();
+        !path.starts_with(&compat) && path != ["providers".to_string()]
+    });
+    Ok(changes)
+}
+
+/// Names of the providers whose key `before` (as the file was read) held and
+/// the file still holds, judged by `on_disk`: the file read again after the
+/// import, or `None` when it cannot be (every key it held is then reported).
+/// Compat entries are matched by name.
+fn keys_still_in_file(before: &Config, on_disk: Option<&Config>) -> Vec<String> {
+    let left = |was: &str, now: Option<&str>| !was.is_empty() && now.is_none_or(|n| !n.is_empty());
+    let b = &before.providers;
+    let d = on_disk.map(|c| &c.providers);
     let mut out: Vec<String> = [
-        ("openai", &b.openai.api_key, &a.openai.api_key),
-        ("anthropic", &b.anthropic.api_key, &a.anthropic.api_key),
-        ("gemini", &b.gemini.api_key, &a.gemini.api_key),
+        (
+            "openai",
+            &b.openai.api_key,
+            d.map(|d| d.openai.api_key.as_str()),
+        ),
+        (
+            "anthropic",
+            &b.anthropic.api_key,
+            d.map(|d| d.anthropic.api_key.as_str()),
+        ),
+        (
+            "gemini",
+            &b.gemini.api_key,
+            d.map(|d| d.gemini.api_key.as_str()),
+        ),
     ]
     .into_iter()
-    .filter(|(_, was, now)| left(was, now))
+    .filter(|(_, was, now)| left(was, *now))
     .map(|(name, ..)| name.to_string())
     .collect();
-    for (was, now) in b.compat.iter().zip(&a.compat) {
-        if left(&was.api_key, &now.api_key) {
+    for was in &b.compat {
+        let now = d.map(|d| {
+            d.compat
+                .iter()
+                .find(|e| e.name == was.name)
+                .map_or("", |e| e.api_key.as_str())
+        });
+        if left(&was.api_key, now) {
             out.push(was.name.clone());
         }
     }
@@ -1340,7 +1378,7 @@ impl Config {
                         // and hand edits stay.
                         let _ = toml::from_str::<Config>(&contents)
                             .map_err(anyhow::Error::from)
-                            .and_then(|read| crate::config_writer::diff(&read, &cfg))
+                            .and_then(|read| repair_changes(&read, &cfg))
                             .and_then(|changes| write_back_fields(path, &changes));
                     }
                     Ok(cfg)
@@ -1419,7 +1457,6 @@ impl Config {
     /// write could blank it) is named in [`Config::keys_left_in_file`].
     fn import_keys_and_write_back(&mut self, path: &Path, store: &dyn SecretStore) {
         let before = self.clone();
-        let mut write_failed = false;
         if self.import_secrets_and_blank(store) {
             // #899: blank only the keys, so comments and hand edits stay. If
             // that cannot be done, the whole-file save still must not leave a
@@ -1427,10 +1464,14 @@ impl Config {
             let wrote = crate::config_writer::blanked_key_changes(&before, self)
                 .and_then(|changes| write_back_fields(path, &changes));
             if wrote.is_err() {
-                write_failed = self.save_to(path).is_err();
+                let _ = self.save_to(path);
             }
         }
-        self.keys_left_in_file = keys_still_in_file(&before, self, write_failed);
+        // A write that said Ok is not proof: read the file again.
+        let on_disk = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str::<Config>(&text).ok());
+        self.keys_left_in_file = keys_still_in_file(&before, on_disk.as_ref());
     }
     /// Fills any still-empty `api_key` field from `store`. Called after
     /// [`Config::import_secrets_and_blank`] so a freshly imported key
@@ -4921,6 +4962,110 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
             "the repair must be written: {on_disk}"
         );
         cleanup(&path);
+    }
+
+    #[test]
+    fn a_key_the_file_still_holds_is_reported_whatever_the_write_said() {
+        // #899 review: judge by the file as read again, not by a write's Ok.
+        let with_keys = |openai: &str, labkey: &str| {
+            let mut c = Config::default();
+            c.providers.openai.api_key = openai.to_string();
+            c.providers.compat = vec![
+                CompatConfig {
+                    name: "lab".into(),
+                    api_key: labkey.to_string(),
+                    ..Default::default()
+                },
+                CompatConfig {
+                    name: "home".into(),
+                    api_key: "k-home".to_string(),
+                    ..Default::default()
+                },
+            ];
+            c
+        };
+        let before = with_keys("sk-1", "k-lab");
+        // The file still holds the openai key: reported.
+        let still = with_keys("sk-1", "");
+        assert_eq!(
+            keys_still_in_file(&before, Some(&still)),
+            vec!["openai".to_string(), "home".to_string()]
+        );
+        // Every key gone from the file: nothing to report.
+        let mut gone = with_keys("", "");
+        gone.providers.compat[1].api_key.clear();
+        assert!(keys_still_in_file(&before, Some(&gone)).is_empty());
+        // The file cannot be read again: every key it held is reported.
+        assert_eq!(
+            keys_still_in_file(&before, None),
+            vec!["openai".to_string(), "lab".to_string(), "home".to_string()]
+        );
+        // Compat entries are matched by name, not by position.
+        let mut reordered = with_keys("", "k-lab");
+        reordered.providers.compat.reverse();
+        reordered.providers.compat[0].api_key.clear();
+        assert_eq!(
+            keys_still_in_file(&before, Some(&reordered)),
+            vec!["lab".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_read_only_config_keeps_the_key_and_reports_it() {
+        let path = scratch_path("import-read-only");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "[providers.openai]\napi_key = \"sk-in-file\"\n").unwrap();
+        let mut config = Config::load_from_with(&path, &|_| None).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms).unwrap();
+        config.import_keys_and_write_back(&path, &InMemoryStore::default());
+        let on_disk = fs::read_to_string(&path).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&path, perms).unwrap();
+        assert!(
+            on_disk.contains("sk-in-file"),
+            "the key must stay: {on_disk}"
+        );
+        assert_eq!(config.keys_left_in_file, vec!["openai".to_string()]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_repair_never_writes_the_compat_list_whole() {
+        // #899 review: a whole-list write is blanked of its keys, and the keys
+        // must not leave the file before the store has accepted them.
+        let mut read = Config::default();
+        read.providers.compat = vec![CompatConfig {
+            name: "lab".into(),
+            api_key: "k-lab".into(),
+            model: "old".into(),
+            ..Default::default()
+        }];
+        let mut repaired = read.clone();
+        repaired.providers.compat[0].model = "new".into();
+        let raw = crate::config_writer::diff(&read, &repaired).unwrap();
+        assert!(
+            raw.iter().any(|c| c
+                .path()
+                .starts_with(&["providers".to_string(), "compat".to_string()])),
+            "fixture must make the diff touch the compat list: {raw:?}"
+        );
+        let safe = repair_changes(&read, &repaired).unwrap();
+        assert!(
+            !safe.iter().any(|c| c
+                .path()
+                .starts_with(&["providers".to_string(), "compat".to_string()])),
+            "{safe:?}"
+        );
+        // Other repairs still go through.
+        repaired.ui.text_scale += 1.0;
+        let safe = repair_changes(&read, &repaired).unwrap();
+        assert!(safe
+            .iter()
+            .any(|c| c.path() == ["ui".to_string(), "text_scale".to_string()]));
     }
 
     #[test]
