@@ -279,6 +279,12 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
         // #1105: the file's baseline and the Run key are read off the UI thread;
         // the Start with Windows box is unchecked until its worker answers.
         start_open_read(inner_ref);
+        // The box cannot be clicked until the Run key has been read.
+        if let Some(box_) = get_dlg_item(hwnd, ID_AUTOSTART) {
+            unsafe {
+                let _ = EnableWindow(box_, false);
+            }
+        }
         start_autostart(inner_ref, AutostartJob::Read);
         // #527, #568: the Ollama status and button arrive later, off the UI
         // thread; the group says "Checking Ollama..." until then.
@@ -1941,6 +1947,14 @@ fn autostart_verdict(job: AutostartJob, answer: &AutostartAnswer) -> AutostartVe
     }
 }
 
+/// Whether a job that arrives while another runs is remembered. Only a click
+/// is: it reads the box when its turn comes. A read is dropped (the running
+/// job's answer is as fresh), and it must never be run as a click, which
+/// would commit a placeholder box.
+fn queued_when_busy(job: AutostartJob) -> bool {
+    matches!(job, AutostartJob::Set(_))
+}
+
 /// Runs a Start with Windows job on a short worker and posts the answer back
 /// (#1105): the window's thread never touches the registry. One job runs at a
 /// time; a click that comes meanwhile is looked at when the answer lands.
@@ -1949,7 +1963,9 @@ fn start_autostart(inner: &mut SettingsInner, job: AutostartJob) {
         return;
     }
     if inner.autostart_busy {
-        inner.autostart_again = true;
+        if queued_when_busy(job) {
+            inner.autostart_again = true;
+        }
         return;
     }
     inner.autostart_busy = true;
@@ -1975,7 +1991,16 @@ fn start_autostart(inner: &mut SettingsInner, job: AutostartJob) {
         });
     if spawned.is_err() {
         inner.autostart_busy = false;
-        if job != AutostartJob::Read {
+        if job == AutostartJob::Read {
+            // No answer will come: do not leave the box dead.
+            if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+                if !crate::portable::is_portable() {
+                    unsafe {
+                        let _ = EnableWindow(box_, true);
+                    }
+                }
+            }
+        } else {
             // Rule 7: not started is a failed row, not a silent no-op.
             inner.tracker.fail(Field::Autostart, AUTOSTART_FAILED);
             set_status(
@@ -2004,8 +2029,18 @@ fn take_autostart(inner: &mut SettingsInner) {
     if inner.closing {
         return;
     }
-    // Clicked again while the job ran: the box holds the newer wish, so it is
-    // not overwritten, and that wish is sent now.
+    // The first answer makes the box real: it was disabled until the Run key
+    // was read (portable mode keeps it disabled for good).
+    if !crate::portable::is_portable() {
+        if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+            unsafe {
+                let _ = EnableWindow(box_, true);
+            }
+        }
+    }
+    // Clicked again while the job ran (this is the retry after a failed or
+    // finished job): the box holds the newer wish, so it is not overwritten
+    // with this answer, and that wish is sent now as a fresh job.
     if std::mem::take(&mut inner.autostart_again) {
         commit_autostart(inner);
     } else if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
@@ -17249,6 +17284,54 @@ mod tests {
             autostart_verdict(AutostartJob::Read, &bad),
             AutostartVerdict::Quiet
         );
+    }
+
+    #[test]
+    fn only_a_click_is_queued_behind_a_running_autostart_job() {
+        assert!(queued_when_busy(AutostartJob::Set(true)));
+        assert!(
+            !queued_when_busy(AutostartJob::Read),
+            "a read would commit the placeholder"
+        );
+        assert!(!queued_when_busy(AutostartJob::Undo(true)));
+    }
+
+    #[test]
+    fn a_coalesced_read_does_not_ask_for_a_second_job() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            inner.autostart_busy = true;
+            start_autostart(inner, AutostartJob::Read);
+            assert!(!inner.autostart_again);
+            start_autostart(inner, AutostartJob::Set(true));
+            assert!(inner.autostart_again);
+        });
+    }
+
+    #[test]
+    fn the_open_time_read_replaces_the_baseline_only_when_it_applies() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let mut file = Config::default();
+            file.ui.card_seconds = 77;
+            let mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+            *inner.open_slot.lock().unwrap() = Some(Opened {
+                baseline: Some(file.clone()),
+                mtime,
+            });
+            inner.wrote = true;
+            take_open_read(inner);
+            assert_ne!(inner.baseline.ui.card_seconds, 77, "a write came first");
+            assert!(inner.file_mtime.is_none());
+            inner.wrote = false;
+            *inner.open_slot.lock().unwrap() = Some(Opened {
+                baseline: Some(file),
+                mtime,
+            });
+            take_open_read(inner);
+            assert_eq!(inner.baseline.ui.card_seconds, 77);
+            assert_eq!(inner.file_mtime, mtime);
+        });
     }
 
     #[test]
