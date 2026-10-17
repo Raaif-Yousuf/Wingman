@@ -6399,6 +6399,12 @@ impl App {
             SettingsCommand::Mode(mode) => self.set_mode_with(mode, true),
             SettingsCommand::Pause(choice) => self.pause_for(choice),
             SettingsCommand::Resume => self.resume(),
+            SettingsCommand::ImportAction => self.import_action(),
+            SettingsCommand::ExportPicked => {
+                if let Some(id) = take_export_pick() {
+                    self.export_action_by_id(&id);
+                }
+            }
         }
     }
 
@@ -7150,6 +7156,12 @@ impl App {
         let Some(id) = self.tray.export_action_at(index).map(str::to_owned) else {
             return;
         };
+        self.export_action_by_id(&id);
+    }
+
+    /// #117, #1152: exports the action `id` to a file the user picks. The tray
+    /// item and Settings' Export button both end here.
+    fn export_action_by_id(&mut self, id: &str) {
         let owner = HWND(self.hwnd_isize() as *mut _);
         let mut turned_off = false;
         let text = actions::load_actions().and_then(|all| {
@@ -7163,7 +7175,7 @@ impl App {
             actions::share::export_toml(&found.action)
         });
         let outcome = text.and_then(|text| {
-            let picked = self.run_os_dialog(|| crate::ui::file_dialog::pick_save_path(owner, &id));
+            let picked = self.run_os_dialog(|| crate::ui::file_dialog::pick_save_path(owner, id));
             let Some(path) = picked else {
                 return Ok(None);
             };
@@ -9487,6 +9499,38 @@ pub(crate) enum SettingsCommand {
     Mode(Mode),
     Pause(PauseChoice),
     Resume,
+    /// #1152: Settings' Import action button, the tray's Import item.
+    ImportAction,
+    /// #1152: Settings' Export button picked an action: its id waits in
+    /// `EXPORT_PICKS` (see `post_export_pick`).
+    ExportPicked,
+}
+
+thread_local! {
+    /// #1152: the action ids Settings picked for export, oldest first. A
+    /// command carries a number, not a string, so the id waits here; Settings
+    /// and the app share the one UI thread.
+    static EXPORT_PICKS: std::cell::RefCell<VecDeque<String>> =
+        const { std::cell::RefCell::new(VecDeque::new()) };
+}
+
+fn push_export_pick(id: String) {
+    EXPORT_PICKS.with(|q| q.borrow_mut().push_back(id));
+}
+
+fn take_export_pick() -> Option<String> {
+    EXPORT_PICKS.with(|q| q.borrow_mut().pop_front())
+}
+
+/// #1152: Settings' Export button picked the action `id`. `false` when the
+/// owner is gone (the id is not kept), which the caller says on its own line.
+pub(crate) fn post_export_pick(owner: isize, id: String) -> bool {
+    push_export_pick(id);
+    let posted = post_settings_command(owner, SettingsCommand::ExportPicked);
+    if !posted {
+        EXPORT_PICKS.with(|q| q.borrow_mut().pop_back());
+    }
+    posted
 }
 
 impl SettingsCommand {
@@ -9501,6 +9545,8 @@ impl SettingsCommand {
             SettingsCommand::Pause(PauseChoice::UntilTomorrow) => 11,
             SettingsCommand::Pause(PauseChoice::UntilResumed) => 12,
             SettingsCommand::Resume => 20,
+            SettingsCommand::ImportAction => 30,
+            SettingsCommand::ExportPicked => 31,
         }
     }
 
@@ -9516,6 +9562,8 @@ impl SettingsCommand {
             11 => SettingsCommand::Pause(PauseChoice::UntilTomorrow),
             12 => SettingsCommand::Pause(PauseChoice::UntilResumed),
             20 => SettingsCommand::Resume,
+            30 => SettingsCommand::ImportAction,
+            31 => SettingsCommand::ExportPicked,
             _ => return None,
         })
     }
@@ -11803,6 +11851,8 @@ mod tests {
             C::Pause(PauseChoice::UntilTomorrow),
             C::Pause(PauseChoice::UntilResumed),
             C::Resume,
+            C::ImportAction,
+            C::ExportPicked,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in all {
@@ -11811,6 +11861,37 @@ mod tests {
         }
         assert_eq!(C::from_wparam(999), None);
         assert_eq!(C::from_wparam(usize::MAX), None);
+    }
+
+    /// #1152: the action Settings picked for export waits in a queue, in the
+    /// order it was picked, and an empty queue gives nothing.
+    #[test]
+    fn export_picks_come_back_in_order() {
+        assert_eq!(super::take_export_pick(), None);
+        super::push_export_pick("one".to_string());
+        super::push_export_pick("two".to_string());
+        assert_eq!(super::take_export_pick().as_deref(), Some("one"));
+        assert_eq!(super::take_export_pick().as_deref(), Some("two"));
+        assert_eq!(super::take_export_pick(), None);
+    }
+
+    /// #1152: the tray's Export item and Settings' Export button share the
+    /// one routine that writes the file.
+    #[test]
+    fn the_tray_export_and_the_settings_export_share_one_routine() {
+        let src = lf(include_str!("app.rs"));
+        let tray = body_between(
+            &src,
+            "    fn export_action(&mut self, index: usize) {",
+            "\n    }\n",
+        );
+        assert!(tray.contains("self.export_action_by_id("), "{tray}");
+        let shared = body_between(
+            &src,
+            "    fn export_action_by_id(&mut self, id: &str) {",
+            "\n    }\n",
+        );
+        assert!(shared.contains("pick_save_path"), "{shared}");
     }
 
     /// #873: the command can wait for a nested loop, and keeps what it carries.
@@ -11836,7 +11917,14 @@ mod tests {
         let proc_src = wnd_proc_body(&src);
         assert!(proc_src.contains("WM_APP_SETTINGS_COMMAND => {"), "no arm");
         let run = body_between(&src, "    fn on_settings_command(", "\n    }\n");
-        for call in ["self.set_mode_with(", "self.pause_for(", "self.resume()"] {
+        // #1152: Import and Export run the tray's own handlers too.
+        for call in [
+            "self.set_mode_with(",
+            "self.pause_for(",
+            "self.resume()",
+            "self.import_action()",
+            "self.export_action_by_id(",
+        ] {
             assert!(run.contains(call), "{call} is not the tray's path:\n{run}");
         }
         for head in [
