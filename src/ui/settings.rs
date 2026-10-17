@@ -357,6 +357,11 @@ pub fn close_now() {
     }
 }
 
+/// Whether the Settings window exists (#1012), in front or not.
+pub fn is_open() -> bool {
+    OPEN_HWND.load(Ordering::SeqCst) != 0
+}
+
 /// Whether the Settings window is open and is the foreground window. The app
 /// holds back anything that would put a card on top of it while this is true.
 pub fn is_foreground() -> bool {

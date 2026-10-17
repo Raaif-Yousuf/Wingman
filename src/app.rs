@@ -4831,7 +4831,12 @@ impl App {
         let saves = self
             .settings_saves
             .load(std::sync::atomic::Ordering::SeqCst);
-        match settings_hold_card(settings::is_foreground(), saves) {
+        let stops = settings_stops_action(
+            settings::is_open(),
+            settings::is_foreground(),
+            TRAY_COMMAND_RUNNING.with(|c| c.get()),
+        );
+        match settings_hold_card(stops, saves) {
             Some((headline, detail)) => {
                 self.card.show_answer(headline, detail, 3, None);
                 true
@@ -4901,8 +4906,7 @@ impl App {
     /// #722: the tray menu runs with the same reentrancy policy as Settings,
     /// so whatever it deferred is delivered here once the menu has closed.
     fn finish_modal_deferrals(&mut self) {
-        let pending: VecDeque<DeferredMessage> =
-            PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let pending = take_pending_messages(settings::is_foreground());
         let taskbar_recreated = TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false));
         let tray_restore_error = if taskbar_recreated {
             self.try_restore_tray_icon()
@@ -5619,8 +5623,7 @@ impl App {
         SETTINGS_OPEN.with(|c| c.set(true));
         let out = dialog();
         SETTINGS_OPEN.with(|c| c.set(false));
-        let pending: VecDeque<DeferredMessage> =
-            PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let pending = take_pending_messages(settings::is_foreground());
         let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
             self.try_restore_tray_icon()
         } else {
@@ -7235,6 +7238,11 @@ thread_local! {
     /// selects [`tray_menu_policy`] instead of the Settings one.
     static TRAY_MENU_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// True while a command chosen from the tray runs (#1012). The menu takes
+    /// the foreground, so "Settings is in front" is never true for such a
+    /// command; `refuse_for_settings` asks whether Settings is open instead.
+    static TRAY_COMMAND_RUNNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// Every `WM_APP_RESULT`/`WM_APP_CALENDAR_RESULT`/`WM_APP_REVIEW_RESULT`/
     /// `WM_APP_PREVIEW_DECIDED` message that arrived while `SETTINGS_OPEN`
     /// was true, oldest first. `open_settings` drains and delivers all of
@@ -7947,6 +7955,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
             h.cancel_learning();
         }
     }
+    let _from_tray = TrayCommandScope::enter();
     match decode(id) {
         MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
         MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
@@ -8003,6 +8012,41 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         app.password_manager_hint = false;
     }
     LRESULT(0)
+}
+
+/// Marks a tray command as running for as long as it lives (#1012).
+struct TrayCommandScope;
+
+impl TrayCommandScope {
+    fn enter() -> Self {
+        TRAY_COMMAND_RUNNING.with(|c| c.set(true));
+        TrayCommandScope
+    }
+}
+
+impl Drop for TrayCommandScope {
+    fn drop(&mut self) {
+        TRAY_COMMAND_RUNNING.with(|c| c.set(false));
+    }
+}
+
+/// Whether the Settings window stops a model action now (#1012). The key and
+/// the palette are stopped while Settings is in front. A tray command never
+/// sees it in front, because the menu took the foreground, so for one the
+/// question is whether Settings is open at all.
+fn settings_stops_action(settings_open: bool, settings_in_front: bool, from_tray: bool) -> bool {
+    settings_in_front || (from_tray && settings_open)
+}
+
+/// Takes what was deferred during a menu or a file dialog (#1012). While
+/// Settings is in front the queue also holds the answers `wnd_proc` kept back
+/// for it, so it is left alone: `on_settings_left` delivers it, in order,
+/// once Settings is left.
+fn take_pending_messages(settings_in_front: bool) -> VecDeque<DeferredMessage> {
+    if settings_in_front {
+        return VecDeque::new();
+    }
+    PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// What a press of the Wingman key does with the double-press wait (#393).
@@ -8784,6 +8828,70 @@ mod tests {
         assert_eq!(settings_hold_card(false, 0), None);
         for (headline, detail) in [open, saving] {
             assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
+        }
+    }
+
+    /// #1012: a tray command never sees Settings in front (the menu took the
+    /// foreground), so it is stopped whenever Settings is open. The key and the
+    /// palette are stopped only while it is in front.
+    #[test]
+    fn a_tray_command_is_stopped_whenever_settings_is_open() {
+        use super::settings_stops_action;
+        // (open, in_front, from_tray) -> stopped
+        let table = [
+            (false, false, false, false),
+            (false, false, true, false),
+            (true, true, false, true),
+            (true, true, true, true),
+            // Open but behind another window: the key still works ...
+            (true, false, false, false),
+            // ... and a tray command is stopped, which is the bug.
+            (true, false, true, true),
+        ];
+        for (open, front, tray, stopped) in table {
+            assert_eq!(
+                settings_stops_action(open, front, tray),
+                stopped,
+                "open {open}, in front {front}, from tray {tray}"
+            );
+        }
+    }
+
+    /// #1012: the gate sees a tray command, and a command chosen from the menu
+    /// is marked as one for exactly as long as it runs.
+    #[test]
+    fn the_gate_reads_the_tray_command_flag_and_the_menu_sets_it() {
+        let src = lf(include_str!("app.rs"));
+        let refuse = body_between(&src, "    fn refuse_for_settings(", "\n    }\n");
+        assert!(refuse.contains("TRAY_COMMAND_RUNNING"), "{refuse}");
+        assert!(refuse.contains("settings::is_open()"), "{refuse}");
+        let tray = body_between(&src, "fn handle_tray_message(", "\n}\n");
+        let scope = tray.find("TrayCommandScope::enter()").expect("never set");
+        let first = tray.find("MenuChoice::OpenAiModel").expect("match moved");
+        assert!(scope < first, "the flag must be set before any command");
+        {
+            let _s = super::TrayCommandScope::enter();
+            assert!(super::TRAY_COMMAND_RUNNING.with(|c| c.get()));
+        }
+        assert!(!super::TRAY_COMMAND_RUNNING.with(|c| c.get()));
+    }
+
+    /// #1012: what was held for Settings stays queued while Settings is in
+    /// front, so a menu or a file dialog closing cannot put cards over it.
+    #[test]
+    fn the_held_queue_is_left_alone_while_settings_is_in_front() {
+        use super::{take_pending_messages, DeferredMessage, PENDING_MESSAGES};
+        PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(DeferredMessage::PauseToggle));
+        assert!(take_pending_messages(true).is_empty());
+        assert_eq!(PENDING_MESSAGES.with(|c| c.borrow().len()), 1, "kept");
+        assert_eq!(take_pending_messages(false).len(), 1);
+        assert_eq!(PENDING_MESSAGES.with(|c| c.borrow().len()), 0);
+        // Both callers use it, so neither drains the queue unguarded.
+        let src = lf(include_str!("app.rs"));
+        for head in ["    fn finish_modal_deferrals(", "    fn run_os_dialog<T>("] {
+            let body = body_between(&src, head, "\n    }\n");
+            assert!(body.contains("take_pending_messages(settings::is_foreground())"));
+            assert!(!body.contains("std::mem::take"), "{head}");
         }
     }
 
