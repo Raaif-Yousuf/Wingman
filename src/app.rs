@@ -2571,7 +2571,7 @@ impl App {
         self.close_options_card();
         std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         self.palette_password_manager = false;
-        self.dispatch_palette_action(id);
+        self.dispatch_palette_action(id, "");
     }
 
     /// #308, #393: one press of the Wingman key. What it does follows what is
@@ -2742,7 +2742,7 @@ impl App {
             PrimaryDispatch::CheckMyWork => self.ask(trigger),
             PrimaryDispatch::Other(id) => {
                 self.palette_password_manager = false;
-                self.dispatch_palette_action(&id);
+                self.dispatch_palette_action(&id, "");
             }
             PrimaryDispatch::Unknown(id) => {
                 let (title, reason) = unknown_primary_action_text(&id);
@@ -2803,7 +2803,7 @@ impl App {
     /// corresponding tray item already calls; there is no second,
     /// palette-only code path. A `None` target (an id the palette itself
     /// never produces) is a no-op, not a panic (rule 7).
-    fn dispatch_palette_action(&mut self, action_id: &str) {
+    fn dispatch_palette_action(&mut self, action_id: &str, line: &str) {
         // A run posted before Settings opened, or while a save is applied.
         if self.refuse_for_settings() {
             return;
@@ -2813,12 +2813,12 @@ impl App {
         // it opened as well, for the length of this one dispatch.
         self.password_manager_hint = self.palette_password_manager;
         self.pending_action = Some(action_id.to_string());
-        self.dispatch_palette_target(action_id);
+        self.dispatch_palette_target(action_id, line);
         self.pending_action = None;
         self.password_manager_hint = false;
     }
 
-    fn dispatch_palette_target(&mut self, action_id: &str) {
+    fn dispatch_palette_target(&mut self, action_id: &str, line: &str) {
         match palette_model::dispatch_target_for(action_id) {
             Some(DispatchTarget::CheckMyWork) => self.ask(Trigger::Palette),
             Some(DispatchTarget::ExtractText) => self.extract_text(),
@@ -2832,7 +2832,7 @@ impl App {
             // #242: any other action id -- a user-authored `actions.toml`
             // entry -- runs through the generic Look/Propose/Confirm/Do
             // path instead of silently doing nothing.
-            Some(DispatchTarget::Generic(action_id)) => self.run_generic_action(&action_id),
+            Some(DispatchTarget::Generic(action_id)) => self.run_generic_action(&action_id, line),
             // `dispatch_target_for` never returns `None` (#242); kept only
             // because the match is over an `Option`, not because this arm
             // is expected to run.
@@ -3228,8 +3228,8 @@ impl App {
     /// the generic path only covers "reuse an existing proposal schema and
     /// executor", the case `docs/actions.md` documents as the intended
     /// shape for a new `actions.toml` action.
-    fn run_generic_action(&mut self, action_id: &str) {
-        self.run_generic_action_with(action_id, None);
+    fn run_generic_action(&mut self, action_id: &str, line: &str) {
+        self.run_generic_action_with(action_id, line, None);
     }
 
     /// [`App::run_generic_action`], with the address the user confirmed when
@@ -3237,7 +3237,12 @@ impl App {
     /// first with `None`, which finds the link and shows the confirmation
     /// card (nothing is fetched, no model is asked), then, after "Do it",
     /// with the confirmed address, which fetches the page and summarizes it.
-    fn run_generic_action_with(&mut self, action_id: &str, confirmed_link: Option<String>) {
+    fn run_generic_action_with(
+        &mut self,
+        action_id: &str,
+        line: &str,
+        confirmed_link: Option<String>,
+    ) {
         let resolved = match actions::load_actions_report() {
             Ok(r) => r,
             Err(e) => {
@@ -3305,6 +3310,11 @@ impl App {
         let redact = self.config.capture.redact;
         let prompt = action.prompt.clone();
         let inputs = action.inputs.clone();
+        // #92: the line typed in the palette, and whether a documents folder
+        // is set, for an action that lists `text` or `knowledge`.
+        let line = line.to_string();
+        let knowledge_folder = self.config.knowledge.folder.clone();
+        let answers_from_documents = action.proposal == actions::knowledge_answer::PROPOSAL_KIND;
         // #68: an action that writes the answer over the selection needs the
         // selection's UIA identity as well as its text.
         let writes_back = action.executor == "replace_text";
@@ -3344,7 +3354,7 @@ impl App {
                     // #127 step 2: the user confirmed this address. The page is the
                     // only input: the selection and the screen are not read again.
                     let mut redirected_to: Option<(String, String)> = None;
-                    let (gathered, inputs) = match &link_step {
+                    let (mut gathered, inputs) = match &link_step {
                         actions::link_summary::Step::Fetch(url) => {
                             let page = crate::inputs::web_page::fetch_page(url)
                                 .map_err(GenericFailure::UserState)?;
@@ -3376,6 +3386,32 @@ impl App {
                             inputs,
                         ),
                     };
+                    // #92: the typed line, and the excerpts found for it. An empty
+                    // line, no folder, nothing indexed and nothing matching each
+                    // end here as a card, before any model is asked.
+                    let mut excerpts = Vec::new();
+                    // Names the excerpts in the egress row and the send preview
+                    // for every request this worker sends; dropped with the closure.
+                    let mut _excerpt_labels = None;
+                    if actions::generic_inputs::wants_text(&inputs) {
+                        gathered.text = Some(line.clone());
+                    }
+                    if actions::generic_inputs::wants_knowledge(&inputs) {
+                        // The line and the folder setting are checked before the
+                        // store is opened, so a store problem never replaces them.
+                        let found =
+                            actions::knowledge_answer::gather(&knowledge_folder, &line, || {
+                                crate::store::global()
+                                    .map_err(|e| format!("Couldn't open your documents index: {e}"))
+                            })
+                            .map_err(GenericFailure::UserState)?;
+                        _excerpt_labels = Some(crate::egress::KnowledgeScope::new(
+                            found.labels.clone(),
+                            found.bytes,
+                        ));
+                        gathered.knowledge = Some(found.block);
+                        excerpts = found.included;
+                    }
                     let planned = plan_generic_inputs(&inputs, &gathered)?;
                     if writes_back && actions::generic_replace::too_long(&gathered) {
                         return Err(GenericFailure::UserState(
@@ -3429,6 +3465,13 @@ impl App {
                             actions::link_summary::note_final_host(proposal, &confirmed, &read)
                         }
                         None => proposal,
+                    };
+                    // #92: only quotes found in their excerpt survive, and the
+                    // citation is built here from the stored file name.
+                    let proposal = if answers_from_documents {
+                        actions::knowledge_answer::finalize(&proposal, &excerpts)
+                    } else {
+                        proposal
                     };
                     Ok((proposal, replace))
                 })()
@@ -3732,7 +3775,7 @@ impl App {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 match url {
-                    Some(url) => self.run_generic_action_with(&action_id, Some(url)),
+                    Some(url) => self.run_generic_action_with(&action_id, "", Some(url)),
                     None => {
                         let detail = self.track_error(
                             "Couldn't fetch the link",
@@ -8465,7 +8508,7 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
     unsafe {
         match msg {
             WM_APP_LEARNED => drop(Box::from_raw(p as *mut Chord)),
-            WM_APP_PALETTE_RUN => drop(Box::from_raw(p as *mut String)),
+            WM_APP_PALETTE_RUN => drop(Box::from_raw(p as *mut palette_model::PaletteRun)),
             WM_APP_SEND_PREVIEW => drop(Box::from_raw(p as *mut crate::ui::send_gate::SendRequest)),
             WM_APP_PENDING_STAGE => drop(Box::from_raw(p as *mut crate::ui::card::PendingStage)),
             WM_APP_MACHINE_CHECK_RESULT => {
@@ -9169,8 +9212,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // WM_APP_PALETTE_RUN doc comment). Take ownership, then run it
             // through the same dispatch table the palette's rows were built
             // from.
-            let action_id = unsafe { *Box::from_raw(lparam.0 as *mut String) };
-            app.dispatch_palette_action(&action_id);
+            let run = unsafe { *Box::from_raw(lparam.0 as *mut palette_model::PaletteRun) };
+            app.dispatch_palette_action(&run.id, &run.line);
             LRESULT(0)
         }
         WM_APP_FIRST_RUN => {
@@ -9852,6 +9895,53 @@ mod tests {
         assert!(
             ask < palette.find("dispatch_palette_target").expect("moved"),
             "{palette}"
+        );
+    }
+
+    /// #92: the palette line reaches the worker of a generic action, the
+    /// excerpts are found before the request is planned (so an empty folder is
+    /// a card, not a question sent alone), and the model's answer is checked
+    /// against those excerpts before it can reach a card.
+    #[test]
+    fn ask_my_documents_is_wired_from_the_palette_line_to_the_checked_answer() {
+        let src = lf(include_str!("app.rs"));
+        let dispatch = body_between(&src, "    fn dispatch_palette_action(", "\n    }\n");
+        assert!(
+            dispatch.contains("dispatch_palette_target(action_id, line)"),
+            "{dispatch}"
+        );
+        let handler = body_between(&src, "        WM_APP_PALETTE_RUN => {", "\n        }\n");
+        assert!(
+            handler.contains("dispatch_palette_action(&run.id, &run.line)"),
+            "{handler}"
+        );
+        let worker = body_between(
+            &src,
+            "    fn run_generic_action_with(",
+            "    /// #551: applies a worker's stage message.",
+        );
+        let text = worker
+            .find("gathered.text = Some(line.clone())")
+            .expect("line unused");
+        let prep = worker
+            .find("knowledge_answer::gather(")
+            .expect("no retrieval");
+        // The excerpts are named for the egress row before the request goes.
+        let scope = worker
+            .find("egress::KnowledgeScope::new(")
+            .expect("excerpts not labelled for the egress row");
+        let plan = worker
+            .find("plan_generic_inputs(&inputs, &gathered)")
+            .expect("plan moved");
+        let ask = worker
+            .find("complete_parsed_with_fallback_attributed")
+            .expect("ask moved");
+        let fin = worker
+            .find("knowledge_answer::finalize(")
+            .expect("answer unchecked");
+        assert!(
+            text < plan && prep < scope && scope < plan && plan < ask && ask < fin,
+            "{worker}"
         );
     }
 
@@ -10635,6 +10725,7 @@ mod tests {
             name: id.to_string(),
             group: None,
             requires_model: false,
+            takes_text: false,
             effect,
         };
         let cat = [
@@ -11228,7 +11319,10 @@ mod tests {
     #[test]
     fn free_boxed_payload_frees_a_boxed_message_and_ignores_the_rest() {
         use windows::Win32::Foundation::LPARAM;
-        let boxed = Box::into_raw(Box::new("palette action".to_string()));
+        let boxed = Box::into_raw(Box::new(crate::ui::palette_model::PaletteRun {
+            id: "palette action".to_string(),
+            line: "typed line".to_string(),
+        }));
         assert!(super::free_boxed_payload(
             WM_APP_PALETTE_RUN,
             LPARAM(boxed as isize)

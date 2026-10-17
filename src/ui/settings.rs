@@ -1736,6 +1736,12 @@ thread_local! {
 }
 
 #[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The Settings window's real DPI while the gallery simulates another one.
+    static NATIVE_DPI: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, debug_assertions))]
 fn forced_dpi() -> Option<u32> {
     FORCED_DPI.with(std::cell::Cell::get)
 }
@@ -2883,8 +2889,11 @@ unsafe fn set_body_scroll(body: HWND, content_px: i32, view_px: i32, pos: i32) {
     SetScrollInfo(body, SB_VERT, &si, true);
 }
 
-/// The width of a vertical scrollbar at `dpi`.
+/// The width of a vertical scrollbar at `dpi`. In the gallery at a simulated
+/// scale the scrollbar is the window's real one, so that is measured instead.
 fn scrollbar_width_px(dpi: u32) -> i32 {
+    #[cfg(any(test, debug_assertions))]
+    let dpi = NATIVE_DPI.with(std::cell::Cell::get).unwrap_or(dpi);
     unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) }.max(0)
 }
 
@@ -7569,6 +7578,30 @@ const GALLERY_CLASS_NAME: &str = "Wingman.Settings.Gallery.3b8f6a52";
 #[cfg(debug_assertions)]
 pub struct GalleryWindow {
     raw: *mut SettingsInner,
+    /// Declared after `raw`: restores the thread's DPI awareness once the
+    /// window is destroyed by `Drop`.
+    _unaware: Option<UnawareScope>,
+}
+
+/// Makes the thread DPI-unaware until dropped (the gallery's real 100%).
+#[cfg(debug_assertions)]
+struct UnawareScope(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
+
+#[cfg(debug_assertions)]
+impl UnawareScope {
+    fn enter() -> UnawareScope {
+        use windows::Win32::UI::HiDpi::{
+            SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE,
+        };
+        UnawareScope(unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) })
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for UnawareScope {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.0) };
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -7586,6 +7619,13 @@ impl GalleryWindow {
             return None;
         }
         ensure_common_controls();
+        // 100% is the one scale a window can really be drawn at on any
+        // screen: made DPI-unaware, Windows gives it 96 DPI and its native
+        // checkbox boxes and scrollbar come out at 96 DPI too (#1016, #1052).
+        // The thread stays unaware until the window is dropped, so the
+        // gallery's capture of it measures in the same units.
+        let unaware = (dpi == Some(96)).then(UnawareScope::enter);
+        let dpi = if unaware.is_some() { None } else { dpi };
         FORCED_DPI.with(|f| f.set(dpi.map(|d| d.max(1))));
 
         let config = Config::default();
@@ -7614,9 +7654,16 @@ impl GalleryWindow {
             return None;
         };
         // From here the window owns nothing the Drop below cannot free.
-        let gallery = GalleryWindow { raw };
+        let gallery = GalleryWindow {
+            raw,
+            _unaware: unaware,
+        };
         let inner = unsafe { &mut *raw };
         inner.hwnd = hwnd;
+        // A simulated scale cannot change the native scrollbar, which keeps
+        // the window's real DPI: remember that DPI so the width reserved for
+        // the scrollbar is the width it really takes (#1052).
+        NATIVE_DPI.with(|n| n.set(dpi.map(|_| unsafe { GetDpiForWindow(hwnd) }.max(1))));
         let dpi = dpi_for(hwnd);
         inner.font = build_font(dpi);
         let fitted_h = fitted_height_dp(hwnd, dpi);
@@ -7676,6 +7723,7 @@ impl Drop for GalleryWindow {
     fn drop(&mut self) {
         // WM_DESTROY frees the font and flags the close; the Box is ours.
         FORCED_DPI.with(|f| f.set(None));
+        NATIVE_DPI.with(|n| n.set(None));
         unsafe {
             let _ = DestroyWindow((*self.raw).hwnd);
             drop(Box::from_raw(self.raw));
@@ -11764,6 +11812,45 @@ mod tests {
         assert_eq!(unsafe { &*big.raw }.dpi, 240, "a DPI message must not win");
         drop(big);
         assert_eq!(forced_dpi(), None, "closing the window clears the override");
+    }
+
+    /// The width the body's own scrollbar really takes: window minus client.
+    #[cfg(debug_assertions)]
+    fn body_scrollbar_px(w: &GalleryWindow) -> i32 {
+        let body = get_dlg_item(w.hwnd(), ID_BODY).expect("body");
+        let mut wr = windows::Win32::Foundation::RECT::default();
+        let mut cr = windows::Win32::Foundation::RECT::default();
+        unsafe {
+            GetWindowRect(body, &mut wr).expect("GetWindowRect");
+            GetClientRect(body, &mut cr).expect("GetClientRect");
+        }
+        (wr.right - wr.left) - (cr.right - cr.left)
+    }
+
+    /// #1016, #1052: a Settings window "at 100%" is a real 96 DPI window
+    /// (so its checkbox boxes and scrollbar are real size), and at another
+    /// simulated scale the width reserved for the scrollbar is the one the
+    /// scrollbar really takes. On a screen above 100% (MEASURED 2026-10-17,
+    /// 250%) both fail without the fix: the scrollbar is 42 px, not 17.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_gallery_settings_scrollbar_matches_the_reserved_width() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::HiDpi::{
+            SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let prev =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let at_100 = GalleryWindow::open(instance, Some(96)).expect("open at 96");
+        assert_eq!(unsafe { GetDpiForWindow(at_100.hwnd()) }, 96, "real 96 DPI");
+        assert_eq!(body_scrollbar_px(&at_100), scrollbar_width_px(96));
+        drop(at_100);
+        let at_150 = GalleryWindow::open(instance, Some(144)).expect("open at 144");
+        assert_eq!(body_scrollbar_px(&at_150), scrollbar_width_px(144));
+        drop(at_150);
+        unsafe { SetThreadDpiAwarenessContext(prev) };
     }
 
     // -- WM_DPICHANGED (#233) ---------------------------------------------

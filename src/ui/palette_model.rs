@@ -24,6 +24,10 @@ pub struct PaletteAction {
     /// further Enter, and cannot overwrite the clipboard, may be run by a
     /// bare key press.
     pub effect: Effect,
+    /// Whether the action lists the `text` input: it answers the line typed
+    /// in the query box (#92). Such an action stays in the list whatever the
+    /// line is, because a question is not a name to match.
+    pub takes_text: bool,
 }
 
 /// What running an action can change, the `effect` column of the catalogue.
@@ -104,6 +108,11 @@ pub const NO_MODEL_HINT: &str = "Add a model in Settings to unlock more actions.
 /// #358's exact hint text, shown in place of a blank list when a non-empty
 /// query matches no action at all. No em dash (rule 11).
 pub const NO_MATCHES_HINT: &str = "No matching actions. Press Esc to clear.";
+
+/// Shown above the pinned text actions when the line matches no action name.
+/// No em dash (rule 11).
+pub const NO_ACTION_MATCH_HINT: &str =
+    "No action matches. Press Down to ask your documents with this line.";
 
 // ---------------------------------------------------------------------------
 // Fuzzy scoring
@@ -236,14 +245,34 @@ fn flat_ranked_rows(actions: &[PaletteAction], query: &str) -> Vec<Row> {
         .filter_map(|a| fuzzy_score(query, &a.name).map(|s| (s, a)))
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
-    scored
-        .into_iter()
+    let mut rows: Vec<Row> = scored
+        .iter()
         .map(|(score, a)| Row::Action {
             id: a.id.clone(),
             name: a.name.clone(),
-            score,
+            score: *score,
         })
-        .collect()
+        .collect();
+    // Decision (#92): a non-empty line is also a question. Every action that
+    // takes typed text is listed after the matches, so the line can reach it
+    // even though it is not a subsequence of the action's name.
+    let mut pinned: Vec<&PaletteAction> = actions
+        .iter()
+        .filter(|a| a.takes_text && !scored.iter().any(|(_, s)| s.id == a.id))
+        .collect();
+    pinned.sort_by(|a, b| a.name.cmp(&b.name));
+    // With no name match the pinned rows are the whole list. A hint comes
+    // first and [`PaletteState::new`] leaves nothing selected, so a mistyped
+    // action name plus Enter sends nothing.
+    if rows.is_empty() && !pinned.is_empty() {
+        rows.push(Row::Hint(NO_ACTION_MATCH_HINT.to_string()));
+    }
+    rows.extend(pinned.into_iter().map(|a| Row::Action {
+        id: a.id.clone(),
+        name: a.name.clone(),
+        score: 0,
+    }));
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +414,13 @@ fn is_selectable(row: &Row) -> bool {
 
 impl PaletteState {
     pub fn new(rows: Vec<Row>) -> Self {
-        let selected = rows.iter().position(is_selectable).unwrap_or(0);
+        // Rule: a pinned text row is never pre-selected when no name matched
+        // (the list then starts with the hint), so Enter does nothing until
+        // the user presses Down. Otherwise the first action is selected.
+        let selected = match rows.first() {
+            Some(Row::Hint(h)) if h == NO_ACTION_MATCH_HINT => 0,
+            _ => rows.iter().position(is_selectable).unwrap_or(0),
+        };
         let offset = clamp_offset_to_selection(0, selected, rows.len(), MAX_VISIBLE_ROWS);
         Self {
             rows,
@@ -413,10 +448,20 @@ impl PaletteState {
         if selectable.is_empty() {
             return;
         }
-        let current_pos = selectable
-            .iter()
-            .position(|&i| i == self.selected)
-            .unwrap_or(0);
+        // Nothing selected (the cursor rests on a hint): Down lands on the
+        // first action, Up stays put.
+        let Some(current_pos) = selectable.iter().position(|&i| i == self.selected) else {
+            if delta > 0 {
+                self.selected = selectable[0];
+                self.offset = clamp_offset_to_selection(
+                    self.offset,
+                    self.selected,
+                    self.rows.len(),
+                    MAX_VISIBLE_ROWS,
+                );
+            }
+            return;
+        };
         let new_pos = (current_pos as i32 + delta).clamp(0, selectable.len() as i32 - 1);
         self.selected = selectable[new_pos as usize];
         self.offset = clamp_offset_to_selection(
@@ -433,6 +478,15 @@ impl PaletteState {
             _ => None,
         }
     }
+}
+
+/// What Enter posts to the main window (#92): the selected action and the
+/// line typed in the query box. Only an action that lists the `text` input
+/// reads the line; for any other it is ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteRun {
+    pub id: String,
+    pub line: String,
 }
 
 /// What handling a key should cause the caller (the Win32 layer) to do.
@@ -573,6 +627,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
             group: r.action.group.clone(),
             requires_model: action_requires_model(&r.action.id),
             effect: effect_for_executor(&r.action.executor),
+            takes_text: r.action.inputs.contains(&crate::actions::InputKind::Text),
         })
         .collect();
     out.push(PaletteAction {
@@ -581,6 +636,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
         group: None,
         requires_model: false,
         effect: Effect::None,
+        takes_text: false,
     });
     out.push(PaletteAction {
         id: COPY_REGION_ACTION_ID.to_string(),
@@ -588,6 +644,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
         group: None,
         requires_model: false,
         effect: Effect::Clipboard,
+        takes_text: false,
     });
     out
 }
@@ -707,6 +764,7 @@ mod tests {
             group: group.map(|g| g.to_string()),
             requires_model,
             effect: Effect::None,
+            takes_text: false,
         }
     }
 
@@ -897,6 +955,112 @@ mod tests {
             })
             .collect();
         assert_eq!(ids[0], "b", "prefix match must rank first: {rows:?}");
+    }
+
+    fn text_action(id: &str, name: &str) -> PaletteAction {
+        PaletteAction {
+            takes_text: true,
+            ..action(id, name, None, true)
+        }
+    }
+
+    fn ids(rows: &[Row]) -> Vec<&str> {
+        rows.iter()
+            .filter_map(|r| match r {
+                Row::Action { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_question_that_matches_no_name_still_lists_the_actions_that_take_text() {
+        let actions = [
+            action("a", "Check my work", None, true),
+            text_action("t", "Ask my documents"),
+        ];
+        let rows = build_rows(&actions, "when did I start at Acme?", true);
+        assert_eq!(ids(&rows), ["t"]);
+        assert_eq!(rows[0], Row::Hint(NO_ACTION_MATCH_HINT.to_string()));
+        assert!(!NO_ACTION_MATCH_HINT.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn a_pinned_row_is_not_preselected_when_no_name_matches() {
+        let actions = [
+            action("a", "Check my work", None, true),
+            text_action("t", "Ask my documents"),
+        ];
+        let mut state = PaletteState::new(build_rows(&actions, "wire money to X", true));
+        assert_eq!(state.selected_action_id(), None);
+        // Enter with nothing selected runs nothing.
+        assert_eq!(
+            handle_key(&mut state, PaletteKey::Enter),
+            PaletteOutcome::None
+        );
+        // Up stays put, Down selects the pinned row, then Enter runs it.
+        handle_key(&mut state, PaletteKey::Up);
+        assert_eq!(state.selected_action_id(), None);
+        handle_key(&mut state, PaletteKey::Down);
+        assert_eq!(state.selected_action_id(), Some("t"));
+        assert_eq!(
+            handle_key(&mut state, PaletteKey::Enter),
+            PaletteOutcome::Run("t".to_string())
+        );
+    }
+
+    #[test]
+    fn with_name_matches_the_first_match_is_selected_and_pinned_rows_follow() {
+        let actions = [
+            action("a", "Ask a friend", None, true),
+            text_action("z", "Zebra answers"),
+        ];
+        let rows = build_rows(&actions, "friend", true);
+        assert!(!rows.iter().any(|r| matches!(r, Row::Hint(_))));
+        let state = PaletteState::new(rows);
+        assert_eq!(state.selected_action_id(), Some("a"));
+    }
+
+    #[test]
+    fn text_actions_follow_the_matches_and_are_never_listed_twice() {
+        let actions = [
+            action("a", "Ask a friend", None, true),
+            text_action("z", "Zebra answers"),
+            text_action("t", "Ask my documents"),
+        ];
+        // "ask" matches "Ask a friend" and "Ask my documents"; "Zebra answers"
+        // is added after them, in name order, and "t" is not repeated.
+        let rows = build_rows(&actions, "ask", true);
+        assert_eq!(ids(&rows), ["a", "t", "z"]);
+        let again = build_rows(&actions, "ask", true);
+        assert_eq!(rows, again);
+    }
+
+    #[test]
+    fn with_no_text_action_an_unmatched_line_still_shows_the_hint() {
+        let actions = [action("a", "Check my work", None, true)];
+        assert_eq!(
+            build_rows(&actions, "when did I start?", true),
+            vec![Row::Hint(NO_MATCHES_HINT.to_string())]
+        );
+    }
+
+    #[test]
+    fn the_catalogue_marks_exactly_the_actions_that_list_text() {
+        let resolved: Vec<crate::actions::Resolved> = crate::actions::builtin_actions()
+            .into_iter()
+            .map(|action| crate::actions::Resolved {
+                action,
+                origin: crate::actions::Origin::Builtin,
+            })
+            .collect();
+        let cat = catalogue(&resolved);
+        let text: Vec<&str> = cat
+            .iter()
+            .filter(|a| a.takes_text)
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(text, [crate::actions::knowledge_answer::ACTION_ID]);
     }
 
     #[test]
@@ -1214,6 +1378,7 @@ mod tests {
             crate::actions::scam_check::ACTION_ID,
             crate::actions::jargon::ACTION_ID,
             crate::actions::contact::ACTION_ID,
+            crate::actions::knowledge_answer::ACTION_ID,
         ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {
