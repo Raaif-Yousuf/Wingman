@@ -126,10 +126,9 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
-    GetStockObject, InvalidateRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW,
-    PAINTSTRUCT, TRANSPARENT,
+    InvalidateRect, SelectObject, SetBkColor, SetBkMode, SetTextColor, UpdateWindow,
+    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
+    FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -306,7 +305,8 @@ impl Palette {
             edit_hwnd: HWND(std::ptr::null_mut()),
             owner: None,
             dpi: 96,
-            font: unsafe { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) },
+            // Made once the window exists and its DPI is known.
+            font: HFONT(std::ptr::null_mut()),
             d2d: None,
             catalogue: Vec::new(),
             model_configured: true,
@@ -397,6 +397,9 @@ impl Palette {
         }
         inner_ref.d2d = d2d;
 
+        // The query box shares the rows' face and size (#884); owned here,
+        // replaced on a DPI change, freed on drop.
+        inner_ref.font = gdi_font(inner_ref.dpi, FW_NORMAL.0 as i32);
         let edit_hwnd = create_query_edit(hwnd, instance, inner_ref.font, inner_ref.dpi);
         inner_ref.edit_hwnd = edit_hwnd;
         if !edit_hwnd.0.is_null() {
@@ -1117,6 +1120,11 @@ struct PaletteInner {
 impl Drop for PaletteInner {
     fn drop(&mut self) {
         self.drop_edit_brush();
+        if !self.font.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+        }
     }
 }
 
@@ -1317,6 +1325,24 @@ impl PaletteInner {
     /// out of [`PaletteInner::reposition_centered`] so `WM_DPICHANGED`'s
     /// handler can re-run the same layout after a DPI change without
     /// re-centering the window on the active monitor too.
+    /// A new query box font for the current DPI. The edit control is given
+    /// the new one before the old one is freed.
+    fn refresh_query_font(&mut self) {
+        let new = gdi_font(self.dpi, FW_NORMAL.0 as i32);
+        unsafe {
+            SendMessageW(
+                self.edit_hwnd,
+                WM_SETFONT,
+                Some(WPARAM(new.0 as usize)),
+                Some(LPARAM(1)),
+            );
+            if !self.font.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+        }
+        self.font = new;
+    }
+
     fn layout_edit_control(&self, w: i32) {
         let pad = scale(PADDING, self.dpi);
         unsafe {
@@ -2090,6 +2116,7 @@ impl PaletteInner {
                     );
                 }
                 self.layout_edit_control(w);
+                self.refresh_query_font();
                 if let Some(renderer) = &mut self.d2d {
                     renderer.set_dpi(self.dpi);
                     renderer.resize(w as u32, h as u32);
@@ -2336,6 +2363,64 @@ mod tests {
                 );
             }
             assert_ne!(p.inner.colors, live_colors());
+        }
+
+        /// The query box face and size, as the edit control reports them.
+        fn query_box_font(p: &Palette) -> windows::Win32::Graphics::Gdi::LOGFONTW {
+            use windows::Win32::Graphics::Gdi::{GetObjectW, LOGFONTW};
+            use windows::Win32::UI::WindowsAndMessaging::WM_GETFONT;
+            let hfont = unsafe { SendMessageW(p.edit_hwnd(), WM_GETFONT, None, None) };
+            let mut lf = LOGFONTW::default();
+            let got = unsafe {
+                GetObjectW(
+                    HGDIOBJ(hfont.0 as *mut c_void),
+                    std::mem::size_of::<LOGFONTW>() as i32,
+                    Some(&mut lf as *mut _ as *mut c_void),
+                )
+            };
+            assert!(got > 0, "the query box has no font");
+            lf
+        }
+
+        fn face(lf: &windows::Win32::Graphics::Gdi::LOGFONTW) -> String {
+            let n = lf.lfFaceName.iter().position(|&c| c == 0).unwrap_or(32);
+            String::from_utf16_lossy(&lf.lfFaceName[..n])
+        }
+
+        /// #884: the query box used the stock GUI font (an Arial-like face,
+        /// never scaled) while every row is Segoe UI at 14 DIP.
+        #[test]
+        fn the_query_box_uses_the_same_font_as_the_rows() {
+            let p = Palette::new_for_test(instance()).unwrap();
+            let lf = query_box_font(&p);
+            assert_eq!(face(&lf), D2D_FONT_FAMILY);
+            assert_eq!(lf.lfHeight, -scale(D2D_FONT_SIZE_DIP as i32, p.inner.dpi));
+        }
+
+        /// The font follows a per-monitor DPI change, like the layout does.
+        #[test]
+        fn the_query_box_font_follows_a_dpi_change() {
+            use windows::Win32::UI::WindowsAndMessaging::WM_DPICHANGED;
+            let p = Palette::new_for_test(instance()).unwrap();
+            let before = query_box_font(&p).lfHeight;
+            let new_dpi = if p.inner.dpi == 192 { 144 } else { 192 };
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: scale(WINDOW_WIDTH, new_dpi),
+                bottom: window_height(new_dpi),
+            };
+            unsafe {
+                SendMessageW(
+                    p.hwnd(),
+                    WM_DPICHANGED,
+                    Some(WPARAM(((new_dpi as usize) << 16) | new_dpi as usize)),
+                    Some(LPARAM(&rect as *const RECT as isize)),
+                );
+            }
+            let after = query_box_font(&p).lfHeight;
+            assert_ne!(before, after);
+            assert_eq!(after, -scale(D2D_FONT_SIZE_DIP as i32, new_dpi));
         }
 
         #[test]
