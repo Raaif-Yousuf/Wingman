@@ -1635,10 +1635,21 @@ impl Config {
         }
         let shared = shared_compat_names(&self.providers.compat);
         for entry in &mut self.providers.compat {
-            if !entry.api_key.is_empty() || is_shared_name(&shared, &entry.name) {
+            if !entry.api_key.is_empty() {
                 continue;
             }
             let target = target_name(&compat_order_name(&entry.name));
+            if is_shared_name(&shared, &entry.name) {
+                // #1225: a stored key exists but no entry may take it. Say so
+                // at startup, or the endpoint just fails with a 401.
+                if matches!(store.get(&target), Ok(Some(_))) {
+                    let label = shared_name_label(&entry.name);
+                    if !self.keys_left_in_file.contains(&label) {
+                        self.keys_left_in_file.push(label);
+                    }
+                }
+                continue;
+            }
             match store.get(&target) {
                 Ok(Some(secret)) => entry.api_key = secret,
                 Ok(None) => {}
@@ -5492,6 +5503,43 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
     }
 
     #[test]
+    fn a_stored_key_that_a_shared_name_cannot_take_is_named_at_startup() {
+        let mut config = Config::default();
+        let mut a = compat_entry("lab", "http://127.0.0.1:1/v1");
+        a.api_key.clear();
+        let mut b = compat_entry("Lab", "http://127.0.0.1:2/v1");
+        b.api_key.clear();
+        config.providers.compat = vec![a, b];
+        let store = InMemoryStore::default();
+        store.set(&target_name("compat:lab"), "stored").unwrap();
+        config.hydrate_secrets(&store);
+        assert_eq!(
+            config.keys_left_in_file.len(),
+            2,
+            "{:?}",
+            config.keys_left_in_file
+        );
+        assert!(config
+            .keys_left_in_file
+            .iter()
+            .all(|l| crate::config::is_shared_name_label(l)));
+
+        // Nothing stored, nothing to report.
+        let mut quiet = Config::default();
+        quiet.providers.compat = vec![
+            compat_entry("lab", "http://127.0.0.1:1/v1"),
+            compat_entry("lab", "http://127.0.0.1:2/v1"),
+        ];
+        quiet
+            .providers
+            .compat
+            .iter_mut()
+            .for_each(|e| e.api_key.clear());
+        quiet.hydrate_secrets(&InMemoryStore::default());
+        assert!(quiet.keys_left_in_file.is_empty());
+    }
+
+    #[test]
     fn an_empty_compat_name_keeps_its_key_in_the_file() {
         let mut config = Config::default();
         config.providers.compat = vec![
@@ -5511,6 +5559,8 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let path = scratch_path("import-duplicate-name");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let text = TWO_COMPAT_KEYS.replace("name = \"home\"", "name = \"lab\"");
+        assert_ne!(text, TWO_COMPAT_KEYS, "the replace must change the fixture");
+        assert_eq!(text.matches("name = \"lab\"").count(), 2);
         fs::write(&path, &text).unwrap();
         let mut config = Config::load_from_with(&path, &|_| None).unwrap();
         config.import_keys_and_write_back(&path, &InMemoryStore::default());
