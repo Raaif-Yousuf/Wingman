@@ -245,6 +245,15 @@ pub(super) fn row_slot(dpi: u32, pos: i32) -> RECT {
     )
 }
 
+/// Where a row's text starts: in from the slot's left edge, the same for
+/// action rows, headers and hints.
+fn text_slot(dpi: u32, slot: RECT) -> RECT {
+    RECT {
+        left: slot.left + px(TEXT_INSET_DP, dpi),
+        ..slot
+    }
+}
+
 /// What a selected or hovered row fills: the slot, less a little above and
 /// below.
 pub(super) fn row_fill(dpi: u32, pos: i32) -> RECT {
@@ -399,14 +408,17 @@ pub(super) fn build_ops(dpi: u32, input: &PaintInput) -> Vec<Op> {
         let pos = (i - input.offset) as i32;
         let slot = row_slot(dpi, pos);
         match row {
+            // #951: a header and a hint start where the row text starts, so
+            // a group reads as a label for what is under it. The header is
+            // in the caption size, quieter than the rows.
             Row::Header(name) => ops.push(Op::Text {
-                rect: slot,
+                rect: text_slot(dpi, slot),
                 text: name.clone(),
                 color: c.header,
-                face: Face::Body,
+                face: Face::Caption,
             }),
             Row::Hint(text) => ops.push(Op::Text {
-                rect: slot,
+                rect: text_slot(dpi, slot),
                 text: text.clone(),
                 color: c.hint,
                 face: Face::Body,
@@ -450,10 +462,7 @@ pub(super) fn build_ops(dpi: u32, input: &PaintInput) -> Vec<Op> {
                     });
                 }
                 ops.push(Op::Text {
-                    rect: RECT {
-                        left: fill.left + px(TEXT_INSET_DP, dpi),
-                        ..slot
-                    },
+                    rect: text_slot(dpi, slot),
                     text: name.clone(),
                     color: if selected { c.selected_text } else { c.text },
                     face: Face::Body,
@@ -599,6 +608,39 @@ mod tests {
                 .unwrap();
             assert_eq!(row_text, glyph, "dpi {dpi}: row text vs glyph");
             assert_eq!(footer_rect(dpi).left, glyph, "dpi {dpi}: footer vs glyph");
+        }
+    }
+
+    #[test]
+    fn group_headers_and_hints_start_where_row_text_starts_and_headers_are_smaller() {
+        for dpi in DPIS {
+            let rows = vec![
+                Row::Header("Answer".to_string()),
+                action("Check my work"),
+                Row::Hint("Add a model".to_string()),
+            ];
+            let ops = ops_for(dpi, &rows, 0, 1, None);
+            let find = |wanted: &str| {
+                ops.iter()
+                    .find_map(|op| match op {
+                        Op::Text {
+                            rect, text, face, ..
+                        } if text == wanted => Some((rect.left, *face)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("dpi {dpi}: no text {wanted:?}"))
+            };
+            let (row_left, row_face) = find("Check my work");
+            let (header_left, header_face) = find("Answer");
+            let (hint_left, _) = find("Add a model");
+            assert_eq!(header_left, row_left, "dpi {dpi}: header vs row text");
+            assert_eq!(hint_left, row_left, "dpi {dpi}: hint vs row text");
+            assert_eq!(row_face, Face::Body);
+            assert_eq!(
+                header_face,
+                Face::Caption,
+                "dpi {dpi}: smaller than the rows"
+            );
         }
     }
 
