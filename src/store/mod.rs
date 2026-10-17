@@ -1019,8 +1019,14 @@ pub fn report(e: &StoreError) {
 }
 
 fn note(text: String) {
-    if !NOTICE_USED.swap(true, Ordering::SeqCst) {
-        *NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+    note_in(&NOTICE_USED, &NOTICE, text);
+}
+
+/// The keep-the-first rule on slots of the caller's choosing, so a test can
+/// check it without the process-wide ones other tests write to.
+fn note_in(used: &AtomicBool, slot: &Mutex<Option<String>>, text: String) {
+    if !used.swap(true, Ordering::SeqCst) {
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
     }
 }
 
@@ -2157,14 +2163,14 @@ mod tests {
 
     #[test]
     fn only_the_first_notice_of_a_run_is_kept() {
-        // Process-wide state: take whatever earlier tests left, then check
-        // that a second note after the first is dropped.
-        let _ = take_notice();
-        note("first".to_string());
-        note("second".to_string());
-        let got = take_notice();
-        assert!(got.is_none() || got.as_deref() == Some("first"), "{got:?}");
-        assert_eq!(take_notice(), None);
+        // Local slots: the process-wide ones are written by other tests
+        // running at the same time.
+        let used = AtomicBool::new(false);
+        let slot = Mutex::new(None);
+        note_in(&used, &slot, "first".to_string());
+        note_in(&used, &slot, "second".to_string());
+        assert_eq!(slot.lock().unwrap().take().as_deref(), Some("first"));
+        assert_eq!(*slot.lock().unwrap(), None);
     }
 
     #[test]
