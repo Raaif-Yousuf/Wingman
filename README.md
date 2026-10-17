@@ -239,10 +239,10 @@ Local (Ollama) and Offline are both real options now, via the tray's
 otherwise cloud) or Offline (loopback only, enforced in code). See
 [`docs/offline.md`](docs/offline.md) for exactly what each mode does.
 
-The config file is still there (`Open config.toml` in the tray menu) if you
+The config file is still there (**Help and diagnostics** > **Open config.toml** in the tray menu) if you
 want to edit it by hand. If it has a mistake that stops it parsing, Wingman
 starts in Offline mode, tells you so on a card, and does not save over the
-file; fix it and choose **Reload settings**. Settings also refuses to save
+file; fix it and choose **Reload settings** (in **Help and diagnostics**). Settings also refuses to save
 over a file that changed while it was open, and one backup copy
 (`config.toml.bak`, keys blanked) is kept before a save replaces the file. See
 [`docs/offline.md`](docs/offline.md#a-config-file-that-does-not-parse).
@@ -266,7 +266,7 @@ Two bindings, both live at once:
 | | default | notes |
 |---|---|---|
 | primary | the Copilot key | Windows emits it as `Win+Shift+F23` |
-| secondary | `Ctrl+Shift+/` | works on any keyboard |
+| secondary | `Ctrl+Shift+/` | works on any keyboard. On a layout that prints another character on that key (`#` on a German keyboard, for example), Wingman shows that character instead. |
 
 One press of the primary key shows the options card: a few choices for what
 is on your screen. Press the key once while the card is up to run the first
@@ -289,13 +289,13 @@ in `config.toml`:
 An id that no action has is named on a card once. After that the key shows the
 options card.
 
-If the Copilot key does nothing, use **Set Copilot key...** in the tray menu
+If the Copilot key does nothing, use **Set Copilot key...** (in **Providers and keys** in the tray menu)
 and press it once: whatever your firmware actually emits gets captured and
 saved. Same for the secondary binding.
 
 A third, optional chord toggles Pause: running -> paused until resumed;
 paused, for any reason -> resume. Unlike primary/secondary it has no default
-binding. Use **Set pause key...** in the tray menu and press the key, or set
+binding. Use **Set pause key...** (in **Providers and keys** in the tray menu) and press the key, or set
 it by hand in `config.toml`:
 
 ```toml
@@ -307,9 +307,9 @@ alt = false
 win = false
 ```
 
-then **Reload settings** (or restart) to pick it up. The tray label shows
+then **Reload settings** (in **Help and diagnostics**, or restart) to pick it up. The tray label shows
 the current key, or "not set". To clear it, delete the `[hotkeys.pause]`
-table from `config.toml` and choose **Reload settings**. It is the one chord
+table from `config.toml` and choose **Reload settings** (in **Help and diagnostics**). It is the one chord
 that still works while paused.
 
 ### Through Windows Settings instead

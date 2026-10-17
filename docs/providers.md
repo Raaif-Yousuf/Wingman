@@ -337,8 +337,8 @@ report gets one warning line. Nothing is cached on disk yet, and the OpenAI
 list has no capability flags, so a text-only model may still appear.
 
 To use an OpenAI-compatible endpoint today, edit
-`%APPDATA%\Wingman\config.toml` by hand (**Open config.toml** in the tray
-menu) and add the provider name to `providers.order`, e.g.:
+`%APPDATA%\Wingman\config.toml` by hand (**Help and diagnostics** > **Open
+config.toml** in the tray menu) and add the provider name to `providers.order`, e.g.:
 
 ```toml
 [providers]
