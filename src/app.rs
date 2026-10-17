@@ -8870,7 +8870,7 @@ mod tests {
     fn opening_settings_forgets_the_options_session_with_its_card() {
         let src = lf(include_str!("app.rs"));
         let open = body_between(&src, "    fn open_settings(&mut self) {", "\n    }\n");
-        let hide = open.find("self.card.hide()").expect("card not hidden");
+        let hide = open.find("self.hide_card()").expect("card not hidden");
         let forget = open.find("self.options = None").expect("session kept");
         assert!(hide < forget, "{open}");
     }
