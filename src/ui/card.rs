@@ -1568,7 +1568,7 @@ const STILL_WORKING_DELAY_MS: u32 = 4000;
 /// (animate) on any Win32 failure, matching this module's existing degrade
 /// pattern of "keep the pre-existing behaviour" rather than inventing a new
 /// failure mode.
-fn client_area_animation_enabled() -> bool {
+pub(crate) fn client_area_animation_enabled() -> bool {
     // SPI_GETCLIENTAREAANIMATION writes a Win32 BOOL (a plain 4-byte int, 0
     // or nonzero) through pvParam -- a raw i32 avoids depending on exactly
     // which module this `windows` crate version exports its BOOL type from.
