@@ -21,7 +21,11 @@ const SECRET_MARKER: &str = "[secret]";
 /// replaced by a marker.
 pub fn mask_sensitive(text: &str) -> String {
     let mut spans: Vec<(Range<usize>, &'static str)> = Vec::new();
-    spans.extend(secret_spans(text).into_iter().map(|r| (r, SECRET_MARKER)));
+    spans.extend(
+        secret_spans(text, true)
+            .into_iter()
+            .map(|r| (r, SECRET_MARKER)),
+    );
     spans.extend(
         card_number_spans(text)
             .into_iter()

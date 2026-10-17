@@ -462,7 +462,7 @@ fn text_key_spans(text: &str) -> Vec<Range<usize>> {
 
 /// Every sensitive byte range in `text` with its marker label, sorted by
 /// start. Ranges may overlap (a key can contain digits that pass Luhn).
-fn text_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
+fn text_spans(text: &str, labels: bool) -> Vec<(Range<usize>, &'static str)> {
     let mut spans: Vec<(Range<usize>, &'static str)> = Vec::new();
     let mut add = |found: Vec<Range<usize>>, label| {
         spans.extend(found.into_iter().map(|r| (r, label)));
@@ -475,8 +475,10 @@ fn text_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
     add(text_key_spans(text), KEY);
     add(shared_key_spans(text), KEY);
     add(email_spans(text), EMAIL);
-    let secrets = secret_label_spans(text, &spans);
-    spans.extend(secrets.into_iter().map(|r| (r, SECRET)));
+    if labels {
+        let secrets = secret_label_spans(text, &spans);
+        spans.extend(secrets.into_iter().map(|r| (r, SECRET)));
+    }
     spans.sort_by_key(|(r, _)| (r.start, r.end));
     spans
 }
@@ -487,7 +489,7 @@ fn text_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
 /// text left after it is kept, and only when it still holds a letter or digit.
 fn secret_label_spans(text: &str, others: &[(Range<usize>, &'static str)]) -> Vec<Range<usize>> {
     let mut out = Vec::new();
-    for span in crate::secret_labels::secret_spans(text) {
+    for span in crate::secret_labels::secret_spans(text, false) {
         let covered_to = others
             .iter()
             .filter(|(r, _)| r.start == span.start)
@@ -581,7 +583,18 @@ impl Redactions {
     /// Overlapping spans become one marker, the first one's. Text with
     /// nothing sensitive comes back unchanged.
     pub fn redact_text(&mut self, text: &str) -> String {
-        let spans = text_spans(text);
+        self.redact_with(text, true)
+    }
+
+    /// [`Redactions::redact_text`] without the labelled-secret step. For text
+    /// where a word like "token:" is prose, not a label: error messages and
+    /// Wingman's own prompts.
+    pub fn redact_text_plain(&mut self, text: &str) -> String {
+        self.redact_with(text, false)
+    }
+
+    fn redact_with(&mut self, text: &str, labels: bool) -> String {
+        let spans = text_spans(text, labels);
         if spans.is_empty() {
             return text.to_string();
         }
@@ -614,7 +627,14 @@ impl Redactions {
     pub fn restore_in_json(&self, response: String) -> String {
         let mut out = response;
         for (marker, original) in &self.pairs {
-            if !out.contains(marker.as_str()) {
+            // A model may change the case of a secret marker ("[Secret 1]").
+            let any_case = marker.starts_with("[secret ");
+            let found = if any_case {
+                out.to_ascii_lowercase().contains(marker.as_str())
+            } else {
+                out.contains(marker.as_str())
+            };
+            if !found {
                 continue;
             }
             let escaped = serde_json::to_string(original).unwrap_or_default();
@@ -622,7 +642,11 @@ impl Redactions {
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
                 .unwrap_or("");
-            out = out.replace(marker.as_str(), escaped);
+            out = if any_case {
+                replace_ascii_case_insensitive(&out, marker, escaped)
+            } else {
+                out.replace(marker.as_str(), escaped)
+            };
         }
         out
     }
@@ -634,7 +658,7 @@ impl Redactions {
     /// copied, images included.
     pub fn redact_value(&mut self, v: &mut serde_json::Value) -> bool {
         self.note_existing_in(v);
-        self.redact_value_under(v, "")
+        self.redact_value_under(v, "", true)
     }
 
     fn note_existing_in(&mut self, v: &serde_json::Value) {
@@ -647,14 +671,18 @@ impl Redactions {
         }
     }
 
-    fn redact_value_under(&mut self, v: &mut serde_json::Value, key: &str) -> bool {
+    /// `labels` is false under Wingman's own instructions (a `system` field, or
+    /// a message whose `role` is `system`): a prompt such as "Password: never
+    /// reveal" must reach the model intact. User content keeps label masking.
+    fn redact_value_under(&mut self, v: &mut serde_json::Value, key: &str, labels: bool) -> bool {
         use serde_json::Value;
+        let labels = labels && !matches!(key, "system" | "instructions" | "system_instruction");
         match v {
             Value::String(s) => {
                 if crate::egress::is_structural_key(key) || crate::egress::is_embedded_png(s) {
                     return false;
                 }
-                let redacted = self.redact_text(s);
+                let redacted = self.redact_with(s, labels);
                 if redacted == *s {
                     return false;
                 }
@@ -664,20 +692,41 @@ impl Redactions {
             Value::Array(items) => {
                 let mut changed = false;
                 for i in items {
-                    changed |= self.redact_value_under(i, key);
+                    changed |= self.redact_value_under(i, key, labels);
                 }
                 changed
             }
             Value::Object(map) => {
+                let own = matches!(
+                    map.get("role").and_then(|r| r.as_str()),
+                    Some("system" | "developer")
+                );
+                let labels = labels && !own;
                 let mut changed = false;
                 for (k, i) in map.iter_mut() {
-                    changed |= self.redact_value_under(i, k);
+                    changed |= self.redact_value_under(i, k, labels);
                 }
                 changed
             }
             _ => false,
         }
     }
+}
+
+/// `text` with every ASCII-case-insensitive copy of the ASCII `needle` replaced.
+/// ASCII lowercasing keeps byte offsets, so every cut is on a char boundary.
+fn replace_ascii_case_insensitive(text: &str, needle: &str, with: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, _) in lower.match_indices(&needle) {
+        out.push_str(text.get(at..start).unwrap_or(""));
+        out.push_str(with);
+        at = start + needle.len();
+    }
+    out.push_str(text.get(at..).unwrap_or(""));
+    out
 }
 
 /// Where each word of `line_text` sits, as byte ranges, found by searching for
@@ -1112,10 +1161,10 @@ mod tests {
     #[test]
     fn a_labelled_secret_gets_a_numbered_marker_and_is_restored() {
         let mut r = Redactions::default();
-        let out = r.redact_text("user: bob\npassword: hunter2\nPIN 1234\npwd=hunter2");
+        let out = r.redact_text("user: bob\npassword: hunter2\nPIN: 1234\npwd=hunter2");
         assert_eq!(
             out,
-            "user: bob\npassword: [secret 1]\nPIN [secret 2]\npwd=[secret 1]"
+            "user: bob\npassword: [secret 1]\nPIN: [secret 2]\npwd=[secret 1]"
         );
         assert_eq!(r.counts().get("secret"), Some(&2), "{:?}", r.counts());
         assert_eq!(
@@ -1139,9 +1188,59 @@ mod tests {
             "the password policy says so",
             "Reset your password.",
             "a pin is small",
+            // A circuit problem: no separator, so no secret.
+            "pin 3 connects to pin 4",
+            "PIN 1234 is on the card",
+            "token ya29.x1",
         ] {
             assert_eq!(red(t), t, "{t}");
         }
+    }
+
+    #[test]
+    fn screen_text_needs_a_separator_or_a_table_cell() {
+        assert_eq!(red("Password：hunter2"), "Password：[secret 1]");
+        assert_eq!(red("| password | hunter2 |"), "| password | [secret 1] |");
+        assert_eq!(red("pin=1234"), "pin=[secret 1]");
+    }
+
+    #[test]
+    fn the_plain_variant_skips_labels_but_keeps_every_other_kind() {
+        let mut r = Redactions::default();
+        assert_eq!(
+            r.redact_text_plain("Password: never reveal. mail me@example.com"),
+            "Password: never reveal. mail [email 1]"
+        );
+    }
+
+    #[test]
+    fn a_request_body_is_label_masked_except_its_system_text() {
+        let mut body = serde_json::json!({
+            "system": "Password: never reveal",
+            "messages": [
+                {"role": "system", "content": "Pin: keep this"},
+                {"role": "user", "content": "password: hunter2"}
+            ]
+        });
+        let mut r = Redactions::default();
+        assert!(r.redact_value(&mut body));
+        assert_eq!(body["system"], "Password: never reveal");
+        assert_eq!(body["messages"][0]["content"], "Pin: keep this");
+        assert_eq!(body["messages"][1]["content"], "password: [secret 1]");
+    }
+
+    #[test]
+    fn a_secret_marker_is_restored_in_any_letter_case() {
+        let mut r = Redactions::default();
+        r.redact_text("password: hunter2");
+        assert_eq!(
+            r.restore_in_json("a [Secret 1] b [SECRET 1] c [secret 1]".to_string()),
+            "a hunter2 b hunter2 c hunter2"
+        );
+        // Other kinds stay exact.
+        let mut r = Redactions::default();
+        r.redact_text("me@example.com");
+        assert_eq!(r.restore_in_json("[EMAIL 1]".to_string()), "[EMAIL 1]");
     }
 
     #[test]

@@ -146,7 +146,11 @@ fn skip_filler(chars: &[(usize, char)], j: usize) -> usize {
 /// count ("the password policy"), nor does a value of only punctuation. Spans
 /// are on character boundaries, and the scan is linear: every attempt that
 /// reads ahead either becomes a span or stops at the first letter or digit.
-pub fn secret_spans(text: &str) -> Vec<Range<usize>> {
+///
+/// `space_join` allows the `PIN 1234` form (a label, a blank and a word with a
+/// digit). Documents turn it on; screen text leaves it off, since "pin 3
+/// connects to pin 4" in a circuit problem is not a secret.
+pub fn secret_spans(text: &str, space_join: bool) -> Vec<Range<usize>> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let at = |k: usize| chars.get(k).map(|&(_, c)| c);
     let mut spans = Vec::new();
@@ -203,7 +207,7 @@ pub fn secret_spans(text: &str) -> Vec<Range<usize>> {
                 Join::Comma
             }
             _ if has_tab => Join::Tab,
-            _ if j > blanks_start => Join::Space,
+            _ if space_join && j > blanks_start => Join::Space,
             _ => {
                 i += 1;
                 continue;
