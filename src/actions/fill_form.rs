@@ -1,5 +1,5 @@
 //! "Fill this form" (#40): the action layer that turns a UIA field snapshot
-//! (`inputs::uia::snapshot_foreground`), the profile (`profile::Profile`)
+//! (`inputs::uia::snapshot_hwnd`), the profile (`profile::Profile`)
 //! and, only when needed, one model completion, into a `form_fill` proposal
 //! the already-shipped `executors::fill_form::FillFormExecutor` (#33) can
 //! run. This file owns the "Propose" half of Look/Propose/Confirm/Do; the
@@ -171,7 +171,7 @@ pub fn control_type_str(kind: ControlKind) -> &'static str {
 }
 
 /// Whether a snapshotted field is worth even considering as a fill
-/// candidate. `inputs::uia::snapshot_foreground` already never emits a
+/// candidate. `inputs::uia::snapshot_hwnd` already never emits a
 /// button (or anything else outside its six known control kinds) as a
 /// `FieldSnapshot` at all -- see that module's `build_snapshot` -- so
 /// "never touches a button" (AGENTS.md, Wingman never presses Send/Submit)

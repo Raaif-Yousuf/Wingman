@@ -706,9 +706,7 @@ mod com {
 
     /// Probes a specific window's element directly via `ElementFromHandle`,
     /// bypassing real desktop focus entirely -- the integration test's seam
-    /// (see the win32 test module's doc comment), the same shape
-    /// `inputs::uia::snapshot_hwnd` uses relative to
-    /// `inputs::uia::snapshot_foreground`.
+    /// (see the win32 test module's doc comment).
     #[cfg_attr(not(test), allow(dead_code))] // test-only seam, see above
     pub(super) fn probe_element(hwnd: HWND) -> anyhow::Result<UiaProbe> {
         let _apartment = ComApartment::enter()?;
@@ -1297,7 +1295,7 @@ mod win32 {
 /// thread). Runs `TextPattern` first; if that yields no usable text, falls
 /// back to a clipboard-safe synthetic Ctrl+C. **Must be called
 /// from a dedicated worker thread**, same requirement as
-/// `inputs::uia::snapshot_foreground` (a hung UIA provider or a slow app's
+/// `inputs::uia::snapshot_hwnd` (a hung UIA provider or a slow app's
 /// own clipboard handling can block for a while; never call this from the
 /// low-level keyboard hook's thread).
 pub fn get_selection_foreground(
