@@ -1748,7 +1748,8 @@ impl Config {
         write_file_atomically(path, &toml_str, true)
     }
 
-    /// Restricts a file's ACL to the current user only, via `icacls`.
+    /// Restricts a file's ACL to the current user only, via `icacls`: no
+    /// inherited entries, and no SYSTEM or Administrators entry either (#966).
     /// Returns an error rather than swallowing one (#257): a caller that
     /// cannot show a card itself (this module never does, per rule 7) must
     /// propagate this so whichever caller CAN show one does.
@@ -1777,10 +1778,7 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?;
         let output = crate::owner_acl::icacls_command()
             .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?
-            .arg(path)
-            .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg(format!("{account}:F"))
+            .args(crate::owner_acl::owner_only_file_args(path, &account))
             .output()
             .context("failed to run icacls to restrict the config file's permissions")?;
         if !output.status.success() {
@@ -4194,6 +4192,50 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         cleanup(&path);
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn restrict_acl_leaves_the_current_user_as_the_only_entry() {
+        // #966: a file made by an elevated process carries explicit allow
+        // entries for SYSTEM and Administrators (the token's default DACL).
+        // `/inheritance:r` does not touch explicit entries, so they survived.
+        // Plant them the same way, restrict, then read the DACL back.
+        let path = scratch_path("acl-owner-only");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "x").unwrap();
+        for sid in ["*S-1-5-18", "*S-1-5-32-544"] {
+            let planted = crate::owner_acl::icacls_command()
+                .unwrap()
+                .arg(&path)
+                .arg("/grant")
+                .arg(format!("{sid}:F"))
+                .output()
+                .expect("icacls should run");
+            assert!(planted.status.success(), "could not plant {sid}");
+        }
+
+        Config::restrict_acl(&path).expect("restrict_acl should succeed");
+
+        let has_entry_for = |sid: &str| {
+            let out = crate::owner_acl::icacls_command()
+                .unwrap()
+                .arg(&path)
+                .arg("/findsid")
+                .arg(sid)
+                .output()
+                .expect("icacls should run");
+            String::from_utf8_lossy(&out.stdout).contains("SID Found")
+        };
+        let me = crate::owner_acl::grant_account().unwrap();
+        let (mine, system, admins) = (
+            has_entry_for(&me),
+            has_entry_for("*S-1-5-18"),
+            has_entry_for("*S-1-5-32-544"),
+        );
+        cleanup(&path);
+        assert!(mine, "the current user lost access");
+        assert!(!system, "SYSTEM still has an entry");
+        assert!(!admins, "Administrators still has an entry");
+    }
     #[test]
     #[cfg(windows)]
     fn migrate_from_aborts_and_reports_when_acl_restriction_fails() {
