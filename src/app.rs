@@ -1176,7 +1176,9 @@ fn broken_file_card(problem: &str, config_path: &str) -> (String, String) {
     let (headline, detail) = config_problem_card(problem);
     (
         headline,
-        format!("{detail}\n\nThe file is here (tray menu, Open config.toml):\n{config_path}"),
+        format!(
+            "{detail}\n\nThe file is here (tray menu, Help and diagnostics, Open config.toml):\n{config_path}"
+        ),
     )
 }
 
@@ -1203,7 +1205,7 @@ fn config_problem_card(problem: &str) -> (String, String) {
         format!(
             "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
              computer) and will not save over your file. Fix it, then choose Reload settings \
-             from the tray menu."
+             (tray menu, Help and diagnostics)."
         ),
     )
 }
@@ -1553,7 +1555,7 @@ impl App {
     fn readiness_gate(
         mode: Mode,
         providers: &Providers,
-        config_path: &str,
+        _config_path: &str,
     ) -> Option<(String, String)> {
         let selected = providers.build_chain_for_mode(mode, true);
         if !selected.ready_provider_names().is_empty() {
@@ -1561,18 +1563,20 @@ impl App {
         }
         Some(match mode {
             Mode::Local | Mode::Offline => (
-                "Local mode needs Ollama configured".to_string(),
-                format!(
-                    "Add \"ollama\" to providers.order and a base_url and model under [providers.ollama] in:\n{config_path}"
-                ),
+                format!("{} mode needs Ollama set up", mode.label()),
+                "Click here to open Settings, then pick Ollama (local) as the Active provider \
+                 and choose an Ollama model."
+                    .to_string(),
             ),
             Mode::Cloud => (
                 "No AI model set up yet".to_string(),
-                "Paste an API key, or install Ollama to run models on this PC for free.".to_string(),
+                "Paste an API key, or install Ollama to run models on this PC for free."
+                    .to_string(),
             ),
             Mode::Auto => (
                 "No AI model set up yet".to_string(),
-                "Paste an API key, or install Ollama to run models on this PC for free.".to_string(),
+                "Paste an API key, or install Ollama to run models on this PC for free."
+                    .to_string(),
             ),
         })
     }
@@ -4950,7 +4954,7 @@ impl App {
             // Rule 7: never a silent no-op.
             self.card.show_error(
                 "Couldn't open settings",
-                "Windows would not create the settings window. Try again, or edit config.toml from the tray menu.",
+                "Windows would not create the settings window. Try again, or open config.toml (tray menu, Help and diagnostics, Open config.toml).",
             );
         }
     }
@@ -10819,9 +10823,13 @@ mod tests {
             "C:\\cfg\\config.toml",
         )
         .expect("must block: local mode has no ollama configured");
-        assert_eq!(headline, "Local mode needs Ollama configured");
-        assert!(detail.contains("ollama"), "{detail}");
-        assert!(detail.contains("C:\\cfg\\config.toml"), "{detail}");
+        assert_eq!(headline, "Local mode needs Ollama set up");
+        // #1022: the way out is Settings (a click on the card), never a hand
+        // edit of the file, and the words match Settings' own labels.
+        assert!(detail.contains("Click here to open Settings"), "{detail}");
+        assert!(detail.contains("Ollama (local)"), "{detail}");
+        assert!(detail.contains("Active provider"), "{detail}");
+        assert!(!detail.contains("providers.order"), "{detail}");
     }
 
     #[test]
@@ -10829,7 +10837,8 @@ mod tests {
         let (headline, _) =
             App::readiness_gate(Mode::Offline, &cloud_ready_providers(), "config.toml")
                 .expect("must block: offline mode has no ollama configured");
-        assert_eq!(headline, "Local mode needs Ollama configured");
+        // #1022: Offline names itself, not "Local".
+        assert_eq!(headline, "Offline mode needs Ollama set up");
     }
 
     #[test]
@@ -11155,6 +11164,14 @@ mod tests {
             assert!(detail.contains("line 3, column 1"), "{detail}");
             assert!(detail.contains(path), "{detail}");
             assert!(detail.contains("Open config.toml"), "{detail}");
+            // #1022: both menu items live under the Help and diagnostics
+            // submenu, and the card says so.
+            assert!(detail.contains("Help and diagnostics"), "{detail}");
+            assert_eq!(
+                detail.matches("Help and diagnostics").count(),
+                2,
+                "{detail}"
+            );
             assert!(!detail.contains("providers.order"), "{detail}");
             assert!(!detail.contains('\u{2014}'));
         }

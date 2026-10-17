@@ -1850,7 +1850,7 @@ impl Config {
         if let Some(problem) = &self.load_problem {
             anyhow::bail!(
                 "{problem}, so Wingman did not save over it. Fix the file, then choose \
-                 Reload settings from the tray menu"
+                 Reload settings (tray menu, Help and diagnostics)"
             );
         }
         // A hand edit made after this config was read is not clobbered.
@@ -1858,7 +1858,7 @@ impl Config {
             if seen != now {
                 anyhow::bail!(
                     "config.toml changed on disk since Wingman read it, so it was not saved. \
-                     Choose Reload settings from the tray menu, then try again"
+                     Choose Reload settings (tray menu, Help and diagnostics), then try again"
                 );
             }
         }

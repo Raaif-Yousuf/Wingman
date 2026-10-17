@@ -84,7 +84,7 @@ to a cloud provider by accident. Wingman shows a card naming the problem and
 refuses to save over the file while it is broken or has changed on disk since
 it was read, so your edit is never overwritten. Before a save does replace the
 file, one copy is kept as `config.toml.bak`, with API keys blanked. Fix the
-file, then choose **Reload settings**.
+file, then choose **Reload settings** (in **Help and diagnostics** in the tray menu).
 
 ## What the guard blocks, and where
 
