@@ -28,6 +28,18 @@ folder = 'C:\Notes'
 
 - `.txt` and `.md` files (also `.text` and `.markdown`), in the folder and its
   subfolders. Markdown headings are kept so an answer can name the section.
+- `.html` and `.htm` files: only the text you would see. Scripts, styles,
+  comments and tags are dropped, character codes such as `&amp;` are decoded,
+  and nothing is loaded from the network.
+- `.csv` and `.tsv` files: the column names on one line, then one line per row
+  as `Name: Jane; City: Lisbon`. Empty cells are left out, and a row with more
+  cells than the first line gets "column 3" style names. Only the first 256
+  cells of a row are kept.
+- `.json` files: one line per value, as `address.city: Paris` or `skills[0]:
+  rust`. Empty values and `null` are left out. A file that is not valid JSON
+  is read as plain text instead.
+- A heading line is never made from a cell or a key: a line that would start
+  with `#` gets a backslash.
 - Other file types are ignored for now: PDF, Word, images and the rest are not
   read.
 - Left out on purpose: folders whose name starts with a dot (such as
