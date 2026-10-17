@@ -222,10 +222,4 @@ mod tests {
             assert!(p.starts_with(std::env::temp_dir()), "{p:?}");
         }
     }
-
-    #[test]
-    fn store_then_load_uses_the_test_path() {
-        store(Vendor::Gemini, &ids(&["gemini-3-pro"]));
-        assert_eq!(load(Vendor::Gemini), Some(ids(&["gemini-3-pro"])));
-    }
 }

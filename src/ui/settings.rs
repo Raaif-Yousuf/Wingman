@@ -5713,6 +5713,10 @@ struct CloudSync {
     /// key field with the same key does not fetch again, and a failed fetch
     /// is retried on the next focus-out.
     fetched_keys: std::sync::Mutex<[String; 3]>,
+    /// The newest fetch number each vendor's list was saved to disk for
+    /// (#585). Held while the file is written, so the newer list wins. The UI
+    /// thread never takes it, so a slow disk cannot stall it.
+    saved_generation: std::sync::Mutex<[u64; 3]>,
 }
 
 /// Whether a worker holding `mine` is still the newest for its vendor.
@@ -5892,9 +5896,8 @@ fn spawn_one_cloud_fetch(
 /// and the store happen under one lock, so an older worker cannot pass the check
 /// and then store after a newer one finished (#678). Returns whether it stored.
 ///
-/// The list is also saved to disk (#585), under the same lock and only once
-/// accepted, so a superseded worker never overwrites a newer saved list. The
-/// write is a small file on a worker thread.
+/// An accepted list is also saved to disk (#585), after the slots lock is
+/// released (the UI thread takes that lock). Called from worker threads only.
 fn store_fetched_list(
     slots: &CloudModels,
     sync: &CloudSync,
@@ -5903,20 +5906,36 @@ fn store_fetched_list(
     key: &str,
     ids: Vec<String>,
 ) -> bool {
-    let Ok(mut guard) = slots.lock() else {
-        return false;
-    };
-    if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
-        return false;
+    let saved = ids.clone();
+    {
+        let Ok(mut guard) = slots.lock() else {
+            return false;
+        };
+        if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
+            return false;
+        }
+        guard[index] = Some(ids);
+        // The fetched-key record is written under the same slots lock (always
+        // slots first, then keys), so it cannot go stale.
+        if let Ok(mut keys) = sync.fetched_keys.lock() {
+            keys[index] = key.trim().to_string();
+        }
     }
-    crate::provider::model_cache::store(CLOUD_VENDORS[index], &ids);
-    guard[index] = Some(ids);
-    // The fetched-key record is written under the same slots lock (always slots
-    // first, then keys), so it cannot go stale.
-    if let Ok(mut keys) = sync.fetched_keys.lock() {
-        keys[index] = key.trim().to_string();
-    }
+    save_accepted_list(sync, index, mine, &saved);
     true
+}
+
+/// Saves an accepted list to disk unless a newer fetch's list was saved
+/// already, so the newer list wins even when the workers finish out of order.
+fn save_accepted_list(sync: &CloudSync, index: usize, mine: u64, ids: &[String]) {
+    let Ok(mut saved) = sync.saved_generation.lock() else {
+        return;
+    };
+    if saved[index] > mine {
+        return;
+    }
+    crate::provider::model_cache::store(CLOUD_VENDORS[index], ids);
+    saved[index] = mine;
 }
 
 /// Runs `post` only while the Settings window is still open (#569). `alive`
@@ -9955,6 +9974,24 @@ impl Drop for GalleryWindow {
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::GW_HWNDPREV;
+
+    #[test]
+    fn an_older_accepted_list_never_overwrites_a_newer_saved_one() {
+        use crate::provider::model_list::Vendor;
+        let sync = CloudSync::default();
+        save_accepted_list(&sync, 2, 5, &["newer".to_string()]);
+        // Both were accepted in their time; the older one finishes writing last.
+        save_accepted_list(&sync, 2, 4, &["older".to_string()]);
+        assert_eq!(
+            crate::provider::model_cache::load(Vendor::Gemini),
+            Some(vec!["newer".to_string()])
+        );
+        save_accepted_list(&sync, 2, 6, &["newest".to_string()]);
+        assert_eq!(
+            crate::provider::model_cache::load(Vendor::Gemini),
+            Some(vec!["newest".to_string()])
+        );
+    }
 
     #[test]
     fn a_superseded_worker_does_not_overwrite_the_saved_list() {
