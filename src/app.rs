@@ -4988,6 +4988,17 @@ impl App {
                 return;
             }
         }
+        // The network, not the setup: say which service, and what to check.
+        // Recorded like any failure (the chain goes to Copy diagnostics).
+        if let Err(packed) = &result {
+            let chain = unpack_error(packed).1.to_string();
+            if let Some((headline, detail)) = network_failure(&chain) {
+                let _ = self.record_last(Err(pack_error(&headline, &chain)));
+                self.card.show_error_with_details(&headline, &detail);
+                self.set_watch(true);
+                return;
+            }
+        }
         let is_err = result.is_err();
         let mut answer = self.record_last(result);
         // A store failure never fails the request (#46); it rides on the
@@ -8947,6 +8958,52 @@ pub(crate) fn setup_failure(raw_chain: &str) -> Option<(String, String)> {
     Some((
         headline,
         format!("{fix} Details: {tag} answered HTTP {shown}."),
+    ))
+}
+
+/// First-run failures that are the network's, not Settings': a cloud provider
+/// that cannot be reached (offline, DNS, a firewall, a timeout) or an Ollama
+/// address that does not resolve. A plain headline and what to check, never
+/// the raw transport text (it stays in Copy diagnostics). `None` for anything
+/// else, including a refused local Ollama, which [`setup_failure`] owns. Pure.
+pub(crate) fn network_failure(raw_chain: &str) -> Option<(String, String)> {
+    let mut first: Option<(usize, &str, &str)> = None;
+    for (tag, name) in FAILURE_TAGS {
+        if let Some(at) = raw_chain.find(&format!("{tag}: transport error:")) {
+            if first.map_or(true, |(best, ..)| at < best) {
+                first = Some((at, tag, name));
+            }
+        }
+    }
+    let (at, tag, name) = first?;
+    let rest = raw_chain[at..].to_ascii_lowercase();
+    let timed_out = rest.contains("timed out") || rest.contains("timeout");
+    if tag == "ollama" {
+        // A local Ollama that refuses is `setup_failure`'s; a slow one is
+        // there. Only an address that leads nowhere is the network's.
+        let lost = ["resolve", "unreachable", "no route", "no such host"]
+            .iter()
+            .any(|m| rest.contains(m));
+        if timed_out || !lost {
+            return None;
+        }
+        return Some((
+            "Can't reach Ollama".to_string(),
+            "Check the Ollama address in Settings, and that the PC running it is on. \
+             Details: Ollama could not be reached."
+                .to_string(),
+        ));
+    }
+    let headline = if timed_out {
+        format!("{name} took too long to answer")
+    } else {
+        format!("Can't reach {name}")
+    };
+    Some((
+        headline,
+        format!(
+            "Check your internet connection, then press again. Details: {tag} could not be reached."
+        ),
     ))
 }
 
@@ -13680,6 +13737,71 @@ mod tests {
         ] {
             assert_eq!(failure(raw), None, "{raw}");
         }
+    }
+
+    // -- network down on the first press -------------------------------------
+
+    #[test]
+    fn a_cloud_provider_that_cannot_be_reached_says_so_and_what_to_check() {
+        for (raw, head) in [
+            (
+                "anthropic: transport error: io: No such host is known. (os error 11001)",
+                "Can't reach Anthropic",
+            ),
+            (
+                "model request failed: openai: transport error: connect error: Connection refused",
+                "Can't reach OpenAI",
+            ),
+            (
+                "gemini: transport error: timeout: global",
+                "Gemini took too long to answer",
+            ),
+        ] {
+            let (headline, detail) = super::network_failure(raw).unwrap_or_else(|| panic!("{raw}"));
+            assert_eq!(headline, head, "{raw}");
+            assert!(detail.contains("internet connection"), "{detail}");
+            assert!(!detail.contains("os error"), "{detail}");
+            assert!(!detail.contains("Try again"), "{detail}");
+            for text in [&headline, &detail] {
+                assert!(
+                    !text.contains('\u{2014}') && !text.contains('\u{2013}'),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_ollama_address_that_does_not_resolve_points_at_the_address() {
+        let (headline, detail) =
+            super::network_failure("ollama: transport error: could not resolve the address")
+                .expect("unresolvable");
+        assert_eq!(headline, "Can't reach Ollama");
+        assert!(detail.contains("address"), "{detail}");
+    }
+
+    #[test]
+    fn network_failure_leaves_other_failures_alone() {
+        for raw in [
+            "ollama: transport error: connect error: Connection refused (os error 10061)",
+            "ollama: transport error: operation timed out after 30s",
+            "anthropic: HTTP 401: {}",
+            "openai: HTTP 500: oops",
+            "No such file or directory (os error 2)",
+            "",
+        ] {
+            assert_eq!(super::network_failure(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn on_result_offers_a_network_failure_its_own_card_before_the_raw_one() {
+        let on_result = app_method_body("on_result");
+        let class = on_result
+            .find("network_failure(")
+            .unwrap_or_else(|| panic!("on_result never maps the failure: {on_result}"));
+        let raw = on_result.find("let is_err").expect("moved");
+        assert!(class < raw, "{on_result}");
     }
 
     /// Wired-to-nothing: the ask result and every action handler offer a
