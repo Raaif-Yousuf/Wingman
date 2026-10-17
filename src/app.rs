@@ -671,6 +671,8 @@ struct App {
     /// #1017: whether that probe started from the options card (the key or the
     /// tray), so a find of nothing ends on that card with its way into Settings.
     first_run_for_options: bool,
+    /// #1017: until when a probe that found no Ollama is not repeated for the options card.
+    first_run_not_running_until: Option<Instant>,
     /// #228: the footer line for the answer now being shown, set by each
     /// action result handler from the worker's attribution and `None` unless
     /// a fallback answered.
@@ -908,6 +910,7 @@ pub fn run() -> Result<()> {
         run_generation: 0,
         first_run_probe: 0,
         first_run_for_options: false,
+        first_run_not_running_until: None,
         fallback_footer: None,
         last_form_undo: None,
         exec_in_flight: false,
@@ -1322,6 +1325,17 @@ fn first_run_card_detail(
     first_run_detail(found).unwrap_or(gate_detail)
 }
 
+/// #1017: how long a probe that found no Ollama is not repeated.
+const FIRST_RUN_NOT_RUNNING_SECS: u64 = 60;
+
+fn first_run_not_running_until(now: Instant) -> Instant {
+    now + Duration::from_secs(FIRST_RUN_NOT_RUNNING_SECS)
+}
+
+/// Whether a remembered `NotRunning` answer still holds at `now`.
+fn first_run_probe_skipped(until: Option<Instant>, now: Instant) -> bool {
+    until.is_some_and(|u| now < u)
+}
 /// #1017: the summary of the no-model options card after the probe: it says
 /// why nothing was adopted only when Ollama answered without a usable model.
 fn no_model_options_summary(found: &FirstRun) -> &'static str {
@@ -1510,7 +1524,9 @@ impl App {
     /// network, so it runs on a worker thread and posts [`WM_APP_FIRST_RUN`];
     /// this only shows the pending card and starts it. Nothing is cached: a
     /// press re-runs the probe, which costs the worker a moment, never the
-    /// message loop. Returns `false` (nothing started) when this setup is not
+    /// message loop. The one exception (#1017): a probe for the options card that
+    /// found no Ollama is remembered for FIRST_RUN_NOT_RUNNING_SECS (or until
+    /// Settings opens), so repeated presses go straight to the card. Returns `false` (nothing started) when this setup is not
     /// eligible: a key, a chosen provider or Cloud mode.
     ///
     /// `for_options` (#1017): the press was the Wingman key on the options
@@ -1521,6 +1537,10 @@ impl App {
             .config
             .providers
             .first_run_local_eligible(self.config.mode)
+        {
+            return false;
+        }
+        if for_options && first_run_probe_skipped(self.first_run_not_running_until, Instant::now())
         {
             return false;
         }
@@ -1598,6 +1618,9 @@ impl App {
             self.persist_diff(&before, outcome);
             self.set_watch(true);
             return;
+        }
+        if matches!(found, FirstRun::NotRunning) {
+            self.first_run_not_running_until = Some(first_run_not_running_until(Instant::now()));
         }
         // #1017: a press of the key that showed the options card ends on it,
         // with the row that opens Settings. A broken config.toml keeps the
@@ -4824,6 +4847,8 @@ impl App {
             self.card.show_answer(headline, detail, 3, None);
             return;
         }
+        // #1017: the user may be about to start Ollama or add a key.
+        self.first_run_not_running_until = None;
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
         self.hide_card();
@@ -10295,6 +10320,44 @@ mod tests {
         assert!(result.contains("self.show_no_model_options("), "{result}");
     }
 
+    /// #1017: a probe that found Ollama absent is remembered for a short window, so a
+    /// second press goes straight to the options card instead of flashing Working.
+    #[test]
+    fn a_recent_not_running_probe_is_not_repeated_until_its_window_ends() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        assert!(!super::first_run_probe_skipped(None, now), "never probed");
+        let until = super::first_run_not_running_until(now);
+        assert!(super::first_run_probe_skipped(Some(until), now));
+        assert!(super::first_run_probe_skipped(
+            Some(until),
+            now + Duration::from_secs(59)
+        ));
+        assert!(
+            !super::first_run_probe_skipped(Some(until), until),
+            "window over"
+        );
+        assert!(!super::first_run_probe_skipped(
+            Some(until),
+            now + Duration::from_secs(61)
+        ));
+    }
+
+    #[test]
+    fn the_not_running_memory_is_set_by_the_result_and_cleared_by_settings() {
+        let result = app_method_body("on_first_run_result");
+        assert!(
+            result.contains("first_run_not_running_until = Some("),
+            "{result}"
+        );
+        let open = app_method_body("open_settings");
+        assert!(
+            open.contains("first_run_not_running_until = None"),
+            "{open}"
+        );
+        let start = app_method_body("start_first_run_probe");
+        assert!(start.contains("first_run_probe_skipped("), "{start}");
+    }
     #[test]
     fn a_first_run_probe_box_is_freed_when_dropped_unhandled() {
         use windows::Win32::Foundation::LPARAM;
