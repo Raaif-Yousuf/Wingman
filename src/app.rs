@@ -657,6 +657,9 @@ struct App {
     /// #42: the action being dispatched right now. It becomes `last_action`
     /// only when its run starts ([`App::note_run_started`]), not on a refusal.
     pending_action: Option<String>,
+    /// #964: what started the action being dispatched right now, so a worker
+    /// it spawns can label its egress rows. Set around one dispatch, then cleared.
+    run_trigger: Option<Trigger>,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -990,6 +993,7 @@ pub fn run() -> Result<()> {
         look_pressed_at: None,
         last_action: None,
         pending_action: None,
+        run_trigger: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -2575,7 +2579,7 @@ impl App {
         self.close_options_card();
         std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         self.palette_password_manager = false;
-        self.dispatch_palette_action(id);
+        self.dispatch_palette_action(id, "", Trigger::Options);
     }
 
     /// #308, #393: one press of the Wingman key. What it does follows what is
@@ -2746,7 +2750,7 @@ impl App {
             PrimaryDispatch::CheckMyWork => self.ask(trigger),
             PrimaryDispatch::Other(id) => {
                 self.palette_password_manager = false;
-                self.dispatch_palette_action(&id);
+                self.dispatch_palette_action(&id, "", trigger);
             }
             PrimaryDispatch::Unknown(id) => {
                 let (title, reason) = unknown_primary_action_text(&id);
@@ -2807,7 +2811,7 @@ impl App {
     /// corresponding tray item already calls; there is no second,
     /// palette-only code path. A `None` target (an id the palette itself
     /// never produces) is a no-op, not a panic (rule 7).
-    fn dispatch_palette_action(&mut self, action_id: &str) {
+    fn dispatch_palette_action(&mut self, action_id: &str, line: &str, trigger: Trigger) {
         // A run posted before Settings opened, or while a save is applied.
         if self.refuse_for_settings() {
             return;
@@ -2817,12 +2821,14 @@ impl App {
         // it opened as well, for the length of this one dispatch.
         self.password_manager_hint = self.palette_password_manager;
         self.pending_action = Some(action_id.to_string());
-        self.dispatch_palette_target(action_id);
+        self.run_trigger = Some(trigger);
+        self.dispatch_palette_target(action_id, line);
+        self.run_trigger = None;
         self.pending_action = None;
         self.password_manager_hint = false;
     }
 
-    fn dispatch_palette_target(&mut self, action_id: &str) {
+    fn dispatch_palette_target(&mut self, action_id: &str, line: &str) {
         match palette_model::dispatch_target_for(action_id) {
             Some(DispatchTarget::CheckMyWork) => self.ask(Trigger::Palette),
             Some(DispatchTarget::ExtractText) => self.extract_text(),
@@ -2836,7 +2842,7 @@ impl App {
             // #242: any other action id -- a user-authored `actions.toml`
             // entry -- runs through the generic Look/Propose/Confirm/Do
             // path instead of silently doing nothing.
-            Some(DispatchTarget::Generic(action_id)) => self.run_generic_action(&action_id),
+            Some(DispatchTarget::Generic(action_id)) => self.run_generic_action(&action_id, line),
             // `dispatch_target_for` never returns `None` (#242); kept only
             // because the match is over an `Option`, not because this arm
             // is expected to run.
@@ -3071,8 +3077,10 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         let redact = self.config.capture.redact;
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 (|| -> Result<Value> {
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
@@ -3232,8 +3240,8 @@ impl App {
     /// the generic path only covers "reuse an existing proposal schema and
     /// executor", the case `docs/actions.md` documents as the intended
     /// shape for a new `actions.toml` action.
-    fn run_generic_action(&mut self, action_id: &str) {
-        self.run_generic_action_with(action_id, None);
+    fn run_generic_action(&mut self, action_id: &str, line: &str) {
+        self.run_generic_action_with(action_id, line, None);
     }
 
     /// [`App::run_generic_action`], with the address the user confirmed when
@@ -3241,7 +3249,12 @@ impl App {
     /// first with `None`, which finds the link and shows the confirmation
     /// card (nothing is fetched, no model is asked), then, after "Do it",
     /// with the confirmed address, which fetches the page and summarizes it.
-    fn run_generic_action_with(&mut self, action_id: &str, confirmed_link: Option<String>) {
+    fn run_generic_action_with(
+        &mut self,
+        action_id: &str,
+        line: &str,
+        confirmed_link: Option<String>,
+    ) {
         let resolved = match actions::load_actions_report() {
             Ok(r) => r,
             Err(e) => {
@@ -3309,6 +3322,11 @@ impl App {
         let redact = self.config.capture.redact;
         let prompt = action.prompt.clone();
         let inputs = action.inputs.clone();
+        // #92: the line typed in the palette, and whether a documents folder
+        // is set, for an action that lists `text` or `knowledge`.
+        let line = line.to_string();
+        let knowledge_folder = self.config.knowledge.folder.clone();
+        let answers_from_documents = action.proposal == actions::knowledge_answer::PROPOSAL_KIND;
         // #68: an action that writes the answer over the selection needs the
         // selection's UIA identity as well as its text.
         let writes_back = action.executor == "replace_text";
@@ -3335,8 +3353,10 @@ impl App {
             } else {
                 (action.clone(), schema.clone())
             };
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let result: GenericResult = catch_worker(|| {
                 (|| -> Result<_, GenericFailure> {
                     // #127 step 1: find the link, check it, and hand it back for
@@ -3348,7 +3368,7 @@ impl App {
                     // #127 step 2: the user confirmed this address. The page is the
                     // only input: the selection and the screen are not read again.
                     let mut redirected_to: Option<(String, String)> = None;
-                    let (gathered, inputs) = match &link_step {
+                    let (mut gathered, inputs) = match &link_step {
                         actions::link_summary::Step::Fetch(url) => {
                             let page = crate::inputs::web_page::fetch_page(url)
                                 .map_err(GenericFailure::UserState)?;
@@ -3380,6 +3400,32 @@ impl App {
                             inputs,
                         ),
                     };
+                    // #92: the typed line, and the excerpts found for it. An empty
+                    // line, no folder, nothing indexed and nothing matching each
+                    // end here as a card, before any model is asked.
+                    let mut excerpts = Vec::new();
+                    // Names the excerpts in the egress row and the send preview
+                    // for every request this worker sends; dropped with the closure.
+                    let mut _excerpt_labels = None;
+                    if actions::generic_inputs::wants_text(&inputs) {
+                        gathered.text = Some(line.clone());
+                    }
+                    if actions::generic_inputs::wants_knowledge(&inputs) {
+                        // The line and the folder setting are checked before the
+                        // store is opened, so a store problem never replaces them.
+                        let found =
+                            actions::knowledge_answer::gather(&knowledge_folder, &line, || {
+                                crate::store::global()
+                                    .map_err(|e| format!("Couldn't open your documents index: {e}"))
+                            })
+                            .map_err(GenericFailure::UserState)?;
+                        _excerpt_labels = Some(crate::egress::KnowledgeScope::new(
+                            found.labels.clone(),
+                            found.bytes,
+                        ));
+                        gathered.knowledge = Some(found.block);
+                        excerpts = found.included;
+                    }
                     let planned = plan_generic_inputs(&inputs, &gathered)?;
                     if writes_back && actions::generic_replace::too_long(&gathered) {
                         return Err(GenericFailure::UserState(
@@ -3433,6 +3479,13 @@ impl App {
                             actions::link_summary::note_final_host(proposal, &confirmed, &read)
                         }
                         None => proposal,
+                    };
+                    // #92: only quotes found in their excerpt survive, and the
+                    // citation is built here from the stored file name.
+                    let proposal = if answers_from_documents {
+                        actions::knowledge_answer::finalize(&proposal, &excerpts)
+                    } else {
+                        proposal
                     };
                     Ok((proposal, replace))
                 })()
@@ -3510,7 +3563,10 @@ impl App {
                 .and_then(Value::as_str)
                 .and_then(|url| crate::inputs::web_page::parse_target(url).ok())
                 .map_or_else(|| "this link".to_string(), |t| t.host);
-            self.pending_preview = Some(PendingPreview::FetchLink(action.id.clone()));
+            self.pending_preview = Some(PendingPreview::FetchLink(
+                action.id.clone(),
+                self.run_trigger,
+            ));
             self.pending_preview_generation = self.card.show_preview(
                 &actions::link_summary::confirm_title(&host),
                 &schema,
@@ -3727,7 +3783,7 @@ impl App {
             Some(PendingPreview::GenericReplace(action, plan)) => {
                 self.run_confirmed_generic_replace(&action, plan, confirmed);
             }
-            Some(PendingPreview::FetchLink(action_id)) => {
+            Some(PendingPreview::FetchLink(action_id, trigger)) => {
                 // #127: the user confirmed the address on the card, so this
                 // is the one place a linked page is fetched.
                 let url = confirmed
@@ -3736,7 +3792,13 @@ impl App {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 match url {
-                    Some(url) => self.run_generic_action_with(&action_id, Some(url)),
+                    Some(url) => {
+                        // #964: the click that confirmed is not the entry
+                        // point; the run keeps the one that opened the card.
+                        self.run_trigger = trigger;
+                        self.run_generic_action_with(&action_id, "", Some(url));
+                        self.run_trigger = None;
+                    }
                     None => {
                         let detail = self.track_error(
                             "Couldn't fetch the link",
@@ -3952,8 +4014,10 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         let redact = self.config.capture.redact;
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
                 catch_worker(|| {
                     (|| -> Result<actions::review_email::ReviewOutcome> {
@@ -4150,8 +4214,10 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         let redact = self.config.capture.redact;
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let mut raw = raw;
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 form_fill_worker(
@@ -5327,10 +5393,10 @@ impl App {
     }
 
     /// #1011: the card for a key press or a second launch that arrived while
-    /// the tray menu was open.
+    /// the tray menu or a file dialog was open (#900).
     fn show_menu_was_open_card(&mut self) {
         self.card
-            .show_answer("The tray menu was open", "Try again.", 3, None);
+            .show_answer("A menu or dialog was open", "Try again.", 3, None);
     }
 
     /// #722: the tray menu runs with the same reentrancy policy as Settings,
@@ -6122,12 +6188,24 @@ impl App {
     /// everything instead of forming a second `&mut App` (see its doc
     /// comment). What was deferred is delivered afterwards, as
     /// `open_settings` does. The closure must not touch `self`.
+    ///
+    /// A press of the key meanwhile is answered by "A menu or dialog was
+    /// open", shown here. When the caller then puts up its own card (the import
+    /// preview, an error, "Action saved") that card replaces the note. That is
+    /// intended: the press was dropped, and the caller's card appearing right
+    /// after the dialog closes is the visible answer that Wingman is awake. When
+    /// the dialog was cancelled the caller shows nothing and the note stays.
     fn run_os_dialog<T>(&mut self, dialog: impl FnOnce() -> T) -> T {
         // Like `open_settings`: no card timers or click watcher while the
         // nested loop runs.
         self.hide_card();
         self.set_watch(false);
         SETTINGS_OPEN.with(|c| c.set(true));
+        // #900: a press or a second launch meanwhile is held and answered with
+        // a card afterwards, not dropped. Only those two: the tray menu's other
+        // deferrals (a send preview, a stage, the router) would be shown under
+        // the card the caller puts up next, where Settings' policy frees them.
+        FILE_DIALOG_OPEN.with(|c| c.set(true));
         // #1013: Settings is not owned by the owner window, so the dialog does
         // not stop it, yet its Tab, Enter and Esc need the main pump this
         // loop replaces. Disabled, it is plainly out of play until the dialog
@@ -6143,6 +6221,7 @@ impl App {
                 settings::bring_to_front();
             }
         }
+        FILE_DIALOG_OPEN.with(|c| c.set(false));
         SETTINGS_OPEN.with(|c| c.set(false));
         let pending = take_pending_messages(settings::is_foreground());
         let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
@@ -7765,6 +7844,10 @@ thread_local! {
     /// selects [`tray_menu_policy`] instead of the Settings one.
     static TRAY_MENU_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// True while an OS file dialog runs (#900). Always set together with
+    /// `SETTINGS_OPEN`; selects [`file_dialog_policy`].
+    static FILE_DIALOG_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// True while a command chosen from the tray runs (#1012). The menu takes
     /// the foreground, so "Settings is in front" is never true for such a
     /// command; `refuse_for_settings` asks whether Settings is open instead.
@@ -8111,7 +8194,7 @@ enum PendingPreview {
     ),
     /// #127: a linked-page action's confirmation card. Carries the action's
     /// id; "Do it" starts the fetch step with the address on the card.
-    FetchLink(String),
+    FetchLink(String, Option<Trigger>),
     /// #105: a worker is blocked before a request that leaves the machine,
     /// waiting for this preview's answer. Holds the channel back to it:
     /// "Send" answers it (`ui::send_gate::decide`), and every other way the
@@ -8202,6 +8285,19 @@ fn tray_menu_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
         | WM_APP_PAUSE_TOGGLE
         | WM_APP_HOTKEY
         | WM_APP_ACTIVATE => SettingsReentrancy::Defer,
+        _ => settings_reentrancy_policy(msg, taskbar_created_msg),
+    }
+}
+
+/// #900: the policy while an OS file dialog is open. The card is hidden first
+/// (as for Settings), so the Settings policy stands, with one change: a press
+/// of the Wingman key or a second launch is deferred, not dropped, so it ends
+/// in a card (`DeferredMessage::KeyDuringMenu`/`ActivateDuringMenu`). The tray
+/// menu's other deferrals do not apply: they exist to keep a card that is
+/// still up, and none is, so they stay freed as Settings frees them.
+fn file_dialog_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
+    match msg {
+        WM_APP_HOTKEY | WM_APP_ACTIVATE => SettingsReentrancy::Defer,
         _ => settings_reentrancy_policy(msg, taskbar_created_msg),
     }
 }
@@ -8501,7 +8597,7 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
     unsafe {
         match msg {
             WM_APP_LEARNED => drop(Box::from_raw(p as *mut Chord)),
-            WM_APP_PALETTE_RUN => drop(Box::from_raw(p as *mut String)),
+            WM_APP_PALETTE_RUN => drop(Box::from_raw(p as *mut palette_model::PaletteRun)),
             WM_APP_SEND_PREVIEW => drop(Box::from_raw(p as *mut crate::ui::send_gate::SendRequest)),
             WM_APP_PENDING_STAGE => drop(Box::from_raw(p as *mut crate::ui::card::PendingStage)),
             WM_APP_MACHINE_CHECK_RESULT => {
@@ -8715,6 +8811,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         }
     }
     let _from_tray = TrayCommandScope::enter();
+    app.run_trigger = Some(Trigger::Tray);
     match decode(id) {
         MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
         MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
@@ -8767,6 +8864,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
     }
     // Not after Quit: the window (and `app`) may already be gone.
     if !matches!(decode(id), MenuChoice::Command(cmd::QUIT)) {
+        app.run_trigger = None;
         app.password_manager_hint = false;
     }
     LRESULT(0)
@@ -8979,6 +9077,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
         let policy = if TRAY_MENU_OPEN.with(|c| c.get()) {
             tray_menu_policy(msg, taskbar_created_msg)
+        } else if FILE_DIALOG_OPEN.with(|c| c.get()) {
+            file_dialog_policy(msg, taskbar_created_msg)
         } else {
             settings_reentrancy_policy(msg, taskbar_created_msg)
         };
@@ -9243,8 +9343,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // WM_APP_PALETTE_RUN doc comment). Take ownership, then run it
             // through the same dispatch table the palette's rows were built
             // from.
-            let action_id = unsafe { *Box::from_raw(lparam.0 as *mut String) };
-            app.dispatch_palette_action(&action_id);
+            let run = unsafe { *Box::from_raw(lparam.0 as *mut palette_model::PaletteRun) };
+            app.dispatch_palette_action(&run.id, &run.line, Trigger::Palette);
             LRESULT(0)
         }
         WM_APP_FIRST_RUN => {
@@ -9894,6 +9994,66 @@ mod tests {
         assert!(body.contains("Outcome::reload()"), "{body}");
     }
 
+    /// #900: a key press or second launch during a file dialog gets the same
+    /// deferred card the tray menu gives it, not a silent drop.
+    #[test]
+    fn a_file_dialog_defers_a_press_and_a_second_launch_like_the_menu() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn run_os_dialog<T>(", "\n    }\n");
+        assert!(!body.is_empty());
+        let on = body
+            .find("FILE_DIALOG_OPEN.with(|c| c.set(true))")
+            .expect("run_os_dialog never selects the file dialog policy");
+        let run = body.find("dialog()").expect("no dialog call");
+        let off = body
+            .find("FILE_DIALOG_OPEN.with(|c| c.set(false))")
+            .expect("run_os_dialog never clears the file dialog policy");
+        assert!(
+            on < run && run < off,
+            "set before the dialog, cleared after"
+        );
+        // wnd_proc reads the cell, or the policy is wired to nothing.
+        let wnd = body_between(&src, "let policy = if TRAY_MENU_OPEN", "};");
+        assert!(wnd.contains("FILE_DIALOG_OPEN") && wnd.contains("file_dialog_policy"));
+        // And the policy it selects defers both, never ignores them.
+        for id in [WM_APP_HOTKEY, WM_APP_ACTIVATE] {
+            assert_eq!(super::file_dialog_policy(id, 0), SettingsReentrancy::Defer);
+        }
+    }
+
+    /// #900: nothing else the tray menu defers is delivered during a file
+    /// dialog. The card is hidden, so a send preview, a stage, a first-run
+    /// answer or a router result would be shown under the card the caller puts
+    /// up next (or strand a blocked worker behind it). They stay freed, as
+    /// Settings frees them, and every other id matches the Settings policy.
+    #[test]
+    fn a_file_dialog_frees_what_settings_frees_except_the_press_and_the_second_launch() {
+        use super::file_dialog_policy;
+        for msg in [
+            WM_APP_SEND_PREVIEW,
+            WM_APP_PENDING_STAGE,
+            WM_APP_FIRST_RUN,
+            WM_APP_ROUTER_RESULT,
+        ] {
+            assert_eq!(file_dialog_policy(msg, 0), SettingsReentrancy::Ignore);
+            assert_ne!(super::tray_menu_policy(msg, 0), SettingsReentrancy::Ignore);
+            // Ignored ids have their boxed payload freed in wnd_proc.
+        }
+        let mut checked = 0;
+        for (name, id) in ALL_WM_APP_IDS {
+            if [WM_APP_HOTKEY, WM_APP_ACTIVATE].contains(id) {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                file_dialog_policy(*id, FAKE_TASKBAR_CREATED_MSG),
+                settings_reentrancy_policy(*id, FAKE_TASKBAR_CREATED_MSG),
+                "{name}"
+            );
+        }
+        assert!(checked > 10, "the registry scan found {checked} ids");
+    }
+
     /// The gate is in the one place every model action starts, before the
     /// busy/paused check and any capture, and nothing keeps a press for later.
     #[test]
@@ -9963,6 +10123,53 @@ mod tests {
         assert!(
             ask < palette.find("dispatch_palette_target").expect("moved"),
             "{palette}"
+        );
+    }
+
+    /// #92: the palette line reaches the worker of a generic action, the
+    /// excerpts are found before the request is planned (so an empty folder is
+    /// a card, not a question sent alone), and the model's answer is checked
+    /// against those excerpts before it can reach a card.
+    #[test]
+    fn ask_my_documents_is_wired_from_the_palette_line_to_the_checked_answer() {
+        let src = lf(include_str!("app.rs"));
+        let dispatch = body_between(&src, "    fn dispatch_palette_action(", "\n    }\n");
+        assert!(
+            dispatch.contains("dispatch_palette_target(action_id, line)"),
+            "{dispatch}"
+        );
+        let handler = body_between(&src, "        WM_APP_PALETTE_RUN => {", "\n        }\n");
+        assert!(
+            handler.contains("dispatch_palette_action(&run.id, &run.line, Trigger::Palette)"),
+            "{handler}"
+        );
+        let worker = body_between(
+            &src,
+            "    fn run_generic_action_with(",
+            "    /// #551: applies a worker's stage message.",
+        );
+        let text = worker
+            .find("gathered.text = Some(line.clone())")
+            .expect("line unused");
+        let prep = worker
+            .find("knowledge_answer::gather(")
+            .expect("no retrieval");
+        // The excerpts are named for the egress row before the request goes.
+        let scope = worker
+            .find("egress::KnowledgeScope::new(")
+            .expect("excerpts not labelled for the egress row");
+        let plan = worker
+            .find("plan_generic_inputs(&inputs, &gathered)")
+            .expect("plan moved");
+        let ask = worker
+            .find("complete_parsed_with_fallback_attributed")
+            .expect("ask moved");
+        let fin = worker
+            .find("knowledge_answer::finalize(")
+            .expect("answer unchecked");
+        assert!(
+            text < plan && prep < scope && scope < plan && plan < ask && ask < fin,
+            "{worker}"
         );
     }
 
@@ -10746,6 +10953,7 @@ mod tests {
             name: id.to_string(),
             group: None,
             requires_model: false,
+            takes_text: false,
             effect,
         };
         let cat = [
@@ -11174,29 +11382,58 @@ mod tests {
     #[test]
     fn opening_the_palette_sends_no_model_request() {
         let src = lf(include_str!("app.rs"));
-        let start = src
-            .find("    fn toggle_palette(&mut self) {")
-            .expect("toggle_palette exists");
-        let body = &src[start..];
-        let end = body.find("\n    }\n").expect("toggle_palette ends");
-        let body = &body[..end];
-        assert!(
-            body.contains("palette.show("),
-            "the scan found the wrong body"
-        );
-        for forbidden in [
-            "show_options_card",
-            "router_worker",
-            "capture::",
-            "grab_raw",
-            "thread::spawn",
-            "set_router_pending",
-        ] {
-            assert!(
-                !body.contains(forbidden),
-                "toggle_palette starts a request again: {forbidden}"
-            );
+        // The body of `fn name(&mut self` or `fn name(&self`, up to the first
+        // method-closing brace.
+        let body_of = |name: &str| -> Option<String> {
+            let start = ["(&mut self", "(&self"]
+                .iter()
+                .find_map(|recv| src.find(&format!("    fn {name}{recv}")))?;
+            let body = &src[start..];
+            Some(body[..body.find("\n    }\n")?].to_owned())
+        };
+        // Everything `toggle_palette` reaches through `self.helper(` calls
+        // defined in this file, so a request hidden behind a new helper is
+        // found too (#886).
+        let mut todo = vec!["toggle_palette".to_owned()];
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(name) = todo.pop() {
+            if seen.contains(&name) {
+                continue;
+            }
+            let Some(body) = body_of(&name) else {
+                continue;
+            };
+            if name == "toggle_palette" {
+                assert!(
+                    body.contains("palette.show("),
+                    "the scan found the wrong body"
+                );
+            }
+            for forbidden in [
+                "show_options_card",
+                "router_worker",
+                "capture::",
+                "grab_raw",
+                "thread::spawn",
+                "set_router_pending",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "opening the palette starts a request again, in {name}: {forbidden}"
+                );
+            }
+            for (i, _) in body.match_indices("self.") {
+                let rest = &body[i + 5..];
+                let end = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                if rest[end..].starts_with('(') {
+                    todo.push(rest[..end].to_owned());
+                }
+            }
+            seen.push(name);
         }
+        assert!(seen.len() > 1, "the scan followed no helper calls");
     }
 
     /// #723: the stuck bound covers every provider in a chain at its own
@@ -11339,7 +11576,10 @@ mod tests {
     #[test]
     fn free_boxed_payload_frees_a_boxed_message_and_ignores_the_rest() {
         use windows::Win32::Foundation::LPARAM;
-        let boxed = Box::into_raw(Box::new("palette action".to_string()));
+        let boxed = Box::into_raw(Box::new(crate::ui::palette_model::PaletteRun {
+            id: "palette action".to_string(),
+            line: "typed line".to_string(),
+        }));
         assert!(super::free_boxed_payload(
             WM_APP_PALETTE_RUN,
             LPARAM(boxed as isize)
@@ -14888,6 +15128,66 @@ mod tests {
                     "edit_settings returns after a card without arming click-away"
                 );
             }
+        }
+    }
+
+    /// #964: every entry point that can start a model call says what started
+    /// it, and every worker that can write an egress row picks that up.
+    #[test]
+    fn every_entry_point_and_model_worker_names_its_trigger() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields a first part");
+        let body_of = |name: &str| {
+            let start = production
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &production[start + 1..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        // Entry points: the options card, the palette, a pinned primary action.
+        assert!(
+            body_of("run_option").contains("dispatch_palette_action(id, \"\", Trigger::Options)")
+        );
+        assert!(production
+            .contains("app.dispatch_palette_action(&run.id, &run.line, Trigger::Palette)"));
+        assert!(
+            body_of("run_primary_action").contains("dispatch_palette_action(&id, \"\", trigger)")
+        );
+        // The dispatch funnel holds the trigger for the length of the run.
+        let funnel = body_of("dispatch_palette_action");
+        assert!(
+            funnel.contains("self.run_trigger = Some(trigger)"),
+            "{funnel}"
+        );
+        assert!(funnel.contains("self.run_trigger = None"), "{funnel}");
+        // The tray menu does the same for its direct commands.
+        assert!(production.contains("app.run_trigger = Some(Trigger::Tray)"));
+        // A linked-page action keeps its trigger across the confirm card.
+        let squashed: String = production.split_whitespace().collect();
+        assert!(squashed.contains("PendingPreview::FetchLink(action.id.clone(),self.run_trigger,)"));
+        assert!(squashed.contains(
+            "self.run_trigger=trigger;self.run_generic_action_with(&action_id,\"\",Some(url));"
+        ));
+        // Workers that call a model carry it into the thread.
+        for name in [
+            "add_event_from_screen",
+            "run_generic_action_with",
+            "review_this_email",
+            "fill_form_from_screen",
+        ] {
+            let body = body_of(name);
+            assert!(
+                body.contains("let trigger = self.run_trigger;"),
+                "{name} does not capture the trigger"
+            );
+            let spawn = body.find("std::thread::spawn").expect("worker spawn");
+            assert!(
+                body[spawn..].contains("crate::activation::set_worker_trigger_opt(trigger)"),
+                "{name}'s worker does not set the trigger"
+            );
         }
     }
 

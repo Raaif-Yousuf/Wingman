@@ -122,6 +122,7 @@ use crate::hotkey::{
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::ollama_gpu_fix;
 use crate::provider::DEFAULT_PROMPT;
+use crate::ui::settings_models::{self, Slot};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -664,6 +665,17 @@ struct SettingsInner {
     /// Each page's content height in dp, padding included, indexed by
     /// [`Page::index`]. The Advanced entry is for the prompt closed.
     page_content_dp: [i32; 5],
+    /// #874: the Models page controls that move or hide with the provider
+    /// choice, and what the choice currently hides.
+    models_flow: Vec<FlowChild>,
+    /// The user pressed "Add another provider": every vendor shows.
+    models_revealed: bool,
+    /// Which provider blocks show now: OpenAI, Anthropic, Gemini, Ollama.
+    models_shown: [bool; 4],
+    /// Whether "Add another provider" is offered now.
+    models_add_shown: bool,
+    /// How much shorter the Models page is than with every block, in dp.
+    models_shrink_dp: i32,
     /// #481: the scrolling body that holds every group above the footer.
     body: HWND,
     /// The dpi the body's scroll position is expressed in, so a dpi change
@@ -761,6 +773,11 @@ impl SettingsInner {
             rail: HWND(std::ptr::null_mut()),
             page: Page::General,
             page_content_dp: [0; 5],
+            models_flow: Vec::new(),
+            models_revealed: false,
+            models_shown: [true; 4],
+            models_add_shown: false,
+            models_shrink_dp: 0,
             body: HWND(std::ptr::null_mut()),
             body_dpi: 96,
             ollama_link_url: None,
@@ -796,10 +813,12 @@ impl SettingsInner {
         self.body = built.body;
         self.body_dpi = self.dpi;
         self.children = built.children;
+        self.models_flow = built.models_flow;
         self.content_top_dp = built.content_top_dp;
         self.win_h_dp = built.win_h_dp;
-        // Only the first page shows.
-        unsafe { sync_visibility(self) };
+        // The Models page starts with the active provider's rows only, and
+        // only the first page shows.
+        unsafe { sync_models_flow(self) };
     }
 }
 
@@ -1097,6 +1116,8 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, &prompt_to_edit(DEFAULT_PROMPT));
         }
+        ID_ACTIVE_PROVIDER if notify == CBN_SELCHANGE => unsafe { sync_models_flow(inner) },
+        ID_ADD_PROVIDER if notify == BN_CLICKED => unsafe { reveal_providers(inner) },
         ID_CARD_CORNER if notify == CBN_SELCHANGE => sync_card_display_enabled(inner.hwnd),
         ID_GEMINI_MODEL if notify == CBN_SELCHANGE => sync_gemini_thinking_enabled(inner.hwnd),
         // #635: the user picked a model themselves, so a pending "select the
@@ -1285,6 +1306,8 @@ const ID_PAUSE_BUTTON: i32 = 152;
 const ID_RESUME_BUTTON: i32 = 153;
 const ID_PAUSE_LABEL: i32 = 154;
 const ID_CHANGE_PAUSE: i32 = 155;
+/// #874: "Add another provider", which shows the vendors that are hidden.
+const ID_ADD_PROVIDER: i32 = 156;
 
 /// #872: the five pages of the window, in rail order. Each existing control
 /// lives on exactly one (see [`PAGE_CONTROLS`]); the rail shows one page at a
@@ -1415,6 +1438,7 @@ const PAGE_CONTROLS: [(Page, &[i32]); 5] = [
             ID_GEMINI_MODEL,
             ID_GEMINI_EFFORT_LABEL,
             ID_GEMINI_EFFORT,
+            ID_ADD_PROVIDER,
             ID_MODEL_LIST_HINT,
             ID_OPEN_CONFIG,
             ID_OLLAMA_MODEL,
@@ -1524,6 +1548,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_RESUME_BUTTON", ID_RESUME_BUTTON),
     ("ID_PAUSE_LABEL", ID_PAUSE_LABEL),
     ("ID_CHANGE_PAUSE", ID_CHANGE_PAUSE),
+    ("ID_ADD_PROVIDER", ID_ADD_PROVIDER),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1733,6 +1758,12 @@ fn dpi_for(hwnd: HWND) -> u32 {
 thread_local! {
     /// The gallery's simulated DPI for this thread's Settings window, if any.
     static FORCED_DPI: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The Settings window's real DPI while the gallery simulates another one.
+    static NATIVE_DPI: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -2028,6 +2059,13 @@ unsafe fn on_dpi_changed(inner: &mut SettingsInner, wparam: WPARAM, lparam: LPAR
 /// window's current client size: the footer is pinned to the bottom, the body
 /// fills the rest, and its scroll range follows the content (#481).
 unsafe fn apply_dpi(inner: &mut SettingsInner) {
+    apply_layout(inner, true);
+}
+
+/// [`apply_dpi`], optionally keeping the current font. A layout change that
+/// is not a DPI or font change (a provider switch, #874) passes `false`, so no
+/// new `HFONT` is made for it.
+unsafe fn apply_layout(inner: &mut SettingsInner, rebuild_font: bool) {
     let dpi = inner.dpi;
     let mut rc = windows::Win32::Foundation::RECT::default();
     let (client_w_px, client_h_px) = if GetClientRect(inner.hwnd, &mut rc).is_ok() {
@@ -2058,7 +2096,11 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     );
     inner.body_dpi = dpi;
 
-    let new_font = build_font(dpi);
+    let new_font = if rebuild_font || inner.font.0.is_null() {
+        build_font(dpi)
+    } else {
+        inner.font
+    };
     // No repaint between the individual moves: one redraw at the end, so a
     // drag across monitors does not flicker.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
@@ -2097,7 +2139,7 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
         set_body_scroll(inner.body, content_px, view_px, pos);
     }
     // Every child now uses the new font, so the old one can go.
-    if !inner.font.0.is_null() {
+    if new_font != inner.font && !inner.font.0.is_null() {
         let _ = DeleteObject(HGDIOBJ(inner.font.0));
     }
     inner.font = new_font;
@@ -2117,6 +2159,8 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
 fn page_content_dp(inner: &SettingsInner, layout: &PromptFooterLayout) -> i32 {
     if inner.page == Page::Advanced {
         layout.content_h()
+    } else if inner.page == Page::Models {
+        inner.page_content_dp[Page::Models.index()] - inner.models_shrink_dp
     } else {
         inner.page_content_dp[inner.page.index()]
     }
@@ -2125,7 +2169,22 @@ fn page_content_dp(inner: &SettingsInner, layout: &PromptFooterLayout) -> i32 {
 /// The height of the fullest page in dp, with the prompt closed: what the
 /// window is made tall enough for (#872).
 fn tallest_page_dp(inner: &SettingsInner) -> i32 {
-    inner.page_content_dp.iter().copied().max().unwrap_or(0)
+    Page::ALL
+        .iter()
+        .map(|p| page_max_dp(inner, *p))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The tallest `page` gets in dp. The Models page is longest with every
+/// provider showing, and then "Add another provider" has gone (#874).
+fn page_max_dp(inner: &SettingsInner, page: Page) -> i32 {
+    let full = inner.page_content_dp[page.index()];
+    if page == Page::Models {
+        full - (ROW_H + ROW_GAP)
+    } else {
+        full
+    }
 }
 
 /// Whether the child `c` should be visible: it is on the page that shows, and
@@ -2139,10 +2198,112 @@ unsafe fn child_visible(inner: &SettingsInner, c: &ChildLayout) -> bool {
     if page != inner.page {
         return false;
     }
+    if page == Page::Models {
+        if let Some(f) = inner.models_flow.iter().find(|f| f.hwnd == c.hwnd) {
+            if !settings_models::slot_shown(f.slot, inner.models_shown, inner.models_add_shown) {
+                return false;
+            }
+        }
+    }
     match GetDlgCtrlID(c.hwnd) {
         ID_OLLAMA_LINK => inner.ollama_link_shown,
         ID_PROMPT_EDIT | ID_RESET_PROMPT => inner.prompt_expanded,
         _ => true,
+    }
+}
+
+/// #874: works out which provider blocks the Models page shows (the active
+/// one, any with a key typed or stored, everything once "Add another provider"
+/// was pressed), moves the blocks under a hidden one up, and re-lays-out. The
+/// hidden controls keep their text, so Save and a switch back lose nothing.
+/// It reads two combo selections and a few text lengths: nothing slow, so it
+/// is safe on the UI thread, and it only runs on a choice, never on a paint.
+unsafe fn sync_models_flow(inner: &mut SettingsInner) {
+    let hwnd = inner.hwnd;
+    let active = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER)
+        .map(|c| SendMessageW(c, CB_GETCURSEL, None, None).0)
+        .filter(|i| *i >= 0)
+        .map(|i| ActiveProvider::from_index(i as usize));
+    let typed = |id: i32| {
+        get_dlg_item(hwnd, id)
+            .is_some_and(|h| windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(h) > 0)
+    };
+    let configured = [
+        typed(ID_OPENAI_KEY),
+        typed(ID_ANTHROPIC_KEY),
+        typed(ID_GEMINI_KEY),
+        inner.original.providers.order.iter().any(|p| p == "ollama"),
+    ];
+    let shown = settings_models::shown_providers(active, configured, inner.models_revealed);
+    let add = settings_models::add_button_shown(shown, inner.models_revealed);
+    inner.models_shown = shown;
+    inner.models_add_shown = add;
+    let pitch = ROW_H + ROW_GAP;
+    for f in &inner.models_flow {
+        let dy = settings_models::slot_dy(f.slot, shown, add, pitch);
+        if let Some(c) = inner.children.iter_mut().find(|c| c.hwnd == f.hwnd) {
+            if f.slot == Slot::Frame {
+                c.h = f.h + dy;
+            } else {
+                c.y = f.y + dy;
+            }
+        }
+    }
+    // A hidden Ollama card also takes its own height off the page. Its group
+    // frame is the tallest control made under the slot.
+    let card_h = inner
+        .models_flow
+        .iter()
+        .filter(|f| f.slot == Slot::OllamaCard)
+        .map(|f| f.h)
+        .max()
+        .unwrap_or(0);
+    let card_gone = if shown[3] { 0 } else { card_h + GROUP_GAP };
+    inner.models_shrink_dp = -settings_models::slot_dy(Slot::Frame, shown, add, pitch) + card_gone;
+    if !inner.hwnd.0.is_null() {
+        // One repaint for the whole change, as `show_page` does: the layout
+        // pass below turns redraw back on and repaints.
+        SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
+    }
+    sync_visibility(inner);
+    if !inner.hwnd.0.is_null() {
+        apply_layout(inner, false);
+        // Focus never stays on a control that just went away.
+        let focus = GetFocus();
+        if !focus.0.is_null()
+            && IsChild(inner.hwnd, focus).as_bool()
+            && !IsWindowVisible(focus).as_bool()
+        {
+            if let Some(combo) = get_dlg_item(inner.hwnd, ID_ACTIVE_PROVIDER) {
+                let _ = SetFocus(Some(combo));
+            }
+        }
+    }
+}
+
+/// The control that takes focus when "Add another provider" shows the blocks
+/// that were hidden `before`: the first field of the first one that appeared.
+fn reveal_focus_id(before: [bool; 4], after: [bool; 4]) -> i32 {
+    const FIRST_FIELD: [i32; 4] = [
+        ID_OPENAI_KEY,
+        ID_ANTHROPIC_KEY,
+        ID_GEMINI_KEY,
+        ID_OLLAMA_MODEL,
+    ];
+    settings_models::first_revealed(before, after)
+        .map(|i| FIRST_FIELD[i])
+        .unwrap_or(ID_ACTIVE_PROVIDER)
+}
+
+/// "Add another provider": shows every vendor and puts focus on the first one
+/// that was hidden, since the button that had focus is gone.
+unsafe fn reveal_providers(inner: &mut SettingsInner) {
+    let before = inner.models_shown;
+    inner.models_revealed = true;
+    sync_models_flow(inner);
+    let target = reveal_focus_id(before, inner.models_shown);
+    if let Some(h) = get_dlg_item(inner.hwnd, target) {
+        let _ = SetFocus(Some(h));
     }
 }
 
@@ -2646,7 +2807,103 @@ unsafe extern "system" fn edit_subclass(
             let _ = RemoveWindowSubclass(hwnd, Some(edit_subclass), EDIT_SUBCLASS_ID);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
-        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        _ => {
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            if edit_may_change_scroll_need(msg) && GetDlgCtrlID(hwnd) == ID_PROMPT_EDIT {
+                sync_prompt_scrollbar(hwnd);
+            }
+            result
+        }
+    }
+}
+
+/// Messages after which the prompt box may need a scroll bar, or no longer
+/// need one: its size, its text and the keys and clipboard that change it.
+fn edit_may_change_scroll_need(msg: u32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_CHAR, WM_CLEAR, WM_CUT, WM_KEYDOWN, WM_LBUTTONUP, WM_PASTE, WM_SETFONT, WM_SETTEXT,
+        WM_SHOWWINDOW, WM_SIZE, WM_UNDO,
+    };
+    const EM_REPLACESEL: u32 = 0x00C2;
+    matches!(
+        msg,
+        WM_SIZE
+            | WM_SETTEXT
+            | WM_SHOWWINDOW
+            | WM_CHAR
+            // Delete and Backspace edit on the key, not through WM_CHAR (Delete
+            // sends none); a new font (apply_dpi) re-wraps; a mouse drop of
+            // text ends on the button release.
+            | WM_KEYDOWN
+            | WM_SETFONT
+            | WM_LBUTTONUP
+            | WM_CUT
+            | WM_PASTE
+            | WM_CLEAR
+            | WM_UNDO
+            | EM_REPLACESEL
+    )
+}
+
+/// #1014: whether `lines` wrapped lines of height `line_h` need a bar in a box
+/// whose text area is `rect_h` tall (all px). Unmeasurable (no height yet) keeps
+/// the bar, so the safe outcome of an unreadable box is the bar. The scroll
+/// range cannot be used: an edit without WS_VSCROLL stops keeping it, so a
+/// hidden bar would never come back.
+fn scrollbar_needed(lines: i32, rect_h: i32, line_h: i32) -> bool {
+    line_h <= 0 || rect_h <= 0 || lines > rect_h / line_h
+}
+
+thread_local! {
+    /// Set while [`sync_prompt_scrollbar`] runs: showing or hiding the bar
+    /// resizes the box, which comes back through the subclass.
+    static SYNCING_PROMPT_BAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// #1014: the prompt box shows a vertical scroll bar only while its text is
+/// taller than the box. An edit control keeps a disabled bar when the text
+/// fits, which reads as an empty strip down the right side.
+unsafe fn sync_prompt_scrollbar(hwnd: HWND) {
+    use windows::Win32::UI::Controls::ShowScrollBar;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE};
+    if SYNCING_PROMPT_BAR.get() {
+        return;
+    }
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetDC, GetTextMetricsW, ReleaseDC, SelectObject, HFONT, TEXTMETRICW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::WM_GETFONT;
+    const EM_GETRECT: u32 = 0x00B2;
+    const EM_GETLINECOUNT: u32 = 0x00BA;
+    let lines = SendMessageW(hwnd, EM_GETLINECOUNT, None, None).0 as i32;
+    let mut rect = RECT::default();
+    SendMessageW(
+        hwnd,
+        EM_GETRECT,
+        None,
+        Some(LPARAM(&mut rect as *mut RECT as isize)),
+    );
+    let mut line_h = 0;
+    let hdc = GetDC(Some(hwnd));
+    if !hdc.is_invalid() {
+        let font = HFONT(SendMessageW(hwnd, WM_GETFONT, None, None).0 as *mut _);
+        let old = (!font.is_invalid()).then(|| SelectObject(hdc, font.into()));
+        let mut tm = TEXTMETRICW::default();
+        if GetTextMetricsW(hdc, &mut tm).as_bool() {
+            line_h = tm.tmHeight;
+        }
+        if let Some(old) = old {
+            SelectObject(hdc, old);
+        }
+        ReleaseDC(Some(hwnd), hdc);
+    }
+    let need = scrollbar_needed(lines, rect.bottom - rect.top, line_h);
+    let shown = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VSCROLL.0 != 0;
+    if need != shown {
+        SYNCING_PROMPT_BAR.set(true);
+        let _ = ShowScrollBar(hwnd, SB_VERT, need);
+        SYNCING_PROMPT_BAR.set(false);
     }
 }
 
@@ -2787,8 +3044,11 @@ unsafe fn set_body_scroll(body: HWND, content_px: i32, view_px: i32, pos: i32) {
     SetScrollInfo(body, SB_VERT, &si, true);
 }
 
-/// The width of a vertical scrollbar at `dpi`.
+/// The width of a vertical scrollbar at `dpi`. In the gallery at a simulated
+/// scale the scrollbar is the window's real one, so that is measured instead.
 fn scrollbar_width_px(dpi: u32) -> i32 {
+    #[cfg(any(test, debug_assertions))]
+    let dpi = NATIVE_DPI.with(std::cell::Cell::get).unwrap_or(dpi);
     unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) }.max(0)
 }
 
@@ -3165,6 +3425,20 @@ struct Ctx {
     /// Every child created through [`Ctx::create`], with its design (96dpi)
     /// rect, so a later `WM_DPICHANGED` can re-lay-out each one (#233).
     children: std::cell::RefCell<Vec<ChildLayout>>,
+    /// #874: the part of the Models page the next control belongs to, if it
+    /// is one that moves or hides when the active provider changes.
+    slot: std::cell::Cell<Option<Slot>>,
+    /// Every control made under a slot, at the place it has when all show.
+    flow: std::cell::RefCell<Vec<FlowChild>>,
+}
+
+/// A Models page control that moves or hides with the provider choice (#874).
+struct FlowChild {
+    hwnd: HWND,
+    slot: Slot,
+    /// Its design `y` and `h` when every provider shows.
+    y: i32,
+    h: i32,
 }
 
 impl Ctx {
@@ -3222,6 +3496,9 @@ impl Ctx {
                         0,
                     );
                 }
+            }
+            if let Some(slot) = self.slot.get() {
+                self.flow.borrow_mut().push(FlowChild { hwnd, slot, y, h });
             }
             self.children.borrow_mut().push(ChildLayout {
                 page: self.page.get(),
@@ -4450,6 +4727,8 @@ unsafe fn run_pause_menu(hwnd: HWND) {
 
 /// Width of the "Open config file" button, in dp (#823).
 const OPEN_CONFIG_W: i32 = 120;
+/// #874: the width of "Add another provider".
+const ADD_PROVIDER_W: i32 = 170;
 
 /// Shown on the validation line when the config file cannot be opened (rule 7:
 /// never a silent no-op, never a dialog).
@@ -4649,6 +4928,8 @@ struct BuiltUi {
     /// The scrolling window the groups live in (#481).
     body: HWND,
     children: Vec<ChildLayout>,
+    /// See [`SettingsInner::models_flow`].
+    models_flow: Vec<FlowChild>,
     /// Where the fixed-height groups end, in dp (the Prompt group's top).
     content_top_dp: i32,
     /// The client height (dp) the elastic region was laid out for.
@@ -4674,6 +4955,8 @@ fn build_ui_recorded(
         dpi,
         font,
         children: std::cell::RefCell::new(Vec::new()),
+        slot: std::cell::Cell::new(None),
+        flow: std::cell::RefCell::new(Vec::new()),
     };
     let content_x = MARGIN;
     let content_w = PAGE_W_DP - 2 * MARGIN;
@@ -4721,6 +5004,7 @@ fn build_ui_recorded(
     r.advance();
 
     // OpenAI
+    ctx.slot.set(Some(Slot::OpenAi));
     ctx.create(
         WC_STATIC,
         "OpenAI API key:",
@@ -4808,6 +5092,7 @@ fn build_ui_recorded(
     r.advance();
 
     // Anthropic
+    ctx.slot.set(Some(Slot::Anthropic));
     ctx.create(
         WC_STATIC,
         "Anthropic API key:",
@@ -4895,6 +5180,7 @@ fn build_ui_recorded(
     r.advance();
 
     // Gemini (#195): same three rows as the other cloud providers.
+    ctx.slot.set(Some(Slot::Gemini));
     ctx.create(
         WC_STATIC,
         "Gemini API key:",
@@ -4985,33 +5271,7 @@ fn build_ui_recorded(
     // Ollama (#183): no key, only which pulled model to use. The combo starts
     // with the configured model alone; the pulled models are added when the
     // background fetch reports in (see `spawn_ollama_models_fetch`).
-    // #427: the cloud model dropdowns list what the provider offers (or
-    // what is in config.toml), so say where to add one that is missing.
-    // Ollama's list comes from what is pulled, so this sits above its row.
-    ctx.create(
-        WC_STATIC,
-        model_list_hint_for(config.mode),
-        0,
-        0,
-        r.x,
-        r.y,
-        r.w - OPEN_CONFIG_W - 8,
-        ROW_H,
-        ID_MODEL_LIST_HINT,
-    );
-    ctx.create(
-        WC_BUTTON,
-        "Open config file",
-        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
-        0,
-        r.x + r.w - OPEN_CONFIG_W,
-        r.y,
-        OPEN_CONFIG_W,
-        ROW_H,
-        ID_OPEN_CONFIG,
-    );
-    r.advance();
-
+    ctx.slot.set(Some(Slot::Ollama));
     ctx.create(
         WC_STATIC,
         "Ollama model:",
@@ -5043,6 +5303,50 @@ fn build_ui_recorded(
     }
     r.advance();
 
+    // #874: shows the providers that are hidden. Under the blocks it
+    // reveals, so a reader reaches it after the rows they can already see.
+    ctx.slot.set(Some(Slot::AddButton));
+    ctx.create(
+        WC_BUTTON,
+        "Add another provider",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + LABEL_W,
+        r.y,
+        ADD_PROVIDER_W,
+        ROW_H,
+        ID_ADD_PROVIDER,
+    );
+    r.advance();
+
+    // #427: the cloud model dropdowns list what the provider offers (or
+    // what is in config.toml), so say where to add one that is missing.
+    ctx.slot.set(Some(Slot::Hint));
+    ctx.create(
+        WC_STATIC,
+        model_list_hint_for(config.mode),
+        0,
+        0,
+        r.x,
+        r.y,
+        r.w - OPEN_CONFIG_W - 8,
+        ROW_H,
+        ID_MODEL_LIST_HINT,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Open config file",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + r.w - OPEN_CONFIG_W,
+        r.y,
+        OPEN_CONFIG_W,
+        ROW_H,
+        ID_OPEN_CONFIG,
+    );
+    r.advance();
+    ctx.slot.set(None);
+
     // `r` already moved past the last row and its gap (#785).
     let providers_bottom = r.y + 4;
     // Created last, once the real extent of what it should enclose is
@@ -5051,6 +5355,7 @@ fn build_ui_recorded(
     // frame outline and caption text (its interior is left untouched, not
     // filled), and this layout keeps that outline/caption clear of every
     // field it encloses, so nothing ends up visually covered.
+    ctx.slot.set(Some(Slot::Frame));
     ctx.create(
         WC_BUTTON,
         "Providers",
@@ -5062,6 +5367,9 @@ fn build_ui_recorded(
         providers_bottom - providers_top,
         0,
     );
+    // The Ollama card under the frame shows with the Ollama block and moves
+    // up with the frame (#874).
+    ctx.slot.set(Some(Slot::OllamaCard));
 
     y = providers_bottom + GROUP_GAP;
     page_y[Page::Models.index()] = y;
@@ -5181,6 +5489,7 @@ fn build_ui_recorded(
     y = ollama_bottom + GROUP_GAP;
     page_y[Page::Models.index()] = y;
     page_bottom[Page::Models.index()] = ollama_bottom;
+    ctx.slot.set(None);
 
     // -- Hotkeys (General) --------------------------------------------------------
     ctx.page.set(Some(Page::General));
@@ -5936,6 +6245,7 @@ fn build_ui_recorded(
         page_content_dp,
         body,
         children: ctx.children.into_inner(),
+        models_flow: ctx.flow.into_inner(),
         content_top_dp,
         win_h_dp,
     }
@@ -7473,6 +7783,30 @@ const GALLERY_CLASS_NAME: &str = "Wingman.Settings.Gallery.3b8f6a52";
 #[cfg(debug_assertions)]
 pub struct GalleryWindow {
     raw: *mut SettingsInner,
+    /// Declared after `raw`: restores the thread's DPI awareness once the
+    /// window is destroyed by `Drop`.
+    _unaware: Option<UnawareScope>,
+}
+
+/// Makes the thread DPI-unaware until dropped (the gallery's real 100%).
+#[cfg(debug_assertions)]
+struct UnawareScope(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
+
+#[cfg(debug_assertions)]
+impl UnawareScope {
+    fn enter() -> UnawareScope {
+        use windows::Win32::UI::HiDpi::{
+            SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE,
+        };
+        UnawareScope(unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) })
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for UnawareScope {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.0) };
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -7490,6 +7824,13 @@ impl GalleryWindow {
             return None;
         }
         ensure_common_controls();
+        // 100% is the one scale a window can really be drawn at on any
+        // screen: made DPI-unaware, Windows gives it 96 DPI and its native
+        // checkbox boxes and scrollbar come out at 96 DPI too (#1016, #1052).
+        // The thread stays unaware until the window is dropped, so the
+        // gallery's capture of it measures in the same units.
+        let unaware = (dpi == Some(96)).then(UnawareScope::enter);
+        let dpi = if unaware.is_some() { None } else { dpi };
         FORCED_DPI.with(|f| f.set(dpi.map(|d| d.max(1))));
 
         let config = Config::default();
@@ -7518,9 +7859,16 @@ impl GalleryWindow {
             return None;
         };
         // From here the window owns nothing the Drop below cannot free.
-        let gallery = GalleryWindow { raw };
+        let gallery = GalleryWindow {
+            raw,
+            _unaware: unaware,
+        };
         let inner = unsafe { &mut *raw };
         inner.hwnd = hwnd;
+        // A simulated scale cannot change the native scrollbar, which keeps
+        // the window's real DPI: remember that DPI so the width reserved for
+        // the scrollbar is the width it really takes (#1052).
+        NATIVE_DPI.with(|n| n.set(dpi.map(|_| unsafe { GetDpiForWindow(hwnd) }.max(1))));
         let dpi = dpi_for(hwnd);
         inner.font = build_font(dpi);
         let fitted_h = fitted_height_dp(hwnd, dpi);
@@ -7565,6 +7913,21 @@ impl GalleryWindow {
         unsafe { show_page(inner, page) };
     }
 
+    /// Picks the active provider on the Models page (what the combo does).
+    pub(crate) fn pick_provider(&mut self, provider: ActiveProvider) {
+        let inner = unsafe { &mut *self.raw };
+        if let Some(combo) = get_dlg_item(inner.hwnd, ID_ACTIVE_PROVIDER) {
+            combo_select_index(combo, provider.index() as i32);
+            unsafe { sync_models_flow(inner) };
+        }
+    }
+
+    /// Shows every provider (what "Add another provider" does).
+    pub(crate) fn reveal_providers(&mut self) {
+        let inner = unsafe { &mut *self.raw };
+        unsafe { reveal_providers(inner) };
+    }
+
     /// Expands or collapses the Advanced group (what its toggle does).
     pub fn set_advanced(&mut self, expanded: bool) {
         let inner = unsafe { &mut *self.raw };
@@ -7580,6 +7943,7 @@ impl Drop for GalleryWindow {
     fn drop(&mut self) {
         // WM_DESTROY frees the font and flags the close; the Box is ours.
         FORCED_DPI.with(|f| f.set(None));
+        NATIVE_DPI.with(|n| n.set(None));
         unsafe {
             let _ = DestroyWindow((*self.raw).hwnd);
             drop(Box::from_raw(self.raw));
@@ -7744,6 +8108,8 @@ mod tests {
 
             // The Ollama button is on Models and only when it has an offer.
             unsafe { handle_page_request(inner, PAGE_PICK, 1) };
+            // The card is under the Ollama block, which shows on request.
+            unsafe { reveal_providers(inner) };
             assert!(!is_shown(hwnd, ID_OLLAMA_LINK), "nothing to offer yet");
             inner.ollama_link_shown = true;
             unsafe { sync_visibility(inner) };
@@ -7966,8 +8332,7 @@ mod tests {
             for dpi in [96u32, 144] {
                 let fitted = fitted_height_for_work_px(1040, dpi);
                 for page in Page::ALL {
-                    let need =
-                        inner.page_content_dp[page.index()] + FOOTER_H_DP + NC_HEIGHT_GUESS_DP;
+                    let need = page_max_dp(inner, page) + FOOTER_H_DP + NC_HEIGHT_GUESS_DP;
                     assert!(
                         need <= fitted,
                         "{page:?} needs {need} dp at {dpi} dpi, the window gets {fitted}"
@@ -8230,6 +8595,228 @@ mod tests {
         }
     }
 
+    // -- Models page shows the active provider (#874) -----------------------
+
+    /// Whether the control carries `WS_VISIBLE` (the window itself is not
+    /// shown in these tests, so `IsWindowVisible` would say no to everything).
+    fn shows(hwnd: HWND, id: i32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GWL_STYLE;
+        let h = get_dlg_item(hwnd, id).unwrap_or_else(|| panic!("id {id} missing"));
+        unsafe { GetWindowLongPtrW(h, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 }
+    }
+
+    const OPENAI_IDS: [i32; 4] = [
+        ID_OPENAI_KEY,
+        ID_OPENAI_SHOW_KEY,
+        ID_OPENAI_MODEL,
+        ID_OPENAI_EFFORT,
+    ];
+    const ANTHROPIC_IDS: [i32; 4] = [
+        ID_ANTHROPIC_KEY,
+        ID_ANTHROPIC_SHOW_KEY,
+        ID_ANTHROPIC_MODEL,
+        ID_ANTHROPIC_EFFORT,
+    ];
+    const GEMINI_IDS: [i32; 5] = [
+        ID_GEMINI_KEY,
+        ID_GEMINI_SHOW_KEY,
+        ID_GEMINI_MODEL,
+        ID_GEMINI_EFFORT,
+        ID_GEMINI_EFFORT_LABEL,
+    ];
+
+    fn pick_provider(inner: &mut SettingsInner, index: i32) {
+        let combo = get_dlg_item(inner.hwnd, ID_ACTIVE_PROVIDER).expect("provider combo");
+        combo_select_index(combo, index);
+        handle_command(inner, ID_ACTIVE_PROVIDER, CBN_SELCHANGE);
+    }
+
+    #[test]
+    fn the_models_page_starts_with_only_the_active_provider() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(OPENAI_IDS.iter().all(|id| shows(hwnd, *id)));
+            assert!(ANTHROPIC_IDS.iter().all(|id| !shows(hwnd, *id)));
+            assert!(GEMINI_IDS.iter().all(|id| !shows(hwnd, *id)));
+            assert!(!shows(hwnd, ID_OLLAMA_MODEL));
+            assert!(shows(hwnd, ID_ACTIVE_PROVIDER));
+            assert!(shows(hwnd, ID_ADD_PROVIDER));
+            assert!(shows(hwnd, ID_OPEN_CONFIG));
+        });
+    }
+
+    #[test]
+    fn switching_provider_swaps_the_visible_group_and_keeps_typed_values() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            let openai_key = get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap();
+            set_text(openai_key, "sk-typed-by-hand");
+            pick_provider(inner, ActiveProvider::Anthropic.index() as i32);
+            assert!(ANTHROPIC_IDS.iter().all(|id| shows(hwnd, *id)));
+            // OpenAI has typed text now, so it stays shown like a vendor with a key.
+            assert!(OPENAI_IDS.iter().all(|id| shows(hwnd, *id)));
+            assert!(GEMINI_IDS.iter().all(|id| !shows(hwnd, *id)));
+            pick_provider(inner, ActiveProvider::Gemini.index() as i32);
+            assert!(GEMINI_IDS.iter().all(|id| shows(hwnd, *id)));
+            assert!(ANTHROPIC_IDS.iter().all(|id| !shows(hwnd, *id)));
+            assert_eq!(get_text(openai_key), "sk-typed-by-hand");
+            pick_provider(inner, ActiveProvider::Ollama.index() as i32);
+            assert!(shows(hwnd, ID_OLLAMA_MODEL));
+        });
+    }
+
+    #[test]
+    fn a_stored_key_keeps_its_vendor_shown() {
+        let mut cfg = Config::default();
+        cfg.providers.openai.api_key = "sk-stored".to_string();
+        cfg.providers.order = vec!["anthropic".to_string(), "openai".to_string()];
+        with_window(cfg, |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(ANTHROPIC_IDS.iter().all(|id| shows(hwnd, *id)));
+            assert!(OPENAI_IDS.iter().all(|id| shows(hwnd, *id)));
+            assert!(GEMINI_IDS.iter().all(|id| !shows(hwnd, *id)));
+        });
+    }
+
+    #[test]
+    fn add_another_provider_shows_the_rest_and_goes_away() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            handle_command(inner, ID_ADD_PROVIDER, BN_CLICKED);
+            for id in OPENAI_IDS
+                .iter()
+                .chain(ANTHROPIC_IDS.iter())
+                .chain(GEMINI_IDS.iter())
+            {
+                assert!(shows(hwnd, *id), "id {id}");
+            }
+            assert!(shows(hwnd, ID_OLLAMA_MODEL));
+            assert!(!shows(hwnd, ID_ADD_PROVIDER));
+            // Switching provider afterwards does not hide what was asked for.
+            pick_provider(inner, ActiveProvider::Anthropic.index() as i32);
+            assert!(shows(hwnd, ID_OPENAI_KEY));
+        });
+    }
+
+    /// The button that had focus is gone after "Add another provider", so
+    /// focus goes to the first row that appeared, never to the hidden button.
+    #[test]
+    fn focus_after_add_another_provider_goes_to_the_first_new_row() {
+        let one = [true, false, false, false];
+        assert_eq!(reveal_focus_id(one, [true; 4]), ID_ANTHROPIC_KEY);
+        assert_eq!(
+            reveal_focus_id([false, true, false, false], [true; 4]),
+            ID_OPENAI_KEY
+        );
+        assert_eq!(
+            reveal_focus_id([true, true, true, false], [true; 4]),
+            ID_OLLAMA_MODEL
+        );
+        // Nothing new appeared: the always-present provider combo.
+        assert_eq!(reveal_focus_id([true; 4], [true; 4]), ID_ACTIVE_PROVIDER);
+        // And the real window really uses it: the pick is a visible control.
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            handle_command(inner, ID_ADD_PROVIDER, BN_CLICKED);
+            assert!(shows(hwnd, reveal_focus_id(one, inner.models_shown)));
+        });
+    }
+
+    #[test]
+    fn the_ollama_card_hides_with_the_ollama_block() {
+        let card = [
+            ID_OLLAMA_MODEL,
+            ID_OLLAMA_STATUS,
+            ID_PULL_NAME,
+            ID_PULL_BUTTON,
+        ];
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(
+                card.iter().all(|id| !shows(hwnd, *id)),
+                "default order has no ollama"
+            );
+            let short = inner.models_shrink_dp;
+            pick_provider(inner, ActiveProvider::Ollama.index() as i32);
+            assert!(card.iter().all(|id| shows(hwnd, *id)));
+            assert!(
+                inner.models_shrink_dp < short,
+                "the card brings its height back"
+            );
+        });
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["openai".to_string(), "ollama".to_string()];
+        with_window(cfg, |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(
+                card.iter().all(|id| shows(hwnd, *id)),
+                "ollama is in the order"
+            );
+        });
+    }
+
+    /// A hidden vendor's hand-edited model, and a stored key on a vendor that
+    /// stays shown, both come back unchanged from the Save path (`read_form`).
+    #[test]
+    fn hidden_vendors_survive_the_save_path_unchanged() {
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["anthropic".to_string()];
+        cfg.providers.openai.model = "gpt-hand-edited".to_string();
+        cfg.providers.openai.models = vec!["gpt-hand-edited".to_string(), "gpt-other".to_string()];
+        cfg.providers.gemini.api_key = "AIza-stored-gemini-key".to_string();
+        cfg.providers.gemini.model = "gemini-hand-edited".to_string();
+        with_window(cfg.clone(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(
+                !shows(hwnd, ID_OPENAI_MODEL),
+                "OpenAI has no key and is not active"
+            );
+            assert!(
+                shows(hwnd, ID_GEMINI_KEY),
+                "a stored key keeps its vendor shown"
+            );
+            let saved = read_form(inner);
+            assert_eq!(saved.providers.openai.model, "gpt-hand-edited");
+            assert_eq!(saved.providers.openai.models, cfg.providers.openai.models);
+            assert_eq!(saved.providers.gemini.api_key, cfg.providers.gemini.api_key);
+            assert_eq!(saved.providers.gemini.model, "gemini-hand-edited");
+            assert_eq!(saved.providers.order, cfg.providers.order);
+        });
+    }
+    #[test]
+    fn a_hidden_block_leaves_no_gap_and_the_page_gets_shorter() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let design_y = |inner: &SettingsInner, id: i32| {
+                let h = get_dlg_item(hwnd, id).unwrap();
+                inner.children.iter().find(|c| c.hwnd == h).unwrap().y
+            };
+            unsafe { show_page(inner, Page::Models) };
+            let first_block_y = design_y(inner, ID_OPENAI_KEY);
+            let hint_y_one_vendor = design_y(inner, ID_OPEN_CONFIG);
+            let shrink_openai = inner.models_shrink_dp;
+            assert!(
+                shrink_openai > 0,
+                "two vendors and the Ollama row are hidden"
+            );
+            pick_provider(inner, ActiveProvider::Anthropic.index() as i32);
+            // Claude takes the place OpenAI had, right under the combo.
+            assert_eq!(design_y(inner, ID_ANTHROPIC_KEY), first_block_y);
+            // Same number of rows hidden, so the bottom did not move.
+            assert_eq!(design_y(inner, ID_OPEN_CONFIG), hint_y_one_vendor);
+            handle_command(inner, ID_ADD_PROVIDER, BN_CLICKED);
+            assert!(inner.models_shrink_dp < shrink_openai);
+            assert!(design_y(inner, ID_OPEN_CONFIG) > hint_y_one_vendor);
+        });
+    }
     #[test]
     fn gemini_thinking_applies_only_to_the_3_line() {
         assert!(gemini_thinking_applies("gemini-3.8-flash"));
@@ -8480,6 +9067,10 @@ mod tests {
             // The Ollama group is on the Models page; its button only shows
             // while that page does.
             unsafe { show_page(inner, Page::Models) };
+            // The card is under the Ollama block, hidden on a default config
+            // (#874); the probe still reports into it, and this checks the
+            // button once it is on show.
+            unsafe { reveal_providers(inner) };
             inner.ollama_status.clone()
         };
         let alive = unsafe { &*raw }.alive.clone();
@@ -8865,6 +9456,8 @@ mod tests {
                 ("Capture", Page::Privacy),
             ] {
                 unsafe { show_page(&mut *raw, page) };
+                // Every provider shows, so both groups are at full height.
+                unsafe { reveal_providers(&mut *raw) };
                 // The group's rect is read with its page showing.
                 let groups: Vec<(String, RECT)> = inner
                     .children
@@ -9186,6 +9779,75 @@ mod tests {
             assert_eq!(EDIT_STYLE_BUILDS.get(), builds + 1);
             unsafe { invalidate_edit_style() };
             assert!(EDIT_STYLE.get().is_none(), "the brushes are released");
+        });
+    }
+
+    /// #1014: a page that fits needs no bar; a taller one does. An unlaid-out
+    /// box (no page) keeps the bar.
+    #[test]
+    fn a_scroll_bar_is_needed_only_when_the_text_is_taller_than_the_box() {
+        assert!(!scrollbar_needed(10, 600, 20), "30 lines of room, 10 used");
+        assert!(!scrollbar_needed(30, 600, 20), "exactly full");
+        assert!(scrollbar_needed(31, 600, 20), "one line too many");
+        assert!(scrollbar_needed(1, 0, 20), "no height yet: keep the bar");
+        assert!(scrollbar_needed(1, 600, 0), "no line height: keep the bar");
+    }
+
+    /// #1014: the prompt box has a bar while its text is longer than the box
+    /// and none when it fits, so no empty strip is left down its side.
+    #[test]
+    fn the_prompt_box_shows_a_bar_only_when_its_text_overflows() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowTextW, GWL_STYLE, SW_SHOW, WS_VSCROLL,
+        };
+        with_window(Config::default(), |hwnd, _raw| {
+            let prompt = get_dlg_item(hwnd, ID_PROMPT_EDIT).expect("prompt edit");
+            let has_bar =
+                || unsafe { GetWindowLongPtrW(prompt, GWL_STYLE) } as u32 & WS_VSCROLL.0 != 0;
+            // The box is created with WS_VSCROLL, so "no bar" is the first
+            // assertion that can only pass if the sync ran.
+            unsafe {
+                let _ = ShowWindow(prompt, SW_SHOW);
+                let _ = SetWindowTextW(prompt, windows::core::w!("short"));
+            }
+            assert!(!has_bar(), "one line needs none");
+            unsafe {
+                let long: Vec<u16> = "a line\r\n".repeat(400).encode_utf16().chain([0]).collect();
+                let _ = SetWindowTextW(prompt, windows::core::PCWSTR(long.as_ptr()));
+            }
+            assert!(has_bar(), "400 lines need a bar");
+            // Select all + Delete: a key, not a text message, empties the box.
+            unsafe {
+                SendMessageW(
+                    prompt,
+                    0x00B1, /* EM_SETSEL */
+                    Some(WPARAM(0)),
+                    Some(LPARAM(-1)),
+                );
+                SendMessageW(
+                    prompt,
+                    windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                    Some(WPARAM(0x2E /* VK_DELETE */)),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert!(
+                !has_bar(),
+                "the strip goes away after select all and Delete"
+            );
+            // A font change re-wraps the text.
+            unsafe {
+                let long: Vec<u16> = "a line\r\n".repeat(400).encode_utf16().chain([0]).collect();
+                let _ = SetWindowTextW(prompt, windows::core::PCWSTR(long.as_ptr()));
+                let _ = windows::Win32::UI::Controls::ShowScrollBar(prompt, SB_VERT, false);
+                SendMessageW(
+                    prompt,
+                    windows::Win32::UI::WindowsAndMessaging::WM_SETFONT,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(1)),
+                );
+            }
+            assert!(has_bar(), "a re-wrap that overflows brings the bar back");
         });
     }
 
@@ -9773,7 +10435,7 @@ mod tests {
     /// #427 wired-to-nothing: the hint is a real control in the built window,
     /// above the Ollama model row (Ollama has no `models` list to extend).
     #[test]
-    fn the_model_list_hint_is_built_above_the_ollama_row() {
+    fn the_model_list_hint_is_built_below_the_provider_rows() {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
@@ -9814,7 +10476,7 @@ mod tests {
             rc.top
         };
         assert!(top(gemini) < top(hint), "below the cloud model rows");
-        assert!(top(hint) < top(ollama), "above the Ollama row");
+        assert!(top(ollama) < top(hint), "below the Ollama row (#874)");
 
         unsafe {
             let _ = DestroyWindow(hwnd);
@@ -11601,6 +12263,45 @@ mod tests {
         assert_eq!(forced_dpi(), None, "closing the window clears the override");
     }
 
+    /// The width the body's own scrollbar really takes: window minus client.
+    #[cfg(debug_assertions)]
+    fn body_scrollbar_px(w: &GalleryWindow) -> i32 {
+        let body = get_dlg_item(w.hwnd(), ID_BODY).expect("body");
+        let mut wr = windows::Win32::Foundation::RECT::default();
+        let mut cr = windows::Win32::Foundation::RECT::default();
+        unsafe {
+            GetWindowRect(body, &mut wr).expect("GetWindowRect");
+            GetClientRect(body, &mut cr).expect("GetClientRect");
+        }
+        (wr.right - wr.left) - (cr.right - cr.left)
+    }
+
+    /// #1016, #1052: a Settings window "at 100%" is a real 96 DPI window
+    /// (so its checkbox boxes and scrollbar are real size), and at another
+    /// simulated scale the width reserved for the scrollbar is the one the
+    /// scrollbar really takes. On a screen above 100% (MEASURED 2026-10-17,
+    /// 250%) both fail without the fix: the scrollbar is 42 px, not 17.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_gallery_settings_scrollbar_matches_the_reserved_width() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::HiDpi::{
+            SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let prev =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let at_100 = GalleryWindow::open(instance, Some(96)).expect("open at 96");
+        assert_eq!(unsafe { GetDpiForWindow(at_100.hwnd()) }, 96, "real 96 DPI");
+        assert_eq!(body_scrollbar_px(&at_100), scrollbar_width_px(96));
+        drop(at_100);
+        let at_150 = GalleryWindow::open(instance, Some(144)).expect("open at 144");
+        assert_eq!(body_scrollbar_px(&at_150), scrollbar_width_px(144));
+        drop(at_150);
+        unsafe { SetThreadDpiAwarenessContext(prev) };
+    }
+
     // -- WM_DPICHANGED (#233) ---------------------------------------------
 
     #[test]
@@ -11903,8 +12604,10 @@ mod tests {
             inner.hwnd = hwnd;
             inner.font = font;
             inner.adopt(built);
-            // The Models page is the longest, so it is the one to scroll.
+            // The Models page is the longest with every provider showing, so
+            // it is the one to scroll.
             unsafe { show_page(inner, Page::Models) };
+            unsafe { reveal_providers(inner) };
         }
         let body = unsafe { &*raw }.body;
         let view_px = client_h_px - to_px(FOOTER_H_DP, 96);

@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 
 /// Every proposal kind [`schema_for`] answers for, so a test can walk them all.
 #[cfg(test)]
-pub(crate) const PROPOSAL_KINDS: [&str; 14] = [
+pub(crate) const PROPOSAL_KINDS: [&str; 15] = [
     "verdict",
     "calendar_event",
     "text_review",
@@ -44,6 +44,7 @@ pub(crate) const PROPOSAL_KINDS: [&str; 14] = [
     "time_list",
     "scam_check",
     "contact_card",
+    "knowledge_answer",
 ];
 
 /// Looks up the JSON Schema for `proposal`. `rate_difficulty` only affects
@@ -99,8 +100,40 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "jargon_terms" => Some(jargon_terms_schema()),
         // #71: one contact read off a signature or contact block.
         "contact_card" => Some(contact_card_schema()),
+        // #92: evidence first, then the answer, then whether it was found.
+        "knowledge_answer" => Some(knowledge_answer_schema()),
         _ => None,
     }
+}
+
+/// The `knowledge_answer` proposal schema (#92): `evidence` (excerpt number
+/// and the words quoted from it), then `answer`, then `found`. The order is
+/// load-bearing (rule 3): the model commits to the words it relies on before
+/// it writes the answer. Wingman checks each quote against its excerpt
+/// (`actions::knowledge_answer`) and builds the citation itself, so there is
+/// no file-name field. Nothing is editable: the card is read-only.
+fn knowledge_answer_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "evidence": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "n": {"type": "integer"},
+                        "quote": {"type": "string"}
+                    },
+                    "required": ["n", "quote"],
+                    "additionalProperties": false
+                }
+            },
+            "answer": {"type": "string"},
+            "found": {"type": "boolean"}
+        },
+        "required": ["evidence", "answer", "found"],
+        "additionalProperties": false
+    })
 }
 
 /// The `time_list` proposal schema (#315): `times`, each with the text as
