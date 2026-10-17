@@ -222,7 +222,11 @@ mod tests {
     fn speaker_new_cold_time() {
         let t = std::time::Instant::now();
         let s = Speaker::new(HWND::default(), 0x8001);
-        eprintln!("Speaker::new cold: {:?} res={:?}", t.elapsed(), s.as_ref().err());
+        eprintln!(
+            "Speaker::new cold: {:?} res={:?}",
+            t.elapsed(),
+            s.as_ref().err()
+        );
         let t = std::time::Instant::now();
         let s2 = Speaker::new(HWND::default(), 0x8001);
         eprintln!("Speaker::new warm: {:?} ok={}", t.elapsed(), s2.is_ok());
