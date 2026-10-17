@@ -91,7 +91,7 @@ use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgCtrlID, GetDlgItem,
     GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    IsChild, IsDialogMessageW, KillTimer, LoadCursorW, PeekMessageW, PostMessageW,
+    IsChild, IsDialogMessageW, IsWindow, KillTimer, LoadCursorW, PeekMessageW, PostMessageW,
     RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW,
@@ -391,6 +391,22 @@ pub fn set_enabled(on: bool) -> bool {
         let _ = EnableWindow(HWND(open as *mut c_void), on);
     }
     true
+}
+
+/// Brings the open Settings window back to the front (#1013), after an OS
+/// dialog that disabled it closed and Windows activated another app. Does
+/// nothing when Settings is gone. UI thread only.
+pub fn bring_to_front() {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    if open == 0 {
+        return;
+    }
+    let hwnd = HWND(open as *mut c_void);
+    unsafe {
+        if IsWindow(Some(hwnd)).as_bool() {
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
 }
 
 thread_local! {
