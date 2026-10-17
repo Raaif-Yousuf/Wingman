@@ -386,7 +386,8 @@ manifest slice, which is a deliberate light-mode change.
 1. **Plumbing**: theme state on the Settings window, new tokens, DWM title bar,
    `WM_CTLCOLOR*` for static and edit, the custom edit frame, live re-theme,
    gallery `--theme`. The dark path is gated by one constant,
-   `SETTINGS_DARK_ENABLED = false`, so no user sees a half-dark window.
+   `SETTINGS_DARK_ENABLED = false` (removed in slice 6), so no user sees a
+   half-dark window while the slices land.
    Done when the gallery shows the dark and high-contrast states and the
    stock states are byte-identical to before.
 2. **Buttons**: push buttons (reusing `card_buttons.rs`), checkboxes, group
@@ -401,6 +402,10 @@ manifest slice, which is a deliberate light-mode change.
    is deleted in this slice and a source-scan test asserts the identifier no
    longer exists; and the "Theme" note in the module doc of `settings.rs` is
    rewritten to say what is true.
+   Built: the constant and its gate function are gone and a source-scan test
+   asserts it; the gallery pictures of every page at every theme and scale were
+   read. The Narrator, real high contrast and colour-mode-switch checks are
+   still to do by hand.
 
 ### Size budget
 
@@ -439,7 +444,7 @@ is the decision.
    stock scrollbar. A custom bar would need a UI Automation provider, which is
    a project in itself.
 6. **Decision: dark ships at slice 6, after the Narrator pass** and the
-   colour-mode-switch check. `SETTINGS_DARK_ENABLED` stays false until then.
+   colour-mode-switch check. `SETTINGS_DARK_ENABLED` stayed false until then; slice 6 removed it.
 
 ## Related decisions
 

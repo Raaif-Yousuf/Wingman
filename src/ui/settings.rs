@@ -55,19 +55,17 @@
 //!   a newly focused control into view, and takes a captured shortcut
 //!   (`WM_APP_LEARNED`, posted to the main window) while a Change is pending.
 //!   It is one atomic load when no window is open.
-//! - **Theme** (#582): a real window is still drawn with the stock (light)
-//!   system control appearance, whatever the OS light/dark setting is. Dark is
-//!   being built slice by slice (spec `2026-10-16-settings-dark-and-high-
-//!   contrast-design.md`) and stays off for users, behind
-//!   `settings_theme::SETTINGS_DARK_ENABLED`, until every control follows it:
-//!   a correct light window beats a half-dark one. So far the title bar, the
-//!   window face, the labels, the text boxes, the rail, the footer divider,
-//!   the push buttons and the checkboxes (`settings_buttons`, drawn from
-//!   `NM_CUSTOMDRAW`), the combo boxes (`settings_combo`) and the trackbar
-//!   (`settings_trackbar`, also `NM_CUSTOMDRAW`) follow the theme; the
-//!   scrollbar is still stock. `edit_style` resolves the theme once per change
-//!   and everything else reads it. The UI gallery forces a theme
-//!   (`--ui-gallery --theme`), which bypasses the gate.
+//! - **Theme** (#582): the window follows the system: light and high contrast
+//!   keep the stock control drawing, and dark paints its own (spec
+//!   `2026-10-16-settings-dark-and-high-contrast-design.md`). In dark the title
+//!   bar, the window face, the labels, the text boxes, the rail, the footer
+//!   divider, the push buttons and the checkboxes (`settings_buttons`, drawn
+//!   from `NM_CUSTOMDRAW`), the combo boxes (`settings_combo`), the trackbar
+//!   (`settings_trackbar`, also `NM_CUSTOMDRAW`) and the body's scrollbar (the
+//!   `DarkMode_Explorer` visual style) follow the theme. `edit_style` resolves
+//!   the theme once per change and everything else reads it. The UI gallery
+//!   forces a theme (`--ui-gallery --theme`) since it cannot switch the system
+//!   theme.
 //!
 //! Fields intentionally not exposed here:
 //! - `providers.openai.models` / `providers.anthropic.models` (the list
@@ -3590,7 +3588,7 @@ fn to_px(dp: i32, dpi: u32) -> i32 {
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     /// The gallery's forced theme for this thread's Settings window, if any
-    /// (#582). A forced theme ignores the system and bypasses the dark gate.
+    /// (#582). A forced theme ignores the system.
     static FORCED_THEME: std::cell::Cell<Option<crate::ui::theme::Theme>> =
         const { std::cell::Cell::new(None) };
 }
@@ -3618,8 +3616,7 @@ struct Look {
 
 /// Resolves the look: the forced theme (the gallery, which draws high contrast
 /// with Windows' black colours since it cannot switch the system), else the
-/// detected one, with dark gated off for real users (see
-/// `settings_theme::SETTINGS_DARK_ENABLED`).
+/// detected one.
 fn current_look() -> Look {
     use crate::ui::theme::{detect_theme, SysColors};
     #[cfg(any(test, debug_assertions))]
@@ -3636,10 +3633,7 @@ fn current_look() -> Look {
         };
     }
     Look {
-        theme: crate::ui::settings_theme::gate(
-            detect_theme(),
-            crate::ui::settings_theme::SETTINGS_DARK_ENABLED,
-        ),
+        theme: detect_theme(),
         sys: SysColors::read(),
         forced: false,
     }
@@ -13489,6 +13483,17 @@ mod tests {
         }
     }
 
+    /// #582 slice 6: with nothing forced (a real window) the look is the
+    /// system's detected theme, not light. The gate that used to turn dark
+    /// into light is gone. Runs on a thread where no theme is forced.
+    #[test]
+    fn an_unforced_window_follows_the_detected_theme() {
+        force_theme(None);
+        let look = current_look();
+        assert!(!look.forced);
+        assert_eq!(look.theme, crate::ui::theme::detect_theme());
+    }
+
     /// The Start with Windows checkbox, on the page Settings opens on.
     fn autostart_checkbox(hwnd: HWND) -> HWND {
         get_dlg_item(hwnd, ID_AUTOSTART).expect("the Start with Windows checkbox")
@@ -14197,6 +14202,8 @@ mod tests {
         use windows::Win32::Graphics::Gdi::{GetBkColor, GetDC, ReleaseDC};
         use windows::Win32::UI::Shell::GetWindowSubclass;
         use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, WM_CTLCOLOREDIT};
+        // The light fill is asserted, so a dark system must not change it.
+        let _light = Forced::new(Theme::Light);
         with_window(Config::default(), |hwnd, raw| {
             let inner = unsafe { &*raw };
             let mut edits = 0;
@@ -16516,6 +16523,8 @@ mod tests {
     #[test]
     fn a_focused_closed_combo_field_keeps_the_window_colours_but_a_list_item_highlights() {
         use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_HIGHLIGHT, COLOR_WINDOW};
+        // The window colour is asserted, so a dark system must not change it.
+        let _light = Forced::new(Theme::Light);
         let window = unsafe { GetSysColor(COLOR_WINDOW) } & 0x00FF_FFFF;
         let highlight = unsafe { GetSysColor(COLOR_HIGHLIGHT) } & 0x00FF_FFFF;
         assert_ne!(window, highlight, "the check needs two different colours");
