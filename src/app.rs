@@ -8685,7 +8685,7 @@ mod tests {
     fn an_option_runs_through_the_one_palette_dispatch() {
         // A click, a digit and the key all run an option through `run_option`.
         assert!(app_method_body("on_options_choice").contains("self.run_option("));
-        assert!(app_method_body("on_primary_key").contains("self.run_option("));
+        assert!(app_method_body("apply_key_action").contains("self.run_option("));
         let body = app_method_body("run_option");
         assert!(body.contains("self.dispatch_palette_action("), "{body}");
         for second in [
