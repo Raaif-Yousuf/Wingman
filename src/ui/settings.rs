@@ -4459,7 +4459,8 @@ fn build_ui_recorded(
     }
     r.advance();
 
-    let providers_bottom = r.y + ROW_H + 8;
+    // `r` already moved past the last row and its gap (#785).
+    let providers_bottom = r.y + 4;
     // Created last, once the real extent of what it should enclose is
     // known, so its height doesn't need to be precomputed by hand. This
     // does put it on top in z-order, but a BS_GROUPBOX only ever paints its
@@ -4578,7 +4579,7 @@ fn build_ui_recorded(
         ID_PULL_STATUS,
     );
     y += ROW_H * 2;
-    let ollama_bottom = y + 8;
+    let ollama_bottom = y + 4;
     ctx.create(
         WC_BUTTON,
         "Ollama",
@@ -4795,8 +4796,8 @@ fn build_ui_recorded(
         ROW_H * 2,
         ID_REDACT_HINT,
     );
-    r.advance();
-    r.advance();
+    // The note's own two rows, then the group's usual bottom padding (#785).
+    r.y += ROW_H * 2;
     let capture_bottom = r.y + 4;
     ctx.create(
         WC_BUTTON,
@@ -7110,6 +7111,78 @@ mod tests {
                 "the note under a checkbox starts at the checkbox's text ({gap} px, want {want} at {dpi} dpi)"
             );
         });
+    }
+
+    /// #785: a group ends a small step below its last control, not a blank
+    /// band. Measured from each group box to the lowest visible control inside
+    /// it, in dp at the test window's DPI.
+    #[test]
+    fn groups_end_close_below_their_last_control() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let dpi = dpi_for(hwnd);
+            // The control's top and its closed height: a combo's window rect
+            // also holds its dropped list.
+            let rect = |h: HWND| {
+                let (mut r, mut c) = (RECT::default(), RECT::default());
+                unsafe {
+                    let _ = GetWindowRect(h, &mut r);
+                    let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(h, &mut c);
+                }
+                RECT {
+                    bottom: r.top + (c.bottom - c.top),
+                    ..r
+                }
+            };
+            let shown = |h: HWND| unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                    h,
+                    windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+                ) as u32
+                    & WS_VISIBLE.0
+                    != 0
+            };
+            let groups: Vec<(String, RECT)> = inner
+                .children
+                .iter()
+                .filter(|c| unsafe { is_group_box(c.hwnd) })
+                .map(|c| (get_text(c.hwnd), rect(c.hwnd)))
+                .collect();
+            assert!(groups.len() >= 5, "found {} group boxes", groups.len());
+            let mut checked = 0;
+            for name in ["Providers", "Ollama", "Capture"] {
+                let (_, g) = groups.iter().find(|(t, _)| t == name).expect(name);
+                let last = inner
+                    .children
+                    .iter()
+                    .filter(|c| unsafe { !is_group_box(c.hwnd) && shown(c.hwnd) })
+                    .map(|c| rect(c.hwnd))
+                    .filter(|r| r.top >= g.top && r.bottom <= g.bottom)
+                    .map(|r| r.bottom)
+                    .max()
+                    .expect("controls inside the group");
+                let slack = g.bottom - last;
+                assert!(
+                    slack <= to_px(16, dpi),
+                    "{name} group ends {slack} px below its last control"
+                );
+                checked += 1;
+            }
+            assert_eq!(checked, 3);
+        });
+    }
+
+    /// Whether `hwnd` is a group box (a button with `BS_GROUPBOX`).
+    unsafe fn is_group_box(hwnd: HWND) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetClassNameW, GetWindowLongPtrW, GWL_STYLE,
+        };
+        let mut name = [0u16; 16];
+        let n = GetClassNameW(hwnd, &mut name) as usize;
+        String::from_utf16_lossy(&name[..n]) == "Button"
+            && (GetWindowLongPtrW(hwnd, GWL_STYLE) as i32 & 0xF) == BS_GROUPBOX
     }
 
     /// #935: a 1 px line sits on the first row of the footer, directly under
