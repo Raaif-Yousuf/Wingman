@@ -540,6 +540,16 @@ const MENU_HOVER_PCT: u32 = 6;
 /// in percent.
 const MENU_DISABLED_PCT: u32 = 55;
 
+/// The colour of the progress ring's moving arc: the user's accent, and the
+/// system highlight in high contrast. `accent` is already held to 3:1 against
+/// the card (`accent_fill`).
+pub(crate) fn progress_ring_ink(theme: Theme, sys: &SysColors, accent: u32) -> u32 {
+    match theme {
+        Theme::HighContrast => sys.highlight,
+        Theme::Light | Theme::Dark => accent,
+    }
+}
+
 /// The fill of the hovered or keyboard-selected row. High contrast uses the
 /// system highlight, as every native menu does.
 pub(crate) fn menu_hover_fill(theme: Theme, tokens: &Tokens, sys: &SysColors) -> u32 {
@@ -712,6 +722,22 @@ mod tests {
         assert_ne!(DARK.control_fill, DARK.surface);
         let hc = Tokens::for_theme(Theme::HighContrast, &HC_WHITE);
         assert_eq!(hc.control_fill, HC_WHITE.window);
+    }
+
+    #[test]
+    fn the_progress_ring_is_the_accent_and_the_system_highlight_in_high_contrast() {
+        let accent = rgb(0x00, 0x67, 0xC0);
+        assert_eq!(progress_ring_ink(Theme::Light, &HC_BLACK, accent), accent);
+        assert_eq!(progress_ring_ink(Theme::Dark, &HC_BLACK, accent), accent);
+        assert_eq!(
+            progress_ring_ink(Theme::HighContrast, &HC_WHITE, accent),
+            HC_WHITE.highlight
+        );
+        let ratio = |a, b| contrast_ratio(relative_luminance(a), relative_luminance(b));
+        for sys in [HC_BLACK, HC_WHITE] {
+            let ink = progress_ring_ink(Theme::HighContrast, &sys, accent);
+            assert!(ratio(ink, sys.window) >= 3.0);
+        }
     }
 
     #[test]
