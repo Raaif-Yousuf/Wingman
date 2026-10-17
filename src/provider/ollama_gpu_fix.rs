@@ -416,8 +416,25 @@ fn marker_path() -> Option<PathBuf> {
 
 /// Whether the last fix never finished (Wingman exited during it), so Ollama
 /// may be stopped. Shown in diagnostics.
-pub fn interrupted() -> bool {
-    !is_running() && marker_path().is_some_and(|m| m.exists())
+///
+/// #846: once Ollama answers on its port the marker is stale (the user started
+/// it again), so it is removed and this says no, instead of repeating the
+/// warning on every later run.
+pub fn interrupted(ollama_listening: bool) -> bool {
+    interrupted_at(marker_path().as_deref(), is_running(), ollama_listening)
+}
+
+fn interrupted_at(marker: Option<&Path>, running: bool, ollama_listening: bool) -> bool {
+    let Some(m) = marker.filter(|m| !running && m.exists()) else {
+        return false;
+    };
+    if ollama_listening {
+        // Best effort: if it cannot be removed it is still not reported, as
+        // Ollama is up now, and the next run tries again.
+        let _ = std::fs::remove_file(m);
+        return false;
+    }
+    true
 }
 
 // ===========================================================================
@@ -1199,6 +1216,27 @@ mod tests {
         drop(first);
         assert!(!marker.exists());
         assert!(begin(&FLAG, Some(marker)).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_left_over_marker_is_stale_once_ollama_listens() {
+        let dir = std::env::temp_dir().join("wingman-test-846-marker");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("gpu-fix-in-progress");
+        std::fs::write(&marker, "x").unwrap();
+        // Nothing listening: the fix really was cut short.
+        assert!(interrupted_at(Some(&marker), false, false));
+        assert!(marker.exists());
+        // A fix running in this process is not an interrupted one.
+        assert!(!interrupted_at(Some(&marker), true, true));
+        assert!(marker.exists());
+        // Ollama answers: the warning ends and the marker is cleared.
+        assert!(!interrupted_at(Some(&marker), false, true));
+        assert!(!marker.exists());
+        // No marker, or nowhere to look: never interrupted.
+        assert!(!interrupted_at(Some(&marker), false, false));
+        assert!(!interrupted_at(None, false, false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
