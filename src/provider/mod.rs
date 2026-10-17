@@ -3804,6 +3804,15 @@ mod tests {
     }
 
     #[test]
+    fn preview_request_shows_a_labelled_secret_as_its_marker() {
+        let mut req = request_with_email();
+        req.user = "login: bob\npassword: hunter2".to_string();
+        let shown = preview_request(&req, true);
+        assert_eq!(shown.user, "login: bob\npassword: [secret 1]");
+        assert!(!shown.user.contains("hunter2"));
+    }
+
+    #[test]
     fn preview_request_is_untouched_when_redaction_is_off_or_nothing_matched() {
         let req = request_with_email();
         assert_eq!(preview_request(&req, false).user, req.user);

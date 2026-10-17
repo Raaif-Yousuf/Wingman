@@ -30,7 +30,8 @@ provider answers, the request carries:
    Windows OCR can read on the screenshot are painted over with solid boxes
    (`capture.redact`, on by default, also a checkbox in Settings). The same
    switch masks those details in text sent along (selected text, page text,
-   field values) and puts the real values back into the answer. A number that
+   field values) and puts the real values back into the answer. In that text,
+   a value after a label such as `password:` or `PIN` is masked too. A number that
    Windows OCR splits across two lines, or does not read at all, may not be
    painted over.
 2. The system prompt from `ui.prompt` in your config, sent alongside the

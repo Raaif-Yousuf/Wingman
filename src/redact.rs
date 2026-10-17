@@ -133,6 +133,9 @@ const CARD: &str = "card number";
 const IBAN: &str = "IBAN";
 const KEY: &str = "key";
 const EMAIL: &str = "email";
+/// The value after a label such as `password:` or `PIN` (#1121). Text only:
+/// a screenshot's OCR lines are not scanned for labels.
+const SECRET: &str = "secret";
 
 /// Vendor key prefixes. A run starting with one of these is a key from
 /// [`MIN_PREFIXED_KEY_CHARS`] characters on. One list for both paths: the text
@@ -472,8 +475,35 @@ fn text_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
     add(text_key_spans(text), KEY);
     add(shared_key_spans(text), KEY);
     add(email_spans(text), EMAIL);
+    let secrets = secret_label_spans(text, &spans);
+    spans.extend(secrets.into_iter().map(|r| (r, SECRET)));
     spans.sort_by_key(|(r, _)| (r.start, r.end));
     spans
+}
+
+/// Labelled-secret spans that do not re-cover what a more specific kind
+/// already marked. A value that starts where a key, card, IBAN or email
+/// starts is that kind's to mark (`token=<jwt>.` stays `token=[key 1].`); only
+/// text left after it is kept, and only when it still holds a letter or digit.
+fn secret_label_spans(text: &str, others: &[(Range<usize>, &'static str)]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for span in crate::secret_labels::secret_spans(text) {
+        let covered_to = others
+            .iter()
+            .filter(|(r, _)| r.start == span.start)
+            .map(|(r, _)| r.end)
+            .max();
+        let Some(end) = covered_to else {
+            out.push(span);
+            continue;
+        };
+        let rest = text.get(end.min(span.end)..span.end).unwrap_or("");
+        let lead = rest.len() - rest.trim_start().len();
+        if rest.chars().any(char::is_alphanumeric) {
+            out.push(end + lead..span.end);
+        }
+    }
+    out
 }
 
 /// The private details swapped out of one outbound request, kept only in
@@ -520,7 +550,7 @@ impl Redactions {
         if !text.contains('[') {
             return;
         }
-        for label in [CARD, IBAN, KEY, EMAIL] {
+        for label in [CARD, IBAN, KEY, EMAIL, SECRET] {
             let open = format!("[{label} ");
             for (at, _) in text.match_indices(&open) {
                 let rest = &text[at + open.len()..];
@@ -676,7 +706,7 @@ pub fn word_byte_ranges(line_text: &str, words: &[OcrWord]) -> Option<Vec<Range<
 pub fn contains_marker(text: &str) -> bool {
     // ASCII lowercasing keeps every byte offset, so no char is split.
     let text = text.to_ascii_lowercase();
-    [CARD, IBAN, KEY, EMAIL].iter().any(|label| {
+    [CARD, IBAN, KEY, EMAIL, SECRET].iter().any(|label| {
         let open = format!("[{} ", label.to_ascii_lowercase());
         text.match_indices(&open).any(|(at, _)| {
             let rest = text.as_bytes().get(at + open.len()..).unwrap_or_default();
@@ -1080,6 +1110,41 @@ mod tests {
     }
 
     #[test]
+    fn a_labelled_secret_gets_a_numbered_marker_and_is_restored() {
+        let mut r = Redactions::default();
+        let out = r.redact_text("user: bob\npassword: hunter2\nPIN 1234\npwd=hunter2");
+        assert_eq!(
+            out,
+            "user: bob\npassword: [secret 1]\nPIN [secret 2]\npwd=[secret 1]"
+        );
+        assert_eq!(r.counts().get("secret"), Some(&2), "{:?}", r.counts());
+        assert_eq!(
+            r.restore_in_json("the password is [secret 1] and [secret 2]".to_string()),
+            "the password is hunter2 and 1234"
+        );
+    }
+
+    #[test]
+    fn secret_markers_are_known_and_numbering_starts_above_existing_ones() {
+        assert!(contains_marker("x [secret 4] y"));
+        assert!(contains_marker("[SECRET 1]"));
+        let mut r = Redactions::default();
+        r.note_existing("earlier [secret 3] text");
+        assert_eq!(r.redact_text("pin: 99"), "pin: [secret 4]");
+    }
+
+    #[test]
+    fn prose_with_secret_words_is_not_redacted_in_text() {
+        for t in [
+            "the password policy says so",
+            "Reset your password.",
+            "a pin is small",
+        ] {
+            assert_eq!(red(t), t, "{t}");
+        }
+    }
+
+    #[test]
     fn redact_text_leaves_ordinary_text_alone() {
         for t in [
             "A 2 kg block slides 3.5 m down a 30 degree slope.\nWhat is g?",
@@ -1209,7 +1274,7 @@ mod tests {
         for t in [
             "open SG.Reports.Quarterly.xlsx now",
             "see SG.team-notes-2024.final.docx",
-            "token ya29.short",
+            "see ya29.short",
         ] {
             assert_eq!(red(t), t, "{t}");
         }
