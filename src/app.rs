@@ -326,6 +326,10 @@ struct App {
     /// are live until quit; a reload after a later successful write puts them
     /// back on the loaded config instead of silently reverting them.
     unsaved: Vec<crate::config_writer::FieldChange>,
+    /// #870: writes handed to the writer thread whose reply has not come back.
+    /// Only the last reply swaps in the loaded config; an earlier one was read
+    /// before a later choice was made.
+    pending_writes: u32,
     /// #339: whether a password manager was in front before Wingman's own UI
     /// (the tray menu, the palette) took the foreground. Set only around a
     /// dispatch from that UI and cleared right after, so it never leaks into
@@ -586,6 +590,7 @@ pub fn run() -> Result<()> {
         taskbar_created_msg,
         config,
         unsaved: Vec::new(),
+        pending_writes: 0,
         chain,
         card,
         palette,
@@ -1265,24 +1270,18 @@ impl App {
             .providers
             .first_run_local_eligible(self.config.mode);
         if let (FirstRun::Found { model, kind }, true) = (&found, eligible) {
+            let before = self.config.clone();
             let base_url = ollama_admin::first_run_base_url(&self.config.providers.ollama.base_url)
                 .unwrap_or_else(|| self.config.providers.ollama.base_url.clone());
             self.config.providers.adopt_local_model(model, &base_url);
             self.chain = Arc::new(self.config.build_chain());
-            let saved = self.config.save();
             self.refresh_tray_labels();
             let (title, text) = first_run_adopted_card(model, *kind);
-            match saved {
-                Ok(()) => self.card.show_answer(&title, &text, 8, None),
-                Err(e) => {
-                    let headline = format!("{title}: not saved");
-                    let human = self.track_error(&headline, &format!("{e:#}"));
-                    self.card.show_error_with_details(
-                        &headline,
-                        &format!("It will revert when you quit.\n\n{human}"),
-                    );
-                }
-            }
+            let mut outcome = crate::config_writer::Outcome::simple(&title);
+            outcome.ok_detail = text;
+            outcome.ok_secs = 8;
+            outcome.fail_headline = format!("{title}: not saved");
+            self.persist_diff(&before, outcome);
             self.set_watch(true);
             return;
         }
@@ -4008,6 +4007,7 @@ impl App {
             }
             LearnedVerdict::Apply => self.pending_conflict = None,
         }
+        let before = self.config.clone();
         apply_learned(&mut self.config.hotkeys, which, chord);
         if let Some(hook) = &self.hook {
             if which == HK_PAUSE {
@@ -4016,23 +4016,14 @@ impl App {
                 hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
             }
         }
-        let saved = self.config.save();
         self.refresh_tray_labels();
 
         let name = chord_to_string(&chord);
-        match saved {
-            Ok(()) => self
-                .card
-                .show_answer(&format!("Bound to {name}"), "", 4, None),
-            Err(e) => {
-                let headline = format!("Bound to {name}: not saved");
-                let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will work until you quit.\n\n{human}"),
-                );
-            }
-        }
+        let mut outcome = crate::config_writer::Outcome::simple(&format!("Bound to {name}"));
+        outcome.ok_secs = 4;
+        outcome.fail_headline = format!("Bound to {name}: not saved");
+        outcome.fail_note = "It will work until you quit.".to_string();
+        self.persist_diff(&before, outcome);
     }
 
     fn reload(&mut self) {
@@ -4381,6 +4372,7 @@ impl App {
 
         let Some(model) = picked else { return };
 
+        let before = self.config.clone();
         let slot = if openai {
             &mut self.config.providers.openai.model
         } else {
@@ -4390,7 +4382,7 @@ impl App {
             return;
         }
         *slot = model.clone();
-        self.commit_model_pick(&model);
+        self.commit_model_pick(&before, &model);
     }
 
     /// #567: apply a model chosen from the tray's Ollama submenu. Same shape
@@ -4403,63 +4395,42 @@ impl App {
         if self.config.providers.ollama.model == model {
             return;
         }
+        let before = self.config.clone();
         self.config.providers.ollama.model = model.clone();
-        self.commit_model_pick(&model);
+        self.commit_model_pick(&before, &model);
     }
 
     /// The part of a tray model pick that comes after the config field is
     /// set: rebuild the chain so the pick is live, save, refresh the tray and
     /// say what happened on a card.
-    fn commit_model_pick(&mut self, model: &str) {
+    fn commit_model_pick(&mut self, before: &Config, model: &str) {
         self.chain = Arc::new(self.config.build_chain());
-        let saved = self.config.save();
         self.refresh_tray_labels();
-
-        match saved {
-            Ok(()) => self.card.show_answer(model, "", 3, None),
-            Err(e) => {
-                let headline = format!("Using {model}: not saved");
-                let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will revert when you quit.\n\n{human}"),
-                );
-            }
-        }
-        self.set_watch(true);
+        self.persist_diff(before, crate::config_writer::Outcome::simple(model));
     }
 
     /// Move a provider to the front of `providers.order`, making it the one
     /// that answers. The other stays in the list as the fallback rather than
     /// being dropped, so switching never costs you the second provider.
     fn set_provider(&mut self, provider: ActiveProvider) {
+        let before = self.config.clone();
         if !provider.move_to_front(&mut self.config.providers.order) {
             return;
         }
 
         self.chain = Arc::new(self.config.build_chain());
-        let saved = self.config.save();
         self.refresh_tray_labels();
 
-        let name = provider.label();
-        match saved {
-            // Issue #569: a provider with no key would fail on the next
-            // press, so say so now and point at Settings.
-            Ok(()) if provider_needs_key(provider, &self.config.providers, self.config.mode) => {
-                let (headline, detail) = missing_key_card(provider);
-                self.show_setup_card(&headline, &detail);
-            }
-            Ok(()) => self.card.show_answer(name, "", 3, None),
-            Err(e) => {
-                let headline = format!("Using {name}: not saved");
-                let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will revert when you quit.\n\n{human}"),
-                );
-            }
+        let mut outcome = crate::config_writer::Outcome::simple(provider.label());
+        // Issue #569: a provider with no key would fail on the next press, so
+        // say so now and point at Settings.
+        if provider_needs_key(provider, &self.config.providers, self.config.mode) {
+            let (headline, detail) = missing_key_card(provider);
+            outcome.ok_headline = headline;
+            outcome.ok_detail = detail;
+            outcome.ok_setup = true;
         }
-        self.set_watch(true);
+        self.persist_diff(&before, outcome);
     }
 
     /// Issue #19: switch `Mode`, publish it to the process-wide atomic the
@@ -4495,11 +4466,39 @@ impl App {
     /// card that reports the outcome. Never blocks and never touches the disk
     /// here; if the writer cannot even be reached the failure is posted back
     /// like any other, so it still ends in a card (rule 7).
-    fn persist_field(&self, label: &str, change: crate::config_writer::FieldChange) {
+    fn persist_field(&mut self, label: &str, change: crate::config_writer::FieldChange) {
+        self.persist_changes(crate::config_writer::Outcome::simple(label), vec![change]);
+    }
+
+    /// Writes whatever differs between `before` (the config before this tray
+    /// change) and the config now, through the writer thread. Replaces a
+    /// whole-file `config.save()`: the file keeps its comments and hand edits,
+    /// no disk work runs on this thread, and a failure is remembered in
+    /// `unsaved` instead of being undone by the next reload.
+    fn persist_diff(&mut self, before: &Config, outcome: crate::config_writer::Outcome) {
+        match crate::config_writer::diff(before, &self.config) {
+            Ok(changes) => self.persist_changes(outcome, changes),
+            Err(e) => {
+                let human = self.track_error(&outcome.fail_headline, &format!("{e:#}"));
+                self.card.show_error_with_details(
+                    &outcome.fail_headline,
+                    &format!("{}\n\n{human}", outcome.fail_note),
+                );
+            }
+        }
+    }
+
+    fn persist_changes(
+        &mut self,
+        outcome: crate::config_writer::Outcome,
+        changes: Vec<crate::config_writer::FieldChange>,
+    ) {
         use crate::config_writer::{WriteReply, Written};
+        self.pending_writes += 1;
         let target = self.hwnd_isize();
-        let changes = vec![change];
+        let label = outcome.ok_headline.clone();
         let sent = changes.clone();
+        let sent_outcome = outcome;
         let done = move |reply: WriteReply| {
             // On the writer thread (or here, if the writer could not start). The
             // reload is the slow part, so it happens here and not in the handler.
@@ -4508,6 +4507,7 @@ impl App {
             let payload = Box::into_raw(Box::new(Written {
                 reply,
                 changes: sent,
+                outcome: sent_outcome,
                 loaded,
             }));
             unsafe {
@@ -4525,9 +4525,9 @@ impl App {
             }
         };
         match crate::config_writer::global() {
-            Ok(writer) => writer.submit(label, changes, done),
+            Ok(writer) => writer.submit(&label, changes, done),
             Err(reason) => done(WriteReply {
-                label: label.to_string(),
+                label,
                 result: Err(reason),
             }),
         }
@@ -4535,54 +4535,73 @@ impl App {
 
     /// The writer thread's answer, with the file already read again (a hand edit
     /// made meanwhile is applied too, and nothing afterwards saves a stale copy
-    /// over it). The card is the one the old in-line save showed. On failure the
-    /// change is live until quit but not on disk, and the card says so; it is
-    /// remembered so a later reload does not quietly undo it.
+    /// over it). On failure the change is live until quit but not on disk, and
+    /// the card says so; it is remembered so a later reload does not quietly undo
+    /// it. While other writes are still in flight this reply's read is stale (a
+    /// later choice may already be live), so only the last reply swaps.
     fn on_config_written(&mut self, written: crate::config_writer::Written) {
         let crate::config_writer::Written {
             reply,
             changes,
+            outcome,
             loaded,
         } = written;
+        let (pending, last) = crate::config_writer::settle(self.pending_writes);
+        self.pending_writes = pending;
         let rewritten =
             |c: &crate::config_writer::FieldChange| changes.iter().any(|n| n.path() == c.path());
         self.unsaved.retain(|c| !rewritten(c));
         match reply.result {
-            Ok(()) => {
-                match loaded {
-                    Some(Ok(config)) if config.load_problem.is_none() => {
+            Ok(()) => match loaded {
+                Some(crate::config_writer::Loaded {
+                    config: Ok(config),
+                    mtime,
+                }) if config.load_problem.is_none() => {
+                    if last {
+                        crate::config_writer::adopt_mtime(mtime);
                         self.config = crate::config_writer::reapply(&config, &self.unsaved)
                             .unwrap_or(*config);
                         self.apply_config();
-                        self.card.show_answer(&reply.label, "", 3, None);
                     }
-                    // The file was edited into something unreadable after our
-                    // write: keep the settings already running, as Reload does,
-                    // and say so.
-                    Some(Ok(config)) => {
-                        let (headline, detail) =
-                            config_problem_card(config.load_problem.as_deref().unwrap_or_default());
-                        self.card.show_error(&headline, &detail);
+                    if outcome.ok_setup {
+                        self.show_setup_card(&outcome.ok_headline, &outcome.ok_detail);
+                    } else {
+                        self.card.show_answer(
+                            &outcome.ok_headline,
+                            &outcome.ok_detail,
+                            outcome.ok_secs,
+                            None,
+                        );
                     }
-                    Some(Err(e)) => {
-                        let detail = self.track_error("Couldn't reload settings", &e);
-                        self.card
-                            .show_error_with_details("Couldn't reload settings", &detail);
-                    }
-                    // The app is quitting.
-                    None => {}
                 }
-            }
+                // The file was edited into something unreadable after our
+                // write: keep the settings already running, as Reload does, and
+                // say so.
+                Some(crate::config_writer::Loaded {
+                    config: Ok(config), ..
+                }) => {
+                    let (headline, detail) =
+                        config_problem_card(config.load_problem.as_deref().unwrap_or_default());
+                    self.card.show_error(&headline, &detail);
+                }
+                Some(crate::config_writer::Loaded { config: Err(e), .. }) => {
+                    let detail = self.track_error("Couldn't reload settings", &e);
+                    self.card
+                        .show_error_with_details("Couldn't reload settings", &detail);
+                }
+                // The app is quitting.
+                None => {}
+            },
             Err(reason) => {
                 self.unsaved.extend(changes);
-                let headline = format!("Using {}: not saved", reply.label);
-                let human = self.track_error(&headline, &reason);
+                let human = self.track_error(&outcome.fail_headline, &reason);
                 self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will revert when you quit.\n\n{human}"),
+                    &outcome.fail_headline,
+                    &format!("{}\n\n{human}", outcome.fail_note),
                 );
             }
         }
+        self.set_watch(true);
     }
 
     /// #567: hand the tray the newest Ollama model list a background refresh
@@ -7484,6 +7503,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_DESTROY => {
             // #870: a settings write still queued must reach the file before the
             // process exits. Bounded, so a stuck disk cannot hang Quit.
+            // The keyboard hook goes first: while it is installed, every key in
+            // the system waits on this thread.
+            app.hook = None;
             crate::config_writer::flush_global(std::time::Duration::from_secs(2));
             // Drop the App (and with it the hook, tray icon and card) before
             // the loop exits, so the tray icon actually disappears.

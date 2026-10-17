@@ -806,7 +806,31 @@ fn seen_mtime(path: &Path) -> Option<std::time::SystemTime> {
     seen.iter().find(|(p, _)| p == path).map(|(_, t)| *t)
 }
 
-fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
+/// Runs `load` (a `Config::load` that notes the file as read) without leaving
+/// that note behind, and returns the mtime it noted. The field writer's thread
+/// loads the file for the UI thread; until the UI thread swaps the result in,
+/// its in-memory config is still the stale one, so a whole-file save must stay
+/// refused. The UI thread calls [`note_mtime`] with the returned value when it
+/// adopts the load.
+pub(crate) fn load_deferring_mtime<T>(
+    path: &Path,
+    load: impl FnOnce() -> T,
+) -> (T, Option<std::time::SystemTime>) {
+    let before = seen_mtime(path);
+    let out = load();
+    let noted = seen_mtime(path);
+    let mut seen = SEEN_MTIMES.lock().unwrap_or_else(|e| e.into_inner());
+    match before {
+        Some(t) => match seen.iter_mut().find(|(p, _)| p == path) {
+            Some(entry) => entry.1 = t,
+            None => seen.push((path.to_path_buf(), t)),
+        },
+        None => seen.retain(|(p, _)| p != path),
+    }
+    (out, noted)
+}
+
+pub(crate) fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
     let Some(mtime) = mtime else { return };
     let mut seen = SEEN_MTIMES.lock().unwrap_or_else(|e| e.into_inner());
     match seen.iter_mut().find(|(p, _)| p == path) {
@@ -820,6 +844,8 @@ fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
 /// copy rather than an intermediate one.
 static BACKED_UP: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 /// A backup that could not be made, for the next card. See [`take_backup_warning`].
+/// Held for the whole of [`write_file_atomically`].
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static BACKUP_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -946,6 +972,9 @@ pub(crate) fn describe_error_span(contents: &str, span: Option<std::ops::Range<u
 /// a whole-file save in between is refused instead of overwriting a hand edit
 /// that the patch carried along.
 pub(crate) fn write_file_atomically(path: &Path, text: &str, note_new_mtime: bool) -> Result<()> {
+    // The UI thread's whole-file save and the writer thread share one temp file
+    // name; two writes at once would trip over it.
+    let _one_writer = lock_ignoring_poison(&WRITE_LOCK);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("failed to create config directory")?;
     }

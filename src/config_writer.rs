@@ -125,8 +125,26 @@ impl FieldChange {
                     // Replace the value where it stands. `insert` would replace
                     // the key too, and with it the comment lines above it.
                     Some(slot) => {
-                        if let (Some(old), Item::Value(new)) = (slot.as_value(), &mut item) {
-                            *new.decor_mut() = old.decor().clone();
+                        match (&*slot, &mut item) {
+                            (Item::Value(old), Item::Value(new)) => {
+                                *new.decor_mut() = old.decor().clone();
+                            }
+                            // A whole table or list of tables: the new tables
+                            // take the old ones' comments and place in the file,
+                            // or they would lose the comment above them and move
+                            // to the end.
+                            (Item::Table(old), Item::Table(new)) => keep_place(old, new),
+                            (Item::ArrayOfTables(old), Item::ArrayOfTables(new)) => {
+                                let last = old.len().checked_sub(1);
+                                for (i, table) in new.iter_mut().enumerate() {
+                                    if let Some(old) =
+                                        old.get(i).or_else(|| last.and_then(|l| old.get(l)))
+                                    {
+                                        keep_place(old, table);
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                         *slot = item;
                     }
@@ -138,6 +156,12 @@ impl FieldChange {
         }
         Ok(())
     }
+}
+
+/// `new` takes `old`'s comments and position in the file.
+fn keep_place(old: &Table, new: &mut Table) {
+    *new.decor_mut() = old.decor().clone();
+    new.set_position(old.position());
 }
 
 fn is_blank_string(v: &toml::Value) -> bool {
@@ -231,7 +255,6 @@ fn to_value(v: &toml::Value) -> Value {
 /// (remove). Arrays and the like are one leaf. `api_key` is skipped everywhere,
 /// and blanked inside any whole table or array that is set: keys go to
 /// Credential Manager, never to the file.
-#[allow(dead_code)] // Settings' Save sends only these (#871); slice 0 ships the tested writer first.
 pub fn diff(before: &Config, after: &Config) -> Result<Vec<FieldChange>> {
     let mut before = toml::Value::try_from(before).context("could not read the old settings")?;
     let mut after = toml::Value::try_from(after).context("could not read the new settings")?;
@@ -459,21 +482,86 @@ pub struct WriteReply {
     pub result: Result<(), String>,
 }
 
+/// The file as `Config::load` read it after a write, and the modified time that
+/// read saw. The UI thread adopts the time when (and only when) it swaps the
+/// config in; see `config::load_deferring_mtime`.
+pub struct Loaded {
+    pub config: Result<Box<Config>, String>,
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+/// The UI thread has taken a [`Loaded`] as its config: from now on a whole-file
+/// save is judged against what was read then (`Loaded::mtime`).
+pub fn adopt_mtime(mtime: Option<std::time::SystemTime>) {
+    if let Ok(path) = Config::path() {
+        crate::config::note_mtime(&path, mtime);
+    }
+}
+
+/// What the cards say once a write is done. Different tray changes word them
+/// differently.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outcome {
+    pub ok_headline: String,
+    pub ok_detail: String,
+    pub ok_secs: u32,
+    /// Show the OK card as a setup card (it points at Settings and stays).
+    pub ok_setup: bool,
+    pub fail_headline: String,
+    /// Said under the failure, after "It ...".
+    pub fail_note: String,
+}
+
+impl Outcome {
+    /// "<label>" on success; "Using <label>: not saved" and "It will revert when
+    /// you quit." on failure.
+    pub fn simple(label: &str) -> Self {
+        Self {
+            ok_headline: label.to_string(),
+            ok_detail: String::new(),
+            ok_secs: 3,
+            ok_setup: false,
+            fail_headline: format!("Using {label}: not saved"),
+            fail_note: "It will revert when you quit.".to_string(),
+        }
+    }
+}
+
 /// What the app is told when a write finishes: the writer's reply, the changes
-/// it was for, and (on success) the config as `Config::load` now reads it. The
-/// load runs on the writer thread, so the Credential Manager reads and any
-/// `icacls` call it makes never run on the thread that hosts the keyboard hook.
+/// it was for, how to word the cards, and (on success) the config as
+/// `Config::load` now reads it. The load runs on the writer thread, so the
+/// Credential Manager reads and any `icacls` call it makes never run on the
+/// thread that hosts the keyboard hook.
 pub struct Written {
     pub reply: WriteReply,
     pub changes: Vec<FieldChange>,
+    pub outcome: Outcome,
     /// `None` when the write failed, or the app is quitting.
-    pub loaded: Option<Result<Box<Config>, String>>,
+    pub loaded: Option<Loaded>,
+}
+
+/// After one write's reply: the writes still in flight, and whether this was the
+/// last. Only the last reply may swap in a loaded config; an earlier one was read
+/// before a later choice was made and would overwrite it.
+pub fn settle(pending: u32) -> (u32, bool) {
+    let left = pending.saturating_sub(1);
+    (left, left == 0)
 }
 
 /// `Config::load` for the handler of [`Written`], with the error as a sentence.
 /// Runs on the writer thread.
-pub fn load_after_write() -> Result<Box<Config>, String> {
-    Config::load().map(Box::new).map_err(|e| format!("{e:#}"))
+pub fn load_after_write() -> Loaded {
+    let load = || Config::load().map(Box::new).map_err(|e| format!("{e:#}"));
+    match Config::path() {
+        Ok(path) => {
+            let (config, mtime) = crate::config::load_deferring_mtime(&path, load);
+            Loaded { config, mtime }
+        }
+        Err(e) => Loaded {
+            config: Err(format!("{e:#}")),
+            mtime: None,
+        },
+    }
 }
 
 struct Job {
@@ -1533,10 +1621,10 @@ x = 1
         assert!(!handler.contains("Config::load"), "{handler}");
         assert!(!handler.contains("load_after_write"), "{handler}");
         let start = app
-            .find("    fn persist_field(")
-            .expect("persist_field moved");
+            .find("    fn persist_changes(")
+            .expect("persist_changes moved");
         let rest = &app[start..];
-        let end = rest.find("\n    }\n").expect("end of persist_field");
+        let end = rest.find("\n    }\n").expect("end of persist_changes");
         assert!(
             rest[..end].contains("load_after_write"),
             "the writer thread must reload"
@@ -1560,6 +1648,191 @@ x = 1
             "{}",
             &rest[..end]
         );
+    }
+
+    // -- re-review fixes (#889) -------------------------------------------------
+
+    #[test]
+    fn replacing_an_array_of_tables_keeps_its_comment_and_its_place() {
+        let text = "# endpoints I use\n[[providers.compat]]\nname = \"a\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\n# second one\n[[providers.compat]]\nname = \"a2\"\nbase_url = \"http://127.0.0.1:2/v1\"\n\n[ui]\ncard_seconds = 7 # keep\n\n[unknown_future_table]\nx = 1\n";
+        let compat: Vec<toml::Value> = ["b", "b2", "b3"]
+            .iter()
+            .map(|n| {
+                toml::Value::try_from(crate::config::CompatConfig {
+                    name: (*n).into(),
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                    ..Default::default()
+                })
+                .unwrap()
+            })
+            .collect();
+        let out = patched(
+            "aot-place",
+            text,
+            &[FieldChange::Set {
+                path: vec!["providers".into(), "compat".into()],
+                value: toml::Value::Array(compat),
+            }],
+        );
+        let at = |needle: &str| {
+            out.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} lost:\n{out}"))
+        };
+        assert!(
+            at("# endpoints I use") < at("name = \"b\""),
+            "the comment must stay above the first table:\n{out}"
+        );
+        assert!(at("# second one") < at("name = \"b2\""), "{out}");
+        assert!(
+            at("name = \"b3\"") < at("[ui]"),
+            "the tables must stay where they were, before [ui]:\n{out}"
+        );
+        assert!(at("[ui]") < at("[unknown_future_table]"), "{out}");
+    }
+
+    #[test]
+    fn replacing_a_table_keeps_its_comment_and_its_place() {
+        let text =
+            "# my cheap model\n[providers.openai]\nmodel = \"a\"\n\n[ui]\ncard_seconds = 7\n";
+        let value = toml_value("model = \"b\"\n");
+        let out = patched(
+            "table-place",
+            text,
+            &[FieldChange::Set {
+                path: vec!["providers".into(), "openai".into()],
+                value,
+            }],
+        );
+        assert!(
+            out.starts_with("# my cheap model\n[providers.openai]"),
+            "{out}"
+        );
+        assert!(
+            out.find("model = \"b\"").unwrap() < out.find("[ui]").unwrap(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn two_threads_writing_the_file_do_not_trip_over_the_shared_temp_file() {
+        let path = scratch("lock");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let handles: Vec<_> = (0..2)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for n in 0..15 {
+                        let text = format!("# writer {t} pass {n}\n{HAND_EDITED}");
+                        crate::config::write_file_atomically(&path, &text, false)
+                            .unwrap_or_else(|e| panic!("writer {t} pass {n}: {e:#}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(toml::from_str::<Config>(&std::fs::read_to_string(&path).unwrap()).is_ok());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_load_on_the_writer_thread_leaves_the_file_unseen_until_the_ui_adopts_it() {
+        let path = scratch("deferred");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let set_mtime = |t: std::time::SystemTime| {
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(t).unwrap();
+        };
+        set_mtime(past);
+        let held = Config::load_from(&path).unwrap();
+        // The file changes, then the writer thread loads it.
+        std::fs::write(
+            &path,
+            replaced(HAND_EDITED, "card_seconds = 12", "card_seconds = 5"),
+        )
+        .unwrap();
+        let (loaded, mtime) =
+            crate::config::load_deferring_mtime(&path, || Config::load_from(&path).unwrap());
+        assert_eq!(loaded.ui.card_seconds, 5);
+        assert!(mtime.is_some());
+        // Until the UI thread swaps `loaded` in, `held` is stale: its save must
+        // still be refused.
+        let err = held.save_to(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("changed on disk"), "{err:#}");
+        // The swap adopts the mtime the load saw; now a save is allowed.
+        crate::config::note_mtime(&path, mtime);
+        assert!(loaded.save_to(&path).is_ok());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn only_the_last_reply_in_a_run_of_writes_swaps_the_config() {
+        // Mode toggled twice quickly: the first reply's file read predates the
+        // second choice and must not overwrite it.
+        let (pending, last) = settle(2);
+        assert_eq!((pending, last), (1, false));
+        let (pending, last) = settle(pending);
+        assert_eq!((pending, last), (0, true));
+        // A stray extra reply never underflows.
+        assert_eq!(settle(0), (0, true));
+    }
+
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src.find(signature).unwrap_or_else(|| {
+            panic!("{signature} moved: this scan is no longer looking at anything")
+        });
+        let rest = &src[start..];
+        let end = rest.find("\n    }\n").expect("end of the function");
+        &rest[..end]
+    }
+
+    #[test]
+    fn tray_changes_reach_the_file_through_the_writer_not_a_whole_file_save() {
+        let app = include_str!("app.rs").replace('\r', "");
+        for signature in [
+            "    fn set_provider(",
+            "    fn commit_model_pick(",
+            "    fn on_learned(",
+        ] {
+            let body = body_of(&app, signature);
+            assert!(!body.contains("config.save("), "{signature}\n{body}");
+            assert!(body.contains("persist_diff("), "{signature}\n{body}");
+        }
+        let at = app
+            .find("adopt_local_model(model, &base_url)")
+            .expect("the first-run adoption moved");
+        let window = &app[at..(at + 900).min(app.len())];
+        assert!(!window.contains("config.save("), "{window}");
+        assert!(window.contains("persist_diff("), "{window}");
+    }
+
+    #[test]
+    fn the_handler_swaps_only_when_no_other_write_is_in_flight() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let body = body_of(&app, "    fn on_config_written(");
+        assert!(body.contains("settle("), "{body}");
+    }
+
+    /// The low-level keyboard hook must be gone before Quit waits on the writer,
+    /// or every key in the system stalls behind a wait on the hook's thread.
+    #[test]
+    fn quitting_unhooks_the_keyboard_before_it_waits_for_the_writer() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let start = app
+            .find("        WM_DESTROY => {")
+            .expect("the WM_DESTROY arm moved");
+        let rest = &app[start..];
+        let end = rest
+            .find("\n        }\n")
+            .expect("end of the WM_DESTROY arm");
+        let arm = &rest[..end];
+        let unhook = arm
+            .find("hook = None")
+            .expect("the hook must be dropped in WM_DESTROY");
+        let flush = arm.find("flush_global(").expect("flush");
+        assert!(unhook < flush, "{arm}");
     }
 
     // -- guards ----------------------------------------------------------------
