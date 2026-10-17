@@ -1957,6 +1957,7 @@ impl CardInner {
 
         self.layout_collapsed();
         self.reveal();
+        self.announce_to_screen_readers();
     }
 
     fn hide(&mut self) {
@@ -2365,6 +2366,14 @@ impl CardInner {
 
     /// [`Self::uia_snapshot`] for a known visibility.
     fn uia_snapshot_for(&self, visible: bool) -> card_uia::Snapshot {
+        // #977: a collapsed card has no links, but with detail behind it a
+        // screen reader can expand it.
+        if self.state == CardState::Collapsed && visible && !self.detail.is_empty() {
+            return card_uia::Snapshot {
+                expandable: true,
+                ..card_uia::Snapshot::default()
+            };
+        }
         if self.state != CardState::Expanded || !visible {
             return card_uia::Snapshot::default();
         }
@@ -2383,6 +2392,7 @@ impl CardInner {
         card_uia::Snapshot {
             links,
             focus: self.focus_link.map(FooterLink::uia_id),
+            expandable: false,
         }
     }
 
@@ -2424,6 +2434,14 @@ impl CardInner {
     /// #654: a screen reader's Invoke or SetFocus on a link, posted from
     /// the UIA thread. Runs only a link that is on the card now.
     fn uia_link_requested(&mut self, id: i32, how: isize) {
+        // #977: the card-level Invoke expands a collapsed card.
+        if id == card_uia::EXPAND_ID {
+            if how == card_uia::LINK_INVOKE {
+                self.try_expand();
+            }
+            self.sync_uia(None);
+            return;
+        }
         if self.state != CardState::Expanded {
             return;
         }
@@ -2444,6 +2462,13 @@ impl CardInner {
         if lparam.0 as i32 != UiaRootObjectId {
             return None;
         }
+        self.ensure_uia();
+        let root = self.uia.as_ref()?.root.clone();
+        Some(unsafe { UiaReturnRawElementProvider(self.hwnd, wparam, lparam, &root) })
+    }
+
+    /// Creates the UIA tree on first use (a client asked, or one is listening).
+    fn ensure_uia(&mut self) {
         if self.uia.is_none() {
             let shared = card_uia::Shared::default();
             let root = card_uia::new_root(self.hwnd, &shared);
@@ -2454,8 +2479,23 @@ impl CardInner {
             });
             self.sync_uia(None);
         }
-        let root = self.uia.as_ref()?.root.clone();
-        Some(unsafe { UiaReturnRawElementProvider(self.hwnd, wparam, lparam, &root) })
+    }
+
+    /// #977: tells a screen reader about a card that just appeared, with a
+    /// UIA notification (the card never takes focus, so there is no focus
+    /// event to ride on). Costs one cheap check and nothing else when no UIA
+    /// client is listening, so a PC without a screen reader pays nothing.
+    fn announce_to_screen_readers(&mut self) {
+        if !unsafe { UiaClientsAreListening() }.as_bool() {
+            return;
+        }
+        self.ensure_uia();
+        // The tree reads the card's state, so bring it up to date first.
+        self.sync_uia(None);
+        let text = card_uia::announcement_text(&self.headline, &self.detail);
+        if let Some(uia) = self.uia.as_ref() {
+            card_uia::raise_announcement(&uia.root, &text);
+        }
     }
 
     /// #654: detaches the tree from UIA when the window goes away.
