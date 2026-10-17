@@ -2262,28 +2262,27 @@ fn footer_divider_rect(client_w_px: i32, client_h_px: i32, dpi: u32) -> (i32, i3
     (0, top, client_w_px, top + 1)
 }
 
-/// #935: the divider's colour. The theme's hairline token; the system's own
-/// text colour in high contrast, where a pale hairline would not show.
-fn footer_divider_color(high_contrast: bool, btn_text: u32) -> u32 {
-    if high_contrast {
-        btn_text
-    } else {
-        crate::ui::theme::LIGHT.border
-    }
+/// #935: the divider's colour: the hairline token of the current theme, which
+/// is the system's window text in high contrast, where a pale hairline would
+/// not show. Settings does not follow dark mode yet, so a normal theme here is
+/// the light one (as for the text boxes).
+fn footer_divider_color(high_contrast: bool, sys: &crate::ui::theme::SysColors) -> u32 {
+    use crate::ui::theme::{Theme, Tokens};
+    Tokens::for_theme(Theme::resolve(true, high_contrast), sys).border
 }
 
 /// Paints the footer divider (#935). The class background has already filled
 /// the client area; only the line is drawn here.
 unsafe fn paint_footer_divider(hwnd: HWND) {
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, CreateSolidBrush, EndPaint, FillRect, GetSysColor, COLOR_BTNTEXT, PAINTSTRUCT,
+        BeginPaint, CreateSolidBrush, EndPaint, FillRect, PAINTSTRUCT,
     };
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rc = windows::Win32::Foundation::RECT::default();
     if GetClientRect(hwnd, &mut rc).is_ok() {
         let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-        let ink = footer_divider_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
+        let ink = footer_divider_color(high_contrast, &crate::ui::theme::SysColors::read());
         let (l, t, r, b) =
             footer_divider_rect(rc.right - rc.left, rc.bottom - rc.top, dpi_for(hwnd));
         let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(ink));
@@ -7102,10 +7101,13 @@ mod tests {
             assert_eq!(left(hwnd, ID_HOTKEY_STATUS), label_edge);
             assert_eq!(left(hwnd, ID_MODEL_LIST_HINT), label_edge);
             assert_eq!(left(hwnd, ID_CAPTURE_DETAIL_HINT), label_edge);
-            assert_eq!(
-                left(hwnd, ID_REDACT_HINT) - left(hwnd, ID_REDACT),
-                to_px(CHECKBOX_TEXT_INDENT_DP, dpi),
-                "the note under a checkbox starts at the checkbox's text"
+            // The layout scales `x + indent` as one sum, so the gap is the
+            // scaled indent give or take the pixel each edge rounds by.
+            let gap = left(hwnd, ID_REDACT_HINT) - left(hwnd, ID_REDACT);
+            let want = to_px(CHECKBOX_TEXT_INDENT_DP, dpi);
+            assert!(
+                (gap - want).abs() <= 1,
+                "the note under a checkbox starts at the checkbox's text ({gap} px, want {want} at {dpi} dpi)"
             );
         });
     }
@@ -7132,10 +7134,11 @@ mod tests {
     /// own text colour in high contrast (a light grey would vanish there).
     #[test]
     fn footer_divider_colour_comes_from_the_tokens() {
-        use crate::ui::theme::{rgb, LIGHT};
-        assert_eq!(footer_divider_color(false, rgb(1, 2, 3)), LIGHT.border);
-        let hc = rgb(255, 255, 255);
-        assert_eq!(footer_divider_color(true, hc), hc);
+        use crate::ui::theme::{HC_BLACK, HC_WHITE, LIGHT};
+        assert_eq!(footer_divider_color(false, &HC_BLACK), LIGHT.border);
+        for sys in [HC_BLACK, HC_WHITE] {
+            assert_eq!(footer_divider_color(true, &sys), sys.window_text);
+        }
     }
 
     /// #934: a text box takes its fill, border and text from the theme tokens
