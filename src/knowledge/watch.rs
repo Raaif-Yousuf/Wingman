@@ -517,6 +517,15 @@ impl Drop for Watcher {
 /// already says why). `Err` is a plain sentence for a card: the thread or its
 /// event could not be created.
 pub fn start(folder: &str) -> Result<Option<Watcher>, String> {
+    start_with(folder, store::global)
+}
+
+/// [`start`] with the way the thread gets its store spelled out, so a test can
+/// give it a store of its own.
+fn start_with(
+    folder: &str,
+    open: impl FnOnce() -> Result<Arc<Store>, StoreError> + Send + 'static,
+) -> Result<Option<Watcher>, String> {
     let Some(target) = ingest::watch_target(folder) else {
         return Ok(None);
     };
@@ -528,7 +537,7 @@ pub fn start(folder: &str) -> Result<Option<Watcher>, String> {
     let (ready, armed) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::Builder::new()
         .name("knowledge-watch".into())
-        .spawn(move || ingest::guarded(|| watch(&target, &for_thread, ready)))
+        .spawn(move || ingest::guarded(|| watch(&target, &for_thread, ready, open)))
         .map_err(|e| failed_to_start(&e.to_string()))?;
     // Wait (bounded) for the first read to be armed, so the caller can start
     // the start-up scan knowing no later change can slip between the two. A
@@ -717,7 +726,12 @@ fn stop_requested(stop: &StopEvent) -> bool {
 /// The thread body: open the folder, then wait for changes or the stop event.
 /// `ready` is sent once the first read is armed; dropping it unsent (any early
 /// return) tells `start` there is nothing to wait for.
-fn watch(folder: &Path, stop: &StopEvent, ready: std::sync::mpsc::SyncSender<()>) {
+fn watch(
+    folder: &Path,
+    stop: &StopEvent,
+    ready: std::sync::mpsc::SyncSender<()>,
+    open: impl FnOnce() -> Result<Arc<Store>, StoreError>,
+) {
     // A folder that is not there is the scan's notice to give, not ours.
     let Ok(root) = ingest::canonical_root(folder) else {
         return;
@@ -740,15 +754,31 @@ fn watch(folder: &Path, stop: &StopEvent, ready: std::sync::mpsc::SyncSender<()>
     // #1053: open the store (if the start-up open has not) at normal priority,
     // as the scan does, and only then drop to background. A store that cannot
     // open has already reported itself.
-    let opened = store::global();
+    let opened = open();
     ingest::lower_thread_priority();
     let Ok(store) = opened else { return };
     // Replaced while the store was opening: do not bring a retired root back.
     if stop_requested(stop) {
         return;
     }
+    // #1158: a damaged store file is swapped for a fresh one mid-run, and the
+    // root id below then points at nothing. The store signals this event after
+    // the swap; subscribed before the root is read, so a swap in between is
+    // not missed (the worst case is one extra rescan).
+    // SAFETY: plain event creation, no pointers. Auto-reset: one wake per swap.
+    let Ok(swapped) = (unsafe { CreateEventW(None, false, false, PCWSTR::null()) }) else {
+        return;
+    };
+    let swapped = Arc::new(StopEvent(swapped));
+    let _subscription = store.on_replaced({
+        let swapped = Arc::clone(&swapped);
+        // SAFETY: the handle stays open while the closure holds the `Arc`.
+        Arc::new(move || unsafe {
+            let _ = SetEvent(swapped.0);
+        })
+    });
     let root_key = root.to_string_lossy().into_owned();
-    let root_id = match store.ensure_root(&root_key, ingest::now_unix()) {
+    let mut root_id = match store.ensure_root(&root_key, ingest::now_unix()) {
         Ok(id) => id,
         Err(e) => {
             store::report(&e);
@@ -759,10 +789,22 @@ fn watch(folder: &Path, stop: &StopEvent, ready: std::sync::mpsc::SyncSender<()>
     let mut tries: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     loop {
         let timeout = wait_millis(pending.wait(Instant::now()));
-        let handles = [dir.event, stop.0];
-        // SAFETY: both handles are live events owned by `dir` and `stop`.
+        let handles = [dir.event, stop.0, swapped.0];
+        // SAFETY: all handles are live events owned by `dir`, `stop` and `swapped`.
         let woke = unsafe { WaitForMultipleObjects(&handles, false, timeout) };
-        if woke == WAIT_OBJECT_0 {
+        if woke.0 == WAIT_OBJECT_0.0 + 2 {
+            // The store file was replaced: read the root id again and index
+            // the whole folder into the fresh database (an overflow is
+            // exactly that: one rescan).
+            root_id = match store.ensure_root(&root_key, ingest::now_unix()) {
+                Ok(id) => id,
+                Err(e) => {
+                    store::report(&e);
+                    return;
+                }
+            };
+            pending.mark_overflow(Instant::now());
+        } else if woke == WAIT_OBJECT_0 {
             match dir.complete() {
                 Ok(Read::Changes(changes)) => {
                     pending.record(long_changes(&root, changes), Instant::now());
@@ -1449,6 +1491,55 @@ mod tests {
         );
         assert!(thread_done, "the thread must end after the stop event");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1158: the store file is damaged and replaced while the watcher runs.
+    /// The fresh database has no root and no documents; the watcher must read
+    /// its root id again and index the folder into it with no file change.
+    #[test]
+    fn the_live_watcher_reindexes_after_the_store_file_is_replaced() {
+        let dir = scratch("live-swap");
+        let db_dir = scratch("live-swap-db");
+        let store = Arc::new(Store::open_for_test(&db_dir.join("wingman.db")).unwrap());
+        let for_thread = Arc::clone(&store);
+        let watcher = start_with(&dir.to_string_lossy(), move || Ok(for_thread))
+            .unwrap()
+            .expect("a thread starts for a set folder");
+        let root = ingest::canonical_root(&dir).unwrap();
+        let key = root.to_string_lossy().into_owned();
+
+        fs::write(dir.join("a.md"), "# A\nswapfirstword here\n").unwrap();
+        wait_for("a.md indexed", Duration::from_secs(10), || {
+            store.fts_hits("swapfirstword").unwrap_or(0) == 1
+        });
+
+        // The file is replaced under the running watcher, then healed by the
+        // next use of the store (as a card or an ask would do).
+        store.damage_file_for_test();
+        let _ = store.fts_hits("swapfirstword");
+        let _ = store.fts_hits("swapfirstword");
+        assert_eq!(
+            store
+                .documents_in_root(store.ensure_root(&key, 0).unwrap())
+                .unwrap()
+                .len(),
+            0,
+            "the fresh database starts empty"
+        );
+
+        // No file changed: the swap alone brings the documents back.
+        wait_for("a.md found again", Duration::from_secs(15), || {
+            store.fts_hits("swapfirstword").unwrap_or(0) == 1
+        });
+        // And a later change lands under the new root, not a dead id.
+        fs::write(dir.join("b.md"), "# B\nswapsecondword here\n").unwrap();
+        wait_for("b.md indexed", Duration::from_secs(10), || {
+            store.fts_hits("swapsecondword").unwrap_or(0) == 1
+        });
+        drop(watcher);
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&db_dir);
     }
 
     /// Drops the watcher (which sets the stop event) and waits for its thread
