@@ -17,6 +17,20 @@ pub const DEFAULT_AGE_MS: u64 = 30_000;
 /// itself even if a hide path is somehow missed.
 pub const CLAIM_GRACE_MS: u64 = 1_000;
 
+/// The tick at which the Esc claim lapses by itself for an overlay shown at
+/// `now_ms` that lives at most `age_ms`. One formula for the state machine and
+/// for the keyboard hook's own lock-free copy of the number.
+pub fn claim_expiry(now_ms: u64, age_ms: u64) -> u64 {
+    now_ms.saturating_add(age_ms).saturating_add(CLAIM_GRACE_MS)
+}
+
+/// Whether the keyboard hook should swallow an Esc: only with no modifiers
+/// down, only while an overlay is showing (`expiry` is `Some`), and only until
+/// the expiry tick. The hook and [`Overlay::esc_claimed`] both ask this.
+pub fn esc_claim_open(expiry: Option<u64>, modifiers_down: bool, now_ms: u64) -> bool {
+    !modifiers_down && expiry.is_some_and(|e| now_ms < e)
+}
+
 /// Every hook the overlay installs while it is visible, and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookKind {
@@ -193,7 +207,7 @@ impl Overlay {
             labels,
             hooks,
             age_timer: true,
-            esc_claim_expiry_ms: Some(now_ms.saturating_add(age_ms).saturating_add(CLAIM_GRACE_MS)),
+            esc_claim_expiry_ms: Some(claim_expiry(now_ms, age_ms)),
         })
     }
 
@@ -203,10 +217,12 @@ impl Overlay {
     }
 
     /// The hooks the record says are installed. Empty after any hide.
+    #[cfg(test)]
     pub fn installed_hooks(&self) -> &[HookKind] {
         &self.hooks
     }
 
+    #[cfg(test)]
     pub fn age_timer_armed(&self) -> bool {
         self.age_timer
     }
@@ -260,8 +276,9 @@ impl Overlay {
 
     /// Whether the keyboard hook should swallow this Esc: only with no
     /// modifiers down, only while showing, and only until the expiry tick.
+    #[cfg(test)]
     pub fn esc_claimed(&self, modifiers_down: bool, now_ms: u64) -> bool {
-        !modifiers_down && self.esc_claim_expiry_ms.is_some_and(|e| now_ms < e)
+        esc_claim_open(self.esc_claim_expiry_ms, modifiers_down, now_ms)
     }
 }
 

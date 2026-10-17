@@ -1213,8 +1213,9 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         // A box the window lost because it was deactivated (alt-tab) keeps its
         // text: a half-typed key must not be stored. Enter and moving to another
         // control of Settings apply it.
+        // No early model-list fetch here: the deferred commit's key check brings
+        // the list, so the key is not sent twice.
         if inner.deactivated {
-            fetch_for_typed_key(inner, index);
             inner.deferred_key = commit_trigger(id, notify);
             return;
         }
@@ -1550,6 +1551,8 @@ fn commit_field(inner: &mut SettingsInner, field: Field) {
         return;
     }
     let mut note = None;
+    // Pause is deliberately not consulted: this is a read-only GET of something
+    // the user typed, like the model-list fetch Settings already makes.
     if let Some(index) = field.key_vendor() {
         if let Some(key) = typed_key_to_check(&inner.original, index, &raw) {
             match commit::key_step((inner.key_seams.mode)()) {

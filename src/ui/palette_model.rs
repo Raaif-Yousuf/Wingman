@@ -611,7 +611,9 @@ fn action_requires_model(action_id: &str) -> bool {
         || action_id == CALCULATE_SELECTION_ACTION_ID
         || action_id == COPY_REGION_ACTION_ID
         || action_id == crate::actions::fill_form::ACTION_ID
-        || action_id == crate::actions::relative_dates::ACTION_ID;
+        || action_id == crate::actions::relative_dates::ACTION_ID
+        // #809: marks a word with no model (listed in debug builds only).
+        || action_id == crate::actions::overlay_debug::ACTION_ID;
     !model_free
 }
 
@@ -1479,6 +1481,13 @@ mod tests {
         assert!(cat.iter().any(|a| a.id == CALCULATE_SELECTION_ACTION_ID));
         assert!(cat.iter().any(|a| a.id == COPY_REGION_ACTION_ID));
         assert_eq!(cat.len(), resolved.len() + 2);
+    }
+
+    #[test]
+    fn the_debug_overlay_action_needs_no_model() {
+        assert!(!action_requires_model(
+            crate::actions::overlay_debug::ACTION_ID
+        ));
     }
 
     #[test]

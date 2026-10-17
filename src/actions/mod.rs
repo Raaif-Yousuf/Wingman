@@ -24,6 +24,7 @@ pub mod generic_replace;
 pub mod jargon;
 pub mod knowledge_answer;
 pub mod link_summary;
+pub mod overlay_debug;
 pub mod page_summary;
 pub mod read_qr;
 pub mod receipt;
@@ -169,6 +170,48 @@ pub struct Action {
     /// its `group`, via `disabled_groups`) is explicitly turned off.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// #809: where the result goes. `card` (the default, so every existing
+    /// action is unchanged) or `overlay`: marks drawn beside the text on
+    /// screen, with a summary card.
+    #[serde(default, skip_serializing_if = "Output::is_card")]
+    pub output: Output,
+    /// #809: the name of a built-in detector over the OCR text, which marks
+    /// the screen with no model and no network. Only built-in actions carry
+    /// one: a user `actions.toml` entry cannot name a detector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector: Option<String>,
+}
+
+/// Where an action's result goes (#809).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Output {
+    /// The result card, as every action did before the overlay.
+    #[default]
+    Card,
+    /// Marks drawn on screen beside the text they are about, plus a summary
+    /// card that repeats them as text.
+    Overlay,
+}
+
+impl Output {
+    fn is_card(&self) -> bool {
+        *self == Output::Card
+    }
+}
+
+impl Action {
+    /// The built-in detector this action runs, when it is a model-free
+    /// overlay action: `output = "overlay"` with a `detector` and no prompt.
+    /// `None` for everything else, so a card action never takes this path.
+    pub fn overlay_detector(&self) -> Option<&str> {
+        if self.output != Output::Overlay || !self.prompt.trim().is_empty() {
+            return None;
+        }
+        self.detector
+            .as_deref()
+            .filter(|d| crate::overlay::detect::is_known(d))
+    }
 }
 
 fn default_enabled() -> bool {
@@ -238,6 +281,11 @@ impl ActionOverride {
             hotkey: self.hotkey,
             rate_difficulty: self.rate_difficulty.unwrap_or(false),
             enabled: self.enabled.unwrap_or(true),
+            // A user entry cannot opt into an overlay or name a detector:
+            // the generic list that would let it arrives with the model
+            // overlays, and a detector is built-in only.
+            output: Output::Card,
+            detector: None,
             id,
         })
     }
@@ -461,6 +509,8 @@ pub fn builtin_actions() -> Vec<Action> {
             prefer: Prefer::default(),
             hotkey: None,
             rate_difficulty: false,
+            output: crate::actions::Output::Card,
+            detector: None,
             enabled: true,
         },
         Action {
@@ -475,6 +525,8 @@ pub fn builtin_actions() -> Vec<Action> {
             prefer: Prefer::default(),
             hotkey: None,
             rate_difficulty: false,
+            output: crate::actions::Output::Card,
+            detector: None,
             enabled: true,
         },
         Action {
@@ -489,6 +541,8 @@ pub fn builtin_actions() -> Vec<Action> {
             prefer: Prefer::default(),
             hotkey: None,
             rate_difficulty: false,
+            output: crate::actions::Output::Card,
+            detector: None,
             enabled: true,
         },
         page_summary::builtin_action(),
@@ -515,6 +569,18 @@ pub fn builtin_actions() -> Vec<Action> {
     actions.extend(code_actions::builtin_actions());
     actions.extend(rewrite_tone::builtin_actions());
     actions
+}
+
+/// The built-ins the loader merges user entries over: [`builtin_actions`], plus the
+/// overlay's debug caller (#809) in debug builds. It is kept out of
+/// [`builtin_actions`] itself so the committed `actions.example.toml`, which
+/// lists that function's actions, is the same in every build.
+fn loadable_builtins() -> Vec<Action> {
+    #[allow(unused_mut)]
+    let mut builtins = builtin_actions();
+    #[cfg(debug_assertions)]
+    builtins.push(overlay_debug::builtin_action());
+    builtins
 }
 
 /// Replaces each built-in whose `id` a user action matches (wholesale -- the
@@ -702,7 +768,7 @@ pub fn load_actions_report_from(user_path: &Path) -> Result<LoadReport> {
         UserActionsFile::default()
     };
 
-    let builtins = builtin_actions();
+    let builtins = loadable_builtins();
     let mut report = LoadReport::default();
     let mut entries = Vec::new();
     let mut seen_ids: Vec<&str> = Vec::new();
@@ -1186,6 +1252,8 @@ not_a_real_field = true
             prefer: Prefer::default(),
             hotkey: None,
             rate_difficulty: false,
+            output: crate::actions::Output::Card,
+            detector: None,
             enabled: true,
         };
         let merged = merge_actions(builtin_actions(), vec![user_action]);
@@ -1275,7 +1343,7 @@ not_a_real_field = true
         let path = scratch_path("missing");
         assert!(!path.exists());
         let resolved = load_actions_from(&path).expect("a missing file is not an error");
-        assert_eq!(resolved.len(), builtin_actions().len());
+        assert_eq!(resolved.len(), loadable_builtins().len());
         let default = resolved
             .iter()
             .find(|r| r.action.id == DEFAULT_ACTION_ID)

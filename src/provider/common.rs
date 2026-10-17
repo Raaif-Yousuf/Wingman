@@ -4042,6 +4042,21 @@ mod tests {
         }
     }
 
+    /// #876: the model-list GET keeps the status of a refusal on its error, which
+    /// is how Settings tells a refused key (401) from a vendor having a bad day.
+    /// Without the wrap in `get_json_with_headers` the downcast finds nothing.
+    #[test]
+    fn a_model_list_refusal_carries_its_http_status() {
+        let _g = network_guard();
+        let t = Duration::from_secs(3);
+        let err = get_json_with_headers(&status_server(401, "{}"), &[], t, "test")
+            .expect_err("a 401 is an error");
+        assert_eq!(
+            err.downcast_ref::<HttpStatus>().map(|h| h.status),
+            Some(401)
+        );
+    }
+
     /// #941: the vendor's own error type and code survive redaction on the
     /// card, and a key echoed next to them does not.
     #[test]
