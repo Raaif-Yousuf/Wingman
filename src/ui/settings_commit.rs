@@ -468,12 +468,77 @@ pub(crate) enum KeyStep {
 
 /// The status line while the vendor is asked.
 pub(crate) const CHECKING_LINE: &str = "Checking key...";
+/// Why a key still being checked when the window closed was not saved: only
+/// when the close could not claim it (its answer was already on the way).
+pub(crate) const KEY_UNFINISHED: &str = "The key was not checked before the window closed.";
 /// A key whose check could not finish is still saved, with this said.
 pub(crate) const UNCHECKED_NOTE: &str = "Saved. Could not check it right now.";
 const OFFLINE_NOTE: &str = "Saved. Not checked in Offline mode.";
 const LOCAL_NOTE: &str = "Saved. Not checked in Local mode.";
-/// Why a key still being checked when the window closed was not saved.
-pub(crate) const KEY_UNFINISHED: &str = "The key was not checked before the window closed.";
+
+/// #1130: a key still being checked when the window closes is saved unchecked,
+/// like one whose check could not finish. If its vendor then refuses it
+/// (401 or 403), nothing is left to show that inline, so it is a card.
+/// `closed_saved` is whether the close saved the very key this verdict is for
+/// (the check's claim, see `close_claims`).
+pub(crate) fn late_refusal(verdict: KeyVerdict, closed_saved: bool) -> bool {
+    verdict == KeyVerdict::Rejected && closed_saved
+}
+
+/// Who owns the answer of one key check: the window (the worker posts it) or
+/// the close (it saved the key unchecked). One shared cell per check, settled
+/// by whichever side moves it off `CLAIM_PENDING` first, so the verdict is
+/// never both posted to a window that is closing and shown as a late card, nor
+/// neither.
+pub(crate) type Claim = std::sync::Arc<std::sync::atomic::AtomicU8>;
+const CLAIM_PENDING: u8 = 0;
+const CLAIM_ANSWERED: u8 = 1;
+const CLAIM_CLOSED_SAVED: u8 = 2;
+
+pub(crate) fn new_claim() -> Claim {
+    Claim::new(std::sync::atomic::AtomicU8::new(CLAIM_PENDING))
+}
+
+fn settle(claim: &Claim, to: u8) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    claim
+        .compare_exchange(CLAIM_PENDING, to, SeqCst, SeqCst)
+        .is_ok()
+}
+
+/// The worker has its verdict: true when it may post it to the window.
+pub(crate) fn worker_claims(claim: &Claim) -> bool {
+    settle(claim, CLAIM_ANSWERED)
+}
+
+/// The window is closing with this check out: true when the close may save the
+/// key unchecked (the worker has not answered yet).
+pub(crate) fn close_claims(claim: &Claim) -> bool {
+    settle(claim, CLAIM_CLOSED_SAVED)
+}
+
+/// Whether the close saved the key this check was asked about.
+pub(crate) fn closed_saved(claim: &Claim) -> bool {
+    claim.load(std::sync::atomic::Ordering::SeqCst) == CLAIM_CLOSED_SAVED
+}
+
+/// The card for a key that was saved on close and then refused by its vendor.
+/// The key stays saved: undoing it would need the writer, and a refused key
+/// only fails requests, which then end in their own card. `vendor`: 0 OpenAI,
+/// 1 Anthropic, 2 Gemini.
+pub(crate) fn late_refusal_card(vendor: usize) -> (String, String) {
+    let name = match vendor {
+        0 => "OpenAI",
+        1 => "Anthropic",
+        _ => "Gemini",
+    };
+    (
+        format!("{name} did not accept the key"),
+        format!(
+            "The key you typed was saved when Settings closed, but {name} refused it. Open Settings and enter a working key."
+        ),
+    )
+}
 
 /// Offline and Local keep every request on this computer, so a key is
 /// shape-checked and saved without asking its vendor.
@@ -539,6 +604,7 @@ pub(crate) struct KeyChecks {
 struct PendingCheck {
     generation: u64,
     key: String,
+    claim: Claim,
 }
 
 impl KeyChecks {
@@ -555,8 +621,30 @@ impl KeyChecks {
         *slot = Some(PendingCheck {
             generation: self.last,
             key: key.to_string(),
+            claim: new_claim(),
         });
         Some(self.last)
+    }
+
+    /// The claim of the check now waiting for `vendor`.
+    pub(crate) fn claim_of(&self, vendor: usize) -> Option<Claim> {
+        self.pending.get(vendor)?.as_ref().map(|p| p.claim.clone())
+    }
+
+    /// The checks waiting, with the key each was asked about, left in place.
+    pub(crate) fn snapshot(&self) -> Vec<(usize, String, Claim)> {
+        self.pending
+            .iter()
+            .enumerate()
+            .filter_map(|(v, p)| p.as_ref().map(|p| (v, p.key.clone(), p.claim.clone())))
+            .collect()
+    }
+
+    /// Forgets the check waiting for `vendor` (the close has dealt with it).
+    pub(crate) fn forget(&mut self, vendor: usize) {
+        if let Some(slot) = self.pending.get_mut(vendor) {
+            *slot = None;
+        }
     }
 
     pub(crate) fn is_pending(&self, vendor: usize) -> bool {
@@ -579,7 +667,7 @@ impl KeyChecks {
         same
     }
 
-    /// The vendors still being checked, now forgotten (the window is closing).
+    /// The vendors still being checked, now forgotten (the window is destroyed).
     pub(crate) fn take_pending(&mut self) -> Vec<usize> {
         let mut vendors = Vec::new();
         for (vendor, slot) in self.pending.iter_mut().enumerate() {
@@ -1162,12 +1250,58 @@ card_seconds = {}
         assert!(rejected_reason(0).starts_with("OpenAI did not accept"));
         assert!(rejected_reason(1).starts_with("Anthropic did not accept"));
         assert!(rejected_reason(2).starts_with("Gemini did not accept"));
-        for text in [
-            CHECKING_LINE,
-            KEY_UNFINISHED,
-            "Saved. Could not check it right now.",
-        ] {
+        for text in [CHECKING_LINE, "Saved. Could not check it right now."] {
             assert!(!text.contains('\u{2014}'), "{text}");
+        }
+    }
+
+    /// #1130: the worker and the close settle a check's answer exactly once.
+    #[test]
+    fn the_worker_and_the_close_cannot_both_claim_a_check() {
+        let claim = new_claim();
+        assert!(close_claims(&claim));
+        assert!(!worker_claims(&claim), "the close got it first");
+        assert!(closed_saved(&claim));
+        let claim = new_claim();
+        assert!(worker_claims(&claim));
+        assert!(!close_claims(&claim), "the answer is already on its way");
+        assert!(!closed_saved(&claim));
+    }
+
+    /// #1130: a replaced check has its own claim, so closing with the newer key
+    /// out never makes the older key's refusal a late card.
+    #[test]
+    fn a_replaced_check_keeps_its_own_claim() {
+        let mut checks = KeyChecks::default();
+        checks.begin(0, "sk-a").unwrap();
+        let first = checks.claim_of(0).unwrap();
+        checks.begin(0, "sk-b").unwrap();
+        let second = checks.claim_of(0).unwrap();
+        let snap = checks.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].1, "sk-b");
+        assert!(close_claims(&snap[0].2));
+        assert!(closed_saved(&second));
+        assert!(!closed_saved(&first), "A's refusal must not raise a card");
+        checks.forget(0);
+        assert!(!checks.is_pending(0));
+    }
+
+    /// #1130: a key saved unchecked on close, then refused, is told in a card.
+    #[test]
+    fn a_late_refusal_is_a_card_for_a_closed_window_only() {
+        assert!(late_refusal(KeyVerdict::Rejected, true));
+        assert!(
+            !late_refusal(KeyVerdict::Rejected, false),
+            "the window tells it, or the key was replaced"
+        );
+        assert!(!late_refusal(KeyVerdict::Accepted, true));
+        assert!(!late_refusal(KeyVerdict::Unchecked, true));
+        for (vendor, name) in [(0, "OpenAI"), (1, "Anthropic"), (2, "Gemini")] {
+            let (headline, detail) = late_refusal_card(vendor);
+            assert!(headline.contains(name), "{headline}");
+            assert!(detail.contains("Settings"), "{detail}");
+            assert!(!format!("{headline}{detail}").contains('\u{2014}'));
         }
     }
 

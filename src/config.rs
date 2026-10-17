@@ -1139,6 +1139,41 @@ fn repair_changes(
     Ok(changes)
 }
 
+/// Compat names that cannot own a store target alone: empty, or used by more
+/// than one entry, compared case-insensitively because Credential Manager
+/// target names are (#1225). Returned lowercased; test membership with
+/// [`is_shared_name`]. Their keys are never imported, written, deleted or
+/// hydrated, so one entry can never overwrite or read another's slot.
+fn shared_compat_names(compat: &[CompatConfig]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (i, e) in compat.iter().enumerate() {
+        let folded = e.name.to_lowercase();
+        let repeated = compat[..i].iter().any(|o| o.name.to_lowercase() == folded);
+        if (folded.is_empty() || repeated) && !out.contains(&folded) {
+            out.push(folded);
+        }
+    }
+    out
+}
+
+fn is_shared_name(shared: &[String], name: &str) -> bool {
+    shared.contains(&name.to_lowercase())
+}
+
+/// What the startup card calls a compat key left in the file because its name
+/// is shared. [`is_shared_name_label`] recognises it again.
+fn shared_name_label(name: &str) -> String {
+    if name.is_empty() {
+        "an endpoint with no name (give it a name)".to_string()
+    } else {
+        format!("{name} (name used more than once, rename one)")
+    }
+}
+
+pub(crate) fn is_shared_name_label(label: &str) -> bool {
+    label.ends_with("(give it a name)") || label.ends_with("(name used more than once, rename one)")
+}
+
 /// Names of the providers whose key `before` (as the file was read) held and
 /// the file still holds, judged by `on_disk`: the file read again after the
 /// import, or `None` when it cannot be (every key it held is then reported).
@@ -1511,8 +1546,11 @@ impl Config {
         }
         // #16: same import-and-blank lifecycle for every configured compat
         // endpoint, keyed `Wingman/compat:<name>` (see `compat_order_name`).
+        // #1225: entries whose name is empty or shared would write to one
+        // target and overwrite each other, so their keys stay in the file.
+        let shared = shared_compat_names(&self.providers.compat);
         for entry in &mut self.providers.compat {
-            if entry.api_key.is_empty() {
+            if entry.api_key.is_empty() || is_shared_name(&shared, &entry.name) {
                 continue;
             }
             let target = target_name(&compat_order_name(&entry.name));
@@ -1547,7 +1585,22 @@ impl Config {
         let on_disk = fs::read_to_string(path)
             .ok()
             .and_then(|text| toml::from_str::<Config>(&text).ok());
-        self.keys_left_in_file = keys_still_in_file(&before, on_disk.as_ref());
+        let shared = shared_compat_names(&before.providers.compat);
+        let mut left = keys_still_in_file(&before, on_disk.as_ref());
+        for e in &before.providers.compat {
+            if e.api_key.is_empty() || !is_shared_name(&shared, &e.name) {
+                continue;
+            }
+            let label = shared_name_label(&e.name);
+            if left.contains(&label) {
+                continue;
+            }
+            match left.iter_mut().find(|n| **n == e.name) {
+                Some(slot) => *slot = label,
+                None => left.push(label),
+            }
+        }
+        self.keys_left_in_file = left;
     }
     /// Fills any still-empty `api_key` field from `store`. Called after
     /// [`Config::import_secrets_and_blank`] so a freshly imported key
@@ -1580,11 +1633,23 @@ impl Config {
                 Err(_) => *key = UNREADABLE_KEY_MARKER.to_string(),
             }
         }
+        let shared = shared_compat_names(&self.providers.compat);
         for entry in &mut self.providers.compat {
             if !entry.api_key.is_empty() {
                 continue;
             }
             let target = target_name(&compat_order_name(&entry.name));
+            if is_shared_name(&shared, &entry.name) {
+                // #1225: a stored key exists but no entry may take it. Say so
+                // at startup, or the endpoint just fails with a 401.
+                if matches!(store.get(&target), Ok(Some(_))) {
+                    let label = shared_name_label(&entry.name);
+                    if !self.keys_left_in_file.contains(&label) {
+                        self.keys_left_in_file.push(label);
+                    }
+                }
+                continue;
+            }
             match store.get(&target) {
                 Ok(Some(secret)) => entry.api_key = secret,
                 Ok(None) => {}
@@ -1712,8 +1777,13 @@ impl Config {
         // #16: no env override for compat entries (a dynamic, user-named
         // list has no single fixed env var to check), so every entry goes
         // straight through the non-env-overridden rules above.
+        // #1225: a shared name has no slot of its own to write or clear.
+        let shared = shared_compat_names(&self.providers.compat);
         for entry in &mut self.providers.compat {
             let target = target_name(&compat_order_name(&entry.name));
+            if is_shared_name(&shared, &entry.name) {
+                continue;
+            }
             if entry.api_key == UNREADABLE_KEY_MARKER {
                 zeroize_string(&mut entry.api_key);
                 continue;
@@ -1987,6 +2057,35 @@ impl Config {
         store: &dyn SecretStore,
         env_is_set: &dyn Fn(&str) -> bool,
     ) -> Result<()> {
+        // #1225: a key edited on a shared name has no slot to go to. Say so
+        // (rule 7) before anything is written, instead of dropping it.
+        let shared = shared_compat_names(&edited.providers.compat);
+        let keys_of = |c: &Config| -> Vec<(String, String)> {
+            c.providers
+                .compat
+                .iter()
+                .filter(|e| is_shared_name(&shared, &e.name))
+                .map(|e| (e.name.clone(), e.api_key.clone()))
+                .collect()
+        };
+        if keys_of(original) != keys_of(edited) {
+            let mut names: Vec<String> = keys_of(edited)
+                .into_iter()
+                .map(|(n, _)| {
+                    if n.is_empty() {
+                        "an endpoint with no name".to_string()
+                    } else {
+                        format!("\"{n}\"")
+                    }
+                })
+                .collect();
+            names.dedup();
+            anyhow::bail!(
+                "The key for {} was not saved because another endpoint has the same name. \
+                 Rename one in config.toml, then choose Reload settings",
+                names.join(", ")
+            );
+        }
         let mut changed = Self::only_changed_secrets(original, edited);
         let mut undo = Vec::new();
         let result = changed.push_secrets_logged(store, env_is_set, &mut undo);
@@ -5296,6 +5395,197 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         config.import_keys_and_write_back(&path, &InMemoryStore::default());
         assert!(config.keys_left_in_file.is_empty());
         assert!(!fs::read_to_string(&path).unwrap().contains("k-"));
+        cleanup(&path);
+    }
+
+    // -- #1225: compat names that share one store target -------------------
+
+    #[test]
+    fn two_compat_entries_with_one_name_keep_their_keys_in_the_file() {
+        let mut config = Config::default();
+        let mut a = compat_entry("lab", "http://127.0.0.1:1/v1");
+        a.api_key = "k-first".into();
+        let mut b = compat_entry("lab", "http://127.0.0.1:2/v1");
+        b.api_key = "k-second".into();
+        config.providers.compat = vec![a, b];
+        let store = InMemoryStore::default();
+
+        assert!(!config.import_secrets_and_blank(&store));
+        assert_eq!(config.providers.compat[0].api_key, "k-first");
+        assert_eq!(config.providers.compat[1].api_key, "k-second");
+        assert_eq!(store.get(&target_name("compat:lab")).unwrap(), None);
+    }
+
+    #[test]
+    fn compat_names_that_differ_only_in_case_share_a_target_and_keep_their_keys() {
+        // Credential Manager target names are case-insensitive.
+        let mut config = Config::default();
+        let mut a = compat_entry("Lab", "http://127.0.0.1:1/v1");
+        a.api_key = "k-first".into();
+        let mut b = compat_entry("lab", "http://127.0.0.1:2/v1");
+        b.api_key = "k-second".into();
+        config.providers.compat = vec![a, b];
+        let store = InMemoryStore::default();
+
+        assert!(!config.import_secrets_and_blank(&store));
+        assert_eq!(config.providers.compat[0].api_key, "k-first");
+        assert_eq!(config.providers.compat[1].api_key, "k-second");
+        assert_eq!(store.get(&target_name("compat:lab")).unwrap(), None);
+        assert_eq!(store.get(&target_name("compat:Lab")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_settings_save_never_writes_or_wipes_the_slot_of_a_shared_name() {
+        let mut config = Config::default();
+        let mut a = compat_entry("lab", "http://127.0.0.1:1/v1");
+        a.api_key = "k1".into();
+        let mut b = compat_entry("lab", "http://127.0.0.1:2/v1");
+        b.api_key = "k2".into();
+        config.providers.compat = vec![a, b];
+        let store = InMemoryStore::default();
+        let slot = target_name("compat:lab");
+
+        // No edits: nothing is written.
+        Config::push_changed_secrets_with(&config, &config, &store, &|_| false).unwrap();
+        assert_eq!(store.get(&slot).unwrap(), None);
+
+        // One entry is retyped: nothing is written, and the save says why.
+        let mut edited = config.clone();
+        edited.providers.compat[1].api_key = "k3".into();
+        let err = Config::push_changed_secrets_with(&config, &edited, &store, &|_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not saved"), "{err}");
+        assert!(err.contains("same name"), "{err}");
+        assert!(err.contains("config.toml"), "{err}");
+        assert!(err.contains("lab"), "{err}");
+        assert!(!err.contains("k3"), "{err}");
+        assert_eq!(store.get(&slot).unwrap(), None);
+
+        // A slot that already holds a key is not wiped by a cleared duplicate,
+        // which is reported the same way.
+        store.set(&slot, "kept").unwrap();
+        let mut cleared = config.clone();
+        cleared.providers.compat[1].api_key.clear();
+        assert!(Config::push_changed_secrets_with(&config, &cleared, &store, &|_| false).is_err());
+        assert_eq!(store.get(&slot).unwrap().as_deref(), Some("kept"));
+
+        // A different, unshared endpoint edited alongside is not blocked.
+        let mut mixed = config.clone();
+        mixed
+            .providers
+            .compat
+            .push(compat_entry("solo", "http://127.0.0.1:3/v1"));
+        let mut mixed_edit = mixed.clone();
+        mixed_edit.providers.compat[2].api_key = "k-solo".into();
+        Config::push_changed_secrets_with(&mixed, &mixed_edit, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get(&target_name("compat:solo")).unwrap().as_deref(),
+            Some("k-solo")
+        );
+    }
+
+    #[test]
+    fn hydrate_never_feeds_a_shared_name_the_slot_of_another() {
+        let mut config = Config::default();
+        let mut a = compat_entry("lab", "http://127.0.0.1:1/v1");
+        a.api_key.clear();
+        let mut b = compat_entry("lab", "http://127.0.0.1:2/v1");
+        b.api_key.clear();
+        config.providers.compat = vec![a, b];
+        let store = InMemoryStore::default();
+        store
+            .set(&target_name("compat:lab"), "someone-elses")
+            .unwrap();
+        config.hydrate_secrets(&store);
+        assert_eq!(config.providers.compat[0].api_key, "");
+        assert_eq!(config.providers.compat[1].api_key, "");
+    }
+
+    #[test]
+    fn a_stored_key_that_a_shared_name_cannot_take_is_named_at_startup() {
+        let mut config = Config::default();
+        let mut a = compat_entry("lab", "http://127.0.0.1:1/v1");
+        a.api_key.clear();
+        let mut b = compat_entry("lab", "http://127.0.0.1:2/v1");
+        b.api_key.clear();
+        config.providers.compat = vec![a, b];
+        let store = InMemoryStore::default();
+        store.set(&target_name("compat:lab"), "stored").unwrap();
+        config.hydrate_secrets(&store);
+        // One line for the one name, not one per entry.
+        assert_eq!(
+            config.keys_left_in_file.len(),
+            1,
+            "{:?}",
+            config.keys_left_in_file
+        );
+        assert!(config
+            .keys_left_in_file
+            .iter()
+            .all(|l| crate::config::is_shared_name_label(l)));
+
+        // Nothing stored, nothing to report.
+        let mut quiet = Config::default();
+        quiet.providers.compat = vec![
+            compat_entry("lab", "http://127.0.0.1:1/v1"),
+            compat_entry("lab", "http://127.0.0.1:2/v1"),
+        ];
+        quiet
+            .providers
+            .compat
+            .iter_mut()
+            .for_each(|e| e.api_key.clear());
+        quiet.hydrate_secrets(&InMemoryStore::default());
+        assert!(quiet.keys_left_in_file.is_empty());
+    }
+
+    #[test]
+    fn an_empty_compat_name_keeps_its_key_in_the_file() {
+        let mut config = Config::default();
+        config.providers.compat = vec![
+            compat_entry("", "http://127.0.0.1:1/v1"),
+            compat_entry("home", "http://127.0.0.1:2/v1"),
+        ];
+        let store = InMemoryStore::default();
+
+        assert!(config.import_secrets_and_blank(&store));
+        assert_eq!(config.providers.compat[0].api_key, "sk-compat-real");
+        assert_eq!(config.providers.compat[1].api_key, "");
+        assert_eq!(store.get(&target_name("compat:")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_duplicate_compat_name_is_reported_and_both_file_keys_survive() {
+        let path = scratch_path("import-duplicate-name");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = TWO_COMPAT_KEYS.replace("name = \"home\"", "name = \"lab\"");
+        assert_ne!(text, TWO_COMPAT_KEYS, "the replace must change the fixture");
+        assert_eq!(text.matches("name = \"lab\"").count(), 2);
+        fs::write(&path, &text).unwrap();
+        let mut config = Config::load_from_with(&path, &|_| None).unwrap();
+        config.import_keys_and_write_back(&path, &InMemoryStore::default());
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("k-lab") && on_disk.contains("k-home"),
+            "{on_disk}"
+        );
+        assert_eq!(
+            config.keys_left_in_file.len(),
+            1,
+            "{:?}",
+            config.keys_left_in_file
+        );
+        assert!(
+            config.keys_left_in_file[0].contains("lab"),
+            "{:?}",
+            config.keys_left_in_file
+        );
+        assert!(
+            config.keys_left_in_file[0].contains("more than once"),
+            "{:?}",
+            config.keys_left_in_file
+        );
         cleanup(&path);
     }
 

@@ -341,6 +341,59 @@ fn store_shell_open_failure(failure: ShellOpenFailure) {
         .push(failure);
 }
 
+/// #1130: a key Settings saved unchecked on close was then refused by its
+/// vendor. Settings is gone, so the worker leaves the card text in the same
+/// queue as a failed open and posts the same message. A null owner (the tests'
+/// windows) says nothing.
+pub(crate) fn post_late_key_refusal(owner: isize, headline: String, detail: String) -> bool {
+    if owner == 0 {
+        return false;
+    }
+    let title = headline.clone();
+    store_shell_open_failure(ShellOpenFailure {
+        title: headline,
+        detail,
+        with_details: false,
+        raw: String::new(),
+    });
+    let posted = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(HWND(owner as *mut _)),
+            WM_APP_SHELL_OPEN_DONE,
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .is_ok()
+    };
+    if !posted {
+        // Nothing will come for it: it must not surface in a later, unrelated card.
+        retract_shell_open_failure(&title);
+    }
+    posted
+}
+
+/// Takes back the newest queued failure titled `title`.
+pub(crate) fn retract_shell_open_failure(title: &str) {
+    let mut queue = SHELL_OPEN_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = queue.iter().rposition(|f| f.title == title) {
+        queue.remove(at);
+    }
+}
+
+/// The titles queued now, left in place (tests). Not `cfg(test)`: the source-scanning
+/// tests split this file at its first test-only item.
+#[allow(dead_code)]
+pub(crate) fn queued_shell_open_titles() -> Vec<String> {
+    SHELL_OPEN_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|f| f.title.clone())
+        .collect()
+}
+
 fn take_shell_open_failures() -> Vec<ShellOpenFailure> {
     std::mem::take(
         &mut *SHELL_OPEN_FAILURES
@@ -1550,11 +1603,20 @@ fn plaintext_keys_card(providers: &[String]) -> Option<(String, String)> {
     if providers.is_empty() {
         return None;
     }
+    // #1225: for a name that is empty or shared, retyping in Settings would
+    // hit the same shared slot, so the advice is to fix the name first.
+    let advice = if providers
+        .iter()
+        .any(|p| crate::config::is_shared_name_label(p))
+    {
+        "Give each endpoint its own name in config.toml, then choose Reload settings (tray menu, Help and diagnostics)."
+    } else {
+        "Choose Reload settings (tray menu, Help and diagnostics) to try again, or retype it in Settings."
+    };
     Some((
         "API key still in config.toml".to_string(),
         format!(
-            "Wingman could not move the key for {} out of config.toml, so it is still there as plain text. \
-             Choose Reload settings (tray menu, Help and diagnostics) to try again, or retype it in Settings.",
+            "Wingman could not move the key for {} out of config.toml, so it is still there as plain text. {advice}",
             providers.join(", ")
         ),
     ))
@@ -11343,6 +11405,17 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_keys_card_says_to_rename_for_a_shared_compat_name() {
+        use super::plaintext_keys_card;
+        let (_, detail) =
+            plaintext_keys_card(&["lab (name used more than once, rename one)".to_string()])
+                .unwrap();
+        assert!(detail.contains("its own name"), "{detail}");
+        assert!(!detail.contains("retype"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
+    }
+
+    #[test]
     fn unreadable_secrets_card_has_no_em_dash() {
         // AGENTS.md rule 11: no em dashes in user-facing strings.
         let (headline, detail) = unreadable_secrets_card(&["openai".to_string()]);
@@ -15570,6 +15643,20 @@ mod tests {
             failure.detail
         );
         assert!(!failure.with_details);
+    }
+
+    /// #1130: a refusal card whose post fails is taken back, so it cannot
+    /// appear inside an unrelated later card.
+    #[test]
+    fn a_late_key_refusal_that_cannot_be_posted_is_not_left_queued() {
+        let headline = "Gemini did not accept the key (post-failure test)".to_string();
+        // 0xDEAD is no window: the post fails.
+        assert!(!super::post_late_key_refusal(
+            0xDEAD,
+            headline.clone(),
+            "x".into()
+        ));
+        assert!(!super::queued_shell_open_titles().contains(&headline));
     }
 
     #[test]
