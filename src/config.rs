@@ -938,7 +938,14 @@ pub(crate) fn describe_error_span(contents: &str, span: Option<std::ops::Range<u
 /// The one atomic write of `config.toml`, shared by [`Config::save_to`] and the
 /// field-level writer (`config_writer`, #870): temp file, owner-only ACL on the
 /// temp file, one-generation backup, rename, then note the new mtime.
-pub(crate) fn write_file_atomically(path: &Path, text: &str) -> Result<()> {
+///
+/// `note_new_mtime` says whether the new file counts as "read by this process".
+/// [`Config::save_to`] writes what the process holds, so yes. The field-level
+/// writer patches the file as it is on disk, which the in-memory config has not
+/// read, so no: the mtime stays unseen until `Config::load` reads the file, and
+/// a whole-file save in between is refused instead of overwriting a hand edit
+/// that the patch carried along.
+pub(crate) fn write_file_atomically(path: &Path, text: &str, note_new_mtime: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("failed to create config directory")?;
     }
@@ -977,7 +984,9 @@ pub(crate) fn write_file_atomically(path: &Path, text: &str) -> Result<()> {
     }
 
     fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
-    note_mtime(path, file_mtime(path));
+    if note_new_mtime {
+        note_mtime(path, file_mtime(path));
+    }
 
     Ok(())
 }
@@ -1620,7 +1629,7 @@ impl Config {
     pub fn save_to(&self, path: &Path) -> Result<()> {
         self.check_save_allowed(path)?;
         let toml_str = toml::to_string_pretty(self).context("failed to serialize config")?;
-        write_file_atomically(path, &toml_str)
+        write_file_atomically(path, &toml_str, true)
     }
 
     /// Restricts a file's ACL to the current user only, via `icacls`.

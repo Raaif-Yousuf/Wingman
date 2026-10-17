@@ -163,10 +163,11 @@ pub const WM_APP_EXECUTOR_DONE: u32 = WM_APP + 22;
 
 /// #870: posted by the `settings-writer` thread (`config_writer`) when a change
 /// to `config.toml` has been written or refused. `lparam` is
-/// `Box::into_raw(Box::new(config_writer::WriteReply))`; the handler takes
-/// ownership, re-reads the file (so a hand edit made meanwhile is picked up) and
-/// shows the result. The file and `icacls` work runs off the message thread,
-/// which also hosts the keyboard hook. `WM_APP + 23`: `+22` is
+/// `Box::into_raw(Box::new(config_writer::Written))`; the handler takes
+/// ownership and swaps in the config the writer thread re-read from the file (so
+/// a hand edit made meanwhile is picked up) and shows the result. The file,
+/// Credential Manager and `icacls` work all runs off the message thread, which
+/// also hosts the keyboard hook. `WM_APP + 23`: `+22` is
 /// `WM_APP_EXECUTOR_DONE`.
 pub const WM_APP_CONFIG_WRITTEN: u32 = WM_APP + 23;
 
@@ -321,6 +322,10 @@ struct App {
     /// doc comment.
     taskbar_created_msg: u32,
     config: Config,
+    /// #870: changes made in memory whose write to `config.toml` failed. They
+    /// are live until quit; a reload after a later successful write puts them
+    /// back on the loaded config instead of silently reverting them.
+    unsaved: Vec<crate::config_writer::FieldChange>,
     /// #339: whether a password manager was in front before Wingman's own UI
     /// (the tray menu, the palette) took the foreground. Set only around a
     /// dispatch from that UI and cleared right after, so it never leaks into
@@ -580,6 +585,7 @@ pub fn run() -> Result<()> {
         instance,
         taskbar_created_msg,
         config,
+        unsaved: Vec::new(),
         chain,
         card,
         palette,
@@ -4490,10 +4496,20 @@ impl App {
     /// here; if the writer cannot even be reached the failure is posted back
     /// like any other, so it still ends in a card (rule 7).
     fn persist_field(&self, label: &str, change: crate::config_writer::FieldChange) {
-        use crate::config_writer::WriteReply;
+        use crate::config_writer::{WriteReply, Written};
         let target = self.hwnd_isize();
+        let changes = vec![change];
+        let sent = changes.clone();
         let done = move |reply: WriteReply| {
-            let payload = Box::into_raw(Box::new(reply));
+            // On the writer thread (or here, if the writer could not start). The
+            // reload is the slow part, so it happens here and not in the handler.
+            let loaded = (reply.result.is_ok() && !crate::config_writer::shutting_down())
+                .then(|| Config::load().map(Box::new).map_err(|e| format!("{e:#}")));
+            let payload = Box::into_raw(Box::new(Written {
+                reply,
+                changes: sent,
+                loaded,
+            }));
             unsafe {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
@@ -4509,7 +4525,7 @@ impl App {
             }
         };
         match crate::config_writer::global() {
-            Ok(writer) => writer.submit(label, vec![change], done),
+            Ok(writer) => writer.submit(label, changes, done),
             Err(reason) => done(WriteReply {
                 label: label.to_string(),
                 result: Err(reason),
@@ -4517,26 +4533,48 @@ impl App {
         }
     }
 
-    /// The writer thread's answer. On success the file is read again, so
-    /// whatever the user hand-edited meanwhile is applied too, and nothing
-    /// afterwards saves a stale copy over it; the card is the one the old
-    /// in-line save showed. On failure the change is live until quit but not on
-    /// disk, and the card says so.
-    fn on_config_written(&mut self, reply: crate::config_writer::WriteReply) {
+    /// The writer thread's answer, with the file already read again (a hand edit
+    /// made meanwhile is applied too, and nothing afterwards saves a stale copy
+    /// over it). The card is the one the old in-line save showed. On failure the
+    /// change is live until quit but not on disk, and the card says so; it is
+    /// remembered so a later reload does not quietly undo it.
+    fn on_config_written(&mut self, written: crate::config_writer::Written) {
+        let crate::config_writer::Written {
+            reply,
+            changes,
+            loaded,
+        } = written;
+        let rewritten =
+            |c: &crate::config_writer::FieldChange| changes.iter().any(|n| n.path() == c.path());
+        self.unsaved.retain(|c| !rewritten(c));
         match reply.result {
             Ok(()) => {
-                match Config::load() {
-                    Ok(config) if config.load_problem.is_none() => {
-                        self.config = config;
+                match loaded {
+                    Some(Ok(config)) if config.load_problem.is_none() => {
+                        self.config = crate::config_writer::reapply(&config, &self.unsaved)
+                            .unwrap_or(*config);
                         self.apply_config();
+                        self.card.show_answer(&reply.label, "", 3, None);
                     }
                     // The file was edited into something unreadable after our
-                    // write: keep the settings already running, as Reload does.
-                    _ => {}
+                    // write: keep the settings already running, as Reload does,
+                    // and say so.
+                    Some(Ok(config)) => {
+                        let (headline, detail) =
+                            config_problem_card(config.load_problem.as_deref().unwrap_or_default());
+                        self.card.show_error(&headline, &detail);
+                    }
+                    Some(Err(e)) => {
+                        let detail = self.track_error("Couldn't reload settings", &e);
+                        self.card
+                            .show_error_with_details("Couldn't reload settings", &detail);
+                    }
+                    // The app is quitting.
+                    None => {}
                 }
-                self.card.show_answer(&reply.label, "", 3, None);
             }
             Err(reason) => {
+                self.unsaved.extend(changes);
                 let headline = format!("Using {}: not saved", reply.label);
                 let human = self.track_error(&headline, &reason);
                 self.card.show_error_with_details(
@@ -6599,7 +6637,7 @@ enum DeferredMessage {
     ExecutorDone(std::result::Result<ExecDone, String>),
     /// `WM_APP_CONFIG_WRITTEN` (#870): a failed write must still end in a card
     /// when Settings was open at the time.
-    ConfigWritten(crate::config_writer::WriteReply),
+    ConfigWritten(crate::config_writer::Written),
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -6924,9 +6962,7 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_EXECUTOR_DONE => drop(Box::from_raw(
                 p as *mut std::result::Result<ExecDone, String>,
             )),
-            WM_APP_CONFIG_WRITTEN => {
-                drop(Box::from_raw(p as *mut crate::config_writer::WriteReply))
-            }
+            WM_APP_CONFIG_WRITTEN => drop(Box::from_raw(p as *mut crate::config_writer::Written)),
             _ => return false,
         }
     }
@@ -7187,7 +7223,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>)
                     }),
                     WM_APP_CONFIG_WRITTEN => DeferredMessage::ConfigWritten(unsafe {
-                        *Box::from_raw(lparam.0 as *mut crate::config_writer::WriteReply)
+                        *Box::from_raw(lparam.0 as *mut crate::config_writer::Written)
                     }),
                     _ => {
                         unreachable!("the reentrancy policies only return Defer for the ids above")
@@ -7310,9 +7346,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_APP_CONFIG_WRITTEN => {
-            let reply =
-                unsafe { *Box::from_raw(lparam.0 as *mut crate::config_writer::WriteReply) };
-            app.on_config_written(reply);
+            let written = unsafe { *Box::from_raw(lparam.0 as *mut crate::config_writer::Written) };
+            app.on_config_written(written);
             LRESULT(0)
         }
         WM_APP_MACHINE_CHECK_RESULT => {
@@ -7447,6 +7482,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
         }
         WM_DESTROY => {
+            // #870: a settings write still queued must reach the file before the
+            // process exits. Bounded, so a stuck disk cannot hang Quit.
+            crate::config_writer::flush_global(std::time::Duration::from_secs(2));
             // Drop the App (and with it the hook, tray icon and card) before
             // the loop exits, so the tray icon actually disappears.
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
