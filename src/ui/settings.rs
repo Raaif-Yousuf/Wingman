@@ -806,7 +806,7 @@ struct SettingsInner {
     autostart_seams: AutostartSeams,
     /// #1152: the Actions page's worker (the file check, the list to export),
     /// one at a time, and the actions its Export menu offers.
-    actions_busy: bool,
+    actions_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     actions_slot: ActionsSlot,
     export_choices: Vec<(String, String)>,
     /// #345: the hotkeys as edited in this window. Starts as the original's
@@ -951,7 +951,7 @@ impl SettingsInner {
             autostart_again: false,
             autostart_slot: Default::default(),
             autostart_seams: AutostartSeams::REAL,
-            actions_busy: false,
+            actions_busy: Default::default(),
             actions_slot: Default::default(),
             export_choices: Vec::new(),
             learning: None,
@@ -7090,12 +7090,13 @@ fn export_outcome(list: Result<Vec<(String, String)>, String>) -> ExportOutcome 
 /// `WM_SETTINGS_ACTIONS`. One at a time: a click while one runs does nothing,
 /// as the line it will print is on its way.
 fn start_actions_job(inner: &mut SettingsInner, job: ActionsJob) {
-    if inner.closing || inner.actions_busy {
+    if inner.closing || inner.actions_busy.load(Ordering::SeqCst) {
         return;
     }
-    inner.actions_busy = true;
+    inner.actions_busy.store(true, Ordering::SeqCst);
     let slot = inner.actions_slot.clone();
     let alive = inner.alive.clone();
+    let busy = inner.actions_busy.clone();
     let hwnd = inner.hwnd.0 as isize;
     let spawned = std::thread::Builder::new()
         .name("settings-actions".into())
@@ -7104,17 +7105,25 @@ fn start_actions_job(inner: &mut SettingsInner, job: ActionsJob) {
             if let Ok(mut g) = slot.lock() {
                 *g = Some(done);
             }
-            post_while_open(&alive, || unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(hwnd as *mut c_void)),
-                    WM_SETTINGS_ACTIONS,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+            let mut posted = false;
+            post_while_open(&alive, || {
+                posted = unsafe {
+                    PostMessageW(
+                        Some(HWND(hwnd as *mut c_void)),
+                        WM_SETTINGS_ACTIONS,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                }
+                .is_ok();
             });
+            // Nobody will answer: free the page for the next click.
+            if !posted {
+                busy.store(false, Ordering::SeqCst);
+            }
         });
     if spawned.is_err() {
-        inner.actions_busy = false;
+        inner.actions_busy.store(false, Ordering::SeqCst);
         say(inner.hwnd, ID_VALIDATION_MESSAGE, ACTIONS_NOT_STARTED);
     }
 }
@@ -7122,7 +7131,7 @@ fn start_actions_job(inner: &mut SettingsInner, job: ActionsJob) {
 /// The worker's answer: open the file, say what is wrong, or ask the window to
 /// show the Export menu (not from here: this runs in the window's handler).
 fn take_actions(inner: &mut SettingsInner) {
-    inner.actions_busy = false;
+    inner.actions_busy.store(false, Ordering::SeqCst);
     let Some(done) = inner.actions_slot.lock().ok().and_then(|mut g| g.take()) else {
         return;
     };
@@ -12425,6 +12434,23 @@ mod tests {
         let click = click.split("ID_PULL_BUTTON").next().unwrap();
         assert!(click.contains("ActionsJob::Export"), "{click}");
         assert!(!click.contains("load_actions"), "IO in the click: {click}");
+    }
+
+    /// #1152: a worker whose answer could not be posted frees the page for the
+    /// next click instead of leaving it busy for good. (When the window is
+    /// gone nothing reads the flag.)
+    #[test]
+    fn a_failed_post_clears_the_actions_busy_flag() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let job = code
+            .split("fn start_actions_job(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn take_actions(").next())
+            .expect("start_actions_job moved");
+        assert!(job.contains("if !posted {"), "{job}");
+        assert!(job.contains("busy.store(false"), "{job}");
+        assert!(job.contains(".is_ok()"), "{job}");
     }
 
     /// #1152: with no owner (as here) a click asks nobody and does not panic.

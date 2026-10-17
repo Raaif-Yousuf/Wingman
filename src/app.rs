@@ -9627,24 +9627,27 @@ pub(crate) enum SettingsCommand {
     /// #1152: Settings' Import action button, the tray's Import item.
     ImportAction,
     /// #1152: Settings' Export button picked an action: its id waits in
-    /// `EXPORT_PICKS` (see `post_export_pick`).
+    /// `EXPORT_PICK` (see `post_export_pick`).
     ExportPicked,
 }
 
 thread_local! {
-    /// #1152: the action ids Settings picked for export, oldest first. A
-    /// command carries a number, not a string, so the id waits here; Settings
-    /// and the app share the one UI thread.
-    static EXPORT_PICKS: std::cell::RefCell<VecDeque<String>> =
-        const { std::cell::RefCell::new(VecDeque::new()) };
+    /// #1152: the action id Settings picked for export. A command carries a
+    /// number, not a string, so the id waits here; Settings and the app share
+    /// the one UI thread. One slot, not a queue: every command is preceded by
+    /// a pick that overwrites it, so a command that was dropped can never
+    /// leave an old id for the next one to export. Two picks before the first
+    /// command runs export the newer one once.
+    static EXPORT_PICK: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn push_export_pick(id: String) {
-    EXPORT_PICKS.with(|q| q.borrow_mut().push_back(id));
+    EXPORT_PICK.with(|p| *p.borrow_mut() = Some(id));
 }
 
 fn take_export_pick() -> Option<String> {
-    EXPORT_PICKS.with(|q| q.borrow_mut().pop_front())
+    EXPORT_PICK.with(|p| p.borrow_mut().take())
 }
 
 /// #1152: Settings' Export button picked the action `id`. `false` when the
@@ -9653,7 +9656,7 @@ pub(crate) fn post_export_pick(owner: isize, id: String) -> bool {
     push_export_pick(id);
     let posted = post_settings_command(owner, SettingsCommand::ExportPicked);
     if !posted {
-        EXPORT_PICKS.with(|q| q.borrow_mut().pop_back());
+        take_export_pick();
     }
     posted
 }
@@ -12000,12 +12003,13 @@ mod tests {
     /// #1152: the action Settings picked for export waits in a queue, in the
     /// order it was picked, and an empty queue gives nothing.
     #[test]
-    fn export_picks_come_back_in_order() {
+    fn a_dropped_export_command_never_leaves_an_old_id_for_the_next_pick() {
         assert_eq!(super::take_export_pick(), None);
-        super::push_export_pick("one".to_string());
-        super::push_export_pick("two".to_string());
-        assert_eq!(super::take_export_pick().as_deref(), Some("one"));
-        assert_eq!(super::take_export_pick().as_deref(), Some("two"));
+        // A pick whose command was dropped, then a new pick: the new id wins.
+        super::push_export_pick("stale".to_string());
+        super::push_export_pick("fresh".to_string());
+        assert_eq!(super::take_export_pick().as_deref(), Some("fresh"));
+        // The second command of two quick picks finds nothing, not an old id.
         assert_eq!(super::take_export_pick(), None);
     }
 
