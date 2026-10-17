@@ -1,4 +1,6 @@
-//! Plain text and Markdown to text, for the chunker.
+//! Plain text, Markdown, HTML, CSV and JSON to text, for the chunker.
+
+use super::flatten;
 
 pub const MAX_FILE_BYTES: usize = 25 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
@@ -30,6 +32,12 @@ pub struct Parsed {
 pub enum Parser {
     Text,
     Markdown,
+    /// Visible text only: scripts, styles and comments are dropped.
+    Html,
+    /// A header line, then one "name: value" line per row.
+    Csv,
+    /// One "path: value" line per value; invalid JSON is read as plain text.
+    Json,
 }
 
 impl Parser {
@@ -37,6 +45,9 @@ impl Parser {
         match self {
             Parser::Text => "txt",
             Parser::Markdown => "md",
+            Parser::Html => "html",
+            Parser::Csv => "csv",
+            Parser::Json => "json",
         }
     }
 }
@@ -51,6 +62,9 @@ pub fn parser_for(file_name: &str) -> Option<Parser> {
     match ext.to_ascii_lowercase().as_str() {
         "txt" | "text" => Some(Parser::Text),
         "md" | "markdown" => Some(Parser::Markdown),
+        "html" | "htm" => Some(Parser::Html),
+        "csv" | "tsv" => Some(Parser::Csv),
+        "json" => Some(Parser::Json),
         _ => None,
     }
 }
@@ -76,6 +90,39 @@ pub fn parse(parser: Parser, bytes: &[u8]) -> Result<Parsed, ParseError> {
                 truncated: truncated || cut,
             })
         }
+        Parser::Html => {
+            // Only the first 2 MB of the file was decoded above, so the markup
+            // is bounded before it is stripped.
+            let text =
+                flatten::escape_headings(&crate::inputs::html_text::html_to_text(&normalized));
+            let (text, cut) = truncate(text, MAX_TEXT_BYTES);
+            Ok(Parsed {
+                title: None,
+                text,
+                truncated: truncated || cut,
+            })
+        }
+        Parser::Csv => {
+            let (text, cut) = flatten::csv_to_text(&normalized, MAX_TEXT_BYTES);
+            Ok(Parsed {
+                title: None,
+                text,
+                truncated: truncated || cut,
+            })
+        }
+        Parser::Json => match flatten::json_to_text(&normalized, MAX_TEXT_BYTES) {
+            Some((text, cut)) => Ok(Parsed {
+                title: None,
+                text,
+                truncated: truncated || cut,
+            }),
+            // Not valid JSON (or cut short): the words are still worth finding.
+            None => Ok(Parsed {
+                title: None,
+                text: normalized,
+                truncated,
+            }),
+        },
     }
 }
 
@@ -803,5 +850,245 @@ mod tests {
             md("\u{feff}# Title\r\nbody").title.as_deref(),
             Some("Title")
         );
+    }
+
+    // -- html, csv, json (K1 readers) -------------------------------------------
+
+    fn read(parser: Parser, s: &str) -> Parsed {
+        parse(parser, s.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn html_csv_and_json_files_get_their_own_readers() {
+        assert_eq!(parser_for("a.html"), Some(Parser::Html));
+        assert_eq!(parser_for("A.HTM"), Some(Parser::Html));
+        assert_eq!(parser_for("t.csv"), Some(Parser::Csv));
+        assert_eq!(parser_for("t.tsv"), Some(Parser::Csv));
+        assert_eq!(parser_for("d.json"), Some(Parser::Json));
+        assert_eq!(parser_for("d.jsonl"), None);
+        assert_eq!(Parser::Html.name(), "html");
+        assert_eq!(Parser::Csv.name(), "csv");
+        assert_eq!(Parser::Json.name(), "json");
+    }
+
+    #[test]
+    fn html_gives_visible_text_only() {
+        let p = read(
+            Parser::Html,
+            "<html><head><title>My page</title><style>p{color:red}</style>\
+             <script>var secret = 'nope';</script></head>\
+             <body><!-- hidden note --><h1>Hello &amp; welcome</h1>\
+             <p>Fish&nbsp;&amp;&nbsp;chips &#8364;5 &lt;b&gt;</p>\
+             <noscript>enable js</noscript><img src=\"http://x.test/a.png\"></body></html>",
+        );
+        assert!(p.text.contains("My page"), "{}", p.text);
+        assert!(p.text.contains("Hello & welcome"), "{}", p.text);
+        assert!(p.text.contains("Fish & chips \u{20AC}5 <b>"), "{}", p.text);
+        for hidden in ["secret", "color:red", "hidden note", "enable js", "x.test"] {
+            assert!(!p.text.contains(hidden), "{hidden}: {}", p.text);
+        }
+        assert!(!p.truncated);
+    }
+
+    #[test]
+    fn hostile_html_never_panics_and_stays_capped() {
+        let cases = [
+            "<".to_string(),
+            "<<<<<<".to_string(),
+            "<script>never closed".to_string(),
+            "<!-- never closed".to_string(),
+            "<div class=\"never closed".to_string(),
+            "&#xFFFFFFFF; &#0; &#55296; &;&&&&;".to_string(),
+            "日本語<p>🙂</p>é<".to_string(),
+            "<div>".repeat(300_000),
+            "&amp;".repeat(500_000),
+            "<script>".repeat(100_000),
+        ];
+        for html in &cases {
+            let p = parse(Parser::Html, html.as_bytes()).unwrap();
+            assert!(p.text.len() <= MAX_TEXT_BYTES);
+        }
+        assert_eq!(
+            read(Parser::Html, "日本語<p>🙂</p>é<").text,
+            "日本語\n🙂\né<"
+        );
+    }
+
+    #[test]
+    fn html_never_makes_a_heading_for_the_chunker() {
+        let p = read(Parser::Html, "<p># not a heading</p><p>ok</p><p>a # b</p>");
+        assert!(p.text.lines().all(|l| !l.starts_with('#')), "{}", p.text);
+        assert!(p.text.contains("# not a heading"), "{}", p.text);
+    }
+
+    #[test]
+    fn json_over_a_megabyte_or_cut_short_is_indexed_as_plain_text() {
+        // Valid, but past the 1 MB the JSON reader will parse.
+        let mut big = String::from("[");
+        while big.len() < 1_200_000 {
+            big.push_str("{\"k\":\"word\"},");
+        }
+        big.push_str("{\"k\":\"end\"}]");
+        let p = parse(Parser::Json, big.as_bytes()).unwrap();
+        assert!(
+            p.text.starts_with("[{\"k\":\"word\"}"),
+            "kept as the raw text"
+        );
+        assert!(!p.text.contains("[0].k:"), "not flattened");
+        // Over 2 MB the file is cut, which is no longer valid JSON: also text.
+        let mut huge = String::from("[");
+        while huge.len() < 2_300_000 {
+            huge.push_str("{\"k\":\"word\"},");
+        }
+        huge.push_str("{\"k\":\"end\"}]");
+        let p = parse(Parser::Json, huge.as_bytes()).unwrap();
+        assert!(p.truncated);
+        assert!(
+            p.text.starts_with("[{\"k\":\"word\"}"),
+            "kept as the raw text"
+        );
+        assert!(!p.text.contains("[0].k:"), "not flattened");
+    }
+
+    #[test]
+    fn html_goes_through_the_same_byte_checks() {
+        assert_eq!(
+            parse(Parser::Html, b"<p>a\0b</p>"),
+            Err(ParseError::NotText)
+        );
+    }
+
+    #[test]
+    fn csv_rows_are_read_with_their_header() {
+        let p = read(
+            Parser::Csv,
+            "Name,Role,Start\nJane,\"Engineer, senior\",2019\nBob,Designer,\n",
+        );
+        assert_eq!(
+            p.text,
+            "Name | Role | Start\n\
+             Name: Jane; Role: Engineer, senior; Start: 2019\n\
+             Name: Bob; Role: Designer"
+        );
+        assert!(!p.truncated);
+    }
+
+    #[test]
+    fn csv_handles_quotes_newlines_other_separators_and_ragged_rows() {
+        // A quoted newline and a doubled quote stay inside one value.
+        let p = read(Parser::Csv, "a,b\n\"line one\nline \"\"two\"\"\",x\n");
+        assert_eq!(p.text, "a | b\na: line one line \"two\"; b: x");
+        // Semicolon and tab separators are found from the first line.
+        assert_eq!(read(Parser::Csv, "a;b\n1;2\n").text, "a | b\na: 1; b: 2");
+        assert_eq!(read(Parser::Csv, "a\tb\n1\t2\n").text, "a | b\na: 1; b: 2");
+        // Too many cells get a column number; too few are just absent.
+        assert_eq!(
+            read(Parser::Csv, "a,b\n1,2,3\n4\n").text,
+            "a | b\na: 1; b: 2; column 3: 3\na: 4"
+        );
+        // Blank lines and an empty file.
+        assert_eq!(
+            read(Parser::Csv, "a,b\n\n\n1,2\n").text,
+            "a | b\na: 1; b: 2"
+        );
+        assert_eq!(read(Parser::Csv, "").text, "");
+        // CRLF line ends.
+        assert_eq!(
+            read(Parser::Csv, "a,b\r\n1,2\r\n").text,
+            "a | b\na: 1; b: 2"
+        );
+    }
+
+    #[test]
+    fn csv_never_makes_a_heading_for_the_chunker() {
+        let p = read(Parser::Csv, "#tag,b\n1,2\n");
+        assert!(p.text.lines().all(|l| !l.starts_with('#')), "{}", p.text);
+        assert!(p.text.contains("tag: 1"), "{}", p.text);
+    }
+
+    #[test]
+    fn hostile_csv_never_panics_and_stays_capped() {
+        let mut big = String::from("h1,h2\n");
+        while big.len() < 3 * 1024 * 1024 {
+            big.push_str("some value,another value\n");
+        }
+        let p = parse(Parser::Csv, big.as_bytes()).unwrap();
+        assert!(p.text.len() <= MAX_TEXT_BYTES);
+        assert!(p.truncated);
+        for s in [
+            "\"never closed,a\nb,c".to_string(),
+            "\"".repeat(100_001),
+            ",".repeat(1_000_000),
+            "日本語,🙂\né,ü\n".to_string(),
+            format!("{}\n1\n", "x,".repeat(100_000)),
+        ] {
+            let p = parse(Parser::Csv, s.as_bytes()).unwrap();
+            assert!(p.text.len() <= MAX_TEXT_BYTES);
+        }
+    }
+
+    #[test]
+    fn json_is_flattened_to_path_value_lines() {
+        let p = read(
+            Parser::Json,
+            r#"{"name":"Jane","address":{"city":"Paris","zip":75001},
+                "skills":["rust","win32"],"jobs":[{"firm":"Acme","years":3}],
+                "retired":false,"nothing":null,"note":"two\nlines"}"#,
+        );
+        assert_eq!(
+            p.text,
+            "name: Jane\n\
+             address.city: Paris\n\
+             address.zip: 75001\n\
+             skills[0]: rust\n\
+             skills[1]: win32\n\
+             jobs[0].firm: Acme\n\
+             jobs[0].years: 3\n\
+             retired: false\n\
+             note: two lines"
+        );
+        assert_eq!(read(Parser::Json, "[1,\"a\"]").text, "[0]: 1\n[1]: a");
+        assert_eq!(read(Parser::Json, "\"just text\"").text, "just text");
+        assert_eq!(read(Parser::Json, "{}").text, "");
+    }
+
+    #[test]
+    fn json_that_is_not_valid_reads_as_plain_text() {
+        let p = read(Parser::Json, "{\"a\": 1,\n trailing words");
+        assert_eq!(p.text, "{\"a\": 1,\n trailing words");
+        // Nested far past the parser's depth limit: an error, not a crash.
+        let deep = format!("{}1{}", "[".repeat(5_000), "]".repeat(5_000));
+        assert!(parse(Parser::Json, deep.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn json_keys_never_make_a_heading_and_odd_text_is_safe() {
+        let p = read(
+            Parser::Json,
+            r##"{"# title":"x","日本":"🙂","":"empty key"}"##,
+        );
+        assert!(p.text.lines().all(|l| !l.starts_with('#')), "{}", p.text);
+        assert!(p.text.contains("title: x"), "{}", p.text);
+        assert!(p.text.contains("日本: 🙂"), "{}", p.text);
+        assert!(p.text.contains(": empty key"), "{}", p.text);
+    }
+
+    #[test]
+    fn big_json_is_capped_and_marked_truncated() {
+        let mut big = String::from("[");
+        while big.len() < 1_500_000 {
+            big.push_str("{\"k\":\"some longer value here\"},");
+        }
+        big.push_str("{\"k\":1}]");
+        let p = parse(Parser::Json, big.as_bytes()).unwrap();
+        assert!(p.text.len() <= MAX_TEXT_BYTES);
+        let small = format!("[{}0]", "\"x\",".repeat(220_000));
+        let p = parse(Parser::Json, small.as_bytes()).unwrap();
+        assert!(p.text.len() <= MAX_TEXT_BYTES);
+        assert!(p.truncated);
+        // A long key is cut, never a panic on a character boundary.
+        let key = "é".repeat(5_000);
+        let p = read(Parser::Json, &format!("{{\"{key}\":\"v\"}}"));
+        assert!(p.text.chars().count() < 1_000, "{}", p.text.len());
     }
 }
