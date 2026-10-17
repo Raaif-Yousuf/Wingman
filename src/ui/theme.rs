@@ -540,6 +540,21 @@ const MENU_HOVER_PCT: u32 = 6;
 /// in percent.
 const MENU_DISABLED_PCT: u32 = 55;
 
+/// How far a keycap is moved from the row it sits on toward the text colour,
+/// in percent: a quiet neutral chip, as Windows draws a shortcut.
+const KEYCAP_FILL_PCT: u32 = 10;
+
+/// The fill of a keycap on a row painted `row_fill`. High contrast has no
+/// tints, so it is the row colour and the border carries the shape.
+pub(crate) fn keycap_fill(theme: Theme, row_fill: u32, text: u32) -> u32 {
+    match theme {
+        Theme::HighContrast => row_fill,
+        Theme::Light | Theme::Dark => {
+            crate::ui::card_buttons::blend(row_fill, text, KEYCAP_FILL_PCT)
+        }
+    }
+}
+
 /// The fill of the hovered or keyboard-selected row. High contrast uses the
 /// system highlight, as every native menu does.
 pub(crate) fn menu_hover_fill(theme: Theme, tokens: &Tokens, sys: &SysColors) -> u32 {
@@ -712,6 +727,22 @@ mod tests {
         assert_ne!(DARK.control_fill, DARK.surface);
         let hc = Tokens::for_theme(Theme::HighContrast, &HC_WHITE);
         assert_eq!(hc.control_fill, HC_WHITE.window);
+    }
+
+    #[test]
+    fn a_keycap_is_a_neutral_step_off_its_row_and_stays_readable() {
+        for (theme, sys) in [(Theme::Light, HC_BLACK), (Theme::Dark, HC_BLACK)] {
+            let t = Tokens::for_theme(theme, &sys);
+            let fill = keycap_fill(theme, t.surface, t.text);
+            assert_ne!(fill, t.surface, "{theme:?}: the cap is a step off the row");
+            let ratio = |a, b| contrast_ratio(relative_luminance(a), relative_luminance(b));
+            assert!(ratio(t.text_dim, fill) >= 4.5, "{theme:?}: digit on cap");
+        }
+        // High contrast has no tints: the row colour, the border carries it.
+        assert_eq!(
+            keycap_fill(Theme::HighContrast, HC_WHITE.window, HC_WHITE.window_text),
+            HC_WHITE.window
+        );
     }
 
     #[test]
