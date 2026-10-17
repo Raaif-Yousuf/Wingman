@@ -52,6 +52,35 @@ mod tests {
     }
 
     #[test]
+    fn files_already_in_the_folder_are_owner_only_after_an_upgrade() {
+        // The upgrade case: wingman.db and its log files were made under the
+        // old list. One child only inherited the folder's entries; the other
+        // carries an explicit SYSTEM and Administrators entry, as a file made
+        // by an elevated process does.
+        let dir =
+            std::env::temp_dir().join(format!("wingman-test-acl-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for sid in ["*S-1-5-18", "*S-1-5-32-544"] {
+            crate::owner_acl::dacl::plant(&dir, sid, true);
+        }
+        let inherited = dir.join("wingman.db");
+        let explicit = dir.join("wingman.db-wal");
+        std::fs::write(&inherited, b"x").unwrap();
+        std::fs::write(&explicit, b"x").unwrap();
+        for sid in ["*S-1-5-18", "*S-1-5-32-544"] {
+            crate::owner_acl::dacl::plant(&explicit, sid, false);
+        }
+        restrict_dir(&dir).expect("restrict should succeed");
+        let check = std::panic::catch_unwind(|| {
+            crate::owner_acl::dacl::assert_owner_only(&inherited);
+            crate::owner_acl::dacl::assert_owner_only(&explicit);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        check.unwrap();
+    }
+
+    #[test]
     fn a_folder_that_cannot_be_restricted_is_an_error() {
         // Fail closed: the store does not open on this error (`open_in`).
         let missing =

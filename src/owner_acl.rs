@@ -167,6 +167,21 @@ pub fn restrict_to_owner(path: &std::path::Path, is_dir: bool) -> Result<(), Str
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    // Items already in the folder (an upgrade: the database and its log
+    // files made under the old list) may carry explicit entries of their
+    // own, which a change on the folder does not touch. Each gets the same
+    // treatment. (MEASURED 2026-10-17: icacls `/T` with the inheritable
+    // grant left a child with an empty list, so the children are done one by
+    // one, a file with the plain grant.) One failure fails the whole call.
+    if is_dir {
+        let entries = std::fs::read_dir(path)
+            .map_err(|e| format!("could not list {}: {e}", path.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("could not list {}: {e}", path.display()))?;
+            let child_is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            restrict_to_owner(&entry.path(), child_is_dir)?;
+        }
+    }
     Ok(())
 }
 
