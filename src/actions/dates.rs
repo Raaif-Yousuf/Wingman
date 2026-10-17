@@ -542,6 +542,17 @@ fn colon_between(text: &str, a: &Tok, b: &Tok) -> bool {
     text.get(a.end..b.start) == Some(":")
 }
 
+/// Whether the gap between a phrase and the time after it is only spaces, or
+/// one comma with spaces around it ("tomorrow, 5pm", "tomorrow,5pm").
+fn time_gap(text: &str, a: &Tok, b: &Tok) -> bool {
+    let Some(gap) = text.get(a.end..b.start) else {
+        return false;
+    };
+    !gap.is_empty()
+        && gap.chars().filter(|&c| c == ',').count() <= 1
+        && gap.chars().all(|c| c.is_whitespace() || c == ',')
+}
+
 /// `am` is false, `pm` is true.
 fn meridiem(t: &str) -> Option<bool> {
     match t {
@@ -549,6 +560,23 @@ fn meridiem(t: &str) -> Option<bool> {
         "pm" => Some(true),
         _ => None,
     }
+}
+
+/// A meridiem that starts with `letter`, the text of (or the end of) the
+/// token `toks[k]`: `am`, `pm`, or the dotted `a.m` and `p.m` (the dot
+/// splits them into two tokens, `a` and `m`). Returns the last token used and
+/// whether it is pm.
+fn meridiem_from(text: &str, toks: &[Tok], k: usize, letter: &str) -> Option<(usize, bool)> {
+    if let Some(pm) = meridiem(letter) {
+        return Some((k, pm));
+    }
+    let pm = match letter {
+        "a" => false,
+        "p" => true,
+        _ => return None,
+    };
+    let (this, next) = (toks.get(k)?, toks.get(k + 1)?);
+    (next.text == "m" && text.get(this.end..next.start) == Some(".")).then_some((k + 1, pm))
 }
 
 /// An ASCII number of one or two digits at the start of `t`, and what follows
@@ -576,20 +604,20 @@ fn twelve_hour(hour: u16, pm: bool) -> Option<u16> {
 fn clock_time(text: &str, toks: &[Tok], j: usize) -> Option<(usize, u16)> {
     let first = toks.get(j)?;
     let (hour, rest) = split_number(&first.text)?;
-    // `5pm`.
-    if let Some(pm) = meridiem(rest) {
-        return Some((j, twelve_hour(hour, pm)? * 60));
+    // `5pm`, `5p.m.`.
+    if let Some((last, pm)) = meridiem_from(text, toks, j, rest) {
+        return Some((last, twelve_hour(hour, pm)? * 60));
     }
     if !rest.is_empty() {
         return None;
     }
     let next = toks.get(j + 1)?;
-    // `5 pm`.
-    if let Some(pm) = meridiem(&next.text) {
+    // `5 pm`, `5 p.m.`.
+    if let Some((last, pm)) = meridiem_from(text, toks, j + 1, &next.text) {
         if !space_between(text, first, next) {
             return None;
         }
-        return Some((j + 1, twelve_hour(hour, pm)? * 60));
+        return Some((last, twelve_hour(hour, pm)? * 60));
     }
     // `5:30`, `5:30pm`, `5:30 pm`, `17:00`.
     if !colon_between(text, first, next) {
@@ -600,13 +628,15 @@ fn clock_time(text: &str, toks: &[Tok], j: usize) -> Option<(usize, u16)> {
     if next.text.len() - tail.len() != 2 || minute > 59 {
         return None;
     }
-    let (last, pm) = match (meridiem(tail), tail.is_empty()) {
-        (Some(pm), _) => (j + 1, Some(pm)),
+    let (last, pm) = match (meridiem_from(text, toks, j + 1, tail), tail.is_empty()) {
+        (Some((last, pm)), _) => (last, Some(pm)),
         (None, true) => match toks.get(j + 2) {
-            Some(after) if space_between(text, next, after) => match meridiem(&after.text) {
-                Some(pm) => (j + 2, Some(pm)),
-                None => (j + 1, None),
-            },
+            Some(after) if space_between(text, next, after) => {
+                match meridiem_from(text, toks, j + 2, &after.text) {
+                    Some((last, pm)) => (last, Some(pm)),
+                    None => (j + 1, None),
+                }
+            }
             _ => (j + 1, None),
         },
         (None, false) => return None,
@@ -631,7 +661,7 @@ fn read_time(text: &str, toks: &[Tok], from: usize) -> Option<(usize, Time)> {
     let prev = toks.get(from.checked_sub(1)?)?;
     let mut j = from;
     let first = toks.get(j)?;
-    if !space_between(text, prev, first) {
+    if !time_gap(text, prev, first) {
         return None;
     }
     if matches!(first.text.as_str(), "at" | "by") {
@@ -658,6 +688,15 @@ fn read_time(text: &str, toks: &[Tok], from: usize) -> Option<(usize, Time)> {
                 j,
                 Time {
                     minute_of_day: 12 * 60,
+                    assumed: false,
+                },
+            ))
+        }
+        "midnight" => {
+            return Some((
+                j,
+                Time {
+                    minute_of_day: 0,
                     assumed: false,
                 },
             ))
@@ -730,8 +769,10 @@ pub fn resolve(phrase: &str, today: CivilDate, week: WeekStart) -> Option<Resolu
 /// week" is Friday or the last day of the week.
 ///
 /// A date phrase can be followed by a time (#706): `EOD` or `COB` or `end of
-/// day` (taken as 17:00, and marked [`Time::assumed`]), `noon`, or a clock
-/// time such as `5pm`, `9:30 am` or `17:00`, with an optional `at` or `by`.
+/// day` (taken as 17:00, and marked [`Time::assumed`]), `noon`, `midnight`
+/// (00:00 on that date), or a clock time such as `5pm`, `5 p.m.`, `9:30 am` or
+/// `17:00`, with an optional `at` or `by`, and an optional comma after the date
+/// (`tomorrow, 5pm`).
 /// A time that could be read two ways ("at 5") is left out and the date still
 /// stands. `in N hours|minutes`, `N hours ago` and `N minutes from now` need
 /// `now_minute`, the minutes since local midnight; without it they are not
@@ -780,11 +821,31 @@ pub fn find_at(
                 let mut phrase = String::new();
                 for k in i..=last {
                     if k > i {
-                        // Between words: a space, or the colon in "5:30".
-                        let colon = colon_between(text, &toks[k - 1], &toks[k]);
-                        phrase.push(if colon { ':' } else { ' ' });
+                        // Between words: a space, the colon in "5:30", the dot
+                        // in "p.m", or the comma in "tomorrow, 5pm".
+                        let gap = text.get(toks[k - 1].end..toks[k].start).unwrap_or(" ");
+                        if gap == ":" || gap == "." {
+                            phrase.push_str(gap);
+                        } else if gap.contains(',') {
+                            phrase.push(',');
+                            if gap.ends_with(char::is_whitespace) {
+                                phrase.push(' ');
+                            }
+                        } else {
+                            phrase.push(' ');
+                        }
                     }
                     phrase.push_str(&text[toks[k].start..toks[k].end]);
+                }
+                // The closing dot of "p.m.".
+                if toks[last].text == "m"
+                    && last > i
+                    && text.get(toks[last - 1].end..toks[last].start) == Some(".")
+                    && text
+                        .get(toks[last].end..)
+                        .is_some_and(|t| t.starts_with('.'))
+                {
+                    phrase.push('.');
                 }
                 if seen.insert(phrase.to_lowercase()) {
                     found.push(Found {
@@ -1542,6 +1603,70 @@ mod tests {
         assert_eq!(time_of("tomorrow at 12pm"), Some((12 * 60, false)));
         assert_eq!(time_of("tomorrow at 12:30pm"), Some((12 * 60 + 30, false)));
         assert_eq!(at("tomorrow at 5:30pm")[0].phrase, "tomorrow at 5:30pm");
+    }
+
+    #[test]
+    fn a_comma_between_the_date_and_the_time_is_read() {
+        let f = at("Tomorrow, 5pm");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].phrase, "Tomorrow, 5pm");
+        assert_eq!(f[0].resolution, Resolution::One(d(2026, 9, 24)));
+        assert_eq!(time_of("tomorrow, 5pm"), Some((17 * 60, false)));
+        assert_eq!(time_of("tomorrow,5pm"), Some((17 * 60, false)));
+        assert_eq!(time_of("tomorrow, at 9:30 am"), Some((9 * 60 + 30, false)));
+        assert_eq!(time_of("tomorrow, noon"), Some((12 * 60, false)));
+        assert_eq!(time_of("tomorrow, EOD"), Some((17 * 60, true)));
+        // Only one comma, and a time must follow it.
+        for text in [
+            "tomorrow,, 5pm",
+            "tomorrow, , 5pm",
+            "tomorrow,",
+            "tomorrow, 5",
+        ] {
+            let f = at(text);
+            assert_eq!(f.len(), 1, "{text}");
+            assert_eq!(f[0].time, None, "{text}");
+            assert_eq!(f[0].phrase, "tomorrow", "{text}");
+        }
+    }
+
+    #[test]
+    fn dotted_am_and_pm_are_read() {
+        let f = at("tomorrow at 5 p.m.");
+        assert_eq!(f[0].phrase, "tomorrow at 5 p.m.");
+        assert_eq!(f[0].time.map(|t| t.minute_of_day), Some(17 * 60));
+        assert_eq!(time_of("Tomorrow, 5 P.M."), Some((17 * 60, false)));
+        assert_eq!(time_of("tomorrow 5p.m."), Some((17 * 60, false)));
+        assert_eq!(time_of("tomorrow 5:30 p.m."), Some((17 * 60 + 30, false)));
+        assert_eq!(time_of("tomorrow 5:30p.m."), Some((17 * 60 + 30, false)));
+        assert_eq!(time_of("tomorrow 9 a.m."), Some((9 * 60, false)));
+        assert_eq!(time_of("tomorrow 9 a.m"), Some((9 * 60, false)));
+        assert_eq!(time_of("tomorrow 12 a.m."), Some((0, false)));
+        assert_eq!(time_of("tomorrow 12 p.m."), Some((12 * 60, false)));
+        assert_eq!(time_of("tomorrow, 12 a.m."), Some((0, false)));
+        assert_eq!(time_of("tomorrow, 12 p.m."), Some((12 * 60, false)));
+        // Malformed dots and hours are not guessed.
+        for text in [
+            "tomorrow 5 p. m.",
+            "tomorrow 5 p..m.",
+            "tomorrow 5 p",
+            "tomorrow 5 x.m.",
+            "tomorrow 13 p.m.",
+            "tomorrow 0 a.m.",
+            "tomorrow 5 pa.m.",
+        ] {
+            let f = at(text);
+            assert_eq!(f.len(), 1, "{text}");
+            assert_eq!(f[0].time, None, "{text}");
+        }
+    }
+
+    #[test]
+    fn midnight_is_the_start_of_the_day() {
+        assert_eq!(time_of("tomorrow at midnight"), Some((0, false)));
+        assert_eq!(time_of("tomorrow, midnight"), Some((0, false)));
+        assert_eq!(time_of("tomorrow MIDNIGHT"), Some((0, false)));
+        assert_eq!(time_of("tomorrow at midnights"), None);
     }
 
     #[test]
