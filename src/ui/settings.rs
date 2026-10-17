@@ -18734,7 +18734,25 @@ mod tests {
     static GATES: std::sync::Mutex<
         Option<std::collections::HashMap<String, std::sync::mpsc::Receiver<()>>>,
     > = std::sync::Mutex::new(None);
-    static CHECKS_DONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    thread_local! {
+        /// One receiver per key-check worker this test's thread started; each
+        /// gets a message when its worker has run to the end.
+        static SPAWNED: std::cell::RefCell<Vec<std::sync::mpsc::Receiver<()>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The real worker thread, plus a signal when the whole job has finished
+    /// (verdict posted, late card queued or not): this test's own checks, never
+    /// another test's.
+    fn tracked_spawn(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        let (done, finished) = std::sync::mpsc::channel();
+        SPAWNED.with(|s| s.borrow_mut().push(finished));
+        spawn_key_check_thread(Box::new(move || {
+            job();
+            let _ = done.send(());
+        }))
+    }
 
     /// A vendor stub that holds each key's answer until the test releases it:
     /// a key with "bad" in it is refused, any other is "could not check".
@@ -18745,9 +18763,9 @@ mod tests {
             .as_mut()
             .and_then(|g| g.remove(key));
         if let Some(rx) = gate {
-            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+            // Only a stuck test reaches this bound: every test releases its gate.
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(120));
         }
-        CHECKS_DONE.fetch_add(1, Ordering::SeqCst);
         if key.contains("bad") {
             KeyCheck::Rejected
         } else {
@@ -18769,7 +18787,7 @@ mod tests {
             check: gated_check,
             mode: auto,
             fetch_all: KeySeams::REAL.fetch_all,
-            spawn: spawn_key_check_thread,
+            spawn: tracked_spawn,
             late_card: crate::app::post_late_key_refusal,
         };
         tx
@@ -18780,15 +18798,16 @@ mod tests {
         leave(hwnd, id);
     }
 
-    /// Waits until `n` more stub checks have returned, then a moment for the
-    /// worker to act on its verdict.
-    fn wait_checks(before: usize, n: usize) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while CHECKS_DONE.load(Ordering::SeqCst) < before + n {
-            assert!(std::time::Instant::now() < deadline, "a check never ended");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+    /// Waits until the `n` checks this test started have run to the end,
+    /// including what the worker does with its verdict. The bound only fails a
+    /// worker that never ends; it is not what makes a test pass.
+    fn wait_checks(n: usize) {
+        let finished: Vec<_> = SPAWNED.with(|s| s.borrow_mut().drain(..).collect());
+        assert_eq!(finished.len(), n, "checks started by this test");
+        for rx in finished {
+            rx.recv_timeout(std::time::Duration::from_secs(120))
+                .expect("a check never ended");
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
     }
 
     fn queued(headline_start: &str) -> usize {
@@ -18806,12 +18825,12 @@ mod tests {
     #[test]
     fn a_key_refused_after_the_window_closed_saved_it_is_one_card() {
         with_open_window(|hwnd, owner| {
+            let _queue = crate::test_locks::lock_shell_queue();
             let release = gate_check(hwnd, "sk-bad-whole-key");
             drain_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE);
             while queued("OpenAI did not accept the key") > 0 {
                 crate::app::retract_shell_open_failure(&commit::late_refusal_card(0).0);
             }
-            let before = CHECKS_DONE.load(Ordering::SeqCst);
             type_key(hwnd, ID_OPENAI_KEY, "sk-bad-whole-key");
             drain_posted(owner, crate::app::WM_APP_SETTINGS_SAVE);
             drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
@@ -18821,7 +18840,7 @@ mod tests {
             assert_eq!(left.wParam.0, 0);
             assert_eq!(queued("OpenAI did not accept the key"), 0, "too early");
             let _ = release.send(());
-            wait_checks(before, 1);
+            wait_checks(1);
             assert_eq!(queued("OpenAI did not accept the key"), 1);
             assert!(take_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE).is_some());
             assert!(take_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE).is_none());
@@ -18834,12 +18853,12 @@ mod tests {
     #[test]
     fn a_replaced_keys_refusal_is_not_a_late_card() {
         with_open_window(|hwnd, owner| {
+            let _queue = crate::test_locks::lock_shell_queue();
             let a = "sk-ant-bad-key";
             let b = "sk-ant-ok-key";
             let release_a = gate_check(hwnd, a);
             let release_b = gate_check(hwnd, b);
             drain_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE);
-            let before = CHECKS_DONE.load(Ordering::SeqCst);
             type_key(hwnd, ID_ANTHROPIC_KEY, a);
             type_key(hwnd, ID_ANTHROPIC_KEY, b);
             drain_posted(owner, crate::app::WM_APP_SETTINGS_SAVE);
@@ -18847,7 +18866,7 @@ mod tests {
             assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_some());
             let _ = release_a.send(());
             let _ = release_b.send(());
-            wait_checks(before, 2);
+            wait_checks(2);
             assert_eq!(queued("Anthropic did not accept the key"), 0);
             assert!(take_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE).is_none());
         });

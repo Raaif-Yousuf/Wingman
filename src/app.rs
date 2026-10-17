@@ -15649,6 +15649,7 @@ mod tests {
     /// appear inside an unrelated later card.
     #[test]
     fn a_late_key_refusal_that_cannot_be_posted_is_not_left_queued() {
+        let _queue = crate::test_locks::lock_shell_queue();
         let headline = "Gemini did not accept the key (post-failure test)".to_string();
         // 0xDEAD is no window: the post fails.
         assert!(!super::post_late_key_refusal(
@@ -15668,6 +15669,7 @@ mod tests {
             raw: String::new(),
         };
         // Nothing queued by another test: this one owns the queue while it runs.
+        let _queue = crate::test_locks::lock_shell_queue();
         let _ = super::take_shell_open_failures();
         super::store_shell_open_failure(fail("A", "one"));
         super::store_shell_open_failure(fail("B", "two"));
