@@ -79,6 +79,9 @@ pub fn follows_variants(state: GalleryState) -> bool {
             | SettingsActions
             | SettingsAdvanced
             | SettingsAdvancedPromptOpen
+            | SettingsSaved
+            | SettingsInvalid
+            | SettingsNotSaved
     )
 }
 
@@ -136,6 +139,9 @@ pub fn follows_dpi_only(state: GalleryState) -> bool {
             | SettingsActions
             | SettingsAdvanced
             | SettingsAdvancedPromptOpen
+            | SettingsSaved
+            | SettingsInvalid
+            | SettingsNotSaved
     )
 }
 
@@ -274,6 +280,12 @@ pub enum GalleryState {
     SettingsAdvanced,
     /// The same with the prompt open.
     SettingsAdvancedPromptOpen,
+    /// #875: the General page with "Saved: Card corner" and Undo in the footer.
+    SettingsSaved,
+    /// #875: a number that does not parse, on the status line.
+    SettingsInvalid,
+    /// #875: a write that failed, on the status line.
+    SettingsNotSaved,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
@@ -327,6 +339,9 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsActions,
         SettingsAdvanced,
         SettingsAdvancedPromptOpen,
+        SettingsSaved,
+        SettingsInvalid,
+        SettingsNotSaved,
         RegionOverlay,
         TrayMenu,
         TrayMenuSubmenu,
@@ -378,6 +393,9 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsActions => "settings-actions",
         SettingsAdvanced => "settings-advanced",
         SettingsAdvancedPromptOpen => "settings-advanced-prompt-open",
+        SettingsSaved => "settings-saved",
+        SettingsInvalid => "settings-invalid",
+        SettingsNotSaved => "settings-not-saved",
         RegionOverlay => "region-overlay",
         TrayMenu => "tray-menu",
         TrayMenuSubmenu => "tray-menu-submenu",
@@ -1165,7 +1183,10 @@ mod driver {
             | SettingsPrivacy
             | SettingsActions
             | SettingsAdvanced
-            | SettingsAdvancedPromptOpen => {
+            | SettingsAdvancedPromptOpen
+            | SettingsSaved
+            | SettingsInvalid
+            | SettingsNotSaved => {
                 card.hide();
                 palette.hide();
                 let mut w = GalleryWindow::open(instance, variant.dpi)
@@ -1177,6 +1198,16 @@ mod driver {
                         w.pick_provider(crate::config::ActiveProvider::Anthropic)
                     }
                     SettingsModelsMoreProviders => w.reveal_providers(),
+                    // #875: the status line after a change (and Undo), a number
+                    // that does not parse, and a write that failed.
+                    SettingsSaved => w.show_status("Saved: Card corner", true),
+                    SettingsInvalid => {
+                        w.show_status("Error: Hide card after. Enter a whole number of seconds, such as 8.", false)
+                    }
+                    SettingsNotSaved => w.show_status(
+                        "Not saved: Card corner. The disk is full. Wingman is still using the old value.",
+                        false,
+                    ),
                     _ => {}
                 }
                 *settings = Some(w);
@@ -1196,7 +1227,10 @@ mod driver {
             | SettingsPrivacy
             | SettingsActions
             | SettingsAdvanced
-            | SettingsAdvancedPromptOpen => settings
+            | SettingsAdvancedPromptOpen
+            | SettingsSaved
+            | SettingsInvalid
+            | SettingsNotSaved => settings
                 .as_ref()
                 .map(|w| w.hwnd())
                 .ok_or_else(|| anyhow::anyhow!("no Settings window"))?,
@@ -1859,14 +1893,17 @@ mod tests {
             "settings-actions",
             "settings-advanced",
             "settings-advanced-prompt-open",
+            "settings-saved",
+            "settings-invalid",
+            "settings-not-saved",
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
         // One state per page of the rail: a page added there needs a picture.
         assert_eq!(
             crate::ui::settings::page_labels().len(),
-            names.iter().filter(|n| n.starts_with("settings-")).count() - 3,
-            "the Advanced page has two states (prompt closed and open) and the Models page three (#874)"
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 6,
+            "the Advanced page has two states (prompt closed and open), the Models page three (#874) and the status line three (#875)"
         );
     }
 

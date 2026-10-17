@@ -17,25 +17,33 @@
 //! foreground or closes (`WM_APP_SETTINGS_LEFT`), and the writer's answer
 //! returns to it (`WM_APP_CONFIG_WRITTEN`).
 //!
-//! Save no longer returns a `Config`. It sends only the fields the user changed
-//! (`config_writer::diff` of the config the window opened with against the
-//! form) to the `settings-writer` thread, which patches them onto the file as it
-//! is on disk now, so a hand edit made meanwhile survives, and then closes the
-//! window. This module never touches the disk or the network on the UI thread.
+//! **Changes apply at once** (#875): there is no Save and no Cancel. A checkbox
+//! or a list applies when it changes, a text or number box when Enter is pressed
+//! or the box is left, the text size slider when it is released. Each change is
+//! one field (`settings_commit::Field`): `commit_field` works out what that field
+//! changed (`settings_commit::plan`), hands it to the `settings-writer` thread
+//! through the owner window, and the thread patches that key onto the file as it
+//! is on disk now, so a hand edit made meanwhile survives. The writer's answer
+//! comes back (`note_write_result`): the status line says "Saved: Card corner"
+//! with an Undo button, or why it was not saved, and the control goes back to the
+//! value that is on disk. A window left with a row still failed puts up one card
+//! (`WM_APP_SETTINGS_LEFT`'s `wparam` is the count). Coming back to the window
+//! reads the file again, on a worker thread, and shows a hand edit in every row
+//! that is not being typed in. This module never touches the disk or the network
+//! on the UI thread.
 //!
 //! The window has a left navigation rail and five pages (#872): General,
 //! Models, Privacy, Actions and Advanced. Every control is created once, tagged
 //! with its page, and the rail shows one page's controls and hides the rest, so
 //! a hidden page is out of the Tab order and the accessibility tree. Ctrl+1 to
 //! Ctrl+5, Ctrl+PageUp and Ctrl+PageDown change the page from anywhere, F6
-//! moves between the rail and the page. Save and Cancel are still pinned under
-//! the pages and still send every touched field at once.
+//! moves between the rail and the page. The status line and Undo are pinned under
+//! the pages.
 //!
-//! The General page's Mode row and Pause and Resume buttons act at once, not on
-//! Save (#873): they post `WM_APP_SETTINGS_COMMAND` to the owner, which runs the
+//! The General page's Mode row and Pause and Resume buttons act at once (#873): they post `WM_APP_SETTINGS_COMMAND` to the owner, which runs the
 //! tray's own `set_mode`, `pause_for` and `resume`. The app calls [`sync_live`]
 //! after any change, so the controls follow the tray and the pause key too. The
-//! pause shortcut is staged and saved like the other two.
+//! pause shortcut is applied like the other two.
 //!
 //! Notes for the integrating app:
 //! - If a settings window is already open, `open` brings it to the front and
@@ -69,8 +77,7 @@
 //!   and the captured chord comes back as `WM_APP_LEARNED`, posted to the main
 //!   window. [`pre_dispatch`] takes that message off the queue itself
 //!   (`take_learned`) while a Change is pending, so the app never sees it as a
-//!   rebind. The new chord is only staged in the window and saved with
-//!   everything else on Save.
+//!   rebind. The new chord is applied at once, like every other field.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -122,6 +129,7 @@ use crate::hotkey::{
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::ollama_gpu_fix;
 use crate::provider::DEFAULT_PROMPT;
+use crate::ui::settings_commit::{self as commit, Field};
 use crate::ui::settings_models::{self, Slot};
 
 // ---------------------------------------------------------------------------
@@ -172,19 +180,24 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
     } else {
         None
     };
-    inner.save_sink = Some(Box::new(move |original: &Config, edited: &Config| {
-        let changes = crate::config_writer::diff(original, edited).map_err(|e| format!("{e:#}"))?;
-        // A list changed here replaces the whole list in the file, so it is
-        // written only if the file's list is still the one this window opened
-        // with; a hand edit of a sibling entry is not silently dropped.
-        let changes = crate::config_writer::guard_whole_values(
-            changes,
-            file_baseline.as_ref().unwrap_or(original),
-        )
-        .map_err(|e| format!("{e:#}"))?;
+    // A list changed here replaces the whole list in the file, so it is written
+    // only if the file's list is still the one the window last saw (`baseline`);
+    // a hand edit of a sibling entry is not silently dropped.
+    if let Some(file) = file_baseline {
+        inner.baseline = file;
+    }
+    if live {
+        inner.file_path = crate::config::Config::path().ok();
+        inner.file_mtime = inner
+            .file_path
+            .as_deref()
+            .and_then(crate::config::file_mtime);
+    }
+    inner.save_sink = Some(Box::new(move |label, changes, original, edited| {
         crate::app::post_settings_save(
             owner_raw,
             crate::app::SettingsSave {
+                label: label.to_string(),
                 changes,
                 original: original.clone(),
                 edited: edited.clone(),
@@ -430,16 +443,16 @@ thread_local! {
 static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// The command Enter triggers when `ctrl_id` has focus (#342): a focused
-/// push button other than Save is pressed (Enter on Cancel cancels, on the
-/// prompt toggle toggles); anywhere else Enter saves.
+/// push button is pressed (Enter on Undo undoes, on the prompt toggle toggles);
+/// anywhere else Enter applies the box it is in (#875).
 fn enter_command(ctrl_id: i32) -> i32 {
     match ctrl_id {
-        ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK | ID_CHANGE_PRIMARY
+        ID_UNDO | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK | ID_CHANGE_PRIMARY
         | ID_CHANGE_SECONDARY | ID_CHANGE_PAUSE | ID_PAUSE_BUTTON | ID_RESUME_BUTTON
         | ID_PULL_BUTTON | ID_OPEN_CONFIG => ctrl_id,
         // #635: Enter in the Pull model box starts the pull.
         ID_PULL_NAME => ID_PULL_BUTTON,
-        _ => ID_SAVE,
+        _ => ID_APPLY_FOCUSED,
     }
 }
 
@@ -467,11 +480,13 @@ unsafe fn handle_key(hwnd: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
         // #345: while a Change is pending, Esc cancels that, not the whole
         // window. (The hook normally swallows this Esc and reports it as a
         // captured key instead; see `judge_learned`.)
+        // #875: otherwise Esc puts back the text being typed, or closes the
+        // window when there is none (`escape_pressed`).
         if !cancel_learning_if_active(hwnd) {
             let _ = PostMessageW(
                 Some(hwnd),
                 WM_COMMAND,
-                WPARAM(ID_CANCEL as usize),
+                WPARAM(ID_ESCAPE as usize),
                 LPARAM(0),
             );
         }
@@ -574,8 +589,10 @@ unsafe fn prompt_edit_of(hwnd: HWND) -> HWND {
 }
 
 /// Tells the owner window that Settings lost the foreground or closed, so what
-/// waited for it can be shown. A window with no owner (the tests') says nothing.
-fn tell_owner_left(owner: HWND) {
+/// waited for it can be shown. `unsaved` is how many rows were still failed when
+/// the window closed (0 when it only lost the foreground): the owner puts up one
+/// card for them. A window with no owner (the tests') says nothing.
+fn tell_owner_left(owner: HWND, unsaved: usize) {
     if owner.0.is_null() {
         return;
     }
@@ -583,7 +600,7 @@ fn tell_owner_left(owner: HWND) {
         let _ = PostMessageW(
             Some(owner),
             crate::app::WM_APP_SETTINGS_LEFT,
-            WPARAM(0),
+            WPARAM(unsaved),
             LPARAM(0),
         );
     }
@@ -727,26 +744,54 @@ struct SettingsInner {
     /// `WM_NCDESTROY` and owns the `OPEN_HWND` guard. The tests' windows are
     /// reclaimed by the test and leave both alone.
     owns_itself: bool,
-    /// Where Save sends the edit: in production the writer thread (see `open`).
-    /// `None` in the tests' windows, which only record `result`.
+    /// Where a commit sends its change: in production the owner window, which
+    /// hands it to the writer thread (see `open`). `None` in the tests' windows.
     save_sink: Option<SaveSink>,
+    /// #875: the file as this window last saw it (defaults for keys it does not
+    /// spell out). A whole value (the provider order) is checked against it, so a
+    /// hand edit of the same list is never written over. `original` is what the
+    /// window believes is applied; this is what it believes the file holds.
+    baseline: Config,
+    /// #875: the writes in flight, the rows that failed and what Undo does.
+    tracker: commit::Tracker,
+    /// Whether the Undo button shows (the latest change was saved).
+    undo_shown: bool,
+    /// Set once the window is closing: nothing is committed from then on.
+    closing: bool,
+    /// #875: the file's path and the modified time the window last read, so
+    /// coming back to the window reads it again only when it moved. `None` in the
+    /// tests' windows (rule 9: they never read the real file).
+    file_path: Option<std::path::PathBuf>,
+    file_mtime: Option<std::time::SystemTime>,
+    /// A re-read of the file is running on its worker.
+    refreshing: bool,
+    /// The worker's answer, taken by `WM_SETTINGS_REFRESH`.
+    refresh_slot: RefreshSlot,
     /// #345: the hotkeys as edited in this window. Starts as the original's
-    /// and only reaches the returned config on Save.
+    /// and is applied at once when a chord is learned.
     hotkeys: Hotkeys,
     /// #345: the slot a pending Change is waiting on a key for.
     learning: Option<usize>,
     /// #345: the `(slot, chord)` last warned about, so pressing the same
     /// conflicting chord again confirms it (same flow as the tray's).
     pending_conflict: Option<(usize, Chord)>,
-    /// The config the last Save produced; `None` until then and on
-    /// Cancel/close.
-    result: Option<Config>,
 }
 
-/// Takes the config the window opened with and the one Save built, and hands
-/// the difference to whatever persists it. An `Err` is a plain sentence and
-/// keeps the window open.
-type SaveSink = Box<dyn Fn(&Config, &Config) -> Result<(), String>>;
+/// Takes one commit: what the field is called, the keys to patch onto the file,
+/// the config before it and the config with it (from which a changed API key is
+/// worked out). An `Err` is a plain sentence for the row.
+type SaveSink = Box<
+    dyn Fn(&str, Vec<crate::config_writer::FieldChange>, &Config, &Config) -> Result<(), String>,
+>;
+
+/// What the re-read of the file found: its modified time and what it parsed to.
+struct Refreshed {
+    mtime: Option<std::time::SystemTime>,
+    /// `None` when the file had not moved, or could not be read as settings.
+    config: Option<Config>,
+}
+
+type RefreshSlot = std::sync::Arc<std::sync::Mutex<Option<Refreshed>>>;
 
 /// Counts the `SettingsInner` values dropped, so a test can tell a double free
 /// from a single one.
@@ -797,10 +842,17 @@ impl SettingsInner {
             owner: HWND(std::ptr::null_mut()),
             owns_itself: false,
             save_sink: None,
+            baseline: original.clone(),
+            tracker: Default::default(),
+            undo_shown: false,
+            closing: false,
+            file_path: None,
+            file_mtime: None,
+            refreshing: false,
+            refresh_slot: Default::default(),
             learning: None,
             pending_conflict: None,
             original,
-            result: None,
         }
     }
 
@@ -843,6 +895,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
     match msg {
         WM_CLOSE => {
+            // #875: nothing waits for a Save, so the box being typed in is
+            // applied first. A destroyed window does not reliably send
+            // `EN_KILLFOCUS`.
+            commit_focused(inner);
+            inner.closing = true;
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
@@ -854,6 +911,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_HSCROLL => {
             update_text_scale_label(hwnd);
+            // #875: the label follows the drag; the size is applied on release.
+            if (wparam.0 & 0xFFFF) as u32 == TB_ENDTRACK {
+                commit_field(inner, Field::TextScale);
+            }
+            LRESULT(0)
+        }
+        // #875: the app's answer for a write (sent, not posted: it is answered
+        // at once with whether the row took it).
+        WM_SETTINGS_WRITE_RESULT => {
+            let answer = &*(lparam.0 as *const WriteAnswer);
+            LRESULT(on_write_result(inner, answer) as isize)
+        }
+        // #875: the worker re-read the file after the window was activated.
+        WM_SETTINGS_REFRESH => {
+            take_refresh(inner);
             LRESULT(0)
         }
         // #872: the rail draws itself through us.
@@ -901,6 +973,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .take()
                     .map(|name| resolve_pulled_name(&models, &name));
                 apply_ollama_models(hwnd, &models, prefer.as_deref());
+                // #875: a model just pulled is picked in the box, so it is
+                // applied like any pick (no Save to carry it).
+                if prefer.is_some() {
+                    commit_field(inner, Field::OllamaModel);
+                }
             }
             LRESULT(0)
         }
@@ -941,13 +1018,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // in another app would otherwise be captured as the new shortcut.
             stop_learning(inner);
             set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
-            tell_owner_left(inner.owner);
+            tell_owner_left(inner.owner, 0);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         // #871: losing the foreground releases whatever waited for it (a
         // finished request's card, a press of the Wingman key).
         WM_ACTIVATE if (wparam.0 & 0xFFFF) == 0 => {
-            tell_owner_left(inner.owner);
+            tell_owner_left(inner.owner, 0);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        // #875: coming back to the window, read the file again (on a worker)
+        // so a hand edit made meanwhile shows in the rows nobody is typing in.
+        WM_ACTIVATE => {
+            start_refresh(inner);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_TIMER if wparam.0 == LEARN_TIMER_ID => {
@@ -975,6 +1058,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_DESTROY => {
             invalidate_edit_style();
             invalidate_rail_style();
+            inner.closing = true;
             inner.alive.store(false, Ordering::SeqCst);
             if inner.owns_itself {
                 OPEN_HWND.store(0, Ordering::SeqCst);
@@ -996,7 +1080,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // queued for the main window, which would take it as a rebind.
                 // Free it unused.
                 drain_learned_messages();
-                tell_owner_left(inner.owner);
+                // A row still failed is told once, as a card (rule 7): inline
+                // is all a window being typed in can show.
+                tell_owner_left(inner.owner, inner.tracker.failed_count());
             }
             LRESULT(0)
         }
@@ -1018,81 +1104,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
-    // #585: a key typed but not saved yet still fetches its model list once
-    // the user leaves the field.
+    // #585: a key typed but not applied yet still fetches its model list once
+    // the user leaves the field. Leaving it applies it too (#875).
     if let Some(index) = typed_key_vendor(id, notify) {
         fetch_for_typed_key(inner, index);
+        if let Some(field) = commit_trigger(id, notify) {
+            commit_field(inner, field);
+        }
         return;
     }
     match id {
-        ID_SAVE => {
-            // #566: Save would close the window and silently stop the pull.
-            if inner.pull_cancel.is_some() {
-                if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-                    set_text(msg, "A pull is running. Stop it first.");
-                }
-                return;
-            }
-            let raw = read_raw_form(inner);
-            // #344: an invalid numeric field must not be silently kept at
-            // its old value -- reject the Save, keep the window open, focus
-            // the bad field and say what is wrong inline (rule 7: never a
-            // dialog box). `config.toml` is never touched in this branch.
-            if let Some(invalid) = find_invalid_numeric_field(&raw) {
-                if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-                    set_text(msg, invalid.message());
-                }
-                focus_and_select_field(inner, invalid.control_id());
-                return;
-            }
-            if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-                // Back to the standing hint (#778), not blank.
-                set_text(msg, &env_key_hint(&env_hint_vars()));
-            }
-
-            // Autostart is registry state rather than a Config field, so it is
-            // applied here instead of riding along in the returned Config.
-            // Only written when it actually changed, to avoid rewriting the
-            // Run key on every Save.
-            let want = checkbox_checked(inner.hwnd, ID_AUTOSTART);
-            if want != crate::autostart::is_enabled() {
-                // Rule 7: a failed registry write must not end in "Settings
-                // saved". Say so here, show the real state, keep the window.
-                if crate::autostart::set_enabled(want).is_err() {
-                    if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-                        set_text(msg, autostart_failure_message());
-                    }
-                    if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
-                        set_checkbox(box_, crate::autostart::is_enabled());
-                    }
-                    return;
-                }
-            }
-            let edited = finalize_config(inner, &raw);
-            // Only the fields that differ from what this window opened with go
-            // on, patched onto the file as it is now (#871), so a hand edit
-            // made while the window was open (#851's concern) is never undone.
-            if let Some(sink) = &inner.save_sink {
-                if let Err(reason) = sink(&inner.original, &edited) {
-                    // Rule 7: say so inline and keep the window, never a
-                    // dialog or a silent no-op.
-                    if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-                        set_text(msg, &format!("Could not save: {reason}"));
-                    }
-                    return;
-                }
-            }
-            inner.result = Some(edited);
-            unsafe {
-                let _ = DestroyWindow(inner.hwnd);
-            }
-        }
-        ID_CANCEL => {
-            inner.result = None;
-            unsafe {
-                let _ = DestroyWindow(inner.hwnd);
-            }
-        }
+        ID_UNDO if notify == BN_CLICKED => undo_last(inner),
+        // Enter in a box (#875): apply it.
+        ID_APPLY_FOCUSED => commit_focused(inner),
+        ID_ESCAPE => escape_pressed(inner),
         // #872: the rail picked a page (a click, an arrow key, Home or End).
         ID_RAIL if notify == LBN_SELCHANGE => {
             let picked = unsafe { SendMessageW(inner.rail, LB_GETCURSEL, None, None).0 };
@@ -1163,6 +1188,13 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         }
         _ => {}
     }
+    // #875: a change in a control is applied at once, after whatever the control
+    // does for the window itself (the arms above).
+    if let Some(field) = commit_trigger(id, notify) {
+        commit_field(inner, field);
+    } else if id == ID_RESET_PROMPT && notify == BN_CLICKED {
+        commit_field(inner, Field::Prompt);
+    }
 }
 
 fn toggle_password(hwnd: HWND, checkbox_id: i32, edit_id: i32) {
@@ -1178,33 +1210,6 @@ fn toggle_password(hwnd: HWND, checkbox_id: i32, edit_id: i32) {
     }
 }
 
-/// #344: sets keyboard focus on the named control and selects its whole
-/// contents, so the user can just start typing over the bad value. For any
-/// plain `WC_EDIT` control (e.g. `ID_CARD_SECONDS`). `ID_MAX_EDGE` became a
-/// `CBS_DROPDOWNLIST` combo in #341 (no free-typed text, so it can no longer
-/// actually reach this function with an invalid value from the real UI, only
-/// from a direct unit-test call) -- `EM_SETSEL` on a `CBS_DROPDOWNLIST`
-/// combo with no editable text portion is simply a no-op, so no special case
-/// is needed here any more.
-fn focus_and_select_field(inner: &mut SettingsInner, id: i32) {
-    let Some(ctrl) = get_dlg_item(inner.hwnd, id) else {
-        return;
-    };
-    unsafe {
-        // A control on a hidden page cannot take focus: show its page first.
-        if let Some(page) = inner
-            .children
-            .iter()
-            .find(|c| c.hwnd == ctrl)
-            .and_then(|c| c.page)
-        {
-            show_page(inner, page);
-        }
-        let _ = SetFocus(Some(ctrl));
-        SendMessageW(ctrl, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1isize)));
-    }
-}
-
 fn update_text_scale_label(hwnd: HWND) {
     let (Some(track), Some(label)) = (
         get_dlg_item(hwnd, ID_TEXT_SCALE_TRACK),
@@ -1215,6 +1220,731 @@ fn update_text_scale_label(hwnd: HWND) {
     let pos = unsafe { SendMessageW(track, TBM_GETPOS, None, None).0 as i32 };
     let scale = clamp_text_scale(pos as f32 / 100.0);
     set_text(label, &format!("{scale:.2}x"));
+}
+
+// ---------------------------------------------------------------------------
+// Instant apply (#875)
+// ---------------------------------------------------------------------------
+// A change in the window is one field. `commit_field` reads the form, asks
+// `settings_commit::plan` what that field changed, and sends it through the sink
+// (the owner window, then the writer thread). Nothing here reads or writes the
+// file: the answer comes back through `note_write_result`.
+
+/// What a control edits, or `None` for one that is not a setting (a label, a
+/// button, the rail). The three shortcuts are changed by their Change buttons,
+/// which start a capture rather than apply anything, so they are not here.
+fn field_of_control(id: i32) -> Option<Field> {
+    Some(match id {
+        ID_ACTIVE_PROVIDER => Field::ActiveProvider,
+        ID_OPENAI_KEY => Field::OpenAiKey,
+        ID_OPENAI_MODEL => Field::OpenAiModel,
+        ID_OPENAI_EFFORT => Field::OpenAiEffort,
+        ID_ANTHROPIC_KEY => Field::AnthropicKey,
+        ID_ANTHROPIC_MODEL => Field::AnthropicModel,
+        ID_ANTHROPIC_EFFORT => Field::AnthropicEffort,
+        ID_GEMINI_KEY => Field::GeminiKey,
+        ID_GEMINI_MODEL => Field::GeminiModel,
+        ID_GEMINI_EFFORT => Field::GeminiEffort,
+        ID_OLLAMA_MODEL => Field::OllamaModel,
+        ID_AUTOSTART => Field::Autostart,
+        ID_CARD_SECONDS => Field::CardSeconds,
+        ID_TEXT_SCALE_TRACK => Field::TextScale,
+        ID_CARD_CORNER => Field::CardCorner,
+        ID_CARD_MONITOR => Field::CardMonitor,
+        ID_MAX_EDGE => Field::MaxEdge,
+        ID_MONITOR => Field::Monitor,
+        ID_REDACT => Field::Redact,
+        ID_REQUIRE_TICK_FOR => Field::RequireTickFor,
+        ID_PROMPT_EDIT => Field::Prompt,
+        _ => return None,
+    })
+}
+
+/// The control that shows `field`. For a shortcut that is its Change button.
+fn control_of_field(field: Field) -> i32 {
+    match field {
+        Field::ActiveProvider => ID_ACTIVE_PROVIDER,
+        Field::OpenAiKey => ID_OPENAI_KEY,
+        Field::OpenAiModel => ID_OPENAI_MODEL,
+        Field::OpenAiEffort => ID_OPENAI_EFFORT,
+        Field::AnthropicKey => ID_ANTHROPIC_KEY,
+        Field::AnthropicModel => ID_ANTHROPIC_MODEL,
+        Field::AnthropicEffort => ID_ANTHROPIC_EFFORT,
+        Field::GeminiKey => ID_GEMINI_KEY,
+        Field::GeminiModel => ID_GEMINI_MODEL,
+        Field::GeminiEffort => ID_GEMINI_EFFORT,
+        Field::OllamaModel => ID_OLLAMA_MODEL,
+        Field::PrimaryKey => ID_CHANGE_PRIMARY,
+        Field::SecondaryKey => ID_CHANGE_SECONDARY,
+        Field::PauseKey => ID_CHANGE_PAUSE,
+        Field::Autostart => ID_AUTOSTART,
+        Field::CardSeconds => ID_CARD_SECONDS,
+        Field::TextScale => ID_TEXT_SCALE_TRACK,
+        Field::CardCorner => ID_CARD_CORNER,
+        Field::CardMonitor => ID_CARD_MONITOR,
+        Field::MaxEdge => ID_MAX_EDGE,
+        Field::Monitor => ID_MONITOR,
+        Field::Redact => ID_REDACT,
+        Field::RequireTickFor => ID_REQUIRE_TICK_FOR,
+        Field::Prompt => ID_PROMPT_EDIT,
+    }
+}
+
+/// When a field is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    /// A list pick (`CBN_SELCHANGE`).
+    Select,
+    /// A checkbox click (`BN_CLICKED`).
+    Click,
+    /// A box left (`EN_KILLFOCUS`) or Enter in it.
+    Leave,
+    /// The slider let go (`TB_ENDTRACK`).
+    Release,
+    /// A learned chord (`handle_learned`).
+    Capture,
+}
+
+fn trigger_of(field: Field) -> Trigger {
+    match field {
+        _ if field.is_text_box() => Trigger::Leave,
+        Field::Autostart | Field::Redact => Trigger::Click,
+        Field::TextScale => Trigger::Release,
+        Field::PrimaryKey | Field::SecondaryKey | Field::PauseKey => Trigger::Capture,
+        _ => Trigger::Select,
+    }
+}
+
+/// The field a control's notification applies, if it is the kind that applies it.
+/// Never a keystroke: a box applies when it is left or Enter is pressed, so a
+/// half-typed number is never written.
+fn commit_trigger(id: i32, notify: u32) -> Option<Field> {
+    let field = field_of_control(id)?;
+    let fires = match trigger_of(field) {
+        Trigger::Select => notify == CBN_SELCHANGE,
+        Trigger::Click => notify == BN_CLICKED,
+        Trigger::Leave => notify == EN_KILLFOCUS,
+        Trigger::Release | Trigger::Capture => false,
+    };
+    fires.then_some(field)
+}
+
+/// Applies the box that has the keyboard focus, if it is a setting: Enter, and
+/// closing the window.
+fn commit_focused(inner: &mut SettingsInner) {
+    let focus = unsafe { GetFocus() };
+    if focus.0.is_null() {
+        return;
+    }
+    let id = unsafe { GetDlgCtrlID(focus) };
+    if let Some(field) = field_of_control(id) {
+        commit_field(inner, field);
+    }
+}
+
+/// The text a field is validated on, from the form.
+fn raw_text(raw: &RawForm, field: Field) -> &str {
+    match field {
+        Field::CardSeconds => &raw.card_seconds_text,
+        _ => "",
+    }
+}
+
+/// Puts the status line's text up, and shows or hides Undo with it.
+fn set_status(inner: &mut SettingsInner, text: &str, undo: bool) {
+    if let Some(line) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+        set_text(line, text);
+    }
+    set_undo_shown(inner, undo);
+}
+
+fn set_undo_shown(inner: &mut SettingsInner, shown: bool) {
+    if inner.undo_shown == shown {
+        return;
+    }
+    inner.undo_shown = shown;
+    let Some(button) = get_dlg_item(inner.hwnd, ID_UNDO) else {
+        return;
+    };
+    unsafe {
+        // A button that goes away with the keyboard focus on it would strand the
+        // focus: the rail is always there.
+        if !shown && GetFocus() == button && !inner.rail.0.is_null() {
+            let _ = SetFocus(Some(inner.rail));
+        }
+        let _ = ShowWindow(button, if shown { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+/// Applies one field: what it changed goes to the writer, the window's picture
+/// of what is applied moves on at once, and the answer decides the status line.
+fn commit_field(inner: &mut SettingsInner, field: Field) {
+    if inner.closing {
+        return;
+    }
+    if field == Field::Autostart {
+        commit_autostart(inner);
+        return;
+    }
+    let raw = read_raw_form(inner);
+    if let Some(why) = commit::invalid(field, raw_text(&raw, field)) {
+        // Not written, and the text stays for fixing. The focus is left alone:
+        // moving it from here would send another box its `EN_KILLFOCUS` in the
+        // middle of this one.
+        set_status(inner, &commit::invalid_line(field.label(), why), false);
+        return;
+    }
+    let edited = finalize_config(inner, &raw);
+    let plan = match commit::plan(field, &inner.baseline, &inner.original, &edited) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => {
+            // Nothing changed. A box shows the applied text again, so stray
+            // spaces or a blank do not linger.
+            if field.is_text_box() {
+                let applied = inner.original.clone();
+                show_field(inner, field, &applied);
+            }
+            return;
+        }
+        Err(why) => {
+            fail_row(inner, field, &why);
+            return;
+        }
+    };
+    let sent = match &inner.save_sink {
+        Some(sink) => sink(
+            field.label(),
+            plan.changes.clone(),
+            &inner.original,
+            &plan.original,
+        ),
+        None => Ok(()),
+    };
+    if let Err(reason) = sent {
+        fail_row(inner, field, &reason);
+        return;
+    }
+    inner.tracker.begin(commit::InFlight {
+        field,
+        undoing: false,
+        before_original: std::mem::replace(&mut inner.original, plan.original),
+        before_baseline: std::mem::replace(&mut inner.baseline, plan.baseline),
+    });
+    inner.tracker.clear_failed(field);
+    // Undo covers the latest change, and never a key.
+    inner.tracker.undo = (!plan.key_changed).then(|| commit::UndoSlot {
+        field,
+        what: commit::UndoWhat::Config {
+            restore: plan.undo.clone(),
+        },
+    });
+    set_undo_shown(inner, false);
+    // The box shows what is applied: a key as its mask, a number as it parsed.
+    if field.key_vendor().is_some() || field.is_text_box() {
+        let applied = inner.original.clone();
+        show_field(inner, field, &applied);
+    }
+    if field == Field::ActiveProvider {
+        unsafe { sync_models_flow(inner) };
+    }
+}
+
+/// Why a Start with Windows change failed (#777): the registry would not take it.
+const AUTOSTART_FAILED: &str = "Windows did not allow the change.";
+
+/// Start with Windows is the registry's, not the file's: one small write on the
+/// click (what Save did before), and it is put back on a failure.
+fn commit_autostart(inner: &mut SettingsInner) {
+    let want = checkbox_checked(inner.hwnd, ID_AUTOSTART);
+    let was = crate::autostart::is_enabled();
+    if want == was {
+        return;
+    }
+    let label = Field::Autostart.label();
+    if crate::autostart::set_enabled(want).is_err() {
+        if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+            set_checkbox(box_, crate::autostart::is_enabled());
+        }
+        inner.tracker.fail(Field::Autostart, AUTOSTART_FAILED);
+        set_status(inner, &commit::failed_line(label, AUTOSTART_FAILED), false);
+        return;
+    }
+    inner.tracker.clear_failed(Field::Autostart);
+    inner.tracker.undo = Some(commit::UndoSlot {
+        field: Field::Autostart,
+        what: commit::UndoWhat::Autostart { was },
+    });
+    set_status(inner, &commit::saved_line(label), true);
+}
+
+/// A field that could not be applied: the control goes back to what is applied,
+/// the row is failed, and the status line says why.
+fn fail_row(inner: &mut SettingsInner, field: Field, reason: &str) {
+    inner.tracker.fail(field, reason);
+    if inner
+        .tracker
+        .undo
+        .as_ref()
+        .is_some_and(|u| u.field == field)
+    {
+        inner.tracker.undo = None;
+    }
+    let applied = inner.original.clone();
+    show_field(inner, field, &applied);
+    set_status(inner, &commit::failed_line(field.label(), reason), false);
+}
+
+/// The app's answer for a write. Only a write this window sent counts; one from
+/// an earlier window is left for the app to say.
+struct WriteAnswer<'a> {
+    label: &'a str,
+    result: &'a Result<(), String>,
+}
+
+/// Tells the open window how a write it sent went. Returns whether a row took
+/// it: `false` when no window is open or the write was not this window's, so the
+/// app shows its own card instead (rule 7). UI thread only.
+pub fn note_write_result(label: &str, result: &Result<(), String>) -> bool {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    if open == 0 {
+        return false;
+    }
+    let answer = WriteAnswer { label, result };
+    unsafe {
+        SendMessageW(
+            HWND(open as *mut c_void),
+            WM_SETTINGS_WRITE_RESULT,
+            None,
+            Some(LPARAM(&answer as *const WriteAnswer as isize)),
+        )
+        .0 != 0
+    }
+}
+
+fn on_write_result(inner: &mut SettingsInner, answer: &WriteAnswer) -> bool {
+    let Some(field) = Field::from_label(answer.label) else {
+        return false;
+    };
+    let Some(entry) = inner.tracker.finish(field) else {
+        return false;
+    };
+    match answer.result {
+        Ok(()) => {
+            inner.tracker.clear_failed(field);
+            if entry.undoing {
+                set_status(inner, &commit::undone_line(field.label()), false);
+            } else {
+                // Undo is offered only while this is still the latest change.
+                let latest = inner
+                    .tracker
+                    .undo
+                    .as_ref()
+                    .is_some_and(|u| u.field == field)
+                    && inner.tracker.writes_in_flight() == 0;
+                set_status(inner, &commit::saved_line(field.label()), latest);
+            }
+        }
+        Err(reason) => {
+            // The file still holds the old value: so does the window again.
+            if let Ok(back) = commit::copy_field(field, &entry.before_original, &inner.original) {
+                inner.original = back;
+            }
+            if let Ok(back) = commit::copy_field(field, &entry.before_baseline, &inner.baseline) {
+                inner.baseline = back;
+            }
+            fail_row(inner, field, reason);
+        }
+    }
+    true
+}
+
+/// Undo: the latest change goes back through the same writer, and the control
+/// shows the old value at once.
+fn undo_last(inner: &mut SettingsInner) {
+    let Some(slot) = inner.tracker.undo.take() else {
+        set_undo_shown(inner, false);
+        return;
+    };
+    set_undo_shown(inner, false);
+    let field = slot.field;
+    match slot.what {
+        commit::UndoWhat::Autostart { was } => {
+            let ok = crate::autostart::set_enabled(was).is_ok();
+            if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+                set_checkbox(box_, crate::autostart::is_enabled());
+            }
+            if ok {
+                set_status(inner, &commit::undone_line(field.label()), false);
+            } else {
+                inner.tracker.fail(field, AUTOSTART_FAILED);
+                set_status(
+                    inner,
+                    &commit::failed_line(field.label(), AUTOSTART_FAILED),
+                    false,
+                );
+            }
+        }
+        commit::UndoWhat::Config { restore } => {
+            let restored = crate::config_writer::reapply(&inner.original, &restore)
+                .map_err(|e| format!("{e:#}"));
+            let baseline = crate::config_writer::reapply(&inner.baseline, &restore)
+                .map_err(|e| format!("{e:#}"));
+            let (Ok(restored), Ok(baseline)) = (restored, baseline) else {
+                fail_row(inner, field, "The old value could not be put back.");
+                return;
+            };
+            let sent = match &inner.save_sink {
+                Some(sink) => sink(field.label(), restore, &inner.original, &restored),
+                None => Ok(()),
+            };
+            if let Err(reason) = sent {
+                fail_row(inner, field, &reason);
+                return;
+            }
+            inner.tracker.begin(commit::InFlight {
+                field,
+                undoing: true,
+                before_original: std::mem::replace(&mut inner.original, restored),
+                before_baseline: std::mem::replace(&mut inner.baseline, baseline),
+            });
+            let shown = inner.original.clone();
+            show_field(inner, field, &shown);
+        }
+    }
+}
+
+/// Whether a text box holds something other than what is applied (so Esc has
+/// something to put back).
+fn text_pending(field: Field, text: &str, applied: &Config) -> bool {
+    match field {
+        Field::CardSeconds => text.trim() != applied.ui.card_seconds.to_string(),
+        Field::Prompt => prompt_from_edit(text) != prompt_from_edit(&applied.ui.prompt),
+        Field::OpenAiKey => text != key_field_display(&applied.providers.openai.api_key),
+        Field::AnthropicKey => text != key_field_display(&applied.providers.anthropic.api_key),
+        Field::GeminiKey => text != key_field_display(&applied.providers.gemini.api_key),
+        _ => false,
+    }
+}
+
+/// Esc: with text typed in a box and not applied, puts the applied text back and
+/// stays; otherwise closes the window.
+fn escape_pressed(inner: &mut SettingsInner) {
+    escape_with(inner, unsafe { GetFocus() });
+}
+
+/// [`escape_pressed`] with the window that has the focus given.
+fn escape_with(inner: &mut SettingsInner, focus: HWND) {
+    let id = if focus.0.is_null() {
+        0
+    } else {
+        unsafe { GetDlgCtrlID(focus) }
+    };
+    if let Some(field) = field_of_control(id).filter(|f| f.is_text_box()) {
+        if text_pending(field, &get_text(focus), &inner.original) {
+            let applied = inner.original.clone();
+            show_field(inner, field, &applied);
+            return;
+        }
+    }
+    unsafe {
+        let _ = PostMessageW(Some(inner.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
+
+const CB_FINDSTRINGEXACT: u32 = 0x0158;
+const CB_GETCOUNT: u32 = 0x0146;
+const CB_GETLBTEXT: u32 = 0x0148;
+const CB_GETLBTEXTLEN: u32 = 0x0149;
+const CB_INSERTSTRING: u32 = 0x014A;
+
+/// Selects the item that is exactly `text`, adding it first when the list does
+/// not have it (a value written by hand that is not one of the presets).
+fn combo_show(hwnd: HWND, id: i32, text: &str) {
+    let Some(combo) = get_dlg_item(hwnd, id) else {
+        return;
+    };
+    let w = wide_z(text);
+    unsafe {
+        let at = SendMessageW(
+            combo,
+            CB_FINDSTRINGEXACT,
+            Some(WPARAM(usize::MAX)),
+            Some(LPARAM(w.as_ptr() as isize)),
+        )
+        .0;
+        if at >= 0 {
+            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(at as usize)), None);
+        } else {
+            combo_add(combo, text);
+            let count = SendMessageW(combo, CB_GETCOUNT, None, None).0;
+            SendMessageW(
+                combo,
+                CB_SETCURSEL,
+                Some(WPARAM((count - 1).max(0) as usize)),
+                None,
+            );
+        }
+    }
+}
+
+/// Selects the Ollama model `model` in its box, whose items may carry a
+/// "(vision)" badge; adds it at the top, unbadged, when it is not pulled.
+fn combo_show_model(hwnd: HWND, id: i32, model: &str) {
+    let Some(combo) = get_dlg_item(hwnd, id) else {
+        return;
+    };
+    unsafe {
+        let count = SendMessageW(combo, CB_GETCOUNT, None, None).0.max(0) as usize;
+        for i in 0..count {
+            let len = SendMessageW(combo, CB_GETLBTEXTLEN, Some(WPARAM(i)), None).0;
+            if len < 0 {
+                continue;
+            }
+            let mut buf = vec![0u16; len as usize + 1];
+            SendMessageW(
+                combo,
+                CB_GETLBTEXT,
+                Some(WPARAM(i)),
+                Some(LPARAM(buf.as_mut_ptr() as isize)),
+            );
+            let item = String::from_utf16_lossy(&buf[..len as usize]);
+            if strip_vision_badge(&item) == model {
+                SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(i)), None);
+                return;
+            }
+        }
+        let w = wide_z(model);
+        SendMessageW(
+            combo,
+            CB_INSERTSTRING,
+            Some(WPARAM(0)),
+            Some(LPARAM(w.as_ptr() as isize)),
+        );
+        SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), None);
+    }
+}
+
+/// Shows `field` as `cfg` has it: the way a failed write puts a control back, a
+/// hand edit reaches a row, and Undo shows the old value. No notification is
+/// sent by any of these calls, so nothing echoes back as a new change.
+fn show_field(inner: &mut SettingsInner, field: Field, cfg: &Config) {
+    let hwnd = inner.hwnd;
+    let p = &cfg.providers;
+    match field {
+        Field::ActiveProvider => {
+            if let Some(combo) = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER) {
+                combo_select_index(combo, combo_index_for_order(&p.order));
+            }
+            unsafe { sync_models_flow(inner) };
+        }
+        Field::OpenAiKey => set_key_box(hwnd, ID_OPENAI_KEY, &p.openai.api_key),
+        Field::AnthropicKey => set_key_box(hwnd, ID_ANTHROPIC_KEY, &p.anthropic.api_key),
+        Field::GeminiKey => set_key_box(hwnd, ID_GEMINI_KEY, &p.gemini.api_key),
+        Field::OpenAiModel => combo_show(hwnd, ID_OPENAI_MODEL, &p.openai.model),
+        Field::AnthropicModel => combo_show(hwnd, ID_ANTHROPIC_MODEL, &p.anthropic.model),
+        Field::GeminiModel => {
+            combo_show(hwnd, ID_GEMINI_MODEL, &p.gemini.model);
+            sync_gemini_thinking_enabled(hwnd);
+        }
+        Field::OpenAiEffort => {
+            combo_show(hwnd, ID_OPENAI_EFFORT, &effort_display(&p.openai.effort))
+        }
+        Field::AnthropicEffort => combo_show(
+            hwnd,
+            ID_ANTHROPIC_EFFORT,
+            &effort_display(&p.anthropic.effort),
+        ),
+        Field::GeminiEffort => {
+            combo_show(hwnd, ID_GEMINI_EFFORT, &effort_display(&p.gemini.effort))
+        }
+        Field::OllamaModel => combo_show_model(hwnd, ID_OLLAMA_MODEL, &p.ollama.model),
+        Field::PrimaryKey => {
+            inner.hotkeys.primary = cfg.hotkeys.primary;
+            set_hotkey_labels(hwnd, &inner.hotkeys);
+        }
+        Field::SecondaryKey => {
+            inner.hotkeys.secondary = cfg.hotkeys.secondary;
+            set_hotkey_labels(hwnd, &inner.hotkeys);
+        }
+        Field::PauseKey => {
+            inner.hotkeys.pause = cfg.hotkeys.pause;
+            set_hotkey_labels(hwnd, &inner.hotkeys);
+        }
+        Field::Autostart => {
+            if let Some(box_) = get_dlg_item(hwnd, ID_AUTOSTART) {
+                set_checkbox(box_, crate::autostart::is_enabled());
+            }
+        }
+        Field::CardSeconds => {
+            if let Some(edit) = get_dlg_item(hwnd, ID_CARD_SECONDS) {
+                set_text(edit, &cfg.ui.card_seconds.to_string());
+            }
+        }
+        Field::TextScale => {
+            if let Some(track) = get_dlg_item(hwnd, ID_TEXT_SCALE_TRACK) {
+                let pos = (clamp_text_scale(cfg.ui.text_scale) * 100.0).round() as isize;
+                unsafe {
+                    SendMessageW(track, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(pos)));
+                }
+            }
+            update_text_scale_label(hwnd);
+        }
+        Field::CardCorner => {
+            combo_show(hwnd, ID_CARD_CORNER, card_corner_label(cfg.ui.card_corner));
+            sync_card_display_enabled(hwnd);
+        }
+        Field::CardMonitor => combo_show(
+            hwnd,
+            ID_CARD_MONITOR,
+            &card_monitor_display(&cfg.ui.card_monitor, crate::ui::card::monitor_count()),
+        ),
+        Field::MaxEdge => combo_show(hwnd, ID_MAX_EDGE, &max_edge_display(cfg.capture.max_edge)),
+        Field::Monitor => combo_show(hwnd, ID_MONITOR, &monitor_display(&cfg.capture.monitor)),
+        Field::Redact => {
+            if let Some(box_) = get_dlg_item(hwnd, ID_REDACT) {
+                set_checkbox(box_, cfg.capture.redact);
+            }
+        }
+        Field::RequireTickFor => combo_show(
+            hwnd,
+            ID_REQUIRE_TICK_FOR,
+            require_tick_for_label(cfg.forms.require_tick_for),
+        ),
+        Field::Prompt => {
+            if let Some(edit) = get_dlg_item(hwnd, ID_PROMPT_EDIT) {
+                set_text(edit, &prompt_to_edit(&cfg.ui.prompt));
+            }
+        }
+    }
+}
+
+fn set_key_box(hwnd: HWND, id: i32, key: &str) {
+    if let Some(edit) = get_dlg_item(hwnd, id) {
+        set_text(edit, &key_field_display(key));
+    }
+}
+
+/// The card for `count` settings still failed when Settings closed (#875).
+pub fn unsaved_card(count: usize) -> (String, String) {
+    commit::unsaved_card(count)
+}
+
+/// Coming back to the window (#875): read the file again if it moved since the
+/// window last read it. The stat and the parse run on a worker; the answer is
+/// `WM_SETTINGS_REFRESH`. Nothing runs while the window is idle.
+fn start_refresh(inner: &mut SettingsInner) {
+    let Some(path) = inner.file_path.clone() else {
+        return;
+    };
+    if inner.refreshing || inner.closing {
+        return;
+    }
+    inner.refreshing = true;
+    let seen = inner.file_mtime;
+    let slot = inner.refresh_slot.clone();
+    let alive = inner.alive.clone();
+    let hwnd = inner.hwnd.0 as isize;
+    let spawned = std::thread::Builder::new()
+        .name("settings-refresh".into())
+        .spawn(move || {
+            let now = crate::config::file_mtime(&path);
+            let config = if now == seen {
+                None
+            } else {
+                read_file_config(&path)
+            };
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(Refreshed { mtime: now, config });
+            }
+            post_while_open(&alive, || unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut c_void)),
+                    WM_SETTINGS_REFRESH,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            });
+        });
+    if spawned.is_err() {
+        inner.refreshing = false;
+    }
+}
+
+/// The file as Wingman would load it, defaults for keys it does not spell out;
+/// `None` when it is missing or does not parse, so a half-edited file never
+/// turns the rows into defaults.
+fn read_file_config(path: &std::path::Path) -> Option<Config> {
+    let text = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<Config>(&text).ok()?;
+    Some(crate::config_writer::baseline_from_text(&text))
+}
+
+fn take_refresh(inner: &mut SettingsInner) {
+    inner.refreshing = false;
+    let Some(found) = inner.refresh_slot.lock().ok().and_then(|mut g| g.take()) else {
+        return;
+    };
+    let Some(fresh) = found.config else {
+        return;
+    };
+    // A write in flight is about to change the file: what was read is already
+    // out of date, and the next activation reads again (the time is not taken).
+    if inner.tracker.writes_in_flight() > 0 || inner.closing {
+        return;
+    }
+    inner.file_mtime = found.mtime;
+    adopt_file(inner, &fresh);
+}
+
+/// Shows a hand edit: every row whose value in `fresh` differs from what the
+/// window has applied takes the file's value, unless it is being typed in. Keys
+/// are never refreshed (they are not in the file), and nothing is written.
+fn adopt_file(inner: &mut SettingsInner, fresh: &Config) {
+    inner.baseline = fresh.clone();
+    let focus = unsafe { GetFocus() };
+    let focused = if focus.0.is_null() {
+        0
+    } else {
+        unsafe { GetDlgCtrlID(focus) }
+    };
+    for field in Field::ALL {
+        if field.key_vendor().is_some() || field == Field::Autostart {
+            continue;
+        }
+        let capture = trigger_of(field) == Trigger::Capture;
+        if capture && inner.learning.is_some() {
+            continue;
+        }
+        let id = control_of_field(field);
+        if focused == id && !capture {
+            continue;
+        }
+        if field.is_text_box() {
+            let typed = get_dlg_item(inner.hwnd, id)
+                .map(get_text)
+                .unwrap_or_default();
+            if text_pending(field, &typed, &inner.original) {
+                continue;
+            }
+        }
+        if !commit::differs(field, &inner.original, fresh) {
+            continue;
+        }
+        let Ok(next) = commit::copy_field(field, fresh, &inner.original) else {
+            continue;
+        };
+        inner.original = next.clone();
+        show_field(inner, field, &next);
+        if inner
+            .tracker
+            .undo
+            .as_ref()
+            .is_some_and(|u| u.field == field)
+        {
+            inner.tracker.undo = None;
+            set_undo_shown(inner, false);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,16 +1967,14 @@ const ID_TEXT_SCALE_TRACK: i32 = 113;
 const ID_TEXT_SCALE_LABEL: i32 = 114;
 const ID_PROMPT_EDIT: i32 = 115;
 const ID_RESET_PROMPT: i32 = 116;
-const ID_SAVE: i32 = 117;
 const ID_AUTOSTART: i32 = 118;
-const ID_CANCEL: i32 = 119;
 /// Read-only status line combining #15's health check and #14's GPU/CPU
 /// indicator (see [`ollama_status_line`]). Not a form field -- never read
 /// back in `read_form`/`build_config`.
 const ID_OLLAMA_STATUS: i32 = 120;
-/// #344: the inline "that field is wrong" message shown above Save/Cancel
-/// after a Save attempt with an invalid numeric field. Not a form field --
-/// never read back in `read_form`/`build_config`.
+/// #344, #875: the status line in the footer: "Saved: Card corner", what is wrong
+/// with a row, or why a change was not saved. Not a form field -- never read
+/// back in `read_form`/`build_config`.
 const ID_VALIDATION_MESSAGE: i32 = 121;
 /// #403: the fill-form tick-requirement combo (`config.forms.require_tick_for`).
 const ID_REQUIRE_TICK_FOR: i32 = 122;
@@ -1308,6 +2036,14 @@ const ID_PAUSE_LABEL: i32 = 154;
 const ID_CHANGE_PAUSE: i32 = 155;
 /// #874: "Add another provider", which shows the vendors that are hidden.
 const ID_ADD_PROVIDER: i32 = 156;
+/// #875: the Undo button in the footer, hidden until a change was saved.
+const ID_UNDO: i32 = 157;
+/// #875: two commands the window sends itself, not controls: apply the box that
+/// has the focus (Enter) and the Esc key.
+const ID_APPLY_FOCUSED: i32 = 158;
+const ID_ESCAPE: i32 = 159;
+/// A trackbar's "the user let go" notification code.
+const TB_ENDTRACK: u32 = 8;
 
 /// #872: the five pages of the window, in rail order. Each existing control
 /// lives on exactly one (see [`PAGE_CONTROLS`]); the rail shows one page at a
@@ -1468,9 +2204,16 @@ const PAGE_CONTROLS: [(Page, &[i32]); 5] = [
 ];
 
 /// The ids that belong to no page: the rail, the scrolling body that holds the
-/// pages, and the footer.
+/// pages, the footer, and the two commands the window sends itself (no control).
 #[cfg(test)]
-const CHROME_IDS: &[i32] = &[ID_RAIL, ID_BODY, ID_SAVE, ID_CANCEL, ID_VALIDATION_MESSAGE];
+const CHROME_IDS: &[i32] = &[
+    ID_RAIL,
+    ID_BODY,
+    ID_UNDO,
+    ID_VALIDATION_MESSAGE,
+    ID_APPLY_FOCUSED,
+    ID_ESCAPE,
+];
 
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
@@ -1487,7 +2230,7 @@ const LEARN_TIMER_MS: u32 = 10_500;
 /// Every control id declared above, paired with its constant name for a
 /// legible test failure. Two controls sharing an id means `GetDlgItem`
 /// resolves to whichever was created last and a `WM_COMMAND` from one fires
-/// the other's handler (issue #144: `ID_AUTOSTART` and `ID_CANCEL` both being
+/// the other's handler (issue #144: `ID_AUTOSTART` and a Cancel button both being
 /// `118` made the autostart checkbox close the dialog instead of toggling).
 /// Add new `ID_*` constants here too -- `control_ids_are_pairwise_unique`
 /// below iterates this array, so an omitted id is invisible to the test.
@@ -1509,9 +2252,7 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_TEXT_SCALE_LABEL", ID_TEXT_SCALE_LABEL),
     ("ID_PROMPT_EDIT", ID_PROMPT_EDIT),
     ("ID_RESET_PROMPT", ID_RESET_PROMPT),
-    ("ID_SAVE", ID_SAVE),
     ("ID_AUTOSTART", ID_AUTOSTART),
-    ("ID_CANCEL", ID_CANCEL),
     ("ID_OLLAMA_STATUS", ID_OLLAMA_STATUS),
     ("ID_VALIDATION_MESSAGE", ID_VALIDATION_MESSAGE),
     ("ID_REQUIRE_TICK_FOR", ID_REQUIRE_TICK_FOR),
@@ -1549,6 +2290,9 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_PAUSE_LABEL", ID_PAUSE_LABEL),
     ("ID_CHANGE_PAUSE", ID_CHANGE_PAUSE),
     ("ID_ADD_PROVIDER", ID_ADD_PROVIDER),
+    ("ID_UNDO", ID_UNDO),
+    ("ID_APPLY_FOCUSED", ID_APPLY_FOCUSED),
+    ("ID_ESCAPE", ID_ESCAPE),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1597,11 +2341,7 @@ const ES_NUMBER: i32 = 0x2000;
 const BS_GROUPBOX: i32 = 0x0007;
 const BS_AUTOCHECKBOX: i32 = 0x0003;
 const BS_PUSHBUTTON: i32 = 0x0000;
-const BS_DEFPUSHBUTTON: i32 = 0x0001;
 const TBS_HORZ: i32 = 0x0000;
-/// #344: selects text in a plain edit control, used to highlight an invalid
-/// numeric field after a failed Save.
-const EM_SETSEL: u32 = 0x00B1;
 
 use windows::Win32::Graphics::Gdi::{
     InvalidateRect, RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
@@ -1728,6 +2468,9 @@ const MIN_WIN_H_DP: i32 = 2 * FOOTER_H_DP;
 /// Height of the pinned Save/Cancel footer, in dp: the button row and its
 /// top and bottom margins (#481).
 const FOOTER_H_DP: i32 = BTN_H + MARGIN * 2;
+
+/// The gap above and below the status line inside the footer, in dp (#875).
+const STATUS_PAD_DP: i32 = 4;
 /// Space kept below the last group inside the scrolling body, in dp.
 const BODY_PAD_BOTTOM: i32 = MARGIN / 2;
 
@@ -2193,7 +2936,8 @@ fn page_max_dp(inner: &SettingsInner, page: Page) -> i32 {
 /// folded away until asked for). The footer is on every page.
 unsafe fn child_visible(inner: &SettingsInner, c: &ChildLayout) -> bool {
     let Some(page) = c.page else {
-        return true;
+        // The footer is on every page; Undo shows only after a saved change.
+        return GetDlgCtrlID(c.hwnd) != ID_UNDO || inner.undo_shown;
     };
     if page != inner.page {
         return false;
@@ -6123,53 +6867,45 @@ fn build_ui_recorded(
     );
     ctx.set_anchor(prompt_group, Anchor::PromptGroup);
 
-    // -- Save / Cancel ------------------------------------------------
+    // -- Status line and Undo ------------------------------------------
     // Pinned footer: a sibling of the body, not inside it, so it never scrolls.
     // It belongs to no page and sits under the pages, right of the rail.
     ctx.parent.set(hwnd);
     ctx.page.set(None);
     let buttons_y = footer.buttons_y;
-    // #344: inline "that field is wrong" message, blank until a Save
-    // attempt fails validation. Sits to the left of the Save/Cancel row so
-    // it never overlaps either the Prompt group or the buttons.
+    // #344, #875: the status line. "Saved: Card corner", what is wrong with a
+    // row, or why a change was not saved; up to three lines, left of Undo.
     let validation = ctx.create(
         WC_STATIC,
         "",
-        0x4000, // SS_ENDELLIPSIS
+        0,
         0,
         RAIL_W_DP + content_x + MARGIN,
-        buttons_y + (BTN_H - ROW_H) / 2,
-        content_w - 2 * MARGIN - 2 * BTN_W - 12 - 12,
-        ROW_H,
+        buttons_y - MARGIN + STATUS_PAD_DP,
+        content_w - 2 * MARGIN - BTN_W - 12,
+        FOOTER_H_DP - 2 * STATUS_PAD_DP,
         ID_VALIDATION_MESSAGE,
     );
     ctx.set_anchor(validation, Anchor::Footer);
     // #778: a key an environment variable overrides cannot be edited here.
     lock_env_key_fields(hwnd);
-    let cancel = ctx.create(
+    // #875: Undo restores the latest change. It shows only once that change was
+    // saved, and never for a key (whose old value is not kept).
+    let undo = ctx.create(
         WC_BUTTON,
-        "Cancel",
-        (BS_PUSHBUTTON) as u32,
+        "Undo",
+        BS_PUSHBUTTON as u32,
         0,
         WIN_W_DP - MARGIN - BTN_W,
         buttons_y,
         BTN_W,
         BTN_H,
-        ID_CANCEL,
+        ID_UNDO,
     );
-    ctx.set_anchor(cancel, Anchor::Footer);
-    let save = ctx.create(
-        WC_BUTTON,
-        "Save",
-        (BS_DEFPUSHBUTTON) as u32,
-        0,
-        WIN_W_DP - MARGIN - BTN_W - 12 - BTN_W,
-        buttons_y,
-        BTN_W,
-        BTN_H,
-        ID_SAVE,
-    );
-    ctx.set_anchor(save, Anchor::Footer);
+    ctx.set_anchor(undo, Anchor::Footer);
+    unsafe {
+        let _ = ShowWindow(undo, SW_HIDE);
+    }
 
     // Tab order / grouping: give the first control of each visual group
     // WS_GROUP so arrow-key navigation and Tab-between-groups behave.
@@ -6183,7 +6919,7 @@ fn build_ui_recorded(
         ID_CARD_SECONDS,
         ID_REQUIRE_TICK_FOR,
         ID_PROMPT_EDIT,
-        ID_SAVE,
+        ID_UNDO,
         ID_AUTOSTART,
         ID_MODE,
     ] {
@@ -6221,8 +6957,7 @@ fn build_ui_recorded(
         ID_PROMPT_TOGGLE,
         ID_PROMPT_EDIT,
         ID_RESET_PROMPT,
-        ID_SAVE,
-        ID_CANCEL,
+        ID_UNDO,
     ] {
         if let Some(h) = get_dlg_item(hwnd, id) {
             add_style(h, WS_TABSTOP.0);
@@ -6277,6 +7012,12 @@ const WC_LISTBOX: &str = "LISTBOX";
 /// Posted to the window to change the page or move focus between the rail and
 /// the page. `wparam` says what (the `PAGE_*` codes), `lparam` is its argument.
 const WM_SETTINGS_PAGE: u32 = 0x8000 + 45; // WM_APP + 45
+/// #875: the app's answer for a write, sent to the window with a
+/// [`WriteAnswer`] in `lparam`. The window answers `1` when a row took it.
+const WM_SETTINGS_WRITE_RESULT: u32 = 0x8000 + 46; // WM_APP + 46
+/// #875: the worker that re-reads the file after an activation has its answer
+/// ready in `refresh_slot`.
+const WM_SETTINGS_REFRESH: u32 = 0x8000 + 47; // WM_APP + 47
 /// `lparam` is the page's rail position.
 const PAGE_PICK: usize = 0;
 /// `lparam` is how many pages to move (negative goes back), wrapping.
@@ -7028,9 +7769,15 @@ fn handle_learned(inner: &mut SettingsInner, which: usize, chord: Chord) {
             stop_learning(inner);
             apply_learned(&mut inner.hotkeys, which, chord);
             set_hotkey_labels(inner.hwnd, &inner.hotkeys);
-            set_hotkey_status(
-                inner.hwnd,
-                &format!("Set to {}. Press Save to keep it.", chord_to_string(&chord)),
+            set_hotkey_status(inner.hwnd, &format!("Set to {}.", chord_to_string(&chord)));
+            // #875: applied at once, like every other field.
+            commit_field(
+                inner,
+                match which {
+                    HK_PRIMARY => Field::PrimaryKey,
+                    HK_SECONDARY => Field::SecondaryKey,
+                    _ => Field::PauseKey,
+                },
             );
         }
     }
@@ -7425,62 +8172,6 @@ fn label_to_card_monitor(label: &str) -> Option<String> {
     parse_custom_label(label).map(str::to_string)
 }
 
-/// #344: a numeric Settings field whose text does not parse to a value
-/// `build_config` would actually accept, found by [`find_invalid_numeric_field`].
-/// Distinct from "blank", which `build_config` already treats as "leave the
-/// original value alone" -- this only fires for text a user actually typed
-/// that isn't a valid whole number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InvalidField {
-    MaxEdge,
-    CardSeconds,
-}
-
-impl InvalidField {
-    /// The control to focus so the user can fix it immediately.
-    fn control_id(self) -> i32 {
-        match self {
-            InvalidField::MaxEdge => ID_MAX_EDGE,
-            InvalidField::CardSeconds => ID_CARD_SECONDS,
-        }
-    }
-
-    /// The inline message shown next to Save (rule 7: never a dialog box).
-    /// No em dash (rule 11).
-    fn message(self) -> &'static str {
-        match self {
-            InvalidField::MaxEdge => "Max edge must be a whole number greater than 0.",
-            InvalidField::CardSeconds => "Auto-dismiss must be a whole number of seconds.",
-        }
-    }
-}
-
-/// Checks the two free-typed numeric fields for text that would silently be
-/// discarded by [`build_config`]'s fallback (#344: the bug was that garbage
-/// input like "2ooo" saved as if nothing had been typed, with no sign
-/// anything was wrong). A blank field is not an error here -- it is the
-/// established "leave this alone" convention `build_config` already
-/// implements and several tests already rely on. Only text that is present
-/// but does not parse to a value `build_config` would actually use counts as
-/// invalid. Returns the first invalid field found (max edge before card
-/// seconds), since only one inline message is shown at a time.
-fn find_invalid_numeric_field(raw: &RawForm) -> Option<InvalidField> {
-    let max_edge = raw.max_edge_text.trim();
-    if !max_edge.is_empty() {
-        match max_edge.parse::<u32>() {
-            Ok(v) if v > 0 => {}
-            _ => return Some(InvalidField::MaxEdge),
-        }
-    }
-
-    let card_seconds = raw.card_seconds_text.trim();
-    if !card_seconds.is_empty() && card_seconds.parse::<u32>().is_err() {
-        return Some(InvalidField::CardSeconds);
-    }
-
-    None
-}
-
 /// Clamps to the range `Card::set_text_scale` (see `ui/card.rs`) accepts;
 /// also guards against NaN/infinite input, which `f32::clamp` propagates
 /// rather than resolving.
@@ -7631,12 +8322,6 @@ fn env_hint_vars() -> Vec<&'static str> {
         .into_iter()
         .map(|(_, v)| v)
         .collect()
-}
-
-/// What Save says when the start-with-Windows switch could not be changed
-/// (#777). The window stays open so nothing is lost.
-fn autostart_failure_message() -> &'static str {
-    "Could not change Start with Windows."
 }
 
 /// The prompt as the multiline edit wants it: CRLF line breaks (#779). The
@@ -7913,6 +8598,14 @@ impl GalleryWindow {
         unsafe { show_page(inner, page) };
     }
 
+    /// Puts `text` on the status line, with Undo when `undo` (what a saved change
+    /// or a failed one shows).
+    pub(crate) fn show_status(&mut self, text: &str, undo: bool) {
+        let inner = unsafe { &mut *self.raw };
+        set_status(inner, text, undo);
+        unsafe { sync_visibility(inner) };
+    }
+
     /// Picks the active provider on the Models page (what the combo does).
     pub(crate) fn pick_provider(&mut self, provider: ActiveProvider) {
         let inner = unsafe { &mut *self.raw };
@@ -8043,7 +8736,7 @@ mod tests {
                 }
             }
             // The footer belongs to no page.
-            for id in [ID_SAVE, ID_CANCEL, ID_VALIDATION_MESSAGE] {
+            for id in [ID_UNDO, ID_VALIDATION_MESSAGE] {
                 let h = get_dlg_item(hwnd, id).expect("footer control");
                 let child = inner
                     .children
@@ -8055,7 +8748,7 @@ mod tests {
             // Every recorded child is on a page or in the footer: a group box
             // or a label made on no page would show on all of them.
             let untagged = inner.children.iter().filter(|c| c.page.is_none()).count();
-            assert_eq!(untagged, 3, "only Save, Cancel and the message line");
+            assert_eq!(untagged, 2, "only Undo and the status line");
         });
     }
 
@@ -8067,7 +8760,10 @@ mod tests {
             assert!(is_shown(hwnd, ID_AUTOSTART));
             assert!(!is_shown(hwnd, ID_REDACT), "Privacy is not showing");
             assert!(!is_shown(hwnd, ID_OPENAI_KEY), "Models is not showing");
-            assert!(is_shown(hwnd, ID_SAVE), "the footer is on every page");
+            assert!(
+                is_shown(hwnd, ID_VALIDATION_MESSAGE),
+                "the footer is on every page"
+            );
 
             // Ctrl+3: Privacy.
             unsafe { handle_page_request(inner, PAGE_PICK, 2) };
@@ -8075,7 +8771,7 @@ mod tests {
             assert!(is_shown(hwnd, ID_REDACT));
             assert!(is_shown(hwnd, ID_MAX_EDGE));
             assert!(!is_shown(hwnd, ID_AUTOSTART));
-            assert!(is_shown(hwnd, ID_SAVE));
+            assert!(is_shown(hwnd, ID_VALIDATION_MESSAGE));
             let sel = unsafe { SendMessageW(inner.rail, LB_GETCURSEL, None, None).0 };
             assert_eq!(sel, 2, "the rail follows a keyboard pick");
 
@@ -8230,38 +8926,6 @@ mod tests {
         assert_eq!(page_key('3' as u32, true, true), None);
         assert_eq!(page_key(0x22, true, true), None);
         assert_eq!(page_key(0x21, true, true), None);
-    }
-
-    /// Save on a bad field shows the page the field is on, then focuses it:
-    /// SetFocus on a hidden page's control does nothing.
-    #[test]
-    fn save_rejecting_a_field_shows_its_page_and_focuses_it() {
-        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-        with_open_window(|hwnd, _owner| {
-            let inner =
-                unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
-            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "abc");
-            unsafe { show_page(inner, Page::Privacy) };
-            assert!(!is_shown(hwnd, ID_CARD_SECONDS));
-            unsafe {
-                SendMessageW(
-                    hwnd,
-                    WM_COMMAND,
-                    Some(WPARAM(ID_SAVE as usize)),
-                    Some(LPARAM(0)),
-                );
-            }
-            assert_eq!(inner.page, Page::General);
-            assert!(is_shown(hwnd, ID_CARD_SECONDS));
-            assert!(
-                unsafe { IsWindow(Some(hwnd)) }.as_bool(),
-                "Save was rejected"
-            );
-            assert_eq!(
-                unsafe { GetFocus() },
-                get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap()
-            );
-        });
     }
 
     #[test]
@@ -9250,63 +9914,6 @@ mod tests {
         });
     }
 
-    /// #871 wired-to-nothing: Save in a real window hands the sink the config
-    /// the window opened with and the one it built, so the sink (the writer
-    /// thread in production) can send only what changed. The sink is the one
-    /// path out of the window, so if Save never called it nothing would be
-    /// saved.
-    #[test]
-    fn save_sends_only_the_touched_fields_to_the_sink() {
-        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
-        let seen: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
-        let record = seen.clone();
-        with_window(Config::default(), |hwnd, raw| {
-            unsafe { &mut *raw }.save_sink = Some(Box::new(move |original, edited| {
-                let changes = crate::config_writer::diff(original, edited).unwrap();
-                record
-                    .borrow_mut()
-                    .extend(changes.iter().map(|c| c.path().join(".")));
-                Ok(())
-            }));
-            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "42");
-            unsafe {
-                SendMessageW(
-                    hwnd,
-                    WM_COMMAND,
-                    Some(WPARAM(ID_SAVE as usize)),
-                    Some(LPARAM(0)),
-                );
-            }
-        });
-        assert_eq!(*seen.borrow(), vec!["ui.card_seconds"]);
-    }
-
-    /// #871: a sink that cannot take the edit keeps the window open and says
-    /// why inline (rule 7), and produces no result.
-    #[test]
-    fn a_sink_that_refuses_keeps_the_window_open_and_says_why() {
-        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SendMessageW};
-        with_window(Config::default(), |hwnd, raw| {
-            unsafe { &mut *raw }.save_sink =
-                Some(Box::new(|_, _| Err("the writer is not running".into())));
-            unsafe {
-                SendMessageW(
-                    hwnd,
-                    WM_COMMAND,
-                    Some(WPARAM(ID_SAVE as usize)),
-                    Some(LPARAM(0)),
-                );
-            }
-            assert!(
-                unsafe { IsWindow(Some(hwnd)) }.as_bool(),
-                "window must stay"
-            );
-            assert!(unsafe { &*raw }.result.is_none());
-            let msg = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("message line");
-            assert_eq!(get_text(msg), "Could not save: the writer is not running");
-        });
-    }
-
     /// #823 wired-to-nothing: the "Open config file" button is a real control
     /// in the built window, Enter on it presses it, and its failure line is
     /// plain words.
@@ -10039,19 +10646,9 @@ mod tests {
             assert_eq!(get_text(status), "Pulling manifest...");
             assert!(unsafe { &*raw }.pull_cancel.is_some());
 
-            // Save does not cancel the pull; it says why.
-            unsafe {
-                SendMessageW(
-                    hwnd,
-                    WM_COMMAND,
-                    Some(WPARAM(ID_SAVE as usize)),
-                    Some(LPARAM(0)),
-                );
-            }
-            let msg = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).unwrap();
-            assert_eq!(get_text(msg), "A pull is running. Stop it first.");
+            // A change in another box does not stop the pull.
+            commit_field(unsafe { &mut *raw }, Field::CardSeconds);
             assert!(!cancel.load(Ordering::SeqCst));
-            assert!(unsafe { &*raw }.result.is_none());
         });
     }
 
@@ -10211,80 +10808,6 @@ mod tests {
         assert_eq!(parse_max_edge_or("0", 1568), 1568);
         assert_eq!(parse_max_edge_or("2048", 1568), 2048);
         assert_eq!(parse_max_edge_or("bogus", 1568), 1568);
-    }
-
-    // -- find_invalid_numeric_field (#344) ---------------------------------
-
-    fn raw_with_numbers(max_edge_text: &str, card_seconds_text: &str) -> RawForm {
-        let mut raw = raw_from(&Config::default());
-        raw.max_edge_text = max_edge_text.to_string();
-        raw.card_seconds_text = card_seconds_text.to_string();
-        raw
-    }
-
-    #[test]
-    fn find_invalid_numeric_field_accepts_valid_values() {
-        assert_eq!(
-            find_invalid_numeric_field(&raw_with_numbers("2048", "30")),
-            None
-        );
-    }
-
-    #[test]
-    fn find_invalid_numeric_field_treats_blank_fields_as_fine() {
-        // Blank is "leave the original value alone" (build_config's existing
-        // fallback contract), not an error.
-        assert_eq!(find_invalid_numeric_field(&raw_with_numbers("", "")), None);
-    }
-
-    #[test]
-    fn find_invalid_numeric_field_catches_letters_in_card_seconds() {
-        // #344's exact repro: typing "2ooo" into Auto-dismiss.
-        assert_eq!(
-            find_invalid_numeric_field(&raw_with_numbers("2048", "2ooo")),
-            Some(InvalidField::CardSeconds)
-        );
-    }
-
-    #[test]
-    fn find_invalid_numeric_field_catches_letters_in_max_edge() {
-        assert_eq!(
-            find_invalid_numeric_field(&raw_with_numbers("wide", "30")),
-            Some(InvalidField::MaxEdge)
-        );
-    }
-
-    #[test]
-    fn find_invalid_numeric_field_catches_a_typed_zero_max_edge() {
-        // Zero max edge is silently rejected by `build_config`'s fallback;
-        // Save must not pretend that succeeded.
-        assert_eq!(
-            find_invalid_numeric_field(&raw_with_numbers("0", "30")),
-            Some(InvalidField::MaxEdge)
-        );
-    }
-
-    #[test]
-    fn find_invalid_numeric_field_catches_a_negative_card_seconds() {
-        assert_eq!(
-            find_invalid_numeric_field(&raw_with_numbers("2048", "-5")),
-            Some(InvalidField::CardSeconds)
-        );
-    }
-
-    #[test]
-    fn find_invalid_numeric_field_reports_max_edge_before_card_seconds() {
-        assert_eq!(
-            find_invalid_numeric_field(&raw_with_numbers("bogus", "also bogus")),
-            Some(InvalidField::MaxEdge)
-        );
-    }
-
-    #[test]
-    fn invalid_field_messages_have_no_em_dash() {
-        for field in [InvalidField::MaxEdge, InvalidField::CardSeconds] {
-            assert!(!field.message().contains('\u{2014}'));
-        }
     }
 
     // -- clamp_text_scale --------------------------------------------------
@@ -10906,7 +11429,6 @@ mod tests {
                 };
                 assert!(!posted.as_bool(), "a command was posted for {key:?}");
                 assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
-                assert!(inner.result.is_none());
                 unsafe {
                     SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(0)), None);
                 }
@@ -10953,11 +11475,12 @@ mod tests {
 
     #[test]
     fn an_autostart_failure_message_is_plain_and_has_no_dash() {
-        let m = autostart_failure_message();
+        let m = commit::failed_line(Field::Autostart.label(), AUTOSTART_FAILED);
         assert!(
-            !m.is_empty() && m.len() <= 45 && !m.contains('\u{2014}'),
+            !AUTOSTART_FAILED.is_empty() && !m.contains('\u{2014}'),
             "{m}"
         );
+        assert!(m.starts_with("Not saved: Start with Windows."), "{m}");
     }
 
     #[test]
@@ -11777,14 +12300,14 @@ mod tests {
     }
 
     #[test]
-    fn enter_presses_the_focused_button_and_saves_elsewhere() {
+    fn enter_presses_the_focused_button_and_applies_the_box_elsewhere() {
         assert_eq!(enter_command(ID_PROMPT_TOGGLE), ID_PROMPT_TOGGLE);
         assert_eq!(enter_command(ID_RESET_PROMPT), ID_RESET_PROMPT);
-        assert_eq!(enter_command(ID_CANCEL), ID_CANCEL);
+        assert_eq!(enter_command(ID_UNDO), ID_UNDO);
         assert_eq!(enter_command(ID_OLLAMA_LINK), ID_OLLAMA_LINK);
-        assert_eq!(enter_command(ID_SAVE), ID_SAVE);
-        assert_eq!(enter_command(ID_CARD_SECONDS), ID_SAVE);
-        assert_eq!(enter_command(0), ID_SAVE);
+        assert_eq!(enter_command(ID_CARD_SECONDS), ID_APPLY_FOCUSED);
+        assert_eq!(enter_command(ID_OPENAI_KEY), ID_APPLY_FOCUSED);
+        assert_eq!(enter_command(0), ID_APPLY_FOCUSED);
     }
 
     #[test]
@@ -11997,8 +12520,8 @@ mod tests {
         set_text(prompt_edit, "hello from a test");
         assert_eq!(get_text(prompt_edit), "hello from a test");
 
-        assert!(get_dlg_item(hwnd, ID_SAVE).is_some());
-        assert!(get_dlg_item(hwnd, ID_CANCEL).is_some());
+        assert!(get_dlg_item(hwnd, ID_UNDO).is_some());
+        assert!(get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).is_some());
 
         // Pasting a full-length API key must not be truncated.
         //
@@ -12239,7 +12762,7 @@ mod tests {
         let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         let instance = HINSTANCE(h.0);
         let save_w = |w: &GalleryWindow| {
-            let save = get_dlg_item(w.hwnd(), ID_SAVE).expect("Save button");
+            let save = get_dlg_item(w.hwnd(), ID_UNDO).expect("Undo button");
             client_size(save).0
         };
         let small = GalleryWindow::open(instance, Some(96)).expect("open at 96");
@@ -12473,7 +12996,7 @@ mod tests {
         let child_count = unsafe { &*raw }.children.len();
         assert_children_split_between_footer_and_body(hwnd, raw, child_count);
 
-        let save = get_dlg_item(hwnd, ID_SAVE).expect("Save button");
+        let save = get_dlg_item(hwnd, ID_UNDO).expect("Undo button");
         assert_eq!(client_size(save), (BTN_W, BTN_H));
         let font_96 = font_height_of(save);
 
@@ -12621,7 +13144,7 @@ mod tests {
             "content {} must overflow the {view_px}px view",
             si.nMax + 1
         );
-        let save = get_dlg_item(hwnd, ID_SAVE).expect("Save");
+        let save = get_dlg_item(hwnd, ID_UNDO).expect("Undo");
         let save_y = top_in_parent_px(hwnd, save);
         assert!(save_y >= view_px, "Save {save_y} overlaps the body");
         assert!(save_y + to_px(BTN_H, 96) <= client_h_px, "Save is cut off");
@@ -12744,7 +13267,7 @@ mod tests {
         let prompt = get_dlg_item(hwnd, ID_PROMPT_EDIT).expect("prompt edit");
         let reset = get_dlg_item(hwnd, ID_RESET_PROMPT).expect("reset button");
         let toggle = get_dlg_item(hwnd, ID_PROMPT_TOGGLE).expect("toggle button");
-        let save = get_dlg_item(hwnd, ID_SAVE).expect("save");
+        let save = get_dlg_item(hwnd, ID_UNDO).expect("undo");
         let visible = |w: HWND| unsafe { IsWindowVisible(w) }.as_bool();
         let click = || unsafe {
             SendMessageW(
@@ -12802,7 +13325,7 @@ mod tests {
             .iter()
             .filter(|c| c.anchor == Anchor::Footer)
             .count();
-        assert!(footer >= 3, "Save, Cancel and the validation line");
+        assert!(footer >= 2, "Undo and the status line");
         assert!(!inner.body.0.is_null(), "no scrolling body");
         // The footer, the body, the rail and the rail's name (#872).
         assert_eq!(direct_child_count(hwnd), footer + 3);
@@ -12926,7 +13449,7 @@ mod tests {
         let win = open_layout_window();
         let (client_w, _) = client_size(win.0);
         assert_eq!(client_w, window_width_px(96), "client width");
-        let cancel = get_dlg_item(win.0, ID_CANCEL).expect("Cancel");
+        let cancel = get_dlg_item(win.0, ID_UNDO).expect("Undo");
         let right = right_in_parent_px(win.0, cancel);
         assert_eq!(
             client_w - right,
@@ -13149,34 +13672,517 @@ mod tests {
         });
     }
 
-    /// #871 wired-to-nothing: Save in the real window posts the changed fields
-    /// (and only those) to the owner as `WM_APP_SETTINGS_SAVE`, then closes. If the
-    /// sink were not the production one, or the post were dropped, nothing would
-    /// reach the writer and no card would ever say "Settings saved".
+    // -- instant apply (#875) ------------------------------------------------
+
+    /// What a commit handed the sink: the field's name and the keys it patches.
+    type Sent = std::rc::Rc<std::cell::RefCell<Vec<(String, Vec<String>)>>>;
+
+    /// Gives the window a sink that records, and takes the commit as done.
+    fn record_sink(raw: *mut SettingsInner) -> Sent {
+        let seen: Sent = Default::default();
+        let record = seen.clone();
+        unsafe { &mut *raw }.save_sink = Some(Box::new(move |label, changes, _before, _with| {
+            record.borrow_mut().push((
+                label.to_string(),
+                changes.iter().map(|c| c.path().join(".")).collect(),
+            ));
+            Ok(())
+        }));
+        seen
+    }
+
+    /// Picks `text` in the list `id`, the way the list tells its window.
+    fn pick(hwnd: HWND, id: i32, text: &str) {
+        let combo = get_dlg_item(hwnd, id).expect("combo");
+        combo_select(combo, text);
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_COMMAND,
+                Some(WPARAM(id as usize | ((CBN_SELCHANGE as usize) << 16))),
+                Some(LPARAM(combo.0 as isize)),
+            );
+        }
+    }
+
+    /// The box `id` loses the focus, the way the box tells its window.
+    fn leave(hwnd: HWND, id: i32) {
+        let edit = get_dlg_item(hwnd, id).expect("box");
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_COMMAND,
+                Some(WPARAM(id as usize | ((EN_KILLFOCUS as usize) << 16))),
+                Some(LPARAM(edit.0 as isize)),
+            );
+        }
+    }
+
+    /// The app's answer for the write of `label`.
+    fn answer(hwnd: HWND, label: &str, result: Result<(), String>) -> bool {
+        let answer = WriteAnswer {
+            label,
+            result: &result,
+        };
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_SETTINGS_WRITE_RESULT,
+                None,
+                Some(LPARAM(&answer as *const WriteAnswer as isize)),
+            )
+            .0 != 0
+        }
+    }
+
+    fn status(hwnd: HWND) -> String {
+        get_text(get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("status line"))
+    }
+
+    /// The observable of slice 5: picking a card corner sends that one field,
+    /// under its name, and the window's picture of what is applied moves on. If
+    /// the commit arm were not wired the sink would hear nothing.
     #[test]
-    fn save_posts_only_the_changed_fields_to_the_owner_and_closes() {
-        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SendMessageW};
-        with_open_window(|hwnd, owner| {
+    fn a_card_corner_pick_sends_only_that_field_to_the_sink() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            // A box with text typed and not applied is not this pick's business.
             set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "42");
+            pick(hwnd, ID_CARD_CORNER, "Top left");
+            assert_eq!(
+                *seen.borrow(),
+                vec![(
+                    "Card corner".to_string(),
+                    vec!["ui.card_corner".to_string()]
+                )]
+            );
+            let inner = unsafe { &*raw };
+            assert_eq!(inner.original.ui.card_corner, CardCorner::TopLeft);
+            assert_eq!(inner.tracker.writes_in_flight(), 1);
+            assert!(inner.tracker.undo.is_some());
+            assert!(!inner.undo_shown, "Undo waits for the write to be saved");
+        });
+    }
+
+    /// Every list, checkbox and box applies on its own trigger, and a keystroke
+    /// never does.
+    #[test]
+    fn each_control_applies_on_its_own_trigger_and_never_per_keystroke() {
+        use windows::Win32::UI::WindowsAndMessaging::CBN_SELCHANGE;
+        const EN_CHANGE: u32 = 0x0300;
+        assert_eq!(
+            commit_trigger(ID_CARD_CORNER, CBN_SELCHANGE),
+            Some(Field::CardCorner)
+        );
+        assert_eq!(
+            commit_trigger(ID_ACTIVE_PROVIDER, CBN_SELCHANGE),
+            Some(Field::ActiveProvider)
+        );
+        assert_eq!(commit_trigger(ID_REDACT, BN_CLICKED), Some(Field::Redact));
+        assert_eq!(
+            commit_trigger(ID_AUTOSTART, BN_CLICKED),
+            Some(Field::Autostart)
+        );
+        assert_eq!(
+            commit_trigger(ID_CARD_SECONDS, EN_KILLFOCUS),
+            Some(Field::CardSeconds)
+        );
+        assert_eq!(
+            commit_trigger(ID_OPENAI_KEY, EN_KILLFOCUS),
+            Some(Field::OpenAiKey)
+        );
+        assert_eq!(
+            commit_trigger(ID_PROMPT_EDIT, EN_KILLFOCUS),
+            Some(Field::Prompt)
+        );
+        // Typing is not a trigger.
+        assert_eq!(commit_trigger(ID_CARD_SECONDS, EN_CHANGE), None);
+        assert_eq!(commit_trigger(ID_PROMPT_EDIT, EN_CHANGE), None);
+        // The slider applies on release (WM_HSCROLL), the shortcuts when a chord
+        // is learned, Mode through the tray's own handler.
+        assert_eq!(commit_trigger(ID_TEXT_SCALE_TRACK, 0), None);
+        assert_eq!(commit_trigger(ID_CHANGE_PRIMARY, BN_CLICKED), None);
+        assert_eq!(commit_trigger(ID_MODE, CBN_SELCHANGE), None);
+        // A list does not apply on a click, a checkbox does not on a focus change.
+        assert_eq!(commit_trigger(ID_CARD_CORNER, BN_CLICKED), None);
+        assert_eq!(commit_trigger(ID_REDACT, EN_KILLFOCUS), None);
+    }
+
+    /// Every field has a control in the window, and the control maps back to it
+    /// (the shortcuts have a Change button that starts a capture instead).
+    #[test]
+    fn every_field_has_a_control_that_maps_back_to_it() {
+        with_window(Config::default(), |hwnd, _raw| {
+            for field in Field::ALL {
+                let id = control_of_field(field);
+                assert!(
+                    get_dlg_item(hwnd, id).is_some(),
+                    "{field:?}: no control {id}"
+                );
+                if trigger_of(field) == Trigger::Capture {
+                    assert_eq!(field_of_control(id), None, "{field:?}");
+                } else {
+                    assert_eq!(field_of_control(id), Some(field), "{field:?}");
+                }
+            }
+        });
+    }
+
+    /// A number box applies when it is left, and what is applied is what was
+    /// typed.
+    #[test]
+    fn leaving_a_number_box_applies_it() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), " 42 ");
+            leave(hwnd, ID_CARD_SECONDS);
+            assert_eq!(
+                *seen.borrow(),
+                vec![(
+                    "Hide card after".to_string(),
+                    vec!["ui.card_seconds".to_string()]
+                )]
+            );
+            assert_eq!(unsafe { &*raw }.original.ui.card_seconds, 42);
+            // The box shows the number as it parsed.
+            assert_eq!(get_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap()), "42");
+            // Leaving it again with nothing new sends nothing.
+            leave(hwnd, ID_CARD_SECONDS);
+            assert_eq!(seen.borrow().len(), 1);
+        });
+    }
+
+    /// A number that does not parse is never written: the row says so, the text
+    /// stays for fixing.
+    #[test]
+    fn a_bad_number_is_not_sent_and_the_row_says_error() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            let field = get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap();
+            set_text(field, "2ooo");
+            leave(hwnd, ID_CARD_SECONDS);
+            assert!(seen.borrow().is_empty(), "a bad number was sent");
+            assert_eq!(get_text(field), "2ooo", "the text stays for fixing");
+            let line = status(hwnd);
+            assert!(line.starts_with("Error: Hide card after."), "{line}");
+            assert!(!line.contains('\u{2014}'), "{line}");
+            assert_eq!(unsafe { &*raw }.tracker.writes_in_flight(), 0);
+        });
+    }
+
+    /// A sink that cannot take the change puts the control back and says why
+    /// (rule 7: never a dialog, never a silent no-op).
+    #[test]
+    fn a_sink_that_refuses_puts_the_control_back_and_says_why() {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe { &mut *raw }.save_sink = Some(Box::new(|_, _, _, _| {
+                Err("The writer is not running.".into())
+            }));
+            let default_seconds = Config::default().ui.card_seconds.to_string();
+            let field = get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap();
+            set_text(field, "42");
+            leave(hwnd, ID_CARD_SECONDS);
+            assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
+            assert_eq!(get_text(field), default_seconds, "back to what is applied");
+            let line = status(hwnd);
+            assert!(line.starts_with("Not saved: Hide card after."), "{line}");
+            assert!(line.contains("The writer is not running."), "{line}");
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 1);
+        });
+    }
+
+    /// The writer's answer: saved shows "Saved: Card corner" with Undo; a failure
+    /// puts the value back and says why.
+    #[test]
+    fn a_write_answer_shows_saved_with_undo_and_a_failure_puts_the_value_back() {
+        with_window(Config::default(), |hwnd, raw| {
+            record_sink(raw);
+            pick(hwnd, ID_CARD_CORNER, "Top left");
+            assert!(answer(hwnd, "Card corner", Ok(())));
+            assert_eq!(status(hwnd), "Saved: Card corner");
+            assert!(is_shown(hwnd, ID_UNDO), "Undo comes with the saved line");
+            assert_eq!(unsafe { &*raw }.tracker.writes_in_flight(), 0);
+
+            // The next change hides Undo until its own answer arrives.
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "42");
+            leave(hwnd, ID_CARD_SECONDS);
+            assert!(!is_shown(hwnd, ID_UNDO));
+            assert!(answer(
+                hwnd,
+                "Hide card after",
+                Err("The disk is full.".into())
+            ));
+            let line = status(hwnd);
+            assert!(line.starts_with("Not saved: Hide card after."), "{line}");
+            assert!(line.contains("The disk is full."), "{line}");
+            let seconds = Config::default().ui.card_seconds.to_string();
+            assert_eq!(
+                get_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap()),
+                seconds
+            );
+            let inner = unsafe { &*raw };
+            assert_eq!(
+                inner.original.ui.card_seconds,
+                Config::default().ui.card_seconds
+            );
+            assert_eq!(inner.tracker.failed_count(), 1);
+            assert!(!is_shown(hwnd, ID_UNDO), "a failed row has nothing to undo");
+            // The corner that did save stays.
+            assert_eq!(inner.original.ui.card_corner, CardCorner::TopLeft);
+            // An answer nobody asked for is left for the app to say.
+            assert!(!answer(hwnd, "Card corner", Ok(())));
+            assert!(!answer(hwnd, "Not a field", Ok(())));
+        });
+    }
+
+    /// Undo sends the old value through the same sink and shows it at once.
+    #[test]
+    fn undo_sends_the_old_value_and_shows_it() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            pick(hwnd, ID_CARD_CORNER, "Top left");
+            assert!(answer(hwnd, "Card corner", Ok(())));
             unsafe {
                 SendMessageW(
                     hwnd,
                     WM_COMMAND,
-                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(WPARAM(ID_UNDO as usize | ((BN_CLICKED as usize) << 16))),
                     Some(LPARAM(0)),
                 );
             }
+            assert_eq!(seen.borrow().len(), 2, "the old value was sent");
+            assert_eq!(seen.borrow()[1].1, vec!["ui.card_corner".to_string()]);
+            let corner = get_dlg_item(hwnd, ID_CARD_CORNER).unwrap();
+            assert_eq!(get_text(corner), card_corner_label(CardCorner::BottomRight));
+            assert!(!is_shown(hwnd, ID_UNDO));
+            assert_eq!(
+                unsafe { &*raw }.original.ui.card_corner,
+                CardCorner::BottomRight
+            );
+            assert!(answer(hwnd, "Card corner", Ok(())));
+            assert_eq!(status(hwnd), "Undone: Card corner");
+            assert!(!is_shown(hwnd, ID_UNDO), "no undoing an undo");
+        });
+    }
+
+    /// Esc with text typed and not applied puts the applied text back and keeps
+    /// the window; with nothing pending it closes.
+    #[test]
+    fn esc_puts_back_pending_text_and_closes_only_when_nothing_is_pending() {
+        with_open_window(|hwnd, _owner| {
+            let inner =
+                unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
+            let field = get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap();
+            let applied = Config::default().ui.card_seconds.to_string();
+            set_text(field, "99");
+            escape_with(inner, field);
+            assert_eq!(get_text(field), applied);
+            assert!(take_posted(hwnd, WM_CLOSE).is_none(), "it kept the window");
+            // Nothing pending now: Esc closes.
+            escape_with(inner, field);
+            assert!(
+                take_posted(hwnd, WM_CLOSE).is_some(),
+                "it closed the window"
+            );
+            // A list is never "pending".
+            let combo = get_dlg_item(hwnd, ID_CARD_CORNER).unwrap();
+            escape_with(inner, combo);
+            assert!(take_posted(hwnd, WM_CLOSE).is_some());
+        });
+    }
+
+    /// A window closed with a row still failed tells the owner how many, so one
+    /// card says so; one closed with none says zero.
+    #[test]
+    fn closing_with_a_failed_row_tells_the_owner_how_many() {
+        with_open_window(|hwnd, owner| {
+            let inner =
+                unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
+            inner.tracker.fail(Field::CardCorner, "disk full");
+            inner.tracker.fail(Field::Redact, "disk full");
+            close_now();
+            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+                .expect("closing tells the owner");
+            assert_eq!(left.wParam.0, 2);
+        });
+        with_open_window(|_hwnd, owner| {
+            close_now();
+            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).unwrap();
+            assert_eq!(left.wParam.0, 0);
+        });
+    }
+
+    /// The owner window receives the field's change from the real sink: one
+    /// field, its name, and the config with it. The window stays open.
+    #[test]
+    fn a_pick_posts_one_field_to_the_owner_and_the_window_stays() {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        with_open_window(|hwnd, owner| {
+            pick(hwnd, ID_CARD_CORNER, "Top right");
             let posted = take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE)
-                .expect("Save must post the save to the owner window");
+                .expect("the change must be posted to the owner window");
             let save = unsafe { *Box::from_raw(posted.lParam.0 as *mut crate::app::SettingsSave) };
             let paths: Vec<String> = save.changes.iter().map(|c| c.path().join(".")).collect();
-            assert_eq!(paths, vec!["ui.card_seconds"]);
-            assert_eq!(save.edited.ui.card_seconds, 42);
+            assert_eq!(save.label, "Card corner");
+            assert_eq!(paths, vec!["ui.card_corner"]);
+            assert_eq!(save.edited.ui.card_corner, CardCorner::TopRight);
+            assert_eq!(save.original.ui.card_corner, CardCorner::BottomRight);
             assert!(
-                !unsafe { IsWindow(Some(hwnd)) }.as_bool(),
-                "Save closes the window"
+                unsafe { IsWindow(Some(hwnd)) }.as_bool(),
+                "no Save closes it"
             );
         });
+    }
+
+    /// The slice's done condition without the app in the middle: what the window
+    /// posts for a card corner, written the way the writer thread writes it onto a
+    /// file that has a comment, an unknown key and a hand edit, changes that one
+    /// key and nothing else. A test-only path (rule 9).
+    #[test]
+    fn a_card_corner_pick_changes_one_key_of_the_file_and_leaves_the_rest() {
+        let path = std::env::temp_dir().join(format!(
+            "wingman-settings-instant-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "# my notes\nmystery = 1\n\n[ui]\ncard_seconds = 11 # hand edit\ncard_corner = \"bottom_right\"\n",
+        )
+        .unwrap();
+        with_open_window(|hwnd, owner| {
+            pick(hwnd, ID_CARD_CORNER, "Top right");
+            let posted = take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).expect("posted");
+            let save = unsafe { *Box::from_raw(posted.lParam.0 as *mut crate::app::SettingsSave) };
+            crate::config_writer::write_changes(&path, &save.changes).expect("written");
+        });
+        let after = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(after.contains("card_corner = \"top_right\""), "{after}");
+        assert!(
+            after.contains("# my notes") && after.contains("mystery = 1"),
+            "{after}"
+        );
+        assert!(after.contains("card_seconds = 11 # hand edit"), "{after}");
+    }
+
+    /// A hand edit shows in every row that is not being typed in, and the row
+    /// being typed in keeps its text.
+    #[test]
+    fn a_hand_edit_shows_in_untouched_rows_but_not_in_the_row_being_typed() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let mut fresh = Config::default();
+            fresh.ui.card_corner = CardCorner::TopRight;
+            fresh.ui.card_seconds = 99;
+            fresh.capture.redact = !Config::default().capture.redact;
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "5");
+            adopt_file(inner, &fresh);
+            assert_eq!(
+                get_text(get_dlg_item(hwnd, ID_CARD_CORNER).unwrap()),
+                card_corner_label(CardCorner::TopRight)
+            );
+            assert_eq!(
+                checkbox_checked(hwnd, ID_REDACT),
+                fresh.capture.redact,
+                "the checkbox follows the file"
+            );
+            assert_eq!(
+                get_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap()),
+                "5",
+                "typed text is not overwritten"
+            );
+            assert_eq!(inner.original.ui.card_corner, CardCorner::TopRight);
+            assert_eq!(inner.baseline.ui.card_seconds, 99);
+            // Nothing was sent: a refresh never writes.
+            assert_eq!(inner.tracker.writes_in_flight(), 0);
+        });
+    }
+
+    /// While a write is in flight the file is about to change, so what was read
+    /// is not shown.
+    #[test]
+    fn a_re_read_during_a_write_waits_for_the_next_activation() {
+        with_window(Config::default(), |hwnd, raw| {
+            record_sink(raw);
+            pick(hwnd, ID_CARD_CORNER, "Top left");
+            let inner = unsafe { &mut *raw };
+            let mut fresh = Config::default();
+            fresh.ui.card_corner = CardCorner::BottomLeft;
+            *inner.refresh_slot.lock().unwrap() = Some(Refreshed {
+                mtime: None,
+                config: Some(fresh),
+            });
+            take_refresh(inner);
+            assert_eq!(
+                get_text(get_dlg_item(hwnd, ID_CARD_CORNER).unwrap()),
+                card_corner_label(CardCorner::TopLeft)
+            );
+            assert!(inner.file_mtime.is_none(), "the time is not taken");
+        });
+    }
+
+    /// Showing a field puts the control at that value, for every field that has
+    /// a plain control: what a failed write, Undo and a hand edit rely on.
+    #[test]
+    fn show_field_puts_every_plain_control_at_the_value() {
+        use crate::ui::settings_commit::tests::changed;
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let base = Config::default();
+            for field in Field::ALL {
+                if field.key_vendor().is_some()
+                    || matches!(field, Field::Autostart | Field::ActiveProvider)
+                {
+                    continue;
+                }
+                let target = changed(field, &base);
+                show_field(inner, field, &target);
+                let mut form = build_config(&base, &read_raw_form(inner));
+                form.hotkeys = inner.hotkeys.clone();
+                assert!(
+                    !commit::differs(field, &form, &target),
+                    "{field:?} was not shown"
+                );
+            }
+        });
+    }
+
+    /// The old Save and Cancel are gone, the commit arms are wired, and nothing
+    /// that reads or writes the file runs on the window's thread.
+    #[test]
+    fn the_window_has_no_save_and_cancel_and_applies_through_its_arms() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(code.contains("fn commit_field("), "the module moved");
+        assert!(!code.contains("ID_SAVE") && !code.contains("ID_CANCEL"));
+        assert!(!code.contains("\"Save\"") && !code.contains("\"Cancel\""));
+        // The arms that apply.
+        let wndproc = &code[code.find("unsafe extern \"system\" fn wndproc").unwrap()..];
+        for arm in [
+            "commit_focused(inner);",
+            "TB_ENDTRACK",
+            "WM_SETTINGS_WRITE_RESULT =>",
+            "WM_SETTINGS_REFRESH =>",
+            "start_refresh(inner);",
+        ] {
+            assert!(wndproc.contains(arm), "wndproc has no `{arm}`");
+        }
+        let command = &code[code.find("fn handle_command(").unwrap()..];
+        assert!(command.contains("commit_trigger(id, notify)"));
+        assert!(command.contains("ID_UNDO if notify == BN_CLICKED"));
+        // No timer but the one a pending shortcut needs, and no polling.
+        assert_eq!(code.matches("SetTimer(").count(), 1, "a timer was added");
+        // The commit path never touches the file.
+        let a = code.find("fn commit_field(").unwrap();
+        let b = code.find("fn commit_autostart(").unwrap();
+        let commit_src = &code[a..b];
+        for banned in ["std::fs", "save_to", "Config::save", "write_changes"] {
+            assert!(!commit_src.contains(banned), "commit_field uses {banned}");
+        }
+        // The re-read is on a worker, not in the window procedure.
+        let refresh = &code[code.find("fn start_refresh(").unwrap()..];
+        assert!(refresh.contains("thread::Builder::new()"));
     }
 
     /// #871 finding 7: Windows destroys a window whose creation fails after
@@ -13267,8 +14273,8 @@ mod tests {
                 ..Default::default()
             };
             assert!(pre_dispatch(&esc), "Esc in a Settings control is ours");
-            let cancel = take_posted(hwnd, WM_COMMAND).expect("Esc posts Cancel");
-            assert_eq!(cancel.wParam.0 & 0xFFFF, ID_CANCEL as usize);
+            let escape = take_posted(hwnd, WM_COMMAND).expect("Esc posts its command");
+            assert_eq!(escape.wParam.0 & 0xFFFF, ID_ESCAPE as usize);
 
             let foreign = MSG {
                 hwnd: owner,
@@ -13281,8 +14287,11 @@ mod tests {
                 "another window's key passes through"
             );
 
-            // Delivering the Cancel closes it, with no loop of ours involved.
-            unsafe { DispatchMessageW(&cancel) };
+            // Delivering the command asks the window to close (nothing is typed
+            // in a box), and delivering that closes it, with no loop of ours.
+            unsafe { DispatchMessageW(&escape) };
+            let close = take_posted(hwnd, WM_CLOSE).expect("Esc asks the window to close");
+            unsafe { DispatchMessageW(&close) };
             assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
         });
     }

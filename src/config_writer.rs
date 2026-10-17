@@ -679,21 +679,22 @@ impl Outcome {
         }
     }
 
-    /// A save from the Settings window. On failure nothing was applied, and a key
-    /// typed there was not stored.
-    pub fn settings_save() -> Self {
+    /// One change from the Settings window (#875), named `label` ("Card corner").
+    /// The window says so itself when it works (its status line), so there is no
+    /// card; on failure nothing was applied, and a card says so only when the
+    /// window cannot (it closed first).
+    pub fn settings_field(label: &str) -> Self {
         Self {
-            ok_headline: "Settings saved".to_string(),
+            ok_headline: label.to_string(),
             ok_detail: String::new(),
             ok_secs: 3,
             ok_setup: false,
-            fail_headline: "Couldn't save settings".to_string(),
-            fail_note: "Your changes were not applied and Wingman is still using its previous \
-                        settings. A key you typed was not stored, so enter it again after \
-                        fixing this."
+            fail_headline: format!("Couldn't save {label}"),
+            fail_note: "Wingman is still using the old value. A key you typed was not stored, \
+                        so enter it again after fixing this."
                 .to_string(),
             from_settings: true,
-            quiet_ok: false,
+            quiet_ok: true,
         }
     }
 }
@@ -2123,22 +2124,28 @@ x = 1
         assert!(reload.contains("unsaved.clear()"), "{reload}");
     }
 
-    /// Settings saves through the writer: its Save builds the changes with
-    /// `diff` and `guard_whole_values`, posts them to the main window, and never
-    /// calls `Config::save` or touches the disk itself.
+    /// Settings changes go through the writer: `settings_commit::plan` builds the
+    /// one field's changes with `diff` and `guard_whole_values`, the window posts
+    /// them to the main window, and it never calls `Config::save` or touches the
+    /// disk itself.
     #[test]
     fn the_settings_window_saves_through_the_writer_thread() {
+        let plan = include_str!("ui/settings_commit.rs").replace('\r', "");
+        let plan = plan
+            .split("#[cfg(test)]\npub(crate) mod tests {")
+            .next()
+            .unwrap();
+        assert!(
+            plan.contains("config_writer::diff("),
+            "a commit must send only the field that changed"
+        );
+        assert!(
+            plan.contains("config_writer::guard_whole_values("),
+            "a changed list must not replace a hand edit of the same list"
+        );
         let src = include_str!("ui/settings.rs").replace('\r', "");
         let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
         assert!(!code.is_empty());
-        assert!(
-            code.contains("crate::config_writer::diff("),
-            "Save must send only the changed fields"
-        );
-        assert!(
-            code.contains("crate::config_writer::guard_whole_values("),
-            "a changed list must not replace a hand edit of the same list"
-        );
         assert!(
             code.contains("crate::config_writer::file_baseline("),
             "the guard must compare with the file as read when the window opened"
@@ -2319,14 +2326,17 @@ x = 1
 
     #[test]
     fn a_settings_outcome_keeps_a_failed_save_out_of_unsaved_and_says_nothing_was_applied() {
-        let o = Outcome::settings_save();
+        let o = Outcome::settings_field("Card corner");
         assert!(o.from_settings);
+        assert!(o.quiet_ok, "the window says it saved");
+        assert_eq!(o.ok_headline, "Card corner");
+        assert_eq!(o.fail_headline, "Couldn't save Card corner");
         assert!(!Outcome::simple("x").from_settings);
         assert!(!Outcome::simple("x").quiet_ok);
         let quiet = Outcome::quiet("x");
         assert!(quiet.quiet_ok && !quiet.from_settings);
         assert_eq!(quiet.fail_headline, Outcome::simple("x").fail_headline);
-        assert!(o.fail_note.contains("not applied"), "{}", o.fail_note);
+        assert!(o.fail_note.contains("old value"), "{}", o.fail_note);
         assert!(o.fail_note.contains("key"), "{}", o.fail_note);
         assert!(!o.fail_note.contains('\u{2014}') && !o.ok_headline.contains('\u{2014}'));
     }
