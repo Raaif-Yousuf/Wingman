@@ -852,6 +852,12 @@ pub struct Options {
     /// while the card is up, or whose IME uses digits to pick a candidate:
     /// the options are then picked by click.
     pub claim_keys: bool,
+    /// #324: whether a click outside an answer or options card closes it
+    /// (default true). Off for someone who wants the card to stay while they
+    /// work in another window; Esc, the key and the options card's
+    /// auto-dismiss still close it. A Do it / Edit preview never closes on a
+    /// click away, whatever this says.
+    pub click_away_dismiss: bool,
 }
 
 impl Default for Options {
@@ -861,6 +867,7 @@ impl Default for Options {
             min_confidence: crate::router::DEFAULT_MIN_CONFIDENCE,
             auto_dismiss_secs: DEFAULT_OPTIONS_DISMISS_SECS,
             claim_keys: true,
+            click_away_dismiss: true,
         }
     }
 }
@@ -2757,6 +2764,25 @@ double_press_ms = 5000
         // The older keys keep their defaults in a partial table.
         assert_eq!(cfg.options.max_options, 4);
         let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.options, cfg.options);
+    }
+
+    // -- options.click_away_dismiss (issue #324) -----------------------------
+
+    #[test]
+    fn click_away_dismiss_is_on_by_default_and_a_missing_key_keeps_it_on() {
+        assert!(Config::default().options.click_away_dismiss);
+        let cfg: Config = toml::from_str("[options]\nclaim_keys = false\n").unwrap();
+        assert!(cfg.options.click_away_dismiss);
+    }
+
+    #[test]
+    fn click_away_dismiss_can_be_switched_off_and_round_trips() {
+        let cfg: Config = toml::from_str("[options]\nclick_away_dismiss = false\n").unwrap();
+        assert!(!cfg.options.click_away_dismiss);
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("click_away_dismiss = false"), "{text}");
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.options, cfg.options);
     }
