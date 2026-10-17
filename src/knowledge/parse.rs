@@ -10,11 +10,16 @@ pub const PARSER_VERSION: i64 = 1;
 pub enum ParseError {
     TooLarge,
     NotText,
+    /// A JSON Lines file with content but no line that gave any text.
+    NoReadableRecord,
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ParseError::NoReadableRecord => {
+                write!(f, "the file has no readable record (no line gave any text)")
+            }
             ParseError::TooLarge => write!(f, "the file is too large to index"),
             ParseError::NotText => write!(f, "the file does not look like text"),
         }
@@ -130,6 +135,9 @@ pub fn parse(parser: Parser, bytes: &[u8]) -> Result<Parsed, ParseError> {
         },
         Parser::JsonLines => {
             let (text, cut) = flatten::jsonl_to_text(&normalized, MAX_TEXT_BYTES);
+            if text.is_empty() && !normalized.trim().is_empty() {
+                return Err(ParseError::NoReadableRecord);
+            }
             Ok(Parsed {
                 title: None,
                 text,
@@ -1125,11 +1133,18 @@ mod tests {
         b.extend_from_slice(b"{\"k\":\"x\xffy\"}\n");
         let p = parse(Parser::JsonLines, &b).unwrap();
         assert!(p.text.contains("[0].k: caf\u{e9}"), "{}", p.text);
-        assert!(parse(Parser::JsonLines, b"not json\nat all\n")
-            .unwrap()
-            .text
-            .is_empty());
+        // #1182: a file with content but no readable record says so, instead
+        // of being indexed with nothing in it.
+        assert_eq!(
+            parse(Parser::JsonLines, b"not json\nat all\n"),
+            Err(ParseError::NoReadableRecord)
+        );
+        assert!(ParseError::NoReadableRecord
+            .to_string()
+            .contains("no readable"));
+        // A truly empty file is still just empty.
         assert_eq!(read(Parser::JsonLines, "").text, "");
+        assert_eq!(read(Parser::JsonLines, "\n\n").text, "");
     }
 
     #[test]
