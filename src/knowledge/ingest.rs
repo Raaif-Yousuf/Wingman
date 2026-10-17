@@ -91,6 +91,10 @@ pub fn start_scan(folder: &str) -> Option<std::thread::JoinHandle<()>> {
 }
 
 fn run_scan(setting: Setting) {
+    // #1053: the first open of the store (if the start-up open has not done
+    // it yet) must run at normal priority. At background priority it would
+    // hold the store's lock for a long time while any other thread waits.
+    let opened = store::global();
     lower_thread_priority();
     let wanted = match setting {
         Setting::Off => None,
@@ -109,7 +113,7 @@ fn run_scan(setting: Setting) {
         },
     };
     // A store that cannot open has already reported itself.
-    let Ok(store) = store::global() else { return };
+    let Ok(store) = opened else { return };
     let keep = wanted.as_ref().map(|r| r.to_string_lossy().into_owned());
     if let Err(e) = store.retire_default_roots_except(keep.as_deref()) {
         store::report(&e);
