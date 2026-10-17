@@ -5204,7 +5204,7 @@ impl App {
     /// window involved at all. A no-op on an empty queue.
     fn deliver_deferred(&mut self, pending: VecDeque<DeferredMessage>) {
         let mut menu_card_shown = false;
-        for message in pending {
+        for message in order_deferred(pending) {
             match message {
                 DeferredMessage::Result(result) => self.on_result(result),
                 DeferredMessage::CalendarResult(result) => self.on_calendar_result(result),
@@ -5232,6 +5232,10 @@ impl App {
                         menu_card_shown = true;
                         self.show_menu_was_open_card();
                     }
+                }
+                DeferredMessage::LearnLost => {
+                    let (headline, detail) = learn_lost_card();
+                    self.card.show_answer(headline, detail, 6, None);
                 }
                 DeferredMessage::ActivateDuringMenu => {
                     // Every one is counted, as in `wnd_proc`; a refusal says so.
@@ -5994,7 +5998,21 @@ impl App {
         self.hide_card();
         self.set_watch(false);
         SETTINGS_OPEN.with(|c| c.set(true));
+        // #1013: Settings is not owned by the owner window, so the dialog does
+        // not stop it, yet its Tab, Enter and Esc need the main pump this
+        // loop replaces. Disabled, it is plainly out of play until the dialog
+        // closes.
+        let settings_was_front = settings::is_foreground();
+        let settings_disabled = settings::set_enabled(false);
         let out = dialog();
+        if settings_disabled {
+            settings::set_enabled(true);
+            // A disabled window cannot be activated, so when the dialog closed
+            // Windows may have picked another app; give Settings the focus back.
+            if settings_was_front {
+                settings::bring_to_front();
+            }
+        }
         SETTINGS_OPEN.with(|c| c.set(false));
         let pending = take_pending_messages(settings::is_foreground());
         let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
@@ -7737,6 +7755,32 @@ enum DeferredMessage {
     /// user can post it (#236), so each one still goes through the activation
     /// rate limit when it is delivered, and only then may it show the card.
     ActivateDuringMenu,
+    /// `WM_APP_LEARNED` (#1013) while a menu, a file dialog or Settings had
+    /// the loop. The hook swallowed that key for a tray "Set ... key", so it
+    /// ends in a card (`learn_lost_card`).
+    LearnLost,
+}
+
+/// The card for a key the hook captured for a shortcut change that could not be
+/// applied because a menu, a dialog or Settings was up (#1013). The learn state
+/// is cleared by the hook the moment it captures, so `wnd_proc` cannot tell a
+/// tray "Set ... key" from a Settings Change that just ended (a timer race);
+/// the wording therefore fits both and names both ways to retry.
+fn learn_lost_card() -> (&'static str, &'static str) {
+    (
+        "Shortcut unchanged",
+        "A key was pressed while a window was open, so it was not applied. Use Set key or Change to try again.",
+    )
+}
+
+/// The batch in delivery order: a `LearnLost` first, so its card never
+/// replaces the card of a result that finished in the same batch (a later
+/// card visibly supersedes an earlier one, and the result matters more).
+fn order_deferred(mut pending: VecDeque<DeferredMessage>) -> VecDeque<DeferredMessage> {
+    pending
+        .make_contiguous()
+        .sort_by_key(|m| !matches!(m, DeferredMessage::LearnLost));
+    pending
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -7951,21 +7995,18 @@ enum SettingsReentrancy {
     /// menu does not pop up, and none of its commands can fire, over the
     /// modal), a dismiss click (the card is already hidden and its watcher
     /// disarmed before `show_modal` runs, so there is nothing to do),
-    /// `WM_APP_LEARNED` (a key captured for a Change inside Settings (#345)
-    /// never gets here: Settings' own message loop takes it off the queue
-    /// first. Any other one is stale, and its boxed `Chord` payload is freed
-    /// rather than leaked), `WM_APP_PAUSE_TOGGLE` (#181: same
-    /// treatment as the hotkey -- a chord press while Settings is open is
-    /// dropped, not queued), and the two palette messages (#25: the palette
-    /// cannot be shown while Settings is modal-open anyway; `WM_APP_PALETTE_RUN`'s
-    /// boxed `String` payload is freed rather than leaked, same as
-    /// `WM_APP_LEARNED`'s), and `WM_APP_ROUTER_RESULT` (#24: the options
+    /// `WM_APP_PAUSE_TOGGLE` (#181: same treatment as the hotkey -- a chord
+    /// press while Settings is open is dropped, not queued), and the two
+    /// palette messages (#25: the palette cannot be shown while Settings is
+    /// modal-open anyway; `WM_APP_PALETTE_RUN`'s boxed `String` payload is
+    /// freed rather than leaked), and `WM_APP_ROUTER_RESULT` (#24: the options
     /// card a router suggestion belongs to cannot be visible while Settings is
     /// modal-open either, so there is nothing left to apply it to -- a
     /// router suggestion is advisory, unlike a finished action's own
     /// result, so rule 7 does not require it to survive Settings the way
     /// `Defer`'s ids must; its boxed `(u64, Result<...>)` payload is freed
-    /// rather than leaked, same as `WM_APP_LEARNED`'s).
+    /// rather than leaked). `WM_APP_LEARNED` is no longer here (#1013): the
+    /// hook swallowed that key, so it is `Defer`red into a card.
     Ignore,
     /// Push the message's payload onto `PENDING_MESSAGES`, oldest-last;
     /// `open_settings` drains and delivers every one of them, in arrival
@@ -8051,6 +8092,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_CONFIG_WRITTEN
         | WM_APP_SETTINGS_LEFT
         | WM_APP_SETTINGS_SAVE
+        // #1013: the hook swallowed the key, so it ends in a card.
+        | WM_APP_LEARNED
         // #845: the verdict the user asked for is shown once Settings is gone,
         // not dropped (#328 ignored it, which left no card at all).
         | WM_APP_MACHINE_CHECK_RESULT => SettingsReentrancy::Defer,
@@ -8058,7 +8101,6 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
         | WM_APP_DISMISS
-        | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
         // #133: only a card update; with Settings open there is nothing to
         // update, so the box is freed and the probe's answer dropped.
@@ -8081,8 +8123,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // still passes the keydown through per the Ignore branch above), so
         // both palette messages are simply dropped here, same treatment
         // WM_APP_PAUSE_TOGGLE already gets. WM_APP_PALETTE_RUN's boxed
-        // `String` payload is freed explicitly below (mirroring
-        // WM_APP_LEARNED's) so it never leaks.
+        // `String` payload is freed explicitly below (`free_boxed_payload`)
+        // so it never leaks.
         // #24: WM_APP_ROUTER_RESULT is dropped the same way -- a router
         // suggestion is advisory, and the palette it belongs to cannot be
         // visible while Settings is modal-open either, so there is nothing
@@ -8237,6 +8279,12 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
             Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts)
         }),
         WM_APP_HOTKEY => DeferredMessage::KeyDuringMenu,
+        // #1013: never applied late (that would rebind on a stale press); the
+        // chord is freed and the user is told it was not taken.
+        WM_APP_LEARNED => {
+            drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
+            DeferredMessage::LearnLost
+        }
         WM_APP_ACTIVATE => DeferredMessage::ActivateDuringMenu,
         _ => return None,
     })
@@ -8347,6 +8395,10 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         | WM_APP_PREVIEW_DECIDED
         | WM_APP_SEND_PREVIEW
         | WM_APP_PAUSE_TOGGLE
+        // #1013: a chord the hook swallowed for a tray "Set ... key" while
+        // Settings is in front. Settings takes its own Change's chord before
+        // it gets here, so this one belongs to the tray; it ends in a card.
+        | WM_APP_LEARNED
         | WM_APP_MACHINE_CHECK_RESULT => ForegroundPolicy::Hold,
         // Advisory updates for cards, the palette and the options card, none
         // of which is showing while Settings is.
@@ -8356,10 +8408,6 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
         | WM_APP_OPTIONS_CHOICE => ForegroundPolicy::Drop,
-        // Settings takes a chord itself while its own Change is pending; one
-        // that reaches here is from a Change that ended (Esc, timeout), and
-        // applying it would rebind a hotkey the user cancelled.
-        WM_APP_LEARNED => ForegroundPolicy::Drop,
         // The writer's answer and the save apply the setting at once; the Wingman
         // key and activation are refused with a card (`settings_hold_card`);
         // Quit, the tray and the card's own clicks work as always.
@@ -8702,9 +8750,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         };
         match policy {
             SettingsReentrancy::Ignore => {
-                // WM_APP_LEARNED, WM_APP_PALETTE_RUN and WM_APP_ROUTER_RESULT
-                // are the only ignored messages carrying a boxed payload;
-                // free them so none leaks. (WM_APP_CALENDAR_RESULT,
+                // WM_APP_PALETTE_RUN and WM_APP_ROUTER_RESULT are the only
+                // ignored messages carrying a boxed payload (WM_APP_LEARNED's
+                // is taken by the Defer arm since #1013); free them so none
+                // leaks. (WM_APP_CALENDAR_RESULT,
                 // WM_APP_REVIEW_RESULT and WM_APP_FORM_FILL_RESULT are all
                 // Defer, not Ignore -- issue #213/#40.)
                 free_boxed_payload(msg, lparam);
@@ -9251,6 +9300,9 @@ mod tests {
             WM_APP_PREVIEW_DECIDED,
             WM_APP_SEND_PREVIEW,
             WM_APP_PAUSE_TOGGLE,
+            // #1013: a chord the hook swallowed for a tray "Set ... key" must
+            // end in a card, not vanish.
+            WM_APP_LEARNED,
             // #845: an on-demand verdict is still owed a card.
             WM_APP_MACHINE_CHECK_RESULT,
         ] {
@@ -9263,10 +9315,6 @@ mod tests {
             WM_APP_PALETTE_TOGGLE,
             WM_APP_PALETTE_RUN,
             WM_APP_OPTIONS_CHOICE,
-            // Settings takes a captured chord itself while a Change is
-            // pending; one that reaches the main window is from a Change that
-            // was cancelled or timed out, and must not rebind a hotkey.
-            WM_APP_LEARNED,
         ] {
             assert_eq!(settings_foreground_policy(id), P::Drop, "{id}");
         }
@@ -9283,6 +9331,83 @@ mod tests {
         ] {
             assert_eq!(settings_foreground_policy(id), P::Pass, "{id}");
         }
+    }
+
+    /// #1013 item 2: a chord the hook swallowed for a tray "Set ... key" ends
+    /// in a card whenever it arrives while a menu, a file dialog or Settings is
+    /// up, and the card says the shortcut is unchanged.
+    #[test]
+    fn a_swallowed_learn_key_is_deferred_into_a_card_not_dropped() {
+        use super::{learn_lost_card, take_deferred, DeferredMessage};
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_LEARNED, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
+        );
+        assert_eq!(
+            super::tray_menu_policy(WM_APP_LEARNED, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
+        );
+        let boxed = Box::into_raw(Box::new(crate::hotkey::Chord {
+            vk: 0x41,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            win: false,
+        }));
+        let got = take_deferred(WM_APP_LEARNED, WPARAM(0), LPARAM(boxed as isize));
+        assert!(matches!(got, Some(DeferredMessage::LearnLost)));
+        let (headline, detail) = learn_lost_card();
+        assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
+        assert!(headline.contains("unchanged"), "{headline}");
+        // Fits a tray "Set key" and a Settings "Change" alike.
+        assert!(
+            detail.contains("Set key") && detail.contains("Change"),
+            "{detail}"
+        );
+    }
+
+    /// #1013: a lost-key card queued after a finished result must not replace
+    /// the result's card, so `LearnLost` is delivered first.
+    #[test]
+    fn a_lost_learn_key_is_delivered_before_a_result_card() {
+        use super::{order_deferred, DeferredMessage};
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(DeferredMessage::KeyDuringMenu);
+        q.push_back(DeferredMessage::Result(Err("e".to_string())));
+        q.push_back(DeferredMessage::LearnLost);
+        let out: Vec<_> = order_deferred(q).into_iter().collect();
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0], DeferredMessage::LearnLost));
+        assert!(matches!(out[1], DeferredMessage::KeyDuringMenu));
+        assert!(matches!(out[2], DeferredMessage::Result(_)));
+        // The issue's case: [Result(ok-ish), LearnLost].
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(DeferredMessage::Result(Err("e".to_string())));
+        q.push_back(DeferredMessage::LearnLost);
+        let out = order_deferred(q);
+        assert!(matches!(out.back(), Some(DeferredMessage::Result(_))));
+    }
+
+    /// #1013 item 1: the file dialog is not owned by Settings, so Settings is
+    /// disabled for as long as the dialog runs (its Tab, Enter and Esc come
+    /// from the main pump, which the dialog's own loop replaces).
+    #[test]
+    fn the_os_file_dialog_disables_settings_around_it() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn run_os_dialog<T>(", "\n    }\n");
+        let off = body
+            .find("settings::set_enabled(false)")
+            .expect("never disabled");
+        let dlg = body.find("dialog()").expect("no dialog call");
+        let on = body
+            .find("settings::set_enabled(true)")
+            .expect("never re-enabled");
+        assert!(off < dlg && dlg < on, "disable, run the dialog, re-enable");
+        let front = body
+            .find("settings::bring_to_front()")
+            .expect("focus never given back");
+        assert!(on < front, "refocus only after it is enabled again");
     }
 
     /// Everything the policy holds must be something `take_deferred` can take, or
@@ -11932,7 +12057,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_reentrancy_ignores_hotkey_activate_tray_dismiss_learned_and_pause_toggle() {
+    fn settings_reentrancy_ignores_hotkey_activate_tray_dismiss_and_pause_toggle() {
         // Issue #213: WM_APP_CALENDAR_RESULT, WM_APP_REVIEW_RESULT,
         // WM_APP_PREVIEW_DECIDED and (#40) WM_APP_FORM_FILL_RESULT used to
         // be asserted Ignore here too, before they moved to Defer -- see
@@ -11942,7 +12067,6 @@ mod tests {
             WM_APP_ACTIVATE,
             WM_APP_TRAY,
             WM_APP_DISMISS,
-            WM_APP_LEARNED,
             WM_APP_PAUSE_TOGGLE,
         ] {
             assert_eq!(
@@ -11957,7 +12081,7 @@ mod tests {
     fn settings_reentrancy_ignores_palette_and_router_messages() {
         // #25/#24: these three share one match arm in
         // `settings_reentrancy_policy` -- covered together here (a gap the
-        // pre-existing `..._hotkey_activate_tray_dismiss_learned_and_pause_toggle`
+        // pre-existing `..._hotkey_activate_tray_dismiss_and_pause_toggle`
         // test above never closed for WM_APP_PALETTE_TOGGLE/WM_APP_PALETTE_RUN;
         // filed as a finding rather than folded into that test's name, which
         // this commit does not otherwise touch). WM_APP_ROUTER_RESULT is
@@ -12764,7 +12888,6 @@ mod tests {
         const DROPPED: &[u32] = &[
             WM_APP_TRAY,
             WM_APP_DISMISS,
-            WM_APP_LEARNED,
             WM_APP_PALETTE_TOGGLE,
             WM_APP_PALETTE_RUN,
             WM_APP_CARD_OPEN_SETTINGS,
@@ -12937,7 +13060,7 @@ mod tests {
         ("WM_APP_TRAY", WM_APP_TRAY, SettingsReentrancy::Ignore),
         ("WM_APP_HOTKEY", WM_APP_HOTKEY, SettingsReentrancy::Ignore),
         ("WM_APP_RESULT", WM_APP_RESULT, SettingsReentrancy::Defer),
-        ("WM_APP_LEARNED", WM_APP_LEARNED, SettingsReentrancy::Ignore),
+        ("WM_APP_LEARNED", WM_APP_LEARNED, SettingsReentrancy::Defer),
         ("WM_APP_DISMISS", WM_APP_DISMISS, SettingsReentrancy::Ignore),
         (
             "WM_APP_ACTIVATE",
