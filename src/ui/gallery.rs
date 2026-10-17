@@ -263,6 +263,9 @@ pub enum GalleryState {
     /// #1125: the General page with the Card corner list dropped open, the
     /// list pasted in from its own window.
     SettingsComboOpen,
+    /// #582: the General page with the Start with Windows checkbox ticked and
+    /// holding the keyboard focus, to see the box, tick and focus frame together.
+    SettingsCheckFocus,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
@@ -333,6 +336,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsKeyRejected,
         SettingsComboHover,
         SettingsComboOpen,
+        SettingsCheckFocus,
         RegionOverlay,
         OverlayNotes,
         TrayMenu,
@@ -398,6 +402,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsKeyRejected => "settings-key-rejected",
         SettingsComboHover => "settings-combo-hover",
         SettingsComboOpen => "settings-combo-open",
+        SettingsCheckFocus => "settings-check-focus",
         RegionOverlay => "region-overlay",
         OverlayNotes => "overlay-notes",
         TrayMenu => "tray-menu",
@@ -1208,6 +1213,7 @@ mod driver {
             | SettingsNotSaved
             | SettingsComboHover
             | SettingsComboOpen
+            | SettingsCheckFocus
             | SettingsKeyChecking
             | SettingsKeyRejected => {
                 card.hide();
@@ -1239,6 +1245,7 @@ mod driver {
                     ),
                     SettingsComboHover => w.hover_combo(crate::ui::settings::CARD_CORNER_COMBO),
                     SettingsComboOpen => w.open_combo_list(crate::ui::settings::CARD_CORNER_COMBO),
+                    SettingsCheckFocus => w.focus_checked_autostart(),
                     _ => {}
                 }
                 *settings = Some(w);
@@ -1264,6 +1271,7 @@ mod driver {
             | SettingsNotSaved
             | SettingsComboHover
             | SettingsComboOpen
+            | SettingsCheckFocus
             | SettingsKeyChecking
             | SettingsKeyRejected => settings
                 .as_ref()
@@ -1808,7 +1816,7 @@ mod tests {
             settings_states += usize::from(n.starts_with("settings-"));
         }
         assert_eq!(
-            settings_states, 15,
+            settings_states, 16,
             "the test must see every Settings state"
         );
     }
@@ -1944,8 +1952,9 @@ mod tests {
         // saved (#875) = 49, + the in-place overlay (#809) = 50, + the key being
         // checked and refused (#876) = 52, + the Settings combo under the mouse
         // (#1109) = 53, + the same combo with its list open (#1125) = 54, + the long
-        // button label (#828) = 55.
-        assert_eq!(states.len(), 55);
+        // button label (#828) = 55, + the focused checked checkbox
+        // (#582) = 56.
+        assert_eq!(states.len(), 56);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -1995,14 +2004,15 @@ mod tests {
             "settings-key-rejected",
             "settings-combo-hover",
             "settings-combo-open",
+            "settings-check-focus",
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
         // One state per page of the rail: a page added there needs a picture.
         assert_eq!(
             crate::ui::settings::page_labels().len(),
-            names.iter().filter(|n| n.starts_with("settings-")).count() - 10,
-            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line five (#875, #876), the combo hover (#1109) and the open combo list (#1125)"
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 11,
+            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line five (#875, #876), the combo hover (#1109) the open combo list (#1125) and the focused checkbox (#582)"
         );
     }
 

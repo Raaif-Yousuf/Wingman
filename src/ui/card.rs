@@ -109,15 +109,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    IsChild, IsWindow, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GetForegroundWindow, GetMessageTime, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, IsChild, IsWindow, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW,
+    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE,
     HMENU, HWND_TOPMOST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETCLIENTAREAANIMATION,
     SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE,
     WM_SHOWWINDOW, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD,
     WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
@@ -307,6 +307,11 @@ impl Card {
             reading_stream: 0,
             preview_decision_pending: false,
             preview_generation: 0,
+            preview_key_arm_ms: if class_name == CLASS_NAME {
+                PREVIEW_KEY_ARM_MS
+            } else {
+                0
+            },
             edit_bg_brush: HBRUSH(std::ptr::null_mut()),
             pending_stage: PendingStage::Working,
             animations_enabled: true,
@@ -1785,6 +1790,9 @@ struct CardInner {
     /// without a generation the owner would process that abandonment later
     /// and clear the state belonging to the preview now on screen.
     preview_generation: u32,
+    /// #1212: how long after a preview is shown a key press may not confirm
+    /// it. Zero (the test window class) turns the time rule off.
+    preview_key_arm_ms: u32,
     /// Issue #350: the brush WM_CTLCOLOREDIT returns for preview EDIT
     /// fields, matching `self.theme`. Created lazily on first use and cached
     /// rather than created per-paint (WM_CTLCOLOREDIT fires on every
@@ -4038,7 +4046,20 @@ impl CardInner {
                 } else if self.state == CardState::Preview {
                     let enter_confirms = self.preview.as_ref().map_or(true, |p| p.enter_confirms);
                     if let Some(command_id) = preview_key_command(wparam.0 as u16, enter_confirms) {
-                        self.run_preview_command(command_id);
+                        // #1212: a key meant for another window can land
+                        // here the moment the card takes focus.
+                        let held_back = command_id == ID_PREVIEW_DO_IT
+                            && !self.preview.as_ref().map_or(true, |p| {
+                                preview_confirm_key_allowed(
+                                    unsafe { GetMessageTime() } as u32,
+                                    p.shown_tick,
+                                    p.key_arm_ms,
+                                    lparam.0,
+                                )
+                            });
+                        if !held_back {
+                            self.run_preview_command(command_id);
+                        }
                     }
                 }
                 Some(LRESULT(0))
@@ -4204,6 +4225,8 @@ impl CardInner {
             error: None,
             confirm_label,
             enter_confirms: label_confirms_with_enter(confirm_label),
+            shown_tick: unsafe { windows::Win32::System::SystemInformation::GetTickCount() },
+            key_arm_ms: self.preview_key_arm_ms,
             note: note.filter(|n| !n.is_empty()).map(str::to_string),
         });
         // #225: from here until a decision is reported, tearing this
@@ -5223,6 +5246,10 @@ struct PreviewUi {
     /// Whether Enter presses the confirm button; `false` for the send
     /// preview (#105), which is click-only.
     enter_confirms: bool,
+    /// #1212: `GetTickCount` when the preview was shown, and the delay after
+    /// it during which a key may not confirm (see [`preview_confirm_key_allowed`]).
+    shown_tick: u32,
+    key_arm_ms: u32,
     /// #228: a small display-only line under the fields, naming the model
     /// that answered when a fallback did. Not a field: never confirmed.
     note: Option<String>,
@@ -5283,6 +5310,48 @@ fn preview_key_command(vk: u16, enter_confirms: bool) -> Option<i32> {
     } else {
         None
     }
+}
+
+/// #1212: how long after a writing preview appears a key may not confirm it.
+/// The model answer arrives seconds after the press, so a user still typing
+/// in the target window can hit Enter or Space just as the card takes focus.
+/// Short enough that nobody waits for it; a click is never held back. This
+/// is a time rule (`GetMessageTime` against the show tick), so there is no
+/// timer and no idle cost. THEORY (unverified): a keystroke that lands later
+/// than this is indistinguishable from a deliberate one.
+const PREVIEW_KEY_ARM_MS: u32 = 500;
+
+/// Whether a confirming key-down (Enter) may press "Do it": not a held key
+/// repeating (bit 30 of `key_lparam`), and stamped `arm_ms` or more after the
+/// preview was shown. `arm_ms == 0` turns the time rule off. Wrap-safe: the
+/// tick counter is a `u32` of milliseconds.
+fn preview_confirm_key_allowed(
+    msg_time: u32,
+    shown_tick: u32,
+    arm_ms: u32,
+    key_lparam: isize,
+) -> bool {
+    if key_lparam & (1 << 30) != 0 {
+        return false;
+    }
+    if arm_ms == 0 {
+        return true;
+    }
+    // The i32 view of the wrapped difference reads negative once the preview
+    // has been open about 24.8 days; accepted, a preview never stays that long.
+    msg_time.wrapping_sub(shown_tick) as i32 >= arm_ms as i32
+}
+
+/// The show tick and arming delay of the preview showing in `card`, for the
+/// child-control subclass. Read-only, like [`live_preview_generation`].
+unsafe fn live_preview_key_gate(card: HWND) -> Option<(u32, u32)> {
+    let ptr = GetWindowLongPtrW(card, GWLP_USERDATA) as *const CardInner;
+    if ptr.is_null() {
+        return None;
+    }
+    (*std::ptr::addr_of!((*ptr).preview))
+        .as_ref()
+        .map(|p| (p.shown_tick, p.key_arm_ms))
 }
 
 /// The confirm button's text on the send preview (#105).
@@ -5390,10 +5459,34 @@ unsafe extern "system" fn preview_control_subclass(
     ref_data: usize,
 ) -> LRESULT {
     let parent = HWND(ref_data as *mut c_void);
+    // #1212: Space presses a focused button on its own, so a Space meant for
+    // another window must not reach it inside the arming delay.
+    if (msg == WM_KEYDOWN || msg == WM_KEYUP)
+        && wparam.0 as u16 == VK_SPACE.0
+        && is_owner_drawn_button(hwnd)
+    {
+        if let Some((shown, arm_ms)) = live_preview_key_gate(parent) {
+            if !preview_confirm_key_allowed(GetMessageTime() as u32, shown, arm_ms, lparam.0) {
+                return LRESULT(0);
+            }
+        }
+    }
     if msg == WM_KEYDOWN {
         if let Some(command_id) =
             preview_key_command(wparam.0 as u16, live_preview_enter_confirms(parent))
         {
+            if command_id == ID_PREVIEW_DO_IT {
+                if let Some((shown, arm_ms)) = live_preview_key_gate(parent) {
+                    if !preview_confirm_key_allowed(
+                        GetMessageTime() as u32,
+                        shown,
+                        arm_ms,
+                        lparam.0,
+                    ) {
+                        return LRESULT(0);
+                    }
+                }
+            }
             let _ = PostMessageW(
                 Some(parent),
                 WM_CARD_PREVIEW_COMMAND,
@@ -8264,6 +8357,54 @@ mod tests {
         }
     }
 
+    // -- #1212: a key meant for another window must not confirm -------------
+
+    #[test]
+    fn a_confirm_key_is_ignored_until_the_arming_delay_has_passed() {
+        let shown = 10_000u32;
+        // Stamped before the card was shown, at the show, just inside the delay.
+        assert!(!preview_confirm_key_allowed(9_000, shown, 500, 0));
+        assert!(!preview_confirm_key_allowed(10_000, shown, 500, 0));
+        assert!(!preview_confirm_key_allowed(10_499, shown, 500, 0));
+        // At the delay and after it.
+        assert!(preview_confirm_key_allowed(10_500, shown, 500, 0));
+        assert!(preview_confirm_key_allowed(60_000, shown, 500, 0));
+        // The tick counter wrapping between show and key is still ordered.
+        assert!(!preview_confirm_key_allowed(100, u32::MAX - 100, 500, 0));
+        assert!(preview_confirm_key_allowed(600, u32::MAX - 100, 500, 0));
+    }
+
+    #[test]
+    fn a_held_key_repeating_never_confirms() {
+        // Bit 30 of the key-down lparam: the key was already down.
+        assert!(!preview_confirm_key_allowed(60_000, 10_000, 500, 1 << 30));
+        assert!(!preview_confirm_key_allowed(60_000, 10_000, 0, 1 << 30));
+    }
+
+    #[test]
+    fn a_zero_arming_delay_turns_the_time_rule_off() {
+        assert!(preview_confirm_key_allowed(0, 10_000, 0, 0));
+    }
+
+    #[test]
+    fn enter_stamped_inside_the_arming_delay_leaves_the_preview_open() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        // A delay no test can outlast, whatever the message clock says.
+        card.inner.preview.as_mut().unwrap().key_arm_ms = 1_000_000;
+
+        let handled = card.handle_message(WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(0));
+        assert!(handled.is_some());
+        assert_eq!(card.state(), CardState::Preview);
+        assert!(card.take_confirmed().is_none());
+
+        // Esc is never held back.
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_ESCAPE.0 as usize), LPARAM(0));
+        assert_eq!(card.state(), CardState::Hidden);
+    }
+
     // -- preview_cancels_on_focus_loss: pure decision (#207) -------------------
 
     #[test]
@@ -9352,6 +9493,86 @@ mod tests {
         );
         assert_eq!(msg.message, WM_CARD_PREVIEW_COMMAND);
         assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_DO_IT);
+    }
+
+    /// #1212: the child-control subclass is where Enter and Space actually
+    /// arrive while a field or button has focus, so the delay must hold there.
+    #[test]
+    fn the_subclass_holds_back_early_and_repeating_confirm_keys() {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let card_hwnd = card.hwnd();
+        let (do_it, start) = {
+            let p = card.inner.preview.as_ref().unwrap();
+            let start = p.edits.iter().find(|(n, _)| n == "start").unwrap().1;
+            (p.do_it_btn, start)
+        };
+        let send = |hwnd: HWND, msg: u32, vk: u16, lparam: isize| unsafe {
+            let _ = preview_control_subclass(
+                hwnd,
+                msg,
+                WPARAM(vk as usize),
+                LPARAM(lparam),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        };
+        let posted = || {
+            let mut m = MSG::default();
+            // Ranged peeks only: an unfiltered discard could loop on WM_PAINT.
+            let command = unsafe {
+                PeekMessageW(
+                    &mut m,
+                    Some(card_hwnd),
+                    WM_CARD_PREVIEW_COMMAND,
+                    WM_CARD_PREVIEW_COMMAND,
+                    PM_REMOVE,
+                )
+                .as_bool()
+            };
+            let click = unsafe {
+                PeekMessageW(&mut m, Some(card_hwnd), WM_COMMAND, WM_COMMAND, PM_REMOVE).as_bool()
+            };
+            command || click
+        };
+
+        // Inside the delay: Enter on a field, Enter and Space on the button.
+        card.inner.preview.as_mut().unwrap().key_arm_ms = 1_000_000;
+        send(start, WM_KEYDOWN, VK_RETURN.0, 0);
+        send(do_it, WM_KEYDOWN, VK_RETURN.0, 0);
+        send(do_it, WM_KEYDOWN, VK_SPACE.0, 0);
+        send(do_it, WM_KEYUP, VK_SPACE.0, 0);
+        assert!(!posted(), "an early key reached the Do it button");
+
+        // Past the delay: a repeating Space or Enter is still held back...
+        {
+            let p = card.inner.preview.as_mut().unwrap();
+            p.key_arm_ms = 1;
+            p.shown_tick = (unsafe { GetMessageTime() } as u32).wrapping_sub(10_000);
+        }
+        send(do_it, WM_KEYDOWN, VK_SPACE.0, 1 << 30);
+        send(do_it, WM_KEYDOWN, VK_RETURN.0, 1 << 30);
+        assert!(!posted(), "a repeating key reached the Do it button");
+
+        // ...and a fresh Enter is not (the gate is not a blanket refusal).
+        send(start, WM_KEYDOWN, VK_RETURN.0, 0);
+        assert!(posted(), "a fresh Enter past the delay must confirm");
+    }
+
+    #[test]
+    fn live_preview_key_gate_reads_the_showing_preview() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        assert_eq!(unsafe { live_preview_key_gate(card.hwnd()) }, None);
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        card.inner.preview.as_mut().unwrap().key_arm_ms = 321;
+        let gate = unsafe { live_preview_key_gate(card.hwnd()) };
+        assert_eq!(gate.map(|g| g.1), Some(321));
     }
 
     // -- stale preview command must not hijack a later preview (#255) -----

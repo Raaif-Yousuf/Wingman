@@ -506,6 +506,11 @@ pub(crate) const COMBO_TEXT_PAD_DP: i32 = SPACE_SM_DP;
 /// Thickness of the accent line under a focused text box, in dp (the
 /// Windows 11 text box underline).
 pub(crate) const FOCUS_LINE_DP: i32 = 2;
+/// Side of a checkbox's box, in dp. Smaller than the Windows 11 20 so the label
+/// starts where the stock one does and the rows keep their layout (#582).
+pub(crate) const CHECK_BOX_DP: i32 = 16;
+/// Gap between a checkbox's box and its label, in dp.
+pub(crate) const CHECK_TEXT_GAP_DP: i32 = 4;
 /// Height of a button, in dp (Windows 11 controls are 32 tall).
 pub(crate) const CONTROL_HEIGHT_DP: i32 = 32;
 /// Gap between stacked rows of a form, in dp.

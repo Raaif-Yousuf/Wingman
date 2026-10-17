@@ -565,24 +565,66 @@ fn default_end(start: &EventTime) -> EventTime {
 /// Escapes RFC 5545 `TEXT` value special characters (§3.3.11): backslash,
 /// comma, semicolon, and a line break to the literal two-character `\n`.
 /// Applied before folding (folding operates on the already-escaped octet
-/// stream, per the connector design doc). A bare CR (no accompanying LF) is
-/// dropped rather than escaped: a JSON string value (the wire shape every
-/// caller of this connector goes through) uses LF line breaks, not
-/// old-Mac-style bare CR, so this is a deliberate scope limitation, not an
-/// unmeasured guess.
+/// stream, per the connector design doc).
+///
+/// #1214: first runs [`strip_unsafe_text`], so control characters, the
+/// Unicode line separators (NEL, LS, PS, which become line breaks) and the
+/// invisible format characters of [`is_hidden_format`] never reach the file.
+/// That includes the left-to-right and right-to-left marks and zero-width
+/// space: a reader could otherwise reorder or hide what the preview showed.
+/// A bare CR is dropped, as is every other control character.
 pub(crate) fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    for c in strip_unsafe_text(s).chars() {
         match c {
             '\\' => out.push_str("\\\\"),
             ',' => out.push_str("\\,"),
             ';' => out.push_str("\\;"),
             '\n' => out.push_str("\\n"),
-            '\r' => {}
             other => out.push(other),
         }
     }
     out
+}
+
+/// Removes what no calendar or contact text may carry (#1214): control
+/// characters (a tab becomes a space), the byte order mark and the hidden
+/// format characters. NEL, LS and PS become `\n`, the one line break kept.
+pub(crate) fn strip_unsafe_text(s: &str) -> String {
+    s.chars()
+        .filter_map(|c| match c {
+            '\n' | '\u{85}' | '\u{2028}' | '\u{2029}' => Some('\n'),
+            '\t' => Some(' '),
+            c if c.is_control() || c == '\u{feff}' || is_hidden_format(c) => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// True for the format characters that reorder or hide text (bidi overrides,
+/// isolates, marks and zero-width or invisible operators, the soft hyphen,
+/// the combining grapheme joiner, the Mongolian vowel separator, interlinear
+/// annotation marks and the Unicode tag block). The joiners ZWJ and ZWNJ are
+/// not in it: scripts need them. The tag block is stripped everywhere, so a
+/// subdivision flag emoji loses its tags and shows as the plain black flag.
+/// Shared by the ICS escaping, the contact cleaning and the typed fallback
+/// so all apply one rule.
+pub(crate) fn is_hidden_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200b}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{061c}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{ad}'
+            | '\u{34f}'
+            | '\u{180e}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
+    )
 }
 
 /// Folds one unfolded content line to RFC 5545's 75-octet limit (§3.1):
@@ -1421,6 +1463,29 @@ END:VCALENDAR\r\n";
         for (input, expected) in cases {
             assert_eq!(escape_text(input), *expected, "failed for {input:?}");
         }
+    }
+
+    /// #1214: nothing that a calendar app might read as a line break or a
+    /// hidden control survives into the file, the same rule the vCard path
+    /// always had.
+    #[test]
+    fn escape_text_strips_controls_and_maps_unicode_line_breaks() {
+        assert_eq!(escape_text("a\u{2028}b"), "a\\nb");
+        assert_eq!(escape_text("a\u{2029}b"), "a\\nb");
+        assert_eq!(escape_text("a\u{85}b"), "a\\nb");
+        for c in [
+            '\u{b}', '\u{c}', '\u{8}', '\u{1b}', '\u{7f}', '\u{202e}', '\u{2066}', '\u{feff}',
+            '\u{200b}',
+        ] {
+            let out = escape_text(&format!("a{c}b"));
+            assert_eq!(out, "ab", "{c:?} must be dropped");
+        }
+        assert_eq!(escape_text("a\u{E0041}b"), "ab");
+        for c in ['\u{ad}', '\u{34f}', '\u{180e}', '\u{fff9}', '\u{fffb}'] {
+            assert_eq!(escape_text(&format!("a{c}b")), "ab", "{c:?}");
+        }
+        assert_eq!(escape_text("a\tb"), "a b");
+        assert_eq!(escape_text("caf\u{e9} \u{1F600}"), "caf\u{e9} \u{1F600}");
     }
 
     #[test]
