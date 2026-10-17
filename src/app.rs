@@ -1294,7 +1294,7 @@ impl App {
         else {
             return false;
         };
-        self.card.show_settings_needed(&headline, &detail);
+        self.show_setup_card(&headline, &detail);
         true
     }
 
