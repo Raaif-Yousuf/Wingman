@@ -82,6 +82,8 @@ pub fn follows_variants(state: GalleryState) -> bool {
             | SettingsSaved
             | SettingsInvalid
             | SettingsNotSaved
+            | SettingsKeyChecking
+            | SettingsKeyRejected
             | SettingsComboHover
     )
 }
@@ -144,6 +146,8 @@ pub fn follows_dpi_only(state: GalleryState) -> bool {
             | SettingsSaved
             | SettingsInvalid
             | SettingsNotSaved
+            | SettingsKeyChecking
+            | SettingsKeyRejected
             | SettingsComboHover
     )
 }
@@ -297,11 +301,19 @@ pub enum GalleryState {
     SettingsInvalid,
     /// #875: a write that failed, on the status line.
     SettingsNotSaved,
+    /// #876: the Models page while a typed key is being checked.
+    SettingsKeyChecking,
+    /// #876: the Models page after a vendor refused a typed key.
+    SettingsKeyRejected,
     /// #1109: the General page with the mouse over the Card corner combo.
     SettingsComboHover,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
+    /// #809: the in-place overlay over a fixture page: three notes, one of
+    /// them flipped below its text and one spanning a line break. Drawn
+    /// straight to a PNG (no window), so a screenshot run only.
+    OverlayNotes,
     /// #825: the real tray menu, drawn from fixture data.
     TrayMenu,
     /// #825: the same with a row selected and its submenu open.
@@ -360,8 +372,11 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsSaved,
         SettingsInvalid,
         SettingsNotSaved,
+        SettingsKeyChecking,
+        SettingsKeyRejected,
         SettingsComboHover,
         RegionOverlay,
+        OverlayNotes,
         TrayMenu,
         TrayMenuSubmenu,
     ]
@@ -420,8 +435,11 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsSaved => "settings-saved",
         SettingsInvalid => "settings-invalid",
         SettingsNotSaved => "settings-not-saved",
+        SettingsKeyChecking => "settings-key-checking",
+        SettingsKeyRejected => "settings-key-rejected",
         SettingsComboHover => "settings-combo-hover",
         RegionOverlay => "region-overlay",
+        OverlayNotes => "overlay-notes",
         TrayMenu => "tray-menu",
         TrayMenuSubmenu => "tray-menu-submenu",
     }
@@ -683,7 +701,13 @@ mod driver {
         path: &std::path::Path,
     ) -> anyhow::Result<HWND> {
         apply_variant(card, palette, variant);
-        if matches!(
+        if state == GalleryState::OverlayNotes {
+            // No window: the overlay is a layered window, which `PrintWindow`
+            // renders black (#626). Its picture is the frame it would show.
+            card.hide();
+            palette.hide();
+            crate::ui::overlay::gallery_png(variant.theme, variant.dpi.unwrap_or(96), path)?;
+        } else if matches!(
             state,
             GalleryState::TrayMenu | GalleryState::TrayMenuSubmenu
         ) {
@@ -883,7 +907,9 @@ mod driver {
         match state {
             GalleryState::SettingsModels
             | GalleryState::SettingsModelsClaude
-            | GalleryState::SettingsModelsMoreProviders => Page::Models,
+            | GalleryState::SettingsModelsMoreProviders
+            | GalleryState::SettingsKeyChecking
+            | GalleryState::SettingsKeyRejected => Page::Models,
             GalleryState::SettingsPrivacy => Page::Privacy,
             GalleryState::SettingsActions => Page::Actions,
             GalleryState::SettingsAdvanced | GalleryState::SettingsAdvancedPromptOpen => {
@@ -1220,6 +1246,12 @@ mod driver {
                 let dpi = variant.dpi.unwrap_or(96);
                 *region = Some(Overlay::open_for_gallery(instance, theme, dpi)?);
             }
+            OverlayNotes => {
+                // Screenshot runs only (see `shoot`): interactively there is
+                // nothing to show, so the card and palette are just cleared.
+                card.hide();
+                palette.hide();
+            }
             TrayMenu | TrayMenuSubmenu => {
                 card.hide();
                 palette.hide();
@@ -1237,7 +1269,9 @@ mod driver {
             | SettingsSaved
             | SettingsInvalid
             | SettingsNotSaved
-            | SettingsComboHover => {
+            | SettingsComboHover
+            | SettingsKeyChecking
+            | SettingsKeyRejected => {
                 card.hide();
                 palette.hide();
                 let mut w = GalleryWindow::open(instance, variant.dpi)
@@ -1257,6 +1291,12 @@ mod driver {
                     }
                     SettingsNotSaved => w.show_status(
                         "Not saved: Card corner. The disk is full. Wingman is still using the old value.",
+                        false,
+                    ),
+                    // #876: a typed key being asked of its vendor, and refused.
+                    SettingsKeyChecking => w.show_status("Checking key...", false),
+                    SettingsKeyRejected => w.show_status(
+                        "Error: OpenAI key. OpenAI did not accept that key. Check it and try again.",
                         false,
                     ),
                     SettingsComboHover => w.hover_combo(crate::ui::settings::CARD_CORNER_COMBO),
@@ -1283,7 +1323,9 @@ mod driver {
             | SettingsSaved
             | SettingsInvalid
             | SettingsNotSaved
-            | SettingsComboHover => settings
+            | SettingsComboHover
+            | SettingsKeyChecking
+            | SettingsKeyRejected => settings
                 .as_ref()
                 .map(|w| w.hwnd())
                 .ok_or_else(|| anyhow::anyhow!("no Settings window"))?,
@@ -1908,8 +1950,10 @@ mod tests {
         // Models page with Claude active and with every provider shown (#874)
         // = 41, + the palette with a widened thumb (#988) = 42, + the preview's
         // button states (#818) = 46, + the status line saved, not valid and not
-        // saved (#875) = 49, + the Settings combo under the mouse (#1109) = 50.
-        assert_eq!(states.len(), 50);
+        // saved (#875) = 49, + the in-place overlay (#809) = 50, + the key being
+        // checked and refused (#876) = 52, + the Settings combo under the mouse
+        // (#1109) = 53.
+        assert_eq!(states.len(), 53);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -1951,6 +1995,8 @@ mod tests {
             "settings-saved",
             "settings-invalid",
             "settings-not-saved",
+            "settings-key-checking",
+            "settings-key-rejected",
             "settings-combo-hover",
         ] {
             assert!(names.contains(&want), "missing {want}");
@@ -1958,8 +2004,8 @@ mod tests {
         // One state per page of the rail: a page added there needs a picture.
         assert_eq!(
             crate::ui::settings::page_labels().len(),
-            names.iter().filter(|n| n.starts_with("settings-")).count() - 7,
-            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line three (#875) and the combo hover (#1109)"
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 9,
+            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line five (#875, #876) and the combo hover (#1109)"
         );
     }
 

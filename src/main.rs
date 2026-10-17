@@ -43,6 +43,7 @@ mod redact;
 mod remote_ollama;
 mod report_problem;
 mod router;
+mod secret_labels;
 mod secrets;
 mod single_instance;
 mod speech;

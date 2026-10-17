@@ -133,6 +133,9 @@ const CARD: &str = "card number";
 const IBAN: &str = "IBAN";
 const KEY: &str = "key";
 const EMAIL: &str = "email";
+/// The value after a label such as `password:` or `PIN` (#1121). Text only:
+/// a screenshot's OCR lines are not scanned for labels.
+const SECRET: &str = "secret";
 
 /// Vendor key prefixes. A run starting with one of these is a key from
 /// [`MIN_PREFIXED_KEY_CHARS`] characters on. One list for both paths: the text
@@ -459,7 +462,7 @@ fn text_key_spans(text: &str) -> Vec<Range<usize>> {
 
 /// Every sensitive byte range in `text` with its marker label, sorted by
 /// start. Ranges may overlap (a key can contain digits that pass Luhn).
-fn text_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
+fn text_spans(text: &str, labels: bool) -> Vec<(Range<usize>, &'static str)> {
     let mut spans: Vec<(Range<usize>, &'static str)> = Vec::new();
     let mut add = |found: Vec<Range<usize>>, label| {
         spans.extend(found.into_iter().map(|r| (r, label)));
@@ -472,8 +475,37 @@ fn text_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
     add(text_key_spans(text), KEY);
     add(shared_key_spans(text), KEY);
     add(email_spans(text), EMAIL);
+    if labels {
+        let secrets = secret_label_spans(text, &spans);
+        spans.extend(secrets.into_iter().map(|r| (r, SECRET)));
+    }
     spans.sort_by_key(|(r, _)| (r.start, r.end));
     spans
+}
+
+/// Labelled-secret spans that do not re-cover what a more specific kind
+/// already marked. A value that starts where a key, card, IBAN or email
+/// starts is that kind's to mark (`token=<jwt>.` stays `token=[key 1].`); only
+/// text left after it is kept, and only when it still holds a letter or digit.
+fn secret_label_spans(text: &str, others: &[(Range<usize>, &'static str)]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for span in crate::secret_labels::secret_spans(text, false) {
+        let covered_to = others
+            .iter()
+            .filter(|(r, _)| r.start == span.start)
+            .map(|(r, _)| r.end)
+            .max();
+        let Some(end) = covered_to else {
+            out.push(span);
+            continue;
+        };
+        let rest = text.get(end.min(span.end)..span.end).unwrap_or("");
+        let lead = rest.len() - rest.trim_start().len();
+        if rest.chars().any(char::is_alphanumeric) {
+            out.push(end + lead..span.end);
+        }
+    }
+    out
 }
 
 /// The private details swapped out of one outbound request, kept only in
@@ -520,7 +552,7 @@ impl Redactions {
         if !text.contains('[') {
             return;
         }
-        for label in [CARD, IBAN, KEY, EMAIL] {
+        for label in [CARD, IBAN, KEY, EMAIL, SECRET] {
             let open = format!("[{label} ");
             for (at, _) in text.match_indices(&open) {
                 let rest = &text[at + open.len()..];
@@ -551,7 +583,18 @@ impl Redactions {
     /// Overlapping spans become one marker, the first one's. Text with
     /// nothing sensitive comes back unchanged.
     pub fn redact_text(&mut self, text: &str) -> String {
-        let spans = text_spans(text);
+        self.redact_with(text, true)
+    }
+
+    /// [`Redactions::redact_text`] without the labelled-secret step. For text
+    /// where a word like "token:" is prose, not a label: error messages and
+    /// Wingman's own prompts.
+    pub fn redact_text_plain(&mut self, text: &str) -> String {
+        self.redact_with(text, false)
+    }
+
+    fn redact_with(&mut self, text: &str, labels: bool) -> String {
+        let spans = text_spans(text, labels);
         if spans.is_empty() {
             return text.to_string();
         }
@@ -584,7 +627,14 @@ impl Redactions {
     pub fn restore_in_json(&self, response: String) -> String {
         let mut out = response;
         for (marker, original) in &self.pairs {
-            if !out.contains(marker.as_str()) {
+            // A model may change the case of a secret marker ("[Secret 1]").
+            let any_case = marker.starts_with("[secret ");
+            let found = if any_case {
+                out.to_ascii_lowercase().contains(marker.as_str())
+            } else {
+                out.contains(marker.as_str())
+            };
+            if !found {
                 continue;
             }
             let escaped = serde_json::to_string(original).unwrap_or_default();
@@ -592,7 +642,11 @@ impl Redactions {
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
                 .unwrap_or("");
-            out = out.replace(marker.as_str(), escaped);
+            out = if any_case {
+                replace_ascii_case_insensitive(&out, marker, escaped)
+            } else {
+                out.replace(marker.as_str(), escaped)
+            };
         }
         out
     }
@@ -604,7 +658,7 @@ impl Redactions {
     /// copied, images included.
     pub fn redact_value(&mut self, v: &mut serde_json::Value) -> bool {
         self.note_existing_in(v);
-        self.redact_value_under(v, "")
+        self.redact_value_under(v, "", true)
     }
 
     fn note_existing_in(&mut self, v: &serde_json::Value) {
@@ -617,14 +671,18 @@ impl Redactions {
         }
     }
 
-    fn redact_value_under(&mut self, v: &mut serde_json::Value, key: &str) -> bool {
+    /// `labels` is false under Wingman's own instructions (a `system` field, or
+    /// a message whose `role` is `system`): a prompt such as "Password: never
+    /// reveal" must reach the model intact. User content keeps label masking.
+    fn redact_value_under(&mut self, v: &mut serde_json::Value, key: &str, labels: bool) -> bool {
         use serde_json::Value;
+        let labels = labels && !matches!(key, "system" | "instructions" | "system_instruction");
         match v {
             Value::String(s) => {
                 if crate::egress::is_structural_key(key) || crate::egress::is_embedded_png(s) {
                     return false;
                 }
-                let redacted = self.redact_text(s);
+                let redacted = self.redact_with(s, labels);
                 if redacted == *s {
                     return false;
                 }
@@ -634,20 +692,41 @@ impl Redactions {
             Value::Array(items) => {
                 let mut changed = false;
                 for i in items {
-                    changed |= self.redact_value_under(i, key);
+                    changed |= self.redact_value_under(i, key, labels);
                 }
                 changed
             }
             Value::Object(map) => {
+                let own = matches!(
+                    map.get("role").and_then(|r| r.as_str()),
+                    Some("system" | "developer")
+                );
+                let labels = labels && !own;
                 let mut changed = false;
                 for (k, i) in map.iter_mut() {
-                    changed |= self.redact_value_under(i, k);
+                    changed |= self.redact_value_under(i, k, labels);
                 }
                 changed
             }
             _ => false,
         }
     }
+}
+
+/// `text` with every ASCII-case-insensitive copy of the ASCII `needle` replaced.
+/// ASCII lowercasing keeps byte offsets, so every cut is on a char boundary.
+fn replace_ascii_case_insensitive(text: &str, needle: &str, with: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, _) in lower.match_indices(&needle) {
+        out.push_str(text.get(at..start).unwrap_or(""));
+        out.push_str(with);
+        at = start + needle.len();
+    }
+    out.push_str(text.get(at..).unwrap_or(""));
+    out
 }
 
 /// Where each word of `line_text` sits, as byte ranges, found by searching for
@@ -676,7 +755,7 @@ pub fn word_byte_ranges(line_text: &str, words: &[OcrWord]) -> Option<Vec<Range<
 pub fn contains_marker(text: &str) -> bool {
     // ASCII lowercasing keeps every byte offset, so no char is split.
     let text = text.to_ascii_lowercase();
-    [CARD, IBAN, KEY, EMAIL].iter().any(|label| {
+    [CARD, IBAN, KEY, EMAIL, SECRET].iter().any(|label| {
         let open = format!("[{} ", label.to_ascii_lowercase());
         text.match_indices(&open).any(|(at, _)| {
             let rest = text.as_bytes().get(at + open.len()..).unwrap_or_default();
@@ -1080,6 +1159,91 @@ mod tests {
     }
 
     #[test]
+    fn a_labelled_secret_gets_a_numbered_marker_and_is_restored() {
+        let mut r = Redactions::default();
+        let out = r.redact_text("user: bob\npassword: hunter2\nPIN: 1234\npwd=hunter2");
+        assert_eq!(
+            out,
+            "user: bob\npassword: [secret 1]\nPIN: [secret 2]\npwd=[secret 1]"
+        );
+        assert_eq!(r.counts().get("secret"), Some(&2), "{:?}", r.counts());
+        assert_eq!(
+            r.restore_in_json("the password is [secret 1] and [secret 2]".to_string()),
+            "the password is hunter2 and 1234"
+        );
+    }
+
+    #[test]
+    fn secret_markers_are_known_and_numbering_starts_above_existing_ones() {
+        assert!(contains_marker("x [secret 4] y"));
+        assert!(contains_marker("[SECRET 1]"));
+        let mut r = Redactions::default();
+        r.note_existing("earlier [secret 3] text");
+        assert_eq!(r.redact_text("pin: 99"), "pin: [secret 4]");
+    }
+
+    #[test]
+    fn prose_with_secret_words_is_not_redacted_in_text() {
+        for t in [
+            "the password policy says so",
+            "Reset your password.",
+            "a pin is small",
+            // A circuit problem: no separator, so no secret.
+            "pin 3 connects to pin 4",
+            "PIN 1234 is on the card",
+            "token ya29.x1",
+        ] {
+            assert_eq!(red(t), t, "{t}");
+        }
+    }
+
+    #[test]
+    fn screen_text_needs_a_separator_or_a_table_cell() {
+        assert_eq!(red("Password：hunter2"), "Password：[secret 1]");
+        assert_eq!(red("| password | hunter2 |"), "| password | [secret 1] |");
+        assert_eq!(red("pin=1234"), "pin=[secret 1]");
+    }
+
+    #[test]
+    fn the_plain_variant_skips_labels_but_keeps_every_other_kind() {
+        let mut r = Redactions::default();
+        assert_eq!(
+            r.redact_text_plain("Password: never reveal. mail me@example.com"),
+            "Password: never reveal. mail [email 1]"
+        );
+    }
+
+    #[test]
+    fn a_request_body_is_label_masked_except_its_system_text() {
+        let mut body = serde_json::json!({
+            "system": "Password: never reveal",
+            "messages": [
+                {"role": "system", "content": "Pin: keep this"},
+                {"role": "user", "content": "password: hunter2"}
+            ]
+        });
+        let mut r = Redactions::default();
+        assert!(r.redact_value(&mut body));
+        assert_eq!(body["system"], "Password: never reveal");
+        assert_eq!(body["messages"][0]["content"], "Pin: keep this");
+        assert_eq!(body["messages"][1]["content"], "password: [secret 1]");
+    }
+
+    #[test]
+    fn a_secret_marker_is_restored_in_any_letter_case() {
+        let mut r = Redactions::default();
+        r.redact_text("password: hunter2");
+        assert_eq!(
+            r.restore_in_json("a [Secret 1] b [SECRET 1] c [secret 1]".to_string()),
+            "a hunter2 b hunter2 c hunter2"
+        );
+        // Other kinds stay exact.
+        let mut r = Redactions::default();
+        r.redact_text("me@example.com");
+        assert_eq!(r.restore_in_json("[EMAIL 1]".to_string()), "[EMAIL 1]");
+    }
+
+    #[test]
     fn redact_text_leaves_ordinary_text_alone() {
         for t in [
             "A 2 kg block slides 3.5 m down a 30 degree slope.\nWhat is g?",
@@ -1209,7 +1373,7 @@ mod tests {
         for t in [
             "open SG.Reports.Quarterly.xlsx now",
             "see SG.team-notes-2024.final.docx",
-            "token ya29.short",
+            "see ya29.short",
         ] {
             assert_eq!(red(t), t, "{t}");
         }

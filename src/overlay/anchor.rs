@@ -66,6 +66,41 @@ pub struct Space {
     pub height: u32,
 }
 
+impl Space {
+    /// The space of the image OCR actually ran on: `width` x `height` are that
+    /// image's own size (after any `fit_for_model` shrink, which is why the
+    /// map's scale can be above 1), and `map` says where its pixel (0, 0) sits
+    /// on the screen and how many screen pixels one image pixel covers. The
+    /// OCR word boxes are in that image's pixels, so this and the boxes must
+    /// come from the same image. `None` for a map that cannot be used.
+    pub fn for_image(width: u32, height: u32, map: &crate::capture::ScreenMap) -> Option<Self> {
+        let space = Self {
+            origin_x: map.origin_x,
+            origin_y: map.origin_y,
+            scale_x: map.scale_x,
+            scale_y: map.scale_y,
+            width,
+            height,
+        };
+        space_is_usable(&space).then_some(space)
+    }
+
+    /// The part of the screen the image covers: the captured monitor, which
+    /// labels are kept inside. Rounded to whole pixels; saturating, since the
+    /// numbers came from outside.
+    pub fn monitor_rect(&self) -> ScreenRect {
+        let edge = |origin: f64, scale: f64, n: u32| {
+            (origin + scale * f64::from(n)).round().clamp(-1e9, 1e9) as i32
+        };
+        ScreenRect {
+            left: self.origin_x.round().clamp(-1e9, 1e9) as i32,
+            top: self.origin_y.round().clamp(-1e9, 1e9) as i32,
+            right: edge(self.origin_x, self.scale_x, self.width),
+            bottom: edge(self.origin_y, self.scale_y, self.height),
+        }
+    }
+}
+
 /// One OCR word that can be drawn at: its box in image pixels and its line.
 struct WordBox {
     line: usize,
@@ -910,5 +945,60 @@ mod tests {
             ..space()
         };
         assert_eq!(locate(&lines, &quote("hello", 1), &s), Located::NotFound);
+    }
+
+    /// A monitor 1600x900 at x=1920, shrunk to 800x450 before OCR.
+    fn shrunk_map() -> crate::capture::ScreenMap {
+        crate::capture::ScreenMap::for_capture(1920, 0, 1600, 900, 800, 450, None)
+    }
+
+    #[test]
+    fn the_space_describes_the_image_ocr_ran_on_not_the_native_monitor() {
+        let sp = Space::for_image(800, 450, &shrunk_map()).unwrap();
+        assert_eq!((sp.width, sp.height), (800, 450));
+        assert_eq!((sp.scale_x, sp.scale_y), (2.0, 2.0));
+        assert_eq!(sp.monitor_rect(), rect(1920, 0, 3520, 900));
+    }
+
+    #[test]
+    fn a_word_found_in_a_shrunk_image_lands_on_the_native_pixels() {
+        // The word sits at image x 100..140, y 50..60, so on the screen at
+        // 1920 + 200 .. 1920 + 280 and y 100..120.
+        let lines = [line("hello", 100.0, 50.0)];
+        let sp = Space::for_image(800, 450, &shrunk_map()).unwrap();
+        let Located::Found(got) = locate(&lines, &quote("hello", 1), &sp) else {
+            panic!("not found");
+        };
+        assert_eq!(got, vec![rect(2120, 100, 2200, 120)]);
+        // Described as the native size instead, the same box would land at
+        // half the distance: the mistake this constructor exists to prevent.
+        let wrong = Space {
+            scale_x: 1.0,
+            scale_y: 1.0,
+            ..sp
+        };
+        let Located::Found(bad) = locate(&lines, &quote("hello", 1), &wrong) else {
+            panic!("not found");
+        };
+        assert_ne!(bad, got);
+    }
+
+    #[test]
+    fn an_unusable_map_or_an_empty_image_gives_no_space() {
+        assert!(Space::for_image(0, 450, &shrunk_map()).is_none());
+        assert!(Space::for_image(800, 0, &shrunk_map()).is_none());
+        let mut bad = shrunk_map();
+        bad.scale_x = f64::NAN;
+        assert!(Space::for_image(800, 450, &bad).is_none());
+        let mut zero = shrunk_map();
+        zero.scale_y = 0.0;
+        assert!(Space::for_image(800, 450, &zero).is_none());
+    }
+
+    #[test]
+    fn the_monitor_rect_of_an_unscaled_capture_is_its_own_size() {
+        let map = crate::capture::ScreenMap::for_capture(-1280, -200, 1280, 1024, 1280, 1024, None);
+        let sp = Space::for_image(1280, 1024, &map).unwrap();
+        assert_eq!(sp.monitor_rect(), rect(-1280, -200, 0, 824));
     }
 }

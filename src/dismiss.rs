@@ -46,7 +46,8 @@ use anyhow::Result;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSLLHOOKSTRUCT,
-    WH_MOUSE_LL, WM_APP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
+    WH_MOUSE_LL, WM_APP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN,
 };
 
 /// Posted to the target `HWND` when a click lands anywhere on screen while
@@ -93,6 +94,34 @@ fn is_button_down(msg: u32) -> bool {
 fn should_report(armed: bool, msg: u32) -> bool {
     armed && is_button_down(msg)
 }
+
+/// True if `msg` is a wheel turn, vertical or horizontal.
+fn is_wheel(msg: u32) -> bool {
+    msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL
+}
+
+/// #809: what the overlay wants to hear about a mouse event: any button down,
+/// and the wheel. `None` when the overlay is not armed or the event is
+/// neither (a move floods the callback and is never reported). The callback
+/// only posts what it saw; the main thread decides what it means.
+fn overlay_report(armed: bool, msg: u32) -> Option<crate::overlay::wire::Kind> {
+    use crate::overlay::wire::Kind;
+    if !armed {
+        None
+    } else if is_button_down(msg) {
+        Some(Kind::Click)
+    } else if is_wheel(msg) {
+        Some(Kind::Wheel)
+    } else {
+        None
+    }
+}
+
+/// The overlay's own window (raw `HWND` value) that its mouse inputs are
+/// posted to, `0` while the overlay is not armed. The overlay shares the one
+/// `WH_MOUSE_LL` hook with the card's click-away: the hook stays installed
+/// while either needs it.
+static OVERLAY_TARGET: AtomicIsize = AtomicIsize::new(0);
 
 /// Target `HWND` (as its raw pointer value) that clicks are posted to. Set
 /// once by [`ClickWatcher::install`] and never mutated afterwards, so no
@@ -171,7 +200,30 @@ pub fn hook_installed() -> bool {
 /// hides). Must run on the thread that installed the hook.
 pub fn disarm() {
     ARMED.store(false, Ordering::Relaxed);
-    HOOK.disarm(uninstall_real_hook);
+    if OVERLAY_TARGET.load(Ordering::Relaxed) == 0 {
+        HOOK.disarm(uninstall_real_hook);
+    }
+}
+
+/// #809: starts reporting clicks and the wheel to `target` for the overlay,
+/// installing the shared hook if the card has not. `false`, with nothing
+/// armed, when the hook cannot be installed: an overlay that cannot hear a
+/// click must not show.
+pub fn arm_overlay(target: HWND) -> bool {
+    if !HOOK.arm(install_real_hook) {
+        return false;
+    }
+    OVERLAY_TARGET.store(target.0 as isize, Ordering::Relaxed);
+    true
+}
+
+/// #809: stops reporting to the overlay, and removes the hook unless the
+/// card's click-away still needs it. Safe to call when not armed.
+pub fn disarm_overlay() {
+    OVERLAY_TARGET.store(0, Ordering::Relaxed);
+    if !ARMED.load(Ordering::Relaxed) {
+        HOOK.disarm(uninstall_real_hook);
+    }
 }
 
 /// Handle for the click watcher. The hook itself is installed only between
@@ -234,8 +286,29 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     let msg = wparam.0 as u32;
 
     // Fastest possible early return for WM_MOUSEMOVE (and anything else
-    // that isn't a button-down): no atomic load, just an integer compare.
-    // This message floods the callback, so this branch must stay minimal.
+    // that isn't a button-down or a wheel turn): no atomic load, just
+    // integer compares. This message floods the callback, so this branch
+    // must stay minimal.
+    if !is_button_down(msg) && !is_wheel(msg) {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
+    // #809: the overlay hears clicks and the wheel. One atomic load, one post.
+    let overlay_target = OVERLAY_TARGET.load(Ordering::Relaxed);
+    if let Some(kind) = overlay_report(overlay_target != 0, msg) {
+        let ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+        let packed = pack_point(ms.pt.x, ms.pt.y);
+        let _ = unsafe {
+            PostMessageW(
+                Some(HWND(overlay_target as *mut _)),
+                crate::ui::overlay::WM_APP_OVERLAY_INPUT,
+                WPARAM(kind as usize),
+                LPARAM(packed as isize),
+            )
+        };
+    }
+
+    // The card's click-away only wants button-downs.
     if !is_button_down(msg) {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
@@ -348,6 +421,31 @@ mod tests {
         const WM_MOUSEWHEEL: u32 = 0x020A;
         assert!(!should_report(true, WM_LBUTTONUP));
         assert!(!should_report(true, WM_MOUSEWHEEL));
+    }
+
+    // -- #809: the overlay's share of the hook -----------------------------
+
+    #[test]
+    fn the_overlay_hears_clicks_and_the_wheel_only_while_armed() {
+        use crate::overlay::wire::Kind;
+        const WM_MOUSEMOVE: u32 = 0x0200;
+        const WM_LBUTTONUP: u32 = 0x0202;
+        assert_eq!(overlay_report(true, WM_LBUTTONDOWN), Some(Kind::Click));
+        assert_eq!(overlay_report(true, WM_RBUTTONDOWN), Some(Kind::Click));
+        assert_eq!(overlay_report(true, WM_MBUTTONDOWN), Some(Kind::Click));
+        assert_eq!(overlay_report(true, WM_MOUSEWHEEL), Some(Kind::Wheel));
+        assert_eq!(overlay_report(true, WM_MOUSEHWHEEL), Some(Kind::Wheel));
+        assert_eq!(overlay_report(true, WM_MOUSEMOVE), None);
+        assert_eq!(overlay_report(true, WM_LBUTTONUP), None);
+        for msg in [WM_LBUTTONDOWN, WM_MOUSEWHEEL] {
+            assert_eq!(overlay_report(false, msg), None);
+        }
+    }
+
+    #[test]
+    fn the_card_still_ignores_the_wheel() {
+        assert!(!should_report(true, WM_MOUSEWHEEL));
+        assert!(!should_report(true, WM_MOUSEHWHEEL));
     }
 
     // -- hook lifecycle (issue #729) ------------------------------------
