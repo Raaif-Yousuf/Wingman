@@ -884,6 +884,8 @@ fn watch(
                 // Once only: a store that stays broken must still end it.
                 if !resynced && (matches!(e, StoreError::Corrupt(_)) || swap_signalled(&swapped)) {
                     resynced = true;
+                    #[cfg(test)]
+                    RESYNCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     // SAFETY: the handle stays open while `swapped` lives.
                     unsafe {
                         let _ = SetEvent(swapped.0);
@@ -896,6 +898,10 @@ fn watch(
         }
     }
 }
+
+/// Test-only: how many times a failed store call was turned into a resync.
+#[cfg(test)]
+static RESYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// True when the store has replaced its file since the swap path last ran. The
 /// event is auto-reset, so looking consumes it: it is set again for the loop.
@@ -1616,6 +1622,10 @@ mod tests {
                 && store.fts_hits("hitsecondword").unwrap_or(0) == 1
         });
         assert!(watcher.is_running(), "the watch must still be running");
+        assert!(
+            RESYNCS.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the watcher must have recovered through its own failed call"
+        );
         drop(watcher);
         drop(store);
         let _ = fs::remove_dir_all(&dir);
