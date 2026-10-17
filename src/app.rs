@@ -210,6 +210,67 @@ pub const WM_APP_MACHINE_CHECK_RESULT: u32 = WM_APP + 21;
 /// `WM_APP + 31`.
 pub const WM_APP_NEED_SCREEN: u32 = WM_APP + 31;
 
+/// #1181: posted by the worker that read today's spend for the tray tooltip.
+/// No payload: the worker leaves the text in [`TOOLTIP_SPEND`] first, so a
+/// message that is dropped or arrives after the window is gone costs nothing.
+/// The read runs off the message thread because it can touch the store file
+/// (an integrity check, even a quarantine and reopen), and that thread also
+/// hosts the keyboard hook, which Windows drops if it stalls. `WM_APP + 32`.
+pub const WM_APP_TOOLTIP_SPEND: u32 = WM_APP + 32;
+
+/// The spend part of the tooltip as the last worker read it (#1181). Written
+/// by the worker, read by `update_tooltip` on the UI thread: no IO there.
+static TOOLTIP_SPEND: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn store_tooltip_spend(part: Option<String>) {
+    *TOOLTIP_SPEND.lock().unwrap_or_else(|e| e.into_inner()) = part;
+}
+
+fn tooltip_spend() -> Option<String> {
+    TOOLTIP_SPEND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Keeps at most one spend worker alive; a request that arrives while one runs
+/// makes it read once more instead of starting a second thread.
+#[derive(Default)]
+struct SpendRefreshGate {
+    running: std::sync::atomic::AtomicBool,
+    again: std::sync::atomic::AtomicBool,
+}
+
+impl SpendRefreshGate {
+    /// True when the caller must start the worker.
+    fn request(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.running.swap(true, SeqCst) {
+            self.again.store(true, SeqCst);
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Called by the worker after each read. True when it must read again.
+    fn finish(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.again.swap(false, SeqCst) {
+            return true;
+        }
+        self.running.store(false, SeqCst);
+        // A request that landed between the two steps above.
+        if self.again.load(SeqCst) && !self.running.swap(true, SeqCst) {
+            self.again.store(false, SeqCst);
+            return true;
+        }
+        false
+    }
+}
+
+static SPEND_REFRESH: std::sync::OnceLock<SpendRefreshGate> = std::sync::OnceLock::new();
+
 /// Set while a machine check is gathering, so a second click does not start
 /// a second worker. Cleared by the worker just before it posts, so an
 /// ignored (Settings open) or dropped result can never leave it stuck.
@@ -6691,28 +6752,67 @@ impl App {
     /// `refresh_tray_labels` always showed. Split out so pausing/resuming
     /// can update just the tooltip without touching the key-binding labels
     /// or model submenus, which haven't changed.
+    ///
+    /// The spend part comes from a worker (#1181): the text is set now from
+    /// the last result, and `WM_APP_TOOLTIP_SPEND` re-sets it when the fresh
+    /// read lands.
     fn update_tooltip(&mut self) {
+        self.apply_tooltip();
+        if !matches!(self.pause, PauseState::Paused { .. }) {
+            self.refresh_tooltip_spend();
+        }
+    }
+
+    /// Build and set the tooltip from what is in memory (#1181): no file or
+    /// store access, this runs on the message thread.
+    fn apply_tooltip(&mut self) {
         if let PauseState::Paused { choice, until } = self.pause {
             let hour_min = until.and_then(local_hour_min);
             self.tray
                 .set_tooltip(&pause::tooltip_text(choice, hour_min));
             return;
         }
-
         let primary = chord_to_string(&self.config.hotkeys.primary);
         let ready = self.chain.ready_provider_names();
-        let tip = if ready.is_empty() {
-            "Wingman: no API key configured".to_string()
-        } else {
-            let base = format!("Wingman: {} · {primary}", ready.join(", "));
-            match crate::usage::tooltip_part() {
-                Some(spend) => format!("{base} · {spend}"),
-                None => base,
-            }
-        };
-        // Issue #327: lead with the state (working / failed / offline).
-        let tip = crate::ui::tray::state_tooltip(self.tray.icon_state(), &tip);
+        let tip = tooltip_text(
+            &ready,
+            &primary,
+            tooltip_spend().as_deref(),
+            self.tray.icon_state(),
+        );
         self.tray.set_tooltip(&tip);
+    }
+
+    /// Read today's spend on a worker thread (#1181), leave it in
+    /// `TOOLTIP_SPEND` and post `WM_APP_TOOLTIP_SPEND`. Event-driven: runs
+    /// only when the tooltip was just updated, never on a timer.
+    fn refresh_tooltip_spend(&mut self) {
+        let gate = SPEND_REFRESH.get_or_init(SpendRefreshGate::default);
+        if !gate.request() {
+            return;
+        }
+        let target = self.hwnd_isize();
+        std::thread::spawn(move || loop {
+            store_tooltip_spend(crate::usage::tooltip_part());
+            unsafe {
+                // A failed post (window gone) is harmless: no payload.
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_TOOLTIP_SPEND,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+            if !gate.finish() {
+                break;
+            }
+        });
+    }
+
+    /// The worker's result is in `TOOLTIP_SPEND`: show it. Does not ask for
+    /// another read, or every result would start the next one.
+    fn on_tooltip_spend(&mut self) {
+        self.apply_tooltip();
     }
 
     /// Enter Pause for `choice` (issue #20): compute the deadline, publish
@@ -8010,6 +8110,26 @@ fn deadline_until_tomorrow() -> Result<SystemTime> {
     systemtime_utc_to_std(&utc)
 }
 
+/// The normal (not paused) tooltip text from data already in memory (#1181).
+fn tooltip_text(
+    ready: &[&str],
+    primary: &str,
+    spend: Option<&str>,
+    state: crate::ui::tray::IconState,
+) -> String {
+    let tip = if ready.is_empty() {
+        "Wingman: no API key configured".to_string()
+    } else {
+        let base = format!("Wingman: {} · {primary}", ready.join(", "));
+        match spend {
+            Some(spend) => format!("{base} · {spend}"),
+            None => base,
+        }
+    };
+    // Issue #327: lead with the state (working / failed / offline).
+    crate::ui::tray::state_tooltip(state, &tip)
+}
+
 /// The local hour/minute of `t`, for the "Paused until HH:MM" tooltip.
 /// Best-effort (`None` on any conversion failure): the tooltip degrades to
 /// plain "Paused" rather than that being treated as a rule-7 failure --
@@ -9221,6 +9341,9 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // key claim is already cleared), so a late choice has nothing to
         // act on. No payload to free.
         | WM_APP_OPTIONS_CHOICE
+        // #1181: no payload, and the worker left the text in TOOLTIP_SPEND, so
+        // the next tooltip update shows it; nothing is lost by dropping this.
+        | WM_APP_TOOLTIP_SPEND
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
@@ -10169,6 +10292,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_need_screen(wparam.0);
             LRESULT(0)
         }
+        WM_APP_TOOLTIP_SPEND => {
+            // #1181: no payload; the text is in TOOLTIP_SPEND.
+            app.on_tooltip_spend();
+            LRESULT(0)
+        }
         WM_APP_CALENDAR_RESULT => {
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>) };
@@ -10466,6 +10594,7 @@ mod tests {
     use super::BeginPlan;
     use super::WM_APP_CONFIG_WRITTEN;
     use super::WM_APP_FIRST_RUN;
+    use super::WM_APP_TOOLTIP_SPEND;
     use super::{
         exec_work_calendar, exec_work_form_fill, exec_work_restore, ExecDone, WM_APP_EXECUTOR_DONE,
     };
@@ -14281,7 +14410,99 @@ mod tests {
         ("WM_APP_SETTINGS_COMMAND", WM_APP_SETTINGS_COMMAND),
         ("WM_APP_OPTIONS_CHOICE", WM_APP_OPTIONS_CHOICE),
         ("WM_APP_NEED_SCREEN", WM_APP_NEED_SCREEN),
+        ("WM_APP_TOOLTIP_SPEND", WM_APP_TOOLTIP_SPEND),
     ];
+
+    // -- #1181: the tooltip's spend part is read off the UI thread -----------
+
+    fn ready<'a>(names: &[&'a str]) -> Vec<&'a str> {
+        names.to_vec()
+    }
+
+    #[test]
+    fn tooltip_text_shows_providers_chord_and_spend() {
+        use crate::ui::tray::IconState;
+        let tip = super::tooltip_text(
+            &ready(&["Claude"]),
+            "Win+Shift+F23",
+            Some("$0.04 today"),
+            IconState::Idle,
+        );
+        assert_eq!(
+            tip,
+            "Wingman: Claude \u{b7} Win+Shift+F23 \u{b7} $0.04 today"
+        );
+        let tip = super::tooltip_text(&ready(&["A", "B"]), "F9", None, IconState::Idle);
+        assert_eq!(tip, "Wingman: A, B \u{b7} F9");
+        let tip = super::tooltip_text(&[], "F9", Some("$1 today"), IconState::Idle);
+        assert_eq!(tip, "Wingman: no API key configured");
+        let tip = super::tooltip_text(&ready(&["A"]), "F9", None, IconState::Working);
+        assert!(tip.ends_with("Wingman: A \u{b7} F9"), "{tip}");
+        assert_ne!(tip, "Wingman: A \u{b7} F9", "the state leads the text");
+    }
+
+    #[test]
+    fn spend_slot_holds_the_last_result_a_worker_stored() {
+        super::store_tooltip_spend(Some("$0.02 today".to_string()));
+        assert_eq!(super::tooltip_spend().as_deref(), Some("$0.02 today"));
+        super::store_tooltip_spend(None);
+        assert_eq!(super::tooltip_spend(), None);
+    }
+
+    #[test]
+    fn spend_refresh_gate_runs_one_worker_and_reruns_once_when_asked_again() {
+        let gate = super::SpendRefreshGate::default();
+        assert!(gate.request(), "the first request starts a worker");
+        assert!(!gate.request(), "a second one while it runs only marks it");
+        assert!(!gate.request(), "marks collapse into one");
+        assert!(gate.finish(), "a request arrived meanwhile: run again");
+        assert!(!gate.finish(), "nothing new: the worker ends");
+        assert!(gate.request(), "after it ended a new worker may start");
+    }
+
+    /// The reason for #1181: the UI thread (which also hosts the keyboard hook)
+    /// must never read the store for the tooltip.
+    #[test]
+    fn update_tooltip_does_no_store_access_on_the_ui_thread() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn update_tooltip(&mut self) {", "\n    }\n");
+        assert!(body.len() > 100, "slicing broke: {body}");
+        for banned in ["tooltip_part", "store::", "day_total"] {
+            assert!(!body.contains(banned), "update_tooltip calls {banned}");
+        }
+        let worker = body_between(
+            &src,
+            "    fn refresh_tooltip_spend(&mut self) {",
+            "\n    }\n",
+        );
+        assert!(worker.contains("std::thread::spawn"), "{worker}");
+        assert!(worker.contains("crate::usage::tooltip_part()"), "{worker}");
+        assert!(worker.contains("WM_APP_TOOLTIP_SPEND"), "{worker}");
+    }
+
+    /// The handler only re-applies the tooltip from the stored result: it must
+    /// not start another refresh, or each result would ask for the next.
+    #[test]
+    fn the_spend_handler_applies_without_refreshing_again() {
+        let src = lf(include_str!("app.rs"));
+        let h = body_between(&src, "    fn on_tooltip_spend(&mut self) {", "\n    }\n");
+        assert!(h.contains("apply_tooltip"), "{h}");
+        assert!(!h.contains("refresh_tooltip_spend"), "{h}");
+        let arm = body_between(&src, "        WM_APP_TOOLTIP_SPEND => {", "\n        }\n");
+        assert!(arm.contains("app.on_tooltip_spend()"), "{arm}");
+    }
+
+    #[test]
+    fn a_stale_spend_message_is_dropped_behind_a_modal() {
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_TOOLTIP_SPEND, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Ignore
+        );
+        assert_eq!(
+            super::settings_foreground_policy(WM_APP_TOOLTIP_SPEND),
+            super::ForegroundPolicy::Pass
+        );
+    }
 
     // -- #567: the tray's Ollama model cache --------------------------------
 
@@ -15146,6 +15367,8 @@ mod tests {
             // has moved on. The Ignore arm marks the overlay stale instead, and it
             // is hidden when the menu closes.
             WM_APP_OVERLAY_INPUT,
+            // #1181: no card involved; the text is already stored.
+            WM_APP_TOOLTIP_SPEND,
         ];
         let mut ignored = 0;
         for (name, id) in ALL_WM_APP_IDS {
@@ -15455,6 +15678,11 @@ mod tests {
             "WM_APP_NEED_SCREEN",
             WM_APP_NEED_SCREEN,
             SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_TOOLTIP_SPEND",
+            WM_APP_TOOLTIP_SPEND,
+            SettingsReentrancy::Ignore,
         ),
     ];
 
