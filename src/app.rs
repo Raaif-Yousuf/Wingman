@@ -1461,6 +1461,23 @@ fn busy_press_card(card: crate::ui::card::CardState) -> BusyPress {
     }
 }
 
+/// #845: what a machine-check verdict may do to the card on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineCheckCard {
+    /// Nothing else is on screen but the check's own working card.
+    Show,
+    /// A preview, an options card or a run in flight owns the card.
+    Hold,
+}
+
+fn machine_check_card(card: crate::ui::card::CardState, busy: bool) -> MachineCheckCard {
+    use crate::ui::card::CardState;
+    if busy || matches!(card, CardState::Preview | CardState::Options) {
+        MachineCheckCard::Hold
+    } else {
+        MachineCheckCard::Show
+    }
+}
 /// #723: whether a press still finds the app busy. A run flagged stuck is
 /// abandoned by the press, so the press can start a new one.
 fn busy_after_press(busy: bool, stuck: bool) -> bool {
@@ -4744,6 +4761,11 @@ impl App {
     }
 
     fn on_machine_check_result(&mut self, facts: &crate::machine::MachineFacts) {
+        // #845: never cover a preview, an options card or a working card of a
+        // run in flight. The check is on demand and cheap, so it is run again.
+        if machine_check_card(self.card.state(), self.busy) == MachineCheckCard::Hold {
+            return;
+        }
         let verdict = crate::machine::verdict(facts);
         self.card
             .show_answer(&verdict.headline, &verdict.detail(), 20, None);
@@ -7928,7 +7950,10 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_EXECUTOR_DONE
         | WM_APP_CONFIG_WRITTEN
         | WM_APP_SETTINGS_LEFT
-        | WM_APP_SETTINGS_SAVE => SettingsReentrancy::Defer,
+        | WM_APP_SETTINGS_SAVE
+        // #845: the verdict the user asked for is shown once Settings is gone,
+        // not dropped (#328 ignored it, which left no card at all).
+        | WM_APP_MACHINE_CHECK_RESULT => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
@@ -7973,10 +7998,6 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
-        // #328: an on-demand card; Settings hides every card when it
-        // opens, so a result arriving then has nothing to show on. The
-        // boxed facts are freed below.
-        | WM_APP_MACHINE_CHECK_RESULT
         // #105: a send preview cannot be answered while Settings is
         // modal-open, so it is dropped, which cancels the send (the worker
         // sees the reply channel close and the request ends in a card).
@@ -8225,7 +8246,8 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         | WM_APP_EXECUTOR_DONE
         | WM_APP_PREVIEW_DECIDED
         | WM_APP_SEND_PREVIEW
-        | WM_APP_PAUSE_TOGGLE => ForegroundPolicy::Hold,
+        | WM_APP_PAUSE_TOGGLE
+        | WM_APP_MACHINE_CHECK_RESULT => ForegroundPolicy::Hold,
         // Advisory updates for cards, the palette and the options card, none
         // of which is showing while Settings is.
         WM_APP_PENDING_STAGE
@@ -8233,7 +8255,6 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         | WM_APP_ROUTER_RESULT
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
-        | WM_APP_MACHINE_CHECK_RESULT
         | WM_APP_OPTIONS_CHOICE => ForegroundPolicy::Drop,
         // Settings takes a chord itself while its own Change is pending; one
         // that reaches here is from a Change that ended (Esc, timeout), and
@@ -9130,6 +9151,8 @@ mod tests {
             WM_APP_PREVIEW_DECIDED,
             WM_APP_SEND_PREVIEW,
             WM_APP_PAUSE_TOGGLE,
+            // #845: an on-demand verdict is still owed a card.
+            WM_APP_MACHINE_CHECK_RESULT,
         ] {
             assert_eq!(settings_foreground_policy(id), P::Hold, "{id}");
         }
@@ -9139,7 +9162,6 @@ mod tests {
             WM_APP_ROUTER_RESULT,
             WM_APP_PALETTE_TOGGLE,
             WM_APP_PALETTE_RUN,
-            WM_APP_MACHINE_CHECK_RESULT,
             WM_APP_OPTIONS_CHOICE,
             // Settings takes a captured chord itself while a Change is
             // pending; one that reaches the main window is from a Change that
@@ -9705,6 +9727,31 @@ mod tests {
         }
     }
 
+    /// #845: a machine-check verdict never covers a card the user is
+    /// reading or answering, or one for a run in flight. Only its own
+    /// working card (or nothing) is replaced.
+    #[test]
+    fn machine_check_card_never_covers_another_card() {
+        use super::MachineCheckCard::{Hold, Show};
+        use crate::ui::card::CardState;
+        for (state, busy, expected) in [
+            (CardState::Pending, false, Show),
+            (CardState::Hidden, false, Show),
+            (CardState::Collapsed, false, Show),
+            (CardState::Expanded, false, Show),
+            (CardState::Preview, false, Hold),
+            (CardState::Options, false, Hold),
+            (CardState::Pending, true, Hold),
+            (CardState::Hidden, true, Hold),
+            (CardState::Preview, true, Hold),
+        ] {
+            assert_eq!(
+                super::machine_check_card(state, busy),
+                expected,
+                "{state:?} busy={busy}"
+            );
+        }
+    }
     // -- #307: the options card's choices ---------------------------------
 
     fn session(generation: u32, ids: &[&str]) -> super::OptionsSession {
@@ -12679,7 +12726,7 @@ mod tests {
         (
             "WM_APP_MACHINE_CHECK_RESULT",
             WM_APP_MACHINE_CHECK_RESULT,
-            SettingsReentrancy::Ignore,
+            SettingsReentrancy::Defer,
         ),
         (
             "WM_APP_FIRST_RUN",
