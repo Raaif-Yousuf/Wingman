@@ -18,6 +18,7 @@
 //! * **Only this module names `rusqlite`.** Callers get typed methods.
 
 mod acl;
+pub mod chunks;
 mod egress;
 mod import;
 mod migrate;
