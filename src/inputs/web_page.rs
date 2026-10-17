@@ -528,7 +528,7 @@ fn code_page_for(label: &str) -> Option<u32> {
 /// Decodes `body` from `code_page` with the Windows converter (no extra
 /// crate). Bytes that do not fit the set become replacement characters, so
 /// this does not fail on malformed input; `None` only if the API refuses.
-fn decode_code_page(body: &[u8], code_page: u32) -> Option<String> {
+pub(crate) fn decode_code_page(body: &[u8], code_page: u32) -> Option<String> {
     use windows::Win32::Globalization::{MultiByteToWideChar, MB_PRECOMPOSED};
     if body.is_empty() {
         return Some(String::new());
